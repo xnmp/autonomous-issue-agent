@@ -69,6 +69,7 @@ from ..domain.fix import (
     ci_flakes,
     CiStallStep,
     ci_remediations,
+    ci_remediation_marker,
     decide_fix,
     duplicate_pr_guards,
     issue_holds,
@@ -133,7 +134,7 @@ from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
 from ..domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
-from ..domain.contracts import BudgetScope, Money
+from ..domain.contracts import BudgetScope, Money, EffectStatus
 from ..domain.self_clear import (
     BudgetBlock,
     BudgetLimitObservation,
@@ -547,6 +548,7 @@ def _effects(
     repository_cap: Money | None = None,
     global_cap: Money | None = None,
     test_configuration=None,
+    fix_config: FixConfig = FixConfig(fix_bot=""),
     issue_cap: Money | None = None,
     retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
     journal: TypedJournal | None = None,
@@ -560,6 +562,7 @@ def _effects(
         identity=identity,
         config_version=config_version,
         test_configuration=test_configuration,
+        fix_config=fix_config,
         repository_cap=repository_cap,
         global_cap=global_cap,
         issue_cap=issue_cap,
@@ -722,7 +725,7 @@ def _reported_world(
     log: Callable[[str], None],
 ) -> Callable:
     deployment = _deployment_identity(cfg, role)
-    return WorldReporter(control, deployment, log, cfg.ci_ignore_checks).wrap(observe)
+    return WorldReporter(control, deployment, log).wrap(observe)
 
 
 class CancellableAsyncDispatch:
@@ -933,13 +936,12 @@ def _onoff(enabled: bool) -> str:
 
 
 def fix_capability_line(*, auto_merge: bool, auto_rebase: bool,
-                        escalate_on_evidence: bool, arm_on_open: bool) -> str:
+                        escalate_on_evidence: bool) -> str:
     """One boot line saying what the fixer can DO in this configuration."""
     return (
         "fix: capabilities: resolve=on "
         f"auto_merge={_onoff(auto_merge)} auto_rebase={_onoff(auto_rebase)} "
         f"escalate_on_evidence={_onoff(escalate_on_evidence)} "
-        f"arm_on_open={_onoff(arm_on_open)}"
     )
 
 
@@ -1965,7 +1967,6 @@ def _fix_state(
     ci_cancel_head = {}
     ci_remediations = {}
     ci_remediation_errors = {}
-    update_branch_head = {}
     pending_ci_escalations = set()
     cleanup_sources = {}
     for pr in world.prs:
@@ -1979,23 +1980,11 @@ def _fix_state(
                 cleanup_sources[pr.number] = cc.PRRepairCleanup(selected.binding, selected.revision, pr.head_ref_oid, pr.state == "MERGED")
             rerun, cancel = selected.component.state.ci_rerun, selected.component.state.ci_cancel
             ci_remediations[pr.number] = (rerun, cancel)
-            def head_marker(item):
-                if item is None:
-                    return ""
-                capture = (item.capture if isinstance(item, cc.OwedCIRemediation)
-                           else item.owed.capture if isinstance(item, cc.SettledCIRemediation) else item)
-                return f"{capture.head}@{capture.decided_at}" if capture.decided_at else capture.head
-            ci_rerun_head[pr.number] = head_marker(rerun)
-            ci_cancel_head[pr.number] = head_marker(cancel)
-            refresh = selected.component.state.branch_refresh
+            ci_rerun_head[pr.number] = ci_remediation_marker(rerun)
+            ci_cancel_head[pr.number] = ci_remediation_marker(cancel)
             escalation = selected.component.state.pending_ci_escalation
-            def recovery_capture(item):
-                return item.capture if isinstance(item, cc.OwedPRRecoveryEffect) else item.owed.capture if isinstance(item, cc.SettledPRRecoveryEffect) else item
-            refresh_capture = recovery_capture(refresh)
-            if refresh_capture is not None:
-                update_branch_head[pr.number] = f"{refresh_capture.head}:{refresh_capture.base}"
-            escalation_capture = recovery_capture(escalation)
-            if escalation_capture is not None:
+            if isinstance(escalation, cc.SettledPRRecoveryEffect) and escalation.receipt.status is EffectStatus.SUCCEEDED:
+                escalation_capture = escalation.owed.capture
                 pending_ci_escalations.add((pr.number, escalation_capture.decision_head
                     if isinstance(escalation_capture, cc.PendingCIEscalationCapture) else escalation_capture.head))
         except (ValueError, sqlite3.Error) as exc:
@@ -2045,7 +2034,6 @@ def _fix_state(
         infra_deaths=infra_deaths, infra_control_errors=infra_errors, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
         ci_remediations=ci_remediations, ci_remediation_errors=ci_remediation_errors,
-        update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
         cleanup_sources=cleanup_sources,
         inflight=inflight,
@@ -2404,7 +2392,7 @@ def _stall_reporter(journal: EventSink | None, store: Store, log):
     not changed for a whole stall threshold emits an escalating
     `target_stalled` TelemetryWarning — regardless of WHY it is stuck.
 
-    2026-08-01's run produced three unrelated stall shapes (advisory-UNSTABLE
+    2026-08-01's run produced three unrelated stall shapes (CI
     merge deadlock, receipt-dead-ended visual resolve, uncounted review
     deferrals); each per-path fix is necessary, but this watchdog is the
     boundary measurement that catches the classes nobody has met yet.
@@ -2657,7 +2645,6 @@ def compose_fix_daemon(
         identity_mode=repo_cfg.identity_mode,
         auto_merge=cfg.auto_merge,
         merge_method=cfg.merge_method,
-        ci_ignore_checks=cfg.ci_ignore_checks,
         ci_pending_max_seconds=cfg.ci_pending_max_seconds,
         duplicate_pr_guard=cfg.duplicate_pr_guard,
         ci_free_rerun=cfg.ci_free_rerun,
@@ -2668,7 +2655,6 @@ def compose_fix_daemon(
         max_rebase_retries=fix_runtime.max_rebase_retries,
         max_resolve_retries=fix_runtime.max_resolve_retries,
         max_infra_deaths=fix_runtime.max_infra_deaths,
-        arm_on_open=cfg.arm_on_open_active,
     )
     journal = _typed_journal(_journal(store), cfg, "fix", store.state_dir)
     infra_breaker = _infra_breaker(cfg, journal, log)
@@ -2723,6 +2709,7 @@ def compose_fix_daemon(
         repository=cfg.repo,
         identity=owner_id,
         config_version=cfg.config_version,
+        fix_config=fix_cfg,
         base_branch=cfg.base_branch,
         repository_cap=Money.from_major("USD", cfg.daily_spend_cap_usd) if cfg.daily_spend_cap_usd > 0 else None,
         global_cap=Money.from_major("USD", cfg.global_daily_spend_cap_usd) if cfg.global_daily_spend_cap_usd > 0 else None,
@@ -2761,7 +2748,7 @@ def compose_fix_daemon(
         current_pr = gateway.pr_for_issue(action.issue, require_unique=True)
         if (breaker_key(pr) != action.issue or pr.head_ref_oid != source.head
                 or pr.state not in {"OPEN", "MERGED"}
-                or (pr.state != "MERGED" and ci_state(pr.checks, fix_cfg.ci_ignore_checks, known=pr.checks_known) is not CIState.OK)
+                or (pr.state != "MERGED" and ci_state(pr.ci) is not CIState.OK)
                 or current_pr != (pr.number if pr.state == "OPEN" else None)):
             raise ValueError("CI reset no longer matches settled green PR/head linkage")
         if workflow_control.reset_ci_episode(source):
@@ -3024,7 +3011,6 @@ def compose_fix_daemon(
         auto_merge=fix_cfg.auto_merge,
         auto_rebase=fix_cfg.auto_rebase_conflicts,
         escalate_on_evidence=cfg.escalate_on_evidence,
-        arm_on_open=fix_cfg.arm_on_open,
     ))
     recovery = _recovery(
         cfg.state_dir,

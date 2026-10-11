@@ -9,9 +9,10 @@ Names mirror config/agent.env.example so operators carry the same env file over.
 
 from __future__ import annotations
 
+import re
+
 import math
 import os
-import re
 import hashlib
 import json
 from dataclasses import MISSING, dataclass, field, fields
@@ -366,21 +367,6 @@ class HarnessConfig:
     # flag — its decide reads CI/mergeability, which the probe cannot see.
     world_probe: bool = True
     world_probe_ttl_seconds: int = 300
-    # ARM_ON_OPEN knob: "auto" (default) = at fix-daemon boot, probe the base
-    # branch's protection and arm auto-merge at PR creation iff it verifiably
-    # requires ≥1 review and ≥1 status check; "0" = never arm early. There is
-    # deliberately no "1": forcing early arming without the verified server-side
-    # gate would merge unreviewed work.
-    arm_on_open: str = field(
-        default="auto",
-        metadata={
-            "env": "ARM_ON_OPEN",
-            "coerce": "choice",
-            "choices": ("auto", "0"),
-        },
-    )
-    # The probe's boot-time verdict (main.build_role fills it; never from env).
-    arm_on_open_active: bool = False
     auto_merge: bool = True
     merge_method: str = field(
         default="squash",
@@ -390,12 +376,9 @@ class HarnessConfig:
             "choices": ("squash", "merge", "rebase"),
         },
     )
-    ci_ignore_checks: str = field(default="", metadata={"coerce": "regex"})
     close_issue_on_merge: bool = True
     # Bound on how long CI may sit PENDING before the PR goes to a human (#30).
-    # CI_IGNORE_CHECKS was the only remedy for a wedged check, and it is a knob,
-    # not a guardrail: it cannot fire on the FIRST occurrence, which is the one
-    # that matters. Default 3600s; 0 disables. Generous on purpose — real
+    # Default 3600s; 0 disables. Real
     # pipelines run well over half an hour and escalating a healthy long run
     # would move the escalation-rate guardrail the wrong way.
     ci_pending_max_seconds: int = 3600
@@ -1279,7 +1262,6 @@ def _require_positive(errors: list[str], name: str, value: int | float) -> None:
 # POLL_SECONDS 60-vs-20 mismatch, review S7).
 _INTERNAL_CONFIG_FIELDS = frozenset(
     {
-        "arm_on_open_active",
         "agent_md",
         "triage_prompt",
         "codex_cost_per_mtok_cached_in",
@@ -1496,13 +1478,6 @@ def _metadata_value(
     raw = env.get(env_name)
     if raw is None:
         return fallback
-    if coercion == "regex":
-        try:
-            re.compile(str(raw))
-        except re.error as exc:
-            errors.append(f"{env_name} must be a valid regex: {exc} — using default {fallback!r}")
-            return fallback
-        return str(raw)
     if coercion == "optional_string":
         return str(raw) or None
     if coercion == "stripped":

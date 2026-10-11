@@ -1,5 +1,7 @@
 """Activation-source scope keeps remote-effect barriers over complete attribution."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -55,8 +57,8 @@ class Gateway:
 
     def __init__(self):
         self.views = {
-            9: PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD),
-            10: PRView(10, head_ref_name="work/topic", head_ref_oid=HEAD),
+            9: observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD),
+            10: observed_pr(10, head_ref_name="work/topic", head_ref_oid=HEAD),
         }
 
     def _gh_json(self, _args):

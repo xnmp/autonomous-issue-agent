@@ -1603,7 +1603,8 @@ def _human_action(
         and str(gh_pr.get("mergeable") or "").upper() == "MERGEABLE"
         and str(gh_pr.get("mergeStateStatus") or "").upper() == "CLEAN"
         and str(gh_pr.get("reviewDecision") or "").upper() == "APPROVED"
-        and _checks_green(gh_pr.get("statusCheckRollup"))
+        and (row.facts.get("pr_ci_gate") in {"ok", "none"} if "pr_ci_gate" in row.facts
+             else _checks_green(gh_pr.get("statusCheckRollup")))
         and not gh_pr.get("autoMergeRequest")
     ):
         return "merge-ready", _merge_ready_since(gh_pr)
@@ -1832,7 +1833,7 @@ def _pr_ci_state(gh_pr: dict | None, row: dash.IssueRow | None = None) -> str | 
         if isinstance(check, dict)
     ]
     state = ci_state(
-        Check("", verdict,
+        Check("status", verdict,
               "fail" if verdict in _CI_FAILURE else "pass" if verdict in _CI_SUCCESS else "pending")
         for verdict in verdicts
     )

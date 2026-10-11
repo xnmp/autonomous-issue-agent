@@ -1,5 +1,7 @@
 """Legacy file counter attribution follows complete open-PR linkage evidence."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 import hashlib
 
@@ -82,11 +84,11 @@ def test_unscoped_same_counter_key_from_two_roots_cannot_be_summed_as_review():
 
 def test_closing_reference_takes_precedence_over_branch_and_no_link_keeps_negative_key():
     closing = classify_legacy_counter_link(
-        PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=8),
+        observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=8),
         ObservedLinkedIssue(IssueView(8)),
     )
     unlinked = classify_legacy_counter_link(
-        PRView(10, head_ref_name="work/topic", head_ref_oid=HEAD), NoLinkedIssue(),
+        observed_pr(10, head_ref_name="work/topic", head_ref_oid=HEAD), NoLinkedIssue(),
     )
 
     assert isinstance(closing, LegacyOpenPRCounterLink) and closing.linked_issue == 8
@@ -99,14 +101,14 @@ def test_closing_reference_takes_precedence_over_branch_and_no_link_keeps_negati
 
 
 @pytest.mark.parametrize("view,linked", [
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD), NoLinkedIssue()),
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD), ObservedLinkedIssue(IssueView(8))),
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD), LinkedIssueUnavailable("offline")),
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, state="CLOSED"), ObservedLinkedIssue(IssueView(7))),
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid="bad"), ObservedLinkedIssue(IssueView(7))),
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=True), ObservedLinkedIssue(IssueView(7))),
-    (PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=0), ObservedLinkedIssue(IssueView(7))),
-    (PRView(9, head_ref_name="fix/" + "9" * 4097 + "-work", head_ref_oid=HEAD), NoLinkedIssue()),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD), NoLinkedIssue()),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD), ObservedLinkedIssue(IssueView(8))),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD), LinkedIssueUnavailable("offline")),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, state="CLOSED"), ObservedLinkedIssue(IssueView(7))),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid="bad"), ObservedLinkedIssue(IssueView(7))),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=True), ObservedLinkedIssue(IssueView(7))),
+    (observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=0), ObservedLinkedIssue(IssueView(7))),
+    (observed_pr(9, head_ref_name="fix/" + "9" * 4097 + "-work", head_ref_oid=HEAD), NoLinkedIssue()),
 ])
 def test_malformed_or_unavailable_linkage_cannot_map_counter(view, linked):
     assert isinstance(classify_legacy_counter_link(view, linked), BlockedLegacyCounterLink)

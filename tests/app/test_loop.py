@@ -1,5 +1,7 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
+from tests.domain.builders import observed_pr
+
 import asyncio
 import json
 import threading
@@ -78,7 +80,7 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
 
         def get_pr(self, pr, *, mergeability=True, checks=True):
             del mergeability, checks
-            return PRView(pr, head_ref_oid=f"head-{pr}")
+            return observed_pr(pr, head_ref_oid=f"head-{pr}")
 
         def enable_auto_merge(self, pr, method, expected_head):
             assert expected_head == f"head-{pr}"
@@ -116,7 +118,7 @@ def test_observation_and_lifecycle_continue_while_the_only_dispatch_slot_is_busy
     class LiveGateway(FakeGateway):
         def __init__(self):
             super().__init__(
-                prs={24: PRView(24, head_ref_oid="head-24")}
+                prs={24: observed_pr(24, head_ref_oid="head-24")}
             )
             self.arm_attempts = 0
 

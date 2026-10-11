@@ -44,6 +44,7 @@ from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import CIState, Comment
 from issue_agent.domain.ci import ci_state, parse_timestamp
+from issue_agent.domain.checks import Unavailable, Observed
 from tests.fakes.workflow_authority import resolve_snapshot
 
 
@@ -141,8 +142,8 @@ def test_parse_pr_checks_feed_ci_state():
     d = {"number": 1, "statusCheckRollup": [
         {"name": "unit", "bucket": "fail"}, {"name": "e2e", "state": "QUEUED"}]}
     pr = parse_pr(d)
-    # parsed checks compose with the domain ci_state (pending beats failure).
-    assert ci_state(pr.checks) is CIState.PENDING
+    # The PR payload cannot prove a complete repository policy or report read.
+    assert isinstance(pr.ci, Unavailable)
 
 
 def test_parse_world():
@@ -552,16 +553,6 @@ def test_get_issue_parses_response():
     assert iss.number == 5 and iss.has(Label.AI_READY)
 
 
-def test_get_pr_merges_checks_endpoint():
-    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
-    checks = [{"name": "unit", "bucket": "pass"}]
-    fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": checks})
-    gw = GitHubGateway("o/r", runner=fr)
-    pr = gw.get_pr(100)
-    assert pr.number == 100
-    assert pr.checks and pr.checks[0].name == "unit"
-    view_call = next(call[0] for call in fr.calls if call[0][1:3] == ["pr", "view"])
-    assert "comments" in view_call[view_call.index("--json") + 1]
 
 
 def test_get_pr_checks_are_head_bound_and_keep_only_latest_attempt():
@@ -617,10 +608,9 @@ def test_get_pr_checks_are_head_bound_and_keep_only_latest_attempt():
             raise AssertionError("moving current head must not select CI")
         return ""
 
-    pr = GitHubGateway("o/r", runner=runner).get_pr(100)
-
-    assert ci_state(pr.checks, known=pr.checks_known) is CIState.OK
-    assert [check.name for check in pr.checks] == ["unit", "legacy"]
+    checks = GitHubGateway("o/r", runner=runner)._checks_for_head("h1")
+    assert [check["bucket"] for check in checks] == ["pass", "pass"]
+    assert [check["name"] for check in checks] == ["unit", "legacy"]
     assert all(
         "/commits/h1/" in " ".join(call)
         for call in calls
@@ -674,71 +664,10 @@ def test_review_world_pr_view_omits_mergeability_fields():
     assert "mergeable" in v2[v2.index("--json") + 1]
 
 
-def test_get_pr_marks_failed_job_advisory_when_owning_run_succeeded(capsys):
-    fr = FakeRunner({
-        "pr view 815": {"number": 815, "state": "OPEN"},
-        "pr checks 815": [{
-            "name": "Security Audit",
-            "bucket": "fail",
-            "link": "https://github.com/o/r/actions/runs/4242/job/99",
-        }],
-        "api repos/o/r/actions/runs/4242": "success",
-    })
-
-    pr = GitHubGateway("o/r", runner=fr).get_pr(815)
-
-    assert pr.checks[0].advisory is True
-    assert ci_state(pr.checks) is CIState.NONE
-    assert "advisory continue-on-error" in capsys.readouterr().err
 
 
-def test_get_pr_keeps_failed_job_real_when_owning_run_is_not_successful():
-    fr = FakeRunner({
-        "pr view 815": {"number": 815, "state": "OPEN"},
-        "pr checks 815": [{
-            "name": "Unit",
-            "bucket": "fail",
-            "link": "https://github.com/o/r/actions/runs/4242/job/99",
-        }],
-        "api repos/o/r/actions/runs/4242": "failure",
-    })
-
-    pr = GitHubGateway("o/r", runner=fr).get_pr(815)
-
-    assert pr.checks[0].advisory is False
-    assert pr.checks[0].run_id == 4242
-    assert ci_state(pr.checks) is CIState.FAILURE
 
 
-def test_get_pr_keeps_failed_job_when_optional_run_lookup_raises():
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "pr view 815" in key:
-            return json.dumps({
-                "number": 815,
-                "state": "OPEN",
-                "headRefOid": "head-815",
-            })
-        if "/commits/head-815/check-runs" in key:
-            return json.dumps([{"check_runs": [{
-                "name": "Unit",
-                "status": "completed",
-                "conclusion": "failure",
-                "details_url": (
-                    "https://github.com/o/r/actions/runs/4242/job/99"
-                ),
-            }]}])
-        if "/commits/head-815/statuses" in key:
-            return json.dumps([[]])
-        if "actions/runs/4242" in key:
-            raise RuntimeError("optional endpoint unavailable")
-        return ""
-
-    pr = GitHubGateway("o/r", runner=runner).get_pr(815)
-
-    assert pr.checks[0].advisory is False
-    assert pr.checks[0].run_id == 4242
-    assert ci_state(pr.checks) is CIState.FAILURE
 
 
 def test_review_world_survives_one_failing_pr_fetch():
@@ -1237,10 +1166,9 @@ def test_every_rerunnable_conclusion_is_found_by_run_id_at_the_observed_head():
     falls through to the paid leg instead of re-running a stranger's run."""
     for conclusion in ("failure", "timed_out", "startup_failure"):
         gw = _pr_with_red_run(conclusion)
-        pr = gw.get_pr(581)
-
-        assert ci_state(pr.checks) is CIState.FAILURE, conclusion
-        assert pr.checks[0].run_id == 4242, conclusion
+        checks = gw._checks_for_head("head-581")
+        assert checks[0]["bucket"] == "fail", conclusion
+        assert "/actions/runs/4242" in checks[0]["link"], conclusion
         assert gw.workflow_run_attempts("head-581", (4242,)) == {4242: 1}
         assert gw.workflow_run_attempts("some-other-head", (4242,)) is None
 
@@ -1275,11 +1203,9 @@ def test_a_cancelled_run_reads_as_a_settled_failure_not_as_green():
             return json.dumps({"conclusion": "cancelled"})
         return ""
 
-    pr = GitHubGateway("o/r", runner=runner).get_pr(177)
-
-    assert ci_state(pr.checks) is CIState.FAILURE
-    assert pr.checks[0].advisory is False
-    assert pr.checks[0].run_id == 4242
+    checks = GitHubGateway("o/r", runner=runner)._checks_for_head("head-177")
+    assert checks[0]["bucket"] == "fail"
+    assert "/actions/runs/4242" in checks[0]["link"]
 
 
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
@@ -1398,23 +1324,8 @@ _ROLLUP_ERR = (
 )
 
 
-def test_benign_statuscheckrollup_failure_is_silent_without_debug(monkeypatch, capsys):
-    """The `gh pr checks` statusCheckRollup failure (App token lacks checks read)
-    is known-benign noise — one line per PR per poll. With debug OFF it must NOT
-    hit stderr."""
-    monkeypatch.delenv("ISSUE_AGENT_DEBUG", raising=False)
-    monkeypatch.setattr(_subprocess, "run", _fake_run_factory(1, _ROLLUP_ERR))
-    out = _subprocess_runner(["gh", "pr", "checks", "112", "--repo", "o/r"], None)
-    assert out == ""                       # still fail-soft (empty result)
-    assert capsys.readouterr().err == ""   # but silent
 
 
-def test_benign_statuscheckrollup_failure_shown_with_debug(monkeypatch, capsys):
-    """Debug ON → the benign noise IS logged (operator asked to see everything)."""
-    monkeypatch.setenv("ISSUE_AGENT_DEBUG", "1")
-    monkeypatch.setattr(_subprocess, "run", _fake_run_factory(1, _ROLLUP_ERR))
-    _subprocess_runner(["gh", "pr", "checks", "112", "--repo", "o/r"], None)
-    assert "gh failed" in capsys.readouterr().err
 
 
 def test_non_benign_gh_failure_stays_loud_without_debug(monkeypatch, capsys):
@@ -2229,45 +2140,6 @@ def test_change_signature_is_one_rest_point_and_fails_soft():
     assert GitHubGateway("o/r", Identity(), runner=FakeRunner()).change_signature() == ""
 
 
-def test_merge_gate_protection_demands_both_reviews_and_checks():
-    """arm_on_open's precondition: only a base whose protection requires ≥1
-    approving review AND ≥1 status check verifies. Anything less — and every
-    ambiguity (404, 403, garbage) — must read False, because early arming
-    without the server-side gate merges unreviewed work."""
-    full = {"required_pull_request_reviews": {"required_approving_review_count": 1},
-            "required_status_checks": {
-                "contexts": ["frontend", "rust"], "strict": True}}
-    checks_only = {"required_status_checks": {"contexts": ["frontend"]}}
-    reviews_only = {"required_pull_request_reviews": {"required_approving_review_count": 2}}
-    zero_reviews = {"required_pull_request_reviews": {"required_approving_review_count": 0},
-                    "required_status_checks": {"contexts": ["frontend"]}}
-    new_shape = {"required_pull_request_reviews": {"required_approving_review_count": 1},
-                 "required_status_checks": {
-                     "checks": [{"context": "rust", "app_id": 15368}],
-                     "strict": True,
-                 }}
-    non_strict = {
-        "required_pull_request_reviews": {
-            "required_approving_review_count": 1
-        },
-        "required_status_checks": {
-            "contexts": ["frontend"],
-            "strict": False,
-        },
-    }
-
-    def gw(payload):
-        fr = FakeRunner({"api repos/o/r/branches/dev/protection": payload})
-        return GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
-
-    assert gw(full).merge_gate_protection("dev") is True
-    assert gw(new_shape).merge_gate_protection("dev") is True
-    assert gw(checks_only).merge_gate_protection("dev") is False
-    assert gw(reviews_only).merge_gate_protection("dev") is False
-    assert gw(zero_reviews).merge_gate_protection("dev") is False
-    assert gw(non_strict).merge_gate_protection("dev") is False
-    assert gw("").merge_gate_protection("dev") is False        # 404/403 → fail-soft ""
-    assert gw("not json").merge_gate_protection("dev") is False
 
 
 # ── recurrence context (harness #10) ─────────────────────────────────────────
@@ -2366,36 +2238,12 @@ def test_merged_prs_in_the_world_get_the_cheap_fetch():
         for a, _ in fr.calls
     )
     assert any(
-        "/commits/head-541/check-runs" in " ".join(a)
+        "/branches/" in " ".join(a)
         for a, _ in fr.calls
     )
 
 
 # ── check start times + world timestamp (#30) ────────────────────────────────
-def test_get_pr_carries_check_start_times():
-    # The pending deadline is measured from these; without them a check wedged
-    # for half an hour is indistinguishable from one that started a second ago.
-    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
-    checks = [{"name": "unit", "bucket": "pass", "startedAt": "2026-07-28T12:00:00Z"}]
-    fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": checks})
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.get_pr(100).checks[0].started_at == "2026-07-28T12:00:00Z"
-    argv = [
-        a
-        for a, _ in fr.calls
-        if "/check-runs?filter=latest&per_page=100" in " ".join(a)
-    ][0]
-    assert "head-100" in " ".join(argv)
-
-
-def test_check_start_time_absent_or_null_parses_to_unknown():
-    # A gh without the field, or a check that has not started, must read as
-    # unknown ("") — the deadline treats that as "cannot fire", never as epoch.
-    d = {"number": 1, "statusCheckRollup": [
-        {"name": "a"}, {"name": "b", "startedAt": None}]}
-    assert [c.started_at for c in parse_pr(d).checks] == ["", ""]
-
-
 def test_build_world_stamps_the_poll_time():
     # The domain may not read a clock, so the world it decides on carries one.
     gw = GitHubGateway("o/r", runner=FakeRunner({"issue list": [], "pr list": []}))
@@ -2646,64 +2494,25 @@ def test_closed_slice_truncation_is_loud_at_its_own_cap(capsys):
 
 
 # ── #48: a failed `gh pr checks` is UNKNOWN, not an empty world ──────────────
-from issue_agent.adapters.github import no_checks_answer  # noqa: E402
 
 
-def test_no_checks_answer_classifies_only_the_honest_exit():
-    argv = ["gh", "pr", "checks", "26", "--repo", "o/r"]
-    assert no_checks_answer(argv, "no checks reported on the 'fix/x' branch")
-    # same stderr on a different subcommand is NOT the honest-none answer
-    assert not no_checks_answer(["gh", "pr", "view", "26"], "no checks reported")
-    # any other pr-checks failure is a failed READ, not an answer
-    assert not no_checks_answer(argv, "HTTP 404: Not Found")
-    assert not no_checks_answer(argv, "")
 
 
-def test_runner_maps_honest_no_checks_to_empty_json(monkeypatch, capsys):
-    """gh exits 1 with "no checks reported…" when a PR simply HAS no checks —
-    the one non-zero `pr checks` exit that is an observation. The runner must
-    surface it as the empty JSON list gh would have printed, so get_pr can tell
-    honest NONE from a failed read."""
-    monkeypatch.setattr(
-        _subprocess, "run",
-        _fake_run_factory(1, "no checks reported on the 'fix/5-x' branch"),
-    )
-    out = _subprocess_runner(["gh", "pr", "checks", "26", "--repo", "o/r"], None)
-    assert json.loads(out) == []
 
 
 def test_get_pr_marks_checks_unknown_when_the_read_fails():
-    """The hole (#48): a swallowed non-infra `gh pr checks` failure used to
+    """The hole (#48): a swallowed non-infra CI read failure used to
     rebuild the PR with checks=() — indistinguishable from a no-CI repo, which
     decide_fix treats as mergeable. The PR must instead say the checks were
     never read this tick."""
     pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
-    fr = FakeRunner({"pr view 100": pr_resp})  # `pr checks` unmatched → "" (failed)
+    fr = FakeRunner({"pr view 100": pr_resp})  # policy read unmatched → unavailable
     pr = GitHubGateway("o/r", runner=fr).get_pr(100)
-    assert pr.checks == () and pr.checks_known is False
+    assert pr.checks == () and isinstance(pr.ci, Unavailable)
 
 
-def test_get_pr_keeps_honest_empty_checks_known():
-    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
-    fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": []})
-    pr = GitHubGateway("o/r", runner=fr).get_pr(100)
-    assert pr.checks == () and pr.checks_known is True
 
 
-def test_honest_no_checks_wins_over_an_infra_looking_branch_name(monkeypatch):
-    """gh's no-checks message embeds the BRANCH NAME, and a branch like
-    fix/12-request-timeout contains 'timeout' — which the infra classifier
-    reads as a network outage. The honest answer must be recognised BEFORE
-    classification, or a no-CI repo with such a branch raises GhUnavailable
-    and skips every tick for as long as the PR exists (review F1)."""
-    monkeypatch.setattr(
-        _subprocess, "run",
-        _fake_run_factory(
-            1, "no checks reported on the 'fix/12-request-timeout' branch"
-        ),
-    )
-    out = _subprocess_runner(["gh", "pr", "checks", "26", "--repo", "o/r"], None)
-    assert json.loads(out) == []
 
 
 def test_a_skipped_checks_call_is_unread_not_empty():
@@ -2712,7 +2521,7 @@ def test_a_skipped_checks_call_is_unread_not_empty():
     pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
     fr = FakeRunner({"pr view 100": pr_resp})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=False)
-    assert pr.checks_known is False
+    assert isinstance(pr.ci, Unavailable)
 
 
 # ── #163: the stale merged tail is built from the list payload, not `pr view` ─
@@ -2765,7 +2574,7 @@ def test_a_list_built_terminal_pr_decides_exactly_like_the_view_built_one():
     assert cheap.labels == frozenset({Label.AI_DONE})
     # UNREAD, never read-as-empty (#48): both flags say so, and the values the
     # richer payload would have carried are absent rather than wrong.
-    assert (cheap.checks_known, cheap.content_known) == (False, False)
+    assert isinstance(cheap.ci, Unavailable) and not cheap.content_known
     assert (cheap.body, cheap.comments, cheap.reviews, cheap.changed_files) == (
         "", (), (), frozenset()
     )

@@ -6,6 +6,8 @@ it from facts minted from its own rows; effects run through the ordinary
 review executor after acceptance has released the deployment barriers.
 """
 
+from tests.domain.builders import observed_pr
+
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import timedelta
@@ -92,7 +94,7 @@ class Rig:
         self.store.initialize()
         self.remote = PersistentGitHub(tmp_path / "remote.sqlite", fault=raising(self.points, self.lost),
                                        clock=lambda: self.clock[0])
-        self.remote.seed_pr(PRView(PR, head_ref_oid=HEAD, labels=frozenset({Label.NEEDS_HUMAN_REVIEW})))
+        self.remote.seed_pr(observed_pr(PR, head_ref_oid=HEAD, labels=frozenset({Label.NEEDS_HUMAN_REVIEW})))
         for index in range(reviews):
             self.remote.seed_review(PR, f"r{index}", author=BOT, commit=HEAD,
                                     submitted_at=f"2026-09-25T11:00:0{index}+00:00")
@@ -2045,7 +2047,7 @@ def seed_pending_pr(rig, number, prefix):
     """A second PR's pending re-arm, driven through the same control."""
     from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
     key = WorkflowKey("o/r", PullRequestRef(number))
-    rig.remote.seed_pr(PRView(number, head_ref_oid=HEAD, labels=frozenset({Label.NEEDS_HUMAN_REVIEW})))
+    rig.remote.seed_pr(observed_pr(number, head_ref_oid=HEAD, labels=frozenset({Label.NEEDS_HUMAN_REVIEW})))
     for index in range(2):
         rig.remote.seed_review(number, f"{prefix}{index}", author=BOT, commit=HEAD,
                                submitted_at=f"2026-09-25T11:00:0{index}+00:00")
@@ -2528,7 +2530,7 @@ def test_departed_pull_requests_are_due_by_their_record_most_overdue_first_and_b
     rig.activate()
     numbers = (PR, 11, 12, 13)
     for number in numbers[1:]:
-        rig.remote.seed_pr(PRView(number, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
+        rig.remote.seed_pr(observed_pr(number, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
     for number in numbers:
         rig.control().ensure_observed_workflow(WorkflowKey("o/r", PullRequestRef(number)))
     assert rig.control().departed_pull_requests(frozenset(), limit=64) == (PR, 11, 12, 13)  # all unrecorded
@@ -2560,7 +2562,7 @@ def test_a_closed_departure_is_re_read_on_the_short_cadence_while_its_workflow_h
     rig.advance(DEPARTED_CONFIRM_SECONDS)
     assert rig.control().departed_pull_requests(frozenset(), limit=64) == (PR,)  # a reopen must find its lever
     ungated_key = WorkflowKey("o/r", PullRequestRef(11))
-    rig.remote.seed_pr(PRView(11, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
+    rig.remote.seed_pr(observed_pr(11, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
     rig.control().ensure_observed_workflow(ungated_key)
     rig.control().record_dispatch_decision(ungated_key, ReviewTerminal(PullRequestState.CLOSED), closed, _departed())
     rig.advance(DEPARTED_CONFIRM_SECONDS)
@@ -2596,7 +2598,7 @@ def test_decisions_are_recorded_in_one_write_and_an_unrecordable_entry_never_dro
 
     rig.gated()
     other = WorkflowKey("o/r", PullRequestRef(11))
-    rig.remote.seed_pr(PRView(11, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
+    rig.remote.seed_pr(observed_pr(11, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
     rig.control().ensure_observed_workflow(other)
     unobserved = WorkflowKey("o/r", PullRequestRef(12))
     # A terminal decision from an open read is contradictory: that entry alone cannot be recorded.

@@ -1,4 +1,6 @@
 """Completed rearm tasks consume their prepared workspace without recreating it."""
+
+from tests.domain.builders import observed_pr
 from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
 
 
@@ -161,7 +163,7 @@ def test_ordinary_resolve_still_ensures_its_worktree() -> None:
     worktrees = RecordingWorktrees(BRANCH, "/unused/prepared/path")
     gateway = FakeGateway(
         issues={5: IssueView(5, title="Ordinary issue", body="body")},
-        prs={100: PRView(100)},
+        prs={100: observed_pr(100)},
         pr_for_issue={5: 100},
     )
     store = FakeStore()

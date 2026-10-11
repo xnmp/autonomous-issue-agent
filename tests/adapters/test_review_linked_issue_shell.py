@@ -1,5 +1,7 @@
 """An issue stored as an inert shell has no resolve gates, so a linked pull request is never held by it."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 import json
 
@@ -24,7 +26,7 @@ from tests.fakes.review_workflow import ISSUE_KEY, NOW, PR_KEY
 from tests.domain.test_review_workflow_policy import fresh
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
-LINKED = PRView(9, closing_issue=7)
+LINKED = observed_pr(9, closing_issue=7)
 
 
 def insert_shell(store, *, generation=0, version=0, stored=None):

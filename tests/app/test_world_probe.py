@@ -10,6 +10,8 @@ POSITIVELY proved nothing changed.
 """
 from __future__ import annotations
 
+from tests.domain.builders import observed_pr
+
 import pytest
 
 from issue_agent.adapters.github import GhUnavailable
@@ -352,7 +354,7 @@ from issue_agent.domain.world import (  # noqa: E402
 def _in_flight_world():
     return WorldState(
         prs=(
-            PRView(
+            observed_pr(
                 number=7,
                 state="OPEN",
                 labels=frozenset({Label.AI_PR_OPEN}),

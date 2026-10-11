@@ -1,5 +1,7 @@
 """Configured remote import reads preserve complete reviews and trusted holds."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 
 from issue_agent.adapters.control_store import SQLiteControlStore
@@ -18,7 +20,7 @@ class ReviewGateway:
     repo = "o/r"
 
     def __init__(self) -> None:
-        self.view = PRView(9, head_ref_name="work/topic", head_ref_oid="a" * 40)
+        self.view = observed_pr(9, head_ref_name="work/topic", head_ref_oid="a" * 40)
         self.reviews = CompleteReviews(())
         self.listed = (9,)
 

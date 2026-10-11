@@ -1,5 +1,7 @@
 """Unpaid review preflight commits over real SQLite and exact parent claims."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 import sqlite3
 from contextlib import contextmanager
@@ -27,7 +29,7 @@ OWNER = "o/r:review:test"
 
 class Gateway:
     def __init__(self):
-        self.view = PRView(9, head_ref_oid="b" * 40, labels=frozenset({Label.AI_PR_OPEN}))
+        self.view = observed_pr(9, head_ref_oid="b" * 40, labels=frozenset({Label.AI_PR_OPEN}))
         self.reviews = CompleteReviews(())
         self.issue = IssueView(7)
         self.dependencies = ()

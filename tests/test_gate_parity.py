@@ -1328,8 +1328,8 @@ def test_doctor_flags_a_stale_active_env(tmp_path: Path) -> None:
     section = _doctor_snapshot_section(
         tmp_path,
         shared='REPO="o/r"\nFIX_BOT="a"\n',
-        overlay='TEST_CMD="make test"\nCI_IGNORE_CHECKS="lint"\n',
-        active=ACTIVE_HEADER + "REPO=o/r\nFIX_BOT=a\nCI_IGNORE_CHECKS=lint\n",
+        overlay='TEST_CMD="make test"\nCI_PENDING_MAX_SECONDS="3600"\n',
+        active=ACTIVE_HEADER + "REPO=o/r\nFIX_BOT=a\nCI_PENDING_MAX_SECONDS=3600\n",
     )
     assert "✗" in section, f"staleness must be an error, not a warning:\n{section}"
     assert "TEST_CMD" in section, "the message must name the omitted variable"
@@ -1342,9 +1342,9 @@ def test_doctor_accepts_a_fresh_active_env(tmp_path: Path) -> None:
     section = _doctor_snapshot_section(
         tmp_path,
         shared='REPO="o/r"\nFIX_BOT="a"\n',
-        overlay='TEST_CMD="make test"\nCI_IGNORE_CHECKS="lint"\n',
+        overlay='TEST_CMD="make test"\nCI_PENDING_MAX_SECONDS="3600"\n',
         active=ACTIVE_HEADER
-        + "REPO=o/r\nFIX_BOT=a\nTEST_CMD='make test'\nCI_IGNORE_CHECKS=lint\n",
+        + "REPO=o/r\nFIX_BOT=a\nTEST_CMD='make test'\nCI_PENDING_MAX_SECONDS=3600\n",
     )
     assert "✗" not in section, section
     assert "matches config/shared.env + repos/demo.env" in section

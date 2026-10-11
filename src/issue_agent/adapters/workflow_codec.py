@@ -406,6 +406,11 @@ def _decode(value: object, depth: int = 0) -> object:
     payload = value.get("fields")
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
+    if tag == "MachineClearProjection" and "ignored_checks" in payload:
+        if not isinstance(payload["ignored_checks"], str):
+            raise WorkflowEncodingError("legacy ignored check policy is malformed")
+        # Old commands/receipts requalify through today's policy at the effect boundary.
+        payload = {key: item for key, item in payload.items() if key != "ignored_checks"}
     legacy: dict[str, object] = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
     field_names = _FIELD_NAMES[constructor]
     required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}

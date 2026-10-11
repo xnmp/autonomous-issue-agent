@@ -1,5 +1,7 @@
 """Offline review activation over real SQLite authority and read-only remote fixtures."""
 
+from tests.domain.builders import observed_pr
+
 from contextlib import closing
 from dataclasses import replace
 import gc
@@ -35,7 +37,7 @@ def review_row(number=1, state="CHANGES_REQUESTED", minute=0):
 
 class Remote:
     def __init__(self):
-        self.views = {7: PRView(7, state="OPEN", head_ref_oid=HEAD, base_ref_oid="c" * 40,
+        self.views = {7: observed_pr(7, state="OPEN", head_ref_oid=HEAD, base_ref_oid="c" * 40,
                                labels=frozenset({Label.AI_PR_OPEN}), author="author", head_ref_name="issue-3")}
         self.reviews = {7: [[review_row()]]}
         self.listing = None

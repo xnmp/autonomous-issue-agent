@@ -1,5 +1,7 @@
 """Action executor — each Action triggers the right adapter call, no logic."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 
 import pytest
@@ -37,7 +39,7 @@ from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 def _exec():
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="head-100")}
+        prs={100: observed_pr(100, head_ref_oid="head-100")}
     )
     removed, ran = [], []
     ex = Executor(
@@ -81,7 +83,7 @@ def test_post_comment():
 
 def test_ci_pending_escalation_reuses_verified_label_and_posts_missing_comment():
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="head-100")}
+        prs={100: observed_pr(100, head_ref_oid="head-100")}
     )
     gw.has_label = lambda kind, number, label: True
     ex = Executor(gw)
@@ -93,7 +95,7 @@ def test_ci_pending_escalation_reuses_verified_label_and_posts_missing_comment()
 
 def test_ci_pending_escalation_refuses_unverified_relabel():
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="head-100")}
+        prs={100: observed_pr(100, head_ref_oid="head-100")}
     )
     gw.has_label = lambda kind, number, label: False
     ex = Executor(gw)
@@ -129,7 +131,7 @@ def test_update_branch():
 
 
 def test_branch_refresh_executes_existing_remote_request():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="head-100")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="head-100")})
     ex = Executor(
         gw
     )
@@ -636,8 +638,8 @@ def test_cleanup_preflight_isolates_refused_recipe_from_healthy_cleanup_and_neig
     from issue_agent.app.loop import Daemon
     from issue_agent.domain.fix import cleanup_actions, FixConfig
     from issue_agent.domain.world import WorldState
-    gateway = FakeGateway(prs={100: PRView(100, state="CLOSED", head_ref_oid="stale"),
-                              101: PRView(101, state="CLOSED", head_ref_oid="healthy")})
+    gateway = FakeGateway(prs={100: observed_pr(100, state="CLOSED", head_ref_oid="stale"),
+                              101: observed_pr(101, state="CLOSED", head_ref_oid="healthy")})
     removed, cleared, logs = [], [], []
     def validate(action):
         if action.pr == 100:
@@ -664,7 +666,7 @@ def test_cleanup_preflight_isolates_refused_recipe_from_healthy_cleanup_and_neig
 
 def test_malformed_cleanup_recipe_refuses_before_any_effect():
     from issue_agent.domain.fix import cleanup_actions, FixConfig
-    gateway = FakeGateway(prs={100: PRView(100, state="CLOSED", head_ref_oid="head")})
+    gateway = FakeGateway(prs={100: observed_pr(100, state="CLOSED", head_ref_oid="head")})
     removed, cleared = [], []
     executor = Executor(gateway, remove_worktree=removed.append, clear_issue_state=cleared.append,
                         validate_cleanup=lambda _: None)
@@ -706,7 +708,7 @@ def test_terminal_cleanup_preflight_keeps_remote_labels_worktree_and_sql_on_refu
     executor = Executor(gateway, remove_worktree=removed.append, validate_cleanup=validate,
                         clear_issue_state=lambda action: authority.cleanup_pr_repair(key, action.merged, action.source),
                         effect_executor=durable)
-    actions = cleanup_actions(PRView(7, state="CLOSED", head_ref_oid="head-1"), 9, FixConfig("bot"), source=source)
+    actions = cleanup_actions(observed_pr(7, state="CLOSED", head_ref_oid="head-1"), 9, FixConfig("bot"), source=source)
     assert not executor.execute_all(actions)
     assert removed == [] and gateway.calls == [] and gateway.labels == labels
     assert store.read_pr_repair(key) == before
@@ -719,7 +721,7 @@ def test_terminal_cleanup_preflight_keeps_remote_labels_worktree_and_sql_on_refu
 
 
 def test_failed_exact_head_merge_remains_unconfirmed_without_legacy_callback():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="head-100")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="head-100")})
     gw.automerge_ok = False
     logged = []
     ex = Executor(gw, log=logged.append)

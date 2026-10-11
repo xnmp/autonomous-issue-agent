@@ -293,39 +293,10 @@ def build_role(
             cfg.repo,
             Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
             progress=scheduler_progress,
-            base_branch=cfg.base_branch,
         )
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.
         store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)
-        # Server merge-gate probe (once per boot): reports whether the base's
-        # protection independently re-checks review/CI/up-to-date at merge
-        # time. Informational since 2026-08-01 — the exact-head client gate in
-        # should_automerge merges either way; without the server gate the
-        # base-advance TOCTOU residual applies (residuals.md). Probed here
-        # (not in from_env) because it needs the gateway; a flip of the repo's
-        # protection therefore takes effect at the next daemon restart.
-        if cfg.arm_on_open != "0":
-            try:
-                active = gw.merge_gate_protection(cfg.base_branch)
-            except GhUnavailable as exc:
-                active = False
-                sys.stderr.write(
-                    f"{role}: merge-gate probe — branch protection could "
-                    f"not be verified ({exc})\n"
-                )
-            cfg = dataclasses.replace(cfg, arm_on_open_active=active)
-            sys.stderr.write(
-                f"{role}: server merge gate "
-                + (
-                    f"VERIFIED — {cfg.base_branch} protection re-checks review "
-                    "+ status checks + up-to-date head at merge time\n"
-                    if active else
-                    f"absent — {cfg.base_branch} protection does not gate "
-                    "review/checks/base freshness; merges rely on the "
-                    "exact-head client gate alone (base-advance residual)\n"
-                )
-            )
         fix_daemon = build_fix_daemon(cfg, gw, store, worktrees, runner)
         probe_when, read_signals = fix_probe_hooks(
             lambda: bool(fix_daemon.active_dispatches), gw.head_signals
@@ -408,7 +379,7 @@ def _serve(role: str) -> None:
     # AGENT_ENV + TARGET_DIR, so without this update the bash checkers read
     # TEST_CMD/ALLOW_UNTESTED/BASE_BRANCH from an empty environment — the
     # test-less-repo escape hatch became unreachable (fail-closed gate) and
-    # operator knobs like CI_IGNORE_CHECKS were honoured in dev and silently
+    # operator configuration were honoured in dev and silently
     # ignored under the service. `update()` (not a fresh dict) matches
     # foreground `set -a` sourcing semantics: the overlay wins over whatever
     # the service unit already set, inherited env stays for anything the

@@ -1,5 +1,7 @@
 """Complete open-PR linkage is reread before offline counter attribution."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 import json
 
@@ -61,8 +63,8 @@ def control(tmp_path):
 
 def _gateway():
     return LinkGateway({
-        9: PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD),
-        10: PRView(10, head_ref_name="work/topic", head_ref_oid=HEAD),
+        9: observed_pr(9, head_ref_name="fix/7-work", head_ref_oid=HEAD),
+        10: observed_pr(10, head_ref_name="work/topic", head_ref_oid=HEAD),
     }, issues={7: IssueView(7)})
 
 
@@ -102,7 +104,7 @@ def test_counter_link_revalidation_blocks_changed_or_unavailable_sources(control
     assert isinstance(observed, CompleteLegacyOpenCounterLinks)
 
     if change == "new_pr":
-        gateway.views[11] = PRView(11, head_ref_name="work/another", head_ref_oid=HEAD)
+        gateway.views[11] = observed_pr(11, head_ref_name="work/another", head_ref_oid=HEAD)
     elif change == "head":
         gateway.views[9] = replace(gateway.views[9], head_ref_oid="b" * 40)
     elif change == "issue":

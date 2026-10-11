@@ -3,6 +3,8 @@
 Drives each handler and asserts the resulting gateway writes + persisted state,
 proving the dispatcher routes inputs→task→run→follow-up correctly. The DECISIONS
 are tested in tests/domain; here we verify the wiring."""
+
+from tests.domain.builders import observed_pr
 from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
 
 
@@ -273,7 +275,7 @@ def _delegated_dispatcher(gw, store, runner):
 
 
 def test_delegated_review_routes_to_workflow():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="sha1")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="sha1")})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, structured={
         "decision": "APPROVE", "body": "lgtm"}, session_id="rs"))
@@ -332,7 +334,7 @@ def _split_dispatcher(gw, store, runner, wt=None, max_contract_rounds=2):
 def test_split_resolve_routes_to_fix_workflow():
     gw = FakeGateway(
         issues={5: IssueView(5, title="Null token", body="x")},
-        prs={100: PRView(100)},
+        prs={100: observed_pr(100)},
         pr_for_issue={},
     )
     store, wt = FakeStore(), FakeWorktrees()
@@ -355,7 +357,7 @@ def test_split_resolve_routes_to_fix_workflow():
 
 
 def test_review_submits_decision_from_structured():
-    pr = PRView(100, head_ref_name="fix/5-x", head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, session_id="rs",
@@ -383,7 +385,7 @@ def _val(confirmed, verdict=""):
 
 
 def test_multi_review_routes_to_workflow():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(
@@ -440,7 +442,7 @@ def _ci_dispatcher(
 
 
 def _ci_pr():
-    return PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    return observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                   checks=(Check("SonarQube Code Analysis", bucket="fail"),))
 
 
@@ -638,7 +640,7 @@ def test_pre_result_death_on_an_issueless_pr_uses_the_negated_pr_key(tmp_path):
     reads what this wrote. The old `or -1` sentinel collapsed every such PR onto
     one dead key and the breaker never tripped (PR #112)."""
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/ACME-2468-x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/ACME-2468-x")})
     d = _dispatcher(gw, store, RaisingRunner())
 
     with pytest.raises(RuntimeError):
@@ -670,7 +672,7 @@ def test_a_deterministic_death_spends_the_whole_retry_budget_at_once(tmp_path):
     cap-1 more unwinnable sessions at full cost, which is what happened on
     xnmp/tauri-explorer PR #552."""
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
     d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
 
     with pytest.raises(RuntimeError):
@@ -684,7 +686,7 @@ def test_a_deterministic_death_reaches_the_reviewers_existing_ceiling(tmp_path):
     from issue_agent.domain.review import ReviewConfig, ReviewExcluded, review_eligibility
 
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
     d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
 
     with pytest.raises(RuntimeError):
@@ -700,7 +702,7 @@ def test_an_ordinary_transport_death_still_costs_exactly_one_life(tmp_path):
     the classifier widened to cover it, every flaky network blip would escalate
     a PR a retry would have rescued."""
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
     d = _capped_dispatcher(gw, store, RaisingRunner(RuntimeError("Stream closed")), cap=5)
 
     with pytest.raises(RuntimeError):
@@ -713,7 +715,7 @@ def test_a_deterministic_death_never_lowers_an_existing_tally(tmp_path):
     store = Store(state_dir=str(tmp_path))
     for _ in range(7):
         store.bump_infra_deaths(-100)
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
     d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
 
     with pytest.raises(RuntimeError):
@@ -726,7 +728,7 @@ def test_without_a_configured_ceiling_a_deterministic_death_bumps_as_before(tmp_
     """cap 0 means the role's breaker is off; saturating to 0 would ERASE the
     tally, so the ordinary bump must stand."""
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
     d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=0)
 
     with pytest.raises(RuntimeError):
@@ -737,7 +739,7 @@ def test_without_a_configured_ceiling_a_deterministic_death_bumps_as_before(tmp_
 
 def test_a_deterministic_death_still_re_raises_unchanged(tmp_path):
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
     d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -770,7 +772,7 @@ class FlakyIssueLookup(FakeGateway):
 
 
 def _review_pr():
-    return PRView(100, head_ref_name="fix/5-x", closing_issue=5)
+    return observed_pr(100, head_ref_name="fix/5-x", closing_issue=5)
 
 
 def test_review_death_stays_pr_keyed_when_issue_lookup_fails(tmp_path):
@@ -819,7 +821,7 @@ def test_a_clean_none_is_still_a_genuinely_issueless_pr(tmp_path):
     `-pr` is exactly `breaker_key`'s convention for it, and treating that as
     unknown would strand every Jira-keyed PR's counter."""
     store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/ACME-2468-x")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/ACME-2468-x")})
     d = _dispatcher(gw, store, RaisingRunner())
 
     with pytest.raises(RuntimeError):
@@ -993,7 +995,7 @@ def test_rebase_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
     """rebase: same ordering as fix_ci (retry bump before the follow-up
     relabel), so the same invariants hold for the CONFLICTING-branch leg."""
     store = Store(state_dir=str(tmp_path))
-    pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5, mergeable="CONFLICTING")
+    pr = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5, mergeable="CONFLICTING")
     gw = FakeGateway(prs={100: pr}, fail_on={"relabel"})
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="reb-live"))
     d = _ci_dispatcher(gw, store, runner)
@@ -1012,7 +1014,7 @@ def test_address_review_mid_dispatch_failure_still_applies_the_rest_of_the_tail(
     the action that actually stops re-dispatch — still lands. (Blocked burns no
     retry by design: waiting on a human is not a failed attempt.)"""
     store = Store(state_dir=str(tmp_path))
-    pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    pr = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="2026-01-01T00:00:01Z"),))
     gw = FakeGateway(prs={100: pr}, fail_on={"comment"})
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="ar-live"))
@@ -1031,7 +1033,7 @@ def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
     AFTER `executor.execute_all`, and with nothing left to execute it must still
     run — the review-retry breaker is the ONLY thing bounding this leg now."""
     store = Store(state_dir=str(tmp_path))
-    pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    pr = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="2026-01-01T00:00:01Z"),))
     gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="ar-live"))
@@ -1055,7 +1057,7 @@ def test_fix_pr_kind_defers_without_dispatch_when_claim_target_carries_no_issue(
     re-derive an identity that was never claimed. `fail_on={"issue_for_pr"}`
     proves the live lookup path is never taken (it would raise if it were)."""
     store = Store(state_dir=str(tmp_path))
-    pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5)
+    pr = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5)
     gw = FakeGateway(prs={100: pr}, fail_on={"issue_for_pr"})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
     action = RunAgent(kind, 100)

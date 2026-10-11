@@ -150,7 +150,8 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     messages = []
     journal = TypedJournal(str(root / "legacy-events.jsonl"), events)
     breaker = InfraBreaker(journal=journal, log=messages.append) if supported_infra else None
-    effects = GitHubEffectExecutor(remote, control, repository="o/r", identity=f"o/r:{role}", log=messages.append)
+    effects = GitHubEffectExecutor(remote, control, repository="o/r", identity=f"o/r:{role}", log=messages.append,
+        fix_config=FixConfig(fix_bot="fix-bot"))
     provider = provider or Provider()
     runtime = AccountingRuntime(
         provider, control, "o/r", "fix", Money("USD", 5_000_000), None, None,
@@ -1536,9 +1537,13 @@ def test_publication_unknown_partial_comment_reconciles_after_restart(tmp_path):
 
 
 def test_same_head_ci_success_cannot_suppress_publication_cause(tmp_path):
+    from dataclasses import asdict
     from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain.checks import Check
     seed_repair_replay(tmp_path, branch="test/7-diagnostics")
     composed = compose(tmp_path)
+    composed.remote.external_pr_change(70, checks=[asdict(
+        Check("external", "PENDING", "pending", "2000-01-01T00:00:00Z", kind="status"))])
     assert composed.effects.execute(EscalateCiPending(70, "head-b", "CI needs operator attention"))
     assert composed.effects.execute(publication_recovery_action(composed))
     assert len([call for call in composed.remote.calls if call[0] == "comment_pr"]) == 2

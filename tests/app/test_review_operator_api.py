@@ -7,6 +7,8 @@ read transport is injected. Assertions read HTTP responses, GitHub writes and
 durable authority; nothing here executes an effect except the daemon's drain.
 """
 
+from tests.domain.builders import observed_pr
+
 from contextlib import closing
 from dataclasses import replace
 from functools import partial
@@ -979,7 +981,7 @@ def owed_beside_a_departing_pull_request(deployment) -> ReviewComposition:
     assert len(daemon.provider.tasks) == 1
     daemon.remote.external_pr_change(PR, labels=[])
     daemon.remote.seed(IssueView(2, title="Add other", state="open"))
-    daemon.remote.seed_pr(PRView(
+    daemon.remote.seed_pr(observed_pr(
         OTHER_PR, head_ref_name="fix/2-other", head_ref_oid=deployment.heads[2], base_ref_oid=deployment.base,
         title="Add other", body="Adds the other thing.", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN",
         closing_issue=2, author=FIX_BOT, base_ref_name="dev"))

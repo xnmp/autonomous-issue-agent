@@ -26,7 +26,7 @@ from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow import FreshResolve, ResolveSession
 
 
-CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
+CFG = FixConfig(fix_bot="fix-bot", )
 
 
 def _runs(actions, kind: AgentKind, number: int) -> bool:

@@ -239,7 +239,8 @@ Two smaller ones worth doing whenever the files are next touched:
   intervention). Doctor warns at launch; the environment manifest (85c98ff)
   now tells legs what they cannot reproduce so they reason from CI logs
   instead of attempting local repro. Accepted residual: true convergence
-  needs paid platform runners or per-repo CI_IGNORE_CHECKS policy — an
+  needs paid platform runners or a repository policy that declares which
+  checks are required (#303) — an
   operator decision per target, not a harness fix. Trigger: a second
   cross-platform non-convergence incident adds a FIX_CI prompt hint that
   names the unreproducible platform and caps local attempts at one leg

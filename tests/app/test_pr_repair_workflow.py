@@ -1,4 +1,6 @@
 """PR repair uses selected SQL continuity before buying a CI leg."""
+
+from tests.domain.builders import observed_pr
 from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
 
 
@@ -23,8 +25,8 @@ from tests.fakes.workflow_authority import install_workflow
 
 
 def test_fix_ci_without_active_pr_component_refuses_without_purchase():
-    gateway = FakeGateway(prs={100:PRView(100, head_ref_name="fix/5-remote", closing_issue=5,
-        checks=(Check("tests", "fail"),))})
+    gateway = FakeGateway(prs={100:observed_pr(100, head_ref_name="fix/5-remote", closing_issue=5,
+        checks=(Check("tests", bucket="fail"),))})
     inner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="unselected"))
     files = FakeStore()
     workflow = _workflow(gateway, files, inner, pr_repair_authority=False)
@@ -38,7 +40,7 @@ def test_fix_ci_without_active_pr_component_refuses_without_purchase():
 
 
 def test_address_review_without_active_pr_component_refuses_without_purchase():
-    gateway = FakeGateway(prs={100: PRView(
+    gateway = FakeGateway(prs={100: observed_pr(
         100, head_ref_name="fix/5-remote", closing_issue=5, head_ref_oid="a" * 40,
         reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-10-02T00:00:01Z", body="fix it"),),
     )})
@@ -58,7 +60,7 @@ def test_address_review_without_active_pr_component_refuses_without_purchase():
 
 def test_rebase_without_active_pr_component_refuses_without_purchase(tmp_path):
     from issue_agent.adapters.store import Store
-    gateway = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-remote", closing_issue=5,
+    gateway = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-remote", closing_issue=5,
         head_ref_oid="a" * 40)})
     inner = FakeRunner(AgentResult(is_error=False, status="pushed", cost_usd=.01, session_id="unselected"))
     files = Store(str(tmp_path / "state"))
@@ -80,8 +82,8 @@ def active_ci_workflow(result, files=None):
     from issue_agent.domain.workflow_identity import WorkflowFamily
     from tests.adapters.test_continuation_admission import active, install_secondary
 
-    gateway = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-remote", closing_issue=5,
-        checks=(Check("tests", "fail"),))})
+    gateway = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-remote", closing_issue=5,
+        checks=(Check("tests", bucket="fail"),))})
     inner = FakeRunner(result)
     files = files if files is not None else FakeStore()
     workflow = _workflow(gateway, files, inner, pr_repair_authority=False)
@@ -373,6 +375,33 @@ def test_duplicate_pr_reply_purchases_one_resume_and_keeps_issue_marker_independ
         assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
 
 
+@pytest.mark.parametrize("status", ["QUEUED", "IN_PROGRESS", "missing"])
+def test_human_reply_resumes_blocked_pr_while_ci_waits(status):
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    from issue_agent.domain.labels import Label
+    from issue_agent.domain.world import Comment, WorldState
+    from issue_agent.app.roles import _fix_state
+    from issue_agent.domain.fix import FixConfig, decide_fix
+    from issue_agent.domain.actions import AgentKind, RunAgent
+    workflow, files, inner, key = pr_reply_workflow(body="Fix the workflow permissions so CI can run.")
+    pr = workflow.gateway.prs[100]
+    pr = replace(pr, author="fix-bot", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
+        ci=Observed(pr.head_ref_oid, pr.head_ref_oid,
+            frozenset({RequiredCheck("tests")}) if status == "missing" else frozenset(),
+            () if status == "missing" else (Check("tests", status, "pending", "2026-10-12T01:50:00Z"),)),
+        comments=(Comment("fix-bot", "**Agent needs input:** Which CI permissions?", "2026-10-02T00:00:00Z"), *pr.comments))
+    workflow.gateway.prs[100] = pr
+    world = WorldState(prs=(pr,), now="2026-10-12T02:00:00Z")
+    state = _fix_state(files, world, workflow_control=files._workflow_authority,
+        available_runtimes=frozenset({"claude"}))
+    assert RunAgent(AgentKind.PR_RESUME, 100) in decide_fix(world, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+    asyncio.run(workflow.resume_pr(100))
+    asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 2
+    state = files._workflow_authority.read_pr_repair(key).component.state
+    assert state.consumed_reply_at == "2026-10-02T00:00:01Z" and state.resumes == 1
+
+
 def test_nonblank_pr_reply_without_compatible_session_stays_unconsumed():
     workflow, files, inner, key = pr_reply_workflow(establish_session=False)
     before = files._workflow_authority.read_pr_repair(key)
@@ -576,7 +605,7 @@ def interrupted_linked_reply(monkeypatch):
     from tests.app.test_issue_reply_admission import setup_reply
     from tests.fakes.accounted_workflow import attach_workflow_authority
     workflow, gateway, files, inner = setup_reply()
-    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
+    gateway.prs[100] = observed_pr(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
     gateway._pr_for_issue[5] = 100
     attach_workflow_authority(gateway, files, pr_repair=True)
     inner.result = AgentResult(is_error=False, status="pushed", cost_usd=.01, session_id="linked-return")
@@ -648,7 +677,7 @@ def test_linked_reply_proven_unlaunched_release_finishes_both_without_paid_sessi
     from tests.app.test_issue_reply_admission import setup_reply
     from tests.fakes.accounted_workflow import attach_workflow_authority
     workflow, gateway, files, inner = setup_reply()
-    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
+    gateway.prs[100] = observed_pr(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
     gateway._pr_for_issue[5] = 100
     attach_workflow_authority(gateway, files, pr_repair=True)
     async def failed_spawn(task):
@@ -676,7 +705,7 @@ def test_selected_blank_source_corruption_after_reservation_refuses_launch(monke
     from tests.app.test_issue_reply_admission import setup_reply
     from tests.fakes.accounted_workflow import attach_workflow_authority
     workflow, gateway, files, inner = setup_reply()
-    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
+    gateway.prs[100] = observed_pr(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
     gateway._pr_for_issue[5] = 100
     attach_workflow_authority(gateway, files, pr_repair=True)
     store = files._workflow_db
@@ -1036,7 +1065,7 @@ def test_rebase_reset_cannot_select_another_issues_pr():
     workflow, files, inner, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
     asyncio.run(workflow.rebase(100))
-    workflow.gateway.prs[101] = PRView(101, head_ref_name="fix/6-other", head_ref_oid="b" * 40, closing_issue=6)
+    workflow.gateway.prs[101] = observed_pr(101, head_ref_name="fix/6-other", head_ref_oid="b" * 40, closing_issue=6)
     install_workflow(files._workflow_db, with_issue_recovery(resolve_snapshot(6)))
     install_pr_repair_authority(workflow.gateway, files)
     asyncio.run(workflow.rebase(101))
@@ -1694,7 +1723,7 @@ def test_public_review_release_and_newer_rebase_preserve_superseded_money_settle
     assert store.settle(old.settlement).disposition is AccountingDisposition.AVAILABLE
     remote = PersistentGitHub(tmp_path / "release.db")
     remote.seed(IssueView(5, title="fixture", updated_at="2026-10-02T00:00:00Z"))
-    remote.seed_pr(PRView(100, head_ref_oid="a" * 40, head_ref_name="fix/5-remote", closing_issue=5,
+    remote.seed_pr(observed_pr(100, head_ref_oid="a" * 40, head_ref_name="fix/5-remote", closing_issue=5,
                          labels=frozenset({Label.AI_PR_OPEN})))
     for number in range(2):
         remote.seed_review(100, f"review-{number}", author="review-bot[bot]", commit="a" * 40,
@@ -2252,7 +2281,9 @@ def test_actual_ci_purchase_cannot_bypass_owed_remediation_with_paired_head(monk
     workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="head-1")
     store = files._workflow_db
-    effects = GitHubEffectExecutor(Gateway(), store, repository="o/r", identity="o/r:fix")
+    gateway = Gateway()
+    gateway.ci_state = "failure"
+    effects = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix")
     store.enqueue_command(effects._command(RerunFailedChecks(100, "head-1", (42,))))
     requests = []
     original = store.reserve

@@ -23,6 +23,8 @@ import errno
 import json
 import re
 import subprocess
+from .github_ci import observe_checks
+from ..domain.checks import Unavailable
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -35,7 +37,6 @@ from ..domain.review_workflow import (
 )
 from .review_effects import ReviewReadUnavailable
 from ..domain.world import (
-    Check,
     ClosingRef,
     Comment,
     HeadRef,
@@ -363,19 +364,6 @@ def _printable_gh_argv(argv: list[str]) -> str:
     return _cap_bytes(" ".join(rendered), _LOGGED_GH_ARGV_BYTES)
 
 
-def no_checks_answer(argv: list[str], detail: str) -> bool:
-    """True iff a failed `gh` call is `pr checks` reporting the HONEST empty
-    answer: gh exits 1 with "no checks reported on the '<branch>' branch" when a
-    PR simply has no checks — the one non-zero exit that IS an observation, not
-    a failure. Everything else non-zero on `pr checks` means the checks were
-    never read (#48). Pure so the classification is unit-testable without a
-    subprocess, like `classify_gh_failure`."""
-    return (
-        list(argv[1:3]) == ["pr", "checks"]
-        and "no checks reported" in (detail or "").lower()
-    )
-
-
 # ── pure parsers ──────────────────────────────────────────────────────────────
 def _label_names(raw: list | None) -> frozenset[str]:
     """Raw label names, in gh's two shapes: [{"name": "ai-ready"}, …] (issue/pr
@@ -446,23 +434,6 @@ def _reviews(raw: list | None) -> tuple[Review, ...]:
     return tuple(out)
 
 
-def _checks(raw: list | None) -> tuple[Check, ...]:
-    return tuple(
-        Check(
-            name=c.get("name", "") or "",
-            state=c.get("state", "") or "",
-            bucket=c.get("bucket", "") or "",
-            # Absent/null on a gh that predates the field, or on a check that has
-            # not started — "" means unknown, and the pending deadline treats
-            # unknown as "cannot fire" rather than as "infinitely old" (#30).
-            started_at=c.get("startedAt") or c.get("started_at") or "",
-            advisory=bool(c.get("advisory", False)),
-            run_id=_workflow_run_id(c),
-        )
-        for c in raw or []
-    )
-
-
 def _checks_digest(raw: list[dict[str, object]]) -> str:
     """A stable, order-free string for one commit's check state (#163 probe).
 
@@ -523,16 +494,6 @@ def _commit_status_observation(raw: dict) -> dict[str, object]:
     }
 
 
-_ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
-
-
-def _workflow_run_id(check: object) -> int | None:
-    if not isinstance(check, dict):
-        return None
-    match = _ACTIONS_RUN_RE.search(str(check.get("link") or ""))
-    return int(match.group(1)) if match else None
-
-
 def parse_issue(d: dict) -> IssueView:
     author = ""
     if isinstance(d.get("author"), dict):
@@ -571,7 +532,7 @@ def parse_pr(d: dict) -> PRView:
         labels=_labels(d.get("labels")),
         comments=_comments(d.get("comments")),
         reviews=_reviews(d.get("reviews")),
-        checks=_checks(d.get("statusCheckRollup") or d.get("checks")),
+
         state=(d.get("state", "OPEN") or "OPEN").upper(),
         closing_issue=closing,
         changed_files=_changed_files(d.get("files")),
@@ -620,7 +581,7 @@ def parse_terminal_pr(row: object, *, label: str) -> PRView | None:
       cheap path is taken only for the stale tail, and every PR that can still
       DRIVE a decision keeps its `gh pr view`.
 
-    `checks_known=False` / `content_known=False`: not fetching something is
+    `ci=Unavailable("checks not requested")` / `content_known=False`: not fetching something is
     UNREAD, never read-as-empty (#48 review F3) — the same contract
     `get_pr(checks=False)` upholds.
 
@@ -654,7 +615,7 @@ def parse_terminal_pr(row: object, *, label: str) -> PRView | None:
         view = parse_pr({**row, "number": number, "state": state})
     except Exception:  # noqa: BLE001 — see the docstring: never raise
         return None
-    return replace(view, checks_known=False, content_known=False)
+    return replace(view, ci=Unavailable("checks not requested"), content_known=False)
 
 
 def _changed_files(files: object) -> frozenset[str]:
@@ -1021,18 +982,11 @@ class GitHubGateway:
         review_pr_label: str = "ai-pr-open",
         review_adopt_unlabeled: bool = False,
         progress: Callable[[], None] | None = None,
-        base_branch: str = "",
     ):
         self.repo = repo
         self.identity = identity or Identity()
         self._run = runner or _subprocess_runner
         self._progress = progress
-        # Configured merge target. Lets build_fix_world observe the base TIP:
-        # GraphQL baseRefOid is a stale anchor (verified live 2026-08-01 — all
-        # keifu PRs still reported the pre-merge oid 30+ min after the base
-        # advanced), so the base-advance signal must come from the ref itself.
-        self.base_branch = base_branch
-        self._base_head_warned = False
         # PR label the review daemon selects on (see build_review_world). Default
         # matches the harness pipeline; an external-repo reviewer passes "ai-review".
         self.review_pr_label = review_pr_label
@@ -1150,10 +1104,8 @@ class GitHubGateway:
                     state=f"{state}/{merged}",
                     ci=_checks_digest(checks),
                     mergeable=f"{mergeable}/{merge_state}",
-                    # A failing check's meaning depends on the advisory-UNSTABLE
-                    # workflow-conclusion enrichment the world build does and this
-                    # digest does not carry, so it forces a build rather than
-                    # risking a skipped tick on a red PR.
+                    # This digest cannot carry policy/report eligibility, so
+                    # failures force a full observation before any CI action.
                     failing=any(
                         isinstance(c, dict) and c.get("bucket") == "fail"
                         for c in checks
@@ -1161,36 +1113,6 @@ class GitHubGateway:
                 )
             )
         return tuple(out)
-
-    def merge_gate_protection(self, base_branch: str) -> bool:
-        """True iff the base branch's protection makes a merge conditional on
-        BOTH ≥1 approving review AND ≥1 required status check — the precondition
-        for arming auto-merge at PR creation (FixConfig.arm_on_open). Anything
-        less reads False: on a base where GitHub does not hold the gate, early
-        arming would merge unreviewed work. Fail-closed on every ambiguity —
-        404 (no protection), 403 (token cannot read the admin endpoint), or
-        unparseable output all mean "no verified gate"."""
-        out = self._gh(["api", f"repos/{self.repo}/branches/{base_branch}/protection"])
-        if not out.strip():
-            return False
-        try:
-            d = json.loads(out)
-        except ValueError:
-            return False
-        if not isinstance(d, dict):
-            return False
-        reviews = (d.get("required_pull_request_reviews") or {}).get(
-            "required_approving_review_count", 0
-        ) or 0
-        rsc = d.get("required_status_checks") or {}
-        contexts = rsc.get("contexts") or [
-            c.get("context") for c in (rsc.get("checks") or []) if isinstance(c, dict)
-        ]
-        return (
-            int(reviews) >= 1
-            and any(contexts)
-            and rsc.get("strict") is True
-        )
 
     def open_blockers(self, number: int) -> tuple[int, ...]:
         """Open GitHub-native ``blocked by`` issue numbers for ``number``.
@@ -1271,7 +1193,7 @@ class GitHubGateway:
                 or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
                        or not label["name"] for label in raw["labels"])):
             raise ValueError("review pull request lifecycle/linkage fields are incomplete or malformed")
-        return replace(parse_pr(raw), checks_known=False)
+        return replace(parse_pr(raw), ci=Unavailable("checks not requested"))
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
@@ -1297,57 +1219,11 @@ class GitHubGateway:
         if not checks:
             # Never READ ≠ read-as-empty: a PR listed non-OPEN but re-opened
             # between the list and this view would otherwise arrive
-            # state=OPEN, checks=(), checks_known=True → honest NONE →
+            # state=OPEN with falsely empty evidence → Clear →
             # mergeable. No consumer reads checks for the non-open PRs this
             # arm is for, so UNKNOWN costs nothing (#48 review F3).
-            return replace(pr, checks_known=False)
-        raw_checks = self._checks_for_head(pr.head_ref_oid)
-        if raw_checks is None:
-            import sys
-
-            sys.stderr.write(
-                f"commit checks failed for PR #{number} head "
-                f"{pr.head_ref_oid[:12] or '?'} — checks UNKNOWN this tick; "
-                "merge gates hold until a successful revision-bound read\n"
-            )
-            return replace(pr, checks_known=False)
-        run_conclusions: dict[int, str] = {}
-        for check in raw_checks:
-            if not isinstance(check, dict) or check.get("bucket") != "fail":
-                continue
-            run_id = _workflow_run_id(check)
-            if run_id is None or run_id in run_conclusions:
-                continue
-            try:
-                conclusion = self._gh(
-                    ["api", f"repos/{self.repo}/actions/runs/{run_id}",
-                     "--jq", ".conclusion"]
-                )
-            except Exception:  # optional enrichment: unknown stays a real failure
-                conclusion = ""
-            run_conclusions[run_id] = conclusion.strip().lower()
-
-        enriched = []
-        advisory_names = []
-        for check in raw_checks:
-            if not isinstance(check, dict):
-                continue
-            run_id = _workflow_run_id(check)
-            advisory = (
-                check.get("bucket") == "fail"
-                and run_id is not None
-                and run_conclusions.get(run_id) == "success"
-            )
-            enriched.append({**check, "advisory": advisory})
-            if advisory:
-                advisory_names.append(str(check.get("name") or "unnamed"))
-        if advisory_names:
-            import sys
-            sys.stderr.write(
-                f"PR #{number}: advisory continue-on-error checks ignored: "
-                f"{', '.join(advisory_names)}\n"
-            )
-        return replace(pr, checks=_checks(enriched))
+            return replace(pr, ci=Unavailable("checks not requested"))
+        return replace(pr, ci=observe_checks(self.repo, pr, self._gh_json))
 
     def _checks_for_head(
         self, head_oid: str
@@ -1732,40 +1608,8 @@ class GitHubGateway:
         # everything else is already in hand.
         return WorldState(
             issues=issues, prs=prs, closing_refs=self.open_closing_refs(),
-            now=build_time(), base_head=self._base_head(),
+            now=build_time(),
         )
-
-    def _base_head(self) -> str:
-        """Tip of the configured base branch at observation, "" when unknown.
-        Fail-soft — a world build must never fail or wedge on this — but NOT
-        silent (adversarial D1): "" disables the advisory-UNSTABLE refresh
-        outright, so a persistent failure here (token without contents:read, a
-        renamed base branch, sustained 5xx) would relocate the very silent
-        disarm this field exists to remove. First failure per process says so
-        on stderr; recovery is automatic once the read works again."""
-        if not self.base_branch:
-            return ""
-        try:
-            tip = self._gh(
-                [
-                    "api",
-                    f"repos/{self.repo}/git/ref/heads/{self.base_branch}",
-                    "--jq", ".object.sha",
-                ]
-            ).strip()
-        except Exception as exc:  # noqa: BLE001 — fail-soft, never fail the build
-            if not self._base_head_warned:
-                self._base_head_warned = True
-                import sys
-                sys.stderr.write(
-                    f"base tip of '{self.base_branch}' unreadable "
-                    f"({type(exc).__name__}: {str(exc)[:120]}) — the "
-                    "advisory-UNSTABLE branch refresh is DISABLED until this "
-                    "read recovers\n"
-                )
-            return ""
-        self._base_head_warned = False
-        return tip
 
     def build_review_world(self) -> WorldState:
         """The review daemon's slice: ONLY PRs carrying `self.review_pr_label` (open
@@ -1974,7 +1818,7 @@ class GitHubGateway:
     # fetch may never kill a dispatch. The one exception is `MissingListLimit`,
     # which is a bug in this module, not a runtime condition (review C2).
     def workflow_run_attempts(
-        self, head: str, run_ids: tuple[int, ...]
+        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
     ) -> dict[int, int] | None:
         """Attempt counters for exact workflow runs, after SHA verification."""
 
@@ -1988,7 +1832,7 @@ class GitHubGateway:
             if (
                 not isinstance(raw, dict)
                 or int(raw.get("id") or 0) != run_id
-                or str(raw.get("head_sha") or "") != head
+                or str(raw.get("head_sha") or "") not in ((head,) if isinstance(head, str) else head)
             ):
                 return None
             attempt = raw.get("run_attempt")
@@ -1998,7 +1842,7 @@ class GitHubGateway:
         return attempts
 
     def workflow_run_states(
-        self, head: str, run_ids: tuple[int, ...]
+        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
     ) -> dict[int, str] | None:
         """Lifecycle status per workflow run, after SHA verification.
 
@@ -2019,7 +1863,7 @@ class GitHubGateway:
             if (
                 not isinstance(raw, dict)
                 or int(raw.get("id") or 0) != run_id
-                or str(raw.get("head_sha") or "") != head
+                or str(raw.get("head_sha") or "") not in ((head,) if isinstance(head, str) else head)
             ):
                 return None
             status = str(raw.get("status") or "").strip().lower()
@@ -2029,7 +1873,7 @@ class GitHubGateway:
         return states
 
     def cancel_workflow_runs(
-        self, head: str, run_ids: tuple[int, ...]
+        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
     ) -> tuple[int, ...] | None:
         """Cancel the still-running workflow runs among `run_ids`.
 
@@ -2067,7 +1911,7 @@ class GitHubGateway:
 
     def rerun_failed_checks(
         self,
-        head: str,
+        head: str | tuple[str, ...],
         run_ids: tuple[int, ...],
         expected_attempts: dict[int, int] | None = None,
     ) -> tuple[int, ...] | None:
@@ -2574,46 +2418,26 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         # from env, not argv — but be defensive about logging command lines).
         printable = _printable_gh_argv(argv)
         detail = (res.stderr or res.stdout or "").strip()
-        # A KNOWN-benign failure — `gh pr checks` reading statusCheckRollup with an
-        # App token that lacks the checks read scope ("Resource not accessible by
-        # integration"). The reviewer does not gate on checks, so this is pure noise:
-        # one line per PR per poll, flooding stdout. Gate it behind ISSUE_AGENT_DEBUG.
-        # Every OTHER gh failure stays loud — the stderr write exists precisely so a
-        # real failure (e.g. a 422 self-approval that made the reviewer look like it
-        # did nothing) is visible rather than silently swallowed.
-        benign_checks_rollup = (
-            "pr checks" in printable
-            and "statusCheckRollup" in detail
-            and "Resource not accessible by integration" in detail
-        )
-        debug_on = os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
-        if not benign_checks_rollup or debug_on:
-            logged_detail = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
-            truncated = (
-                "\n  [gh stderr truncated]"
-                if logged_detail != detail
-                else ""
-            )
-            sys.stderr.write(
-                f"gh failed (exit {res.returncode}): {printable}\n"
-                f"  {logged_detail}{truncated}\n"
-            )
+        capability = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+        if (any("/rules/branches/" in arg for arg in argv)
+                and detail.removeprefix("gh: ") == f"{capability} (HTTP 403)"):
+            try:
+                error = json.loads(res.stdout) if res.stdout.strip() else None
+                if isinstance(error, list) and len(error) == 1:
+                    error = error[0]
+                if error is None or (isinstance(error, dict) and error.get("status") == "403"
+                        and error.get("message") == capability):
+                    return "[[]]"
+            except ValueError:
+                pass
+        logged_detail = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
+        truncated = "\n  [gh stderr truncated]" if logged_detail != detail else ""
+        sys.stderr.write(f"gh failed (exit {res.returncode}): {printable}\n  {logged_detail}{truncated}\n")
         # Infra? Then this is NOT an answer — raise so the caller can refuse to
         # act on a world it never actually observed. The stderr line above is
         # kept for the raise path too: some callers legitimately swallow
         # GhUnavailable (update_branch, add_blocked_by), and a swallowed infra
         # failure with no trace on stderr is the very bug this section fixes.
-        # A no-checks PR is the one non-zero `pr checks` exit that IS an answer:
-        # return the empty JSON list gh would have printed, so get_pr can tell
-        # honest NONE (mergeable) from a failed read (UNKNOWN — never mergeable,
-        # #48). Any other swallowed failure stays "" → checks_known=False.
-        # MUST run before the infra classification: gh's message embeds the
-        # BRANCH NAME ("no checks reported on the 'fix/12-request-timeout'
-        # branch"), and a branch containing "timeout"/"connection reset"/… would
-        # otherwise read as a network outage — GhUnavailable → tick skipped,
-        # every tick, for as long as that PR exists.
-        if no_checks_answer(argv, detail):
-            return "[]"
         kind = classify_gh_failure(detail)
         if kind is not None:
             raise GhUnavailable(

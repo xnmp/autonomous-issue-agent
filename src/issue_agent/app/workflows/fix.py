@@ -8,6 +8,8 @@ central dispatcher can become a thin role router.
 
 from __future__ import annotations
 
+from ...domain.ci import Failed, reduce_ci, failed_checks, gated_checks, repair_evidence_incomplete
+from ...domain.checks import Unavailable
 from ...domain.agent_task import RUNTIME_CAPABILITIES
 from ...domain.model_routing import ModelRoute
 
@@ -466,8 +468,8 @@ class FixWorkflow:
             return ""
         try:
             run_ids = tuple(dict.fromkeys(
-                c.run_id for c in pr.checks
-                if c.bucket == "fail" and not c.advisory and c.run_id is not None
+                c.run_id for c in failed_checks(pr.ci)
+                if c.run_id is not None
             ))
             return self.gateway.failed_run_log(pr.head_ref_oid, run_ids) or ""
         except Exception as exc:  # noqa: BLE001 — advisory prompt enrichment
@@ -1582,12 +1584,13 @@ class FixWorkflow:
 
     def _dispatch_pr(self, pr: int, issue_hint: int | None):
         """Bind fresh PR state to the issue captured by its claim (ADR 0008)."""
+        current = self.gateway.get_pr(pr)
+        if repair_evidence_incomplete(current.ci) and (not current.has(Label.AI_BLOCKED) or isinstance(current.ci, Unavailable)):
+            self.cfg.log(f"PR #{pr}: repair withheld until required-check evidence is complete")
+            return None
         if issue_hint is None:
             issue = self.gateway.issue_for_pr(pr)
-            if issue is None:
-                return None
-            return self.gateway.get_pr(pr), issue
-        current = self.gateway.get_pr(pr)
+            return (current, issue) if issue is not None else None
         fresh_target = fix_domain.breaker_key(current)
         if fresh_target != issue_hint:
             self.cfg.log(
@@ -1631,7 +1634,7 @@ class FixWorkflow:
         if dispatch is None:
             return
         p, issue = dispatch
-        if issue is None or p.state != "OPEN":
+        if issue is None or p.state != "OPEN" or isinstance(reduce_ci(p.ci), Unavailable):
             return
         # Read before any repair side effect: an unavailable active-review read
         # raises a workflow hold and defers the whole repair (ADR 0015).
@@ -1662,11 +1665,11 @@ class FixWorkflow:
             return
         iss = self.gateway.get_issue(issue)
         session_id = repair.session.handle
-        leg = "fix-ci" if any(check.bucket == "fail" and not check.advisory for check in p.checks) else "resume"
+        leg = "fix-ci" if bool(failed_checks(p.ci)) else "resume"
         fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss, inherited_model=repair.model, inherited_runtime=repair.runtime)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         fork = max(selected.component.state.resumes, handoff.resumes if handoff is not None else 0) + 1 >= self.cfg.fork_threshold
-        if any(check.bucket == "fail" and not check.advisory for check in p.checks):
+        if bool(failed_checks(p.ci)):
             task = self._ci_task(p, issue, cwd, fork=fork, session_id=session_id, fix_cfg=fix_cfg)
         else:
             task = task_builders.build_resume_task(
@@ -1820,10 +1823,10 @@ class FixWorkflow:
     def _ci_task(self, p: PRView, issue: int, cwd: str, *, fork: bool = False,
                  session_id: str = "", fix_cfg: FixTaskConfig | None = None):
         pr = p.number
-        failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
+        failed = "\n".join(c.name for c in failed_checks(p.ci))
         failed_log = self._failed_run_log(p)
         mcp_servers = mcp_servers_for_checks(
-            self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
+            self.cfg.fix_mcp_config, [c.name for c in gated_checks(p.ci)], self.cfg.harness_root
         )
         # PRIOR attempts only — the current one is the prompt's own subject, and
         # a history that always contained it could never be empty. `_try`-wrapped
@@ -1854,7 +1857,7 @@ class FixWorkflow:
         if dispatch is None:
             return
         p, issue = dispatch
-        if issue is None:
+        if issue is None or not isinstance(reduce_ci(p.ci), Failed):
             return
         control = self.workflow_control
         selected = control.read_pr_repair(WorkflowKey(control.writer.repository, PullRequestRef(pr))) if control is not None else None
@@ -1878,7 +1881,7 @@ class FixWorkflow:
             cc.CIRepairInput(issue_selected, PullRequestRef(pr), p.head_ref_oid, self.cfg.max_ci_retries), head=p.head_ref_oid)
         guidance = self._pr_guidance(p.number)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
-        attempt = make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"])
+        attempt = make_attempt(p.head_ref_oid, [c.name for c in failed_checks(p.ci)])
         task = dataclasses.replace(self._ci_task(p, issue, cwd,
             session_id=repair.session.handle if repair.session is not None else "",
             fix_cfg=self._repair_fix_cfg(issue, "fix-ci", inherited_model=repair.model, inherited_runtime=repair.runtime)), pr_repair_input=repair)

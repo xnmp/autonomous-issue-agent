@@ -1,3 +1,5 @@
+
+from tests.domain.builders import observed_pr
 from pathlib import Path
 
 from issue_agent.adapters.control_store import SQLiteControlStore
@@ -134,7 +136,7 @@ def test_world_wrapper_includes_bounded_issue_and_pr_interactions(
     observe = _reported_world(
         lambda: WorldState(
             issues=(IssueView(7, comments=comments),),
-            prs=(PRView(8, comments=comments, reviews=reviews),),
+            prs=(observed_pr(8, comments=comments, reviews=reviews),),
         ),
         control,
         HarnessConfig(repo="o/r", target_dir=str(tmp_path)),
@@ -184,7 +186,7 @@ def test_pathological_pr_facts_cannot_roll_back_the_snapshot(
         for _index in range(20)
     )
     checks = tuple(
-        Check(hostile, hostile, hostile, hostile, run_id=index)
+        Check(hostile, hostile, hostile, hostile, run_id=index + 1)
         for index in range(100)
     )
     paths = frozenset(
@@ -193,7 +195,7 @@ def test_pathological_pr_facts_cannot_roll_back_the_snapshot(
     observe = _reported_world(
         lambda: WorldState(
             prs=(
-                PRView(
+                observed_pr(
                     8,
                     title=hostile,
                     comments=comments,
@@ -201,7 +203,7 @@ def test_pathological_pr_facts_cannot_roll_back_the_snapshot(
                     checks=checks,
                     changed_files=paths,
                 ),
-                PRView(9, title="small"),
+                observed_pr(9, title="small"),
             ),
         ),
         control,

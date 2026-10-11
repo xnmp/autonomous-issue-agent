@@ -1,3 +1,5 @@
+
+from tests.domain.builders import observed_pr, with_checks
 from dataclasses import replace
 from types import SimpleNamespace
 import json
@@ -24,7 +26,7 @@ from issue_agent.domain.self_clear import (
     MachineBlocker,
     self_clear_actions,
 )
-from issue_agent.domain.world import IssueView, PRView, WorldState
+from issue_agent.domain.world import Check, IssueView, PRView, WorldState
 from tests.fakes.executor import ImmediateExecutor
 from tests.fakes.in_memory_github import InMemoryGitHub
 from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
@@ -141,7 +143,7 @@ def test_lost_recovery_reply_adopts_same_source_after_actual_paid_return_once(tm
     admission = receipt(control, requested.run_id)
     selected = control.read_issue_recovery(key)
     issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
-    pr = PRView(100, head_ref_oid="same-head", labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
+    pr = observed_pr(100, head_ref_oid="same-head", labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
     world = WorldState(issues=(issue,), prs=(pr,))
     actions = self_clear_actions(world, {7: machine} if cause == "machine" else {},
         {7: budget} if cause == "budget" else {},
@@ -259,7 +261,7 @@ def test_changed_budget_evidence_refuses_remote_mutation_and_restored_policy_pro
     seed_imported_budget_hold(control, block)
     selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
     issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
-    pr = PRView(100, head_ref_oid="budget-head", labels=issue.labels, closing_issue=7)
+    pr = observed_pr(100, head_ref_oid="budget-head", labels=issue.labels, closing_issue=7)
     world = WorldState(issues=(issue,), prs=(pr,))
     actions = self_clear_actions(world, {}, {7: block}, {7: _observed_budget(store, world, block)}, {}, frozenset(),
         budget_revisions={7: selected.revision}, self_clear_bindings={7: selected.binding})
@@ -395,7 +397,7 @@ def test_alternating_machine_budget_recoveries_and_restart_consume_one_sql_ceili
     workflow, store, _, _ = active_ci_workflow(AgentResult(
         is_error=False, status="blocked", structured={"blocker": "publication"}, cost_usd=.01), Store(str(tmp_path)))
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="head")
-    pr = PRView(100, head_ref_oid="head", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}), closing_issue=5)
+    pr = observed_pr(100, head_ref_oid="head", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}), closing_issue=5)
     issue = IssueView(5, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
     gateway = InMemoryGitHub(prs={100: pr}, issues=(issue,))
     journal = _Journal()
@@ -444,7 +446,7 @@ def test_external_discard_retires_only_selected_cause_without_count_and_stale_re
     seed_imported_machine_hold(control, machine)
     seed_imported_budget_hold(control, budget)
     selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
-    pr = PRView(100, head_ref_oid="head" if cause == "machine" else "different-head",
+    pr = observed_pr(100, head_ref_oid="head" if cause == "machine" else "different-head",
                 labels=frozenset() if cause == "machine" else frozenset({Label.AI_BLOCKED}))
     issue = IssueView(7, labels=frozenset() if cause == "budget" else frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
     actions = self_clear_actions(WorldState(prs=(pr,), issues=(issue,)), {7: machine}, {7: budget}, {}, {}, frozenset(),
@@ -483,7 +485,7 @@ def test_effect_receipt_failure_cannot_keep_partial_hold_or_count_when_caught(tm
     block = MachineBlock(7, Target.PR, 100, 100, MachineBlocker.PUBLICATION, "head")
     seed_imported_machine_hold(control, block)
     selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
-    pr = PRView(100, head_ref_oid="head", labels=frozenset({Label.AI_BLOCKED}))
+    pr = observed_pr(100, head_ref_oid="head", labels=frozenset({Label.AI_BLOCKED}))
     action = self_clear_actions(WorldState(prs=(pr,)), {7: block}, {}, {}, {}, frozenset(),
                                machine_revisions={7: selected.revision})[0]
     command = command_for_action(action, repository="o/r", executor_identity="o/r:fix")
@@ -528,7 +530,7 @@ def test_sibling_recovery_uses_a_fresh_revision_and_shared_count_before_second_r
     seed_imported_budget_hold(store._workflow_db, BudgetBlock(5, Target.PR if same_target else Target.ISSUE,
         100 if same_target else 5, 2_000_000, "issue:5", 5_000_000, 100_000))
     _seed_clear_count(store, 5, initial_count)
-    pr = PRView(100, head_ref_oid="published-head", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}), closing_issue=5)
+    pr = observed_pr(100, head_ref_oid="published-head", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}), closing_issue=5)
     if same_target:
         pr = replace(pr, labels=pr.labels | {Label.NEEDS_BUDGET_REVIEW})
     issue = IssueView(5, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
@@ -563,7 +565,7 @@ def test_sibling_recovery_uses_a_fresh_revision_and_shared_count_before_second_r
         from issue_agent.domain.fix import FixConfig, decide_fix
         from issue_agent.domain.actions import RunAgent
         from issue_agent.domain.world import Check
-        paid_pr = replace(gateway.prs[100], author="fix-bot", head_ref_name="fix/5-test",
+        paid_pr = with_checks(gateway.prs[100], author="fix-bot", head_ref_name="fix/5-test",
                           checks=(Check("unit", bucket="fail"),))
         paid_world = WorldState(prs=(paid_pr,), issues=(replace(issue, labels=frozenset({Label.AI_PR_OPEN})),))
         state = _fix_state(store, paid_world, workflow_control=workflow.workflow_control)
@@ -602,7 +604,7 @@ def test_machine_retirement_is_journalled_after_label_is_observed_gone(tmp_path)
     from issue_agent.domain.outcome import AgentResult
     from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
     from tests.app.test_pr_repair_workflow import active_ci_workflow
-    pr = PRView(
+    pr = observed_pr(
         100,
         head_ref_oid="published-head",
         labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
@@ -762,7 +764,7 @@ def test_ceiling_event_is_persisted_once(tmp_path):
     block = MachineBlock(
         7, Target.PR, 100, 100, MachineBlocker.PUBLICATION, "head"
     )
-    pr = PRView(100, head_ref_oid="head", labels=frozenset({Label.AI_BLOCKED}))
+    pr = observed_pr(100, head_ref_oid="head", labels=frozenset({Label.AI_BLOCKED}))
     store = Store(str(tmp_path))
     from tests.app.test_control_record_isolation import workflow_control
     from tests.fakes.accounted_workflow import seed_imported_machine_hold
@@ -786,3 +788,76 @@ def test_ceiling_event_is_persisted_once(tmp_path):
         isinstance(event.payload, SelfClearCeilingReached)
         for event in journal.events
     ) == 1
+
+
+@pytest.mark.parametrize("currently_green", [False, True])
+def test_predeploy_ignore_regex_lifecycle_command_replays_against_current_ci(tmp_path, currently_green):
+    from issue_agent.domain.checks import Check
+    from issue_agent.domain.contracts import EffectReceipt, EffectStatus
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_machine_hold
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    block = MachineBlock(7, Target.PR, 100, 100, MachineBlocker.CHECKS, "head")
+    seed_imported_machine_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    green = observed_pr(100, head_ref_oid="head", labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}),
+        checks=(Check("unit", bucket="pass"),))
+    action = self_clear_actions(WorldState(prs=(green,)), {7: block}, {}, {}, {}, frozenset(),
+        machine_revisions={7: selected.revision}, self_clear_bindings={7: selected.binding})[0]
+    command = command_for_action(action, repository="o/r", executor_identity="o/r:fix")
+    # This is the pre-deploy JSON stored in lifecycle_commands.payload_json.
+    proof = json.loads(command.payload["self_clear"])
+    proof["value"]["fields"]["ignored_checks"] = "^unit$"
+    old_proof = json.dumps(proof)
+    from issue_agent.domain.contracts import CommandId
+    old_command = replace(command, command_id=CommandId("predeploy-self-clear"), idempotency_key="legacy:self-clear",
+        payload={**command.payload, "self_clear": old_proof})
+    control.enqueue_command(old_command)
+    current = green if currently_green else with_checks(green, checks=(Check("unit", bucket="fail"),))
+    gateway = InMemoryGitHub(prs={100: current})
+    _executor(gateway, store, _Journal())
+    from issue_agent.adapters.effects import GitHubEffectExecutor, StaleExpectedRevision
+    executor = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix")
+    replayed = action_from_command(control.pending_commands()[0].command)
+    if currently_green:
+        assert executor.execute(replayed)
+    else:
+        with pytest.raises(StaleExpectedRevision):
+            executor.execute(replayed)
+    assert control.effect_receipt(old_command.command_id).status is (EffectStatus.SUCCEEDED if currently_green else EffectStatus.PERMANENT_FAILURE)
+    assert (Label.AI_BLOCKED not in gateway.prs[100].labels) == currently_green
+    after = _recovery_state(store, 7)
+    assert after.self_clears == int(currently_green)
+    assert (after.machine_block is None) == currently_green
+    if currently_green:
+        assert executor.drain_pending_commands() == 0
+        assert _recovery_state(store, 7).self_clears == 1
+
+
+def test_predeploy_self_clear_receipt_with_ignore_regex_settles_exactly_once(tmp_path):
+    from issue_agent.domain.contracts import EffectReceipt, EffectStatus
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_machine_hold
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    block = MachineBlock(7, Target.PR, 100, 100, MachineBlocker.CHECKS, "head")
+    seed_imported_machine_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    pr = observed_pr(100, head_ref_oid="head", labels=frozenset({Label.AI_BLOCKED}),
+        checks=(Check("unit", "SUCCESS", "pass"),))
+    action = self_clear_actions(WorldState(prs=(pr,)), {7: block}, {}, {}, {}, frozenset(),
+        machine_revisions={7: selected.revision}, self_clear_bindings={7: selected.binding})[0]
+    command = command_for_action(action, repository="o/r", executor_identity="o/r:fix")
+    proof = json.loads(command.payload["self_clear"])
+    proof["value"]["fields"]["ignored_checks"] = "^advisory$"
+    old_proof = json.dumps(proof)
+    old_command = replace(command, payload={**command.payload, "self_clear": old_proof})
+    control.enqueue_command(old_command)
+    control.begin_command(command.command_id)
+    receipt = EffectReceipt(command.command_id, "o/r:fix", control.now(), control.now(),
+        EffectStatus.SUCCEEDED, remote_revision=old_proof)
+    assert control.record_effect(receipt)
+    assert control.record_effect(receipt)
+    after = control.read_issue_recovery(selected.revision.fence.key).component.state
+    assert after.machine_block is None and after.self_clears == 1

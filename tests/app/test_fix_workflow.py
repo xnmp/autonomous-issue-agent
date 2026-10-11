@@ -3,6 +3,8 @@
 These cover the extracted fix-side workflow directly so AgentDispatcher can keep
 shrinking into a router without losing behavior coverage.
 """
+
+from tests.domain.builders import observed_pr, with_checks
 from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
 
 
@@ -88,7 +90,7 @@ def _workflow(gw, store, runner, wt=None, *, pr_repair_authority=True, **cfg_ove
 def test_resolve_saves_session_and_uses_ground_truth_pr():
     gw = FakeGateway(
         issues={5: IssueView(5, title="Add token", body="body")},
-        prs={100: PRView(100)},
+        prs={100: observed_pr(100)},
         pr_for_issue={5: 100},
     )
     store = FakeStore()
@@ -163,7 +165,7 @@ def test_resolve_closed_without_a_pr_retires_the_issue_worktree_and_state():
 
 def test_fix_ci_records_retry_and_writes_no_label_on_push():
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+        prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5,
                          checks=(Check("unit", bucket="fail"),))},
     )
     store = FakeStore()
@@ -184,7 +186,7 @@ def test_fix_ci_attaches_mcp_when_check_matches(tmp_path):
     cfgfile = tmp_path / "sonar.json"
     cfgfile.write_text('{"mcpServers": {"sonarqube": {"command": "npx"}}}')
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+        prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5,
                          checks=(Check("SonarQube Code Analysis", bucket="fail"),))},
     )
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
@@ -204,7 +206,7 @@ def test_fix_ci_attaches_mcp_when_check_matches(tmp_path):
 
 def test_fix_ci_no_mcp_when_no_check_matches():
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+        prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5,
                          checks=(Check("SonarQube Code Analysis", bucket="fail"),))},
     )
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
@@ -236,7 +238,7 @@ def test_fix_ci_defers_and_journals_dispatch_deferred_when_claim_disagrees():
     disagrees with the claimed issue_hint, AND surfaces a
     TelemetryWarning('dispatch_deferred', ...) with Correlation(pr=N) so a
     persistent linkage flap is visible in the dashboard per-issue event view."""
-    pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6,
+    pr = observed_pr(100, head_ref_name="fix/6-moved", closing_issue=6,
                 checks=(Check("unit", bucket="fail"),))
     gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
@@ -264,7 +266,7 @@ def test_fix_ci_defers_even_when_journalling_the_deferral_raises():
         def emit(self, event):
             raise OSError("journal disk full")
 
-    pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6,
+    pr = observed_pr(100, head_ref_name="fix/6-moved", closing_issue=6,
                 checks=(Check("unit", bucket="fail"),))
     gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
@@ -395,7 +397,7 @@ def test_productive_resume_keeps_its_session():
 def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     iss = IssueView(5, title="Token", body="b")
-    p = PRView(
+    p = observed_pr(
         100, head_ref_name="fix/5-token", closing_issue=5,
         comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
@@ -405,7 +407,7 @@ def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
                         AgentResult(is_error=False, status="pushed", session_id="s5")])
     workflow = _workflow(gw, store, runner, fix_bot="fix-bot")
     asyncio.run(workflow.resolve(5))
-    gw.prs[100] = dataclasses.replace(gw.prs[100], labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
+    gw.prs[100] = with_checks(gw.prs[100], labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
     asyncio.run(workflow.resume_pr(100))
 
     assert pr_repair_state(store).consumed_reply_at == "2026-10-01T00:00:02Z"
@@ -419,7 +421,7 @@ def test_resolve_session_handoff_dispatches_and_runs_pr_reply_without_legacy_res
     from issue_agent.domain.fix import FixConfig, prs_needing_resume
 
     issue = IssueView(5, title="Add token", body="body")
-    pr = PRView(100, author="fix-bot", head_ref_name="fix/5-add-token", closing_issue=5)
+    pr = observed_pr(100, author="fix-bot", head_ref_name="fix/5-add-token", closing_issue=5)
     gw = FakeGateway(issues={5: issue}, prs={100: pr}, pr_for_issue={5: 100})
     store = Store(str(tmp_path))
     runner = SeqRunner([
@@ -432,7 +434,7 @@ def test_resolve_session_handoff_dispatches_and_runs_pr_reply_without_legacy_res
     assert not retained_issue_file(store, 5, "session")
     assert not retained_issue_file(store, 5, "model")
 
-    gw.prs[100] = dataclasses.replace(gw.prs[100], labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
+    gw.prs[100] = with_checks(gw.prs[100], labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
         checks=(Check("native", bucket="fail"),) if red_ci else (),
         comments=(Comment("fix-bot", "**Agent needs input:** choose A or B\n\n_Reply to unblock._", "2026-09-14T00:00:00Z"),
                   Comment("alice", "Use A.", "2026-09-14T00:01:00Z")))
@@ -464,9 +466,9 @@ def test_pr_resume_ignores_retired_file_session_and_preserves_sql_default_model(
     seed_retained_issue_file(store, 5, "model", "stale-model")
     if legacy:
         seed_retained_issue_file(store, 5, "session", "retired-transcript")
-    gw = FakeGateway(issues={5: IssueView(5, title="Token")}, prs={100: PRView(
+    gw = FakeGateway(issues={5: IssueView(5, title="Token")}, prs={100: observed_pr(
         100, closing_issue=5, head_ref_name="fix/5-token", head_ref_oid="a" * 40,
-        comments=(Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),))}, pr_for_issue={5: 100})
+        checks=(Check("unit", bucket="fail"),), comments=(Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),))}, pr_for_issue={5: 100})
     runner = SeqRunner([AgentResult(is_error=False, status="pushed", session_id="repair-transcript"),
                         AgentResult(is_error=False, status="pushed", session_id="new-repair"),
                         AgentResult(is_error=False, status="pushed", session_id="new-repair")])
@@ -487,7 +489,7 @@ def test_pr_reply_without_compatible_handoff_does_not_consume_reply_or_run(runti
     store = FakeStore()
     if runtime:
         _seed_resolve(store, 5, session_id="foreign-session", runtime=runtime)
-    gw = FakeGateway(issues={5: IssueView(5)}, prs={100: PRView(
+    gw = FakeGateway(issues={5: IssueView(5)}, prs={100: observed_pr(
         100, closing_issue=5, head_ref_name="fix/5-token",
         comments=(Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),))})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
@@ -517,7 +519,7 @@ def test_address_review_attempt_rekeys_counter_to_current_review():
     # The counter follows the review being addressed: a count accumulated
     # against an OLDER review restarts at 1 for the new one, and a successful
     # push still counts (no clear-on-success — V2/#64).
-    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    p = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
@@ -530,7 +532,7 @@ def test_address_review_attempt_rekeys_counter_to_current_review():
 
 
 def test_address_review_blocked_does_not_bump_counter():
-    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    p = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
@@ -544,13 +546,13 @@ def test_address_review_blocked_does_not_bump_counter():
 
 # ── infra death must not advance a breaker (FAILURE-MODES #58) ───────────────
 def _ci_pr():
-    return PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+    return observed_pr(100, head_ref_name="fix/5-token", closing_issue=5,
                   checks=(Check("unit", bucket="fail"),))
 
 
 # ── CI attempt history (tauri PR #620) ──────────────────────────────────────
 def _ci_pr_at(sha, *check_names):
-    return PRView(
+    return observed_pr(
         100, head_ref_name="fix/5-token", head_ref_oid=sha, closing_issue=5,
         checks=tuple(Check(n, bucket="fail") for n in check_names),
     )
@@ -675,7 +677,7 @@ def test_a_merged_pr_leaves_no_history_for_the_next_one(tmp_path):
 
     runner = _pushed_runner()
     asyncio.run(_workflow(
-        FakeGateway(prs={101: PRView(101, head_ref_name="fix/5-token",
+        FakeGateway(prs={101: observed_pr(101, head_ref_name="fix/5-token",
                                      head_ref_oid="c" * 40, closing_issue=5,
                                      checks=(Check("e2e tests", bucket="fail"),))}),
         store, runner,
@@ -720,7 +722,7 @@ def test_fix_ci_infra_death_does_not_advance_the_breaker():
 
 
 def test_rebase_error_advances_the_breaker():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5)})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
 
@@ -730,7 +732,7 @@ def test_rebase_error_advances_the_breaker():
 
 
 def test_rebase_infra_death_does_not_advance_the_breaker():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5)})
     store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
@@ -781,7 +783,7 @@ def test_fix_ci_error_does_not_touch_the_infra_ceiling(tmp_path):
 
 
 def test_rebase_infra_death_counts_against_the_infra_ceiling(tmp_path):
-    gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5)})
     store = Store(state_dir=str(tmp_path))
     runner = FakeRunner(AgentResult(is_error=True, status="timeout",
                                     exit_reason=ExitReason.KILLED_EXTERNALLY))
@@ -900,7 +902,7 @@ def test_the_resolve_leg_decays_it_too(tmp_path):
 
 
 def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
-    gw = FakeGateway(prs={100: PRView(
+    gw = FakeGateway(prs={100: observed_pr(
         100, head_ref_name="fix/5-x", closing_issue=5,
         reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
     )})
@@ -918,7 +920,7 @@ def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
 
 
 def test_address_review_infra_death_does_not_burn_a_review_retry():
-    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    p = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
@@ -937,7 +939,7 @@ def test_address_review_infra_death_does_not_burn_a_review_retry():
 def test_split_majority_case_author_then_implement_opens_pr():
     gw = FakeGateway(
         issues={5: IssueView(5, title="Null token", body="x")},
-        prs={100: PRView(100)},
+        prs={100: observed_pr(100)},
         pr_for_issue={},
     )
     store, wt = FakeStore(), FakeWorktrees()
@@ -983,7 +985,7 @@ def test_split_author_blocked_stops_before_implement():
 def test_split_contract_change_revised_then_pr():
     gw = FakeGateway(
         issues={5: IssueView(5, title="t", body="b")},
-        prs={100: PRView(100)},
+        prs={100: observed_pr(100)},
         pr_for_issue={},
     )
     store, wt = FakeStore(), FakeWorktrees()
@@ -1179,7 +1181,7 @@ class LegacyGateway(FakeGateway):
 
 
 def _review_pr():
-    return PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+    return observed_pr(100, head_ref_name="fix/5-x", closing_issue=5,
                   reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
 
 
@@ -1427,7 +1429,7 @@ def test_resolve_persists_router_path_predictions_for_later_overlap_checks():
 
 def test_router_defers_the_selected_issue_before_resolve_when_prediction_overlaps():
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
-    gw.build_world = lambda: WorldState(prs=(PRView(
+    gw.build_world = lambda: WorldState(prs=(observed_pr(
         100, state="OPEN", changed_files=frozenset({"src/action.rs"}),
     ),))
     store = PredictionRecordingStore()
@@ -1814,7 +1816,7 @@ def test_a_store_that_cannot_answer_still_dispatches():
             raise OSError("state dir vanished")
 
     gw = FakeGateway(
-        issues={5: _issue()}, prs={100: PRView(100)}, pr_for_issue={5: 100}
+        issues={5: _issue()}, prs={100: observed_pr(100)}, pr_for_issue={5: 100}
     )
     runner = SeqRunner([
         _router_result("standard"),
@@ -1835,7 +1837,7 @@ def _pr_with_rounds(n, extra=()):
         Review("CHANGES_REQUESTED", "rev-bot", f"2026-01-01T00:00:{i:02d}Z", body="fix it")
         for i in range(1, n + 1)
     ) + tuple(extra)
-    return PRView(100, head_ref_name="fix/5-x", closing_issue=5, reviews=reviews)
+    return observed_pr(100, head_ref_name="fix/5-x", closing_issue=5, reviews=reviews)
 
 
 def test_repair_legs_keep_their_model_while_thinking_harder():
@@ -1980,6 +1982,7 @@ def test_hard_history_on_an_unpinned_repair_preserves_its_stored_model_and_journ
     failures: the ceiling selects a fresh resolve model, never a resumed one."""
     gw = FakeGateway(prs={100: _pr_with_rounds(1)}, issues={5: IssueView(5)})
     store = FakeStore()
+    gw.prs[100] = with_checks(gw.prs[100], checks=(Check("unit", bucket="fail"),))
     store.models[5] = "gpt-5.6-terra"
     _seed_resolve(store, 5, failures=2)
     # Continuation comes from a verified paid repair return, replacing the
@@ -2091,7 +2094,7 @@ def test_a_broken_journal_never_fails_a_dispatch():
 
 def _failing_ci_pr():
     return FakeGateway(
-        prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+        prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5,
                          checks=(Check("unit", bucket="fail"),))},
     )
 
@@ -2143,7 +2146,7 @@ def test_fix_ci_without_marker_keeps_the_runtime_default():
 def test_resolve_persists_its_model_for_later_repair_legs():
     gw = FakeGateway(
         issues={5: IssueView(5, title="t", body="b")},
-        prs={100: PRView(100)},
+        prs={100: observed_pr(100)},
         pr_for_issue={5: 100},
     )
     store = FakeStore()
@@ -2255,7 +2258,7 @@ def test_a_runner_that_cannot_name_its_legs_still_resolves():
 
 
 def test_fix_ci_persists_structured_publication_block_for_reconciliation(tmp_path):
-    pr = PRView(
+    pr = observed_pr(
         100,
         head_ref_name="fix/5-token",
         head_ref_oid="blocked-head",
@@ -2295,7 +2298,7 @@ def test_fix_ci_persists_harness_budget_facts_for_re_evaluation(tmp_path, monkey
             return runtime.store.reserve(request)
         return dataclasses.replace(runtime, admit=admit)
     monkeypatch.setattr(accounted_workflow, "AccountingRuntime", limited)
-    pr = PRView(
+    pr = observed_pr(
         100,
         head_ref_name="fix/5-token",
         head_ref_oid="head",
@@ -2320,7 +2323,7 @@ def test_fix_ci_persists_harness_budget_facts_for_re_evaluation(tmp_path, monkey
 
 @pytest.mark.parametrize("forged_facts", [None, AdmissionBudgetBlock("issue:5", 2_000_000, 5_000_000, 4_750_000, "USD")])
 def test_in_run_budget_kill_does_not_create_a_re_evaluable_marker(tmp_path, forged_facts):
-    pr = PRView(
+    pr = observed_pr(
         100,
         head_ref_name="fix/5-token",
         head_ref_oid="head",
@@ -2902,9 +2905,9 @@ def _review_guidance_control(tmp_path, guidance):
 
 @pytest.mark.parametrize("handler", ["address_review", "fix_ci", "rebase"])
 def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_side_effects(handler):
-    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
+    p = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
-               checks=(Check("ci", "fail"),))
+               checks=(Check("ci", bucket="fail"),))
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
@@ -2935,7 +2938,7 @@ def test_the_repair_reads_the_committed_review_episode_guidance(tmp_path):
     reader = review_guidance_reader(control, "o/r")
     assert reader(pr) == "Scope: the parser only"
     assert reader(pr + 1) == ""  # active but never observed: no legacy fallback
-    p = PRView(pr, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
+    p = observed_pr(pr, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
     asyncio.run(_workflow(FakeGateway(prs={pr: p}), FakeStore(), runner, operator_guidance=reader).address_review(pr))
@@ -2950,3 +2953,20 @@ def test_an_inactive_review_family_defers_guidance_until_migrated(tmp_path):
     reader = review_guidance_reader(control, "o/r")
     with pytest.raises(WorkflowAuthorityError, match="review_migration_required"):
         reader(9)
+
+
+@pytest.mark.parametrize("method", ["rebase", "address_review", "resume_pr", "fix_ci"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_incomplete_ci_withholds_every_paid_pr_repair_and_allowance(method, missing):
+    from issue_agent.domain.checks import Observed, RequiredCheck, Unavailable
+    ci = Observed("head", "head", frozenset({RequiredCheck("absent")}), ()) if missing else Unavailable("partial pagination")
+    p = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5,
+        reviews=(Review("CHANGES_REQUESTED", "review-bot"),), ci=ci)
+    gateway = FakeGateway(prs={100: p})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
+    workflow = _workflow(gateway, store, runner)
+    before = pr_repair_state(store)
+    asyncio.run(getattr(workflow, method)(100))
+    assert not runner.tasks and not gateway.calls
+    assert pr_repair_state(store) == before

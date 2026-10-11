@@ -591,6 +591,12 @@ module requires placing it in the appropriate tier and explaining it here.
 
 `domain/` — pure values and policy:
 `domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
+`domain/checks.py` (the repository's required-check policy and the typed CI
+observation/reduction: `Clear | Waiting | Failed`, or `Unavailable`; declared
+policies use the test-merge revision when it has checks, otherwise the head.
+Empty policies retain head report selection and escalate unverified green
+after same-head cancellation until the free rerun is spent. Unavailable reads
+leave durable escalations owed; settled Clear obsoletes other CI escalations),
 `domain/ci_history.py`
 (the bounded per-issue record of what each FIX_CI leg was pointed at and what
 was red, so attempt N can see the pattern across attempts 1..N-1 instead of
@@ -675,6 +681,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/effects.py`,
 `adapters/env_file.py`, `adapters/environment.py`,
 `adapters/event_log.py`, `adapters/github.py`,
+`adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
 `adapters/governor.py`, `adapters/gate_transport.py` (trusted shell gate composition), `adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,

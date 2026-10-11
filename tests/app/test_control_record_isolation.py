@@ -1,5 +1,7 @@
 """A damaged target's file must not buy work or starve another target."""
 
+from tests.domain.builders import observed_pr
+
 from datetime import datetime, timezone
 
 from issue_agent.adapters.store import Store
@@ -142,7 +144,7 @@ def test_corrupt_current_review_allowance_holds_only_affected_pr(rig):
     with control.transaction() as db:
         db.execute("UPDATE workflows SET episode_json='oops' WHERE target_kind='pr' AND target_number=9")
     world = WorldState(prs=tuple(
-        PRView(n, labels=frozenset({Label.AI_PR_OPEN}), head_ref_oid=f"h{n}")
+        observed_pr(n, labels=frozenset({Label.AI_PR_OPEN}), head_ref_oid=f"h{n}")
         for n in (9, 10)
     ))
     errors = {}

@@ -1,3 +1,5 @@
+
+from tests.domain.builders import observed_pr
 from dataclasses import replace
 import json
 import sqlite3
@@ -57,13 +59,13 @@ def test_explicit_no_link_does_not_read_an_issue_or_initialize_authority(control
     gateway = IssueGateway(ConnectionError("must not read"))
     with control._connect() as db:
         before = tuple(db.iterdump())
-    assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, PRView(9)), NoLinkedIssue)
+    assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, observed_pr(9)), NoLinkedIssue)
     assert gateway.reads == []
     with control._connect() as db:
         assert tuple(db.iterdump()) == before
 
 
-@pytest.mark.parametrize("view", [PRView(9, closing_issue=7), PRView(9, head_ref_name="fix/7-linked")])
+@pytest.mark.parametrize("view", [observed_pr(9, closing_issue=7), observed_pr(9, head_ref_name="fix/7-linked")])
 def test_closing_reference_and_branch_fallback_observe_known_issue(control, view):
     gateway = IssueGateway()
     assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, view), ObservedLinkedIssue)
@@ -73,25 +75,25 @@ def test_closing_reference_and_branch_fallback_observe_known_issue(control, view
 
 def test_closing_reference_takes_precedence_over_branch(control):
     gateway = IssueGateway(IssueView(8))
-    assert not review_linked_issue_holds(control, gateway, PR_KEY, PRView(9, closing_issue=8, head_ref_name="fix/7-linked"))
+    assert not review_linked_issue_holds(control, gateway, PR_KEY, observed_pr(9, closing_issue=8, head_ref_name="fix/7-linked"))
     assert gateway.reads == [8]
 
 
 @pytest.mark.parametrize("issue", [ConnectionError("offline"), None, IssueView(8), IssueView(7, state="unknown")])
 def test_failed_or_mismatched_known_issue_is_unavailable(control, issue):
-    result = read_review_linked_issue(control, IssueGateway(issue), PR_KEY, PRView(9, closing_issue=7))
+    result = read_review_linked_issue(control, IssueGateway(issue), PR_KEY, observed_pr(9, closing_issue=7))
     assert isinstance(result, LinkedIssueUnavailable)
 
 
-@pytest.mark.parametrize("view,key", [(None, PR_KEY), (PRView(10), PR_KEY), (PRView(9), ISSUE_KEY),
-                                     (PRView(9, closing_issue=True), PR_KEY), (PRView(9, closing_issue=0), PR_KEY)])
+@pytest.mark.parametrize("view,key", [(None, PR_KEY), (observed_pr(10), PR_KEY), (observed_pr(9), ISSUE_KEY),
+                                     (observed_pr(9, closing_issue=True), PR_KEY), (observed_pr(9, closing_issue=0), PR_KEY)])
 def test_malformed_or_mismatched_pr_linkage_is_unavailable(control, view, key):
     assert isinstance(read_review_linked_issue(control, IssueGateway(), key, view), LinkedIssueUnavailable)
 
 
 @pytest.mark.parametrize("dependencies", [ConnectionError("dependency read failed"), None, [True], [0], ["8"]])
 def test_unreadable_dependencies_never_clear_a_known_issue(control, dependencies):
-    result = read_review_linked_issue(control, IssueGateway(dependencies=dependencies), PR_KEY, PRView(9, closing_issue=7))
+    result = read_review_linked_issue(control, IssueGateway(dependencies=dependencies), PR_KEY, observed_pr(9, closing_issue=7))
     assert isinstance(result, LinkedIssueUnavailable)
 
 
@@ -102,7 +104,7 @@ def test_real_gateway_soft_dependency_failures_never_prove_clear_linkage(control
             return json.dumps({"number": 7, "state": "OPEN", "labels": []})
         return dependencies
     gateway = GitHubGateway("o/r", runner=runner)
-    assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, PRView(9, closing_issue=7)),
+    assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, observed_pr(9, closing_issue=7)),
                       LinkedIssueUnavailable)
 
 
@@ -113,7 +115,7 @@ def test_real_gateway_incomplete_issue_response_never_proves_clear_linkage(contr
     def runner(argv, *_):
         return json.dumps(payload) if argv[1:3] == ["issue", "view"] else "[[]]"
     gateway = GitHubGateway("o/r", runner=runner)
-    assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, PRView(9, closing_issue=7)),
+    assert isinstance(read_review_linked_issue(control, gateway, PR_KEY, observed_pr(9, closing_issue=7)),
                       LinkedIssueUnavailable)
 
 
@@ -126,7 +128,7 @@ def test_real_gateway_complete_dependency_pages_decide_review_hold(control, depe
         if argv[1:3] == ["issue", "view"]:
             return json.dumps({"number": 7, "state": "OPEN", "labels": []})
         return dependencies
-    holds = review_linked_issue_holds(control, GitHubGateway("o/r", runner=runner), PR_KEY, PRView(9, closing_issue=7))
+    holds = review_linked_issue_holds(control, GitHubGateway("o/r", runner=runner), PR_KEY, observed_pr(9, closing_issue=7))
     assert bool(holds) is blocked
     if blocked:
         assert any("open dependency" in hold for hold in holds)
@@ -184,7 +186,7 @@ def test_explicit_empty_raw_refs_use_complete_branch_evidence(control, branch, l
     (IssueView(7), [8], "open dependency"),
 ])
 def test_current_remote_holds_block_review(control, issue, dependencies, reason):
-    holds = review_linked_issue_holds(control, IssueGateway(issue, dependencies=dependencies), PR_KEY, PRView(9, closing_issue=7))
+    holds = review_linked_issue_holds(control, IssueGateway(issue, dependencies=dependencies), PR_KEY, observed_pr(9, closing_issue=7))
     assert any(reason in hold and "#7" in hold for hold in holds)
 
 
@@ -192,7 +194,7 @@ def test_current_sql_gate_holds_review_even_after_remote_label_is_cleared(contro
     install_workflow(control, held_issue())
     with control._connect() as db:
         before = tuple(db.iterdump())
-    holds = review_linked_issue_holds(control, IssueGateway(), PR_KEY, PRView(9, closing_issue=7))
+    holds = review_linked_issue_holds(control, IssueGateway(), PR_KEY, observed_pr(9, closing_issue=7))
     assert any("#7" in hold and "workflow gates" in hold for hold in holds)
     with control._connect() as db:
         assert tuple(db.iterdump()) == before
@@ -208,7 +210,7 @@ def test_pending_issue_rearm_is_preserved_as_a_review_hold_with_clear_remote_lab
     with control.transaction() as db:
         persist_workflow_snapshot(db, change.snapshot)
         insert_pending_rearm(db, workflow_scope(change.snapshot.revision.fence.key), change.snapshot.intent, change.audit)
-    holds = review_linked_issue_holds(control, IssueGateway(), PR_KEY, PRView(9, closing_issue=7))
+    holds = review_linked_issue_holds(control, IssueGateway(), PR_KEY, observed_pr(9, closing_issue=7))
     assert any("pending workflow re-arm" in hold and "#7" in hold for hold in holds)
 
 
@@ -217,14 +219,14 @@ def test_retained_issue_authority_without_activation_is_local_corruption(control
     with control.transaction() as db:
         db.execute("DELETE FROM workflow_authority_epochs")
     with pytest.raises(WorkflowAuthorityError, match="retained"):
-        read_review_linked_issue(control, IssueGateway(), PR_KEY, PRView(9, closing_issue=7))
+        read_review_linked_issue(control, IssueGateway(), PR_KEY, observed_pr(9, closing_issue=7))
 
 
 def test_local_sql_error_propagates_without_becoming_remote_evidence(control):
     with control.transaction() as db:
         db.execute("DROP TABLE workflow_authority_epochs")
     with pytest.raises(sqlite3.Error):
-        read_review_linked_issue(control, IssueGateway(), PR_KEY, PRView(9, closing_issue=7))
+        read_review_linked_issue(control, IssueGateway(), PR_KEY, observed_pr(9, closing_issue=7))
 
 
 def review_reservation(issue=7):
@@ -238,7 +240,7 @@ def test_issue_gate_arriving_after_review_plan_refuses_paid_reservation(control)
     install_workflow(control, fresh())
     install_workflow(control, resolve_snapshot(7))
     planned = review_reservation()
-    assert not review_linked_issue_holds(control, IssueGateway(), PR_KEY, PRView(9, closing_issue=7))
+    assert not review_linked_issue_holds(control, IssueGateway(), PR_KEY, observed_pr(9, closing_issue=7))
     with control.transaction() as db:
         persist_workflow_snapshot(db, held_issue())
     assert not control.reserve(planned).admitted

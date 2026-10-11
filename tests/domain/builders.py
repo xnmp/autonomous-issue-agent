@@ -49,7 +49,7 @@ def pr(number: int, *label_names: str, **kw) -> PRView:
     # overrides author= to exercise the human-PR path.
     kw.setdefault("author", "fix-bot")
     kw.setdefault("merge_state", "CLEAN")
-    return PRView(number=number, **kw)
+    return observed_pr(number=number, **kw)
 
 
 def closing_ref(pr_number: int, issue_number: int, author: str = "human",
@@ -63,7 +63,7 @@ def closing_ref(pr_number: int, issue_number: int, author: str = "human",
 
 
 def world(
-    issues=(), prs=(), now: str = "", closing_refs=(), base_head: str = ""
+    issues=(), prs=(), now: str = "", closing_refs=()
 ) -> WorldState:
     # `now` defaults to "" (unstamped): every time-based gate reads that as
     # "elapsed time unknown" and stays inert, so tests that don't care about
@@ -72,8 +72,7 @@ def world(
     # guard reads as "no evidence of a duplicate" (fail-open) — so every test
     # written before #39 keeps dispatching exactly as it did.
     return WorldState(issues=tuple(issues), prs=tuple(prs),
-                      closing_refs=tuple(closing_refs), now=now,
-                      base_head=base_head)
+                      closing_refs=tuple(closing_refs), now=now)
 
 
 __all__ = [
@@ -87,3 +86,20 @@ __all__ = [
     "Review",
     "Label",
 ]
+
+
+from dataclasses import replace
+from issue_agent.domain.checks import Observed, Unavailable
+
+
+def observed_pr(*args, checks=(), checks_known=True, **kwargs):
+    kwargs.setdefault("ci", Observed(kwargs.get("head_ref_oid") or "fixture-head",
+        kwargs.get("head_ref_oid") or "fixture-head", frozenset(), tuple(checks))
+        if checks_known else Unavailable("checks not requested"))
+    return PRView(*args, **kwargs)
+
+
+def with_checks(pr, *, checks=None, checks_known=True, **kwargs):
+    head = kwargs.get("head_ref_oid", pr.head_ref_oid) or "fixture-head"
+    kwargs["ci"] = Observed(head, head, frozenset(), tuple(pr.checks if checks is None else checks)) if checks_known else Unavailable("checks not requested")
+    return replace(pr, **kwargs)

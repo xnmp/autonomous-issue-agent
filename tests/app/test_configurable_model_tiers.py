@@ -1,4 +1,6 @@
 """Configured routes govern actual purchases and retain transcript provenance."""
+
+from tests.domain.builders import observed_pr
 import asyncio
 from dataclasses import replace
 
@@ -116,7 +118,7 @@ def test_pr_repair_handoff_and_followup_keep_original_provider():
         async def run(self, task):
             result = await super().run(task)
             if task.model == "claude-opus-5-5":
-                gateway.prs[100] = PRView(100, closing_issue=5,
+                gateway.prs[100] = observed_pr(100, closing_issue=5,
                     head_ref_name="fix/5-issue", head_ref_oid="a" * 40, checks=(Check("unit", bucket="fail"),))
                 gateway._pr_for_issue[5] = 100
             return result
