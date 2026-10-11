@@ -1380,6 +1380,9 @@ class FixWorkflow:
             if not isinstance(selected, cc.SelectedIssueRecovery):
                 raise WorkflowAuthorityError("fix infrastructure episode is unavailable")
             deaths = selected.component.state.infra_failures
+            refusals = getattr(self.workflow_control, "fix_admission_refusals", None)
+            if refusals is not None:
+                deaths += refusals(issue)
         except Exception as exc:  # noqa: BLE001 — reporting preserves the original fault
             self.cfg.log(f"agent #{issue}: infra episode unavailable ({exc})")
             return

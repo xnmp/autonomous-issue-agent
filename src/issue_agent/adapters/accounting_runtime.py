@@ -293,6 +293,20 @@ class AccountingRuntime(AgentRuntime):
         self._identity.set((run_id, leg_id))
 
     async def run(self, task: RuntimePlan) -> AgentResult:
+        result = await self._admit_and_run(task)
+        if self.role == "fix" and result.status == RETURN_REFUSED_STATUS:
+            # Refused before any run exists, so the episode's receipt-driven
+            # infra charge can never see it (#262). Count it durably here;
+            # the fix role folds the ledger into the infra-death ceiling.
+            issue = self._context.get()[0]
+            if issue is not None:
+                try:
+                    self.store.record_fix_admission_refusal(self.repository, issue, result.summary)
+                except Exception:  # noqa: BLE001 - the refusal itself is still returned
+                    pass
+        return result
+
+    async def _admit_and_run(self, task: RuntimePlan) -> AgentResult:
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return _return_refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
@@ -618,6 +632,12 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.AGENT_ERROR,
             )
+        if self.role == "fix" and issue is not None:
+            # Admission succeeded: whatever authority was missing is back.
+            try:
+                self.store.clear_fix_admission_refusals(self.repository, issue)
+            except Exception:  # noqa: BLE001 - a stale count only brings the ceiling nearer
+                pass
         publication_owner = (
             self.owner_id or f"{self.repository}:{self.role}"
         )
@@ -1181,13 +1201,17 @@ def _issue_scope(
     )
 
 
+RETURN_REFUSED_STATUS = "return_authority_unavailable"
+
+
 def _return_refused(detail: str) -> AgentResult:
     # Receipt authority is a harness precondition, not evidence of exhausted
-    # money or a failed issue implementation. Existing infra ceilings own it.
+    # money or a failed issue implementation. `AccountingRuntime.run` counts it
+    # toward the fix infra ceiling (it mints no run, so no receipt would).
     return AgentResult(
         is_error=True,
-        status="return_authority_unavailable",
-        envelope_subtype="return_authority_unavailable",
+        status=RETURN_REFUSED_STATUS,
+        envelope_subtype=RETURN_REFUSED_STATUS,
         summary=f"paid admission refused: {detail}",
         exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
     )

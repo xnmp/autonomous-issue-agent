@@ -307,6 +307,9 @@ def infra_class_reason(result: AgentResult) -> str:
     """
     if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
         return result.envelope_subtype
+    if result.envelope_subtype == "return_authority_unavailable":
+        # Harness-minted summary names the authority that was missing (#262).
+        return f"return_authority_unavailable: {result.summary}"[:300]
     if (infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason)
             or result.exit_reason in _INFRA_CLASS_EXTRA):
         return result.exit_reason.value if result.exit_reason else ""

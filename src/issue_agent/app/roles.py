@@ -1945,7 +1945,13 @@ def _fix_state(
             selected_infra = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
             if not isinstance(selected_infra, cc.SelectedIssueRecovery):
                 raise ValueError("fix infrastructure episode is inactive or migration blocked")
-            infra_deaths[number] = selected_infra.component.state.infra_failures
+            # Refusals before admission mint no run, hence no episode receipt;
+            # they spend the same ceiling (#262).
+            refusals = getattr(workflow_control, "fix_admission_refusals", None)
+            infra_deaths[number] = (
+                selected_infra.component.state.infra_failures
+                + (refusals(number) if refusals is not None else 0)
+            )
         except (ValueError, sqlite3.Error) as exc:
             infra_errors[number] = str(exc)
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not

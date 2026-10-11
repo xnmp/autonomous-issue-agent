@@ -4818,6 +4818,29 @@ class SQLiteControlStore:
                 ),
             )
 
+    # Pre-admission refusals (accounting_runtime._return_refused) mint no run,
+    # so the infra episode's receipt-driven charge never sees them (#262). This
+    # level ledger is their ceiling input: the fix role adds it to the episode's
+    # infra_failures, and any admitted run on the issue clears it.
+    _REFUSAL_NAMESPACE = "fix-admission-refusals"
+
+    def fix_admission_refusals(self, repository: str, issue: int) -> int:
+        entry = self.load_level_state(self._REFUSAL_NAMESPACE, repository).get(str(issue))
+        count = entry.get("count") if entry else 0
+        return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+
+    def record_fix_admission_refusal(self, repository: str, issue: int, detail: str) -> int:
+        entries = {k: dict(v) for k, v in self.load_level_state(self._REFUSAL_NAMESPACE, repository).items()}
+        count = self.fix_admission_refusals(repository, issue) + 1
+        entries[str(issue)] = {"count": count, "detail": detail[:500]}
+        self.replace_level_state(self._REFUSAL_NAMESPACE, repository, entries)
+        return count
+
+    def clear_fix_admission_refusals(self, repository: str, issue: int) -> None:
+        entries = {k: dict(v) for k, v in self.load_level_state(self._REFUSAL_NAMESPACE, repository).items()}
+        if entries.pop(str(issue), None) is not None:
+            self.replace_level_state(self._REFUSAL_NAMESPACE, repository, entries)
+
     def record_world_observation(
         self,
         *,
