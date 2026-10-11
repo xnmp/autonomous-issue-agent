@@ -2046,11 +2046,9 @@ def test_resume_below_infra_ceiling_still_dispatches():
     assert RunAgent(AgentKind.RESUME, 7, workflow=_workflow(7).binding) in _run_agents(actions)
 
 
-@pytest.mark.parametrize("slots", [0, 1])
-def test_ci_leg_at_infra_ceiling_escalates_the_pr(slots):
+def test_ci_leg_at_infra_ceiling_escalates_the_pr():
     st = FixState(infra_deaths={9: 2})  # keyed by breaker_key → closing_issue 9
-    actions = decide_fix(world(prs=[_ci_fail_pr()]), INFRA_CFG, st, fixer_busy=False,
-                         dispatch_slots=slots)
+    actions = decide_fix(world(prs=[_ci_fail_pr()]), INFRA_CFG, st, fixer_busy=False)
     assert _run_agents(actions) == []
     assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
 
@@ -3416,6 +3414,32 @@ def test_free_rerun_still_excludes_active_work_on_its_linked_issue(slots):
     assert _run_agents(actions) == []
 
 
+@pytest.mark.parametrize(("slots", "inflight"), [
+    (0, ()),
+    (1, (InFlightFix(7, frozenset({"src/shared.py"})),)),
+])
+def test_a_tripped_ci_breaker_neither_reruns_nor_escalates_without_capacity(slots, inflight):
+    # Only the free rerun ignores capacity: the breaker's handover keeps the
+    # paid path's capacity and path gates and waits for them.
+    red = replace(_red_pr(), changed_files=frozenset({"src/shared.py"}))
+    cfg = FixConfig(fix_bot="fix-bot", max_ci_retries=1)
+    actions = decide_fix(world(prs=[red]), cfg, FixState(ci_retries={100: 1}, inflight=inflight),
+                         fixer_busy=bool(inflight), dispatch_slots=slots)
+    assert _reruns(actions) == []
+    assert _run_agents(actions) == []
+    assert not any(isinstance(a, Relabel) for a in actions)
+
+
+def test_an_issueless_pr_is_not_escalated_on_a_busy_tick():
+    stale = replace(
+        _red_pr(), closing_issue=None, head_ref_name="feat/ACME-2468-x",
+        checks=(Check("unit", bucket="pass"),),
+        reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old-sha"),),
+    )
+    actions = decide_fix(world(prs=[stale]), CFG, FixState(), fixer_busy=True, dispatch_slots=0)
+    assert not any(isinstance(a, Relabel) for a in actions)
+
+
 def test_spent_free_rerun_cannot_launch_paid_repair_without_capacity():
     actions = decide_fix(
         world(prs=[_red_pr()]), CFG, FixState(ci_rerun_head={100: "sha-1"}),
@@ -3449,14 +3473,12 @@ def test_zero_capacity_preserves_free_rerun_safety_and_repair_precedence(overrid
     assert _run_agents(actions) == []
 
 
-@pytest.mark.parametrize("slots", [0, 1])
-def test_the_ci_breaker_still_escalates_before_a_free_re_run(slots):
+def test_the_ci_breaker_still_escalates_before_a_free_re_run():
     # A PR that has burnt its CI-fix budget belongs to a human; delaying that by
     # a CI cycle would move the escalation latency the wrong way.
     cfg = FixConfig(fix_bot="fix-bot", max_ci_retries=1)
     w = world(prs=[_red_pr()])
-    actions = decide_fix(w, cfg, FixState(ci_retries={100: 1}), fixer_busy=False,
-                         dispatch_slots=slots)
+    actions = decide_fix(w, cfg, FixState(ci_retries={100: 1}), fixer_busy=False)
     assert _reruns(actions) == []
     assert Relabel(Target.PR, 100, Label.AI_PR_OPEN,
                    Label.NEEDS_HUMAN_REVIEW) in actions

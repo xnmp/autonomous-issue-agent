@@ -1967,6 +1967,8 @@ def decide_fix(
         # when it actually needs the fixer (conflict / changes-requested / CI
         # fail); a clean issueless PR is left for the reviewer + auto-merge.
         if issue_n is None:
+            if not remaining:
+                continue
             _rev = latest_other_review(pr.reviews, cfg.fix_bot)
             needs_fix = (
                 (cfg.auto_rebase_conflicts and pr.is_conflicting())
@@ -2071,17 +2073,9 @@ def decide_fix(
                 continue
             if not target_available(issue_n):
                 continue
-            if infra_ceiling_hit(state, cfg, bkey):
-                actions.extend(_escalate_pr(
-                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                continue
-            if breaker_tripped(state.ci_retries.get(bkey, 0),
-                               cfg.max_ci_retries):
-                actions.extend(_escalate_pr(
-                    pr.number,
-                    f"CI fix failed {cfg.max_ci_retries}× without going green.",
-                ))
-                continue
+            paths = pr.changed_files | issue_paths(issue_n)
+            infra_hit = infra_ceiling_hit(state, cfg, bkey)
+            ci_hit = breaker_tripped(state.ci_retries.get(bkey, 0), cfg.max_ci_retries)
             # Flake first (#38): one free `gh run rerun --failed` per head
             # SHA before any paid repair. Two FIX_CI legs of one deployment
             # night ($13.15 + $28.88, plus a $8 review tail on the second)
@@ -2089,7 +2083,7 @@ def decide_fix(
             # PR's diff had touched — ≈$80 of a $188 batch. A re-run costs
             # one CI cycle and no tokens.
             #
-            # AFTER the breakers on purpose: a PR that has already burnt its
+            # Never past a tripped breaker: a PR that has already burnt its
             # CI-fix budget belongs to a human, and delaying that handover by
             # a CI cycle would move the escalation-latency the wrong way. In
             # practice the two never meet — the free re-run fires on the
@@ -2101,17 +2095,26 @@ def decide_fix(
             # pending-outranks-failure rule then makes the fixer wait for
             # them without any special casing here — while #30's pending
             # deadline stops that wait from becoming the new deadlock.
-            if free_ci_rerun(pr, state, cfg):
+            #
+            # Only the free rerun ignores paid capacity (tauri #1074 waited
+            # hours behind an unrelated RESOLVE slot, 2026-10-11); breaker
+            # escalations and FIX_CI keep their capacity and path gates.
+            if not (infra_hit or ci_hit) and free_ci_rerun(pr, state, cfg):
                 actions.append(
-                    RerunFailedChecks(
-                        pr.number,
-                        pr.head_ref_oid,
-                        ci_rerun_run_ids(pr, cfg),
-                    )
+                    RerunFailedChecks(pr.number, pr.head_ref_oid, ci_rerun_run_ids(pr, cfg))
                 )
                 continue
-            paths = pr.changed_files | issue_paths(issue_n)
             if not remaining or not dispatchable(issue_n, paths):
+                continue
+            if infra_hit:
+                actions.extend(_escalate_pr(
+                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                continue
+            if ci_hit:
+                actions.extend(_escalate_pr(
+                    pr.number,
+                    f"CI fix failed {cfg.max_ci_retries}× without going green.",
+                ))
                 continue
             actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
             claim(issue_n, paths)
