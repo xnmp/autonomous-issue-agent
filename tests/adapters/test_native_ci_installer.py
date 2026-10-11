@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -91,7 +92,18 @@ BALLAST = Profile("ballast", ["ballast"], "ballast-ci", "/var/lib/ballast-ci", "
 PROFILES = pytest.mark.parametrize("profile", [DEFAULT, BALLAST], ids=lambda p: p.name)
 
 
+def operator_checkout(tmp_path):
+    # The installer refuses a checkout inside a runner home, which is where CI
+    # itself runs these tests, so each run uses a copy outside any runner home.
+    checkout = tmp_path / "checkout"
+    (checkout / "bin").mkdir(parents=True)
+    shutil.copy2(INSTALLER, checkout / "bin" / INSTALLER.name)
+    shutil.copytree(SYSTEMD, checkout / "ops" / "systemd")
+    return checkout / "bin" / INSTALLER.name
+
+
 def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=None, loaded=False, registered_to=None):
+    installer = operator_checkout(tmp_path)
     binaries = tmp_path / "bin"
     binaries.mkdir()
     mutation = tmp_path / "host-mutation"
@@ -106,7 +118,7 @@ def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=N
         target.write_text(f"#!{sys.executable}\n{STUB}")
         target.chmod(0o755)
     result = subprocess.run(
-        ["bash", str(INSTALLER), *(profile.args if args is None else args)],
+        ["bash", str(installer), *(profile.args if args is None else args)],
         env={**os.environ, "PATH": f"{binaries}:/usr/bin:/bin", "CI_INSTALL_FIXTURE": json.dumps(fixture)},
         capture_output=True, text=True, check=False,
     )
@@ -373,3 +385,20 @@ def test_runner_user_tools_resolve_through_sudo_path_not_hardcoded_directories()
     for line in runner_lines:
         for tool in ("test", "install", "find", "tar", "jq"):
             assert f"/usr/bin/{tool} " not in line, line
+
+
+@pytest.mark.skipif(
+    not str(ROOT.resolve()).startswith(f"{DEFAULT.home}/"),
+    reason="only a checkout inside the default runner home (the CI workspace) exercises this",
+)
+def test_a_checkout_inside_the_runner_home_is_refused_before_any_privileged_step(tmp_path):
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    for tool in ("sudo", "gh"):
+        (binaries / tool).write_text("#!/bin/sh\necho called >> \"$0.log\"\nexit 99\n")
+        (binaries / tool).chmod(0o755)
+    result = subprocess.run(["bash", str(INSTALLER)], env={**os.environ, "PATH": f"{binaries}:/usr/bin:/bin"},
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 2
+    assert "inside /var/lib/issue-agent-ci" in result.stderr
+    assert not (binaries / "sudo.log").exists() and not (binaries / "gh.log").exists()

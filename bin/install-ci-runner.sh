@@ -34,7 +34,12 @@ load_profile() {
 
 [[ $# -le 1 ]] || { echo "Usage: $0 [default|ballast]" >&2; exit 2; }
 load_profile "${1-default}" || { echo "Unknown profile: ${1-} (expected default or ballast)" >&2; exit 2; }
-root=$(cd "$(dirname "$0")/.." && pwd)
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+# Root installs the unit from this checkout; one inside the runner home (such as
+# a CI workspace) is runner-writable, so root would install a file the runner chose.
+case "$root/" in
+    "$runner_home"/*) echo "Refusing to install from a checkout inside $runner_home; use the operator's checkout." >&2; exit 2 ;;
+esac
 
 for tool in awk bash curl gh git jq make sha256sum sudo tar xz; do
     command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 2; }
