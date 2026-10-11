@@ -96,6 +96,8 @@ class _Rollout:
     completed_turns: set[str] = field(default_factory=set)
     started_turns: set[str] = field(default_factory=set)
     token_counts: dict[str, list[TokenUsage | None]] = field(default_factory=dict)
+    # Raw (total, last) of the previous token_count, kept across incremental reads.
+    last_count: tuple[dict, dict] | None = None
 
 
 @dataclass
@@ -333,6 +335,15 @@ class CodexChildUsageMeter:
         elif event_kind == "token_count":
             info = payload.get("info") or {}
             raw = info.get("last_token_usage")
+            total = info.get("total_token_usage")
+            # Codex re-emits a token_count (e.g. after a rate-limit refresh) with
+            # an unchanged cumulative total and last usage: no tokens were added,
+            # so it is not a further response. Only exact equality of both
+            # well-formed counters qualifies; anything else stays ambiguous.
+            counters = (total, raw) if isinstance(total, dict) and total and isinstance(raw, dict) else None
+            if counters is not None and counters == rollout.last_count:
+                return
+            rollout.last_count = counters
             normalized = normalize_usage(raw) if isinstance(raw, dict) else None
             if sum(len(v) for r in self.rollouts.values() for v in r.token_counts.values()) >= self.max_responses:
                 raise ValueError("native observer exceeded its token-count bound")

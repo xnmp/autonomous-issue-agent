@@ -409,7 +409,13 @@ using the same captured card as the parent. Copied fork prefixes and referenced
 ancestor history are excluded. The configured card also prices root-only work;
 legacy scalar rates cannot override its cap decision. Missing lineage, model,
 usage or completion returns `ACCOUNTING_UNAVAILABLE` and retains the full
-obligation. Recovery requires the complete version-2 invocation/card evidence.
+obligation.
+A rollout `token_count` whose cumulative `total_token_usage` and `last_token_usage`
+both equal the previous one in the same rollout is an idempotent Codex
+re-emission (for example after a rate-limit refresh) that adds no tokens, so it
+is not counted against the response receipts. Equal totals with different last
+usage, decreasing totals, or a missing or malformed total stay ambiguous and
+fail closed; the receipt equality check is unchanged. Recovery requires the complete version-2 invocation/card evidence.
 Unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child
 accounting. JSONL remains evidence for the authoritative SQLite settlement.
 Native accounting uncertainty cannot expire through the legacy completed-run
