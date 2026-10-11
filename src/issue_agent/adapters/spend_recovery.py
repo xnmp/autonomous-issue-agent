@@ -196,10 +196,14 @@ class CodexSpendReconciler:
             if not isinstance(root, str) or not isinstance(model, str):
                 raise ValueError("native recovery identity is malformed")
             usage = self._usage(evidence, root, ended_at)
-            if usage is None or not model:
-                return UnavailableRunUsage("native recovery root usage or model is missing")
             observed = meter.sample(root, model, usage)
             if isinstance(observed, UnavailableRunUsage):
                 return observed
+            # A receipted root needs no counter; the meter records it in `roots` when it is priced.
+            if not model or root not in meter.roots:
+                return UnavailableRunUsage("native recovery root usage or model is missing")
         observed = meter.sample(session_id, roots[session_id], self._usage(evidence, session_id, ended_at), final=True)
+        if ended_at is None and any(r.usage for r in meter.rollouts.values()):
+            # An unbounded receipt window could absorb a later leg's responses.
+            return UnavailableRunUsage("native re-meter requires the run's recorded end")
         return observed if observed is not None else MeasuredRunUsage(tuple(meter.roots.values()))

@@ -21,7 +21,9 @@ from issue_agent.adapters.codex_runner import CodexRunner, write_spend_evidence,
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.adapters.control_store import AccountingDisposition
-from tests.adapters.test_spend_recovery import _reserved_store
+from tests.adapters.test_spend_recovery import _end_run_at, _reserved_store
+
+ENDED = datetime(2100, 1, 1, tzinfo=timezone.utc)
 from tests.adapters.test_codex_child_usage import (
     ROOT, CHILD, OTHER, NOW, START, RATES, metadata, spawn, child_records, event, write,
 )
@@ -127,6 +129,7 @@ def test_native_recovery_settles_exact_frozen_mixed_price_once(tmp_path, fork):
     write(home, CHILD, child)
     directory = tmp_path / "evidence"
     write_spend_evidence(str(directory), str(run_id), evidence)
+    _end_run_at(store, run_id, ENDED)
     reconciler = CodexSpendReconciler(store, (str(directory),))
     assert reconciler.reconcile(run_id)
     assert not reconciler.reconcile(run_id)
@@ -189,6 +192,7 @@ def test_recovery_subtracts_prior_leg_baseline_only_from_its_original_root(tmp_p
                     native_root_sessions={ROOT: "sol", OTHER: "sol"})
     directory = tmp_path / "evidence"
     write_spend_evidence(str(directory), str(run_id), evidence)
+    _end_run_at(store, run_id, ENDED)
     assert CodexSpendReconciler(store, (str(directory),)).reconcile(run_id)
     assert store.snapshot(scope).settled == Money("USD", 2374)
 
@@ -319,18 +323,14 @@ def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for
 
     asyncio.run(scenario())
     assert all(not ProcessSupervisor.matches_identity(i.pid, i.start_ticks) for i in identities)
-    assert len(control.active_reservation_runs()) == 1
+    # Operator policy (2026-10-11): the interrupted request costs zero. Receipts are only priced
+    # inside the run's recorded end, so the reservation waits for it and then settles at 1224.
     run_id = control.active_reservation_runs()[0]
-    with open(spend_evidence_path(str(directory), str(run_id))) as stream:
-        evidence = json.load(stream)
-    assert evidence["native_usage_failure"]
-    assert control.release_retained(run_id, "legacy unmeasured grace elapsed",
-                                    datetime.now(timezone.utc) + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
-    assert not CodexSpendReconciler(control, (str(directory),)).reconcile(run_id)
-    assert control.active_reservation_runs() == (run_id,)
+    _end_run_at(control, run_id, ENDED)
+    assert CodexSpendReconciler(control, (str(directory),)).reconcile(run_id)
+    assert control.active_reservation_runs() == ()
     with control.transaction() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
-        assert db.execute("SELECT maximum_micros FROM budget_reservations").fetchone()[0] == 2_000_000
+        assert db.execute("SELECT amount_micros FROM charges").fetchall()[0][0] == 1224
 
 
 @pytest.mark.parametrize("resume", [True, False])
