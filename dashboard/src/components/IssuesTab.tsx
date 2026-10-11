@@ -46,6 +46,7 @@ import {
   usd,
 } from "../lib/format";
 import { shortModel } from "../lib/models";
+import { readRecord } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadge } from "./ui/StepBadge";
@@ -161,9 +162,7 @@ function storedTaskHistoryVisibility(storageKey: string): Record<string, boolean
     TASK_HISTORY_COLUMN_CHOICES.map(({ key }) => [key, true]),
   );
   try {
-    const all = JSON.parse(
-      localStorage.getItem(TASK_HISTORY_COLUMN_STORAGE) ?? "{}",
-    ) as Record<string, Record<string, boolean>>;
+    const all = readRecord<Record<string, boolean>>(TASK_HISTORY_COLUMN_STORAGE);
     return { ...defaults, ...all[storageKey] };
   } catch {
     return defaults;
@@ -175,9 +174,7 @@ function persistTaskHistoryVisibility(
   visibility: Record<string, boolean>,
 ) {
   try {
-    const all = JSON.parse(
-      localStorage.getItem(TASK_HISTORY_COLUMN_STORAGE) ?? "{}",
-    ) as Record<string, Record<string, boolean>>;
+    const all = readRecord<Record<string, boolean>>(TASK_HISTORY_COLUMN_STORAGE);
     localStorage.setItem(
       TASK_HISTORY_COLUMN_STORAGE,
       JSON.stringify({ ...all, [storageKey]: visibility }),
