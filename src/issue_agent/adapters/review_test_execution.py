@@ -16,7 +16,7 @@ from types import MappingProxyType
 from ..domain.contracts import RunId, TestExecution, TestExecutionStatus, classify_test_exit_code, parse_test_failure_exit_codes
 from ..domain.review_test_evidence import (
     MissingOperatorTestCommand, OperatorTestCommand, OperatorTestWaiver, ReviewTestConfiguration,
-    ReviewTestInvocation, ReviewTestCompletion, ReviewTestOutcome, ReviewTestTreeProof, digest,
+    ReviewTestInvocation, ReviewTestCompletion, ReviewTestOutcome, ReviewTestTreeProof, SUMMARY_LIMIT, digest,
 )
 from .governor import target_command_inputs
 from .child_env import child_process_env
@@ -52,7 +52,7 @@ def freeze_test_configuration(environment: dict[str, str], config_version: str) 
     return configuration, MappingProxyType(workload)
 
 
-EVIDENCE_TAIL_BYTES = 2048
+EVIDENCE_TAIL_BYTES = SUMMARY_LIMIT - 256  # room for the outcome line and marker
 OMITTED_MARKER = "[earlier output omitted]\n"
 
 
@@ -198,13 +198,13 @@ class ReviewTestExecutor:
                 config.executor_policy, invocation.subject.head_sha)
             outcome = ReviewTestOutcome.PASSED if status is TestExecutionStatus.PASSED else ReviewTestOutcome.FAILED if status is TestExecutionStatus.TEST_FAILED else ReviewTestOutcome.UNAVAILABLE
             return ReviewTestCompletion(invocation, outcome, execution, before, after,
-                (outcome.value + "\n" + content.text())[-4096:])
+                (outcome.value + "\n" + content.text())[-SUMMARY_LIMIT:])
         except asyncio.CancelledError:
             await _await_teardown(asyncio.create_task(teardown()))
             raise
         except Exception as exc:
             return ReviewTestCompletion(invocation, ReviewTestOutcome.UNAVAILABLE, execution, before, after,
-                f"{type(exc).__name__}: {exc}"[:4096])
+                f"{type(exc).__name__}: {exc}"[:SUMMARY_LIMIT])
         finally:
             await _await_teardown(asyncio.create_task(teardown()))
 

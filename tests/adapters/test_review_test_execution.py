@@ -7,7 +7,7 @@ import pytest
 
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.review_test_execution import ReviewTestExecutor, freeze_test_configuration
-from issue_agent.domain.review_test_evidence import ReviewTestOutcome, OperatorTestCommand
+from issue_agent.domain.review_test_evidence import SUMMARY_LIMIT, ReviewTestOutcome, OperatorTestCommand
 from tests.domain.test_review_test_evidence import invocation
 
 
@@ -70,7 +70,7 @@ def test_missing_operator_command_does_not_use_target_true_marker(tmp_path):
 def test_large_separate_streams_are_drained_with_bounded_summary(tmp_path):
     result, _, _, _ = run(tmp_path, "head -c 1000000 /dev/zero; head -c 1000000 /dev/zero >&2")
     assert result.outcome is ReviewTestOutcome.PASSED
-    assert len(result.summary) <= 4096
+    assert len(result.summary) <= SUMMARY_LIMIT
     assert result.execution.stdout_digest == result.execution.stderr_digest
 
 
@@ -233,7 +233,7 @@ def test_huge_output_keeps_failure_summary_printed_last(tmp_path):
     assert result.outcome is ReviewTestOutcome.FAILED
     assert result.summary.rstrip().endswith("FAILED 3 tests: test_widget")
     assert "earlier output omitted" in result.summary
-    assert len(result.summary) <= 4096
+    assert len(result.summary) <= SUMMARY_LIMIT
 
 
 def test_output_shorter_than_bound_is_kept_in_full_without_marker(tmp_path):
@@ -248,16 +248,32 @@ def test_empty_output_yields_outcome_only_summary(tmp_path):
 
 
 def test_interleaved_streams_stay_bounded_and_keep_last_line(tmp_path):
-    command = "for i in $(seq 1 3000); do echo out$i; echo err$i >&2; done; echo FINAL-LINE >&2; exit 1"
+    command = "for i in $(seq 1 20000); do echo out$i; echo err$i >&2; done; echo FINAL-LINE >&2; exit 1"
     result, _, _, _ = run(tmp_path, command)
-    assert len(result.summary) <= 4096
+    assert len(result.summary) <= SUMMARY_LIMIT
     assert "FINAL-LINE" in result.summary
     assert "out1\n" not in result.summary
 
 
 @pytest.mark.parametrize("prefix", ["", "a"])
 def test_multibyte_character_split_at_cut_decodes_cleanly(tmp_path, prefix):
-    result, _, _, _ = run(tmp_path, f"printf {prefix!r}; for i in $(seq 3000); do printf é; done; echo END; exit 1")
+    result, _, _, _ = run(tmp_path, f"printf {prefix!r}; for i in $(seq 20000); do printf é; done; echo END; exit 1")
     assert "�" not in result.summary
     assert result.summary.rstrip().endswith("éEND")
-    assert len(result.summary) <= 4096
+    assert len(result.summary) <= SUMMARY_LIMIT
+
+
+def test_compiler_error_survives_a_long_echoed_command_line(tmp_path):
+    # Live shape (Tauri PR #1075): cargo prints the rustc error, then echoes the
+    # failed multi-kilobyte rustc invocation last.
+    command = (
+        "head -c 200000 /dev/zero | tr '\\0' x; echo; "
+        "echo 'error[E0425]: cannot find value `widget` in this scope'; "
+        "printf 'error: could not compile; process didn'\\''t exit successfully: `rustc'; "
+        "for i in $(seq 120); do printf ' --extern dep%d=/cache/target/debug/deps/libdep%d-0123456789abcdef.rlib' $i $i; done; "
+        "echo '` (exit status: 1)'; exit 1"
+    )
+    result, _, _, _ = run(tmp_path, command)
+    assert "error[E0425]: cannot find value `widget`" in result.summary
+    assert result.summary.rstrip().endswith("(exit status: 1)")
+    assert len(result.summary) <= SUMMARY_LIMIT
