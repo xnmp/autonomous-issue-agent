@@ -7,7 +7,6 @@
 #   bin/install-launchd.sh uninstall <name> # unload + remove AGENT_ENV deployment
 set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
 LA="$HOME/Library/LaunchAgents"
 mkdir -p "$LA"
 
@@ -45,6 +44,7 @@ esac
 
 if [ "${1:-}" = "uninstall" ]; then
   if [ -n "${2:-}" ]; then
+    CONFIG="${AGENT_ENV:?AGENT_ENV is unset or empty; source bin/compose-env.sh <name> or use issue-agent uninstall-service}"
     [ -f "$CONFIG" ] || {
       echo "config not found: $CONFIG; refusing scoped uninstall" >&2
       exit 1
@@ -98,7 +98,8 @@ if [ "${1:-}" = "uninstall" ]; then
   exit 0
 fi
 
-[ -f "$CONFIG" ] || { echo "config not found: $CONFIG (copy config/agent.env.example → config/agent.env)"; exit 1; }
+CONFIG="${AGENT_ENV:?AGENT_ENV is unset or empty; use issue-agent install-service or source bin/compose-env.sh <name>}"
+[ -f "$CONFIG" ] || { echo "config not found: $CONFIG (run issue-agent install-service or source bin/compose-env.sh <name>)"; exit 1; }
 UV_BIN="$(command -v uv || true)"
 [ -n "$UV_BIN" ] || { echo "uv executable not found"; exit 1; }
 PLUTIL="$(command -v plutil || true)"

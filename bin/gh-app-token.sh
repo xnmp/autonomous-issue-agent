@@ -5,7 +5,7 @@
 # This script caches the token to a file and only re-mints when <5 min remain,
 # making it cheap to call on every gh invocation.
 #
-# Required env (from config/agent.env):
+# Required env (exported by sourcing bin/compose-env.sh <name>):
 #   GH_APP_ID          numeric App ID (shown on the App's settings page after creation)
 #   GH_APP_KEY_FILE    path to the downloaded .pem private key
 #   GH_APP_INSTALL_ID  installation id (see `resolve install id` below)

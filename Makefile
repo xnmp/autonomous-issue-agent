@@ -19,14 +19,14 @@ help:
 	@echo "  make test-app           run the app-layer suite (dashboard web collectors + endpoints)"
 	@echo "  make dashboard-ui       build the interactive dashboard SPA into dashboard/dist"
 	@echo "  make test-parity        run the gate PARITY suite (same case through bash + Python gates)"
-	@echo "  make doctor             preflight: tooling, config, identities, repo access"
+	@echo "  make doctor AGENT_ENV=config/.active.<name>.env   preflight tooling, config, identities, repo access"
 	@echo "  make install            install the 'issue-agent' CLI (uv sync + ~/.local/bin shim)"
 	@echo "  make point-at REPO=<name>   compose config, preflight, ensure dev branch, and run all 3 daemons"
 	@echo "  make run-fix            run the Python fix watcher in the foreground (Ctrl-C to stop)"
 	@echo "  make run-review         run the Python review watcher in the foreground"
 	@echo "  make run-steward        run the Python steward in the foreground"
-	@echo "  make install-launchd    install+load the 3 launchd agents (macOS)"
-	@echo "  make install-systemd    install+enable the 3 systemd user units (Linux)"
+	@echo "  make install-launchd AGENT_ENV=config/.active.<name>.env   install+load the 3 launchd agents (macOS)"
+	@echo "  make install-systemd AGENT_ENV=config/.active.<name>.env   install+enable the 3 systemd user units (Linux)"
 	@echo "  make demo-init          create + seed the local demo target repo"
 	@echo "  make clean              remove caches and demo scratch"
 
@@ -123,7 +123,7 @@ typecheck:
 		--progress-bar no
 
 doctor:
-	@bash bin/doctor.sh
+	@AGENT_ENV="$${AGENT_ENV:?source bin/compose-env.sh <name> first}" bash bin/doctor.sh
 
 # Install the operator CLI: `uv sync` (editable, into the checkout .venv that
 # point-at.sh's `uv run` reuses) + a launcher shim on ~/.local/bin. Then
@@ -149,17 +149,17 @@ run-steward:
 
 # Phase 5 acceptance gate — live end-to-end against a throwaway demo repo.
 demo-gate:
-	@test -n "$(DEMO_REPO)" || { echo "usage: make demo-gate DEMO_REPO=owner/repo"; exit 1; }
-	@DEMO_REPO="$(DEMO_REPO)" bash bin/demo-gate.sh
+	@test -n "$(DEMO_REPO)" || { echo "usage: make demo-gate AGENT_ENV=config/.active.<name>.env DEMO_REPO=owner/repo"; exit 1; }
+	@AGENT_ENV="$${AGENT_ENV:?source bin/compose-env.sh <name> first}" DEMO_REPO="$(DEMO_REPO)" bash bin/demo-gate.sh
 
 install-launchd:
-	@bash bin/install-launchd.sh
+	@AGENT_ENV="$${AGENT_ENV:?source bin/compose-env.sh <name> first}" bash bin/install-launchd.sh
 
 uninstall-launchd:
 	@bash bin/install-launchd.sh uninstall
 
 install-systemd:
-	@bash bin/install-systemd.sh
+	@AGENT_ENV="$${AGENT_ENV:?source bin/compose-env.sh <name> first}" bash bin/install-systemd.sh
 
 uninstall-systemd:
 	@bash bin/install-systemd.sh uninstall

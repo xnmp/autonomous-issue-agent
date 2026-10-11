@@ -72,6 +72,6 @@ def exhausted_effect_advice(kind: str, target: str) -> str:
         "refusing it. The usual cause is the acting identity's token: a "
         "fine-grained PAT missing Issues: Read+Write / Pull requests: "
         "Read+Write, or a bot whose collaborator invite was never accepted. "
-        "Run bin/doctor.sh to probe the identities, then re-mint the token; "
+        "Run issue-agent doctor to probe the identities, then re-mint the token; "
         "the command and its payload stay in the control store."
     )

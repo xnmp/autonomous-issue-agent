@@ -2010,6 +2010,28 @@ def test_install_service_aborts_on_compose_failure(tmp_path, monkeypatch):
     )
 
 
+def test_doctor_aborts_on_compose_failure_without_checking_inherited_snapshot(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
+    monkeypatch.setattr(cli, "check_overlay_mismatch", lambda *_args: "")
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text('REPO=o/r\n')
+    shared = tmp_path / "shared.env"
+    shared.write_text("")
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+    monkeypatch.setenv("AGENT_ENV", str(tmp_path / "another-deployment.env"))
+
+    def run(cmd, **kwargs):
+        assert Path(cmd[1]).name == "compose-env.sh", "preflight ran after failed compose"
+        return argparse.Namespace(returncode=7)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli.cmd_doctor(_install_args(tmp_path)) == 7
+    assert "refusing to check a stale or missing" in capsys.readouterr().err
+
+
 def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     """Anti-vacuity twin: a successful compose still installs the service."""
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))

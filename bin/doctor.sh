@@ -6,7 +6,7 @@ set -uo pipefail
 # config/repos/ tree to exercise the collision check below in isolation);
 # normal invocations never set it, so this resolves exactly as before.
 HARNESS_ROOT="${HARNESS_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
+CONFIG="${AGENT_ENV:?AGENT_ENV is unset or empty; use issue-agent start or issue-agent doctor, or source bin/compose-env.sh <name>}"
 WARN=0; ERR=0
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { WARN=$((WARN+1)); printf '  \033[33m⚠\033[0m %s\n' "$1"; }
@@ -66,7 +66,7 @@ if [ -f "$CONFIG" ]; then
   # shellcheck disable=SC1090
   set -a; . "$CONFIG"; set +a
 else
-  bad "config not found: $CONFIG (copy config/agent.env.example → config/agent.env)"
+  bad "config not found: $CONFIG (run issue-agent start or source bin/compose-env.sh <name>)"
 fi
 
 echo "== config snapshot (config/.active.<name>.env) =="

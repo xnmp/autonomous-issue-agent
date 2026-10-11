@@ -10,7 +10,7 @@
 #   4. Seed the demo issues (ai-ready).
 #   5. Print how to start the watchers.
 #
-# Requires: gh authenticated, config/agent.env present (REPO is set from DEMO_REPO).
+# Requires: gh authenticated (REPO is set from DEMO_REPO).
 set -uo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEMO_SRC="$HARNESS_ROOT/examples/demo-target"
@@ -64,9 +64,8 @@ REPO="$DEMO_REPO" bash "$DEMO_SRC/seed-issues.sh"
 cat <<EOF
 
 ✓ Demo ready on $DEMO_REPO (base branch: $BASE_BRANCH)
-  Make sure config/agent.env has:  REPO=$DEMO_REPO  BASE_BRANCH=$BASE_BRANCH
-                                    TEST_CMD='pytest -q'
-  Preflight:   make doctor
-  Run it:      make run-fix       (and, in three-bot mode, make run-review / make run-steward)
-  Watch:       bin/master.sh
+  Configure config/shared.env, then run issue-agent start from $SCRATCH.
+  Set the repo overlay's BASE_BRANCH=$BASE_BRANCH and TEST_CMD='pytest -q'.
+  Preflight:   issue-agent doctor --target-dir "$SCRATCH" --repo "$DEMO_REPO"
+  Watch:       source bin/compose-env.sh <name> && bin/master.sh
 EOF

@@ -102,13 +102,8 @@ def _fake_tool_path(tmp_path: Path) -> Path:
 def _run_doctor(env: dict, cwd: Path | None = None) -> subprocess.CompletedProcess:
     full_env = dict(os.environ)
     full_env.update(env)
-    # Hermeticity: doctor.sh resolves `CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"`
-    # and SOURCES it with `set -a`, so without an explicit AGENT_ENV it reads the
-    # developer's own (gitignored) config/agent.env and that file's values
-    # OVERRIDE the env this helper passes in. Tests then silently assert against
-    # whatever happens to be on the machine — they passed for a while only
-    # because their fixture logins coincided with the shipped example values in
-    # that file. Point every run at an empty config unless the test supplies one.
+    # doctor requires an explicit config. An empty fixture keeps these checks
+    # isolated from operator config while preserving the test's passed env.
     if "AGENT_ENV" not in env:
         empty = Path(tempfile.mkdtemp(prefix="doctor-cfg-")) / "empty.env"
         empty.write_text("")
@@ -921,6 +916,19 @@ def _ci_doctor(tmp_path: Path, extra_env: dict, **fixture) -> subprocess.Complet
     }
     env.update(extra_env)
     return _run_doctor(env)
+
+
+def test_doctor_checks_explicit_composed_snapshot(tmp_path):
+    active = _compose(
+        tmp_path, 'IDENTITY_MODE=solo\nFIX_BOT=acme-fixer\n',
+        'REPO=acme/widget\nBASE_BRANCH=trunk\nTEST_CMD="uv run pytest -q"\n',
+    )
+    result = _ci_doctor(tmp_path, {"AGENT_ENV": str(active)}, workflows=0)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"config: {active}" in result.stdout
+    assert "REPO=acme/widget" in result.stdout
+    assert "TEST_CMD=uv run pytest -q" in result.stdout
 
 
 def _pr(number: int, checks: list | None) -> dict:

@@ -5,10 +5,12 @@
 # cannot prove (it exercises the live SDK query + the in-process governor firing
 # inside a real worktree + real gh writes).
 #
+#   . bin/compose-env.sh demo
 #   DEMO_REPO=you/calc-demo bash bin/demo-gate.sh
 #
-# Requires: gh authenticated; Anthropic creds for the SDK; config/agent.env (or
-# env) with REPO=$DEMO_REPO, FIX_BOT, BASE_BRANCH=dev, TARGET_DIR pointing at the
+# Requires: gh authenticated; Anthropic creds for the SDK; AGENT_ENV pointing at
+# config/.active.<name>.env (from bin/compose-env.sh) with REPO=$DEMO_REPO,
+# FIX_BOT, BASE_BRANCH=dev, TARGET_DIR pointing at the
 # demo clone; the three-identity App config if you want the review leg too.
 #
 # Steps:
@@ -21,6 +23,8 @@
 set -uo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 : "${DEMO_REPO:?set DEMO_REPO=owner/repo}"
+: "${AGENT_ENV:?AGENT_ENV is unset or empty; source bin/compose-env.sh <name> first}"
+[ -f "$AGENT_ENV" ] || { echo "AGENT_ENV does not name a file: $AGENT_ENV" >&2; exit 1; }
 
 echo "== 1. init demo target =="
 DEMO_REPO="$DEMO_REPO" bash "$HARNESS_ROOT/examples/demo-target/init-demo.sh"
