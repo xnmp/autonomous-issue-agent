@@ -18,6 +18,15 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.world import PRView, WorldState
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
+from tests.fakes.manual_clock import ManualClock
+
+# Shutdown timeout and clock steps that put a daemon at the start of its
+# forced-teardown window: the 10 s escalation reserve remains, graceful
+# draining is over, and the reserves leave a 2 s real-time kill window.
+_SHUTDOWN_TIMEOUT = 30
+_GRACEFUL_WINDOW = 20
+# Closes the post-kill wait while leaving the finalize+terminalize reserves.
+_KILL_WINDOW = 2
 
 
 def _daemon(decide, observe=None, logs=None):
@@ -359,6 +368,7 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
     from issue_agent.domain.actions import AgentKind, RunAgent
     from issue_agent.domain.supervision import ExitCode
 
+    clock = ManualClock()
     started = threading.Event()
     release = threading.Event()
     forced = []
@@ -367,6 +377,10 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
         started.set()
         release.wait(timeout=5)
 
+    def kill():
+        forced.append(True)
+        clock.advance(_KILL_WINDOW)
+
     daemon = Daemon(
         "review",
         lambda: WorldState(),
@@ -374,8 +388,10 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
         Executor(FakeGateway(), run_agent=run_agent),
         poll_seconds=1,
         dispatch_capacity=1,
-        shutdown_timeout_seconds=1,
-        force_kill_dispatches=lambda: forced.append(True),
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
+        force_kill_dispatches=kill,
     )
 
     def before_shutdown(_seconds):
@@ -384,14 +400,16 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
             # A deadline can already be exhausted by earlier shutdown work;
             # optional teardown has no remaining allocation in that case.
             daemon._shutdown_deadline = 0
+        raise KeyboardInterrupt
 
     try:
-        with pytest.raises(SystemExit) as stopped:
+        with pytest.raises((KeyboardInterrupt, SystemExit)) as stopped:
             daemon.run_forever(
                 sleep=before_shutdown,
                 now=lambda: 0,
                 max_ticks=1,
             )
+        assert stopped.type is SystemExit
         assert stopped.value.code is ExitCode.TRANSIENT
         assert forced == ([] if exhausted else [True])
         assert daemon.requires_hard_exit is True
@@ -403,6 +421,7 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
 def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
     from issue_agent.domain.actions import AgentKind, RunAgent
 
+    clock = ManualClock()
     release = threading.Event()
     worker_accounted = threading.Event()
     order = []
@@ -431,17 +450,19 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
         ),
         poll_seconds=1,
         dispatch_capacity=1,
-        shutdown_timeout_seconds=0.1,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
         finalize=finalize,
         force_kill_dispatches=kill,
         terminalize=lambda: order.append("terminalize"),
     )
 
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: 0,
-        max_ticks=1,
-    )
+    def interrupt(_seconds):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        daemon.run_forever(sleep=interrupt, now=lambda: 0, max_ticks=1)
 
     assert order == ["kill", "worker_accounted", "persist", "terminalize"]
     daemon.wait_for_dispatches()
@@ -450,6 +471,7 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
 def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
     from issue_agent.domain.actions import AgentKind, RunAgent
 
+    clock = ManualClock()
     started = threading.Event()
     release = threading.Event()
     settled = threading.Event()
@@ -461,8 +483,10 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
         assert release.wait(timeout=5)
         settled.set()
 
-    def kill_then_settle_after_first_wait():
-        threading.Timer(0.04, release.set).start()
+    def kill_without_worker_settling_in_window():
+        # The kill window closes with the finalize+terminalize reserves still
+        # intact, and the worker has not settled yet.
+        clock.set(_SHUTDOWN_TIMEOUT - 8)
 
     daemon = Daemon(
         "fix",
@@ -470,15 +494,18 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
         lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
         Executor(FakeGateway(), run_agent=run_agent),
         dispatch_capacity=1,
-        shutdown_timeout_seconds=0.2,
-        force_kill_dispatches=kill_then_settle_after_first_wait,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
+        force_kill_dispatches=kill_without_worker_settling_in_window,
         finalize=lambda: finalized.append("finalized"),
         terminalize=lambda: terminalized.append("terminalized"),
     )
     daemon.tick()
     assert started.wait(timeout=1)
 
-    assert daemon.shutdown_dispatches(cancel=False) is False
+    assert daemon.shutdown_dispatches(cancel=True) is False
+    release.set()
     assert settled.wait(timeout=1)
     daemon.wait_for_dispatches()
     assert daemon.shutdown_dispatches(cancel=False) is True
@@ -490,6 +517,7 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
 def test_timed_out_finalizer_never_overlaps_terminalization():
     from issue_agent.domain.actions import AgentKind, RunAgent
 
+    clock = ManualClock()
     started = threading.Event()
     release_dispatch = threading.Event()
     finalizer_started = threading.Event()
@@ -499,6 +527,9 @@ def test_timed_out_finalizer_never_overlaps_terminalization():
     def run_agent(_action):
         started.set()
         assert release_dispatch.wait(timeout=5)
+        # Unwinding the killed worker consumed the budget: only the
+        # terminalize reserve and a sliver for finalization remain.
+        clock.set(_SHUTDOWN_TIMEOUT - 3 - 0.05)
 
     def finalize():
         finalizer_started.set()
@@ -510,7 +541,9 @@ def test_timed_out_finalizer_never_overlaps_terminalization():
         lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
         Executor(FakeGateway(), run_agent=run_agent),
         dispatch_capacity=1,
-        shutdown_timeout_seconds=0.2,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
         force_kill_dispatches=release_dispatch.set,
         finalize=finalize,
         terminalize=terminalized.set,
@@ -520,7 +553,7 @@ def test_timed_out_finalizer_never_overlaps_terminalization():
 
     assert daemon.shutdown_dispatches(cancel=True) is False
 
-    assert finalizer_started.is_set()
+    assert finalizer_started.wait(timeout=1)
     assert not terminalized.is_set()
     release_finalizer.set()
     daemon.wait_for_dispatches()
@@ -626,6 +659,7 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
         pgid=123,
         process_start_ticks=99,
     )
+    clock = ManualClock()
     started = threading.Event()
     release = threading.Event()
 
@@ -640,20 +674,23 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
         Executor(FakeGateway(), run_agent=run_agent),
         poll_seconds=1,
         dispatch_capacity=1,
-        shutdown_timeout_seconds=0.1,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
         prepare_shutdown=lambda: control.record_owned_cancellation_intents(
             "o/r:fix",
             "shutdown_deadline_spend_unknown",
         ),
-        force_kill_dispatches=lambda: None,
+        force_kill_dispatches=lambda: clock.advance(_KILL_WINDOW),
     )
 
-    with pytest.raises(SystemExit):
-        daemon.run_forever(
-            sleep=lambda _seconds: None,
-            now=lambda: 0,
-            max_ticks=1,
-        )
+    def interrupt(_seconds):
+        assert started.wait(timeout=1)
+        raise KeyboardInterrupt
+
+    with pytest.raises((KeyboardInterrupt, SystemExit)) as stopped:
+        daemon.run_forever(sleep=interrupt, now=lambda: 0, max_ticks=1)
+    assert stopped.type is SystemExit
 
     assert started.is_set()
     assert control.active_reservation_runs("o/r:fix") == (run_id,)

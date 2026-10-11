@@ -1,1 +1,1 @@
-uv run pytest tests/app/test_dashweb_snapshots.py
+uv run --quiet --extra dev --extra sdk --extra dash pytest tests/app/test_loop.py tests/app/test_loop_shutdown_clock.py -q
