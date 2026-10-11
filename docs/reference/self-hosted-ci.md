@@ -48,7 +48,10 @@ after `curl: (23)` from a full `/tmp`.
 private repository `xnmp/ballast`, whose hosted Actions minutes are exhausted.
 Omitting the argument (or `default`) installs the runner above, unchanged. The
 two profiles share no account, home, `_work` directory, registration, runner
-name, label, service or unit, so caches and credentials cannot cross repositories.
+name, label, service or unit, so caches and credentials do not cross repositories through the filesystem.
+Accepted residual: the runners still share `/dev/shm`, abstract sockets, loopback
+and `/proc` visibility, since neither unit sets `PrivateIPC` or `ProtectProc`;
+that is acceptable for trusted private repositories.
 
 | | default | ballast |
 | --- | --- | --- |
@@ -62,12 +65,13 @@ name, label, service or unit, so caches and credentials cannot cross repositorie
 The Ballast unit is the hardened template with only those limits raised (Android
 builds plus an x86_64 emulator). It grants no supplementary groups, and the
 installer asserts the installed unit has none. Upstream systemd's udev rules
-(`50-udev-default.rules`, shipped by Arch and Debian) make `/dev/kvm` mode
-`0666`, so the `kvm` group adds nothing for KVM and would also expose
-`/dev/udmabuf` (`0660 root:kvm`). If a host's `/dev/kvm` is not world-readable
-and writable, KVM is unavailable to the runner; that is a deliberate operator
-decision, not something the installer overrides. Every identity,
-public-repository and foreign-registration refusal applies per profile. Root
+(`50-udev-default.rules`) make `/dev/kvm` mode `0666`, as on Arch, so the `kvm`
+group adds nothing for KVM and would also expose `/dev/udmabuf` (`0660
+root:kvm`). Some distributions build systemd with `0660`; there the runner has
+no KVM unless the operator explicitly decides to grant it, and the installer
+never does. Every identity,
+public-repository and foreign-registration refusal applies per profile. On a reinstall the installer stops a loaded runner service before any step
+running as the runner uid, so a live job cannot ptrace those steps. Root
 operates only on the runner home; the runner tree is extracted and inspected as
 the runner user, since jobs can write there.
 

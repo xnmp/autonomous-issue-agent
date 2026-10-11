@@ -58,6 +58,7 @@ if getent passwd "$runner_user" >/dev/null; then
        $(awk -F: -v name="$runner_user" '$1 == name {print $3}' <<< "$passwd_records") == "$runner_uid" &&
        $(awk -F: -v id="$runner_gid" '$3 == id {print $1}' <<< "$group_records") == "$runner_user" &&
        $(awk -F: -v name="$runner_user" '$1 == name {print $3}' <<< "$group_records") == "$runner_gid" &&
+       $(awk -F: -v name="$runner_user" '$1 == name {print $4}' <<< "$group_records") == "" &&
        $(cut -d: -f6 <<< "$account") == "$runner_home" &&
        $(cut -d: -f7 <<< "$account") == /usr/bin/nologin &&
        $(id -G "$runner_user") == "$runner_gid" ]] || {
@@ -74,13 +75,18 @@ if sudo -n test -e "$runner_home"; then
     sudo -n test -d "$runner_home" || exit 2
 fi
 sudo -n install -d -m 0700 -o "$runner_user" -g "$runner_user" "$runner_home"
-sudo -n -u "$runner_user" /usr/bin/test ! -L "$runner_dir" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
-sudo -n -u "$runner_user" /usr/bin/install -d -m 0700 "$runner_dir"
+# A live job shares the runner uid and, where Yama ptrace_scope is 0, could
+# ptrace the unsandboxed sudo children below. The install restarts it at the end.
+if [[ $(systemctl show "$service" -p LoadState --value) == loaded ]]; then
+    sudo -n systemctl stop "$service"
+fi
+sudo -n -u "$runner_user" test ! -L "$runner_dir" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
+sudo -n -u "$runner_user" install -d -m 0700 "$runner_dir"
 
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
-if ! sudo -n -u "$runner_user" /usr/bin/test -f "$runner_dir/.runner"; then
-    [[ $(sudo -n -u "$runner_user" /usr/bin/find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
+if ! sudo -n -u "$runner_user" test -f "$runner_dir/.runner"; then
+    [[ $(sudo -n -u "$runner_user" find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
         echo "Unconfigured runner directory is not empty; inspect it before installing." >&2; exit 2;
     }
     [[ $(gh api "repos/$repository/actions/runners" | jq --arg name "$runner_name" '[.runners[] | select(.name == $name)] | length') == 0 ]] || {
@@ -94,7 +100,7 @@ if ! sudo -n -u "$runner_user" /usr/bin/test -f "$runner_dir/.runner"; then
     printf '%s  %s\n' "$checksum" "$scratch/runner.tgz" | sha256sum --check --status
     # The verified tarball is streamed so the runner user, not root, writes the tree.
     # shellcheck disable=SC2024 # the operator, not the runner, reads the scratch file
-    sudo -n -u "$runner_user" /usr/bin/tar -xzf - -C "$runner_dir" < "$scratch/runner.tgz"
+    sudo -n -u "$runner_user" tar -xzf - -C "$runner_dir" < "$scratch/runner.tgz"
     token=$(gh api --method POST "repos/$repository/actions/runners/registration-token" --jq .token)
     # Official input transport removes this environment value after reading
     # it. stdin keeps the one-hour credential out of argv and shell traces.
@@ -107,8 +113,8 @@ if ! sudo -n -u "$runner_user" /usr/bin/test -f "$runner_dir/.runner"; then
     ' _ "$runner_dir" "https://github.com/$repository" "$runner_name" "$runner_label"
     unset token
 else
-    sudo -n -u "$runner_user" /usr/bin/test ! -L "$runner_dir/.runner" || exit 2
-    [[ $(sudo -n -u "$runner_user" /usr/bin/jq -er .gitHubUrl "$runner_dir/.runner") == "https://github.com/$repository" ]] || exit 2
+    sudo -n -u "$runner_user" test ! -L "$runner_dir/.runner" || exit 2
+    [[ $(sudo -n -u "$runner_user" jq -er .gitHubUrl "$runner_dir/.runner") == "https://github.com/$repository" ]] || exit 2
 fi
 
 if ! command -v shellcheck >/dev/null; then

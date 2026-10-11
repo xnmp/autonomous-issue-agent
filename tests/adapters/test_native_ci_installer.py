@@ -22,12 +22,22 @@ if tool == 'sudo':
     with open(fixture['sudo_log'], 'a') as log: log.write(json.dumps(args) + '\\n')
     Path(fixture['mutation']).write_text(' '.join(args))
     if not fixture['proceed']: sys.exit(99)
-    # Success path: a fresh host that stops at the first service mutation.
-    if 'systemctl' in args: sys.exit(99)
+    # Success path: 'fresh' has no .runner yet, 'configured' is a reinstall.
     if '-u' in args:
         sys.stdin.read()
-        if '/usr/bin/test' in args and '-f' in args: sys.exit(1)
+        if args[3:5] == ['test', '-f']: sys.exit(0 if fixture['proceed'] == 'configured' else 1)
+        if 'jq' in args: print('https://github.com/' + fixture['registered'])
     sys.exit(0)
+if tool == 'systemctl':
+    if args[0] == 'is-active': sys.exit(0)
+    shown = {
+        'LoadState': 'loaded' if fixture['loaded'] else 'not-found',
+        'User': fixture['user'], 'Group': fixture['user'], 'SupplementaryGroups': '', 'DropInPaths': '',
+        'FragmentPath': '/etc/systemd/system/' + fixture['service'],
+        'WorkingDirectory': fixture['dir'],
+        'ExecStart': '{ path=%s/runsvc.sh ; argv[]=%s/runsvc.sh ;' % (fixture['dir'], fixture['dir']),
+    }
+    print(shown[args[args.index('-p') + 1]]); sys.exit(0)
 if tool == 'gh':
     with open(fixture['gh_log'], 'a') as log: log.write(' '.join(args) + '\\n')
     endpoint = ' '.join(args)
@@ -66,6 +76,7 @@ class Profile:
         self.name, self.args, self.user, self.home = name, args, user, home
         self.uid, self.repository = uid, repository
         self.group = f"{user}:x:{uid}:"
+        self.service = f"{user}-runner.service" if user == "ballast-ci" else "issue-agent-ci-runner.service"
         self.dedicated = f"{user}:x:{uid}:{uid}::{home}:/usr/bin/nologin"
 
     def account(self, uid=None, gid=None, home=None, shell="/usr/bin/nologin"):
@@ -80,16 +91,17 @@ BALLAST = Profile("ballast", ["ballast"], "ballast-ci", "/var/lib/ballast-ci", "
 PROFILES = pytest.mark.parametrize("profile", [DEFAULT, BALLAST], ids=lambda p: p.name)
 
 
-def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=False):
+def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=None, loaded=False, registered_to=None):
     binaries = tmp_path / "bin"
     binaries.mkdir()
     mutation = tmp_path / "host-mutation"
     gh_log = tmp_path / "gh.log"
     fixture = {
-        "passwd": passwd, "group": group, "groups": groups, "proceed": proceed,
+        "passwd": passwd, "group": group, "groups": groups, "proceed": proceed, "loaded": loaded, "registered": registered_to or profile.repository,
+        "user": profile.user, "dir": f"{profile.home}/runner", "service": profile.service,
         "mutation": str(mutation), "gh_log": str(gh_log), "sudo_log": str(tmp_path / "sudo.log"),
     }
-    for tool in ("sudo", "gh", "id", "getent", "curl", "sha256sum", "shellcheck"):
+    for tool in ("sudo", "gh", "id", "getent", "systemctl", "curl", "sha256sum", "shellcheck"):
         target = binaries / tool
         target.write_text(f"#!{sys.executable}\n{STUB}")
         target.chmod(0o755)
@@ -119,6 +131,7 @@ def refusal_cases(p):
         "foreign-home": ([p.account(home="/home/operator")], [p.group], p.uid),
         "login-shell": ([p.account(shell="/bin/bash")], [p.group], p.uid),
         "extra-group": ([p.dedicated], [p.group], f"{p.uid} 998"),
+        "group-member": ([p.dedicated], [f"{p.user}:x:{p.uid}:alice"], p.uid),
         "malformed-uid": ([p.account(uid="invalid")], [p.group], p.uid),
     }
 
@@ -262,18 +275,18 @@ def test_installer_hardcodes_no_profile_path_outside_the_profile_table():
 
 @PROFILES
 def test_fresh_install_registers_and_extracts_as_the_runner_user_with_profile_values(tmp_path, profile):
-    result, _, gh_log = run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed=True)
+    result, _, gh_log = run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="fresh")
     calls = sudo_calls(tmp_path)
     runner_dir = f"{profile.home}/runner"
 
-    assert result.returncode == 99, result.stderr
+    assert result.returncode == 0, result.stderr
     config = next(c for c in calls if any("config.sh" in arg for arg in c))
     assert config[:3] == ["-n", "-u", profile.user]
     # Values arrive as positional arguments after the script, never inside it.
     assert config[-4:] == [runner_dir, f"https://github.com/{profile.repository}", profile.user, profile.user]
     script = next(arg for arg in config if "config.sh" in arg)
     assert profile.user not in script and profile.repository not in script
-    extract = next(c for c in calls if "/usr/bin/tar" in c)
+    extract = next(c for c in calls if "tar" in c)
     assert extract[:3] == ["-n", "-u", profile.user]
     assert extract[-4:] == ["-xzf", "-", "-C", runner_dir]
     assert "SECRET-TOKEN" not in result.stdout + result.stderr + json.dumps(calls)
@@ -282,7 +295,7 @@ def test_fresh_install_registers_and_extracts_as_the_runner_user_with_profile_va
 
 @PROFILES
 def test_root_names_no_path_beneath_the_runner_home(tmp_path, profile):
-    run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed=True)
+    run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="fresh")
 
     root_calls = [c for c in sudo_calls(tmp_path) if c[:2] != ["-n", "-u"]]
     assert root_calls
@@ -308,3 +321,55 @@ def test_runner_name_lookup_binds_the_name_with_jq_arg_not_interpolation():
 
     assert "jq --arg name" in script
     assert 'select(.name==\\"' not in script
+
+
+@PROFILES
+def test_reinstall_of_a_configured_runner_reuses_registration_and_restarts_the_service(tmp_path, profile):
+    result, _, gh_log = run_installer(
+        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="configured", loaded=True,
+    )
+    calls = sudo_calls(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not any("config.sh" in arg for c in calls for arg in c)
+    assert not any("tar" in c for c in calls)
+    assert "registration-token" not in gh_log.read_text()
+    assert ["-n", "systemctl", "restart", profile.service] in calls
+
+
+@PROFILES
+def test_a_configured_runner_registered_to_another_repository_is_refused(tmp_path, profile):
+    result, _, _ = run_installer(
+        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid,
+        proceed="configured", registered_to="someone/else",
+    )
+
+    assert result.returncode == 2
+    assert not any(c[:3] == ["-n", "systemctl", "restart"] for c in sudo_calls(tmp_path))
+
+
+@PROFILES
+def test_a_loaded_service_is_stopped_before_any_runner_uid_step(tmp_path, profile):
+    run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="configured", loaded=True)
+    calls = sudo_calls(tmp_path)
+
+    stop = calls.index(["-n", "systemctl", "stop", profile.service])
+    first_runner_step = next(i for i, c in enumerate(calls) if c[:3] == ["-n", "-u", profile.user])
+    assert stop < first_runner_step
+
+
+@PROFILES
+def test_an_unloaded_service_is_not_stopped(tmp_path, profile):
+    run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="fresh", loaded=False)
+
+    assert not any(c[:3] == ["-n", "systemctl", "stop"] for c in sudo_calls(tmp_path))
+
+
+def test_runner_user_tools_resolve_through_sudo_path_not_hardcoded_directories():
+    script = INSTALLER.read_text()
+    runner_lines = [line for line in script.splitlines() if 'sudo -n -u "$runner_user"' in line]
+
+    assert runner_lines
+    for line in runner_lines:
+        for tool in ("test", "install", "find", "tar", "jq"):
+            assert f"/usr/bin/{tool} " not in line, line
