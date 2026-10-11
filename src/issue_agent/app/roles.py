@@ -2929,22 +2929,29 @@ def compose_fix_daemon(
             workflow_control=workflow_control,
             available_runtimes=frozenset(provider.value for provider in cfg.fix_runtimes),
         )
-        for target, reason in state.control_errors.items():
-            log(f"workflow {target} held: {reason}")
-        for target, reason in state.review_control_errors.items():
-            log(f"address-review {target} held: {reason}")
-        for target, reason in state.infra_control_errors.items():
-            log(f"fix infrastructure {target} held: {reason}")
+        open_prs = {pr.number for pr in world.prs if pr.state == "OPEN"}
+        open_targets = {issue.number for issue in world.open_issues()} | {
+            breaker_key(pr) for pr in world.prs if pr.number in open_prs
+        }
+        for prefix, errors in (
+            ("workflow", state.control_errors),
+            ("address-review", state.review_control_errors),
+            ("fix infrastructure", state.infra_control_errors),
+        ):
+            for target, reason in errors.items():
+                if target in open_targets:
+                    log(f"{prefix} {target} held: {reason}")
         for target, reason in state.pr_reply_control_errors.items():
-            log(f"PR reply {target} held: {reason}")
+            if target in open_prs:
+                log(f"PR reply {target} held: {reason}")
         migration_required = sorted(
             target for target, workflow in state.resolve_workflows.items()
-            if isinstance(workflow, WorkflowMigrationRequired)
+            if target in open_targets and isinstance(workflow, WorkflowMigrationRequired)
         )
         if migration_required:
             log(f"resolve workflows held ({len(migration_required)}): resolve_migration_required")
         for target, workflow in state.resolve_workflows.items():
-            if isinstance(workflow, WorkflowUnavailable):
+            if target in open_targets and isinstance(workflow, WorkflowUnavailable):
                 log(f"resolve workflow {target} held: {workflow.reason}")
         budget_blocks, budget_worlds = _budget_self_clear_worlds(
             control, cfg, world, state.budget_blocks

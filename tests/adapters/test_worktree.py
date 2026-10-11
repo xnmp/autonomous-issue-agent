@@ -358,6 +358,7 @@ def test_build_gate_context_leaves_old_side_empty_when_that_git_call_fails():
 
 def test_build_gate_context_reads_published_subjects_from_the_remote_branch():
     fg = _builder_git()
+    fg.table["for-each-ref"] = GitResult(0, "refs/remotes/origin/fix/5-x\n")
     fg.table[_PUBLISHED_LOG] = GitResult(
         0, "red: t\nMerge branch 'dev' into fix/5-x\n"
     )
@@ -365,8 +366,64 @@ def test_build_gate_context_reads_published_subjects_from_the_remote_branch():
     assert ctx.published_subjects == ("red: t", "Merge branch 'dev' into fix/5-x")
 
 
+@pytest.mark.parametrize("published", ["absent", "loose", "packed", "broken"])
+def test_published_history_observation_is_quiet_for_an_unpushed_branch(
+    tmp_path, capsys, published,
+):
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "dev")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+        "commit", "-q", "--allow-empty", "-m", "base")
+    git("update-ref", "refs/remotes/origin/dev", "HEAD")
+    git("checkout", "-q", "-b", "fix/5-x")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+        "commit", "-q", "--allow-empty", "-m", "green: impl")
+    if published != "absent":
+        git("update-ref", "refs/remotes/origin/fix/5-x", "HEAD")
+    if published == "packed":
+        git("pack-refs", "--all", "--prune")
+    if published == "broken":
+        (tmp_path / ".git/refs/remotes/origin/fix/5-x").write_text("a" * 40 + "\n")
+
+    calls = []
+
+    def run(args, cwd):
+        calls.append(args)
+        return wt_mod._subprocess_git(args, cwd)
+
+    ctx = build_gate_context(str(tmp_path), git=run)
+
+    assert ctx.published_subjects == (() if published in {"absent", "broken"} else ("green: impl",))
+    assert ctx.branch_subjects == ("green: impl",)
+    err = capsys.readouterr().err
+    if published == "broken":
+        assert "[worktree] git log" in err and "failed" in err
+    else:
+        assert err == ""
+    if published == "absent":
+        assert not any(args[0] == "log" and "refs/remotes/" in args[1] for args in calls)
+
+
+@pytest.mark.parametrize("refs", [
+    "", "not a ref\n", "refs/remotes/origin/fix/5-x/other\n",
+    "refs/remotes/origin/fix/5-x-other\n" * 100_000,
+])
+def test_published_history_requires_the_exact_remote_ref(refs):
+    fg = _builder_git()
+    fg.table["for-each-ref"] = GitResult(0, refs)
+    fg.table[_PUBLISHED_LOG] = GitResult(0, "green: unrelated history\n")
+
+    ctx = build_gate_context("/wt", git=fg)
+
+    assert ctx.published_subjects == ()
+    assert not any(args[0] == "log" and "refs/remotes/" in args[1] for args, _ in fg.calls)
+
+
 def test_build_gate_context_drops_published_subjects_when_the_remote_log_fails():
     fg = _builder_git()
+    fg.table["for-each-ref"] = GitResult(0, "refs/remotes/origin/fix/5-x\n")
     fg.table[_PUBLISHED_LOG] = GitResult(1, "fatal: bad revision")
     ctx = build_gate_context("/wt", base_branch="dev", git=fg)
     assert ctx.published_subjects == ()
