@@ -190,23 +190,28 @@ retired owner fail closed, and a rebooted old service exits cleanly at startup.
 V16 classifies every active reservation as spawn-pending, running, or
 reconcile-only. Recovery can release only spawn-pending work while atomically
 rechecking that no lease registered and the run never started; any reservation
-that may have reached a paid provider remains unavailable until positive
-settlement evidence or explicit operator resolution.
+that may still be running retains capacity until terminal recovery can settle it.
 V17 separates workload repository attribution from the budget scope that
 admitted a run, so global-only reservations still charge the correct
 repository. It also restores pre-v16 reserved/no-lease rows to spawn-pending
 when the old lease-before-exec contract proves they never launched. Paid child
 registration carries the launcher's immutable expected owner and checks it in
 the lease transaction, while a normal completion that races dead-lease spend
-recovery converges with an equal recovered charge and corrects the false
-abandonment. Read-only spend projections validate the current migration
+recovery replaces its recovered charge with the normal return's evidence and
+corrects the false abandonment, atomically with output capture. The accounting
+journal records the correction and reverses the old spend projection before
+adding the replacement; replay keeps one charge. Read-only spend projections validate the current migration
 history, SQLite quick check, foreign keys, and semantic invariants before
 showing authoritative current-day values.
-Completed usage-blind runs use a narrower bounded adjudication path: recovery
-first retries exact provider reconciliation for the reservation grace window,
-then atomically releases only a lease-free `completed/spend_unreconciled`
-reservation and records `spend_unmeasured_released`. Migrated ambiguous rows,
-dead leases, and running work cannot enter this path.
+Completed legs settle from the sum of usable request receipts, otherwise streamed
+usage at the captured rate card, otherwise zero for interrupted/unusable requests.
+Partial evidence produces `basis=estimate` and an accounting gap journal event;
+the reserved maximum is never charged as an estimate. Terminal, lease-free legacy
+`accounting_unavailable` rows follow the same idempotent boot recovery transaction.
+Live work retains its reservation and stops its process group on a metering
+fault that prevents cap enforcement. See [ADR 0002](../adr/0002-money-and-accounting.md)
+for runtime provenance, Claude's remaining cumulative-cost gap, and deferred late
+corrections.
 The coordinator feeds lease, reconciliation, and compare-and-set results into
 the pure `domain/reservation_recovery.py` state machine. That model owns action
 ordering and terminal reporting; SQLite remains responsible for atomically
@@ -219,21 +224,17 @@ execution continues counting. A launched PR repair (REBASE, ADDRESS_REVIEW,
 FIX_CI, linked reply) that ends without a captured `pr-repair-result` is
 acknowledged by `reconcile_pr_repair_returns` only once its run is terminal,
 lease- and claim-free, has no unresolved publication command, and its money is
-accounted for: the reservation is released or settled, or it is retained as
-unknown spend (active, recovery policy `reconcile_only`, run outcome
-`accounting_unavailable`; operator decision 2026-10-11, Tauri PR #1019). Any
-other active reservation keeps the hold until an explicit accounting
-disposition. Acknowledging a retained run never releases, settles or
-reclassifies its reservation: it keeps counting against the caps as unknown
-spend alongside the next repair's own reservation (deliberately conservative,
-so both count), and a later release or settle works normally without a second
-acknowledgment or a renewed hold. The journal records this as
-`unreturned_acknowledged_money_retained` instead of `unreturned_acknowledged`.
+accounted for: the reservation is released or settled. Recovery settles old
+accounting holds before this check. There is no retained-money exception or
+`unreturned_acknowledged_money_retained` event; acknowledgments use
+`unreturned_acknowledged` and follow the ordinary settled-money rule.
 The acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
 or settlement), charges the paired issue allowance one attempt so existing
 breakers still bound retries, and changes only the exact current admissions.
-Existing session/model provenance and financial evidence remain unchanged; a
-late normal result cannot overwrite this acknowledgment. Recovery shares the
+The acknowledgment preserves existing session/model provenance. A late real
+result is captured and corrects any estimated charge through the shared settlement
+path, while the acknowledgment continues to prevent duplicate attempt debt and
+changes to newer workflow state. Recovery shares the
 existing ceiling of 32 completions per reconciliation pass.
 
 PR-repair acknowledgment crash/concurrency matrix (ADR 0003, ADR 0016):
@@ -248,7 +249,7 @@ writes. No process or network operation runs inside either transaction.
 | During paired state/receipt/outbox writes | The transaction/savepoint rolls back both components and receipts; retry completes once. | `test_pr_repair_terminal_recovery_guards.py::test_acknowledgment_rolls_back_both_components_and_receipts_on_write_failure` |
 | Commit succeeds but the caller never receives the return | Both components and the distinct acknowledgment remain committed; retry adds no debt or receipt. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-commit]` |
 | Normal result captured after selection, before acknowledgment's recheck | Capture wins; acknowledgment returns false without mutation. The next ordinary pass applies the real result/session exactly once. | `test_pr_repair_recovery_interleavings.py::test_capture_between_selection_and_acknowledgment_wins` |
-| Acknowledgment commits before normal capture | The late capture is refused, retaining prior genuine session/model and financial records. | `test_pr_repair_terminal_recovery_guards.py::test_settled_recovery_preserves_prior_session_and_money_and_refuses_late_capture` |
+| Acknowledgment commits before normal capture | The real result is captured, money is corrected, and acknowledged workflow effects remain consumed. | `test_pr_repair_terminal_recovery.py::test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack`; `test_pr_repair_terminal_recovery_guards.py::test_settled_recovery_preserves_prior_session_and_money_and_accepts_late_capture` |
 | Retained (unknown-cost) run acknowledged, then later released or settled | Money is untouched by the acknowledgment; the later disposition finds the existing receipt and neither re-acknowledges nor re-holds the PR. | `test_pr_repair_retained_money_proceeds.py::test_later_release_of_retained_run_keeps_pr_consistent` |
 | Newer generation or admission supersedes the selected run | Exact admission guards preserve the newer components. | `test_pr_repair_terminal_recovery.py::test_stale_unreturned_repair_cannot_rewrite_a_newer_generation`; `test_pr_repair_terminal_recovery_guards.py::test_recovered_run_cannot_clear_newer_pending_admission` |
 
@@ -426,37 +427,27 @@ full reservation remains active instead of becoming new headroom.
 
 Codex 0.160 native review children share their parent's run and reservation.
 The run-scoped observer joins durable spawn call/output receipts to canonical
-child metadata, then prices each child's own response usage at its actual model
-using the same captured card as the parent. Copied fork prefixes and referenced
-ancestor history are excluded. The configured card also prices root-only work;
-legacy scalar rates cannot override its cap decision. Missing lineage, model,
-usage or completion returns `ACCOUNTING_UNAVAILABLE` and retains the full
-obligation.
-A rollout session (root or child) that has `token_usage_record` receipts is priced
-as exactly the sum of its receipts inside the run window (`started_at` through
-`runs.completed_at`); the `token_count` counter is not consulted for it. Only a
-session with no receipts keeps the counter path. Policy (operator, 2026-10-11):
-a request interrupted by the kill has no receipt and therefore costs zero; this
-is an accepted under-count of that one request, nothing else. A receipted
-session's unterminated tail is forgiven only when it is a strict prefix of one
-killed write; any parseable or otherwise invalid tail, any malformed receipt, a
-completed turn without a receipt, and an unpriced model fail closed.
-Spend evidence freezes the meter's failure text. Recovery parses it once into
-`NativeFailure`; for the ambiguous-token-count and unfinished-turns classes (fully determined by the
-retained rollouts) it re-runs the meter over `codex_home` and, when that now
-measures, settles through the normal reconcile path and journals
-`accounting.native_usage.remetered.v1` (once per run and class, in the settlement transaction). Every recovery read
-(root cumulative usage and all child events) is bounded by the harness-owned
-`runs.completed_at`, so a later leg resuming the same session is never billed to
-the ended run; an event without a parseable timestamp fails closed, and a run
-with no `completed_at` is not re-metered. A still-failing, missing or malformed
-re-read keeps the unavailable result and its retained obligation, and every
-other frozen failure class stays final without reading rollouts. Recovery requires the complete version-2 invocation/card evidence.
-Unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child
-accounting. JSONL remains evidence for the authoritative SQLite settlement.
-Native accounting uncertainty cannot expire through the legacy completed-run
-grace release; only actual reconciliation or an explicit accounting disposition
-can remove its obligation.
+child metadata and excludes copied fork prefixes and referenced ancestor history.
+Each root/child session contributes the per-token-category maximum of cumulative
+usage and deduplicated receipt totals, after subtracting pre-launch usage. Frozen
+Each receipt uses its usable provider dollars, otherwise its frozen token price;
+frozen rates price only the cumulative remainder after subtracting receipt tokens. The same
+observation drives the live cap watchdog and terminal settlement, so delayed
+receipts cannot discard another request's spend. Missing/unusable evidence contributes zero
+and journals an estimate gap; live metering faults stop the process group when
+cap enforcement cannot be established. Complete terminal records are parsed even
+without their final newline; an unparseable tail contributes zero.
+
+Recovery bounds all root and child evidence by the harness-owned invocation start
+and `runs.completed_at`. A later leg's resumed usage cannot enter the ended run.
+Legacy version-1 evidence prices usable parent usage at its frozen scalar rates;
+missing native-child metadata journals a gap instead of erasing parent spend.
+Version-2 evidence uses the captured native card. Repeated recovery keeps one
+charge. A late real return supersedes a recovery estimate using signed correction
+events and durable output capture, including after repair unreturned acknowledgment.
+The persisted typed charge origin makes a normal return final even at estimated
+prices. No older or recovery receipt can overwrite it.
+JSONL remains evidence for authoritative SQLite settlement.
 The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
 scoped verifiers and required evidence capture within this same leg's budget.
 

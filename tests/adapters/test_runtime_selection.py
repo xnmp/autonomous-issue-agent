@@ -15,7 +15,7 @@ from tests.adapters.test_accounting_runtime import Runtime, _wrapper, _publicati
 @pytest.mark.parametrize("provider", [RuntimeName.CLAUDE, RuntimeName.CODEX])
 def test_selected_provider_is_accounted_before_launch_and_shared_cap_refuses_peer(tmp_path, provider):
     raw = Runtime(AgentResult(False, status="ok", cost_usd=1.25, session_id="receipt",
-                              usage={"input_tokens": 100, "output_tokens": 10}))
+                              usage={"input_tokens": 250_000, "output_tokens": 0, "source": "provider"}))
     wrapper, store = _wrapper(tmp_path, raw, runtime_name=provider.value, cap=2_000_000)
     other = RuntimeName.CODEX if provider is RuntimeName.CLAUDE else RuntimeName.CLAUDE
     peer = Runtime(AgentResult(False, status="ok"))
@@ -29,6 +29,8 @@ def test_selected_provider_is_accounted_before_launch_and_shared_cap_refuses_pee
     assert peer.calls == 0
     with store.transaction() as db:
         import json
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (
+            1_250_000, "provider_reported" if provider is RuntimeName.CLAUDE else "estimate")
         rows = db.execute("SELECT dispatch_id FROM runs").fetchall()
         assert json.loads(rows[0][0])["runtime"] == provider.value
 

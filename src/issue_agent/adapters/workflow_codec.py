@@ -30,7 +30,7 @@ from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
 from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
-from ..domain.contracts import BudgetScope, WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, SettlementRequest
+from ..domain.contracts import BudgetScope, WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, ChargeOrigin, SettlementRequest
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
 from ..domain.labels import Label
@@ -174,7 +174,7 @@ _VALUES = (
 _ENUMS = (
     TestExecutionStatus, test_evidence.ReviewTestOutcome, test_evidence.PostedReview,
     MachineBlocker, Target, EffectStatus,
-    UsageSource, PricingBasis,
+    UsageSource, PricingBasis, ChargeOrigin,
     LifecycleOperation,
     cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.StewardLane, cc.StewardFailureKind, cc.FixInfraOutcome,
     migration.ReviewImportBlockerKind,
@@ -212,6 +212,7 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS: dict[str, dict[str, object]] = {
+    "SettlementRequest": {"accounting_gap": "", "origin": {"type": "ChargeOrigin", "value": "normal_return"}},
     "BudgetWorld": {"config_version": ""},
     "MachineClearProjection": {"binding": None},
     "BudgetClearProjection": {"binding": None},
@@ -284,6 +285,8 @@ def _encode(value: object, depth: int = 0) -> object:
                     and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block", "budget_block"} and getattr(value, field.name) is None)
                     and not (type(value) is cc.IssueRecoveryState and field.name == "self_clear_ceiling_reported" and not value.self_clear_ceiling_reported)
                     and not (type(value) is BudgetWorld and field.name == "config_version" and not value.config_version)
+                    and not (type(value) is SettlementRequest and field.name == "accounting_gap" and not value.accounting_gap)
+                    and not (type(value) is SettlementRequest and field.name == "origin" and value.origin is ChargeOrigin.NORMAL_RETURN)
                     and not (type(value) is BudgetLimitObservation and field.name == "budget_scope" and value.budget_scope is None)
                     and not (type(value) in {MachineClearProjection, BudgetClearProjection} and field.name == "binding" and value.binding is None)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
@@ -407,7 +410,7 @@ def _decode(value: object, depth: int = 0) -> object:
     field_names = _FIELD_NAMES[constructor]
     required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}
                 if tag == "StewardLaneState" else field_names - legacy.keys())
-    if tag in {"StewardLaneState", "StewardPurchase", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
+    if tag in {"SettlementRequest", "StewardLaneState", "StewardPurchase", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
         payload = {**legacy, **payload}
     if legacy and set(payload) == field_names - legacy.keys():
         payload = {**legacy, **payload}

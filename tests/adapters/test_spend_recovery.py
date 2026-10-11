@@ -15,8 +15,8 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.adapters.codex_child_usage import CodexChildUsageMeter
-from issue_agent.domain.run_usage import MeasuredRunUsage, UnavailableRunUsage, price_run_usage
-from issue_agent.domain.events import NativeUsageRemetered, Producer, decode_event_line
+from issue_agent.domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage
+from issue_agent.domain.events import ControlTransitionCommitted, NativeUsageRemetered, Producer, decode_event_line
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -75,7 +75,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
     rollout_dir = codex_home / "sessions" / NOW.strftime("%Y/%m/%d")
     rollout_dir.mkdir(parents=True)
     (rollout_dir / "rollout-now-session-1.jsonl").write_text(
-        '{"type":"event_msg","payload":{"type":"token_count","info":'
+        '{"timestamp":"' + NOW.isoformat() + '","type":"event_msg","payload":{"type":"token_count","info":'
         '{"total_token_usage":{"input_tokens":1000,"output_tokens":200,'
         '"cached_input_tokens":400}}}}\n'
     )
@@ -104,6 +104,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
         },
     )
 
+    _end_run_at(store, run_id, END)
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
     assert store.active_reservation_runs() == ()
@@ -135,7 +136,7 @@ def test_missing_rollout_does_not_fabricate_recovered_spend(tmp_path):
     assert store.active_reservation_runs() == (run_id,)
 
 
-def test_legacy_receipt_retains_obligation_without_native_invocation_contract(tmp_path):
+def test_legacy_receipt_without_native_invocation_contract_settles_estimate(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path)
     evidence_dir = tmp_path / "spend-evidence"
     write_spend_evidence(str(evidence_dir), str(run_id), {
@@ -144,9 +145,8 @@ def test_legacy_receipt_retains_obligation_without_native_invocation_contract(tm
         "cost_per_mtok_out": 20, "cost_per_mtok_cached_in": 1,
     })
     store.record_reservation_retained(run_id, "prior completed unmeasured run")
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.release_retained(run_id, "unmeasured grace elapsed", NOW + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
 def test_unavailable_recovery_preserves_proven_unlaunched_release(tmp_path):
@@ -173,9 +173,8 @@ def test_running_codex_uncertainty_survives_generic_completion_and_grace(tmp_pat
         db.execute("UPDATE runs SET state='running' WHERE run_id=?", (str(run_id),))
     assert not CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)).reconcile(run_id)
     store.record_reservation_retained(run_id, "generic post-run retention")
-    assert store.release_retained(run_id, "completed unmeasured grace elapsed",
-                                  NOW + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
-    assert store.active_reservation_runs() == (run_id,)
+    assert store.settle_terminal_estimate(run_id, "process returned without evidence")
+    assert store.active_reservation_runs() == ()
 
 
 ROOT = "019fa244-0000-7de0-8e18-e56f423bbbcc"
@@ -277,7 +276,8 @@ def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settl
     _end_run_at(store, run_id, END)
     log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
     store.bind_event_outbox(log.prepare, log.append_committed)
-    assert store.record_accounting_unavailable(run_id, AMBIGUOUS)
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
@@ -288,7 +288,8 @@ def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settl
     assert store.snapshot(scope).settled == Money("USD", 12_500)
     assert not any(evidence_dir.iterdir())
     payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
-    assert NativeUsageRemetered(str(run_id), "AMBIGUOUS_TOKEN_COUNTS", "measured") in payloads
+    assert not any(isinstance(p, NativeUsageRemetered) for p in payloads)
+    assert any(isinstance(p, ControlTransitionCommitted) and p.entity_kind == "accounting" and p.state == "estimated" for p in payloads)
 
 
 @pytest.mark.parametrize("failure", ["native child has no corroborating rollout", "something unclassified"])
@@ -302,7 +303,7 @@ def test_other_frozen_failures_are_final_without_reading_rollouts(tmp_path, fail
 
 
 @pytest.mark.parametrize("damage", ["missing_home", "missing_child_rollout", "malformed_rollout"])
-def test_frozen_ambiguous_failure_fails_closed_when_rollouts_are_unusable(tmp_path, damage):
+def test_frozen_failure_with_unusable_rollouts_settles_remaining_evidence(tmp_path, damage):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
     home = _native_home(tmp_path)
@@ -314,8 +315,8 @@ def test_frozen_ambiguous_failure_fails_closed_when_rollouts_are_unusable(tmp_pa
         next(home.rglob(f"*{CHILD}.jsonl")).write_text("{not json\n")
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
 def _append(path, records):
@@ -367,12 +368,12 @@ def test_root_token_count_exactly_at_the_end_is_counted(tmp_path):
     assert store.snapshot(scope).settled == Money("USD", 22_500)
 
 
-def test_root_token_count_one_millisecond_after_the_end_fails_closed(tmp_path):
+def test_root_token_count_one_millisecond_after_the_end_is_not_charged(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
     evidence_dir = _root_count_at(tmp_path, store, run_id, END + timedelta(milliseconds=1))
 
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
 def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
@@ -385,7 +386,7 @@ def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
     assert store.active_reservation_runs() == (run_id,)
 
 
-def test_remeter_journal_is_emitted_once_across_sweeps(tmp_path):
+def test_estimate_gap_journal_is_emitted_once_across_sweeps(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
     log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
     store.bind_event_outbox(log.prepare, log.append_committed)
@@ -398,10 +399,11 @@ def test_remeter_journal_is_emitted_once_across_sweeps(tmp_path):
     reconciler.reconcile(run_id)
 
     payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
-    assert sum(isinstance(p, NativeUsageRemetered) for p in payloads) == 1
+    assert sum(isinstance(p, ControlTransitionCommitted) and p.entity_kind == "accounting" and p.state == "estimated" for p in payloads) == 1
+    assert not any(isinstance(p, NativeUsageRemetered) for p in payloads)
 
 
-def test_untimestamped_root_usage_inside_the_bounded_window_fails_closed(tmp_path):
+def test_untimestamped_root_usage_does_not_prevent_estimated_settlement(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, NOW + timedelta(seconds=10))
     home = _native_home(tmp_path)
@@ -411,11 +413,11 @@ def test_untimestamped_root_usage_inside_the_bounded_window_fails_closed(tmp_pat
             "total_token_usage": {"input_tokens": 1, "output_tokens": 1}}}}) + "\n")
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
-# --- Operator policy 2026-10-11: price the sum of a session's receipts in the run window ---
+# Each session uses the per-category maximum of cumulative usage and receipt totals.
 
 UNFINISHED = "native child has unfinished turns or turns without usage"
 CARD = RateTable("card", "v1", "USD", {"gpt": ModelRates(10000000, 20000000, 1000000, 10000000)})
@@ -442,7 +444,7 @@ def _killed_child_home(tmp_path, *, responses=2, completed=False, receipts=True,
     for i in range(1, responses + 1):
         if receipts:
             body.append(_ev("token_usage_record", {"thread_id": CHILD, "turn_id": turn, "response_id": f"r{i}",
-                                                   "usage": CHILD_TOKENS, "thread_token_usage": CHILD_TOKENS}))
+                                                   "usage": CHILD_TOKENS, "thread_token_usage": _scaled(i)}))
         body.append(_count(CHILD_TOKENS, _scaled(i)))
     if in_flight and responses:
         body.append(_ev("response_item", {"type": "custom_tool_call_output", "call_id": "c", "output": "ok"}))
@@ -512,20 +514,23 @@ def test_child_unfinished_turn_without_any_receipt_costs_nothing(tmp_path):
     assert price_run_usage(_final(_meter(tmp_path, home), final=True), CARD).micros == ROOT_ONLY_MICROS
 
 
-def test_completed_child_turn_without_receipts_still_fails_closed(tmp_path):
+def test_completed_child_turn_without_receipts_prices_stream_usage_as_estimate(tmp_path):
     home = _killed_child_home(tmp_path, responses=1, completed=True, receipts=False)
 
-    assert isinstance(_final(_meter(tmp_path, home), final=True), UnavailableRunUsage)
+    observed = _final(_meter(tmp_path, home), final=True)
+    assert isinstance(observed, EstimatedRunUsage)
+    assert price_run_usage(observed, CARD).micros == ROOT_ONLY_MICROS + CHILD_RESPONSE_MICROS
 
 
-def test_token_counts_do_not_price_a_receipted_session(tmp_path):
-    # The Codex 0/0 token_count quirk and a total that disagrees are irrelevant: receipts are the price.
+def test_cumulative_usage_above_receipts_remains_known_spend(tmp_path):
     zero = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0}
     home = _killed_child_home(tmp_path, responses=2, completed=True, in_flight=False)
     with next(home.rglob(f"*{CHILD}.jsonl")).open("a") as stream:
         stream.write(json.dumps(_count(zero, _scaled(9))) + "\n")
 
-    assert price_run_usage(_final(_meter(tmp_path, home), final=True), CARD).micros == ROOT_ONLY_MICROS + 2 * CHILD_RESPONSE_MICROS
+    observed = _final(_meter(tmp_path, home), final=True)
+    assert isinstance(observed, EstimatedRunUsage)
+    assert price_run_usage(observed, CARD).micros == ROOT_ONLY_MICROS + 9 * CHILD_RESPONSE_MICROS
 
 
 def test_root_with_receipts_is_priced_at_its_receipts_not_its_counter(tmp_path):
@@ -589,7 +594,7 @@ def test_receipt_before_the_window_starts_is_not_charged(tmp_path):
 
 
 @pytest.mark.parametrize("fault", ["negative", "missing_usage", "foreign_thread", "unpriced_child_model"])
-def test_malformed_receipt_fails_closed(tmp_path, fault):
+def test_malformed_receipt_preserves_priceable_stream_usage(tmp_path, fault):
     home = _killed_child_home(tmp_path, responses=1)
     path = next(home.rglob(f"*{CHILD}.jsonl"))
     lines = [json.loads(line) for line in path.read_text().splitlines()]
@@ -604,7 +609,10 @@ def test_malformed_receipt_fails_closed(tmp_path, fault):
         next(e for e in lines if e["type"] == "turn_context")["payload"]["model"] = "unpriced"
     path.write_text("".join(json.dumps(e) + "\n" for e in lines))
 
-    assert isinstance(_final(_meter(tmp_path, home), final=True), UnavailableRunUsage)
+    observed = _final(_meter(tmp_path, home), final=True)
+    assert isinstance(observed, EstimatedRunUsage)
+    child_charge = 0 if fault == "unpriced_child_model" else CHILD_RESPONSE_MICROS
+    assert price_run_usage(observed, CARD).micros == ROOT_ONLY_MICROS + child_charge
 
 
 def test_a_truncated_trailing_record_is_the_killed_write_and_an_invalid_one_is_not(tmp_path):
@@ -612,15 +620,16 @@ def test_a_truncated_trailing_record_is_the_killed_write_and_an_invalid_one_is_n
     bad = _killed_child_home(tmp_path / "b", responses=2, tail='{"timestamp": INVALID}')
     whole = _killed_child_home(tmp_path / "c", responses=2, tail=json.dumps(_count(CHILD_TOKENS, _scaled(3))))
 
-    assert isinstance(_final(_meter(tmp_path / "a", cut), final=True), MeasuredRunUsage)
-    assert isinstance(_final(_meter(tmp_path / "b", bad), final=True), UnavailableRunUsage)
-    assert isinstance(_final(_meter(tmp_path / "c", whole), final=True), UnavailableRunUsage)
+    assert isinstance(_final(_meter(tmp_path / "a", cut), final=True), EstimatedRunUsage)
+    assert isinstance(_final(_meter(tmp_path / "b", bad), final=True), EstimatedRunUsage)
+    assert isinstance(_final(_meter(tmp_path / "c", whole), final=True), EstimatedRunUsage)
 
 
 def test_recovery_of_an_unfinished_turns_run_settles_the_receipts_inside_the_run_window(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
-    assert store.record_accounting_unavailable(run_id, UNFINISHED)
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     home = _killed_child_home(tmp_path, responses=2, late_response=True)
     evidence_dir = _frozen_evidence(tmp_path, home, UNFINISHED)
     reconciler = CodexSpendReconciler(store, (str(evidence_dir),))
@@ -645,8 +654,8 @@ def test_other_frozen_classes_stay_final_even_when_rollouts_would_meter(tmp_path
     _end_run_at(store, run_id, END)
     evidence_dir = _frozen_evidence(tmp_path, _killed_child_home(tmp_path), "native child has no corroborating rollout")
 
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
 @pytest.mark.parametrize("fault", ["absent", "later"])
@@ -674,13 +683,13 @@ def test_completed_root_turn_without_a_receipt_is_not_settled_from_the_others(tm
         _ev("turn_context", {"turn_id": "u", "model": "gpt"}),
         _ev("event_msg", {"type": "task_complete", "turn_id": "u"}), _count(CHILD_TOKENS, _scaled(2))])
 
-    assert isinstance(_root_sample(tmp_path, home, _counter(2)), UnavailableRunUsage)
+    assert isinstance(_root_sample(tmp_path, home, _counter(2)), EstimatedRunUsage)
     evidence_dir = _frozen_evidence(tmp_path, home, "")
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
-def test_a_tail_with_a_syntax_error_before_a_cut_multibyte_character_fails_closed(tmp_path):
+def test_malformed_tail_does_not_prevent_estimated_settlement(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
     home = _killed_child_home(tmp_path, responses=2)
@@ -688,8 +697,8 @@ def test_a_tail_with_a_syntax_error_before_a_cut_multibyte_character_fails_close
         stream.write(b'{"timestamp":INVALID,"note":"\xe2')
     evidence_dir = _frozen_evidence(tmp_path, home, UNFINISHED)
 
-    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == ()
 
 
 def test_a_valid_prefix_ending_in_a_cut_multibyte_character_is_the_killed_write(tmp_path):
@@ -704,7 +713,7 @@ def test_a_valid_prefix_ending_in_a_cut_multibyte_character_is_the_killed_write(
 def test_a_non_object_unterminated_tail_is_not_a_killed_event_write(tmp_path, tail):
     home = _killed_child_home(tmp_path, responses=2, tail=tail)
 
-    assert isinstance(_final(_meter(tmp_path, home), final=True), UnavailableRunUsage)
+    assert isinstance(_final(_meter(tmp_path, home), final=True), EstimatedRunUsage)
 
 
 @pytest.mark.parametrize("frozen", ["", UNFINISHED])

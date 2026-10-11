@@ -266,6 +266,8 @@ class RecoveryControl(Protocol):
     Missing leases/reservations are normal empty results.
     """
 
+    def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool: ...
+
     def reclaim_dead_leases(
         self, owner_id: str, is_alive: Callable[[int, int], bool]
     ) -> tuple[RunId, ...]: ...

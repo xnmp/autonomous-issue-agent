@@ -177,7 +177,7 @@ def test_stale_unreturned_repair_cannot_rewrite_a_newer_generation(monkeypatch):
     assert issue_ci_state(files) == newer_issue and control.read_pr_repair(key) == newer_repair
 
 
-def test_acknowledged_run_refuses_a_late_real_result_and_keeps_newer_work(monkeypatch):
+def test_acknowledged_run_captures_a_late_real_result_and_keeps_newer_work(monkeypatch):
     workflow, files, inner, key = _workflow("rebase")
     store, control = files._workflow_db, files._workflow_authority
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, "rebase")
@@ -194,12 +194,63 @@ def test_acknowledged_run_refuses_a_late_real_result_and_keeps_newer_work(monkey
             (store._continuation_receipt_key(run_id, newer.admission.attempt.binding.authority.family),)).fetchone()[0]
     stale_admission = decode_workflow(receipt, tuple)[0]
     late = replace(newer, admission=stale_admission,
-        settlement=replace(newer.settlement, run_id=run_id),
+        settlement=replace(newer.settlement, run_id=run_id, provider_receipt_id=f"late:{run_id}"),
         state=replace(newer.state, session=replace(newer.state.session, source=stale_admission),
                       actual_model=replace(newer.state.actual_model, source=stale_admission)),
         rebase=replace(newer.rebase, admission=store.rebase_repair_admission(stale_admission.attempt)))
-    with pytest.raises(WorkflowAuthorityError):
-        store.settle_pr_repair_result(late, control.writer)
+    assert store.settle_pr_repair_result(late, control.writer).disposition.value == 'available'
+    assert store.settle_pr_repair_result(late, control.writer).idempotent
+    with store.transaction() as db:
+        assert db.execute("SELECT amount_micros FROM charges WHERE run_id=?", (str(run_id),)).fetchone()[0] == late.settlement.amount.micros
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 2
     assert issue_ci_state(files) == newer_issue and control.read_pr_repair(key) == newer_repair
     assert control.reconcile_pr_repair_returns() == 0
     assert issue_ci_state(files) == newer_issue and control.read_pr_repair(key) == newer_repair
+
+
+@pytest.mark.parametrize("lane", ["rebase", "review", "ci"])
+@pytest.mark.parametrize("estimate", [0, 500_000])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack(monkeypatch, tmp_path, lane, estimate, interrupted):
+    from issue_agent.adapters.event_log import EventLog
+    from issue_agent.domain.contracts import ChargeOrigin, Money, PricingBasis, SettlementRequest
+    from issue_agent.domain.events import Producer, SpendRecorded, decode_event_line
+    workflow, files, inner, key = _workflow(lane)
+    store, control = files._workflow_db, files._workflow_authority
+    log = tmp_path / "events.jsonl"
+    events = EventLog(str(log), Producer("test", "o/r", "fix", 123, "boot"))
+    store.bind_event_outbox(events.prepare, events.append_committed)
+    run_ids = []
+
+    async def late(task):
+        run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
+        run_ids.append(run_id)
+        store.register_process_lease(run_id, expected_owner_id=OWNER, pid=123, pgid=123, process_start_ticks=99)
+        assert store.reclaim_dead_leases(OWNER, lambda *_args: False) == (run_id,)
+        if estimate:
+            assert store.settle(SettlementRequest(run_id, Money("USD", estimate), PricingBasis.ESTIMATE,
+                f"earlier-estimate:{run_id}", None, None, None, origin=ChargeOrigin.RECOVERY_ESTIMATE)).disposition.value == "available"
+        else:
+            assert store.settle_terminal_estimate(run_id, "provider exited before return capture")
+        assert control.reconcile_pr_repair_returns() == 1
+        return AgentResult(False, status="pushed", summary="real repair output", cost_usd=1.25, session_id="late")
+
+    monkeypatch.setattr(inner, "run", late)
+    if interrupted:
+        def disappear_after_capture(*args, **kwargs):
+            raise RuntimeError("caller disappeared after durable capture")
+        monkeypatch.setattr(store, "settle_pr_repair", disappear_after_capture)
+        with pytest.raises(RuntimeError, match="after durable capture"):
+            _repair(workflow, lane)
+    else:
+        _repair(workflow, lane)
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges WHERE run_id=?", (str(run_ids[0]),)).fetchone()) == (1_250_000, "provider_reported")
+        result = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
+    assert result.state.session.handle == "late"
+    assert _pending(issue_ci_state(files), lane) is None
+    assert _failures(issue_ci_state(files), lane) == 1
+    contributions = [decode_event_line(line).payload.amount_micros for line in log.read_text().splitlines()
+        if isinstance(decode_event_line(line).payload, SpendRecorded)]
+    assert contributions == [estimate, -estimate, 1_250_000]
+    assert control.reconcile_pr_repair_returns() == 0

@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from issue_agent.adapters.control_path import control_store_path
+from issue_agent.adapters.codex_child_usage import NativeFailure
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -46,6 +47,7 @@ from issue_agent.domain.contracts import (
     Money,
     PriceQuote,
     PricingBasis,
+    ChargeOrigin,
     ReservationId,
     RunId,
     TokenUsage,
@@ -66,7 +68,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 41))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 42))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -123,6 +125,7 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        41: ("ALTER TABLE charges DROP COLUMN origin",),
         40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
              "DROP INDEX lifecycle_review_generation_candidates"),
         39: ("DROP INDEX workflow_repair_owed", "DROP INDEX continuation_pr_admission_identity",
@@ -1899,8 +1902,9 @@ def test_settle_is_idempotent_and_conflicting_receipt_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("recovery_settles_first", (False, True))
+@pytest.mark.parametrize("recovery_basis", [PricingBasis.RECONCILED, PricingBasis.ESTIMATE])
 def test_normal_settlement_converges_with_dead_lease_recovery(
-    tmp_path,
+    tmp_path, recovery_basis,
     recovery_settles_first,
 ) -> None:
     store = _store(tmp_path)
@@ -1923,11 +1927,12 @@ def test_normal_settlement_converges_with_dead_lease_recovery(
     recovered = SettlementRequest(
         request.run_id,
         Money("USD", 50),
-        PricingBasis.RECONCILED,
+        recovery_basis,
         "codex-recovered:session:run-1",
         TokenUsage(1, 2),
         "card",
         "v1",
+        origin=ChargeOrigin.RECOVERY_ESTIMATE,
     )
     normal = SettlementRequest(
         request.run_id,
@@ -3510,6 +3515,8 @@ def _retained_schema_rows(db):
         if table == 'runs' and 'continuations_json' in columns:
             assert not db.execute("SELECT 1 FROM runs WHERE continuations_json<>? LIMIT 1", (encode_workflow(()),)).fetchone()
             columns.remove('continuations_json')
+        if table == 'charges' and 'origin' in columns:
+            columns.remove('origin')
         selection = ','.join('"' + name.replace('"', '""') + '"' for name in columns)
         rows[table] = tuple(sorted((tuple(row) for row in db.execute(
             'SELECT ' + selection + ' FROM "' + table.replace('"', '""') + '"',
@@ -3644,3 +3651,81 @@ def test_v34_unrelated_writes_need_no_retired_projection_witness(tmp_path):
     assert store.claim('unrelated', 'other/repository', 'key')
     assert store.release(RunId('run-1'), 'cancelled').disposition is AccountingDisposition.AVAILABLE
     store.integrity_check()
+
+
+@pytest.mark.parametrize("earlier_receipt", ["codex-recovered:session:run-1", "earlier-estimate:run-1", "claude:session:run-1"])
+@pytest.mark.parametrize("recovered,actual", [(0, 0), (0, 1_250_000), (1_000_000, 1_250_000), (1_250_000, 50)])
+def test_normal_return_corrects_terminal_recovery_idempotently(tmp_path, recovered, actual, earlier_receipt):
+    store = _store(tmp_path)
+    published = []
+    store.bind_event_outbox(lambda payload, correlation: EventEnvelope(payload, new_event_id(NOW), len(published), NOW, NOW,
+                            len(published), Producer("test", "o/r", "fix", 123, "boot"), correlation), published.append)
+    request = dataclasses.replace(_request(1), owner_id="o/r:fix")
+    assert store.reserve(request, lease=Lease(request.run_id, request.dispatch_id, request.owner_id,
+                                             123, 123, NOW, 99)).admitted
+    assert store.reclaim_dead_leases(request.owner_id, lambda _pid, _start: False) == (request.run_id,)
+    if recovered:
+        assert store.settle(SettlementRequest(request.run_id, Money("USD", recovered), PricingBasis.ESTIMATE,
+                            earlier_receipt, None, "card", "v1", origin=ChargeOrigin.RECOVERY_ESTIMATE)).disposition is AccountingDisposition.AVAILABLE
+    else:
+        assert store.settle_terminal_estimate(request.run_id, "no request evidence")
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("abandoned", "dead_lease")
+    normal = SettlementRequest(request.run_id, Money("USD", actual), PricingBasis.PROVIDER_REPORTED,
+                               "claude:session:run-1", None, None, None)
+    assert store.settle(normal).disposition is AccountingDisposition.AVAILABLE
+    restarted = SQLiteControlStore(store.path, now=lambda: NOW)
+    restarted.initialize()
+    assert restarted.settle(normal).idempotent
+    assert restarted.settle(dataclasses.replace(normal, amount=Money("USD", actual + 1))).disposition is AccountingDisposition.CONFLICT
+    assert restarted.snapshot(_scope()).settled == Money("USD", actual)
+    assert sum(fold(published).spend_micros_by_basis.values()) == actual
+    assert fold(published).spend_micros_by_basis.get("estimate", 0) == 0
+    corrections = [e.payload for e in published if isinstance(e.payload, ControlTransitionCommitted)
+                   and e.payload.entity_kind == "accounting" and e.payload.state == "corrected"]
+    assert len(corrections) == 1 and corrections[0].attributes["previous_amount_micros"] == recovered
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("completed", "settled")
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
+        assert db.execute("SELECT provider_receipt_id FROM runs").fetchone()[0] == normal.provider_receipt_id
+
+
+def test_measured_remeter_cannot_claim_an_estimated_charge(tmp_path):
+    store = _store(tmp_path)
+    assert store.reserve(_request(1)).admitted
+    request = SettlementRequest(RunId("run-1"), Money("USD", 50), PricingBasis.ESTIMATE,
+                                "codex-recovered:session:run-1", None, "card", "v1", origin=ChargeOrigin.RECOVERY_ESTIMATE)
+    with pytest.raises(ValueError, match="measured recovery"):
+        store.settle_remetered(request, NativeFailure.AMBIGUOUS_TOKEN_COUNTS)
+    assert store.snapshot(_scope()).reserved == Money("USD", 60)
+    measured = dataclasses.replace(request, basis=PricingBasis.RECONCILED)
+    assert store.settle_remetered(measured, NativeFailure.AMBIGUOUS_TOKEN_COUNTS).disposition is AccountingDisposition.AVAILABLE
+    assert store.snapshot(_scope()).settled == Money("USD", 50)
+
+
+@pytest.mark.parametrize("receipt_id,origin", [
+    ("codex-recovered:session:run-1", ChargeOrigin.RECOVERY_ESTIMATE),
+    ("terminal-estimate:run-1", ChargeOrigin.RECOVERY_ESTIMATE),
+    ("earlier-estimate:run-1", ChargeOrigin.NORMAL_RETURN),
+    ("codex:session:run-1", ChargeOrigin.NORMAL_RETURN),
+    ("codex-recovered:session:other", ChargeOrigin.NORMAL_RETURN),
+])
+def test_v41_preserves_existing_money_and_only_marks_identifiable_legacy_recovery(tmp_path, receipt_id, origin):
+    store = _store(tmp_path)
+    request = _request(1)
+    assert store.reserve(request).admitted
+    earlier = SettlementRequest(request.run_id, Money("USD", 50), PricingBasis.ESTIMATE,
+                                receipt_id, None, None, None, origin=origin)
+    assert store.settle(earlier).disposition is AccountingDisposition.AVAILABLE
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 40)
+    restarted = SQLiteControlStore(store.path, now=lambda: NOW)
+    restarted.initialize()
+    assert restarted.snapshot(_scope()).settled == Money("USD", 50)
+    assert restarted.settle(earlier).idempotent
+    normal = dataclasses.replace(earlier, amount=Money("USD", 51), provider_receipt_id="new-normal",
+                                 origin=ChargeOrigin.NORMAL_RETURN)
+    result = restarted.settle(normal)
+    assert result.disposition is (AccountingDisposition.AVAILABLE if origin is ChargeOrigin.RECOVERY_ESTIMATE
+                                  else AccountingDisposition.CONFLICT)
+    assert restarted.snapshot(_scope()).settled == Money("USD", 51 if origin is ChargeOrigin.RECOVERY_ESTIMATE else 50)

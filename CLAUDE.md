@@ -123,9 +123,10 @@ observe GitHub → pure decide → execute Actions → dispatch paid Legs
 ```
 
 Every paid leg receives a `run_id`/`leg_id`, reserves its maximum charge in one
-transaction, then settles or is recovered. A configured cap plus unavailable,
-corrupt, or unpriceable accounting blocks paid admission while observation and
-reconciliation continue.
+transaction, then settles or is recovered. Completed legs settle usable request evidence,
+with streamed usage marked as an estimate and interrupted requests charged zero.
+Unavailable/corrupt SQLite authority or missing required pre-launch pricing blocks
+paid admission while observation and reconciliation continue.
 
 `SIGTERM` stops admission, cancels/drains active work within a bound, writes
 handover/receipts, flushes the outbox, kills remaining groups, and exits with a

@@ -96,7 +96,7 @@ from .actions import (  # noqa: F401
     Target,
 )
 from .labels import Label
-from .contracts import WorkflowAttemptIdentity
+from .contracts import PricingBasis, WorkflowAttemptIdentity
 from .run_usage import RunUsage
 
 
@@ -148,7 +148,7 @@ class ExitReason(str, Enum):
     # TRANSPORT_DEATH, which is a session that started and then lost its stream,
     # and from AGENT_ERROR, which is a session that ran and reported failure.
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
-    ACCOUNTING_UNAVAILABLE = "accounting_unavailable"  # work ran; its complete charge is unknown
+    ACCOUNTING_UNAVAILABLE = "accounting_unavailable"  # live budget authority failed; terminal spend still settles
     # The leg ended its own turn while a background child task it started was
     # still pending. A headless leg can never receive that child's notification,
     # so a `blocked` it declares is waiting on itself, not on a human (#255).
@@ -470,6 +470,8 @@ class AgentResult:
     workflow_attempt: WorkflowAttemptIdentity | None = None
     # Runtime-authored only: structured model output cannot supply accounting.
     run_usage: RunUsage | None = None
+    # Accounting-authored settlement provenance for completion telemetry.
+    pricing_basis: PricingBasis | None = None
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):

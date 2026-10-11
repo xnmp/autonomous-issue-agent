@@ -162,9 +162,15 @@ class TokenUsage:
 class PricingBasis(str, Enum):
     PROVIDER_REPORTED = "provider_reported"
     CONFIGURED_RATE_CARD = "configured_rate_card"
+    ESTIMATE = "estimate"
     LEARNED_ESTIMATE = "learned_estimate"
     RECONCILED = "reconciled"
     SYNTHETIC = "synthetic"
+
+
+class ChargeOrigin(str, Enum):
+    RECOVERY_ESTIMATE = "recovery_estimate"
+    NORMAL_RETURN = "normal_return"
 
 
 @dataclass(frozen=True)
@@ -176,10 +182,16 @@ class SettlementRequest:
     usage: TokenUsage | None
     rate_card_id: str | None
     rate_card_version: str | None
+    accounting_gap: str = ""
+    origin: ChargeOrigin = ChargeOrigin.NORMAL_RETURN
 
     def __post_init__(self) -> None:
         if not str(self.run_id) or not self.provider_receipt_id:
             raise ValueError("run and provider receipt identities are required")
+        if not isinstance(self.accounting_gap, str) or len(self.accounting_gap) > 2048:
+            raise ValueError("accounting gap must be bounded text")
+        if not isinstance(self.origin, ChargeOrigin):
+            raise ValueError("charge origin must be typed")
         if (
             self.basis is PricingBasis.CONFIGURED_RATE_CARD
             and (not self.rate_card_id or not self.rate_card_version)

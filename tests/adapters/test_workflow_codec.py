@@ -13,7 +13,7 @@ from issue_agent.domain.workflow import (
     NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, ResolveEpisode, RetryAuthorizationRequired,
     WorkflowSnapshot,
 )
-from issue_agent.domain.contracts import CommandId, RunId, WorkflowAttemptIdentity
+from issue_agent.domain.contracts import ChargeOrigin, CommandId, Money, PricingBasis, RunId, SettlementRequest, WorkflowAttemptIdentity
 from issue_agent.domain.resolve_return import PendingResolveReturn, ReturnedResolve
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
@@ -28,6 +28,26 @@ from issue_agent.domain.workflow_identity import (
 def test_decoder_rejects_duplicate_fields_including_escaped_and_nested_keys(raw, field):
     with pytest.raises(WorkflowEncodingError, match=f"duplicate workflow JSON field: {field}"):
         decode_workflow(raw, object)
+
+
+def test_legacy_settlement_receipt_remains_byte_stable_and_gap_round_trips():
+    receipt = SettlementRequest(RunId("r"), Money.zero(), PricingBasis.ESTIMATE, "provider:r", None, None, None)
+    raw = encode_workflow(receipt)
+    assert "accounting_gap" not in json.loads(raw)["value"]["fields"]
+    for _ in range(2):
+        receipt = decode_workflow(raw, SettlementRequest)
+        assert receipt.accounting_gap == ""
+        assert encode_workflow(receipt) == raw
+    corrected = replace(receipt, accounting_gap="completed request has no usage")
+    assert decode_workflow(encode_workflow(corrected), SettlementRequest) == corrected
+
+
+@pytest.mark.parametrize("origin", tuple(ChargeOrigin))
+@pytest.mark.parametrize("gap", ["", "receipt gap"])
+def test_settlement_origin_survives_command_replay_independently_of_basis(origin, gap):
+    receipt = SettlementRequest(RunId("r"), Money("USD", 50), PricingBasis.ESTIMATE,
+                                "provider:r", None, None, None, gap, origin)
+    assert decode_workflow(encode_workflow(receipt), SettlementRequest) == receipt
 
 
 def test_repeated_input_still_runs_domain_constructor_validation(monkeypatch):

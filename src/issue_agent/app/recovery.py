@@ -129,7 +129,8 @@ class RecoveryCoordinator:
                     break
                 if decision.action is ReservationRecoveryAction.RECONCILE_SPEND:
                     state = state.after_spend_reconciliation(
-                        settled=self.spend.reconcile(run_id)
+                        settled=(self.spend.reconcile(run_id) or
+                                 self.control.settle_terminal_estimate(run_id, "terminal recovery has no usable request evidence"))
                     )
                     continue
                 if decision.action is ReservationRecoveryAction.RELEASE_UNLAUNCHED:
