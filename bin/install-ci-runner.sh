@@ -1,13 +1,41 @@
 #!/usr/bin/env bash
-# One native runner for this private repository; registration stays in GitHub.
+# One native runner per private repository profile; registration stays in GitHub.
+# Usage: install-ci-runner.sh [default|ballast]
 set -euo pipefail
 
-repository=xnmp/autonomous-issue-agent
-runner_user=issue-agent-ci
-runner_home=/var/lib/issue-agent-ci
-runner_dir=$runner_home/runner
-runner_name=issue-agent-ci
-service=issue-agent-ci-runner.service
+# BEGIN PROFILES (pure data; tests source this block to compare profiles)
+# unit_groups is a unit-level SupplementaryGroups grant. It never changes the
+# account's own groups, which must stay exactly its primary group.
+load_profile() {
+    case $1 in
+        default)
+            repository=xnmp/autonomous-issue-agent
+            runner_user=issue-agent-ci
+            runner_home=/var/lib/issue-agent-ci
+            runner_name=issue-agent-ci
+            runner_label=issue-agent-ci
+            service=issue-agent-ci-runner.service
+            unit_file=github-actions-runner.service
+            unit_groups=
+            ;;
+        ballast)
+            repository=xnmp/ballast
+            runner_user=ballast-ci
+            runner_home=/var/lib/ballast-ci
+            runner_name=ballast-ci
+            runner_label=ballast-ci
+            service=ballast-ci-runner.service
+            unit_file=github-actions-runner-ballast.service
+            unit_groups=kvm
+            ;;
+        *) return 1 ;;
+    esac
+    runner_dir=$runner_home/runner
+}
+# END PROFILES
+
+[[ $# -le 1 ]] || { echo "Usage: $0 [default|ballast]" >&2; exit 2; }
+load_profile "${1-default}" || { echo "Unknown profile: ${1-} (expected default or ballast)" >&2; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 
 for tool in awk bash curl gh git jq make sha256sum sudo tar xz; do
@@ -18,6 +46,12 @@ sudo -n true || { echo "Authenticate with sudo -v, then rerun." >&2; exit 2; }
 [[ $(gh api "repos/$repository" --jq .private) == true ]] || {
     echo "Refusing a native runner for a public repository." >&2; exit 2;
 }
+if [[ -n $unit_groups ]]; then
+    # A missing group makes systemd refuse to start the unit (status 216).
+    getent group "$unit_groups" >/dev/null || {
+        echo "Host group required by the service unit is missing: $unit_groups" >&2; exit 2;
+    }
+fi
 
 if getent passwd "$runner_user" >/dev/null; then
     account=$(getent passwd "$runner_user")
@@ -54,7 +88,7 @@ if ! sudo -n test -f "$runner_dir/.runner"; then
     [[ $(sudo -n find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
         echo "Unconfigured runner directory is not empty; inspect it before installing." >&2; exit 2;
     }
-    [[ $(gh api "repos/$repository/actions/runners" --jq "[.runners[] | select(.name==\"$runner_name\")] | length") == 0 ]] || {
+    [[ $(gh api "repos/$repository/actions/runners" | jq --arg name "$runner_name" '[.runners[] | select(.name == $name)] | length') == 0 ]] || {
         echo "An existing GitHub runner uses this name; inspect it before replacing." >&2; exit 2;
     }
     package=$(gh api "repos/$repository/actions/runners/downloads" --jq '.[] | select(.os=="linux" and .architecture=="x64")')
@@ -72,9 +106,9 @@ if ! sudo -n test -f "$runner_dir/.runner"; then
     printf '%s\n' "$token" | sudo -n -u "$runner_user" /usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/bash -euc '
         IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN
         export ACTIONS_RUNNER_INPUT_TOKEN
-        cd /var/lib/issue-agent-ci/runner
-        ./config.sh --unattended --url https://github.com/xnmp/autonomous-issue-agent --name issue-agent-ci --labels issue-agent-ci --work _work
-    '
+        cd "$1"
+        ./config.sh --unattended --url "$2" --name "$3" --labels "$4" --work _work
+    ' _ "$runner_dir" "https://github.com/$repository" "$runner_name" "$runner_label"
     unset token
 else
     sudo -n test ! -L "$runner_dir/.runner" || exit 2
@@ -95,19 +129,20 @@ fi
 # Official svc.sh install copies bin/runsvc.sh to the root of the runner; do
 # that copy as the runner user instead of running runner-writable svc.sh as root.
 sudo -n -u "$runner_user" /usr/bin/bash -euc '
-    cd /var/lib/issue-agent-ci/runner
+    cd "$1"
     [[ ! -L bin && -f bin/runsvc.sh && ! -L bin/runsvc.sh ]] || exit 1
     [[ ! -L runsvc.sh && ( ! -e runsvc.sh || -f runsvc.sh ) ]] || exit 1
     install -m 0755 bin/runsvc.sh runsvc.sh
     [[ -f runsvc.sh && ! -L runsvc.sh && -x runsvc.sh ]] || exit 1
-' || { echo "Refusing an unsafe runner service entrypoint." >&2; exit 2; }
+' _ "$runner_dir" || { echo "Refusing an unsafe runner service entrypoint." >&2; exit 2; }
 
 # Root installs the operator-owned unit; runner-owned scripts never run as root.
 sudo -n test ! -L "/etc/systemd/system/$service" || exit 2
-sudo -n install -m 0644 "$root/ops/systemd/github-actions-runner.service" "/etc/systemd/system/$service"
+sudo -n install -m 0644 "$root/ops/systemd/$unit_file" "/etc/systemd/system/$service"
 sudo -n systemctl daemon-reload
 [[ $(systemctl show "$service" -p User --value) == "$runner_user" &&
    $(systemctl show "$service" -p Group --value) == "$runner_user" &&
+   $(systemctl show "$service" -p SupplementaryGroups --value) == "$unit_groups" &&
    $(systemctl show "$service" -p DropInPaths --value) == "" &&
    $(systemctl show "$service" -p FragmentPath --value) == "/etc/systemd/system/$service" &&
    $(systemctl show "$service" -p WorkingDirectory --value) == "$runner_dir" ]] || exit 2

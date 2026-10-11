@@ -25,7 +25,7 @@ credentials remain in its private home, never in the repository.
 
 ```bash
 sudo -v
-bash bin/install-ci-runner.sh
+bash bin/install-ci-runner.sh [default|ballast]
 gh api repos/xnmp/autonomous-issue-agent/actions/runners \
   --jq '.runners[] | {name,status,busy,labels:[.labels[].name]}'
 ```
@@ -41,6 +41,44 @@ An interrupted installation resumes on rerun: an existing matching account and
 download scratch honours `TMPDIR`; point it at disk-backed storage when the
 operator's `/tmp` is small or quota-limited, as the first installation needed
 after `curl: (23)` from a full `/tmp`.
+
+## Ballast profile
+
+`bin/install-ci-runner.sh ballast` installs a second, independent runner for the
+private repository `xnmp/ballast`, whose hosted Actions minutes are exhausted.
+Omitting the argument (or `default`) installs the runner above, unchanged. The
+two profiles share no account, home, `_work` directory, registration, runner
+name, label, service or unit, so caches and credentials cannot cross repositories.
+
+| | default | ballast |
+| --- | --- | --- |
+| Repository | `xnmp/autonomous-issue-agent` | `xnmp/ballast` |
+| Account / home | `issue-agent-ci`, `/var/lib/issue-agent-ci` | `ballast-ci`, `/var/lib/ballast-ci` |
+| Runner name / label | `issue-agent-ci` | `ballast-ci` |
+| Service | `issue-agent-ci-runner.service` | `ballast-ci-runner.service` |
+| Unit | `github-actions-runner.service` | `github-actions-runner-ballast.service` |
+| Limits | 6 CPU, 12 GB, 512 tasks | `CPUQuota=1200%`, `MemoryMax=24G`, `TasksMax=2048` |
+
+The Ballast unit is the hardened template with only those limits raised (Android
+builds plus an x86_64 emulator) and `SupplementaryGroups=kvm` added. The grant is
+unit-level: the `ballast-ci` account itself still has no groups beyond its
+primary one, and the identity check refuses any other. `/dev/kvm` is currently
+`0666 root:kvm`, but the grant keeps the emulator working on hosts where it is
+`0660`. The installer refuses if the host has no `kvm` group, because systemd
+cannot start a unit naming a missing group. Every identity, public-repository
+and foreign-registration refusal applies per profile.
+
+Trust: the runner executes workflow code as `ballast-ci` with no sandbox. Use it
+only for the private repository and trusted pull requests; never route fork PRs
+to it. Recheck this if Ballast's visibility or contributor model changes.
+
+Ballast's `native-test` needs host packages the operator installs; the runner
+never installs them. On Debian/Ubuntu: `libwebkit2gtk-4.1-dev`,
+`libayatana-appindicator3-dev`, `librsvg2-dev`, `patchelf`. On Arch:
+`webkit2gtk-4.1`, `libayatana-appindicator`, `librsvg`, `patchelf`.
+
+Pointing Ballast's PR jobs at the runner (`runs-on: [self-hosted, linux, x64,
+ballast-ci]`) is a change in that repository.
 
 ## Workflow and operation
 

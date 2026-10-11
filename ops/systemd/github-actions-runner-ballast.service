@@ -1,0 +1,38 @@
+[Unit]
+Description=GitHub Actions native CI runner (xnmp/ballast)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# GitHub's documented service entrypoint runs with the dedicated identity.
+Type=simple
+User=ballast-ci
+Group=ballast-ci
+# /dev/kvm for the Android emulator; the account itself stays in no extra group.
+SupplementaryGroups=kvm
+WorkingDirectory=/var/lib/ballast-ci/runner
+ExecStart=/var/lib/ballast-ci/runner/runsvc.sh
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/ballast-ci
+RuntimeDirectory=ballast-ci
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/ballast-ci
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+CPUQuota=1200%
+MemoryMax=24G
+MemorySwapMax=0
+TasksMax=2048
+KillMode=mixed
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=multi-user.target
