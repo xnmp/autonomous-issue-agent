@@ -13,7 +13,7 @@ from .codex_runner import (
     spend_evidence_path,
     usage_delta,
 )
-from .codex_child_usage import CodexChildUsageMeter, NativeFailure, recovered_rate_table
+from .codex_child_usage import CodexChildUsageMeter, NativeFailure, RemeterOutcome, recovered_rate_table
 from ..domain.run_usage import MeasuredRunUsage, RunUsage, UnavailableRunUsage, price_run_usage, total_usage
 from .control_store import (
     AccountingDisposition,
@@ -57,21 +57,19 @@ class CodexSpendReconciler:
                 remetered = NativeFailure.parse(evidence.get("native_usage_failure"))
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 return self._unavailable(run_id, "Codex recovery evidence is malformed or unpriceable")
-            result = self.store.settle(
-                SettlementRequest(
-                    run_id,
-                    amount,
-                    PricingBasis.RECONCILED,
-                    f"codex-recovered:{session_id}:{run_id}",
-                    total_usage(native.samples),
-                    rates.rate_card_id,
-                    rates.version,
-                )
+            request = SettlementRequest(
+                run_id,
+                amount,
+                PricingBasis.RECONCILED,
+                f"codex-recovered:{session_id}:{run_id}",
+                total_usage(native.samples),
+                rates.rate_card_id,
+                rates.version,
             )
+            result = (self.store.settle(request) if remetered is None
+                      else self.store.settle_remetered(request, remetered, RemeterOutcome.MEASURED))
             if result.disposition is not AccountingDisposition.AVAILABLE:
                 return self._unavailable(run_id, "Codex measured recovery settlement was refused")
-            if remetered is not None:
-                self.store.record_native_remetered(run_id, remetered, "measured")
             remove_spend_evidence(directory, run_id)
             return True
         return self._unavailable(run_id, "Codex recovery evidence is missing or invalid")
@@ -176,6 +174,10 @@ class CodexSpendReconciler:
         frozen = evidence.get("native_usage_failure")
         # Ambiguous token counts are determined by the retained rollouts alone,
         # so a meter fix can resolve them; any other frozen failure stays final.
+        if frozen and NativeFailure.parse(frozen) is not None and ended_at is None:
+            # That class always belongs to a completed run; without the
+            # harness-owned end an unbounded re-read could absorb a later leg.
+            return UnavailableRunUsage("native re-meter requires the run's recorded end")
         if frozen and NativeFailure.parse(frozen) is None:
             return UnavailableRunUsage(str(evidence["native_usage_failure"])[:2048])
         roots = evidence.get("native_root_sessions")

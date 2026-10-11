@@ -241,8 +241,22 @@ def _frozen_evidence(tmp_path, home, failure):
     return evidence_dir
 
 
+def _end_run_at(store, run_id, at):
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET state='completed', completed_at=? WHERE run_id=?",
+                   (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)))
+
+
+def _later(seconds):
+    return (NOW + timedelta(seconds=seconds)).isoformat()
+
+
+END = NOW.replace(microsecond=0) + timedelta(seconds=10)
+
+
 def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settles(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
     log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
     store.bind_event_outbox(log.prepare, log.append_committed)
     assert store.record_accounting_unavailable(run_id, AMBIGUOUS)
@@ -261,6 +275,7 @@ def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settl
 
 def test_frozen_ambiguous_failure_with_genuinely_conflicting_rollout_stays_unavailable(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
     doubled = {k: v * 2 for k, v in CHILD_TOKENS.items()}
     home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, doubled)])
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
@@ -282,6 +297,7 @@ def test_other_frozen_failures_are_final_without_reading_rollouts(tmp_path, fail
 @pytest.mark.parametrize("damage", ["missing_home", "missing_child_rollout", "malformed_rollout"])
 def test_frozen_ambiguous_failure_fails_closed_when_rollouts_are_unusable(tmp_path, damage):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
     home = _native_home(tmp_path)
     if damage == "missing_home":
         home = tmp_path / "nowhere"
@@ -295,47 +311,87 @@ def test_frozen_ambiguous_failure_fails_closed_when_rollouts_are_unusable(tmp_pa
     assert store.active_reservation_runs() == (run_id,)
 
 
-def _end_run_at(store, run_id, at):
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET state='completed', completed_at=? WHERE run_id=?",
-                   (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)))
+def _append(path, records):
+    with path.open("a") as stream:
+        stream.write("".join(json.dumps(e) + "\n" for e in records))
 
 
-def _later(seconds):
-    return (NOW + timedelta(seconds=seconds)).isoformat()
-
-
-def test_later_leg_activity_on_the_resumed_root_is_not_billed_to_the_ended_run(tmp_path):
+def test_later_leg_children_after_the_end_are_not_billed_to_the_ended_run(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
-    assert store.record_accounting_unavailable(run_id, AMBIGUOUS)
-    _end_run_at(store, run_id, NOW + timedelta(seconds=10))
+    _end_run_at(store, run_id, END)
     home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
-    # A later leg resumes the root: bigger cumulative total and a brand-new child.
     other = "019fa244-0000-7de0-8e18-e56f423bbbcf"
-    rollout = next(home.rglob(f"*{ROOT}.jsonl"))
-    huge = {"input_tokens": 9_000_000, "output_tokens": 900_000, "cached_input_tokens": 100}
-    later = [{"timestamp": _later(60), "type": "response_item", "payload": {
-                 "type": "function_call", "name": "spawn_agent", "call_id": "c2",
-                 "arguments": json.dumps({"task_name": "again", "message": "go"})}},
-             {"timestamp": _later(60), "type": "response_item", "payload": {
-                 "type": "function_call_output", "call_id": "c2",
-                 "output": json.dumps({"task_name": "/root/again", "nickname": None})}},
-             {**_count(huge, huge), "timestamp": _later(61)}]
-    with rollout.open("a") as stream:
-        stream.write("".join(json.dumps(e) + "\n" for e in later))
+    at = {"timestamp": _later(60)}
+    _append(next(home.rglob(f"*{ROOT}.jsonl")), [
+        {**at, "type": "response_item", "payload": {
+            "type": "function_call", "name": "spawn_agent", "call_id": "c2",
+            "arguments": json.dumps({"task_name": "again", "message": "go"})}},
+        {**at, "type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "c2",
+            "output": json.dumps({"task_name": "/root/again", "nickname": None})}}])
     turn = "turn:later"
     _write_rollout(home, other, [
-        {**_meta(other, tmp_path, ROOT), "timestamp": _later(60)},
-        {**_ev("event_msg", {"type": "task_started", "turn_id": turn}), "timestamp": _later(60)},
-        {**_ev("turn_context", {"turn_id": turn, "model": "gpt"}), "timestamp": _later(60)},
+        {**_meta(other, tmp_path, ROOT), **at},
+        {**_ev("event_msg", {"type": "task_started", "turn_id": turn}), **at},
+        {**_ev("turn_context", {"turn_id": turn, "model": "gpt"}), **at},
         {**_ev("token_usage_record", {"thread_id": other, "turn_id": turn, "response_id": "x",
-                                      "usage": CHILD_TOKENS, "thread_token_usage": CHILD_TOKENS}),
-         "timestamp": _later(60)}])
+                                      "usage": CHILD_TOKENS, "thread_token_usage": CHILD_TOKENS}), **at}])
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
     assert store.snapshot(scope).settled == Money("USD", 12_500)
+
+
+def _root_count_at(tmp_path, store, run_id, at):
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    total = {"input_tokens": 2000, "output_tokens": 10, "cached_input_tokens": 500}
+    _append(next(home.rglob(f"*{ROOT}.jsonl")), [{**_count(total, total), "timestamp": at.isoformat()}])
+    return _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+
+def test_root_token_count_exactly_at_the_end_is_counted(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    evidence_dir = _root_count_at(tmp_path, store, run_id, END)
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.snapshot(scope).settled == Money("USD", 22_500)
+
+
+def test_root_token_count_one_millisecond_after_the_end_fails_closed(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    evidence_dir = _root_count_at(tmp_path, store, run_id, END + timedelta(milliseconds=1))
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    assert store.run_completed_at(run_id) is None
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_remeter_journal_is_emitted_once_across_sweeps(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
+    store.bind_event_outbox(log.prepare, log.append_committed)
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+    reconciler = CodexSpendReconciler(store, (str(evidence_dir),))
+
+    assert reconciler.reconcile(run_id)
+    reconciler.reconcile(run_id)
+
+    payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
+    assert sum(isinstance(p, NativeUsageRemetered) for p in payloads) == 1
 
 
 def test_untimestamped_root_usage_inside_the_bounded_window_fails_closed(tmp_path):

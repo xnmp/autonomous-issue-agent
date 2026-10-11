@@ -420,11 +420,11 @@ Spend evidence freezes the meter's failure text. Recovery parses it once into
 `NativeFailure`; for the ambiguous-token-count class (fully determined by the
 retained rollouts) it re-runs the meter over `codex_home` and, when that now
 measures, settles through the normal reconcile path and journals
-`accounting.native_usage.remetered.v1` (once per run and class). Every recovery read
+`accounting.native_usage.remetered.v1` (once per run and class, in the settlement transaction). Every recovery read
 (root cumulative usage and all child events) is bounded by the harness-owned
 `runs.completed_at`, so a later leg resuming the same session is never billed to
 the ended run; an event without a parseable timestamp fails closed, and a run
-with no `completed_at` stays unbounded. A still-failing, missing or malformed
+with no `completed_at` is not re-metered; a root token_count after the end also fails closed. A still-failing, missing or malformed
 re-read keeps the unavailable result and its retained obligation, and every
 other frozen failure class stays final without reading rollouts. Recovery requires the complete version-2 invocation/card evidence.
 Unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child

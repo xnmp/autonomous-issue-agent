@@ -25,7 +25,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from ..domain import continuation_components as cc
-from .codex_child_usage import NativeFailure
+from .codex_child_usage import NativeFailure, RemeterOutcome
 from ..domain.contracts import ContinuationAdmission
 
 from ..domain.contracts import (
@@ -4112,20 +4112,22 @@ class SQLiteControlStore:
             row = db.execute("SELECT completed_at FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         return _parse_stamp(row["completed_at"]).timestamp() if row is not None and row["completed_at"] else None
 
-    def record_native_remetered(self, run_id: RunId, failure: NativeFailure, outcome: str) -> bool:
-        """Journal a re-metered recovery once per run and failure class."""
-        if not outcome:
-            raise ValueError("native re-meter journal requires its outcome")
+    def settle_remetered(self, request: SettlementRequest, failure: NativeFailure,
+                         outcome: RemeterOutcome) -> SettlementResult:
+        """Settle a re-metered run and journal it in the same transaction, at most once."""
         with self.transaction() as db:
-            claimed = db.execute(
-                "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                "VALUES ('native-remetered',?,?,?,?)",
-                (str(run_id), failure.name, _stamp(self._now()), outcome),
-            ).rowcount
-            if claimed:
-                self._event(db, NativeUsageRemetered(str(run_id), failure.name, outcome),
-                            correlation=Correlation(run_id=str(run_id)))
-            return bool(claimed)
+            result = self._settle(db, request)
+            if result.disposition is AccountingDisposition.AVAILABLE:
+                claimed = db.execute(
+                    "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                    "VALUES ('native-remetered',?,?,?,?)",
+                    (str(request.run_id), failure.name, _stamp(self._now()),
+                     json.dumps({"outcome": outcome.value})),
+                ).rowcount
+                if claimed:
+                    self._event(db, NativeUsageRemetered(str(request.run_id), failure.name, outcome.value),
+                                correlation=Correlation(run_id=str(request.run_id)))
+            return result
 
     def record_admission_reconciled(
         self,

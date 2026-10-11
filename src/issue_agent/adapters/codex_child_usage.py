@@ -35,6 +35,10 @@ class NativeFailure(str, Enum):
         return next((member for member in cls if raw == member.value), None)
 
 
+class RemeterOutcome(str, Enum):
+    MEASURED = "measured"
+
+
 def normalize_usage(raw: dict) -> TokenUsage:
     if not isinstance(raw, dict) or not {"input_tokens", "output_tokens"} <= raw.keys():
         raise ValueError("native usage record lacks explicit input/output counters")

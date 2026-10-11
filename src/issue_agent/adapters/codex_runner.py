@@ -532,7 +532,9 @@ def read_rollout_usage(
 
     `until` (epoch seconds) ignores token_counts stamped after it, so recovery of
     a finished run cannot absorb a later leg that resumed the session; a
-    token_count without a parseable timestamp then reads as None (fail closed).
+    token_count without a parseable timestamp, or any token_count after it,
+    reads as None (fail closed): the run's end is not corroborated by a clean
+    stop in the root rollout.
     """
     if not session_id:
         return None
@@ -557,7 +559,7 @@ def read_rollout_usage(
                 if payload.get("type") != "token_count":
                     continue
                 if until is not None and _rollout_event_time(event) > until:
-                    continue
+                    return None
                 total = (payload.get("info") or {}).get("total_token_usage") or {}
                 if total:
                     found = total
