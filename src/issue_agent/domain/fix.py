@@ -1715,8 +1715,8 @@ def decide_fix(
       auto-merge (lock-free) → cleanup of merged/closed PRs (lock-free).
 
     A red PR's FIRST failure on a head emits `RerunFailedChecks` INSTEAD of the
-    FIX_CI dispatch (#38) — a free GitHub-side action, so it consumes no fixer
-    either.
+    FIX_CI dispatch (#38) — a free GitHub-side action, so it neither requires
+    nor consumes paid capacity or path reservations.
 
     `dispatch_slots=None` preserves the legacy single-fixer contract: idle means
     one slot, busy means none. The fix daemon passes its pool's current free
@@ -1819,13 +1819,15 @@ def decide_fix(
     inflight = list(state.inflight)
     issues_by_number = {issue.number: issue for issue in world.issues}
 
-    def dispatchable(issue: int, paths: frozenset[str]) -> bool:
+    def target_available(issue: int) -> bool:
         if issue in state.infra_control_errors or issue in state.machine_control_errors or issue in state.budget_control_errors:
             return False
+        return all(active.issue != issue for active in inflight)
+
+    def dispatchable(issue: int, paths: frozenset[str]) -> bool:
         exclusive = not paths
-        return all(
-            active.issue != issue
-            and not exclusive
+        return target_available(issue) and all(
+            not exclusive
             and not active.exclusive
             and not (active.paths and paths & active.paths)
             for active in inflight
@@ -1954,165 +1956,166 @@ def decide_fix(
                 actions.append(RunAgent(AgentKind.PR_RESUME, pr.number))
                 claim(issue, paths)
             continue
-        if remaining:
-            issue_n = _issue_for_pr(pr)
-            bkey = breaker_key(pr)  # retry-counter key (issue N, or -PR when issueless)
-            # 3·0) A PR the fixer CANNOT resolve to an issue (no closing-ref AND a
-            # non-numeric branch — e.g. a Jira-keyed `feat/ACME-2468-…` PR opened
-            # outside the harness) has no issue-keyed worktree/session, so every
-            # fixer agent (rebase/address-review/fix-ci) early-returns without doing
-            # work — re-dispatching forever (observed: PR #112 rebase loop). The
-            # fixer can't drive it; hand it to a human ONCE and stop re-acting. Only
-            # when it actually needs the fixer (conflict / changes-requested / CI
-            # fail); a clean issueless PR is left for the reviewer + auto-merge.
-            if issue_n is None:
-                _rev = latest_other_review(pr.reviews, cfg.fix_bot)
-                needs_fix = (
-                    (cfg.auto_rebase_conflicts and pr.is_conflicting())
-                    or (_rev is not None and _rev.state == REVIEW_CHANGES_REQUESTED)
-                    or ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
-                    == CIState.FAILURE
-                )
-                if needs_fix:
-                    actions.extend(_escalate_pr(
-                        pr.number,
-                        "this PR has no linked GitHub issue (no `Closes #n` and a "
-                        "branch without an issue number), so the issue-scoped fixer "
-                        "can't drive it — a human needs to rebase/fix or link an issue.",
-                    ))
-                continue
-            # 3a) CONFLICTING branch → wake the fixer to rebase onto base. The
-            # backup plan for a conflict that slipped past the pre-dispatch
-            # file-overlap gate (two in-flight PRs colliding, or an issue that
-            # declared no paths). The agent already has the worktree + session —
-            # it just needs re-triggering (its session ended at pr_opened, before
-            # the conflict existed). Bounded by a breaker → needs-human-review, so
-            # a conflict it genuinely can't resolve escalates instead of looping.
-            if cfg.auto_rebase_conflicts and pr.is_conflicting():
-                paths = pr.changed_files | issue_paths(issue_n)
-                if not dispatchable(issue_n, paths):
-                    continue
-                if infra_ceiling_hit(state, cfg, bkey):
-                    actions.extend(_escalate_pr(
-                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                    continue
-                if breaker_tripped(state.rebase_retries.get(bkey, 0),
-                                   cfg.max_rebase_retries):
-                    actions.extend(_escalate_pr(
-                        pr.number,
-                        f"rebase failed {cfg.max_rebase_retries}× without a clean "
-                        "merge — the conflict needs a human.",
-                    ))
-                    continue
-                # Admission refuses an unresolved allowance; selecting it again
-                # would consume the slot without launching any paid work.
-                if _has_pending_rebase_return(state, issue_n):
-                    actions.append(NoOp(
-                        f"rebase #{pr.number} held: waiting for the current workflow's durable rebase return"
-                    ))
-                    continue
-                actions.append(RunAgent(AgentKind.REBASE, pr.number))
-                claim(issue_n, paths)
-                continue
-            review = latest_other_review(pr.reviews, cfg.fix_bot)
-            if (
-                review is not None
-                and review.state == REVIEW_CHANGES_REQUESTED
-                and not review_superseded(review, pr)
-            ):
-                paths = pr.changed_files | issue_paths(issue_n)
-                if not dispatchable(issue_n, paths):
-                    continue
-                # Circuit breaker: repeated address-review ATTEMPTS on the SAME
-                # review escalate to a human rather than looping forever. The
-                # counter is keyed to the review's submitted_at — a stored count
-                # from an OLDER review reads as 0 (superseded = reset), and
-                # nothing else resets it (see FixState.review_retries).
-                if bkey in state.review_control_errors:
-                    continue
-                if infra_ceiling_hit(state, cfg, bkey):
-                    actions.extend(_escalate_pr(
-                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                    continue
-                at, n = state.review_retries.get(bkey, ("", 0))
-                count = n if at == review.submitted_at else 0
-                if breaker_tripped(count, cfg.max_review_retries):
-                    actions.extend(_escalate_pr(
-                        pr.number,
-                        f"address-review failed {cfg.max_review_retries}× without resolution.",
-                    ))
-                    continue
-                actions.append(RunAgent(AgentKind.ADDRESS_REVIEW, pr.number))
-                claim(issue_n, paths)
-                continue
-            # A superseded CHANGES_REQUESTED review (head moved past it) falls
-            # through: the fixer's push is awaiting re-review, but a CI failure
-            # on the NEW head is still the fixer's to fix.
-            # (The `not lifecycle.is_working` conjunct that used to guard this
-            # was deleted with the rest of the phantom PR busy-marker — review
-            # M22/D9: nothing ever adds ai-working to a PR, so it was
-            # permanently true. See decide_fix's docstring for the live lease.)
-            current_ci = ci_state(
-                pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+        issue_n = _issue_for_pr(pr)
+        bkey = breaker_key(pr)  # retry-counter key (issue N, or -PR when issueless)
+        # 3·0) A PR the fixer CANNOT resolve to an issue (no closing-ref AND a
+        # non-numeric branch — e.g. a Jira-keyed `feat/ACME-2468-…` PR opened
+        # outside the harness) has no issue-keyed worktree/session, so every
+        # fixer agent (rebase/address-review/fix-ci) early-returns without doing
+        # work — re-dispatching forever (observed: PR #112 rebase loop). The
+        # fixer can't drive it; hand it to a human ONCE and stop re-acting. Only
+        # when it actually needs the fixer (conflict / changes-requested / CI
+        # fail); a clean issueless PR is left for the reviewer + auto-merge.
+        if issue_n is None:
+            _rev = latest_other_review(pr.reviews, cfg.fix_bot)
+            needs_fix = (
+                (cfg.auto_rebase_conflicts and pr.is_conflicting())
+                or (_rev is not None and _rev.state == REVIEW_CHANGES_REQUESTED)
+                or ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
+                == CIState.FAILURE
             )
-            # Settled GREEN closes the red-CI episode: the breaker's text is
-            # "without going green", so going green must reset it. The counter
-            # was lifetime-per-issue, so a later unrelated red episode (base
-            # drift, a new review round's push) inherited the spent budget and
-            # could escalate on its FIRST repair attempt (latent class, keifu
-            # PR #181 diagnosis 2026-08-03; review_retries' submitted_at key
-            # is the same episode idea). OK only — NONE means "no checks
-            # reported", which is absence of a verdict, not a green one.
-            if current_ci == CIState.OK and state.ci_retries.get(bkey, 0) > 0:
-                actions.append(ResetCiRetries(issue_n, state.ci_resets.get(pr.number)))
-            if current_ci == CIState.FAILURE:
-                if ci_remediation_owed(pr, state):
-                    continue
-                paths = pr.changed_files | issue_paths(issue_n)
-                if not dispatchable(issue_n, paths):
-                    continue
-                if infra_ceiling_hit(state, cfg, bkey):
-                    actions.extend(_escalate_pr(
-                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                    continue
-                if breaker_tripped(state.ci_retries.get(bkey, 0),
-                                   cfg.max_ci_retries):
-                    actions.extend(_escalate_pr(
-                        pr.number,
-                        f"CI fix failed {cfg.max_ci_retries}× without going green.",
-                    ))
-                    continue
-                # Flake first (#38): one free `gh run rerun --failed` per head
-                # SHA before any paid repair. Two FIX_CI legs of one deployment
-                # night ($13.15 + $28.88, plus a $8 review tail on the second)
-                # both "fixed" the same pre-existing flaky test that neither
-                # PR's diff had touched — ≈$80 of a $188 batch. A re-run costs
-                # one CI cycle and no tokens.
-                #
-                # AFTER the breakers on purpose: a PR that has already burnt its
-                # CI-fix budget belongs to a human, and delaying that handover by
-                # a CI cycle would move the escalation-latency the wrong way. In
-                # practice the two never meet — the free re-run fires on the
-                # FIRST failure of a head, when the counter is 0.
-                #
-                # Emits no RunAgent, so the dispatch budget is untouched: this costs no
-                # fixer and another PR may still dispatch a real leg this poll.
-                # The re-run flips the checks to PENDING, and the #49
-                # pending-outranks-failure rule then makes the fixer wait for
-                # them without any special casing here — while #30's pending
-                # deadline stops that wait from becoming the new deadlock.
-                if free_ci_rerun(pr, state, cfg):
-                    actions.append(
-                        RerunFailedChecks(
-                            pr.number,
-                            pr.head_ref_oid,
-                            ci_rerun_run_ids(pr, cfg),
-                        )
-                    )
-                    continue
-                actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
-                claim(issue_n, paths)
+            if needs_fix:
+                actions.extend(_escalate_pr(
+                    pr.number,
+                    "this PR has no linked GitHub issue (no `Closes #n` and a "
+                    "branch without an issue number), so the issue-scoped fixer "
+                    "can't drive it — a human needs to rebase/fix or link an issue.",
+                ))
+            continue
+        # 3a) CONFLICTING branch → wake the fixer to rebase onto base. The
+        # backup plan for a conflict that slipped past the pre-dispatch
+        # file-overlap gate (two in-flight PRs colliding, or an issue that
+        # declared no paths). The agent already has the worktree + session —
+        # it just needs re-triggering (its session ended at pr_opened, before
+        # the conflict existed). Bounded by a breaker → needs-human-review, so
+        # a conflict it genuinely can't resolve escalates instead of looping.
+        if cfg.auto_rebase_conflicts and pr.is_conflicting():
+            paths = pr.changed_files | issue_paths(issue_n)
+            if not remaining or not dispatchable(issue_n, paths):
                 continue
+            if infra_ceiling_hit(state, cfg, bkey):
+                actions.extend(_escalate_pr(
+                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                continue
+            if breaker_tripped(state.rebase_retries.get(bkey, 0),
+                               cfg.max_rebase_retries):
+                actions.extend(_escalate_pr(
+                    pr.number,
+                    f"rebase failed {cfg.max_rebase_retries}× without a clean "
+                    "merge — the conflict needs a human.",
+                ))
+                continue
+            # Admission refuses an unresolved allowance; selecting it again
+            # would consume the slot without launching any paid work.
+            if _has_pending_rebase_return(state, issue_n):
+                actions.append(NoOp(
+                    f"rebase #{pr.number} held: waiting for the current workflow's durable rebase return"
+                ))
+                continue
+            actions.append(RunAgent(AgentKind.REBASE, pr.number))
+            claim(issue_n, paths)
+            continue
+        review = latest_other_review(pr.reviews, cfg.fix_bot)
+        if (
+            review is not None
+            and review.state == REVIEW_CHANGES_REQUESTED
+            and not review_superseded(review, pr)
+        ):
+            paths = pr.changed_files | issue_paths(issue_n)
+            if not remaining or not dispatchable(issue_n, paths):
+                continue
+            # Circuit breaker: repeated address-review ATTEMPTS on the SAME
+            # review escalate to a human rather than looping forever. The
+            # counter is keyed to the review's submitted_at — a stored count
+            # from an OLDER review reads as 0 (superseded = reset), and
+            # nothing else resets it (see FixState.review_retries).
+            if bkey in state.review_control_errors:
+                continue
+            if infra_ceiling_hit(state, cfg, bkey):
+                actions.extend(_escalate_pr(
+                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                continue
+            at, n = state.review_retries.get(bkey, ("", 0))
+            count = n if at == review.submitted_at else 0
+            if breaker_tripped(count, cfg.max_review_retries):
+                actions.extend(_escalate_pr(
+                    pr.number,
+                    f"address-review failed {cfg.max_review_retries}× without resolution.",
+                ))
+                continue
+            actions.append(RunAgent(AgentKind.ADDRESS_REVIEW, pr.number))
+            claim(issue_n, paths)
+            continue
+        # A superseded CHANGES_REQUESTED review (head moved past it) falls
+        # through: the fixer's push is awaiting re-review, but a CI failure
+        # on the NEW head is still the fixer's to fix.
+        # (The `not lifecycle.is_working` conjunct that used to guard this
+        # was deleted with the rest of the phantom PR busy-marker — review
+        # M22/D9: nothing ever adds ai-working to a PR, so it was
+        # permanently true. See decide_fix's docstring for the live lease.)
+        current_ci = ci_state(
+            pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+        )
+        # Settled GREEN closes the red-CI episode: the breaker's text is
+        # "without going green", so going green must reset it. The counter
+        # was lifetime-per-issue, so a later unrelated red episode (base
+        # drift, a new review round's push) inherited the spent budget and
+        # could escalate on its FIRST repair attempt (latent class, keifu
+        # PR #181 diagnosis 2026-08-03; review_retries' submitted_at key
+        # is the same episode idea). OK only — NONE means "no checks
+        # reported", which is absence of a verdict, not a green one.
+        if current_ci == CIState.OK and state.ci_retries.get(bkey, 0) > 0:
+            actions.append(ResetCiRetries(issue_n, state.ci_resets.get(pr.number)))
+        if current_ci == CIState.FAILURE:
+            if ci_remediation_owed(pr, state):
+                continue
+            if not target_available(issue_n):
+                continue
+            if infra_ceiling_hit(state, cfg, bkey):
+                actions.extend(_escalate_pr(
+                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                continue
+            if breaker_tripped(state.ci_retries.get(bkey, 0),
+                               cfg.max_ci_retries):
+                actions.extend(_escalate_pr(
+                    pr.number,
+                    f"CI fix failed {cfg.max_ci_retries}× without going green.",
+                ))
+                continue
+            # Flake first (#38): one free `gh run rerun --failed` per head
+            # SHA before any paid repair. Two FIX_CI legs of one deployment
+            # night ($13.15 + $28.88, plus a $8 review tail on the second)
+            # both "fixed" the same pre-existing flaky test that neither
+            # PR's diff had touched — ≈$80 of a $188 batch. A re-run costs
+            # one CI cycle and no tokens.
+            #
+            # AFTER the breakers on purpose: a PR that has already burnt its
+            # CI-fix budget belongs to a human, and delaying that handover by
+            # a CI cycle would move the escalation-latency the wrong way. In
+            # practice the two never meet — the free re-run fires on the
+            # FIRST failure of a head, when the counter is 0.
+            #
+            # Emits no RunAgent, so the dispatch budget is untouched: this costs no
+            # fixer and another PR may still dispatch a real leg this poll.
+            # The re-run flips the checks to PENDING, and the #49
+            # pending-outranks-failure rule then makes the fixer wait for
+            # them without any special casing here — while #30's pending
+            # deadline stops that wait from becoming the new deadlock.
+            if free_ci_rerun(pr, state, cfg):
+                actions.append(
+                    RerunFailedChecks(
+                        pr.number,
+                        pr.head_ref_oid,
+                        ci_rerun_run_ids(pr, cfg),
+                    )
+                )
+                continue
+            paths = pr.changed_files | issue_paths(issue_n)
+            if not remaining or not dispatchable(issue_n, paths):
+                continue
+            actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
+            claim(issue_n, paths)
+            continue
 
     # 2) Blocked issues with NEW answers, up to the remaining disjoint slots.
     if remaining:
@@ -2200,7 +2203,7 @@ def decide_fix(
     # lock states. (A PR escalated on an EARLIER poll carries needs-human-review,
     # so is_blocked keeps it out; a PR escalated on THIS poll is not filtered,
     # because reading this poll's escalations would re-import pool dependence —
-    # escalation itself only happens when a dispatch slot is available.)
+    # some paid-repair escalations still depend on dispatch capacity.)
     for pr in open_prs:
         if not isinstance(pr_eligibility(pr, LifecycleOperation.MERGE), AllowedEligibility):
             continue  # a human owns the next move — don't arm anything
