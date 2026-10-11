@@ -73,3 +73,6 @@ content remains trusted until process/credential separation is implemented.
 - Target tests cannot mutate harness control state through inherited authority.
 - Hook bypass remains possible in the current same-account posture, so gates
   cannot replace durable effect or accounting controls.
+
+Screenshot-read receipts and visual-evidence bookkeeping were superseded by #327
+(2026-10-12): the reviewer judges screenshot evidence; the 700KB image limit remains.

@@ -137,24 +137,6 @@ def test_nonpublishing_author_does_not_gain_native_review_authorization():
     assert "user explicitly authorizes" not in task.prompt
 
 
-def test_receiptless_runtime_gets_the_visual_evidence_note():
-    # Codex cannot mint screenshot-read receipts (#153): the fixer must be told
-    # the reviewer is its evidence's only verifier, and that the visual path is
-    # OPEN (keifu #142 burned a leg + a human question on a prompt that forbade
-    # it). Receipted runtimes (claude) keep AGENT.md untouched.
-    cfg = replace(FIX_CFG, mints_visual_receipts=False)
-    prompt = build_resolve_task(5, U("t"), U("b"), "/wt", cfg).append_system_prompt
-    assert prompt.startswith("AGENTMD")
-    # Assert on text unique to the VISUAL note: "independent reviewer" alone
-    # now also appears in the standing autonomy contract, so it would pass
-    # vacuously on a runtime that never got this note.
-    assert "RUNTIME NOTE — visual evidence" in prompt
-    assert "cannot record trusted screenshot-read receipts" in prompt
-    assert "NEVER" not in prompt          # the path is open, not forbidden
-    receipted = build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG)
-    assert "RUNTIME NOTE — visual evidence" not in receipted.append_system_prompt
-
-
 def test_review_prompt_makes_the_reviewer_the_sole_evidence_verifier():
     t = build_review_task(
         7, U("t"), U("b"), U("diff"),

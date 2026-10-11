@@ -302,12 +302,12 @@ rm -rf "$d"
 
 d=$(setup_pr_repo) || fixture_die "setup_pr_repo failed"
 out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_NO_AC" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "missing AC blocked" || no "missing AC blocked" "rc=$rc"
+[ "$rc" -eq 0 ] && ok "missing AC passes to broker" || no "missing AC passes to broker" "rc=$rc"
 rm -rf "$d"
 
 d=$(setup_pr_repo) || fixture_die "setup_pr_repo failed"
 out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_NO_LINK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "missing Fixes #n blocked" || no "missing Fixes #n blocked" "rc=$rc"
+[ "$rc" -eq 0 ] && ok "missing issue link passes to broker" || no "missing issue link passes to broker" "rc=$rc"
 rm -rf "$d"
 
 # fix/ branch with NO test file in the diff → blocked.
@@ -851,130 +851,6 @@ out=$( fixture_cd "$d" && BASE_BRANCH=dev TEST_CMD='test -f mod.py' bash "$CHECK
 
 Fixes #14' 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "feat/ accepts conventional test name" || no "feat/ accepts conventional test name" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-echo "== check-pr.sh §7d (one screenshot per AC item) =="
-# Fixture: a compliant fix/ PR that ALSO declares a visual acceptance criterion
-# and commits <n> screenshots, all recorded as read by the agent.
-setup_visual_repo() {  # setup_visual_repo <n-screenshots> [<n-read>]
-  local d n read_n i; d=$(setup_pr_repo) || fixture_die "setup_pr_repo failed"; n="$1"; read_n="${2:-$1}"
-  : > "$d.trusted-screenshots-read"
-  ( fixture_cd "$d"
-    mkdir -p evidence
-    : > .harness/visual-ac
-    i=1
-    while [ "$i" -le "$n" ]; do
-      # Distinct bytes per shot: the gate rejects byte-identical evidence.
-      printf '\x89PNG shot %s' "$i" > "evidence/ac-$i.png"
-      [ "$i" -le "$read_n" ] && echo "ac-$i.png" >> "$d.trusted-screenshots-read"
-      i=$((i + 1))
-    done
-    if [ "$n" -gt 0 ]; then
-      git add evidence
-      git -c core.hooksPath=/dev/null commit -qm "evidence: screenshots"
-    fi ) || fixture_die "visual fixture setup failed"
-  printf '%s\n' "$d"
-}
-AC3_LINKED=$'## Acceptance Criteria\n- [ ] one\n  ![the one state rendered](evidence/ac-1.png)\n- [ ] two\n  ![the two state rendered](evidence/ac-2.png)\n- [ ] three\n  ![the three state rendered](evidence/ac-3.png)\n\nFixes #7'
-AC3_ONE_LINK=$'## Acceptance Criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n![only one](evidence/ac-1.png)\n\nFixes #7'
-
-# 3 AC items but only 2 screenshots → blocked, message names both counts.
-d=$(setup_visual_repo 2) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '3 AC items but only 2'; } \
-  && ok "3 AC items with 2 screenshots blocked (counts named)" \
-  || no "per-AC screenshot count enforced" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# 3 AC items, 3 read+committed screenshots, each referenced → allowed.
-d=$(setup_visual_repo 3) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "one screenshot per AC item passes" || no "one screenshot per AC item passes" "rc=$rc out=${out:0:200}"
-
-# 3 AC items, images referenced but item 1's embed carries no claim (alt text
-# under 12 chars) → blocked, message names the item and the remedy.
-AC3_UNCLAIMED=$'## Acceptance Criteria\n- [ ] one\n  ![AC 1](evidence/ac-1.png)\n- [ ] two\n  ![the two state rendered](evidence/ac-2.png)\n- [ ] three\n  ![the three state rendered](evidence/ac-3.png)\n\nFixes #7'
-d=$(setup_visual_repo 3) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_UNCLAIMED" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'AC item 1 carries no evidence claim'; } \
-  && ok "AC item without an evidence claim blocked (item named)" \
-  || no "AC item without an evidence claim blocked" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-rm -rf "$d"
-
-# Enough screenshots, but the body links only one → blocked (unlinked shots are
-# invisible to the reviewer).
-d=$(setup_visual_repo 3) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_ONE_LINK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'references only 1'; } \
-  && ok "unreferenced screenshots blocked" || no "body must reference each screenshot" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Unparseable (prose) AC section → falls back to the ≥1-screenshot floor: one
-# read+committed shot passes even though the body links nothing.
-d=$(setup_visual_repo 1) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "prose AC section falls back to the 1-screenshot floor" || no "AC parse miss must not deny" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Floor still holds: visual-ac declared with no screenshot committed → blocked.
-d=$(setup_visual_repo 0) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no screenshot is committed'; } \
-  && ok "visual-ac without any screenshot blocked" || no "visual-ac floor (>=1 shot)" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Floor still holds: a committed screenshot the agent never READ → blocked.
-d=$(setup_visual_repo 3 2) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'never read/verified'; } \
-  && ok "unread screenshot blocked" || no "visual-ac floor (all shots read)" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Receipt-less runtime (HARNESS_SCREENSHOTS_READ unset — codex, #153): the
-# read check is skipped and committed evidence passes the fixer gate; the
-# independent reviewer is the sole content verifier (keifu #142/#156). An
-# agent-authored worktree marker is simply irrelevant, not a bypass vector.
-d=$(setup_visual_repo 1) || fixture_die "setup_visual_repo failed"
-rm -f "$d.trusted-screenshots-read"
-printf '%s\n' "ac-1.png" > "$d/.harness/screenshots-read"
-out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "receipt-less runtime passes evidence through to review" \
-  || no "receipt-less visual path must not dead-end" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Receipt-less runtime keeps the committed floor: no screenshot → still blocked.
-d=$(setup_visual_repo 0) || fixture_die "setup_visual_repo failed"
-out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no screenshot is committed'; } \
-  && ok "receipt-less runtime still requires a committed screenshot" \
-  || no "receipt-less floor (>=1 shot)" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Runtime that DOES mint receipts, but this read failed (var set, file gone) →
-# recoverable deny, never the capability dead-end.
-d=$(setup_visual_repo 1) || fixture_die "setup_visual_repo failed"
-rm -f "$d.trusted-screenshots-read"
-out=$( fixture_cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'receipt is unavailable'; } \
-  && ok "minted-but-unreadable receipt blocked as recoverable" \
-  || no "unreadable receipt deny" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# Byte-identical evidence images → blocked on EVERY runtime (#153 reuse gaming).
-d=$(setup_visual_repo 2) || fixture_die "setup_visual_repo failed"
-cp "$d/evidence/ac-1.png" "$d/evidence/ac-2.png"
-( fixture_cd "$d" && git add evidence && git -c core.hooksPath=/dev/null commit -qm "evidence: dupe" )
-out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'byte-identical'; } \
-  && ok "byte-identical evidence images blocked" \
-  || no "byte-identical evidence deny" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# No .harness/visual-ac → the whole rule is inert, even with a 3-item checklist.
-d=$(setup_pr_repo) || fixture_die "setup_pr_repo failed"
-out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "no visual-ac declared → no screenshot demanded" || no "non-visual PR unaffected" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 echo "== check-pr.sh §7c (red-must-actually-fail) =="

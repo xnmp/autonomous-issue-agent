@@ -73,18 +73,6 @@ def test_git_rebase_exec_is_denied() -> None:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="CLAIM-VISUAL-AC: visual scope is still agent-declared",
-)
-def test_visual_acceptance_scope_is_not_agent_writable(tmp_path) -> None:
-    marker_dir = tmp_path / ".harness"
-    marker_dir.mkdir()
-    (marker_dir / "visual-ac").touch()
-
-    assert HarnessMarkers(str(tmp_path)).visual_ac() is False
-
-
-@pytest.mark.xfail(
-    strict=True,
     reason="CLAIM-TEST-CMD: agent command selection remains the no-operator fallback",
 )
 def test_agent_marker_cannot_select_the_gate_test_command() -> None:

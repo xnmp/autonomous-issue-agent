@@ -15,7 +15,6 @@ fake; the production default shells out. Both advisory transports reuse the
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -1680,8 +1679,6 @@ def build_gate_context(
     gh: GhRunner = _subprocess_gh,
     run_tests: Callable[[str], bool] | None = None,
     retry_sleep: Callable[[], None] = _sleep_between_probes,
-    screenshots_read_path: str = "",
-    screenshots_receipt_key: bytes | None = None,
     durable_publish: bool = False,
 ) -> GateContext:
     """Gather the worktree facts the governor's gate rules need. Pure-ish: all
@@ -1806,117 +1803,6 @@ def build_gate_context(
                     )
 
     markers = HarnessMarkers(cwd)
-    screenshots_read: tuple[str, ...] = ()
-    screenshots_receipt_available = False
-    # Distinct from "unavailable": the runtime DOES mint receipts but this
-    # read failed (transient I/O). The gate must say "retry/read the images",
-    # never the capability dead-end message (adversarial P2-3 — the latter
-    # instructs deleting committed evidence over a recoverable condition).
-    screenshots_receipt_unreadable = False
-    if screenshots_read_path:
-        # A CONFIGURED path IS the capability statement: this runtime mints
-        # receipts, whatever happens to the read below. Anything less fails
-        # OPEN — e.g. a transient `git rev-parse HEAD` failure used to leave
-        # this False, which under receipt-less-pass-through gate semantics
-        # silently disables the read check on the SDK path (adversarial P1-1).
-        screenshots_receipt_available = True
-        try:
-            with open(screenshots_read_path, encoding="utf-8") as receipt:
-                lines = tuple(receipt.read(64 * 1024).splitlines())
-            if screenshots_receipt_key is None:
-                # Explicit compatibility surface for the shell parity harness.
-                # Production callers always supply the daemon-held signing key.
-                screenshots_read = tuple(
-                    line.strip() for line in lines if line.strip()
-                )
-            else:
-                head_result = git(["rev-parse", "HEAD"], cwd)
-                if head_result.code == 0 and head_result.out.strip():
-                    current_head = head_result.out.strip()
-                    verified: list[str] = []
-                    for line in lines:
-                        try:
-                            record = json.loads(line)
-                            payload = {
-                                "v": record["v"],
-                                "head": record["head"],
-                                "path": record["path"],
-                                "digest": record["digest"],
-                            }
-                            encoded = json.dumps(
-                                payload,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            )
-                            valid_signature = hmac.compare_digest(
-                                str(record["signature"]),
-                                hmac.new(
-                                    screenshots_receipt_key,
-                                    encoded.encode(),
-                                    hashlib.sha256,
-                                ).hexdigest(),
-                            )
-                            relative = str(record["path"])
-                            image_path = os.path.realpath(
-                                os.path.join(cwd, relative)
-                            )
-                            evidence_root = os.path.realpath(
-                                os.path.join(cwd, "evidence")
-                            )
-                            valid_path = (
-                                os.path.commonpath(
-                                    (image_path, evidence_root)
-                                )
-                                == evidence_root
-                            )
-                            if (
-                                not valid_signature
-                                or record["v"] != 1
-                                or record["head"] != current_head
-                                or not valid_path
-                            ):
-                                continue
-                            with open(image_path, "rb") as image:
-                                digest = hashlib.sha256(
-                                    image.read()
-                                ).hexdigest()
-                            if digest != record["digest"]:
-                                continue
-                            verified.append(os.path.basename(relative))
-                        except (
-                            KeyError,
-                            OSError,
-                            TypeError,
-                            ValueError,
-                            json.JSONDecodeError,
-                        ):
-                            continue
-                    screenshots_read = tuple(verified)
-        except OSError:
-            screenshots_read = ()
-            screenshots_receipt_unreadable = True
-
-    # Harness-side digests of committed evidence images: the byte-identical
-    # reuse check (#153) must not depend on receipts, so it reads the worktree
-    # directly on EVERY runtime. Per-file fail-soft: `changed` includes paths
-    # deleted later on the branch, and killing the whole map on one miss both
-    # disabled the rule (agent-triggerable: commit-then-delete a spare image)
-    # and diverged from check-pr.sh's `[ -f ] || continue` (adversarial P1-2).
-    # Guarded on the visual-ac marker because this runs on EVERY Bash call the
-    # agent makes — no I/O tax on the non-visual common case.
-    image_digests: dict[str, str] = {}
-    if markers.visual_ac():
-        for path in changed:
-            if not path.startswith("evidence/"):
-                continue
-            try:
-                with open(os.path.join(cwd, path), "rb") as image:
-                    image_digests[path] = hashlib.sha256(
-                        image.read()
-                    ).hexdigest()
-            except OSError:
-                continue
-
     def instruction_blobs(staged: bool) -> tuple[tuple[str, str], ...] | None:
         selected = git(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd) if staged else None
         if selected is not None and selected.code != 0:
@@ -2148,11 +2034,6 @@ def build_gate_context(
         open_pr=open_pr,
         open_pr_retry_sleep=retry_sleep,
         allow_untested=allow_untested,
-        visual_ac=markers.visual_ac(),
-        screenshots_read=screenshots_read,
-        screenshots_receipt_available=screenshots_receipt_available,
-        screenshots_receipt_unreadable=screenshots_receipt_unreadable,
-        image_digests=image_digests,
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,

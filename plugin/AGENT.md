@@ -98,79 +98,9 @@ daemon's memory limit and can kill the entire run.
    `chore(evidence): …`. Check for commitlint BEFORE your first commit; if present,
    use the scoped form for every commit. Do NOT disable the hook (`--no-verify` is
    blocked anyway).
-6. Put proof artifacts in `evidence/`. Non-image artifacts (logs, dumps) are
-   gitignored — do NOT commit them. Screenshot IMAGES (`.png/.jpg/.jpeg/.gif/.webp`)
-   under `evidence/` ARE committed — they render in the reviewer's Files-changed tab.
-   **Visual acceptance criteria:** if any criterion is visual (a rendered UI, a page
-   state, a chart), `touch .harness/visual-ac` and capture **one screenshot per AC
-   item** — not one screenshot for the whole PR. One shot proves one criterion, and
-   the reviewer opens each image and judges it against the criterion it claims to
-   prove. Concretely:
-   - **One image per AC checklist item**, captured from the ACTUALLY RUNNING app
-     (a real server/browser rendering your branch) — never a mockup, a hand-edited
-     image, a design file, or a screenshot of source code.
-   - **Name the file after the criterion it proves**: `evidence/ac-<n>-<slug>.png`
-     (e.g. `evidence/ac-2-empty-state.png`), at a resolution where the asserted
-     text/state is legible.
-   - **Write the PR's `## Acceptance Criteria` section as a `- [ ]` checklist** (one
-     line per criterion) and reference each image directly under its own item:
-
-         ## Acceptance Criteria
-         - [ ] the browser tab title reads "My App"
-           ![tab title reads "My App" on the running branch](evidence/ac-1-tab-title.png)
-         - [ ] the empty list shows the "Add your first item" CTA
-           ![empty list with the "Add your first item" CTA visible](evidence/ac-2-empty-state.png)
-
-     The image's ALT TEXT is your CLAIM (12+ characters): state what the shot
-     shows that proves the criterion — the state, zoom, data, or theme the
-     criterion asserts. The PR gate counts the checklist items and requires
-     that many read+committed screenshots, that many `evidence/…` references,
-     AND a claim under every item; the reviewer verifies each image against
-     exactly its claim. Before committing, re-open each image and confirm your
-     claim is actually true in it — a screenshot that exists but demonstrates
-     nothing costs a full review round. (A prose, non-checklist AC section
-     falls back to requiring a single screenshot, but then the reviewer has to
-     guess which criterion it proves — write the checklist.)
-   - **Repair legs carry unaffected evidence forward.** On address-review or
-     fix-CI, keep the existing capture for every acceptance criterion whose
-     behavior the repair does not change. Re-capture only criteria touched by the
-     feedback/failure or by the repair, and keep every carried or new image directly
-     mapped to its criterion in the PR body.
-
-   Two ways to capture — pick by whether the shot is a byproduct of the asserting test:
-     - **Playwright-native (preferred IF the repo's e2e test already drives the page
-       to the asserted state):** capture inside that test as a side-effect of the
-       assertion — `await expect(...).toHaveText('X'); await page.screenshot({ path:
-       'evidence/<name>.png' });` — so the image is GUARANTEED to depict the exact
-       state the test asserts (no test↔screenshot drift) and reuses the browser the
-       test already drove. Run the test once to produce the file, then `git add` it.
-     - **agent-browser (otherwise — no e2e setup, or the shot is a separate action
-       from the asserting test):** start the preview/dev server and
-       `agent-browser open <url>` then `agent-browser screenshot evidence/<name>.png`.
-
-       **How to start that server.** The `run_in_background` TOOL OPTION is denied
-       (it ends your turn without a result and loses the whole run) — but that is
-       NOT a ban on long-running processes. Detach it in the shell instead:
-
-           nohup bun run dev > /tmp/dev-<port>.log 2>&1 &     # run_in_background omitted
-           # wait for readiness rather than sleeping blindly:
-           for i in $(seq 30); do curl -sf localhost:<port> >/dev/null && break; sleep 1; done
-
-       That returns immediately, survives across later tool calls, and is allowed.
-       Kill it when you are done. Do NOT run a server as a plain foreground command
-       — it never returns and burns your whole budget waiting. If the repo's
-       Playwright config has a `webServer` block it already does all of this for
-       you; prefer that and start nothing yourself.
-   Either way, COMMIT the screenshot before opening the PR (the PR gate's red-check
-   transiently reverts the impl and re-runs the tests, which could overwrite a
-   test-produced screenshot in the working tree with a reverted-state image — the
-   COMMITTED blob is what the reviewer sees, so commit the good one first). Evidence
-   must exist before the PR, NOT before the adversarial review — capture may run
-   concurrently with it (step 8). Then **Read every screenshot
-   you captured** with the Read tool and confirm it actually shows the criterion met.
-   A screenshot you did not Read blocks PR creation (the gate requires you to have
-   looked at it), and one that does not genuinely constitute the evidence will be
-   rejected by the reviewer — so verify it really demonstrates the behaviour first.
+6. For a UI-facing change, commit screenshot evidence from the running app under
+   `evidence/`; the reviewer judges whether it demonstrates the changed behavior.
+   Keep each image at or below 700KB.
 7. `docs:` update folder `CLAUDE.md` with anything non-obvious you learned.
 8. Adversarial review — overlap it with evidence capture instead of serializing.
    The review judges the diff + acceptance criteria (tests, layers, seams); it does
@@ -179,14 +109,14 @@ daemon's memory limit and can kill the entire run.
    - **If step 6's screenshots are still uncaptured** (they were not a test
      byproduct): spawn, IN ONE SINGLE MESSAGE so they run concurrently, BOTH the
      adversarial pre-PR subagent AND an evidence-capture subagent that follows
-     step 6's mechanics (detached dev server, one screenshot per visual AC item
-     into `evidence/`, report the file paths). A subagent launched in a later
+     step 6 (screenshots from the running app into `evidence/`, report the file
+     paths). A subagent launched in a later
      message serializes behind the first and wastes the 6–9 min review wait; a
      background/detached subagent is NOT allowed — both must be blocking calls in
-     the same message. When both return, commit the screenshots and Read each one
-     (step 6) while acting on the verdict.
+     the same message. When both return, commit the screenshots while acting on
+     the verdict.
    - **If evidence already exists** (test-byproduct screenshots, or no visual
-     ACs): commit + Read it per step 6, then spawn the adversarial subagent alone.
+     ACs): commit it per step 6, then spawn the adversarial subagent alone.
    The adversarial subagent gets a fresh context and only the diff + acceptance
    criteria + whatever evidence is already committed. It must return PASS. Write
    Record its findings in the PR description or review discussion. This is
@@ -217,11 +147,9 @@ daemon's memory limit and can kill the entire run.
    `issue-agent-publish gh pr create …` to open the PR, and
    `issue-agent-publish gh pr edit <your PR number> --body '…'` to REPLACE your
    own PR's body (the whole body — the flag overwrites, it does not append).
-   That is the supported way to keep the acceptance-criteria checklist and its
-   evidence references current after a repair; the broker refuses any PR number
-   other than the one on your branch. A replacement body must still pass the
-   same body gate `gh pr create` does — keep the `## Acceptance Criteria`
-   section and the `Fixes #<issue>` line, or the edit is refused. For a long
+   The broker supplies missing acceptance criteria from the issue and closing
+   linkage on both creation and replacement; it edits only your branch's PR.
+   For a long
    markdown body, write it to a scratch file and pass `--body "$(cat body.md)"`
    — the broker takes a literal value only, so `--body-file` is rejected. The
    broker commits a
@@ -231,9 +159,6 @@ daemon's memory limit and can kill the entire run.
    `gh pr create`. Without it, `gh` targets the repo's
    DEFAULT branch (often `main`), which routes the PR through the wrong branch's CI
    and breaks auto-merge; the PR gate rejects a PR whose base ≠ `$BASE_BRANCH`.
-   Include a `## Acceptance Criteria` section — written as a `- [ ]` checklist, one
-   line per criterion, each visual one followed by its `evidence/…` image reference
-   (step 6) — and `Fixes #$ISSUE_NUMBER` in the body.
 
 ## Hard rules
 - Do NOT use `--no-verify`, `-n` on commit, `HUSKY=0`, or override

@@ -16,7 +16,6 @@ from issue_agent.adapters.governor import (
     evaluate_command,
     make_posttooluse_hook,
     make_pretooluse_hook,
-    make_read_record_hook,
 )
 
 
@@ -854,45 +853,6 @@ def test_posttooluse_fails_open_on_runner_error():
     hook = make_posttooluse_hook("tsc", run_check=boom)
     out = asyncio.run(hook({"cwd": "/x"}, "id", None))
     assert out == {}  # never wedge the agent over a broken check
-
-
-# ── PostToolUse(Read) screenshot-read recorder ────────────────────────────────
-def _read_hook_with_recorder():
-    recorded = []
-    hook = make_read_record_hook(record=lambda cwd, name: recorded.append((cwd, name)))
-    return hook, recorded
-
-
-def test_read_record_logs_evidence_image():
-    hook, recorded = _read_hook_with_recorder()
-    out = asyncio.run(hook(
-        {"tool_input": {"file_path": "/wt/issue-5/evidence/tab.png"}, "cwd": "/wt/issue-5"}, "id", None
-    ))
-    assert out == {}                       # observe-only
-    assert recorded == [("/wt/issue-5", "/wt/issue-5/evidence/tab.png")]
-
-
-def test_read_record_ignores_non_image():
-    hook, recorded = _read_hook_with_recorder()
-    asyncio.run(hook({"tool_input": {"file_path": "evidence/run.log"}, "cwd": "/x"}, "id", None))
-    assert recorded == []
-
-
-def test_read_record_ignores_image_outside_evidence():
-    hook, recorded = _read_hook_with_recorder()
-    asyncio.run(hook({"tool_input": {"file_path": "src/assets/logo.png"}, "cwd": "/x"}, "id", None))
-    assert recorded == []
-
-
-def test_read_record_fails_open():
-    def boom(cwd, name):
-        raise RuntimeError("disk full")
-
-    hook = make_read_record_hook(record=boom)
-    out = asyncio.run(hook(
-        {"tool_input": {"file_path": "evidence/a.png"}, "cwd": "/x"}, "id", None
-    ))
-    assert out == {}  # recorder error never wedges the agent
 
 
 # ── malformed Gate-Exemption hint (ADR 0014) ─────────────────────────────────

@@ -47,6 +47,8 @@ class Remote:
         self.pr_base = ""
         self.pr_auto_merge = False
         self.pr_body = "## Acceptance Criteria\n- [ ] a\n\nFixes #42"
+        self.issue_data = {"body": "## Acceptance Criteria\n- [ ] issue contract", "comments": []}
+        self.issue_view_fails = False
         self.body_view_fails = False
         self.effects = []
         self.crash_after_push = False
@@ -64,6 +66,9 @@ class Remote:
         self.fetch_fails = False
 
     def run(self, argv, _cwd):
+        if argv[:3] == ("gh", "issue", "view"):
+            assert argv[3:] == ("42", "--repo", "github.com/o/r", "--json", "body,comments")
+            return CommandResult(1 if self.issue_view_fails else 0, json.dumps(self.issue_data))
         if argv[:2] == ("git", "cat-file"):
             return CommandResult(1 if self.prior_object_missing else 0, "")
         if argv[:2] == ("git", "fetch"):
@@ -128,6 +133,7 @@ class Remote:
             self.pr_state = "OPEN"
             self.pr_head = self.create_pr_head or self.head
             self.pr_base = argv[argv.index("--base") + 1]
+            self.pr_body = argv[argv.index("--body") + 1]
             return CommandResult(0, self.pr + "\n")
         if argv[:3] == ("gh", "pr", "close"):
             self.effects.append(argv)
@@ -831,7 +837,7 @@ def test_pr_literal_body_is_snapshotted_before_command_commit(tmp_path):
 
     assert result.code == 0
     effect = remote.effects[0]
-    assert effect[effect.index("--body") + 1] == "Fixes #42\n"
+    assert effect[effect.index("--body") + 1] == "Fixes #42\n\n## Acceptance Criteria\n- [ ] issue contract"
     assert effect[effect.index("--repo") + 1] == "github.com/o/r"
     assert effect[effect.index("--head") + 1] == "fix/42-issue"
     assert effect[effect.index("--base") + 1] == "dev"
@@ -1585,31 +1591,48 @@ def test_body_update_pins_repository_even_when_the_child_names_another(
     assert edit[edit.index("--repo") + 1] == "github.com/o/r"
 
 
-# The create-time body gate must survive the body becoming mutable: an edit
-# that strips `Fixes #N` would leave the merged PR's issue open for the steward
-# to re-triage into fresh paid legs.
-@pytest.mark.parametrize(
-    "body",
-    (
-        "",
-        "x",
-        "just some prose with no sections at all",
-        "## Acceptance Criteria\n- [x] a",          # no closing keyword
-        "Fixes #42",                                 # no criteria section
-        "## Acceptance criteria\n- [x] a\n\nFixes #42",  # wrong case
-    ),
-)
-def test_body_update_still_enforces_the_pull_request_body_gate(tmp_path, body):
+@pytest.mark.parametrize("operation", ["create", "edit"])
+@pytest.mark.parametrize("body", ["", "x", "narrative", "## Acceptance criteria\n- [x] a", "Fixes #42"])
+def test_publication_supplies_missing_contract_without_duplication(tmp_path, operation, body):
+    remote = Remote() if operation == "create" else _open_pr(Remote())
+    remote.remote = remote.head
+    publisher = broker(tmp_path, remote)
+    argv = (("gh", "pr", "create", "--title", "t", "--body", body)
+            if operation == "create" else ("gh", "pr", "edit", "42", "--body", body))
+    assert publisher.publish(argv, str(tmp_path)).code == 0
+    published = agent_publish._normalized_body(remote.pr_body)
+    assert published.lower().count("## acceptance criteria") == 1
+    assert (published.count("Closes #42") + published.count("Fixes #42")) == 1
+    if "acceptance criteria" not in body.lower():
+        assert "- [ ] issue contract" in published
+    assert publisher.publish(argv, str(tmp_path)).code == 0
+    assert agent_publish._normalized_body(remote.pr_body) == published
+    assert len(remote.effects) == 1
+
+
+@pytest.mark.parametrize("data", [None, [], {"body": 3}, {"comments": [None]}, {"comments": ["bad"]}, {"comments": [{"body": []}]}])
+def test_malformed_issue_response_never_publishes(tmp_path, data):
     remote = _open_pr(Remote())
-    original = remote.pr_body
+    remote.issue_data = data
+    with pytest.raises(RuntimeError, match="malformed issue"):
+        broker(tmp_path, remote).publish(("gh", "pr", "edit", "42", "--body", "narrative"), str(tmp_path))
+    assert not remote.effects
 
-    with pytest.raises(ValueError, match="body update rejected"):
-        broker(tmp_path, remote).publish(
-            ("gh", "pr", "edit", "42", "--body", body), str(tmp_path)
-        )
 
-    assert remote.pr_body == original
-    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+def test_issue_read_failure_never_publishes(tmp_path):
+    remote = _open_pr(Remote())
+    remote.issue_view_fails = True
+    with pytest.raises(RuntimeError, match="cannot read issue"):
+        broker(tmp_path, remote).publish(("gh", "pr", "edit", "42", "--body", "narrative"), str(tmp_path))
+    assert not remote.effects
+
+
+def test_completion_is_bounded_after_appending_issue_contract(tmp_path):
+    remote = _open_pr(Remote())
+    remote.issue_data = {"comments": [{"body": "## Acceptance Criteria\n" + "é" * 30_000}]}
+    with pytest.raises(ValueError, match="exceeds the durable limit"):
+        broker(tmp_path, remote).publish(("gh", "pr", "edit", "42", "--body", "narrative"), str(tmp_path))
+    assert not remote.effects
 
 
 def test_body_update_bounds_an_oversize_body(tmp_path):
@@ -1625,10 +1648,11 @@ def test_body_update_bounds_an_oversize_body(tmp_path):
 
 
 def test_body_update_measures_the_bound_in_bytes_not_characters(tmp_path):
-    remaining = agent_publish.MAX_PR_BODY_BYTES - len(GOOD_BODY.encode())
+    complete = GOOD_BODY + "\n"
+    remaining = agent_publish.MAX_PR_BODY_BYTES - len(complete.encode())
     # "é" is two bytes, so an odd remainder needs one ASCII filler to land
     # exactly on the boundary.
-    at_limit = GOOD_BODY + "x" * (remaining % 2) + "é" * (remaining // 2)
+    at_limit = complete + "x" * (remaining % 2) + "é" * (remaining // 2)
     assert len(at_limit.encode()) == agent_publish.MAX_PR_BODY_BYTES
 
     assert broker(tmp_path, _open_pr(Remote())).publish(
@@ -1851,3 +1875,48 @@ def test_body_update_refuses_after_origin_is_switched(tmp_path):
 
     assert recovered.drain_pending_commands() == 0
     assert remote.pr_body != GOOD_BODY.replace("\n", "\r\n")
+
+
+@pytest.mark.parametrize("operation", ["create", "edit"])
+def test_recovery_replays_completed_contract_without_reading_the_issue(tmp_path, operation):
+    remote = Remote() if operation == "create" else _open_pr(Remote())
+    remote.remote = remote.head
+    publisher = broker(tmp_path, remote)
+    argv = (("gh", "pr", "create", "--title", "t", "--body", "narrative")
+            if operation == "create" else ("gh", "pr", "edit", "42", "--body", "narrative"))
+    command = publisher._command(argv, str(tmp_path))
+    publisher.effects.enqueue(command)
+    remote.issue_view_fails = True
+    assert publisher.drain_pending_commands() == 1
+    assert agent_publish._normalized_body(remote.pr_body) == (
+        "narrative\n\n## Acceptance Criteria\n- [ ] issue contract\n\nCloses #42"
+    )
+
+
+@pytest.mark.parametrize("operation", ["create", "edit"])
+def test_legacy_commands_replay_captured_bodies_unchanged(tmp_path, operation):
+    remote = Remote() if operation == "create" else _open_pr(Remote())
+    remote.remote = remote.head
+    publisher = broker(tmp_path, remote)
+    argv = (("gh", "pr", "create", "--title", "t", "--body", GOOD_BODY)
+            if operation == "create" else ("gh", "pr", "edit", "42", "--body", GOOD_BODY))
+    command = publisher._command(argv, str(tmp_path))
+    legacy_argv = list(command.payload["argv"])
+    legacy_argv[legacy_argv.index("--body") + 1] = "legacy captured body"
+    payload = {**command.payload, "argv": legacy_argv}
+    if operation == "edit":
+        payload["body"] = "legacy captured body"
+    publisher.effects.enqueue(replace(command, payload=payload))
+    remote.issue_view_fails = True
+    assert publisher.drain_pending_commands() == 1
+    assert remote.pr_body == "legacy captured body"
+
+
+@pytest.mark.parametrize("data", [{}, {"body": None, "comments": None}, {"comments": [{"body": None}]}])
+def test_missing_issue_criteria_publish_without_inventing_requirements(tmp_path, data):
+    remote = _open_pr(Remote())
+    remote.issue_data = data
+    assert broker(tmp_path, remote).publish(
+        ("gh", "pr", "edit", "42", "--body", "narrative"), str(tmp_path)
+    ).code == 0
+    assert agent_publish._normalized_body(remote.pr_body) == "narrative\n\n## Acceptance Criteria\n\nCloses #42"

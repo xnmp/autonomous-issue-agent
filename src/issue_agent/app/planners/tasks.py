@@ -73,12 +73,6 @@ class FixTaskConfig:
     # resolve/CI failures. It belongs in the appended system prompt, not issue data.
     difficulty_notice: str = ""
     router_budget_usd: float = 1.0
-    # Whether this fixer runtime can mint trusted screenshot-read receipts.
-    # When it cannot (codex), the visual-evidence PR gate is unpassable by
-    # construction (#153), so the leg must be told UP FRONT never to declare
-    # `.harness/visual-ac` — keifu #156 burned two paid legs and #142 burned a
-    # leg plus a human question dead-ending on this after the fact.
-    mints_visual_receipts: bool = True
     # Harness-attested environment capability manifest (adapters.environment),
     # probed once at daemon boot and carried into the appended system prompt so
     # a fixer never promises — or blocks on — evidence the machine cannot
@@ -185,24 +179,6 @@ _HUMAN_MESSAGES = (
 )
 
 
-# Adjusts AGENT.md's visual-evidence instructions for runtimes that cannot mint
-# trusted read receipts (#153): the gate no longer requires receipts there, so
-# the independent reviewer is the only content verifier the evidence will meet.
-# Appended on fresh AND resumed sessions: the contract text the resumed
-# transcript already carries describes the receipted path, so the override must
-# survive the resume path too.
-_UNRECEIPTED_VISUAL_NOTICE = (
-    "\n\nRUNTIME NOTE — visual evidence: this runtime cannot record trusted "
-    "screenshot-read receipts, so your evidence goes straight to the "
-    "independent reviewer, who opens every image and REQUESTS CHANGES on any "
-    "that fails to show its criterion met. Before committing a screenshot under "
-    "`evidence/`, actually look at it and confirm it shows the right screen in "
-    "the right state; capture a DISTINCT screenshot per acceptance criterion "
-    "(byte-identical images are rejected by the gate). Where a visually-shaped "
-    "criterion can be asserted in a test instead, prefer that — it is IN SCOPE "
-    "and needs no permission."
-)
-
 # The autonomy contract (operator directive, 2026-08-03): technical decisions
 # belong to the fixer, in service of the acceptance criteria; an independent
 # reviewer and the gates bound the damage of a wrong call, while a question
@@ -251,11 +227,8 @@ def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     session, the short reminder when a session id is carried (resumed OR forked —
     both inherit the server-side transcript that already contains AGENT.md)."""
     base = _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
-    # Appended on fresh AND resumed sessions, same reasoning as the visual
-    # notice: a resumed transcript predates whatever policy was added since.
+    # A resumed transcript predates whatever policy was added since.
     base += _STANDING_POLICY_NOTICE + "\n" + _HUMAN_MESSAGES
-    if not cfg.mints_visual_receipts:
-        base += _UNRECEIPTED_VISUAL_NOTICE
     return base + _environment_notice(cfg) + _difficulty_notice(cfg)
 
 
@@ -588,8 +561,7 @@ def build_address_review_task(
         "the feedback or by your fix; keep each carried or new image mapped to its "
         "criterion in the PR body. To change the PR body itself, run\n"
         f"`issue-agent-publish gh pr edit {pr_number} --body '<full new body>'` — "
-        "it REPLACES the body, so pass the complete text, keeping the "
-        "'## Acceptance Criteria' section and the 'Fixes #<issue>' line. Do not "
+        "it REPLACES the body; the broker supplies missing criteria and issue linkage. Do not "
         "escalate for a PR-body edit; this is the supported operation for it.\n\n"
         f"{_fenced('review body', as_untrusted(without_review_command_marker(review_body.value)))}\n\n"
         f"{_fenced('inline comments', inline)}"
@@ -1115,9 +1087,6 @@ def _location_paths(location: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
-# On receipt-less runtimes (codex, #153) the fixer gate no longer verifies that
-# evidence images were read — the reviewer is the SOLE content authority for
-# visual evidence, so this note must make it act like one, not a rubber stamp.
 _VISUAL_REVIEW_NOTE = (
     "If the PR commits screenshots under `evidence/` for a visual acceptance "
     "criterion, you are the ONLY verifier of that evidence — the fixer gate "
@@ -1125,8 +1094,7 @@ _VISUAL_REVIEW_NOTE = (
     "actually substantiates its criterion (right screen, right state, the "
     "criterion visibly met). REQUEST_CHANGES if a screenshot is missing, "
     "irrelevant, or does not show the behaviour the criterion claims — and "
-    "also if two images are the same capture wearing different names, an image "
-    "shows a stale or pre-change state, or an image was clearly reused from an "
+    "also if an image shows a stale or pre-change state, or was reused from an "
     "earlier round without reflecting the current diff."
 )
 

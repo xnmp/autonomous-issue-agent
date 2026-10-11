@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from ...domain.ci import Failed, reduce_ci, failed_checks, gated_checks, repair_evidence_incomplete
 from ...domain.checks import Unavailable
-from ...domain.agent_task import RUNTIME_CAPABILITIES
 from ...domain.model_routing import ModelRoute
 
 import contextlib
@@ -390,7 +389,7 @@ class FixWorkflow:
         if session is not None:
             runtime = self._available_runtime(session.runtime)
             cfg = dataclasses.replace(cfg, model=None if session.model == "<runtime-default>" else session.model,
-                runtime=runtime, mints_visual_receipts=RUNTIME_CAPABILITIES[runtime].mints_visual_receipts)
+                runtime=runtime)
         return self._escalated(cfg, issue, "resume", iss=iss)
 
     def _resolve_runtime_name(self) -> str:
@@ -406,8 +405,7 @@ class FixWorkflow:
 
     def _with_route(self, cfg: FixTaskConfig, tier: str) -> FixTaskConfig:
         route = task_builders.route_selection(tier, self._resolve_runtime_name(), self.cfg.fix_model_routes)
-        return dataclasses.replace(cfg, model=route.model, runtime=route.runtime,
-            mints_visual_receipts=RUNTIME_CAPABILITIES[route.runtime].mints_visual_receipts)
+        return dataclasses.replace(cfg, model=route.model, runtime=route.runtime)
 
     def _pr_runtime(self, selected: cc.SelectedPRRepair, issue: int) -> RuntimeName:
         if not self.cfg.fix_model_routes:
@@ -740,8 +738,7 @@ class FixWorkflow:
         # (pre-#21 sessions, unrouted resolves) keeps today's fallback.
         if inherited_runtime is not None:
             runtime = self._available_runtime(inherited_runtime.value)
-            cfg = dataclasses.replace(cfg, runtime=runtime,
-                mints_visual_receipts=RUNTIME_CAPABILITIES[runtime].mints_visual_receipts)
+            cfg = dataclasses.replace(cfg, runtime=runtime)
         if inherited_model and (not cfg.model or inherited_runtime is not None and inherited_runtime.value != self._resolve_runtime_name()):
             cfg = dataclasses.replace(cfg, model=None if inherited_model == "<runtime-default>" else inherited_model)
         # Behind the kill switch: with escalation off nothing reads the labels,
@@ -941,7 +938,6 @@ class FixWorkflow:
             cfg,
             model=model,
             runtime=runtime,
-            mints_visual_receipts=RUNTIME_CAPABILITIES[runtime].mints_visual_receipts,
             effort=context.selection.effort,
             difficulty_notice=context.selection.difficulty_notice,
         )
