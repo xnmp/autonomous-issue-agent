@@ -71,6 +71,9 @@
   --tier-terra: #ffb56b;
   --tier-sol: #f08a3c;
   --tier-high: var(--c-red-br);
+  /* ink on filled shapes: strong accent/ok fills, and series/running fills */
+  --ink-on-accent: var(--c-fg);
+  --ink-on-fill: var(--c-bg);
 
   /* ---- categorical series (cost mix) ----
    * Slot order is FIXED and never cycled. Validated with the dataviz palette
@@ -290,6 +293,45 @@
   --c-blue-br: #98b9ff;
   --c-magenta-br: #ccb2ff;
   --c-cyan-br: #9bdcff;
+}
+
+/*
+ * The only light theme. Raw Latte accents sit at 2-4.5:1 on its own base, so
+ * each hue is darkened toward black just far enough to reach 4.5:1 on the
+ * darkest surface (#e6e9ef); that also keeps light ink legible on them as
+ * fills. The -br variants carry emphasis by being darker, not brighter.
+ * Derivations above that assume a dark base are re-pointed: shadows and the
+ * scrim are cast in ink, overlays sit on the elevated surface, and ink on
+ * filled shapes is the light panel colour.
+ */
+:root[data-theme="catppuccin-latte"] {
+  color-scheme: light;
+  --c-bg: #e6e9ef;
+  --c-panel: #eff1f5;
+  --c-elevated: #f7f8fa;
+  --c-fg: #4c4f69;
+  --c-muted: #5c5f77;
+  --c-selection: #ccd5f0;
+  --c-red: #cf103a;
+  --c-green: #307820;
+  --c-yellow: #915c13;
+  --c-blue: #1c5fe4;
+  --c-magenta: #8436e8;
+  --c-cyan: #127379;
+  --c-red-br: color-mix(in srgb, var(--c-red) 85%, black);
+  --c-green-br: color-mix(in srgb, var(--c-green) 85%, black);
+  --c-yellow-br: color-mix(in srgb, var(--c-yellow) 85%, black);
+  --c-blue-br: color-mix(in srgb, var(--c-blue) 85%, black);
+  --c-magenta-br: color-mix(in srgb, var(--c-magenta) 85%, black);
+  --c-cyan-br: color-mix(in srgb, var(--c-cyan) 85%, black);
+
+  --surface-overlay: var(--c-elevated);
+  --shadow-color: color-mix(in srgb, var(--c-fg) 16%, transparent);
+  --scrim: color-mix(in srgb, var(--c-fg) 28%, transparent);
+  --ink-on-accent: var(--c-panel);
+  --ink-on-fill: var(--c-panel);
+  --tier-terra: #b24608;
+  --tier-sol: #a8313c;
 }
 
 @media (prefers-reduced-motion: reduce) {

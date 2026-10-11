@@ -612,6 +612,51 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
     path: "../evidence/dashboard-theme-settings.png",
     fullPage: true,
   });
+  await page.getByLabel("Theme").selectOption("catppuccin-latte");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "catppuccin-latte");
+  // The only light theme: it must actually render light, and every state
+  // tone used as text — and ink on every filled shape — must stay readable
+  // (WCAG AA 4.5:1). Tokens are resolved by the browser, color-mix included.
+  const latte = await page.evaluate(() => {
+    const probe = document.createElement("span");
+    document.body.append(probe);
+    const resolve = (token: string) => {
+      probe.style.color = `var(${token})`;
+      const value = getComputedStyle(probe).color;
+      const parts = (value.match(/-?\d*\.?\d+/g) ?? []).map(Number);
+      return value.startsWith("color(") ? parts.slice(0, 3).map((c) => c * 255) : parts.slice(0, 3);
+    };
+    const luminance = ([r, g, b]: number[]) => {
+      const [lr, lg, lb] = [r, g, b].map((c) => {
+        const s = c / 255;
+        return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+    };
+    const contrast = (a: string, b: string) => {
+      const [la, lb] = [luminance(resolve(a)), luminance(resolve(b))];
+      return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    };
+    const onSurface = ["--ink", "--ink-muted", "--ok", "--running", "--fail", "--info", "--meta",
+      "--link", "--accent", "--tier-luna", "--tier-terra", "--tier-sol", "--tier-high"];
+    const pairs: Record<string, number> = {};
+    for (const token of onSurface) pairs[`${token} on --bg`] = contrast(token, "--bg");
+    for (const fill of ["--accent", "--ok"]) pairs[`--ink-on-accent on ${fill}`] = contrast("--ink-on-accent", fill);
+    for (const fill of ["--running", "--series-1", "--series-2", "--series-3", "--series-4"]) {
+      pairs[`--ink-on-fill on ${fill}`] = contrast("--ink-on-fill", fill);
+    }
+    const bg = luminance(resolve("--bg"));
+    probe.remove();
+    return { bg, pairs, scheme: getComputedStyle(document.documentElement).colorScheme };
+  });
+  expect(latte.scheme).toBe("light");
+  expect(latte.bg).toBeGreaterThan(0.75);
+  const illegible = Object.entries(latte.pairs).filter(([, ratio]) => ratio < 4.5);
+  expect(illegible).toEqual([]);
+  await page.screenshot({
+    path: "../evidence/dashboard-theme-catppuccin-latte.png",
+    fullPage: true,
+  });
   await page.getByLabel("Theme").selectOption("cosmic-dusk");
   await page.getByRole("button", { name: "Settings" }).click();
   await expect(page.locator(".duration-breakdown").first()).toContainText("1:17");
