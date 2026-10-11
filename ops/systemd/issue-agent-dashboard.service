@@ -18,7 +18,7 @@ WorkingDirectory=@HARNESS_ROOT@
 # moving a toolchain so the singleton follows the latest harness installation.
 Environment=PATH=@INSTALL_PATH@
 Restart=on-failure
-RestartSec=30
+RestartSec=3
 RestartPreventExitStatus=0 2 3 4 5 6
 # Exit 87 is the designed hot-reload path. It is successful for reporting but
 # still forces systemd to restart the dashboard on the newly committed code.

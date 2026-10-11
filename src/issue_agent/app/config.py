@@ -495,10 +495,9 @@ class HarnessConfig:
     escalate_on_evidence: bool = True
     # Codex is the default reviewer runtime, so pin its deployable default here
     # instead of leaving the task un-attributed to the Codex CLI default.
-    # Sol (opus-class), not terra, since 2026-08-09: a reviewer at the fixer's
-    # own tier approved/cycled at parity; the independent check should be at
-    # least as strong as what it judges.
-    review_model: str | None = "gpt-5.6-sol"
+    # gpt-6.1-sol keeps the independent check at least as strong as the fixer;
+    # a reviewer at the fixer's own tier approved/cycled at parity.
+    review_model: str | None = "gpt-6.1-sol"
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
     router_budget_usd: float = 1.0

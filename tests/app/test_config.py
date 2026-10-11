@@ -54,7 +54,7 @@ def test_reviewer_runtime_defaults_to_codex_at_the_fixer_tier_or_above():
     cfg = from_env({"REPO": "x"})
 
     assert cfg.reviewer_runtime == "codex"
-    assert cfg.review_model == "gpt-5.6-sol"
+    assert cfg.review_model == "gpt-6.1-sol"
     assert cfg.review_budget_usd == 15.0
 
 
