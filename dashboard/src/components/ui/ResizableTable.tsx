@@ -1,3 +1,4 @@
+import { readRecord } from "../../lib/prefs";
 import {
   Children,
   cloneElement,
@@ -34,7 +35,7 @@ export const MIN_COLUMN_WIDTH = 112;
 
 function storedWidths(key: string): Record<string, number> {
   try {
-    const all = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Record<string, Record<string, number>>;
+    const all = readRecord<Record<string, number>>(STORAGE_KEY);
     return all[key] ?? {};
   } catch {
     return {};
@@ -43,7 +44,7 @@ function storedWidths(key: string): Record<string, number> {
 
 function persistWidths(key: string, widths: Record<string, number>) {
   try {
-    const all = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Record<string, Record<string, number>>;
+    const all = readRecord<Record<string, number>>(STORAGE_KEY);
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...all, [key]: widths }));
   } catch {
     // Resizing remains available for this session when storage is disabled.
@@ -52,7 +53,7 @@ function persistWidths(key: string, widths: Record<string, number>) {
 
 function storedOrder(key: string): string[] {
   try {
-    const all = JSON.parse(localStorage.getItem(ORDER_STORAGE_KEY) ?? "{}") as Record<string, string[]>;
+    const all = readRecord<string[]>(ORDER_STORAGE_KEY);
     return Array.isArray(all[key]) ? all[key] : [];
   } catch {
     return [];
@@ -61,7 +62,7 @@ function storedOrder(key: string): string[] {
 
 function persistOrder(key: string, order: string[]) {
   try {
-    const all = JSON.parse(localStorage.getItem(ORDER_STORAGE_KEY) ?? "{}") as Record<string, string[]>;
+    const all = readRecord<string[]>(ORDER_STORAGE_KEY);
     localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify({ ...all, [key]: order }));
   } catch {
     // Reordering remains available for this session when storage is disabled.
@@ -128,7 +129,7 @@ function storedSort(
 ): TableSort {
   if (!id) return fallback;
   try {
-    const all = JSON.parse(localStorage.getItem(SORT_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
+    const all = readRecord<unknown>(SORT_STORAGE_KEY);
     const saved = all[id] as { key?: unknown; direction?: unknown } | undefined;
     if (
       !saved
@@ -147,7 +148,7 @@ function storedSort(
 function persistSort(id: string | undefined, sort: TableSort) {
   if (!id) return;
   try {
-    const all = JSON.parse(localStorage.getItem(SORT_STORAGE_KEY) ?? "{}") as Record<string, TableSort>;
+    const all = readRecord<TableSort>(SORT_STORAGE_KEY);
     localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ ...all, [id]: sort }));
   } catch {
     // Sorting remains available for this session when storage is disabled.

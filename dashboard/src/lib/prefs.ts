@@ -15,6 +15,16 @@ export function readFlag(key: string, fallback: boolean): boolean {
   }
 }
 
+/** A stored JSON object, or `{}` when the entry is absent, blank, truncated or not an object. */
+export function readRecord<T = unknown>(key: string): Record<string, T> {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, T>) : {};
+  } catch {
+    return {};
+  }
+}
+
 export function writeFlag(key: string, value: boolean): void {
   try {
     localStorage.setItem(key, String(value));

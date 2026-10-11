@@ -3,6 +3,23 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { ResizableTable, useSortedRows } from "./ResizableTable";
 
+describe("ResizableTable persisted layout", () => {
+  it("still saves a resize after the stored widths were blanked", async () => {
+    localStorage.setItem("issue-agent.dashboard.column-widths", "");
+    const { unmount } = render(
+      <ResizableTable storageKey="blank-widths" columns={[{ key: "issue", label: "Issue", width: 100 }]} ariaLabel="Blank widths">
+        <tbody><tr><td>#1</td></tr></tbody>
+      </ResizableTable>,
+    );
+    screen.getByRole("separator", { name: "Resize Issue column" }).focus();
+    await userEvent.keyboard("{ArrowRight}");
+    unmount();
+
+    expect(JSON.parse(localStorage.getItem("issue-agent.dashboard.column-widths") ?? "")).toEqual({ "blank-widths": { issue: 124 } });
+    localStorage.clear();
+  });
+});
+
 describe("ResizableTable", () => {
   it("resizes a column from the keyboard and keeps a real table structure", async () => {
     const { container } = render(

@@ -67,6 +67,11 @@ describe("recoverRequest", () => {
     expect(sessionStorage.getItem(retryKey("demo", 77))).toBe("{not json");
   });
 
+  it.each([[""], ["  \n"]])("is idle, not blocked, when the saved record is blank (%j)", (blank) => {
+    sessionStorage.setItem(retryKey("demo", 77), blank);
+    expect(recoverRequest(sessionStorage, "demo", 77)).toEqual({ kind: "idle" });
+  });
+
   it("is blocked when the saved envelope is missing its version marker", () => {
     sessionStorage.setItem(retryKey("demo", 77), JSON.stringify({ command }));
     expect(recoverRequest(sessionStorage, "demo", 77)).toEqual({ kind: "blocked", reason: expect.stringContaining("format is not recognized") });
@@ -127,6 +132,18 @@ describe("retainRequest", () => {
     expect(() => retainRequest(sessionStorage, "demo", command)).not.toThrow();
   });
 
+  it("saves over a blank record instead of failing on it", () => {
+    sessionStorage.setItem(retryKey("demo", 77), "");
+    retainRequest(sessionStorage, "demo", command);
+    expect(recoverRequest(sessionStorage, "demo", 77)).toMatchObject({ kind: "uncertain", command });
+  });
+
+  it("explains a truncated saved record without exposing the JSON engine's message", () => {
+    sessionStorage.setItem(retryKey("demo", 77), '{"version":1,"comm');
+    expect(() => retainRequest(sessionStorage, "demo", command)).toThrow("Saved request is not valid JSON.");
+    expect(() => acknowledgeRequest(sessionStorage, "demo", command)).toThrow("Saved request is not valid JSON.");
+  });
+
   it("refuses to replace a different saved command awaiting a response", () => {
     retainRequest(sessionStorage, "demo", command);
     const different: ResolveCommand = { ...command, request_id: "request-2" };
@@ -176,6 +193,11 @@ describe("acknowledgeRequest", () => {
     retainRequest(sessionStorage, "demo", command);
     acknowledgeRequest(sessionStorage, "demo", command);
     expect(sessionStorage.getItem(retryKey("demo", 77))).toBeNull();
+  });
+
+  it("is a no-op when the saved record is blank", () => {
+    sessionStorage.setItem(retryKey("demo", 77), "");
+    expect(() => acknowledgeRequest(sessionStorage, "demo", command)).not.toThrow();
   });
 
   it("is a no-op when nothing is saved", () => {
