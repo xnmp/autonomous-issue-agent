@@ -34,6 +34,14 @@ describe("validated API client", () => {
     await expect(api.repos()).rejects.toThrow(/invalid response/);
   });
 
+  it.each([[200], [503]])("reads an empty HTTP %i body as a restarting backend, not a JSON error", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("", { status })));
+
+    await expect(api.repos()).rejects.toEqual(
+      expect.objectContaining({ name: "ApiError", message: expect.stringMatching(/restarting/), status }),
+    );
+  });
+
   it("reports a request that timed out distinctly from an unreachable backend", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => {
       throw new DOMException("request timed out", "TimeoutError");

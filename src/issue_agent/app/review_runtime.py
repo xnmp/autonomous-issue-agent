@@ -29,7 +29,7 @@ from ..adapters.review_linkage import ReviewLinkedIssueUnavailable, review_linke
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl, read_review_guidance
 from ..adapters.review_test_execution import ReviewTestExecutor
 from ..domain.review_test_evidence import (ReviewTestConfiguration, ReviewTestSubject, ReviewTestInvocation,
-    ReviewTestCompletion, ReviewTestOutcome, PostedReview, posted_review)
+    ReviewTestCompletion, ReviewTestOutcome, PostedReview, posted_review, failed_test_review_body)
 from ..domain.review_rounds import ReviewPlanningRefused
 from ..domain.continuation_components import BlockedPRRepair
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
@@ -725,7 +725,8 @@ class ActiveReviewRuntime:
             if selected.outcome is ReviewTestOutcome.FAILED:
                 from ..domain.review import review_submission, resolve_authenticated_grants, ReviewTarget
                 from ..domain.exemptions import authenticated_grant_pairs
-                decision = review_submission("REQUEST_CHANGES", "Independent operator tests failed.\n" + selected.summary,
+                decision = review_submission("REQUEST_CHANGES", failed_test_review_body(selected.summary,
+                    selected.execution.exit_code if selected.execution is not None else None),
                     self.prior_rejections(bound, counted_past), self._max_review_rejections,
                     grant_resolution=resolve_authenticated_grants((), authenticated_grant_pairs((), issue_number=None, patch_id=patch_id, mac_key=""),
                         target=ReviewTarget(None, patch_id)), target=ReviewTarget(None, patch_id))

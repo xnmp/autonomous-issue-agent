@@ -18,6 +18,7 @@ from ..domain.review_test_evidence import (
     MissingOperatorTestCommand, OperatorTestCommand, OperatorTestWaiver, ReviewTestConfiguration,
     ReviewTestInvocation, ReviewTestCompletion, ReviewTestOutcome, ReviewTestTreeProof, SUMMARY_LIMIT, digest,
 )
+from ..domain.terminal_output import strip_ansi
 from .governor import target_command_inputs
 from .child_env import child_process_env
 from .process_supervisor import ProcessSupervisor
@@ -83,7 +84,7 @@ class _OutputTail:
         if self.truncated:
             # The cut may land inside a UTF-8 sequence; drop its orphaned continuation bytes.
             data = data.lstrip(bytes(range(0x80, 0xC0)))
-        return (OMITTED_MARKER if self.truncated else "") + data.decode(errors="replace")
+        return (OMITTED_MARKER if self.truncated else "") + strip_ansi(data.decode(errors="replace"), truncated=self.truncated)
 
 
 def clean_tree(cwd: str, head: str) -> ReviewTestTreeProof:
@@ -204,7 +205,7 @@ class ReviewTestExecutor:
             raise
         except Exception as exc:
             return ReviewTestCompletion(invocation, ReviewTestOutcome.UNAVAILABLE, execution, before, after,
-                f"{type(exc).__name__}: {exc}"[:SUMMARY_LIMIT])
+                strip_ansi(f"{type(exc).__name__}: {exc}")[:SUMMARY_LIMIT])
         finally:
             await _await_teardown(asyncio.create_task(teardown()))
 

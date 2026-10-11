@@ -247,6 +247,59 @@ def test_empty_output_yields_outcome_only_summary(tmp_path):
     assert result.summary.strip() == ReviewTestOutcome.FAILED.value
 
 
+def test_completion_captures_clean_terminal_output(tmp_path):
+    result, _, _, _ = run(tmp_path, "printf '\\033[32méchec 日本語\\033[0m\\n'; exit 1")
+    assert result.summary == "failed\néchec 日本語\n"
+    assert "\x1b" not in result.summary
+
+
+@pytest.mark.parametrize("fragment", [b"[32m", b"2;1H"])
+def test_truncated_capture_removes_only_leading_csi_remainder(fragment):
+    from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
+
+    output = _OutputTail()
+    retained = fragment + b"FAIL\n" + b"y" * (EVIDENCE_TAIL_BYTES - len(fragment) - 5)
+    output.extend(b"old output\n\x1b[" + retained)
+    assert output.text() == "[earlier output omitted]\n" + retained[len(fragment):].decode()
+
+
+def test_unfinished_stdout_osc_cannot_consume_interleaved_stderr_failure():
+    from issue_agent.adapters.review_test_execution import _OutputTail
+
+    output = _OutputTail()
+    output.extend(b"\x1b]8;;https://example.test")
+    output.extend(b"FAIL stderr test case\n")
+    output.extend(b"\x1b\\")
+    assert output.text() == "]8;;https://example.testFAIL stderr test case\n"
+
+
+@pytest.mark.parametrize("payload_size", [100, 4 * 16384])
+def test_same_bytes_produce_identical_output_in_production_chunk_sizes(payload_size):
+    from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
+
+    data = b"FAIL important\n\x1b]" + b"x" * payload_size + b"\x1b\\AFTER\n"
+    texts = []
+    for chunk_size in (8064, 8192):
+        output = _OutputTail()
+        for start in range(0, len(data), chunk_size):
+            output.extend(data[start:start + chunk_size])
+        texts.append(output.text())
+    assert texts[0] == texts[1]
+    assert texts[0].endswith("AFTER\n")
+    if len(data) <= EVIDENCE_TAIL_BYTES:
+        assert texts[0] == "FAIL important\nAFTER\n"
+    else:
+        assert texts[0] == "[earlier output omitted]\n" + "x" * (EVIDENCE_TAIL_BYTES - 8) + "AFTER\n"
+
+
+def test_malformed_utf8_is_replaced_without_losing_following_evidence():
+    from issue_agent.adapters.review_test_execution import _OutputTail
+
+    output = _OutputTail()
+    output.extend(b"\xffFAIL\n")
+    assert output.text() == "�FAIL\n"
+
+
 def test_interleaved_streams_stay_bounded_and_keep_last_line(tmp_path):
     command = "for i in $(seq 1 20000); do echo out$i; echo err$i >&2; done; echo FINAL-LINE >&2; exit 1"
     result, _, _, _ = run(tmp_path, command)
