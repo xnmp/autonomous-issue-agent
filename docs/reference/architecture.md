@@ -418,6 +418,13 @@ can remove its obligation.
 The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
 scoped verifiers and required evidence capture within this same leg's budget.
 
+A Claude leg that declares `blocked` while a delegated agent task it started is still
+non-terminal (tracked from SDK `task_started` / `task_notification` /
+`task_updated`) cannot ever receive that task's notification. The runner
+reclassifies it as an infra-class `BACKGROUND_CHILD_PENDING` error instead of a
+human-input block; resume parks the issue back to `ai-ready`, and the ordinary
+consecutive-infra ceiling bounds repeats. Only `blocked` is rewritten.
+
 Counters decay on any leg that returns a result, so the ceilings bound
 *consecutive* failure rather than accumulating over a healthy issue's lifetime.
 

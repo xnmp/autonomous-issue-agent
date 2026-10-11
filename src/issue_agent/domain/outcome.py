@@ -81,7 +81,7 @@ inferred later from prose.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 MAX_BUDGET_STATUS = "error_max_budget_usd"
@@ -149,6 +149,10 @@ class ExitReason(str, Enum):
     # and from AGENT_ERROR, which is a session that ran and reported failure.
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
     ACCOUNTING_UNAVAILABLE = "accounting_unavailable"  # work ran; its complete charge is unknown
+    # The leg ended its own turn while a background child task it started was
+    # still pending. A headless leg can never receive that child's notification,
+    # so a `blocked` it declares is waiting on itself, not on a human (#255).
+    BACKGROUND_CHILD_PENDING = "background_child_pending"
 
 
 def infra_death(reason: ExitReason | None) -> bool:
@@ -226,6 +230,41 @@ def no_session_evidence(
     )
 
 
+# Infra-class reasons beyond the death/unavailability predicates. A pending
+# background child is the runtime contract failing, not evidence about the
+# issue, so it rides the infra ceiling rather than a per-issue quality breaker.
+_INFRA_CLASS_EXTRA: frozenset[ExitReason] = frozenset(
+    {ExitReason.ACCOUNTING_UNAVAILABLE, ExitReason.BACKGROUND_CHILD_PENDING}
+)
+
+
+def background_child_pending(reason: ExitReason | None) -> bool:
+    """Whether the leg ended while its own background child was pending (#255)."""
+    return reason is ExitReason.BACKGROUND_CHILD_PENDING
+
+
+def reclassify_pending_background_block(
+    result: AgentResult, pending_children: int
+) -> AgentResult:
+    """Strip a self-inflicted human-input block from a headless leg.
+
+    `pending_children` is the runtime-observed count of background tasks this
+    leg started that had not reached a terminal state when its own turn's
+    result arrived. A non-interactive leg cannot receive their notifications,
+    so a `blocked` declared over them asks a human to do the waiting (#253 →
+    #255). Only that claim is rewritten: a result that is already an error, or
+    that claims anything other than `blocked`, passes through, so a missed task
+    terminal can never demote real work. The agent's claim stays in `status`.
+    """
+    if pending_children <= 0 or result.is_error or result.status != "blocked":
+        return result
+    return replace(
+        result,
+        is_error=True,
+        exit_reason=ExitReason.BACKGROUND_CHILD_PENDING,
+    )
+
+
 def infra_class_failure(result: AgentResult) -> bool:
     """True iff this failed leg measures the HARNESS, not the issue.
 
@@ -255,7 +294,7 @@ def infra_class_failure(result: AgentResult) -> bool:
     return (
         infra_death(result.exit_reason)
         or runtime_unavailable(result.exit_reason)
-        or result.exit_reason is ExitReason.ACCOUNTING_UNAVAILABLE
+        or result.exit_reason in _INFRA_CLASS_EXTRA
         or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
     )
 
@@ -269,7 +308,7 @@ def infra_class_reason(result: AgentResult) -> str:
     if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
         return result.envelope_subtype
     if (infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason)
-            or result.exit_reason is ExitReason.ACCOUNTING_UNAVAILABLE):
+            or result.exit_reason in _INFRA_CLASS_EXTRA):
         return result.exit_reason.value if result.exit_reason else ""
     return ""
 
@@ -711,6 +750,10 @@ def resume_actions(
         ]
     if infra_death(result.exit_reason):
         return []
+    # The human's reply was consumed by a leg that then waited on itself;
+    # parking it ai-blocked again would ask the human a question nobody posed.
+    if background_child_pending(result.exit_reason):
+        return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
     if classify_outcome(result) == Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
