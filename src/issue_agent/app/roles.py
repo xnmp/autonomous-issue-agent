@@ -2178,7 +2178,7 @@ def _hold_reporter(
             return f"issue #{issue} waiting on #{blocker_issue}"
         return f"issue #{issue} waiting on an open dependency"
 
-    def report(world, inflight=()) -> None:
+    def report(world, inflight=()) -> dict[int, str]:
         nonlocal active
         if active is None:
             if control is not None:
@@ -2256,6 +2256,11 @@ def _hold_reporter(
                 repo,
                 {stored_key(key): fields for key, fields in active.items()},
             )
+        reasons: dict[int, str] = {}
+        for key in current:
+            reason = waiting_label(key).removeprefix(f"issue #{key[0]} ")
+            reasons[key[0]] = "; ".join(filter(None, (reasons.get(key[0]), reason)))
+        return reasons
 
     return report
 
@@ -2411,7 +2416,7 @@ def _stall_reporter(journal: EventSink | None, store: Store, log):
 
     emitted: set[tuple[str, int]] = set()
 
-    def report(world) -> None:
+    def report(world, holds: Mapping[int, str] | None = None) -> None:
         seen: dict[str, tuple[str, str]] = {}
         for pr in world.prs:
             if pr.state == "OPEN":
@@ -2434,9 +2439,14 @@ def _stall_reporter(journal: EventSink | None, store: Store, log):
                 continue
             emitted.add(dedupe)
             minutes = int(stall.age_seconds // 60)
+            reason = holds.get(stall.number) if stall.kind == "issue" and isinstance(holds, Mapping) else None
+            suffix = (
+                f"deferred: {reason}" if isinstance(reason, str) and reason.strip()
+                else "nothing is moving it"
+            )
             log(
                 f"STALL: {stall.kind} #{stall.number} unchanged for "
-                f"{minutes} min (level {stall.level}) — nothing is moving it"
+                f"{minutes} min (level {stall.level}) — {suffix}"
             )
             if journal is None:
                 continue
@@ -2961,12 +2971,12 @@ def compose_fix_daemon(
             budget_blocks=budget_blocks,
             budget_worlds=budget_worlds,
         )
-        report_holds(world, inflight)
+        holds = report_holds(world, inflight)
         report_prediction_outcomes(world)
         report_ci_stalls(world, state)
         report_duplicates(world)
         report_ci_flakes(world, state)
-        report_stalls(world)
+        report_stalls(world, holds)
         daemon = daemon_ref.get("daemon")
         externally_busy = fixer_busy()
         slots = (
