@@ -1895,3 +1895,19 @@ def test_escalation_signal_identity_names_the_escalation_never_the_attempt():
     assert escalation_signal_identity(ceiling) == ceiling_gate_of(changed(
         open_new(fresh(), observe(rejections(2), labels=(TRIGGER,)))).snapshot).gate_id
     assert escalation_signal_identity(accepted().commands[0]) is None
+
+
+def test_review_rearm_preserves_legacy_fix_attention_on_the_same_pr():
+    from issue_agent.domain.actions import Relabel
+    from issue_agent.domain.lifecycle import pr_escalation
+
+    legacy = pr_escalation(PR.number, "CI ceiling").actions()
+    labels = tuple(action.add for action in legacy if isinstance(action, Relabel))
+    result = accepted(observation=observe(rejections(2), labels=labels),
+                      holds=("legacy fix attention",))
+    projection = result.commands[-1]
+    assert projection.payload["remove"] is None
+    assert projection.payload["add"] == Label.NEEDS_HUMAN_REVIEW.value
+    assert projection.workflow == result.snapshot.binding
+    assert len(result.commands) == 3
+    assert all(command.kind is CommandKind.DISMISS_REVIEW for command in result.commands[:-1])

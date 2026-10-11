@@ -40,8 +40,9 @@ fresh series.
 
 from __future__ import annotations
 
-from .actions import Action, PostComment, Relabel, Target
+from .actions import Action, Target
 from .labels import Label
+from .lifecycle import attention_actions
 from .outcome import (
     ADMISSION_REFUSAL_SUBTYPES,
     ExitReason,
@@ -145,7 +146,4 @@ def steward_stall_actions(
     # output, which is what makes the exemption safe (ADR 0012: a harness-owned
     # signal is minted in the harness's own trust domain). Delivery stays
     # bounded by the durable retry ceiling.
-    return [
-        PostComment(Target.ISSUE, issue, body, True),
-        Relabel(Target.ISSUE, issue, None, label, None, True),
-    ]
+    return attention_actions(Target.ISSUE, issue, None, label, body, harness_signal=True)

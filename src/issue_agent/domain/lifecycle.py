@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from .actions import PostComment, Relabel, Target
+from .actions import Action, PostComment, Relabel, Target
 from .labels import Label
 from .eligibility import (
     AllowedEligibility, Eligibility, HeldEligibility, InvalidEligibility,
@@ -307,10 +307,8 @@ class PrEscalation:
     from_label: Label = Label.AI_PR_OPEN
 
     def actions(self) -> list:
-        return [
-            PostComment(Target.PR, self.pr, f"**Circuit breaker:** {self.reason} Escalating to a human."),
-            Relabel(Target.PR, self.pr, self.from_label, Label.NEEDS_HUMAN_REVIEW),
-        ]
+        return attention_actions(Target.PR, self.pr, self.from_label, Label.NEEDS_HUMAN_REVIEW,
+                                 f"**Circuit breaker:** {self.reason} Escalating to a human.")
 
 
 @dataclass(frozen=True)
@@ -325,11 +323,16 @@ class IssueEscalation:
     from_label: Label
 
     def actions(self) -> list:
-        return [
-            PostComment(Target.ISSUE, self.issue,
-                        f"**Circuit breaker:** {self.reason} Escalating to a human."),
-            Relabel(Target.ISSUE, self.issue, self.from_label, Label.NEEDS_HUMAN_REVIEW),
-        ]
+        return attention_actions(Target.ISSUE, self.issue, self.from_label, Label.NEEDS_HUMAN_REVIEW,
+                                 f"**Circuit breaker:** {self.reason} Escalating to a human.")
+
+
+def attention_actions(
+    target: Target, number: int, remove: Label | None, add: Label, body: str, *, harness_signal: bool = False,
+) -> list[Action]:
+    """The producer owns the explicit transition; partial workflow reasons cannot infer label absence."""
+    return [PostComment(target, number, body, harness_signal),
+            Relabel(target, number, remove, add, harness_signal=harness_signal)]
 
 
 def retry_breaker(attempts: int, cap: int) -> RetryBreaker:
@@ -367,4 +370,5 @@ __all__ = [
     "retry_breaker",
     "pr_escalation",
     "issue_escalation",
+    "attention_actions",
 ]
