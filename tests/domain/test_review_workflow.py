@@ -864,3 +864,24 @@ def test_a_pending_review_rearm_plans_its_projection_among_its_obligations():
         assert isinstance(intent, (CancelledReviewRearm, SupersededReviewRearm))
         with pytest.raises(ValueError, match="planned projection"):
             replace(intent, projection=None)
+
+
+@pytest.mark.parametrize("line", [
+    "    <!-- issue-agent-review-command id=abc -->",
+    "\t<!-- issue-agent-review-command id=abc -->",
+    "<!-- issue-agent-review-command id=abc --> ",
+    "<!-- issue-agent-review-command id=abc -->\n",
+    "<!-- issue-agent-review-command id=bad id -->",
+])
+def test_noncanonical_final_review_marker_is_preserved(line):
+    from issue_agent.domain.review_workflow import without_review_command_marker
+
+    body = "Please fix parsing of this input:\n\n" + line
+    assert without_review_command_marker(body) == body
+
+
+@pytest.mark.parametrize("body", ["", "Review prose.\n\n"])
+def test_canonical_final_review_marker_is_removed(body):
+    from issue_agent.domain.review_workflow import review_command_marker, without_review_command_marker
+
+    assert without_review_command_marker(body + review_command_marker("abc")) == body.rstrip()

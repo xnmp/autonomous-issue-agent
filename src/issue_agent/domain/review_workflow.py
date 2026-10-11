@@ -616,6 +616,15 @@ def body_review_command(body: object) -> str | None:
     return command if _marker_command(command) else None
 
 
+def without_review_command_marker(body: str) -> str:
+    """Remove only the exact canonical final-line harness marker."""
+    command = body_review_command(body)
+    prefix, _, last = body.rpartition("\n")
+    if command is None or last != review_command_marker(command):
+        return body
+    return prefix.rstrip()
+
+
 @dataclass(frozen=True)
 class SubmittedReviewFact:
     """One submitted review from a complete read; `commit_id` None is an unresolved commit.

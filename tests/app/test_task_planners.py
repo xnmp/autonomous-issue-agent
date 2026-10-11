@@ -63,6 +63,36 @@ FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_b
 U = as_untrusted
 
 
+@pytest.mark.parametrize("marked", [False, True])
+def test_address_review_prompt_omits_only_the_harness_command_marker(marked):
+    from issue_agent.domain.review_workflow import mark_review_body
+    from issue_agent.domain.trust import untrusted_block
+
+    body = "Please fix the failure.\n\nKeep this spacing.  \n"
+    incoming = mark_review_body(body, "3ecc4f6b" * 8) if marked else body
+    task = build_address_review_task(7, U(incoming), U("inline"), "/wt", "session", FIX_CFG)
+    assert "issue-agent-review-command" not in task.prompt
+    assert "3ecc4f6b" not in task.prompt
+    expected = body.rstrip() if marked else body
+    assert untrusted_block("review_body", U(expected)) in task.prompt
+    assert "must not quote internal identifiers" in task.prompt
+    assert "must not quote internal identifiers" in task.append_system_prompt
+
+
+def test_address_review_prompt_preserves_indented_marker_reproducer():
+    from issue_agent.domain.trust import untrusted_block
+
+    body = "Please fix parsing of this input:\n\n    <!-- issue-agent-review-command id=abc -->"
+    task = build_address_review_task(7, U(body), U("inline"), "/wt", "session", FIX_CFG)
+    assert untrusted_block("review_body", U(body)) in task.prompt
+
+
+@pytest.mark.parametrize("session", ["", "session"])
+def test_fixer_human_message_guidance_survives_fresh_and_resumed_sessions(session):
+    task = build_resume_task(U("reply"), "/wt", session, FIX_CFG)
+    assert "must not quote internal identifiers" in task.append_system_prompt
+
+
 def test_resolve_task():
     t = build_resolve_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
     assert t.schema is FIX_SCHEMA
