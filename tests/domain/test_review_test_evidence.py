@@ -9,6 +9,7 @@ from issue_agent.domain.review_test_evidence import (
     MissingOperatorTestCommand, OperatorTestCommand, OperatorTestWaiver, ReviewTestConfiguration,
     ReviewTestSubject, ReviewTestInvocation, ReviewTestCompletion, ReviewTestTreeProof, ReviewTestOutcome,
     posted_review,
+    test_only_rejection_release_eligible as release_eligible,
 )
 from tests.domain.test_review_execution import binding
 
@@ -78,3 +79,36 @@ def test_posted_outcomes_cannot_contradict_event_and_escalation():
     assert posted_review("APPROVE", None).event == "APPROVE"
     with pytest.raises(ValueError):
         posted_review("APPROVE", "ceiling")
+
+
+@pytest.mark.parametrize("mismatch", [None, "event", "reference", "absent", "malformed", "oversized",
+                                     "completion", "outcome", "head", "patch", "rejection", "execution"])
+def test_test_only_rejection_release_requires_exact_failed_harness_evidence(mismatch):
+    evidence = completion(outcome=ReviewTestOutcome.FAILED)
+    subject = evidence.invocation.subject
+    arguments = dict(event="REQUEST_CHANGES", reference=evidence.invocation.invocation_id, completion=evidence,
+                     rejection=subject.rejection, execution=subject.execution, head=subject.head_sha,
+                     patch=subject.patch_id)
+    if mismatch == "event":
+        arguments["event"] = "APPROVE"
+    elif mismatch == "reference":
+        arguments["reference"] = "another-invocation"
+    elif mismatch == "absent":
+        arguments["reference"] = None
+    elif mismatch == "malformed":
+        arguments["reference"] = {"invocation": evidence.invocation.invocation_id}
+    elif mismatch == "oversized":
+        arguments["reference"] = "x" * 100000
+    elif mismatch == "completion":
+        arguments["completion"] = None
+    elif mismatch == "outcome":
+        arguments["completion"] = completion()
+    elif mismatch == "head":
+        arguments["head"] = "f" * 40
+    elif mismatch == "patch":
+        arguments["patch"] = "f" * 64
+    elif mismatch == "rejection":
+        arguments["rejection"] = replace(subject.rejection, episode_id="another-episode")
+    elif mismatch == "execution":
+        arguments["execution"] = replace(subject.execution, execution_episode="another-execution")
+    assert release_eligible(**arguments) is (mismatch is None)

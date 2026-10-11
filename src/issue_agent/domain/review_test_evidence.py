@@ -214,6 +214,25 @@ def posted_review(event: str, cause: str | None) -> PostedReview:
     raise ValueError("contradictory posted review outcome")
 
 
+def test_only_rejection_release_eligible(
+    *, event: str, reference: object, completion: ReviewTestCompletion | None,
+    rejection: WorkflowBinding, execution: ReviewExecutionBinding, head: str, patch: str,
+) -> bool:
+    """Only approval conversion carries a test ref; findings never acquire one.
+
+    The caller authenticates the registered submission and loads completion
+    from harness-owned storage. Neither review prose nor fixer claims is evidence.
+    """
+    if (event != "REQUEST_CHANGES" or not isinstance(reference, str)
+            or not isinstance(completion, ReviewTestCompletion)
+            or completion.outcome is not ReviewTestOutcome.FAILED):
+        return False
+    invocation = completion.invocation
+    subject = invocation.subject
+    return (reference == invocation.invocation_id and subject.rejection == rejection
+            and subject.execution == execution and subject.head_sha == head and subject.patch_id == patch)
+
+
 def ordinary_test_required_fact(subject: ReviewTestSubject) -> str:
     return f"ordinary test {subject.head_sha} {digest(repr(subject.execution))} {subject.identity}"
 

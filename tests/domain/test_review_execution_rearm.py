@@ -234,8 +234,10 @@ def verdict_request(snapshot, receipt, request_id="release:1"):
         expected_binding=snapshot.binding)
 
 
-def test_selected_verdict_release_preserves_execution_allowance_and_dismisses_nothing():
+@pytest.mark.parametrize("escalated", [False, True])
+def test_selected_verdict_release_preserves_execution_allowance_and_dismisses_nothing(escalated):
     snapshot, selection, receipt = verdict_snapshot()
+    receipt = replace(receipt, escalated=escalated)
     result = accept_fixed(snapshot, verdict_request(snapshot, receipt), selection.observation,
                           holds=(UNPRODUCTIVE_ROUND_HOLD,), receipt=receipt)
     assert isinstance(result, WorkflowChanged)
@@ -278,5 +280,5 @@ def test_execution_renewal_retains_confirmed_verdict_through_cancel_continue_and
     assert released.snapshot.execution.state.failures == 0
     assert released.snapshot.execution.origin == renewed.snapshot.execution.origin
     refused = accept_fixed(state, verdict_request(state, receipt), selection.observation,
-                           receipt=replace(receipt, escalated=False))
+                           receipt=None)
     assert isinstance(refused, WorkflowRejected)
