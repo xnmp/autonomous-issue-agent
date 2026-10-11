@@ -721,11 +721,6 @@ class ReservationResult:
     # The limit that actually tripped, which is not always the primary scope
     # when a leg carries repository, global, and issue caps at once.
     tripped_dimension: str = ""
-    # True only when the refusal is about THIS workflow (a held or stale
-    # purchase, a disagreeing receipt), never a deployment state (database,
-    # owner, filesystem). Per-issue ceilings may count the former; the latter
-    # belongs to the deployment-wide infra breaker (#262).
-    workflow_scoped: bool = False
 
     @property
     def admitted(self) -> bool:
@@ -5614,17 +5609,7 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
-        except WorkflowAuthorityError as exc:
-            return ReservationResult(
-                AccountingDisposition.UNAVAILABLE,
-                None,
-                Money.zero(request.scope.currency),
-                requested,
-                request.cap,
-                str(exc),
-                workflow_scoped=True,
-            )
-        except (sqlite3.DatabaseError, OSError, WorkflowEncodingError) as exc:
+        except (sqlite3.DatabaseError, OSError, WorkflowAuthorityError, WorkflowEncodingError) as exc:
             return ReservationResult(
                 AccountingDisposition.UNAVAILABLE,
                 None,

@@ -40,8 +40,8 @@ from ..domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
-    DEPLOYMENT_REFUSED_SUBTYPE,
     RETURN_REFUSED_STATUS,
+    pre_admission_refusal,
     budget_exhausted,
     infra_class_failure,
     address_review_actions,
@@ -305,7 +305,7 @@ class AccountingRuntime(AgentRuntime):
             result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
         else:
             result = await self._admit_and_run(task)
-        if track and result.envelope_subtype == RETURN_REFUSED_STATUS:  # issue-scoped only
+        if track and pre_admission_refusal(result):
             # Refused before any run exists, so the episode's receipt-driven
             # infra charge can never see it (#262). Count it durably here;
             # the fix role folds the ledger into the infra-death ceiling.
@@ -603,10 +603,7 @@ class AccountingRuntime(AgentRuntime):
             )
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
-                return _return_refused(
-                    reservation.detail or reservation.disposition.value,
-                    deployment=not reservation.workflow_scoped,
-                )
+                return _return_refused(reservation.detail or reservation.disposition.value)
             headroom = max(
                 0, reservation.cap.micros - reservation.committed.micros
             )
@@ -1227,17 +1224,16 @@ def _issue_scope(
     )
 
 
-def _return_refused(detail: str, *, deployment: bool = False) -> AgentResult:
+def _return_refused(detail: str) -> AgentResult:
     # Receipt authority is a harness precondition, not evidence of exhausted
-    # money or a failed issue implementation. `AccountingRuntime.run` counts an
-    # issue-scoped refusal toward the fix infra ceiling (it mints no run, so no
-    # receipt would). A deployment-scoped one carries a different subtype so no
-    # single issue is charged for an outage; the fix workflow still reports it
-    # to the deployment-wide infra breaker (it is infra-class).
+    # money or a failed issue implementation. `AccountingRuntime.run` counts
+    # every such refusal toward its issue's infra ceiling (it mints no run, so
+    # no receipt would); being infra-class it also feeds the deployment-wide
+    # InfraBreaker through the fix workflow, which gates dispatch on an outage.
     return AgentResult(
         is_error=True,
         status=RETURN_REFUSED_STATUS,
-        envelope_subtype=DEPLOYMENT_REFUSED_SUBTYPE if deployment else RETURN_REFUSED_STATUS,
+        envelope_subtype=RETURN_REFUSED_STATUS,
         summary=f"paid admission refused: {detail}",
         exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
     )

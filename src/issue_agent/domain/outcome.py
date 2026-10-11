@@ -202,14 +202,11 @@ ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset(
 # Minted by the accounting runtime when a paid leg is refused BEFORE any run
 # exists (#262); its summary names the missing authority.
 RETURN_REFUSED_STATUS = "return_authority_unavailable"
-# The same refusal when a DEPLOYMENT state caused it (database, owner, filesystem):
-# not countable against one issue; the deployment-wide infra breaker owns it.
-DEPLOYMENT_REFUSED_SUBTYPE = "admission_deployment_unavailable"
 
 
 def pre_admission_refusal(result: AgentResult) -> bool:
     """Harness-minted refusal marker (envelope_subtype is never agent-declared)."""
-    return result.envelope_subtype in (RETURN_REFUSED_STATUS, DEPLOYMENT_REFUSED_SUBTYPE)
+    return result.envelope_subtype == RETURN_REFUSED_STATUS
 
 
 

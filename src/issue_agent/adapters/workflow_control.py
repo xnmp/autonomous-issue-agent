@@ -1692,6 +1692,14 @@ class SQLiteWorkflowControl:
             accepted_preflight = decode_workflow(row["actor_json"], AuthorizedOperatorCommand).preflight
         retry_facts = self._retry_facts(db, transition.audit.command) if isinstance(transition.audit, AuthorizedOperatorCommand) and isinstance(transition.audit.command, AuthorizeAbsentRetry) else None
         validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission, retry_facts=retry_facts)
+        if transition.snapshot.binding != prior.binding:
+            # A new generation/episode starts the pre-admission refusal count
+            # over (#262). Deleted whatever the row holds, so a corrupt one
+            # (which holds the issue) is recoverable by the operator's re-arm.
+            db.execute(
+                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                (self._control._REFUSAL_NAMESPACE, self.writer.repository, str(expected.fence.key.target.number)),
+            )
         self._persist(db, prior, transition, encoded)
         if retry_facts is not None:
             self._persist_retry_authorization(db, transition, retry_facts)

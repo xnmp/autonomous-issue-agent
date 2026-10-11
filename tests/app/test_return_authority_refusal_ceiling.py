@@ -271,30 +271,31 @@ def test_a_rearm_generation_bump_starts_the_refusal_count_over():
     assert refusal_count(wf) == 0
 
 
-def test_deployment_scoped_refusals_are_not_charged_to_the_issue(monkeypatch):
-    """A database outage refuses every issue's reservation; counting it per issue
-    would escalate each active issue one by one."""
-    from issue_agent.adapters import control_store
+def test_refusals_across_issues_trip_the_breaker_and_each_issue_keeps_its_own_ceiling():
+    from issue_agent.app.infra_breaker import InfraBreaker
 
+    other = ISSUE + 1
     store = FakeStore()
-    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
+    gateway = FakeGateway(
+        issues={n: IssueView(n, title="t", body="b") for n in (ISSUE, other)}, pr_for_issue={},
+    )
     runner = FakeRunner(ran_and_failed())
-    wf = workflow(gateway, store, runner)
-    from issue_agent.domain.contracts import Money
+    breaker = InfraBreaker()
+    refusing = FixTaskConfig("o/r", agent_md="AM", model="m", runtime=RuntimeName.CODEX)
+    wf = workflow(gateway, store, runner, fix=refusing, infra_breaker=breaker)
+    assert breaker.gate_reason() is None
 
-    def outage(self, request, **kw):
-        return control_store.ReservationResult(
-            control_store.AccountingDisposition.UNAVAILABLE, None,
-            Money.zero(request.scope.currency), request.quote.maximum_charge, request.cap,
-            "deployment effect authority unavailable: disk I/O error",
-        )
-
-    monkeypatch.setattr(type(store._workflow_db), "reserve", outage)
-    for _ in range(CFG.max_infra_deaths + 2):
-        asyncio.run(wf.resolve(ISSUE))
+    for number in (ISSUE, other, ISSUE, other):
+        asyncio.run(wf.resolve(number))
 
     assert runner.tasks == []
-    assert refusal_count(wf) == 0
+    assert breaker.gate_reason() is not None  # the tick gate pauses paid dispatch
+    assert refusal_count(wf, ISSUE) == 2 and refusal_count(wf, other) == 2
+
+    # A single issue is still bounded by its own ceiling (ADR 0012).
+    for _ in range(CFG.max_infra_deaths - 2):
+        asyncio.run(wf.resolve(ISSUE))
+    assert refusal_count(wf, ISSUE) == CFG.max_infra_deaths
 
 
 def test_a_corrupt_ledger_row_holds_only_that_issue_and_does_not_abort_the_tick():
