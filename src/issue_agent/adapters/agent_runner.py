@@ -27,7 +27,12 @@ from typing import Any
 from .child_env import CHILD_ENV_MANIFEST
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import RunId
-from ..domain.outcome import AgentResult, ExitReason, declared_status
+from ..domain.outcome import (
+    AgentResult,
+    ExitReason,
+    declared_status,
+    reclassify_pending_background_block,
+)
 
 # Longest single slice we block waiting for the next stream event before we come
 # up for air to re-check the WALL clock. Small enough that a sleep-spanning gap is
@@ -385,6 +390,40 @@ def _trace_message(msg: Any) -> str:
         return "??"
 
 
+# The CLI reports a killed task as `killed` on task_updated and `stopped` on
+# task_notification; both vocabularies end a task.
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
+
+
+def background_task_transition(msg: Any) -> tuple[str, bool] | None:
+    """Pure: SDK task-lifecycle system message → (task_id, still_pending).
+
+    Read from the base `subtype`/`data` fields every SDK build populates, so an
+    older SDK that yields a generic SystemMessage is tracked the same way as
+    the typed Task*Message subclasses. A terminal state can arrive on EITHER a
+    task_notification or a task_updated patch (the SDK documents both), so
+    both clear the task. Anything else, or a malformed payload, is None —
+    never raises on a lifecycle event.
+    """
+    subtype = getattr(msg, "subtype", None)
+    data = getattr(msg, "data", None)
+    if not isinstance(data, dict):
+        return None
+    task_id = data.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    if subtype == "task_started":
+        return task_id, True
+    if subtype == "task_notification":
+        return task_id, False
+    if subtype == "task_updated":
+        patch = data.get("patch")
+        status = patch.get("status") if isinstance(patch, dict) else None
+        if status in _TERMINAL_TASK_STATUSES:
+            return task_id, False
+    return None
+
+
 async def _aclose_quietly(agen: Any) -> None:
     """Best-effort close of the SDK async generator after an idle-timeout abort —
     tears down the underlying query subprocess. Never raises (we're already in an
@@ -588,6 +627,11 @@ class AgentRunner(AgentRuntime):
         last_msg: Any = None  # the actual last message object (for drop-path forensics)
         terminal_seen = ""    # any terminal_reason observed across the stream
         resolved_model = ""   # the SDK init model for an intentionally unpinned task
+        # Background tasks started and not yet terminal, and the snapshot of them
+        # taken when OUR turn's result arrived: a headless leg that ends its turn
+        # over a pending child can never consume that child's notification (#255).
+        live_children: set[str] = set()
+        children_at_result: frozenset[str] = frozenset()
 
         def with_resolved_model(result: AgentResult) -> AgentResult:
             """Keep the init model on every returned terminal outcome.
@@ -760,6 +804,13 @@ class AgentRunner(AgentRuntime):
                 tr = getattr(message, "terminal_reason", None)
                 if tr:
                     terminal_seen = str(tr)
+                transition = background_task_transition(message)
+                if transition is not None:
+                    task_id, still_pending = transition
+                    if still_pending:
+                        live_children.add(task_id)
+                    else:
+                        live_children.discard(task_id)
                 # ALWAYS maintained, not debug-gated: this string is what the
                 # wall/idle abort lines print as "(last: …)". Gated behind
                 # _debug it was never assigned in production, so every abort
@@ -785,6 +836,7 @@ class AgentRunner(AgentRuntime):
                             self._log("sdk: skipping task-notification follow-up result")
                         continue
                     final = message
+                    children_at_result = frozenset(live_children)
         except asyncio.CancelledError:
             # Daemon shutdown cancels the root dispatch task from another
             # thread. Closing the SDK generator tears down its query subprocess;
@@ -878,6 +930,18 @@ class AgentRunner(AgentRuntime):
             ))
         result = result_to_agent_result(final)
         result = with_resolved_model(result)
+        reclassified = reclassify_pending_background_block(
+            result, len(children_at_result)
+        )
+        if reclassified is not result:
+            self._log(
+                "sdk: BACKGROUND CHILD PENDING — the leg declared "
+                f"{result.status!r} while its own background task(s) "
+                f"{sorted(children_at_result)} were still running; a headless "
+                "leg cannot receive their notification, so this is not a "
+                "human-input block"
+            )
+            result = reclassified
         # Attach the stream sum to the COMPLETED result too: journaled beside the
         # ResultMessage total, each completed run becomes a calibration pair, and
         # the estimator learns its $/token rate in stream units — the only units
