@@ -96,6 +96,7 @@ from .actions import (  # noqa: F401
     Target,
 )
 from .labels import Label
+from .lifecycle import attention_actions
 from .contracts import PricingBasis, WorkflowAttemptIdentity
 from .run_usage import RunUsage
 
@@ -563,20 +564,15 @@ def unblock_prompt(heading: str, message: str) -> str:
 
 def budget_actions(issue: int) -> list[Action]:
     """Stop a budget-capped resolve-family leg for an operator cap review."""
-    return [
-        PostComment(
-            Target.ISSUE,
-            issue,
-            unblock_prompt(
-                "**Agent needs input:**",
-                "**Budget review needed:** the resolve leg reached its configured "
-                "spend cap before finishing. Review the cap and resume when ready; "
-                "the saved handover will be provided to the next fixer leg.",
-            ),
+    return attention_actions(
+        Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
+        unblock_prompt(
+            "**Agent needs input:**",
+            "**Budget review needed:** the resolve leg reached its configured "
+            "spend cap before finishing. Review the cap and resume when ready; "
+            "the saved handover will be provided to the next fixer leg.",
         ),
-        Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
-        Relabel(Target.ISSUE, issue, None, Label.NEEDS_BUDGET_REVIEW),
-    ]
+    ) + [Relabel(Target.ISSUE, issue, None, Label.NEEDS_BUDGET_REVIEW)]
 
 
 def pr_budget_actions(pr: int) -> list[Action]:
@@ -591,22 +587,17 @@ def pr_budget_actions(pr: int) -> list[Action]:
     not an agent breaker, controls continuation. ai-blocked stops re-dispatch;
     needs-budget-review names WHICH decision unblocks it (remove both labels
     after raising the cap, or wait for the daily window to roll)."""
-    return [
-        PostComment(
-            Target.PR,
-            pr,
-            unblock_prompt(
-                "**Agent needs input:**",
-                "**Budget review needed:** the repair leg hit its configured "
-                "spend cap (or the daily cap left no admission headroom for "
-                "its reservation) before finishing. Raise the cap or wait for "
-                "the daily window, then remove `ai-blocked` and "
-                "`needs-budget-review` to resume.",
-            ),
+    return attention_actions(
+        Target.PR, pr, None, Label.AI_BLOCKED,
+        unblock_prompt(
+            "**Agent needs input:**",
+            "**Budget review needed:** the repair leg hit its configured "
+            "spend cap (or the daily cap left no admission headroom for "
+            "its reservation) before finishing. Raise the cap or wait for "
+            "the daily window, then remove `ai-blocked` and "
+            "`needs-budget-review` to resume.",
         ),
-        Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
-        Relabel(Target.PR, pr, None, Label.NEEDS_BUDGET_REVIEW),
-    ]
+    ) + [Relabel(Target.PR, pr, None, Label.NEEDS_BUDGET_REVIEW)]
 
 
 def resolve_actions(
@@ -643,10 +634,8 @@ def resolve_actions(
         return []
     if fu is ResolveFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
-        return [
-            PostComment(Target.ISSUE, issue, unblock_prompt("**Agent needs input:**", needs)),
-            Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
-        ]
+        return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
+                                 unblock_prompt("**Agent needs input:**", needs))
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
 
 
@@ -691,10 +680,8 @@ def author_actions(issue: int, result: AgentResult) -> list[Action]:
         return []
     if fu is AuthorFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
-        return [
-            PostComment(Target.ISSUE, issue, unblock_prompt("**Author needs input:**", needs)),
-            Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
-        ]
+        return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
+                                 unblock_prompt("**Author needs input:**", needs))
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
 
 
@@ -745,10 +732,7 @@ def contract_escalation_actions(issue: int, objection: str, trail: str) -> list[
         f"**Implementer's objection:**\n{objection or 'see logs'}\n\n"
         f"**Adjudication trail:**\n{trail or '(none)'}"
     )
-    return [
-        PostComment(Target.ISSUE, issue, body),
-        Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.NEEDS_HUMAN_REVIEW),
-    ]
+    return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.NEEDS_HUMAN_REVIEW, body)
 
 
 def resume_actions(
@@ -772,10 +756,8 @@ def resume_actions(
         return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
     if classify_outcome(result) == Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
-        return [
-            PostComment(Target.ISSUE, issue, unblock_prompt("**Agent still needs input:**", needs)),
-            Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
-        ]
+        return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
+                                 unblock_prompt("**Agent still needs input:**", needs))
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)]
 
 
@@ -843,10 +825,7 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
             f"{result.summary or result.needs}\n\n---\n_Reply to unblock._"
         )
         # blocked: do NOT burn a retry; ai-blocked stops re-dispatch until a reply.
-        return AddressReviewOutcome(
-            [PostComment(Target.PR, pr, body),
-             Relabel(Target.PR, pr, None, Label.AI_BLOCKED)]
-        )
+        return AddressReviewOutcome(attention_actions(Target.PR, pr, None, Label.AI_BLOCKED, body))
     # ok AND error both count: only a superseding review proves progress.
     return AddressReviewOutcome([], bump_retry=True)
 
@@ -875,8 +854,6 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
         # landed, and no comment, journal field, or log line anywhere said what
         # it thought it needed. The human inherits a mystery.
         needs = result.needs or result.summary or "see logs"
-        return [
-            PostComment(Target.PR, pr, unblock_prompt("**Agent needs input:**", needs)),
-            Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
-        ]
+        return attention_actions(Target.PR, pr, None, Label.AI_BLOCKED,
+                                 unblock_prompt("**Agent needs input:**", needs))
     return []

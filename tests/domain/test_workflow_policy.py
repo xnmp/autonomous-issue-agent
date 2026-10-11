@@ -808,3 +808,24 @@ def test_multiple_authors_and_blocked_resume_converge_for_every_delivery_order(o
         state = record_resolve_attempt(state, results[index], ceiling=3, admission=proofs[index]).snapshot
     assert state.episode.continuation == AuthoredResolve(proofs[1], 4, None)
     assert state.episode.failures == 0
+
+
+@pytest.mark.parametrize("producer", ["fix", "steward"])
+def test_resolve_rearm_preserves_legacy_attention_on_the_same_issue(producer):
+    from issue_agent.domain.lifecycle import issue_escalation
+    from issue_agent.domain.steward_stall import steward_stall_actions
+    from issue_agent.domain.workflow_policy import resolve_rearm_projection
+
+    state = exhausted()
+    number = state.revision.fence.key.target.number
+    legacy = (issue_escalation(number, "infra ceiling", Label.AI_READY).actions() if producer == "fix"
+              else steward_stall_actions(number, "groom", 3, budget=False))
+    labels = frozenset(action.add for action in legacy if isinstance(action, Relabel))
+    external = (f"legacy {producer} attention",)
+    pending = start(state, external_holds=external).snapshot
+    projection = resolve_rearm_projection(pending, observed(state, labels=labels).issue,
+                                          external_holds=external)
+    assert projection.removed_labels == ()
+    assert projection.added_labels == (Label.NEEDS_HUMAN_REVIEW,)
+    assert (labels - set(projection.removed_labels)) | set(projection.added_labels) == labels
+    assert projection.workflow == pending.binding
