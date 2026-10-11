@@ -832,6 +832,13 @@ class SelectedIssueRecovery:
     def binding(self) -> WorkflowBinding:
         return self.component.identity.bind(self.revision.fence)
 
+    @property
+    def episode_scope(self) -> str:
+        """Names this recovery episode and re-arm generation; a counter kept
+        outside the component (pre-admission refusals, #262) is valid only
+        while this value is unchanged."""
+        return f"{self.component.identity.episode_id}@{self.revision.fence.generation}"
+
 
 @dataclass(frozen=True)
 class SelectedPRRepair:

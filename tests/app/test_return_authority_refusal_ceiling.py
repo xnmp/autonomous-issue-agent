@@ -16,6 +16,7 @@ from issue_agent.domain.fix import decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import IssueView
 
+from issue_agent.domain.outcome import AgentResult, ExitReason
 from tests.domain.builders import issue as build_issue, world
 from tests.app.test_infra_class_counters import (
     CFG, ISSUE, FakeGateway, FakeRunner, FakeStore, ran_and_failed, workflow,
@@ -34,6 +35,13 @@ def refusing_resolve(store, times):
         )
         asyncio.run(wf.resolve(ISSUE))
     return wf, runner
+
+
+def refusal_count(wf, issue=ISSUE):
+    from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
+
+    selected = wf.workflow_control.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue)))
+    return wf.workflow_control.fix_admission_refusals(selected)
 
 
 def decide_after(store, wf):
@@ -79,7 +87,7 @@ def test_each_refusal_is_journalled_with_the_authority_it_lacked_and_its_ceiling
 def test_a_later_admitted_run_resets_the_refusal_count():
     store = FakeStore()
     wf, _ = refusing_resolve(store, CFG.max_infra_deaths - 1)
-    assert wf.workflow_control.fix_admission_refusals(ISSUE) == CFG.max_infra_deaths - 1
+    assert refusal_count(wf) == CFG.max_infra_deaths - 1
 
     healthy = workflow(
         FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={}),
@@ -87,7 +95,7 @@ def test_a_later_admitted_run_resets_the_refusal_count():
     )
     asyncio.run(healthy.resolve(ISSUE))
 
-    assert healthy.workflow_control.fix_admission_refusals(ISSUE) == 0
+    assert refusal_count(healthy) == 0
     assert [a for a in decide_after(store, healthy) if isinstance(a, RunAgent)]
 
 
@@ -152,7 +160,7 @@ def test_an_unwritable_refusal_ledger_fails_the_issue_closed_instead_of_proceedi
     def unwritable(*_args, **_kwargs):
         raise OSError("disk I/O error")
 
-    monkeypatch.setattr(store._workflow_db, "replace_level_state", unwritable)
+    monkeypatch.setattr(type(store._workflow_db), "_refusal_count", staticmethod(unwritable))
     asyncio.run(wf.resolve(ISSUE))
     assert store._workflow_db.fix_refusal_unrecorded("o/r", ISSUE)
 
@@ -182,3 +190,79 @@ def test_refusal_detail_reaches_the_done_log_line():
     assert any(
         "done" in line and "selected provider differs from accounting runtime" in line for line in lines
     ), lines
+
+
+def test_concurrent_ledger_updates_on_different_issues_are_never_lost():
+    import threading
+
+    store = FakeStore()
+    wf, _ = refusing_resolve(store, 1)  # initialises the control store
+    ledger = store._workflow_db
+    ledger.record_fix_admission_refusal("o/r", 9, "ep", "seed")
+    rounds = 25
+
+    def refuse_seven_and_eleven():
+        for _ in range(rounds):
+            ledger.record_fix_admission_refusal("o/r", 7, "ep", "d")
+            ledger.record_fix_admission_refusal("o/r", 11, "ep", "d")
+
+    def clear_nine():
+        for _ in range(rounds):
+            ledger.clear_fix_admission_refusals("o/r", 9)
+
+    threads = [threading.Thread(target=refuse_seven_and_eleven), threading.Thread(target=clear_nine)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert ledger.fix_admission_refusals("o/r", 7, "ep") == rounds
+    assert ledger.fix_admission_refusals("o/r", 11, "ep") == rounds
+    assert ledger.fix_admission_refusals("o/r", 9, "ep") == 0
+
+
+def test_an_agent_declared_refusal_status_is_not_counted_as_a_harness_refusal():
+    store = FakeStore()
+    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
+    forged = AgentResult(
+        is_error=True, status="return_authority_unavailable", summary="agent prose",
+        session_id="sess", cost_usd=1.0, num_turns=3, exit_reason=ExitReason.AGENT_ERROR,
+    )
+    lines = []
+    wf = workflow(gateway, store, FakeRunner(forged), log=lines.append)
+
+    asyncio.run(wf.resolve(ISSUE))
+
+    assert refusal_count(wf) == 0
+    assert not any("agent prose" in line for line in lines)
+
+
+def test_refusals_from_another_recovery_episode_or_a_closed_issue_do_not_count():
+    store = FakeStore()
+    wf, _ = refusing_resolve(store, 2)
+    assert refusal_count(wf) == 2
+    ledger = store._workflow_db
+
+    ledger.record_fix_admission_refusal("o/r", 21, "old-episode@1", "stale")
+    ledger.record_fix_admission_refusal("o/r", 21, "old-episode@1", "stale")
+    assert ledger.fix_admission_refusals("o/r", 21, "new-episode@1") == 0
+
+    assert wf.workflow_control.prune_fix_admission_refusals({21}) == 1  # ISSUE closed, 21 still open
+    assert refusal_count(wf) == 0
+    assert ledger.fix_admission_refusals("o/r", 21, "old-episode@1") == 2
+
+
+def test_a_corrupt_ledger_row_holds_only_that_issue_and_does_not_abort_the_tick():
+    store = FakeStore()
+    wf, _ = refusing_resolve(store, 1)
+    with store._workflow_db.transaction() as db:
+        db.execute(
+            "UPDATE level_state SET payload_json='not json' WHERE namespace='fix-admission-refusals'"
+        )
+    view = world(issues=[build_issue(ISSUE, "ai-ready")])
+
+    state = _fix_state(store, view, workflow_control=wf.workflow_control, available_runtimes=frozenset({"claude"}))
+    actions = decide_fix(view, CFG, state, fixer_busy=False)
+
+    assert ISSUE in state.infra_control_errors
+    assert not [a for a in actions if isinstance(a, RunAgent)]

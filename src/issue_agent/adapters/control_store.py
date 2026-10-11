@@ -15,7 +15,7 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -4825,22 +4825,55 @@ class SQLiteControlStore:
     # infra_failures, and any admitted run on the issue clears it.
     _REFUSAL_NAMESPACE = "fix-admission-refusals"
 
-    def fix_admission_refusals(self, repository: str, issue: int) -> int:
-        entry = self.load_level_state(self._REFUSAL_NAMESPACE, repository).get(str(issue))
-        count = entry.get("count") if entry else 0
-        return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+    # One row per issue, each mutated in its own BEGIN IMMEDIATE transaction:
+    # fix legs dispatch from a thread pool, so a whole-scope read-modify-write
+    # would lose a concurrent refusal or clear. `episode` scopes a count to one
+    # issue-recovery episode/generation; a count from another episode reads 0.
+    def fix_admission_refusals(self, repository: str, issue: int, episode: str) -> int:
+        with closing(self._connect()) as db, db:
+            row = db.execute(
+                "SELECT payload_json FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                (self._REFUSAL_NAMESPACE, repository, str(issue)),
+            ).fetchone()
+        return self._refusal_count(row, episode)
 
+    @staticmethod
+    def _refusal_count(row, episode: str) -> int:
+        if row is None:
+            return 0
+        try:
+            payload = json.loads(row["payload_json"])
+            count, stored = payload["count"], payload["episode"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise CorruptControlStore("invalid fix admission refusal row") from exc
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(stored, str):
+            raise CorruptControlStore("invalid fix admission refusal row")
+        return count if stored == episode else 0
+
+    # In memory by necessity: it records that the DURABLE write failed, so it
+    # cannot itself be durable. Bounded residual: a restart forgets it, costing
+    # at most one uncounted refusal per lost write (architecture.md).
     def fix_refusal_unrecorded(self, repository: str, issue: int) -> bool:
         """True while a refusal for this issue could not be written: its ceiling
         position is unknown, so callers must not admit paid work (ADR 0012)."""
         return (repository, issue) in self._unrecorded_refusals
 
-    def record_fix_admission_refusal(self, repository: str, issue: int, detail: str) -> int:
+    def record_fix_admission_refusal(self, repository: str, issue: int, episode: str, detail: str) -> int:
         try:
-            entries = {k: dict(v) for k, v in self.load_level_state(self._REFUSAL_NAMESPACE, repository).items()}
-            count = self.fix_admission_refusals(repository, issue) + 1
-            entries[str(issue)] = {"count": count, "detail": detail[:500]}
-            self.replace_level_state(self._REFUSAL_NAMESPACE, repository, entries)
+            with self.transaction() as db:
+                row = db.execute(
+                    "SELECT payload_json FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                    (self._REFUSAL_NAMESPACE, repository, str(issue)),
+                ).fetchone()
+                count = self._refusal_count(row, episode) + 1
+                db.execute(
+                    "INSERT INTO level_state(namespace, scope, key, payload_json, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(namespace, scope, key) DO UPDATE SET "
+                    "payload_json=excluded.payload_json, updated_at=excluded.updated_at",
+                    (self._REFUSAL_NAMESPACE, repository, str(issue),
+                     _json({"count": count, "episode": episode, "detail": detail[:500]}),
+                     _stamp(self._now())),
+                )
         except Exception:
             self._unrecorded_refusals.add((repository, issue))
             raise
@@ -4848,9 +4881,27 @@ class SQLiteControlStore:
         return count
 
     def clear_fix_admission_refusals(self, repository: str, issue: int) -> None:
-        entries = {k: dict(v) for k, v in self.load_level_state(self._REFUSAL_NAMESPACE, repository).items()}
-        if entries.pop(str(issue), None) is not None:
-            self.replace_level_state(self._REFUSAL_NAMESPACE, repository, entries)
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                (self._REFUSAL_NAMESPACE, repository, str(issue)),
+            )
+
+    def prune_fix_admission_refusals(self, repository: str, open_issues: Collection[int]) -> int:
+        """Drop counts for issues no longer open, so a reopened issue starts clean."""
+        keep = {str(n) for n in open_issues}
+        with self.transaction() as db:
+            stale = [
+                r["key"] for r in db.execute(
+                    "SELECT key FROM level_state WHERE namespace=? AND scope=?",
+                    (self._REFUSAL_NAMESPACE, repository),
+                ) if r["key"] not in keep
+            ]
+            db.executemany(
+                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                [(self._REFUSAL_NAMESPACE, repository, key) for key in stale],
+            )
+        return len(stale)
 
     def record_world_observation(
         self,

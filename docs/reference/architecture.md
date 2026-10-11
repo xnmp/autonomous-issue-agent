@@ -372,7 +372,13 @@ that matters is not "wrong answer" but "loop that bills forever":
 - per-leg retry counters (`ci`, `review`, `rebase`, `resolve`) → escalate at cap
 - `MAX_INFRA_DEATHS` / `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — a *separate, higher*
   ceiling for sessions that die before returning a result, which deliberately do
-  not count as attempts
+  not count as attempts. Refusals minted before admission
+  (`return_authority_unavailable`: no run, so no episode receipt) spend the same
+  ceiling through a per-issue `level_state` row scoped to the issue-recovery
+  episode and re-arm generation; an admitted run or the issue closing clears
+  it, and a corrupt row holds only that issue. If that write itself fails, the
+  issue fails closed from an in-memory marker. Bounded residual: a restart
+  forgets the marker, costing at most one uncounted refusal per lost write.
 - `INFRA_BREAKER` — the deployment-wide twin of the per-issue infra ceiling.
   `INFRA_BREAKER_DEATHS` infra-class deaths over ≥2 distinct issues inside
   `INFRA_BREAKER_WINDOW_SECONDS` cannot be about any one issue, so paid

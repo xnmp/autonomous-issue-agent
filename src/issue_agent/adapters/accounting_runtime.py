@@ -303,12 +303,17 @@ class AccountingRuntime(AgentRuntime):
             result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
         else:
             result = await self._admit_and_run(task)
-        if track and result.status == RETURN_REFUSED_STATUS:
+        if track and result.envelope_subtype == RETURN_REFUSED_STATUS:
             # Refused before any run exists, so the episode's receipt-driven
             # infra charge can never see it (#262). Count it durably here;
             # the fix role folds the ledger into the infra-death ceiling.
             try:
-                self.store.record_fix_admission_refusal(self.repository, issue, result.summary)
+                selected = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
+                if not isinstance(selected, cc.SelectedIssueRecovery):
+                    raise ValueError("issue recovery episode is unavailable to scope the refusal")
+                self.store.record_fix_admission_refusal(
+                    self.repository, issue, selected.episode_scope, result.summary
+                )
             except Exception as exc:  # noqa: BLE001 - the store now fails this issue closed
                 result = replace(result, summary=f"{result.summary} [refusal not recorded: {exc}]")
         return result

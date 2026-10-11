@@ -1,10 +1,11 @@
 """Bound repository/owner ports for resolve and review-rejection workflow control; ADR 0015."""
 
+from collections.abc import Collection
 from typing import Protocol, runtime_checkable
 from contextlib import AbstractContextManager
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
-from .continuation_components import CIEpisodeReset, RebaseAllowanceReset, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
+from .continuation_components import CIEpisodeReset, SelectedIssueRecovery, RebaseAllowanceReset, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
 from .world import IssueView
 from .agent_task import RuntimeName
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
@@ -49,6 +50,13 @@ class WorkflowControl(Protocol):
     def read_pr_repair(self, key: WorkflowKey) -> PRRepairSelection: ...
 
     def read_issue_recovery(self, key: WorkflowKey) -> IssueRecoverySelection: ...
+
+    def fix_admission_refusals(self, selected: SelectedIssueRecovery) -> int:
+        """Refusals minted before admission (no run, no receipt), scoped to the
+        selected recovery episode; they spend the infra-death ceiling (#262)."""
+        ...
+
+    def prune_fix_admission_refusals(self, open_issues: Collection[int]) -> int: ...
 
     def reset_ci_episode(self, source: CIEpisodeReset) -> bool: ...
 

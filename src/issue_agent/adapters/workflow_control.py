@@ -102,9 +102,15 @@ class SQLiteWorkflowControl:
         if not isinstance(key, WorkflowKey) or key.repository != self.writer.repository or not isinstance(key.target, IssueRef):
             raise WorkflowAuthorityError("workflow is outside the bound resolve writer scope")
 
-    def fix_admission_refusals(self, issue: int) -> int:
-        """Pre-admission refusals since the issue's last admitted run (#262)."""
-        return self._control.fix_admission_refusals(self.writer.repository, issue)
+    def fix_admission_refusals(self, selected: cc.SelectedIssueRecovery) -> int:
+        """Pre-admission refusals in this recovery episode since the issue's last
+        admitted run (#262)."""
+        key = selected.binding.fence.key
+        self._scope(key)
+        return self._control.fix_admission_refusals(self.writer.repository, key.target.number, selected.episode_scope)
+
+    def prune_fix_admission_refusals(self, open_issues) -> int:
+        return self._control.prune_fix_admission_refusals(self.writer.repository, open_issues)
 
     def reconcile_pr_repair_returns(self) -> int:
         return self._control.reconcile_pr_repair_returns(self.writer)

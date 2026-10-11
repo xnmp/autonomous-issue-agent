@@ -1938,7 +1938,14 @@ def _fix_state(
             errors[number] = str(exc)
     infra_deaths = {}
     infra_errors = {}
-    for number in {issue.number for issue in world.issues} | pr_issues:
+    live_issues = {issue.number for issue in world.issues} | pr_issues
+    if workflow_control is not None:
+        try:
+            # A closed (then possibly reopened) issue must not inherit refusals.
+            workflow_control.prune_fix_admission_refusals(live_issues)
+        except (ControlStoreError, sqlite3.Error):
+            pass  # stale counts only bring the ceiling nearer; the next tick retries
+    for number in live_issues:
         try:
             if workflow_control is None:
                 raise ValueError("fix infrastructure episode authority is unavailable")
@@ -1947,12 +1954,13 @@ def _fix_state(
                 raise ValueError("fix infrastructure episode is inactive or migration blocked")
             # Refusals before admission mint no run, hence no episode receipt;
             # they spend the same ceiling (#262).
-            refusals = getattr(workflow_control, "fix_admission_refusals", None)
             infra_deaths[number] = (
                 selected_infra.component.state.infra_failures
-                + (refusals(number) if refusals is not None else 0)
+                + workflow_control.fix_admission_refusals(selected_infra)
             )
-        except (ValueError, sqlite3.Error) as exc:
+        except (ValueError, sqlite3.Error, ControlStoreError) as exc:
+            # A corrupt ledger row holds THIS issue only (fail closed); the
+            # tick logs it as "fix infrastructure <n> held".
             infra_errors[number] = str(exc)
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR

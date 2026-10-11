@@ -881,7 +881,7 @@ class JournalingRuntime:
                         usage,
                         (
                             _bounded_blocked_text(result.summary)
-                            if result.status in ("blocked", RETURN_REFUSED_STATUS)
+                            if result.status == "blocked" or result.envelope_subtype == RETURN_REFUSED_STATUS
                             else None
                         ),
                         ctx.kind,
