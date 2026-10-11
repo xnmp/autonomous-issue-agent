@@ -40,7 +40,13 @@ export function createRetryJournal<C>(scope: JournalScope<C>) {
 
   const decode = (raw: string, target: number): C => {
     if (raw.length > MAX_STORED_LENGTH) throw new Error("Saved request is too large.");
-    const value: unknown = JSON.parse(raw);
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      // The engine's own text ("Unexpected end of JSON input") is not an operator message.
+      throw new Error("Saved request is not valid JSON.");
+    }
     if (!value || typeof value !== "object" || !("version" in value) || value.version !== 1 || !("command" in value)) {
       throw new Error("Saved request format is not recognized.");
     }
@@ -48,6 +54,9 @@ export function createRetryJournal<C>(scope: JournalScope<C>) {
     if (scope.target(command) !== target) throw new Error(`Saved request belongs to another ${scope.noun}.`);
     return command;
   };
+
+  /** A blank entry names no command, so it is the same as no entry. */
+  const present = (raw: string | null) => (raw === null || raw.trim() === "" ? null : raw);
 
   const same = (left: C, right: C) => canonical(left) === canonical(right);
 
@@ -61,12 +70,12 @@ export function createRetryJournal<C>(scope: JournalScope<C>) {
       } catch {
         return { kind: "blocked", reason: "The browser could not read the saved request. No new command can be sent safely. Restore access to this tab’s session storage and reload." };
       }
-      if (raw === null) return { kind: "idle" };
+      if (raw === null || present(raw) === null) return { kind: "idle" };
       try {
         return { kind: "uncertain", command: decode(raw, target), reason: "A saved request has no confirmed response. Check its status or retry the exact same request." };
       } catch (error) {
         // Never delete it here: it may name a command the server already accepted.
-        const detail = error instanceof SyntaxError ? "Saved request is not valid JSON." : error instanceof Error && !("issues" in error) ? error.message : "Saved request does not match the command contract.";
+        const detail = error instanceof Error && !("issues" in error) ? error.message : "Saved request does not match the command contract.";
         return { kind: "blocked", reason: `${detail} No new command can be sent safely. Inspect this tab’s session storage entry before reloading.` };
       }
     },
@@ -75,7 +84,7 @@ export function createRetryJournal<C>(scope: JournalScope<C>) {
     retain(storage: Storage, deployment: string, command: C): void {
       const target = scope.target(command);
       const stored = key(deployment, target);
-      const prior = storage.getItem(stored);
+      const prior = present(storage.getItem(stored));
       if (prior !== null && !same(decode(prior, target), command)) {
         throw new Error("Another saved request needs a response. Reload to inspect it before sending a new command.");
       }
@@ -87,7 +96,7 @@ export function createRetryJournal<C>(scope: JournalScope<C>) {
     acknowledge(storage: Storage, deployment: string, command: C): void {
       const target = scope.target(command);
       const stored = key(deployment, target);
-      const prior = storage.getItem(stored);
+      const prior = present(storage.getItem(stored));
       if (prior === null) return;
       if (!same(decode(prior, target), command)) throw new Error("Another saved request replaced this one. Reload to inspect it.");
       storage.removeItem(stored);

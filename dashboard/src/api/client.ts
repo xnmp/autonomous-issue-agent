@@ -52,7 +52,10 @@ async function decodeError(res: Response): Promise<never> {
     const body: unknown = await res.json();
     detail = errorDetail(body) ?? detail;
   } catch {
-    /* non-JSON body: keep the status line */
+    // A non-JSON 502/503/504 is a restarting or proxied-away backend.
+    if ([502, 503, 504].includes(res.status)) {
+      detail = `cannot reach the dashboard backend (it may be restarting): ${detail.trim()}`;
+    }
   }
   throw new ApiError(detail, res.status);
 }
@@ -136,7 +139,11 @@ async function request<T>(
     if (error instanceof DOMException && error.name === "TimeoutError") {
       throw new ApiError("the dashboard backend did not respond in time", res.status);
     }
-    throw new ApiError(`dashboard backend returned an invalid response for ${path}`, res.status);
+    // An empty or cut-off body is what a restarting backend sends.
+    throw new ApiError(
+      `cannot reach the dashboard backend (it may be restarting): empty or unreadable reply for ${path}`,
+      res.status,
+    );
   }
   const payload = normalise ? normalise(body) : body;
   if (!responseSchema) return payload as T;
