@@ -130,14 +130,13 @@ uv sync --extra dev --extra sdk --extra dash
 uv run --no-sync pytest tests/app/test_execute.py
 uv run --no-sync pytest tests/adapters/test_sql_read_budget.py
 uv run --no-sync pytest tests/app/test_loop.py
-make test-hooks
 make test-domain
 ```
 
 These focused commands support iteration; the commit gate remains `make test`.
 On the reference host, the combined executor/SQL/daemon selection passed in
-2.70 seconds, `make test-domain` in 6.54 seconds and `make test-hooks` in
-17.65 seconds with dependencies already prepared. All are below 60 seconds.
+2.70 seconds, `make test-domain` in 6.54 seconds
+with dependencies already prepared. All are below 60 seconds.
 The real 4,097/5,000 scale tests and broad acceptance replay selections are
 slower categories; select a specific outcome contract for iteration, and keep
 their complete coverage in the full gate.

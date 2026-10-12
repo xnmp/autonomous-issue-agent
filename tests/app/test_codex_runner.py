@@ -92,6 +92,8 @@ def test_argv_basic_shape():
     assert argv[:2] == ["codex", "exec"]
     assert argv[-1] == "do it"  # prompt is last positional
     assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
+    # A hook supplied by the target checkout must never be auto-trusted.
+    assert "--dangerously-bypass-hook-trust" not in argv
     # No model configured anywhere → NO -m flag: `-m ""` is not "the default",
     # and with no -m codex uses the provider's own default (in OAuth mode, the
     # subscription's current model).

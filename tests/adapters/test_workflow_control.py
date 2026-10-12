@@ -1439,3 +1439,28 @@ def test_v45_split_history_still_admits_the_next_resolve(control, split_stage):
     paid_result(store, state, "run-b", ResolveStage.RESOLVE)
     assert [end.kind for end in store.fix_leg_ends("o/r", before.revision.fence.key.target.number)] == [
         AgentKind.RESOLVE, AgentKind.RESOLVE]
+
+
+def test_v45_relabels_a_split_run_carrying_continuations_and_restores_its_identity_trigger(control):
+    from tests.adapters.test_control_store import _historical_fixture
+    before = initial_snapshot()
+    install_workflow(control, before)
+    paid_result(control, before, "run-a", ResolveStage.RESOLVE)
+    with closing(sqlite3.connect(control.path)) as db, db:
+        triggers = dict(db.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name='runs'"))
+        db.execute("DROP TRIGGER runs_continuation_selections_update")
+        db.execute("DROP TRIGGER runs_continuation_identity_update")
+        db.execute("""UPDATE runs SET continuations_json='{"format":1,"value":["x"]}', kind='AUTHOR',
+                      dispatch_id=json_set(dispatch_id,'$.kind','AUTHOR') WHERE run_id='run-a'""")
+        db.execute("UPDATE dedupe_keys SET payload_json=json_set(payload_json,'$.value.fields.stage.value','AUTHOR') "
+                   "WHERE namespace IN ('workflow-admission','workflow-work-latest')")
+        db.execute(triggers["runs_continuation_selections_update"])
+        db.execute(triggers["runs_continuation_identity_update"])
+        _historical_fixture(db, 44)
+    SQLiteControlStore(control.path, now=lambda: NOW).initialize()
+    with closing(sqlite3.connect(control.path)) as db:
+        assert db.execute("SELECT kind, json_extract(dispatch_id,'$.kind') FROM runs WHERE run_id='run-a'"
+                          ).fetchone() == ("RESOLVE", "RESOLVE")
+        assert dict(db.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name='runs'")) == triggers
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute("UPDATE runs SET kind='X' WHERE run_id='run-a'")

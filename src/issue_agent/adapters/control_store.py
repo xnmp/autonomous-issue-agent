@@ -1298,6 +1298,7 @@ END;"""
     )
 
 
+# The stale split kinds stay: migration 37's digest and its partial index use this exact text.
 _FIX_ISSUE_DISPATCH = """CASE WHEN json_valid(dispatch_id) THEN
     json_type(dispatch_id)='object' AND json_type(dispatch_id,'$.repository')='text'
     AND json_extract(dispatch_id,'$.role')='fix' AND json_type(dispatch_id,'$.issue')='integer'
