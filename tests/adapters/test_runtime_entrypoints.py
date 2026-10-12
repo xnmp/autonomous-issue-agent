@@ -5,8 +5,8 @@ match anywhere (a comment, an unrelated target/section) would pass just as
 happily as the real thing, and the check couldn't tell "the fix unit's
 ExecStart runs python" from "the word appears somewhere in this file". Each
 template format has a real parser (`configparser`-shaped for the systemd
-units, `plistlib` for the launchd plists, tree-sitter-bash for the shell
-wrapper, a small target→recipe split for the Makefile); assertions run against
+units, `plistlib` for the launchd plists, a small target→recipe split for the
+Makefile); assertions run against
 the PARSED structure — the actual `ExecStart`, `ProgramArguments`, `exec`
 argv — instead of the raw text.
 """

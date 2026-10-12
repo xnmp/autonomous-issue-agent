@@ -13,7 +13,7 @@ StartLimitBurst=10
 [Service]
 Type=notify
 NotifyAccess=all
-ExecStart=@UV_BIN@ run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main fix
+ExecStart=@UV_BIN@ run --extra sdk python -m issue_agent.app.main fix
 WorkingDirectory=@HARNESS_ROOT@
 Environment=AGENT_ENV=@CONFIG@
 Environment=ISSUE_AGENT_DEPLOYMENT_ID=@DEPLOYMENT_ID@

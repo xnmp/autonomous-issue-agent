@@ -18,9 +18,8 @@ assigned var is still emitted. Hence the set-equality test below.
 
 C5(b): nothing exported the composed config into os.environ, so under systemd
 (unit files set only AGENT_ENV + TARGET_DIR) every subprocess spawned
-downstream (bash gate checkers, git, gh, codex — none of which pass `env=`
-explicitly) inherited an empty environment: the ALLOW_UNTESTED escape hatch
-became unreachable and operator knobs like CI_PENDING_MAX_SECONDS were silently
+downstream (git, gh, codex — none of which pass `env=`
+explicitly) inherited an empty environment: operator knobs like CI_PENDING_MAX_SECONDS were silently
 ignored. `app/main.py::main()` now calls `os.environ.update(env)` before
 building anything.
 
@@ -37,7 +36,7 @@ self-locating `dirname "${BASH_SOURCE[0]}"/..` root resolves to the scratch
 config, never touching the real repo's (gitignored) config/. bin/doctor.sh is
 run in place with HARNESS_ROOT overridden for the same reason, and PATH
 prepended with fake gh/claude/jq/uv stubs so the run is hermetic (no network,
-no real gh auth / tree-sitter needed) — per the wave brief's suggestion to
+no real gh auth needed) — per the wave brief's suggestion to
 "test via a stub PATH with a fake gh".
 """
 
@@ -67,7 +66,7 @@ DOCTOR_SH = ROOT / "bin" / "doctor.sh"
 def _fake_tool_path(tmp_path: Path) -> Path:
     """A PATH-prependable dir with fast, deterministic stand-ins for the
     external tools bin/doctor.sh shells out to, so tests never depend on real
-    gh auth, network, or a tree-sitter-capable `uv` environment. `git` is
+    gh auth, network, or a real `uv` environment. `git` is
     deliberately NOT stubbed — the real one is already on PATH and
     `git --version` is harmless."""
     fake_bin = tmp_path / "fake_bin"
@@ -82,10 +81,7 @@ def _fake_tool_path(tmp_path: Path) -> Path:
         ),
         "claude": '#!/usr/bin/env bash\necho "claude 0.0.0-fake"\n',
         "jq": '#!/usr/bin/env bash\necho "jq-0.0.0-fake"\n',
-        # Governor self-test wants rc=2 (blocked) from `uv run --quiet <path>`;
-        # stubbed unconditionally so the check is fast and independent of
-        # whether plugin/hooks/bash_governor.py exists under the (possibly
-        # scratch) HARNESS_ROOT being tested.
+        # Any `uv run` doctor makes is stubbed so the check stays hermetic.
         "uv": (
             '#!/usr/bin/env bash\n'
             'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\n'

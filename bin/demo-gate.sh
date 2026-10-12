@@ -34,7 +34,7 @@ echo "== 2. one fix-daemon tick (real SDK) =="
 # ISSUE_AGENT_MAX_TICKS bounds run_forever for the gate (see app/main.py override
 # below); without it the daemon loops forever.
 ISSUE_AGENT_MAX_TICKS="${ISSUE_AGENT_MAX_TICKS:-1}" \
-  uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
+  uv run --extra sdk \
   python -m issue_agent.app.main fix
 
 echo "== 3. assert a PR opened against dev =="

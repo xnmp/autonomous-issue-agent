@@ -12,10 +12,6 @@
 	    <string>run</string>
 	    <string>--extra</string>
 	    <string>sdk</string>
-	    <string>--with</string>
-	    <string>tree-sitter</string>
-	    <string>--with</string>
-	    <string>tree-sitter-bash</string>
 	    <string>python</string>
 	    <string>-m</string>
 	    <string>issue_agent.app.launchd_main</string>

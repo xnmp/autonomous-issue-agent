@@ -346,7 +346,7 @@ run_role() {
     reloaded=0
     while :; do
       rc=0
-      uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
+      uv run --extra sdk \
         python -m issue_agent.app.main "$role" || rc=$?
       if [ "$rc" -eq 87 ]; then
         if [ -n "${AGENT_ENV:-}" ] && [ -f "$AGENT_ENV" ]; then
@@ -385,7 +385,7 @@ run_webhook() {
   (
     cd "$HARNESS_ROOT"
     while :; do
-      uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
+      uv run --extra sdk \
         python -m issue_agent.app.webhook || true
       echo "webhook forwarder died — retrying in 60s (daemons stay on the reconcile cadence)"
       sleep 60
