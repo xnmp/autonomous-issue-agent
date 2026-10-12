@@ -13,13 +13,16 @@ quality counter; a leg that ran and produced no PR still does.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig
+from issue_agent.app.roles import _fix_state
 from issue_agent.app.workflows.fix import FixWorkflowConfig
+from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
@@ -211,6 +214,33 @@ def test_admission_refusal_subtypes_are_machine_failures_not_strikes():
     ), 3)
 
     assert resolve_state(store, ISSUE).episode.failures == 0
+
+
+def test_pre_admission_refusals_are_spaced_by_the_machine_backoff_and_never_escalate(monkeypatch):
+    """#262 shape on RESOLVE. A selected provider the accounting runtime cannot
+    serve is refused before any paid run, every time. The refusal is a machine
+    end, so a tick every 30s re-dispatches only on the doubling backoff, never
+    escalates, and claims/releases the issue once per dispatch, not per tick."""
+    store = FakeStore()
+    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
+    runner = FakeRunner(ran_and_failed())
+    wf = workflow(gateway, store, runner, fix=FixTaskConfig("o/r", agent_md="AM", model="m", runtime=RuntimeName.CODEX))
+    start = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    clock = [start]
+    monkeypatch.setattr(store._workflow_db, "_now", lambda: clock[0])
+    dispatched, escalations = [], 0
+    for tick in range(32):
+        clock[0] = start + timedelta(seconds=30 * tick)
+        view = world(issues=[build_issue(ISSUE, "ai-ready")], now=clock[0].isoformat().replace("+00:00", "Z"))
+        state = _fix_state(store, view, workflow_control=wf.workflow_control, available_runtimes=frozenset({"claude"}))
+        actions = decide_fix(view, CFG, state, fixer_busy=False)
+        escalations += sum(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions)
+        if resolve_dispatches(actions):
+            dispatched.append(30 * tick)
+            asyncio.run(wf.resolve(ISSUE))
+    assert runner.tasks == [] and escalations == 0
+    assert dispatched == [0, 60, 180, 420, 900]
+    assert len([c for c in gateway.calls if c[0] == "relabel"]) <= 2 * len(dispatched)
 
 
 # ── router evidence (#16) ────────────────────────────────────────────────────

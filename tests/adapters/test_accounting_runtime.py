@@ -273,7 +273,7 @@ def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, b
     assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
     assert result.workflow_attempt is None
     with store._connect() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
 
 

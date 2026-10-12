@@ -825,7 +825,7 @@ def test_rebase_charges_sql_allowance_and_exact_retry_preserves_sibling_debt():
     assert len(inner.tasks) == 1
     with files._workflow_db.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 1
 
 
 def test_rebase_reopened_process_recovers_captured_result_once(monkeypatch):
@@ -915,7 +915,6 @@ def test_concurrent_rebase_admissions_purchase_only_one_current_attempt(monkeypa
     assert inner.tasks == [] and issue_ci_state(files).rebase_failures == 0
     assert issue_ci_state(files).pending_rebase is not None
     with store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
 
@@ -1063,6 +1062,42 @@ def test_review_repair_preserves_primary_review_and_sibling_issue_allowances():
     assert replace(issue_after, review_failures=issue_before.review_failures) == issue_before
 
 
+def test_held_repair_purchase_refusals_are_spaced_by_the_machine_backoff(monkeypatch):
+    """#262 / tauri PR #1019: ADDRESS_REVIEW refused before admission because
+    the PR repair purchase is held. Ticking every 30s, the refusal re-dispatches
+    only on the doubling machine backoff, buys nothing and never escalates."""
+    from datetime import datetime, timedelta, timezone
+    from issue_agent.app.roles import _fix_state
+    from issue_agent.domain.actions import AgentKind, Relabel, RunAgent
+    from issue_agent.domain.fix import FixConfig, decide_fix
+    from issue_agent.domain.labels import Label
+    from tests.domain.builders import issue as build_issue, labels, world
+
+    workflow, files, inner, _key = review_workflow(AgentResult(is_error=True, summary="x", session_id="s", num_turns=3))
+
+    def held_purchase(*_a, **_k):
+        raise ValueError("PR repair purchase is held, consumed or exhausted")
+
+    monkeypatch.setattr(cc, "consume_pr_repair", held_purchase)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], author="fix-bot", state="OPEN", labels=labels("ai-pr-open"))
+    start = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    clock = [start]
+    monkeypatch.setattr(files._workflow_db, "_now", lambda: clock[0])
+    dispatched, escalations = [], 0
+    for tick in range(32):
+        clock[0] = start + timedelta(seconds=30 * tick)
+        view = world(issues=[build_issue(5, "ai-pr-open")], prs=[workflow.gateway.prs[100]],
+                     now=clock[0].isoformat().replace("+00:00", "Z"))
+        state = _fix_state(files, view, workflow_control=workflow.workflow_control, available_runtimes=frozenset({"claude"}))
+        actions = decide_fix(view, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+        escalations += sum(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions)
+        if any(isinstance(a, RunAgent) and a.kind is AgentKind.ADDRESS_REVIEW for a in actions):
+            dispatched.append(30 * tick)
+            asyncio.run(workflow.address_review(100))
+    assert inner.tasks == [] and escalations == 0
+    assert dispatched == [0, 60, 180, 420, 900]
+
+
 def test_unknown_legacy_review_episode_refuses_without_purchasing_or_resetting():
     from tests.fakes.accounted_workflow import seed_review_retry
     workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
@@ -1071,7 +1106,7 @@ def test_unknown_legacy_review_episode_refuses_without_purchasing_or_resetting()
     asyncio.run(workflow.address_review(100))
     assert inner.tasks == [] and issue_ci_state(files) == before
     with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
 def test_disabled_review_ceiling_preserves_existing_unbounded_policy():
@@ -1216,7 +1251,7 @@ def test_review_relinking_and_ambiguous_current_prs_refuse_without_purchase():
     assert len(inner.tasks) == 1
     assert issue_ci_state(files).review_failures.count == 1
     with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
 
 
 def test_review_distinct_reviewer_filter_does_not_rekey_to_own_or_nonqualifying_review():
@@ -1262,7 +1297,6 @@ def test_repair_common_admission_refuses_missing_purchase_or_changed_actual_cont
     assert not original(request).admitted
     assert inner.tasks == []
     with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
@@ -2153,7 +2187,6 @@ def test_actual_ci_purchase_cannot_bypass_owed_remediation_with_paired_head(monk
     assert original(requested).disposition is AccountingDisposition.UNAVAILABLE
     assert inner.tasks == []
     with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
