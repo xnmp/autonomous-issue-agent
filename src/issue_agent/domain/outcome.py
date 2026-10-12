@@ -253,11 +253,9 @@ def no_session_evidence(
 
 
 # Infra-class reasons beyond the death/unavailability predicates. A pending
-# background child is the runtime contract failing, not evidence about the
-# issue, so it rides the infra ceiling rather than a per-issue quality breaker.
-_INFRA_CLASS_EXTRA: frozenset[ExitReason] = frozenset(
-    {ExitReason.ACCOUNTING_UNAVAILABLE, ExitReason.BACKGROUND_CHILD_PENDING}
-)
+# background child is NOT one: the agent started it and ended its turn (#255),
+# a full paid session of its own behaviour, so it counts as an attempt.
+_INFRA_CLASS_EXTRA: frozenset[ExitReason] = frozenset({ExitReason.ACCOUNTING_UNAVAILABLE})
 
 
 def background_child_pending(reason: ExitReason | None) -> bool:

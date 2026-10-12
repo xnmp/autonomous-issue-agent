@@ -1,6 +1,6 @@
 """#255 at the workflow seam: a leg that declared `blocked` over its own pending
-background child is a machine failure, not an attempt, and is never parked
-`ai-blocked` for a human (#253's gap)."""
+background child is the agent's own behaviour, so it counts as an attempt, but
+it is never parked `ai-blocked` for a human (#253's gap)."""
 
 import asyncio
 
@@ -24,15 +24,15 @@ def pending_child_leg():
     )
 
 
-def test_resolve_leg_over_pending_child_is_not_an_attempt_and_never_parks_a_human():
+def test_resolve_leg_over_pending_child_is_an_attempt_and_never_parks_a_human():
     store = FakeStore()
     gateway = FakeGateway(
         issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={}
     )
 
-    run_resolves(store, pending_child_leg(), 5, gateway=gateway)
+    run_resolves(store, pending_child_leg(), 2, gateway=gateway)
 
-    assert _resolve_snapshot(store, ISSUE).episode.failures == 0
+    assert _resolve_snapshot(store, ISSUE).episode.failures == 2
     assert not any(
         call[:2] == ("relabel", "issue") and call[-1] == "ai-blocked"
         for call in gateway.calls
