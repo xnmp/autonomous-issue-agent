@@ -7,7 +7,7 @@
  */
 
 import type { components } from "./generated";
-import type { OperatorCommand, ReleaseCommand } from "../lib/release-command";
+import type { ReleaseCommand } from "../lib/release-command";
 
 type Schema = components["schemas"];
 
@@ -50,18 +50,7 @@ export type ResolveRearm = Schema["Rearm"];
 export type ResolveCommand = Schema["CancelRearm"] | Extract<ReleaseCommand<Schema["ResolveExpected"]>, { operation: "request_rearm" | "continue_rearm" | "authorize_retry" }>;
 export type ResolveCommandResult = Schema["CommandResult"];
 export type ResolveGuidance = Schema["ResumeGate"]["guidance"];
-export type ReviewControl = Schema["ReviewCommandResult"]["control"];
-export type AvailableReviewControl = Schema["ReviewAvailableControl"];
-export type ReviewGate = Schema["ReviewGate"];
-export type ReviewGateCause = ReviewGate["cause"];
-export type ReviewGateAction = ReviewGate["actions"][number];
-export type ReviewRearm = NonNullable<AvailableReviewControl["current_intent"]>;
-export type ReviewDaemonDecision = AvailableReviewControl["daemon"];
-export type ReviewDispatch = Extract<ReviewDaemonDecision, { state: "recorded" }>["dispatch"];
 export type WorkflowFamilies = Schema["WorkflowFamiliesAvailable"] | Schema["WorkflowFamiliesUnavailable"];
-export type ReviewCommand = OperatorCommand<Schema["ReviewExpected"]>;
-export type ReviewCommandResult = Schema["ReviewCommandResult"];
-export type ReviewGuidance = Schema["ResumeGate"]["guidance"];
 
 export type RoleName = "fix" | "review";
 export type VerificationStatus =

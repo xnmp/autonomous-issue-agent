@@ -31,8 +31,7 @@ import { liveClocks, useNow, useSnapshotOffset } from "../lib/clock";
 import { kindLabel } from "../lib/semantics";
 import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
-import { reviewablePullRequests } from "./review/model";
-import { useLegacyUnblockRefusal } from "./review/use-legacy-unblock";
+import { useLegacyUnblockRefusal } from "./legacy-unblock";
 import { ResolveControls } from "./resolve/ResolveControls";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { tipProps } from "./ui/Tip";
@@ -272,9 +271,6 @@ function BoardDrawer({
   );
   const note = plainHarnessMessage(detail.data?.harness_message)
     ?? (operatorOwned(board) ? board.reason : null);
-  const prs = detail.data
-    ? reviewablePullRequests(detail.data.pull_requests, detail.data.prs)
-    : item.pr !== null ? [item.pr] : [];
   return (
     <div className="board-drawer" id={id}>
       {item.title && item.title.length > CLAMPED_TITLE_CHARS ? (
@@ -307,7 +303,7 @@ function BoardDrawer({
       <button type="button" className="board-linkbtn board-openfull" onClick={() => onOpenIssue(item.issue)}>
         Open full issue
       </button>
-      <Action repo={repo} item={item} prs={prs} onRefresh={onRefresh} onDetailRefresh={detail.refresh} />
+      <Action repo={repo} item={item} onRefresh={onRefresh} onDetailRefresh={detail.refresh} />
     </div>
   );
 }
@@ -429,13 +425,11 @@ function TierBadge({ tier }: { tier: Tier | null }) {
 function Action({
   repo,
   item,
-  prs,
   onRefresh,
   onDetailRefresh,
 }: {
   repo: string;
   item: BoardItem;
-  prs: number[];
   onRefresh: () => void;
   onDetailRefresh: () => void;
 }) {
@@ -447,7 +441,6 @@ function Action({
         repo={repo}
         item={item}
         action={action}
-        prs={prs}
         onChanged={() => {
           onDetailRefresh();
           onRefresh();
@@ -461,13 +454,11 @@ function ActionControl({
   repo,
   item,
   action,
-  prs,
   onChanged,
 }: {
   repo: string;
   item: BoardItem;
   action: PrimaryAction;
-  prs: number[];
   onChanged: () => void;
 }) {
   const [revealed, setRevealed] = useState(false);
@@ -514,7 +505,7 @@ function ActionControl({
     case "rearm":
     case "budget":
       return revealed ? (
-        <HeldControls repo={repo} issue={item.issue} prs={prs} onChanged={onChanged} />
+        <HeldControls repo={repo} issue={item.issue} onChanged={onChanged} />
       ) : (
         <button type="button" className="btn btn-primary" onClick={() => setRevealed(true)}>
           {action.label}
@@ -527,15 +518,13 @@ function ActionControl({
 function HeldControls({
   repo,
   issue,
-  prs,
   onChanged,
 }: {
   repo: string;
   issue: number;
-  prs: number[];
   onChanged: () => void;
 }) {
-  const legacyRefusal = useLegacyUnblockRefusal(repo, prs, true);
+  const legacyRefusal = useLegacyUnblockRefusal(repo, true);
   return (
     <div className="board-held-controls">
       <ResolveControls
