@@ -92,7 +92,9 @@ def test_argv_basic_shape():
     assert argv[:2] == ["codex", "exec"]
     assert argv[-1] == "do it"  # prompt is last positional
     assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
-    assert "--dangerously-bypass-hook-trust" in argv
+    # No harness hooks are configured, so no checkout-supplied hook is ever
+    # auto-trusted.
+    assert "--dangerously-bypass-hook-trust" not in argv
     # No model configured anywhere → NO -m flag: `-m ""` is not "the default",
     # and with no -m codex uses the provider's own default (in OAuth mode, the
     # subscription's current model).
@@ -197,7 +199,7 @@ def test_argv_resume_omits_exec_only_flags():
     # -o / --output-schema ARE legal on resume and must survive (else no envelope)
     assert argv[argv.index("-o") + 1] == "/tmp/o.json"
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
-    assert "--dangerously-bypass-hook-trust" in argv  # governor stays on
+    assert "--dangerously-bypass-hook-trust" not in argv
 
 
 def test_argv_nonresume_keeps_sandbox_and_cd():
@@ -754,7 +756,7 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     codex_home = tmp_path / "codex-home"
-    # HookPreparingRuntime sets CODEX_HOME on the task, not on the daemon.
+    # CodexHomeRuntime sets CODEX_HOME on the task, not on the daemon.
     # The runner must read the same isolated profile its child writes even when
     # the ambient operator profile points elsewhere.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "wrong-ambient-home"))

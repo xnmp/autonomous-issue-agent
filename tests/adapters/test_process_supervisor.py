@@ -529,8 +529,8 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
         "ISSUE_AGENT_OWNER_ID": None,
         "ISSUE_AGENT_BASE_BRANCH": None,
         "ISSUE_AGENT_EVENT_LOG": None,
-        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-        "ISSUE_AGENT_LEG_ROLE": "fix",
+        "ISSUE_AGENT_DURABLE_PUBLISH": None,
+        "ISSUE_AGENT_LEG_ROLE": None,
     }
     assert result["carrier"] == authority
 
@@ -698,7 +698,7 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
         '[ -z "${GH_TOKEN:-}" ] || exit 9\n'
         '[ "${TEST_CMD:-}" = "uv run pytest" ] || exit 10\n'
         '[ -z "${ISSUE_AGENT_AUTHORITY_BUNDLE:-}" ] || exit 11\n'
-        '[ "${ISSUE_AGENT_DURABLE_PUBLISH:-}" = "1" ] || exit 12\n'
+        '[ -z "${ISSUE_AGENT_DURABLE_PUBLISH:-}" ] || exit 12\n'
         '[ "${CARGO_INCREMENTAL:-}" = "0" ] || exit 13\n'
         '[ "${CARGO_TARGET_DIR:-}" = "/operator/shared-cargo-target" ] || exit 14\n'
         '[ "${CARGO_BUILD_JOBS:-}" = "2" ] || exit 15\n'

@@ -2,8 +2,8 @@
 
 `pyproject.toml` declares two entry points; the installer wrote exactly one
 hand-named shim (`$BIN_DIR/issue-agent`). So on any box bootstrapped with
-`make install`, `issue-agent-publish` — the executable the governor instructs
-every fixer to publish through — was simply absent from PATH, and issue #18's
+`make install`, `issue-agent-publish` — the executable every fixer is told to publish
+through — was simply absent from PATH, and issue #18's
 resolve leg blocked at $1.84 asking the operator to install it (keifu,
 2026-08-02).
 
@@ -201,7 +201,7 @@ def test_doctor_is_quiet_when_both_entry_points_resolve(tmp_path):
     ).stdout
 
     assert "issue-agent-publish on PATH" in out
-    assert "not on PATH" not in out.split("== governor")[0]
+    assert "not on PATH" not in out.split("== config ==")[0]
 
 
 def test_doctor_says_nothing_about_shims_in_a_plain_dev_checkout(tmp_path):

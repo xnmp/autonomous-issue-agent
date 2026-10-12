@@ -42,7 +42,6 @@ from issue_agent.app.planners.tasks import (
 
 from issue_agent.app.dashweb import guidance as guidance_rules
 from issue_agent.domain.ci_history import CiAttempt
-from issue_agent.domain import environment as domain_env
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
 U = as_untrusted
@@ -303,7 +302,7 @@ def test_every_fixer_leg_carries_the_deny_list():
 
 def test_deny_list_blocks_exfiltration_and_credential_paths():
     denied = set(FIXER_DENY)
-    # outbound network the governor cannot see inside
+    # outbound network
     assert {"WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"} <= denied
     # credential + raw-API escape hatches around the gh guardrails
     assert {"Bash(gh auth:*)", "Bash(gh secret:*)", "Bash(gh api:*)"} <= denied
@@ -581,7 +580,7 @@ def test_fresh_and_delegated_review_prompts_carry_the_guidance_too():
         assert "OPERATOR_GUIDANCE" in t.prompt
 
 
-# ── PR conversation + environment manifest (2026-08-08, tauri #613/#614) ──
+# ── PR conversation (2026-08-08, tauri #613/#614) ──
 DISCUSSION = U("@fixer[bot]: this deployment has no display; no screenshot exists")
 
 
@@ -646,103 +645,6 @@ def test_the_gate_and_the_validator_get_no_discussion():
     )
     for t in (gate, validator):
         assert "pr_discussion" not in t.prompt
-
-
-HEADLESS = domain_env.manifest(
-    domain_env.EnvironmentObservation(), domain_env.WEBKITGTK_STACK
-)
-UNDECLARED = domain_env.manifest(domain_env.EnvironmentObservation())
-MANIFEST_CFG = replace(RCFG, environment_manifest=HEADLESS)
-
-
-def test_review_builders_state_the_manifest_as_harness_fact():
-    t = build_review_task(100, U("t"), U("b"), U("d"), MANIFEST_CFG)
-    assert "harness-attested fact, not a claim by any author" in t.prompt
-    assert "CANNOT be produced in this environment" in t.prompt
-    assert "Do not require evidence this manifest rules out" in t.prompt
-
-
-def test_an_undeclared_stack_states_facts_without_telling_anyone_to_skip_e2e():
-    # The probe covers one toolchain; on any other, "skip the e2e tier" would be
-    # a harness-attested falsehood. Facts still ride along — they are true.
-    rcfg = replace(RCFG, environment_manifest=UNDECLARED)
-    fcfg = replace(FIX_CFG, environment_manifest=UNDECLARED)
-    review = build_review_task(100, U("t"), U("b"), U("d"), rcfg).prompt
-    fix = build_resolve_task(5, U("t"), U("b"), "/wt", fcfg).append_system_prompt
-    for prompt in (review, fix):
-        assert "harness-attested" in prompt
-        assert "no X display" in prompt
-        assert "CANNOT be produced" not in prompt
-    assert "Do not require evidence this manifest rules out" not in review
-    assert "Never raise an operator block" not in fix
-
-
-def test_the_manifest_never_lands_inside_an_untrusted_fence():
-    # It is harness-owned FACT: fenced, it would read as one more party's claim.
-    t = build_review_task(
-        100, U("t"), U("b"), U("d"), MANIFEST_CFG, discussion=DISCUSSION
-    )
-    fenced = t.prompt[t.prompt.index("<untrusted_pr_discussion_json>"):]
-    assert "harness-attested" not in fenced
-    assert t.prompt.index("harness-attested") < t.prompt.index(
-        "<untrusted_pr_discussion_json>"
-    )
-
-
-def test_every_review_builder_carries_the_manifest():
-    dcfg = replace(DCFG, environment_manifest=HEADLESS)
-    builders = (
-        build_review_task(100, U("t"), U("b"), U("d"), MANIFEST_CFG),
-        build_re_review_task(100, 2, "old", "new", U("d"), "rs", MANIFEST_CFG),
-        build_fresh_re_review_task(
-            100, 3, U("t"), U("b"), "old", "new", U("d"), U("prior"), MANIFEST_CFG
-        ),
-        build_delegated_review_task(100, U("t"), U("b"), U("d"), dcfg),
-        build_delegated_re_review_task(
-            100, 3, "old", "new", U("d"), U("prior"), dcfg
-        ),
-        build_review_gate_task(100, U("t"), U("b"), U("d"), MANIFEST_CFG),
-        build_review_dimension_task(
-            100, "correctness", "logic bugs", U("t"), U("b"), U("d"), MANIFEST_CFG
-        ),
-    )
-    for t in builders:
-        assert "ENVIRONMENT — harness-attested fact" in t.prompt
-
-
-@pytest.mark.parametrize(
-    "manifest",
-    [
-        domain_env.EnvironmentManifest(),
-        domain_env.EnvironmentManifest(text="   "),
-    ],
-)
-def test_an_unknown_environment_attests_nothing(manifest):
-    # Absent must not read as "every kind of evidence is possible" — when the
-    # probe cannot run, the prompt says nothing at all.
-    rcfg = replace(RCFG, environment_manifest=manifest)
-    fcfg = replace(FIX_CFG, environment_manifest=manifest)
-    assert "ENVIRONMENT" not in build_review_task(
-        100, U("t"), U("b"), U("d"), rcfg
-    ).prompt
-    assert "ENVIRONMENT" not in build_resolve_task(
-        5, U("t"), U("b"), "/wt", fcfg
-    ).append_system_prompt
-
-
-def test_fixer_legs_carry_the_complementary_instruction():
-    fcfg = replace(FIX_CFG, environment_manifest=HEADLESS)
-    legs = (
-        build_resolve_task(5, U("t"), U("b"), "/wt", fcfg),
-        build_address_review_task(100, U("rev"), U("inline"), "/wt", "s1", fcfg),
-        build_fix_ci_task(100, U("checks"), U("log"), "/wt", "s1", fcfg),
-    )
-    for t in legs:
-        prompt = t.append_system_prompt
-        assert "CANNOT be produced in this environment" in prompt
-        assert "not producible in this environment (harness manifest)" in prompt
-        # The dead end this fixes: the block channel the reviewer cannot read.
-        assert "Never raise an operator block solely to report unproducibility" in prompt
 
 
 # ── delegated review (REVIEW_MODE=delegated) ──
@@ -1058,8 +960,8 @@ def test_every_review_judgment_builder_fences_its_untrusted_inputs():
 # review comments are writable by ANY user with read access to the repo (not
 # just the PR author), and a CI log echoes attacker-influenced PR titles/branch
 # names verbatim; the consumer here is the FIXER running under
-# `permission_mode=bypassPermissions` with a governor that only inspects git/gh
-# argv shapes, so `curl … | sh` embedded in either input was ungoverned. Fields
+# `permission_mode=bypassPermissions` with no command filter, so `curl … | sh`
+# embedded in either input is runnable. Fields
 # discovered BY NAME so a future fixer input-carrying builder is automatically
 # pulled into the completeness check, instead of shipping unguarded.
 _FIXER_REPAIR_BUILDER_NAME_RE = re.compile(r"^build_(address_review|fix_ci)_task$")

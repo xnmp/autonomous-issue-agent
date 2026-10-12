@@ -1,41 +1,23 @@
-"""Git worktree management + the GateContext builder for the in-process governor.
+"""Git worktree management for fix episodes and pinned review checkouts.
 
 `Worktrees.ensure` / `.remove` port agent/lib.sh:ensure_worktree + cleanup.sh's
-`git worktree remove`. `build_gate_context` is the git/fs fact-gatherer the
-governor's `make_pretooluse_hook(build_ctx)` needs — it reads the worktree's
-branch, the commit subjects since base, the changed-file list, the `.harness/`
-markers, and wires the `run_tests` / `revert_and_run` /
-`open_pr` callables (§1 + §10 + the push gate) over real git and `gh`.
-
-git/subprocess is injected as `run` so the path/branch logic is testable with a
-fake; the production default shells out. Both advisory transports reuse the
-§10 revert simulation (revert impl to base, run tests, restore HEAD).
+`git worktree remove`. git/subprocess is injected as `run` so the path/branch
+logic is testable with a fake; the production default shells out.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..domain.contracts import (
-    DEFAULT_TEST_FAILURE_EXIT_CODES,
-    TestExecution,
-    TestExecutionStatus,
-    classify_test_exit_code,
-    parse_test_failure_exit_codes,
-)
-from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from ..domain.git_remote import require_repository_remote, require_safe_fetch_url
 from ..domain.refs import issue_from_branch
 from ..domain.resolve_workspace import (
@@ -47,8 +29,6 @@ from ..domain.resolve_workspace import (
     ObservedResolveBase,
 )
 from ..domain.workflow_identity import canonical_workflow_repository
-from .governor import GateContext, run_target_command
-from .store import HarnessMarkers
 
 
 @dataclass(frozen=True)
@@ -65,29 +45,20 @@ GitRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
 # `gh pr view` hang that blocked ~14 minutes and froze the whole review daemon
 # because the poll loop is synchronous). This same runner is used on BOTH the
 # dispatch path (`Worktrees.ensure`'s `git fetch origin`, a real network call)
-# AND inside `build_gate_context`'s local ops, which run on EVERY Bash call the
-# agent makes via the PreToolUse hook — an unbounded hang on either path wedges
-# the daemon or the agent's whole session, the identical failure class as the
-# gh hang above, just via a different command. 60s is far above a healthy call
+# — an unbounded hang wedges the daemon, the identical failure class as the gh
+# hang above, just via a different command. 60s is far above a healthy call
 # (local git plumbing is sub-second; a `fetch` against a live remote is at most
 # a few seconds) yet bounds a pathological one (a stale `index.lock`, a dead
 # proxy holding a fetch open — see CLAUDE.md's proxy note).
 _GIT_TIMEOUT_S = 60.0
-
-# All target-command execution defenses (env scrub, HARNESS_GATE_DEPTH
-# re-entrancy bound, process-group containment — the #63 fork-bomb class) live
-# in governor.run_target_command; this module only wires it into the gate.
 
 
 def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     """Run `git` in `cwd`, bounded by `_GIT_TIMEOUT_S`.
 
     NEVER raises: a timeout, a missing `git`, or a spawn failure all come back
-    as a non-zero `GitResult` — the same "never raise across this seam"
-    contract `_subprocess_gh` below already uses, so every existing `if
-    result.code != 0` caller keeps working unchanged. Unlike `_subprocess_gh`
-    (whose failures are routine and expected — "no branch yet" is not an
-    error), a git failure here is surfaced on OUR stderr with the captured
+    as a non-zero `GitResult`, so every `if result.code != 0` caller keeps
+    working unchanged. A git failure is surfaced on OUR stderr with the captured
     stderr text, because a silently-swallowed `worktree add` failure is
     exactly how `ensure` used to hand back a path to a worktree that was never
     created (M20's other half — see `Worktrees.ensure`)."""
@@ -1424,455 +1395,3 @@ class ReviewCheckouts:
                 ["worktree", "remove", "--force", self.path(pr)], self.repo_dir
             )
             self._git(["worktree", "prune"], self.repo_dir)
-
-
-# ── GateContext builder ───────────────────────────────────────────────────────
-_DEFAULT_TEST_TIMEOUT_S = 600.0
-
-
-def _test_failure_exit_codes() -> frozenset[int]:
-    """Trusted runner exit codes that mean an asserted test failed, as this
-    deployment declares them. Parsing lives in the domain so doctor reports on
-    exactly the set the gate enforces."""
-
-    return parse_test_failure_exit_codes(
-        os.environ.get(
-            "GATE_TEST_FAILURE_EXIT_CODES", DEFAULT_TEST_FAILURE_EXIT_CODES
-        )
-    )
-
-
-def _test_timeout_s() -> float:
-    """GATE_TEST_TIMEOUT_S in seconds, read fresh on every call (not cached at
-    import/build time) so a test can override it per-case and an operator's env
-    edit takes effect without restarting the daemon. A hung TEST_CMD must never
-    wedge the gate hook — same failure class as FAILURE-MODES #24 — so an
-    empty or malformed value falls back to the default rather than disabling
-    the timeout outright (precedent: governor.py's edit-check uses a fixed
-    120s; the test suite gets a generous but finite default since it can
-    legitimately run longer)."""
-    raw = os.environ.get("GATE_TEST_TIMEOUT_S", "")
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return _DEFAULT_TEST_TIMEOUT_S
-    return seconds if seconds > 0 else _DEFAULT_TEST_TIMEOUT_S
-
-
-# ── open-PR probe: the push gate's precondition (review known-gap-2) ─────────
-# Bounded from day one because this runs INLINE in the PreToolUse hook, on the
-# agent's own `git push`: an unbounded `gh` (dead proxy, auth prompt, a GitHub
-# 5xx holding the socket) would wedge the session mid-push. Same failure class
-# as the TEST_CMD timeout above; 20s is far above a healthy call (<2s).
-_OPEN_PR_TIMEOUT_S = 20.0
-
-# Pause between the probe's two attempts (`resolve_open_pr`'s retry) — long
-# enough for a transient blip to clear, short enough that the agent is not left
-# waiting on its own push.
-_OPEN_PR_RETRY_SLEEP_S = 1.0
-
-# A `gh … list` argv MUST state its ceiling (review C2) — without `--limit`, gh
-# silently answers with the 30 NEWEST items and looks complete. The question
-# here is purely existential ("does this head have an open PR?"), so 1 is a
-# complete answer by construction rather than a truncation; the flag is still
-# passed explicitly so this call can never be mistaken for another instance of
-# the C2 omission.
-_OPEN_PR_LIMIT = "1"
-
-GhRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
-
-
-def _subprocess_gh(args: list[str], cwd: str) -> GitResult:
-    """Run `gh` in `cwd`, bounded by `_OPEN_PR_TIMEOUT_S`.
-
-    NEVER raises: a timeout, a missing `gh`, an auth failure and a 5xx all come
-    back as a non-zero result, which `classify_open_pr` turns into
-    `OpenPrLookup.ERROR` — "I could not look", never "there is no PR". That
-    collapse is the exact bug `OpenPrLookup` exists to prevent."""
-    try:
-        res = subprocess.run(
-            ["gh", *args], cwd=cwd, capture_output=True, text=True,
-            timeout=_OPEN_PR_TIMEOUT_S,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return GitResult(1, "")
-    return GitResult(res.returncode, res.stdout)
-
-
-def classify_open_pr(result: GitResult) -> OpenPrLookup:
-    """`gh pr list --json number` result → the domain's tri-state. Pure, so the
-    error-vs-empty distinction the whole type exists for is unit-testable.
-
-    Non-zero exit, unparseable output, or a non-list payload ⇒ ERROR. Only a
-    well-formed EMPTY list means "no open PR"; a blank stdout on a 0 exit is an
-    answer we cannot read, so it is an error, not an absence."""
-    if result.code != 0:
-        return OpenPrLookup.ERROR
-    try:
-        prs = json.loads(result.out)
-    except ValueError:
-        return OpenPrLookup.ERROR
-    if not isinstance(prs, list):
-        return OpenPrLookup.ERROR
-    return OpenPrLookup.OPEN if prs else OpenPrLookup.NONE
-
-
-_repo_unset_warned = False
-
-
-def _warn_repo_unset_once() -> None:
-    """The open-PR probe is the ONE gh call in the harness that can silently
-    change meaning when it is not pinned to a repo (P1R-11): unpinned, gh
-    resolves a repo from the worktree's remotes, and on a fork/two-remote
-    checkout it can pick a DIFFERENT repo where this branch has no PR — which
-    answers NONE, and NONE means "no gate". That is precisely the bypass
-    `OpenPrLookup` exists to kill, wearing a valid-looking answer. If the
-    orchestrator ever stops threading `repo=`, say so loudly rather than
-    degrading in silence (§5: an absence bug is invisible by construction)."""
-    global _repo_unset_warned
-    if _repo_unset_warned:
-        return
-    _repo_unset_warned = True
-    print(
-        "[gate] WARNING: the open-PR probe is running WITHOUT --repo (no `repo=` was "
-        "passed to build_gate_context). gh will resolve a repo from the worktree's "
-        "remotes; on a fork or two-remote checkout that can be the wrong one, and a "
-        "wrong repo answers 'no open PR' — which silently disables the push gate. "
-        "Wire cfg.repo through to build_gate_context.",
-        file=sys.stderr,
-    )
-
-
-def probe_open_pr(
-    branch: str, cwd: str, gh: GhRunner = _subprocess_gh, repo: str = ""
-) -> OpenPrLookup:
-    """One `gh pr list --repo <repo> --head <branch> --state open` round-trip →
-    tri-state. Port of check-push.sh's precondition. The retry lives in the
-    domain (`resolve_open_pr`), so this stays a single honest observation.
-
-    `branch` is the ref the push WRITES (not necessarily the checked-out one) —
-    see `governor._push_gate`. `repo` pins the question to the target repo, like
-    every other gh call in the harness; empty falls back to gh's own remote
-    resolution and warns once."""
-    if not repo:
-        _warn_repo_unset_once()
-    args = ["pr", "list"]
-    if repo:
-        args += ["--repo", repo]
-    args += ["--head", branch, "--state", "open",
-             "--limit", _OPEN_PR_LIMIT, "--json", "number"]
-    return classify_open_pr(gh(args, cwd))
-
-
-def _sleep_between_probes() -> None:
-    time.sleep(_OPEN_PR_RETRY_SLEEP_S)
-
-
-def _resolve_base_ref(git: GitRunner, cwd: str, base: str) -> str | None:
-    for ref in (f"origin/{base}", base):
-        if git(["rev-parse", "--verify", "--quiet", ref], cwd).code == 0:
-            return ref
-    return None
-
-
-def build_gate_context(
-    cwd: str,
-    base_branch: str = "dev",
-    repo: str = "",
-    env_test_cmd: str | None = None,
-    red_must_fail: bool = True,
-    verify_red_at_commit: bool = True,
-    allow_untested: bool = False,
-    git: GitRunner = _subprocess_git,
-    gh: GhRunner = _subprocess_gh,
-    run_tests: Callable[[str], bool] | None = None,
-    retry_sleep: Callable[[], None] = _sleep_between_probes,
-    durable_publish: bool = False,
-) -> GateContext:
-    """Gather the worktree facts the governor's gate rules need. Pure-ish: all
-    git/gh access goes through the injected `git`/`gh` runners, so a fake
-    exercises the wiring without a real repo. `run_tests` defaults to a real
-    shell eval in `cwd`.
-
-    The open-PR lookup is wired as a LAZY probe, never a value: this function
-    runs on EVERY Bash call the agent makes, and resolving it eagerly would put
-    a `gh` round-trip behind every `ls` (review known-gap-2)."""
-    branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd).out.strip()
-    baseref = _resolve_base_ref(git, cwd, base_branch)
-    base_resolvable = baseref is not None
-
-    history_available = True
-    branch_diff_available = True
-    subjects: tuple[str, ...] = ()
-    published_subjects: tuple[str, ...] = ()
-    changed: tuple[str, ...] = ()
-    if baseref:
-        log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
-        history_available = log.code == 0
-        subjects = tuple(s for s in log.out.splitlines() if s)
-        diff = git(["diff", "--name-only", f"{baseref}...HEAD"], cwd)
-        changed = tuple(f for f in diff.out.splitlines() if f)
-        branch_diff_available = diff.code == 0
-        # Commits already on the observed remote PR branch are published
-        # history the agent cannot rewrite (the broker requires them as
-        # ancestors), so the commit-log gate must not re-police their
-        # subjects — GitHub's Update-branch merge commit wedged keifu PR
-        # #182 (2026-08-03). Local origin/<branch> only, never a fetch:
-        # this context is built on every Bash call. A stale or absent ref
-        # fails toward the stricter, pre-exemption behavior.
-        if branch and branch != "HEAD":
-            remote_ref = f"refs/remotes/origin/{branch}"
-            # An unmatched ref query succeeds quietly, including packed refs.
-            refs = git(["for-each-ref", "--format=%(refname)", remote_ref], cwd)
-            if refs.code == 0 and remote_ref in refs.out.splitlines():
-                plog = git(
-                    [
-                        "log",
-                        f"{baseref}..{remote_ref}",
-                        "--reverse",
-                        "--format=%s",
-                    ],
-                    cwd,
-                )
-                if plog.code == 0:
-                    published_subjects = tuple(
-                        s for s in plog.out.splitlines() if s
-                    )
-
-    markers = HarnessMarkers(cwd)
-    def instruction_blobs(staged: bool) -> tuple[tuple[str, str], ...] | None:
-        selected = git(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd) if staged else None
-        if selected is not None and selected.code != 0:
-            return None
-        paths = selected.out.splitlines() if selected is not None else changed
-        tree = None if staged else git(["ls-tree", "--name-only", "HEAD", "--", "AGENTS.md", "AGENTS.override.md"], cwd)
-        if tree is not None and tree.code != 0:
-            return None
-        present = set(tree.out.splitlines()) if tree is not None else set(paths)
-        blobs = []
-        for path in ("AGENTS.md", "AGENTS.override.md"):
-            if path not in paths or path not in present:
-                continue
-            blob = git(["show", f":{path}" if staged else f"HEAD:{path}"], cwd)
-            if blob.code != 0 or len(blob.out) > 2_000_000:
-                return None
-            blobs.append((path, blob.out))
-        return tuple(blobs)
-
-    def commit_image_sizes() -> tuple[tuple[str, int], ...] | None:
-        staged = git(["diff", "--cached", "--name-only", "--diff-filter=AM"], cwd)
-        local = git(["ls-files", "--others", "--modified", "--exclude-standard", "--", "evidence"], cwd)
-        if staged.code != 0 or local.code != 0:
-            return None
-        images = []
-        for path in dict.fromkeys(staged.out.splitlines() + local.out.splitlines()):
-            if os.path.splitext(path)[1].lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
-                continue
-            try:
-                images.append((path, os.path.getsize(os.path.join(cwd, path))))
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return None
-        return tuple(images)
-
-    def open_pr(target_branch: str) -> OpenPrLookup:
-        """Resolved ONLY when the governor actually gates a push (see
-        `governor._push_gate`) — building this context must stay gh-free.
-
-        `target_branch` is the ref the push writes, derived from the push argv;
-        it is NOT necessarily `branch` (the checked-out one), which is the whole
-        of P1R-10 — `git push origin HEAD:x` and any push from a detached
-        mid-rebase HEAD used to ask about the wrong branch, or skip the gate."""
-        return probe_open_pr(target_branch, cwd, gh, repo=repo)
-
-    def exists_at_base(path: str) -> bool:
-        if not baseref:
-            return False
-        if git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0:
-            return True
-        # cat-file uses the same failure code for absent objects and failed
-        # reads. A successful tree lookup must prove absence before deleting
-        # an implementation in red verification.
-        tree = git(["ls-tree", "-z", "--name-only", baseref, "--", path], cwd)
-        if tree.code != 0:
-            raise ValueError("base-tree evidence is unavailable")
-        paths = tree.out.split("\x00")
-        if any(value and value != path for value in paths):
-            raise ValueError("malformed base-tree evidence")
-        return path in paths
-
-    def _default_run_tests(cmd: str) -> bool | None:
-        """Run the test command via `governor.run_target_command` (env scrub +
-        re-entrancy bound + process-group kill on timeout — the #63 defenses).
-
-        Tri-state: True = passed, False = failed (incl. timeout), None = the
-        run was REFUSED because it would re-enter the gate. None must flow to
-        the domain unchanged — the rules fail CLOSED on it with a recursion
-        message, which is a different verdict than 'your tests are red'. A
-        hang still resolves to False here, never an exception —
-        `evaluate_command` runs under a broad fail-OPEN except and an escaping
-        TimeoutExpired would silently ALLOW the gated command."""
-        rc, _ = run_target_command(cmd, cwd, _test_timeout_s())
-        if rc is None:
-            return None
-        return rc == 0
-
-    rt = run_tests or _default_run_tests
-
-    def receipt(
-        command: str,
-        status: TestExecutionStatus,
-        *,
-        code: int | None = None,
-        output: str = "",
-        started: float | None = None,
-    ) -> TestExecution:
-        revision = git(["rev-parse", "HEAD"], cwd).out.strip() or "unknown"
-        duration_ms = (
-            max(0, round((time.monotonic() - started) * 1000))
-            if started is not None
-            else 0
-        )
-        digest = hashlib.sha256(output.encode()).hexdigest()
-        return TestExecution(
-            status=status,
-            command=("/bin/bash", "-c", command or "<unresolved>"),
-            exit_code=code,
-            duration_ms=duration_ms,
-            stdout_digest=digest,
-            stderr_digest=digest,
-            executor_identity="issue-agent:trusted-verifier",
-            repository_revision=revision,
-        )
-
-    def run_red_tests(cmd: str) -> TestExecution:
-        """Return typed evidence; only TEST_FAILED authorizes a red commit."""
-        started = time.monotonic()
-        if run_tests is not None:
-            passed = rt(cmd)
-            status = (
-                TestExecutionStatus.INFRA_ERROR
-                if passed is None
-                else TestExecutionStatus.PASSED
-                if passed
-                else TestExecutionStatus.TEST_FAILED
-            )
-            code = 127 if passed is None else 0 if passed else 1
-            return receipt(cmd, status, code=code, started=started)
-        rc, output = run_target_command(
-            cmd, cwd, _test_timeout_s(), capture=True
-        )
-        status = classify_test_exit_code(rc, _test_failure_exit_codes())
-        return receipt(
-            cmd,
-            status,
-            code=(
-                None
-                if status
-                in {
-                    TestExecutionStatus.TIMED_OUT,
-                    TestExecutionStatus.CANCELLED,
-                }
-                else 127 if rc is None else rc
-            ),
-            output=output,
-            started=started,
-        )
-
-    def revert_and_run(impl_files: tuple[str, ...]) -> TestExecution:
-        """§10: drop new impl / revert modified impl to base, run the test cmd,
-        restore HEAD, and return a typed trusted-execution receipt. Only an exit
-        code declared by the operator as an assertion-failure code becomes
-        TEST_FAILED; timeouts, signals, command-not-found, and runner failures
-        remain non-authorizing infrastructure evidence."""
-        # Same precedence as every other gate rule — operator TEST_CMD first
-        # (P1R-18). This site used to inline its own `markers.test_cmd() or
-        # env_test_cmd` order, so §10 would have kept running the agent-written
-        # command even after the domain's `resolve_test_cmd` stopped preferring
-        # it. One resolver, one order.
-        test_cmd = resolve_test_cmd(markers.test_cmd(), env_test_cmd)
-
-        if not baseref or not test_cmd:
-            return receipt(
-                test_cmd, TestExecutionStatus.INFRA_ERROR, code=127
-            )
-        started = time.monotonic()
-        try:
-            for f in impl_files:
-                if exists_at_base(f):
-                    if git(["checkout", "-q", baseref, "--", f], cwd).code != 0:
-                        return receipt(
-                            test_cmd,
-                            TestExecutionStatus.INFRA_ERROR,
-                            code=127,
-                            started=started,
-                        )
-                else:
-                    try:
-                        os.remove(os.path.join(cwd, f))
-                    except OSError:
-                        pass
-            if run_tests is not None:
-                passed = rt(test_cmd)
-                status = (
-                    TestExecutionStatus.INFRA_ERROR
-                    if passed is None
-                    else TestExecutionStatus.PASSED
-                    if passed
-                    else TestExecutionStatus.TEST_FAILED
-                )
-                code = 127 if passed is None else 0 if passed else 1
-                return receipt(
-                    test_cmd, status, code=code, started=started
-                )
-            rc, output = run_target_command(
-                test_cmd, cwd, _test_timeout_s(), capture=True
-            )
-            status = classify_test_exit_code(
-                rc, _test_failure_exit_codes()
-            )
-            return receipt(
-                test_cmd,
-                status,
-                code=(
-                    None
-                    if status in {
-                        TestExecutionStatus.TIMED_OUT,
-                        TestExecutionStatus.CANCELLED,
-                    }
-                    else 127 if rc is None else rc
-                ),
-                output=output,
-                started=started,
-            )
-        finally:
-            restored = git(["checkout", "-q", "HEAD", "--", *impl_files], cwd)
-            if restored.code != 0:
-                return receipt(test_cmd, TestExecutionStatus.INFRA_ERROR, code=127,
-                    output="implementation restore failed", started=started)
-
-    return GateContext(
-        history_available=history_available,
-        branch_diff_available=branch_diff_available,
-        base_branch=base_branch,
-        repository=repo,
-        instruction_blobs=instruction_blobs,
-        commit_image_sizes=commit_image_sizes,
-        branch=branch,
-        branch_subjects=subjects,
-        published_subjects=published_subjects,
-        base_resolvable=base_resolvable,
-        changed_files=changed,
-        open_pr=open_pr,
-        open_pr_retry_sleep=retry_sleep,
-        allow_untested=allow_untested,
-        harness_test_cmd=markers.test_cmd(),
-        env_test_cmd=env_test_cmd,
-        run_tests=rt,
-        run_red_tests=run_red_tests,
-        revert_and_run=revert_and_run,
-        red_must_fail=red_must_fail,
-        verify_red_at_commit=verify_red_at_commit,
-        durable_publish=durable_publish,
-    )

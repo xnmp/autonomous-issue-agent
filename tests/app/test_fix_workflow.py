@@ -878,7 +878,7 @@ _PUSHED = AgentResult(is_error=False, status="pushed", session_id="s")
 
 def test_fix_ci_prompt_carries_the_failed_run_log():
     # M13: the prompt rendered "Log (last 150 lines):" over nothing, so the
-    # fixer had to rediscover the failure with `gh api` denied by the governor.
+    # fixer had to rediscover the failure with `gh api` denied by the tool policy.
     gw = PromptInputGateway(prs={100: _ci_pr()}, run_log="E   assert 1 == 2  # SENTINEL")
     runner = FakeRunner(_PUSHED)
 

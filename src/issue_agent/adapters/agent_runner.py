@@ -71,11 +71,10 @@ def _option_field_names() -> frozenset[str]:
 _OPTION_FIELDS: frozenset[str] | None = None
 
 
-# Default governed permission posture. `auto` exists in the Python SDK
-# (Literal includes it) but we default to bypassPermissions so the in-process
-# governor hook is unambiguously THE gate — matching the bash design where the
-# settings allow-list + hook, not the classifier, enforced safety. Override via
-# AgentRunner(permission_mode=…) if a target wants the classifier too.
+# Default permission posture: bypassPermissions, so the task's tool lists and
+# the trusted-inbound-content posture (see the capability matrix) are the
+# boundary, not the classifier. Override via AgentRunner(permission_mode=…) if
+# a target wants the classifier too.
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
 # Ceiling on ONE decoded SDK stream message. The SDK's own default is 1MB, and a
@@ -90,13 +89,10 @@ DEFAULT_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 def build_option_kwargs(
     task: RuntimePlan,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
-    extra_hooks: dict | None = None,
     max_buffer_size: int | None = None,
 ) -> dict[str, Any]:
     """Pure: RuntimePlan → kwargs for ClaudeAgentOptions. No SDK import, no I/O, so
-    it is unit-tested directly. `extra_hooks` is the already-built
-    {"PreToolUse": [HookMatcher(...)]} dict from the governor adapter (passed in
-    so this stays SDK-free); merged verbatim."""
+    it is unit-tested directly."""
     kwargs: dict[str, Any] = {
         "permission_mode": permission_mode,
         "max_budget_usd": task.max_budget_usd,
@@ -161,12 +157,9 @@ def build_option_kwargs(
             }
             for s in task.subagents
         }
-    if extra_hooks:
-        kwargs["hooks"] = extra_hooks
-
-    # Target project settings and CLAUDE.md are untrusted checkout data. Hooks
-    # are injected explicitly, and repository guidance is appended to the user
-    # task by RepositoryGuidanceRuntime.
+    # Target project settings and CLAUDE.md are untrusted checkout data, so
+    # none load (no target hooks either); repository guidance is appended to
+    # the user task by RepositoryGuidanceRuntime.
     kwargs["setting_sources"] = []
     return kwargs
 
@@ -291,7 +284,7 @@ def error_forensics(msg: Any) -> str:
     """WHY an errored ResultMessage errored, as one grep-able line.
 
     The SDK envelope carries far more than we map onto AgentResult:
-    `errors`, `permission_denials` (the governor blocking the agent in a loop —
+    `errors`, `permission_denials` (a tool policy blocking the agent in a loop —
     invisible everywhere else), `num_turns` (a max-turns wall), `stop_reason`,
     `terminal_reason`, `api_error_status`, and the model's own `result` text.
     All of it was being discarded, so a failed run left `exit_reason=agent_error`
@@ -311,7 +304,7 @@ def error_forensics(msg: Any) -> str:
         denials = getattr(msg, "permission_denials", None)
         if denials:
             # The count matters as much as the content: one denial is a blocked
-            # command, forty is an agent wedged against the governor.
+            # command, forty is an agent wedged against a tool policy.
             try:
                 count = len(denials)
             except TypeError:
@@ -464,7 +457,6 @@ class AgentRunner(AgentRuntime):
     def __init__(
         self,
         permission_mode: str = DEFAULT_PERMISSION_MODE,
-        hooks: dict | None = None,
         log: Any = None,
         debug: bool = False,
         idle_timeout: float | None = None,
@@ -475,8 +467,6 @@ class AgentRunner(AgentRuntime):
         process_supervisor: Any = None,
     ):
         self.permission_mode = permission_mode
-        # Pre-built {"PreToolUse": [HookMatcher(...)]} from the governor adapter.
-        self.hooks = hooks
         # Diagnostics: `log` is a str->None sink (stderr in prod). `debug` turns on
         # per-message tracing so a mid-session transport death ("Stream closed")
         # shows the LAST tool the agent ran before it — the blind spot today.
@@ -556,7 +546,7 @@ class AgentRunner(AgentRuntime):
         accounting_run_id = task.env.get("ISSUE_AGENT_RUN_ID", "")
         supervised_run_id = RunId(accounting_run_id or uuid.uuid4().hex)
         kwargs = build_option_kwargs(
-            task, self.permission_mode, self.hooks, self._max_buffer_size
+            task, self.permission_mode, self._max_buffer_size
         )
         if self._process_supervisor is not None:
             executable = resolve_claude_cli(
@@ -834,9 +824,7 @@ class AgentRunner(AgentRuntime):
                     # ResultMessage carries origin={"kind":"task-notification"} — it
                     # does NOT answer our prompt, and letting it overwrite `final`
                     # would clobber (or stand in for) the real verdict. Keep only the
-                    # result for our own turn. (Background Bash is separately blocked
-                    # at the governor hook; this is defense-in-depth for any other
-                    # background path the preset may open.) Duck-typed: older SDK
+                    # result for our own turn. Duck-typed: older SDK
                     # builds have no `origin` → getattr None → treated as ours.
                     origin = getattr(message, "origin", None)
                     if isinstance(origin, dict) and origin.get("kind") == "task-notification":

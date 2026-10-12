@@ -27,19 +27,9 @@ commands, remote readback, and receipts. Publication environment variables are
 removed from supervised child commands, but the model still runs as the daemon
 OS account and inherits its home-directory surface. Environment scrubbing does
 not prevent recovery through filesystem or local-socket access
-(`CRED-HOME`). An agent-local hook therefore remains defense-in-depth, not an
-authorization boundary.
-
-The resolver denies parse errors, excessive syntax depth, functions, dynamic
-command positions, supported interpreter `-c` forms, obscuring wrappers, and
-all governed commands it recognizes. It does **not** close arbitrary indirect
-execution. The accepted holes are:
-
-- script-file execution through `bash file.sh` or `./file.sh`
-  (`GOV-SCRIPT-FILE`);
-- util-linux `script -c` (`GOV-SCRIPT-C`);
-- `node`/`perl`/`ruby -e` (`GOV-INTERPRETER-E`);
-- `git rebase --exec` (`GOV-REBASE-EXEC`).
+(`CRED-HOME`). Slice 6a (2026-10) deleted the command governor and the
+agent-local hook stack outright, so there is no in-process command filter at
+all: the agent can run any command its OS account can.
 
 **Consequence:** do not point this at a repository whose inbound issue, PR,
 review, or CI text is supplied by people you do not trust. The trigger-gated
@@ -48,16 +38,14 @@ publisher; see ADR 0001 and the capability matrix.
 
 ### 1.2 Agent-written claims are not authorization evidence
 
-The PR gate no longer reads `.harness/ac-posted`, `test-plan-posted`, or
-`adversarial-verdict`. Acceptance criteria remain visible in the PR body,
-test results come from the trusted executor, and adversarial review is process
-discipline rather than self-attestation.
+The harness reads no agent-written `.harness/` claims. Acceptance criteria
+remain visible in the PR body, and adversarial review is process discipline
+rather than self-attestation.
 
 Visual-evidence marker/receipt bookkeeping was removed in #327; reviewers judge
-screenshot outcomes. `.harness/test-cmd` remains an agent-selected
-fallback when the operator supplies no `TEST_CMD` (`CLAIM-TEST-CMD`), but it
-never supplies the execution result. That claim alone does not authorize
-publication.
+screenshot outcomes. Slice 6a deleted the publication gates, so no harness-run
+test result gates publication either; CI and the independent reviewer judge
+the pushed head.
 
 ### 1.3 The first real GitHub canary is complete
 

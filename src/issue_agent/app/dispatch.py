@@ -218,8 +218,7 @@ class AgentDispatcher:
 
     async def _run_logged(self, label: str, issue: int, task):
         """Run one agent leg, bracketing it with start/done breadcrumbs so a long
-        in-session TDD run isn't a silent gap in the log. The per-commit milestones
-        (red:/green:/docs:) are logged live by the governor hook as they happen."""
+        in-session run isn't a silent gap in the log."""
         return await run_leg(
             self.runner,
             self.cfg.log,

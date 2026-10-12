@@ -400,9 +400,7 @@ def test_fix_ci_defers_when_fresh_pr_linkage_disagrees_with_claim():
 
 # ── logging breadcrumbs: no more silent gap between dispatch and PR ────────────
 def test_resolve_logs_worktree_and_agent_lifecycle():
-    """A resolve emits: worktree ready → agent running → agent done. This is the
-    in-process half of the fix log (the per-commit red:/green: half is the
-    governor hook's, tested in test_governor_adapter)."""
+    """A resolve emits: worktree ready → agent running → agent done."""
     gw = FakeGateway(issues={5: IssueView(5, title="Null token", body="x")},
                      pr_for_issue={5: 100})
     runner = FakeRunner(AgentResult(is_error=False, status="pr_opened",

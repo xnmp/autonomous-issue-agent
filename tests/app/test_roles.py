@@ -1896,7 +1896,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     runtime = dispatcher.runner.inner
     assert runtime.__class__.__name__ == "AccountingRuntime"
     runtime = runtime.inner
-    assert runtime.__class__.__name__ == "HookPreparingRuntime"
+    assert runtime.__class__.__name__ == "CodexHomeRuntime"
     assert isinstance(runtime.inner, CapturingCodexRunner)
     assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["enforce_budget"] is True
@@ -1904,9 +1904,6 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert seen["resume_on_retry"] is False
     assert dispatcher.review_workflow.cfg.execution_cwd == str(tmp_path)
     assert callable(dispatcher.review_workflow.cfg.prepare_cwd)
-    # #113: the leg carries its own role, so the governor never has to infer it
-    # from a hook file that a differently-roled leg may also resolve to.
-    assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "review"
 
 
 def _git_target(tmp_path):
@@ -2079,54 +2076,11 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
     assert store.get_infra_deaths(151) == 0
 
 
-def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path, monkeypatch):
-    """#113: the reviewer's hook lives at TARGET_DIR and fixer worktrees are
-    nested beneath it, so a fix leg can execute the reviewer's read-only hook.
-    The runner states the role in the leg's environment; the governor gives it
-    precedence over the inherited flag."""
-    from issue_agent.adapters import codex_runner
-
-    seen = {}
-
-    class CapturingCodexRunner:
-        def __init__(self, **kwargs):
-            seen.update(kwargs)
-
-        def preflight(self):
-            return None
-
-        def oauth_auth_file(self):
-            return ""
-
-    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
-    _codex_daemon(tmp_path)
-
-    assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "fix"
 
 
-def test_codex_fixer_composes_operator_base_into_gate_local_hook(tmp_path):
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    daemon = _codex_daemon(
-        tmp_path,
-        BASE_BRANCH="canary/dashboard-e2e",
-    )
-    dispatcher = daemon.executor._run_agent._dispatch.__self__
-
-    prepare_cwd = dispatcher.fix_workflow.prepare_cwd
-    assert prepare_cwd is not None
-    prepare_cwd(str(worktree))
-
-    scripts = tuple(
-        (tmp_path / "state" / "codex-hooks").glob("*/hooks/gov.sh")
-    )
-    assert len(scripts) == 1
-    assert "export BASE_BRANCH=canary/dashboard-e2e" in scripts[0].read_text()
-
-
-def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkeypatch):
-    """Building a daemon must not mutate a fixer worktree's Codex hook."""
-    from issue_agent.adapters import codex_hook, codex_runner
+def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, monkeypatch):
+    """Building a daemon must not prepare any checkout's CODEX_HOME."""
+    from issue_agent.adapters import codex_home, codex_runner
     from issue_agent.app.config import from_env
     from issue_agent.app.roles import build_review_daemon
 
@@ -2144,7 +2098,7 @@ def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkey
 
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     monkeypatch.setattr(
-        codex_hook, "write_hook_config", lambda *args, **kwargs: hook_calls.append((args, kwargs))
+        codex_home, "write_codex_home", lambda *args, **kwargs: hook_calls.append((args, kwargs))
     )
     cfg = replace(
         from_env({

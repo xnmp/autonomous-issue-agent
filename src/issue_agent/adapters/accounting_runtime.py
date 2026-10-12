@@ -599,7 +599,6 @@ class AccountingRuntime(AgentRuntime):
                 **authority,
                 **(
                     {
-                        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
                         "ISSUE_AGENT_AUTHORITY_BUNDLE": authority_bundle,
                     }
                     if publication_authority

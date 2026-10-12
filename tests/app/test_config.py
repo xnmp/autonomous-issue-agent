@@ -241,9 +241,6 @@ def test_merge_method():
     assert c.merge_method == "merge"
 
 
-def test_edit_check_cmd():
-    assert from_env({"REPO": "x"}).edit_check_cmd == ""  # default off
-    assert from_env({"REPO": "x", "EDIT_CHECK_CMD": "npx tsc --noEmit"}).edit_check_cmd == "npx tsc --noEmit"
 
 
 def test_retry_caps():
@@ -309,12 +306,10 @@ def test_an_unset_shell_command_is_reported_as_empty_not_as_quotes():
     assert describe_command("", empty="none") == "none"
 
 
-def test_describe_shows_the_real_alert_and_edit_check_commands():
-    c = from_env({"REPO": "o/r", "ALERT_CMD": "notify-send 'harness capped'",
-                  "EDIT_CHECK_CMD": "cargo check --quiet"})
+def test_describe_shows_the_real_alert_command():
+    c = from_env({"REPO": "o/r", "ALERT_CMD": "notify-send 'harness capped'"})
     d = c.describe()
 
-    assert "cargo check --quiet" in d
     assert "notify-send 'harness capped'" in d or 'notify-send' in d
 
 
@@ -1165,19 +1160,19 @@ def test_file_value_wins_over_inherited_value(tmp_path):
 
 
 def test_shell_escaped_values_survive_the_file_read(tmp_path):
-    # compose-env.sh writes `printf '%s=%q'`, so a real TEST_CMD/EDIT_CHECK_CMD
-    # lands backslash-escaped. Mis-parsing one breaks every gate.
+    # compose-env.sh writes `printf '%s=%q'`, so a real command value such as
+    # ALERT_CMD lands backslash-escaped.
     env_file = tmp_path / "active.env"
     cmd = "set -e; (cd backend && uv run pytest) && pnpm exec tsc -b"
     quoted = subprocess.run(
-        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "EDIT_CHECK_CMD", cmd],
+        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "ALERT_CMD", cmd],
         capture_output=True, text=True, check=True,
     ).stdout
     env_file.write_text(f"REPO=o/r\n{quoted}\n")
 
     c = from_env({"AGENT_ENV": str(env_file)})
 
-    assert c.edit_check_cmd == cmd
+    assert c.alert_cmd == cmd
 
 
 def test_unparseable_agent_env_file_falls_back_to_process_env(tmp_path):

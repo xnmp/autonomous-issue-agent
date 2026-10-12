@@ -10,7 +10,7 @@
 # under one trap. Ctrl-C stops both. Idempotent.
 #
 # Point-and-fire: nothing is installed into the target's tracked tree. The SDK
-# daemons inject the governor hook + AGENT.md in-process; the only target-side
+# daemons inject AGENT.md in-process; the only target-side
 # effects are GitHub labels and a local .git/info/exclude.
 #
 # Env knobs:
@@ -57,10 +57,10 @@ info() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 
 # A configured TEST_CMD belongs to the target checkout. The deployment knobs
 # that selected it must not be inherited by its descendants; otherwise this
-# project self-hosting `make test` recursively invokes its own gate hooks.
-# HARNESS_GATE_DEPTH is the re-entrancy bound backing that scrub (see
-# plugin/hooks/checks/_pr_common.sh:prc_run_test_cmd for the full rationale):
-# executing at depth ≥ 2 means the command re-entered the gate (#63) — refuse.
+# project self-hosting `make test` recursively re-enters the harness (#63).
+# HARNESS_GATE_DEPTH is the re-entrancy bound backing that scrub: executing at
+# depth ≥ 2 means the command re-entered the probe — refuse. compose-env.sh
+# also parses RTC_SCRUB_STATIC as its pass-through floor.
 # Exported: the probe transports run_target_test_cmd into a `timeout bash -c`
 # subshell via `declare -f`, which does NOT carry plain script variables.
 export RTC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_TEST_FAILURE_EXIT_CODES GATE_GH_RETRY_SLEEP HARNESS_SCREENSHOTS_READ GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV ISSUE_AGENT_DEPLOYMENT_ID"
@@ -236,8 +236,8 @@ else
 fi
 
 # ── 4. Point-and-fire prep: NO repo mutation ──────────────────────────────────
-# The SDK daemons inject the governor hook + AGENT.md IN-PROCESS (governor.py /
-# main.py:_agent_md) and run the fixer under bypassPermissions — so the target
+# The SDK daemons inject AGENT.md IN-PROCESS (main.py:_agent_md) and run the
+# fixer under bypassPermissions — so the target
 # needs NO installed .claude/ plugin, settings.json, or AGENT.md. We touch only:
 #   (a) GitHub labels — the lifecycle bus the watchers key off (not repo files).
 #   (b) the target's LOCAL .git/info/exclude — so the fixer's per-issue worktree

@@ -4,14 +4,13 @@ of the Claude Agent SDK, so the *fixer* leg can use a different/cheaper model
 AgentResult` contract, so the domain/orchestration layer is unchanged.
 
 This is the SECOND runtime adapter (see docs/CODEX-RUNNER.md). It speaks to
-`codex exec`, which is itself an agentic loop with hooks + sandbox — so the
-governor ports as a Codex PreToolUse hook (emitted by `codex_hook` below) and
-runs UNMODIFIED. The pure pieces (`build_codex_argv`, `parse_codex_envelope`)
-are factored out so they unit-test with no subprocess.
+`codex exec`, which is itself an agentic loop with a sandbox. The pure pieces
+(`build_codex_argv`, `parse_codex_envelope`) are factored out so they unit-test
+with no subprocess.
 
 Why `codex exec` and not the OpenAI SDK: the SDK is a chat API, not an agentic
-runtime; reusing Codex keeps the tool loop, the pre-tool governor gate, worktree
-isolation, and structured output that our fixer depends on.
+runtime; reusing Codex keeps the tool loop, worktree isolation, and structured
+output that our fixer depends on.
 """
 
 from __future__ import annotations
@@ -62,8 +61,8 @@ DEFAULT_CODEX_MODEL = ""
 
 # Codex hardcodes `.git` read-only under --sandbox workspace-write (no config
 # knob; OpenAI issues #12280/#14338), which breaks the git-driven fixer. We use
-# full-access and rely on the governor hook as the gate — the SAME posture the
-# Claude fixer runs in (permission_mode=bypassPermissions + governor).
+# full-access — the SAME posture the Claude fixer runs in
+# (permission_mode=bypassPermissions).
 DEFAULT_SANDBOX = "danger-full-access"
 
 # `codex exec` left alone runs at reasoning effort LOW (observed in live
@@ -287,22 +286,16 @@ def build_codex_argv(
         if task.cwd:
             argv += ["-C", task.cwd]
 
-    # Headless: no interactive /hooks trust prompt is possible, so trust the
-    # configured governor hook for this invocation. This KEEPS the gate on.
-    # Legal on both exec and resume.
-    argv += ["--dangerously-bypass-hook-trust"]
-
     if schema_path:
         argv += ["--output-schema", schema_path]
     if output_path:
         argv += ["-o", output_path]
 
     # AGENT.md parity: Codex has no system-prompt-preset append. Preferred path —
-    # the contract is written to the worktree's AGENTS.override.md (Codex's native
-    # per-project instructions; see codex_hook.write_hook_config) and
-    # inject_system_prompt is False, so we DON'T also prepend it here (that would
-    # duplicate the whole contract into every prompt). When AGENTS.override.md
-    # isn't in use (inject_system_prompt=True), fall back to prepending.
+    # the contract rides the external CODEX_HOME's developer_instructions (see
+    # codex_home.write_codex_home) and inject_system_prompt is False, so we DON'T
+    # also prepend it here (that would duplicate the whole contract into every
+    # prompt). Without it (inject_system_prompt=True), fall back to prepending.
     prompt = task.prompt
     if inject_system_prompt and task.append_system_prompt:
         prompt = f"{task.append_system_prompt}\n\n---\n\n{prompt}"
@@ -1216,8 +1209,8 @@ def parse_codex_envelope(
 @dataclass
 class CodexRunner(AgentRuntime):
     """Runs fixer tasks over `codex exec`. `provider`/`sandbox`/`model` are
-    process-level config; the governor must already be installed in the task's
-    cwd as a Codex hook (see `codex_hook.write_hook_config`). All subprocess/IO
+    process-level config; the task's CODEX_HOME is prepared by
+    `codex_home.CodexHomeRuntime`. All subprocess/IO
     lives in `run`; `build_codex_argv` + `parse_codex_envelope` stay pure."""
 
     codex_bin: str = "codex"
@@ -1467,7 +1460,7 @@ class CodexRunner(AgentRuntime):
         return None
 
     def oauth_auth_file(self) -> str:
-        """Existing Codex-login file used by the isolated hook CODEX_HOME."""
+        """Existing Codex-login file used by the isolated CODEX_HOME."""
 
         if self.provider.base_url:
             return ""

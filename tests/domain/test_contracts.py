@@ -16,11 +16,8 @@ from issue_agent.domain.contracts import (
     ChargeOrigin,
     RunId,
     SettlementRequest,
-    TestExecution as ExecutionReceipt,
-    TestExecutionStatus as ExecutionStatus,
     TokenUsage,
     UsageSource,
-    classify_test_exit_code,
     daily_budget_scope,
 )
 
@@ -70,36 +67,6 @@ def test_money_major_units_use_decimal_half_up(amount, micros):
 def test_money_major_units_reject_ambiguous_values(amount):
     with pytest.raises(ValueError):
         Money.from_major("USD", amount)
-
-
-@pytest.mark.parametrize(
-    ("exit_code", "status"),
-    (
-        (0, ExecutionStatus.PASSED),
-        (1, ExecutionStatus.TEST_FAILED),
-        (2, ExecutionStatus.INFRA_ERROR),
-        (124, ExecutionStatus.TIMED_OUT),
-        (125, ExecutionStatus.INFRA_ERROR),
-        (126, ExecutionStatus.INFRA_ERROR),
-        (127, ExecutionStatus.INFRA_ERROR),
-        (-9, ExecutionStatus.CANCELLED),
-        (137, ExecutionStatus.CANCELLED),
-        (None, ExecutionStatus.INFRA_ERROR),
-    ),
-)
-def test_test_exit_classification_requires_confirmed_failure_code(
-    exit_code, status
-):
-    assert classify_test_exit_code(exit_code) is status
-
-
-def test_trusted_runner_can_declare_a_nonstandard_failure_exit_code() -> None:
-    assert classify_test_exit_code(
-        2, frozenset({1, 2})
-    ) is ExecutionStatus.TEST_FAILED
-    assert classify_test_exit_code(
-        127, frozenset({127})
-    ) is ExecutionStatus.INFRA_ERROR
 
 
 def test_token_usage_is_disjoint_and_stderr_is_not_accounting_evidence():
@@ -159,25 +126,6 @@ def test_daily_budget_periods_follow_civil_dst_and_leap_boundaries(
     )
     assert elapsed == timedelta(hours=hours)
     assert scope.period_id == period_id
-
-
-def test_only_genuine_nonzero_test_exit_can_be_red_evidence():
-    trusted = dict(
-        command=("pytest",),
-        duration_ms=1,
-        stdout_digest="a",
-        stderr_digest="b",
-        executor_identity="verifier",
-        repository_revision="deadbeef",
-    )
-    result = ExecutionReceipt(
-        ExecutionStatus.TEST_FAILED, exit_code=1, **trusted
-    )
-    assert result.status is ExecutionStatus.TEST_FAILED
-    with pytest.raises(ValueError, match="non-zero"):
-        ExecutionReceipt(ExecutionStatus.TEST_FAILED, exit_code=0, **trusted)
-    with pytest.raises(ValueError, match="cannot claim"):
-        ExecutionReceipt(ExecutionStatus.TIMED_OUT, exit_code=124, **trusted)
 
 
 def test_lifecycle_payload_is_immutable_and_receipt_state_is_total():

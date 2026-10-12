@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 import pytest
 
-from issue_agent.adapters.store import HarnessMarkers, Store
+from issue_agent.adapters.store import Store
 from issue_agent.domain.ci_history import CiAttempt
 
 def _seed_legacy_ci_counter(store, issue, count):
@@ -356,20 +356,6 @@ def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
     s.cleanup_pr(100, None, merged=False)
     assert Path(s.pr_path(100, "automerge")).exists()        # PR-side untouched, as before
     assert s.get_infra_deaths(-100) == 1           # kept — same conservatism as a real issue
-
-# ── .harness claims ──
-def test_harness_test_command():
-    with tempfile.TemporaryDirectory() as root:
-        hd = os.path.join(root, ".harness")
-        os.makedirs(hd)
-        m = HarnessMarkers(root)
-        with open(os.path.join(hd, "test-cmd"), "w") as f:
-            f.write("\n  \ncd backend && pytest -q\nextra\n")
-        assert m.test_cmd() == "cd backend && pytest -q"  # first non-blank line
-
-def test_harness_test_cmd_none_when_absent():
-    with tempfile.TemporaryDirectory() as root:
-        assert HarnessMarkers(root).test_cmd() is None
 
 def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open():
     s, _ = _store()

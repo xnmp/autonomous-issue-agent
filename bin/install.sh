@@ -5,7 +5,7 @@
 #   make install
 #
 # The harness is NOT a standalone wheel: the daemon walks __file__ up to THIS
-# checkout to load plugin/AGENT.md, plugin/hooks/bash_governor.py, config/mcp/*.
+# checkout to load plugin/AGENT.md and config/mcp/*.
 # So we install editable into the checkout's .venv (the same env point-at.sh's
 # `uv run` reuses) and put a thin launcher shim on PATH that execs that venv's
 # entry point with the checkout baked in. Idempotent; re-runnable.
@@ -19,7 +19,7 @@ grn() { printf '\033[32m%s\033[0m\n' "$1"; }
 inf() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 
 # #156: this used to shim ONE hand-written name while pyproject declared two,
-# so `issue-agent-publish` — the executable the governor tells every fixer to
+# so `issue-agent-publish` — the executable AGENT.md tells every fixer to
 # publish through — was absent on any box bootstrapped with `make install`, and
 # paid resolve legs blocked asking the operator to install it. The list is now
 # DERIVED from the single declaration that materialises .venv/bin: the keys of

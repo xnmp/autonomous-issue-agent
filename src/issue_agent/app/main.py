@@ -1,7 +1,7 @@
 """Entry point — `python -m issue_agent.app.main <fix|review>`.
 
 Builds the identity (fixer = ambient/PAT; review = GitHub App token), the
-adapters, the governor hook, and runs the chosen role's daemon forever.
+adapters, and runs the chosen role's daemon forever.
 """
 
 from __future__ import annotations
@@ -22,17 +22,16 @@ from ..adapters.control_store import (
 )
 from ..adapters.env_file import source_env_file
 from ..adapters.github import GhUnavailable, GitHubGateway, Identity
-from ..adapters.governor import build_hooks
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from ..adapters.systemd_notify import SystemdNotifier
 from ..adapters.store import Store
-from ..adapters.worktree import Worktrees, build_gate_context
+from ..adapters.worktree import Worktrees
 from ..domain.world import HeadSignal, ProbeSignals, WorldState
 from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
 from ..domain.recovery import RecoveryArm, RecoveryTrigger, recovery_plan
 from ..domain.repository import canonical_repository
-from .config import HarnessConfig, describe_command, from_env, render_agent_md
+from .config import HarnessConfig, from_env, render_agent_md
 from .roles import (
     build_fix_daemon,
     build_review_daemon,
@@ -178,52 +177,22 @@ def build_role(
 
     # Resolved-config print (lean P5.1): every daemon start states what it
     # ACTUALLY loaded — the only structural defense against the silent-default
-    # class (#16/#49/#50/#78). TEST_CMD/ALLOW_UNTESTED are env facts the gate
-    # reads directly, so they're reported here alongside the config.
+    # class (#16/#49/#50/#78).
     for line in cfg.describe().splitlines():
         sys.stderr.write(f"{role}: config: {line}\n")
-    sys.stderr.write(
-        f"{role}: config: TEST_CMD={describe_command(env.get('TEST_CMD'))} "
-        f"ALLOW_UNTESTED={env.get('ALLOW_UNTESTED', '0') or '0'}\n"
-    )
     sys.stderr.flush()
 
-    # The governor hook needs a GateContext built from the agent's worktree cwd.
-    def build_ctx(cwd: str):
-        return build_gate_context(
-            cwd, base_branch=cfg.base_branch,
-            # Pin the open-PR probe to THIS repo (review P1R-11). Without it gh
-            # resolves the repo from the worktree's remotes, and on a target with
-            # more than one remote it answers about the wrong repository — where
-            # the branch has no PR, so the push gate silently does not apply.
-            repo=cfg.repo,
-            env_test_cmd=env.get("TEST_CMD"),
-            red_must_fail=env.get("RED_MUST_FAIL", "1") != "0",
-            verify_red_at_commit=env.get("VERIFY_RED_AT_COMMIT", "1") != "0",
-            # Operator opt-out for a test-less repo: without it the fail-closed
-            # tests gate (check_tests) denies every pr-create/push. Mirrors the
-            # bash checks' ALLOW_UNTESTED — an overlay fact, never agent-set.
-            allow_untested=env.get("ALLOW_UNTESTED", "") == "1",
-            durable_publish=True,
-        )
-
-    # Live per-commit breadcrumb (red:/green:/docs:) from inside the agent session,
-    # tagged with the role so it interleaves with the daemon's own log lines.
+    # Runner diagnostics, tagged with the role so they interleave with the
+    # daemon's own log lines.
     def _commit_log(msg: str) -> None:
         sys.stderr.write(f"{role}: {msg}\n")
         sys.stderr.flush()
 
-    # ISSUE_AGENT_DEBUG=1 turns on the deep trace: every Bash command + gate
-    # verdict (governor hook) AND every SDK stream message (runner). This is the
+    # ISSUE_AGENT_DEBUG=1 turns on the deep trace: every SDK stream message
+    # (runner). This is the
     # instrument for the "Stream closed" wedge — off by default (verbose), on when
     # diagnosing. Boot logs whether it's active so the log is self-describing.
     debug = env.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
-    hooks = build_hooks(
-        build_ctx,
-        edit_check_cmd=cfg.edit_check_cmd or None,
-        log=_commit_log,
-        debug=debug,
-    )
     _idle = cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None
     # Two independent caps: silence (idle) and total elapsed (wall). The wall cap is
     # what bounds a limping post-suspend stream, which never goes silent enough to
@@ -232,7 +201,7 @@ def build_role(
     from ..adapters.process_supervisor import ProcessSupervisor
 
     runner = AgentRunner(
-        hooks=hooks, log=_commit_log, debug=debug,
+        log=_commit_log, debug=debug,
         idle_timeout=_idle, max_runtime=_wall,
         max_buffer_size=cfg.sdk_max_buffer_bytes or None,
         process_supervisor=ProcessSupervisor(
@@ -349,14 +318,12 @@ def _serve(role: str) -> None:
         raise SystemExit(ExitCode.INVALID_CONFIG) from exc
     # review C5(b): export the composed config into THIS process's environment
     # before building anything. No adapter subprocess call passes `env=`
-    # explicitly, so every shell-out downstream (bash gate checkers, git, gh,
+    # explicitly, so every shell-out downstream (git, gh,
     # codex) inherits os.environ as it stood at spawn time. Foreground
     # `point-at.sh` happens to `set -a`-source the same files into its own
     # shell first, so dev mode worked by accident; systemd units set only
-    # AGENT_ENV + TARGET_DIR, so without this update the bash checkers read
-    # TEST_CMD/ALLOW_UNTESTED/BASE_BRANCH from an empty environment — the
-    # test-less-repo escape hatch became unreachable (fail-closed gate) and
-    # operator configuration were honoured in dev and silently
+    # AGENT_ENV + TARGET_DIR, so without this update subprocesses read an
+    # empty environment and operator configuration was honoured in dev and silently
     # ignored under the service. `update()` (not a fresh dict) matches
     # foreground `set -a` sourcing semantics: the overlay wins over whatever
     # the service unit already set, inherited env stays for anything the
