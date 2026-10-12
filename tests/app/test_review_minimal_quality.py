@@ -33,8 +33,13 @@ def deployment(tmp_path, monkeypatch):
     return result
 
 
-@pytest.mark.parametrize("bucket,mergeable", [("pending", False), ("fail", False), (None, False), ("pass", True)])
-def test_model_approval_without_local_execution_still_requires_ci(deployment, tmp_path, monkeypatch, bucket, mergeable):
+@pytest.mark.parametrize("bucket,required,mergeable", [
+    ("pending", True, False), ("fail", True, False), (None, True, False), ("pass", True, True),
+    (None, False, False),  # a target with no CI checks at all never merges on a model verdict
+])
+def test_model_approval_without_local_execution_still_requires_ci(
+    deployment, tmp_path, monkeypatch, bucket, required, mergeable,
+):
     marker = tmp_path / "target-tests-ran"
     monkeypatch.setenv("TEST_CMD", f"touch '{marker}'; exit 1")
     monkeypatch.setenv("ALLOW_UNTESTED", "invalid-retired-review-waiver")
@@ -45,26 +50,28 @@ def test_model_approval_without_local_execution_still_requires_ci(deployment, tm
     assert not marker.exists()
     pr = client.remote.get_pr(PR)
     reports = () if bucket is None else (Check("required-unit", bucket=bucket, required=True),)
-    pr = replace(pr, merge_state="CLEAN", ci=Observed(pr.head_ref_oid, pr.head_ref_oid,
-                                frozenset({RequiredCheck("required-unit")}), reports))
+    policy = frozenset({RequiredCheck("required-unit")}) if required else frozenset()
+    pr = replace(pr, merge_state="CLEAN", ci=Observed(pr.head_ref_oid, pr.head_ref_oid, policy, reports))
     assert should_automerge(pr, FixState(), FixConfig(fix_bot="fix-bot")) is mergeable
 
 
 @pytest.mark.parametrize("mode", [ReviewMode.SINGLE, ReviewMode.DELEGATED, ReviewMode.MULTI])
-def test_workflow_changes_escalate_instead_of_model_approval(deployment, mode):
+@pytest.mark.parametrize("path", [".github/workflows/ci.yml", ".github/actions/setup/action.yml"])
+def test_workflow_changes_escalate_instead_of_model_approval(deployment, mode, path):
     provider = ScriptedProvider(verdicts("APPROVE"))
     if mode is ReviewMode.MULTI:
         from issue_agent.domain.outcome import AgentResult, ExitReason
         provider = ScriptedProvider([AgentResult(is_error=False, exit_reason=ExitReason.OK, cost_usd=0.1, structured={"reviewable": False, "reason": "configuration"})])
     client = compose_review(deployment, provider=provider, mode=mode)
     head = deployment.heads[0]
-    client.remote.set_diff(head, "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
-                                 "--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n"
+    client.remote.set_diff(head, f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
                                  "@@ -1 +1 @@\n-old\n+new\n")
     client.boot()
     client.tick()
     review = client.bot_reviews()[-1]
-    assert review.state == "COMMENTED" and ".github/workflows/" in review.body
+    assert review.state == "COMMENTED" and ".github/" in review.body
+    if mode is not ReviewMode.MULTI:
+        assert "verdict 0" in review.body, "the reviewer's findings must reach the human"
     client.tick(2)
     assert Label(NHR) in client.remote.get_pr(PR).labels
     assert len(client.bot_reviews()) == 1

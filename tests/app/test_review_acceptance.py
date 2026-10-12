@@ -30,7 +30,7 @@ from issue_agent.domain.review_rounds import (
 )
 from issue_agent.domain.world import IssueView
 from issue_agent.domain.review_workflow import (
-    CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, ReviewedBaseline, ReviewRejectionCeiling,
+    CompletedReviewRearm, PendingReviewRearm, ReviewedBaseline, ReviewRejectionCeiling,
     SupersededReviewRearm,
 )
 from issue_agent.domain.workflow import (

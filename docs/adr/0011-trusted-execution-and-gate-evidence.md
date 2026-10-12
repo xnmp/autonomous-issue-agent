@@ -48,8 +48,8 @@ Agent-created `.harness/` markers may request verification or describe visual
 acceptance criteria, but cannot assert that a test passed.
 
 Review approval comes from the model verdict on the exact PR head; the harness
-does not execute target tests during review. Repository-required CI checks still
-gate merge. Diffs touching `.github/workflows/**` escalate through the existing
+does not execute target tests during review. Targets must have CI checks: a PR with
+no reported checks does not merge. Diffs touching `.github/**` escalate through the existing
 human-review path because CI configuration is repository governance.
 
 Environment scrubbing is capability reduction, not a security boundary against

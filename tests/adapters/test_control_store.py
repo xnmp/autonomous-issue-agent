@@ -3732,14 +3732,13 @@ def test_v41_preserves_existing_money_and_only_marks_identifiable_legacy_recover
     assert restarted.snapshot(_scope()).settled == Money("USD", 51 if origin is ChargeOrigin.RECOVERY_ESTIMATE else 50)
 
 
-@pytest.mark.parametrize("rearming", [False, True])
-def test_retiring_synthetic_execution_rejection_keeps_model_verdict_holds(tmp_path, rearming):
+def test_retiring_synthetic_execution_rejection_keeps_model_verdict_holds(tmp_path):
     from issue_agent.adapters.control_store import _encoded_payload_digest
     from issue_agent.adapters.workflow_codec import encode_workflow
     from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
     from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
     from issue_agent.domain.review_rejection import ReviewVerdictHold
-    from issue_agent.domain.workflow import NoAuthorizedRemediation, OpenGate, RearmingGate
+    from issue_agent.domain.workflow import NoAuthorizedRemediation, OpenGate
     from tests.domain.test_review_workflow_policy import fresh
     from tests.fakes.workflow_authority import install_workflow
 
@@ -3769,10 +3768,56 @@ def test_retiring_synthetic_execution_rejection_keeps_model_verdict_holds(tmp_pa
             (f"pr:{state.revision.fence.key.target.number}", "a" * 40, payload,
              _encoded_payload_digest(payload, binding), NOW.isoformat(), NOW.isoformat(), binding),
         )
-        if rearming:
-            db.execute("UPDATE workflow_gates SET state='rearming',payload_json=? WHERE gate_id=?",
-                       (encode_workflow(RearmingGate(retired, "retired-request")), retired.gate_id))
     store.initialize()
     with store.transaction() as db:
         loaded = load_review_workflow_row(db, state.revision.fence.key)
     assert loaded is not None and loaded.gates == (retained,)
+
+
+def test_migration_42_retires_retry_grant_attached_to_a_retired_renewal(tmp_path):
+    from issue_agent.adapters.control_store import _encoded_payload_digest
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
+    from issue_agent.domain.workflow import EvidenceUnavailable, NoAuthorizedRemediation, OpenGate
+    from tests.domain.test_review_workflow_policy import fresh
+    from tests.fakes.workflow_authority import install_workflow
+
+    store = _store(tmp_path)
+    state = fresh()
+    gen = state.revision.fence.generation
+    held = OpenGate("ordinary-test:legacy", gen, EvidenceUnavailable("independent operator tests", NOW, 12, "x"),
+                    NoAuthorizedRemediation("retired"))
+    retry = OpenGate("retry:obligation", gen, EvidenceUnavailable("relabel outcome", NOW, 1, "x"),
+                     NoAuthorizedRemediation("retry"))
+    install_workflow(store, state)
+    with store.transaction() as db:
+        persist_workflow_snapshot(db, dataclasses.replace(state, gates=(held, retry)))
+    pr = state.revision.fence.key.target.number
+    binding = encode_workflow(state.binding)
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 41)
+        payload = json.dumps({"labels": "x"})
+        db.execute(
+            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
+            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
+            "state,created_at,updated_at,workflow_binding_json) VALUES ('obligation','k','k',0,'relabel',?,"
+            "'r','legacy','o/r','review-owner',?,?,'unknown_outcome',?,?,?)",
+            (f"pr:{pr}", payload, _encoded_payload_digest(payload, binding), NOW.isoformat(), NOW.isoformat(), binding))
+        db.execute("INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,status,"
+                   "remote_object_id,receipt_digest) VALUES ('obligation','review-owner','s','c','unknown_outcome',NULL,?)",
+                   ("b" * 64,))
+        db.execute("UPDATE workflow_gates SET state='rearming' WHERE gate_id=?", (held.gate_id,))
+        db.execute("INSERT INTO workflow_rearms VALUES ('legacy-renewal','o/r','pr',?,?,?,?,'pending','d','a','i')",
+                   (pr, held.gate_id, gen, gen + 1))
+        db.execute("INSERT INTO workflow_rearm_commands VALUES ('legacy-renewal','relabel','obligation','required','{}')")
+        db.execute("INSERT INTO workflow_evidence VALUES ('absence-1','o/r','pr',?,'obligation','absence','{}')", (pr,))
+        db.execute("INSERT INTO workflow_retry_authorizations(authorization_id,request_id,command_id,gate_id,"
+                   "association_kind,binding_json,evidence_id,request_digest,actor_json,generation,unavailable_reads,accepted_at) "
+                   "VALUES ('grant-1','legacy-renewal','obligation',?,'rearm','{}','absence-1','d','{}',?,0,?)",
+                   (retry.gate_id, gen, NOW.isoformat()))
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+    store.initialize()
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 42
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert db.execute("SELECT count(*) FROM workflow_retry_authorizations").fetchone()[0] == 0

@@ -117,8 +117,9 @@ Important fields:
   the issue scope is omitted because no issue authority exists.
 - `ISSUE_AGENT_MAX_TICKS=N` is the safe one/few-tick live canary control.
 
-The reviewer approves on its model verdict for the exact PR head. Merge still
-requires the repository's required checks. Changes to `.github/workflows/**`
+The reviewer approves on its model verdict for the exact PR head. Merge
+requires a passing CI report: targets must have CI checks, and a PR with no
+reported checks does not merge. Changes under `.github/**`
 escalate through the existing human-review path. Review legs do not execute
 operator test commands.
 

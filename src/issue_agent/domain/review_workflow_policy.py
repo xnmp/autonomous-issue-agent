@@ -38,7 +38,7 @@ from .review_workflow import (
 )
 from .workflow import (
     MAX_WORKFLOW_GATES, AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, ClearGuidance, ContinueGrantedRearm,
-    EvidenceUnavailable, NoAuthorizedRemediation, ObservedTransition, OpenGate, OperatorActor, RearmingGate, RearmNeedsDecision,
+    NoAuthorizedRemediation, ObservedTransition, OpenGate, OperatorActor, RearmingGate, RearmNeedsDecision,
     RemoteOutcomeUncertain, RequestRearm, RetryAuthorizationRequired, SetGuidance, StopReason, UnresolvedGate,
     WorkflowChanged, WorkflowMutation, WorkflowRejected, WorkflowRejection, WorkflowTransition, WorkflowUnchanged,
     RequestReviewExecutionRenewal, RequestReviewVerdictRelease,

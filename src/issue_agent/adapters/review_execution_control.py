@@ -105,8 +105,6 @@ class SQLiteReviewExecutionControl:
         self._preparation_control = preparation_control
         self._round_cursor = _START_CURSOR
 
-
-
     def _write_current_outcome_in_tx(
         self, db: sqlite3.Connection, facts: ReviewRoundFacts, expected: WorkflowRevision,
     ) -> FinalizedReviewRound | DeferredReviewPreparation:

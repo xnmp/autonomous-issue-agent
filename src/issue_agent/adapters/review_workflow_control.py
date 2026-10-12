@@ -85,7 +85,7 @@ from .control_store import (
 )
 from .deployment_authority import deployment_effect_barrier, deployment_role
 from .review_effects import (
-    PullRequestProjectionOp, ReviewCheck, ReviewReads, bound_submission_op, check_review_op, observe_pull_request,
+    PullRequestProjectionOp, ReviewCheck, ReviewReads, check_review_op, observe_pull_request,
     read_pull_request, review_family_op,
 )
 from .review_dispatch_holds import (
@@ -2759,9 +2759,6 @@ class SQLiteReviewWorkflowControl:
         return changed, "", terminal
 
     # -- unreadable evidence (the ADR 0012/0015 UNVERIFIABLE loops) ------------------------------
-
-
-
 
     def _evidence_schedule(
         self, db: sqlite3.Connection, key: WorkflowKey, kind: ReviewEvidenceKind,

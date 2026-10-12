@@ -107,7 +107,6 @@ class FixtureReviewAuthority:
     def record_evidence(self, round, error):
         self.state.evidence.append((round.head_sha, error))
 
-
     async def submit(self, round, event, body, *, patch_id, escalate_cause, counted_past=frozenset()):
         pr = round.binding.fence.key.target.number
         self.state.submissions.append((pr, event, escalate_cause, counted_past))

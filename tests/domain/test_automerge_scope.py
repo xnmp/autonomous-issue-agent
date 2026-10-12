@@ -203,11 +203,10 @@ def test_unread_checks_do_not_automerge():
     assert should_automerge(pr, FixState(), _cfg()) is False
 
 
-def test_honest_no_checks_still_automerges():
-    """The no-CI-repo path is deliberate and must not regress: a SUCCESSFUL
-    read of zero checks (honest NONE) stays mergeable."""
+def test_honest_no_checks_never_automerges():
+    """Targets must have CI: a successful read of zero checks is not evidence."""
     pr = _pr("fix/504-tab-titles", checks=())
-    assert should_automerge(pr, FixState(), _cfg()) is True
+    assert should_automerge(pr, FixState(), _cfg()) is False
 
 
 def test_unread_checks_do_not_branch_update():
@@ -223,3 +222,4 @@ def test_verified_gate_does_not_turn_unread_checks_into_merge_evidence():
     pr = observed_pr(number=540, head_ref_name="fix/522-lanes", reviews=(),
                 checks=(), checks_known=False)
     assert should_automerge(pr, FixState(), _cfg()) is False
+

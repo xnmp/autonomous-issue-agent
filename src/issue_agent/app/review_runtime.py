@@ -26,7 +26,6 @@ from ..adapters.review_effects import (
 from ..adapters.review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl, read_review_guidance
 from ..domain.review import PostedReview, posted_review
-from ..domain.review_rounds import ReviewPlanningRefused
 from ..domain.continuation_components import BlockedPRRepair
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
@@ -641,7 +640,6 @@ class ActiveReviewRuntime:
         """Whether every read a review of this head depends on may be attempted now."""
         key = binding.fence.key
         return all(self.control.evidence_due(key, head_sha, kind) for kind in ReviewEvidenceKind if kind is not ReviewEvidenceKind.EXEMPTION_TRAILERS)
-
 
     async def submit(
         self, bound: BoundReviewRound, event: str, body: str, *, patch_id: str, escalate_cause: str | None,

@@ -698,7 +698,7 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
 
 
 def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
-    """Distinct approval at the exact head and successful or absent CI."""
+    """Distinct approval at the exact head and successful CI; no reported checks never merges."""
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if (
         review is None
@@ -707,9 +707,7 @@ def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
         or review.commit_id != pr.head_ref_oid
     ):
         return False
-    return ci_state(
-        pr.ci
-    ) in (CIState.OK, CIState.NONE)
+    return ci_state(pr.ci) is CIState.OK
 
 
 def should_update_branch(pr: PRView, state: FixState, cfg: FixConfig) -> bool:

@@ -8,7 +8,7 @@ completion can never repopulate it. Values perform no I/O.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -21,7 +21,7 @@ from .review_rejection import (
 )
 from .workflow import (
     GUIDANCE_MAX_CHARS, MAX_DETAIL_CHARS, MAX_WORKFLOW_GATES,
-    EvidenceUnavailable, AuthorizedOperatorCommand, ContinueGrantedRearm, OpenGate, RearmNeedsDecision, RearmingGate, RequestRearm,
+    AuthorizedOperatorCommand, ContinueGrantedRearm, OpenGate, RearmNeedsDecision, RearmingGate, RequestRearm,
     RequestReviewExecutionRenewal, RequestReviewVerdictRelease,
     ResolveCeiling, StopReason, WorkflowAbsent, WorkflowChanged, WorkflowMigrationRequired, WorkflowMutation,
     WorkflowSnapshot, WorkflowUnavailable,
@@ -31,7 +31,7 @@ from .review_evidence import is_review_evidence_gate
 from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, BlockedReviewExecutionMigration, ReviewExecutionComponent, renew_current_review_execution
 from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
-    FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
+    FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
 )
 
 __all__ = [

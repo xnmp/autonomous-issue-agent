@@ -2419,6 +2419,9 @@ CREATE TEMP TABLE retired_review_gates AS
         )
     );
 DELETE FROM workflow_retry_authorizations WHERE gate_id IN (SELECT gate_id FROM retired_review_gates);
+DELETE FROM workflow_retry_authorizations WHERE request_id IN (
+    SELECT request_id FROM workflow_rearms WHERE gate_id IN (SELECT gate_id FROM retired_review_gates)
+);
 DELETE FROM workflow_rearm_commands WHERE request_id IN (
     SELECT request_id FROM workflow_rearms WHERE gate_id IN (SELECT gate_id FROM retired_review_gates)
 );

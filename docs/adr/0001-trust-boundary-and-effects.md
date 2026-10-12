@@ -17,7 +17,7 @@ also capture the prior remote revision; a remote value that is neither the
 captured prior nor the proposed revision is divergence and never executes.
 
 The shell governor and hooks are advisory defence-in-depth. Credential
-placement, expected-revision checks, trusted test receipts, and effect receipts
+placement, expected-revision checks, and effect receipts
 are the authority. Until agents run without publication credentials, supported
 repositories remain trusted-inbound only.
 

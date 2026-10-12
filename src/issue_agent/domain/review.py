@@ -48,7 +48,7 @@ UNGRANTED_DOWNGRADE_MARKER = (
 def touches_workflows(diff: object) -> bool:
     if not isinstance(diff, str):
         return False
-    return any(re.search(r'(?:^| )"?[ab]/\.github/workflows/', line) is not None
+    return any(re.search(r'(?:^| )"?[ab]/\.github/', line) is not None
                for line in diff.splitlines() if line.startswith("diff --git "))
 
 

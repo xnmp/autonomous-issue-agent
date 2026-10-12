@@ -123,8 +123,8 @@ tests pass.
 
 ## Review quality
 
-The reviewer submits its model verdict for the exact PR head. Repository-required
-CI checks remain the merge gate. A diff touching `.github/workflows/**` escalates
+The reviewer submits its model verdict for the exact PR head. Targets must have CI
+checks; a PR with no reported checks does not merge. A diff touching `.github/**` escalates
 through the existing human-review path. Reviewer legs do not execute target tests.
 See [ADR 0011](../adr/0011-trusted-execution-and-gate-evidence.md).
 

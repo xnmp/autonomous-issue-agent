@@ -587,7 +587,12 @@ class ReviewWorkflow:
     ) -> PostedReview | None:
         assert self.authority is not None
         if review_dom.touches_workflows(diff):
-            sub = review_dom.EscalatedSubmission("Changes to .github/workflows/ require human review.", "verdict")
+            # A legless escalation is not registrable: a COPIED submission needs a
+            # covered patch, so the notice rides on the paid leg's own findings.
+            notice = "Changes under .github/ require human review."
+            findings = sub.body.strip()
+            sub = review_dom.EscalatedSubmission(
+                f"{notice}\n\nReviewer findings:\n\n{findings}" if findings else notice, "verdict")
         return await self.authority.submit(
             bound, sub.event, sub.body, patch_id=patch_id,
             escalate_cause=sub.escalate_cause if sub.escalate else None,
