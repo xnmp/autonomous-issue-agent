@@ -722,7 +722,7 @@ def test_fix_ci_infra_death_does_not_advance_the_breaker():
 
 
 def test_rebase_error_advances_the_breaker():
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5)})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5, mergeable="CONFLICTING")})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
 
@@ -732,7 +732,7 @@ def test_rebase_error_advances_the_breaker():
 
 
 def test_rebase_infra_death_does_not_advance_the_breaker():
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5)})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5, mergeable="CONFLICTING")})
     store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
@@ -748,6 +748,7 @@ def test_rebase_infra_death_does_not_advance_the_breaker():
             state=dataclasses.replace(current.issue_recovery.state, rebase_failures=1))))
     asyncio.run(workflow.rebase(100))
 
+    assert len(runner.tasks) == 1
     assert issue_recovery_state(store).rebase_failures == 1
 
 
@@ -783,7 +784,7 @@ def test_fix_ci_error_does_not_touch_the_infra_ceiling(tmp_path):
 
 
 def test_rebase_infra_death_counts_against_the_infra_ceiling(tmp_path):
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5)})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="fix/5-token", closing_issue=5, mergeable="CONFLICTING")})
     store = Store(state_dir=str(tmp_path))
     runner = FakeRunner(AgentResult(is_error=True, status="timeout",
                                     exit_reason=ExitReason.KILLED_EXTERNALLY))
@@ -902,10 +903,11 @@ def test_the_resolve_leg_decays_it_too(tmp_path):
 
 
 def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
-    gw = FakeGateway(prs={100: observed_pr(
+    reviewed = observed_pr(
         100, head_ref_name="fix/5-x", closing_issue=5,
         reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
-    )})
+    )
+    gw = FakeGateway(prs={100: dataclasses.replace(reviewed, mergeable="CONFLICTING")})
     store = Store(state_dir=str(tmp_path))
     ok = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
 
@@ -914,6 +916,7 @@ def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
     asyncio.run(wf.rebase(100))
     assert issue_recovery_state(store).infra_failures == 0
 
+    gw.prs[100] = reviewed
     seed_infra_outcome(store._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
     asyncio.run(wf.address_review(100))
     assert issue_recovery_state(store).infra_failures == 0
@@ -2907,7 +2910,8 @@ def _review_guidance_control(tmp_path, guidance):
 def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_side_effects(handler):
     p = observed_pr(100, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
-               checks=(Check("ci", bucket="fail"),))
+               checks=(Check("ci", bucket="fail"),),
+               mergeable="CONFLICTING" if handler == "rebase" else "")
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
@@ -2961,6 +2965,7 @@ def test_incomplete_ci_withholds_every_paid_pr_repair_and_allowance(method, miss
     from issue_agent.domain.checks import Observed, RequiredCheck, Unavailable
     ci = Observed("head", "head", frozenset({RequiredCheck("absent")}), ()) if missing else Unavailable("partial pagination")
     p = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5,
+        mergeable="MERGEABLE",
         reviews=(Review("CHANGES_REQUESTED", "review-bot"),), ci=ci)
     gateway = FakeGateway(prs={100: p})
     store = FakeStore()
@@ -2970,3 +2975,58 @@ def test_incomplete_ci_withholds_every_paid_pr_repair_and_allowance(method, miss
     asyncio.run(getattr(workflow, method)(100))
     assert not runner.tasks and not gateway.calls
     assert pr_repair_state(store) == before
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_a_conflicting_head_is_rebased_without_ci_evidence(missing):
+    """tauri #1068: a conflicting head gets no pull-request checks until rebased."""
+    from issue_agent.domain.checks import Observed, RequiredCheck, Unavailable
+    ci = Observed("head", "head", frozenset({RequiredCheck("absent")}), ()) if missing else Unavailable("partial pagination")
+    p = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5,
+        mergeable="CONFLICTING", ci=ci)
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
+    asyncio.run(_workflow(FakeGateway(prs={100: p}), FakeStore(), runner).rebase(100))
+    assert len(runner.tasks) == 1
+
+
+@pytest.mark.parametrize("fresh_missing", [False, True])
+def test_a_rebase_selected_on_a_conflict_is_not_run_once_the_conflict_clears(fresh_missing):
+    from issue_agent.domain.checks import Check, Observed, RequiredCheck
+    policy = frozenset({RequiredCheck("unit")})
+    complete = Observed("head", "head", policy, (Check("unit", "SUCCESS", "pass", required=True),))
+    fresh = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5, mergeable="MERGEABLE",
+        ci=Observed("head", "head", policy, ()) if fresh_missing else complete)
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
+    asyncio.run(_workflow(FakeGateway(prs={100: fresh}), FakeStore(), runner).rebase(100, issue_hint=5))
+    assert not runner.tasks
+
+
+@pytest.mark.parametrize("mergeable", ["", "UNKNOWN"])
+def test_a_rebase_waits_while_fresh_mergeability_is_unknown(mergeable):
+    from issue_agent.domain.checks import Unavailable
+    fresh = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5, mergeable=mergeable,
+        ci=Unavailable("partial pagination"))
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
+    asyncio.run(_workflow(FakeGateway(prs={100: fresh}), FakeStore(), runner).rebase(100, issue_hint=5))
+    assert not runner.tasks
+
+
+@pytest.mark.parametrize("hold", [Label.NEEDS_HUMAN_REVIEW, Label.NEEDS_BUDGET_REVIEW, Label.AI_PARKED, Label.AI_BLOCKED])
+def test_a_rebase_selected_on_a_conflict_is_not_run_once_the_pr_is_held(hold):
+    from issue_agent.domain.checks import Observed
+    fresh = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5, mergeable="CONFLICTING",
+        labels=frozenset({Label.AI_PR_OPEN, hold}), ci=Observed("head", "head", frozenset(), ()))
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
+    asyncio.run(_workflow(FakeGateway(prs={100: fresh}), FakeStore(), runner).rebase(100, issue_hint=5))
+    assert not runner.tasks
+
+
+def test_a_fresh_human_escalation_still_withholds_review_repair_on_incomplete_evidence():
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    p = observed_pr(100, head_ref_name="fix/5-x", head_ref_oid="head", closing_issue=5,
+        labels=frozenset({Label.NEEDS_HUMAN_REVIEW}), mergeable="MERGEABLE",
+        reviews=(Review("CHANGES_REQUESTED", "review-bot"),),
+        ci=Observed("head", "head", frozenset({RequiredCheck("absent")}), ()))
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
+    asyncio.run(_workflow(FakeGateway(prs={100: p}), FakeStore(), runner).address_review(100, issue_hint=5))
+    assert not runner.tasks

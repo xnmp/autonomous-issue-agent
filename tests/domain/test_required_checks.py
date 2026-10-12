@@ -10,7 +10,7 @@ from issue_agent.domain.ci import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.checks import Check, Observed, RequiredCheck, Unavailable
-from issue_agent.domain.actions import EnableAutoMerge, RunAgent, RerunFailedChecks, UpdateBranch
+from issue_agent.domain.actions import AgentKind, EnableAutoMerge, RunAgent, RerunFailedChecks, UpdateBranch
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.world import PRView, Review, WorldState
 
@@ -101,15 +101,43 @@ def test_untrusted_shapes_cannot_construct_an_observed_variant(args):
         Observed(*args)
 
 
-@pytest.mark.parametrize("conflicting", [False, True])
+def _incomplete(missing):
+    return observation(policy=(RequiredCheck("never-reported"),)) if missing else Unavailable("incomplete policy")
+
+
 @pytest.mark.parametrize("missing", [False, True])
-def test_incomplete_evidence_holds_other_paid_repairs_that_clear_evidence_would_dispatch(conflicting, missing):
+def test_incomplete_evidence_holds_other_paid_repairs_that_clear_evidence_would_dispatch(missing):
     pr = PRView(1074, head_ref_name="fix/7-tauri", head_ref_oid="head", closing_issue=7, author="fix-bot",
-        labels=frozenset({Label.AI_PR_OPEN}), ci=observation(policy=()),
-        mergeable="CONFLICTING" if conflicting else "MERGEABLE",
+        labels=frozenset({Label.AI_PR_OPEN}), ci=observation(policy=()), mergeable="MERGEABLE",
         reviews=(Review("CHANGES_REQUESTED", "review-bot", commit_id="head"),))
     cfg = FixConfig(fix_bot="fix-bot")
     assert any(isinstance(a, RunAgent) for a in decide_fix(WorldState(prs=(pr,)), cfg, FixState(), fixer_busy=False))
-    held = observation(policy=(RequiredCheck("never-reported"),)) if missing else Unavailable("incomplete policy")
-    assert not any(isinstance(a, RunAgent) for a in decide_fix(WorldState(prs=(replace(pr, ci=held),)),
+    assert not any(isinstance(a, RunAgent) for a in decide_fix(WorldState(prs=(replace(pr, ci=_incomplete(missing)),)),
         cfg, FixState(), fixer_busy=False))
+
+
+# tauri #1068 (2026-10-12): GitHub runs no pull-request checks on a conflicting
+# head, so required-check evidence for it never arrives. Holding the rebase on
+# that evidence left an approved PR wedged for hours; the rebase reads no CI.
+@pytest.mark.parametrize("missing", [False, True])
+@pytest.mark.parametrize("closing_issue", [7, None])
+def test_a_conflicting_pr_is_rebased_or_escalated_without_ci_evidence(missing, closing_issue):
+    pr = PRView(1068, head_ref_name="fix/7-tauri" if closing_issue else "feat/no-issue", head_ref_oid="head",
+        closing_issue=closing_issue, author="fix-bot", labels=frozenset({Label.AI_PR_OPEN}),
+        ci=_incomplete(missing), mergeable="CONFLICTING",
+        reviews=(Review("APPROVED", "review-bot", commit_id="head"),))
+    actions = decide_fix(WorldState(prs=(pr,)), FixConfig(fix_bot="fix-bot"), FixState(), fixer_busy=False)
+    if closing_issue:
+        assert [a for a in actions if isinstance(a, RunAgent)] == [RunAgent(AgentKind.REBASE, 1068)]
+    else:
+        assert Label.NEEDS_HUMAN_REVIEW in {getattr(a, "add", None) for a in actions}
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_with_auto_rebase_off_a_conflict_releases_no_other_repair_on_incomplete_evidence(missing):
+    pr = PRView(1068, head_ref_name="fix/7-tauri", head_ref_oid="head", closing_issue=7, author="fix-bot",
+        labels=frozenset({Label.AI_PR_OPEN}), ci=_incomplete(missing), mergeable="CONFLICTING",
+        reviews=(Review("CHANGES_REQUESTED", "review-bot", commit_id="head"),))
+    actions = decide_fix(WorldState(prs=(pr,)), FixConfig(fix_bot="fix-bot", auto_rebase_conflicts=False),
+        FixState(), fixer_busy=False)
+    assert not any(isinstance(a, RunAgent) for a in actions)
