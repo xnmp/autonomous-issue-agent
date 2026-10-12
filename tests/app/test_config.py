@@ -197,7 +197,7 @@ def test_rendered_agent_contract_names_the_configured_non_default_base():
     assert "running headless on a prepared issue branch" in rendered
     assert "The integration base is `canary/dashboard-e2e`" in rendered
     assert "$BASE_BRANCH" not in rendered
-    assert "do NOT call `gh issue create`" in rendered
+    assert "Never call `gh issue create`" in rendered
     assert "file an issue on" not in rendered
 
 
