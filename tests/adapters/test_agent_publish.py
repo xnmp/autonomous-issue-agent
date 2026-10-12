@@ -220,6 +220,43 @@ def test_supervised_publication_persists_its_captured_run_and_workflow(tmp_path,
         assert "Updated evidence." in remote.pr_body
 
 
+def test_ungated_fix_leg_push_and_pr_take_exactly_the_broker_path(tmp_path, monkeypatch):
+    """Slice 6a deleted the fixer's publication gates. A fix leg that pushes a
+    commit carrying no tests and no red/green evidence, with no TEST_CMD
+    configured, still publishes only through the durable broker: one branch
+    push, one PR create, one open PR at the pushed head, each committed then
+    receipted. `Remote.run` rejects any other argv, so a reintroduced
+    pre-publication test run or gate probe fails this test."""
+    monkeypatch.delenv("TEST_CMD", raising=False)
+    control = store(tmp_path)
+    snapshot = resolve_snapshot(42)
+    install_workflow(control, snapshot)
+    run_id = _publication_run(control, tmp_path, workflow=snapshot.binding)
+    remote = Remote()
+    publisher = _supervised_broker(control, remote, tmp_path, run_id)
+
+    pushed = publisher.publish(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path))
+    opened = publisher.publish(
+        ("gh", "pr", "create", "--title", "Fix #42", "--body", "Implementation only."),
+        str(tmp_path),
+    )
+
+    assert (pushed.code, opened.code) == (0, 0)
+    assert [effect[:3] for effect in remote.effects] == [
+        ("git", "push", "--force-with-lease=refs/heads/fix/42-issue:"),
+        ("gh", "pr", "create"),
+    ]
+    assert (remote.pr_state, remote.pr_head, remote.pr_base) == ("OPEN", remote.head, "dev")
+    with control._connect() as db:
+        commands = db.execute("SELECT kind, state FROM lifecycle_commands ORDER BY rowid").fetchall()
+        receipts = db.execute("SELECT status FROM effect_receipts").fetchall()
+    assert [(row["kind"], row["state"]) for row in commands] == [
+        (CommandKind.PUBLISH_BRANCH.value, "succeeded"),
+        (CommandKind.OPEN_PULL_REQUEST.value, "succeeded"),
+    ]
+    assert [row["status"] for row in receipts] == ["succeeded", "succeeded"]
+
+
 def test_queued_publication_cannot_write_after_its_generation_changes(tmp_path):
     control = store(tmp_path)
     snapshot = resolve_snapshot(42)

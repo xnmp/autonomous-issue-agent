@@ -1512,7 +1512,7 @@ class GitHubGateway:
         # gated on OBSERVING the issue still carrying ai-pr-open in the same
         # snapshot as its merged PR (`_issue_carries_ai_pr_open`, review P1R-15
         # — it must not stomp a fresh dispatch). But `Fixes #n` is MANDATORY in
-        # every harness PR body (check-pr.sh), so GitHub closes the issue at the
+        # every harness PR body (the publish broker supplies it), so GitHub closes the issue at the
         # instant of merge; by the next poll the issue was in neither the open
         # slice above nor any closed slice, the gate read False, and the
         # ai-pr-open→ai-done relabel that would have made it visible again never

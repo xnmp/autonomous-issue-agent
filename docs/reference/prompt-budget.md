@@ -34,3 +34,6 @@ UTF-8 bytes and 1,099 whitespace-delimited words.
 
 Re-measured 2026-10-13 after machine failures stopped counting as attempt
 debt: 8,339 UTF-8 bytes and 1,110 whitespace-delimited words.
+
+Re-measured 2026-10-13 after slice 6a deleted the fixer gates and governor:
+8,026 UTF-8 bytes and 1,073 whitespace-delimited words.

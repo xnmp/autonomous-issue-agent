@@ -104,7 +104,6 @@ stayed lean. Full table in `docs/history/2026-07-25-improvement-plan.md` §4.
 | P4.9 cross-leg prompt-cache sharing | `agent_run.usage.cache_read_input_tokens` ≈ 0 across real runs |
 | P4.1 model routing (`build_router_task` is dead code kept for this) | median cost of `trivial`-labelled issues ≳ $1 |
 | P4.2/P4.3 review cost work | review legs are a top-2 ledger line |
-| P3.2 governor tiers | before onboarding any repo with untrusted inbound issues (see §1.2) |
 | Webhook push (`gh webhook forward`) + poll demoted to slow reconciler (#1) | GraphQL rate limiting recurs despite POLL_SECONDS=60 and the ETag pre-check (first hit 2026-07-26, review+steward on one token at 20s polls) |
 
 ---
@@ -118,11 +117,8 @@ Detail in the 2026-07-25 review §6. The plan deliberately gates all of it on
 operating experience: none of it is required for correctness, and the shape of
 the right abstraction depends on which legs actually get added.
 
-Two smaller ones worth doing whenever the files are next touched:
+One smaller one worth doing whenever the files are next touched:
 
-- `build_gate_context` / `main.py` should take `lint_cmd`/`typecheck_cmd`/`adr_dir`
-  directly, so `governor.complete_gate_context` can be deleted (it fills fields
-  the builder leaves at named inert sentinels, so removing it is a no-op).
 - Historical schema-v1 JSONL readers remain only as a read-only dashboard/status
   converter. They are never queried for admission, deduplication, process
   ownership, or effect authorization.

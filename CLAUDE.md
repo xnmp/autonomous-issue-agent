@@ -13,8 +13,7 @@ Start with:
 - [documentation index](docs/README.md) — which other documents are current.
 
 The numbered documents under `docs/archive/` describe the deleted bash
-orchestration. Do not implement from them. `plugin/hooks/checks/` remains live
-because the Python Codex runtime uses the shared gate stack.
+orchestration. Do not implement from them.
 
 ## Direction and guardrails
 
@@ -103,13 +102,11 @@ REPO=<name>` is the lower-level equivalent. After a one-tick canary, use
 Configuration layers:
 
 - `config/shared.env` — credentials and shared runtime/pricing defaults;
-- `config/repos/<name>.env` — repo, checkout, state dirs, test command, overrides;
+- `config/repos/<name>.env` — repo, checkout, state dirs, overrides;
 - `config/.active.<name>.env` — generated launch snapshot.
 
-`TEST_CMD` must terminate. Trusted execution scrubs harness controls, bounds
-recursion and time, and kills the process group on timeout.
-`GATE_TEST_FAILURE_EXIT_CODES` defaults to `1`; only operator-declared
-assertion-failure codes count as trusted red-test evidence.
+`TEST_CMD` is only `bin/point-at.sh`'s base-branch probe; no fixer gate runs
+it. It must terminate.
 
 ## Operational model
 
@@ -145,7 +142,7 @@ Selection is not acknowledgment authority: a real result captured before the
 mutation recheck wins. The architecture reference maps both race orderings and
 crash boundaries to behavioral tests.
 
-The governor is advisory. Current agent children still inherit publication
+There is no command governor. Current agent children still inherit publication
 capability, so the supported posture is trusted inbound content only. See the
 capability matrix before changing runtime/tool/credential boundaries.
 
@@ -159,8 +156,6 @@ make typecheck
 make test-domain
 make test-adapters
 make test-app
-make test-hooks
-make test-governor
 ```
 
 `make test` must be green before any commit. The daemons hot-reload from this
@@ -180,7 +175,7 @@ the complete diff in a subagent.
 - `src/issue_agent/domain/` — value objects, policies, events, projection, ports.
 - `src/issue_agent/adapters/` — GitHub/runtime/process/store/event/dashboard I/O.
 - `src/issue_agent/app/` — config, roles, workflows, daemon loop, CLI.
-- `plugin/` — advisory governor integration and live gate checks.
+- `plugin/` — fixer (`AGENT.md`) and reviewer prompt guidance.
 - `ops/` / `bin/` — service templates/installers and launch tooling.
 - `tests/domain`, `tests/adapters`, `tests/app` — mirrored test tiers.
 - `docs/adr/` — authority, money, events, supervision decisions.
