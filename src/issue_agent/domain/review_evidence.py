@@ -41,18 +41,15 @@ class ReviewEvidenceKind(str, Enum):
     REVIEW_HISTORY = "review-history"
     LINKED_ISSUE = "linked-issue"
     RUNTIME_PREPARATION = "review-runtime-preparation"
-    ORDINARY_TEST = "ordinary-test"
 
 
 _SUBJECT = {
-    ReviewEvidenceKind.ORDINARY_TEST: "independent operator test execution",
     ReviewEvidenceKind.EXEMPTION_TRAILERS: "gate-exemption declarations",
     ReviewEvidenceKind.REVIEW_HISTORY: "the complete review history",
     ReviewEvidenceKind.LINKED_ISSUE: "the linked issue and its current holds",
     ReviewEvidenceKind.RUNTIME_PREPARATION: "the local review runtime configuration",
 }
 _REMEDIATION = {
-    ReviewEvidenceKind.ORDINARY_TEST: "renew the settled execution episode through the existing operator recovery action",
     ReviewEvidenceKind.EXEMPTION_TRAILERS: (
         "a scheduled harness read of the commit trailers must succeed; it never approves or grants an exemption"),
     ReviewEvidenceKind.REVIEW_HISTORY: (

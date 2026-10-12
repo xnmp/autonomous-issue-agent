@@ -1337,7 +1337,7 @@ def test_a_projection_refusal_or_present_label_settles_without_waiting_for_dismi
     assert status == "permanent_failure" and "head moved" in error
 
 
-def test_legacy_present_approval_reconciles_before_missing_test_receipt_or_linkage(rig):
+def test_present_approval_reconciles_before_linkage(rig):
     from issue_agent.adapters.effects import bound_review_command_id
     from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
     from tests.domain.test_review_workflow_policy import fresh

@@ -83,7 +83,7 @@ class BoundReviewRound:
     observation: object = field(compare=False, repr=False, default=None)
 
 
-from ...domain.review_test_evidence import PostedReview
+from ...domain.review import PostedReview
 
 
 class ReviewAuthority(Protocol):
@@ -107,7 +107,6 @@ class ReviewAuthority(Protocol):
         """Whether every harness read a review of this head needs is off its backoff."""
         ...
 
-    def test_due(self, round: BoundReviewRound, patch_id: str) -> bool: ...
 
     async def submit(
         self, round: BoundReviewRound, event: str, body: str, *, patch_id: str, escalate_cause: str | None,
@@ -360,9 +359,6 @@ class ReviewWorkflow:
             return
         signature = review_dom.patch_signature(diff)
         assert self.authority is not None
-        if not self.authority.test_due(bound, signature):
-            self.authority.stop(bound, ReviewPlanningRefused("ordinary-test-backoff:" + bound.plan.round.round_id))
-            return
         guidance = bound.guidance
         discussion = self._pr_discussion(p)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
@@ -408,7 +404,7 @@ class ReviewWorkflow:
         prior = self._prior_rejections(bound, counted_past)
         if not await self._submit_review(
             p, result, bound.plan.displayed_round, prior,
-            patch_id=signature,
+            patch_id=signature, diff=diff,
             bound=bound,
             counted_past=counted_past,
         ):
@@ -447,9 +443,6 @@ class ReviewWorkflow:
             return
         signature = review_dom.patch_signature(diff)
         assert self.authority is not None
-        if not self.authority.test_due(bound, signature):
-            self.authority.stop(bound, ReviewPlanningRefused("ordinary-test-backoff:" + bound.plan.round.round_id))
-            return
         patch_shortcut = await self._bound_patch_unchanged(p, diff, signature, bound, claim_target)
         if patch_shortcut.settled:
             return
@@ -535,7 +528,7 @@ class ReviewWorkflow:
         prior = self._prior_rejections(bound, counted_past)
         if not await self._submit_review(
             p, result, round_number, prior,
-            patch_id=signature,
+            patch_id=signature, diff=diff,
             bound=bound,
             counted_past=counted_past,
         ):
@@ -589,10 +582,12 @@ class ReviewWorkflow:
         return self.authority.prior_rejections(bound, non_resetting)
 
     async def _post(
-        self, sub, bound: BoundReviewRound, patch_id: str,
+        self, sub, bound: BoundReviewRound, patch_id: str, diff: str,
         counted_past: frozenset[str] = frozenset(),
     ) -> PostedReview | None:
         assert self.authority is not None
+        if review_dom.touches_workflows(diff):
+            sub = review_dom.EscalatedSubmission("Changes to .github/workflows/ require human review.", "verdict")
         return await self.authority.submit(
             bound, sub.event, sub.body, patch_id=patch_id,
             escalate_cause=sub.escalate_cause if sub.escalate else None,
@@ -624,11 +619,9 @@ class ReviewWorkflow:
         if event is None:
             return _PatchShortcut()
         body = prior.body.strip() or "Mechanical rebase: patch is unchanged from the reviewed revision."
-        posted = await self.authority.submit(bound, event, body, patch_id=signature, escalate_cause=None)
+        sub = review_dom.ApprovedSubmission(body) if event == "APPROVE" else review_dom.ChangesRequestedSubmission(body)
+        posted = await self._post(sub, bound, signature, diff)
         if posted is None:
-            if not self.authority.test_due(bound, signature):
-                self.cfg.log(f"re-review #{p.number}: copied verdict awaits independent ordinary-test evidence")
-                return _PatchShortcut(settled=True)
             self.cfg.log(
                 f"re-review #{p.number}: unchanged patch verdict could not be "
                 "bound to the new head — reviewing normally"
@@ -741,9 +734,6 @@ class ReviewWorkflow:
                 return
         signature = review_dom.patch_signature(diff)
         assert self.authority is not None
-        if not self.authority.test_due(bound, signature):
-            self.authority.stop(bound, ReviewPlanningRefused("ordinary-test-backoff:" + bound.plan.round.round_id))
-            return
         rcfg = self.cfg.review
         guidance = bound.guidance
         discussion = self._pr_discussion(p)
@@ -794,7 +784,7 @@ class ReviewWorkflow:
                 f"({gate.field('reason') or 'no behavioural change'}) "
                 f"→ {sub.event}"
             )
-            if await self._post(sub, bound, signature, counted_past):
+            if await self._post(sub, bound, signature, diff, counted_past):
                 self._cleanup_checkout(p.number)
             else:
                 self._no_progress(p, f"gate {sub.event} POST failed")
@@ -904,7 +894,7 @@ class ReviewWorkflow:
             # including returned failures when no verdict can be synthesized.
             self._no_progress(p, "incomplete fan-out, no verdict to submit")
             return
-        if not await self._post(sub, bound, signature, counted_past):
+        if not await self._post(sub, bound, signature, diff, counted_past):
             self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
         self._cleanup_checkout(p.number)
@@ -927,7 +917,7 @@ class ReviewWorkflow:
         round_number: int,
         prior_rejections: int,
         patch_id: str,
-        *, bound: BoundReviewRound,
+        *, bound: BoundReviewRound, diff: str,
         counted_past: frozenset[str] = frozenset(),
     ) -> bool:
         """Submit the verdict; return True iff the gh POST succeeded. On a failed
@@ -941,7 +931,7 @@ class ReviewWorkflow:
             result.field("decision"), result.field("body") or "",
             prior_rejections, self.cfg.max_review_rejections,
         )
-        posted = await self._post(sub, bound, patch_id, counted_past)
+        posted = await self._post(sub, bound, patch_id, diff, counted_past)
         if posted is None:
             return False
         # Log the OUTCOME of a successful submit — always on (not DEBUG-gated).

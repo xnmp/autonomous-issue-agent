@@ -1410,13 +1410,10 @@ def _request_fixed_review_rearm(
     revision = _next(snapshot, advance_generation=True)
     rejection = WorkflowBinding(revision.fence, snapshot.authority, snapshot.episode.episode_id)
     grant: ReviewRearmGrant
-    cause: ReviewExecutionCeiling | ReviewVerdictHold | EvidenceUnavailable
+    cause: ReviewExecutionCeiling | ReviewVerdictHold
     holds = _holds(external_holds)
     basis = snapshot
     selected_gate: OpenGate | None = None
-    from .review_test_evidence import ordinary_test_hold
-    test_gate = next((g for g in snapshot.gates if isinstance(g, OpenGate) and g.gate_id == command.gate_id
-        and ordinary_test_hold(g, execution.binding, pr.head_sha)), None)
     if isinstance(command, RequestReviewVerdictRelease):
         # Acceptance and transition validation independently mint release eligibility.
         baseline = snapshot.episode.continuation
@@ -1444,9 +1441,9 @@ def _request_fixed_review_rearm(
             selected_gate = retained
             basis = replace(snapshot, gates=tuple(gate for gate in snapshot.gates if gate != retained))
     else:
-        if test_gate is None and (_ceiling_value(execution_ceiling) <= 0 or execution.state.failures < execution_ceiling):
+        if _ceiling_value(execution_ceiling) <= 0 or execution.state.failures < execution_ceiling:
             return _reject(WorkflowRejection.NOT_EXHAUSTED, "the execution allowance is not exhausted")
-        if test_gate is None and command.gate_id != review_execution_ceiling_gate_id(snapshot, pr.head_sha, execution_ceiling):
+        if command.gate_id != review_execution_ceiling_gate_id(snapshot, pr.head_sha, execution_ceiling):
             return _reject(WorkflowRejection.INVALID_SCOPE, "execution exhaustion or head changed before renewal")
         if execution.baseline.through_sequence != execution.last_sequence:
             return _reject(WorkflowRejection.OTHER_HOLD, "unfinished execution work must settle before renewal")
@@ -1455,14 +1452,10 @@ def _request_fixed_review_rearm(
         grant = ReviewExecutionRenewalGrant(execution.binding.execution_epoch,
             execution.binding.execution_episode, after_execution.binding.execution_episode,
             receipt.origin.evidence_id, command.request_id)
-        cause = test_gate.cause if test_gate is not None else ReviewExecutionCeiling(
+        cause = ReviewExecutionCeiling(
             execution.binding.execution_epoch, execution.binding.execution_episode,
             pr.head_sha, execution.state.failures, execution_ceiling)
-        selected_gate = test_gate
-        if test_gate is None:
-            holds = tuple(hold for hold in holds if hold != UNPRODUCTIVE_ROUND_HOLD)
-        # Only an ESCALATE survives renewal as a hold: a test-only rejection is
-        # bound to its head, and retaining it would strand a moved head behind it.
+        holds = tuple(hold for hold in holds if hold != UNPRODUCTIVE_ROUND_HOLD)
         if isinstance(verdict_receipt, ReviewSubmissionReceipt) and verdict_receipt.escalated:
             verdict_id = review_verdict_release_gate_id(snapshot, verdict_receipt.submission)
             if not any(_open(gate).gate_id == verdict_id for gate in snapshot.gates):
@@ -1474,9 +1467,8 @@ def _request_fixed_review_rearm(
                     NoAuthorizedRemediation("the selected confirmed verdict requires an explicit release")),))
     gate = selected_gate or OpenGate(command.gate_id, snapshot.revision.fence.generation, cause,
                     NoAuthorizedRemediation("only this accepted fixed review recovery grant is authorized"))
-    kept = (_kept_holds(basis, basis.gates, gate.gate_id, (), holds, trigger_label) if test_gate is not None
-            else request_rearm_kept_holds(basis, gate.gate_id, holds, trigger_label))
-    retained = tuple(g for g in basis.gates if _open(g).gate_id != gate.gate_id) if test_gate is not None else _request_gates(basis)
+    kept = request_rearm_kept_holds(basis, gate.gate_id, holds, trigger_label)
+    retained = _request_gates(basis)
     gates = retained + (RearmingGate(gate, command.request_id),)
     if len(gates) > MAX_WORKFLOW_GATES:
         return _reject(WorkflowRejection.OTHER_HOLD, "the workflow cannot hold another pending review decision")
@@ -1844,7 +1836,7 @@ class ReviewTransitionFacts:
     - `rule`: the configured counting rule, captured only by a NEW gate.
     - `escalation`: the ceiling escalation receipt a NEW gate requires.
     - `submission`: the SUBMIT_REVIEW command/receipt facts a recorded review requires.
-    - `verdict_receipt`: a registered ESCALATE or harness test-only rejection
+    - `verdict_receipt`: a registered ESCALATE
       independently confirmed as release-eligible, never a caller's claim.
     - `accepted_preflight`: the stopped intent's accepted preflight for
       decision-changed supersession.

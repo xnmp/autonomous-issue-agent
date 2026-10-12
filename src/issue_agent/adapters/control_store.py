@@ -111,7 +111,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 42
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2386,6 +2386,32 @@ UPDATE charges SET origin='recovery_estimate'
 WHERE provider_receipt_id='terminal-estimate:' || run_id
     OR (basis IN ('estimate','reconciled') AND provider_receipt_id LIKE 'codex-recovered:%'
         AND substr(provider_receipt_id,-length(run_id)-1)=':' || run_id);
+"""),
+    SchemaMigration(42, """
+CREATE TEMP TABLE retired_review_gates AS
+    SELECT g.gate_id FROM workflow_gates g
+    WHERE g.target_kind='pr' AND (
+        g.gate_id LIKE 'ordinary-test:%'
+        OR COALESCE(
+            json_extract(g.payload_json,'$.fields.cause.fields.submission_command_id'),
+            json_extract(g.payload_json,'$.fields.gate.fields.cause.fields.submission_command_id')
+        ) IN (
+            SELECT command_id FROM lifecycle_commands
+            WHERE json_extract(payload_json,'$.event')='REQUEST_CHANGES'
+                AND json_extract(payload_json,'$.test_evidence_ref') IS NOT NULL
+        )
+    );
+DELETE FROM workflow_retry_authorizations WHERE gate_id IN (SELECT gate_id FROM retired_review_gates);
+DELETE FROM workflow_rearm_commands WHERE request_id IN (
+    SELECT request_id FROM workflow_rearms WHERE gate_id IN (SELECT gate_id FROM retired_review_gates)
+);
+DELETE FROM workflow_rearms WHERE gate_id IN (SELECT gate_id FROM retired_review_gates);
+DELETE FROM workflow_gates WHERE gate_id IN (SELECT gate_id FROM retired_review_gates);
+DROP TABLE retired_review_gates;
+DELETE FROM dedupe_keys WHERE namespace IN (
+    'review-round-test-intent', 'review-round-test-invocation',
+    'review-round-test-completion', 'review-round-test-evidence'
+);
 """),
 )
 

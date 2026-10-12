@@ -277,7 +277,6 @@ class ReviewComposition:
 def compose_review(
     deployment: ReviewDeployment, *, fault: Callable[[str], None] = lambda _: None,
     provider: ScriptedProvider | None = None, alerts: Path | None = None, mode: ReviewMode | None = None,
-    test_command: str = "true",
 ) -> ReviewComposition:
     """The production review daemon (``roles.compose_review_daemon``) over the deployment.
 
@@ -293,12 +292,7 @@ def compose_review(
     if provider.during is not register_review_launch:
         provider.launch = register_review_launch
     log: list[str] = []
-    from unittest.mock import patch
-    import os
-    # This fixture's explicit operator command is frozen by real composition;
-    # individual contracts can replace it with a genuine failing/missing scope.
-    with patch.dict(os.environ, {"TEST_CMD": test_command}):
-        review = roles.compose_review_daemon(cfg, remote, Store(cfg.review_state_dir), provider, log=log.append)
+    review = roles.compose_review_daemon(cfg, remote, Store(cfg.review_state_dir), provider, log=log.append)
     return ReviewComposition(deployment, cfg, review, remote, provider, log)
 
 

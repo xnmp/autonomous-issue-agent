@@ -843,3 +843,17 @@ def test_approval_needs_no_test_grant_and_preserves_legacy_body_text(body):
     assert submitted.event == "APPROVE"
     assert submitted.body == body
     assert not submitted.escalate
+
+
+@pytest.mark.parametrize("diff,touches", [
+    (None, False), ("", False), ("malformed", False),
+    ("diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml\n", True),
+    ('diff --git "a/.github/workflows/build job.yml" "b/.github/workflows/build job.yml"\n', True),
+    ("diff --git a/build.yml b/.github/workflows/build.yml\nrename from build.yml\n", True),
+    ("diff --git a/.github/workflows/build.yml b/build.yml\ndeleted file mode 100644\n", True),
+    ("diff --git a/docs/workflows.md b/docs/workflows.md\n+diff --git a/.github/workflows/x b/x\n", False),
+    ("diff --git a/.github/workflows.md b/.github/workflows.md\n", False),
+])
+def test_workflow_governance_uses_diff_paths(diff, touches):
+    from issue_agent.domain.review import touches_workflows
+    assert touches_workflows(diff) is touches

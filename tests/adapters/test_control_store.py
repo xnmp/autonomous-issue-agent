@@ -68,7 +68,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 42))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 43))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -125,6 +125,7 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        42: (),
         41: ("ALTER TABLE charges DROP COLUMN origin",),
         40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
              "DROP INDEX lifecycle_review_generation_candidates"),

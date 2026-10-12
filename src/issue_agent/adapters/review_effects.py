@@ -120,7 +120,6 @@ class BoundReviewSubmissionOp:
     patch_id: str | None
     escalate_cause: str | None
     non_resetting_commits: tuple[str, ...] = ()
-    test_evidence_ref: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.pr) is not int or self.pr <= 0:
@@ -145,8 +144,6 @@ class BoundReviewSubmissionOp:
         ):
             raise ValueError("a bound review records its reviewed patch identity as a SHA-256 digest")
         # Canonical (sorted, unique, bounded) so one decision is one command identity.
-        if self.test_evidence_ref is not None:
-            validate_workflow_identifier(self.test_evidence_ref, "test evidence reference")
         CountingRule(self.author, self.non_resetting_commits)
         if self.non_resetting_commits and self.escalate_cause != "ceiling":
             raise ValueError("only a ceiling escalation records the counting rule its verdict used")
@@ -159,8 +156,6 @@ class BoundReviewSubmissionOp:
         payload = {"pr": self.pr, "event": self.event, "body": self.body, "head": self.head, "author": self.author,
                 "patch_id": self.patch_id, "escalate_cause": self.escalate_cause,
                 "non_resetting_commits": list(self.non_resetting_commits)}
-        if self.test_evidence_ref is not None:
-            payload["test_evidence_ref"] = self.test_evidence_ref
         return payload
 
 
@@ -176,14 +171,14 @@ def bound_submission_op(command: LifecycleCommand) -> BoundReviewSubmissionOp | 
     binding = command.workflow
     assert binding is not None
     raw = _mapping(command.payload, {"pr", "event", "body", "head", "author", "patch_id", "escalate_cause",
-                                     "non_resetting_commits"} | ({"test_evidence_ref"} if "test_evidence_ref" in command.payload else set()), "bound review submission payload")
+                                     "non_resetting_commits"}, "bound review submission payload")
     commits = raw["non_resetting_commits"]
     if not isinstance(commits, list) or any(not isinstance(commit, str) for commit in commits):
         raise ValueError("malformed bound review counting rule")
     op = BoundReviewSubmissionOp(
         raw["pr"], _text(raw["event"], "review event"), _text(raw["body"], "review body"),  # type: ignore[arg-type]
         _text(raw["head"], "reviewed head"), _text(raw["author"], "review identity"),
-        raw["patch_id"], raw["escalate_cause"], tuple(commits), raw.get("test_evidence_ref"),  # type: ignore[arg-type]
+        raw["patch_id"], raw["escalate_cause"], tuple(commits),  # type: ignore[arg-type]
     )
     if op.pr != binding.fence.key.target.number or command.target != f"pr:{op.pr}":
         raise ValueError("bound review submission disagrees with its pull request workflow")

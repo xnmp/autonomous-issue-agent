@@ -107,8 +107,6 @@ class FixtureReviewAuthority:
     def record_evidence(self, round, error):
         self.state.evidence.append((round.head_sha, error))
 
-    def test_due(self, round, patch_id):
-        return True
 
     async def submit(self, round, event, body, *, patch_id, escalate_cause, counted_past=frozenset()):
         pr = round.binding.fence.key.target.number
@@ -117,7 +115,7 @@ class FixtureReviewAuthority:
             return None
         self.state.set_head(pr, round.head_sha)
         self.state.set_patch(pr, patch_id)
-        from issue_agent.domain.review_test_evidence import posted_review
+        from issue_agent.domain.review import posted_review
         return posted_review(event, escalate_cause)
 
 

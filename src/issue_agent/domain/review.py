@@ -45,6 +45,13 @@ UNGRANTED_DOWNGRADE_MARKER = (
     "did not grant every gate exemption required by the current patch"
 )
 
+def touches_workflows(diff: object) -> bool:
+    if not isinstance(diff, str):
+        return False
+    return any(re.search(r'(?:^| )"?[ab]/\.github/workflows/', line) is not None
+               for line in diff.splitlines() if line.startswith("diff --git "))
+
+
 def latest_reviewer_verdict(pr: PRView, reviewer: str) -> Review | None:
     """The reviewer's latest non-dismissed submitted verdict, if known."""
     own_verdicts = [
@@ -783,3 +790,26 @@ def synthesize_review(
         prior_rejections,
         max_rejections,
     )
+
+
+class PostedReview(str, Enum):
+    APPROVED = "APPROVE"
+    CHANGES_REQUESTED = "REQUEST_CHANGES"
+    VERDICT_ESCALATED = "verdict"
+    CEILING_ESCALATED = "ceiling"
+
+    @property
+    def event(self) -> str:
+        return "COMMENT" if self.escalated else self.value
+
+    @property
+    def escalated(self) -> bool:
+        return self in {PostedReview.VERDICT_ESCALATED, PostedReview.CEILING_ESCALATED}
+
+
+def posted_review(event: str, cause: str | None) -> PostedReview:
+    if event == "COMMENT" and cause in {"verdict", "ceiling"}:
+        return PostedReview(cause)
+    if cause is None and event in {"APPROVE", "REQUEST_CHANGES"}:
+        return PostedReview(event)
+    raise ValueError("contradictory posted review outcome")

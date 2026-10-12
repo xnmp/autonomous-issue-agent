@@ -500,16 +500,6 @@ class ReviewWorkflowSnapshot:
                         or (self.execution.binding.execution_epoch, self.execution.binding.execution_episode)
                         != (grant.execution_epoch, grant.renewed_episode)):
                     raise ValueError("execution ceiling requires its exact renewed episode grant")
-            elif isinstance(cause, EvidenceUnavailable) and rearming[0].gate.gate_id.startswith("ordinary-test:"):
-                from .review_test_evidence import ordinary_test_hold
-                grant = self.intent.grant
-                if not isinstance(grant, ReviewExecutionRenewalGrant) or not isinstance(self.execution, CurrentReviewExecution):
-                    raise ValueError("ordinary test hold requires its exact execution renewal")
-                old_rejection = replace(self.execution.binding.rejection,
-                    fence=WorkflowFence(self.revision.fence.key, self.intent.from_generation))
-                old_execution = replace(self.execution.binding, rejection=old_rejection, execution_episode=grant.previous_episode)
-                if not ordinary_test_hold(rearming[0].gate, old_execution):
-                    raise ValueError("ordinary test renewal belongs to another subject")
             elif isinstance(cause, ReviewVerdictHold):
                 grant = self.intent.grant
                 if (not isinstance(grant, ReviewVerdictReleaseGrant)
@@ -847,12 +837,8 @@ def validate_review_change(change: WorkflowChanged) -> None:
                          and g.gate.gate_id == command.gate_id), None)
         if selected is None or selected.request_id != command.request_id:
             raise ValueError("fixed recovery requires its exact selected pending gate")
-        from .review_test_evidence import ordinary_test_hold
-        ordinary_recovery = (isinstance(prior.execution, CurrentReviewExecution)
-            and ordinary_test_hold(selected.gate, prior.execution.binding, preflight.head_sha))
-        retained = ({g for g in prior.gates if g.gate_id != command.gate_id} if ordinary_recovery else
-            {g for g in prior.gates if not ends_with_advance(g) and not (
-                isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision))})
+        retained = {g for g in prior.gates if not ends_with_advance(g) and not (
+            isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision))}
         if isinstance(command, RequestReviewVerdictRelease):
             grant = intent.grant
             if (not isinstance(grant, ReviewVerdictReleaseGrant)
@@ -879,7 +865,7 @@ def validate_review_change(change: WorkflowChanged) -> None:
                     or grant.renewed_episode != renewed.binding.execution_episode
                     or grant.origin_evidence_id != receipt.origin.evidence_id
                     or grant.original_request_id != command.request_id
-                    or not (ordinary_recovery or isinstance(cause, ReviewExecutionCeiling)
+                    or not (isinstance(cause, ReviewExecutionCeiling)
                         and cause.execution_episode == prior.execution.binding.execution_episode
                         and cause.failures == prior.execution.state.failures and cause.head_sha == preflight.head_sha)):
 
