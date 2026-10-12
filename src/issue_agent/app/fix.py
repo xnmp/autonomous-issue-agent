@@ -26,7 +26,7 @@ from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions, question_text
 from ..domain.refs import harness_branch_issue, slugify
-from ..domain.state import Harness, ItemKey, Local, derive, issue_key, pr_key
+from ..domain.state import DerivedState, Harness, ItemKey, Local, Wait, WaitReason, derive, issue_key, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from .planners import tasks
@@ -96,13 +96,13 @@ def item_issues(world: WorldState) -> frozenset[int]:
 
 
 def fix_actions(
-    world: WorldState, local: Local, harness: Harness, slots: int, *, merge: bool = True,
+    states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int, *, merge: bool = True,
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches, with at
     most `slots` paid dispatches (issues first, then PRs, by number). With
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     out: list[Action] = []
-    for action in policy_actions(derive(world, local, harness), harness):
+    for action in policy_actions(states, harness):
         if isinstance(action, MergePullRequest) and not merge:
             continue
         if isinstance(action, RunAgent):
@@ -147,6 +147,7 @@ class FixFacts:
         active: Callable[[], Iterable[RunAgent]],
         headroom: Callable[[], bool],
         lifetime_capped: Callable[[int], bool],
+        log: Callable[[str], None],
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.control = control
@@ -154,6 +155,7 @@ class FixFacts:
         self.active = active
         self.headroom = headroom
         self.lifetime_capped = lifetime_capped
+        self.log = log
         self.now = now
 
     def held_issues(self) -> set[int]:
@@ -178,7 +180,8 @@ class FixFacts:
         runs = self.control.fix_runs(self.settings.repository, issues)
         try:
             capped: frozenset[int] | None = frozenset(n for n in issues if self.lifetime_capped(n))
-        except Exception:  # noqa: BLE001 - see the class docstring
+        except Exception as exc:  # noqa: BLE001 - see the class docstring
+            self.log(f"fix: lifetime spend unreadable, paid legs wait this tick: {exc}")
             capped = None
         return Local(
             now=self.now(),
@@ -249,15 +252,15 @@ class FixLegs:
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
         runs = sorted(self.control.fix_runs(self.settings.repository, (issue,)), key=lambda r: r.completed_at)
         mine = [r for r in runs if run_item(r) == item]
-        latest = mine[-1] if mine else None
-        # The question is the newest agent leg's, the same rule derive stops on:
-        # a machine death after the answer must not drop the answer.
-        answered = next((r for r in reversed(mine) if _leg(r) is not LegClass.MACHINE), None)
-        asked = answered if answered is not None and _leg(answered) is LegClass.ASKED else None
-        # Resume once (classify_leg): a leg continuing a machine end's session.
-        continues = latest is not None and _leg(latest) is LegClass.MACHINE and bool(self._session([latest]))
+        # The newest agent leg, the rule derive uses: machine and transport
+        # deaths after it neither drop its question nor reset resume-once.
+        last = next((i for i in range(len(mine) - 1, -1, -1) if _leg(mine[i]) is not LegClass.MACHINE), -1)
+        asked = mine[last] if last >= 0 and _leg(mine[last]) is LegClass.ASKED else None
+        # Resume once (classify_leg): continue the newest machine end since that
+        # leg that left a session; a wall cap on the continuation is an attempt.
+        cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r])), None)
         self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue,
-                                 head=action.head, resumed=continues)
+                                 head=action.head, resumed=cut_off is not None)
         try:
             if action.kind is AgentKind.RESOLVE:
                 branch = self._resolve_branch(issue, subject.title)
@@ -266,7 +269,7 @@ class FixLegs:
                 cwd = self.worktrees.sync(issue, subject.head_ref_name, action.head)
             if self.prepare_cwd is not None:
                 self.prepare_cwd(cwd)
-            task = self._task(action, subject, cwd, runs, latest if continues else None, asked)
+            task = self._task(action, subject, cwd, runs, cut_off, asked)
             task = replace(task, env={**task.env, **self._git_identity()})
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")
@@ -363,7 +366,14 @@ def decide_with(
     log: Callable[[str], None],
 ) -> Callable[[WorldState], list[Action]]:
     def decide(world: WorldState) -> list[Action]:
-        chosen = list(fix_actions(world, facts(world), settings.harness, slots(), merge=settings.auto_merge))
+        states = derive(world, facts(world), settings.harness)
+        prs = {p.number: p for p in world.prs}
+        for key, state in sorted(states.items(), key=lambda kv: kv[0].sort_key):
+            if state == Wait(WaitReason.MERGEABILITY_UNKNOWN) and (pr := prs.get(key.number)) is not None:
+                # Approved and green but not mergeable now: BLOCKED waits on a human (branch protection).
+                log(f"fix: PR #{key.number} waits to merge: mergeable={pr.mergeable or '?'} "
+                    f"state={pr.merge_state or '?'}")
+        chosen = list(fix_actions(states, settings.harness, slots(), merge=settings.auto_merge))
         for action in chosen:
             log(f"fix: {action!r}")
         return chosen

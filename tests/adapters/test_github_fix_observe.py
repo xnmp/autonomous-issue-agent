@@ -104,7 +104,6 @@ def test_a_malformed_pr_node_is_incomplete(node):
 @pytest.mark.parametrize(("node", "owed"), [
     (ref("5-x"), True),                                                           # never had a PR
     (ref("5-x", ahead=0), False),                                                 # nothing ahead of base (P1-9)
-    (ref("5-x", ahead=None), False),                                              # comparison impossible: unproven
     (ref("5-x", assoc("OPEN")), False),
     (ref("5-x", assoc("MERGED", "2026-09-01T00:00:00Z")), False),
     (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z")), True),                  # pushed after a human closed it (P1-8)
@@ -113,20 +112,48 @@ def test_a_malformed_pr_node_is_incomplete(node):
     (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z"), committed=""), False),   # untimed push proves nothing
 ])
 def test_a_branch_is_owed_a_pr_only_when_ahead_of_base_and_without_a_live_or_newer_pr(node, owed):
-    assert parse_fix_refs([node]) == ((Branch("fix/5-x", node["target"]["committedDate"]),) if owed else ())
+    expected = (Branch("fix/5-x", node["target"]["committedDate"]),) if owed else ()
+    assert parse_fix_refs([node]) == (expected, {})
 
 
 @pytest.mark.parametrize("bad", [
-    [None], [{"name": 5}], [{"name": "5-x"}],
-    [{**ref("5-x"), "associatedPullRequests": {"totalCount": "0", "nodes": []}}],
-    [{**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": []}}],
-    [{**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": [{"state": "DRAFT"}]}}],
-    [{**ref("5-x"), "compare": {"behindBy": "2"}}],
-    [{**ref("5-x"), "compare": []}],
+    {**ref("5-x"), "associatedPullRequests": {"totalCount": "0", "nodes": []}},
+    {**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": []}},      # a hidden or deleted PR
+    {**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": [{"state": "DRAFT"}]}},
+    ref("5-x", ahead=None),                                                         # no comparison (missing base)
+    {**ref("5-x"), "compare": {"behindBy": "2"}},
+    {**ref("5-x"), "compare": []},
 ])
-def test_an_unreadable_branch_association_is_incomplete_not_unpublished(bad):
+def test_an_unjudgeable_branch_makes_only_its_issue_unknown(bad):
+    owed, unknown = parse_fix_refs([bad, ref("6-y")])
+    assert owed == (Branch("fix/6-y", "2026-10-01T00:00:00Z"),) and set(unknown) == {5}
+
+
+@pytest.mark.parametrize("bad", [[None], [{"name": 5}]])
+def test_a_malformed_ref_list_is_incomplete(bad):
     with pytest.raises(FixObservationIncomplete):
         parse_fix_refs(bad)
+
+
+def test_an_issue_whose_branch_cannot_be_judged_waits_out_of_the_world():
+    runner = GraphQL({"issues": page([issue_node(5), issue_node(6)]), "pullRequests": page([]),
+                      "refs": page([ref("5-x", ahead=None), ref("6-y")])})
+    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    assert [i.number for i in world.issues] == [6]
+    assert world.branches == (Branch("fix/6-y", "2026-10-01T00:00:00Z"),)
+
+
+def test_the_pr_lookup_for_a_branch_considers_open_prs_only():
+    # P1-8 depends on it: a closed PR found here would make act skip the open forever.
+    calls = []
+
+    def runner(argv, _token):
+        calls.append(argv)
+        return json.dumps([{"number": 101, "headRefName": "fix/5-x"}, {"number": 7, "headRefName": "fix/5-xy"}])
+
+    assert GitHubGateway("o/r", runner=runner).pull_request_for_branch("fix/5-x") == 101
+    (argv,) = calls
+    assert argv[argv.index("--state") + 1] == "open" and argv[argv.index("--head") + 1] == "fix/5-x"
 
 
 def test_merged_harness_prs_come_only_from_this_repository_and_fix_branches():

@@ -13,12 +13,14 @@ Precedence, the single place it is defined (first match wins, per item):
                nothing else is decided about the item.
 2. Unread      the PR's content could not be read -> Wait (no stop or label
                logic runs on a placeholder).
-3. needs-human labelled with a stop comment: a lifetime stop on a still-capped
-               issue -> Wait (money is a grant, so a reply cannot release
-               it); a qualifying reply (Q8) -> Release; else Wait. Labelled
-               with no stop comment (the comment failed, or a human labelled
-               it): the steps below run, a NeedsHuman is emitted (the label
-               add is idempotent, the comment keyed) and anything else waits.
+3. needs-human labelled with this episode's stop comment (one newer than the
+               item's last leg end; a stop is always posted after the legs it
+               judges): a lifetime stop on a still-capped issue -> Wait (money
+               is a grant, so a reply cannot release it); a qualifying reply
+               (Q8) -> Release; else Wait. Labelled without one (the comment
+               failed, or a human labelled it): the steps below run, a
+               NeedsHuman is emitted (the label add is idempotent, the comment
+               keyed) and anything else waits.
 4. Question    the item's latest agent leg asked a human for judgment and no
                stop comment follows it -> NeedsHuman, whose comment carries
                the question (the stop is the single needs-human writer).
@@ -343,13 +345,13 @@ def _decide(item: _Item, local: Local, harness: Harness, observed: datetime | No
     anchor = last_end.isoformat() if last_end else "-"
     comments = [(at, c) for c in item.comments if (at := parse_timestamp(c.created_at))]
     stops = [(at, m.group(1)) for at, c in comments if harness.wrote(c) and (m := _STOP_TAG_RE.search(c.body))]
-    last_stop = max(stops, default=None)
+    # Older stops were released; they still matter below (reset floor, workflow).
+    last_stop = max((s for s in stops if last_end is None or s[0] > last_end), default=None)
     labelled = Label.NEEDS_HUMAN in item.labels
     if labelled and last_stop is not None:
         if item.issue in local.lifetime_capped and last_stop[1] == StopReason.LIFETIME_CAP.value:
             return Wait(WaitReason.NEEDS_HUMAN)
-        if any(at > last_stop[0] and (last_end is None or at > last_end) and _human_comment(c, harness)
-               for at, c in comments):
+        if any(at > last_stop[0] and _human_comment(c, harness) for at, c in comments):
             return Release()
         return Wait(WaitReason.NEEDS_HUMAN)
     state = _proceed(item, local, harness, legs, comments, stops, anchor)

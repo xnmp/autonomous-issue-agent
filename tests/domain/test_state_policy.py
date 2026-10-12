@@ -818,3 +818,17 @@ def test_a_blocked_approved_green_pr_waits_for_branch_protection():
     states = derive(WorldState(prs=(pr(merge_state="BLOCKED", reviews=(review("APPROVED", 1),)),)), local(), H)
     assert states == {pr_key(7): Wait(WaitReason.MERGEABILITY_UNKNOWN)}
     assert actions(states, H) == ()
+
+
+
+def test_an_old_released_stop_does_not_stand_in_for_this_episodes_failed_one():
+    # Round 2: episode 1 stopped and was released; episode 2's label landed, its comment failed.
+    view = labelled([stop(StopReason.ATTEMPTS, 3.5), human(3.6)], ci=RED)
+    states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 1, 2, 3, 4, 5, 6))), H)
+    assert states == {pr_key(7): NeedsHuman(StopReason.ATTEMPTS, iso(6), FIX)}
+
+
+def test_an_old_lifetime_stop_does_not_pin_a_different_current_stop():
+    view = labelled([stop(StopReason.LIFETIME_CAP, 0.5), human(0.6)], ci=RED)
+    loc = local(pr_legs(*legs(FIX, 1, 2, 3)), lifetime_capped=frozenset({3}))
+    assert pr_state(view, loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)

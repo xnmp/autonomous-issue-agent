@@ -559,3 +559,35 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     legs = [r.receipt["leg"] for r in sorted(composed.control.fix_runs("o/r", (5,)), key=lambda r: r.completed_at)
             if r.receipt is not None]
     assert legs == ["machine", "agent"]
+
+
+
+def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(role, later):
+    # Round 2: a receipt-less death between two wall caps does not reset resume-once.
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    capped = lambda _task: AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT,  # noqa: E731
+                                       cost_usd=0.1, session_id="s-wall")
+    agent = Agent(capped, died, capped)
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    later()
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # dies, no receipt
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # continues the wall-capped session
+    runs = sorted(composed.control.fix_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    assert [r.receipt["leg"] if r.receipt else None for r in runs] == ["machine", None, "agent"]
+    assert agent.tasks[2].resume == "s-wall"
+
+
+def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(tmp_path):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, merge_state="BLOCKED",
+            reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
+    cfg = replace(from_env({"REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "BASE_BRANCH": "dev",
+                            "STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "rs")}),
+                  control_authority_root=str(tmp_path / "ms"))
+    lines: list[str] = []
+    composed = compose_fix_daemon(cfg, gh, Store(cfg.state_dir), FakeWorktrees(tmp_path / "wt"), Agent(),
+                                  log=lines.append)
+    assert tick(composed) == [] and gh.merged == []
+    assert any("PR #100 waits to merge" in line and "BLOCKED" in line for line in lines)

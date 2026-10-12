@@ -1164,6 +1164,7 @@ def compose_fix_daemon(
         active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
         headroom=_headroom(_control_spend_gate(cfg, control, fix_runtime.budget_usd)),
         lifetime_capped=_lifetime_capped(cfg, control),
+        log=log,
     )
     recovery = _recovery(
         cfg.state_dir, cfg, control, _NoCommands(), "fix", worktrees,

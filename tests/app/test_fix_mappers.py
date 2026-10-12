@@ -15,7 +15,7 @@ from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
-from issue_agent.domain.state import Harness, Local, issue_key, pr_key
+from issue_agent.domain.state import Harness, Local, derive, issue_key, pr_key
 from issue_agent.domain.world import Comment, IssueView, PRView, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -114,23 +114,23 @@ def local(**kw):
 def test_paid_dispatches_fit_the_free_slots_issues_first():
     world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)),
                        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),))
-    chosen = fix_actions(world, local(), H, slots=2)
+    chosen = fix_actions(derive(world, local(), H), H, slots=2)
     assert chosen == (RunAgent(AgentKind.RESOLVE, 1), RunAgent(AgentKind.RESOLVE, 2))
-    assert fix_actions(world, local(), H, slots=0) == ()
+    assert fix_actions(derive(world, local(), H), H, slots=0) == ()
 
 
 def test_free_actions_ignore_the_slot_budget_and_review_is_never_the_fix_roles():
     approved = harness_pr(100, reviews=(Review("APPROVED", "review-bot", commit_id="h1"),))
     unreviewed = harness_pr(101, issue=6)
-    chosen = fix_actions(WorldState(prs=(approved, unreviewed)), local(), H, slots=0)
+    chosen = fix_actions(derive(WorldState(prs=(approved, unreviewed)), local(), H), H, slots=0)
     assert chosen == (MergePullRequest(100, "h1"),)
-    assert fix_actions(WorldState(prs=(approved, unreviewed)), local(), H, slots=5, merge=False) == ()
+    assert fix_actions(derive(WorldState(prs=(approved, unreviewed)), local(), H), H, slots=5, merge=False) == ()
 
 
 @pytest.mark.parametrize("slots", [-1, 0])
 def test_no_slots_means_no_paid_dispatch(slots):
     world = WorldState(issues=(IssueView(1, labels=frozenset({Label.AI_READY})),))
-    assert fix_actions(world, local(), H, slots=slots) == ()
+    assert fix_actions(derive(world, local(), H), H, slots=slots) == ()
 
 
 # ── reply and question text ──────────────────────────────────────────────────
@@ -150,3 +150,31 @@ def test_the_reply_is_every_human_comment_after_the_leg_in_order():
 
 def test_no_reply_is_empty():
     assert human_reply((), T0, H) == ""
+
+
+
+# ── FixFacts (round 2) ───────────────────────────────────────────────────────
+
+class _Control:
+    def fix_runs(self, repository, issues):
+        return ()
+
+    def active_dispatch_claims(self, repository, role):
+        return ()
+
+    def leases(self):
+        return ()
+
+
+def test_an_unreadable_lifetime_read_holds_paid_work_and_says_so():
+    from issue_agent.app.fix import FixFacts, FixSettings
+
+    def unreadable(_issue):
+        raise RuntimeError("spend snapshot unavailable")
+
+    lines: list[str] = []
+    facts = FixFacts(_Control(), FixSettings("o/r", True, "dev", "claude", "owner", H), active=lambda: (),
+                     headroom=lambda: True, lifetime_capped=unreadable, log=lines.append, now=lambda: T0)
+    loc = facts(WorldState(issues=(IssueView(5, labels=frozenset({Label.AI_READY})),)))
+    assert loc.headroom is False and loc.lifetime_capped == frozenset()
+    assert len(lines) == 1 and "spend snapshot unavailable" in lines[0]

@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 from ..domain.ci import parse_timestamp
 from ..domain.labels import Label
+from ..domain.refs import harness_branch_issue
 from ..domain.review_rejection import MAX_OBSERVED_REVIEWS, is_commit_sha
 from ..domain.review_workflow import (
     CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
@@ -871,36 +872,49 @@ def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PR
     )
 
 
-def parse_fix_refs(nodes: list) -> tuple[Branch, ...]:
-    """Harness branches owed a PR: ahead of base, and either never had a PR or
-    were pushed after their newest PR was closed unmerged (a human closed it
-    and the issue went back to RESOLVE). A branch with nothing ahead of base
-    is owed nothing: opening its PR could only fail, every tick."""
-    out = []
+def parse_fix_refs(nodes: list) -> tuple[tuple[Branch, ...], dict[int, str]]:
+    """Harness branches owed a PR, and the issues whose branch could not be
+    judged (with why). A branch is owed when it is ahead of base and either
+    never had a PR or was pushed after its newest PR was closed unmerged (a
+    human closed it and the issue went back to RESOLVE). A branch with nothing
+    ahead of base is owed nothing: opening its PR could only fail, every tick.
+    An unjudgeable branch (a hidden PR, a comparison GitHub cannot make, e.g.
+    a missing base) makes only its issue unknown, never the whole read."""
+    owed: list[Branch] = []
+    unknown: dict[int, str] = {}
     for node in nodes:
         if not isinstance(node, dict) or not isinstance(node.get("name"), str):
             raise FixObservationIncomplete("branch ref is malformed")
-        prs = node.get("associatedPullRequests")
-        if not isinstance(prs, dict) or type(prs.get("totalCount")) is not int or not isinstance(prs.get("nodes"), list):
-            raise FixObservationIncomplete("branch PR association is unreadable")
-        compare = node.get("compare")
-        if compare is not None and (not isinstance(compare, dict) or type(compare.get("behindBy")) is not int):
-            raise FixObservationIncomplete("branch comparison is unreadable")
-        target = node.get("target") if isinstance(node.get("target"), dict) else {}
-        committed = target.get("committedDate") if isinstance(target.get("committedDate"), str) else ""
-        # GitHub answers null when the comparison cannot be made: unproven, so not owed.
-        if compare is None or compare["behindBy"] <= 0:
-            continue
-        if prs["totalCount"]:
-            newest = prs["nodes"][-1] if prs["nodes"] else None
-            if not isinstance(newest, dict) or newest.get("state") not in ("OPEN", "CLOSED", "MERGED"):
-                raise FixObservationIncomplete("branch PR state is unreadable")
-            closed_at = parse_timestamp(newest.get("closedAt") or "")
-            pushed_at = parse_timestamp(committed)
-            if newest["state"] != "CLOSED" or closed_at is None or pushed_at is None or pushed_at <= closed_at:
-                continue
-        out.append(Branch(_HARNESS_BRANCH_PREFIX + node["name"], committed))
-    return tuple(out)
+        branch = _HARNESS_BRANCH_PREFIX + node["name"]
+        try:
+            if _owed(node):
+                target = node.get("target") if isinstance(node.get("target"), dict) else {}
+                committed = target.get("committedDate")
+                owed.append(Branch(branch, committed if isinstance(committed, str) else ""))
+        except FixObservationIncomplete as exc:
+            if (issue := harness_branch_issue(branch)) is not None:
+                unknown[issue] = str(exc)
+    return tuple(owed), unknown
+
+
+def _owed(node: dict) -> bool:
+    prs = node.get("associatedPullRequests")
+    if not isinstance(prs, dict) or type(prs.get("totalCount")) is not int or not isinstance(prs.get("nodes"), list):
+        raise FixObservationIncomplete("branch PR association is unreadable")
+    compare = node.get("compare")
+    if not isinstance(compare, dict) or type(compare.get("behindBy")) is not int:
+        raise FixObservationIncomplete("branch cannot be compared with the base")
+    if compare["behindBy"] <= 0:
+        return False
+    if not prs["totalCount"]:
+        return True
+    newest = prs["nodes"][-1] if prs["nodes"] else None
+    if not isinstance(newest, dict) or newest.get("state") not in ("OPEN", "CLOSED", "MERGED"):
+        raise FixObservationIncomplete("branch PR state is unreadable")
+    target = node.get("target") if isinstance(node.get("target"), dict) else {}
+    closed_at = parse_timestamp(newest.get("closedAt") or "")
+    pushed_at = parse_timestamp(target.get("committedDate") or "")
+    return newest["state"] == "CLOSED" and closed_at is not None and pushed_at is not None and pushed_at > closed_at
 
 
 # ── write command builders ──────────────────────────────────────────────────
@@ -1634,8 +1648,11 @@ class GitHubGateway:
                 prs.append(PRView(number=node["number"], head_ref_name=node["headRefName"], state="OPEN",
                                   content_known=False))
         prs.extend(p for n, p in sorted(merged.items()) if n not in {o.number for o in prs})
-        return WorldState(issues=tuple(issues), prs=tuple(prs), now=now,
-                          branches=parse_fix_refs(collected["refs"]))
+        branches, unknown = parse_fix_refs(collected["refs"])
+        for number, why in sorted(unknown.items()):
+            self._skip_item("issue", number, FixObservationIncomplete(why))
+        return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
+                          branches=branches)
 
     def pull_request_for_branch(self, branch: str) -> int | None:
         """The open PR whose head is `branch` in this repository. A closed one
