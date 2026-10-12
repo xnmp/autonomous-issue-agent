@@ -878,6 +878,7 @@ def _install_state(
     present,
     install_rc=0,
     after=None,
+    after_foreign=(),
     live=(),
     foreign=(),
     timeout=False,
@@ -886,7 +887,8 @@ def _install_state(
     """PATH resolution for the declared console scripts, plus a recording stub
     for `make install` that can flip what PATH resolves afterwards. `foreign`
     names scripts that resolve to ANOTHER checkout's shim; `live` is what the
-    deployment-liveness probe reports."""
+    deployment-liveness probe reports; `after_foreign` is what still shadows
+    after the install."""
     calls: list[list[str]] = []
     state = {"present": set(present), "foreign": set(foreign)}
     scripts = set(cli.declared_console_scripts())
@@ -914,7 +916,7 @@ def _install_state(
         calls.append(list(cmd))
         if after is not None:  # a successful install rewrites every shim
             state["present"] = set(after)
-            state["foreign"] = set()
+            state["foreign"] = set(after_foreign)
         if timeout:
             raise subprocess.TimeoutExpired(cmd, 300, output=b"sync log\nboom")
         return subprocess.CompletedProcess(cmd, install_rc, "", "boom")
@@ -925,24 +927,8 @@ def _install_state(
     return calls
 
 
-def test_start_reinstalls_when_only_one_entry_point_resolves(monkeypatch, capsys):
-    """Live incident: doctor said 're-run make install' and killed the launch;
-    the operator ran exactly that by hand. `start` now does it."""
-    calls = _install_state(
-        monkeypatch,
-        present=("issue-agent",),
-        after=("issue-agent", "issue-agent-publish"),
-    )
-
-    assert cli.heal_entrypoint_drift() is True
-    assert [c[:2] for c in calls] == [["make", "install"]]
-    assert "auto-fixed stale/partial install" in capsys.readouterr().out
-
-
 def test_start_does_not_reinstall_when_the_entry_points_are_intact(monkeypatch):
-    calls = _install_state(
-        monkeypatch, present=("issue-agent", "issue-agent-publish")
-    )
+    calls = _install_state(monkeypatch, present=("issue-agent",))
 
     assert cli.heal_entrypoint_drift() is True
     assert calls == []
@@ -959,7 +945,7 @@ def test_start_does_not_reinstall_a_checkout_that_never_installed(monkeypatch):
 
 def test_start_gives_up_after_one_failed_reinstall(monkeypatch, capsys):
     calls = _install_state(
-        monkeypatch, present=("issue-agent",), install_rc=2
+        monkeypatch, present=("issue-agent",), foreign=("issue-agent",), install_rc=2
     )
 
     assert cli.heal_entrypoint_drift() is False
@@ -971,7 +957,8 @@ def test_start_gives_up_when_the_reinstall_does_not_clear_the_drift(
     monkeypatch, capsys
 ):
     calls = _install_state(
-        monkeypatch, present=("issue-agent",), after=("issue-agent",)
+        monkeypatch, present=("issue-agent",), foreign=("issue-agent",),
+        after=("issue-agent",), after_foreign=("issue-agent",),
     )
 
     assert cli.heal_entrypoint_drift() is False
@@ -983,7 +970,7 @@ def test_start_refuses_to_reinstall_under_a_live_deployment(monkeypatch, capsys)
     """`make install` runs `uv sync` on the ONE .venv every deployment's daemons
     execute from; pruning it mid-tick breaks the running ones."""
     calls = _install_state(
-        monkeypatch, present=("issue-agent",), live=("keifu", "sol")
+        monkeypatch, present=("issue-agent",), foreign=("issue-agent",), live=("keifu", "sol")
     )
 
     assert cli.heal_entrypoint_drift() is False
@@ -998,9 +985,9 @@ def test_start_treats_a_shim_from_another_checkout_as_drift(monkeypatch, capsys)
     the daemon then execs a different tree's plugin/ and config/."""
     calls = _install_state(
         monkeypatch,
-        present=("issue-agent", "issue-agent-publish"),
-        foreign=("issue-agent-publish",),
-        after=("issue-agent", "issue-agent-publish"),
+        present=("issue-agent",),
+        foreign=("issue-agent",),
+        after=("issue-agent",),
     )
 
     assert cli.heal_entrypoint_drift() is True
@@ -1013,7 +1000,7 @@ def test_drift_flags_an_install_resolving_into_a_transient_worktree(monkeypatch)
     into the launcher; from inside that process every other check reads
     coherent, so the path itself is the signature."""
     _install_state(
-        monkeypatch, present=("issue-agent", "issue-agent-publish"),
+        monkeypatch, present=("issue-agent",),
         harness_root="/home/u/repo/.claude/worktrees/agent-x",
     )
 
@@ -1024,7 +1011,7 @@ def test_heal_refuses_to_reinstall_from_a_transient_worktree(monkeypatch, capsys
     """`make install` from the transient process would reinstall the transient
     tree — the exact state being healed."""
     calls = _install_state(
-        monkeypatch, present=("issue-agent", "issue-agent-publish"),
+        monkeypatch, present=("issue-agent",),
         harness_root="/home/u/repo/.claude/worktrees/agent-x",
     )
 
@@ -1047,7 +1034,7 @@ def test_doctor_refuses_to_render_from_a_transient_worktree(monkeypatch, capsys)
 
 
 def test_start_gives_up_when_the_reinstall_times_out(monkeypatch, capsys):
-    calls = _install_state(monkeypatch, present=("issue-agent",), timeout=True)
+    calls = _install_state(monkeypatch, present=("issue-agent",), foreign=("issue-agent",), timeout=True)
 
     assert cli.heal_entrypoint_drift() is False
     assert len(calls) == 1
@@ -1059,10 +1046,7 @@ def test_start_gives_up_when_the_reinstall_times_out(monkeypatch, capsys):
 def test_entrypoint_drift_covers_every_declared_console_script():
     """Derived from pyproject's [project.scripts], not a second hardcoded list
     that can disagree with the one bin/install.sh materialises."""
-    assert set(cli.declared_console_scripts()) == {
-        "issue-agent",
-        "issue-agent-publish",
-    }
+    assert set(cli.declared_console_scripts()) == {"issue-agent"}
 
 
 def test_live_deployment_names_ignores_stopped_deployments(tmp_path, monkeypatch):
@@ -1088,7 +1072,7 @@ def test_start_still_launches_the_preflight_after_a_failed_reinstall(
     _prep_mismatch_overlay(tmp_path, monkeypatch, isolate_entrypoint=False)
     execve_calls: list = []
     monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
-    install_calls = _install_state(monkeypatch, present=("issue-agent",), install_rc=1)
+    install_calls = _install_state(monkeypatch, present=("issue-agent",), foreign=("issue-agent",), install_rc=1)
 
     cli.cmd_start(
         _start_args(repo="acme/app", target_dir="/srv/acme-app", name="app")

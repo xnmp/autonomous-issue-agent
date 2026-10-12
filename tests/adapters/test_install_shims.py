@@ -1,9 +1,8 @@
 """bin/install.sh must shim EVERY declared console script (#156).
 
-`pyproject.toml` declares two entry points; the installer wrote exactly one
-hand-named shim (`$BIN_DIR/issue-agent`). So on any box bootstrapped with
-`make install`, `issue-agent-publish` — the executable every fixer is told to publish
-through — was simply absent from PATH, and issue #18's
+`pyproject.toml` once declared two entry points while the installer wrote
+exactly one hand-named shim (`$BIN_DIR/issue-agent`), so the second was absent
+from PATH on every box bootstrapped with `make install`, and issue #18's
 resolve leg blocked at $1.84 asking the operator to install it (keifu,
 2026-08-02).
 
@@ -13,11 +12,8 @@ drive the REAL bin/install.sh from a scratch checkout (its `dirname $0/..`
 self-location makes that a copy of the script beside a scratch pyproject) with
 a fake `uv` on PATH, so nothing here syncs a venv or touches the operator's
 ~/.local/bin. The scratch pyproject deliberately declares a THIRD script the
-real one does not: an assertion naming only the two current entry points would
+real one does not: an assertion naming only the current entry points would
 pass against a hand-maintained list.
-
-The doctor half drives the real bin/doctor.sh with a stubbed PATH, mirroring
-the `_fake_bin`/`_run_doctor` pattern in test_doctor_write_probe.py.
 """
 
 from __future__ import annotations
@@ -25,13 +21,10 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = ROOT / "bin" / "install.sh"
-DOCTOR_SH = ROOT / "bin" / "doctor.sh"
-
 SCRATCH_PYPROJECT = """\
 [project]
 name = "issue-agent"
@@ -39,7 +32,7 @@ version = "0.0.0"
 
 [project.scripts]
 issue-agent = "issue_agent.app.cli:main"
-issue-agent-publish = "issue_agent.adapters.agent_publish:main"
+issue-agent-extra = "issue_agent.app.extra:main"
 issue-agent-later = "issue_agent.app.later:main"
 
 [tool.something]
@@ -106,7 +99,7 @@ def _run_install(root: Path, bin_dir: Path) -> subprocess.CompletedProcess:
     )
 
 
-DECLARED = ("issue-agent", "issue-agent-publish", "issue-agent-later")
+DECLARED = ("issue-agent", "issue-agent-extra", "issue-agent-later")
 
 
 def test_install_shims_every_declared_console_script(tmp_path):
@@ -130,31 +123,31 @@ def test_install_shims_every_declared_console_script(tmp_path):
 
 
 def test_install_overwrites_a_hand_written_operator_shim(tmp_path):
-    """The #156 stopgap was a hand-written ~/.local/bin/issue-agent-publish.
-    Re-running the installer must replace it, not skip or fail on it."""
+    """The #156 stopgap was a hand-written ~/.local/bin shim. Re-running the
+    installer must replace it, not skip or fail on it."""
     root = _scratch_install(tmp_path, materialise=DECLARED)
     bin_dir = tmp_path / "bin_dir"
     bin_dir.mkdir()
-    _exe(bin_dir / "issue-agent-publish", "#!/usr/bin/env bash\necho stopgap\n")
+    _exe(bin_dir / "issue-agent-extra", "#!/usr/bin/env bash\necho stopgap\n")
 
     assert _run_install(root, bin_dir).returncode == 0
     # Idempotent: a second run over its own output is still clean.
     assert _run_install(root, bin_dir).returncode == 0
 
     ran = subprocess.run(
-        [str(bin_dir / "issue-agent-publish"), "x"],
+        [str(bin_dir / "issue-agent-extra"), "x"],
         capture_output=True,
         text=True,
         timeout=30,
     )
-    assert ran.stdout.strip() == "venv issue-agent-publish ran: x"
+    assert ran.stdout.strip() == "venv issue-agent-extra ran: x"
 
 
 def test_install_fails_loudly_when_a_declared_script_is_missing(tmp_path):
     """Deriving the list is only safe if a declaration the sync did not
     materialise stops the install instead of shipping a dangling shim."""
     root = _scratch_install(
-        tmp_path, materialise=("issue-agent", "issue-agent-publish")
+        tmp_path, materialise=("issue-agent", "issue-agent-extra")
     )
     bin_dir = tmp_path / "bin_dir"
 
@@ -162,51 +155,3 @@ def test_install_fails_loudly_when_a_declared_script_is_missing(tmp_path):
 
     assert result.returncode != 0
     assert "issue-agent-later" in result.stdout + result.stderr
-
-
-# ── doctor: the broken-installer signature ──────────────────────────────────
-def _run_doctor(path_dir: Path) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    env["PATH"] = f"{path_dir}{os.pathsep}{_base_path()}"
-    empty = Path(tempfile.mkdtemp(prefix="doctor-cfg-")) / "empty.env"
-    empty.write_text("")
-    env["AGENT_ENV"] = str(empty)
-    return subprocess.run(
-        ["bash", str(DOCTOR_SH)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-
-def _doctor_path(tmp_path: Path, *, present: tuple[str, ...]) -> Path:
-    stub_bin = tmp_path / "doctor_bin"
-    stub_bin.mkdir()
-    for stub in ("claude", "gh", "jq", "git", *present):
-        _exe(stub_bin / stub, "#!/usr/bin/env bash\nexit 0\n")
-    return stub_bin
-
-
-def test_doctor_flags_issue_agent_without_its_publish_sibling(tmp_path):
-    out = _run_doctor(_doctor_path(tmp_path, present=("issue-agent",))).stdout
-
-    assert "issue-agent-publish not on PATH" in out
-    assert "make install" in out
-
-
-def test_doctor_is_quiet_when_both_entry_points_resolve(tmp_path):
-    out = _run_doctor(
-        _doctor_path(tmp_path, present=("issue-agent", "issue-agent-publish"))
-    ).stdout
-
-    assert "issue-agent-publish on PATH" in out
-    assert "not on PATH" not in out.split("== config ==")[0]
-
-
-def test_doctor_says_nothing_about_shims_in_a_plain_dev_checkout(tmp_path):
-    """A checkout that never ran `make install` has neither executable — that
-    is not a broken install and must not be reported as one."""
-    out = _run_doctor(_doctor_path(tmp_path, present=())).stdout
-
-    assert "issue-agent-publish" not in out

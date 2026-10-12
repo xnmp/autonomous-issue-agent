@@ -1,4 +1,4 @@
-"""Generation-fenced review workflow under ADR 0015.
+"""Generation-fenced review workflow under ADR 0009 and ADR 0015.
 
 Owns single, delegated, and multi-agent review dispatch outside the central
 AgentDispatcher so review behavior can evolve behind a role-specific module.

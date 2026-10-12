@@ -19,7 +19,6 @@ from ..domain.actions import Target
 from ..domain.labels import Label
 from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
-from ..domain.backoff import LegEnd
 from ..domain.outcome import budget_exhausted, infra_class_failure
 from ..domain.resolve_rearm import (
     AbsentResolveControl, InactiveResolveControl, PendingRetry, ResolveControlRead, ResolveControlView,
@@ -35,13 +34,47 @@ from ..domain.resolve_workspace import (
     ObservedResolveBase, PriorResolveAdmission, ResolveWorkspaceObserved,
 )
 from ..domain.workflow import (
-    ActiveReconciliation, ReconciliationOnly, RetiredSettledCommand, RetiredUncertainCommand, AuthorizeAbsentRetry, RearmObligation, RetryAuthorizationRequired, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
-    ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate, OperatorActor,
-    PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
-    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind,
-    StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
-    WorkflowConflict, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
-    WorkflowUnchanged, WorkflowRejected, WorkflowRejection,
+    ActiveReconciliation,
+    ReconciliationOnly,
+    RetiredSettledCommand,
+    RetiredUncertainCommand,
+    AuthorizeAbsentRetry,
+    RetryAuthorizationRequired,
+    AuthorizedOperatorCommand,
+    CancelRearm,
+    CancelledRearm,
+    CompletedRearm,
+    ContinueGrantedRearm,
+    HeldProjection,
+    LinkedPrPresent,
+    NoLinkedPr,
+    ObservedIssue,
+    ObservedTransition,
+    OpenGate,
+    OperatorActor,
+    PendingRearm,
+    RearmingGate,
+    RearmIntent,
+    RemoteOutcomeUncertain,
+    RequestRearm,
+    ResolveAdmission,
+    ResolveAttemptResult,
+    ResolveRearmAcceptance,
+    ResolveRearmPreflight,
+    ResolveResultKind,
+    StopReason,
+    SupersededRearm,
+    WorkflowAbsent,
+    WorkflowChanged,
+    WorkflowCommitted,
+    WorkflowConflict,
+    WorkflowMigrationRequired,
+    WorkflowRead,
+    WorkflowSnapshot,
+    WorkflowUnavailable,
+    WorkflowUnchanged,
+    WorkflowRejected,
+    WorkflowRejection,
 )
 from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
@@ -52,11 +85,22 @@ from ..domain.workflow_policy import (
     cancel_resolve_rearm, record_resolve_attempt, resolve_return_actions, return_gate_id,
     update_return_observation, validate_resolve_transition,
 )
-from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, minted_authorization, retry_authorization_available
+from ..domain.workflow_retry import (
+    RetryAuthorizationFacts,
+    authorize_absent_retry,
+    retry_authorization_available,
+)
 from .control_store import (
-    load_retry_authorization_facts, AccountingDisposition, ControlStoreError, SettlementRequest, SettlementResult, SQLiteControlStore,
-    _command_from_row, _stamp, latest_work_admission,
-    target_has_work_admissions, workflow_run_scope_bounds,
+    load_retry_authorization_facts,
+    AccountingDisposition,
+    ControlStoreError,
+    SettlementRequest,
+    SettlementResult,
+    SQLiteControlStore,
+    _command_from_row,
+    latest_work_admission,
+    target_has_work_admissions,
+    workflow_run_scope_bounds,
 )
 from .effects import command_for_action
 from .deployment_authority import DeploymentAuthority, deployment_role, deployment_effect_barrier
@@ -94,9 +138,6 @@ class SQLiteWorkflowControl:
     def _scope(self, key: WorkflowKey) -> None:
         if not isinstance(key, WorkflowKey) or key.repository != self.writer.repository or not isinstance(key.target, IssueRef):
             raise WorkflowAuthorityError("workflow is outside the bound resolve writer scope")
-
-    def fix_leg_ends(self, issue: int) -> tuple[LegEnd, ...]:
-        return self._control.fix_leg_ends(self.writer.repository, issue)
 
     def reconcile_pr_repair_returns(self) -> int:
         return self._control.reconcile_pr_repair_returns(self.writer)

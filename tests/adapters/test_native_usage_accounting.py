@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
@@ -15,13 +15,11 @@ from issue_agent.domain.contracts import Money, TokenUsage, UsageSource
 from issue_agent.domain.outcome import AgentResult, ExitReason, infra_class_failure
 from issue_agent.domain.pricing import BudgetPolicy, RateTable, ModelRates
 from issue_agent.domain.run_usage import ModelUsage, MeasuredRunUsage, EstimatedRunUsage
-from tests.adapters.test_accounting_runtime import Runtime, _wrapper, _publication_context_for_accounting_tests
-from tests.fakes.workflow_authority import resolve_snapshot
+from tests.adapters.test_accounting_runtime import Runtime, _wrapper
 from issue_agent.adapters.codex_child_usage import rate_table_evidence
 from issue_agent.adapters.codex_runner import CodexRunner, write_spend_evidence, spend_evidence_path
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
-from issue_agent.adapters.control_store import AccountingDisposition
 from tests.adapters.test_spend_recovery import _end_run_at, _reserved_store
 
 ENDED = datetime(2100, 1, 1, tzinfo=timezone.utc)
@@ -51,7 +49,7 @@ def test_same_admission_prices_each_native_model_and_emits_one_aggregate_charge(
                          run_usage=MeasuredRunUsage(samples()))
     wrapper, control = _wrapper(tmp_path, Runtime(result))
     wrapper = replace(wrapper, rate_table=table())
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
     with control.transaction() as db:
         charges = db.execute("SELECT amount_micros,basis FROM charges").fetchall()
@@ -67,7 +65,7 @@ def test_missing_child_receipt_settles_known_parent_estimate_without_holding(tmp
                          run_usage=EstimatedRunUsage("child receipt missing", samples()[:1]))
     wrapper, control = _wrapper(tmp_path, Runtime(result))
     wrapper = replace(wrapper, rate_table=table())
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     returned = asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
     assert returned.status == "pushed" and not infra_class_failure(returned)
     assert control.active_reservation_runs() == ()
@@ -79,7 +77,7 @@ def test_interrupted_unusaged_native_request_settles_zero_without_the_reserved_m
     result = AgentResult(True, exit_reason=ExitReason.NO_RESULT,
                          run_usage=EstimatedRunUsage("interrupted request"))
     wrapper, control = _wrapper(tmp_path, Runtime(result))
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
     assert control.active_reservation_runs() == ()
     with control.transaction() as db:
@@ -98,7 +96,7 @@ def test_completed_request_without_evidence_journals_gap_in_actual_settlement(tm
     observed = CodexChildUsageMeter(str(home), START, RATES, str(tmp_path)).sample(ROOT, "sol", None, final=True)
     wrapper, control = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     if crash_after_commit:
         settle = control.settle
 
@@ -347,7 +345,7 @@ def test_observer_limits_fail_closed(tmp_path, mode):
     wrapper, control = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 2000)}))
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.002,
                                                 env={"CODEX_HOME": str(tmp_path / "codex")})))
     assert not (tmp_path / "finished").exists()
@@ -392,7 +390,7 @@ def test_native_child_crossing_cap_stops_inflight_or_final_success_under_one_res
     wrapper, control = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 1200)}))
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     async def run():
         # Bound failure cleanup if the watchdog stops enforcing the cap;
         # the process/stream events above determine the race ordering.
@@ -425,7 +423,7 @@ def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for
     runner = native_runner(tmp_path, native_executable(tmp_path, complete=False), directory)
     wrapper, control = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     identities = []
 
     async def scenario():
@@ -464,7 +462,7 @@ def test_transport_retry_prices_every_attempt_and_child_without_another_admissio
     runner = replace(runner, resume_on_retry=resume)
     wrapper, control = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2,
                                                 env={"CODEX_HOME": str(tmp_path / "codex")})))
     assert (tmp_path / "attempts").read_text() == "2", (result.summary, result.exit_reason)
@@ -558,7 +556,7 @@ def test_journalled_run_cost_matches_the_committed_settlement(tmp_path, usage_ki
     wrapper = replace(wrapper, rate_table=RATES)
     journaled = JournalingRuntime(wrapper, Journal(str(tmp_path / "journal.jsonl")),
                                   repo="o/r", role="fix", runtime="codex")
-    journaled.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    journaled.set_context("fix", "RESOLVE", 1, 1)
 
     asyncio.run(journaled.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
     completed = next(r for r in (json.loads(line) for line in (tmp_path / "journal.jsonl").read_text().splitlines())

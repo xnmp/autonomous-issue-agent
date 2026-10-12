@@ -61,6 +61,10 @@ class Label(str, Enum):
     # ADR 0012); no daemon ever adds or removes it.
     AI_PARKED = "ai-parked"
 
+    # The single stop of the two-label design (docs/open/2026-10-12-minimal-harness-design.md):
+    # only policy writes it; a human reply or removing it releases the item.
+    NEEDS_HUMAN = "needs-human"
+
     # Escalation.
     NEEDS_HUMAN_REVIEW = "needs-human-review"  # review/address-review exhausted
     # A runtime budget cap needs an operator to change the cap or resume from
@@ -99,16 +103,3 @@ LIFECYCLE_LABELS: frozenset[Label] = frozenset(
     }
 )
 
-# Priority order for picking the next ai-ready issue (watcher.sh §1: P1<P2<P3,
-# then everything else). Lower sort key = picked first.
-_PRIORITY_RANK: dict[Label, int] = {Label.P1: 1, Label.P2: 2, Label.P3: 3}
-DEFAULT_PRIORITY_RANK = 4
-
-
-def priority_rank(labels: frozenset[Label]) -> int:
-    """Sort key for an ai-ready issue: P1→1, P2→2, P3→3, none→4. Mirrors the
-    jq priority expression in watcher.sh §1."""
-    for label, rank in _PRIORITY_RANK.items():
-        if label in labels:
-            return rank
-    return DEFAULT_PRIORITY_RANK

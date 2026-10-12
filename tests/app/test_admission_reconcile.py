@@ -10,9 +10,7 @@ reconciliation pass released every one of those reservations.
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-import pytest
 
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
@@ -48,32 +46,12 @@ from issue_agent.domain.pricing import (
     UnknownModelPolicy,
 )
 
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 REPOSITORY = "o/r"
 ISSUE = 34
 OWNER = "o/r:fix"
 LEG_MAXIMUM = Money("USD", 2_000_000)
 GRACE = timedelta(minutes=2)
-
-
-@pytest.fixture(autouse=True)
-def _publication_authority(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        accounting_runtime,
-        "_fix_publication_context",
-        lambda role, cwd: (
-            accounting_runtime._FixPublicationContext(
-                str(Path(cwd or tmp_path).resolve()),
-                f"fix/{ISSUE}-broken-binary",
-                "/usr/bin/git",
-                "/usr/bin/gh",
-                "/usr/bin:/bin",
-            )
-            if role == "fix"
-            else None
-        ),
-    )
 
 
 class _Runtime:
@@ -160,12 +138,11 @@ def _store(tmp_path, stamped_at: datetime):
         str(tmp_path / "control.db"), now=lambda: stamped_at
     )
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot(ISSUE)))
     return store
 
 
 def _scope(now: datetime):
-    return accounting_runtime._issue_scope(REPOSITORY, ISSUE, "USD", now)
+    return accounting_runtime.issue_budget_scope(REPOSITORY, ISSUE, "USD")
 
 
 def _reserve(store, scope, run_id: str, cap: Money, at: datetime, lease=None):
@@ -255,7 +232,7 @@ def _admission(store, runtime, cap: Money, reconciler):
         owner_id=OWNER,
         reservation_reconciler=late,
     )
-    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE, workflow=resolve_snapshot(ISSUE).binding)
+    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE)
     return wrapper
 
 

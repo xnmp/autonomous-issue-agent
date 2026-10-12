@@ -13,7 +13,6 @@ APP = ROOT / "src" / "issue_agent" / "app"
 PLUGIN = ROOT / "plugin"
 PRIVILEGED_EFFECT_ADAPTERS = frozenset(
     {
-        Path("src/issue_agent/adapters/agent_publish.py"),
         Path("src/issue_agent/adapters/effects.py"),
         Path("src/issue_agent/adapters/github.py"),
         Path("src/issue_agent/adapters/operator_effects.py"),

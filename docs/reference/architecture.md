@@ -23,7 +23,7 @@ Two role daemons — **fix** and **review** — reconcile GitHub and
 drive Claude, Codex, or GLM sessions. Each is assembled in `app/roles.py` from:
 
 ```
-observe   gateway.build_world()      the GitHub slice this role needs
+observe   gateway.build_*_world()    the GitHub slice this role needs
 decide    a PURE function            world + config + state → list[Action]
 execute   Executor.execute()         the ONE place writes happen
 dispatch  AgentDispatcher            RunAgent → an actual paid agent session
@@ -35,10 +35,8 @@ The layering is hexagonal and **machine-enforced** (import-linter contracts
 in `make test`): `domain/` is pure — no I/O, no env, no clock — `adapters/` is
 I/O, `app/` is wiring. New pure logic goes in `domain/`; new I/O goes behind an
 existing adapter or an injected callable.
-`domain/model_routing.py` validates immutable difficulty-tier provider/model
-selections. `adapters/runtime_selection.py` selects the existing governed
-provider stack before paid admission; each stack retains its own accounting
-runtime under one journaling wrapper. This adds no lifecycle state or worker.
+The fix role runs one configured model and effort (refactor decision Q12);
+there is no difficulty router or per-tier provider selection.
 The Pyrefly seam gate structurally assigns every production adapter to each
 domain port it implements. An AST coverage contract requires every newly
 declared Protocol to join that checked set or an explicit documented exemption,
@@ -72,11 +70,12 @@ tests pass.
    exclusively, so an old mutation either completes before retirement or fails
    its owner check after it. Peer effects remain concurrent and no SQLite
    transaction spans network I/O. This includes
-   CLI/dashboard labels, bootstrap settings, base-branch creation,
-   and webhook relay lifecycle. Paid agents publish branches and open PRs
-   through `issue-agent-publish`; `AgentPublicationBroker` commits
-   intent before the network call and reconciles remote state before retrying an
-   ambiguous outcome. Credential isolation remains separately trigger-gated,
+   CLI/dashboard labels, bootstrap settings and base-branch creation.
+   The fix role is the exception since slice 5b
+   (ADR 0001 amendment): `adapters/act.py` executes its Actions directly, each
+   write naturally idempotent or keyed in SQLite and confirmed by a GitHub
+   read-back. Fix agents push their own branch with git; the harness opens the
+   PR from it, once. Credential isolation remains separately trigger-gated,
    so this is durability—not an untrusted-input security claim.
 3. **Impure rules are higher-order.** `check_tests(test_cmd, run_tests, …)` is
    the template: pure policy, unit-tested, with ~3 lines of shell-out injected
@@ -208,7 +207,7 @@ boundary and serialize fresh/v8/v9 boot. Machine-readable
 evidence is in `control-store-migration-evidence.json`.
 V12 removes the run-level active-dispatch uniqueness constraint: one review
 workflow may legitimately run several validator sublegs concurrently. The
-coarser paid-dispatch authority is instead the durable target/path claim made
+coarser paid-dispatch authority is instead the durable target claim made
 before the workflow starts and released on every completion, rejection, or
 cancellation path. Process liveness is snapshotted before the claim
 transaction, so OS inspection never holds SQLite's cross-process write lock.
@@ -221,9 +220,10 @@ JSONL is the per-role daemon log only; losing it cannot authorize a write,
 deduplicate work, or admit spend. Metrics derive from the SQLite legs/money
 tables plus GitHub.
 Every lifecycle command and paid run is scoped to repository, role, and stable
-checkout deployment identity in the shared store. Cross-process dispatch/path
+checkout deployment identity in the shared store. Cross-process dispatch
 claims remain repository/role-global, so two intentionally allowed checkouts
-cannot both admit the same target or overlapping path set. A daemon queries
+cannot both admit the same target (targets are the only conflict; Q13 deleted
+the path-overlap holds). A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
 The observed-world target used to acquire a dispatch claim is carried through
@@ -507,10 +507,6 @@ policies use the test-merge revision when it has checks, otherwise the head.
 Empty policies retain head report selection and escalate unverified green
 after same-head cancellation until the free rerun is spent. Unavailable reads
 leave durable escalations owed; settled Clear obsoletes other CI escalations),
-`domain/ci_history.py`
-(the bounded per-issue record of what each FIX_CI leg was pointed at and what
-was red, so attempt N can see the pattern across attempts 1..N-1 instead of
-re-diagnosing one tick's failure blind),
 `domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
 `domain/eligibility.py`
 (action-specific allowed/held/invalid results and immutable completion facts;
@@ -529,6 +525,8 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
+`domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
+minimal-harness design; the fix role runs on it since slice 5b),
 `domain/review.py`,
 `domain/supervision.py`,
 `domain/trust.py`, and
@@ -564,7 +562,8 @@ proves, refusing commands on a recorded merged pull request while a closed
 pull request retains its lever subject to fresh acceptance reads).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
-`adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
+`adapters/accounting_runtime.py`, `adapters/act.py` (the fix role's `act` step:
+idempotent or keyed-and-read-back GitHub writes, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_home.py`, `adapters/codex_runner.py`,
@@ -593,28 +592,26 @@ re-arm reconciliation and the ceiling-release projection fact),
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
-`adapters/wake.py`, `adapters/worktree.py`, `adapters/workflow_codec.py`,
+`adapters/worktree.py`, `adapters/workflow_codec.py`,
 `adapters/workflow_rows.py` (family-scoped authority reads),
 `adapters/workflow_commit.py` (family-neutral CAS receipt helpers),
-`adapters/workflow_control.py`, and
-`adapters/workspace_admission.py`. Dashboard-specific read
+and `adapters/workflow_control.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
 `app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
-`app/dispatch.py`,
-`app/execute.py`, `app/identity_pools.py`,
+`app/dispatch.py` (the review role's paid-leg dispatcher),
+`app/execute.py`, `app/fix.py` (the fix role: local facts from SQLite, the
+derive → policy tick, and one paid leg per dispatch), `app/identity_pools.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
-`app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
-`app/resolve_control.py`,
+`app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),
 `app/review_control.py` (the review owner's operator composition from the
 launch snapshot for the PR-scoped dashboard API),
-`app/service_doctor.py`, `app/webhook.py`,
-and `app/world_probe.py`.
+and `app/service_doctor.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid
 workflow sequencing and the single `run_leg` path are in `app/workflows/`;
 its shared completion helper revalidates current facts between confirmed

@@ -3,11 +3,11 @@
 import json
 import re
 from dataclasses import replace
+from functools import partial
 from typing import Any, cast
 
 import issue_agent.app.planners.tasks as tasks_module
 import pytest
-from issue_agent.adapters.runtime_plan import McpServer
 from issue_agent.domain.trust import as_untrusted
 from issue_agent.app.planners.schemas import (
     FIX_SCHEMA,
@@ -15,7 +15,6 @@ from issue_agent.app.planners.schemas import (
     REVIEW_GATE_SCHEMA,
     REVIEW_SCHEMA,
     REVIEW_VALIDATION_SCHEMA,
-    ROUTER_SCHEMA,
 )
 from issue_agent.app.planners.tasks import (
     FIXER_DENY,
@@ -36,12 +35,10 @@ from issue_agent.app.planners.tasks import (
     build_review_dimension_task,
     build_review_task,
     build_review_validation_task,
-    build_router_task,
     scope_diff,
 )
 
 from issue_agent.app.dashweb import guidance as guidance_rules
-from issue_agent.domain.ci_history import CiAttempt
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
 U = as_untrusted
@@ -78,7 +75,7 @@ def test_fixer_human_message_guidance_survives_fresh_and_resumed_sessions(sessio
 
 
 def test_resolve_task():
-    t = build_resolve_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
+    t = build_resolve_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG, "fix/5-null-token")
     assert t.schema is FIX_SCHEMA
     # AGENT.md first, then the standing autonomy contract (operator directive
     # 2026-08-03): technical calls are the fixer's, and a question is a defect.
@@ -91,7 +88,7 @@ def test_resolve_task():
 
 
 @pytest.mark.parametrize("builder,args", [
-    (build_resolve_task, (5, U("title"), U("body"), "/wt")),
+    (partial(build_resolve_task, branch="fix/5-title"), (5, U("title"), U("body"), "/wt")),
     (build_resume_task, (U("reply"), "/wt", "session")),
     (build_fresh_reply_task, (5, U("title"), U("body"), U("reply"), "/wt")),
     (build_address_review_task, (7, U("review"), U("inline"), "/wt", "session")),
@@ -127,7 +124,7 @@ def test_review_prompt_makes_the_reviewer_the_sole_evidence_verifier():
 def test_raw_text_cannot_cross_the_prompt_boundary():
     with pytest.raises(TypeError, match="branded as Untrusted"):
         build_resolve_task(
-            5, cast(Any, "raw"), U("body"), "/wt/issue-5", FIX_CFG
+            5, cast(Any, "raw"), U("body"), "/wt/issue-5", FIX_CFG, "fix/5-raw"
         )
 
 
@@ -179,22 +176,6 @@ def test_fix_ci_task_carries_unaffected_evidence_forward():
     assert t.schema is FIX_SCHEMA
 
 
-def test_fix_ci_task_includes_diagnosis_and_mcp():
-    mcp = (McpServer("sonarqube", {"command": "npx"}, "mcp__sonarqube__*"),)
-    t = build_fix_ci_task(
-        100,
-        U("unit FAIL"),
-        U("traceback…"),
-        "/wt",
-        "s1",
-        FIX_CFG,
-        mcp_servers=mcp,
-    )
-    assert "CI is failing on PR #100" in t.prompt
-    assert "Do NOT suppress" in t.prompt           # anti-suppression guardrail ported
-    assert "unit FAIL" in t.prompt and "traceback" in t.prompt
-    assert t.mcp_servers == mcp
-    assert "mcp__sonarqube__*" in t.all_allowed_tools()
 
 
 def test_fix_ci_task_omits_the_history_section_on_the_first_attempt():
@@ -203,48 +184,10 @@ def test_fix_ci_task_omits_the_history_section_on_the_first_attempt():
     assert "de-flaked" not in t.prompt
 
 
-def test_fix_ci_task_shows_prior_attempts_and_the_flaky_test_diagnosis():
-    # tauri PR #620: three blind legs missed "same check, different symptom,
-    # every time, in a spec file this PR adds".
-    t = build_fix_ci_task(
-        100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG,
-        ci_history=(
-            CiAttempt("aaaaaaaaaa11", ("e2e tests",)),
-            CiAttempt("bbbbbbbbbb22", ("e2e tests", "lint")),
-        ),
-    )
-    assert "previous FIX_CI attempts" in t.prompt
-    assert "attempt 1 @ aaaaaaa: e2e tests" in t.prompt
-    assert "attempt 2 @ bbbbbbb: e2e tests, lint" in t.prompt
-    # the diagnosis the human made, stated as information the leg can weigh
-    assert "DIFFERENT symptom" in t.prompt
-    assert "test you wrote is the likely defect" in t.prompt
-    assert "instead of sleeping a fixed interval" in t.prompt
-    assert "say in the PR body which test you de-flaked" in t.prompt
-    # …and the opposite reading is stated too, so it cannot be read as a
-    # standing licence to weaken any failing test.
-    assert "same way every time" in t.prompt
 
 
-def test_the_recorded_check_names_are_fenced_but_the_guidance_is_not():
-    # The harness's own prose must stay readable prose; the repository-authored
-    # strings it summarises must sit inside the fence, like the live copy.
-    t = build_fix_ci_task(
-        100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG,
-        ci_history=(CiAttempt("aaaaaaaaaa11", ("e2e tests",)),),
-    )
-    fenced_text, unfenced_text = _fenced_and_unfenced(t.prompt)
-    assert "attempt 1 @ aaaaaaa: e2e tests" in fenced_text
-    assert "attempt 1 @ aaaaaaa: e2e tests" not in unfenced_text
-    assert "DIFFERENT symptom" in unfenced_text
 
 
-def test_fix_ci_history_section_tolerates_an_attempt_with_nothing_recorded():
-    t = build_fix_ci_task(
-        100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG,
-        ci_history=(CiAttempt("", ()),),
-    )
-    assert "attempt 1 @ unknown: unrecorded" in t.prompt
 
 
 def test_rebase_task_resumes_session_and_names_base():
@@ -261,37 +204,23 @@ def test_rebase_task_resumes_session_and_names_base():
     assert t.cwd == "/wt/issue-5"
 
 
-def test_router_task_is_cheap_and_schemad():
-    t = build_router_task(U("Tidy readme"), U("typo"), model="haiku")
-    assert t.schema is ROUTER_SCHEMA
-    assert t.model == "haiku"
-    assert t.max_budget_usd == 1.0
-    assert t.append_system_prompt == ""            # no system prompt for the router
 
 
-def test_router_task_requests_conservative_repository_relative_path_predictions():
-    t = build_router_task(U("Tidy readme"), U("typo"), model="haiku")
-    assert "repository-relative" in t.prompt
-    assert "[]" in t.prompt
 
 
 # ── fixer deny-list (P3.1) ──
 # The fixer runs bypassPermissions, so settings.json's deny list never applies:
 # disallowed_tools on the task is the ONLY thing standing between an
 # issue-body-driven agent and `curl`/`gh auth`/`.env`.
+
+
 def _every_fixer_task():
-    from issue_agent.app.planners.tasks import build_rebase_task
     return {
-        "resolve": build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG),
+        "resolve": build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG, "fix/5-t"),
         "resume": build_resume_task(U("reply"), "/wt", "s1", FIX_CFG),
-        "address_review": build_address_review_task(
-            9, U("rb"), U("il"), "/wt", "s1", FIX_CFG
-        ),
-        "fix_ci": build_fix_ci_task(
-            9, U("fail"), U("log"), "/wt", "s1", FIX_CFG
-        ),
+        "address_review": build_address_review_task(9, U("rb"), U("il"), "/wt", "s1", FIX_CFG),
+        "fix_ci": build_fix_ci_task(9, U("fail"), U("log"), "/wt", "s1", FIX_CFG),
         "rebase": build_rebase_task(9, "dev", "/wt", "s1", FIX_CFG),
-        "router": build_router_task(U("t"), U("b")),
     }
 
 
@@ -985,10 +914,8 @@ _FIXER_REPAIR_BUILDERS = {
     "build_fix_ci_task": (
         build_fix_ci_task,
         dict(pr_number=1, failed_checks=U("unit FAIL"), failed_log=U(FIXER_SENTINEL_CI_LOG),
-             cwd="/wt", session_id="", cfg=FIX_CFG,
-             ci_history=(CiAttempt("deadbeef1234", (FIXER_SENTINEL_CI_HISTORY,)),)),
-        {"failed_log": FIXER_SENTINEL_CI_LOG,
-         "ci_history": FIXER_SENTINEL_CI_HISTORY},
+             cwd="/wt", session_id="", cfg=FIX_CFG),
+        {"failed_log": FIXER_SENTINEL_CI_LOG},
     ),
 }
 
@@ -1023,81 +950,8 @@ def test_every_fixer_repair_builder_fences_its_untrusted_inputs():
             )
 
 
-def test_route_model_maps_tiers_within_the_active_runtime_family():
-    """A codex fixer must be routed to sol/terra/luna — handing it a Claude
-    alias it cannot resolve is a dispatch-time failure, not a routing choice."""
-    from issue_agent.app.planners.tasks import route_model
-
-    assert route_model("complex", "codex") == "gpt-5.6-sol"
-    assert route_model("standard", "codex") == "gpt-5.6-terra"
-    assert route_model("trivial", "codex") == "gpt-5.6-luna"
-    assert route_model("complex", "claude") == "opus"
-    assert route_model("trivial") == "haiku"
 
 
-def test_route_model_is_total_over_garbage_classifier_output():
-    """Schema drift or a garbage tier prices as `standard`; an unknown runtime
-    falls back to the Claude table — a router misfire degrades, never raises."""
-    from issue_agent.app.planners.tasks import route_model
-
-    assert route_model("nonsense", "codex") == "gpt-5.6-terra"
-    assert route_model("", "claude") == "sonnet"
-    assert route_model("complex", "gemini???") == "opus"
-
-
-def test_route_model_maps_tiers_within_the_glm_family():
-    """glm runs on the Claude SDK runner, so an unrouted Anthropic alias would
-    reach the Z.ai endpoint unresolved — the ids must come from the GLM family."""
-    from issue_agent.app.planners.tasks import route_model
-
-    assert route_model("complex", "glm") == "glm-5.2[1m]"
-    assert route_model("standard", "glm") == "glm-5.2"
-    assert route_model("trivial", "glm") == "glm-4.7"
-    assert route_model("nonsense", "glm") == "glm-5.2"
-
-
-def test_router_task_runs_on_the_active_runtimes_cheapest_tier():
-    from issue_agent.app.planners.tasks import build_router_task
-
-    assert (
-        build_router_task(U("t"), U("b"), runtime="codex").model
-        == "gpt-5.6-luna"
-    )
-    assert build_router_task(U("t"), U("b")).model == "haiku"
-    assert (
-        build_router_task(U("t"), U("b"), model="opus", runtime="codex").model
-        == "opus"
-    )
-
-
-# ── tier table ↔ ladder (#16) ─────────────────────────────────────────────────
-def test_every_runtime_prices_every_tier_the_ladder_can_produce():
-    """The escalation ladder walks TIER_LADDER; a tier the table cannot price
-    would silently downgrade to `standard` on the most expensive dispatch there
-    is. tasks.py raises at import if this ever drifts — assert it here too, so
-    the failure names the missing tier instead of an ImportError three frames up.
-    """
-    from issue_agent.app.planners.tasks import MODEL_TIERS
-    from issue_agent.domain.effort import TIER_LADDER
-
-    for runtime, column in MODEL_TIERS.items():
-        assert set(column) >= set(TIER_LADDER), f"{runtime} cannot price every tier"
-
-
-def test_route_model_degrades_an_unknown_tier_to_the_default_tier():
-    from issue_agent.app.planners.tasks import MODEL_TIERS, route_model
-    from issue_agent.domain.effort import DEFAULT_TIER
-
-    for runtime in MODEL_TIERS:
-        expected = MODEL_TIERS[runtime][DEFAULT_TIER]
-        assert route_model("wibble", runtime) == expected
-        assert route_model("", runtime) == expected
-
-
-def test_route_model_degrades_an_unknown_runtime_to_the_claude_table():
-    from issue_agent.app.planners.tasks import MODEL_TIERS, route_model
-
-    assert route_model("complex", "no-such-runtime") == MODEL_TIERS["claude"]["complex"]
 
 
 # Incident: docs/open/issues/review-no-resultmessage-background-tasks.md — a
@@ -1108,7 +962,7 @@ def test_route_model_degrades_an_unknown_runtime_to_the_claude_table():
     "plan",
     [
         build_resolve_task(
-            5, U("t"), U("b"), "/wt", replace(FIX_CFG, model="claude-sonnet-5")
+            5, U("t"), U("b"), "/wt", replace(FIX_CFG, model="claude-sonnet-5"), "fix/5-t"
         ),
         build_review_task(
             7, U("t"), U("b"), U("diff"), ReviewTaskConfig(repo="o/r", review_prompt="r")

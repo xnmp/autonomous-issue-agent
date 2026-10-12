@@ -23,6 +23,17 @@ def issue_from_branch(branch: str) -> int | None:
     return int(m.group(2)) if m else None
 
 
+_HARNESS_BRANCH_RE = re.compile(r"^fix/([1-9][0-9]{0,9})-")
+
+
+def harness_branch_issue(branch: str) -> int | None:
+    """The issue a harness PR works on, or None if the branch is not the
+    harness's. Harness PR identity is the `fix/<issue>-` head branch, not the
+    author: FIX_BOT can be the operator's own login (refactor decision Q1)."""
+    m = _HARNESS_BRANCH_RE.match(branch) if isinstance(branch, str) else None
+    return int(m.group(1)) if m else None
+
+
 def is_governed_branch(branch: str) -> bool:
     """True iff the branch carries harness work (a governed prefix)."""
     return bool(_BRANCH_RE.match(branch or "")) or any(

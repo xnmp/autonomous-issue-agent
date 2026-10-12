@@ -2168,12 +2168,11 @@ def test_an_aborted_run_still_reports_its_model():
 # drifted from every schema: `done` exists in none of them, and `pushed` — the
 # status of a COMPLETED FORCE-PUSH — was missing, so that leg could be re-run on
 # resume. Pin the vocabulary here so a schema change breaks loudly.
-_FIXER_TERMINAL_STATUSES = frozenset(
-    {"pr_opened", "pushed", "blocked", "failed"}
-)
-# `done` is in no schema; agent/lib.sh and classify_outcome still accept it, so a
-# codex run that emits it must still count as real output.
-_LEGACY_OK_ALIASES = frozenset({"done"})
+_FIXER_TERMINAL_STATUSES = frozenset({"pushed", "blocked", "failed"})
+# `done` is in no schema and `pr_opened` left it in slice 5b (the harness opens
+# the PR now); classify_outcome still accepts both, so a codex run (or a
+# resumed pre-5b session) that emits one must still count as real output.
+_LEGACY_OK_ALIASES = frozenset({"done", "pr_opened"})
 
 
 def test_fixer_status_vocabulary_is_exactly_the_schemas_union():

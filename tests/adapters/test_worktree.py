@@ -15,7 +15,6 @@ from issue_agent.adapters.worktree import (
     GitResult,
     WorktreeUnavailable,
     Worktrees,
-    worktree_list_contains_issue,
 )
 
 
@@ -81,17 +80,6 @@ def test_concurrent_worktree_setup_serializes_shared_git_metadata():
     assert paths[0].endswith("issue-5")
     assert paths[1].endswith("issue-6")
     assert maximum == 1
-
-
-def test_worktree_list_matches_exact_issue_directory_not_prefix():
-    listing = "\n".join([
-        "worktree /repo/.claude/worktrees/issue-50",
-        "HEAD abc123",
-        "branch refs/heads/fix/50-x",
-    ])
-
-    assert worktree_list_contains_issue(listing, 50) is True
-    assert worktree_list_contains_issue(listing, 5) is False
 
 
 def test_ensure_does_not_reuse_issue_with_prefix_collision():

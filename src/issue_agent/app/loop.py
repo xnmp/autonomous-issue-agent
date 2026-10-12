@@ -17,6 +17,7 @@ without real time.
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable
+from typing import Protocol
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,12 +44,18 @@ from ..domain.supervision import (
     suspension_between,
 )
 from ..domain.world import WorldState
-from .execute import Executor
-from .world_probe import WorldUnchanged
 
 
 def _ignore_log(_message: str) -> None:
     pass
+
+
+class ActionExecutor(Protocol):
+    """What the loop needs from a role's executor."""
+
+    def execute(self, action: Action) -> None: ...
+
+    def replay_pending(self) -> bool: ...
 
 
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
@@ -97,7 +104,7 @@ class Daemon:
     name: str
     observe: Callable[[], WorldState]
     decide: Callable[[WorldState], list[Action]]
-    executor: Executor
+    executor: ActionExecutor
     poll_seconds: int = 60
     log: Callable[[str], None] = _ignore_log
     # Optional typed telemetry sink. When set, skipped ticks become countable
@@ -108,12 +115,6 @@ class Daemon:
     # level-triggered halt costs no GraphQL quota and writes no labels (#27).
     # None (the field, or the return) = no gate.
     tick_gate: Callable[[], str | None] | None = None
-    # Optional push wake (adapters.wake.WakeSignal.pending). When set, the
-    # inter-tick sleep is served in ≤1s slices and ends early the moment a
-    # webhook delivery lands, which demotes `poll_seconds` from "how fast the
-    # harness notices" to "the reconciler backstop". None = today's behaviour:
-    # ONE sleep(poll_seconds) call, unsliced.
-    wake_check: Callable[[], bool] | None = None
     # Paid dispatches may run behind the observation loop. Zero preserves the
     # synchronous behavior used by review and by existing hand-built
     # daemons; a positive value bounds the background worker pool.
@@ -593,13 +594,6 @@ class Daemon:
             if scheduler_progress is not None:
                 scheduler_progress()
             actions = self.decide(world)
-        except WorldUnchanged:
-            # The probe proved this tick would observe the world the last full
-            # build already observed; re-deciding it re-derives the same actions.
-            # Deliberately SILENT — a line every quiet poll is exactly the
-            # heartbeat noise the probe exists to remove, and run_forever's ♥
-            # already proves liveness.
-            return []
         except GhUnavailable as exc:
             self._retry_after_seconds = exc.retry_after_s
             self.log(
@@ -708,12 +702,7 @@ class Daemon:
         `reload_check` (hot reload): consulted between ticks. A concurrent fixer
         closes admission on the first positive result, keeps observing while its
         paid work drains, then exits with RELOAD_EXIT_CODE for point-at."""
-        mode = (
-            f"webhook wake + reconcile {self.poll_seconds}s"
-            if self.wake_check is not None
-            else f"poll {self.poll_seconds}s"
-        )
-        self.log(f"{self.name}: watching ({mode})")
+        self.log(f"{self.name}: watching (poll {self.poll_seconds}s)")
         self._transition(DaemonState.RUNNING)
         last = now()
         last_active = active_now()
@@ -873,37 +862,19 @@ class Daemon:
         sleep: Callable[[int], None],
         scheduler_progress: Callable[[], None] | None = None,
     ) -> None:
-        """Sleep one poll interval, cut short by a push wake if one is wired.
-
-        A notifier slices even quiet/retry-after waits to keep a systemd
-        watchdog alive. A wake check uses ≤1s slices and returns on delivery.
-        Without either callback this remains one sleep call for compatibility."""
+        """Sleep one poll interval. A notifier slices the wait to keep a
+        systemd watchdog alive; without one this is one sleep call."""
         interval = max(
             self.poll_seconds,
             int(self._retry_after_seconds or 0),
         )
         self._retry_after_seconds = None
-        if self.wake_check is None and scheduler_progress is None:
+        if scheduler_progress is None:
             sleep(interval)
             return
-        wake_check = self.wake_check
         remaining = interval
         while remaining > 0:
-            step_limit = 1 if wake_check is not None else 30
-            step = min(step_limit, remaining)
+            step = min(30, remaining)
             sleep(step)
             remaining -= step
-            if scheduler_progress is not None:
-                scheduler_progress()
-            if wake_check is None:
-                continue
-            try:
-                woken = wake_check()
-            except Exception as exc:  # noqa: BLE001 - a broken wake ≠ a dead daemon
-                self.log(f"{self.name}: wake check failed (polling on): {exc}")
-                # Disable probing for this interval, but keep the remainder
-                # sliced so the service watchdog still sees scheduler liveness.
-                wake_check = None
-                continue
-            if woken:
-                return
+            scheduler_progress()

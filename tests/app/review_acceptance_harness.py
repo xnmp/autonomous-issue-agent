@@ -54,7 +54,7 @@ from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import KeepGuidance, OpenGate, OperatorActor, RearmingGate, RequestRearm
 from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey
 from issue_agent.domain.world import IssueView, PRView
-from tests.app.resolve_acceptance_harness import Clock, Crash, ScriptedProvider, fail_at, install_clock, isolate_authority
+from tests.app.acceptance_support import Clock, Crash, ScriptedProvider, fail_at, install_clock, isolate_authority
 from tests.fakes.persistent_github import PersistentGitHub
 
 REPO = "o/r"

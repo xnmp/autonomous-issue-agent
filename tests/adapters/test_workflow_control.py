@@ -1397,34 +1397,6 @@ def test_v45_retires_split_records_and_keeps_resolve_records_byte_canonical(cont
         assert db.execute("SELECT count(*) FROM sqlite_master WHERE name='runs_adjudication_episode'").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("split_stage", [None, "AUTHOR", "IMPLEMENT", "ADJUDICATE"])
-def test_v45_split_history_still_admits_the_next_resolve(control, split_stage):
-    """An issue whose latest work admission was a split leg is not wedged by
-    schema 45: the split run and every receipt recording its stage become
-    RESOLVE, so the latest-admission chain stays valid, the next RESOLVE is
-    admitted, and the old leg still counts as a resolve attempt for backoff."""
-    from issue_agent.domain.actions import AgentKind
-    from tests.adapters.test_control_store import _historical_fixture
-
-    before = initial_snapshot()
-    install_workflow(control, before)
-    paid_result(control, before, "run-a", ResolveStage.RESOLVE)
-    with closing(sqlite3.connect(control.path)) as db, db:
-        if split_stage is not None:  # the rows a split leg left at schema 44
-            db.execute("UPDATE runs SET kind=?,dispatch_id=json_set(dispatch_id,'$.kind',?) WHERE run_id='run-a'",
-                       (split_stage, split_stage))
-            db.execute("UPDATE dedupe_keys SET payload_json=json_set(payload_json,'$.value.fields.stage.value',?) "
-                       "WHERE namespace IN ('workflow-admission','workflow-work-latest')", (split_stage,))
-        _historical_fixture(db, 44)
-    store = SQLiteControlStore(control.path, now=lambda: NOW)
-    store.initialize()
-
-    state = adapter(store).load_workflow(before.revision.fence.key)
-    paid_result(store, state, "run-b", ResolveStage.RESOLVE)
-    assert [end.kind for end in store.fix_leg_ends("o/r", before.revision.fence.key.target.number)] == [
-        AgentKind.RESOLVE, AgentKind.RESOLVE]
-
-
 def test_v45_relabels_a_split_run_carrying_continuations_and_restores_its_identity_trigger(control):
     from tests.adapters.test_control_store import _historical_fixture
     before = initial_snapshot()

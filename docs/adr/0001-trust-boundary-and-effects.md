@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/operator_effects.py src/issue_agent/domain/trust.py
+Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/operator_effects.py src/issue_agent/adapters/act.py src/issue_agent/domain/trust.py
 
 ## Decision
 
@@ -20,6 +20,16 @@ The shell governor and hooks were deleted in slice 6a (2026-10). Credential
 placement, expected-revision checks, and effect receipts
 are the authority. Until agents run without publication credentials, supported
 repositories remain trusted-inbound only.
+
+Slice 5b (2026-10-13) amends this for the fix role. It queues no
+`LifecycleCommand`s: `adapters/act.py` executes its derived Actions directly.
+Each write is naturally idempotent (a label set, a merge or update-branch
+bound to the decided head, a PR opened only when the branch has no open one)
+or claims an idempotency key in SQLite before writing and confirms it only
+after a GitHub read-back. A failed read-back raises and the next tick
+re-derives from GitHub. The agent pushes its own branch with git; the publish
+broker is deleted (refactor decision Q11). The review role keeps durable
+commands until slice 5c.
 
 ## Consequences
 

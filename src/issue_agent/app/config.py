@@ -23,7 +23,6 @@ from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
 from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
-from ..domain.model_routing import ModelRoute, parse_model_route
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.review_rejection import MAX_COUNTED_REVIEWS
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
@@ -36,21 +35,13 @@ from ..domain.repository import (
 )
 
 
-FIX_MODEL_TIER_ENV_KEYS = ("FIX_MODEL_LOW", "FIX_MODEL_MED", "FIX_MODEL_HIGH", "FIX_MODEL_XHIGH")
-
-
 def fix_runtime_names_from_env(env: dict) -> frozenset[str]:
-    """Readiness includes providers retained for mixed-tier transcript continuity.
+    """The fixer provider readiness must cover: the one `FIXER_RUNTIME`.
 
-    Doctor renders malformed configuration too; full model-route validation
-    remains the immutable config boundary rather than raising during discovery.
+    Doctor renders malformed configuration too, so this never raises.
     """
-    values = tuple(str(env.get(key) or "").strip().strip("\"'") for key in FIX_MODEL_TIER_ENV_KEYS)
-    providers = {value.partition(":")[0] for value in values if value}
-    if any(values):
-        providers.update(("claude", "codex"))
     primary = str(env.get("FIXER_RUNTIME") or "").strip().strip("\"'").lower()
-    return frozenset(providers | ({primary} if primary else set()))
+    return frozenset({primary} if primary else set())
 
 SHELL_CMD_LOG_LIMIT = 120
 REPOINT_HISTORY_ENV = "REPOINTED_FROM_DEPLOYMENTS"
@@ -192,12 +183,6 @@ class FixRuntimeConfig:
     # alone. The escalation ladder (#16) raises it from here, never below it.
     effort: Effort | None
     budget_usd: float
-    max_ci_retries: int
-    max_review_retries: int
-    auto_rebase_conflicts: bool
-    max_rebase_retries: int
-    max_resolve_retries: int
-    mcp_config: str
 
 
 @dataclass(frozen=True)
@@ -296,28 +281,12 @@ class HarnessConfig:
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
     # there is exactly one source and 20 (the value that actually shipped) wins.
     poll_seconds: int = 20
-    # Paid fix legs run independently of observation; values >1 admit disjoint
-    # work up to this bound (the path-overlap serializer still keeps same-path
-    # and path-unknown legs exclusive). Default 2 since 2026-08-02: with one
+    # Paid fix legs run independently of observation; values >1 admit legs on
+    # different issues up to this bound (one leg per issue). Default 2 since 2026-08-02: with one
     # slot a single ADDRESS_REVIEW leg held the whole deployment while other
     # PRs' repairs queued behind it. Review dispatch remains
     # synchronous. Set FIX_DISPATCH_CONCURRENCY=1 to restore serial dispatch.
     fix_dispatch_concurrency: int = 2
-    # Webhook push (#1): `gh webhook forward` runs as a supervised fourth
-    # process and touches each role's wake file on every delivery. Deliveries
-    # are WAKE SIGNALS ONLY — never acted on as payloads — so the stateless
-    # reconcile stays the single source of truth and a missed delivery costs
-    # latency, not correctness. With it on, the poll loop demotes to a slow
-    # backstop at `reconcile_seconds` (GitHub documents delivery as
-    # best-effort, and a dead forwarder must degrade to today's behaviour).
-    webhook_wake: bool = False
-    reconcile_seconds: int = 300
-    # Change-probe gate on review world builds (app/world_probe.py):
-    # 1 REST point asks "did any issue/PR update?" before paying ~14 GraphQL
-    # points for a full build. The fixer is NEVER probed regardless of this
-    # flag — its decide reads CI/mergeability, which the probe cannot see.
-    world_probe: bool = True
-    world_probe_ttl_seconds: int = 300
     auto_merge: bool = True
     merge_method: str = field(
         default="squash",
@@ -328,41 +297,12 @@ class HarnessConfig:
         },
     )
     close_issue_on_merge: bool = True
-    # Bound on how long CI may sit PENDING before the PR goes to a human (#30).
-    # Default 3600s; 0 disables. Real
-    # pipelines run well over half an hour and escalating a healthy long run
-    # would move the escalation-rate guardrail the wrong way.
-    ci_pending_max_seconds: int = 3600
-    # Refuse to RESOLVE an issue that an OPEN, not-ours PR already closes (#39):
-    # comment naming the PR, then ai-ready → ai-blocked. The evidence was a ≈$32
-    # duplicate resolve of an issue the operator's own open PR had already fixed.
-    # Advisory — the operator un-blocks by closing the stale PR.
-    duplicate_pr_guard: bool = True
-    # Give a red PR ONE free `gh run rerun --failed` per head SHA before paying
-    # for a CI-fix leg (#38). ≈$80 of one $188 batch went to two repair legs that
-    # both re-fixed the same pre-existing flaky test. Costs one CI cycle on a
-    # genuinely broken PR; a second failure on the same head pays as before.
-    ci_free_rerun: bool = True
-    max_ci_retries: int = 3
     # Escalation ceiling for the reviewer: after this many REQUEST_CHANGES verdicts
     # on one PR (counting the reviewer's OWN rejections, NOT author pushes — a
     # rebase/housekeeping push that ends in APPROVE never counts), the next
     # unsatisfied review escalates to a human instead of bouncing back to the
     # fixer. Default 4 = 3 rejections bounce, the 4th escalates.
     max_review_rejections: int = 4
-    max_review_retries: int = 3
-    # Auto-rebase a PR that goes CONFLICTING/DIRTY after its base advances (the
-    # backup plan for a conflict that slips past the pre-dispatch file-overlap
-    # gate — e.g. two in-flight PRs that collide with each other, or an issue that
-    # declared no paths). Default on: dispatch the fixer to rebase onto base +
-    # resolve, bounded by max_rebase_retries → then needs-human-review. Set
-    # AUTO_REBASE_CONFLICTS=0 to instead escalate to a human on the first conflict.
-    auto_rebase_conflicts: bool = True
-    max_rebase_retries: int = 3
-    # Resolve breaker (T3 finding): every other paid leg had a retry ceiling;
-    # resolve — the most expensive — had none, so an always-erroring resolve
-    # requeued ai-ready and re-dispatched a full session every poll forever.
-    max_resolve_retries: int = 3
     # Counts paid review
     # rounds that advanced NOTHING — a session that died pre-result, but also a
     # fan-out whose synthesis returned None, a failed submit POST, or an errored
@@ -379,28 +319,17 @@ class HarnessConfig:
     effect_retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
-    # Explicit runtime:model overrides; empty retains the runtime-specific ladder.
-    fix_model_low: str = ""
-    fix_model_med: str = ""
-    fix_model_high: str = ""
-    fix_model_xhigh: str = ""
     # FIX_EFFORT: base reasoning effort for the fix legs, runtime-agnostic
     # (harness #16). None = say nothing and leave each runtime on its own default
     # — CODEX_REASONING_EFFORT for codex, the SDK's own for Claude — which is
     # exactly what every deployment did before the knob existed.
     fix_effort: Effort | None = None
-    # ESCALATE_ON_EVIDENCE: run a leg one rung stronger when the harness already
-    # knows the previous attempt under-delivered — a recurrence label (#10), a
-    # failed resolve retry, a second-and-later review round. Off pins every leg
-    # to the router's verdict no matter what has happened before.
-    escalate_on_evidence: bool = True
     # Codex is the default reviewer runtime, so pin its deployable default here
     # instead of leaving the task un-attributed to the Codex CLI default.
     # gpt-6.1-sol keeps the independent check at least as strong as the fixer;
     # a reviewer at the fixer's own tier approved/cycled at parity.
     review_model: str | None = "gpt-6.1-sol"
     fix_budget_usd: float = 10.0
-    router_budget_usd: float = 1.0
     # $15 not $8 since 2026-08-09: the sol default reviews at ~2.5x terra's
     # token rates; $8 sized for terra would clip sol mid-review.
     review_budget_usd: float = 15.0
@@ -424,10 +353,6 @@ class HarnessConfig:
     review_validation_budget_usd: float = 0.20
     agent_md: str = ""
     review_prompt: str = ""
-    # FIX_MCP_CONFIG: JSON map {check-name-regex: {config: <mcp.json path>, tools:
-    # <glob>}}. On the CI-fix leg, servers whose regex matches a PR check are attached
-    # to the fixer. Relative config paths resolve against harness_root.
-    fix_mcp_config: str = ""
     harness_root: str = ""
     # Fixer runtime: "claude" (default, Claude Agent SDK), "codex" (OpenAI Codex
     # CLI, e.g. GPT-5.5), or "glm" (GLM via Z.ai's Anthropic-compatible endpoint —
@@ -594,22 +519,6 @@ class HarnessConfig:
         object.__setattr__(self, "repo", canonical_repository(self.repo))
 
     @property
-    def fix_model_routes(self) -> tuple[ModelRoute, ...]:
-        return tuple(parse_model_route(tier, value) for tier, value in (
-            ("trivial", self.fix_model_low), ("standard", self.fix_model_med),
-            ("complex", self.fix_model_high), ("exceptional", self.fix_model_xhigh),
-        ) if value.strip())
-
-    @property
-    def fix_runtimes(self) -> frozenset[RuntimeName]:
-        if not self.fix_model_routes:
-            return frozenset({self.fixer_runtime})
-        # Both native providers remain available to resume existing transcripts
-        # after a tier is reassigned. GLM additionally requires its operator profile.
-        return frozenset({self.fixer_runtime, RuntimeName.CLAUDE, RuntimeName.CODEX,
-            *(route.runtime for route in self.fix_model_routes)})
-
-    @property
     def config_version(self) -> str:
         """Stable identity of the immutable snapshot used by one admission."""
 
@@ -619,7 +528,7 @@ class HarnessConfig:
     def tick_interval_seconds(self) -> int:
         """What a daemon actually sleeps between ticks. One source of truth for
         the poll-vs-reconcile choice, so no role can wire the wrong one."""
-        return self.reconcile_seconds if self.webhook_wake else self.poll_seconds
+        return self.poll_seconds
 
     @property
     def repository(self) -> RepositoryConfig:
@@ -646,12 +555,6 @@ class HarnessConfig:
             model=self.fix_model,
             effort=self.fix_effort,
             budget_usd=self.fix_budget_usd,
-            max_ci_retries=self.max_ci_retries,
-            max_review_retries=self.max_review_retries,
-            auto_rebase_conflicts=self.auto_rebase_conflicts,
-            max_rebase_retries=self.max_rebase_retries,
-            max_resolve_retries=self.max_resolve_retries,
-            mcp_config=self.fix_mcp_config,
         )
 
     @property
@@ -707,30 +610,10 @@ class HarnessConfig:
         # traceback three frames deep in int()/float()) and must never be lost
         # behind a range check on the substituted default.
         errors: list[str] = list(self.parse_errors)
-        for tier, name, value in (
-            ("trivial", "FIX_MODEL_LOW", self.fix_model_low),
-            ("standard", "FIX_MODEL_MED", self.fix_model_med),
-            ("complex", "FIX_MODEL_HIGH", self.fix_model_high),
-            ("exceptional", "FIX_MODEL_XHIGH", self.fix_model_xhigh),
-        ):
-            if value.strip():
-                try:
-                    parse_model_route(tier, value)
-                except ValueError as exc:
-                    errors.append(f"{name}: {exc}")
         _require_positive(errors, "POLL_SECONDS", self.poll_seconds)
         _require_positive(
             errors, "FIX_DISPATCH_CONCURRENCY", self.fix_dispatch_concurrency
         )
-        # Same rule as POLL_SECONDS: 0 is not "disabled", it is a busy loop.
-        _require_positive(errors, "RECONCILE_SECONDS", self.reconcile_seconds)
-        _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
-        _require_non_negative(
-            errors, "CI_PENDING_MAX_SECONDS", self.ci_pending_max_seconds
-        )
-        _require_non_negative(errors, "MAX_REVIEW_RETRIES", self.max_review_retries)
-        _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
-        _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
         _require_non_negative(
             errors, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS", self.max_unproductive_review_rounds
         )
@@ -786,14 +669,13 @@ class HarnessConfig:
             )
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
-            ("ROUTER_BUDGET_USD", self.router_budget_usd),
             ("REVIEW_BUDGET_USD", self.review_budget_usd),
             ("REVIEW_GATE_BUDGET_USD", self.review_gate_budget_usd),
             ("REVIEW_DIMENSION_BUDGET_USD", self.review_dimension_budget_usd),
             ("REVIEW_VALIDATION_BUDGET_USD", self.review_validation_budget_usd),
         ):
             _require_positive(errors, name, value)
-        if (self.fixer_runtime is RuntimeName.GLM or any(value.strip().startswith("glm:") for value in (self.fix_model_low, self.fix_model_med, self.fix_model_high, self.fix_model_xhigh))) and not self.glm_settings_file.strip():
+        if self.fixer_runtime is RuntimeName.GLM and not self.glm_settings_file.strip():
             # The glm runtime IS "the Claude runner plus a profile's env"; with no
             # profile there is nothing to inject and the fixer would silently run
             # on Anthropic credentials instead. Existence of the file is a
@@ -900,38 +782,21 @@ class HarnessConfig:
                 )
                 fix_budget += f" (NOT ENFORCED on codex, {why} — {bound})"
 
-        # Push mode changes what the interval MEANS (notice latency → backstop
-        # cadence), so it prints as a different fact rather than a smaller poll.
-        cadence = (
-            f"wake=webhook reconcile={self.reconcile_seconds}s"
-            if self.webhook_wake else f"poll={self.poll_seconds}s"
-        )
+        cadence = f"poll={self.poll_seconds}s"
 
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
             # getattr, not IdentityMode(...): describe() is the startup diagnostic
             # and must print whatever it was handed rather than raise on it.
             f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
-            f"{cadence} "
-            f"probe={f'on/{self.world_probe_ttl_seconds}s' if self.world_probe else 'off'}",
+            f"{cadence}",
             f"fixer={self.fixer_runtime.value} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
-            f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} "
             f"{fix_budget}",
-            f"fix_tiers: low={self.fix_model_low or '(default)'} "
-            f"med={self.fix_model_med or '(default)'} "
-            f"high={self.fix_model_high or '(default)'} "
-            f"xhigh={self.fix_model_xhigh or '(default)'}",
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
-            f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
-            f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
-            f"ci_pending="
-            f"{f'{self.ci_pending_max_seconds}s' if self.ci_pending_max_seconds else 'off'}",
-            f"spend_guards: dup_pr_guard={'on' if self.duplicate_pr_guard else 'off'} "
-            f"ci_free_rerun={'on' if self.ci_free_rerun else 'off'}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
             f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
@@ -1069,7 +934,6 @@ _INTERNAL_CONFIG_FIELDS = frozenset(
 )
 _ENV_NAME_OVERRIDES = {
     "fix_budget_usd": "MAX_BUDGET_USD",
-    "router_budget_usd": "ROUTER_BUDGET_USD",
     "max_review_rejections": "REVIEW_MAX_REJECTIONS",
     "harness_root": "HARNESS_ROOT_DIR",
     "agent_idle_timeout": "AGENT_IDLE_TIMEOUT_SECONDS",
@@ -1150,16 +1014,6 @@ def _dc_default(field: str):
 
 def _env_name(field_name: str) -> str:
     return str(_FIELD_DEFINITIONS[field_name].metadata["env"])
-
-
-def _raw(
-    env: dict,
-    field_name: str,
-    *,
-    default: object = MISSING,
-) -> object:
-    fallback = _dc_default(field_name) if default is MISSING else default
-    return env.get(_env_name(field_name), fallback)
 
 
 def _metadata_choice(

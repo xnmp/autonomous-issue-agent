@@ -87,20 +87,19 @@ typechecks and compiler suites sequentially; honor configured worker counts.
      red?" If not → FAIL.
    - **Observable seam untested** — the acceptance criterion names a user-visible
      or contract-level result, but no test asserts at that seam.
-9. Publish only through the durable broker: `issue-agent-publish git push …`,
-   `issue-agent-publish gh pr create …`, and
-   `issue-agent-publish gh pr edit <your PR number> --body '…'`.
-   Editing replaces your own PR's whole body. The broker supplies missing
-   acceptance criteria and closing linkage on create/edit, and edits only your
-   branch's PR. Pass a literal `--body` (for long Markdown, use a scratch file
-   with `--body "$(cat body.md)"`); `--body-file` is rejected.
-   Always create with `--base "$BASE_BRANCH"`.
-   The broker commits lifecycle commands before network effects and reconciles
-   ambiguous outcomes before retry.
+9. Publish with plain git: commit, then `git push -u origin <your branch>`
+   (`--force-with-lease` only after a rebase). Never run `gh pr create`: the
+   harness opens the pull request from your pushed branch against
+   `$BASE_BRANCH`, using your final `summary` as the PR description (it adds
+   the acceptance criteria and the closing `Fixes #` line itself), so write
+   the summary as the PR description. On a later leg for an open PR, change
+   its description only with `gh pr edit <PR number> --body '…'`, which
+   replaces the whole body: keep its Acceptance Criteria section and its
+   `Fixes #` line.
 
 ## Hard rules
 - Never bypass the repo's git hooks: no `--no-verify`, commit `-n`, `HUSKY=0`,
-  or `core.hooksPath` override. Open a PR only when they pass.
+  or `core.hooksPath` override. Push only when they pass.
 - Never skip/disable tests to go green. Correct wrong existing expectations and
   explain in the PR description. Do not refactor unrelated code.
 - Fix quality/security signals for changed code; never hide them with exclusions,
@@ -127,10 +126,10 @@ typechecks and compiler suites sequentially; honor configured worker counts.
 
 ## Structured output contract
 You are invoked with `--json-schema`. Your FINAL message must satisfy it:
-  status  : "pr_opened" | "pushed" | "blocked" | "failed"
-  summary : one-paragraph summary of what you did
+  status  : "pushed" | "blocked" | "failed"
+  summary : what you did; on a push, written as the PR description
   needs   : if blocked, EXACTLY what you need to proceed
-Return `status=pr_opened` only once `gh pr create` has actually succeeded.
+Return `status=pushed` only once `git push` has actually succeeded.
 
 ## Debugging / Logging / Documentation / Tests
 $DIAGNOSE_RULES

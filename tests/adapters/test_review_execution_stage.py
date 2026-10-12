@@ -85,7 +85,7 @@ def test_new_stage_requires_its_original_still_owned_claim_occurrence(rig, repla
     expected = current(store, selection).revision
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     if replacement:
-        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     before = dump(store)
     with pytest.raises(WorkflowAuthorityError):
         control.register_stage(plan.round.round_id, expected, stage(plan))
@@ -182,7 +182,7 @@ from tests.adapters.test_review_execution_control import Gateway
 selection = decode_workflow(sys.argv[3], ReviewPreflightSelection)
 store = SQLiteControlStore(sys.argv[1], now=lambda: selection.observation.observed_at)
 store.initialize()
-assert store.claim_dispatch('o/r','review',-9,'REVIEW',sys.argv[2],frozenset())
+assert store.claim_dispatch('o/r','review',-9,'REVIEW',sys.argv[2])
 claim = store.active_dispatch_claims('o/r','review')[0]
 control = SQLiteReviewExecutionControl(store, WorkflowWriter('o/r','review',sys.argv[2]), Gateway())
 print(encode_workflow(control.preflight(replace(selection, claim_occurrence_id=claim.claim_key))))
@@ -303,7 +303,7 @@ def test_lost_or_changed_parent_claim_cannot_seal_planning(rig):
     with pytest.raises(WorkflowAuthorityError, match="claim"):
         control.seal_completed_planning(plan.round.round_id, expected)
     assert dump(store) == before
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     before = dump(store)
     with pytest.raises(WorkflowAuthorityError, match="claim"):
         control.seal_completed_planning(plan.round.round_id, expected)
@@ -324,7 +324,7 @@ def test_parent_replacement_after_liveness_probe_cannot_seal_planning(rig, monke
         if not after_replacement:
             assert live
             assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
             after_replacement.append(dump(store))
         return live
 

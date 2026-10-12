@@ -73,7 +73,7 @@ def exhaust_with_three_settled_returns(rig, label="later", first=1):
     store, _, _, selection, execution = rig
     for index in range(3):
         if not store.active_dispatch_claims("o/r", "review"):
-            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
         occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
         snapshot = current(store, selection)
         round = execution.preflight(replace(selection, request_id=f"{label}:failure:{index}",

@@ -167,7 +167,7 @@ def test_invalid_child_or_parent_never_buys_an_admission(planned, change):
     elif change in {"released_parent", "replaced_parent"}:
         assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
         if change == "replaced_parent":
-            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     else:
         with store.transaction() as db:
             if change == "missing_round":
@@ -387,10 +387,10 @@ def test_parent_replacement_between_liveness_probe_and_admission_is_refused(plan
 import sys
 from issue_agent.adapters.control_store import SQLiteControlStore
 store = SQLiteControlStore(sys.argv[1])
-assert store.claim_dispatch('o/r','review',-9,'REVIEW',sys.argv[2],frozenset())
+assert store.claim_dispatch('o/r','review',-9,'REVIEW',sys.argv[2])
 """, store.path, OWNER], check=True, capture_output=True, text=True)
             else:
-                assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+                assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
             captured.append(dump(store))
         return live
 
@@ -478,7 +478,7 @@ from tests.adapters.test_review_execution_stage import stage
 selection = decode_workflow(sys.argv[3], ReviewPreflightSelection)
 store = SQLiteControlStore(sys.argv[1], now=lambda: selection.observation.observed_at)
 store.initialize()
-assert store.claim_dispatch('o/r','review',-9,'REVIEW',sys.argv[2],frozenset())
+assert store.claim_dispatch('o/r','review',-9,'REVIEW',sys.argv[2])
 claim = store.active_dispatch_claims('o/r','review')[0]
 selection = replace(selection, claim_occurrence_id=claim.claim_key)
 control = SQLiteReviewExecutionControl(store, WorkflowWriter('o/r','review',sys.argv[2]), Gateway())

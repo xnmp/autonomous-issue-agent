@@ -39,7 +39,7 @@ from ..domain.actions import (
     RunAgent,
     Target,
 )
-from ..domain.labels import ADVISORY_LABELS, Label
+from ..domain.labels import Label
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -94,13 +94,6 @@ def _missing_handler(name: str):
         raise RuntimeError(f"required executor handler is not configured: {name}")
 
     return missing
-
-
-def _is_advisory_relabel(action: Relabel) -> bool:
-    return (
-        any(label in ADVISORY_LABELS for label in action.removed_labels)
-        or any(label in ADVISORY_LABELS for label in action.added_labels)
-    )
 
 
 def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:

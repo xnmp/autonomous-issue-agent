@@ -46,7 +46,6 @@ from .codex_resolution import (
 )
 from .config import (
     REPOINT_HISTORY_ENV,
-    FIX_MODEL_TIER_ENV_KEYS,
     fix_runtime_names_from_env,
     default_state_dir as config_default_state_dir,
     parse_repoint_history,
@@ -126,7 +125,6 @@ _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR",
     "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
     "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
-    *FIX_MODEL_TIER_ENV_KEYS,
     # Read by the dashboard's operator re-arm: which login's change requests
     # count toward the rejection ceiling, how many of them it takes, and the
     # same App → token identity the review daemon used to author them.

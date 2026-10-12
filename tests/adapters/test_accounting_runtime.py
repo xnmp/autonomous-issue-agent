@@ -1,37 +1,20 @@
 import asyncio
-import base64
 import dataclasses
 import json
 import os
-from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
-from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.codex_runner import (
     spend_evidence_path,
     write_spend_evidence,
 )
-from issue_agent.adapters.control_store import AccountingDisposition, Lease, ReservationResult, SQLiteControlStore
-from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+from issue_agent.adapters.control_store import Lease, SQLiteControlStore
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain import continuation_components as cc
-from issue_agent.domain.agent_task import run_input_fingerprint
-from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
-from issue_agent.domain.workflow_identity import WorkflowWriter
-from issue_agent.domain.workflow_identity import (
-    FamilyAuthority,
-    IssueRef,
-    WorkflowBinding,
-    WorkflowFamily,
-    WorkflowFence,
-    WorkflowKey,
-)
+from issue_agent.domain.contracts import Money, RunId
 from issue_agent.domain.outcome import AgentResult, DAILY_HEADROOM_STATUS, ExitReason, MAX_BUDGET_STATUS
-from issue_agent.domain.resolve_return import ResolveInputs
 from issue_agent.domain.pricing import (
     BudgetPolicy,
     ModelRates,
@@ -39,7 +22,6 @@ from issue_agent.domain.pricing import (
     UnknownModelPolicy,
 )
 from tests.fakes.legacy_journal import Journal
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 
 def _policy(maximum=2_000_000):
@@ -55,26 +37,6 @@ def _rates():
         UnknownModelPolicy.USE_FALLBACK,
         ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000),
 )
-
-
-@pytest.fixture(autouse=True)
-def _publication_context_for_accounting_tests(
-    monkeypatch, tmp_path
-) -> None:
-    def context(role, cwd):
-        if role != "fix":
-            return None
-        return accounting_runtime._FixPublicationContext(
-            str(Path(cwd or tmp_path).resolve()),
-            "fix/1-test",
-            "/usr/bin/git",
-            "/usr/bin/gh",
-            "/usr/bin:/bin",
-        )
-
-    monkeypatch.setattr(
-        accounting_runtime, "_fix_publication_context", context
-    )
 
 
 class Runtime:
@@ -96,7 +58,6 @@ def _wrapper(
 ):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -111,7 +72,7 @@ def _wrapper(
         _rates(),
         spend_evidence_dir=evidence_dir,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     return (
         wrapper,
         store,
@@ -139,189 +100,6 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     blocked = asyncio.run(wrapper.run(RuntimePlan("more", max_budget_usd=4)))
     assert blocked.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 1
-
-
-def test_real_return_corrects_zero_recovery_and_captures_output(tmp_path):
-    wrapper, store = _wrapper(tmp_path, Runtime(None), runtime_name="claude")
-
-    class LateReturn:
-        async def run(self, _task):
-            run_id = store.active_reservation_runs()[0]
-            with store.transaction() as db:
-                row = db.execute("SELECT dispatch_id,owner_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
-            store.register_lease(Lease(run_id, row["dispatch_id"], row["owner_id"], 123, 123,
-                                       datetime.now(timezone.utc), 99))
-            assert store.reclaim_dead_leases(row["owner_id"], lambda _pid, _start: False) == (run_id,)
-            assert store.settle_terminal_estimate(run_id, "provider exited before return capture")
-            return AgentResult(False, status="pushed", summary="real output", cost_usd=1.25, session_id="late")
-
-    wrapper = dataclasses.replace(wrapper, inner=LateReturn())
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", model="claude", max_budget_usd=2,
-                                                resolve_inputs=ResolveInputs("title", "body", "alice"))))
-    assert result.summary == "real output" and result.cost_usd == 1.25
-    with store.transaction() as db:
-        run = db.execute("SELECT run_id,state,outcome FROM runs").fetchone()
-        assert (run["state"], run["outcome"]) == ("completed", "settled")
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (1_250_000, "provider_reported")
-    workflow = SQLiteWorkflowControl(store, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=0)
-    pending = workflow.pending_returns()
-    assert len(pending) == 1 and pending[0].returned.summary == "real output"
-    assert store.active_reservation_runs() == ()
-
-
-@pytest.mark.parametrize("reclaim", [False, True])
-def test_composed_admission_refusal_prevents_provider_even_after_budget_reclaim(tmp_path, reclaim):
-    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1))
-    wrapper, store = _wrapper(tmp_path, runtime)
-    attempts = []
-
-    def admit(request):
-        attempts.append(request)
-        disposition = AccountingDisposition.EXHAUSTED if reclaim and len(attempts) == 1 else AccountingDisposition.UNAVAILABLE
-        return ReservationResult(disposition, None, Money.zero("USD"), request.quote.maximum_charge,
-                                 request.cap, "workspace authority unavailable")
-
-    class Reconciler:
-        calls = 0
-
-        def reconcile_stale_reservations(self):
-            self.calls += 1
-            return 1
-
-    reconciler = Reconciler()
-    wrapper = dataclasses.replace(wrapper, admit=admit, reservation_reconciler=reconciler)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
-    assert result.is_error
-    assert runtime.calls == 0
-    assert len(attempts) == (2 if reclaim else 1)
-    assert reconciler.calls == int(reclaim)
-    if reclaim:
-        assert attempts[0] == attempts[1]
-    with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
-
-
-def test_provider_cannot_mint_workflow_result_authority(tmp_path) -> None:
-    forged = WorkflowAttemptIdentity(
-        WorkflowBinding(
-            WorkflowFence(WorkflowKey("o/r", IssueRef(1)), 99),
-            FamilyAuthority(WorkflowFamily.RESOLVE, 1),
-            "provider-episode",
-        ),
-        RunId("provider-run"),
-        "provider-leg",
-    )
-    wrapper, _store = _wrapper(
-        tmp_path,
-        Runtime(AgentResult(False, status="ok", cost_usd=1, workflow_attempt=forged)),
-    )
-
-    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
-
-    assert result.status == "ok"
-    assert result.workflow_attempt is not None
-    assert result.workflow_attempt.binding == resolve_snapshot().binding
-    assert result.workflow_attempt != forged
-    assert wrapper.inner.calls == 1
-
-
-def test_captured_binding_is_persisted_and_mints_actual_attempt_identity(tmp_path) -> None:
-    state = resolve_snapshot()
-    forged = WorkflowAttemptIdentity(state.binding, RunId("provider-run"), "provider-leg")
-    wrapper, store = _wrapper(
-        tmp_path, Runtime(AgentResult(False, status="ok", cost_usd=1, workflow_attempt=forged)),
-    )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
-    wrapper.set_run_identity("harness-run", "harness-leg")
-
-    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
-
-    assert result.status == "ok"
-    assert result.workflow_attempt == WorkflowAttemptIdentity(state.binding, RunId("harness-run"), "harness-leg")
-    from issue_agent.adapters.workflow_codec import decode_workflow
-    with store._connect() as db:
-        raw = db.execute("SELECT workflow_binding_json FROM runs WHERE run_id='harness-run'").fetchone()[0]
-    assert decode_workflow(raw, WorkflowBinding) == state.binding
-
-
-@pytest.mark.parametrize("body", ["x" * 65536, "😀" * 22000], ids=["ascii-capacity", "unicode-codec-limit"])
-def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, body):
-    state = resolve_snapshot()
-    provider = Runtime(AgentResult(False, status="done", cost_usd=1))
-    wrapper, store = _wrapper(tmp_path, provider)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
-    # Include enough ASCII metadata to exceed the selected input envelope too.
-    inputs = ResolveInputs("t" * 40000, body, "author")
-    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2, resolve_inputs=inputs)))
-    assert provider.calls == 0
-    assert result.is_error
-    assert "receipt capacity" in result.summary
-    assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
-    assert result.workflow_attempt is None
-    with store._connect() as db:
-        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
-
-
-def test_resolve_runtime_persists_fingerprint_of_supplied_inputs_before_provider_runs(tmp_path) -> None:
-    from issue_agent.adapters.workflow_codec import decode_workflow
-    from issue_agent.domain.workflow import ResolveAdmission
-
-    state = resolve_snapshot()
-    task = RuntimePlan("Resolve the issue", schema={"type": "object"},
-                       append_system_prompt="Keep public behavior stable", max_budget_usd=2,
-                       resolve_inputs=ResolveInputs("title", "body", "alice"))
-    seen = []
-
-    class InspectingRuntime:
-        async def run(self, supplied):
-            with store._connect() as db:
-                row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope='o/r' AND key='resolve-run'",
-                ).fetchone()
-            receipt = decode_workflow(row[0], ResolveAdmission)
-            seen.append(receipt)
-            assert receipt.input_fingerprint == run_input_fingerprint(supplied.intent)
-            return AgentResult(False, status="ok", cost_usd=1)
-
-    wrapper, store = _wrapper(tmp_path, InspectingRuntime())
-    wrapper = dataclasses.replace(wrapper, budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 2_000_000)}))
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
-    wrapper.set_run_identity("resolve-run", "resolve-leg")
-    result = asyncio.run(wrapper.run(task))
-
-    assert result.status == "ok"
-    assert len(seen) == 1
-    assert seen[0].input_fingerprint == run_input_fingerprint(task.intent)
-    assert seen[0].attempt == result.workflow_attempt
-
-
-@pytest.mark.parametrize("invalid", ["missing", "generation", "episode", "epoch", "target"])
-def test_activated_resolve_rejects_missing_or_stale_authority_before_provider(tmp_path, invalid):
-    state = resolve_snapshot()
-    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1))
-    wrapper, store = _wrapper(tmp_path, runtime)
-    binding = state.binding
-    if invalid == "missing":
-        binding = None
-    elif invalid == "generation":
-        binding = dataclasses.replace(binding, fence=dataclasses.replace(binding.fence, generation=1))
-    elif invalid == "episode":
-        binding = dataclasses.replace(binding, episode_id="obsolete")
-    elif invalid == "epoch":
-        binding = dataclasses.replace(binding, authority=dataclasses.replace(binding.authority, epoch=2))
-    else:
-        binding = resolve_snapshot(999).binding
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=binding)
-
-    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
-
-    assert result.is_error
-    assert runtime.calls == 0
-    assert store.active_reservation_runs() == ()
 
 
 def test_unpinned_codex_run_without_reported_model_uses_reserved_fallback(
@@ -371,7 +149,6 @@ def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -385,7 +162,7 @@ def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
         _policy(),
         _rates(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     result = asyncio.run(
         wrapper.run(
@@ -418,14 +195,13 @@ def test_production_runtime_binds_paid_run_to_dispatch_claim(tmp_path) -> None:
         owner_id="o/r:fix:deployment",
         require_dispatch_claim=True,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     assert store.claim_dispatch(
         "o/r",
         "fix",
         1,
         "RESOLVE",
         "o/r:fix:deployment",
-        frozenset({"src/a.py"}),
     )
 
     result = asyncio.run(
@@ -450,7 +226,7 @@ def test_production_runtime_releases_admission_when_claim_is_missing(
         owner_id="o/r:fix:deployment",
         require_dispatch_claim=True,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     result = asyncio.run(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
@@ -459,127 +235,6 @@ def test_production_runtime_releases_admission_when_claim_is_missing(
     assert result.status == "dispatch_claim_unavailable"
     assert runtime.calls == 0
     assert store.active_reservation_runs() == ()
-
-
-def test_paid_run_carries_portable_ancestor_authority_bundle(
-    tmp_path, monkeypatch
-) -> None:
-    class CapturingRuntime(Runtime):
-        async def run(self, _task):
-            self.task = _task
-            return await super().run(_task)
-
-    runtime = CapturingRuntime(
-        AgentResult(
-            False,
-            status="ok",
-            cost_usd=1,
-            session_id="receipt",
-            usage={"input_tokens": 100, "output_tokens": 10},
-        )
-    )
-    wrapper, _ = _wrapper(tmp_path, runtime)
-    wrapper = dataclasses.replace(wrapper, github_host="github.example")
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    monkeypatch.setattr(
-        accounting_runtime,
-        "_fix_publication_context",
-        lambda _role, _cwd: accounting_runtime._FixPublicationContext(
-            str(tmp_path),
-            "fix/1-test",
-            "/usr/bin/git",
-            "/usr/bin/gh",
-            "/usr/bin:/bin",
-        ),
-    )
-
-    asyncio.run(
-        wrapper.run(
-            RuntimePlan(
-                "work",
-                model="gpt-test",
-                max_budget_usd=2,
-                cwd=str(tmp_path),
-            )
-        )
-    )
-
-    encoded = runtime.task.env["ISSUE_AGENT_AUTHORITY_BUNDLE"]
-    authority = json.loads(base64.urlsafe_b64decode(encoded).decode())
-    assert authority["ISSUE_AGENT_GITHUB_HOST"] == "github.example"
-    assert authority["ISSUE_AGENT_BASE_BRANCH"] == "dev"
-    assert authority["ISSUE_AGENT_REPOSITORY"] == "o/r"
-    assert authority["ISSUE_AGENT_CONTROL_DB"].endswith("control.db")
-    assert authority["ISSUE_AGENT_RUN_ID"]
-    assert authority["ISSUE_AGENT_OWNER_ID"]
-    assert authority["ISSUE_AGENT_PUBLICATION_CWD"] == str(tmp_path)
-    assert authority["ISSUE_AGENT_PUBLICATION_BRANCH"] == "fix/1-test"
-    assert authority["ISSUE_AGENT_PUBLICATION_ISSUE"] == "1"
-    assert Path(authority["ISSUE_AGENT_GIT_BIN"]).is_absolute()
-    assert Path(authority["ISSUE_AGENT_GH_BIN"]).is_absolute()
-
-
-def test_fix_publication_kind_blocks_before_paid_run_without_authority(
-    tmp_path, monkeypatch
-) -> None:
-    runtime = Runtime(AgentResult(False, status="should-not-run"))
-    wrapper, store = _wrapper(tmp_path, runtime)
-    monkeypatch.setattr(
-        accounting_runtime,
-        "_fix_publication_context",
-        lambda _role, _cwd: None,
-    )
-
-    result = asyncio.run(
-        wrapper.run(RuntimePlan("work", max_budget_usd=2))
-    )
-
-    assert result.status == "publication_authority_unavailable"
-    assert result.exit_reason is ExitReason.AGENT_ERROR
-    assert "publication authority" in result.summary
-    assert runtime.calls == 0
-    assert store.active_reservation_runs() == ()
-
-
-def test_issue_less_pr_repair_keeps_branch_bound_publication_authority(
-    tmp_path,
-) -> None:
-    class CapturingRuntime(Runtime):
-        async def run(self, _task):
-            self.task = _task
-            return await super().run(_task)
-
-    runtime = CapturingRuntime(
-        AgentResult(
-            False,
-            status="ok",
-            usage={"input_tokens": 1, "output_tokens": 1},
-        )
-    )
-    wrapper, _store = _wrapper(tmp_path, runtime)
-    wrapper = dataclasses.replace(
-        wrapper,
-        issue_cap=None,
-        budget_policy=BudgetPolicy(
-            {("fix", "FIX_CI"): Money("USD", 2_000_000)}
-        ),
-    )
-    wrapper.set_context("fix", "FIX_CI", 100, None)
-
-    result = asyncio.run(
-        wrapper.run(
-            RuntimePlan("repair", max_budget_usd=2, cwd=str(tmp_path))
-        )
-    )
-
-    assert result.status == "ok"
-    authority = json.loads(
-        base64.urlsafe_b64decode(
-            runtime.task.env["ISSUE_AGENT_AUTHORITY_BUNDLE"]
-        ).decode()
-    )
-    assert authority["ISSUE_AGENT_PUBLICATION_ISSUE"] == "0"
-    assert authority["ISSUE_AGENT_PUBLICATION_BRANCH"] == "fix/1-test"
 
 
 def test_issue_less_review_keeps_repository_and_global_caps(tmp_path) -> None:
@@ -656,7 +311,6 @@ def test_issue_less_review_binds_pr_claim_without_issue_budget_scope(
         -42,
         "REVIEW",
         owner,
-        frozenset({"pr:42"}),
     )
     wrapper.set_context(
         "review",
@@ -714,7 +368,6 @@ def test_issue_less_multi_review_preserves_pr_claim_across_leg_context(
         -42,
         "REVIEW",
         owner,
-        frozenset({"pr:42"}),
     )
     journaled = JournalingRuntime(
         accounting,
@@ -774,7 +427,6 @@ def test_linked_review_separates_issue_claim_from_pr_retry_key(tmp_path) -> None
         9,
         "REVIEW",
         owner,
-        frozenset({"pr:42"}),
     )
     wrapper.set_context(
         "review",
@@ -928,7 +580,6 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -941,7 +592,7 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
         "claude",
         _policy(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
@@ -967,7 +618,6 @@ def test_disabled_caps_still_price_observed_subscription_stream_usage(
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -981,7 +631,7 @@ def test_disabled_caps_still_price_observed_subscription_stream_usage(
         _policy(),
         _rates(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     result = asyncio.run(
         wrapper.run(
@@ -1009,7 +659,6 @@ def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -1023,7 +672,7 @@ def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
         _policy(),
         None,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     result = asyncio.run(
         wrapper.run(RuntimePlan("work", max_budget_usd=2))
@@ -1059,7 +708,6 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
     runtime = SubscriptionRuntime()
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -1073,7 +721,7 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
         _policy(),
         _rates(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     first = asyncio.run(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
@@ -1189,9 +837,8 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
         "runtime_exception_before_launch",
     )
 
-    selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
-    assert isinstance(selected, cc.SelectedIssueRecovery)
-    assert selected.component.state == cc.IssueRecoveryState()  # a machine failure is no attempt
+    # A machine failure is no attempt: the ended run carries no leg receipt.
+    assert [run.receipt for run in store.fix_runs("o/r", (1,))] == [None]
 
 
 def test_malformed_usage_settles_zero_estimate_without_changing_work_result(
@@ -1260,9 +907,8 @@ def test_non_codex_runtime_exception_releases_after_completed_teardown(
         "runtime_exception_before_launch",
     )
 
-    selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
-    assert isinstance(selected, cc.SelectedIssueRecovery)
-    assert selected.component.state == cc.IssueRecoveryState()  # a machine failure is no attempt
+    # A machine failure is no attempt: the ended run carries no leg receipt.
+    assert [run.receipt for run in store.fix_runs("o/r", (1,))] == [None]
 
 
 def test_runtime_exception_after_child_registration_retains_reservation(
@@ -1417,55 +1063,27 @@ def test_concurrent_review_validators_share_context_without_false_dedup(
     assert store.active_reservation_runs() == ()
 
 
-def test_reconciled_provisional_fix_refusal_does_not_persist_budget_hold(tmp_path):
-    from issue_agent.domain.contracts import ReservationId, SettlementRequest, PricingBasis
-    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
-    wrapper, store = _wrapper(tmp_path, runtime, cap=5_000_000)
-    attempts = []
-    def admit(request):
-        if not attempts:
-            overhang = dataclasses.replace(request, run_id=RunId("overhang"), reservation_id=ReservationId("overhang"),
-                kind="overhang", owner_id="o/r:fix:overhang", dispatch_id="overhang", workflow=None, continuations=(),
-                quote=dataclasses.replace(request.quote, maximum_charge=Money("USD", 4_000_000)))
-            assert store.reserve(overhang).admitted
-        attempts.append(request)
-        return store.reserve(request)
-    class Reconciler:
-        def reconcile_stale_reservations(self):
-            store.settle(SettlementRequest(RunId("overhang"), Money("USD", 0), PricingBasis.PROVIDER_REPORTED,
-                                          "overhang-zero", None, None, None))
-            return 1
-    wrapper = dataclasses.replace(wrapper, admit=admit, reservation_reconciler=Reconciler())
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
-    assert not result.is_error and runtime.calls == 1 and len(attempts) == 2, (result.summary, len(attempts))
-    with store.transaction() as db:
-        assert db.execute("SELECT sum(amount_micros) FROM charges").fetchone()[0] == 10000
-
-
 @pytest.mark.parametrize("cap_kind,status", [
     ("repository", DAILY_HEADROOM_STATUS), ("global", DAILY_HEADROOM_STATUS), ("issue", MAX_BUDGET_STATUS),
 ])
 def test_fix_admission_refusal_is_a_daily_wait_only_for_daily_caps(tmp_path, cap_kind, status):
     # Decision #7: daily/global windows refill with time, so their refusal is a
     # label-free wait; the lifetime issue cap needs a human decision. Neither
-    # persists workflow state or opens a paid run.
+    # opens a paid run; the zero-cost refused row spaces the retry (#262).
     runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
     wrapper, store = _wrapper(tmp_path, runtime)
     wrapper = dataclasses.replace(wrapper, repository_cap=Money("USD", 0) if cap_kind == "repository" else None,
         global_cap=Money("USD", 0) if cap_kind == "global" else None,
         issue_cap=Money("USD", 0) if cap_kind == "issue" else None)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    key = WorkflowKey("o/r", IssueRef(1))
-    before = store.read_issue_recovery(key)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
     assert result.is_error and result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert (result.status, result.envelope_subtype) == (status, status)
     assert runtime.calls == 0
-    assert store.read_issue_recovery(key) == before
     with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert [tuple(row) for row in db.execute("SELECT state, outcome FROM runs")] == [("cancelled", "admission_refused")]
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+    assert [run.receipt for run in store.fix_runs("o/r", (1,))] == [None]
 
 
 @pytest.mark.parametrize("invalid", [None, True, -1, 1.5, "12", 10**100])

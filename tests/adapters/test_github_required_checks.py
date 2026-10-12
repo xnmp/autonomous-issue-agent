@@ -115,13 +115,8 @@ def test_large_paginated_rollup_preserves_every_obligation():
 
 @pytest.mark.parametrize("head_red", [False, True])
 @pytest.mark.parametrize("declared", [False, True])
-def test_declared_policy_uses_test_merge_checks_and_empty_policy_uses_head(head_red, declared):
-    from dataclasses import replace
+def test_declared_policy_reads_test_merge_checks_and_empty_policy_reads_head(head_red, declared):
     from issue_agent.domain.ci import Failed
-    from issue_agent.domain.actions import EnableAutoMerge, RunAgent
-    from issue_agent.domain.fix import FixConfig, FixState, decide_fix
-    from issue_agent.domain.labels import Label
-    from issue_agent.domain.world import Review, WorldState
     merge_commit = {"id": "merge-id", "oid": "merge-sha", "statusCheckRollup": {"contexts": {"totalCount": 1}}}
     meta = metadata(merge=merge_commit)
     def run(argv, token):
@@ -139,13 +134,6 @@ def test_declared_policy_uses_test_merge_checks_and_empty_policy_uses_head(head_
     assert isinstance(ci, Observed) and ci.tested_revision == ("merge-sha" if declared else "head")
     red = not head_red if declared else head_red
     assert isinstance(reduce_ci(ci), Failed if red else Clear)
-    pr = replace(pr, author="fix-bot", head_ref_name="fix/7-example", closing_issue=7,
-        labels=frozenset({Label.AI_PR_OPEN}), mergeable="MERGEABLE", merge_state="CLEAN",
-        reviews=(Review("APPROVED", "review-bot", commit_id="head"),))
-    actions = decide_fix(WorldState(prs=(pr,)), FixConfig(fix_bot="fix-bot"),
-        FixState(ci_rerun_head={3: "head"}), fixer_busy=False)
-    assert any(isinstance(a, RunAgent) and a.kind.name == "FIX_CI" for a in actions) == red
-    assert any(isinstance(a, EnableAutoMerge) for a in actions) == (not red)
 
 
 @pytest.mark.parametrize("merge", [None, {"id": "merge-id", "oid": "merge-sha", "statusCheckRollup": None},

@@ -4,9 +4,14 @@ from typing import Protocol
 from contextlib import AbstractContextManager
 
 from .contracts import CommandId, WorkflowAttemptIdentity
-from .continuation_components import CIEpisodeReset, SelectedIssueRecovery, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff
+from .continuation_components import (
+    CIEpisodeReset,
+    IssueRecoverySelection,
+    PRRepairSelection,
+    PRRepairCleanup,
+    RepairHandoff,
+)
 from .agent_task import RuntimeName
-from .backoff import LegEnd
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
 from .resolve_rearm import PendingResolveRearm, ResolveControlRead, UnavailableResolveRearm
@@ -40,10 +45,6 @@ class WorkflowControl(Protocol):
     def read_pr_repair(self, key: WorkflowKey) -> PRRepairSelection: ...
 
     def read_issue_recovery(self, key: WorkflowKey) -> IssueRecoverySelection: ...
-
-    def fix_leg_ends(self, issue: int) -> tuple[LegEnd, ...]:
-        """Ended fix legs for one issue, the input to the machine backoff."""
-        ...
 
     def reset_ci_episode(self, source: CIEpisodeReset) -> bool: ...
 

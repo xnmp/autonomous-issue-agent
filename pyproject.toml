@@ -14,7 +14,6 @@ dependencies = []
 # to find the sibling plugin/ + config/ trees — a plain wheel omits them.
 [project.scripts]
 issue-agent = "issue_agent.app.cli:main"
-issue-agent-publish = "issue_agent.adapters.agent_publish:main"
 
 # The adapter layer (Phase 2+) imports the Claude Agent SDK. Kept as an optional
 # extra so the domain layer + its tests stay installable with zero third-party deps.

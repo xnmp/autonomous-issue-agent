@@ -25,25 +25,27 @@ import re
 import subprocess
 from .github_ci import observe_checks
 from ..domain.checks import Unavailable
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from ..domain.ci import parse_timestamp
 from ..domain.labels import Label
+from ..domain.refs import harness_branch_issue
 from ..domain.review_rejection import MAX_OBSERVED_REVIEWS, is_commit_sha
 from ..domain.review_workflow import (
     CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
 )
 from .review_effects import ReviewReadUnavailable
 from ..domain.world import (
+    Branch,
     ClosingRef,
     Comment,
-    HeadRef,
-    HeadSignal,
     IssueView,
     PRView,
     PullRequestDiff,
+    Push,
     Review,
     WorldState,
     extract_declared_paths,
@@ -433,27 +435,6 @@ def _reviews(raw: list | None) -> tuple[Review, ...]:
     return tuple(out)
 
 
-def _checks_digest(raw: list[dict[str, object]]) -> str:
-    """A stable, order-free string for one commit's check state (#163 probe).
-
-    Only ever compared against another digest of the same source, so it carries
-    the fields whose movement must wake the fixer — the per-check name, state and
-    pass/fail/pending bucket — and nothing timing-dependent (startedAt, links)
-    that would churn the digest without changing any decision."""
-    return "\n".join(
-        sorted(
-            f"{c.get('name') or ''}\t{c.get('state') or ''}\t{c.get('bucket') or ''}"
-            # `startedAt` is CONSTANT for a given run and changes only when the
-            # check is re-run, so it discriminates a re-run that lands on the
-            # same name/state/bucket triple without churning otherwise
-            # (adversarial review F12).
-            f"\t{c.get('startedAt') or ''}"
-            for c in raw
-            if isinstance(c, dict)
-        )
-    )
-
-
 def _check_run_observation(raw: dict) -> dict[str, object]:
     status = str(raw.get("status") or "").lower()
     conclusion = str(raw.get("conclusion") or "").lower()
@@ -761,12 +742,179 @@ def build_time() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def parse_world(issues: list[dict], prs: list[dict], now: str = "") -> WorldState:
-    return WorldState(
-        issues=tuple(parse_issue(i) for i in issues),
-        prs=tuple(parse_pr(p) for p in prs),
-        now=now,
+_FIX_MAX_PAGES = {"issues": 10, "pullRequests": 10, "refs": 10}
+_FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500}
+_HARNESS_BRANCH_PREFIX = "fix/"
+_COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt}}}}"
+_LABELS = "labels(first:100){totalCount nodes{name}}"
+# Cross-references, paged in full like any nested connection: a merged harness
+# PR past one page must read as "unknown" (the issue is skipped), never as
+# "not merged" (which would re-RESOLVE a done issue). No totalCount: whether
+# it honours `itemTypes` is undocumented, so completeness rests on paging.
+_TIMELINE = ("timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:100{before}){{pageInfo{{hasPreviousPage startCursor}} "
+             "nodes{{... on CrossReferencedEvent{{source{{... on PullRequest{{number state headRefName "
+             "repository{{nameWithOwner}}}}}}}}}}}}")
+_FIX_ISSUE = (
+    "id number title state author{login} " + _LABELS + " "
+    + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="")
+)
+_REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
+            "nodes{{author{{login}} state submittedAt body commit{{oid}}}}}}")
+_FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
+_FIX_PR = (
+    "id number state headRefName headRefOid baseRefName baseRefOid isDraft title author{login} "
+    "mergeable mergeStateStatus " + _LABELS + " " + _COMMENTS.format(before="") + " "
+    + _REVIEWS.format(before="") + " " + _FILES.format(after="")
+    + " commits(last:1){nodes{commit{oid committedDate author{user{login}}}}}"
+)
+# Per branch: its newest PR (any state), its head commit's date, and how many
+# commits it has that the base lacks (`compare` reads the ref as the base, so
+# that count is `behindBy`).
+_FIX_REFS = ("refs(refPrefix:\"refs/heads/" + _HARNESS_BRANCH_PREFIX + "\",first:100{after}){{pageInfo{{hasNextPage endCursor}} "
+             "nodes{{name associatedPullRequests(last:1,orderBy:{{field:CREATED_AT,direction:ASC}})"
+             "{{totalCount nodes{{state closedAt}}}} target{{... on Commit{{committedDate}}}} "
+             "compare(headRef:$base){{behindBy}}}}}}")
+def _escaped(fields: str) -> str:
+    return fields.replace("{", "{{").replace("}", "}}")
+
+
+_FIX_CONNECTIONS = {
+    "issues": ("issues(states:OPEN,labels:[\"ai-ready\",\"needs-human\"],first:100{after},"
+               "orderBy:{{field:CREATED_AT,direction:ASC}}){{pageInfo{{hasNextPage endCursor}} nodes{{" + _escaped(_FIX_ISSUE) + "}}}}"),
+    "pullRequests": ("pullRequests(states:OPEN,first:100{after},orderBy:{{field:CREATED_AT,direction:ASC}})"
+                     "{{pageInfo{{hasNextPage endCursor}} nodes{{" + _escaped(_FIX_PR) + "}}}}"),
+    "refs": _FIX_REFS,
+}
+
+
+class FixObservationIncomplete(ValueError):
+    """A required connection could not be read in full within its bound."""
+
+
+def _connection(parent: object, name: str) -> tuple[list, dict]:
+    if not isinstance(parent, dict) or not isinstance(parent.get(name), dict):
+        raise FixObservationIncomplete(f"{name} is absent")
+    conn = parent[name]
+    nodes, info = conn.get("nodes"), conn.get("pageInfo")
+    if not isinstance(nodes, list) or (info is not None and not isinstance(info, dict)):
+        raise FixObservationIncomplete(f"{name} is malformed")
+    return nodes, info or {}
+
+
+def _login(raw: object) -> str:
+    login = raw.get("login") if isinstance(raw, dict) else None
+    return login if isinstance(login, str) else ""
+
+
+def _complete_labels(node: dict) -> frozenset[Label]:
+    nodes, _ = _connection(node, "labels")
+    if node["labels"].get("totalCount") != len(nodes):
+        raise FixObservationIncomplete("labels exceed one page")
+    return _labels(nodes)
+
+
+def parse_fix_issue(node: object, comments: list) -> IssueView:
+    """One issue node (with its fully paged comments) → IssueView."""
+    if not isinstance(node, dict) or type(node.get("number")) is not int or node["number"] <= 0:
+        raise FixObservationIncomplete("issue identity is malformed")
+    state = node.get("state")
+    if state not in ("OPEN", "CLOSED"):
+        raise FixObservationIncomplete("issue state is malformed")
+    return IssueView(
+        number=node["number"], title=node.get("title") or "", labels=_complete_labels(node),
+        comments=_comments(comments), author=_login(node.get("author")), state=state.lower(),
     )
+
+
+def parse_merged_harness_prs(items: list, repository: str) -> tuple[PRView, ...]:
+    """Merged same-repo harness PRs among an issue's (fully paged)
+    cross-references. A merged harness PR means the issue is done even while
+    it stays open (base ≠ default branch never auto-closes it)."""
+    out = []
+    for item in items:
+        source = item.get("source") if isinstance(item, dict) else None
+        if not isinstance(source, dict) or source.get("state") != "MERGED":
+            continue
+        repo = (source.get("repository") or {}).get("nameWithOwner") if isinstance(source.get("repository"), dict) else ""
+        head = source.get("headRefName")
+        if (not isinstance(repo, str) or repo.casefold() != repository.casefold() or type(source.get("number")) is not int
+                or not isinstance(head, str) or not head.startswith(_HARNESS_BRANCH_PREFIX)):
+            continue
+        out.append(PRView(number=source["number"], head_ref_name=head, state="MERGED", content_known=False))
+    return tuple(out)
+
+
+def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PRView:
+    """One open PR node (with fully paged nested connections) → PRView. CI is
+    attached separately by the revision-bound required-check observer."""
+    if not isinstance(node, dict) or type(node.get("number")) is not int or node["number"] <= 0:
+        raise FixObservationIncomplete("PR identity is malformed")
+    head = node.get("headRefOid")
+    if not isinstance(head, str) or not isinstance(node.get("headRefName"), str):
+        raise FixObservationIncomplete("PR head is malformed")
+    commits, _ = _connection(node, "commits")
+    pushes: tuple[Push, ...] = ()
+    if commits:
+        commit = commits[-1].get("commit") if isinstance(commits[-1], dict) else None
+        if not isinstance(commit, dict) or commit.get("oid") != head:
+            raise FixObservationIncomplete("PR head commit disagrees with its head")
+        author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+        pushes = (Push(_login(author.get("user")), commit.get("committedDate") or ""),)
+    return PRView(
+        number=node["number"], head_ref_name=node["headRefName"], head_ref_oid=head,
+        base_ref_name=node.get("baseRefName") or "", base_ref_oid=node.get("baseRefOid") or "",
+        title=node.get("title") or "", labels=_complete_labels(node),
+        comments=_comments(comments), reviews=_reviews(reviews),
+        state=str(node.get("state") or ""), changed_files=_changed_files([{"path": f.get("path")} for f in files
+                                                                         if isinstance(f, dict)]),
+        mergeable=str(node.get("mergeable") or ""), merge_state=str(node.get("mergeStateStatus") or ""),
+        is_draft=node.get("isDraft") is True, author=_login(node.get("author")), pushes=pushes,
+    )
+
+
+def parse_fix_refs(nodes: list) -> tuple[tuple[Branch, ...], dict[int, str]]:
+    """Harness branches owed a PR, and the issues whose branch could not be
+    judged (with why). A branch is owed when it is ahead of base and either
+    never had a PR or was pushed after its newest PR was closed unmerged (a
+    human closed it and the issue went back to RESOLVE). A branch with nothing
+    ahead of base is owed nothing: opening its PR could only fail, every tick.
+    An unjudgeable branch (a hidden PR, a comparison GitHub cannot make, e.g.
+    a missing base) makes only its issue unknown, never the whole read."""
+    owed: list[Branch] = []
+    unknown: dict[int, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+            raise FixObservationIncomplete("branch ref is malformed")
+        branch = _HARNESS_BRANCH_PREFIX + node["name"]
+        try:
+            if _owed(node):
+                target = node.get("target") if isinstance(node.get("target"), dict) else {}
+                committed = target.get("committedDate")
+                owed.append(Branch(branch, committed if isinstance(committed, str) else ""))
+        except FixObservationIncomplete as exc:
+            if (issue := harness_branch_issue(branch)) is not None:
+                unknown[issue] = str(exc)
+    return tuple(owed), unknown
+
+
+def _owed(node: dict) -> bool:
+    prs = node.get("associatedPullRequests")
+    if not isinstance(prs, dict) or type(prs.get("totalCount")) is not int or not isinstance(prs.get("nodes"), list):
+        raise FixObservationIncomplete("branch PR association is unreadable")
+    compare = node.get("compare")
+    if not isinstance(compare, dict) or type(compare.get("behindBy")) is not int:
+        raise FixObservationIncomplete("branch cannot be compared with the base")
+    if compare["behindBy"] <= 0:
+        return False
+    if not prs["totalCount"]:
+        return True
+    newest = prs["nodes"][-1] if prs["nodes"] else None
+    if not isinstance(newest, dict) or newest.get("state") not in ("OPEN", "CLOSED", "MERGED"):
+        raise FixObservationIncomplete("branch PR state is unreadable")
+    target = node.get("target") if isinstance(node.get("target"), dict) else {}
+    closed_at = parse_timestamp(newest.get("closedAt") or "")
+    pushed_at = parse_timestamp(target.get("committedDate") or "")
+    return newest["state"] == "CLOSED" and closed_at is not None and pushed_at is not None and pushed_at > closed_at
 
 
 # ── write command builders ──────────────────────────────────────────────────
@@ -983,19 +1131,6 @@ class GitHubGateway:
         out = self._gh(args)
         return json.loads(out) if out.strip() else None
 
-    # ── reads ──
-    def list_issue_numbers(
-        self, label: str, state: str = "open", limit: int = _LIST_LIMIT
-    ) -> list[int]:
-        data = self._gh_json(
-            ["issue", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", "number", "--limit", str(limit)]
-        ) or []
-        _warn_if_list_truncated(
-            f"gh issue list --label {label} --state {state}", len(data), limit
-        )
-        return [int(i["number"]) for i in data]
-
     def get_issue(self, number: int) -> IssueView:
         d = self._gh_json(
             ["issue", "view", str(number), "--repo", self.repo, "--json",
@@ -1016,78 +1151,6 @@ class GitHubGateway:
                        or not label["name"] for label in raw["labels"])):
             raise ValueError("linked issue lifecycle fields are incomplete or malformed")
         return parse_issue(raw)
-
-    def change_signature(self) -> str:
-        """Cheapest possible "did anything change?" probe: number@updated_at of
-        the single most-recently-updated issue-or-PR (the REST issues list
-        includes PRs). One REST point — a pool the GraphQL-backed world builds
-        never touch. "" on an empty repo or a benignly-failed call; callers must
-        read "" as "assume changed" (fail open), never as "no change". Infra
-        failures raise GhUnavailable like every other read here."""
-        out = self._gh([
-            "api",
-            f"repos/{self.repo}/issues?state=all&sort=updated"
-            "&direction=desc&per_page=1",
-            "--jq", r'.[0] | "\(.number)@\(.updated_at)"',
-        ])
-        return out.strip()
-
-    def head_signals(self, heads: Sequence[HeadRef]) -> tuple[HeadSignal, ...] | None:
-        """CI + mergeability of the given in-flight PR heads, over REST only —
-        the two facts `change_signature` cannot see (#163). Feeds
-        `domain.world.fix_probe_safe`, which compares this reading against the
-        one taken for the last full build; nothing here interprets it.
-
-        Three REST calls per head (the pull object, its check-runs, its commit
-        statuses) against a pool the GraphQL world builds never touch. It
-        replaces a ~45-point GraphQL build per tick while a PR waits on CI.
-
-        `None` means UNREADABLE — any head whose pull object or checks did not
-        parse — and the predicate turns that into a full build. `GhUnavailable`
-        propagates: that is the whole world being unreadable, which is the
-        tick's call, not this method's."""
-        out: list[HeadSignal] = []
-        for head in heads:
-            try:
-                raw = self._gh(
-                    ["api", f"repos/{self.repo}/pulls/{head.number}", "--jq",
-                     r'[.state, (.merged|tostring), (.mergeable|tostring), '
-                     r'(.mergeable_state // ""), .head.sha] | @tsv']
-                ).strip()
-                fields = raw.split("\t")
-                if len(fields) != 5 or not fields[4]:
-                    return None
-                state, merged, mergeable, merge_state, sha = fields
-                checks = self._checks_for_head(sha)
-            except GhUnavailable as exc:
-                # A TIMED-OUT call is the one per-CALL sub-case (see the class
-                # docstring): one wedged head must not skip every fix tick for
-                # as long as it stays wedged — that is strictly worse than the
-                # per-PR isolation `_safe_get_pr` gives the same read inside a
-                # build (adversarial review F1). Unread → the predicate builds.
-                if exc.timed_out:
-                    return None
-                raise
-            except Exception:  # noqa: BLE001 — an answered-but-odd read is UNREAD
-                return None
-            if checks is None:
-                return None
-            out.append(
-                HeadSignal(
-                    number=head.number,
-                    head_ref_oid=sha,
-                    state=f"{state}/{merged}",
-                    ci=_checks_digest(checks),
-                    mergeable=f"{mergeable}/{merge_state}",
-                    # This digest cannot carry policy/report eligibility, so
-                    # failures force a full observation before any CI action.
-                    failing=any(
-                        isinstance(c, dict) and c.get("bucket") == "fail"
-                        for c in checks
-                    ),
-                )
-            )
-        return tuple(out)
 
     def open_blockers(self, number: int) -> tuple[int, ...]:
         """Open GitHub-native ``blocked by`` issue numbers for ``number``.
@@ -1401,9 +1464,6 @@ class GitHubGateway:
             checks=is_open,
         )
 
-    def list_pr_numbers(self, label: str, state: str = "open") -> list[int]:
-        return [n for n, _ in self.list_pr_states(label, state)]
-
     def list_pr_states(self, label: str, state: str = "open") -> list[tuple[int, str]]:
         """(number, state) pairs, so world builders can pick per-PR enrichment
         depth BEFORE fetching. The `--state all` label list serves STALE search
@@ -1490,101 +1550,125 @@ class GitHubGateway:
         _warn_if_list_truncated("gh pr list --state open (closing refs)", len(data))  # type: ignore[arg-type]
         return parse_closing_refs(data)
 
-    def build_world(self) -> WorldState:
-        """Fetch the slice the daemons need: ai-ready/ai-working/ai-blocked/
-        ai-pr-open issues (the last one open AND closed — see below) and
-        ai-pr-open PRs (open + recently merged/closed for cleanup). Composed
-        from the typed reads above so it's exercised by the gateway tests.
+    def _graphql(self, query: str, **variables: str) -> dict:
+        """One query; `variables` must be exactly the ones it declares (GitHub
+        rejects a declared-but-unused variable)."""
+        args = ["api", "graphql", "-f", f"query={query}"]
+        for key, value in variables.items():
+            args += ["-f", f"{key}={value}"]
+        raw = self._gh_json(args)
+        if not isinstance(raw, dict) or raw.get("errors") or not isinstance(raw.get("data"), dict):
+            raise FixObservationIncomplete("GraphQL answered with errors or no data")
+        return raw["data"]
 
-        `GhUnavailable` PROPAGATES out of here (all four world builders): a
-        partially-read world is not a world, and the caller (`Daemon.tick`) is
-        the only layer that can decide "skip this pass". Note the list calls run
-        FIRST, so a throttled poll aborts before any per-item fetch — the empty
-        world of V10 is unreachable rather than merely unlikely."""
-        issue_numbers: set[int] = set()
-        ready_numbers: set[int] = set()
-        for lbl in ("ai-ready", "ai-working", "ai-blocked", "ai-pr-open"):
-            nums = self.list_issue_numbers(lbl)
-            issue_numbers.update(nums)
-            if lbl == "ai-ready":
-                ready_numbers.update(nums)
-        # …and the CLOSED `ai-pr-open` issues (#28). The merge cleanup arm is
-        # gated on OBSERVING the issue still carrying ai-pr-open in the same
-        # snapshot as its merged PR (`_issue_carries_ai_pr_open`, review P1R-15
-        # — it must not stomp a fresh dispatch). But `Fixes #n` is MANDATORY in
-        # every harness PR body (the publish broker supplies it), so GitHub closes the issue at the
-        # instant of merge; by the next poll the issue was in neither the open
-        # slice above nor any closed slice, the gate read False, and the
-        # ai-pr-open→ai-done relabel that would have made it visible again never
-        # ran. Self-reinforcing: zero issues ever reached ai-done, the #10
-        # recurrence guardrail could never fire, and RemoveWorktree/ClearIssueState
-        # never ran (24 stale worktrees / 2.3 GB observed). Fetching the closed
-        # half makes the stuck state OBSERVABLE without touching the gate; the
-        # REPAIR is `domain.fix.orphaned_cleanup_actions`, which is also what
-        # drains this query (an unlabelled merged PR is invisible, so the
-        # PR-driven arm alone could never reach a pre-existing backlog).
-        # The OPEN half of the same label is in the loop above for the
-        # symmetric reason: a CLOSED-unmerged PR leaves its issue open+ai-pr-open,
-        # and the requeue-to-ai-ready arm was invisible in exactly the same way.
-        issue_numbers.update(
-            self.list_issue_numbers("ai-pr-open", "closed", _CLOSED_CLEANUP_LIMIT)
+    def _repository_page(self, fields: str, **variables: str) -> dict:
+        owner, name = self.repo.split("/", 1)
+        declared = "".join(f",${key}:String!" for key in variables)
+        data = self._graphql(
+            f"query($owner:String!,$repo:String!{declared}){{repository(owner:$owner,name:$repo){{{fields}}}}}",
+            owner=owner, repo=name, **variables,
         )
-        pr_rows: dict[int, dict] = {}
-        for state in ("open", "all"):
-            for row in self.list_pr_rows("ai-pr-open", state):
-                pr_rows.setdefault(int(row["number"]), row)
-        # The unlabelled terminal tail is built straight from the list payload
-        # (#163). Everything else is fetched; non-OPEN PRs (a terminal PR that
-        # still carries the label — the cleanup this arm exists for) get the
-        # cheap fetch: no mergeable (hang-class) and no checks call.
-        # PRs are fetched BEFORE issues: the blocked-by gate below needs to
-        # know which issues have an OPEN PR, and that linkage lives on the PR.
-        prs = tuple(
-            p for n in sorted(pr_rows)
-            if (p := self._pr_for_world(pr_rows[n], "ai-pr-open")) is not None
-        )
-        # Dependencies gate paid dispatch at BOTH stages: pick_ready_issue for
-        # admission, and the decide_fix repair arm for issues with an OPEN PR
-        # (unparked keifu #130/#157 would otherwise re-dispatch FIX_CI into the
-        # wedge their blocker existed to fix, 2026-08-03). Only those two
-        # slices pay the blocked-by read — an ai-working/blocked issue without
-        # a PR never needs it. Cheapest-first keeps it ~1 call each.
-        # The domain's own linkage rule, not a re-statement — if the two
-        # drifted, the gate would silently under-cover and the repair arm's
-        # documented fail-open for unlinked issues would become the default.
-        from ..domain.fix import _issue_for_pr as domain_issue_for_pr
+        if not isinstance(data.get("repository"), dict):
+            raise FixObservationIncomplete("repository is unreadable")
+        return data["repository"]
 
-        pr_linked = {
-            linked
-            for p in prs
-            if p.state == "OPEN"
-            and (linked := domain_issue_for_pr(p)) is not None
-        }
-        issues = tuple(
-            i for n in sorted(issue_numbers)
-            if (i := self._safe_get_issue(
-                n, blocker_gate=n in ready_numbers or n in pr_linked
-            )) is not None
-        )
-        # The label lists above are SEARCH-backed and serve stale results: an
-        # OPEN PR whose ai-pr-open was just removed (an operator park) kept
-        # reappearing here for minutes and re-holding every path-overlapping
-        # ai-ready issue (keifu PR #179, 2026-08-03). The per-PR fetch carries
-        # the fresh labels, so they are the authority for the OPEN slice. The
-        # non-OPEN slice stays unfiltered — the merge-cleanup arms exist to
-        # drain PRs in exactly the "merged but still labelled" state.
-        prs = tuple(
-            p for p in prs
-            if p.state != "OPEN" or Label.AI_PR_OPEN in p.labels
-        )
-        # One extra list call, and only on a FULL build (a probe-gated tick never
-        # reaches here). Fetched AFTER the per-item enrichment so a duplicate
-        # guard can never be the reason a world build fails late: by this point
-        # everything else is already in hand.
-        return WorldState(
-            issues=issues, prs=prs, closing_refs=self.open_closing_refs(),
-            now=build_time(),
-        )
+    def _nested(self, node: dict, name: str, template: str, *, on: str, backward: bool) -> list | None:
+        """A nested connection of an `on`-typed node read in full, or None past its bound."""
+        nodes, info = _connection(node, name)
+        nodes = list(nodes)
+        total = node[name].get("totalCount")
+        more, cursor_key = ("hasPreviousPage", "startCursor") if backward else ("hasNextPage", "endCursor")
+        while info.get(more):
+            cursor = info.get(cursor_key)
+            if len(nodes) >= _FIX_NESTED_MAX[name] or not isinstance(cursor, str) or not cursor:
+                return None
+            field = template.format(**{"before" if backward else "after": f",{'before' if backward else 'after'}:$cursor"})
+            data = self._graphql(
+                f"query($id:ID!,$cursor:String!){{node(id:$id){{... on {on}{{{field}}}}}}}",
+                id=str(node.get("id") or ""), cursor=cursor,
+            )
+            page, info = _connection(data.get("node"), name)
+            nodes = [*page, *nodes] if backward else [*nodes, *page]
+        if type(total) is int and total != len(nodes) or len(nodes) > _FIX_NESTED_MAX[name]:
+            return None
+        return nodes
+
+    def build_fix_world(self, base: str) -> WorldState:
+        """The fix role's observation: open `ai-ready`/`needs-human` issues,
+        open harness PRs (`fix/<issue>-`) with head, mergeability, required
+        checks, reviews, comments, every changed file and the head push, and
+        harness branches owed a PR against `base`. `GhUnavailable` and
+        incomplete top-level reads propagate: the daemon skips the tick."""
+        now = build_time()
+        first = self._repository_page(" ".join(t.format(after="") for t in _FIX_CONNECTIONS.values()), base=base)
+        collected: dict[str, list] = {}
+        for name, template in _FIX_CONNECTIONS.items():
+            nodes, info = _connection(first, name)
+            nodes, pages = list(nodes), 1
+            while info.get("hasNextPage"):
+                cursor = info.get("endCursor")
+                if pages >= _FIX_MAX_PAGES[name] or not isinstance(cursor, str) or not cursor:
+                    raise FixObservationIncomplete(f"{name} exceed {_FIX_MAX_PAGES[name]} pages")
+                page = self._repository_page(template.format(after=",after:$after"), after=cursor,
+                                             **({"base": base} if name == "refs" else {}))
+                more, info = _connection(page, name)
+                nodes.extend(more)
+                pages += 1
+            collected[name] = nodes
+        issues: list[IssueView] = []
+        merged: dict[int, PRView] = {}
+        for node in collected["issues"]:
+            number = node.get("number") if isinstance(node, dict) else None
+            try:
+                comments = self._nested(node, "comments", _COMMENTS, on="Issue", backward=True)
+                xrefs = self._nested(node, "timelineItems", _TIMELINE, on="Issue", backward=True)
+                if comments is None or xrefs is None:
+                    raise FixObservationIncomplete("comments or cross-references exceed their bound")
+                issues.append(parse_fix_issue(node, comments))
+                merged.update((p.number, p) for p in parse_merged_harness_prs(xrefs, self.repo))
+            except FixObservationIncomplete as exc:
+                self._skip_item("issue", number if type(number) is int else 0, exc)
+        prs: list[PRView] = []
+        for node in collected["pullRequests"]:
+            if not isinstance(node, dict) or type(node.get("number")) is not int or not isinstance(node.get("headRefName"), str):
+                raise FixObservationIncomplete("open PR identity is unreadable")
+            if not node["headRefName"].startswith(_HARNESS_BRANCH_PREFIX):
+                continue
+            try:
+                comments = self._nested(node, "comments", _COMMENTS, on="PullRequest", backward=True)
+                reviews = self._nested(node, "reviews", _REVIEWS, on="PullRequest", backward=True)
+                files = self._nested(node, "files", _FILES, on="PullRequest", backward=False)
+                if comments is None or reviews is None or files is None:
+                    raise FixObservationIncomplete("a nested connection exceeds its bound")
+                pr = parse_fix_pr(node, comments, reviews, files)
+                prs.append(replace(pr, ci=observe_checks(self.repo, pr, self._gh_json)))
+            except FixObservationIncomplete as exc:
+                # Still the item (it shadows its issue), but with no head to act on.
+                self._skip_item("PR", node["number"], exc)
+                prs.append(PRView(number=node["number"], head_ref_name=node["headRefName"], state="OPEN",
+                                  content_known=False))
+        prs.extend(p for n, p in sorted(merged.items()) if n not in {o.number for o in prs})
+        branches, unknown = parse_fix_refs(collected["refs"])
+        for number, why in sorted(unknown.items()):
+            self._skip_item("issue", number, FixObservationIncomplete(why))
+        return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
+                          branches=branches)
+
+    def pull_request_for_branch(self, branch: str) -> int | None:
+        """The open PR whose head is `branch` in this repository. A closed one
+        does not count: a branch pushed after its PR was closed is reopened
+        with a new PR."""
+        data = self._gh_json(["pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
+                              "--json", "number,headRefName", "--limit", "10"])
+        if not isinstance(data, list):
+            raise FixObservationIncomplete("PR lookup by branch is unreadable")
+        numbers = [row["number"] for row in data if isinstance(row, dict) and row.get("headRefName") == branch
+                   and type(row.get("number")) is int]
+        return min(numbers) if numbers else None
+
+    def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
+        self._gh(["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
+                  "--title", title, "--body", body])
 
     def build_review_world(self) -> WorldState:
         """The review daemon's slice: ONLY PRs carrying `self.review_pr_label` (open

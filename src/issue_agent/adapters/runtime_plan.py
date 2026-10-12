@@ -9,9 +9,8 @@ an adapter/application concern.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from ..domain.agent_task import RunIntent, RuntimeName
@@ -19,8 +18,6 @@ from ..domain.effort import Effort
 from ..domain.outcome import AgentResult
 from ..domain.workflow_identity import WorkflowBinding
 from ..domain.review_execution import ReviewChildIdentity
-from ..domain.resolve_return import ResolveInputs
-from ..domain.continuation_components import IssueReplyInput, LinkedPRIssueReplyInput, PRRepairInput
 
 
 @dataclass(frozen=True)
@@ -62,9 +59,6 @@ class RuntimePlan:
     # Scratch history is execution context, never authoritative task input.
     context_prefix: str
     context_suffix: str
-    resolve_inputs: ResolveInputs | None
-    issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None
-    pr_repair_input: PRRepairInput | None
 
     def __init__(
         self,
@@ -87,9 +81,6 @@ class RuntimePlan:
         runtime: RuntimeName | None = None,
         context_prefix: str = "",
         context_suffix: str = "",
-        resolve_inputs: ResolveInputs | None = None,
-        issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None = None,
-        pr_repair_input: PRRepairInput | None = None,
     ) -> None:
         selected_intent = intent
         if selected_intent is None:
@@ -119,15 +110,6 @@ class RuntimePlan:
             raise ValueError("runtime context must be text")
         object.__setattr__(self, "context_prefix", context_prefix)
         object.__setattr__(self, "context_suffix", context_suffix)
-        if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
-            raise ValueError("resolve completion inputs must be validated")
-        object.__setattr__(self, "resolve_inputs", resolve_inputs)
-        if issue_reply is not None and not isinstance(issue_reply, (IssueReplyInput, LinkedPRIssueReplyInput)):
-            raise ValueError("issue reply launch inputs must be validated")
-        object.__setattr__(self, "issue_reply", issue_reply)
-        if pr_repair_input is not None and not isinstance(pr_repair_input, PRRepairInput):
-            raise ValueError("PR repair launch input must be validated")
-        object.__setattr__(self, "pr_repair_input", pr_repair_input)
 
     @property
     def prompt(self) -> str:
@@ -185,6 +167,8 @@ class ContextualRuntime(AgentRuntime, Protocol):
         *,
         workflow: WorkflowBinding | None = None,
         review_child: ReviewChildIdentity | None = None,
+        head: str = "",
+        resumed: bool = False,
     ) -> None: ...
 
 

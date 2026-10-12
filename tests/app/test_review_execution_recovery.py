@@ -15,7 +15,7 @@ from issue_agent.domain.review_rounds import ReviewParentAbandoned
 from issue_agent.domain.review_workflow import ObservedPullRequest
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from tests.app.review_acceptance_harness import KEY, PR, REPO, compose_review, create_review_deployment
-from tests.app.resolve_acceptance_harness import install_clock, isolate_authority
+from tests.app.acceptance_support import install_clock, isolate_authority
 
 
 def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tmp_path, monkeypatch):
@@ -30,7 +30,7 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
         snapshot = load_review_workflow_row(db, KEY)
         assert snapshot is not None and isinstance(snapshot.execution, CurrentReviewExecution)
     assert review.control.claim_dispatch(REPO, "review", 1, AgentKind.REVIEW.name,
-                                         review.owner_id, frozenset())
+                                         review.owner_id)
     claim = review.control.active_dispatch_claims(REPO, "review")[0]
     observed, view = read_pull_request(composed.remote, KEY, deployment.clock.now(), reviews=True)
     assert isinstance(observed, ObservedPullRequest) and view is not None
