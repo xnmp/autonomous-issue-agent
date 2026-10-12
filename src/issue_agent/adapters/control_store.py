@@ -6923,58 +6923,6 @@ class SQLiteControlStore:
                        (key.repository, receipt_key, _stamp(self._now()), encoded))
             return True
 
-    def reset_rebase_allowance(self, source: cc.RebaseAllowanceReset, writer) -> bool:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        if not isinstance(source, cc.RebaseAllowanceReset):
-            raise ValueError("rebase reset requires its exact selected branch")
-        key = source.binding.fence.key
-        encoded = encode_workflow(source)
-        receipt_key = hashlib.sha256(encoded.encode()).hexdigest()
-        with self.transaction() as db, self.mutation_savepoint(db):
-            if writer.repository != key.repository or writer.role != "fix":
-                raise WorkflowAuthorityError("rebase reset belongs to another deployment")
-            self._assert_owner_active(db, writer.owner_id)
-            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='rebase-allowance-reset' AND scope=? AND key=?",
-                (key.repository, receipt_key)).fetchone()
-            if prior is not None:
-                if prior[0] != encoded:
-                    raise WorkflowAuthorityError("rebase reset conflicts with its original selection")
-                return False
-            aggregate = load_issue_aggregate(db, key)
-            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-            pr = load_review_workflow_row(db, source.pr_fence.key)
-            repair = cc.select_pr_repair(pr) if pr is not None else None
-            if (not isinstance(selected, cc.SelectedIssueRecovery) or selected.binding != source.binding
-                    or aggregate.revision != source.revision or not isinstance(repair, cc.SelectedPRRepair)
-                    or repair.revision.fence != source.pr_fence or repair.component.state.branch != source.branch):
-                raise WorkflowAuthorityError("rebase reset selection is stale, unavailable or on another branch")
-            self._validate_pr_repair_sources(db, repair)
-            model = repair.component.state.actual_model
-            if model is None:
-                from ..domain.refs import issue_from_branch
-                if issue_from_branch(source.branch) != key.target.number:
-                    raise WorkflowAuthorityError("rebase reset branch has no verified issue ownership")
-            else:
-                purchase, _ = self._continuation_return_admission(db, model.source, WorkflowFamily.PR_REPAIR)
-                run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(model.source.attempt.run_id),)).fetchone()
-                dispatch = json.loads(run[0]) if run is not None else None
-                if (not isinstance(purchase, cc.PRRepairPurchase) or purchase.branch != source.branch
-                        or not isinstance(dispatch, dict) or dispatch.get("repository") != key.repository
-                        or type(dispatch.get("issue")) is not int or dispatch.get("issue") != key.target.number
-                        or type(dispatch.get("number")) is not int or dispatch.get("number") != source.pr_fence.key.target.number):
-                    raise WorkflowAuthorityError("rebase reset branch belongs to another issue or selected return")
-            component = selected.component
-            if component.state.pending_rebase is not None and component.state.pending_rebase.attempt.binding == selected.binding:
-                raise WorkflowAuthorityError("rebase reset waits for the selected admitted attempt")
-            if not component.state.rebase_failures:
-                raise WorkflowAuthorityError("rebase reset has no spent allowance")
-            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
-                issue_recovery=replace(component, state=replace(component.state, rebase_failures=0)))
-            persist_workflow_snapshot(db, after)
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('rebase-allowance-reset',?,?,?,?)",
-                (key.repository, receipt_key, _stamp(self._now()), encoded))
-            return True
-
     def steward_admission(self, attempt: WorkflowAttemptIdentity) -> cc.StewardAttemptSource:
         with self.transaction() as db:
             return self._steward_admission(db, attempt)

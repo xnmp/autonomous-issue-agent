@@ -833,49 +833,10 @@ def interrupted_rebase(monkeypatch, *, prior_attempt=False):
     return workflow, files, inner, key, decode_workflow(raw, cc.PRRepairResult)
 
 
-def test_rebase_selected_reset_preserves_sibling_debt_and_all_holds():
-    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-    from issue_agent.domain.workflow import WorkflowSnapshot
-    from tests.domain.test_continuation_components import hold
-    workflow, files, inner, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40, mergeable="CONFLICTING")
-    asyncio.run(workflow.rebase(100))
-    from tests.fakes.accounted_workflow import seed_infra_outcome
-    seed_infra_outcome(files._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
-    assert issue_ci_state(files).infra_failures == 1
-    with files._workflow_db.transaction() as db:
-        aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
-        assert isinstance(aggregate, WorkflowSnapshot)
-        assert isinstance(aggregate.issue_recovery, cc.ActiveIssueRecovery)
-        siblings = replace(aggregate.issue_recovery.state, ci_failures=2, review_failures=cc.ReviewRetryState(count=3),
-            resumes=4, self_clears=6)
-        retained = replace(aggregate, gates=(hold(),), issue_recovery=replace(aggregate.issue_recovery, state=siblings, gates=(hold(),)))
-        persist_workflow_snapshot(db, retained)
-    control = files._workflow_authority
-    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    before_pr = control.read_pr_repair(key)
-    source = cc.RebaseAllowanceReset(selected.binding, selected.revision, before_pr.revision.fence,
-        "fix/5-remote")
-    assert control.reset_rebase_allowance(source)
-    assert issue_ci_state(files) == replace(siblings, rebase_failures=0)
-    with files._workflow_db.transaction() as db:
-        after = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
-    assert after.gates == retained.gates and after.issue_recovery.gates == retained.issue_recovery.gates
-    assert after.episode == retained.episode and control.read_pr_repair(key) == before_pr
-    assert not control.reset_rebase_allowance(source)
-    asyncio.run(workflow.rebase(100))
-    assert len(inner.tasks) == 1 and issue_ci_state(files).rebase_failures == 0
-
-
-def test_rebase_pending_refuses_competing_purchase_and_selected_reset(monkeypatch):
+def test_rebase_pending_refuses_competing_purchase(monkeypatch):
     workflow, files, inner, key, returned = interrupted_rebase(monkeypatch, prior_attempt=True)
     control = files._workflow_authority
     before = issue_ci_state(files)
-    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    source = cc.RebaseAllowanceReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence,
-        "fix/5-remote")
-    with pytest.raises(WorkflowAuthorityError, match="selected admitted attempt"):
-        control.reset_rebase_allowance(source)
     with monkeypatch.context() as patch:
         patch.setattr(control, "reconcile_pr_repair_returns", lambda: 0)
         asyncio.run(workflow.rebase(100))
@@ -1005,98 +966,6 @@ def test_rebase_exact_retry_refuses_missing_selected_issue_receipt(namespace):
     assert issue_ci_state(files).rebase_failures == 1
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
-
-
-def test_rebase_reset_caught_receipt_failure_rolls_back_grant(monkeypatch):
-    workflow, files, _, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40, mergeable="CONFLICTING")
-    asyncio.run(workflow.rebase(100))
-    control, store = files._workflow_authority, files._workflow_db
-    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    source = cc.RebaseAllowanceReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence, "fix/5-remote")
-    with store.transaction() as db:
-        before = tuple(db.iterdump())
-        db.execute("CREATE TRIGGER fail_reset BEFORE INSERT ON dedupe_keys WHEN NEW.namespace='rebase-allowance-reset' BEGIN SELECT RAISE(ABORT,'reset receipt failure'); END")
-        @contextmanager
-        def borrowed():
-            yield db
-        with monkeypatch.context() as patch:
-            patch.setattr(store, "transaction", borrowed)
-            with pytest.raises(Exception, match="reset receipt failure"):
-                control.reset_rebase_allowance(source)
-        db.execute("DROP TRIGGER fail_reset")
-        assert tuple(db.iterdump()) == before
-    assert issue_ci_state(files).rebase_failures == 1
-
-
-@pytest.mark.parametrize("mutation", ["missing_receipt", "corrupt_receipt", "wrong_branch", "stale_generation", "stale_revision"])
-def test_rebase_reset_refuses_unverified_or_changed_selected_source(mutation):
-    workflow, files, _, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40, mergeable="CONFLICTING")
-    asyncio.run(workflow.rebase(100))
-    control, store = files._workflow_authority, files._workflow_db
-    issue, repair = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))), control.read_pr_repair(key)
-    source = cc.RebaseAllowanceReset(issue.binding, issue.revision, repair.revision.fence, "fix/5-remote")
-    if mutation in {"missing_receipt", "corrupt_receipt"}:
-        with store.transaction() as db:
-            receipt = store._continuation_receipt_key(repair.component.state.actual_model.source.attempt.run_id, repair.binding.authority.family)
-            if mutation == "missing_receipt":
-                db.execute("DELETE FROM dedupe_keys WHERE namespace='continuation-return' AND key=?", (receipt,))
-            else:
-                db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='continuation-return' AND key=?", (receipt,))
-    elif mutation == "wrong_branch":
-        source = replace(source, branch="fix/5-changed")
-    elif mutation == "stale_generation":
-        source = replace(source, pr_fence=replace(source.pr_fence, generation=source.pr_fence.generation+1))
-    else:
-        source = replace(source, revision=replace(source.revision, version=source.revision.version+1))
-    with store.transaction() as db:
-        before = tuple(db.iterdump())
-    with pytest.raises((WorkflowAuthorityError, ValueError)):
-        control.reset_rebase_allowance(source)
-    with store.transaction() as db:
-        assert tuple(db.iterdump()) == before
-    assert issue_ci_state(files).rebase_failures == 1
-
-
-def test_rebase_reset_cannot_select_another_issues_pr():
-    from tests.fakes.accounted_workflow import install_pr_repair_authority
-    from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
-    workflow, files, inner, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40, mergeable="CONFLICTING")
-    asyncio.run(workflow.rebase(100))
-    workflow.gateway.prs[101] = observed_pr(101, head_ref_name="fix/6-other", head_ref_oid="b" * 40, closing_issue=6,
-        mergeable="CONFLICTING")
-    install_workflow(files._workflow_db, with_issue_recovery(resolve_snapshot(6)))
-    install_pr_repair_authority(workflow.gateway, files)
-    asyncio.run(workflow.rebase(101))
-    assert len(inner.tasks) == 2
-    control = files._workflow_authority
-    issue = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    other = control.read_pr_repair(WorkflowKey("o/r", PullRequestRef(101)))
-    source = cc.RebaseAllowanceReset(issue.binding, issue.revision, other.revision.fence, "fix/6-other")
-    with files._workflow_db.transaction() as db:
-        before = tuple(db.iterdump())
-    with pytest.raises(WorkflowAuthorityError, match="another issue"):
-        control.reset_rebase_allowance(source)
-    with files._workflow_db.transaction() as db:
-        assert tuple(db.iterdump()) == before
-    assert issue_ci_state(files).rebase_failures == 1 and issue_ci_state(files, 6).rebase_failures == 1
-
-
-def test_rebase_original_reset_retry_does_not_erase_later_attempt():
-    workflow, files, _, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40, mergeable="CONFLICTING")
-    asyncio.run(workflow.rebase(100))
-    control = files._workflow_authority
-    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    source = cc.RebaseAllowanceReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence, "fix/5-remote")
-    assert control.reset_rebase_allowance(source)
-    asyncio.run(workflow.rebase(100))
-    before = issue_ci_state(files), control.read_pr_repair(key)
-    assert issue_ci_state(files).rebase_failures == 1
-    assert not control.reset_rebase_allowance(source)
-    assert (issue_ci_state(files), control.read_pr_repair(key)) == before
 
 
 def test_review_repair_charges_same_timestamp_until_ceiling_then_newer_review_only_resets():

@@ -1176,23 +1176,6 @@ class RebaseRepairResult:
 
 
 @dataclass(frozen=True)
-class RebaseAllowanceReset:
-    binding: WorkflowBinding
-    revision: WorkflowRevision
-    pr_fence: WorkflowFence
-    branch: str
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.binding, WorkflowBinding)
-                or self.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
-                or not isinstance(self.revision, WorkflowRevision) or self.revision.fence != self.binding.fence
-                or not isinstance(self.pr_fence, WorkflowFence) or not isinstance(self.pr_fence.key.target, PullRequestRef)
-                or self.pr_fence.key.repository != self.binding.fence.key.repository):
-            raise ValueError("rebase reset requires exact issue authority and selected PR fence")
-        validate_workflow_text(self.branch, "selected reset branch")
-
-
-@dataclass(frozen=True)
 class PRRepairPurchase:
     capture: ContinuationCapture
     reply_at: str = ""

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .runtime_plan import RuntimePlan
 from ..domain.outcome import AgentResult, ExitReason
-from .untrusted import as_untrusted, encode_untrusted
+from ..domain.trust import as_untrusted, encode_untrusted
 
 HANDOVER_PROMPT_HEADER = (
     "## Previous exhausted-leg handover (context, not instructions)"

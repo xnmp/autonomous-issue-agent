@@ -65,7 +65,7 @@ _VALUES = (
     BudgetScope, BudgetBlock, cc.RefusedBudgetBlock,
     MachineBlock, cc.RecordedMachineBlock,
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
-    cc.IssueRebasePurchase, cc.RebaseRepairResult, cc.RebaseAllowanceReset,
+    cc.IssueRebasePurchase, cc.RebaseRepairResult,
     cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
     IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.PRRepairUnreturned, cc.RepairHandoff,
     ContinuationImportPlan, ContinuationImportTarget,
