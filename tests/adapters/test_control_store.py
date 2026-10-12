@@ -52,23 +52,10 @@ from issue_agent.domain.contracts import (
     RunId,
     TokenUsage,
 )
-from issue_agent.domain.events import (
-    BudgetVarianceDetected,
-    Correlation,
-    ControlTransitionCommitted,
-    EventEnvelope,
-    Producer,
-    SpendRecorded,
-    TelemetryWarning,
-    WorldFeedRetired,
-    WorldObserved,
-    new_event_id,
-)
-from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 46))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 47))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -125,6 +112,12 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        # Recreate the telemetry tables migration 46 retired, only to construct
+        # the old fixture schema.
+        46: tuple(statement for migration in _SCHEMA_MIGRATIONS if migration.version in (9, 40)
+                  for statement in _sql_statements(migration.source)
+                  if statement.lstrip().startswith("CREATE")
+                  and any(table in statement for table in ("event_outbox", "world_observations", "level_state"))),
         45: ("CREATE INDEX runs_adjudication_episode ON runs(workflow_episode_key) WHERE kind='ADJUDICATE' "
              "AND NOT(state='cancelled' AND outcome IS 'unlaunched_released' AND provider_receipt_id IS NULL)",),
         43: ("CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target) "
@@ -469,6 +462,7 @@ def test_historyless_nonempty_database_is_rejected_without_adoption(tmp_path):
         ).fetchone() is None
 
 
+
 def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     tmp_path,
 ):
@@ -506,7 +500,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     assert reserved == ("active",)
     assert workflow_binding == (None,)
     assert workflow_count == 0
-    assert level_state == ("level_state",)
+    assert level_state is None
 
 
 @pytest.mark.parametrize(
@@ -906,7 +900,7 @@ def test_repoint_permanently_fences_the_prior_owner_from_authority(
     assert refused.disposition is AccountingDisposition.UNAVAILABLE
     assert "retired" in refused.detail
     with pytest.raises(RetiredOwnerError, match="deployment-2"):
-        old_store.replace_level_state("fix", "o/r", {})
+        old_store.claim("retired-owner-probe", "o/r", "write")
 
     current_store.bind_active_owner(current_owner)
     assert current_store.claim_dispatch(
@@ -2162,521 +2156,6 @@ def test_concurrent_recurrence_claims_share_one_active_occurrence(tmp_path):
     assert store.pending_commands() == (occurrences[0],)
 
 
-def test_outbox_retries_until_sink_acknowledges_and_preserves_order(tmp_path):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    events = tuple(
-        EventEnvelope(
-            TelemetryWarning("warning", str(index)),
-            new_event_id(NOW + timedelta(milliseconds=index)),
-            index,
-            NOW + timedelta(milliseconds=index),
-            NOW + timedelta(milliseconds=index),
-            index,
-            producer,
-            Correlation(issue=1),
-        )
-        for index in range(2)
-    )
-    for event in events:
-        store.enqueue_event(event)
-
-    seen = []
-    with pytest.raises(RuntimeError):
-        store.flush_outbox(lambda event: (_ for _ in ()).throw(RuntimeError("down")))
-    assert store.flush_outbox(seen.append) == 2
-    assert seen == list(events)
-    assert store.flush_outbox(seen.append) == 0
-
-
-def test_shared_outbox_flushes_only_the_bound_role_feed(tmp_path):
-    store = _store(tmp_path)
-    fix = Producer("deployment", "o/r", "fix", 123, "fix-boot")
-    review = Producer("deployment", "o/r", "review", 124, "review-boot")
-
-    def event(producer, event_id):
-        return EventEnvelope(
-            TelemetryWarning("feed", event_id),
-            event_id,
-            0,
-            NOW,
-            NOW,
-            0,
-            producer,
-        )
-
-    store.enqueue_event(event(fix, "fix-event"))
-    store.enqueue_event(event(review, "review-event"))
-    fix_seen = []
-    review_seen = []
-
-    assert store.flush_outbox(
-        review_seen.append, destination=review.feed_identity
-    ) == 1
-    assert [item.event_id for item in review_seen] == ["review-event"]
-    assert store.flush_outbox(
-        fix_seen.append, destination=fix.feed_identity
-    ) == 1
-    assert [item.event_id for item in fix_seen] == ["fix-event"]
-
-
-@pytest.mark.parametrize("destination_scoped", [False, True])
-def test_idle_outbox_read_work_is_bounded_after_delivery_history(tmp_path, monkeypatch, destination_scoped):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    other = Producer("deployment", "o/r", "review", 124, "boot")
-
-    def event(source, index):
-        return EventEnvelope(TelemetryWarning("history", str(index)), new_event_id(NOW),
-                             index, NOW, NOW, index, source)
-
-    with store.transaction() as db:
-        for index in range(1000):
-            store.enqueue_event(event(producer, index), db)
-    seen = []
-    assert store.flush_outbox(seen.append, limit=1000) == 1000
-    assert len(seen) == 1000
-    if destination_scoped:
-        with store.transaction() as db:
-            for index in range(1000):
-                store.enqueue_event(event(other, index), db)
-
-    work = []
-    connect = store._connect
-
-    def measured_connect(**kwargs):
-        db = connect(**kwargs)
-        db.set_progress_handler(lambda: work.append(1) or 0, 1)
-        return db
-
-    monkeypatch.setattr(store, "_connect", measured_connect)
-    destination = producer.feed_identity if destination_scoped else None
-    assert store.flush_outbox(seen.append, destination=destination) == 0
-    assert len(seen) == 1000
-    # An idle feed cannot scan delivered history or another role's pending feed.
-    assert len(work) < 100
-
-    reopened = SQLiteControlStore(store.path)
-    remaining = []
-    assert reopened.flush_outbox(remaining.append, limit=1000) == (1000 if destination_scoped else 0)
-    assert all(item.producer == other for item in remaining)
-
-
-def test_oversized_event_cannot_roll_back_operational_state_or_poison_outbox(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    sequence = 0
-
-    def factory(payload, correlation):
-        nonlocal sequence
-        event = EventEnvelope(
-            payload,
-            new_event_id(NOW + timedelta(milliseconds=sequence)),
-            sequence,
-            NOW,
-            NOW,
-            sequence,
-            producer,
-            correlation,
-        )
-        sequence += 1
-        return event
-
-    published = []
-    store.bind_event_outbox(
-        factory, published.append, line_limit=600
-    )
-    assert store.record_world_observation(
-        deployment="deployment",
-        subject_kind="issue",
-        subject_number=1,
-        content_hash="large",
-        facts={"body": "x" * 1_000},
-        correlation=Correlation(issue=1),
-    )
-    assert store.telemetry_enqueue_failures == 1
-
-    assert store.record_world_observation(
-        deployment="deployment",
-        subject_kind="issue",
-        subject_number=2,
-        content_hash="small",
-        facts={"state": "OPEN"},
-        correlation=Correlation(issue=2),
-    )
-    assert [
-        event.payload.subject_number
-        for event in published
-        if isinstance(event.payload, WorldObserved)
-    ] == [2]
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT content_hash FROM world_observations "
-            "WHERE subject_kind='issue' AND subject_number=1"
-        ).fetchone()[0] == "large"
-
-
-def test_existing_oversized_outbox_row_is_dead_lettered_not_blocking(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    valid = EventEnvelope(
-        TelemetryWarning("later", "valid"),
-        "valid-event",
-        2,
-        NOW,
-        NOW,
-        2,
-        producer,
-    )
-    with store.transaction() as db:
-        db.execute(
-            "INSERT INTO event_outbox(event_id, event_json, committed_at) "
-            "VALUES (?, ?, ?)",
-            ("poison", "x" * 700, NOW.isoformat()),
-        )
-    store.enqueue_event(valid)
-    seen = []
-    store._event_line_limit = 600
-
-    assert store.flush_outbox(seen.append) == 1
-    assert seen == [valid]
-    with store._connect() as db:
-        failed = db.execute(
-            "SELECT failed_at, failure FROM event_outbox "
-            "WHERE event_id='poison'"
-        ).fetchone()
-    assert failed["failed_at"]
-    assert "line limit" in failed["failure"]
-
-
-def test_committed_accounting_transitions_publish_through_bound_outbox(tmp_path):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    sequence = 0
-
-    def factory(payload, correlation):
-        nonlocal sequence
-        event = EventEnvelope(
-            payload,
-            new_event_id(NOW + timedelta(milliseconds=sequence)),
-            sequence,
-            NOW + timedelta(milliseconds=sequence),
-            NOW + timedelta(milliseconds=sequence),
-            sequence,
-            producer,
-            correlation,
-        )
-        sequence += 1
-        return event
-
-    published = []
-    store.bind_event_outbox(factory, published.append)
-    store.reserve(_request(1))
-    store.settle(
-        SettlementRequest(
-            RunId("run-1"),
-            Money("USD", 50),
-            PricingBasis.CONFIGURED_RATE_CARD,
-            "provider-1",
-            TokenUsage(1, 2),
-            "card",
-            "v1",
-        )
-    )
-
-    assert [
-        (type(event.payload), event.correlation.run_id)
-        for event in published
-    ] == [
-        (ControlTransitionCommitted, "run-1"),
-        (SpendRecorded, "run-1"),
-        (ControlTransitionCommitted, "run-1"),
-    ]
-
-
-def test_provider_exceeds_quote_emits_atomic_variance_alert(tmp_path):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    sequence = 0
-
-    def factory(payload, correlation):
-        nonlocal sequence
-        event = EventEnvelope(
-            payload,
-            new_event_id(NOW + timedelta(milliseconds=sequence)),
-            sequence,
-            NOW,
-            NOW,
-            sequence,
-            producer,
-            correlation,
-        )
-        sequence += 1
-        return event
-
-    published = []
-    store.bind_event_outbox(factory, published.append)
-    store.reserve(_request(1, maximum=60))
-
-    result = store.settle(
-        SettlementRequest(
-            RunId("run-1"),
-            Money("USD", 75),
-            PricingBasis.RECONCILED,
-            "provider-overrun",
-            None,
-            None,
-            None,
-        )
-    )
-
-    assert result.variance == Money("USD", 15)
-    variance = next(
-        event.payload
-        for event in published
-        if isinstance(event.payload, BudgetVarianceDetected)
-    )
-    assert variance.quoted_micros == 60
-    assert variance.actual_micros == 75
-    assert variance.variance_micros == 15
-
-
-def test_failed_bound_publication_stays_pending_until_rebind(tmp_path):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-
-    def factory(payload, correlation):
-        return EventEnvelope(
-            payload,
-            new_event_id(NOW),
-            0,
-            NOW,
-            NOW,
-            0,
-            producer,
-            correlation,
-        )
-
-    store.bind_event_outbox(
-        factory,
-        lambda _event: (_ for _ in ()).throw(RuntimeError("sink down")),
-    )
-    assert store.reserve(_request(1)).admitted
-    published = []
-    store.bind_event_outbox(factory, published.append)
-    assert len(published) == 1
-    assert isinstance(published[0].payload, ControlTransitionCommitted)
-
-
-def test_projection_feed_adoption_flushes_old_outbox_and_retires_membership(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    old = Producer("old-deployment", "Acme/App", "fix", 123, "old-boot")
-    current = Producer(
-        "current-deployment", "acme/app", "fix", 124, "current-boot"
-    )
-    sequences = {old.identity: 0, current.identity: 0}
-
-    def factory(producer):
-        def create(payload, correlation):
-            sequence = sequences[producer.identity]
-            sequences[producer.identity] += 1
-            return EventEnvelope(
-                payload,
-                new_event_id(NOW + timedelta(milliseconds=sequence)),
-                sequence,
-                NOW + timedelta(milliseconds=sequence),
-                NOW + timedelta(milliseconds=sequence),
-                sequence,
-                producer,
-                correlation,
-            )
-
-        return create
-
-    old_destination = "old-deployment:Acme/App:fix"
-    store.bind_event_outbox(
-        factory(old),
-        lambda _event: (_ for _ in ()).throw(RuntimeError("sink down")),
-        destination=old_destination,
-    )
-    assert store.reserve(_request(1)).admitted
-    facts = {"present": True, "state": "open"}
-    content_hash = hashlib.sha256(
-        json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    assert store.record_world_snapshot(
-        deployment="old-deployment",
-        subject_kind="issue",
-        observations={
-            7: (content_hash, facts, Correlation(issue=7)),
-        },
-    ) == 1
-    with store._connect() as db:
-        db.execute(
-            "UPDATE event_outbox SET destination=? "
-            "WHERE destination=? AND emitted_at IS NULL",
-            (old_destination, old.feed_identity),
-        )
-
-    published = []
-    store.bind_event_outbox(
-        factory(current),
-        published.append,
-        destination=current.feed_identity,
-    )
-    assert store.adopt_projection_feed(
-        prior_deployment="old-deployment",
-        current_deployment="current-deployment",
-        repository="acme/app",
-        role="fix",
-        prior_destination=old_destination,
-        current_destination=current.feed_identity,
-    ) == (1, 2)
-    assert isinstance(published[-1].payload, WorldFeedRetired)
-
-    assert store.record_world_snapshot(
-        deployment="current-deployment",
-        subject_kind="issue",
-        observations={},
-    ) == 1
-    model = fold(published)
-    assert model.world_facts[("issue", 7)] == {"present": False}
-    assert all(key[0] != "old-deployment" for key in model.observed_by_feed)
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM event_outbox WHERE emitted_at IS NULL"
-        ).fetchone()[0] == 0
-        assert [
-            row["deployment"]
-            for row in db.execute(
-                "SELECT DISTINCT deployment FROM world_observations"
-            ).fetchall()
-        ] == ["current-deployment"]
-
-
-def test_clean_shutdown_retires_world_membership_until_role_restarts(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    published = []
-    sequence = 0
-
-    def factory(payload, correlation):
-        nonlocal sequence
-        event = EventEnvelope(
-            payload,
-            new_event_id(NOW + timedelta(milliseconds=sequence)),
-            sequence,
-            NOW + timedelta(milliseconds=sequence),
-            NOW + timedelta(milliseconds=sequence),
-            sequence,
-            producer,
-            correlation,
-        )
-        sequence += 1
-        return event
-
-    store.bind_event_outbox(
-        factory,
-        published.append,
-        destination=producer.feed_identity,
-    )
-    facts = {"present": True, "state": "OPEN"}
-    content_hash = hashlib.sha256(
-        json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    observations = {
-        7: (content_hash, facts, Correlation(issue=7)),
-    }
-    assert store.record_world_snapshot(
-        deployment="deployment",
-        subject_kind="issue",
-        observations=observations,
-    ) == 1
-
-    assert store.retire_projection_feed(
-        deployment="deployment",
-        repository="o/r",
-        role="fix",
-    ) == 1
-
-    retirement = published[-1].payload
-    assert isinstance(retirement, WorldFeedRetired)
-    assert retirement.restartable is True
-    assert ("issue", 7) not in fold(published).world_facts
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM world_observations "
-            "WHERE deployment='deployment'"
-        ).fetchone()[0] == 0
-
-    assert store.record_world_snapshot(
-        deployment="deployment",
-        subject_kind="issue",
-        observations=observations,
-    ) == 1
-    assert fold(published).world_facts[("issue", 7)] == facts
-
-
-def test_world_observation_dedup_is_latest_state_and_outbox_atomic(tmp_path):
-    store = _store(tmp_path)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    sequence = 0
-
-    def factory(payload, correlation):
-        nonlocal sequence
-        event = EventEnvelope(
-            payload,
-            new_event_id(NOW + timedelta(milliseconds=sequence)),
-            sequence,
-            NOW + timedelta(milliseconds=sequence),
-            NOW + timedelta(milliseconds=sequence),
-            sequence,
-            producer,
-            correlation,
-        )
-        sequence += 1
-        return event
-
-    store.bind_event_outbox(
-        factory,
-        lambda _event: (_ for _ in ()).throw(RuntimeError("sink down")),
-    )
-    common = {
-        "deployment": "deployment",
-        "subject_kind": "issue",
-        "subject_number": 7,
-        "correlation": Correlation(issue=7),
-    }
-    assert store.record_world_observation(
-        **common, content_hash="A", facts={"state": "open"}
-    )
-    assert not store.record_world_observation(
-        **common, content_hash="A", facts={"state": "open"}
-    )
-    assert store.record_world_observation(
-        **common, content_hash="B", facts={"state": "closed"}
-    )
-    assert store.record_world_observation(
-        **common, content_hash="A", facts={"state": "open"}
-    )
-
-    published = []
-    store.bind_event_outbox(factory, published.append)
-    observations = [
-        event.payload
-        for event in published
-        if isinstance(event.payload, WorldObserved)
-    ]
-    assert [event.content_hash for event in observations] == ["A", "B", "A"]
-
 
 def test_legacy_spend_import_preserves_all_live_cap_dimensions(tmp_path):
     store = _store(tmp_path)
@@ -2982,7 +2461,7 @@ def test_a_claim_with_an_unreadable_row_is_skipped(tmp_path) -> None:
 
 def _selected_review_claim_request(store, request):
     from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, IssueRef, PullRequestRef
+    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, PullRequestRef
     from issue_agent.adapters.workflow_codec import encode_workflow
     from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
     from tests.fakes.review_workflow import held
@@ -3512,7 +2991,8 @@ def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change
 def _retained_schema_rows(db):
     from issue_agent.adapters.workflow_codec import encode_workflow
     retired = {'review_archive_identity_members', 'review_archive_identity_certifications',
-               'review_archive_source_versions', 'schema_migrations'}
+               'review_archive_source_versions', 'schema_migrations',
+               'event_outbox', 'world_observations', 'level_state'}
     tables = tuple(row[0] for row in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     ) if row[0] not in retired)
@@ -3664,9 +3144,6 @@ def test_v34_unrelated_writes_need_no_retired_projection_witness(tmp_path):
 @pytest.mark.parametrize("recovered,actual", [(0, 0), (0, 1_250_000), (1_000_000, 1_250_000), (1_250_000, 50)])
 def test_normal_return_corrects_terminal_recovery_idempotently(tmp_path, recovered, actual, earlier_receipt):
     store = _store(tmp_path)
-    published = []
-    store.bind_event_outbox(lambda payload, correlation: EventEnvelope(payload, new_event_id(NOW), len(published), NOW, NOW,
-                            len(published), Producer("test", "o/r", "fix", 123, "boot"), correlation), published.append)
     request = dataclasses.replace(_request(1), owner_id="o/r:fix")
     assert store.reserve(request, lease=Lease(request.run_id, request.dispatch_id, request.owner_id,
                                              123, 123, NOW, 99)).admitted
@@ -3686,11 +3163,9 @@ def test_normal_return_corrects_terminal_recovery_idempotently(tmp_path, recover
     assert restarted.settle(normal).idempotent
     assert restarted.settle(dataclasses.replace(normal, amount=Money("USD", actual + 1))).disposition is AccountingDisposition.CONFLICT
     assert restarted.snapshot(_scope()).settled == Money("USD", actual)
-    assert sum(fold(published).spend_micros_by_basis.values()) == actual
-    assert fold(published).spend_micros_by_basis.get("estimate", 0) == 0
-    corrections = [e.payload for e in published if isinstance(e.payload, ControlTransitionCommitted)
-                   and e.payload.entity_kind == "accounting" and e.payload.state == "corrected"]
-    assert len(corrections) == 1 and corrections[0].attributes["previous_amount_micros"] == recovered
+    with store.transaction() as db:
+        assert [tuple(row) for row in db.execute("SELECT amount_micros,basis FROM charges WHERE run_id='run-1'")] == [
+            (actual, "provider_reported")]
     with store.transaction() as db:
         assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("completed", "settled")
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
@@ -3923,7 +3398,7 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
     store.initialize()
 
     with sqlite3.connect(store.path) as db:
-        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 45
+        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 46
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert [row[0] for row in db.execute("SELECT command_id FROM lifecycle_commands")] == ["plain-cmd"]
         assert [row[0] for row in db.execute("SELECT command_id FROM effect_receipts")] == ["plain-cmd"]
@@ -3941,8 +3416,7 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
             ("run-1", "abandoned", "spend_unmeasured_released", "released"),
             ("run-2", "reserved", None, "active")]
         assert db.execute("SELECT run_id FROM leases").fetchall() == []
-        assert sorted(row[0] for row in db.execute("SELECT event_id FROM event_outbox")) == [
-            "fix-pending", "steward-emitted"]
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='event_outbox'").fetchall() == []
 
 
 def test_migration_44_rewrites_steward_out_of_episode_json_on_both_branches(tmp_path):

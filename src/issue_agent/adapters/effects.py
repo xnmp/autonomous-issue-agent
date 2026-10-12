@@ -57,7 +57,7 @@ from ..domain.effect_retry import (
     exhausted_effect_advice,
     exhausted_effect_reason,
 )
-from ..domain.events import Correlation, LevelChanged, TelemetryEvent
+from ..domain.events import Correlation, EscalationRaised, LevelChanged, TelemetryEvent
 from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
 from .control_store import ControlStoreError, PendingCommand
@@ -497,13 +497,14 @@ class GitHubEffectExecutor:
         the action funnel. Its receipt can settle SUCCEEDED on the direct
         write, on a scheduled or reconciliation read after a lost reply, or in
         a restart's recovery, so the signal is claimed from the durable
-        receipts after each drain instead of on one of those paths. The
-        journal event commits with the claim (the control store's outbox,
-        always bound in a composed daemon); the alert follows it.
+        receipts after each drain instead of on one of those paths. The claim
+        deduplicates the journal line and the alert that follow it.
         """
         if not _REVIEW_ROLE_COMMAND_KINDS <= self.owned_kinds:
             return
         for number in self.store.claim_escalation_signals(self.repository, self.identity):
+            if self.journal is not None:
+                self.journal.emit(TelemetryEvent(EscalationRaised("pr", number), Correlation(pr=number)))
             alert(self.alert_cmd, json.dumps({"event": "escalation", "target": "pr", "number": number}, sort_keys=True))
 
     def _execute_review_guarded(self, op: ReviewFamilyOp, pending) -> bool:

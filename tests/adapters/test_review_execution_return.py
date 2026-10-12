@@ -54,41 +54,6 @@ def test_launched_return_commits_exact_output_and_charge_without_projecting_the_
         assert tuple(db.execute("SELECT closure_json,outcome_json FROM review_execution_rounds").fetchone()) == (None, None)
 
 
-@pytest.mark.parametrize("is_error", [True, False])
-def test_cohort_execution_outcome_comes_from_paid_child_return_not_settlement(admitted, is_error):
-    from issue_agent.adapters.measurement import export_cohort
-    from issue_agent.domain.cohort import CohortWindow
-    store, _, proposed = admitted
-    register(store, proposed)
-    evidence = returned(store, proposed, result=AgentResult(is_error, status="error" if is_error else "APPROVE",
-        exit_reason=ExitReason.KILLED_EXTERNALLY if is_error else ExitReason.OK))
-    assert store.settle_review_return(settlement(proposed), evidence).disposition is AccountingDisposition.AVAILABLE
-    at = store.now()
-    result = export_cohort(store.path, CohortWindow("o/r", at, at + timedelta(minutes=1), at + timedelta(minutes=2), primary_family="review_execution"))
-    assert result["failed_or_abandoned_spend_micros"] == ({"USD:provider_reported":12} if is_error else {})
-    assert result["failed_or_abandoned_spend_coverage"]["complete"]
-
-
-@pytest.mark.parametrize("change", ["owner", "run", "child"])
-def test_cohort_refuses_a_return_that_disagrees_with_its_paid_child(admitted, change):
-    from issue_agent.adapters.measurement import export_cohort
-    from issue_agent.domain.cohort import CohortWindow
-    store, _, proposed = admitted
-    register(store, proposed)
-    evidence = returned(store, proposed)
-    assert store.settle_review_return(settlement(proposed), evidence).disposition is AccountingDisposition.AVAILABLE
-    bad = (replace(evidence, owner_id="o/r:review:other") if change == "owner" else
-           replace(evidence, run_id="another-run") if change == "run" else
-           replace(evidence, child=replace(evidence.child, child_id="another-child")))
-    with store.transaction() as db:
-        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-return' AND key=?", (encode_workflow(bad), evidence.run_id))
-    at = store.now()
-    result = export_cohort(store.path, CohortWindow("o/r", at, at + timedelta(minutes=1), at + timedelta(minutes=2), primary_family="review_execution"))
-    assert not result["failed_or_abandoned_spend_coverage"]["complete"]
-    assert result["run_execution_observations"][0]["outcome"] == "unknown"
-    assert any("invalid execution review-execution-return" in gap for gap in result["coverage_gaps"])
-
-
 def test_exact_return_and_settlement_replay_are_inert(admitted):
     store, _, proposed = admitted
     register(store, proposed)

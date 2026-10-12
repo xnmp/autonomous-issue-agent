@@ -150,7 +150,6 @@ class ReservationRecoveryState:
 class ReservationRecoveryDecision:
     action: ReservationRecoveryAction
     report_spend_unknown: bool = False
-    record_abandonment: bool = False
 
 
 def decide_reservation_recovery(
@@ -160,16 +159,12 @@ def decide_reservation_recovery(
 
     if state.lease is LeaseEvidence.LIVE:
         return ReservationRecoveryDecision(ReservationRecoveryAction.PRESERVE)
-    abandoned = state.lease is LeaseEvidence.RECLAIMED
     if state.spend is SpendEvidence.UNCHECKED:
         return ReservationRecoveryDecision(
             ReservationRecoveryAction.RECONCILE_SPEND
         )
     if state.spend is SpendEvidence.SETTLED:
-        return ReservationRecoveryDecision(
-            ReservationRecoveryAction.COMPLETE,
-            record_abandonment=abandoned,
-        )
+        return ReservationRecoveryDecision(ReservationRecoveryAction.COMPLETE)
     if state.unlaunched_release is ReleaseEvidence.UNCHECKED:
         return ReservationRecoveryDecision(
             ReservationRecoveryAction.RELEASE_UNLAUNCHED
@@ -178,7 +173,6 @@ def decide_reservation_recovery(
         return ReservationRecoveryDecision(
             ReservationRecoveryAction.COMPLETE,
             report_spend_unknown=True,
-            record_abandonment=True,
         )
     if state.retained_release is ReleaseEvidence.UNCHECKED:
         return ReservationRecoveryDecision(
@@ -189,5 +183,4 @@ def decide_reservation_recovery(
         report_spend_unknown=(
             state.retained_release is ReleaseEvidence.RELEASED
         ),
-        record_abandonment=abandoned,
     )

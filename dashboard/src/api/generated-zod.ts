@@ -1858,32 +1858,6 @@ const endpoints = makeApi([
   },
   {
     method: "get",
-    path: "/api/repos/:name/measurement",
-    alias: "api_measurement_api_repos__name__measurement_get",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "specification",
-        type: "Query",
-        schema: z.string().max(65536),
-      },
-    ],
-    response: z.unknown(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "get",
     path: "/api/repos/:name/overview",
     alias: "api_overview_api_repos__name__overview_get",
     requestFormat: "json",

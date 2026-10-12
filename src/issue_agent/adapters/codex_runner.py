@@ -691,8 +691,7 @@ def codex_cost_usd(
     """Pure: token counters × the configured USD-per-MILLION-token rates.
 
     Both rates 0 → 0.0: an operator who zeroes the price table opts out of
-    codex spend tracking entirely, and gets a loud "the caps cannot see this
-    runtime" warning instead (see `codex_cost_blindspot_warning`). HarnessConfig
+    codex spend tracking entirely, and the caps cannot see this runtime. HarnessConfig
     ships non-zero list-price defaults, so this is an explicit choice, not the
     common path.
 
@@ -764,11 +763,10 @@ def budget_overrun_usd(
     - `max_budget_usd <= 0` — no bound was configured, so there is nothing to
       cross.
     - the priced spend is 0 — either no usage has been reported yet, or the
-      price table is zeroed. The latter is exactly the blind spot
-      `codex_cost_blindspot_warning` announces: a cap measured in dollars
-      cannot bound a runtime whose every run reads as free. Staying silent
-      keeps that failure mode "unbounded, and loudly warned about at boot"
-      rather than "silently bounded by a number nobody can measure".
+      price table is zeroed. A cap measured in dollars cannot bound a
+      runtime whose every run reads as free; staying silent keeps that
+      opt-out "unbounded" rather than "bounded by a number nobody can
+      measure".
 
     Returns the spend rather than a bool so the caller can report what the run
     had actually burned when it was stopped — a kill that cannot say how much
@@ -869,158 +867,6 @@ def rates_with_cache_for_model(
         if name == key:
             return rate_in, rate_out, rate_cached_in if rate_cached_in > 0 else rate_in
     return rate_in, rate_out, default_cache_read_rate(model, rate_in)
-
-
-def codex_cost_blindspot_warning(
-    *,
-    cost_per_mtok_in: float,
-    cost_per_mtok_out: float,
-    issue_spend_cap_usd: float,
-    daily_spend_cap_usd: float,
-    max_runtime: float = 0.0,
-    runtime_name: str = "FIXER_RUNTIME",
-    unpriced_cached_models: tuple[str, ...] = (),
-) -> str | None:
-    """The ONE startup line D12 requires: with a spend cap armed but no codex
-    price table, every codex run costs $0.00 on the ledger and neither cap can
-    ever fire. Returns None (silence) when the rates ARE configured or when no
-    cap is armed — there is nothing to mislead the operator about. The shipped
-    defaults are non-zero, so reaching this warning means someone zeroed them.
-
-    All three rates must be >0 to count as configured: pricing only the input
-    side, or leaving a model's cache tier at $0 (#89 — cache reads are the bulk
-    of a long leg's input), still under-counts every run, which is the same
-    blind spot in weaker form.
-
-    Per-run budget enforcement has its own warning below. Keeping these
-    diagnostics separate prevents a zero-price boot from emitting two
-    conflicting explanations of MAX_BUDGET_USD."""
-    if cost_per_mtok_in > 0 and cost_per_mtok_out > 0 and not unpriced_cached_models:
-        return None
-    if issue_spend_cap_usd <= 0 and daily_spend_cap_usd <= 0:
-        return None
-    caps = ", ".join(
-        part
-        for part in (
-            f"issue=${issue_spend_cap_usd:.2f}" if issue_spend_cap_usd > 0 else "",
-            f"daily=${daily_spend_cap_usd:.2f}" if daily_spend_cap_usd > 0 else "",
-        )
-        if part
-    )
-    # The scalars come first when either is wrong: a zeroed cache tier on top of
-    # them is a symptom, and naming three knobs at once names none of them.
-    if cost_per_mtok_in <= 0 or cost_per_mtok_out <= 0:
-        knob = "both CODEX_COST_PER_MTOK_IN/OUT must be positive"
-        remedy = "Set both to your gateway's USD-per-million-token prices."
-        consequence = (
-            "every codex run records $0.00 and NEITHER cap can ever fire"
-            if cost_per_mtok_in <= 0 and cost_per_mtok_out <= 0
-            else "one token class is unpriced, so codex spend is undercounted "
-            "and neither cap is a reliable ceiling"
-        )
-    else:
-        knob = (
-            "the CACHED_IN rate in CODEX_COST_PER_MTOK must be positive for "
-            + ", ".join(unpriced_cached_models)
-        )
-        remedy = (
-            "Set it to your gateway's cached-input price, or omit the component "
-            "for the list-price default."
-        )
-        consequence = (
-            "cache reads price at $0.00, so codex spend is undercounted and "
-            "neither cap is a reliable ceiling"
-        )
-    if max_runtime > 0:
-        per_run = (
-            "Codex has no per-session budget flag natively; until pricing is "
-            f"complete, the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s) "
-            "is the only in-run bound"
-        )
-    else:
-        per_run = (
-            "Codex has no per-session budget flag natively and "
-            "AGENT_MAX_RUNTIME_SECONDS is unset; CODEX_MAX_RUNTIME_SECONDS is "
-            "unset because it is not a valid setting"
-        )
-    return (
-        "codex: WARNING — spend caps are armed "
-        f"({caps}) but {knob}; "
-        f"{consequence}. {remedy} {per_run}. ({runtime_name}=codex)"
-    )
-
-
-def codex_budget_not_enforced_warning(
-    *,
-    fix_budget_usd: float,
-    max_runtime: float = 0.0,
-    enforced: bool = False,
-    priced: bool = False,
-    pricing_gap: str = "",
-    budget_name: str = "MAX_BUDGET_USD",
-    runtime_name: str = "FIXER_RUNTIME",
-) -> str | None:
-    """The half of `codex_cost_blindspot_warning` that has nothing to do with
-    pricing, split out so it can actually be seen (#29).
-
-    `build_codex_argv` still has no analogue of the SDK's per-session budget
-    flag, so the ONLY thing that can bound a codex run is the harness watching
-    the session's own streamed token counters and killing it — which is what
-    `CodexRunner.enforce_budget` now does. When that check is live AND the
-    price table is set, MAX_BUDGET_USD is a real ceiling and this function
-    returns an informational notice distinguishing native CLI support from the
-    active harness enforcement.
-
-    It is NOT live in two cases, and each gets named explicitly rather than
-    hidden behind one vague sentence:
-
-    - `enforced=False` (CODEX_ENFORCE_BUDGET=0) — the operator opted out.
-    - `priced=False` (an input, output or cached-input rate is missing) — an
-      unpriced token class can grow without moving the measured spend.
-      Enforcement is armed but cannot provide an honest dollar ceiling.
-      `pricing_gap` names the rate that is actually missing (default: the
-      IN/OUT scalars), so the line does not send an operator to knobs that are
-      already correct.
-
-    The defaults are the pessimistic pair on purpose: a caller that forgets to
-    say enforcement is live gets the loud line, never a false all-clear.
-
-    Returns None when no fix budget is configured — there is then no number
-    being misreported, and nothing to correct.
-
-    History: this text used to live inside the blindspot warning, which returns
-    early when the price table is set — so the operators who had configured
-    pricing CORRECTLY were exactly the ones who never saw it (observed: keifu
-    2026-07-28, a $28.74 resolve against MAX_BUDGET_USD=20, zero grep matches
-    in the logs).
-    """
-    if fix_budget_usd <= 0:
-        return None
-    if enforced and priced:
-        return (
-            "codex: NOTICE — the native per-session budget flag is NOT ENFORCED "
-            "on this runtime because codex has no such flag; harness enforcement "
-            f"ACTIVE for {budget_name}=${fix_budget_usd:.2f} using streamed "
-            f"rollout usage. ({runtime_name}=codex)"
-        )
-    bound = (
-        f"the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
-        if max_runtime > 0
-        else "NOTHING (AGENT_MAX_RUNTIME_SECONDS is unset — "
-        "CODEX_MAX_RUNTIME_SECONDS is unset because it is not a valid setting)"
-    )
-    why = (
-        "CODEX_ENFORCE_BUDGET=0"
-        if not enforced
-        else f"{pricing_gap or 'both CODEX_COST_PER_MTOK_IN and CODEX_COST_PER_MTOK_OUT'}"
-        " must be positive, so the check cannot measure a reliable dollar ceiling"
-    )
-    return (
-        f"codex: WARNING — {budget_name}=${fix_budget_usd:.2f} is NOT ENFORCED "
-        f"on this runtime ({why}): codex has no per-session budget flag, so "
-        f"{bound} limits a single run, and the issue/daily spend caps (checked "
-        f"only BETWEEN legs) are the first real ceiling. ({runtime_name}=codex)"
-    )
 
 
 # ── the runtime could not start (keifu #130) ─────────────────────────────────
@@ -1139,13 +985,6 @@ def parse_codex_envelope(
         }
     else:
         usage = parse_codex_usage(stderr)
-    stderr_warning = (
-        "Codex reported usage only on stderr; retained as untrusted telemetry "
-        "and excluded from pricing and budget enforcement"
-        if usage is not None
-        and usage.get("source") == UsageSource.STDERR.value
-        else ""
-    )
     cost = codex_cost_usd(
         usage,
         cost_per_mtok_in=cost_per_mtok_in,
@@ -1170,7 +1009,6 @@ def parse_codex_envelope(
                 session_id=session_id,
                 cost_usd=cost,
                 usage=usage,
-                telemetry_warning=stderr_warning,
                 exit_reason=(
                     ExitReason.RUNTIME_UNAVAILABLE
                     if stillborn
@@ -1180,7 +1018,6 @@ def parse_codex_envelope(
         return AgentResult(
             is_error=False, summary=raw[:2000], session_id=session_id,
             cost_usd=cost, usage=usage,
-            telemetry_warning=stderr_warning,
             exit_reason=ExitReason.OK,
         )
 
@@ -1197,7 +1034,6 @@ def parse_codex_envelope(
         # no rates are configured or codex printed no usage line.
         cost_usd=cost,
         usage=usage,
-        telemetry_warning=stderr_warning,
         session_id=session_id,
         structured=structured,
         # A parsed envelope means the agentic loop reached its own terminal —
@@ -1276,8 +1112,8 @@ class CodexRunner(AgentRuntime):
     max_rate_limit_retries: int = 5
     # Price table for codex spend (review M1 / D12), USD per MILLION tokens. Both
     # 0 (the default) → cost_usd stays 0.0 and codex runs never reach the ledger,
-    # which is exactly the blind spot `codex_cost_blindspot_warning` announces at
-    # startup. Set them and every codex run becomes visible to both spend caps.
+    # so the caps cannot see codex. Set them and every codex run becomes visible
+    # to both spend caps.
     cost_per_mtok_in: float = 0.0
     cost_per_mtok_out: float = 0.0
     # PER-MODEL overrides of the scalar rates above (#43): (model, in, out, cached-in), USD
@@ -1295,9 +1131,8 @@ class CodexRunner(AgentRuntime):
     # process group and returns ExitReason.BUDGET_EXHAUSTED — the same exit the
     # Claude SDK's `error_max_budget_usd` maps to, so retry/escalation needs no
     # codex special case. False (CODEX_ENFORCE_BUDGET=0) keeps the old
-    # behaviour where the wall cap is the only per-run bound; the boot line and
-    # `codex_budget_not_enforced_warning` then say so instead of claiming a
-    # guarantee. Also inert when the price table is zeroed — see
+    # behaviour where the wall cap is the only per-run bound. Also inert when
+    # the price table is zeroed — see
     # `budget_overrun_usd` for why a $0.00-per-run runtime must not be killed
     # on a dollar threshold.
     enforce_budget: bool = True
@@ -1639,8 +1474,7 @@ class CodexRunner(AgentRuntime):
                 final=True,
             )
             amount = price_run_usage(observed, native_meter.rates)
-            result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000,
-                             telemetry_warning=result.telemetry_warning or (observed.detail if isinstance(observed, EstimatedRunUsage) else ""))
+            result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
             if self.enforce_budget and task.max_budget_usd > 0 and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros:
                 result = replace(result, is_error=True, status=MAX_BUDGET_STATUS,
                                  envelope_subtype=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
@@ -2424,7 +2258,6 @@ class CodexRunner(AgentRuntime):
                 "token usage; cost telemetry, spend caps, and resume may be blind"
             )
             self._log(f"codex: TELEMETRY WARNING — {warning}")
-            result = _replace(result, telemetry_warning=warning)
         if exit_code < 0 and not hung:
             # A NEGATIVE returncode means terminated by signal -exit_code, and we did
             # not do it (our own killpg paths set `hung` and returned above). So this

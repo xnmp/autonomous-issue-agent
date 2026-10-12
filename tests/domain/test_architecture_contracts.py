@@ -441,29 +441,6 @@ def test_application_event_producers_cannot_emit_free_form_names() -> None:
     assert violations == []
 
 
-def test_legacy_jsonl_compatibility_is_read_only() -> None:
-    journal = (
-        ROOT / "src" / "issue_agent" / "adapters" / "journal.py"
-    )
-    tree = ast.parse(journal.read_text(), filename=str(journal))
-    locator = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "LegacyJournalLocator"
-    )
-    assert not any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "emit"
-        for node in locator.body
-    )
-    assert not any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "event_line"
-        for node in tree.body
-    )
-
-
 def test_legacy_json_lifecycle_queue_is_removed() -> None:
     forbidden = ("pending-actions.json", "quarantined-actions.json")
     violations = [
@@ -542,7 +519,6 @@ def test_architecture_docs_name_authoritative_subsystems() -> None:
         "app/",
         "sqlite",
         "effect",
-        "schema-v2",
         "supervision",
         "dashboard",
     ):
@@ -555,7 +531,7 @@ def test_architecture_docs_name_authoritative_subsystems() -> None:
         "run/process ownership",
         "deduplication",
         "gate evidence",
-        "telemetry/dashboard",
+        "logs/dashboard",
     ):
         assert authority in matrix
 

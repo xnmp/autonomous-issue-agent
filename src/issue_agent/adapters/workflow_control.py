@@ -17,7 +17,6 @@ from ..domain.contracts import EffectStatus, PricingBasis, WorkflowAttemptIdenti
 from ..domain import continuation_components as cc
 from ..domain.actions import Target
 from ..domain.labels import Label
-from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
 from ..domain.backoff import LegEnd
@@ -277,9 +276,6 @@ class SQLiteWorkflowControl:
             self._persist_snapshot(db, after)
             self._control._enqueue_command(db, command)
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('issue-reply-noop',?,?,?,?)", (self.writer.repository, receipt_key, self._control._now().isoformat(), request))
-            if self._control._event_factory is not None:
-                event = ControlTransitionCommitted("issue_reply", receipt_key, "consumed_blank", {"reply_at": reply_at, "command_id": str(command.command_id)})
-                self._control.enqueue_event(self._control._event_factory(event, Correlation(issue=binding.fence.key.target.number)), db)
             return True
 
     def resolve_control_view(self, key: WorkflowKey, *, request_id: str | None = None) -> ResolveControlRead:
@@ -349,9 +345,6 @@ class SQLiteWorkflowControl:
                 "INSERT INTO workflow_evidence VALUES (?, ?, ?, ?, NULL, 'observation', ?)",
                 (snapshot.episode.episode_id, *scope, encode_workflow(observation)),
             )
-            self._control._transition(db, "workflow", encode_workflow(observation.key), "discovered",
-                                      {"generation": snapshot.revision.fence.generation,
-                                       "version": snapshot.revision.version, "epoch": authority.epoch})
             return WorkflowCommitted(snapshot)
 
     def lookup_rearm(self, key: WorkflowKey, request_id: str) -> RearmIntent | None:
@@ -472,10 +465,6 @@ class SQLiteWorkflowControl:
                         ).hexdigest()
                         reason = "Invalid re-arm request index; " + reason[:16000]
                     self._schedule_rearm_audit(db, raw_key, next_read)
-                    self._control._transition(
-                        db, "workflow_rearm", record_key, "authority_unavailable",
-                        {"reason": reason, "next_read_at": next_read.isoformat()},
-                    )
                     pending.append(UnavailableResolveRearm(record_key, reason, next_read))
                 finally:
                     db.execute("RELEASE pending_rearm")
@@ -504,11 +493,6 @@ class SQLiteWorkflowControl:
                 raise WorkflowAuthorityError("re-arm observation schedule changed before deferral")
             if after != state:
                 self._persist_snapshot(db, after)
-            self._control._transition(
-                db, "workflow_rearm", state.intent.request_id, "observation_deferred",
-                {"failed_reads": deferred.history.failed_reads,
-                 "next_read_at": deferred.history.next_read_at.isoformat()},
-            )
 
     def _rearm_command_facts(
         self, db: sqlite3.Connection, state: WorkflowSnapshot,
@@ -871,8 +855,6 @@ class SQLiteWorkflowControl:
         self._persist_snapshot(db, after)
         self._insert_return_record(db, "workflow-return-disposition", returned,
                                    encode_workflow(RetiredResolveReturn(returned.attempt, prior.binding)))
-        self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "retired",
-                                  {"generation": prior.revision.fence.generation})
         return after
 
     def capture_return(self, returned: ReturnedResolve) -> WorkflowCommitted | WorkflowConflict:
@@ -899,8 +881,6 @@ class SQLiteWorkflowControl:
         self._insert_return_record(db, "workflow-return-observation", returned, encode_workflow(pending), at=pending.next_read_at)
         after = update_return_observation(prior, returned, pending)
         self._persist_snapshot(db, after)
-        self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "captured",
-                                  {"generation": after.revision.fence.generation})
         return WorkflowCommitted(after)
 
     def settle_return(self, request: SettlementRequest, returned: ReturnedResolve) -> SettlementResult:
@@ -981,8 +961,6 @@ class SQLiteWorkflowControl:
                         record_key = "invalid-index:" + hashlib.sha256(repr(record_key).encode("utf-8", "backslashreplace")).hexdigest()
                         reason = "Invalid paid return index; " + reason[:16000]
                     self._schedule_return_audit(db, row["run_id"], next_read)
-                    self._control._transition(db, "workflow_return", record_key, "authority_unavailable",
-                                              {"reason": reason, "next_read_at": next_read.isoformat()})
                     pending.append(UnavailableResolveReturn(record_key, reason, next_read))
                 finally:
                     db.execute("RELEASE returned_observation")
@@ -1014,8 +992,6 @@ class SQLiteWorkflowControl:
             db.execute("UPDATE dedupe_keys SET claimed_at=?,payload_json=? WHERE namespace='workflow-return-observation' AND scope=? AND key=?",
                        (pending.next_read_at.isoformat(), encode_workflow(pending), self.writer.repository, str(returned.attempt.run_id)))
             self._persist_snapshot(db, update_return_observation(prior, returned, pending))
-            self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "observation_deferred",
-                                      {"failed_reads": pending.failed_reads, "next_read_at": pending.next_read_at.isoformat()})
 
     def _require_return(self, db: sqlite3.Connection, returned: ReturnedResolve) -> None:
         row = self._return_row(db, "workflow-return", returned)
@@ -1084,8 +1060,6 @@ class SQLiteWorkflowControl:
                                        encode_workflow(FinalizedResolveReturn(classified, issue, linkage, tuple(commands))))
             if cleanup is not None:
                 self._insert_return_record(db, "workflow-return-cleanup", returned, encode_workflow(cleanup))
-            self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "finalized",
-                                      {"classification": classified.kind.value, "commands": commands})
             return WorkflowCommitted(after)
 
     @contextmanager
@@ -1291,11 +1265,6 @@ class SQLiteWorkflowControl:
                 (WORKSPACE_ACK_NAMESPACE, self.writer.repository, handoff.handoff_id,
                  completed.observed_at.isoformat(), encode_workflow(completed)),
             )
-            self._control._transition(
-                db, "workflow_workspace", handoff.handoff_id, "verified",
-                {"archive_ref": completed.result.archive_ref,
-                 "generation": completed.performed_under.fence.generation},
-            )
             return completed
 
     def prepared_workspace(
@@ -1355,9 +1324,6 @@ class SQLiteWorkflowControl:
                 "VALUES ('workflow-result', ?, ?, ?, ?)",
                 (self.writer.repository, str(result.attempt.run_id), self._control._now().isoformat(), encoded),
             )
-            self._control._transition(db, "workflow_attempt", str(result.attempt.run_id), result.kind.value,
-                                      {"generation": result.attempt.binding.fence.generation,
-                                       "current_generation": after.revision.fence.generation})
             return WorkflowCommitted(after)
 
     def commit_workflow(

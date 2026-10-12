@@ -254,20 +254,6 @@ def test_rowless_activation_keeps_its_recorded_ceiling_and_digest(deployment, ca
     assert dump(store) == before
 
 
-def test_activation_records_its_event_through_the_committed_outbox(deployment, capsys):
-    state, store, _ = deployment
-    seed(state)
-    _, reviewed, _ = run(capsys, "shadow")
-    assert run(capsys, "activate", "--confirm-plan-digest", reviewed["plan"]["plan_digest"])[0] == 0
-    with closing(sqlite3.connect(store.path)) as db:
-        rows = [(json.loads(raw), emitted) for raw, emitted in db.execute(
-            "SELECT event_json, emitted_at FROM event_outbox")]
-    activations = [(event, emitted) for event, emitted in rows if "workflow_activation" in json.dumps(event)]
-    assert len(activations) == 1 and activations[0][1] is not None
-    feed = (state / "events-v2.jsonl").read_text()
-    assert "workflow_activation" in feed and reviewed["plan"]["source_digest"] in feed
-
-
 def test_every_role_root_and_named_older_root_is_imported(deployment, capsys, tmp_path):
     state, store, env = deployment
     review = Path(env["REVIEW_STATE_DIR"])

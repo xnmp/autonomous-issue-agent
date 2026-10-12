@@ -491,7 +491,7 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
         "'child': {k: os.environ.get(k) for k in ("
         "'ISSUE_AGENT_AUTHORITY_BUNDLE', 'ISSUE_AGENT_CONTROL_DB', "
         "'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID', "
-        "'ISSUE_AGENT_BASE_BRANCH', 'ISSUE_AGENT_EVENT_LOG')}, "
+        "'ISSUE_AGENT_BASE_BRANCH')}, "
         "'carrier': _process_environment(os.getppid())}))"
     )
     command = supervisor.supervised_command(
@@ -509,7 +509,6 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
             "ISSUE_AGENT_RUN_ID": str(run_id),
             "ISSUE_AGENT_OWNER_ID": request.owner_id,
             "ISSUE_AGENT_BASE_BRANCH": "canary/live",
-            "ISSUE_AGENT_EVENT_LOG": str(tmp_path / "events.jsonl"),
             "ISSUE_AGENT_AUTHORITY_BUNDLE": bundle,
         },
         check=False,
@@ -525,7 +524,6 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
         "ISSUE_AGENT_RUN_ID": None,
         "ISSUE_AGENT_OWNER_ID": None,
         "ISSUE_AGENT_BASE_BRANCH": None,
-        "ISSUE_AGENT_EVENT_LOG": None,
     }
     assert result["carrier"] == authority
 

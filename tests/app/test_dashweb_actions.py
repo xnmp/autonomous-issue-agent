@@ -7,6 +7,7 @@ enough to prove nothing. What matters is the command: `start` must go through
 edit so a half-applied change cannot leave an issue with no priority at all.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 import shlex
@@ -14,6 +15,7 @@ import shlex
 import pytest
 
 from issue_agent.adapters.dashweb import actions, costchart
+from issue_agent.adapters.journal import read_events
 from issue_agent.app.dashweb import guidance as guidance_rules
 from issue_agent.app.dashweb import service
 
@@ -401,9 +403,9 @@ def _unblock_backend(
         now_fn=lambda: datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
     )
     monkeypatch.setattr(
-        backend._collector,
-        "collect",
-        lambda **_kwargs: dash.Snapshot(
+        backend,
+        "_deployment_snapshot",
+        lambda *_args, **_kwargs: dash.Snapshot(
             "demo", "o/r", "/t", deployment, ()
         ),
     )
@@ -424,12 +426,26 @@ def test_unblock_drops_the_holding_labels_and_names_the_operator_action(
     assert set(kwargs["remove"]) == set(actions.UNBLOCK_LABELS)
 
 
-def _journalled(dirs):
-    from issue_agent.adapters.event_log import read_event_log
+@dataclass(frozen=True)
+class _Journalled:
+    kind: str
+    number: int | None
+    target: str
+    display: str
+    attributes: dict
 
+
+def _journalled(dirs):
     return [
-        event.payload
-        for event in read_event_log(str(dirs["fix"] / "events-v2.jsonl")).events
+        _Journalled(
+            kind=line["action"]["type"],
+            number=line["action"].get("number"),
+            target=str(line["action"].get("target", "")).lower(),
+            display=line["desc"],
+            attributes=line["action"],
+        )
+        for line in read_events(str(dirs["fix"] / "journal.jsonl"))
+        if line.get("event") == "action"
     ]
 
 
@@ -723,15 +739,6 @@ def test_unblock_on_an_issue_with_no_pr_clears_what_it_can(monkeypatch, tmp_path
 
     assert backend.unblock("demo", 7) == (True, "ok")
     assert not (dirs["fix"] / "issue-7.ci-retries").exists()
-
-
-def test_the_operator_journal_is_opened_once_per_deployment(monkeypatch, tmp_path):
-    """Opening an EventLog re-reads the whole feed under the writer lock the
-    daemons append through; one per request would stall a live fix loop."""
-    backend, _dirs, _calls = _unblock_backend(monkeypatch, tmp_path)
-    first = backend._operator_journal("demo", "o/r")
-    backend.unblock("demo", 7)
-    assert backend._operator_journal("demo", "o/r") is first
 
 
 def test_unblock_of_an_unknown_deployment_never_reaches_github(monkeypatch, tmp_path):

@@ -602,8 +602,6 @@ def test_repeatedly_lost_requests_reach_the_ceiling_instead_of_re_executing_fore
         # Fast ticks expose the schedule itself: each re-execution waits at
         # least twice as long as the one before.
         assert all(later >= 2 * earlier - 1 for earlier, later in zip(gaps, gaps[1:])), gaps
-    journal = (deployment.root / "fix-state" / "events-v2.jsonl").read_text()
-    assert journal.count('"reexecution_ceiling"') == 1  # the cap is journalled once
     view = client.read()
     gate = _retry_gate(view)
     assert gate is not None and gate["cause"]["command_id"] == command_id
@@ -1211,7 +1209,6 @@ def activation_cli(bare, monkeypatch, capsys):
     # These stopped activation sources exercise resolve/fix authority. Stall
     # telemetry has its separate F12 parser and explicit refusal case below.
     from issue_agent.app import roles
-    monkeypatch.setattr(roles, "_stall_reporter", lambda *_args: lambda *_report_args: None)
 
     from issue_agent.app import continuation_activation
     original_scope = continuation_activation.activation_scope

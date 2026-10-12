@@ -13,4 +13,3 @@
   disposition.
 - **world** — one authoritative GitHub observation used by pure decision logic.
 - **outcome** — typed interpretation of a completed/cancelled run.
-- **projection** — rebuildable read model folded from schema-v2 telemetry.

@@ -754,206 +754,16 @@ def _write_jsonl(path: str, *lines: str) -> None:
             f.write(line + "\n")
 
 
-def test_status_merges_all_journals_in_global_ts_order(tmp_path):
-    """review M11: a STATE_DIR-only read made review runs, spend
-    blocks, and escalations invisible to `issue-agent status`. Interleaved
-    events across both files must render as ONE global timeline."""
-    fix_j = str(tmp_path / "fix" / "journal.jsonl")
-    review_j = str(tmp_path / "review" / "journal.jsonl")
-    _write_jsonl(
-        fix_j,
-        json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run",
-                    "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
-    )
-    _write_jsonl(
-        review_j,
-        json.dumps({"ts": "2026-07-25T10:05:00+00:00", "event": "agent_run",
-                    "kind": "REVIEW", "number": 9, "cost_usd": 2.0, "status": "ok"}),
-        json.dumps({"ts": "2026-07-25T10:06:00+00:00", "event": "spend_block",
-                    "scope": "issue", "issue": 9}),
-        json.dumps({"ts": "2026-07-25T10:07:00+00:00", "event": "escalation",
-                    "target": "issue", "number": 3}),
-    )
-    now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    out = "\n".join(cli.spend_status_lines(
-        [fix_j, review_j],
-        10.0,
-        lambda: now,
-    ))
-    # review events reach the render — the M11 blind spot.
-    assert "REVIEW" in out and "#9" in out
-    assert "1 spend block(s) today" in out
-    assert "1 escalation(s) to needs-human-review in 24h" in out
-    # Global ts order: RESOLVE (10:00, fix) precedes REVIEW (10:05, review) in
-    # the "last runs" listing, matching timestamp order across files, not
-    # per-file read order.
-    assert out.index("RESOLVE") < out.index("REVIEW")
 
 
-def test_status_merge_anti_vacuity_single_populated_journal_unchanged(tmp_path):
-    """With only the fix journal populated (review never ran — its
-    file doesn't exist), passing the full journal_paths pair must render
-    IDENTICALLY to passing the fix journal alone (pre-M11 behaviour) — a role
-    that never ran must not perturb the output."""
-    fix_j = str(tmp_path / "fix" / "journal.jsonl")
-    _write_jsonl(
-        fix_j,
-        json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run",
-                    "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
-    )
-    missing_review = str(tmp_path / "review" / "journal.jsonl")
-    now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    out_single = cli.spend_status_lines(fix_j, 10.0, lambda: now)
-    out_multi = cli.spend_status_lines(
-        [fix_j, missing_review],
-        10.0,
-        lambda: now,
-    )
-    assert out_single == out_multi
-    assert out_single != []  # sanity: the fixture actually produced output
 
 
-def test_status_prefers_live_v2_runs_over_retired_legacy_journal(tmp_path):
-    from issue_agent.adapters.event_log import EventLog
-    from issue_agent.domain.events import (
-        AgentRunCompleted,
-        Correlation,
-        Producer,
-    )
-
-    state = tmp_path / "fix"
-    state.mkdir()
-    legacy = state / "journal.jsonl"
-    _write_jsonl(
-        str(legacy),
-        json.dumps({
-            "ts": "2026-07-24T10:00:00+00:00",
-            "event": "agent_run",
-            "kind": "RESOLVE",
-            "number": 1,
-            "cost_usd": 99.0,
-            "status": "old",
-        }),
-    )
-    EventLog(
-        str(state / "events-v2.jsonl"),
-        Producer("deployment", "owner/repo", "fix", 100, "boot"),
-    ).emit(
-        AgentRunCompleted(
-            "ok",
-            False,
-            None,
-            1_000,
-            "model",
-            "codex",
-            500_000,
-            "USD",
-            "configured_rate_card",
-            None,
-            None,
-            "REBASE",
-            {"number": 7},
-        ),
-        correlation=Correlation(issue=7),
-    )
-
-    output = "\n".join(
-        cli.spend_status_lines(
-            str(legacy),
-            now_fn=lambda: datetime.now(timezone.utc),
-            all_repositories_spent=0.5,
-        )
-    )
-
-    assert "REBASE" in output and "#7" in output and "$  0.50" in output
-    assert "RESOLVE" not in output and "$ 99.00" not in output
 
 
-def test_status_v2_summary_reports_spend_blocks_and_rotated_runs(tmp_path):
-    from issue_agent.adapters.event_log import EventLog
-    from issue_agent.domain.events import (
-        AgentRunCompleted,
-        Correlation,
-        Producer,
-        SpendBlocked,
-    )
-
-    state = tmp_path / "fix"
-    state.mkdir()
-    events = EventLog(
-        str(state / "events-v2.jsonl"),
-        Producer("deployment", "owner/repo", "fix", 100, "boot"),
-        max_bytes=1,
-    )
-    events.emit(
-        AgentRunCompleted(
-            "ok", False, None, 1_000, "model", "codex", 250_000, "USD",
-            "configured_rate_card", None, None, "REVIEW", {"number": 9},
-        ),
-        correlation=Correlation(pr=9),
-    )
-    events.emit(
-        SpendBlocked("issue", "exhausted", 2_000_000, 1_000_000, "USD", "cap"),
-        correlation=Correlation(issue=9),
-    )
-
-    output = "\n".join(
-        cli.spend_status_lines(
-            str(state / "journal.jsonl"),
-            now_fn=lambda: datetime.now(timezone.utc),
-            all_repositories_spent=0.25,
-        )
-    )
-
-    assert "REVIEW" in output and "#9" in output
-    assert "1 spend block(s) today (scope: issue)" in output
 
 
-def test_status_v2_summary_surfaces_all_malformed_typed_history(tmp_path):
-    state = tmp_path / "fix"
-    state.mkdir()
-    (state / "events-v2.jsonl").write_text("not json\n{truncated")
-    _write_jsonl(
-        str(state / "journal.jsonl"),
-        json.dumps({
-            "ts": "2026-07-24T10:00:00+00:00",
-            "event": "agent_run",
-            "kind": "RESOLVE",
-            "number": 1,
-            "cost_usd": 99.0,
-            "status": "old",
-        }),
-    )
-
-    output = "\n".join(
-        cli.spend_status_lines(
-            str(state / "journal.jsonl"),
-            now_fn=lambda: datetime.now(timezone.utc),
-        )
-    )
-
-    assert "skipped 2 malformed schema-v2 event line(s)" in output
-    assert "RESOLVE" not in output and "$ 99.00" not in output
 
 
-def test_status_merge_agent_run_start_does_not_appear_in_last_runs(tmp_path):
-    """The journal now also carries `agent_run_start` events (wave A's
-    pre-await receipt). The merged 'last runs' listing must only show settled
-    `agent_run` events, never the start half, or an in-flight/never-settled
-    run renders as if it completed."""
-    fix_j = str(tmp_path / "fix" / "journal.jsonl")
-    _write_jsonl(
-        fix_j,
-        json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run_start",
-                    "kind": "RESOLVE", "number": 1}),
-        json.dumps({"ts": "2026-07-25T10:00:05+00:00", "event": "agent_run",
-                    "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
-    )
-    now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    out = "\n".join(
-        cli.spend_status_lines(fix_j, 10.0, lambda: now)
-    )
-    assert out.count("RESOLVE") == 1
 
 
 def test_status_caps_resolve_overlay_then_shared_config(
@@ -3090,28 +2900,21 @@ def test_gh_login_rejects_a_literal_null_from_jq(monkeypatch):
 # ── `issue-agent status` reports operator interventions (unattended metric) ───
 def _operator_unblock_journal(state_dir: Path, issue: int, seq: int) -> None:
     """One journalled dashboard unblock, written the way the daemons write it."""
-    from issue_agent.adapters.event_log import EventLog
-    from issue_agent.domain.events import ActionApplied, Correlation, Producer
-
     state_dir.mkdir(parents=True, exist_ok=True)
-    EventLog(
-        str(state_dir / "events-v2.jsonl"),
-        Producer("app", "acme/app", "fix", 100, "boot"),
-    ).emit(
-        ActionApplied(
-            f"operator-unblock:{seq:x}",
-            "operator_unblock",
-            "issue",
-            f"operator unblock issue #{issue}: -ai-blocked",
-            issue,
-            {
+    with open(state_dir / "journal.jsonl", "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "ts": f"2026-07-25T10:0{seq}:00+00:00",
+            "event": "action",
+            "desc": f"operator unblock issue #{issue}: -ai-blocked",
+            "command_id": f"operator-unblock:{seq:x}",
+            "issue": issue,
+            "action": {
+                "type": "operator_unblock",
                 "add": [],
                 "remove": ["ai-blocked"],
                 "operator": "acme/app:dashboard",
             },
-        ),
-        correlation=Correlation(issue=issue),
-    )
+        }) + "\n")
 
 
 def test_cmd_status_reports_operator_interventions(tmp_path, monkeypatch, capsys):

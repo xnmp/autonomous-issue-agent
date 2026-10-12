@@ -270,11 +270,6 @@ class CodexRuntimeConfig:
         """Whether every configured model path has complete dollar pricing."""
         return not self.budget_pricing_gap
 
-    @property
-    def unpriced_cached_models(self) -> tuple[str, ...]:
-        """Models whose cache tier prices at $0 — cached spend is invisible."""
-        return tuple(model for model, rate in self.cost_per_mtok_cached_in if rate <= 0)
-
 
 @dataclass(frozen=True)
 class HarnessConfig:
@@ -535,8 +530,8 @@ class HarnessConfig:
     # free-tier limit killed two RESOLVE runs on 2026-07-27), and a fictional
     # price is the only thing that lets ISSUE/DAILY_SPEND_CAP_USD bound codex
     # TOKEN VOLUME at all. Override with your gateway's real rates if you pay
-    # per token; set both to 0 to opt out (spend goes untracked and the loud
-    # `codex_cost_blindspot_warning` fires at startup instead).
+    # per token; set both to 0 to opt out (spend goes untracked and the caps
+    # cannot bound codex).
     codex_cost_per_mtok_in: float = 5.0
     codex_cost_per_mtok_out: float = 30.0
     # PER-MODEL rates, which the two scalars above cannot express (#43). With

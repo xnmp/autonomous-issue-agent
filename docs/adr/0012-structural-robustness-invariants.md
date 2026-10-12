@@ -1,7 +1,7 @@
 # ADR 0012 — Structural robustness invariants (post-voyage)
 
 Status: Accepted
-Governs: src/issue_agent/domain/liveness.py src/issue_agent/adapters/agent_publish.py
+Governs: src/issue_agent/adapters/agent_publish.py
 
 Decided 2026-08-01.
 Evidence: the 2026-08-01 supervised keifu run (nine live defects; see
@@ -14,6 +14,9 @@ throughout: **prefer removing a write channel over adding a guard.** Removed
 channels cannot false-positive; guards charge agents in blocked legs.
 
 ## 1. No silent forever (built: stall watchdog)
+
+The stall watchdog (`domain/liveness.py` and the stall reporter) was deleted
+in refactor slice 8a; the standing rule below remains.
 
 Every incident shared a signature: a target stuck in a non-terminal state
 with nothing bounding or reporting the stuckness (advisory-UNSTABLE merge

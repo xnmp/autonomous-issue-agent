@@ -7,14 +7,12 @@ import hashlib
 import os
 import re
 import sqlite3
-import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from ..adapters.control_store import SQLiteControlStore
 from ..adapters.control_path import control_store_path
-from ..adapters.event_log import EventLog
 from ..adapters.github import GitHubGateway, parse_review_pages
 from ..adapters.resolve_activation import LegacyRoots, copy_for_rehearsal, distinct_roots, file_digests
 from ..adapters.review_activation import (
@@ -25,7 +23,6 @@ from ..adapters.review_effects import read_pull_request
 from ..adapters.review_linkage import read_review_linked_issue
 from ..adapters.store import Store
 from ..adapters.workflow_rows import load_workflow_row
-from ..domain.events import Producer
 from ..domain.labels import Label
 from ..domain.resolve_activation import ActivationBlocked, DeploymentInventory, LegacyAbsent, LegacyFile, LegacyPresent, UnmappedLegacyEntry
 from ..domain.review_activation import (
@@ -255,18 +252,10 @@ def report(scope: ReviewActivationScope, evaluation: Evaluation, *, shadow: bool
     return result
 
 
-def _bind_operator_feed(control: SQLiteControlStore, scope: ReviewActivationScope) -> None:
-    events = EventLog(os.path.join(scope.event_dir, "events-v2.jsonl"),
-                      Producer(f"operator:{scope.name}", scope.repository, "operator", os.getpid(), uuid.uuid4().hex))
-    control.bind_event_outbox(events.prepare, events.append_committed,
-                             line_limit=events.line_limit, destination=events.producer.feed_identity)
 
-
-def _operator_activation(scope: ReviewActivationScope, *, journal: bool = False) -> SQLiteReviewActivation:
+def _operator_activation(scope: ReviewActivationScope) -> SQLiteReviewActivation:
     control = SQLiteControlStore(scope.control_path)
     control.require_initialized()
-    if journal:
-        _bind_operator_feed(control, scope)
     return SQLiteReviewActivation(control)
 
 
@@ -275,7 +264,7 @@ def inspect(scope: ReviewActivationScope, *, shadow: bool) -> JsonReport:
 
 
 def activate(scope: ReviewActivationScope, *, confirm_plan_digest: str) -> JsonReport:
-    activation = _operator_activation(scope, journal=True)
+    activation = _operator_activation(scope)
     evaluation = evaluate(scope, activation)
     decision = evaluation.decision
     if isinstance(decision, ActivationBlocked):
@@ -311,7 +300,6 @@ def rehearse(scope: ReviewActivationScope, *, copy_to: str) -> JsonReport:
     events = os.path.join(copy_to, "events")
     os.makedirs(events, mode=0o700, exist_ok=True)
     copied_scope = replace(scope, control_path=copied.control_path, legacy_roots=copied.roots, event_dir=events)
-    _bind_operator_feed(control, copied_scope)
     activation = SQLiteReviewActivation(control)
     evaluation = evaluate(copied_scope, activation)
     result = report(copied_scope, evaluation, shadow=True)

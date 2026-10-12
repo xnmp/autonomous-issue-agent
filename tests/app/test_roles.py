@@ -72,23 +72,15 @@ from issue_agent.app.roles import (
     EffectRecovery,
     _FIX_RUNTIME_REGISTRY,
     _REVIEW_RUNTIME_REGISTRY,
-    _ci_flake_reporter,
-    _ci_stall_reporter,
     _control_store,
     _control_store_path,
-    _duplicate_pr_reporter,
-    _fix_hold_reporter,
     _fix_holds,
     _fix_state as read_fix_state,
-    _hold_reporter,
     _inject_predicted_paths,
-    _prediction_outcome_reporter,
-    _journal,
     _owner_identity,
     _shutdown_finalize,
     _shutdown_prepare,
     _shutdown_terminalize,
-    _typed_journal,
     process_supervision_state_dir,
 )
 from issue_agent.domain.agent_task import RuntimeName
@@ -141,20 +133,6 @@ from issue_agent.domain.world import (
     WorldState,
 )
 
-
-@pytest.mark.parametrize("raw", ["[]", "null", "1", '{"sig": [], "since": {}}'])
-def test_malformed_stall_advisory_does_not_stop_observation(tmp_path, raw):
-    from pathlib import Path
-    from issue_agent.app.roles import _stall_reporter
-    from tests.domain.builders import issue, world
-    store = Store(str(tmp_path))
-    Path(store.issue_path(7, "stall-sig")).write_text(raw)
-    observed = world(issues=[issue(7, "ai-ready")], now="2026-10-01T00:00:00Z")
-    _stall_reporter(None, store, lambda _: None)(observed)
-    sig, since = store.get_stall_marker("issue", 7)
-    assert isinstance(sig, str) and sig
-    assert since == observed.now
-    assert observed.issues[0].labels == frozenset({Label.AI_READY})
 
 
 def test_runtime_wiring_registries_cover_every_supported_runtime():
@@ -361,13 +339,7 @@ def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
         )
     )
 
-    journal = _typed_journal(
-        _journal(Store(state_dir=state)),
-        current,
-        "fix",
-        state,
-    )
-    adopted = _control_store(current, state, journal)
+    adopted = _control_store(current, state, "fix")
     current_owner = _owner_identity(current, "fix")
     assert adopted.leases(current_owner)[0].run_id == request.run_id
     assert adopted.reclaim_dead_leases(
@@ -444,10 +416,9 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
         control,
         Effects(),
         owner_id="o/r:fix",
-        retire_projection_feed=lambda: order.append("retire-feed"),
     )()
 
-    assert order == ["effects", "retire-feed"]
+    assert order == ["effects"]
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
 
     class Spend:
@@ -1086,64 +1057,6 @@ def _holds_in(journal):
     return [e for e in read_events(journal.path) if e.get("event") == "deferred"]
 
 
-def test_a_defer_is_journaled_and_logged_only_when_it_begins(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    report = _hold_reporter(journal, "o/r", logs.append)
-
-    for _ in range(3):
-        report(_held_world())
-
-    events = _holds_in(journal)
-    assert events == [{
-        "ts": events[0]["ts"], "event": "deferred", "state": "waiting",
-        "issue": 522, "reason": "overlap", "blocker_pr": 123,
-        "blocker_issue": None,
-    }]
-    assert logs == ["DEFERRED: issue #522 waiting on PR #123; dispatches once that clears"]
-
-
-def test_releasing_a_defer_emits_one_clear_then_allows_a_new_begin(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    report = _hold_reporter(journal, "o/r", logs.append)
-
-    report(_held_world())
-    report(_held_world("MERGED"))   # released
-    report(_held_world())           # same (issue, reason, blocker) again
-
-    assert [event["state"] for event in _holds_in(journal)] == [
-        "waiting", "cleared", "waiting",
-    ]
-    assert logs[1] == "issue #522 no longer waiting on PR #123; eligible for dispatch"
-
-
-def test_restart_clears_a_persisted_hold_that_is_no_longer_active(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    control = _control(tmp_path)
-    control.replace_level_state(
-        "holds",
-        "o/r",
-        {
-            "522:overlap:123:": {
-                "issue": 522,
-                "reason": "overlap",
-                "blocker_pr": 123,
-                "blocker_issue": None,
-            }
-        },
-    )
-    logs = []
-
-    _hold_reporter(
-        journal, "o/r", logs.append, control=control
-    )(_held_world("MERGED"))
-
-    assert _holds_in(journal)[-1]["state"] == "cleared"
-    assert logs == [
-        "issue #522 no longer waiting on PR #123; eligible for dispatch"
-    ]
-
 
 def test_router_predictions_are_injected_before_the_overlap_decision(tmp_path):
     store = Store(str(tmp_path))
@@ -1389,62 +1302,6 @@ def test_reaper_ignores_a_leg_that_finishes_during_the_world_fetch(tmp_path):
     assert not any(isinstance(a, RunAgent) and a.number == 8 for a in second)
 
 
-def test_terminal_pr_journals_router_prediction_against_actual_changed_files(tmp_path):
-    store = Store(str(tmp_path))
-    store.save_predicted_paths(522, frozenset({"backend/app/x.py", "wrong.py"}))
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    terminal = WorldState(
-        issues=(IssueView(522, labels=frozenset({Label.AI_PR_OPEN})),),
-        prs=(observed_pr(123, state="MERGED", closing_issue=522,
-                    changed_files=frozenset({"backend/app/x.py", "actual.py"})),),
-    )
-
-    report = _prediction_outcome_reporter(journal, "o/r", store, lambda _m: None)
-    report(terminal)
-    report(terminal)
-
-    events = [e for e in read_events(journal.path) if e.get("event") == "path_prediction"]
-    assert events == [{
-        "ts": events[0]["ts"], "event": "path_prediction", "issue": 522,
-        "pr": 123, "predicted_paths": ["backend/app/x.py", "wrong.py"],
-        "changed_files": ["actual.py", "backend/app/x.py"],
-        "matched_paths": ["backend/app/x.py"],
-        "block_key": "path-prediction:o/r:522:123",
-    }]
-
-
-def test_a_second_blocker_is_its_own_hold(tmp_path):
-    """Anti-vacuity for the dedup: it keys on the TUPLE, so a different blocking
-    PR — a genuinely new fact — is still reported."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    report = _hold_reporter(journal, "o/r", lambda _m: None)
-
-    report(_held_world())
-    w = _held_world()
-    report(replace(w, prs=(replace(w.prs[0], number=124),)))
-
-    assert [
-        e.get("blocker_pr")
-        for e in _holds_in(journal)
-        if e["state"] == "waiting"
-    ] == [123, 124]
-
-
-def test_the_hold_dedup_survives_a_daemon_restart(tmp_path):
-    """The flood shape is a daemon restarting (hot reload / Restart=always), so
-    an in-process set alone would re-emit every boot. A FRESH reporter over the
-    same journal must stay silent."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    control = _control(tmp_path)
-    _hold_reporter(
-        journal, "o/r", lambda _m: None, control=control
-    )(_held_world())
-    _hold_reporter(
-        journal, "o/r", lambda _m: None, control=control
-    )(_held_world())
-
-    assert len(_holds_in(journal)) == 1
-
 
 # ── CI pending-deadline reporting (#30) ──────────────────────────────────────
 _STALL_CFG = FixConfig(fix_bot=FIX_BOT, ci_pending_max_seconds=3600)
@@ -1479,65 +1336,6 @@ def _steps_in(journal):
     ]
 
 
-def test_a_wedged_check_is_journaled_once_and_logged_every_poll(tmp_path):
-    """AC: the deadlock stops being invisible. The journal carries the PR, the
-    head, the elapsed seconds and the pinning check names — enough to compute an
-    escalation rate and to go cancel the job — once per stuck run, while the log
-    keeps answering "why is PR #144 not moving?" on every poll."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, logs.append)
-
-    for _ in range(3):
-        report(_stalled_world(), _EMPTY_FIX_STATE)
-
-    assert _stalls_in(journal) == [
-        {
-            "ts": _stalls_in(journal)[0]["ts"], "event": "ci_pending_deadline",
-            "pr": 144, "issue": 9, "head": "sha-aaa", "seconds": 3601,
-            "checks": ["Test (windows-latest)"],
-            # The remediation STEP is part of the key: this PR's pending check
-            # is an external status with no workflow-run identity, so the only
-            # step available is the human escalation.
-            "block_key": "ci-pending:o/r:144:sha-aaa:escalate",
-        }
-    ]
-    assert len(logs) == 3 and all("#144" in ln for ln in logs)
-
-
-def test_a_healthy_pending_pr_is_neither_logged_nor_journaled(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, logs.append)(
-        _stalled_world(elapsed=23 * 60), _EMPTY_FIX_STATE
-    )
-    assert _stalls_in(journal) == [] and logs == []
-
-
-def test_a_new_head_wedging_again_is_its_own_event(tmp_path):
-    """Anti-vacuity for the dedup: it keys on the head SHA, so a push that
-    produces a fresh check run which ALSO wedges is a genuinely new fact."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
-
-    report(_stalled_world(head="sha-aaa"), _EMPTY_FIX_STATE)
-    report(_stalled_world(head="sha-bbb"), _EMPTY_FIX_STATE)
-
-    assert [e["head"] for e in _stalls_in(journal)] == ["sha-aaa", "sha-bbb"]
-
-
-def test_the_stall_dedup_survives_a_daemon_restart(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    control = _control(tmp_path)
-    _ci_stall_reporter(
-        journal, "o/r", _STALL_CFG, lambda _m: None, control
-    )(_stalled_world(), _EMPTY_FIX_STATE)
-    _ci_stall_reporter(
-        journal, "o/r", _STALL_CFG, lambda _m: None, control
-    )(_stalled_world(), _EMPTY_FIX_STATE)
-
-    assert len(_stalls_in(journal)) == 1
-
 
 def _wedged_run_world(head="sha-aaa", elapsed=3601):
     """A stalled PR whose pinning check carries a workflow-run identity, so the
@@ -1552,61 +1350,6 @@ def _wedged_run_world(head="sha-aaa", elapsed=3601):
 def _cancelled_state(at="2026-07-28T13:00:01+00:00"):
     return FixState(ci_cancel_head={144: f"sha-aaa@{at}"})
 
-
-def test_each_remediation_step_is_journaled_once_with_its_correlation(tmp_path):
-    """ADR 0012: the cancel, the wait it opens and the escalation that bounds it
-    are three facts about one head, each journaled once — a wait that recurs
-    every poll would be noise, and a wait nothing records is invisible."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
-
-    for _ in range(3):
-        report(_wedged_run_world(), _EMPTY_FIX_STATE)
-    for _ in range(3):
-        report(_wedged_run_world(elapsed=3700), _cancelled_state())
-    report(_wedged_run_world(elapsed=7201), _cancelled_state())
-
-    assert [(e["step"], e["block_key"]) for e in _steps_in(journal)] == [
-        ("cancel", "ci-pending:o/r:144:sha-aaa:cancel"),
-        ("await_cancel", "ci-pending:o/r:144:sha-aaa:await_cancel"),
-    ]
-    # Correlation carries both ends of the incident, not just the PR.
-    assert all(
-        (e["pr"], e["issue"]) == (144, 9)
-        for e in _steps_in(journal) + _stalls_in(journal)
-    )
-
-
-def test_a_wedge_the_harness_heals_never_counts_as_an_escalation(tmp_path):
-    """`ci_pending_deadline` is the escalation-rate guardrail. A rate counted
-    from steps that hand nothing to a human is not a rate — the change would
-    appear to worsen the guardrail it exists to protect."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
-
-    report(_wedged_run_world(), _EMPTY_FIX_STATE)
-    report(_wedged_run_world(elapsed=3700), _cancelled_state())
-
-    assert _stalls_in(journal) == []
-    assert [e["step"] for e in _steps_in(journal)] == ["cancel", "await_cancel"]
-
-    # …and the step that DOES reach a human still counts.
-    report(_wedged_run_world(elapsed=7201), _cancelled_state())
-    assert [e["head"] for e in _stalls_in(journal)] == ["sha-aaa"]
-
-
-def test_the_journal_agrees_with_the_cancel_it_explains(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    w = _wedged_run_world()
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(
-        w, _EMPTY_FIX_STATE
-    )
-
-    cancelled = {
-        a.pr for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
-        if isinstance(a, CancelWorkflowRuns)
-    }
-    assert cancelled == {e["pr"] for e in _steps_in(journal)} == {144}
 
 
 def _green_after_cancel_world(head="sha-aaa"):
@@ -1627,53 +1370,6 @@ def _green_after_cancel_world(head="sha-aaa"):
         ),
     )
 
-
-@pytest.mark.parametrize(
-    "world_builder,state_builder,expected",
-    [
-        (_stalled_world, lambda: _EMPTY_FIX_STATE, {144}),
-        (_green_after_cancel_world, _cancelled_state, {144}),
-    ],
-    ids=["pending-deadline", "cancel-aftermath"],
-)
-def test_the_journal_agrees_with_the_escalation_it_explains(
-    tmp_path, world_builder, state_builder, expected
-):
-    """The two halves read the SAME derivation, so a journaled stall is always a
-    PR decide_fix escalates in that very poll — never a line about a PR nothing
-    acted on, nor an escalation with no record.
-
-    Empty-policy green after cancellation still requires operator attention.
-    """
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    w = world_builder()
-    state = state_builder()
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w, state)
-
-    escalated = {
-        a.pr for a in decide_fix(w, _STALL_CFG, state, fixer_busy=False)
-        if isinstance(a, EscalateCiPending)
-    }
-    assert escalated == {e["pr"] for e in _stalls_in(journal)} == expected
-
-
-def test_hold_reporting_without_a_journal_still_logs(tmp_path):
-    """Observability must never add a failure mode: no journal → log only."""
-    logs = []
-    _hold_reporter(None, "o/r", logs.append)(_held_world())
-    assert len(logs) == 1
-
-
-def test_a_journaled_hold_explains_the_issue_decide_fix_actually_withheld(tmp_path):
-    """The two halves must agree: the issue named in the journal is exactly the
-    one `decide_fix` refuses to dispatch this poll."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    w = _held_world()
-    _hold_reporter(journal, "o/r", lambda _m: None)(w)
-
-    actions = decide_fix(w, _cfg(), _fix_state(Store(str(tmp_path)), w), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.RESOLVE)
-    assert [e["issue"] for e in _holds_in(journal)] == [522]
 
 
 # ── FIXER_RUNTIME=glm wiring (build_fix_daemon) ──────────────────────────────
@@ -1844,17 +1540,6 @@ def _codex_daemon(tmp_path, **env):
         FakeRunner(AgentResult(is_error=False)),
     )
 
-
-def test_a_codex_fixer_warns_that_the_per_session_budget_is_not_enforced(tmp_path, capsys):
-    """It fired for nobody before: the clause lived inside the blindspot
-    warning, which goes silent as soon as pricing is configured — so the
-    operators who set up pricing correctly were the ones who never saw it."""
-    _codex_daemon(tmp_path)  # shipped (non-zero) rates → no blindspot warning
-
-    err = capsys.readouterr().err
-    assert "CODEX_COST_PER_MTOK_IN/OUT are 0" not in err, "pricing IS configured"
-    assert "NOT ENFORCED on this runtime" in err
-    assert "MAX_BUDGET_USD=$20.00" in err
 
 
 def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
@@ -2117,48 +1802,6 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     assert hook_calls == []
 
 
-def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch, capsys):
-    """A review deployment must not inherit a fixer-only warning that sends the
-    operator to the wrong knob while REVIEW_BUDGET_USD is unmeasurable."""
-    from issue_agent.adapters import codex_runner
-    from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_review_daemon
-
-    class CapturingCodexRunner:
-        def __init__(self, **_kwargs):
-            pass
-
-        def preflight(self):
-            return None
-
-    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
-    cfg = replace(
-        from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-            **_role_state_env(tmp_path),
-            "REVIEW_BUDGET_USD": "2.5", "CODEX_COST_PER_MTOK_IN": "0",
-            "CODEX_COST_PER_MTOK_OUT": "0",
-        }),
-        control_authority_root=str(tmp_path / "machine-state"),
-    )
-
-    build_review_daemon(
-        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
-        FakeRunner(AgentResult(is_error=False)),
-    )
-
-    err = capsys.readouterr().err
-    assert "REVIEW_BUDGET_USD=$2.50 is NOT ENFORCED" in err
-    assert "REVIEWER_RUNTIME=codex" in err
-
-
-def test_the_warning_still_fires_with_the_price_table_zeroed(tmp_path, capsys):
-    _codex_daemon(tmp_path, CODEX_COST_PER_MTOK_IN="0", CODEX_COST_PER_MTOK_OUT="0")
-
-    err = capsys.readouterr().err
-    assert "NOT ENFORCED on this runtime" in err
-    assert "NEITHER cap can ever fire" in err, "the zero-price warning is unchanged"
-
 
 # ── duplicate-PR guard reporting (#39) ───────────────────────────────────────
 _GUARD_CFG = FixConfig(fix_bot=FIX_BOT)
@@ -2178,58 +1821,6 @@ def _duplicates_in(journal):
     ]
 
 
-def test_a_duplicate_pr_is_journaled_once_and_logged_every_poll(tmp_path):
-    """The event IS the metric #39 moves — resolves not bought — so it carries
-    the issue, the PR and the author, once per pair; the log keeps answering
-    "why did my ai-ready issue go to ai-blocked?" on any poll it survives."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    report = _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, logs.append)
-
-    for _ in range(3):
-        report(_duplicate_world())
-
-    events = _duplicates_in(journal)
-    assert len(events) == 1
-    assert (events[0]["issue"], events[0]["pr"], events[0]["author"]) == (554, 558, "xnmp")
-    assert events[0]["block_key"] == "duplicate-pr:o/r:554:558"
-    assert len(logs) == 3 and all("#554" in ln and "#558" in ln for ln in logs)
-
-
-def test_the_fixers_own_pr_is_never_reported_as_a_duplicate(tmp_path):
-    # anti-vacuity twin: the normal in-flight state must produce no event at all.
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, logs.append)(
-        _duplicate_world(author=FIX_BOT)
-    )
-    assert _duplicates_in(journal) == [] and logs == []
-
-
-def test_the_duplicate_dedup_survives_a_daemon_restart(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    control = _control(tmp_path)
-    _duplicate_pr_reporter(
-        journal, "o/r", _GUARD_CFG, lambda _m: None, control
-    )(_duplicate_world())
-    _duplicate_pr_reporter(
-        journal, "o/r", _GUARD_CFG, lambda _m: None, control
-    )(_duplicate_world())
-    assert len(_duplicates_in(journal)) == 1
-
-
-def test_the_reporter_and_the_decision_read_the_same_world(tmp_path):
-    """Single definition: what is journaled is what decide_fix refuses. Prove it
-    end-to-end rather than by re-stating the predicate."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    world = _duplicate_world()
-    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(world)
-    snapshot = resolve_snapshot(554)
-    actions = decide_fix(world, _GUARD_CFG, FixState(resolve_workflows={554: snapshot}), fixer_busy=False)
-    assert [a for a in actions if isinstance(a, RunAgent)] == []
-    assert Relabel(Target.ISSUE, 554, Label.AI_READY, Label.AI_BLOCKED, workflow=snapshot.binding) in actions
-    assert _duplicates_in(journal)[0]["pr"] == 558
-
 
 # ── confirmed-flake reporting (#38) ──────────────────────────────────────────
 def _rerun_world(bucket="pass", head="sha-1"):
@@ -2245,31 +1836,6 @@ def _rerun_world(bucket="pass", head="sha-1"):
 def _flakes_in(journal):
     return [e for e in read_events(journal.path) if e.get("event") == "ci_flake"]
 
-
-def test_a_green_head_that_used_its_free_rerun_is_journaled_once(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    report = _ci_flake_reporter(journal, "o/r", _GUARD_CFG, logs.append)
-    state = FixState(ci_rerun_head={144: "sha-1"})
-
-    for _ in range(3):
-        report(_rerun_world(), state)
-
-    events = _flakes_in(journal)
-    assert len(events) == 1
-    assert (events[0]["pr"], events[0]["head"]) == (144, "sha-1")
-    assert events[0]["block_key"] == "ci-flake:o/r:144:sha-1"
-    assert len(logs) == 3
-
-
-def test_a_green_pr_that_never_re_ran_is_not_a_flake(tmp_path):
-    # anti-vacuity twin: without this the "flake rate" would be the green rate.
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    _ci_flake_reporter(journal, "o/r", _GUARD_CFG, logs.append)(
-        _rerun_world(), FixState()
-    )
-    assert _flakes_in(journal) == [] and logs == []
 
 
 # ── FixState carries the re-run marker (#38) ─────────────────────────────────
@@ -2484,61 +2050,6 @@ def _fix_holds_in(journal):
         and event.get("reason") == "fix_leg_active"
     ]
 
-
-def test_a_review_deferral_is_journaled_once_per_blocking_claim(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    report = _fix_hold_reporter(journal, "o/r", logs.append, _control(tmp_path))
-    hold = FixHold(581, "claim-1", 30.0)
-
-    for seconds in (30.0, 50.0, 70.0):
-        report((replace(hold, held_seconds=seconds),), ())
-
-    events = _fix_holds_in(journal)
-    assert [(e["state"], e["blocker_pr"], e["blocking_claim"]) for e in events] == [
-        ("waiting", 581, "claim-1")
-    ]
-    assert len(logs) == 1
-
-
-def test_the_ceiling_override_is_journaled_on_the_same_key(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    report = _fix_hold_reporter(journal, "o/r", lambda _m: None)
-    report((FixHold(581, "claim-1", 30.0),), ())
-    report((), (FixHold(581, "claim-1", 3000.0),))
-    report((), (FixHold(581, "claim-1", 3020.0),))  # still wedged, still forcing
-    report((), ())                                   # claim finally released
-
-    # "stopped" is a CLOSING level (a forced dispatch is not an open deferral),
-    # so a released claim owes no second close and a still-wedged one owes no
-    # per-tick repeat.
-    assert [e["state"] for e in _fix_holds_in(journal)] == ["waiting", "stopped"]
-
-
-def test_a_persisted_review_deferral_clears_after_a_restart(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    control = _control(tmp_path)
-    control.replace_level_state(
-        "review_fix_hold", "o/r", {"581:claim-1": {"state": "waiting"}}
-    )
-
-    _fix_hold_reporter(journal, "o/r", lambda _m: None, control)((), ())
-
-    assert [e["state"] for e in _fix_holds_in(journal)] == ["cleared"]
-    assert control.load_level_state("review_fix_hold", "o/r") == {}
-
-
-def test_a_malformed_persisted_deferral_still_clears(tmp_path):
-    """A level-state row without a readable state must not wedge the tick; the
-    reporter's only job is journalling, so it treats it as an unknown level and
-    clears it."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    control = _control(tmp_path)
-    control.replace_level_state("review_fix_hold", "o/r", {"581:claim-1": {}})
-
-    _fix_hold_reporter(journal, "o/r", lambda _m: None, control)((), ())
-
-    assert [e["state"] for e in _fix_holds_in(journal)] == ["cleared"]
 
 
 def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):

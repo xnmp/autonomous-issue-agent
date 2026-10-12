@@ -15,14 +15,13 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.dashweb.ghdata import GhReader
 from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.github import GitHubGateway
-from issue_agent.adapters.journal import LegacyJournalLocator
+from issue_agent.adapters.journal import Journal
 from issue_agent.adapters.process_supervisor import (
     ProcessSupervisor as DurableProcessSupervisor,
 )
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.adapters.store import Store
-from issue_agent.adapters.typed_journal import TypedJournal
 from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.execute import Executor
 from issue_agent.app.dashweb.ports import GitHubQueries
@@ -40,8 +39,6 @@ from issue_agent.domain.ports import (
     EventSink,
     FixWorktreePort,
     GitHubReads,
-    LegacyJournal,
-    LevelState,
     PendingEffect,
     PendingEffectReads,
     PredictionReader,
@@ -51,14 +48,12 @@ from issue_agent.domain.ports import (
     RecoveryLease,
     RecoveryRelease,
     ReviewPromptReads,
-    RunAbandonmentSink,
     SpendReconciler,
     StaleReservationReconciler,
     WorkflowGitHubReads,
     WorkflowState,
     WorktreePort,
     WorktreeRecovery,
-    WorldObservationStore,
 )
 
 # An AST contract requires every Protocol in domain/ports.py to appear in
@@ -73,8 +68,6 @@ COVERED_PORTS = frozenset(
         "EventSink",
         "FixWorktreePort",
         "GitHubReads",
-        "LegacyJournal",
-        "LevelState",
         "PendingEffect",
         "PendingEffectReads",
         "PredictionReader",
@@ -84,14 +77,12 @@ COVERED_PORTS = frozenset(
         "RecoveryLease",
         "RecoveryRelease",
         "ReviewPromptReads",
-        "RunAbandonmentSink",
         "SpendReconciler",
         "StaleReservationReconciler",
         "WorkflowGitHubReads",
         "WorkflowState",
         "WorktreePort",
         "WorktreeRecovery",
-        "WorldObservationStore",
     }
 )
 EXEMPT_PORTS = frozenset(
@@ -119,22 +110,12 @@ def recovery_control(store: SQLiteControlStore) -> RecoveryControl:
     return store
 
 
-def level_state(store: SQLiteControlStore) -> LevelState:
-    return store
-
-
 def pending_effect_reads(store: SQLiteControlStore) -> PendingEffectReads:
     return store
 
 
 def pending_effect(pending: PendingCommand) -> PendingEffect:
     return pending
-
-
-def world_observations(
-    store: SQLiteControlStore,
-) -> WorldObservationStore:
-    return store
 
 
 def fix_worktrees(worktrees: Worktrees) -> FixWorktreePort:
@@ -199,11 +180,7 @@ def late_reservation_reconciler(
     return reconciler
 
 
-def event_sink(journal: TypedJournal) -> EventSink:
-    return journal
-
-
-def abandonment_sink(journal: TypedJournal) -> RunAbandonmentSink:
+def event_sink(journal: Journal) -> EventSink:
     return journal
 
 
@@ -211,10 +188,6 @@ def worktree_recovery(
     recovery: NoWorktreeRecovery,
 ) -> WorktreeRecovery:
     return recovery
-
-
-def legacy_journal(locator: LegacyJournalLocator) -> LegacyJournal:
-    return locator
 
 
 def prediction_reader(store: Store) -> PredictionReader:

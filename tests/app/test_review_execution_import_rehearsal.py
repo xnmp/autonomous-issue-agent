@@ -16,14 +16,12 @@ from tests.app.test_review_execution_activation import Gateway
 
 
 import sqlite3
-from itertools import count
 
 from issue_agent.adapters.control_store import AccountingDisposition
 from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
 from issue_agent.adapters.workflow_rows import load_review_workflow_row
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.agent_task import RuntimeName
-from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.review import ReviewMode
@@ -271,15 +269,6 @@ def test_original_plan_malformed_input_refuses_without_writes(execution_deployme
 
 def test_imported_empty_origin_survives_paid_failure_and_later_abandonment(rig):
     cfg, store, gateway, _files_store, files, links, sql, _liveness, activation = rig
-    sequence = count()
-    producer = Producer("review-rehearsal", cfg.repo, "review", 123, "boot")
-
-    def factory(payload, correlation):
-        index = next(sequence)
-        return EventEnvelope(payload, new_event_id(store.now()), index, store.now(), store.now(),
-                             index, producer, correlation)
-
-    store.bind_event_outbox(factory, lambda envelope: None)
     activation_plan = activation.plan(files, links, sql)
     assert not activation.activate(activation_plan, files, links, sql).idempotent
 

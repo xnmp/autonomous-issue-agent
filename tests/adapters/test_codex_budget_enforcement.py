@@ -221,32 +221,6 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
     assert result.cost_usd == pytest.approx(28.0)
 
 
-def test_final_stderr_usage_cannot_mint_a_budget_verdict_without_rollout(
-    tmp_path, monkeypatch
-):
-    """Agent-controlled stderr is telemetry, not provider billing evidence."""
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    body = (
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        f'echo "session id: {SID}" >&2\n'
-        "echo 'Token usage: total=5,100,000 input=5,000,000 "
-        "(+ 0 cached) output=100,000' >&2\n"
-        "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
-    )
-
-    result = asyncio.run(
-        _runner(tmp_path, body, poll_slice=30.0).run(
-            RuntimePlan(prompt="x", max_budget_usd=20.0)
-        )
-    )
-
-    assert result.status == "pr_opened"
-    assert result.exit_reason is ExitReason.OK
-    assert result.cost_usd == 0
-    assert result.usage["source"] == "stderr"
-    assert "excluded from pricing" in result.telemetry_warning
-
 
 def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(
     tmp_path, monkeypatch

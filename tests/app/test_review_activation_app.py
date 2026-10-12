@@ -107,7 +107,7 @@ def settle(control):
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
-def test_inventory_shadow_and_activation_import_exact_continuation_and_event(deployment):
+def test_inventory_shadow_and_activation_import_exact_continuation(deployment):
     state, control, remote, scope = deployment
     seed(state)
     before = dump(control)
@@ -126,7 +126,6 @@ def test_inventory_shadow_and_activation_import_exact_continuation_and_event(dep
         assert isinstance(baseline, ReviewedBaseline) and isinstance(baseline.source, ImportedBaseline)
         assert baseline.head_sha == HEAD and baseline.patch_id == PATCH
         assert not db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='review-dispatch-decision'").fetchall()
-    assert "workflow_activation" in (state / "events-v2.jsonl").read_text()
     assert all(call[0] == "api" for call in remote.calls)
 
 

@@ -15,7 +15,6 @@ import os
 import re
 import subprocess
 import sys
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -30,8 +29,6 @@ from ..domain.contracts import (
 from .control_store import PendingCommand, SQLiteControlStore
 from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
-from .event_log import EventLog
-from ..domain.events import Producer
 from ..domain.pr_body import complete_pr_body, has_acceptance_criteria, issue_acceptance_criteria
 from ..domain.refs import is_governed_branch, issue_from_branch
 from ..domain.repository import canonical_repository
@@ -1765,30 +1762,6 @@ def main(argv: list[str] | None = None) -> None:
     repository = authority_env["ISSUE_AGENT_REPOSITORY"]
     store = SQLiteControlStore(path)
     store.integrity_check()
-    event_path = authority_env.get("ISSUE_AGENT_EVENT_LOG", "")
-    if event_path:
-        producer = Producer(
-            authority_env["ISSUE_AGENT_EVENT_DEPLOYMENT"],
-            repository,
-            authority_env["ISSUE_AGENT_EVENT_ROLE"],
-            os.getpid(),
-            f"{authority_env['ISSUE_AGENT_RUN_ID']}:{uuid.uuid4().hex}",
-        )
-        events = EventLog(
-            event_path,
-            producer,
-            line_limit=int(
-                authority_env.get(
-                    "ISSUE_AGENT_EVENT_LINE_LIMIT", "65536"
-                )
-            ),
-        )
-        store.bind_event_outbox(
-            events.prepare,
-            events.append_committed,
-            line_limit=events.line_limit,
-            destination=producer.feed_identity,
-        )
     broker = AgentPublicationBroker(
         store,
         repository=repository,

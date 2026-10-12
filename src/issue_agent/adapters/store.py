@@ -159,38 +159,6 @@ class Store:
     def get_infra_deaths(self, key: int) -> int:
         return self._read_int(self.issue_path(key, "infra-deaths"))
 
-    # ── stall watchdog markers (no-silent-forever) ──
-    # (signature, since_iso) per watched target: the observable state last
-    # seen and when it first appeared. Written only when the signature
-    # changes, so a stable target costs zero writes per poll.
-    def get_stall_marker(self, kind: str, number: int) -> tuple[str, str]:
-        path = (
-            self.pr_path(number, "stall-sig")
-            if kind == "pr"
-            else self.issue_path(number, "stall-sig")
-        )
-        raw = self._read(path)
-        if not raw:
-            return ("", "")
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return ("", "")
-        if not isinstance(data, dict):
-            return ("", "")
-        sig, since = data.get("sig", ""), data.get("since", "")
-        return (sig, since) if isinstance(sig, str) and isinstance(since, str) else ("", "")
-
-    def set_stall_marker(
-        self, kind: str, number: int, sig: str, since: str
-    ) -> None:
-        path = (
-            self.pr_path(number, "stall-sig")
-            if kind == "pr"
-            else self.issue_path(number, "stall-sig")
-        )
-        self._write(path, json.dumps({"sig": sig, "since": since}))
-
 
     # ── advisory cleanup ──
     def _clear_issue_advisory(self, issue: int) -> None:

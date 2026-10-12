@@ -110,7 +110,6 @@ class SQLiteReviewExecutionControl:
         self, db: sqlite3.Connection, facts: ReviewRoundFacts, expected: WorkflowRevision,
     ) -> FinalizedReviewRound | DeferredReviewPreparation:
         """Resolve exact receipts before current eligibility; publish atomically."""
-        from ..domain.events import ControlTransitionCommitted, Correlation
 
         with self._control.mutation_savepoint(db):
             if not isinstance(facts, ReviewRoundFacts) or not isinstance(expected, WorkflowRevision):
@@ -170,8 +169,6 @@ class SQLiteReviewExecutionControl:
             execution = current if stale else finalize_current_review_round(
                 current, read_current_review_pending(db, current), result.outcome,
             ).execution
-            if self._control._event_factory is None:
-                raise WorkflowAuthorityError("current outcome requires a bound durable event outbox")
             changed = db.execute(
                 "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
                 "WHERE round_id=? AND closure_json IS NULL AND outcome_json IS NULL",
@@ -187,11 +184,6 @@ class SQLiteReviewExecutionControl:
             after = replace(snapshot, revision=WorkflowRevision(snapshot.revision.fence, expected.version + 1),
                             execution=execution)
             persist_workflow_snapshot(db, after)
-            self._control.enqueue_event(self._control._event_factory(
-                ControlTransitionCommitted("review_round", round.round_id, "outcome_finalized", {
-                    "disposition": type(result.outcome.disposition).__name__, "sequence": round.sequence,
-                }), Correlation(),
-            ), db)
             return result
 
     def reconcile_review_rounds(self) -> ReviewRoundSweep:
@@ -364,9 +356,6 @@ class SQLiteReviewExecutionControl:
                 (_BLOCK_NAMESPACE, self._writer.repository, round_id,
                  _stamp(self._control.now()), payload),
             )
-            self._control._transition(db, "review_round", round_id, "recovery_blocked", {
-                "reason": reason[:480],
-            })
 
     @staticmethod
     def _pending_progress_digest(db: sqlite3.Connection, facts: ReviewRoundFacts) -> tuple[str, bool]:
@@ -421,10 +410,6 @@ class SQLiteReviewExecutionControl:
             (_WAIT_NAMESPACE, self._writer.repository, round_id,
              _stamp(self._control.now()), encode_workflow((facts.closure_receipt, reasons, progress, attempts))),
         )
-        if attempts in (1, MAX_ABANDONMENT_WAIT_OBSERVATIONS):
-            self._control._transition(db, "review_round", round_id, "evidence_wait", {
-                "reasons": reasons, "observations": attempts,
-            })
 
     def read_round_facts(self, round_id: str) -> ReviewRoundFacts:
         """Join one round's source receipts under a single SQLite snapshot."""
@@ -520,7 +505,6 @@ class SQLiteReviewExecutionControl:
         result: FinalizedReviewRound | DeferredReviewPreparation,
     ) -> FinalizedReviewRound | DeferredReviewPreparation:
         """Retain exact terminal evidence without granting or changing prior authority."""
-        from ..domain.events import ControlTransitionCommitted, Correlation
 
         if (not isinstance(held.execution, ActivatedReviewExecution)
                 or not same_execution_episode(held.execution.binding, facts.plan.round.binding)
@@ -528,8 +512,6 @@ class SQLiteReviewExecutionControl:
                 or facts.plan.round.binding.rejection.fence.generation > held.revision.fence.generation):
             raise WorkflowAuthorityError("held round belongs to a foreign or future component")
         with self._control.mutation_savepoint(db):
-            if self._control._event_factory is None:
-                raise WorkflowAuthorityError("held settlement requires a bound durable event outbox")
             changed = db.execute(
                 "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
                 "WHERE round_id=? AND closure_json IS NULL AND outcome_json IS NULL",
@@ -558,11 +540,6 @@ class SQLiteReviewExecutionControl:
                     (REVIEW_PREPARATION_NAMESPACE, self._writer.repository, facts.plan.round.round_id,
                      _stamp(self._control.now()), encode_workflow((facts, result.failures))),
                 )
-            self._control.enqueue_event(self._control._event_factory(
-                ControlTransitionCommitted("review_round", facts.plan.round.round_id, "held_outcome_finalized", {
-                    "disposition": type(result.outcome.disposition).__name__, "sequence": facts.plan.round.sequence,
-                }), Correlation(),
-            ), db)
             return result
 
     def _finalize_current_nonproductive_in_tx(
@@ -598,10 +575,6 @@ class SQLiteReviewExecutionControl:
                         db, round.binding.rejection.fence.key, facts.plan.head_sha,
                         ReviewEvidenceKind.RUNTIME_PREPARATION, error=preparation_error,
                     )
-                else:
-                    self._control._transition(db, "review_round", round.round_id, "preparation_superseded", {
-                        "settled_generation": snapshot.revision.fence.generation,
-                    })
             return accepted
 
     def _settle_productive_in_tx(
@@ -903,9 +876,6 @@ class SQLiteReviewExecutionControl:
                 (PREFLIGHT_NAMESPACE, key.repository, selection.request_id, _stamp(now),
                  encode_workflow((selection, self._writer.owner_id, plan))),
             )
-            self._control._transition(db, "review_round", plan.round.round_id, "preflight_open", {
-                "sequence": plan.round.sequence, "claim_occurrence_id": selection.claim_occurrence_id,
-            })
             return plan
 
     def register_stage(
@@ -978,9 +948,6 @@ class SQLiteReviewExecutionControl:
                 (REVIEW_STAGE_NAMESPACE, self._writer.repository, review_stage_receipt_key(round_id, stage.stage_id),
                  _stamp(now), encode_workflow((round_id, stage))),
             )
-            self._control._transition(db, "review_round", round_id, "stage_registered", {
-                "stage_id": stage.stage_id, "children": len(stage.children),
-            })
             return updated
 
     def _completed_seal_receipt(
@@ -1140,9 +1107,6 @@ class SQLiteReviewExecutionControl:
                 )
             after = replace(snapshot, revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1))
             persist_workflow_snapshot(db, after)
-            self._control._transition(db, "review_round", round_id, "submission_registered", {
-                "command_id": submission.command_id, "kind": kind.value,
-            })
             return pending
 
     def seal_completed_planning(
@@ -1224,9 +1188,6 @@ class SQLiteReviewExecutionControl:
                      round_id, self._writer.owner_id, selection.claim_occurrence_id, expected, plan, sealed,
                  ))),
             )
-            self._control._transition(db, "review_round", round_id, "planning_sealed", {
-                "seal_receipt": sealed.seal_receipt,
-            })
             return sealed
 
     def seal_abandoned_planning(self, round_id: str) -> ReviewParentAbandoned:
@@ -1276,8 +1237,4 @@ class SQLiteReviewExecutionControl:
                          round_id, parent_owner, selection.claim_occurrence_id, plan, abandoned,
                      ))),
                 )
-                self._control._transition(db, "review_round", round_id, "planning_abandoned", {
-                    "claim_occurrence_id": selection.claim_occurrence_id,
-                    "abandonment_receipt": abandoned.abandonment_receipt,
-                })
                 return abandoned

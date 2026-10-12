@@ -35,28 +35,28 @@ def test_completed_control_operations_keep_original_bytes_stable(tmp_path: Path)
 
         with store.transaction() as db:
             db.execute(
-                "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
                 "VALUES (?,?,?,?,?)",
-                ("connection-lifecycle", "test", "committed", "{}", "2026-09-30T00:00:00+00:00"),
+                ("connection-lifecycle", "test", "committed", "2026-09-30T00:00:00+00:00", "{}"),
             )
         _backup_and_collect(store, tmp_path / "committed-copy.db")
         with closing(sqlite3.connect(tmp_path / "committed-copy.db")) as copied:
             assert copied.execute(
-                "SELECT payload_json FROM level_state WHERE namespace='connection-lifecycle'"
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='connection-lifecycle'"
             ).fetchone() == ("{}",)
 
         with pytest.raises(RuntimeError, match="rollback stimulus"):
             with store.transaction() as db:
                 db.execute(
-                    "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
                     "VALUES (?,?,?,?,?)",
-                    ("connection-lifecycle", "test", "rolled-back", "{}", "2026-09-30T00:00:00+00:00"),
+                    ("connection-lifecycle", "test", "rolled-back", "2026-09-30T00:00:00+00:00", "{}"),
                 )
                 raise RuntimeError("rollback stimulus")
         _backup_and_collect(store, tmp_path / "rolled-back-copy.db")
         with closing(sqlite3.connect(tmp_path / "rolled-back-copy.db")) as copied:
             assert copied.execute(
-                "SELECT key FROM level_state WHERE namespace='connection-lifecycle'"
+                "SELECT key FROM dedupe_keys WHERE namespace='connection-lifecycle'"
             ).fetchall() == [("committed",)]
     finally:
         if automatic_gc:

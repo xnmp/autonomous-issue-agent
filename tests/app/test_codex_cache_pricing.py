@@ -6,8 +6,6 @@ import pytest
 
 from issue_agent.adapters.codex_runner import (
     budget_overrun_usd,
-    codex_budget_not_enforced_warning,
-    codex_cost_blindspot_warning,
     codex_cost_usd,
     rates_with_cache_for_model,
 )
@@ -173,56 +171,6 @@ def _cached_gap_runtime():
         cost_per_mtok_cached_in=(("gpt-5.6-sol", 0.0),),
     )
 
-
-def test_the_pricing_gap_names_the_cached_knob_not_the_in_out_scalars():
-    runtime = _cached_gap_runtime()
-    assert runtime.budget_priceable is False
-    assert "CACHED_IN" in runtime.budget_pricing_gap
-    assert runtime.unpriced_cached_models == ("gpt-5.6-sol",)
-
-    warning = codex_budget_not_enforced_warning(
-        fix_budget_usd=20.0,
-        max_runtime=3600.0,
-        enforced=True,
-        priced=runtime.budget_priceable,
-        pricing_gap=runtime.budget_pricing_gap,
-    )
-    assert warning is not None
-    assert "CACHED_IN" in warning
-    assert "CODEX_COST_PER_MTOK_IN and" not in warning, (
-        "two knobs that are already correct"
-    )
-
-
-def test_the_blindspot_line_fires_for_an_unpriced_cache_tier():
-    runtime = _cached_gap_runtime()
-    warning = codex_cost_blindspot_warning(
-        cost_per_mtok_in=runtime.cost_per_mtok_in,
-        cost_per_mtok_out=runtime.cost_per_mtok_out,
-        issue_spend_cap_usd=40.0,
-        daily_spend_cap_usd=0.0,
-        max_runtime=3600.0,
-        unpriced_cached_models=runtime.unpriced_cached_models,
-    )
-    assert warning is not None
-    assert "CACHED_IN" in warning and "gpt-5.6-sol" in warning
-    assert "cache reads price at $0.00" in warning
-
-
-def test_the_blindspot_line_stays_silent_on_a_fully_priced_cache_tier():
-    cfg = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK": "gpt-5.6-sol=5/30/0.5",
-        "ISSUE_SPEND_CAP_USD": "40",
-    })
-    assert cfg.codex_runtime.budget_priceable is True
-    assert codex_cost_blindspot_warning(
-        cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
-        cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
-        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-        unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
-    ) is None
 
 
 @pytest.mark.parametrize("model,expected", [

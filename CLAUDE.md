@@ -21,13 +21,11 @@ The north star is lower cost per merged PR without weakening quality. An
 efficiency change must name the metric it moves, the guardrail it must not move,
 and the next measurement that adjudicates it.
 
-Primary metrics, derived from schema-v2 events and the SQLite-backed spend
-projection:
+Primary metrics, derived from the SQLite legs/money tables (runs, charges)
+plus GitHub:
 
 - cost per merged PR, split by pricing basis;
 - cost mix by `Leg` (resolve/review/repair/router/triage);
-- probe hit rate and patch-id re-review skips;
-- predicted-path hit rate;
 - issue-to-merge wall time.
 
 Guardrails:
@@ -73,14 +71,14 @@ unchanged; name what it removes before writing it.
   untrusted inputs before constructing a trusted variant; retain runtime
   validation at external boundaries.
 - SQLite is authority for admission, spend, leases, runs, deduplication,
-  lifecycle commands, and receipts. JSONL is telemetry/projection input only.
+  lifecycle commands, and receipts. JSONL is the daemon log only.
 - Tests assert public behavior and observable outputs. Business rules include
   malformed, absent, boundary, and huge inputs.
 - Comments explain constraints or incident history, never narrate the next line.
 - New gate/review verdict inputs state their provenance (who can write them,
   in which trust domain); below harness-owned means laundered through a
   harness-side mint or treated as an untrusted claim. Retry/defer/skip loops
-  carry a journal event and a ceiling. (ADR 0012; existing code migrates when
+  carry a log line and a ceiling (or are spaced by the machine backoff). (ADR 0012; existing code migrates when
   touched.)
 
 Import-linter and AST contracts enforce these boundaries in `make test`.
@@ -116,8 +114,8 @@ Each role performs:
 observe GitHub → pure decide → execute Actions → dispatch paid Legs
                          ↓
                   SQLite control store
-                         ↓ committed outbox
-                  schema-v2 event log → one fold → dashboard
+                         ↓
+                  dashboard (SQLite + GitHub + journal.jsonl log)
 ```
 
 Every paid leg receives a `run_id`/`leg_id`, reserves its maximum charge in one
@@ -127,10 +125,9 @@ Unavailable/corrupt SQLite authority or missing required pre-launch pricing bloc
 paid admission while observation and reconciliation continue.
 
 `SIGTERM` stops admission, cancels/drains active work within a bound, writes
-handover/receipts, flushes the outbox, kills remaining groups, and exits with a
+handover/receipts, kills remaining groups, and exits with a
 stable taxonomy. Boot and suspension recovery kill orphans, reclaim leases,
-reconcile unsettled spend, drain commands reconcile-first, and emit abandoned
-run corrections.
+reconcile unsettled spend, and drain commands reconcile-first.
 
 PR-repair accounting disposition does not itself acknowledge paired workflow
 admissions. `reconcile_pr_repair_returns` also recovers launched terminal work
@@ -172,7 +169,7 @@ the complete diff in a subagent.
 
 ## Repository map
 
-- `src/issue_agent/domain/` — value objects, policies, events, projection, ports.
+- `src/issue_agent/domain/` — value objects, policies, events, ports.
 - `src/issue_agent/adapters/` — GitHub/runtime/process/store/event/dashboard I/O.
 - `src/issue_agent/app/` — config, roles, workflows, daemon loop, CLI.
 - `plugin/` — fixer (`AGENT.md`) and reviewer prompt guidance.

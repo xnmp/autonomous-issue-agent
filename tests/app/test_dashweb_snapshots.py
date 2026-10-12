@@ -16,18 +16,7 @@ from issue_agent.adapters.store import Store
 from tests.adapters.test_review_execution_control import rig as current_review_rig
 from issue_agent.app.dashweb import service, snapshots
 from issue_agent.domain import dashboard as dash
-from issue_agent.domain.events import (
-    AgentRunCompleted,
-    AgentRunStarted,
-    Correlation,
-    EventEnvelope,
-    Producer,
-    SpendBlocked,
-    SpendRecorded,
-    WorldObserved,
-)
 from issue_agent.domain.labels import LIFECYCLE_LABELS
-from issue_agent.domain.projection import fold
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -52,31 +41,8 @@ def build(events, name="demo", repo="o/r"):
     return dash.build_deployment(name, repo, feeds, (), now_fn=lambda: NOW)
 
 
-def v2_event(payload, event_id, seq, *, role="fix", **correlation):
-    stamp = NOW - timedelta(hours=1)
-    return EventEnvelope(
-        payload,
-        event_id,
-        seq,
-        stamp,
-        stamp,
-        seq,
-        Producer("demo", "o/r", role, 10, "boot"),
-        Correlation(**correlation),
-    )
 
 
-def v2_deployment(events, name="demo", repo="o/r"):
-    """A deployment built the way the daemons build one: schema-v2 events only,
-    folded, with no journal-dict or GitHub input."""
-    feeds = (
-        ("fix", "/j/fix", "/l/fix", tuple(events)),
-        ("review", "/j/rev", "/l/rev", ()),
-        ("steward", "/j/std", "/l/std", ()),
-    )
-    return dash.build_deployment_v2(
-        name, repo, feeds, fold(events), lambda: NOW
-    )
 
 
 def row_for(events, issue):
@@ -87,9 +53,8 @@ def row_for(events, issue):
 def row_view(events, legs=(), issue=7):
     """A row whose feed is exactly `events`, in order.
 
-    The v2 fold attributes an event to an issue by correlation; the legacy
-    dict builder can only re-parse a prose `desc`, so it cannot express the
-    structured actions the current journal emits.
+    The dict builder attributes an action to an issue by re-parsing its prose
+    `desc`, so it cannot express structured actions.
     """
     row = row_for([*legs] or [RESOLVE], issue)
     return replace(row, events=tuple(events))
@@ -717,14 +682,11 @@ def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     assert card["merged_ts"] == "2026-07-29T10:00:00Z"
 
 
-@pytest.mark.parametrize("enriched", [False, True])
 @pytest.mark.parametrize("done", [False, True])
-def test_merged_pr_without_rollup_or_journal_ci_stays_unknown(enriched, done):
+def test_merged_pr_without_rollup_or_journal_ci_stays_unknown(done):
     row = replace(row_for([RESOLVE, REVIEW_LEG], 7), done=done)
     pr = {"state": "MERGED", "mergedAt": ts(minutes=20), "headRefOid": "merged-head",
           "reviewDecision": "APPROVED", "mergeable": "MERGEABLE"}
-    if enriched:
-        pr = service._github_enrichment(pr)
     card = snapshots.issue_card(row, NOW, gh_prs={12: pr})
     detail = snapshots.issue_detail(row, NOW, gh_prs={12: pr})
 
@@ -899,29 +861,6 @@ def test_a_parked_pending_card_keeps_its_pr_link_and_ci_state():
     assert card["pr_ci_state"] == "passing"
 
 
-def test_a_parked_issue_leaves_the_in_flight_lane_for_pending():
-    # Park moves an issue off the active board even mid-history: an operator
-    # decision outranks whatever legs or holds the journal accumulated.
-    dep = v2_deployment([
-        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=34, run_id="r"),
-        v2_event(
-            AgentRunCompleted(
-                "done", False, "ok", 1000, "m", "codex",
-                cost_micros=750_000, currency="USD", pricing_basis="api",
-                kind="RESOLVE",
-            ),
-            "b", 1, issue=34, run_id="r",
-        ),
-        v2_event(
-            WorldObserved(
-                "issue", 34, "h",
-                {"present": True, "state": "OPEN",
-                 "labels": ["ai-parked", "ai-triage"]},
-            ),
-            "c", 2, issue=34,
-        ),
-    ])
-    assert dep.issues[0].lane == "pending"
 
 
 def test_pending_card_carries_the_issue_body_for_the_drill_down():
@@ -1021,38 +960,6 @@ def test_health_trend_uses_the_native_timezone_day_boundary():
     }]
 
 
-def test_v2_today_spend_uses_the_injected_local_day_boundary():
-    local = timezone(timedelta(hours=10))
-    now = datetime(2026, 7, 2, 0, 30, tzinfo=timezone.utc)
-    stamp = datetime(2026, 7, 1, 23, 30, tzinfo=timezone.utc)
-    event = EventEnvelope(
-        SpendRecorded("run", 700_000, "USD", "configured", "card", "v1"),
-        "spend-local-day",
-        1,
-        stamp,
-        stamp,
-        1,
-        Producer("demo", "o/r", "fix", 10, "boot"),
-        Correlation(run_id="run"),
-    )
-    feeds = (
-        ("fix", "/j/fix", "/l/fix", (event,)),
-        ("review", "/j/rev", "/l/rev", ()),
-        ("steward", "/j/std", "/l/std", ()),
-    )
-
-    deployment = dash.build_deployment_v2(
-        "demo",
-        "o/r",
-        feeds,
-        fold((event,)),
-        lambda: now,
-        to_local_date=lambda timestamp: datetime.fromtimestamp(
-            timestamp, local
-        ).date(),
-    )
-
-    assert deployment.metrics.today_usd == 0.7
 
 
 def test_overview_projects_lifecycle_recurrence_and_first_observed_day(monkeypatch):
@@ -1165,64 +1072,6 @@ def test_metrics_json_carries_the_intervention_split_and_ratio():
     assert payload["interventions_per_merged_pr"] is None  # nothing merged yet
 
 
-# ── settled-leg stage in the fold ─────────────────────────────────────────────
-# The third mapping site for the #158 class, and the one an operator actually
-# reads: the stage the fold puts on the issue row. Claude settles a clean leg
-# with an empty exit reason and codex settles it `ok`, so keying failure on the
-# field's presence rendered whole healthy codex batches as "run failed".
-@pytest.mark.parametrize(
-    "exit_reason,is_error,stage",
-    [
-        pytest.param("ok", False, "working", id="codex-clean"),
-        pytest.param("OK", False, "working", id="clean-uppercased"),
-        pytest.param(None, False, "working", id="claude-clean"),
-        pytest.param("ok", True, "run failed", id="error-despite-clean-reason"),
-        pytest.param("budget_exhausted", True, "run failed", id="budget"),
-        pytest.param("agent_error", False, "run failed", id="agent-error"),
-        pytest.param("wall_cap", False, "run failed", id="infra-death"),
-        pytest.param("!" + "x" * 10_000, False, "run failed", id="huge-unknown"),
-    ],
-)
-def test_the_fold_stages_a_settled_leg_by_its_error_signal(
-    exit_reason, is_error, stage
-):
-    dep = v2_deployment([
-        v2_event(AgentRunStarted("m", kind="TRIAGE"), "a", 0, issue=7, run_id="r"),
-        v2_event(
-            AgentRunCompleted(
-                "done", is_error, exit_reason, 1000, "m", "codex",
-                kind="TRIAGE", cost_micros=680_000, currency="USD",
-                pricing_basis="api",
-            ),
-            "b", 1, issue=7, run_id="r",
-        ),
-        _observed(7, ["ai-working"], 2),
-    ])
-
-    # A clean settle renders the issue's lifecycle state; only an error signal
-    # renders "run failed".
-    assert dep.issues[0].stage == stage
-
-
-def test_a_clean_codex_leg_does_not_flag_the_card_as_failed():
-    dep = v2_deployment([
-        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=7, run_id="r"),
-        v2_event(
-            AgentRunCompleted(
-                "done", False, "ok", 1000, "m", "codex", kind="RESOLVE",
-                cost_micros=680_000, currency="USD", pricing_basis="api",
-            ),
-            "b", 1, issue=7, run_id="r",
-        ),
-        _observed(7, ["ai-pr-open"], 2),
-    ])
-
-    card = snapshots.issue_card(dep.issues[0], NOW)
-
-    assert card["stage"] == "awaiting review"
-    assert [step["state"] for step in card["steps"]] == ["ok"]
-
-
 # ── escalation reasons ────────────────────────────────────────────────────────
 def _deployment_of(*rows):
     return replace(build([RESOLVE]), issues=tuple(rows))
@@ -1275,89 +1124,18 @@ def _observed_view(
     }
 
 
-def test_a_label_removed_out_of_band_retires_the_escalation():
-    # GitHub UI / raw-API removals journal no action event; the observed
-    # world is the retirement authority (tauri #650, 2026-08-10).
-    row = row_view([
-        BREAKER_COMMENT, ESCALATION,
-        _observed_view(["ai-pr-open"], hours=1),
-    ])
-
-    assert snapshots.escalation_reasons(_deployment_of(row)) == []
-    assert snapshots.issue_detail(row, NOW)["escalation_reason"] is None
 
 
-def test_an_observation_from_before_the_escalation_cannot_retire_it():
-    row = row_view([
-        _observed_view(["ai-ready"], hours=3),
-        BREAKER_COMMENT, ESCALATION,
-    ])
-
-    assert snapshots.issue_detail(row, NOW)["escalation_reason"] is not None
 
 
-def test_an_observation_still_carrying_the_label_keeps_the_escalation():
-    row = row_view([
-        BREAKER_COMMENT, ESCALATION,
-        _observed_view(["needs-human-review"], hours=1),
-    ])
-
-    assert snapshots.issue_detail(row, NOW)["escalation_reason"] is not None
 
 
-def test_a_stale_clearing_observation_self_heals_on_the_next_poll():
-    # A fetch that started before the label landed can publish after the
-    # escalation event; observation is level-triggered so the next fresh
-    # poll restores the affordance instead of losing it forever.
-    row = row_view([
-        BREAKER_COMMENT, ESCALATION,
-        _observed_view(["ai-pr-open"], hours=1),
-        _observed_view(["needs-human-review"], hours=0),
-    ])
-
-    assert snapshots.issue_detail(row, NOW)["escalation_reason"] is not None
 
 
-def test_a_truncated_observation_proves_presence_but_never_absence():
-    # world_reporter clips label lists to five when facts overflow; a
-    # clipped list omitting needs-human-review says nothing about the hold.
-    clipped = row_view([
-        BREAKER_COMMENT, ESCALATION,
-        _observed_view(["a", "b", "c", "d", "e"], hours=1, truncated=True),
-    ])
-    held = row_view([
-        BREAKER_COMMENT, ESCALATION,
-        _observed_view(["ai-pr-open"], hours=1),
-        _observed_view(["needs-human-review"], hours=0, truncated=True),
-    ])
-
-    assert snapshots.issue_detail(clipped, NOW)["escalation_reason"] is not None
-    assert snapshots.issue_detail(held, NOW)["escalation_reason"] is not None
 
 
-def test_a_pr_escalation_survives_issue_observations_but_not_pr_ones():
-    # F6: the issue can look healthy while the PR still carries the hold.
-    pr_escalation = {**ESCALATION, "target": "pr", "number": 12}
-    held = row_view([
-        BREAKER_COMMENT, pr_escalation,
-        _observed_view(["ai-pr-open"], hours=1),
-    ])
-    released = row_view([
-        BREAKER_COMMENT, pr_escalation,
-        _observed_view(["ai-pr-open"], hours=1, kind="pr", number=12),
-    ])
-
-    assert snapshots.issue_detail(held, NOW)["escalation_reason"] is not None
-    assert snapshots.issue_detail(released, NOW)["escalation_reason"] is None
 
 
-def test_a_tombstoned_observation_does_not_retire_the_escalation():
-    row = row_view([
-        BREAKER_COMMENT, ESCALATION,
-        _observed_view([], hours=1, present=False),
-    ])
-
-    assert snapshots.issue_detail(row, NOW)["escalation_reason"] is not None
 
 
 def test_a_finished_issue_is_not_still_escalated_on_the_overview():
@@ -1375,123 +1153,26 @@ def test_the_tile_sub_lines_and_the_issue_card_state_the_same_reason():
 
 
 # ── needs attention ───────────────────────────────────────────────────────────
-def _observed(issue: int, labels, seq: int, *, title="a title", present=True):
-    return v2_event(
-        WorldObserved(
-            "issue", issue, f"h{issue}",
-            {"present": present, "state": "OPEN", "title": title,
-             "labels": list(labels)},
-        ),
-        f"w{issue}-{seq}", seq, issue=issue,
-    )
 
 
-def _attention(events):
-    return snapshots.needs_attention(v2_deployment(events))
 
 
-def test_needs_attention_names_the_issue_and_why_it_is_waiting():
-    items = _attention([
-        _observed(7, ["ai-blocked"], 0),
-        _observed(8, ["needs-human-review"], 1, title="escalated one"),
-        _observed(9, ["needs-budget-review", "ai-working"], 2),
-    ])
-
-    assert [(item["issue"], item["kind"]) for item in items] == [
-        (7, "blocked"), (8, "escalated"), (9, "needs-budget-review"),
-    ]
-    assert items[1]["title"] == "escalated one"
 
 
-def test_a_blocked_issue_carries_the_question_the_agent_actually_asked():
-    items = _attention([
-        _observed(7, ["ai-blocked"], 0),
-        v2_event(AgentRunStarted("m", kind="RESOLVE"), "s", 1, issue=7, run_id="r"),
-        v2_event(
-            AgentRunCompleted(
-                "blocked", False, "ok", 1000, "m", "codex",
-                kind="RESOLVE", cost_micros=0, currency="USD",
-                pricing_basis="api",
-                attributes={
-                    "needs": "Which database should the migration target?\nmore"
-                },
-            ),
-            "c", 2, issue=7, run_id="r",
-        ),
-    ])
-
-    assert [item["kind"] for item in items] == ["blocked"]
-    assert items[0]["detail"] == "Which database should the migration target?"
 
 
-def test_one_issue_waiting_for_two_reasons_is_reported_as_both():
-    items = _attention([
-        _observed(7, ["ai-blocked", "needs-budget-review"], 0),
-    ])
-
-    assert [item["kind"] for item in items] == ["blocked", "needs-budget-review"]
 
 
-def test_a_parked_issue_is_reported_as_held_with_the_operators_reason():
-    items = _attention([_observed(7, ["ai-parked"], 0)])
-
-    assert [(item["kind"], item["detail"]) for item in items] == [("held", "parked")]
 
 
-def test_the_attention_panel_is_ordered_by_urgency_then_issue_number():
-    items = _attention([
-        _observed(30, ["ai-parked"], 0),
-        _observed(20, ["needs-human-review"], 1),
-        _observed(12, ["ai-blocked"], 2),
-        _observed(11, ["ai-blocked"], 3),
-    ])
-
-    assert [item["kind"] for item in items] == [
-        "blocked", "blocked", "escalated", "held",
-    ]
-    assert [item["issue"] for item in items][:2] == [11, 12]
 
 
-def test_a_finished_or_untouched_issue_needs_no_attention():
-    assert _attention([_observed(7, ["ai-done"], 0)]) == []
-    assert _attention([_observed(7, [], 0)]) == []
 
 
-def test_a_resolved_spend_block_drops_out_of_current_attention():
-    events = [
-        v2_event(
-            SpendBlocked("issue", "exhausted", 2_000_000, 1_000_000, "USD", "cap"),
-            "spend-block",
-            0,
-            issue=7,
-        ),
-        _observed(7, ["ai-working"], 1),
-    ]
-    deployment = v2_deployment(events)
-
-    assert deployment.issues[0].spend_blocks == 1
-    assert snapshots.needs_attention(deployment) == []
 
 
-def test_needs_attention_tolerates_an_issue_with_no_observed_labels():
-    """A row the world reporter never described must not crash the overview —
-    it simply has nothing to say about who is waiting."""
-    dep = v2_deployment([
-        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=7, run_id="r"),
-    ])
-
-    assert snapshots.needs_attention(dep) == []
 
 
-def test_the_pending_card_and_the_attention_panel_share_one_hold_definition():
-    row = v2_deployment([_observed(7, ["ai-parked"], 0)]).issues[0]
-    card = snapshots.pending_card(
-        {"number": 7, "labels": ["ai-parked", "ai-ready"]}, row
-    )
-
-    assert card["held"] is True
-    assert card["hold_reason"] == "parked"
-    assert snapshots.hold_state(row, ["ai-parked"]) == (True, "parked")
 
 
 # ── operator-actions timeline ─────────────────────────────────────────────────
@@ -2595,29 +2276,6 @@ def test_spend_per_hour_counts_a_deployment_level_leg_priced_only_by_estimate():
     )
 
 
-def test_spend_per_hour_charges_legs_on_an_issue_the_world_no_longer_shows():
-    """A retired issue is filtered out of the display rows but its legs were
-    still paid for, and the metrics still charge them. The chart reads the same
-    rows or it under-reports the deployment's spend."""
-    dep = v2_deployment([
-        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=7, run_id="r"),
-        v2_event(
-            AgentRunCompleted(
-                "done", False, "ok", 1000, "m", "codex",
-                cost_micros=750_000, currency="USD", pricing_basis="api",
-                kind="RESOLVE",
-            ),
-            "b", 1, issue=7, run_id="r",
-        ),
-        v2_event(
-            WorldObserved("issue", 7, "hash", {"present": False, "state": "OPEN"}),
-            "c", 2, issue=7,
-        ),
-    ])
-
-    assert [row.issue for row in dep.issues] == []
-    assert dep.metrics.total_cost_usd == 0.75
-    assert sum(b["usd"] for b in snapshots.spend_per_hour(dep, NOW)) == 0.75
 
 
 def test_spend_per_hour_totals_a_huge_journal_without_losing_charges():
@@ -2628,15 +2286,15 @@ def test_spend_per_hour_totals_a_huge_journal_without_losing_charges():
     assert round(sum(b["usd"] for b in snapshots.spend_per_hour(dep, NOW)), 2) == 20.0
 
 
-# ── v2 GitHub enrichment ──────────────────────────────────────────────────────
+# ── GitHub enrichment ──────────────────────────────────────────────────────
 REVIEW_LEG = {"ts": ts(hours=1), "event": "agent_run", "role": "review",
               "kind": "REVIEW", "issue": 7, "number": 12, "cost_usd": 0.5,
               "status": "done", "exit_reason": "ok", "model": "m",
               "session_id": "s"}
 
 
-def v2_backend(monkeypatch, ledger_rows=(), **pr_fields):
-    deployment = replace(build([RESOLVE, REVIEW_LEG]), schema_version=2)
+def stub_backend(monkeypatch, ledger_rows=(), **pr_fields):
+    deployment = build([RESOLVE, REVIEW_LEG])
     snapshot = dash.Snapshot("demo", "o/r", "/target", deployment, (NOW,))
 
     class Gh:
@@ -2671,8 +2329,8 @@ def card_for(payload, issue=7):
     return next(card for card in everything if card["issue"] == issue)
 
 
-def test_v2_cards_carry_pr_state_and_merge_readiness_from_github(monkeypatch):
-    backend = v2_backend(monkeypatch, reviewDecision="APPROVED", mergeable="MERGEABLE")
+def test_cards_carry_pr_state_and_merge_readiness_from_github(monkeypatch):
+    backend = stub_backend(monkeypatch, reviewDecision="APPROVED", mergeable="MERGEABLE")
 
     first = card_for(backend.issues("demo"))
     assert (first["pr"], first["pr_state"]) == (12, None)
@@ -2686,8 +2344,8 @@ def test_v2_cards_carry_pr_state_and_merge_readiness_from_github(monkeypatch):
     assert card["pr_review_state"] == "mergeable"
 
 
-def test_v2_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch):
-    backend = v2_backend(monkeypatch)
+def test_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch):
+    backend = stub_backend(monkeypatch)
     card = eventually(
         lambda: card_for(backend.issues("demo")),
         lambda current: current["pr_state"] is not None,
@@ -2697,7 +2355,7 @@ def test_v2_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch
 
 
 def test_issue_detail_uses_cached_deployment_leg_and_unproductive_caps(monkeypatch):
-    backend = v2_backend(monkeypatch)
+    backend = stub_backend(monkeypatch)
     configured = {
         "MAX_BUDGET_USD": "6.5",
         "REVIEW_BUDGET_USD": "2.5",
@@ -2727,10 +2385,10 @@ def test_issue_detail_reads_current_execution_allowance_and_ignores_retired_file
     from tests.adapters.test_review_execution_control import dump
 
     store, _, _, _, _ = current_review_rig
-    backend = v2_backend(monkeypatch)
+    backend = stub_backend(monkeypatch)
     backend.control_db_path = store.path
     original = backend.snapshot("demo")
-    deployment = replace(build([RESOLVE, {**REVIEW_LEG, "number": 9}]), schema_version=2)
+    deployment = build([RESOLVE, {**REVIEW_LEG, "number": 9}])
     backend.snapshot = lambda _name: replace(original, deployment=deployment)
     review_dir = tmp_path / "review"
     review_dir.mkdir()
@@ -2754,7 +2412,7 @@ def test_cards_carry_the_verification_reason_for_issue_and_pr(monkeypatch):
     ledger = [{"change": "#7 the bug", "shipped": "PR #12", "status": "VERIFIED",
                "reason": "probe stayed green over two deployments"}]
 
-    card = card_for(v2_backend(monkeypatch, ledger_rows=ledger).issues("demo"))
+    card = card_for(stub_backend(monkeypatch, ledger_rows=ledger).issues("demo"))
 
     assert card["issue_verification"] == "VERIFIED"
     assert card["issue_verification_reason"] == "probe stayed green over two deployments"
@@ -2765,60 +2423,16 @@ def test_cards_omit_a_verification_reason_the_ledger_does_not_give(monkeypatch):
     ledger = [{"change": "#7 the bug", "shipped": "PR #12", "status": "VERIFIED",
                "reason": None}]
 
-    card = card_for(v2_backend(monkeypatch, ledger_rows=ledger).issues("demo"))
+    card = card_for(stub_backend(monkeypatch, ledger_rows=ledger).issues("demo"))
 
     assert card["issue_verification"] == "VERIFIED"
     assert card["issue_verification_reason"] is None
 
 
-def test_a_github_read_cannot_displace_the_projected_issue_state():
-    """The v2 projection is authority for an issue's lifecycle. A GitHub read
-    that disagrees — a stale list, a closed-then-reopened issue — may only add
-    presentation, never overwrite the projected answer."""
-    row = replace(
-        row_for([RESOLVE], 7),
-        facts={"state": "OPEN", "labels": ("ai-ready",)},
-    )
-    enrichment = service._github_issue_enrichment({
-        "number": 7, "title": "the bug", "url": "u/7",
-        "state": "CLOSED", "mergedAt": "2026-07-01T00:00:00+00:00",
-        "reviewDecision": "APPROVED", "mergeable": "MERGEABLE",
-    })
-
-    issue = service._projected_issue(row, enrichment)
-
-    assert issue["state"] == "OPEN"
-    assert (issue["title"], issue["url"]) == ("the bug", "u/7")
-    assert "mergedAt" not in issue
 
 
-def test_issue_enrichment_carries_the_body_the_projection_cannot_supply():
-    # The v2 facts have no `body`/`createdAt`; without GitHub's, every
-    # expanded backlog row rendered empty (2026-08-02).
-    row = replace(row_for([RESOLVE], 7), facts={"state": "OPEN", "labels": ()})
-    enrichment = service._github_issue_enrichment({
-        "number": 7, "title": "the bug", "url": "u/7",
-        "body": "## What happened\n\nit broke",
-        "createdAt": "2026-08-01T00:00:00+00:00",
-        "state": "CLOSED",
-    })
-
-    issue = service._projected_issue(row, enrichment)
-    card = snapshots.backlog_card(issue, NOW)
-
-    assert card["body"] == "## What happened\n\nit broke"
-    assert card["age_days"] is not None
-    assert issue["state"] == "OPEN"
 
 
-def test_pull_request_enrichment_still_carries_its_merge_and_review_state():
-    assert service._github_enrichment({
-        "state": "OPEN", "mergedAt": None, "reviewDecision": "APPROVED",
-        "mergeable": "MERGEABLE", "title": "t", "url": "u",
-    }) == {
-        "state": "OPEN", "reviewDecision": "APPROVED",
-        "mergeable": "MERGEABLE", "title": "t", "url": "u",
-    }
 
 
 # ── card labels ───────────────────────────────────────────────────────────────
@@ -2984,22 +2598,6 @@ def test_merge_ownership_follows_the_fixers_per_branch_rule(branch, status):
         assert "The harness merges it next." in board_of(card)["reason"]
 
 
-def test_a_v2_enriched_pr_keeps_the_merge_readiness_the_board_needs():
-    # The v2 enrichment once dropped mergeStateStatus, so an approved, green
-    # PR on a repo the harness does not merge read "Ready to merge" (Working)
-    # instead of asking the operator to merge it.
-    full = {**_MERGE_READY_PR, "headRefName": "fix/7-test"}
-    enriched = service._github_enrichment(full)
-
-    owned_by_operator = snapshots.issue_card(_approved_row(), NOW, gh_prs={12: enriched})
-    behind = snapshots.issue_card(
-        _approved_row(), NOW,
-        gh_prs={12: service._github_enrichment({**full, "mergeStateStatus": "BEHIND"})},
-    )
-
-    assert ask_of(owned_by_operator) == "merge"
-    assert board_of(behind)["status"] == "working"
-    assert board_of(behind)["headline"] == "Approved"
 
 
 def test_an_approval_does_not_survive_the_ci_fix_that_changed_the_head():
@@ -3084,91 +2682,8 @@ def test_a_projection_without_an_attention_label_keeps_the_journal_escalation():
     assert ask_of(card) == "rearm"
 
 
-@pytest.mark.parametrize("operation", ["release", "rearm"])
-@pytest.mark.parametrize("settlement", ["write", "present", "lost_reply", "refused"])
-def test_review_release_retires_board_attention_only_after_verified_relabel(tmp_path, operation, settlement):
-    from tests.adapters.test_review_effects import Rig, PR, accepted_rearm, commit_rearm, committed_release
-    from issue_agent.domain.events import EscalationRaised
-
-    def fault(point):
-        if settlement == "lost_reply" and point == "relabel_pr_applied":
-            raise TimeoutError("reply lost after label removal")
-
-    rig = Rig(tmp_path, fault=fault)
-    events = []
-    sequence = 0
-
-    def envelope(payload, correlation):
-        nonlocal sequence
-        sequence += 1
-        seq = sequence
-        return EventEnvelope(payload, f"event-{seq}", seq, rig.clock[0], rig.clock[0], seq,
-                             Producer("demo", "o/r", "review", 10, "boot"), correlation)
-
-    rig.store.bind_event_outbox(envelope, events.append)
-    events.append(envelope(WorldObserved("issue", 7, "issue", {
-        "present": True, "state": "OPEN", "labels": ["ai-pr-open"],
-    }), Correlation(issue=7)))
-    events.append(envelope(WorldObserved("pr", PR, "pr", {
-        "present": True, "state": "OPEN", "closing_issue": 7, "labels": ["ai-pr-open"],
-        "observation_truncated": True,
-    }), Correlation(pr=PR)))
-    events.append(envelope(EscalationRaised("pr", PR), Correlation(pr=PR)))
-
-    def board():
-        feeds = (("review", "/j/rev", "/l/rev", tuple(events)),)
-        dep = dash.build_deployment_v2("demo", "o/r", feeds, fold(events), lambda: rig.clock[0])
-        row = next(row for row in dep.issues if row.issue == 7)
-        return board_of(snapshots.issue_card(row, rig.clock[0], gh_issue={"title": "x"}))
-
-    assert board()["ask"] == "escalated"
-    rig.advance(60)
-    if operation == "release":
-        committed_release(rig)
-    else:
-        commit_rearm(rig.store, accepted_rearm())
-    if settlement == "present":
-        rig.remote.external_pr_change(PR, labels=["ai-pr-open"])
-    elif settlement == "refused":
-        rig.remote.external_pr_change(PR, labels=["needs-human-review", "ai-blocked"])
-    rig.drain()
-    if settlement == "lost_reply":
-        assert board()["ask"] == "escalated"
-        rig.advance(60)
-        rig.drain()
-    if settlement == "refused":
-        assert board()["ask"] == "escalated"
-        return
-    assert board().get("ask") is None
-    assert board()["status"] != "needs_you"
-
-    rig.advance(60)
-    events.append(envelope(EscalationRaised("pr", PR), Correlation(pr=PR)))
-    assert board()["ask"] == "escalated"
-    assert board()["status"] == "needs_you"
-    for truncated in (False, True):
-        rig.advance(60)
-        events.append(envelope(WorldObserved("pr", PR, f"absent-{truncated}", {
-            "present": True, "state": "OPEN", "closing_issue": 7, "labels": ["ai-pr-open"],
-            "observation_truncated": truncated,
-        }), Correlation(pr=PR)))
-        assert board()["ask"] == "escalated"
-        assert board()["status"] == "needs_you"
 
 
-@pytest.mark.parametrize("label,ask", [("needs-human-review", "escalated"), ("needs-budget-review", "budget")])
-def test_a_v2_escalation_label_from_the_world_projection_asks_the_operator(label, ask):
-    observed = v2_event(
-        WorldObserved("issue", 7, "h", {"present": True, "state": "OPEN", "labels": ["ai-working", label]}),
-        "observed", 1, issue=7,
-    )
-    row = v2_deployment([observed]).issues[0]
-    # The v2 GitHub enrichment carries no labels: the projection owns them.
-    enrichment = service._github_issue_enrichment({"title": "needs action", "labels": [label]})
-
-    card = snapshots.issue_card(row, NOW, gh_issue=enrichment)
-
-    assert ask_of(card) == ask
 
 
 @pytest.mark.parametrize(
@@ -3496,11 +3011,11 @@ def test_a_new_head_observed_after_a_stall_answers_it():
     assert ask_of(snapshots.issue_card(row, NOW)) != "stalled"
 
 
-def test_a_v2_merge_wait_starts_at_the_approval_on_a_repo_without_ci():
+def test_a_merge_wait_starts_at_the_approval_on_a_repo_without_ci():
     pr = {**_MERGE_READY_PR, "statusCheckRollup": [], "updatedAt": ts(minutes=20)}
 
     card = snapshots.issue_card(replace(_approved_row(), facts={"pr_ci_gate": "none"}), NOW,
-                                gh_prs={12: service._github_enrichment(pr)})
+                                gh_prs={12: pr})
 
     assert ask_of(card) == "merge"
     assert board_of(card)["since_ts"] == ts(minutes=30)

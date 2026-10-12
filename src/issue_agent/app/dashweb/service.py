@@ -21,11 +21,9 @@ if TYPE_CHECKING:
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
 from ...adapters.control_store import SQLiteControlStore
 from ...adapters.control_path import control_store_path
-from ...adapters.event_log import EventLog
-from ...adapters.journal import default_ledger_path
+from ...adapters.journal import Journal, default_ledger_path
 from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
-from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
 from ...domain.labels import Label
 from ...domain.fix import harness_merges_branch
@@ -35,7 +33,6 @@ _ParkMove = tuple[str, int, tuple[str, ...], tuple[str, ...]]
 from ...domain.events import (
     ActionApplied,
     Correlation,
-    Producer,
     TelemetryEvent,
 )
 from .. import cli, config
@@ -221,19 +218,11 @@ class Backend:
             ttl_s=gh_enrichment_ttl_s,
             executor=gh_enrichment_executor,
         )
-        # Behind the TTL, because the TTL only bounds how often we ask: on
-        # expiry the old collector re-read and re-folded all three feeds from
-        # byte zero, so a single polling browser tab held a core at 100% and
-        # the cost grew with the deployment's history (keifu, 2026-08-02). The
-        # collector answers an unchanged deployment from its own fingerprint
-        # and parses only appended bytes otherwise.
-        self._collector = system.SnapshotCollector()
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
         self._resolve_factory = resolve_factory
         self._review_factory = review_factory
-        self._journals: dict[tuple[str, str, str], TypedJournal | None] = {}
 
     # ── journal side ──
     def names(self) -> tuple[str, ...]:
@@ -263,7 +252,7 @@ class Backend:
     def _deployment_snapshot(
         self, name: str, repo: str, target_dir: str, journal_paths: tuple[str, ...], control_db_path: str,
     ) -> dash.Snapshot:
-        return self._collector.collect(
+        return system.collect_snapshot(
             name=name, repo=repo, target_dir=target_dir, journal_paths=list(journal_paths),
             log_dir=cli.log_dir(), ledger_path=default_ledger_path(), now_fn=self.now_fn,
             stale_after_s=self.stale_after_s, control_db_path=control_db_path,
@@ -296,23 +285,12 @@ class Backend:
             verification.default_path(self.harness_root)
         )
 
-    def measurement(self, name: str, specification: dict) -> dict:
-        from ..measurement import local_export
-        cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
-        state_dirs = (cfg.state_dir, cfg.review_state_dir)
-        path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
-        return local_export(path, cfg.repo, specification)
-
     def overview(self, name: str, timezone_name: str | None = None) -> dict:
         live, scan_ok = system.scan_proc_daemons()
         snapshot = self.snapshot(name)
         local_tz = _local_timezone(timezone_name)
         first_observed_day = snapshots.first_observed_day(snapshot, local_tz)
-        issues, issue_error = (
-            ([], None)
-            if snapshot.deployment.schema_version == 2
-            else self.gh.issues(snapshot.repo)
-        )
+        issues, issue_error = self.gh.issues(snapshot.repo)
         recurrence_events = [
             event
             for row in snapshot.deployment.issues
@@ -439,15 +417,6 @@ class Backend:
             ("issues", snap.repo),
             lambda: self._gh_context(snap.repo),
         )
-        if snap.deployment.schema_version == 2:
-            gh_issues = {
-                number: _github_issue_enrichment(issue)
-                for number, issue in gh_issues.items()
-            }
-            gh_prs = {
-                number: _github_enrichment(pr)
-                for number, pr in gh_prs.items()
-            }
         rows = snap.deployment.issues
         projected_by_model = snapshots.projected_cost_by_model(rows)
         verification_payload = self.verification()
@@ -476,45 +445,23 @@ class Backend:
             )
 
         row_by_issue = {row.issue: row for row in rows}
-        ready_numbers = (
-            {
-                row.issue
-                for row in rows
-                if row.lane == "pending" and not row.done
-            }
-            if snap.deployment.schema_version == 2
-            else {
-                number
-                for number, issue in gh_issues.items()
-                if ghdata.is_open(issue)
-                and "ai-ready" in snapshots.labels_of(issue)
-            }
-        )
-        backlog_numbers = (
-            {
-                row.issue
-                for row in rows
-                if row.lane == "backlog" and not row.done
-            }
-            if snap.deployment.schema_version == 2
-            else set()
-        )
+        ready_numbers = {
+            number
+            for number, issue in gh_issues.items()
+            if ghdata.is_open(issue)
+            and "ai-ready" in snapshots.labels_of(issue)
+        }
         in_flight_numbers = {
             row.issue
             for row in rows
-            if (
-                not row.done
-                and row.issue not in ready_numbers
-                and row.issue not in backlog_numbers
-            )
+            if not row.done and row.issue not in ready_numbers
         }
         pending, backlog = [], []
-        if snap.deployment.schema_version == 2:
-            for number in sorted(ready_numbers):
-                issue = _projected_issue(
-                    row_by_issue[number],
-                    gh_issues.get(number, {}),
-                )
+        for number, issue in sorted(gh_issues.items()):
+            if not ghdata.is_open(issue):
+                continue
+            labels = snapshots.labels_of(issue)
+            if "ai-ready" in labels:
                 pending.append(
                     snapshots.pending_card(
                         issue,
@@ -523,38 +470,12 @@ class Backend:
                         harness_merges=harness_merges,
                     )
                 )
-            for number in sorted(backlog_numbers):
-                issue = _projected_issue(
-                    row_by_issue[number],
-                    gh_issues.get(number, {}),
-                )
+            elif snapshots.is_backlog(issue):
                 backlog.append(
                     snapshots.backlog_card(
-                        issue,
-                        now,
-                        row_by_issue.get(number),
+                        issue, now, row_by_issue.get(number)
                     )
                 )
-        else:
-            for number, issue in sorted(gh_issues.items()):
-                if not ghdata.is_open(issue):
-                    continue
-                labels = snapshots.labels_of(issue)
-                if "ai-ready" in labels:
-                    pending.append(
-                        snapshots.pending_card(
-                            issue,
-                            row_by_issue.get(number),
-                            gh_prs=gh_prs,
-                            harness_merges=harness_merges,
-                        )
-                    )
-                elif snapshots.is_backlog(issue):
-                    backlog.append(
-                        snapshots.backlog_card(
-                            issue, now, row_by_issue.get(number)
-                        )
-                    )
         return {
             "in_flight": [
                 card(row) for row in rows
@@ -580,15 +501,6 @@ class Backend:
             ("issue", snap.repo, row.issue, row.prs),
             lambda: self._gh_issue_context(snap.repo, row.prs),
         )
-        if snap.deployment.schema_version == 2:
-            gh_issues = {
-                key: _github_issue_enrichment(value)
-                for key, value in gh_issues.items()
-            }
-            gh_prs = {
-                key: _github_enrichment(value)
-                for key, value in gh_prs.items()
-            }
         budget_caps, unproductive_cap = self._cached_detail_limits(
             name, snap.repo
         )
@@ -1187,7 +1099,7 @@ class Backend:
         pr_requested_added: dict[int, tuple[str, ...]] | None = None,
         pr_applied: dict[int, bool] | None = None,
         channel: str = "api",
-        *, journal: TypedJournal | None,
+        *, journal: Journal | None,
     ) -> None:
         if journal is None:
             return
@@ -1314,123 +1226,12 @@ class Backend:
             **established,
         )
 
-    def _operator_journal(self, name: str, repo: str, *, legacy_path: str | None = None) -> TypedJournal | None:
-        """Where an operator intervention becomes visible to the fold.
-
-        It is written to the fix role's canonical feed because the dashboard
-        reads only the three role feeds — an event anywhere else does not
-        exist. The producer identity is the dashboard's own and never a
-        daemon's: role liveness and the world projection are per-feed, and an
-        operator click must not stand in for either.
-
-        Cached for the process's lifetime: opening an `EventLog` re-reads the
-        whole feed to restore its projection state, under the writer lock the
-        daemons append through, so building one per request would stall a live
-        fix loop on a mature deployment. The log is append-only, so a cached
-        one can never go stale.
-        """
+    def _operator_journal(self, name: str, repo: str, *, legacy_path: str | None = None) -> Journal | None:
+        """The fix role's journal, where an operator intervention becomes
+        visible to the board; the dashboard holds no other record of it."""
         if not repo:
             return None
-        legacy = cli.journal_paths(name)[0] if legacy_path is None else legacy_path
-        key = name, repo, os.path.realpath(legacy)
-        if key in self._journals:
-            return self._journals[key]
-        journal: TypedJournal | None = None
-        try:
-            events = EventLog(
-                os.path.join(os.path.dirname(legacy), "events-v2.jsonl"),
-                Producer(
-                    f"dashboard:{name}",
-                    repo,
-                    "dashboard",
-                    os.getpid(),
-                    uuid.uuid4().hex,
-                ),
-            )
-        except (OSError, ValueError):
-            journal = None  # telemetry never blocks the mutation
-        else:
-            journal = TypedJournal(legacy, events)
-        self._journals[key] = journal
-        return journal
-
-
-# Only fields GitHub may add to an authoritative v2 projection. Every key is
-# presentational: the v2 world projection decides which bucket a card sits in,
-# and none of these can move it.
-#
-# A pull request has no v2-projected lifecycle of its own, so its merge/review
-# fields come from GitHub — without them a v2 deployment showed a PR chip with
-# no state at all. An *issue* does: `state` and `mergedAt` are the projection's
-# to own, and letting a GitHub read supply them would put a second, contradicting
-# answer in the same dict key the projection already filled.
-_PR_ENRICHMENT_FIELDS = (
-    "title", "url", "state", "mergedAt", "reviewDecision", "mergeable",
-    # The chip's CI colour: ghdata already fetches the rollup, and without it
-    # here every v2 card rendered pr_ci_state=None while CI was visibly red.
-    "statusCheckRollup",
-    # Labels feed `_human_action`'s attention/ai-blocked arms. Without them
-    # the journal fallback was the ONLY block signal for PRs — and it is
-    # sticky: an operator clearing ai-blocked with a plain gh write (never
-    # journalled) left the fold believing a human owned the row forever,
-    # freezing both clocks while paid legs ran (keifu #142/#181, 2026-08-03).
-    "labels",
-    # The merge-readiness inputs. Without them a v2 board could not tell an
-    # approved, green PR GitHub refuses (draft, behind, blocked) from one the
-    # operator should merge now.
-    "mergeStateStatus", "isDraft", "autoMergeRequest",
-    # When the merge wait began (`_merge_ready_since`): without them a repo
-    # with no CI had no stamp at all, so its merge ask sorted last.
-    "latestReviews", "updatedAt",
-    # Head-bound approval (`_head_approved`): gh leaves latestReviews[].commit.oid
-    # empty, so only `reviews` carries the commit each approval was made on.
-    "reviews",
-    # Fetched only by GhReader.pr for an open issue detail. Keeping them in the
-    # v2 enrichment is necessary because `_github_enrichment` deliberately
-    # strips list-query fields that cannot affect the projected lifecycle.
-    "headRefName", "headRefOid", "closingIssuesReferences", "commits", "files",
-)
-# `body` and `createdAt` are presentational fields the projection does not
-# carry: the backlog drill-down renders the issue text, and its age column
-# needs the creation instant. Dropping them here blanked every expanded
-# backlog row (2026-08-02).
-_ISSUE_ENRICHMENT_FIELDS = ("title", "url", "body", "createdAt")
-
-
-def _enrichment(value: dict, fields: tuple[str, ...]) -> dict:
-    return {key: value[key] for key in fields if value.get(key) is not None}
-
-
-def _github_enrichment(value: dict) -> dict:
-    """PR-side enrichment: everything a PR chip renders."""
-
-    return _enrichment(value, _PR_ENRICHMENT_FIELDS)
-
-
-def _github_issue_enrichment(value: dict) -> dict:
-    """Issue-side enrichment: only what the v2 projection cannot supply."""
-
-    return _enrichment(value, _ISSUE_ENRICHMENT_FIELDS)
-
-
-def _projected_issue(row: dash.IssueRow, enrichment: dict) -> dict:
-    """Presentation fields from the authoritative v2 world projection."""
-
-    facts = row.facts
-    labels = facts.get("labels", ())
-    projected_labels = (
-        [str(label) for label in labels]
-        if isinstance(labels, (tuple, list, set, frozenset))
-        else []
-    )
-    return {
-        "number": row.issue,
-        "state": str(facts.get("state") or ""),
-        "title": facts.get("title"),
-        "labels": projected_labels,
-        "comments": facts.get("comments_total", facts.get("comments", ())),
-        **enrichment,
-    }
+        return Journal(cli.journal_paths(name)[0] if legacy_path is None else legacy_path)
 
 
 def _local_timezone(name: str | None):

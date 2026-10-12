@@ -1,7 +1,7 @@
 """SQLite operational authority defined by ADR 0003.
 
-The store owns reservations, run/lease state, deduplication, lifecycle commands,
-effect receipts, and the event outbox.  Transactions are intentionally short:
+The store owns reservations, run/lease state, deduplication, lifecycle commands
+and effect receipts.  Transactions are intentionally short:
 no network, model, or subprocess work is accepted by this adapter.
 """
 
@@ -66,7 +66,13 @@ from ..domain.review_workflow_policy import (
     bound_submission_owed, escalation_signal_identity,
 )
 from ..domain.workflow_retry import (
-    MAX_AUTHORIZED_ATTEMPTS, MAX_RELEVANT_AUTHORIZATIONS, BeginRetry, DeclineRetry, grant_unavailable_void, RetryAbsenceRead, RetryAuthorization, RetryAuthorizationFacts,
+    MAX_RELEVANT_AUTHORIZATIONS,
+    BeginRetry,
+    DeclineRetry,
+    grant_unavailable_void,
+    RetryAbsenceRead,
+    RetryAuthorization,
+    RetryAuthorizationFacts,
     retry_spend_decision,
 )
 from ..domain.workflow_reconciliation import (
@@ -76,27 +82,6 @@ from ..domain.workflow_reconciliation import (
 from ..domain.resolve_return import FinalizedResolveReturn
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.outcome import ExitReason
-from ..domain.events import (
-    ActionApplied,
-    ActionFailed,
-    AdmissionReconciled,
-    BudgetVarianceDetected,
-    ControlTransitionCommitted,
-    Correlation,
-    EscalationRaised,
-    EventEnvelope,
-    EventPayload,
-    JsonValue,
-    MAX_EVENT_LINE_BYTES,
-    NativeUsageRemetered,
-    ReservationRetained,
-    SpendRecorded,
-    TelemetryWarning,
-    WorldFeedRetired,
-    WorldObserved,
-    decode_event_line,
-    encode_event_line,
-)
 from ..domain.repository import canonical_repository
 from ..domain.refs import issue_from_branch
 from .deployment_authority import (
@@ -108,7 +93,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 45
+SCHEMA_VERSION = 46
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2432,6 +2417,16 @@ WHERE json_type(episode_json,'$.value')='array'
     AND json_extract(episode_json,'$.value[1].fields.continuation.type')='AuthoredResolve';
 DROP INDEX runs_adjudication_episode;
 """),
+    # Slice 8a: telemetry no longer passes through SQLite. The outbox, the
+    # world-observation dedupe and the reporters' level state lost their only
+    # writers, and these dedupe namespaces only deduplicated telemetry lines.
+    SchemaMigration(46, """
+DROP TABLE event_outbox;
+DROP TABLE world_observations;
+DROP TABLE level_state;
+DELETE FROM dedupe_keys WHERE namespace IN ('measurement-observation','path-prediction',
+    'ci-pending','duplicate-pr','ci-flake','world-feed-retirement','native-remetered');
+"""),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -2467,106 +2462,8 @@ class SQLiteControlStore:
         self.busy_timeout_ms = busy_timeout_ms
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._migration_observer = migration_observer
-        self._event_factory: (
-            Callable[[EventPayload, Correlation], EventEnvelope] | None
-        ) = None
-        self._event_sink: Callable[[EventEnvelope], None] | None = None
-        self._event_destination: str | None = None
-        self._event_line_limit = MAX_EVENT_LINE_BYTES
-        self._flushing_outbox = False
         self._bound_owner_id: str | None = None
-        self._telemetry_enqueue_failures = 0
 
-    @property
-    def telemetry_enqueue_failures(self) -> int:
-        return self._telemetry_enqueue_failures
-
-    def bind_event_outbox(
-        self,
-        factory: Callable[[EventPayload, Correlation], EventEnvelope],
-        sink: Callable[[EventEnvelope], None],
-        *,
-        line_limit: int = MAX_EVENT_LINE_BYTES,
-        destination: str | None = None,
-    ) -> None:
-        """Bind telemetry publication after store initialization.
-
-        State commits do not depend on the sink. A failed publication leaves its
-        row pending and a later mutation/startup retries it.
-        """
-
-        if line_limit <= 0:
-            raise ValueError("outbox event line limit must be positive")
-        self._event_factory = factory
-        self._event_sink = sink
-        self._event_line_limit = line_limit
-        self._event_destination = destination
-        self._flush_bound_outbox()
-
-    def _transition(
-        self,
-        db: sqlite3.Connection,
-        entity_kind: str,
-        entity_id: str,
-        state: str,
-        detail: Mapping[str, JsonValue] | None = None,
-        *,
-        correlation: Correlation = Correlation(),
-    ) -> None:
-        if self._event_factory is None:
-            return
-        payload = ControlTransitionCommitted(
-            entity_kind,
-            entity_id,
-            state,
-            dict(detail or {}),
-        )
-        self._enqueue_operational_event(db, payload, correlation)
-
-    def _event(
-        self,
-        db: sqlite3.Connection,
-        payload: EventPayload,
-        *,
-        correlation: Correlation = Correlation(),
-    ) -> None:
-        self._enqueue_operational_event(db, payload, correlation)
-
-    def _enqueue_operational_event(
-        self,
-        db: sqlite3.Connection,
-        payload: EventPayload,
-        correlation: Correlation,
-    ) -> None:
-        """Keep telemetry encoding failures outside authoritative transactions."""
-
-        if self._event_factory is None:
-            return
-        try:
-            self.enqueue_event(
-                self._event_factory(payload, correlation),
-                db,
-            )
-        except Exception:
-            self._telemetry_enqueue_failures += 1
-
-    def _flush_bound_outbox(self) -> int:
-        if self._event_sink is None or self._flushing_outbox:
-            return 0
-        self._flushing_outbox = True
-        try:
-            return self.flush_outbox(
-                self._event_sink, destination=self._event_destination
-            )
-        except Exception:
-            return 0
-        finally:
-            self._flushing_outbox = False
-
-    def flush_bound_outbox(self) -> int:
-        """Retry every committed event for this role's bound destination."""
-
-        return self._flush_bound_outbox()
 
     def initialize(self) -> None:
         parent = os.path.dirname(self.path)
@@ -3194,85 +3091,6 @@ class SQLiteControlStore:
             )
             return (runs, commands)
 
-    def adopt_projection_feed(
-        self,
-        *,
-        prior_deployment: str,
-        current_deployment: str,
-        repository: str,
-        role: str,
-        prior_destination: str,
-        current_destination: str,
-    ) -> tuple[int, int]:
-        """Retire a case-alias feed without stranding membership or outbox rows."""
-
-        if (
-            not prior_deployment
-            or not current_deployment
-            or not repository
-            or not role
-            or not prior_destination
-            or not current_destination
-        ):
-            raise ValueError("projection feed adoption identity is incomplete")
-        if prior_deployment == current_deployment:
-            return (0, 0)
-        if (
-            self._event_factory is None
-            or self._event_destination != current_destination
-        ):
-            raise ValueError(
-                "current projection event destination must be bound before adoption"
-            )
-        retirement_key = hashlib.sha256(
-            f"{prior_destination}->{current_destination}".encode()
-        ).hexdigest()
-        with self.transaction() as db:
-            db.execute(
-                "INSERT OR IGNORE INTO dedupe_keys("
-                "namespace, scope, key, claimed_at"
-                ") VALUES ('world-feed-retirement', ?, ?, ?)",
-                (
-                    current_destination,
-                    retirement_key,
-                    _stamp(self._now()),
-                ),
-            )
-            if not int(db.execute("SELECT changes()").fetchone()[0]):
-                return (0, 0)
-            moved_outbox = db.execute(
-                "UPDATE event_outbox SET destination=? "
-                "WHERE destination=? AND emitted_at IS NULL",
-                (current_destination, prior_destination),
-            ).rowcount
-            prior_rows = int(
-                db.execute(
-                    "SELECT COUNT(*) FROM world_observations "
-                    "WHERE deployment=?",
-                    (prior_deployment,),
-                ).fetchone()[0]
-            )
-            db.execute(
-                "INSERT OR IGNORE INTO world_observations("
-                "deployment, subject_kind, subject_number, content_hash, "
-                "observed_at"
-                ") SELECT ?, subject_kind, subject_number, content_hash, "
-                "observed_at FROM world_observations WHERE deployment=?",
-                (current_deployment, prior_deployment),
-            )
-            db.execute(
-                "DELETE FROM world_observations WHERE deployment=?",
-                (prior_deployment,),
-            )
-            self._event(
-                db,
-                WorldFeedRetired(
-                    prior_deployment,
-                    repository,
-                    role,
-                ),
-            )
-            return (prior_rows, moved_outbox)
 
     def now(self) -> datetime:
         """This store's authority clock; executors stamp their reads with it."""
@@ -3307,7 +3125,6 @@ class SQLiteControlStore:
                 raise
             else:
                 db.commit()
-                self._flush_bound_outbox()
 
     def start_run(
         self,
@@ -3333,17 +3150,6 @@ class SQLiteControlStore:
                     state,
                     config_version,
                     now,
-                ),
-            )
-            self._transition(
-                db,
-                "run",
-                str(run_id),
-                state,
-                {"dispatch_id": dispatch_id, "kind": kind, "owner_id": owner_id},
-                correlation=Correlation(
-                    dispatch_id=dispatch_id,
-                    run_id=str(run_id),
                 ),
             )
 
@@ -3380,17 +3186,6 @@ class SQLiteControlStore:
                 (state, outcome, provider_receipt_id, _stamp(self._now()), str(run_id)),
             )
             db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
-            self._transition(
-                db,
-                "run",
-                str(run_id),
-                state,
-                {
-                    "outcome": outcome,
-                    "provider_receipt_id": provider_receipt_id,
-                },
-                correlation=Correlation(run_id=str(run_id)),
-            )
             return True
 
     def register_lease(self, lease: Lease) -> None:
@@ -3433,23 +3228,6 @@ class SQLiteControlStore:
                 "UPDATE reservation_recovery SET policy='running', "
                 "reason=NULL, updated_at=? WHERE run_id=?",
                 (_stamp(self._now()), str(lease.run_id)),
-            )
-            self._transition(
-                db,
-                "lease",
-                str(lease.run_id),
-                "active",
-                {
-                    "dispatch_id": lease.dispatch_id,
-                    "owner_id": lease.owner_id,
-                    "pid": lease.pid,
-                    "pgid": lease.pgid,
-                    "process_start_ticks": lease.process_start_ticks,
-                },
-                correlation=Correlation(
-                    dispatch_id=lease.dispatch_id,
-                    run_id=str(lease.run_id),
-                ),
             )
 
     def register_process_lease(
@@ -3596,11 +3374,6 @@ class SQLiteControlStore:
                     started_at = _parse_stamp(_stamp(self._now()))
                     db.execute("UPDATE leases SET pid=?,pgid=?,process_start_ticks=?,started_at=? WHERE run_id=?",
                                (pid, pgid, process_start_ticks, _stamp(started_at), str(run_id)))
-                    self._transition(db, "lease", str(run_id), "active", {
-                        "dispatch_id": run["dispatch_id"], "owner_id": expected_owner_id,
-                        "pid": pid, "pgid": pgid, "process_start_ticks": process_start_ticks,
-                        "replaced_pid": existing["pid"], "replaced_start_ticks": existing["process_start_ticks"],
-                    }, correlation=Correlation(dispatch_id=run["dispatch_id"], run_id=str(run_id)))
                     return Lease(run_id, run["dispatch_id"], expected_owner_id,
                                  pid, pgid, started_at, process_start_ticks)
                 if review_attached:
@@ -3678,23 +3451,6 @@ class SQLiteControlStore:
                     "VALUES ('review-execution-launch',?,?,?,?)",
                     (review_scope[0], str(run_id), _stamp(started_at), encode_workflow(launch)),
                 )
-            self._transition(
-                db,
-                "lease",
-                str(run_id),
-                "active",
-                {
-                    "dispatch_id": lease.dispatch_id,
-                    "owner_id": lease.owner_id,
-                    "pid": pid,
-                    "pgid": pgid,
-                    "process_start_ticks": process_start_ticks,
-                },
-                correlation=Correlation(
-                    dispatch_id=lease.dispatch_id,
-                    run_id=str(run_id),
-                ),
-            )
             return lease
 
     @staticmethod
@@ -3805,13 +3561,6 @@ class SQLiteControlStore:
     def release_lease(self, run_id: RunId) -> None:
         with self.transaction() as db:
             db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
-            self._transition(
-                db,
-                "lease",
-                str(run_id),
-                "released",
-                correlation=Correlation(run_id=str(run_id)),
-            )
 
     def leases(self, owner_id: str | None = None) -> tuple[Lease, ...]:
         with closing(self._connect()) as db, db:
@@ -3986,24 +3735,6 @@ class SQLiteControlStore:
                     "reason=?, updated_at=? WHERE run_id=?",
                     (retained_reason, _stamp(self._now()), str(run_id)),
                 )
-                reservation = db.execute(
-                    "SELECT state FROM budget_reservations WHERE run_id=?",
-                    (str(run_id),),
-                ).fetchone()
-                if reservation is not None and reservation["state"] == "active":
-                    self._event(
-                        db,
-                        ReservationRetained(str(run_id), retained_reason),
-                        correlation=Correlation(run_id=str(run_id)),
-                    )
-                self._transition(
-                    db,
-                    "run",
-                    str(run_id),
-                    "abandoned",
-                    {"outcome": "dead_lease"},
-                    correlation=Correlation(run_id=str(run_id)),
-                )
                 reclaimed.append(run_id)
         return tuple(reclaimed)
 
@@ -4101,13 +3832,13 @@ class SQLiteControlStore:
                     raise ControlStoreError("review return has no retainable or settled reservation")
                 return False
             now = _stamp(self._now())
-            recovery_changed = db.execute(
+            db.execute(
                 "UPDATE reservation_recovery SET policy='reconcile_only', "
                 "reason=?, updated_at=? WHERE run_id=? "
                 "AND (policy IS NOT 'reconcile_only' OR reason IS NOT ?)",
                 (reason, now, str(run_id), reason),
-            ).rowcount
-            run_changed = db.execute(
+            )
+            db.execute(
                 "UPDATE runs SET "
                 "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN state ELSE 'completed' END, "
@@ -4118,16 +3849,10 @@ class SQLiteControlStore:
                 "AND (state NOT IN ('completed','cancelled','abandoned') "
                 "OR completed_at IS NULL)",
                 (now, str(run_id)),
-            ).rowcount
-            lease_removed = db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),)).rowcount
+            )
+            db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
             if review_return is not None and not review_return[1]:
                 self._insert_review_return(db, review_return[0], returned_review)
-            if recovery_changed or run_changed or lease_removed or review_return is not None and not review_return[1]:
-                self._event(
-                    db,
-                    ReservationRetained(str(run_id), reason),
-                    correlation=_run_correlation(run_id, row["dispatch_id"]),
-                )
             return True
 
     def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool:
@@ -4168,44 +3893,8 @@ class SQLiteControlStore:
             raise ValueError("measured recovery requires reconciled request evidence")
         with self.transaction() as db:
             result = self._settle(db, request)
-            if result.disposition is AccountingDisposition.AVAILABLE:
-                claimed = db.execute(
-                    "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                    "VALUES ('native-remetered',?,?,?,?)",
-                    (str(request.run_id), failure.name, _stamp(self._now()),
-                     json.dumps({"outcome": "measured"})),
-                ).rowcount
-                if claimed:
-                    self._event(db, NativeUsageRemetered(str(request.run_id), failure.name, "measured"),
-                                correlation=Correlation(run_id=str(request.run_id)))
             return result
 
-    def record_admission_reconciled(
-        self,
-        run_id: RunId,
-        scope: str,
-        released_runs: int,
-        admitted: bool,
-        reason: str,
-    ) -> None:
-        """Journal the single reconcile-then-retry admission took (ADR 0012)."""
-
-        if not reason or not scope:
-            raise ValueError("admission reconcile scope and reason are required")
-        if released_runs < 0:
-            raise ValueError("released run count cannot be negative")
-        with self.transaction() as db:
-            self._event(
-                db,
-                AdmissionReconciled(
-                    str(run_id),
-                    scope,
-                    released_runs,
-                    admitted,
-                    reason,
-                ),
-                correlation=Correlation(run_id=str(run_id)),
-            )
 
     def record_owned_cancellation_intents(
         self,
@@ -4265,16 +3954,6 @@ class SQLiteControlStore:
                         ),
                         stored["reason"],
                     )
-                )
-                self._transition(
-                    db,
-                    "run",
-                    str(run_id),
-                    row["state"],
-                    {"reason": reason, "spend_recovery_pending": True},
-                    correlation=_run_correlation(
-                        run_id, row["dispatch_id"]
-                    ),
                 )
         return tuple(intents)
 
@@ -4813,61 +4492,6 @@ class SQLiteControlStore:
             )
             return True
 
-    def load_level_state(
-        self, namespace: str, scope: str
-    ) -> dict[str, dict[str, JsonValue]]:
-        """Read a named level snapshot; malformed persisted payload fails closed."""
-
-        if not namespace or not scope:
-            raise ValueError("level namespace and scope are required")
-        with closing(self._connect()) as db, db:
-            rows = db.execute(
-                "SELECT key, payload_json FROM level_state "
-                "WHERE namespace=? AND scope=? ORDER BY key",
-                (namespace, scope),
-            ).fetchall()
-        result: dict[str, dict[str, JsonValue]] = {}
-        for row in rows:
-            try:
-                payload = json.loads(row["payload_json"])
-            except json.JSONDecodeError as exc:
-                raise CorruptControlStore(
-                    f"invalid level payload for {namespace}/{scope}/{row['key']}"
-                ) from exc
-            if not isinstance(payload, dict):
-                raise CorruptControlStore(
-                    f"level payload for {namespace}/{scope}/{row['key']} "
-                    "is not an object"
-                )
-            result[str(row["key"])] = payload
-        return result
-
-    def replace_level_state(
-        self,
-        namespace: str,
-        scope: str,
-        values: Mapping[str, Mapping[str, JsonValue]],
-    ) -> None:
-        """Atomically replace a restart-safe level snapshot."""
-
-        if not namespace or not scope:
-            raise ValueError("level namespace and scope are required")
-        if any(not key for key in values):
-            raise ValueError("level keys are required")
-        updated_at = _stamp(self._now())
-        with self.transaction() as db:
-            db.execute(
-                "DELETE FROM level_state WHERE namespace=? AND scope=?",
-                (namespace, scope),
-            )
-            db.executemany(
-                "INSERT INTO level_state(namespace, scope, key, payload_json, "
-                "updated_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    (namespace, scope, key, _json(payload), updated_at)
-                    for key, payload in sorted(values.items())
-                ),
-            )
 
     def fix_leg_ends(self, repository: str, issue: int) -> tuple[LegEnd, ...]:
         """Every ended fix leg for one issue, classified machine or not.
@@ -4891,208 +4515,7 @@ class SQLiteControlStore:
             for row in rows if (kind := dispatched_kind(row["kind"])) is not None
         )
 
-    def record_world_observation(
-        self,
-        *,
-        deployment: str,
-        subject_kind: str,
-        subject_number: int,
-        content_hash: str,
-        facts: Mapping[str, JsonValue],
-        correlation: Correlation,
-    ) -> bool:
-        """Commit a changed observation and its outbox event atomically.
 
-        Deduplication is against the subject's *latest* hash, not every hash ever
-        seen, so ``A → B → A`` remains three observable transitions. A failed
-        event sink leaves the committed outbox row pending for retry.
-        """
-
-        if (
-            not deployment
-            or subject_kind not in {"issue", "pr"}
-            or subject_number <= 0
-            or not content_hash
-        ):
-            raise ValueError("world observation identity is incomplete")
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT content_hash FROM world_observations "
-                "WHERE deployment=? AND subject_kind=? AND subject_number=?",
-                (deployment, subject_kind, subject_number),
-            ).fetchone()
-            if row is not None and row["content_hash"] == content_hash:
-                return False
-            db.execute(
-                "INSERT INTO world_observations("
-                "deployment, subject_kind, subject_number, content_hash, observed_at"
-                ") VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(deployment, subject_kind, subject_number) DO UPDATE SET "
-                "content_hash=excluded.content_hash, observed_at=excluded.observed_at",
-                (
-                    deployment,
-                    subject_kind,
-                    subject_number,
-                    content_hash,
-                    _stamp(self._now()),
-                ),
-            )
-            self._event(
-                db,
-                WorldObserved(
-                    subject_kind,
-                    subject_number,
-                    content_hash,
-                    dict(facts),
-                ),
-                correlation=correlation,
-            )
-            return True
-
-    def record_world_snapshot(
-        self,
-        *,
-        deployment: str,
-        subject_kind: str,
-        observations: Mapping[
-            int,
-            tuple[str, Mapping[str, JsonValue], Correlation],
-        ],
-    ) -> int:
-        """Atomically publish one role feed's complete membership for a kind."""
-
-        if not deployment or subject_kind not in {"issue", "pr"}:
-            raise ValueError("world snapshot identity is incomplete")
-        if any(number <= 0 for number in observations):
-            raise ValueError("world snapshot subject numbers must be positive")
-        changed = 0
-        with self.transaction() as db:
-            prior = {
-                int(row["subject_number"]): str(row["content_hash"])
-                for row in db.execute(
-                    "SELECT subject_number, content_hash "
-                    "FROM world_observations "
-                    "WHERE deployment=? AND subject_kind=?",
-                    (deployment, subject_kind),
-                ).fetchall()
-            }
-            for number, (content_hash, raw_facts, correlation) in sorted(
-                observations.items()
-            ):
-                if not content_hash or content_hash.startswith("tombstone:"):
-                    raise ValueError("world observation hash is invalid")
-                facts = {"present": True, **dict(raw_facts)}
-                encoded = json.dumps(
-                    facts,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                expected_hash = hashlib.sha256(encoded.encode()).hexdigest()
-                if content_hash != expected_hash:
-                    raise ValueError(
-                        "world observation hash does not match its facts"
-                    )
-                if prior.get(number) == content_hash:
-                    continue
-                db.execute(
-                    "INSERT INTO world_observations("
-                    "deployment, subject_kind, subject_number, content_hash, "
-                    "observed_at) VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(deployment, subject_kind, subject_number) "
-                    "DO UPDATE SET content_hash=excluded.content_hash, "
-                    "observed_at=excluded.observed_at",
-                    (
-                        deployment,
-                        subject_kind,
-                        number,
-                        content_hash,
-                        _stamp(self._now()),
-                    ),
-                )
-                self._event(
-                    db,
-                    WorldObserved(
-                        subject_kind,
-                        number,
-                        content_hash,
-                        facts,
-                    ),
-                    correlation=correlation,
-                )
-                changed += 1
-            for number, old_hash in sorted(prior.items()):
-                if number in observations or old_hash.startswith("tombstone:"):
-                    continue
-                tombstone_hash = "tombstone:" + hashlib.sha256(
-                    f"{subject_kind}:{number}".encode()
-                ).hexdigest()
-                db.execute(
-                    "UPDATE world_observations SET content_hash=?, observed_at=? "
-                    "WHERE deployment=? AND subject_kind=? AND subject_number=?",
-                    (
-                        tombstone_hash,
-                        _stamp(self._now()),
-                        deployment,
-                        subject_kind,
-                        number,
-                    ),
-                )
-                correlation = (
-                    Correlation(issue=number)
-                    if subject_kind == "issue"
-                    else Correlation(pr=number)
-                )
-                self._event(
-                    db,
-                    WorldObserved(
-                        subject_kind,
-                        number,
-                        tombstone_hash,
-                        {
-                            "present": False,
-                            "reason": "absent_from_feed",
-                        },
-                    ),
-                    correlation=correlation,
-                )
-                changed += 1
-        return changed
-
-    def retire_projection_feed(
-        self,
-        *,
-        deployment: str,
-        repository: str,
-        role: str,
-    ) -> int:
-        """Remove a stopped role's membership and commit its fold tombstone."""
-
-        repository = canonical_repository(repository)
-        destination = f"{deployment}:{repository}:{role}"
-        if not deployment or not role:
-            raise ValueError("projection feed retirement identity is incomplete")
-        if (
-            self._event_factory is None
-            or self._event_destination != destination
-        ):
-            raise ValueError(
-                "retiring projection feed must be bound to its event destination"
-            )
-        with self.transaction() as db:
-            removed = db.execute(
-                "DELETE FROM world_observations WHERE deployment=?",
-                (deployment,),
-            ).rowcount
-            self._event(
-                db,
-                WorldFeedRetired(
-                    deployment,
-                    repository,
-                    role,
-                    restartable=True,
-                ),
-            )
-            return removed
 
     def snapshot(self, scope: BudgetScope) -> AccountingSnapshot:
         try:
@@ -5489,41 +4912,6 @@ class SQLiteControlStore:
                         "reason=NULL, updated_at=? WHERE run_id=?",
                         (now, str(lease.run_id)),
                     )
-                    self._transition(
-                        db,
-                        "lease",
-                        str(lease.run_id),
-                        "active",
-                        {
-                            "dispatch_id": lease.dispatch_id,
-                            "owner_id": lease.owner_id,
-                            "pid": lease.pid,
-                            "pgid": lease.pgid,
-                            "process_start_ticks": lease.process_start_ticks,
-                        },
-                        correlation=Correlation(
-                            dispatch_id=lease.dispatch_id,
-                            run_id=str(lease.run_id),
-                        ),
-                    )
-                self._transition(
-                    db,
-                    "reservation",
-                    str(request.run_id),
-                    "active",
-                    {
-                        "reservation_id": str(request.reservation_id),
-                        "maximum_micros": requested.micros,
-                        "currency": requested.currency,
-                        "rate_card_id": request.quote.rate_card_id,
-                        "rate_card_version": request.quote.rate_card_version,
-                        "config_version": request.config_version,
-                    },
-                    correlation=Correlation(
-                        dispatch_id=request.dispatch_id,
-                        run_id=str(request.run_id),
-                    ),
-                )
                 return ReservationResult(
                     AccountingDisposition.AVAILABLE,
                     request.reservation_id,
@@ -6560,11 +5948,6 @@ class SQLiteControlStore:
             admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
             self._require_repair_writer(db, writer, admission, run["owner_id"])
             self._finish_pr_repair_without_return(db, run_id, launched=True)
-            self._transition(db, "pr_repair", str(run_id),
-                "unreturned_acknowledged",
-                {"pr": admission.attempt.binding.fence.key.target.number,
-                 "admission_version": admission.admission_version},
-                correlation=Correlation(run_id=str(run_id)))
             return True
 
 
@@ -7574,9 +6957,6 @@ class SQLiteControlStore:
                 request.amount,
                 detail=f"reservation is already {reservation['state']}",
             )
-        correlation = _run_correlation(
-            request.run_id, reservation["dispatch_id"]
-        )
         maximum = int(reservation["maximum_micros"])
         variance = (
             Money(request.amount.currency, request.amount.micros - maximum)
@@ -7650,70 +7030,6 @@ class SQLiteControlStore:
                     (settled_at, str(request.run_id)),
                 )
         db.execute("DELETE FROM leases WHERE run_id=?", (str(request.run_id),))
-        if request.accounting_gap or request.basis is PricingBasis.ESTIMATE:
-            self._transition(db, "accounting", str(request.run_id), "estimated",
-                             {"gap": request.accounting_gap or "request receipts or usable usage incomplete; settled best evidence"},
-                             correlation=correlation)
-        if existing is not None:
-            # Reverse the prior projection contribution in the same transaction
-            # as its replacement and any return capture; SQLite keeps one charge.
-            self._event(db, SpendRecorded(str(request.run_id), -existing["amount_micros"],
-                        existing["currency"], existing["basis"], existing["rate_card_id"], existing["rate_card_version"]),
-                        correlation=correlation)
-            self._transition(db, "accounting", str(request.run_id), "corrected",
-                             {"previous_receipt": existing["provider_receipt_id"],
-                              "previous_amount_micros": existing["amount_micros"],
-                              "provider_receipt_id": request.provider_receipt_id, "amount_micros": request.amount.micros},
-                             correlation=correlation)
-        self._event(
-            db,
-            SpendRecorded(
-                str(request.run_id),
-                request.amount.micros,
-                request.amount.currency,
-                request.basis.value,
-                request.rate_card_id,
-                request.rate_card_version,
-            ),
-            correlation=correlation,
-        )
-        if variance is not None:
-            self._event(
-                db,
-                BudgetVarianceDetected(
-                    str(request.run_id),
-                    maximum,
-                    request.amount.micros,
-                    variance.micros,
-                    request.amount.currency,
-                ),
-                correlation=correlation,
-            )
-        self._transition(
-            db,
-            "reservation",
-            str(request.run_id),
-            "settled",
-            {
-                "amount_micros": request.amount.micros,
-                "currency": request.amount.currency,
-                "basis": request.basis.value,
-                "provider_receipt_id": request.provider_receipt_id,
-            },
-            correlation=correlation,
-        )
-        if corrected_dead_lease:
-            self._transition(
-                db,
-                "run",
-                str(request.run_id),
-                "completed",
-                {
-                    "outcome": "settled",
-                    "settlement": "normal_after_reclaim",
-                },
-                correlation=correlation,
-            )
         return SettlementResult(
             AccountingDisposition.AVAILABLE,
             request.amount,
@@ -7834,17 +7150,6 @@ class SQLiteControlStore:
                 "UPDATE runs SET outcome='spend_unmeasured_released' "
                 "WHERE run_id=?",
                 (str(run_id),),
-            )
-            self._transition(
-                db,
-                "reservation",
-                str(run_id),
-                "released",
-                {
-                    "reason": reason,
-                    "accounting": "unmeasured_after_reconciliation_grace",
-                },
-                correlation=Correlation(run_id=str(run_id)),
             )
             return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
@@ -7977,14 +7282,6 @@ class SQLiteControlStore:
             )
         if never_launched is not None:
             self._finish_unlaunched_pr_repair(db, run_id)
-        self._transition(
-            db,
-            "reservation",
-            str(run_id),
-            "released",
-            {"reason": reason},
-            correlation=Correlation(run_id=str(run_id)),
-        )
         return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def enqueue_command(self, command: LifecycleCommand) -> PendingCommand:
@@ -8056,20 +7353,6 @@ class SQLiteControlStore:
             self._record_ci_remediation(db, command)
         if "pr_recovery" in command.payload:
             self._record_pr_recovery(db, command)
-        self._transition(
-            db,
-            "lifecycle_command",
-            str(command.command_id),
-            "pending",
-            {
-                "kind": command.kind.value,
-                "target": command.target,
-                "idempotency_key": command.idempotency_key,
-                "expected_revision": command.expected_revision,
-                "config_version": command.config_version,
-            },
-            correlation=_command_correlation(command),
-        )
         return PendingCommand(command, "pending", 0)
 
     @staticmethod
@@ -8531,22 +7814,6 @@ class SQLiteControlStore:
                     _encoded_command_binding(command),
                 ),
             )
-            self._transition(
-                db,
-                "lifecycle_command",
-                str(command_id),
-                "pending",
-                {
-                    "kind": command.kind.value,
-                    "target": command.target,
-                    "idempotency_key": occurrence_key,
-                    "logical_key": logical_key,
-                    "occurrence": occurrence,
-                    "expected_revision": command.expected_revision,
-                    "config_version": command.config_version,
-                },
-                correlation=_command_correlation(repeated),
-            )
             return PendingCommand(repeated, "pending", 0)
 
     def last_published_revision(self, target: str) -> str | None:
@@ -8718,15 +7985,11 @@ class SQLiteControlStore:
                 if isinstance(parsed, str):
                     self._claim_key(db, ESCALATION_SIGNAL_QUARANTINE_NAMESPACE, row["scope"], row["key"],
                                     {"error": parsed})
-                    self._transition(db, "review_escalation_signal", row["key"], "escalation_signal_malformed",
-                                     {"owner": row["scope"], "error": parsed})
                     continue
                 number, reason = parsed
                 if self._claim_key(db, ESCALATION_SIGNAL_NAMESPACE, repository, row["key"],
                                    {"pr": number, "reason": reason}):
                     claimed.append(number)
-            for number in claimed:
-                self._event(db, EscalationRaised("pr", number), correlation=Correlation(pr=number))
         return tuple(claimed)
 
     @classmethod
@@ -8987,7 +8250,6 @@ class SQLiteControlStore:
             # A retired command can never execute, so its grant ends with it.
             self._dispose_grant(db, grant, RetryDisposition.VOID.value, "the command was retired before the grant was spent",
                                 details={"evidence_id": retirement_id})
-        self._transition(db, "lifecycle_command", str(command.command_id), "superseded", {"evidence_id": retirement_id})
         return state
 
     def _reconciliation_gate(
@@ -9082,10 +8344,6 @@ class SQLiteControlStore:
                         # The grant stays spendable: its absence evidence keeps
                         # the gate while the read schedule backs off.
                         keep_gate = True
-                        self._transition(db, "workflow_retry_authorization", judged.authorization_id, "deferred", {
-                            "command_id": str(command_id), "unavailable_reads": reads,
-                            "next_read_at": _stamp(progress.state.history.next_read_at) if isinstance(progress.state, ReconciliationOnly) else None,
-                        })
                     judged = None
             else:
                 if row["state"] not in ("executing", "unknown_outcome"):
@@ -9120,7 +8378,6 @@ class SQLiteControlStore:
                     "a newer absence observation superseded the grant before it was spent",
                     details={"evidence_id": evidence_id},
                 )
-            self._transition(db, "lifecycle_command", str(command_id), "reconciled_read_only", {"evidence_id": evidence_id})
             return observed is True
 
     def record_scheduled_read(
@@ -9177,7 +8434,6 @@ class SQLiteControlStore:
                 self._replace_effect_receipt(db, command)
                 db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (executor_identity, str(command_id)))
                 self._insert_effect(db, receipt, _receipt_digest(receipt))
-                self._transition(db, "lifecycle_command", str(command_id), "reconciled_read_only", {"evidence_id": evidence_id})
                 return True
             progress = unavailable_reconciliation(
                 binding, command_id, history, now=now, evidence_id=evidence_id,
@@ -9188,15 +8444,6 @@ class SQLiteControlStore:
                        (encode_workflow(progress.state), str(command_id)))
             if progress.gate is not None:
                 self._reconciliation_gate(db, binding, progress.gate.gate_id, progress.gate)
-            state = progress.state
-            active = state.history if isinstance(state, ReconciliationOnly) else state
-            self._transition(db, "lifecycle_command", str(command_id),
-                             "reexecution_ceiling" if reexecution_ceiling else
-                             "reconciliation_expired" if isinstance(state, ReconciliationOnly) else "reconciliation_deferred", {
-                                 "evidence_id": evidence_id,
-                                 "failed_reads": active.failed_reads,
-                                 "reexecutions": active.reexecutions,
-                             })
             return False
 
     @staticmethod
@@ -9278,12 +8525,6 @@ class SQLiteControlStore:
                        (encode_workflow(history), str(command_id)))
             if progress.gate is not None:
                 self._reconciliation_gate(db, binding, progress.gate.gate_id, progress.gate)
-            self._transition(db, "lifecycle_command", str(command_id),
-                             "prewrite_evidence_gated" if progress.gate is not None else "prewrite_evidence_deferred", {
-                                 "failed_reads": history.failed_reads,
-                                 "next_read_at": _stamp(history.next_read_at),
-                                 "error": error[:512],
-                             })
             return True
 
     def latest_command(self, logical_key: str) -> PendingCommand | None:
@@ -9343,12 +8584,6 @@ class SQLiteControlStore:
         if row is not None and row["prewrite_read_json"] is not None:
             binding = self._command_reconciliation_binding(db, _command_from_row(row))
             self._reconciliation_gate(db, binding, prewrite_evidence_gate_id(command_id), None)
-        self._transition(
-            db,
-            "lifecycle_command",
-            str(command_id),
-            "executing",
-        )
 
     @staticmethod
     def _workspace_projection_ready(db: sqlite3.Connection, command: LifecycleCommand) -> bool:
@@ -9451,13 +8686,6 @@ class SQLiteControlStore:
             if isinstance(history, ActiveReconciliation):
                 db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
                            (encode_workflow(absent_reexecution(history)), str(command_id)))
-            self._transition(
-                db,
-                "lifecycle_command",
-                str(command_id),
-                "retryable_failure",
-                {"reason": "authoritative verification found no effect"},
-            )
 
     @staticmethod
     def _validate_workflow_reexecution(row: sqlite3.Row) -> None:
@@ -9538,9 +8766,6 @@ class SQLiteControlStore:
             (disposition, reason[:4096], _stamp(self._now()), attempt, grant.authorization_id),
         ).rowcount != 1:
             raise WorkflowAuthorityError("retry grant was disposed concurrently")
-        self._transition(db, "workflow_retry_authorization", grant.authorization_id, disposition, {
-            "command_id": str(grant.command_id), "reason": reason[:4096], **(details or {}),
-        })
 
     @staticmethod
     def _read_absence(command: LifecycleCommand, authorization_id: str, read: RetryAbsenceRead) -> CommandAbsenceEvidence:
@@ -9646,12 +8871,6 @@ class SQLiteControlStore:
                 "attempt": attempt, "absence_evidence_id": evidence.evidence_id,
                 "applicability_evidence_id": applicability.evidence_id,
             })
-            spent = int(db.execute("SELECT count(*) FROM workflow_retry_authorizations "
-                                   "WHERE command_id=? AND disposition='consumed'", (str(command_id),)).fetchone()[0])
-            if spent >= MAX_AUTHORIZED_ATTEMPTS:
-                self._transition(db, "workflow_retry_authorization", authorization_id, "ceiling_reached", {
-                    "command_id": str(command_id), "authorized_attempts": spent, "ceiling": MAX_AUTHORIZED_ATTEMPTS,
-                })
             self._replace_effect_receipt(db, command)
             self._mark_executing(db, command_id)
             self._attempt_uncertainty(db, command, expected, f"authorized retry attempt {attempt} began; outcome unverified")
@@ -9746,9 +8965,6 @@ class SQLiteControlStore:
             self._attempt_uncertainty(db, command, state, f"authorized retry attempt {int(row['attempts'])} outcome unknown")
         else:
             raise ControlStoreError("an authorized retry settles only as verified success or unknown outcome")
-        self._transition(db, "workflow_retry_authorization", grant["authorization_id"],
-                         "succeeded" if receipt.status is EffectStatus.SUCCEEDED else "unresolved",
-                         {"command_id": str(receipt.command_id), "attempt": int(row["attempts"])})
 
     @staticmethod
     def _archive_workflow_receipt(db: sqlite3.Connection, command: LifecycleCommand) -> None:
@@ -9997,35 +9213,6 @@ class SQLiteControlStore:
             ),
         )
         self._schedule_unresolved(db, command_row, receipt.status, now)
-        if receipt.status is EffectStatus.SUCCEEDED:
-            self._event(
-                db,
-                _command_applied_event(command),
-                correlation=_command_correlation(command),
-            )
-        else:
-            self._event(
-                db,
-                ActionFailed(
-                    str(receipt.command_id),
-                    command.kind.value,
-                    receipt.status.value,
-                    receipt.error or "",
-                ),
-                correlation=_command_correlation(command),
-            )
-        self._transition(
-            db,
-            "lifecycle_command",
-            str(receipt.command_id),
-            receipt.status.value,
-            {
-                "kind": command.kind.value,
-                "target": command.target,
-                "executor_identity": receipt.executor_identity,
-            },
-            correlation=_command_correlation(command),
-        )
 
     def effect_receipt(self, command_id: CommandId) -> EffectReceipt | None:
         with closing(self._connect()) as db, db:
@@ -10046,91 +9233,6 @@ class SQLiteControlStore:
             error=row["error"],
         )
 
-    def enqueue_event(self, event: EventEnvelope, db: sqlite3.Connection | None = None) -> None:
-        encoded = encode_event_line(event)
-        encoded_bytes = len((encoded + "\n").encode())
-        if encoded_bytes > self._event_line_limit:
-            raise ValueError(
-                f"outbox event line is {encoded_bytes} bytes; "
-                f"limit is {self._event_line_limit}"
-            )
-
-        def insert(connection: sqlite3.Connection) -> None:
-            connection.execute(
-                "INSERT OR IGNORE INTO event_outbox("
-                "event_id, destination, event_json, committed_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    event.event_id,
-                    event.producer.feed_identity,
-                    encoded,
-                    _stamp(self._now()),
-                ),
-            )
-
-        if db is not None:
-            insert(db)
-            return
-        with self.transaction() as connection:
-            insert(connection)
-
-    def flush_outbox(
-        self,
-        emit: Callable[[EventEnvelope], None],
-        limit: int = 100,
-        *,
-        destination: str | None = None,
-    ) -> int:
-        """Emit committed rows in order and acknowledge each only after success."""
-
-        if limit <= 0:
-            return 0
-        emitted = 0
-        processed = 0
-        while processed < limit:
-            with closing(self._connect()) as db, db:
-                row = (
-                    db.execute(
-                        "SELECT outbox_id, event_json FROM event_outbox "
-                        "WHERE emitted_at IS NULL AND failed_at IS NULL "
-                        "AND destination=? ORDER BY outbox_id LIMIT 1",
-                        (destination,),
-                    ).fetchone()
-                    if destination is not None
-                    else db.execute(
-                        "SELECT outbox_id, event_json FROM event_outbox "
-                        "WHERE emitted_at IS NULL AND failed_at IS NULL "
-                        "ORDER BY outbox_id LIMIT 1"
-                    ).fetchone()
-                )
-            if row is None:
-                break
-            processed += 1
-            try:
-                if len((row["event_json"] + "\n").encode()) > self._event_line_limit:
-                    raise ValueError("event exceeds configured line limit")
-                event = decode_event_line(row["event_json"])
-            except (TypeError, ValueError) as exc:
-                with self.transaction() as db:
-                    db.execute(
-                        "UPDATE event_outbox SET failed_at=?, failure=? "
-                        "WHERE outbox_id=? AND failed_at IS NULL",
-                        (
-                            _stamp(self._now()),
-                            str(exc)[:500],
-                            row["outbox_id"],
-                        ),
-                    )
-                continue
-            emit(event)
-            with self.transaction() as db:
-                db.execute(
-                    "UPDATE event_outbox SET emitted_at=? "
-                    "WHERE outbox_id=? AND emitted_at IS NULL",
-                    (_stamp(self._now()), row["outbox_id"]),
-                )
-            emitted += 1
-        return emitted
 
     def backup(self, destination: str) -> None:
         target = os.path.abspath(destination)
@@ -10589,92 +9691,6 @@ def _encoded_payload_digest(payload: str, binding: str | None) -> str:
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
-def _command_applied_event(command: LifecycleCommand) -> ActionApplied:
-    # Typed projections bypass the app's Action executor; their durable success
-    # must carry the same label moves so the dashboard can retire attention.
-    if command.kind is CommandKind.RELABEL:
-        correlation = _command_correlation(command)
-        number = correlation.issue or correlation.pr
-        if number is not None:
-            target = "issue" if correlation.issue is not None else "pr"
-            moves: dict[str, JsonValue] = {}
-            display_moves = []
-            for field, plural, sign in (("remove", "removes", "-"), ("add", "adds", "+")):
-                extra = command.payload.get(plural)
-                values = (command.payload.get(field), *(extra if isinstance(extra, (list, tuple)) else ()))
-                labels = list(dict.fromkeys(value for value in values if isinstance(value, str)))
-                moves[field] = labels
-                display_moves.extend(f"{sign}{label}" for label in labels)
-            # Escalation payloads carry no label fields; keep their generic event
-            # rather than misreporting a labelled write as a no-op.
-            if display_moves:
-                return ActionApplied(str(command.command_id), "relabel", target,
-                                     f"relabel {target} #{number}: {' '.join(display_moves)}",
-                                     number, moves)
-    return ActionApplied(str(command.command_id), command.kind.value, command.target, command.kind.value)
-
-
-def _command_correlation(command: LifecycleCommand) -> Correlation:
-    kind, separator, raw_number = command.target.partition(":")
-    if not separator:
-        return Correlation()
-    if kind == "pull-request-body":
-        # Broker targets are `<kind>:<owner/repo>:<number>` — the repository
-        # segment sits in the middle, so the number is the LAST field, not the
-        # first one after the kind. Without this the dashboard folded every
-        # body-update transition with an EMPTY correlation and the edit could
-        # not be traced back to its PR or issue.
-        issue = command.payload.get("issue")
-        try:
-            pr = int(command.target.rpartition(":")[2])
-        except ValueError:
-            return Correlation()
-        if pr <= 0:
-            return Correlation()
-        return Correlation(
-            pr=pr,
-            issue=issue if isinstance(issue, int) and issue > 0 else None,
-        )
-    try:
-        number = int(raw_number)
-    except ValueError:
-        return Correlation()
-    if number <= 0:
-        return Correlation()
-    if kind == "issue":
-        return Correlation(issue=number)
-    if kind == "pr":
-        return Correlation(pr=number)
-    return Correlation()
-
-
-def _run_correlation(run_id: RunId, dispatch_id: str) -> Correlation:
-    try:
-        payload = json.loads(dispatch_id)
-        issue = payload.get("issue")
-        number = payload.get("number")
-        kind = str(payload.get("kind") or "")
-    except (AttributeError, TypeError, json.JSONDecodeError):
-        return Correlation(run_id=str(run_id))
-    correlated_issue = (
-        int(issue)
-        if isinstance(issue, int) and not isinstance(issue, bool) and issue > 0
-        else None
-    )
-    correlated_pr = (
-        int(number)
-        if correlated_issue is None
-        and isinstance(number, int)
-        and not isinstance(number, bool)
-        and number > 0
-        and "REVIEW" in kind
-        else None
-    )
-    return Correlation(
-        issue=correlated_issue,
-        pr=correlated_pr,
-        run_id=str(run_id),
-    )
 
 
 def _dispatch_issue(dispatch_id: str) -> int | None:

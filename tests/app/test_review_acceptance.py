@@ -697,11 +697,6 @@ def nhr_projections(client) -> list:
     return [c for c in client.remote.calls if c[0] == "relabel_pr" and c[3] == NHR]
 
 
-def journal(client, state: str) -> int:
-    with sqlite3.connect(client.review.control.path) as db:
-        return db.execute("SELECT COUNT(*) FROM event_outbox WHERE event_json LIKE ?", (f'%"{state}"%',)).fetchone()[0]
-
-
 def _before_escalating_round(deployment, cause: str) -> None:
     """The ceiling escalates on the second rejection; a verdict escalation is the first round."""
     if cause == "ceiling":
@@ -754,7 +749,7 @@ def test_a_restart_around_an_escalation_buys_once_posts_once_and_holds_once(depl
     assert len(restarted.submissions()) == PAID_ROUNDS[cause]
     assert NHR in restarted.labels() and TRIGGER not in restarted.labels()
     # One hold, projected by the settlement itself rather than repaired later.
-    assert len(nhr_projections(restarted)) == 1 and journal(restarted, "hold_reprojected") == 0
+    assert len(nhr_projections(restarted)) == 1
     if cause == "ceiling":
         assert restarted.gate_causes() == ["ReviewRejectionCeiling"]
     else:
@@ -777,7 +772,6 @@ def test_a_lost_reply_to_an_escalation_settles_from_the_drain_without_a_second_r
     client.tick(10, minutes=5)
     assert len(client.provider.tasks) == 1 and len(client.submissions()) == PAID_ROUNDS[cause]
     assert NHR in client.labels() and TRIGGER not in client.labels() and len(nhr_projections(client)) == 1
-    assert journal(client, "hold_reprojected") == 0
 
 
 def test_an_escalation_whose_outcome_read_is_unavailable_holds_once_the_read_heals(deployment):
@@ -804,7 +798,6 @@ def test_an_escalation_whose_outcome_read_is_unavailable_holds_once_the_read_hea
     progress_until(client, lambda c: NHR in c.labels(), limit=20, minutes=10)
     assert client.gate_causes() == ["ReviewRejectionCeiling"] and TRIGGER not in client.labels()
     assert len(client.provider.tasks) == 2 and len(nhr_projections(client)) == 1
-    assert journal(client, "hold_reprojected") == 0
 
 
 def test_an_escalation_whose_settlement_read_is_unavailable_settles_on_a_bounded_schedule(deployment, monkeypatch):
@@ -839,7 +832,6 @@ def test_an_escalation_whose_settlement_read_is_unavailable_settles_on_a_bounded
     progress_until(client, lambda c: NHR in c.labels(), limit=20, minutes=10)
     assert client.gate_causes() == ["ReviewRejectionCeiling"] and TRIGGER not in client.labels()
     assert len(client.provider.tasks) == 2 and len(nhr_projections(client)) == 1
-    assert journal(client, "hold_reprojected") == 0
 
 
 def test_a_human_dismissal_racing_the_escalation_refuses_the_ceiling_and_buys_one_fresh_review(deployment):
@@ -873,7 +865,7 @@ def test_an_open_ceiling_restores_a_hold_a_human_removed_on_its_reconciliation_s
     client.tick(6, minutes=10)
     assert NHR in client.labels() and TRIGGER not in client.labels()
     assert client.gate_causes() == ["ReviewRejectionCeiling"] and len(client.provider.tasks) == 2
-    assert len(nhr_projections(client)) == 2 and journal(client, "hold_reprojected") == 1
+    assert len(nhr_projections(client)) == 2
 
 
 # -- evidence reads a dispatch depends on are bounded before any read ------------------------------
@@ -1074,9 +1066,10 @@ def test_the_composed_fix_role_defers_a_repair_on_unreadable_review_guidance_the
 # -- increment 6 re-review: escalation holds are fenced by hold facts, re-planned, signalled once ----
 
 def escalation_events(client) -> int:
-    with sqlite3.connect(client.review.control.path) as db:
-        return db.execute("SELECT COUNT(*) FROM event_outbox WHERE event_json LIKE '%lifecycle.escalation.raised%'"
-                          ).fetchone()[0]
+    journal = Path(client.cfg.review_state_dir) / "journal.jsonl"
+    if not journal.exists():
+        return 0
+    return sum(json.loads(line).get("event") == "escalation" for line in journal.read_text().splitlines())
 
 
 def alert_lines(path) -> list[str]:
@@ -1098,7 +1091,7 @@ def test_an_escalation_hold_is_refused_only_by_a_hold_fact_and_then_re_planned(d
     # The hold is visible, the human's label is kept, and the covered head is never re-bought.
     assert NHR in client.labels() and label in client.labels() and TRIGGER not in client.labels()
     assert len(client.provider.tasks) == 1 and client.gate_causes() == []
-    assert len(nhr_projections(client)) == 1 and journal(client, "escalation_reprojected") == int(replanned)
+    assert len(nhr_projections(client)) == 1
     assert escalation_events(client) == 1 and len(alert_lines(alerts)) == 1
 
 
@@ -1115,7 +1108,7 @@ def test_a_refused_verdict_escalation_is_moot_after_a_close_or_a_push(deployment
     client.tick(8, minutes=10)
     # No hold is written to a closed PR or over a new head; a new head is owed exactly one review.
     assert nhr_projections(client) == [] and NHR not in client.labels()
-    assert journal(client, "escalation_moot") == 1 and escalation_events(client) == 0
+    assert escalation_events(client) == 0
     assert len(client.provider.tasks) == (2 if change == "push" else 1) and client.gate_causes() == []
 
 
@@ -1136,11 +1129,8 @@ def test_a_verdict_escalation_whose_hold_is_contested_becomes_a_visible_gate_and
     client.boot()
     client.tick()
     progress_until(client, lambda c: "ReviewProjectionRefused" in c.gate_causes(), limit=40, minutes=10)
-    from issue_agent.domain.review_workflow_policy import MAX_ESCALATION_REPLANS
-
     refused = [c for c in client.remote.calls if c[0] == "relabel_pr"]
-    assert refused == [] and journal(client, "escalation_reprojected") == MAX_ESCALATION_REPLANS
-    assert journal(client, "escalation_projection_exhausted") == 1
+    assert refused == []
     assert escalation_events(client) == 1 and len(alert_lines(alerts)) == 1
     assert len(client.provider.tasks) == 1
     war[0] = False
@@ -1168,7 +1158,6 @@ def test_a_refused_ceiling_projection_is_restored_and_signalled_once(deployment,
     progress_until(client, lambda c: NHR in c.labels(), limit=12, minutes=10)
     client.tick(4, minutes=10)
     assert client.gate_causes() == ["ReviewRejectionCeiling"] and "no-ai-review" in client.labels()
-    assert journal(client, "escalation_owned_by_ceiling") == 1 and journal(client, "hold_reprojected") == 1
     assert escalation_events(client) == 1 and len(alert_lines(alerts)) == 1 and len(client.provider.tasks) == 2
 
 
@@ -1200,8 +1189,7 @@ def test_an_escalation_whose_hold_a_human_applied_after_its_refusal_is_signalled
     progress_until(client, lambda c: not human[0], limit=12, minutes=5)
     client.tick(8, minutes=10)
     assert client.labels() == {NHR, "no-ai-review"} and nhr_projections(client) == []
-    assert journal(client, "escalation_hold_verified" if cause == "verdict" else "escalation_owned_by_ceiling") == 1
-    assert journal(client, "hold_reprojected") == 0 and escalation_events(client) == 1
+    assert escalation_events(client) == 1
     assert [json.loads(line) for line in alert_lines(alerts)] == [{"event": "escalation", "number": PR,
                                                                    "target": "pr"}]
     assert client.gate_causes() == ([] if cause == "verdict" else ["ReviewRejectionCeiling"])
@@ -1227,10 +1215,9 @@ def test_a_ceiling_hold_whose_every_restoration_is_refused_is_contested_and_sign
     war[0] = True
     from issue_agent.domain.review_workflow_policy import MAX_HOLD_RESTORES
 
-    progress_until(client, lambda c: journal(c, "hold_contested") == 1, limit=40, minutes=10)
+    progress_until(client, lambda c: escalation_events(c) == 1, limit=40, minutes=10)
     client.tick(4, minutes=10)
     assert NHR not in client.labels() and nhr_projections(client) == []
-    assert journal(client, "hold_reprojected") == MAX_HOLD_RESTORES and journal(client, "hold_contested") == 1
     assert escalation_events(client) == 1 and len(alert_lines(alerts)) == 1
     assert client.gate_causes() == ["ReviewRejectionCeiling"] and len(client.provider.tasks) == 2
 
@@ -1298,13 +1285,12 @@ def test_a_contested_hold_is_restored_a_bounded_number_of_times_then_surfaced_on
     assert len(nhr_projections(client)) - before == MAX_HOLD_RESTORES and len(read_at) <= 12
     assert all(later > earlier or later == max(gaps) for earlier, later in zip(gaps, gaps[1:]))
     assert signals == escalation_events(client) == 1
-    assert journal(client, "hold_contested") == 1 and journal(client, "hold_reprojected") == MAX_HOLD_RESTORES
     assert client.gate_causes() == ["ReviewRejectionCeiling"] and len(client.provider.tasks) == 2
     # The contested state belongs to that gate: a human dismissal releases it and clears the contest.
     (counted,) = client.gates()[0].cause.counted
     client.remote.external_review_change(counted.review_id, state="DISMISSED")
     progress_until(client, lambda c: len(c.provider.tasks) == 3, limit=20, minutes=10)
-    assert journal(client, "hold_contest_cleared") == 1 and client.gate_causes() == []
+    assert client.gate_causes() == []
 
 
 def test_a_never_observed_pull_request_whose_first_read_fails_backs_off(bare, monkeypatch):
@@ -1321,7 +1307,6 @@ def test_a_never_observed_pull_request_whose_first_read_fails_backs_off(bare, mo
     client.tick(60)
     # An hour of ticks costs a handful of first reads, not sixty; nothing is bought.
     assert 3 <= reads[0] <= 12 and client.provider.tasks == []
-    assert journal(client, "first_observation_unavailable") == 1
     assert any("first observation backing off" in line for line in client.log)
     broken[0] = False
     client.activate_execution(monkeypatch)

@@ -23,10 +23,8 @@ from issue_agent.adapters.control_store import SQLiteControlStore, RetiredOwnerE
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.effects import GitHubEffectExecutor
-from issue_agent.adapters.event_log import EventLog, read_event_log
 from issue_agent.adapters.github import GhUnavailable
-from issue_agent.adapters.journal import JournalingRuntime
-from issue_agent.adapters.typed_journal import TypedJournal
+from issue_agent.adapters.journal import Journal, JournalingRuntime
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
@@ -38,7 +36,6 @@ from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.contracts import EffectStatus, Money, daily_budget_scope
 from issue_agent.domain.fix import FixConfig, decide_fix
-from issue_agent.domain.events import ControlTransitionCommitted, Producer, SpendRecorded
 from issue_agent.domain.labels import Label
 from issue_agent.domain.lifecycle import LifecycleOperation, completion_guard
 from issue_agent.domain.outcome import AgentResult
@@ -121,11 +118,9 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
         control, WorkflowWriter("o/r", "fix", "o/r:fix"),
         resolve_ceiling=FixConfig(fix_bot="fix-bot").max_resolve_retries,
     )
-    events = EventLog(str(root / "events.jsonl"), Producer("test", "o/r", role, os.getpid(), "test-boot"))
-    control.bind_event_outbox(events.prepare, events.append_committed)
     state = Store(state_dir=str(state_dir or root / role))
     messages = []
-    journal = TypedJournal(str(root / "legacy-events.jsonl"), events)
+    journal = Journal(str(root / "legacy-events.jsonl"))
     effects = GitHubEffectExecutor(remote, control, repository="o/r", identity=f"o/r:{role}", log=messages.append,
         fix_config=FixConfig(fix_bot="fix-bot"))
     provider = provider or Provider()
@@ -503,7 +498,6 @@ def test_local_commit_failure_cannot_apply_remote_mutation(tmp_path, boundary):
     assert any("injected transaction failure" in message for message in first.log)
     if boundary == "INSERT":
         assert first.control.pending_commands() == ()
-        assert read_event_log(str(tmp_path / "events.jsonl")).events == ()
     else:
         assert first.control.pending_commands()[0].state == "pending"
     with sqlite3.connect(first.control.path) as db:
@@ -533,12 +527,6 @@ def test_unknown_remote_result_remains_visible_and_does_not_repeat_write(tmp_pat
     assert restarted.remote.calls == [["comment", 7, action.body]]
     assert restarted.control.pending_commands()[0].command.command_id == command.command_id
     assert restarted.control.effect_receipt(command.command_id).status is EffectStatus.UNKNOWN_OUTCOME
-    assert any(
-        isinstance(event.payload, ControlTransitionCommitted)
-        and event.payload.entity_id == command.command_id
-        and event.payload.state == "unknown_outcome"
-        for event in read_event_log(str(tmp_path / "events.jsonl")).events
-    )
     assert any("readback unavailable" in message for message in restarted.log)
     assert restarted.provider.tasks == []
 
@@ -662,15 +650,6 @@ def test_paid_attempt_settlement_is_conserved_when_completion_receipt_is_lost(tm
             run_id, "completed", run_id,
             f"claude:provider-receipt:{run_id}", 250_000,
         )]
-    settlements = [
-        event for event in read_event_log(str(tmp_path / "events.jsonl")).events
-        if isinstance(event.payload, SpendRecorded)
-    ]
-    assert len(settlements) == 1
-    assert settlements[0].payload.run_id == run_id
-    assert settlements[0].correlation.run_id == run_id
-    assert settlements[0].correlation.issue == 7
-    assert settlements[0].payload.amount_micros == 250_000
 
 
 @pytest.mark.parametrize("human_hold", [False, True], ids=["repair-own-add", "preserve-new-hold"])

@@ -353,12 +353,6 @@ def departed_backoff_seconds(failed_reads: int) -> int:
     return min(DEPARTED_CONFIRM_SECONDS * 2 ** min(failed_reads - 1, 16), MAX_DEPARTED_BACKOFF_SECONDS)
 
 
-def departed_backoff_at_ceiling(failed_reads: int) -> bool:
-    """Whether this failure count first reaches the backoff ceiling (the journal's second event)."""
-    return (departed_backoff_seconds(failed_reads) == MAX_DEPARTED_BACKOFF_SECONDS
-            and (failed_reads == 1 or departed_backoff_seconds(failed_reads - 1) < MAX_DEPARTED_BACKOFF_SECONDS))
-
-
 def departed_read_after(record: RecordedReviewDecision | None, *, holds_gates: bool) -> datetime | None:
     """From when a pull request missing from the review read is due its own read; None when never.
 

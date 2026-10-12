@@ -17,7 +17,7 @@ import asyncio
 import json
 import os
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
@@ -25,30 +25,20 @@ from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import (
     JournalingRuntime,
     alert,
-    death_key,
     default_ledger_path,
-    events_within,
-    hold_keys,
     read_events,
-    read_events_tail,
-    recent_runs,
-    repeated_dispatch_warning,
-    spend_blocked_keys,
-    sum_issue,
-    sum_today,
-    unsettled_starts,
 )
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.app.planners.tasks import FixTaskConfig, ReviewTaskConfig
+from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.app.review_runtime import review_guidance_reader
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
-from issue_agent.domain.world import IssueView, PRView
+from issue_agent.domain.world import IssueView
 from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.review_workflow import held as held_review
@@ -72,113 +62,6 @@ def _spend(dt: datetime, cost: float, repo="o/r", issue=5, kind="RESOLVE") -> st
                        "issue": issue, "kind": kind, "cost_usd": cost})
 
 
-# ── Journal.emit ──────────────────────────────────────────────────────────────
-def test_emit_appends_one_parseable_json_line_per_event(tmp_path):
-    j = Journal(str(tmp_path / "sub" / "journal.jsonl"))
-    j.emit("agent_run", kind="RESOLVE", number=5)
-    j.emit("action", desc="relabel issue #5")
-
-    events = read_events(j.path)
-    assert [e["event"] for e in events] == ["agent_run", "action"]
-    assert events[0]["kind"] == "RESOLVE" and events[0]["number"] == 5
-    # A UTC stamp at seconds resolution, so the file stays greppable by date.
-    assert events[0]["ts"].endswith("+00:00") and "." not in events[0]["ts"]
-
-
-def test_emit_never_raises_on_an_unwritable_path(tmp_path, capsys):
-    # A journal whose parent is a FILE can never be created. Observability must
-    # degrade to a stderr line, never take the daemon down with it.
-    blocker = tmp_path / "blocker"
-    blocker.write_text("not a directory")
-    Journal(str(blocker / "journal.jsonl")).emit("agent_run", number=1)
-    assert "journal" in capsys.readouterr().err
-
-
-def test_monthly_ledger_rotation_preserves_prior_file(tmp_path):
-    path = tmp_path / "spend.jsonl"
-    path.write_text('{"event":"spend","cost_usd":1}\n')
-    old = datetime(2020, 1, 2, tzinfo=timezone.utc).timestamp()
-    os.utime(path, (old, old))
-
-    Journal(str(path), monthly_rotation=True).emit(
-        "spend", schema=2, cost_usd=2, currency="USD"
-    )
-
-    assert json.loads(path.read_text())["cost_usd"] == 2
-    assert json.loads((tmp_path / "spend.2020-01.jsonl").read_text())[
-        "cost_usd"
-    ] == 1
-
-
-def test_emit_serialises_unjsonable_values_instead_of_dropping_the_event(tmp_path):
-    j = Journal(str(tmp_path / "j.jsonl"))
-    j.emit("agent_run", exit_reason=ExitReason.WALL_TIMEOUT)
-    assert read_events(j.path)[0]["exit_reason"].endswith("wall_timeout")
-
-
-def test_an_event_with_a_multiline_field_is_still_exactly_one_line(tmp_path):
-    # review T6: lock-free appending by three daemons rests entirely on POSIX
-    # O_APPEND atomicity for ONE write() of ONE line. A field carrying embedded
-    # newlines — an agent summary, a traceback, a diff — must be escaped into
-    # that single line; the moment an event spans two writes, a concurrent
-    # appender interleaves between them and BOTH records become unreadable.
-    j = Journal(str(tmp_path / "j.jsonl"))
-    body = "summary line one\nline two\r\n\nline four"
-    j.emit("agent_run", summary=body)
-    j.emit("action", desc="a second event lands after it")
-
-    with open(j.path, encoding="utf-8") as fh:
-        raw = fh.read()
-    assert raw.count("\n") == 2, "one newline per event and not one more"
-    assert len(raw.splitlines()) == 2
-    # Anti-vacuity: one line because it was ESCAPED, not because it was mangled.
-    assert json.loads(raw.splitlines()[0])["summary"] == body
-    assert read_events(j.path)[1]["event"] == "action"
-
-
-def test_an_event_is_appended_with_exactly_one_write_call(tmp_path, monkeypatch):
-    # review T6, the other half: POSIX guarantees only that a SINGLE write() to
-    # an O_APPEND fd is not interleaved with another appender's. `write(line)`
-    # then `write("\n")` yields byte-identical output single-threaded and a
-    # shredded ledger the moment the review daemon appends between the two — so
-    # the contract here is the write COUNT, which no assertion on the resulting
-    # file can see. (Rewriting `emit` on top of a different single-shot writer is
-    # fine; splitting one event across two writes is not.)
-    import builtins
-
-    real_open = builtins.open
-    writes: list[str] = []
-
-    class _CountingHandle:
-        def __init__(self, fh):
-            self._fh = fh
-
-        def write(self, text):
-            writes.append(text)
-            return self._fh.write(text)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return self._fh.__exit__(*exc)
-
-    def spying_open(file, mode="r", *args, **kwargs):
-        fh = real_open(file, mode, *args, **kwargs)
-        return _CountingHandle(fh) if "a" in mode else fh
-
-    j = Journal(str(tmp_path / "j.jsonl"))
-    monkeypatch.setattr(builtins, "open", spying_open)
-    try:
-        j.emit("agent_run", summary="one\ntwo", number=5)
-    finally:
-        monkeypatch.undo()
-
-    assert len(writes) == 1, "one event must reach the fd as one write()"
-    assert writes[0].endswith("\n") and writes[0].count("\n") == 1
-    assert read_events(j.path)[0]["number"] == 5  # and it really landed
-
-
 # ── readers ───────────────────────────────────────────────────────────────────
 def test_read_events_skips_malformed_and_truncated_lines(tmp_path):
     path = _write(
@@ -197,178 +80,34 @@ def test_read_events_of_a_missing_file_is_an_empty_history(tmp_path):
     assert read_events(str(tmp_path / "nope.jsonl")) == []
 
 
-def test_sum_today_counts_only_todays_utc_spend(tmp_path):
-    path = _write(
-        str(tmp_path / "spend.jsonl"),
-        _spend(NOW - timedelta(days=1), 99.0),          # yesterday
-        _spend(NOW - timedelta(hours=11), 1.50),        # today, earlier UTC
-        _spend(NOW, 2.25),
-        json.dumps({"ts": _at(NOW), "event": "agent_run", "cost_usd": 100.0}),  # not spend
-    )
-    assert sum_today(path, lambda: NOW) == pytest.approx(3.75)
 
 
-def test_sum_today_of_a_missing_ledger_is_zero(tmp_path):
-    assert sum_today(str(tmp_path / "none.jsonl"), lambda: NOW) == 0.0
 
 
-def test_sum_issue_is_lifetime_and_scoped_to_repo_and_issue(tmp_path):
-    path = _write(
-        str(tmp_path / "spend.jsonl"),
-        _spend(NOW - timedelta(days=30), 4.0, issue=5),   # old, still counts
-        _spend(NOW, 1.0, issue=5),
-        _spend(NOW, 7.0, issue=6),                        # other issue
-        _spend(NOW, 9.0, repo="other/repo", issue=5),     # other repo
-    )
-    assert sum_issue(path, "o/r", 5) == pytest.approx(5.0)
 
 
-def test_recent_runs_returns_the_last_n_agent_runs_oldest_first(tmp_path):
-    path = _write(
-        str(tmp_path / "j.jsonl"),
-        *[json.dumps({"ts": _at(NOW), "event": "agent_run", "number": n}) for n in range(6)],
-        json.dumps({"ts": _at(NOW), "event": "action", "desc": "x"}),
-    )
-    assert [r["number"] for r in recent_runs(path, 3)] == [3, 4, 5]
 
 
-def test_events_within_drops_old_and_unstamped_events():
-    events = [
-        {"ts": _at(NOW - timedelta(hours=2)), "event": "old"},
-        {"ts": _at(NOW - timedelta(minutes=5)), "event": "fresh"},
-        {"event": "unstamped"},
-        {"ts": "not-a-timestamp", "event": "garbled"},
-    ]
-    assert [e["event"] for e in events_within(events, 3600, lambda: NOW)] == ["fresh"]
 
 
-def test_repeated_dispatch_warning_fires_on_a_non_converging_loop():
-    events = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
-         "kind": "RESOLVE", "number": 5}
-        for m in (40, 30, 20, 10)
-    ]
-    warning = repeated_dispatch_warning(events, 3600, 4)
-    assert "RESOLVE" in warning and "#5" in warning
 
 
-def test_repeated_dispatch_warning_silent_when_spread_beyond_the_window():
-    events = [
-        {"ts": _at(NOW - timedelta(hours=h)), "event": "agent_run",
-         "kind": "RESOLVE", "number": 5}
-        for h in (4, 3, 2, 1)
-    ]
-    assert repeated_dispatch_warning(events, 3600, 4) == ""
 
 
-def test_repeated_dispatch_warning_does_not_conflate_different_targets():
-    # Four runs in the window, but each a different issue — that is a busy
-    # harness, not a loop, and warning about it would train operators to ignore it.
-    events = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
-         "kind": "RESOLVE", "number": n}
-        for m, n in ((40, 1), (30, 2), (20, 3), (10, 4))
-    ]
-    assert repeated_dispatch_warning(events, 3600, 4) == ""
 
 
-def test_repeated_dispatch_warning_sees_a_loop_made_only_of_starts():
-    # review C3: a session that dies before any ResultMessage never produces a
-    # settled `agent_run`, so a detector that reads only settled runs reported a
-    # healthy harness while it bought a full session every other poll, forever.
-    events = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run_start",
-         "kind": "RESOLVE", "number": 5}
-        for m in (40, 30, 20, 10)
-    ]
-    warning = repeated_dispatch_warning(events, 3600, 4)
-    assert "RESOLVE" in warning and "#5" in warning
 
 
-def test_repeated_dispatch_warning_counts_a_start_and_its_settlement_once():
-    # Anti-vacuity twin of the above: every HEALTHY run now emits both halves,
-    # so counting events rather than dispatches would halve every operator's
-    # threshold overnight and warn about four ordinary runs as if they were eight.
-    events = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": ev,
-         "kind": "RESOLVE", "number": 5}
-        for m in (40, 30, 20, 10)
-        for ev in ("agent_run_start", "agent_run")
-    ]
-    assert repeated_dispatch_warning(events, 3600, 5) == "", "8 events, 4 dispatches"
-    assert "dispatched 4x" in repeated_dispatch_warning(events, 3600, 4)
 
 
-def test_one_healthy_multi_agent_review_is_not_a_retry_loop():
-    """review P1R-4. A `REVIEW_MODE=multi` dispatch fans a gate + five dimension
-    specialists + validators out under ONE (kind, number), so counting LEGS
-    reported "dispatched 16x … likely a non-converging retry loop" for every
-    healthy review. A warning that is always on is a warning that is off — and
-    this is the only operator-visible signal for the process deaths of P0R-4."""
-    legs = [
-        {"ts": _at(NOW - timedelta(seconds=60 - i)), "event": ev,
-         "kind": "REVIEW", "number": 100, "dispatch": "d1"}
-        for i in range(8)
-        for ev in ("agent_run_start", "agent_run")
-    ]
-    assert repeated_dispatch_warning(legs, 3600, 4) == "", "16 legs, ONE dispatch"
 
 
-def test_five_separate_dispatches_of_one_target_still_warn():
-    """Anti-vacuity twin: collapsing legs must not collapse POLLS. Five
-    consecutive re-dispatches are five paid rounds and the exact shape the
-    detector exists for."""
-    events = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": ev,
-         "kind": "REVIEW", "number": 100, "dispatch": f"d{m}"}
-        for m in (50, 40, 30, 20, 10)
-        for ev in ("agent_run_start", "agent_run")
-    ]
-    warning = repeated_dispatch_warning(events, 3600, 5)
-    assert "REVIEW" in warning and "#100" in warning and "dispatched 5x" in warning
 
 
-def test_a_dispatch_is_stamped_when_it_started_not_when_its_last_leg_settled():
-    """The window is measured between dispatches, so a long fan-out must not
-    push its own dispatch outside the span and hide a loop."""
-    events = []
-    for i, minutes in enumerate((59, 40, 20, 1)):
-        events.append({"ts": _at(NOW - timedelta(minutes=minutes)),
-                       "event": "agent_run_start", "kind": "RESOLVE",
-                       "number": 5, "dispatch": f"d{i}"})
-        events.append({"ts": _at(NOW - timedelta(minutes=minutes) + timedelta(minutes=5)),
-                       "event": "agent_run", "kind": "RESOLVE",
-                       "number": 5, "dispatch": f"d{i}"})
-    assert "dispatched 4x" in repeated_dispatch_warning(events, 3600, 4)
 
 
-def test_ided_and_legacy_events_for_one_target_are_each_counted_once():
-    """A journal that spans the upgrade holds both shapes. Neither may be
-    dropped (a missed loop) nor double counted (a phantom one)."""
-    ided = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": ev,
-         "kind": "RESOLVE", "number": 5, "dispatch": f"d{m}"}
-        for m in (40, 30)
-        for ev in ("agent_run_start", "agent_run")
-    ]
-    legacy = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
-         "kind": "RESOLVE", "number": 5}
-        for m in (20, 10)
-    ]
-    assert repeated_dispatch_warning(ided + legacy, 3600, 5) == "", "4 dispatches"
-    assert "dispatched 4x" in repeated_dispatch_warning(ided + legacy, 3600, 4)
 
 
-def test_repeated_dispatch_warning_still_reads_a_journal_with_no_start_events():
-    # Journals written before `agent_run_start` existed (and any run whose start
-    # line was lost) must keep tripping the detector on settled runs alone.
-    events = [
-        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
-         "kind": "REVIEW", "number": 7}
-        for m in (40, 30, 20, 10)
-    ]
-    assert "#7" in repeated_dispatch_warning(events, 3600, 4)
 
 
 def test_default_ledger_path_is_global_and_honours_xdg(monkeypatch):
@@ -394,78 +133,18 @@ def _run(dt, kind="RESOLVE", number=5, issue=5, dispatch="", role="fix", **extra
             "dispatch": dispatch, **extra}
 
 
-def test_a_start_with_no_settlement_is_one_unsettled_death():
-    assert unsettled_starts([_start(NOW)], now_fn=lambda: NOW) == {5: 1}
 
 
-def test_a_start_and_its_settlement_are_not_a_death():
-    """Anti-vacuity: the shape of EVERY healthy run. A counter that read starts
-    alone would escalate every issue the harness ever worked on."""
-    events = [_start(NOW - timedelta(minutes=m + 1)) for m in range(4)]
-    events += [_run(NOW - timedelta(minutes=m)) for m in range(4)]
-    assert unsettled_starts(events, now_fn=lambda: NOW) == {}
 
 
-def test_the_raise_path_death_settles_and_so_is_not_counted_here():
-    """Anti-double-count. A pre-result transport death the PROCESS SURVIVED is
-    already counted once, by the dispatcher's store bump; `JournalingRuntime`
-    also writes it a settled `transport_death` line. Counting it here too would
-    count one death twice."""
-    events = [
-        _start(NOW - timedelta(minutes=1)),
-        _run(NOW, status="raised", is_error=True, exit_reason="transport_death",
-             error="RuntimeError: stream closed before any result"),
-    ]
-    assert unsettled_starts(events, now_fn=lambda: NOW) == {}
 
 
-def test_a_concurrent_fanout_of_legs_reports_no_deaths():
-    """The rule that forces COUNTING over positional pairing. A
-    REVIEW_MODE=multi dispatch runs its gate, 5 dimensions and N validators
-    concurrently under ONE context, so its journal is a run of interleaved
-    starts and settlements in arbitrary order. Pairing "a start is unsettled if
-    no settlement precedes the next start" would report 7 phantom deaths for
-    this — one healthy review would trip a ceiling of 5 on its own."""
-    starts = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100, issue=7, role="review")
-              for i in range(8)]
-    settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100, issue=7, role="review")
-               for i in range(8)]
-    assert unsettled_starts(starts + settles, now_fn=lambda: NOW) == {}
-    # …and the same journal WITH one leg killed reports exactly one death.
-    assert unsettled_starts(starts + settles[:-1], now_fn=lambda: NOW) == {-100: 1}
 
 
-def test_a_dispatch_killed_mid_fanout_is_ONE_death_not_one_per_leg():
-    """The money question a per-leg count gets wrong. A `systemctl restart`
-    during a REVIEW_MODE=multi review kills a gate + 5 dimension legs at once;
-    charging six deaths trips a ceiling of five on a single routine restart,
-    which is exactly the "memory pressure must not walk healthy work to a human"
-    rule (FAILURE-MODES #58) inverted."""
-    legs = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100,
-                   issue=7, dispatch="d1", role="review") for i in range(6)]
-    settled_two = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100,
-                        issue=7, dispatch="d1", role="review") for i in range(2)]
-    assert unsettled_starts(legs + settled_two, now_fn=lambda: NOW) == {-100: 1}
 
 
-def test_separate_dispatches_are_separate_deaths():
-    """Anti-vacuity twin: collapsing legs must not collapse POLLS. Three
-    consecutive killed dispatches are three paid rounds, and a ceiling that saw
-    one would never trip on the loop it exists for."""
-    events = [
-        _start(NOW - timedelta(minutes=m), kind="REVIEW", number=100, issue=7,
-               dispatch=f"d{m}", role="review")
-        for m in (30, 20, 10)
-    ]
-    assert unsettled_starts(events, now_fn=lambda: NOW) == {-100: 3}
 
 
-def test_a_fully_settled_dispatch_is_no_death():
-    legs = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100,
-                   issue=7, dispatch="d1", role="review") for i in range(6)]
-    settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100,
-                    issue=7, dispatch="d1", role="review") for i in range(6)]
-    assert unsettled_starts(legs + settles, now_fn=lambda: NOW) == {}
 
 
 def test_the_real_runtime_stamps_one_dispatch_id_across_every_leg(tmp_path):
@@ -526,85 +205,26 @@ def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
     assert by_number[5][0]["dispatch"] != by_number[7][0]["dispatch"]
 
 
-def test_a_journal_written_before_dispatch_ids_still_counts_deaths():
-    """Backward compatibility: an upgrade must not silently zero the counter for
-    every run already on disk. With no `dispatch` field the rule falls back to
-    (kind, number) counting."""
-    legacy = {"ts": _at(NOW), "event": "agent_run_start", "kind": "RESOLVE",
-              "number": 5, "issue": 5}
-    assert unsettled_starts([legacy], now_fn=lambda: NOW) == {5: 1}
 
 
-def test_review_deaths_key_to_the_pr_even_when_an_issue_is_linked():
-    assert unsettled_starts(
-        [_start(NOW, kind="REVIEW", number=100, issue=7, role="review")],
-        now_fn=lambda: NOW,
-    ) == {-100: 1}
 
 
-def test_an_issueless_prs_death_keys_to_the_negated_pr_number():
-    """`breaker_key`'s convention for a PR with no closing ref and a Jira-keyed
-    branch: the dispatcher falls back to `-action.number`, so this must too."""
-    assert unsettled_starts(
-        [_start(NOW, kind="RE_REVIEW", number=112, issue=None, role="review")], now_fn=lambda: NOW
-    ) == {-112: 1}
-    assert death_key({"number": 112, "issue": None}) == -112
-    assert death_key({"number": 112, "issue": 9}) == 9
-    assert death_key({"role": "review", "number": 112, "issue": 9}) == -112
-    assert death_key({}) is None
 
 
-def test_different_kinds_on_one_issue_sum_into_one_ceiling_key():
-    events = [_start(NOW, kind="RESOLVE"), _start(NOW, kind="RESUME")]
-    assert unsettled_starts(events, now_fn=lambda: NOW) == {5: 2}
 
 
-def test_deaths_older_than_the_window_are_not_counted():
-    assert unsettled_starts([_start(NOW - timedelta(hours=25))], now_fn=lambda: NOW) == {}
-    assert unsettled_starts(
-        [_start(NOW - timedelta(hours=25))], window_s=0, now_fn=lambda: NOW
-    ) == {5: 1}
 
 
-def test_a_settlement_whose_start_fell_outside_the_window_invents_no_death():
-    """The window can only cut a pair the wrong way round; a bound that
-    over-reports would walk a healthy issue to a human on a long session."""
-    assert unsettled_starts([_run(NOW)], now_fn=lambda: NOW) == {}
 
 
-def test_unstamped_and_unrelated_events_are_ignored():
-    events = [
-        {"event": "agent_run_start", "kind": "RESOLVE", "number": 5, "issue": 5},  # no ts
-        {"ts": _at(NOW), "event": "escalation", "number": 5},
-        {"ts": _at(NOW), "event": "agent_run_start", "kind": "RESOLVE",
-         "number": "not-a-number", "issue": None},
-    ]
-    assert unsettled_starts(events, now_fn=lambda: NOW) == {}
 
 
 # ── read_events_tail ──────────────────────────────────────────────────────────
 # The poll-loop reader must not grow with the age of the install; a byte window
 # means its first line is usually torn, and a parser handed half an object must
 # skip it exactly like a killed writer's tail.
-def test_read_events_tail_reads_only_the_last_bytes(tmp_path):
-    path = str(tmp_path / "journal.jsonl")
-    lines = [json.dumps({"event": "agent_run", "number": n, "pad": "x" * 100})
-             for n in range(50)]
-    _write(path, *lines)
-    tail = read_events_tail(path, max_bytes=500)
-    assert tail, "a bounded read must still return events"
-    assert [e["number"] for e in tail] == list(range(50))[-len(tail):]
-    assert len(tail) < 50, "the whole file was read — the bound did nothing"
-    # Every returned object parsed cleanly: the torn leading line was dropped,
-    # not handed to json.loads and silently counted as garbage.
-    assert all(e.get("pad") == "x" * 100 for e in tail)
 
 
-def test_read_events_tail_reads_a_whole_small_file_and_tolerates_a_missing_one(tmp_path):
-    path = str(tmp_path / "journal.jsonl")
-    _write(path, json.dumps({"event": "agent_run", "number": 1}))
-    assert read_events_tail(path) == [{"event": "agent_run", "number": 1}]
-    assert read_events_tail(str(tmp_path / "nope.jsonl")) == []
 
 
 # ── JournalingRuntime ─────────────────────────────────────────────────────────
@@ -801,7 +421,6 @@ def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_pa
             is_error=False,
             cost_usd=1.0,
             model="claude-opus-4-1",
-            telemetry_warning="missing usage",
         ),
     )
 
@@ -813,7 +432,6 @@ def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_pa
     } == {
         "agent_run_start": "opus",
         "agent_run": "opus",
-        "telemetry_warning": "opus",
     }
     assert read_events(ledger) == []
 
@@ -1080,31 +698,10 @@ def test_an_ordinary_relabel_is_not_an_escalation(tmp_path):
     assert [e for e in read_events(journal.path) if e["event"] == "escalation"] == []
 
 
-def test_spend_blocked_keys_reads_only_keyed_blocks():
-    events = [
-        {"event": "spend_block", "block_key": "issue:o/r:5"},
-        {"event": "spend_block", "scope": "daily"},          # pre-upgrade line
-        {"event": "agent_run", "block_key": "issue:o/r:9"},  # not a block
-    ]
-    assert spend_blocked_keys(events) == {"issue:o/r:5"}
 
 
-def test_hold_keys_reads_only_keyed_holds():
-    events = [
-        {"event": "hold", "block_key": "hold:o/r:522:overlap:pr#123"},
-        {"event": "hold", "reason": "blocker"},                  # unkeyed → ignored
-        {"event": "spend_block", "block_key": "issue:o/r:9"},    # a different level
-    ]
-    assert hold_keys(events) == {"hold:o/r:522:overlap:pr#123"}
 
 
-def test_hold_keys_survives_a_round_trip_through_a_real_journal(tmp_path):
-    """The dedup that matters is the one across a process restart, so the read
-    must work off what `Journal.emit` actually wrote — not a hand-built dict."""
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    journal.emit("hold", issue=522, reason="overlap", blocker="pr#123",
-                 block_key="hold:o/r:522:overlap:pr#123")
-    assert hold_keys(read_events_tail(journal.path)) == {"hold:o/r:522:overlap:pr#123"}
 
 
 def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
@@ -1171,24 +768,20 @@ def test_daemon_journals_a_skipped_tick_when_github_is_unavailable(tmp_path):
 
 
 # ── CLI status summary ────────────────────────────────────────────────────────
-def test_status_summary_is_silent_with_no_history(tmp_path):
+def test_status_summary_is_silent_with_no_spend():
     from issue_agent.app.cli import spend_status_lines
 
-    assert spend_status_lines(str(tmp_path / "j.jsonl")) == []
+    assert spend_status_lines() == []
 
 
-def test_status_summary_reports_sqlite_spend_without_legacy_history(
-    tmp_path,
-):
+def test_status_summary_reports_sqlite_spend_per_repo_and_globally():
     from issue_agent.app.cli import spend_status_lines
 
     output = "\n".join(
         spend_status_lines(
-            str(tmp_path / "absent-journal.jsonl"),
             50.0,
-            lambda: NOW,
-            repo="o/r",
-            global_cap=100.0,
+            "o/r",
+            100.0,
             repository_spent=1.25,
             all_repositories_spent=3.5,
         )
@@ -1198,34 +791,12 @@ def test_status_summary_reports_sqlite_spend_without_legacy_history(
     assert "today, all repos: $3.50 / $100.00 cap" in output
 
 
-def test_status_summary_reports_spend_runs_and_warnings(tmp_path):
+def test_status_summary_without_a_repo_pairs_the_cap_with_the_global_total():
     from issue_agent.app.cli import spend_status_lines
 
-    journal = str(tmp_path / "j.jsonl")
-    _write(
-        journal,
-        *[json.dumps({"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
-                      "kind": "RESOLVE", "number": 5, "cost_usd": 1.0,
-                      "exit_reason": "agent_error", "is_error": True})
-          for m in (40, 30, 20, 10)],
-        json.dumps({"ts": _at(NOW), "event": "spend_block", "scope": "issue", "issue": 5}),
-        json.dumps({"ts": _at(NOW - timedelta(hours=3)), "event": "escalation",
-                    "target": "issue", "number": 5}),
-    )
-    out = "\n".join(
-        spend_status_lines(
-            journal,
-            50.0,
-            lambda: NOW,
-            all_repositories_spent=12.5,
-        )
-    )
+    out = "\n".join(spend_status_lines(50.0, all_repositories_spent=12.5))
 
     assert "$12.50" in out and "$50.00 cap" in out
-    assert "RESOLVE" in out and "#5" in out and "agent_error" in out
-    assert "non-converging retry loop" in out
-    assert "1 spend block(s) today" in out
-    assert "1 escalation(s) to needs-human-review in 24h" in out
 
 
 def test_status_journal_path_prefers_the_overlay_state_dir(tmp_path, monkeypatch):

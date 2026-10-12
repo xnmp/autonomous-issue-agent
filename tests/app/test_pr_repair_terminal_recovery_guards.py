@@ -1,7 +1,8 @@
 """Recovery must preserve real provenance and refuse incomplete quiescence."""
+import sqlite3
+
 import pytest
 
-from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.contracts import RunId
 from tests.app.test_pr_repair_terminal_recovery import (
     OWNER, _dump, _launch_and_lose_return, _repair, _workflow,
@@ -105,16 +106,16 @@ def test_acknowledgment_rolls_back_both_components_and_receipts_on_write_failure
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, 'rebase')
     assert store.release(run_id, 'operator disposition').disposition.value == 'available'
     held = _dump(store)
-    original = store._transition
-
-    def fail_acknowledgment(db, entity, *args, **kwargs):
-        if entity == 'pr_repair':
-            raise WorkflowAuthorityError('injected final acknowledgment write failure')
-        return original(db, entity, *args, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(store, '_transition', fail_acknowledgment)
-        assert control.reconcile_pr_repair_returns() == 0
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER injected_ack_failure BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='continuation-return' "
+                   "BEGIN SELECT RAISE(ABORT, 'injected final acknowledgment write failure'); END")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="injected final acknowledgment"):
+            control.reconcile_pr_repair_returns()
+    finally:
+        with store.transaction() as db:
+            db.execute("DROP TRIGGER injected_ack_failure")
     assert _dump(store) == held
     assert control.reconcile_pr_repair_returns() == 1
 

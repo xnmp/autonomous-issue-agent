@@ -291,58 +291,6 @@ def _holds(
     return tuple(holds)
 
 
-def issue_holds(
-    world: WorldState, inflight: tuple[InFlightFix, ...] = ()
-) -> tuple[Hold, ...]:
-    """Every hold in force this poll: for each OPEN, ai-ready issue that
-    `pick_ready_issue` will skip, why — plus one blocker hold per OPEN-PR
-    issue whose open dependency gates the repair arm. Pure; ordered by the
-    world's issue order, then blocker-before-overlap for a doubly-held issue.
-
-    Reported, not acted on — the wiring journals these (deduped per
-    issue/reason/blocker) so a harness that looks idle can be told apart from a
-    harness that is deliberately waiting."""
-    ready_holds = tuple(
-        hold
-        for issue in world.open_issues()
-        if issue_lifecycle(issue).is_ready
-        for hold in _holds(issue, world, inflight)
-    )
-    # PR-stage twin of the blocker hold: an OPEN issue whose PR is already up
-    # but whose GitHub dependency is still open gets no repair legs (see the
-    # decide_fix open-PR loop, which skips on this same predicate), and that
-    # wait must be as visible as the admission-stage one. One hold per issue.
-    reported = {hold.issue for hold in ready_holds}
-    pr_stage: list[Hold] = []
-    for pr in world.prs:
-        # ai-pr-open only: a hold says "the fixer is deliberately waiting",
-        # so a PR the repair arm would never touch must not generate one
-        # (adversarial review F3: reviewer-adopted human PRs produced
-        # DEFERRED lines for dispatches that were never going to happen).
-        # The author!=fix_bot slice still slips through — cfg does not reach
-        # this reporter — and is accepted noise.
-        if pr.state != "OPEN" or Label.AI_PR_OPEN not in pr.labels:
-            continue
-        held = _observed_issue(world, _issue_for_pr(pr))
-        if (
-            held is None
-            or held.number in reported
-            or not dependency_blocked(held)
-        ):
-            continue
-        reported.add(held.number)
-        pr_stage.append(
-            Hold(
-                held.number,
-                HOLD_BLOCKER,
-                blocker_issue=held.open_blocker_numbers[0]
-                if held.open_blocker_numbers
-                else None,
-            )
-        )
-    return ready_holds + tuple(pr_stage)
-
-
 # ── duplicate-PR guard (#39) ─────────────────────────────────────────────────
 @dataclass(frozen=True)
 class DuplicatePR:
@@ -1406,38 +1354,6 @@ def ci_rerun_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
     if not failures or any(check.run_id is None for check in failures):
         return ()
     return tuple(sorted({check.run_id for check in failures if check.run_id is not None}))
-
-
-@dataclass(frozen=True)
-class CiFlake:
-    """A PR whose head spent its free re-run and is now GREEN — i.e. the failure
-    that would have bought a FIX_CI leg was a flake, and the leg never happened.
-
-    The confirmation half of #38: the re-run itself is journalled when it fires
-    (`ci_rerun`), but "was it actually a flake?" is only knowable one CI cycle
-    later, from the world. That makes it a derivation over world+state rather
-    than an event any code path can emit at the moment it happens — the same
-    reason `CiPendingStall` exists."""
-
-    pr: int
-    head: str
-
-
-def ci_flakes(
-    world: WorldState, cfg: FixConfig, state: FixState
-) -> tuple[CiFlake, ...]:
-    """Every fixer PR that used its free re-run on its current head and is now
-    settled OK. The measurement behind the metric #38 moves (repair-leg share of
-    spend): each one is a FIX_CI leg — $13–29 plus its review tail — that was
-    not bought. Pure; the wiring journals exactly this, deduped per (PR, head)."""
-    return tuple(
-        CiFlake(pr=pr.number, head=pr.head_ref_oid)
-        for pr in fixer_prs(world, cfg)
-        if pr.head_ref_oid
-        and state.ci_rerun_head.get(pr.number, "") == pr.head_ref_oid
-        and ci_state(pr.ci)
-        == CIState.OK
-    )
 
 
 def _escalate_pr(

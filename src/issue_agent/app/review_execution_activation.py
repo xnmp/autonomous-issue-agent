@@ -22,7 +22,6 @@ from ..adapters.review_execution_import_sources import (
     held_legacy_execution_counter_sources,
 )
 from ..adapters.store import Store
-from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
 from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport, ReviewExecutionImportPlan
 from ..domain.review_workflow import RecordedPullRequest
@@ -227,15 +226,6 @@ class ConfiguredReviewExecutionActivation:
                 if fresh.plan_digest != plan.plan_digest:
                     raise ReviewExecutionActivationRefused("review execution import sources changed since the plan was reviewed")
                 commit_review_execution_import(db, fresh, now=datetime.now(timezone.utc))
-                if self._control._event_factory is not None:
-                    self._control.enqueue_event(self._control._event_factory(
-                        ControlTransitionCommitted("workflow_activation", f"{plan.repository}:review_execution", "activated", {
-                            "epoch": plan.execution_epoch, "plan_digest": plan.plan_digest,
-                            "source_digest": plan.source_digest, "inventory_digest": plan.inventory_digest,
-                            "imported": sum(isinstance(item, EligibleZeroHistoryReviewImport) for item in plan.candidates),
-                            "blocked": sum(not isinstance(item, EligibleZeroHistoryReviewImport) for item in plan.candidates),
-                        }), Correlation(),
-                    ), db)
         return ReviewExecutionActivationCommitted(plan)
 
 
@@ -277,20 +267,11 @@ def _scope_roots(cfg: HarnessConfig, extra_roots: tuple[str, ...]) -> tuple[tupl
     return distinct_roots(configured + tuple((f"extra:{os.path.realpath(path)}", path) for path in extra_roots))
 
 
-def _scope_control(scope: ReviewExecutionActivationScope, *, journal: bool = False) -> SQLiteControlStore:
-    import uuid
-    from ..adapters.event_log import EventLog
-    from ..domain.events import Producer
-
+def _scope_control(scope: ReviewExecutionActivationScope) -> SQLiteControlStore:
     cfg = scope.cfg
     control = SQLiteControlStore(control_store_path((cfg.state_dir, cfg.review_state_dir),
                                                   authority_root=cfg.control_authority_root))
     control.require_initialized()
-    if journal:
-        events = EventLog(os.path.join(cfg.review_state_dir, "events-v2.jsonl"),
-                          Producer(f"operator:{scope.name}", cfg.repo, "operator", os.getpid(), uuid.uuid4().hex))
-        control.bind_event_outbox(events.prepare, events.append_committed,
-                                 line_limit=events.line_limit, destination=events.producer.feed_identity)
     return control
 
 
@@ -438,7 +419,7 @@ def activate(scope: ReviewExecutionActivationScope, *, confirm_plan_digest: str,
     if replay:
         return _plan_report(scope, plan, status="already_active_with_this_plan")
     files, links, sql = _observed_scope_sources(scope, control)
-    control = _scope_control(scope, journal=True)
+    control = _scope_control(scope)
     activation = ConfiguredReviewExecutionActivation(scope.cfg, control, scope.gateway, Store(scope.cfg.review_state_dir), liveness=scope.liveness)
     committed = activation.activate(plan, files, links, sql, extra_roots=scope.extra_roots)
     return _plan_report(scope, plan, status="already_active_with_this_plan" if committed.idempotent else "activated")
@@ -470,7 +451,7 @@ def rehearse(scope: ReviewExecutionActivationScope, *, copy_to: str) -> dict[str
     copied_scope = replace(scope, cfg=copied_cfg, extra_roots=tuple(translate(path) for path in scope.extra_roots), liveness=lambda: ())
     copied_control = SQLiteControlStore(copied.control_path)
     copied_control.initialize()
-    copied_control = _scope_control(copied_scope, journal=True)
+    copied_control = _scope_control(copied_scope)
     files, links, sql = _observed_scope_sources(copied_scope, copied_control)
     activation = ConfiguredReviewExecutionActivation(copied_cfg, copied_control, scope.gateway,
                                                     Store(copied_cfg.review_state_dir), liveness=lambda: ())

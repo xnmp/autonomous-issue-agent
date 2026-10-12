@@ -18,7 +18,7 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 from .actions import Action
 from .ci_history import CiAttempt
-from .events import Correlation, EventEnvelope, JsonValue, TelemetryEvent
+from .events import TelemetryEvent
 from .contracts import (
     BudgetScope,
     LifecycleCommand,
@@ -105,14 +105,6 @@ class ActionExecutor(Protocol):
         self, pr: int, event: str, body: str, expected_head: str
     ) -> bool: ...
 
-
-class LegacyJournal(Protocol):
-    """Read-only locator retained solely for historical JSONL conversion."""
-
-    @property
-    def path(self) -> str: ...
-    @property
-    def canonical(self) -> bool: ...
 
 
 @runtime_checkable
@@ -273,16 +265,6 @@ class StaleReservationReconciler(Protocol):
     def reconcile_stale_reservations(self) -> int: ...
 
 
-class RunAbandonmentSink(Protocol):
-    """Emit a correction for a durable run proven dead by recovery.
-
-    ``False`` means the referenced start was unavailable; telemetry failure
-    never changes operational recovery state.
-    """
-
-    def abandon_run(self, run_id: RunId, reason: str) -> bool: ...
-
-
 class WorktreeRecovery(Protocol):
     """Idempotent local checkout recovery; any validation failure is fatal."""
 
@@ -307,13 +289,6 @@ class ControlStore(Protocol):
     def receipt(
         self, namespace: str, scope: str, key: str, payload: Mapping[str, object]
     ) -> bool: ...
-    def flush_outbox(
-        self,
-        emit: Callable[[EventEnvelope], None],
-        limit: int = 100,
-        *,
-        destination: str | None = None,
-    ) -> int: ...
 
 
 @runtime_checkable
@@ -345,59 +320,6 @@ class PendingEffectReads(Protocol):
         executor_identity: str | None = None,
     ) -> tuple[PendingEffect, ...]: ...
 
-
-@runtime_checkable
-class LevelState(Protocol):
-    """Restart-safe level memory; corrupt/unavailable reads fail closed."""
-
-    def load_level_state(
-        self, namespace: str, scope: str
-    ) -> Mapping[str, Mapping[str, JsonValue]]: ...
-
-    def replace_level_state(
-        self,
-        namespace: str,
-        scope: str,
-        values: Mapping[str, Mapping[str, JsonValue]],
-    ) -> None: ...
-
-
-class WorldObservationStore(Protocol):
-    """Persist committed observation hashes.
-
-    ``False`` is an idempotent unchanged observation. Storage failures raise;
-    they are not interpreted as a changed or empty world.
-    """
-
-    def record_world_observation(
-        self,
-        *,
-        deployment: str,
-        subject_kind: str,
-        subject_number: int,
-        content_hash: str,
-        facts: Mapping[str, JsonValue],
-        correlation: Correlation,
-    ) -> bool: ...
-
-    def record_world_snapshot(
-        self,
-        *,
-        deployment: str,
-        subject_kind: str,
-        observations: Mapping[
-            int,
-            tuple[str, Mapping[str, JsonValue], Correlation],
-        ],
-    ) -> int: ...
-
-    def retire_projection_feed(
-        self,
-        *,
-        deployment: str,
-        repository: str,
-        role: str,
-    ) -> int: ...
 
 
 @runtime_checkable

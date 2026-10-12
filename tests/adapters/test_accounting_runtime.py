@@ -16,7 +16,6 @@ from issue_agent.adapters.codex_runner import (
 )
 from issue_agent.adapters.control_store import AccountingDisposition, Lease, ReservationResult, SQLiteControlStore
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain import continuation_components as cc
@@ -30,12 +29,6 @@ from issue_agent.domain.workflow_identity import (
     WorkflowFamily,
     WorkflowFence,
     WorkflowKey,
-)
-from issue_agent.domain.events import (
-    Producer,
-    ReservationRetained,
-    SpendRecorded,
-    decode_event_line,
 )
 from issue_agent.domain.outcome import AgentResult, DAILY_HEADROOM_STATUS, ExitReason, MAX_BUDGET_STATUS
 from issue_agent.domain.resolve_return import ResolveInputs
@@ -150,8 +143,6 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
 
 def test_real_return_corrects_zero_recovery_and_captures_output(tmp_path):
     wrapper, store = _wrapper(tmp_path, Runtime(None), runtime_name="claude")
-    events = EventLog(str(tmp_path / "events.jsonl"), Producer("deployment", "o/r", "fix", 123, "boot"))
-    store.bind_event_outbox(events.prepare, events.append_committed)
 
     class LateReturn:
         async def run(self, _task):
@@ -177,8 +168,6 @@ def test_real_return_corrects_zero_recovery_and_captures_output(tmp_path):
     pending = workflow.pending_returns()
     assert len(pending) == 1 and pending[0].returned.summary == "real output"
     assert store.active_reservation_runs() == ()
-    emitted = tuple(decode_event_line(line) for line in (tmp_path / "events.jsonl").read_text().splitlines())
-    assert sum(e.payload.amount_micros for e in emitted if isinstance(e.payload, SpendRecorded)) == 1_250_000
 
 
 @pytest.mark.parametrize("reclaim", [False, True])
@@ -883,15 +872,6 @@ def test_codex_missing_usage_never_settles_productive_run_as_free(
         ),
     )
 
-    event_log = EventLog(
-        str(tmp_path / "events-v2.jsonl"),
-        Producer("deployment", "o/r", "fix", 100, "boot"),
-    )
-    store.bind_event_outbox(
-        event_log.prepare,
-        event_log.append_committed,
-    )
-
     result = asyncio.run(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
     )
@@ -900,9 +880,6 @@ def test_codex_missing_usage_never_settles_productive_run_as_free(
     assert store.active_reservation_runs() == ()
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
-    events = tuple(decode_event_line(line) for line in (tmp_path / "events-v2.jsonl").read_text().splitlines())
-    assert not any(isinstance(event.payload, ReservationRetained) for event in events)
-    assert "interrupted requests charged zero" in (tmp_path / "events-v2.jsonl").read_text()
 
 
 def test_stderr_codex_usage_cannot_release_a_paid_reservation(
@@ -1343,23 +1320,14 @@ def test_journal_supplied_run_identity_is_the_reservation_identity(tmp_path) -> 
         AgentResult(False, status="ok", cost_usd=1, session_id="receipt")
     )
     wrapper, store = _wrapper(tmp_path, runtime)
-    event_path = tmp_path / "events.jsonl"
-    events = EventLog(
-        str(event_path),
-        Producer("deployment", "o/r", "fix", 123, "boot"),
-    )
-    store.bind_event_outbox(events.prepare, events.append_committed)
     wrapper.set_run_identity("journal-run", "journal-leg")
 
     asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
-    emitted = tuple(
-        decode_event_line(line) for line in event_path.read_text().splitlines()
-    )
-    spend = next(
-        event for event in emitted if isinstance(event.payload, SpendRecorded)
-    )
-    assert spend.correlation.run_id == "journal-run"
+    with store.transaction() as db:
+        assert [tuple(row) for row in db.execute("SELECT run_id,state FROM runs")] == [
+            ("journal-run", "completed")]
+        assert [row[0] for row in db.execute("SELECT run_id FROM charges")] == ["journal-run"]
 
 
 def test_successful_settlement_removes_crash_recovery_evidence(tmp_path) -> None:
@@ -1528,3 +1496,23 @@ def test_unusable_provider_dollars_preserve_valid_stream_estimate(tmp_path, inva
     assert store.active_reservation_runs() == ()
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (800, "estimate")
+
+
+def test_a_completed_leg_settles_and_the_daily_cap_gates_with_no_event_log_or_outbox(
+    tmp_path,
+) -> None:
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1.25, session_id="receipt"))
+    wrapper, store = _wrapper(tmp_path, runtime)
+
+    settled = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    refused = asyncio.run(wrapper.run(RuntimePlan("more", model="gpt-test", max_budget_usd=4)))
+
+    assert settled.status == "ok"
+    assert refused.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert runtime.calls == 1
+    with store.transaction() as db:
+        assert [row[0] for row in db.execute("SELECT amount_micros FROM charges")] == [1_250_000]
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('event_outbox','world_observations')"
+        ).fetchall() == []
+    assert sorted(path.name for path in tmp_path.iterdir() if path.suffix == ".jsonl") == []

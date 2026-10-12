@@ -97,17 +97,18 @@ def test_configuration_change_cannot_redirect_unblock_files_or_effects(monkeypat
     assert (dirs["fix"] / "issue-7.resolve-retries").read_text() == "4"
     assert (dirs["review"] / "pr-12.last-sha").read_text() == "preserve-head"
     assert (dirs["review"] / "pr-12.operator-guidance").read_text() == "old scope"
-    assert (dirs["fix"] / "events-v2.jsonl").exists()
+    assert (dirs["fix"] / "journal.jsonl").exists()
 
 
-def test_journal_cache_is_scoped_to_repository_and_captured_path(monkeypatch, tmp_path):
+def test_journal_is_scoped_to_the_captured_path(monkeypatch, tmp_path):
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
-    first = backend._operator_journal("demo", "o/r")
-    assert backend._operator_journal("demo", "o/r") is first
-    other_repo = backend._operator_journal("demo", "other/repo")
-    other_path = backend._operator_journal("demo", "o/r", legacy_path=str(tmp_path / "other" / "journal.jsonl"))
-    assert first is not None and other_repo is not None and other_path is not None
-    assert other_repo is not first and other_path is not first
+    captured = tmp_path / "other" / "journal.jsonl"
+    default = backend._operator_journal("demo", "o/r")
+    pinned = backend._operator_journal("demo", "o/r", legacy_path=str(captured))
+    assert default is not None and pinned is not None
+    assert default.path == str(dirs["fix"] / "journal.jsonl")
+    assert pinned.path == str(captured)
+    assert backend._operator_journal("demo", "") is None
 
 
 def test_overlay_cannot_hide_active_snapshot_family_authority(monkeypatch, tmp_path):
@@ -138,12 +139,14 @@ def test_missing_active_snapshot_never_falls_back_to_overlay_or_creates_authorit
 def test_admission_projection_uses_captured_snapshot_not_overlay_or_ui_cache(monkeypatch, tmp_path):
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path, prs=())
     monkeypatch.setattr(backend, "snapshot", lambda *a, **kw: pytest.fail("legacy admission reused UI snapshot"))
-    collect = backend._collector.collect
+    collect = backend._deployment_snapshot
     captured = []
-    def observe(**kwargs):
-        captured.append(kwargs)
-        return collect(**kwargs)
-    monkeypatch.setattr(backend._collector, "collect", observe)
+    def observe(name, repo, target_dir, journal_paths, control_db_path):
+        captured.append({"repo": repo, "target_dir": target_dir,
+                         "journal_paths": list(journal_paths),
+                         "control_db_path": control_db_path})
+        return collect(name, repo, target_dir, journal_paths, control_db_path)
+    monkeypatch.setattr(backend, "_deployment_snapshot", observe)
     monkeypatch.setattr(backend, "overlay_field", lambda *_: "future/repo")
 
     assert backend.unblock("demo", 7) == (True, "ok")

@@ -8009,53 +8009,6 @@
         "summary": "Api Unpark"
       }
     },
-    "/api/repos/{name}/measurement": {
-      "get": {
-        "operationId": "api_measurement_api_repos__name__measurement_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "specification",
-            "required": true,
-            "schema": {
-              "maxLength": 65536,
-              "title": "Specification",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Measurement"
-      }
-    },
     "/api/repos/{name}/overview": {
       "get": {
         "operationId": "api_overview_api_repos__name__overview_get",

@@ -352,9 +352,8 @@ class ActiveReviewRuntime:
             suppressed, self._record_failures, self._record_failure_reported = self._record_failures - 1, 0, now
             self._log(f"review dispatch decisions not recorded ({suppressed} earlier failures unreported): "
                       f"{detail[:512]}")
-            self.control.journal_decision_record_failure(detail[:512], suppressed)
-        except Exception as exc:  # noqa: BLE001 - the report is best effort; the log line above already ran
-            self._log(f"review dispatch decision failure not journalled: {type(exc).__name__}: {exc}"[:600])
+        except Exception as exc:  # noqa: BLE001 - the report is best effort
+            self._log(f"review dispatch decision failure not reported: {type(exc).__name__}: {exc}"[:600])
 
     def _plan_one(
         self, pr, key: WorkflowKey, observed: ObservedPullRequest | PullRequestUnavailable, cfg: ReviewConfig,

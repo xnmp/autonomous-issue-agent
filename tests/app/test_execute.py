@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from issue_agent.adapters.journal import _legacy_event_record
+from issue_agent.adapters.journal import record_fields
 from issue_agent.app.execute import (
     Executor as DurableExecutor,
     _is_advisory_relabel,
@@ -162,7 +162,7 @@ class _Journal:
 
     def emit(self, event, **fields):
         if not isinstance(event, str):
-            event, fields = _legacy_event_record(event)
+            event, fields = record_fields(event)
         self.events.append((event, fields))
 
 

@@ -1,8 +1,8 @@
 """Composed resolve re-arm acceptance harness (ADR 0015 fault matrix).
 
 The fix daemon is ``roles.compose_fix_daemon`` -- the function behind
-``build_fix_daemon`` -- so the command drain, boot/wake recovery (with the
-outbox flush), the re-arm reconciliation binding, the daily spend gate,
+``build_fix_daemon`` -- so the command drain, boot/wake recovery, the
+re-arm reconciliation binding, the daily spend gate,
 dispatch claims, path reservations, ``WorkspaceAdmission`` and worktree
 removal are production wiring, not a replica. Operator commands and the held
 projection go through the dashboard ``Backend`` over the production
@@ -131,7 +131,7 @@ class _ShiftedDateTime(_REAL_DATETIME, metaclass=_ShiftedMeta):
 _CLOCKED_MODULES = (
     "issue_agent.adapters.accounting_runtime", "issue_agent.adapters.control_store",
     "issue_agent.adapters.durable_effects", "issue_agent.adapters.journal",
-    "issue_agent.adapters.event_log", "issue_agent.app.loop", "issue_agent.app.recovery",
+    "issue_agent.app.loop", "issue_agent.app.recovery",
     "issue_agent.app.roles", "issue_agent.app.workflows.fix", "issue_agent.app.resolve_control",
     "issue_agent.app.dashweb.service",
 )

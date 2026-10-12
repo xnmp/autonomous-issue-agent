@@ -18,7 +18,8 @@ import pytest
 
 import issue_agent.adapters.review_workflow_control as review_control_module
 from issue_agent.adapters.control_store import (
-    ESCALATION_SIGNAL_OWED_NAMESPACE, ControlStoreError, RetiredOwnerError, SQLiteControlStore, owe_escalation_signal,
+    ESCALATION_SIGNAL_NAMESPACE, ESCALATION_SIGNAL_OWED_NAMESPACE, ESCALATION_SIGNAL_QUARANTINE_NAMESPACE,
+    ControlStoreError, RetiredOwnerError, SQLiteControlStore, owe_escalation_signal,
 )
 from issue_agent.adapters.deployment_authority import deployment_effect_authority
 from issue_agent.adapters.effects import GitHubEffectExecutor
@@ -31,7 +32,6 @@ from issue_agent.adapters.review_execution_activation import (
 )
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, workflow_scope
-from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from issue_agent.domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, RunId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_rearm import (
@@ -101,17 +101,7 @@ class Rig:
         self.logs: list[str] = []
 
     def _store(self):
-        store = SQLiteControlStore(str(self.tmp_path / "control.db"), now=lambda: self.clock[0])
-        producer = Producer("deployment", "o/r", "review", 123, "boot")
-
-        def factory(payload, correlation):
-            return EventEnvelope(payload, new_event_id(self.clock[0]), 0, self.clock[0], self.clock[0], 0, producer,
-                                 correlation)
-
-        def offline(_event):
-            raise RuntimeError("sink offline: events stay in the committed outbox")
-        store.bind_event_outbox(factory, offline)
-        return store
+        return SQLiteControlStore(str(self.tmp_path / "control.db"), now=lambda: self.clock[0])
 
     def restart(self):
         """A fresh process: new store handle and control over the same files."""
@@ -197,8 +187,9 @@ class Rig:
     def reconcile(self, control=None):
         return (control or self.control()).reconcile_rearm(self.workflow().revision)
 
-    def journal(self, event):
-        return self.query("SELECT event_json FROM event_outbox WHERE event_json LIKE ?", f"%{event}%")
+    def quarantined_signals(self):
+        return {row[0] for row in self.query("SELECT key FROM dedupe_keys WHERE namespace=?",
+                                             ESCALATION_SIGNAL_QUARANTINE_NAMESPACE)}
 
 
 @pytest.fixture
@@ -633,9 +624,8 @@ def test_commit_workflow_refuses_every_barrier_ordered_mutation(rig):
 
 # -- operator acceptance ---------------------------------------------------------------------
 
-def test_request_commits_intent_commands_evidence_schedule_and_outbox_together(rig):
+def test_request_commits_intent_commands_evidence_and_schedule_together(rig):
     state = rig.gated()
-    outbox_before = rig.query("SELECT COUNT(*) FROM event_outbox")[0][0]
     command, result = rig.request()
     after = result.snapshot
     intent = after.intent
@@ -651,7 +641,6 @@ def test_request_commits_intent_commands_evidence_schedule_and_outbox_together(r
     assert evidence[0][0] == "observation"
     view = rig.control().review_control_view(PR_KEY)
     assert isinstance(view, ReviewControlView) and view.observation is not None
-    assert rig.query("SELECT COUNT(*) FROM event_outbox")[0][0] > outbox_before
 
 
 def test_request_replay_is_idempotent_without_a_read_and_reuse_conflicts(rig):
@@ -921,7 +910,6 @@ def test_an_unavailable_read_backs_off_journals_and_gates_at_the_ceiling(rig):
             break
     gate = rig.gate(gate_id)
     assert isinstance(gate.cause, EvidenceUnavailable) and gate.cause.failed_reads >= 1
-    assert rig.journal("observation_deferred")
     assert isinstance(rig.workflow().intent, PendingReviewRearm)
     rig.points.clear()
     rig.drain()
@@ -1145,7 +1133,6 @@ def test_a_generation_advance_retires_older_commands_and_ends_their_schedules(ri
     assert rig.store.prewrite_read(stuck) is None
     retired_state = rig.store.command_reconciliation(stuck)
     assert isinstance(retired_state, RetiredSettledCommand)
-    assert rig.journal("stale_generation_retired")
     selected = rig.store.runnable_commands(repository="o/r", executor_identity=REVIEWER, diagnose=rig.logs.append)
     assert stuck not in {p.command.command_id for p in selected}  # never re-selected every tick
     rig.advance(3600)
@@ -1189,7 +1176,6 @@ def test_an_uncertain_older_generation_submission_is_cleared_by_a_read_not_a_gra
     retired = rig.store.command_reconciliation(verdict)
     assert isinstance(retired, RetiredUncertainCommand)
     assert isinstance(rig.gate(retired.uncertainty.gate_id).cause, cause)
-    assert rig.journal("stale_generation_retired")
     assert isinstance(rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH), ReviewHeld)
     assert rig.control().review_control_view(PR_KEY).retry_authorizable == frozenset()
     rig.points.add("reviews_page:0")  # unreadable for a while: the hold stays visible, nothing is re-written
@@ -1236,7 +1222,6 @@ def test_an_absent_submission_awaiting_reexecution_retires_at_every_advance(rig,
     outcome = json.loads(rig.query("SELECT payload_json FROM workflow_evidence WHERE evidence_id=?",
                                    retired.outcome_evidence_id)[0][0])
     assert outcome["observation"] == "proven_absent_never_settled" and outcome["prior_receipts"]
-    assert rig.journal("stale_generation_retired")
     rig.advance(3600)
     rig.drain()
     assert len(submit_calls(rig)) == writes  # never re-executed under the old generation
@@ -1772,7 +1757,7 @@ def _release(rig):
 def test_every_commit_path_is_atomic_across_a_crash_and_idempotent_after_restart(rig, monkeypatch, prepare):
     operate = prepare(rig)
     before = rig.workflow()
-    tables = ("lifecycle_commands", "workflow_rearms", "workflow_gates", "dedupe_keys", "event_outbox")
+    tables = ("lifecycle_commands", "workflow_rearms", "workflow_gates", "dedupe_keys")
     counts = {table: rig.query(f"SELECT COUNT(*) FROM {table}")[0][0] for table in tables}
 
     def crash(*args, **kwargs):
@@ -1878,7 +1863,6 @@ def test_unreadable_pending_authority_is_reported_rescheduled_and_journaled(rig)
     assert unavailable.__class__.__name__ == "UnavailableResolveRearm"
     assert unavailable.request_id == "request:1" and unavailable.next_read_at > rig.clock[0]
     assert rig.control().pending_rearms() == ()  # backed off, not re-reported every tick
-    assert rig.journal("authority_unavailable")
 
 
 def test_a_proven_absent_workflow_owes_the_initial_review(rig):
@@ -1890,7 +1874,7 @@ def test_a_proven_absent_workflow_owes_the_initial_review(rig):
 def test_inspection_never_writes(rig):
     rig.pending()
     before = {table: rig.query(f"SELECT COUNT(*) FROM {table}")[0][0]
-              for table in ("workflow_evidence", "dedupe_keys", "event_outbox", "workflow_gates")}
+              for table in ("workflow_evidence", "dedupe_keys", "workflow_gates")}
     control = rig.control()
     control.review_control_view(PR_KEY)
     control.load_workflow(PR_KEY)
@@ -1974,7 +1958,6 @@ def test_a_refused_gate_from_an_earlier_generation_is_reconciled_by_its_own_comm
     rig.remote.external_pr_change(PR, labels=[TRIGGER.value])  # corrected by hand
     rig.control().reconcile_release(PR_KEY)
     assert rig.gate(gate.gate_id) is None
-    assert rig.journal("verified_by_observation")
 
 
 def test_a_terminal_pull_request_closes_a_refused_release_gate(rig):
@@ -2108,7 +2091,6 @@ def test_one_inconsistent_pull_request_never_stops_the_reconciliation_pass(rig, 
     done = control.load_workflow(healthy)
     assert isinstance(done.intent, CompletedReviewRearm)
     assert isinstance(rig.workflow().intent, PendingReviewRearm)
-    assert rig.journal("authority_unavailable")
     assert control.pending_rearms() == ()  # the broken PR backs off rather than failing every tick
     rig.advance(3600)
     (again,) = control.pending_rearms()
@@ -2233,7 +2215,7 @@ SUCCESSOR = "o/r:review:successor"
 
 
 def escalation_signals(rig) -> int:
-    return rig.query("SELECT COUNT(*) FROM event_outbox WHERE event_json LIKE '%lifecycle.escalation.raised%'")[0][0]
+    return rig.query("SELECT COUNT(*) FROM dedupe_keys WHERE namespace=?", ESCALATION_SIGNAL_NAMESPACE)[0][0]
 
 
 def settled_escalation(rig) -> CommandId:
@@ -2321,13 +2303,12 @@ def test_a_malformed_owed_signal_is_quarantined_once_and_never_blocks_the_well_f
     malformed_signal(rig, payload, key=gate_id)  # corrupt, under a real escalation's identity
     owe(rig, "verdict-escalation", pr=11)
     assert rig.store.claim_escalation_signals("o/r", REVIEWER) == (11,)
-    quarantined = rig.journal("escalation_signal_malformed")
-    assert {json.loads(row[0])["data"]["entity_id"] for row in quarantined} == {"corrupt", gate_id}
+    assert rig.quarantined_signals() == {"corrupt", gate_id}
     # Quarantine is per record: that escalation's own settled hold is still signalled, and nothing is re-read.
     settle_projection(rig)
     assert rig.store.claim_escalation_signals("o/r", REVIEWER) == (PR,)
     assert rig.store.claim_escalation_signals("o/r", REVIEWER) == ()
-    assert len(rig.journal("escalation_signal_malformed")) == 2 and escalation_signals(rig) == 2
+    assert len(rig.quarantined_signals()) == 2 and escalation_signals(rig) == 2
 
 
 def test_a_drain_past_a_malformed_owed_signal_completes_and_still_signals(rig):
@@ -2335,7 +2316,7 @@ def test_a_drain_past_a_malformed_owed_signal_completes_and_still_signals(rig):
     malformed_signal(rig, "not json")
     rig.drain()
     rig.drain()
-    assert escalation_signals(rig) == 1 and len(rig.journal("escalation_signal_malformed")) == 1
+    assert escalation_signals(rig) == 1 and len(rig.quarantined_signals()) == 1
 
 
 @pytest.mark.parametrize("fields", [
@@ -2608,10 +2589,6 @@ def test_failed_departed_reads_are_journalled_at_the_first_failure_and_at_the_ba
         assert control.departed_pull_requests(frozenset(), limit=64) == ()
         rig.advance(1)
         assert control.departed_pull_requests(frozenset(), limit=64) == (PR,)
-    events = [row[0] for row in rig.journal("review_departed_read")]
-    assert len(events) == 2
-    assert '"read_failed"' in events[0] and '"failed_reads":1' in events[0].replace(" ", "")
-    assert '"read_backoff_ceiling"' in events[1] and '"failed_reads":6' in events[1].replace(" ", "")
 
 
 def test_decisions_are_recorded_in_one_write_and_an_unrecordable_entry_never_drops_the_others(rig):
@@ -2625,7 +2602,6 @@ def test_decisions_are_recorded_in_one_write_and_an_unrecordable_entry_never_dro
     unobserved = WorkflowKey("o/r", PullRequestRef(12))
     # A terminal decision from an open read is contradictory: that entry alone cannot be recorded.
     contradictory = DecisionUpdate(other, ReviewTerminal(PullRequestState.CLOSED), _basis(), _departed())
-    before = rig.query("SELECT COUNT(*) FROM event_outbox")[0][0]
     result = rig.control().record_dispatch_decisions((
         DecisionUpdate(PR_KEY, ReviewOwed(ReviewKind.RE_REVIEW), _basis(), _listed()),
         contradictory,
@@ -2634,7 +2610,6 @@ def test_decisions_are_recorded_in_one_write_and_an_unrecordable_entry_never_dro
     assert result.written == 1 and len(result.skipped) == 1 and result.skipped[0].startswith("#11: ")
     assert rig.control().recorded_decision(PR_KEY).decision == ReviewOwed(ReviewKind.RE_REVIEW)
     assert rig.control().recorded_decision(other) is None and rig.control().recorded_decision(unobserved) is None
-    assert rig.query("SELECT COUNT(*) FROM event_outbox")[0][0] == before  # no journal for plain decisions
     # An unchanged decision within its confirmation bound opens no write transaction at all.
     control = rig.control()
     writes = []
@@ -2657,8 +2632,6 @@ def test_a_failed_read_of_a_closed_departure_keeps_it_shown_closed(rig):
     record = control.recorded_decision(PR_KEY)
     assert record.decision == ReviewTerminal(PullRequestState.CLOSED) and record.basis == closed
     assert record.as_of == NOW and record.read_failure.reason == "502 Bad Gateway"
-    events = [row[0] for row in rig.journal("review_departed_read")]
-    assert len(events) == 1 and '"read_failed"' in events[0]
 
 
 def test_active_workflow_families_are_read_exactly_as_the_legacy_unblock_refuses(rig):

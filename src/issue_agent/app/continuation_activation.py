@@ -35,7 +35,6 @@ from ..domain.review_activation import OpenPullRequestsListed
 from ..domain.review_workflow import ObservedPullRequest, PullRequestState
 from ..domain.workflow_identity import IssueRef, PullRequestRef, WorkflowFamily, WorkflowKey
 from .resolve_control import load_operator_configuration
-from .resolve_activation import _bind_operator_feed
 from .review_identity import review_identity
 
 
@@ -250,7 +249,6 @@ def activate(scope: ContinuationActivationScope, *, confirm_plan_digest: str, pl
             raise ResolveActivationRefused("continuation sources changed since original plan review")
         if liveness():
             raise ResolveActivationRefused("watchers may be running before continuation publication")
-        _bind_operator_feed(control, scope)
         with control.transaction() as db:
             if read_continuation_roots(scope.repository, scope.legacy_roots, scope.families)[1] != plan.file_digest:
                 raise ResolveActivationRefused("continuation sources changed before publication")
@@ -272,7 +270,6 @@ def rehearse(scope: ContinuationActivationScope, *, copy_to: str) -> dict[str, o
     if read_continuation_roots(scope.repository, copied.roots, scope.families)[0] != records:
         raise ResolveActivationRefused("copied continuation sources differ before rehearsal publication")
     plan = evaluate(selected, control)
-    _bind_operator_feed(control, selected)
     with control.transaction() as db:
         publish_continuation_import(db, plan, now=datetime.now(timezone.utc), control=control)
         retry = verify_original_plan(db, plan)

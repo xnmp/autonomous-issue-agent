@@ -17,7 +17,7 @@ import dataclasses
 from pathlib import Path
 import pytest
 
-from issue_agent.adapters.journal import _legacy_event_record
+from issue_agent.adapters.journal import record_fields
 from issue_agent.adapters.store import Store
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
@@ -1245,7 +1245,7 @@ class RecordingJournal:
 
     def emit(self, event, **fields):
         if not isinstance(event, str):
-            event, fields = _legacy_event_record(event)
+            event, fields = record_fields(event)
         self.events.append((event, fields))
 
 

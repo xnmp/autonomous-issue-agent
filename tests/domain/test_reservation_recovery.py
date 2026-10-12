@@ -44,7 +44,6 @@ def test_unlaunched_release_reports_unknown_spend_and_abandonment() -> None:
 
     assert decision.action is ReservationRecoveryAction.COMPLETE
     assert decision.report_spend_unknown is True
-    assert decision.record_abandonment is True
 
 
 def test_retained_release_is_tried_only_after_unlaunched_conflict() -> None:
@@ -61,7 +60,6 @@ def test_retained_release_is_tried_only_after_unlaunched_conflict() -> None:
     )
     assert decision.action is ReservationRecoveryAction.COMPLETE
     assert decision.report_spend_unknown is True
-    assert decision.record_abandonment is False
 
 
 def test_reclaimed_settled_run_records_only_abandonment() -> None:
@@ -74,7 +72,6 @@ def test_reclaimed_settled_run_records_only_abandonment() -> None:
 
     assert decision.action is ReservationRecoveryAction.COMPLETE
     assert decision.report_spend_unknown is False
-    assert decision.record_abandonment is True
 
 
 def test_impossible_evidence_order_is_rejected() -> None:

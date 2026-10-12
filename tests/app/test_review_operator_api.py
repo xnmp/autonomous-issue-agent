@@ -808,12 +808,6 @@ def test_a_terminal_departed_pr_is_recorded_when_its_linked_issue_is_unavailable
     assert len(daemon.provider.tasks) == paid
 
 
-def departed_read_journal(deployment) -> list[str]:
-    with closing(sqlite3.connect(deployment.control_path)) as db:
-        return [row[0] for row in db.execute(
-            "SELECT event_json FROM event_outbox WHERE event_json LIKE '%review_departed_read%' ORDER BY rowid")]
-
-
 def hold_fix_claim(deployment) -> None:
     """A live fix-role dispatch claim on the pull request's issue, as the fix daemon takes one (#176)."""
     store = SQLiteControlStore(deployment.control_path, now=deployment.clock.now)
@@ -919,7 +913,7 @@ def failed_reads(daemon_view: dict) -> int:
     return (daemon_view["read_failure"] or {}).get("failed_reads", 0)
 
 
-def test_a_failed_departed_read_keeps_the_last_good_facts_and_backs_off_to_a_journalled_ceiling(deployment):
+def test_a_failed_departed_read_keeps_the_last_good_facts_and_backs_off_to_a_ceiling(deployment):
     outage = [False]
 
     def fault(point):
@@ -943,9 +937,6 @@ def test_a_failed_departed_read_keeps_the_last_good_facts_and_backs_off_to_a_jou
         daemon.tick(minutes=15)
         attempts.append(failed_reads(api.read()["daemon"]))
     assert max(attempts) <= 20  # exponential backoff to a six-hour ceiling, not a read every tick
-    journal = departed_read_journal(deployment)
-    assert [event for event in journal if "read_failed" in event] == [journal[0]]
-    assert [event for event in journal if "read_backoff_ceiling" in event] == [journal[1]] and len(journal) == 2
     outage[0] = False
     daemon.tick(minutes=6 * 60)
     recovered = api.read()["daemon"]
@@ -1046,10 +1037,6 @@ def test_a_persistent_recording_failure_is_reported_once_per_interval_with_what_
     daemon.tick(minutes=16)
     reports = [line for line in daemon.log if "review dispatch decisions not recorded" in line]
     assert len(reports) == 2 and "(2 earlier failures unreported)" in reports[1]
-    with closing(sqlite3.connect(deployment.control_path)) as db:
-        journalled = db.execute("SELECT COUNT(*) FROM event_outbox WHERE event_json LIKE '%review_dispatch_record%' "
-                                "AND event_json LIKE '%record_failed%'").fetchone()[0]
-    assert journalled == 2
 
 
 def test_a_review_owed_behind_another_deployments_claim_is_recorded_withheld_reserved(deployment):

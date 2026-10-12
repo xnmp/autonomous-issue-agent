@@ -27,7 +27,6 @@ from issue_agent.domain.actions import (
     Target,
 )
 from issue_agent.domain.fix import (
-    CiFlake,
     CiStallStep,
     FixConfig,
     FixState,
@@ -37,7 +36,6 @@ from issue_agent.domain.fix import (
     Hold,
     breaker_tripped,
     breaker_key,
-    ci_flakes,
     ci_pending_stalls,
     ci_remediations,
     ci_stall_remedies,
@@ -45,7 +43,6 @@ from issue_agent.domain.fix import (
     label_repair_actions,
     decide_fix as raw_decide_fix,
     duplicate_pr_guards,
-    issue_holds,
     issues_needing_any_resume,
     issues_needing_resume,
     orphaned_cleanup_actions,
@@ -203,88 +200,15 @@ def test_pick_ready_overlap_ignores_closed_pr():
     assert pick_ready_issue(world(issues=[iss], prs=[merged])) == 2
 
 
-# ── holds: WHY a ready issue was not picked (harness #6) ──────────────────────
-def test_issue_holds_names_the_overlapping_pr():
-    iss = issue(2, "ai-ready", declared_paths=frozenset({"backend/app/services/x.py"}))
-    open_pr = pr(100, "ai-pr-open", state="OPEN",
-                 changed_files=frozenset({"backend/app/services/x.py"}))
-    assert issue_holds(world(issues=[iss], prs=[open_pr])) == (
-        Hold(2, HOLD_OVERLAP, blocker_pr=100),
-    )
-
-
-def test_issue_holds_reports_a_dependency_hold_with_no_nameable_blocker():
-    # blocked_by_open is a settled boolean, so there is no number to name; the
-    # REASON is still the thing the operator needs.
-    w = world(issues=[issue(3, "ai-ready", blocked_by_open=True)])
-    assert issue_holds(w) == (Hold(3, HOLD_BLOCKER),)
-
-
-def test_issue_holds_reports_both_reasons_for_a_doubly_held_issue():
-    iss = issue(4, "ai-ready", blocked_by_open=True,
-                declared_paths=frozenset({"a/b.py"}))
-    open_pr = pr(7, state="OPEN", changed_files=frozenset({"a/b.py"}))
-    assert issue_holds(world(issues=[iss], prs=[open_pr])) == (
-        Hold(4, HOLD_BLOCKER), Hold(4, HOLD_OVERLAP, blocker_pr=7),
-    )
-
-
-def test_issue_holds_is_empty_when_nothing_is_held():
-    # A dispatchable issue, an unrelated open PR, and an issue that is not
-    # ai-ready at all (its non-dispatch is not a hold — it was never queued).
-    iss = issue(2, "ai-ready", declared_paths=frozenset({"routes/y.py"}))
-    other = issue(9, "ai-working", blocked_by_open=True)
-    open_pr = pr(100, state="OPEN", changed_files=frozenset({"services/x.py"}))
-    assert issue_holds(world(issues=[iss, other], prs=[open_pr])) == ()
-
-
-def test_issue_holds_ignores_a_closed_issue():
-    iss = issue(2, "ai-ready", state="closed", blocked_by_open=True)
-    assert issue_holds(world(issues=[iss])) == ()
-
-
-def test_a_held_issue_is_exactly_one_absent_from_pick_ready_issue():
-    """The anti-drift contract: the journal must explain the REAL decision, so
-    `issue_holds` reports a hold for exactly those ai-ready issues
-    `pick_ready_issue` refuses to pick. Driven over every combination of the two
-    gate inputs against one open PR (plus the fail-open no-paths case)."""
-    open_pr = pr(100, state="OPEN", changed_files=frozenset({"x.py"}))
-    for n, (blocked, paths) in enumerate(
-        [(b, p) for b in (False, True)
-         for p in (frozenset(), frozenset({"x.py"}), frozenset({"y.py"}))],
-        start=1,
-    ):
-        w = world(
-            issues=[issue(n, "ai-ready", blocked_by_open=blocked, declared_paths=paths)],
-            prs=[open_pr],
-        )
-        held = bool(issue_holds(w))
-        assert held is (pick_ready_issue(w) is None), (blocked, paths)
-
 
 def test_holds_do_not_mask_a_pickable_issue():
-    # Anti-vacuity for the consistency test: with one held and one free issue,
-    # the free one is still dispatched and only the held one is reported.
+    # With one held and one free issue, the free one is still dispatched.
     held = issue(1, "ai-ready", "P1", declared_paths=frozenset({"x.py"}))
     free = issue(2, "ai-ready", "P2")
     open_pr = pr(100, state="OPEN", changed_files=frozenset({"x.py"}))
     w = world(issues=[held, free], prs=[open_pr])
     assert pick_ready_issue(w) == 2
-    assert issue_holds(w) == (Hold(1, HOLD_OVERLAP, blocker_pr=100),)
 
-
-def test_dependency_hold_names_the_blocking_issue():
-    w = world(
-        issues=[
-            issue(
-                3,
-                "ai-ready",
-                blocked_by_open=True,
-                open_blocker_numbers=(42,),
-            )
-        ]
-    )
-    assert issue_holds(w) == (Hold(3, HOLD_BLOCKER, blocker_issue=42),)
 
 
 # ── the blocked-by dependency also holds the PR REPAIR arm ───────────────────
@@ -383,79 +307,6 @@ def test_a_blocked_issues_pr_that_went_green_and_approved_still_merges():
     assert EnableAutoMerge(100, "squash", "head-100") in actions
 
 
-def test_pr_stage_blocker_hold_names_the_issue_and_its_blocker():
-    # The wait must be as visible as the admission-stage one: an issue whose PR
-    # is up and whose dependency is open is NOT ai-ready, so only the PR-stage
-    # report can explain why the fixer looks idle.
-    assert issue_holds(_blocked_pr_world(blocked=True)) == (
-        Hold(130, HOLD_BLOCKER, blocker_issue=185),
-    )
-
-
-def test_pr_stage_blocker_hold_with_no_nameable_blocker():
-    # blocked_by_open is settled true but no number was collected.
-    w = _blocked_pr_world(blocked=True, blockers=())
-    w = world(issues=[replace(w.issues[0], open_blocker_numbers=())], prs=w.prs)
-    assert issue_holds(w) == (Hold(130, HOLD_BLOCKER, blocker_issue=None),)
-
-
-def test_pr_stage_blocker_hold_reports_only_the_first_open_blocker():
-    w = _blocked_pr_world(blocked=True, blockers=(185, 186))
-    assert issue_holds(w) == (Hold(130, HOLD_BLOCKER, blocker_issue=185),)
-
-
-def test_no_pr_stage_hold_for_a_closed_pr_or_a_closed_issue():
-    # Nothing is being withheld in either case: a non-OPEN PR gets no repair
-    # legs anyway, and a closed issue is done.
-    for issues, prs in (
-        ([issue(130, "ai-pr-open", blocked_by_open=True,
-                open_blocker_numbers=(185,))],
-         [pr(100, state="MERGED", head_ref_name="fix/130-x", closing_issue=130)]),
-        ([issue(130, "ai-pr-open", state="closed", blocked_by_open=True,
-                open_blocker_numbers=(185,))],
-         [pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
-             closing_issue=130)]),
-    ):
-        assert issue_holds(world(issues=issues, prs=prs)) == ()
-
-
-def test_an_issue_held_at_both_stages_is_reported_once():
-    # ai-ready AND linked from an open PR: one hold, not a duplicate pair.
-    linked = issue(130, "ai-ready", blocked_by_open=True,
-                   open_blocker_numbers=(185,))
-    open_pr = pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
-                 closing_issue=130)
-    assert issue_holds(world(issues=[linked], prs=[open_pr])) == (
-        Hold(130, HOLD_BLOCKER, blocker_issue=185),
-    )
-
-
-def test_two_open_prs_on_one_blocked_issue_report_one_hold():
-    linked = issue(130, "ai-pr-open", blocked_by_open=True,
-                   open_blocker_numbers=(185,))
-    prs = [pr(n, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
-              closing_issue=130) for n in (100, 101)]
-    assert issue_holds(world(issues=[linked], prs=prs)) == (
-        Hold(130, HOLD_BLOCKER, blocker_issue=185),
-    )
-
-
-def test_an_unresolvable_or_unobserved_pr_link_holds_nothing():
-    # No closing ref and a non-numeric branch (a Jira-keyed PR), and a PR whose
-    # linked issue is outside every slice this world fetched: neither can be
-    # judged blocked, and neither may crash the report or the repair arm.
-    unlinked = pr(100, "ai-pr-open", state="OPEN",
-                  head_ref_name="feat/ACME-2468-thing")
-    unobserved = pr(101, "ai-pr-open", state="OPEN", head_ref_name="fix/999-x",
-                    closing_issue=999)
-    w = world(prs=[unlinked, unobserved])
-    assert issue_holds(w) == ()
-    decide_fix(w, CFG, FixState(), fixer_busy=False)  # no crash
-
-
-def test_pr_stage_hold_ignores_an_issue_whose_blocker_is_closed():
-    assert issue_holds(_blocked_pr_world(blocked=False)) == ()
-
 
 def test_resolve_dispatch_relabels_then_runs():
     w = world(issues=[issue(5, "ai-ready", updated_at="issue-rev-5")])
@@ -530,9 +381,6 @@ def test_active_unknown_path_resolve_excludes_other_work():
     inflight = (InFlightFix(1, exclusive=True),)
 
     assert pick_ready_issue(w, inflight) is None
-    assert issue_holds(w, inflight) == (
-        Hold(2, HOLD_OVERLAP, blocker_issue=1),
-    )
 
 
 def test_inflight_paths_hold_a_ready_issue_before_it_has_a_pr():
@@ -543,9 +391,6 @@ def test_inflight_paths_hold_a_ready_issue_before_it_has_a_pr():
     inflight = (InFlightFix(1, frozenset({"src/shared.py"})),)
 
     assert pick_ready_issue(w, inflight) == 3
-    assert issue_holds(w, inflight) == (
-        Hold(2, HOLD_OVERLAP, blocker_issue=1),
-    )
 
 
 def test_inflight_issue_cannot_receive_a_second_pr_leg():
@@ -2880,8 +2725,6 @@ def test_guard_is_one_shot_because_the_relabel_leaves_the_ready_set():
 
 
 def test_guard_reports_exactly_what_it_refuses():
-    # Same single-definition contract as issue_holds / ci_pending_stalls: the
-    # journal reads this, decide_fix acts on this, so they cannot disagree.
     w = _guard_world(closing_ref(558, 7, author="xnmp"))
     dups = duplicate_pr_guards(w, CFG)
     assert len(dups) == 1
@@ -3141,35 +2984,6 @@ def test_a_strangers_red_pr_is_never_re_run():
            checks=(Check("unit", bucket="fail"),))
     actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
     assert _reruns(actions) == [] and _run_agents(actions) == []
-
-
-def test_a_head_that_used_its_re_run_and_went_green_is_a_confirmed_flake():
-    # The measurement behind #38's metric: a leg that was never bought.
-    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
-           checks=(Check("unit", bucket="pass"),))
-    state = FixState(ci_rerun_head={100: "sha-1"})
-    assert ci_flakes(world(prs=[p]), CFG, state) == (CiFlake(pr=100, head="sha-1"),)
-
-
-def test_green_without_a_spent_re_run_is_not_a_flake():
-    # anti-vacuity twin: an ordinarily-green PR must not inflate the flake count.
-    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
-           checks=(Check("unit", bucket="pass"),))
-    assert ci_flakes(world(prs=[p]), CFG, FixState()) == ()
-
-
-def test_a_re_run_head_that_is_still_red_is_not_yet_a_flake():
-    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
-           checks=(Check("unit", bucket="fail"),))
-    state = FixState(ci_rerun_head={100: "sha-1"})
-    assert ci_flakes(world(prs=[p]), CFG, state) == ()
-
-
-
-
-
-
-
 
 
 
