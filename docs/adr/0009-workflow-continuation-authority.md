@@ -6,7 +6,7 @@ Status: Accepted; selected runtime continuity superseded by
 acceptance is complete under A2; retained files are inert except for the
 explicitly preserved Jira counter path described below.
 Date: 2026-08-01
-Governs: src/issue_agent/adapters/store.py src/issue_agent/app/workflows/fix.py src/issue_agent/app/workflows/review.py src/issue_agent/adapters/worktree.py
+Governs: src/issue_agent/adapters/store.py src/issue_agent/app/workflows/review.py src/issue_agent/adapters/worktree.py
 
 ## Context
 

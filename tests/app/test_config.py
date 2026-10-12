@@ -41,10 +41,6 @@ def test_review_mode_defaults_single():
     assert from_env({"REPO": "x"}).review_scout_model == "sonnet"
 
 
-def test_router_budget_defaults_to_one_dollar():
-    assert from_env({"REPO": "x"}).router_budget_usd == 1.0
-
-
 def test_reviewer_runtime_defaults_to_codex_at_the_fixer_tier_or_above():
     """The deployment default is visible in the task-producing config, not
     merely documented in an example overlay. Sol + $15 since 2026-08-09: the
@@ -243,14 +239,6 @@ def test_merge_method():
 
 
 
-def test_retry_caps():
-    c = from_env({"REPO": "x", "MAX_CI_RETRIES": "5", "MAX_REVIEW_RETRIES": "2",
-                  "MAX_RESOLVE_RETRIES": "4"})
-    assert c.max_ci_retries == 5
-    assert c.max_review_retries == 2
-    assert c.max_resolve_retries == 4
-
-
 def test_validate_fails_loud_on_empty_repo():
     # Silent-default class (#50): an empty REPO must die at startup with a
     # pointed message, not surface as an opaque gh error on the first poll.
@@ -314,11 +302,11 @@ def test_describe_shows_the_real_alert_command():
 
 
 def test_describe_reports_effective_values_and_no_secrets():
-    c = from_env({"REPO": "o/r", "MAX_RESOLVE_RETRIES": "2",
+    c = from_env({"REPO": "o/r", "POLL_SECONDS": "45",
                   "FIX_BOT_TOKEN": "sekret-token"})
     d = c.describe()
     assert "repo=o/r" in d
-    assert "resolve=2" in d
+    assert "poll=45s" in d
     assert "sekret" not in d
 
 
@@ -405,21 +393,15 @@ def _assert_each_knob_flagged_once(errors: tuple[str, ...], expected_knobs: set[
     assert len(errors) == len(expected_knobs)
 
 
-def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
+def test_validation_rejects_invalid_poll_seconds_and_rejection_ceiling():
     c = from_env({
         "REPO": "x",
         "FIX_BOT": "fix-bot",
         "POLL_SECONDS": "0",
-        "MAX_CI_RETRIES": "-1",
-        "MAX_REVIEW_RETRIES": "-2",
-        "MAX_REBASE_RETRIES": "-3",
         "REVIEW_MAX_REJECTIONS": "-4",
     })
 
-    _assert_each_knob_flagged_once(c.validation_errors(), {
-        "POLL_SECONDS", "MAX_CI_RETRIES", "MAX_REVIEW_RETRIES",
-        "MAX_REBASE_RETRIES", "REVIEW_MAX_REJECTIONS",
-    })
+    _assert_each_knob_flagged_once(c.validation_errors(), {"POLL_SECONDS", "REVIEW_MAX_REJECTIONS"})
 
 
 def test_review_rejection_ceiling_fits_one_rearm_dismissal_fan_out():
@@ -652,43 +634,6 @@ def test_poll_seconds_default_is_20_everywhere():
     # reads its default off the dataclass field, so there is one source.
     assert HarnessConfig(repo="x").poll_seconds == 20
     assert from_env({"REPO": "x"}).poll_seconds == 20
-
-
-def test_webhook_wake_is_off_by_default_and_polls_at_poll_seconds():
-    c = from_env({"REPO": "x"})
-    assert c.webhook_wake is False
-    assert c.reconcile_seconds == 300
-    assert c.tick_interval_seconds == c.poll_seconds == 20
-
-
-def test_webhook_wake_demotes_the_poll_loop_to_the_reconcile_cadence():
-    """The knob's whole observable effect: what a daemon sleeps between ticks.
-    POLL_SECONDS is left alone so turning the knob back off restores it."""
-    c = from_env({"REPO": "x", "WEBHOOK_WAKE": "1", "RECONCILE_SECONDS": "600"})
-    assert c.webhook_wake is True
-    assert c.poll_seconds == 20
-    assert c.tick_interval_seconds == 600
-
-
-def test_reconcile_seconds_must_be_positive():
-    # 0 is not "disabled" here, it is a busy loop — same rule as POLL_SECONDS.
-    errs = from_env({"REPO": "x", "RECONCILE_SECONDS": "0"}).validation_errors()
-    assert any("RECONCILE_SECONDS" in e for e in errs)
-
-
-def test_malformed_reconcile_seconds_falls_back_loudly():
-    c = from_env({"REPO": "x", "RECONCILE_SECONDS": "soon"})
-    assert c.reconcile_seconds == 300
-    assert any("RECONCILE_SECONDS" in e and "soon" in e for e in c.validation_errors())
-
-
-def test_describe_states_which_cadence_is_live():
-    """Push mode changes what the interval MEANS; the boot line must not read
-    like a 300s poll (the silent-default class this project keeps paying for)."""
-    polling = from_env({"REPO": "x"}).describe()
-    assert "poll=20s" in polling and "wake=webhook" not in polling
-    pushed = from_env({"REPO": "x", "WEBHOOK_WAKE": "1"}).describe()
-    assert "wake=webhook" in pushed and "reconcile=300s" in pushed
 
 
 def test_state_dirs_default_per_repo():
@@ -1235,12 +1180,6 @@ def test_a_misspelled_fix_effort_is_reported_and_falls_back():
     c = from_env({"REPO": "x", "FIX_EFFORT": "hihg"})
     assert c.fix_effort is None
     assert any("FIX_EFFORT" in e for e in c.validation_errors())
-
-
-def test_escalation_defaults_on_and_can_be_switched_off():
-    assert from_env({"REPO": "x"}).escalate_on_evidence is True
-    assert from_env({"REPO": "x", "ESCALATE_ON_EVIDENCE": "0"}).escalate_on_evidence is False
-    assert from_env({"REPO": "x", "ESCALATE_ON_EVIDENCE": "False"}).escalate_on_evidence is False
 
 
 def test_fix_effort_reaches_the_fix_runtime_view():

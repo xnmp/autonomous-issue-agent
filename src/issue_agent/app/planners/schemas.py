@@ -7,31 +7,16 @@ into RuntimePlan.schema → ClaudeAgentOptions.output_format.
 
 from __future__ import annotations
 
-from ...domain.effort import TIER_LADDER
 
 # agent/lib.sh FIX_SCHEMA — resolve / resume / address-review / fix-ci.
 FIX_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "status": {"type": "string", "enum": ["pr_opened", "pushed", "blocked", "failed"]},
+        "status": {"type": "string", "enum": ["pushed", "blocked", "failed"]},
         "summary": {"type": "string"},
         "needs": {"type": "string", "description": "if blocked, exactly what is needed"},
     },
     "required": ["status", "ticket_key", "summary"],
-}
-
-# agent/lib.sh ROUTER_SCHEMA — difficulty classifier.
-ROUTER_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "tier": {"type": "string", "enum": list(TIER_LADDER)},
-        "predicted_paths": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Likely repository-relative files touched; [] when uncertain.",
-        },
-    },
-    "required": ["tier"],
 }
 
 # review/lib.sh REVIEW_SCHEMA — review / re-review.

@@ -13,8 +13,6 @@ Async because AgentRunner.run is async (the SDK query is a coroutine).
 
 from __future__ import annotations
 
-from ..domain.model_routing import ModelRoute
-
 from dataclasses import dataclass, replace
 from collections.abc import Callable
 from functools import partial
@@ -31,16 +29,8 @@ from ..domain.agent_task import (
     RuntimeName,
 )
 from ..domain.leg import Leg, LegTarget
-from ..domain.ports import (
-    ActionExecutor,
-    FixWorktreePort,
-    EventSink,
-    WorkflowGitHubReads,
-    WorkflowState,
-)
-from ..domain.workflow_ports import WorkflowControl
-from .planners.tasks import FixTaskConfig, ReviewTaskConfig
-from .workflows.fix import FixWorkflow, FixWorkflowConfig
+from ..domain.ports import ActionExecutor, EventSink, WorkflowGitHubReads, WorkflowState
+from .planners.tasks import ReviewTaskConfig
 from .workflows.review import ReviewAuthority, ReviewWorkflow, ReviewWorkflowConfig
 from .workflows.base import run_leg
 
@@ -52,7 +42,6 @@ def _ignore_log(_message: str) -> None:
 @dataclass
 class DispatchConfig:
     base_branch: str = "dev"
-    fix: FixTaskConfig | None = None
     review: ReviewTaskConfig | None = None
     fork_threshold: int = 5
     max_review_rejections: int = 4
@@ -72,25 +61,11 @@ class DispatchConfig:
     review_prepare_cwd: Callable[[str], None] | None = None
     review_checkout: Callable[[int, str], str] | None = None
     review_checkout_cleanup: Callable[[int], None] | None = None
-    fix_mcp_config: str = ""
-    harness_root: str = ""
     # PR label removed when a review escalates to needs-human-review. Matches the
     # reviewer's trigger label (default ai-pr-open; ai-review for an external repo).
     review_trigger_label: str = "ai-pr-open"
     # Diagnostic logger (stderr in production).
     log: Callable[[str], None] = _ignore_log
-    # Fixer login, threaded to FixWorkflow so its resume path filters comments
-    # with the same rule the decide side uses (see FixWorkflowConfig.fix_bot).
-    fix_bot: str = ""
-    # Fixer runtime ("claude" | "codex"), threaded to FixWorkflow so difficulty
-    # routing picks from the runtime's own model family (see MODEL_TIERS).
-    fixer_runtime: RuntimeName = RuntimeName.CLAUDE
-
-    # Kill switch for the evidence-driven tier/effort ladder (#16). See
-    # FixWorkflowConfig.escalate_on_evidence.
-    fix_model_routes: tuple[ModelRoute, ...] = ()
-    available_fix_runtimes: frozenset[RuntimeName] = frozenset()
-    escalate_on_evidence: bool = True
     # Paid accounting is enforced by the runtime wrapper over SQLite. These two
     # fields only provide durable run attribution.
     role: str = ""
@@ -98,35 +73,11 @@ class DispatchConfig:
     command_identity: str = ""
     deployment_owner_id: str = ""
     config_version: str = ""
-    max_ci_retries: int = 3
-    max_review_retries: int = 3
-    max_rebase_retries: int = 3
     operator_guidance: Callable[[int], str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reviewer_runtime, RuntimeName):
             self.reviewer_runtime = RuntimeName(self.reviewer_runtime)
-        if not isinstance(self.fixer_runtime, RuntimeName):
-            self.fixer_runtime = RuntimeName(self.fixer_runtime)
-
-    def fix_workflow_config(self) -> FixWorkflowConfig:
-        return FixWorkflowConfig(
-            base_branch=self.base_branch,
-            fix=self.fix,
-            fork_threshold=self.fork_threshold,
-            fix_mcp_config=self.fix_mcp_config,
-            harness_root=self.harness_root,
-            log=self.log,
-            fix_bot=self.fix_bot,
-            fixer_runtime=self.fixer_runtime,
-            fix_model_routes=self.fix_model_routes,
-            available_fix_runtimes=self.available_fix_runtimes,
-            escalate_on_evidence=self.escalate_on_evidence,
-            operator_guidance=self.operator_guidance,
-            max_ci_retries=self.max_ci_retries,
-            max_review_retries=self.max_review_retries,
-            max_rebase_retries=self.max_rebase_retries,
-        )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:
         return ReviewWorkflowConfig(
@@ -144,26 +95,6 @@ class DispatchConfig:
         )
 
 
-class _NoFixWorktrees:
-    """Typed null object for roles that cannot dispatch fix work."""
-
-    @staticmethod
-    def _unavailable() -> RuntimeError:
-        return RuntimeError("fix worktrees are unavailable for this role")
-
-    def ensure(self, issue: int, branch: str) -> str:
-        del issue, branch
-        raise self._unavailable()
-
-    def remove(self, issue: int) -> None:
-        del issue
-        raise self._unavailable()
-
-    def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str | None:
-        del issue, fallback
-        raise self._unavailable()
-
-
 class AgentDispatcher:
     """Runs one RunAgent action end-to-end. `executor` applies the follow-up
     Actions (so all writes funnel through one place); `runner` is the SDK
@@ -175,14 +106,10 @@ class AgentDispatcher:
         cfg: DispatchConfig,
         gateway: WorkflowGitHubReads,
         store: WorkflowState,
-        worktrees: FixWorktreePort | None,
         runner: AgentRuntime,
         executor: ActionExecutor,
-        prepare_cwd: Callable[[str], None] | None = None,
         journal: EventSink | None = None,
-        reserve_fix_paths: Callable[[int, frozenset[str]], bool] | None = None,
         dispatch_claim_target: Callable[[RunAgent], int | None] | None = None,
-        workflow_control: WorkflowControl | None = None,
         review_authority: ReviewAuthority | None = None,
     ):
         self.cfg = cfg
@@ -195,20 +122,6 @@ class AgentDispatcher:
         # PR → issue answers this process has actually received, so a dying
         # gateway does not silently drop the per-issue spend scope.
         self._issue_memo: dict[int, int] = {}
-        fix_worktrees = worktrees if worktrees is not None else _NoFixWorktrees()
-        self.fix_workflow = FixWorkflow(
-            # The journal arrives as a constructor argument, not through
-            # DispatchConfig, so it is folded in here.
-            replace(cfg.fix_workflow_config(), journal=journal),
-            gateway,
-            store,
-            fix_worktrees,
-            runner,
-            executor,
-            prepare_cwd,
-            reserve_fix_paths,
-            workflow_control,
-        )
         self.review_workflow = ReviewWorkflow(
             replace(cfg.review_workflow_config(), journal=journal),
             gateway, store, runner,
@@ -234,10 +147,7 @@ class AgentDispatcher:
 
     # Kinds keyed by PR number rather than issue number. The per-issue spend cap
     # needs the ISSUE behind the work, so these are resolved through the gateway.
-    _PR_KEYED = frozenset({
-        AgentKind.PR_RESUME, AgentKind.ADDRESS_REVIEW, AgentKind.FIX_CI, AgentKind.REBASE,
-        AgentKind.REVIEW, AgentKind.RE_REVIEW,
-    })
+    _PR_KEYED = frozenset({AgentKind.REVIEW, AgentKind.RE_REVIEW})
 
     def _lookup_issue(self, pr: int) -> int | None:
         """The PR's issue from the gateway; on a failed lookup, the last answer
@@ -269,56 +179,13 @@ class AgentDispatcher:
 
     async def dispatch(self, action: RunAgent) -> None:
         handler = {
-            AgentKind.RESOLVE: self.fix_workflow.resolve,
-            AgentKind.RESUME: self.fix_workflow.resume,
-            AgentKind.PR_RESUME: self.fix_workflow.resume_pr,
-            AgentKind.ADDRESS_REVIEW: self.fix_workflow.address_review,
-            AgentKind.FIX_CI: self.fix_workflow.fix_ci,
-            AgentKind.REBASE: self.fix_workflow.rebase,
             AgentKind.REVIEW: self.review_workflow.review,
             AgentKind.RE_REVIEW: self.review_workflow.re_review,
         }.get(action.kind)
         if handler is None:
             return
-        if action.kind in {AgentKind.RESOLVE, AgentKind.RESUME, AgentKind.REVIEW, AgentKind.RE_REVIEW}:
-            handler = partial(handler, binding=action.workflow)
+        handler = partial(handler, binding=action.workflow)
         issue, claim_target = self._spend_target(action)
-        if action.kind in {
-            AgentKind.PR_RESUME,
-            AgentKind.ADDRESS_REVIEW,
-            AgentKind.FIX_CI,
-            AgentKind.REBASE,
-        } and claim_target is not None:
-            # ADR 0008: a fix PR dispatch whose reserved claim carries no issue
-            # must not fall through to a live linkage lookup — that would run
-            # under an identity that was never claimed. decide_fix currently
-            # never dispatches issueless PR work, so this is a fence, not a path.
-            if issue is None:
-                self.cfg.log(
-                    f"dispatch {action.kind.name} PR #{action.number}: deferred "
-                    f"— claim target {claim_target} carries no issue; refusing "
-                    "live-lookup identity (ADR 0008)"
-                )
-                if self.journal is not None:
-                    try:
-                        self.journal.emit(
-                            TelemetryEvent(
-                                TelemetryWarning(
-                                    "dispatch_deferred",
-                                    f"{action.kind.name} claim target "
-                                    f"{claim_target} carries no issue",
-                                    {"observed_target": claim_target},
-                                ),
-                                Correlation(pr=action.number),
-                            )
-                        )
-                    except Exception as exc:  # noqa: BLE001 — telemetry must not block
-                        self.cfg.log(
-                            f"dispatch PR #{action.number}: deferral not "
-                            f"journalled ({exc})"
-                        )
-                return
-            handler = partial(handler, issue_hint=issue)
         if action.kind in {
             AgentKind.REVIEW,
             AgentKind.RE_REVIEW,
@@ -334,6 +201,7 @@ class AgentDispatcher:
                 issue,
                 claim_target=claim_target,
                 workflow=action.workflow,
+                head=action.head,
             )
         try:
             await handler(action.number)

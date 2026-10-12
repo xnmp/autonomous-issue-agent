@@ -9,14 +9,11 @@ called — rather than merely that a label moved.
 
 from __future__ import annotations
 
-from issue_agent.domain.checks import Check
 
-from tests.domain.builders import observed_pr
 
 import asyncio
 import json
 import os
-from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -28,21 +25,12 @@ from issue_agent.adapters.journal import (
     default_ledger_path,
     read_events,
 )
-from issue_agent.adapters.store import Store
-from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.app.review_runtime import review_guidance_reader
-from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
+from issue_agent.domain.actions import Relabel, Target
 from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
-from issue_agent.domain.world import IssueView
-from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
-from tests.fakes.review_workflow import held as held_review
-from tests.fakes.workflow_authority import install_workflow
 
 NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -702,51 +690,6 @@ def test_an_ordinary_relabel_is_not_an_escalation(tmp_path):
 
 
 
-
-
-def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
-    ledger = str(tmp_path / "spend.jsonl")
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    inner = FakeInner(AgentResult(is_error=False, status="pushed", cost_usd=0.5))
-    runtime = JournalingRuntime(inner, journal, repo="o/r", role="fix")
-    gw = FakeGateway(
-        issues={5: IssueView(5, title="t", body="b")},
-        prs={100: observed_pr(100, head_ref_name="fix/5-context", closing_issue=5,
-            checks=(Check("unit", bucket="fail"),))},
-    )
-    gw.pr_issues[100] = 5
-    control = SQLiteControlStore(str(tmp_path / "control.sqlite"))
-    control.initialize()
-    install_workflow(control, replace(held_review(key=WorkflowKey("o/r", PullRequestRef(100))), gates=()))
-    cfg = DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM"), role="fix", repo="o/r",
-                         operator_guidance=review_guidance_reader(control, "o/r"))
-
-    class _WT:
-        def ensure(self, issue, branch):
-            return f"/wt/{issue}"
-
-        def remove(self, issue):
-            pass
-
-        def reset(self, issue):
-            pass
-
-    from tests.fakes.accounted_dispatch import with_resolve_authority
-    d = with_resolve_authority(AgentDispatcher(
-        cfg,
-        gw,
-        Store(str(tmp_path / "state")),
-        _WT(),
-        runtime,
-        Executor(gw),
-        journal=journal,
-    ))
-    asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
-
-    run = [e for e in read_events(journal.path) if e["event"] == "agent_run"][0]
-    assert (run["role"], run["kind"], run["number"], run["issue"]) == ("fix", "FIX_CI", 100, 5)
-    assert run["issue"] == 5
-    assert read_events(ledger) == []
 
 
 # ── Daemon: GhUnavailable is a countable event ────────────────────────────────

@@ -8,7 +8,6 @@ the ports where a drift could skip a durable write or corrupt control state.
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     Lease,
-    PendingCommand,
     ReleaseResult,
     SQLiteControlStore,
 )
@@ -22,7 +21,6 @@ from issue_agent.adapters.process_supervisor import (
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.adapters.store import Store
-from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.execute import Executor
 from issue_agent.app.dashweb.ports import GitHubQueries
 from issue_agent.app.recovery import NoWorktreeRecovery
@@ -33,26 +31,18 @@ from issue_agent.app.roles import (
 import issue_agent.domain.workflow_ports as workflow_ports
 from issue_agent.domain.ports import (
     ActionExecutor,
-    CiPromptReads,
     CommandRecovery,
-    ControlStore,
     EventSink,
-    FixWorktreePort,
     GitHubReads,
-    PendingEffect,
-    PendingEffectReads,
-    PredictionReader,
     ProcessSupervisor,
     RecoveryControl,
     RecoveryDisposition,
     RecoveryLease,
     RecoveryRelease,
-    ReviewPromptReads,
     SpendReconciler,
     StaleReservationReconciler,
     WorkflowGitHubReads,
     WorkflowState,
-    WorktreePort,
     WorktreeRecovery,
 )
 
@@ -62,26 +52,18 @@ from issue_agent.domain.ports import (
 COVERED_PORTS = frozenset(
     {
         "ActionExecutor",
-        "CiPromptReads",
         "CommandRecovery",
-        "ControlStore",
         "EventSink",
-        "FixWorktreePort",
         "GitHubReads",
-        "PendingEffect",
-        "PendingEffectReads",
-        "PredictionReader",
         "ProcessSupervisor",
         "RecoveryControl",
         "RecoveryDisposition",
         "RecoveryLease",
         "RecoveryRelease",
-        "ReviewPromptReads",
         "SpendReconciler",
         "StaleReservationReconciler",
         "WorkflowGitHubReads",
         "WorkflowState",
-        "WorktreePort",
         "WorktreeRecovery",
     }
 )
@@ -89,8 +71,6 @@ EXEMPT_PORTS = frozenset(
     {
         # Time is injected as three callables in the current daemon loop.
         "Clock",
-        # Superseded by ReservationRequest/SettlementRequest control-store APIs.
-        "SpendAccount",
     }
 )
 
@@ -102,28 +82,13 @@ def workflow_state(store: Store) -> WorkflowState:
 dashboard_github_queries: GitHubQueries = GhReader()
 
 
-def control_store(store: SQLiteControlStore) -> ControlStore:
-    return store
-
 
 def recovery_control(store: SQLiteControlStore) -> RecoveryControl:
     return store
 
 
-def pending_effect_reads(store: SQLiteControlStore) -> PendingEffectReads:
-    return store
 
 
-def pending_effect(pending: PendingCommand) -> PendingEffect:
-    return pending
-
-
-def fix_worktrees(worktrees: Worktrees) -> FixWorktreePort:
-    return worktrees
-
-
-def worktrees(worktrees: Worktrees) -> WorktreePort:
-    return worktrees
 
 
 def github_reads(gateway: GitHubGateway) -> GitHubReads:
@@ -136,12 +101,6 @@ def workflow_github_reads(
     return gateway
 
 
-def review_prompts(gateway: GitHubGateway) -> ReviewPromptReads:
-    return gateway
-
-
-def ci_prompts(gateway: GitHubGateway) -> CiPromptReads:
-    return gateway
 
 
 def action_executor(
@@ -189,9 +148,6 @@ def worktree_recovery(
 ) -> WorktreeRecovery:
     return recovery
 
-
-def prediction_reader(store: Store) -> PredictionReader:
-    return store
 
 
 def recovery_lease(lease: Lease) -> RecoveryLease:

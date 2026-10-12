@@ -255,9 +255,11 @@ def test_a_huge_drift_list_is_bounded(tmp_path):
     assert "+15 more" in findings[0].message
 
 
-def test_mixed_tiers_require_codex_even_with_all_role_defaults_claude(tmp_path):
+def test_retired_tier_knobs_no_longer_require_codex(tmp_path):
+    # Slice 5b deleted the per-tier model ladder (Q12): a leftover tier knob
+    # selects no provider, so an all-claude deployment needs no codex binary.
     env = {"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude",
            "FIX_MODEL_LOW": "codex:gpt-6-luna", "FIX_MODEL_MED": "codex:gpt-6.1-sol"}
     snapshot = "\n".join(f'{key}="{value}"' for key, value in env.items()) + "\n"
     findings = _findings(tmp_path, composed=env, snapshot=snapshot, which=_WHICH_CORE)
-    assert any(f.level == "error" and "'codex'" in f.message for f in findings)
+    assert not any("'codex'" in f.message for f in findings)

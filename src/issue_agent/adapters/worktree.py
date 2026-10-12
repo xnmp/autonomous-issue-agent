@@ -89,17 +89,6 @@ def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     return GitResult(res.returncode, res.stdout)
 
 
-def worktree_list_contains_issue(listing: str, issue: int) -> bool:
-    expected = f"issue-{issue}"
-    for line in listing.splitlines():
-        if not line.startswith("worktree "):
-            continue
-        path = line.removeprefix("worktree ").strip()
-        if os.path.basename(path) == expected:
-            return True
-    return False
-
-
 def _registered_branch(listing: str, expected_path: str) -> str | None:
     """None means absent; an empty branch means a registered detached checkout."""
     expected = os.path.realpath(expected_path)
@@ -960,6 +949,21 @@ class Worktrees:
         if observed.code != 0 or observed.out.strip() != branch:
             raise WorktreeUnavailable(f"branch identity could not be verified at {abs_path!r}")
         return abs_path
+
+    def sync(self, issue: int, branch: str, head: str) -> str:
+        """The issue's worktree on `branch`, hard-reset to the pushed `head` a
+        PR-stage leg was decided on. Unpushed local work is not part of the PR,
+        so it is discarded; a remote head that moved refuses the leg."""
+        with self._mutation_lock:
+            path = self._ensure(issue, branch)
+            remote = f"refs/remotes/origin/{branch}"
+            fetched = self._git(["fetch", "origin", f"+refs/heads/{branch}:{remote}", "--quiet"], path)
+            observed = self._git(["rev-parse", remote], path)
+            if fetched.code != 0 or observed.code != 0 or observed.out.strip() != head:
+                raise WorktreeUnavailable(f"branch {branch!r} is not at the decided head {head[:12]}")
+            if self._git(["reset", "--hard", head], path).code != 0:
+                raise WorktreeUnavailable(f"cannot reset issue #{issue} checkout to {head[:12]}")
+            return path
 
     def remove(self, issue: int) -> None:
         with self._mutation_lock:

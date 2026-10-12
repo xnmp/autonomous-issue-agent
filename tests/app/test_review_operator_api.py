@@ -36,7 +36,7 @@ from issue_agent.domain.world import IssueView, PRView, WorldState
 from tests.adapters.test_review_workflow_control import Rig
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.fakes.review_workflow import HEAD
-from tests.app.resolve_acceptance_harness import ScriptedProvider
+from tests.app.acceptance_support import ScriptedProvider
 from tests.app.review_acceptance_harness import (
     BOT, FIX_BOT, NHR, PR, REPO, TRIGGER, ReviewComposition, compose_review, create_review_deployment, install_clock,
     isolate_authority, verdicts, register_review_launch,

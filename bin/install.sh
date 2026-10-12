@@ -18,11 +18,7 @@ red() { printf '\033[31m%s\033[0m\n' "$1"; }
 grn() { printf '\033[32m%s\033[0m\n' "$1"; }
 inf() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 
-# #156: this used to shim ONE hand-written name while pyproject declared two,
-# so `issue-agent-publish` — the executable AGENT.md tells every fixer to
-# publish through — was absent on any box bootstrapped with `make install`, and
-# paid resolve legs blocked asking the operator to install it. The list is now
-# DERIVED from the single declaration that materialises .venv/bin: the keys of
+# #156: the shim list is DERIVED from the single declaration that materialises .venv/bin: the keys of
 # pyproject's [project.scripts] table. Same drift class compose-env.sh removed
 # for env vars — adding an entry point to pyproject is the only edit needed,
 # and there is no second list that can disagree with it.

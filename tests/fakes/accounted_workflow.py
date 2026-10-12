@@ -1,139 +1,15 @@
-"""Isolated accounting-backed resolve workflow fixtures, never live authority."""
+"""Isolated review/PR-repair workflow authority fixtures, never live authority."""
 
 from tests.domain.builders import observed_pr
 
-import contextlib
 import dataclasses
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
-from issue_agent.adapters import accounting_runtime
-from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-from issue_agent.adapters.effects import GitHubEffectExecutor
-from issue_agent.app.workflows.fix import FixWorkflow
-from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
-from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable, UnknownModelPolicy
-from issue_agent.domain.workflow import FreshResolve, ResolveSession
 from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
-from issue_agent.domain.world import PRView
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
-from tests.fakes.legacy_journal import Journal
-
-
-def seed_resolve(store, issue, *, failures=0, session_id=None, runtime="claude", model="m", guidance=""):
-    state = resolve_snapshot(issue)
-    if session_id:
-        source = WorkflowAttemptIdentity(state.binding, RunId("imported-session"), "imported-leg")
-        state = dataclasses.replace(state, revision=dataclasses.replace(state.revision, version=1), episode=dataclasses.replace(
-            state.episode, continuation=FreshResolve(ResolveSession(source, session_id, runtime, model), 1),
-        ))
-    object.__setattr__(store, "_workflow_seed", dataclasses.replace(state, episode=dataclasses.replace(state.episode, failures=failures, guidance=guidance)))
-
-
-def resolve_state(store, issue=5):
-    return store._workflow_authority.load_workflow(WorkflowKey("o/r", IssueRef(issue)))
-
-
-class AccountedFixtureWorkflow(FixWorkflow):
-    """Direct workflow calls receive the same captured context as dispatch."""
-
-    @contextlib.contextmanager
-    def _accounted(self, issue, kind, binding):
-        original = self.runner
-        original_effects = self.executor._effect_executor
-        self.executor._effect_executor = GitHubEffectExecutor(
-            self.gateway, self.store._workflow_db, repository="o/r",
-            identity="o/r:fix:fixture", log=self.cfg.log,
-        )
-        inner = original.inner if isinstance(original, JournalingRuntime) else original
-        maximum = self.cfg.fix.max_budget_usd
-        limits = {("fix", stage): Money.from_major("USD", maximum) for stage in (
-            "RESOLVE", "RESUME", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE",
-        )}
-        limits[("fix", "ROUTE")] = Money.from_major("USD", self.cfg.fix.router_budget_usd)
-        accounted = AccountingRuntime(
-            inner, self.store._workflow_db, "o/r", "fix", None, None, None, "fixture", self._resolve_runtime_name(),
-            BudgetPolicy(limits), RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
-                                            ModelRates(1, 1, 1, 1)),
-            owner_id="o/r:fix:fixture",
-        )
-        if self.cfg.available_fix_runtimes:
-            from issue_agent.adapters.runtime_selection import SelectingRuntime
-            from issue_agent.domain.agent_task import RuntimeName
-            accounted = SelectingRuntime({
-                provider: dataclasses.replace(accounted, runtime_name=provider.value)
-                for provider in self.cfg.available_fix_runtimes
-            }, RuntimeName(self._resolve_runtime_name()))
-        journalled = original if isinstance(original, JournalingRuntime) else JournalingRuntime(
-            accounted, Journal(str(Path(self.store._workflow_dir.name) / "events.jsonl")), repo="o/r", role="fix",
-        )
-        if isinstance(original, JournalingRuntime):
-            original.inner = accounted
-        self.runner = journalled
-        journalled.set_context("fix", kind, issue, issue, workflow=binding)
-        publication = accounting_runtime._FixPublicationContext(
-            f"/wt/issue-{issue}", f"fix/{issue}-fixture", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
-        )
-        selected_workspaces = {}
-        original_ensure = self.worktrees.ensure
-
-        def selected_workspace(number, branch):
-            cwd = original_ensure(number, branch)
-            selected_workspaces[cwd] = branch
-            return cwd
-
-        def captured_publication(role, cwd):
-            return dataclasses.replace(publication, cwd=cwd, branch=selected_workspaces.get(cwd, publication.branch))
-        try:
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(patch.object(self.worktrees, "ensure", side_effect=selected_workspace))
-                stack.enter_context(patch.object(
-                    accounting_runtime,
-                    "_fix_publication_context",
-                    side_effect=captured_publication,
-                ))
-                yield
-        finally:
-            self.runner = original
-            self.executor._effect_executor = original_effects
-            if isinstance(original, JournalingRuntime):
-                original.inner = inner
-
-    async def fix_ci(self, pr, *, issue_hint=None):
-        issue = issue_hint or self.gateway.issue_for_pr(pr)
-        with self._accounted(issue, "FIX_CI", None):
-            await super().fix_ci(pr, issue_hint=issue_hint)
-
-    async def address_review(self, pr, *, issue_hint=None):
-        issue = issue_hint or self.gateway.issue_for_pr(pr)
-        with self._accounted(issue, "ADDRESS_REVIEW", None):
-            await super().address_review(pr, issue_hint=issue_hint)
-
-    async def rebase(self, pr, *, issue_hint=None):
-        issue = issue_hint or self.gateway.issue_for_pr(pr)
-        with self._accounted(issue, "REBASE", None):
-            await super().rebase(pr, issue_hint=issue_hint)
-
-    async def resume_pr(self, pr, *, issue_hint=None):
-        issue = issue_hint or self.gateway.issue_for_pr(pr)
-        with self._accounted(issue, "PR_RESUME", None):
-            self.runner.set_context("fix", "PR_RESUME", pr, issue, workflow=None)
-            await super().resume_pr(pr, issue_hint=issue_hint)
-
-    async def resolve(self, issue, *, binding=None):
-        binding = binding or resolve_state(self.store, issue).binding
-        with self._accounted(issue, "RESOLVE", binding):
-            await super().resolve(issue, binding=binding)
-
-    async def resume(self, issue, *, binding=None):
-        binding = binding or resolve_state(self.store, issue).binding
-        with self._accounted(issue, "RESUME", binding):
-            await super().resume(issue, binding=binding)
-
 
 
 def install_pr_repair_authority(gateway, store):
@@ -160,20 +36,6 @@ def install_pr_repair_authority(gateway, store):
 def pr_repair_state(store, pr=100):
     from issue_agent.domain.workflow_identity import PullRequestRef
     return store._workflow_authority.read_pr_repair(WorkflowKey("o/r", PullRequestRef(pr))).component.state
-
-
-def seed_verified_ci_rerun(store, pr, head):
-    from types import SimpleNamespace
-    from tests.adapters.test_effects import Gateway
-    from issue_agent.adapters.effects import GitHubEffectExecutor
-    from issue_agent.domain.actions import RerunFailedChecks
-    from issue_agent.domain.world import PRView
-    attach_workflow_authority(SimpleNamespace(issues={}, prs={pr: observed_pr(pr, head_ref_oid=head)}), store, pr_repair=True)
-    gateway = Gateway()
-    gateway.head = head
-    gateway.ci_state = "failure"
-    assert GitHubEffectExecutor(gateway, store._workflow_db, repository="o/r", identity="o/r:fix:fixture").execute(
-        RerunFailedChecks(pr, head, (42,)))
 
 
 def issue_recovery_state(store, issue=5):
@@ -229,37 +91,3 @@ def attach_workflow_authority(
     if pr_repair:
         install_pr_repair_authority(gw, store)
     return store._workflow_authority
-
-
-def seed_infra_outcome(control, issue, normal=False, *, owner_id="o/r:fix:fixture", reclaim=False):
-    """Seed one ended fix leg through actual admission, classification and money:
-    a normal return, or (by default) a machine end that records no receipt."""
-    import uuid
-    from issue_agent.domain import continuation_components as cc
-    from issue_agent.adapters.control_store import SettlementRequest
-    from issue_agent.domain.contracts import PricingBasis
-    from tests.adapters.test_workflow_admission import request
-    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue)))
-    assert isinstance(selected, cc.SelectedIssueRecovery)
-    name = "infra-fixture:" + uuid.uuid4().hex
-    from issue_agent.adapters.workflow_rows import load_issue_aggregate
-    with control.transaction() as db:
-        principal = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue))).binding
-    captured = cc.IssueInfraPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:" + name))
-    paid = dataclasses.replace(request(name, binding=principal), owner_id=owner_id, continuations=(captured,))
-    assert control.reserve(paid).admitted
-    if reclaim:
-        control.register_process_lease(paid.run_id, expected_owner_id=owner_id, pid=123, pgid=123, process_start_ticks=99)
-        assert control.reclaim_dead_leases(owner_id, lambda *_: False) == (paid.run_id,)
-    elif normal:
-        control.record_fix_infra_return(paid.run_id, WorkflowWriter("o/r", "fix", owner_id))
-    assert control.settle(SettlementRequest(paid.run_id, Money("USD", 0), PricingBasis.PROVIDER_REPORTED,
-        "infra-fixture:" + str(paid.run_id), None, None, None)).disposition.value == "available"
-    return paid.run_id
-
-
-
-def machine_ends(store, issue=5, repository="o/r"):
-    """Sorted machine flags of every ended fix leg for one issue."""
-    control = getattr(store, "_workflow_db", store)
-    return sorted(end.machine for end in control.fix_leg_ends(repository, issue))

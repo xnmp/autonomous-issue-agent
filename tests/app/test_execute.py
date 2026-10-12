@@ -9,7 +9,6 @@ import pytest
 from issue_agent.adapters.journal import record_fields
 from issue_agent.app.execute import (
     Executor as DurableExecutor,
-    _is_advisory_relabel,
 )
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.domain.actions import (
@@ -340,10 +339,6 @@ def test_legacy_relabel_audit_shape_omits_empty_compound_fields() -> None:
     }
 
 
-def test_relabel_is_advisory_when_only_an_additional_label_is_advisory() -> None:
-    assert _is_advisory_relabel(_compound_relabel())
-
-
 def test_rerun_executes_the_exact_requested_runs():
     gw = FakeGateway()
     marked = []
@@ -631,93 +626,6 @@ def test_failed_worktree_cleanup_withholds_dependent_state_transitions():
     assert gw.calls == []
     assert cleared == []
     assert any("SKIPPED" in line and "issue #9" in line for line in logged)
-
-
-@pytest.mark.parametrize("daemon", [False, True])
-def test_cleanup_preflight_isolates_refused_recipe_from_healthy_cleanup_and_neighbor(daemon):
-    from issue_agent.app.loop import Daemon
-    from issue_agent.domain.fix import cleanup_actions, FixConfig
-    from issue_agent.domain.world import WorldState
-    gateway = FakeGateway(prs={100: observed_pr(100, state="CLOSED", head_ref_oid="stale"),
-                              101: observed_pr(101, state="CLOSED", head_ref_oid="healthy")})
-    removed, cleared, logs = [], [], []
-    def validate(action):
-        if action.pr == 100:
-            raise ValueError("selected cleanup revision changed")
-    executor = Executor(gateway, remove_worktree=removed.append, clear_issue_state=cleared.append,
-                        validate_cleanup=validate, log=logs.append)
-    actions = [NoOp("unrelated observation")]
-    actions += cleanup_actions(gateway.prs[100], 9, FixConfig("fix-bot"))
-    actions += [PostComment(Target.ISSUE, 30, "unrelated guidance")]
-    actions += cleanup_actions(gateway.prs[101], 10, FixConfig("fix-bot"))
-    if daemon:
-        tick = Daemon(name="fix", observe=lambda: WorldState(), decide=lambda _: actions,
-                      executor=executor, poll_seconds=60)
-        tick.tick()
-    else:
-        assert not executor.execute_all(actions)
-    assert removed == [10] and [action.pr for action in cleared] == [101]
-    assert ("relabel", "issue", 9, "ai-pr-open", "ai-ready") not in gateway.calls
-    assert ("relabel", "pr", 100, "ai-pr-open", None) not in gateway.calls
-    assert ("relabel", "issue", 10, "ai-pr-open", "ai-ready") in gateway.calls
-    assert ("comment", "issue", 30, "unrelated guidance") in gateway.calls
-    assert any("REFUSED" in line for line in logs)
-
-
-def test_malformed_cleanup_recipe_refuses_before_any_effect():
-    from issue_agent.domain.fix import cleanup_actions, FixConfig
-    gateway = FakeGateway(prs={100: observed_pr(100, state="CLOSED", head_ref_oid="head")})
-    removed, cleared = [], []
-    executor = Executor(gateway, remove_worktree=removed.append, clear_issue_state=cleared.append,
-                        validate_cleanup=lambda _: None)
-    actions = cleanup_actions(gateway.prs[100], 9, FixConfig("fix-bot"))
-    actions.insert(1, PostComment(Target.ISSUE, 30, "interleaved"))
-    assert not executor.execute_all(actions)
-    assert gateway.calls == [] and removed == [] and cleared == []
-
-
-@pytest.mark.parametrize("refusal", ["missing", "stale", "owed"])
-def test_terminal_cleanup_preflight_keeps_remote_labels_worktree_and_sql_on_refusal(tmp_path, refusal):
-    from issue_agent.app.execute import Executor
-    from issue_agent.adapters.control_store import SQLiteControlStore
-    from tests.adapters.test_effects import _executor
-    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-    from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.fix import cleanup_actions, FixConfig
-    from issue_agent.domain.world import PRView
-    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef, WorkflowWriter, WorkflowRevision
-    durable, gateway, store = _executor(tmp_path, ci=True)
-    key = WorkflowKey("o/r", PullRequestRef(7))
-    if refusal == "owed":
-        store.enqueue_command(durable._command(RerunFailedChecks(7, "head-1", (42,))))
-    selected = store.read_pr_repair(key)
-    source = None if refusal == "missing" else cc.PRRepairCleanup(selected.binding, selected.revision, "head-1", False)
-    if refusal == "stale":
-        with store.transaction() as db:
-            aggregate = load_review_workflow_row(db, key)
-            persist_workflow_snapshot(db, replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence,
-                aggregate.revision.version + 1)))
-    before = store.read_pr_repair(key)
-    authority = SQLiteWorkflowControl(store, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=3)
-    gateway.labels.update({("issue", 9, "ai-pr-open"), ("pr", 7, "ai-pr-open")})
-    labels = set(gateway.labels)
-    removed = []
-    def validate(action):
-        authority.validate_pr_repair_cleanup(key, action.merged, action.source)
-    executor = Executor(gateway, remove_worktree=removed.append, validate_cleanup=validate,
-                        clear_issue_state=lambda action: authority.cleanup_pr_repair(key, action.merged, action.source),
-                        effect_executor=durable)
-    actions = cleanup_actions(observed_pr(7, state="CLOSED", head_ref_oid="head-1"), 9, FixConfig("bot"), source=source)
-    assert not executor.execute_all(actions)
-    assert removed == [] and gateway.calls == [] and gateway.labels == labels
-    assert store.read_pr_repair(key) == before
-    assert not any(command.command.payload.get("type") in {"relabel", "close_issue"} for command in store.pending_commands())
-    # A fresh process repeats the exact refusal without publishing the requeue.
-    restarted = SQLiteWorkflowControl(SQLiteControlStore(store.path), authority.writer, resolve_ceiling=3)
-    executor._validate_cleanup = lambda action: restarted.validate_pr_repair_cleanup(key, action.merged, action.source)
-    assert not executor.execute_all(actions)
-    assert gateway.calls == [] and gateway.labels == labels and removed == []
 
 
 def test_failed_exact_head_merge_remains_unconfirmed_without_legacy_callback():

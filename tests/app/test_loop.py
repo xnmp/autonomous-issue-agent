@@ -11,14 +11,13 @@ import pytest
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import read_events
 from issue_agent.adapters.github import GhUnavailable
-from issue_agent.adapters.store import Store
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import NoOp, Relabel, Target
 from issue_agent.domain.events import TelemetryEvent, TickGated
 from issue_agent.domain.labels import Label
 from issue_agent.domain.recovery import RecoveryTrigger
-from issue_agent.domain.world import PRView, WorldState
+from issue_agent.domain.world import WorldState
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.manual_clock import ManualClock
 
@@ -234,7 +233,7 @@ def test_rejected_dispatch_releases_exclusive_lease_and_can_retry():
     daemon.tick()
     assert started.wait(timeout=1)
     assert daemon.tick() == []
-    assert reservations.snapshot() == ()
+    assert reservations.issue_for(rejected) is None
 
     unrelated = RunAgent(AgentKind.RESOLVE, 99)
     assert reservations.reserve(unrelated, 99, frozenset({"src/z.py"}))
@@ -266,7 +265,7 @@ def test_submit_exception_releases_decision_lease():
     daemon._dispatch_pool.shutdown()
 
     assert daemon.tick() == []
-    assert reservations.snapshot() == ()
+    assert reservations.issue_for(action) is None
     assert reservations.reserve(
         RunAgent(AgentKind.RESOLVE, 99),
         99,
@@ -1351,24 +1350,6 @@ def _waking_daemon(wake_check, poll_seconds=60, logs=None):
     return d
 
 
-def test_a_wake_mid_sleep_ends_the_interval_early():
-    """The whole point of push: a delivery must not wait out the reconcile
-    interval. Asserted on the observable — total seconds slept — not on how the
-    sleep is chopped up."""
-    ticks = {"n": 0}
-    # Wake on the 3rd probe of the first interval, never again.
-    probes = {"n": 0}
-
-    def wake():
-        probes["n"] += 1
-        return probes["n"] == 3
-
-    d = _waking_daemon(wake, poll_seconds=300)
-    slept = []
-    d.run_forever(sleep=slept.append, now=lambda: ticks["n"], max_ticks=2)
-    assert sum(slept) == 3 + 300  # cut short once, then a full backstop interval
-
-
 def test_without_a_wake_the_full_interval_is_slept():
     d = _waking_daemon(lambda: False, poll_seconds=5)
     slept = []
@@ -1391,18 +1372,6 @@ def test_no_wake_check_sleeps_in_one_call_as_before():
     slept = []
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert slept == [60, 60]
-
-
-def test_a_wake_check_that_raises_leaves_the_reconciler_running():
-    """Losing push latency must never wedge the loop."""
-    logs = []
-
-    def boom():
-        raise RuntimeError("stat failed")
-
-    d = _waking_daemon(boom, poll_seconds=10, logs=logs)
-    d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=2)
-    assert any("wake check failed" in m for m in logs)
 
 
 def test_wake_failure_keeps_long_remainder_watchdog_safe():
@@ -1606,19 +1575,3 @@ def test_no_gate_is_the_default_and_changes_nothing():
     assert observed == [1] and gw.calls != []
 
 
-def test_world_unchanged_skips_silently_without_deciding():
-    """The probe's skip is not an incident: no decide, no execute, no log line
-    (a line every quiet poll is the noise the probe exists to remove)."""
-    from issue_agent.app.world_probe import WorldUnchanged
-
-    logs = []
-    decided = []
-
-    def unchanged():
-        raise WorldUnchanged()
-
-    d, gw = _daemon(lambda w: decided.append(w) or [], observe=unchanged, logs=logs)
-    assert d.tick() == []
-    assert decided == []
-    assert gw.calls == []
-    assert logs == []

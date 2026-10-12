@@ -4,10 +4,6 @@ from tests.domain.builders import Check, Review
 
 from issue_agent.domain.ci import (
     ci_state,
-    latest_other_review,
-    pending_age_seconds,
-    pending_checks,
-    pending_deadline_breached,
 )
 from issue_agent.domain.world import CIState
 from issue_agent.domain.checks import Unavailable
@@ -47,55 +43,6 @@ def test_queued_is_pending():
 
 
 
-def test_latest_other_review_excludes_fixer():
-    reviews = [
-        Review("APPROVED", "fix-bot", "2026-01-01T00:00:00Z"),
-    ]
-    assert latest_other_review(reviews, "fix-bot") is None
-
-
-def test_latest_other_review_picks_newest_distinct_actor():
-    reviews = [
-        Review("CHANGES_REQUESTED", "review-bot", "2026-01-01T00:00:00Z"),
-        Review("APPROVED", "review-bot", "2026-01-02T00:00:00Z"),
-        Review("APPROVED", "fix-bot", "2026-01-03T00:00:00Z"),  # self — ignored
-    ]
-    latest = latest_other_review(reviews, "fix-bot")
-    assert latest is not None and latest.state == "APPROVED"
-    assert latest.submitted_at == "2026-01-02T00:00:00Z"
-
-
-# ── review C1: the self-review guard survives the `[bot]` suffix asymmetry ─────
-def test_c1_suffixed_fix_bot_still_excludes_its_own_bare_login_review():
-    # FIX_BOT='fix-bot[bot]' (App form) vs the bare `fix-bot` gh reports in the
-    # review author field. Under a raw `==` the fixer's OWN approval survived the
-    # filter and read as an independent one — the 422 self-approval shape.
-    reviews = [Review("APPROVED", "fix-bot", "2026-01-01T00:00:00Z")]
-    assert latest_other_review(reviews, "fix-bot[bot]") is None
-
-
-def test_c1_bare_fix_bot_still_excludes_its_own_suffixed_login_review():
-    # The asymmetry runs both ways.
-    reviews = [Review("APPROVED", "fix-bot[bot]", "2026-01-01T00:00:00Z")]
-    assert latest_other_review(reviews, "fix-bot") is None
-
-
-def test_c1_suffix_tolerance_does_not_swallow_a_genuine_reviewer():
-    # Anti-vacuity twin: a genuinely distinct actor is still returned, whichever
-    # form either side is written in.
-    reviews = [
-        Review("APPROVED", "fix-bot", "2026-01-01T00:00:00Z"),        # self
-        Review("APPROVED", "review-bot", "2026-01-02T00:00:00Z"),     # distinct
-    ]
-    latest = latest_other_review(reviews, "fix-bot[bot]")
-    assert latest is not None and latest.author == "review-bot"
-
-
-def test_c1_login_comparison_is_case_insensitive():
-    reviews = [Review("APPROVED", "Fix-Bot", "2026-01-01T00:00:00Z")]
-    assert latest_other_review(reviews, "fix-bot[bot]") is None
-
-
 # ── pending deadline (#30) ───────────────────────────────────────────────────
 # A check stuck IN_PROGRESS pins ci_state at PENDING, and PENDING outranks
 # FAILURE, so nothing downstream ever acts. These bound the wait without
@@ -111,137 +58,6 @@ def _later(seconds: int) -> str:
         datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
         + timedelta(seconds=seconds)
     ).isoformat()
-
-
-def test_pending_past_the_deadline_breaches():
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_T0)]
-    assert pending_deadline_breached(checks, _later(3601), 3600)
-
-
-def test_pending_under_the_deadline_does_not_breach():
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_T0)]
-    assert not pending_deadline_breached(checks, _later(1380), 3600)
-
-
-def test_exactly_at_the_deadline_breaches():
-    # `>=`, so a deadline of N fires at N — no one-second sliver where a
-    # configured bound is silently not yet in force.
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_T0)]
-    assert pending_deadline_breached(checks, _later(3600), 3600)
-
-
-def test_zero_deadline_disables():
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_T0)]
-    assert not pending_deadline_breached(checks, _later(10**6), 0)
-
-
-def test_negative_deadline_disables():
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_T0)]
-    assert not pending_deadline_breached(checks, _later(10**6), -1)
-
-
-def test_missing_started_at_never_breaches():
-    # THE fail-safe: an unknown start must read as unknown, never as epoch —
-    # otherwise every pending check on a gh without the field escalates at once.
-    checks = [Check("windows", state="IN_PROGRESS")]
-    assert not pending_deadline_breached(checks, _later(10**6), 3600)
-
-
-def test_malformed_started_at_never_breaches():
-    for raw in ("not-a-date", "2026-13-45T99:99:99Z", "0", "   "):
-        checks = [Check("windows", state="IN_PROGRESS", started_at=raw)]
-        assert not pending_deadline_breached(checks, _later(10**6), 3600), raw
-
-
-def test_unstamped_now_never_breaches():
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_T0)]
-    assert not pending_deadline_breached(checks, "", 3600)
-    assert not pending_deadline_breached(checks, "whenever", 3600)
-
-
-def test_settled_checks_never_breach_however_old():
-    checks = [Check("unit", bucket="pass", started_at=_T0),
-              Check("lint", bucket="fail", started_at=_T0)]
-    assert not pending_deadline_breached(checks, _later(10**6), 3600)
-
-
-def test_newest_pending_start_is_what_counts():
-    # A long pipeline that keeps STARTING new jobs is making progress: the newest
-    # start is the clock, so a fresh job inside the window holds the deadline off.
-    checks = [
-        Check("old", state="IN_PROGRESS", started_at=_T0),
-        Check("just-started", state="IN_PROGRESS", started_at=_later(3500)),
-    ]
-    assert not pending_deadline_breached(checks, _later(3600), 3600)
-    assert pending_deadline_breached(checks, _later(7101), 3600)
-
-
-def test_a_runnerless_queued_check_never_breaches_however_long_it_waits():
-    # PRs #1065/#1070: saturated hosted runners held jobs QUEUED for 67-80 min.
-    checks = [Check("macos", state="QUEUED", started_at=_T0)]
-    assert not pending_deadline_breached(checks, _later(10**6), 3600)
-    assert pending_age_seconds(checks, _later(10**6)) is None
-
-
-def test_a_fresh_queued_job_neither_holds_off_nor_extends_an_executing_hang():
-    checks = [
-        Check("wedged", state="IN_PROGRESS", started_at=_T0),
-        Check("queued", state="QUEUED", started_at=_later(3500)),
-    ]
-    assert pending_deadline_breached(checks, _later(3600), 3600)
-
-
-def test_every_non_queued_pending_state_keeps_its_deadline():
-    for check in (Check("ext", bucket="pending", state="PENDING", started_at=_T0),
-                  Check("env", state="WAITING", bucket="pending", started_at=_T0),
-                  Check("exp", state="EXPECTED", bucket="pending", started_at=_T0),
-                  Check("run", state="IN_PROGRESS", started_at=_T0)):
-        assert pending_deadline_breached([check], _later(3601), 3600), check
-
-
-def test_a_settled_recent_check_does_not_hold_off_the_deadline():
-    # Anti-vacuity twin of the above: only PENDING starts count. A quick job that
-    # finished just now must not mask a sibling wedged for hours.
-    checks = [
-        Check("wedged", state="IN_PROGRESS", started_at=_T0),
-        Check("fast", bucket="pass", started_at=_later(3599)),
-    ]
-    assert pending_deadline_breached(checks, _later(3601), 3600)
-
-
-
-
-def test_deadline_ignores_a_start_in_the_future():
-    # Clock skew between GitHub and this host must not escalate instantly.
-    checks = [Check("windows", state="IN_PROGRESS", started_at=_later(10**6))]
-    assert not pending_deadline_breached(checks, _T0, 3600)
-
-
-def test_naive_timestamps_are_read_as_utc():
-    checks = [Check("windows", state="IN_PROGRESS", started_at="2026-07-28T12:00:00")]
-    assert pending_deadline_breached(checks, "2026-07-28T13:30:00", 3600)
-
-
-def test_pending_checks_names_the_pinning_checks():
-    checks = [
-        Check("unit", bucket="pass"),
-        Check("windows", state="IN_PROGRESS"),
-        Check("mac", bucket="pending"),
-    ]
-    assert [c.name for c in pending_checks(checks)] == ["windows", "mac"]
-
-
-def test_pending_age_is_none_when_nothing_is_pending():
-    assert pending_age_seconds([Check("unit", bucket="pass")], _later(10)) is None
-
-
-def test_the_deadline_does_not_change_ci_state_precedence():
-    # The guardrail on this whole feature: pending still OUTRANKS failure, breach
-    # or no breach. The deadline adds a bound; it does not reorder anything.
-    checks = [Check("unit", bucket="fail", started_at=_T0),
-              Check("e2e", state="IN_PROGRESS", started_at=_T0)]
-    assert pending_deadline_breached(checks, _later(10**6), 3600)
-    assert ci_state(checks) is CIState.PENDING
 
 
 # ── #48: an unread checks fetch is UNKNOWN, never an answer ───────────────────

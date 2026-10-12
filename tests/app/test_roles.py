@@ -28,18 +28,14 @@ exact result.
 
 from __future__ import annotations
 
-from tests.domain.builders import observed_pr, with_checks
+from tests.domain.builders import observed_pr
 
 
-from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
 from issue_agent.domain import continuation_components as cc
 
-import asyncio
 import json
 import os
-from pathlib import Path
 import subprocess
-import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -47,8 +43,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
@@ -58,15 +52,9 @@ from issue_agent.adapters.control_store import (
     SettlementRequest,
 )
 from issue_agent.adapters.store import Store
-from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
+from issue_agent.app.dispatch import AgentDispatcher
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.main import _recover_pre_adapter_processes
-from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.app.planners.tasks import (
-    FixTaskConfig,
-    REVIEW_DIMENSIONS,
-    ReviewTaskConfig,
-)
 from issue_agent.app.roles import (
     DispatchPathReservations,
     EffectRecovery,
@@ -75,8 +63,6 @@ from issue_agent.app.roles import (
     _control_store,
     _control_store_path,
     _fix_holds,
-    _fix_state as read_fix_state,
-    _inject_predicted_paths,
     _owner_identity,
     _shutdown_finalize,
     _shutdown_prepare,
@@ -84,25 +70,10 @@ from issue_agent.app.roles import (
     process_supervision_state_dir,
 )
 from issue_agent.domain.agent_task import RuntimeName
-from issue_agent.domain.actions import (
-    AgentKind,
-    CancelWorkflowRuns,
-    EscalateCiPending,
-    Relabel,
-    RunAgent,
-    Target,
-)
-from issue_agent.domain.fix import (
-    FixConfig,
-    FixState,
-    InFlightFix,
-    breaker_key,
-    decide_fix,
-)
+from issue_agent.domain.actions import AgentKind, RunAgent
+from issue_agent.domain.fix import breaker_key
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.backoff import machine_backoff_until
-from issue_agent.app.planners.schemas import ROUTER_SCHEMA
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -111,27 +82,15 @@ from issue_agent.domain.contracts import (
     ReservationId,
     RunId,
 )
-from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.review import (
     BoundReviewState,
-    FixHold,
     ReviewConfig,
-    ReviewMode,
     decide_bound_review,
     fix_hold_ceiling_seconds,
     hold_review_dispatch,
 )
-from issue_agent.domain.world import (
-    Check,
-    ClosingRef,
-    IssueView,
-    PRView,
-    PullRequestDiff,
-    Review,
-    REVIEW_CHANGES_REQUESTED,
-    WorldState,
-)
+from issue_agent.domain.world import IssueView, WorldState
 
 
 
@@ -451,7 +410,7 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
     assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
 
 
-def test_effect_recovery_drains_remote_actions_and_agent_publications():
+def test_effect_recovery_reconciles_workflows_then_drains_remote_actions():
     calls = []
 
     class Recovery:
@@ -463,38 +422,21 @@ def test_effect_recovery_drains_remote_actions_and_agent_publications():
             calls.append(self.name)
             return self.count
 
-    recovery = EffectRecovery(
-        Recovery("actions", 2),
-        Recovery("publications", 3),
-    )
+    def reconcile():
+        calls.append("workflows")
+        return 3
+
+    recovery = EffectRecovery(Recovery("actions", 2), reconcile)
 
     assert recovery.drain_pending_commands() == 5
-    assert calls == ["actions", "publications"]
+    assert calls == ["workflows", "actions"]
 
-from test_dispatch import (
-    FakeRunner,
-    FakeWorktrees,
-    RaisingRunner,
-    SchemaRunner,
-    _gate,
-    _val,
-)
+from test_dispatch import FakeRunner, FakeWorktrees
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
-from tests.fakes.accounted_dispatch import with_resolve_authority
-from tests.fakes.accounted_workflow import issue_recovery_state
-from tests.fakes.accounted_workflow import attach_workflow_authority, resolve_state
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 FIX_BOT = "fix-bot"
 
 
-def _fix_state(store, world, *args, **kwargs):
-    """Behavior fixtures supply isolated SQL authority explicitly."""
-    workflows = attach_workflow_authority(FakeGateway(
-        issues={i.number: i for i in world.issues},
-        prs={p.number: p for p in world.prs},
-    ), store, resolve_ceiling=3, pr_repair=True)
-    return read_fix_state(store, world, *args, workflow_control=workflows, **kwargs)
 
 
 def _control(tmp_path) -> SQLiteControlStore:
@@ -503,61 +445,8 @@ def _control(tmp_path) -> SQLiteControlStore:
     return control
 
 
-def _dispatcher(gw, store, runner, **overrides):
-    kwargs = dict(
-        # Pinned model: keeps the difficulty-router leg out of these scripted
-        # sequences (see test_fix_workflow's routing tests for the unpinned path).
-        fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
-        review=ReviewTaskConfig("o/r", review_prompt="p"),
-        fix_bot=FIX_BOT,
-    )
-    kwargs.update(overrides)
-    cfg = DispatchConfig(**kwargs)
-    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return with_review_authority(with_resolve_authority(AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor)))
 
 
-def _cfg(**overrides):
-    kwargs = dict(fix_bot=FIX_BOT)
-    kwargs.update(overrides)
-    return FixConfig(**kwargs)
-
-
-def _has_run(actions, kind) -> bool:
-    return any(isinstance(a, RunAgent) and a.kind is kind for a in actions)
-
-
-def test_concurrent_router_expansions_atomically_reserve_one_shared_path():
-    reservations = DispatchPathReservations()
-    first = RunAgent(AgentKind.RESOLVE, 1)
-    second = RunAgent(AgentKind.RESOLVE, 2)
-    assert reservations.reserve(first, 1, frozenset({"src/a.py"}))
-    assert reservations.reserve(second, 2, frozenset({"src/b.py"}))
-    assert reservations.issue_for(first) == 1
-    assert reservations.issue_for(second) == 2
-
-    gate = threading.Barrier(3)
-    results: list[bool] = []
-
-    def expand(issue):
-        gate.wait()
-        results.append(
-            reservations.expand(issue, frozenset({"src/shared.py"}))
-        )
-
-    threads = [
-        threading.Thread(target=expand, args=(1,)),
-        threading.Thread(target=expand, args=(2,)),
-    ]
-    for thread in threads:
-        thread.start()
-    gate.wait()
-    for thread in threads:
-        thread.join(timeout=1)
-
-    assert sorted(results) == [False, True]
-    snapshots = {item.issue: item.paths for item in reservations.snapshot()}
-    assert sum("src/shared.py" in paths for paths in snapshots.values()) == 1
 
 
 def test_distinct_checkouts_share_durable_fix_dispatch_claims(
@@ -595,358 +484,16 @@ def test_distinct_checkouts_share_durable_fix_dispatch_claims(
 
 
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
-def test_resolve_episode_round_trip_trips_the_gate(tmp_path):
-    """Settled attempts update the same SQL episode the scheduler observes."""
-    issue = 5
-    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=True))  # error, no PR opened, no infra death
-    d = _dispatcher(gw, store, runner)
-    cfg = _cfg(max_resolve_retries=3)
-
-    def world():
-        return WorldState(issues=(
-            IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
-        ))
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert resolve_state(store).episode.failures == 1
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert _has_run(actions, AgentKind.RESOLVE)          # anti-vacuity: below cap, still dispatches
-    assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) not in actions
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert resolve_state(store).episode.failures == 2
-    assert _has_run(decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False), AgentKind.RESOLVE)
-    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert resolve_state(store).episode.failures == 3
-    assert resolve_state(store).gates
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.RESOLVE)      # at cap: withheld
-    assert any(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions)
-
-
-# ── ci-retries (PR-keyed via closing_issue) ────────────────────────────────────
-def _ci_pr(issue):
-    return observed_pr(
-        100, head_ref_name="fix/5-x", closing_issue=issue,
-        checks=(Check("unit", bucket="fail"),),
-        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT,
-    )
-
-
-def test_ci_retries_round_trip_trips_the_breaker(tmp_path):
-    """review C4. Write: FIX_CI dispatches bump ci-retries via the REAL
-    FixWorkflow.fix_ci. Read: _fix_state keys ci_retries by breaker_key(pr)
-    (== the closing issue here); decide_fix withholds RunAgent(FIX_CI) and
-    escalates the PR once the cap is hit."""
-    issue, pr = 5, 100
-    gw = FakeGateway(prs={pr: _ci_pr(issue)})
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c"))
-    d = _dispatcher(gw, store, runner)
-    cfg = _cfg(max_ci_retries=2)
-
-    def world():
-        return WorldState(prs=(_ci_pr(issue),))
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, pr)))
-    assert issue_recovery_state(store, issue).ci_failures == 1
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert _has_run(actions, AgentKind.FIX_CI)
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, pr)))
-    assert issue_recovery_state(store, issue).ci_failures == 2
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.FIX_CI)
-    assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
-
-
-@pytest.mark.parametrize("change", ["none", "head", "linkage", "checks", "empty-checks", "unknown-checks", "merged", "replacement", "ambiguous"])
-def test_composed_fix_daemon_resets_only_the_selected_settled_green_ci(tmp_path, change):
-    from issue_agent.domain.ci_history import CiAttempt
-    from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.actions import ResetCiRetries
-    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, IssueRef, PullRequestRef
-    from issue_agent.adapters.workflow_rows import load_issue_aggregate
-    from tests.fakes.workflow_authority import with_issue_recovery
-    from tests.fakes.review_workflow import held
-    from tests.adapters.test_continuation_admission import active, install_secondary
-    daemon = _codex_daemon(tmp_path)
-    dispatcher = daemon.executor._run_agent._dispatch.__self__
-    control = dispatcher.fix_workflow.workflow_control
-    sql = control._control
-    base = with_issue_recovery(resolve_snapshot(5))
-    state = replace(base.issue_recovery.state, ci_failures=2, review_failures=cc.ReviewRetryState(count=3), rebase_failures=4, resumes=5)
-    issue = replace(base, issue_recovery=replace(base.issue_recovery, state=state))
-    install_workflow(sql, issue)
-    key = WorkflowKey("o/r", PullRequestRef(100))
-    pr_base = replace(held(key=key), gates=())
-    install_workflow(sql, pr_base)
-    component = active(key, WorkflowFamily.PR_REPAIR)
-    install_secondary(sql, replace(pr_base, pr_repair=component), component)
-    observed = with_checks(_ci_pr(5), head_ref_oid="a" * 40, checks=(Check("unit", bucket="pass"),))
-    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    source = cc.CIEpisodeReset(selected.binding, selected.revision, pr_base.revision.fence, observed.head_ref_oid)
-    if change == "head":
-        observed = replace(observed, head_ref_oid="b" * 40)
-    elif change == "linkage":
-        observed = replace(observed, closing_issue=6, head_ref_name="fix/6-other")
-    elif change == "checks":
-        observed = with_checks(observed, checks=(Check("unit", bucket="fail"),))
-    elif change == "unknown-checks":
-        observed = with_checks(observed, checks_known=False)
-    elif change == "empty-checks":
-        observed = with_checks(observed, checks=())
-    elif change in {"merged", "replacement"}:
-        observed = with_checks(observed, state="MERGED", checks=(Check("unit", bucket="fail"),))
-    if change in {"replacement", "ambiguous"}:
-        dispatcher.gw.prs[101] = replace(_ci_pr(5), number=101, head_ref_oid="b" * 40)
-    dispatcher.gw.prs[100] = observed
-    dispatcher.store.append_ci_attempt(5, CiAttempt("old-head", ("unit",)))
-    from pathlib import Path
-    Path(dispatcher.store.issue_path(5, "ci-retries")).write_text("-999")
-    assert control.read_issue_recovery(selected.binding.fence.key).component.state.ci_failures == 2
-    if change == "merged":
-        from issue_agent.domain.actions import ClearIssueState
-        world = WorldState(prs=(observed,), issues=(IssueView(5, labels=frozenset({Label.AI_PR_OPEN})),))
-        state_view = read_fix_state(dispatcher.store, world, workflow_control=control)
-        planned = decide_fix(world, _cfg(), state_view, fixer_busy=True)
-        resets = [action for action in planned if isinstance(action, ResetCiRetries)]
-        assert resets == [ResetCiRetries(5, source)]
-        daemon.executor.execute(resets[0])
-        cleanup = next(action for action in planned if isinstance(action, ClearIssueState))
-        assert cleanup.source is not None
-        daemon.executor.execute(cleanup)
-    elif change == "none":
-        daemon.executor.execute(ResetCiRetries(5, source))
-    else:
-        with pytest.raises(ValueError, match="settled green PR/head linkage|ambiguous"):
-            daemon.executor.execute(ResetCiRetries(5, source))
-    with sql.transaction() as db:
-        after = load_issue_aggregate(db, selected.binding.fence.key)
-        assert after.episode == issue.episode
-    assert after.issue_recovery.state == (replace(state, ci_failures=0) if change in {"none", "merged"} else state)
-    assert bool(dispatcher.store.get_ci_history(5)) is (change not in {"none", "merged"})
-    if change == "merged":
-        from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
-        from issue_agent.domain.workflow_identity import WorkflowRevision
-        new_debt = replace(after.issue_recovery.state, ci_failures=1)
-        with sql.transaction() as db:
-            persist_workflow_snapshot(db, replace(after,
-                revision=WorkflowRevision(after.revision.fence, after.revision.version+1),
-                issue_recovery=replace(after.issue_recovery, state=new_debt)))
-        dispatcher.store.append_ci_attempt(5, CiAttempt("new-head", ("unit",)))
-        daemon.executor.execute(ResetCiRetries(5, source))
-        assert control.read_issue_recovery(selected.binding.fence.key).component.state == new_debt
-        assert len(dispatcher.store.get_ci_history(5)) == 1
-        dispatcher.gw.prs[101] = replace(_ci_pr(5), number=101, head_ref_oid="b" * 40)
-        with pytest.raises(ValueError, match="settled green PR/head linkage"):
-            daemon.executor.execute(ResetCiRetries(5, source))
-        assert control.read_issue_recovery(selected.binding.fence.key).component.state == new_debt
-
-
-# ── rebase-retries (PR-keyed via closing_issue) ────────────────────────────────
-def _rebase_pr(issue):
-    return observed_pr(
-        200, head_ref_name="fix/6-y", closing_issue=issue, mergeable="CONFLICTING",
-        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT,
-    )
-
-
-def test_rebase_retries_round_trip_trips_the_breaker(tmp_path):
-    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
-    """review C4. Write: REBASE dispatches bump rebase-retries via the REAL
-    FixWorkflow.rebase. Read/decide as above, for the CONFLICTING-branch leg."""
-    issue, pr = 6, 200
-    gw = FakeGateway(prs={pr: _rebase_pr(issue)})
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=True))  # a failed rebase attempt, not an infra death
-    d = _dispatcher(gw, store, runner)
-    cfg = _cfg(max_rebase_retries=2)
-
-    def world():
-        return WorldState(prs=(_rebase_pr(issue),))
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.REBASE, pr)))
-    assert store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue))).component.state.rebase_failures == 1
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert _has_run(actions, AgentKind.REBASE)
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.REBASE, pr)))
-    assert store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue))).component.state.rebase_failures == 2
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.REBASE)
-    assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
-
-
-# ── review-retry (PR-keyed via closing_issue; (at, count) tuple) ──────────────
-def _review_pr(issue, submitted_at="2026-01-01T00:00:01Z"):
-    return observed_pr(
-        300, head_ref_name="fix/7-z", closing_issue=issue,
-        reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at=submitted_at),),
-        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT,
-    )
-
-
-def test_review_retry_round_trip_trips_the_breaker(tmp_path):
-    """review C4. Write: ADDRESS_REVIEW dispatches bump review-retry (keyed to
-    the review's submitted_at) via the REAL FixWorkflow.address_review. Read/
-    decide: decide_fix compares the SAME submitted_at before trusting the
-    stored count (a superseding review would reset it — not exercised here)."""
-    issue, pr = 7, 300
-    gw = FakeGateway(prs={pr: _review_pr(issue)})
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="a"))
-    d = _dispatcher(gw, store, runner)
-    cfg = _cfg(max_review_retries=2)
-
-    def world():
-        return WorldState(prs=(_review_pr(issue),))
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, pr)))
-    assert review_retry_pair(store, issue) == ("2026-01-01T00:00:01Z", 1)
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert _has_run(actions, AgentKind.ADDRESS_REVIEW)
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, pr)))
-    assert review_retry_pair(store, issue) == ("2026-01-01T00:00:01Z", 2)
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.ADDRESS_REVIEW)
-    assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
 
 
 # ── machine deaths (issue-keyed) ───────────────────────────────────────────────
-def test_machine_death_leaves_attempts_unchanged_and_redispatches_only_after_backoff(tmp_path):
-    """review C4 / C3, and the rule that machine failures are never issue debt.
-    Write: a RESOLVE session that dies pre-result (raises, never returns) is a
-    reclaimed run, a machine end. Read/decide: the issue's attempts do not
-    move; the next RESOLVE waits out the doubling backoff from the last death,
-    then dispatches again. Five deaths in a row never escalate."""
-    issue = 8
-    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
-    store = Store(state_dir=str(tmp_path))
-    class LaunchedDeath(RaisingRunner):
-        async def run(self, task):
-            store._workflow_db.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
-                expected_owner_id="o/r:fix:fixture", pid=123, pgid=123, process_start_ticks=99)
-            return await super().run(task)
-    d = _dispatcher(gw, store, LaunchedDeath())
-    cfg = _cfg()
-
-    def world(at):
-        return WorldState(issues=(
-            IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
-        ), now=at.isoformat().replace("+00:00", "Z"))
-
-    for deaths in range(1, 6):
-        with pytest.raises(RuntimeError):
-            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-        ends = store._workflow_db.fix_leg_ends("o/r", issue)
-        assert [end.machine for end in ends] == [True] * deaths
-        assert resolve_state(store, issue).episode.failures == 0
-        due = max(end.ended_at for end in ends) + min(timedelta(seconds=60 * 2 ** (deaths - 1)), timedelta(hours=1))
-        early = decide_fix(world(due - timedelta(seconds=1)), cfg, _fix_state(store, world(due)), fixer_busy=False)
-        assert not _has_run(early, AgentKind.RESOLVE)
-        assert not any(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in early)
-        assert _has_run(decide_fix(world(due), cfg, _fix_state(store, world(due)), fixer_busy=False), AgentKind.RESOLVE)
 
 
-def test_routed_resolve_deaths_double_the_backoff_despite_normal_router_legs(tmp_path):
-    """Slice 3 review finding 1. With FIX_MODEL unpinned every RESOLVE dispatch
-    first runs the difficulty router, which returns normally, then the RESOLVE
-    leg dies pre-result. Only the leg that ended the dispatch counts, so the
-    wait still doubles per death instead of staying at the 60s base."""
-    issue = 8
-    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
-    store = Store(state_dir=str(tmp_path))
-
-    class RouteOkResolveDies:
-        def __init__(self):
-            self.routed = 0
-
-        async def run(self, task):
-            if task.schema is ROUTER_SCHEMA:
-                self.routed += 1
-                return AgentResult(is_error=False, session_id="rt", structured={"tier": "standard"})
-            store._workflow_db.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
-                expected_owner_id="o/r:fix:fixture", pid=123, pgid=123, process_start_ticks=99)
-            raise RuntimeError("stream closed before any result")
-
-    runner = RouteOkResolveDies()
-    d = _dispatcher(gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"))
-    waits = []
-    for _ in range(5):
-        with pytest.raises(RuntimeError):
-            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-        ends = store._workflow_db.fix_leg_ends("o/r", issue)
-        until = machine_backoff_until(ends, AgentKind.RESOLVE)
-        assert until is not None
-        waits.append((until - max(end.ended_at for end in ends)).total_seconds())
-    assert runner.routed == 5
-    assert waits == [60.0, 120.0, 240.0, 480.0, 960.0]
 
 
 # ── C4 key-agreement: breaker_key(pr) vs gateway.issue_for_pr(pr) ──────────────
-def test_breaker_key_agrees_with_gateway_issue_for_pr_when_issueless(tmp_path):
-    """review C4 (the PR #112 class). A PR with NO closing-ref AND a
-    non-numeric branch is genuinely issueless: domain.fix.breaker_key falls
-    back to -pr.number.
-
-    FixWorkflow.fix_ci/rebase/address_review all early-return WITHOUT writing
-    anything for such a PR (`if issue is None: return`) — and decide_fix's own
-    routing never dispatches those kinds on an issueless PR in the first place
-    (see fix.py's `issue_n is None` branch), so there is no "workflow write"
-    for ci/rebase/review-retry to round-trip here at all. The ONE production
-    writer that ever touches a PR's negated key is AgentDispatcher.dispatch's
-    exception-bump path (`key = issue if issue is not None else -action.number`),
-    which is common to every PR-keyed AgentKind — so REVIEW stands in for it.
-    This proves the key FORMULA agrees; see the report for the write-side gap
-    this surfaces (not a bug: decide_fix's own gating makes it moot)."""
-    pr = observed_pr(400, head_ref_name="feat/ACME-2468-x")  # no closing_issue, non-numeric branch
-    assert issue_from_branch(pr.head_ref_name) is None  # sanity: genuinely issueless
-    assert breaker_key(pr) == -400
-
-    gw = FakeGateway(prs={pr.number: pr})
-    store = Store(state_dir=str(tmp_path))
-    d = _dispatcher(gw, store, RaisingRunner())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, pr.number)))
-
-    state = _fix_state(store, WorldState(prs=(pr,)))
-    assert breaker_key(pr) not in state.leg_ends
-    assert not _has_run(decide_fix(WorldState(prs=(pr,)), _cfg(), state, False), AgentKind.FIX_CI)
 
 
-def test_breaker_key_agrees_with_gateway_issue_for_pr_when_branch_numbered_no_closing_ref(tmp_path):
-    """review C4. The other half of #112: NO closing-ref, but the branch DOES
-    encode an issue number (the fixer's own branch-naming convention). Both
-    key implementations must resolve to the SAME real issue number, never the
-    negated PR number — write through FixWorkflow.fix_ci, read through
-    breaker_key + _fix_state."""
-    issue, pr_no = 42, 401
-    pr = observed_pr(
-        pr_no, head_ref_name=f"fix/{issue}-thing", closing_issue=None,
-        checks=(Check("unit", bucket="fail"),),
-        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT,
-    )
-    assert issue_from_branch(pr.head_ref_name) == issue
-    assert breaker_key(pr) == issue  # NOT -pr_no
-
-    gw = FakeGateway(prs={pr_no: pr})
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c"))
-    d = _dispatcher(gw, store, runner)
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, pr_no)))
-
-    # The SQL workflow charge, where `issue` comes from gateway.issue_for_pr,
-    # must land under the SAME
-    # key `_fix_state` reads via the domain's breaker_key.
-    state = _fix_state(store, WorldState(prs=(pr,)))
-    assert state.ci_retries[breaker_key(pr)] == 1
-    assert issue_recovery_state(store, issue).ci_failures == 1  # explicit: the real issue number, not -401
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -962,7 +509,7 @@ def test_breaker_key_agrees_with_gateway_issue_for_pr_when_branch_numbered_no_cl
 # ══════════════════════════════════════════════════════════════════════════════
 REVIEW_BOT = "review-bot"
 
-from tests.fakes.review_authority import review_binding, review_state, with_review_authority
+from tests.fakes.review_authority import review_binding, review_state
 
 
 def _bound_review_state(store, world):
@@ -974,402 +521,10 @@ def _bound_review_state(store, world):
     return BoundReviewState(owed=owed, unproductive_rounds=counts, control_errors=errors)
 
 
-def _open_pr(number=500, issue=9, sha="abc"):
-    return observed_pr(
-        number, head_ref_name=f"fix/{issue}-x", head_ref_oid=sha, closing_issue=issue,
-        title="t", body="b", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN",
-        author=FIX_BOT,
-    )
-
-
-def test_a_currently_running_dispatch_is_not_a_machine_end(tmp_path):
-    issue = 8
-    store = Store(state_dir=str(tmp_path))
-    world = WorldState(issues=(
-        IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_WORKING})),
-    ))
-    state = _fix_state(
-        store,
-        world,
-        (InFlightFix(issue, frozenset({"src/x.py"})),),
-    )
-
-    assert state.leg_ends.get(issue, ()) == ()
-    assert state.inflight == (InFlightFix(issue, frozenset({"src/x.py"})),)
-
-
-def test_a_raise_path_death_is_one_machine_end_not_two(tmp_path):
-    """Anti-double-count, driven through the REAL write side. A pre-result
-    transport death the process SURVIVED is reclaimed AND emits a settled
-    `transport_death` journal line; the backoff reads the run table only, so
-    it sees exactly one machine end."""
-    issue = 8
-    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
-    store = Store(state_dir=str(tmp_path))
-    journal = Journal(os.path.join(str(tmp_path), "journal.jsonl"))
-    class LaunchedDeath(RaisingRunner):
-        async def run(self, task):
-            store._workflow_db.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
-                expected_owner_id="o/r:fix:fixture", pid=123, pgid=123, process_start_ticks=99)
-            return await super().run(task)
-    runner = JournalingRuntime(LaunchedDeath(), journal, repo="o/r", role="fix")
-    d = _dispatcher(gw, store, runner)
-    world = WorldState(issues=(IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),))
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-
-    events = read_events(journal.path)
-    assert [e["event"] for e in events] == ["agent_run_start", "agent_run"]
-    assert events[1]["exit_reason"] == "transport_death"
-    assert [end.machine for end in _fix_state(store, world).leg_ends[issue]] == [True]
-
-
 # ── infra-death key split (review P1R-1) ───────────────────────────────────────
-def test_issueless_pr_has_no_invented_issue_machine_history(tmp_path):
-    store = Store(str(tmp_path))
-    pr = observed_pr(100, head_ref_name="chore/no-issue-here", closing_issue=None,
-        checks=(Check("unit", bucket="fail"),), labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT)
-    w = WorldState(prs=(pr,))
-    Path(store.issue_path(-100, "infra-deaths")).write_text("1")
-    state = _fix_state(store, w)
-    assert -100 not in state.leg_ends
-    assert not _has_run(decide_fix(w, _cfg(), state, False), AgentKind.FIX_CI)
-
-
-# ── hold reporting (harness #6) ───────────────────────────────────────────────
-def _held_world(pr_state="OPEN"):
-    """One ai-ready issue whose declared path collides with a PR's changed
-    files. `pr_state="MERGED"` is the same world after the hold RELEASES."""
-    return WorldState(
-        issues=(
-            IssueView(522, title="t", body="b", labels=frozenset({Label.AI_READY}),
-                      declared_paths=frozenset({"backend/app/x.py"})),
-        ),
-        prs=(
-            observed_pr(123, head_ref_name="fix/9-x", state=pr_state, author=FIX_BOT,
-                   changed_files=frozenset({"backend/app/x.py"})),
-        ),
-    )
-
-
-def _holds_in(journal):
-    return [e for e in read_events(journal.path) if e.get("event") == "deferred"]
-
-
-
-def test_router_predictions_are_injected_before_the_overlap_decision(tmp_path):
-    store = Store(str(tmp_path))
-    store.save_predicted_paths(522, frozenset({"backend/app/x.py"}))
-
-    enriched = _inject_predicted_paths(store, _held_world())
-
-    assert enriched.issues[0].predicted_paths == frozenset({"backend/app/x.py"})
-
-
-def test_fix_daemon_reports_a_pending_repair_hold(tmp_path, monkeypatch):
-    from issue_agent.app.config import HarnessConfig
-    from issue_agent.app.roles import compose_fix_daemon
-    from issue_agent.domain.actions import NoOp
-
-    reason = "rebase #1019 held: waiting for the current workflow's durable rebase return"
-    monkeypatch.setattr("issue_agent.app.roles.decide_fix", lambda *_args, **_kwargs: [NoOp(reason)])
-    logs = []
-
-    class QuietGateway(FakeGateway):
-        def build_world(self):
-            return WorldState()
-
-    daemon = compose_fix_daemon(
-        HarnessConfig(repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
-                      state_dir=str(tmp_path / "state")),
-        QuietGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
-        FakeRunner(AgentResult(is_error=False)), log=logs.append,
-    ).daemon
-
-    daemon.tick()
-
-    assert reason in logs
-
-
-@pytest.mark.parametrize("issue_state,pr_state,held", [
-    ("closed", "CLOSED", False),
-    ("closed", "MERGED", False),
-    ("open", "CLOSED", True),
-    ("closed", "OPEN", True),
-    (None, "OPEN", True),
-    (None, "MERGED", False),
-    (None, "", False),
-])
-def test_fix_daemon_reports_workflow_holds_only_for_open_targets(
-    tmp_path, issue_state, pr_state, held,
-):
-    from issue_agent.app.roles import compose_fix_daemon
-
-    observed = WorldState(
-        issues=() if issue_state is None else (IssueView(514, state=issue_state),),
-        prs=(observed_pr(678, state=pr_state, closing_issue=514),),
-        now="2026-10-11T00:00:00Z",
-    )
-
-    class Gateway(FakeGateway):
-        def build_world(self):
-            return observed
-
-    logs = []
-    daemon = compose_fix_daemon(
-        HarnessConfig(repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
-                      state_dir=str(tmp_path / "state"),
-                      control_authority_root=str(tmp_path / "authority")),
-        Gateway(issues=observed.issues, prs={678: observed.prs[0]}),
-        Store(str(tmp_path / "state")), FakeWorktrees(),
-        FakeRunner(AgentResult(is_error=False)), log=logs.append,
-    ).daemon
-
-    daemon.tick()
-
-    reason = "workflow 514 held: CI issue recovery authority is inactive or migration blocked"
-    assert (reason in logs) is held
-    if not held:
-        assert not any(" held:" in line for line in logs)
-
-
-def test_fix_daemon_still_cleans_up_a_closed_target_without_reporting_a_hold(tmp_path):
-    from issue_agent.app.roles import compose_fix_daemon
-
-    closed = IssueView(514, state="closed", labels=frozenset({Label.AI_PR_OPEN}),
-                       updated_at="2026-10-11T00:00:00Z")
-
-    class Gateway(FakeGateway):
-        def build_world(self):
-            return WorldState(issues=tuple(self.issues.values()), now="2026-10-11T00:00:00Z")
-
-    gateway = Gateway(issues=(closed,))
-    worktrees = FakeWorktrees()
-    logs = []
-    composition = compose_fix_daemon(
-        HarnessConfig(repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
-                      state_dir=str(tmp_path / "state"),
-                      control_authority_root=str(tmp_path / "authority")),
-        gateway, Store(str(tmp_path / "state")), worktrees,
-        FakeRunner(AgentResult(is_error=False)), log=logs.append,
-    )
-    install_workflow(composition.control, resolve_snapshot(514))
-
-    actions = composition.daemon.tick()
-
-    assert gateway.get_issue(514).labels == frozenset({Label.AI_DONE}), (logs, actions)
-    assert not any(" held:" in line for line in logs)
-
-
-def test_daemon_holds_predicted_overlap_before_every_resolve_dispatch(tmp_path):
-    """Persisted router hints must cross the real daemon decision seam."""
-    from issue_agent.app.config import HarnessConfig
-    from issue_agent.app.roles import build_fix_daemon
-
-    issue = 522
-    world = WorldState(
-        issues=(IssueView(issue, labels=frozenset({Label.AI_READY})),),
-        prs=(observed_pr(123, state="OPEN", changed_files=frozenset({"backend/app/x.py"})),),
-    )
-
-    class PredictionOverlapGateway(FakeGateway):
-        def build_world(self):
-            return world
-
-    store = Store(str(tmp_path / "state"))
-    store.save_predicted_paths(issue, ["backend/app/x.py"])
-    daemon = build_fix_daemon(
-        HarnessConfig(
-            repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
-            state_dir=str(tmp_path / "state"),
-        ),
-        PredictionOverlapGateway(), store, FakeWorktrees(),
-        FakeRunner(AgentResult(is_error=False)),
-    )
-
-    actions = [*daemon.tick(), *daemon.tick()]
-
-    assert not any(
-        isinstance(action, RunAgent)
-        and action.kind is AgentKind.RESOLVE
-        and action.number == issue
-        for action in actions
-    )
-
-
-def test_reaper_ignores_a_leg_that_finishes_during_the_world_fetch(tmp_path):
-    """The relabel race (keifu #18/#25 dual labels, 2026-08-02): a leg that
-    completes while build_world is in flight releases its reservation, and the
-    already-fetched world still shows the issue's ai-working label with no PR.
-    A reservation snapshot taken after the fetch reads "nothing active" against
-    that stale world, so the reaper requeued — and the next poll paid for — an
-    issue that was never orphaned. Reservations sampled BEFORE the fetch must
-    protect the issue for the tick that consumes that world."""
-    import sqlite3
-
-    from issue_agent.app.config import HarnessConfig
-    from issue_agent.app.roles import build_fix_daemon
-
-    release = threading.Event()
-    runner_returned = threading.Event()
-
-    class BlockingRunner:
-        def __init__(self):
-            self.tasks = []
-
-        async def run(self, task):
-            self.tasks.append(task)
-            await asyncio.to_thread(release.wait)
-            runner_returned.set()
-            return AgentResult(is_error=False)
-
-    state_dir = tmp_path / "state"
-
-    def dispatch_claims_released() -> bool:
-        # The in-memory reservation is dropped BEFORE its durable claim row
-        # (DispatchPathReservations.finish), so an empty dispatch_claims table
-        # proves the in-memory release the race needs has already happened.
-        for path in state_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            try:
-                with sqlite3.connect(path) as db:
-                    count = db.execute(
-                        "SELECT count(*) FROM dispatch_claims"
-                    ).fetchone()[0]
-                return count == 0
-            except sqlite3.Error:
-                continue
-        return False
-
-    ready = WorldState(issues=(
-        IssueView(8, labels=frozenset({Label.AI_READY}),
-                  updated_at="2026-08-02T00:00:00Z"),
-    ))
-    # What GitHub served while the leg was still running: claimed, no PR yet.
-    stale = WorldState(issues=(
-        IssueView(8, labels=frozenset({Label.AI_WORKING}),
-                  updated_at="2026-08-02T00:10:00Z"),
-    ))
-
-    class RacingGateway(FakeGateway):
-        def __init__(self):
-            super().__init__(issues={8: ready.issues[0]})
-            self.fetches = 0
-
-        def build_world(self):
-            self.fetches += 1
-            if self.fetches == 1:
-                return ready
-            if self.fetches == 2:
-                # The fetch is "in flight" and the leg completes under it.
-                release.set()
-                assert runner_returned.wait(20), "leg never completed"
-                deadline = time.monotonic() + 20
-                while not dispatch_claims_released():
-                    assert time.monotonic() < deadline, "claim never released"
-                    time.sleep(0.02)
-                return stale
-            return stale
-
-    cfg = HarnessConfig(
-        repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
-        state_dir=str(state_dir),
-    )
-    control = SQLiteControlStore(_control_store_path(cfg, str(state_dir)))
-    control.initialize()
-    from tests.fakes.workflow_authority import with_issue_recovery
-    install_workflow(control, with_issue_recovery(resolve_snapshot(8)))
-    daemon = build_fix_daemon(
-        cfg,
-        RacingGateway(), Store(str(state_dir)), FakeWorktrees(),
-        BlockingRunner(),
-    )
-
-    first = daemon.tick()
-    assert any(isinstance(a, RunAgent) and a.number == 8 for a in first)
-
-    second = daemon.tick()
-    stale_repairs = [
-        a for a in second
-        if isinstance(a, Relabel) and a.number == 8
-        and a.remove is Label.AI_WORKING
-    ]
-    assert stale_repairs == [], (
-        "the reaper repaired an issue whose leg finished during the fetch"
-    )
-    assert not any(isinstance(a, RunAgent) and a.number == 8 for a in second)
-
 
 
 # ── CI pending-deadline reporting (#30) ──────────────────────────────────────
-_STALL_CFG = FixConfig(fix_bot=FIX_BOT, ci_pending_max_seconds=3600)
-_EMPTY_FIX_STATE = FixState()
-
-
-def _stalled_world(head="sha-aaa", elapsed=3601, started="2026-07-28T12:00:00Z"):
-    """One fixer PR with a check wedged IN_PROGRESS past the deadline."""
-    return WorldState(
-        prs=(
-            observed_pr(144, head_ref_name="fix/9-x", head_ref_oid=head, state="OPEN",
-                   author=FIX_BOT, labels=frozenset({Label.AI_PR_OPEN}),
-                   checks=(Check("Test (windows-latest)", state="IN_PROGRESS",
-                                 started_at=started),)),
-        ),
-        now=(
-            datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
-            + timedelta(seconds=elapsed)
-        ).isoformat(),
-    )
-
-
-def _stalls_in(journal):
-    return [
-        e for e in read_events(journal.path) if e.get("event") == "ci_pending_deadline"
-    ]
-
-
-def _steps_in(journal):
-    return [
-        e for e in read_events(journal.path) if e.get("event") == "ci_stall_step"
-    ]
-
-
-
-def _wedged_run_world(head="sha-aaa", elapsed=3601):
-    """A stalled PR whose pinning check carries a workflow-run identity, so the
-    harness can cancel it instead of handing it to a human (keifu PR #177)."""
-    w = _stalled_world(head=head, elapsed=elapsed)
-    pr = w.prs[0]
-    return replace(
-        w, prs=(with_checks(pr, checks=(replace(pr.checks[0], run_id=4242),)),)
-    )
-
-
-def _cancelled_state(at="2026-07-28T13:00:01+00:00"):
-    return FixState(ci_cancel_head={144: f"sha-aaa@{at}"})
-
-
-
-def _green_after_cancel_world(head="sha-aaa"):
-    """Current Clear CI must obsolete an earlier cancellation marker."""
-    w = _stalled_world(head=head)
-    pr = w.prs[0]
-    return replace(
-        w,
-        prs=(
-            with_checks(
-                pr,
-                checks=(
-                    replace(
-                        pr.checks[0], state="COMPLETED", bucket="pass", run_id=4242
-                    ),
-                ),
-            ),
-        ),
-    )
-
 
 
 # ── FIXER_RUNTIME=glm wiring (build_fix_daemon) ──────────────────────────────
@@ -1384,7 +539,7 @@ def _green_after_cancel_world(head="sha-aaa"):
 class _BuildableGateway(FakeGateway):
     """FakeGateway plus the one member `build_fix_daemon` binds at build time."""
 
-    def build_world(self):  # pragma: no cover - never ticked in these tests
+    def build_fix_world(self):  # pragma: no cover - never ticked in these tests
         raise AssertionError("these tests build the daemon, they do not tick it")
 
     def build_review_world(self):  # pragma: no cover - never ticked in these tests
@@ -1495,43 +650,9 @@ def test_a_malformed_glm_profile_is_not_ready_rather_than_a_traceback(tmp_path, 
 # The log line IS the contract here: an operator watching three healthy daemons
 # reasonably concludes the daemons are doing the same thing, so these assert on
 # the rendered text.
-def test_the_fix_and_review_capability_lines_name_what_the_role_can_do():
-    from issue_agent.app.roles import fix_capability_line, review_capability_line
-
-    fix = fix_capability_line(
-        auto_merge=False, auto_rebase=True, escalate_on_evidence=False,
-
-    )
-    review = review_capability_line(can_approve=False, adopt_unlabeled=True)
-
-    assert "fix: capabilities:" in fix
-    assert "auto_merge=off" in fix and "auto_rebase=on" in fix
-    assert "escalate_on_evidence=off" in fix
-    # approve=off is solo mode: the reviewer reviews but nothing it does merges.
-    assert "review: capabilities:" in review
-    assert "approve=off" in review and "adopt_unlabeled=on" in review
 
 
 # ── #29: a codex fixer announces that MAX_BUDGET_USD bounds nothing ──────────
-
-
-def _codex_daemon(tmp_path, **env):
-    from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_fix_daemon
-
-    cfg = replace(
-        from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "codex",
-            **_role_state_env(tmp_path), "MAX_BUDGET_USD": "20",
-            "AGENT_MAX_RUNTIME_SECONDS": "3600", **env,
-        }),
-        control_authority_root=str(tmp_path / "machine-state"),
-    )
-    return build_fix_daemon(
-        cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
-        FakeRunner(AgentResult(is_error=False)),
-    )
-
 
 
 def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
@@ -1641,7 +762,7 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path, monkeyp
         issues={150: IssueView(150, title="dashboard health", state="open")},
         fail_on={"issue_for_pr"},
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
     from tests.app.review_acceptance_harness import register_review_launch
     from issue_agent.domain.outcome import ExitReason
     runner = ScriptedProvider([
@@ -1717,7 +838,7 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
     gateway = RelinkedReviewGateway(prs={changed.number: changed}, issues={
         number: IssueView(number, title="dashboard health", state="open") for number in (150, 151)
     })
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
     from tests.app.review_acceptance_harness import register_review_launch
     from issue_agent.domain.outcome import ExitReason
     runner = ScriptedProvider([
@@ -1794,139 +915,13 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
 
 
 # ── duplicate-PR guard reporting (#39) ───────────────────────────────────────
-_GUARD_CFG = FixConfig(fix_bot=FIX_BOT)
-
-
-def _duplicate_world(author="xnmp"):
-    """One ai-ready issue an open, NOT-ours PR already closes."""
-    return WorldState(
-        issues=(IssueView(554, title="t", labels=frozenset({Label.AI_READY})),),
-        closing_refs=(ClosingRef(pr=558, issue=554, author=author, base_ref_name="main"),),
-    )
-
-
-def _duplicates_in(journal):
-    return [
-        e for e in read_events(journal.path) if e.get("event") == "duplicate_pr_guard"
-    ]
-
-
-
-# ── confirmed-flake reporting (#38) ──────────────────────────────────────────
-def _rerun_world(bucket="pass", head="sha-1"):
-    return WorldState(
-        prs=(
-            observed_pr(144, head_ref_name="fix/9-x", head_ref_oid=head, state="OPEN",
-                   author=FIX_BOT, labels=frozenset({Label.AI_PR_OPEN}),
-                   checks=(Check("unit", bucket=bucket),)),
-        ),
-    )
-
-
-def _flakes_in(journal):
-    return [e for e in read_events(journal.path) if e.get("event") == "ci_flake"]
-
 
 
 # ── FixState carries the re-run marker (#38) ─────────────────────────────────
-def test_fix_state_reads_the_ci_rerun_marker_the_executor_wrote(tmp_path):
-    """Round trip through the REAL store: the executor's write must be the value
-    the domain reads, or the free re-run repeats forever."""
-    store = Store(str(tmp_path / "state"))
-    world = _rerun_world(bucket="fail")
-    assert _fix_state(store, world).ci_rerun_head[144] == ""   # fresh PR: unspent
-    from tests.fakes.accounted_workflow import seed_verified_ci_rerun
-    seed_verified_ci_rerun(store, 144, "sha-1")
-    assert _fix_state(store, world).ci_rerun_head[144] == "sha-1"
-    # ...and that is exactly what stops a second free re-run on the same head.
-    actions = decide_fix(world, _GUARD_CFG, _fix_state(store, world), fixer_busy=False)
-    assert RunAgent(AgentKind.FIX_CI, 144) in actions
 
 
-@pytest.mark.parametrize("legacy_hint", [False, True])
-def test_unknown_actual_ci_rerun_blocks_paid_repair_after_restart(tmp_path, legacy_hint):
-    from types import SimpleNamespace
-    from pathlib import Path
-    from tests.app.test_control_record_isolation import workflow_control
-    from tests.fakes.accounted_workflow import install_pr_repair_authority
-    from tests.adapters.test_effects import Gateway
-    from issue_agent.adapters.effects import GitHubEffectExecutor
-    from issue_agent.domain.actions import RerunFailedChecks
-    from tests.app.test_durable_workflow_composition import Crash
-    control, authority = workflow_control(tmp_path, numbers=(9,))
-    store = Store(str(tmp_path / "state"))
-    object.__setattr__(store, "_workflow_db", control)
-    object.__setattr__(store, "_workflow_authority", authority)
-    gateway = Gateway()
-    gateway.head = "sha-1"
-    gateway.ci_state = "failure"
-    world = _rerun_world(bucket="fail")
-    world = replace(world, prs=(with_checks(world.prs[0], checks=(Check("unit", bucket="fail", run_id=42),)),))
-    install_pr_repair_authority(SimpleNamespace(prs={144: world.prs[0]}), store)
-    baseline = decide_fix(world, _GUARD_CFG, _fix_state(store, world), fixer_busy=False)
-    assert RerunFailedChecks(144, "sha-1", (42,)) in baseline
-    def lose_reply(*args):
-        gateway.calls.append(("rerun", "sha-1", (42,)))
-        raise Crash("rerun success reply is unavailable")
-    gateway.rerun_failed_checks = lose_reply
-    if legacy_hint:
-        Path(store.pr_path(144, "ci-rerun-head")).parent.mkdir(parents=True, exist_ok=True)
-        Path(store.pr_path(144, "ci-rerun-head")).write_text("sha-1")
-    effect = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
-    with pytest.raises(Crash):
-        effect.execute(RerunFailedChecks(144, "sha-1", (42,)))
-    restarted = _fix_state(store, world)
-    actions = decide_fix(world, _GUARD_CFG, restarted, fixer_busy=False)
-    assert RunAgent(AgentKind.FIX_CI, 144) not in actions
-    assert RerunFailedChecks(144, "sha-1", (42,)) not in actions
-    gateway.advance_run_attempts()
-    restarted_effect = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
-    assert restarted_effect.execute(RerunFailedChecks(144, "sha-1", (42,)))
-    assert restarted_effect.execute(RerunFailedChecks(144, "sha-1", (42,)))
-    assert gateway.calls == [("rerun", "sha-1", (42,))]
-    fresh = _fix_state(store, world)
-    assert RunAgent(AgentKind.FIX_CI, 144) in decide_fix(world, _GUARD_CFG, fresh, fixer_busy=False)
-    next_world = replace(world, prs=(with_checks(world.prs[0], head_ref_oid="sha-2", checks=(Check("unit", bucket="fail", run_id=43),)),))
-    assert RerunFailedChecks(144, "sha-2", (43,)) in decide_fix(next_world, _GUARD_CFG,
-        _fix_state(store, next_world), fixer_busy=False)
 
 
-def test_actual_ci_cancel_restart_wait_then_rerun_preserves_existing_progression(tmp_path):
-    from tests.app.test_control_record_isolation import workflow_control
-    from tests.fakes.accounted_workflow import install_pr_repair_authority
-    from tests.adapters.test_effects import Gateway
-    from issue_agent.adapters.effects import GitHubEffectExecutor
-    from issue_agent.domain.actions import CancelWorkflowRuns, RerunFailedChecks
-    from types import SimpleNamespace
-    control, authority = workflow_control(tmp_path, numbers=(9,))
-    store = Store(str(tmp_path / "state"))
-    object.__setattr__(store, "_workflow_db", control)
-    object.__setattr__(store, "_workflow_authority", authority)
-    world = _wedged_run_world()
-    install_pr_repair_authority(SimpleNamespace(prs={144: world.prs[0]}), store)
-    gateway = Gateway()
-    gateway.head = world.prs[0].head_ref_oid
-    planned = decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
-    cancels = [action for action in planned if isinstance(action, CancelWorkflowRuns)]
-    assert len(cancels) == 1
-    assert cancels[0].run_ids == (4242,)
-    effect = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
-    gateway.get_pr = lambda number, **kwargs: world.prs[0]
-    assert effect.execute(cancels[0])
-    waiting = decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
-    assert not any(isinstance(action, (CancelWorkflowRuns, RerunFailedChecks, RunAgent)) for action in waiting)
-    failed = replace(world, prs=(with_checks(world.prs[0], checks=(Check("unit", bucket="fail", run_id=4242),)),))
-    gateway.run_states[4242] = "completed"
-    gateway.get_pr = lambda number, **kwargs: failed.prs[0]
-    reruns = [action for action in decide_fix(failed, _STALL_CFG, _fix_state(store, failed), fixer_busy=False)
-              if isinstance(action, RerunFailedChecks)]
-    assert reruns == [RerunFailedChecks(144, gateway.head, (4242,))]
-    restarted = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
-    assert restarted.execute(reruns[0])
-    assert restarted.execute(reruns[0])
-    final = decide_fix(failed, _STALL_CFG, _fix_state(store, failed), fixer_busy=False)
-    assert RunAgent(AgentKind.FIX_CI, 144) in final
-    assert gateway.calls == [("cancel", gateway.head, (4242,)), ("rerun", gateway.head, (4242,))]
 
 
 def _held_pr(number=581, issue=500):
@@ -2032,16 +1027,6 @@ def test_an_unreadable_control_store_fails_open_to_dispatch(tmp_path):
     ) == {}
 
 
-def _fix_holds_in(journal):
-    return [
-        event
-        for event in read_events(journal.path)
-        if event.get("event") == "deferred"
-        and event.get("reason") == "fix_leg_active"
-    ]
-
-
-
 def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):
     """`breaker_key` falls back to -PR for a PR with no closing ref and a
     non-numeric branch; the fixer claims under that key, so the review side has
@@ -2063,36 +1048,6 @@ def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):
     assert [hold.pr for hold in plan.deferred] == [617]
 
 
-@pytest.mark.parametrize("cancel_still_gates", [False, True])
-def test_clear_current_policy_obsoletes_cancel_even_when_its_run_still_reports(tmp_path, cancel_still_gates):
-    from issue_agent.domain.checks import Observed, RequiredCheck
-    from issue_agent.domain.actions import CancelWorkflowRuns, EnableAutoMerge, EscalateCiPending
-    from tests.app.test_control_record_isolation import workflow_control
-    from tests.fakes.accounted_workflow import install_pr_repair_authority
-    from tests.adapters.test_effects import Gateway
-    from issue_agent.adapters.effects import GitHubEffectExecutor
-    from types import SimpleNamespace
-    control, authority = workflow_control(tmp_path, numbers=(9,))
-    store = Store(str(tmp_path / "state"))
-    object.__setattr__(store, "_workflow_db", control)
-    object.__setattr__(store, "_workflow_authority", authority)
-    world = _wedged_run_world()
-    install_pr_repair_authority(SimpleNamespace(prs={144: world.prs[0]}), store)
-    gateway = Gateway()
-    gateway.head = world.prs[0].head_ref_oid
-    gateway.get_pr = lambda number, **kwargs: world.prs[0]
-    action = next(a for a in decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
-        if isinstance(a, CancelWorkflowRuns))
-    assert GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture").execute(action)
-    ci = Observed(gateway.head, gateway.head, frozenset({RequiredCheck("unit")}), (
-        Check("unit", "SKIPPED" if cancel_still_gates else "SUCCESS", "pass", required=True,
-            run_id=4242 if cancel_still_gates else 9999), Check("macos", "CANCELLED", "fail", run_id=4242)))
-    current = replace(world.prs[0], ci=ci, merge_state="UNSTABLE",
-        reviews=(Review("APPROVED", "review-bot", commit_id=gateway.head),))
-    world = replace(world, prs=(current,))
-    actions = decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
-    assert any(isinstance(a, EnableAutoMerge) for a in actions)
-    assert not any(isinstance(a, EscalateCiPending) for a in actions)
 
 
 @pytest.mark.parametrize("cap_usd, blocked", [(5.0, True), (10.0, False), (50.0, False)])

@@ -1,7 +1,7 @@
 # ADR 0012 — Structural robustness invariants (post-voyage)
 
 Status: Accepted
-Governs: src/issue_agent/adapters/agent_publish.py
+Governs: src/issue_agent/domain/effect_retry.py src/issue_agent/app/cli.py
 
 Decided 2026-08-01.
 Evidence: the 2026-08-01 supervised keifu run (nine live defects; see
@@ -33,6 +33,10 @@ event and a ceiling that terminates in a human-visible state. The watchdog is
 the backstop for the paths this rule misses, not a substitute for it.
 
 ## 2. Single writer per mutable location (built: discard-check; rule: handoffs)
+
+Slice 5b (2026-10-13) deleted the publish broker this section describes: the
+agent pushes its own branch with git (refactor decision Q11). The handoff
+rule stands; the broker's fence below is history.
 
 The publish broker's leased force push is race-safe, not authorship-safe —
 an agent rebase erased an operator commit on keifu #169 (#154). Built now:

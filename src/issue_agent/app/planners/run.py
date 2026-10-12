@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from ...adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
 from ...domain.agent_task import RunIntent, RuntimeName
 from ...domain.effort import Effort
-from ...domain.resolve_return import ResolveInputs
-from ...domain.continuation_components import IssueReplyInput, LinkedPRIssueReplyInput, PRRepairInput
 
 
 @dataclass(frozen=True, init=False)
@@ -25,9 +23,6 @@ class PlannedRun:
     mcp_servers: tuple[McpServer, ...]
     subagents: tuple[SubagentDef, ...]
     env: dict[str, str]
-    resolve_inputs: ResolveInputs | None
-    issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None
-    pr_repair_input: PRRepairInput | None
 
     def __init__(
         self,
@@ -48,9 +43,6 @@ class PlannedRun:
         *,
         intent: RunIntent | None = None,
         runtime: RuntimeName | None = None,
-        resolve_inputs: ResolveInputs | None = None,
-        issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None = None,
-        pr_repair_input: PRRepairInput | None = None,
     ) -> None:
         selected_intent = intent or (
             prompt
@@ -74,15 +66,6 @@ class PlannedRun:
         object.__setattr__(self, "mcp_servers", mcp_servers)
         object.__setattr__(self, "subagents", subagents)
         object.__setattr__(self, "env", dict(env or {}))
-        if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
-            raise ValueError("resolve completion inputs must be validated")
-        object.__setattr__(self, "resolve_inputs", resolve_inputs)
-        if issue_reply is not None and not isinstance(issue_reply, (IssueReplyInput, LinkedPRIssueReplyInput)):
-            raise ValueError("issue reply launch inputs must be validated")
-        object.__setattr__(self, "issue_reply", issue_reply)
-        if pr_repair_input is not None and not isinstance(pr_repair_input, PRRepairInput):
-            raise ValueError("PR repair launch input must be validated")
-        object.__setattr__(self, "pr_repair_input", pr_repair_input)
 
     @property
     def prompt(self) -> str:
@@ -130,7 +113,4 @@ def compose_runtime_plan(plan: PlannedRun) -> RuntimePlan:
         mcp_servers=plan.mcp_servers,
         subagents=plan.subagents,
         env=plan.env,
-        resolve_inputs=plan.resolve_inputs,
-        issue_reply=plan.issue_reply,
-        pr_repair_input=plan.pr_repair_input,
     )

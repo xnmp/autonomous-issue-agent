@@ -1,13 +1,10 @@
 """Store adapter — path construction + read/write/clear round-trips + markers."""
-from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
 
 import os
 import tempfile
 from pathlib import Path
-import pytest
 
 from issue_agent.adapters.store import Store
-from issue_agent.domain.ci_history import CiAttempt
 
 def _seed_legacy_ci_counter(store, issue, count):
     Path(store.issue_path(issue, "ci-retries")).write_text(str(count))
@@ -25,81 +22,6 @@ def test_paths_are_pure():
     assert s.issue_path(5, "session") == "/state/issue-5.session"
     assert s.pr_path(100, "round") == "/state/pr-100.round"
 
-# ── CI attempt history (tauri PR #620) ──────────────────────────────────────
-def test_ci_history_survives_the_process_that_wrote_it():
-    # The whole point is that attempt N sees attempts 1..N-1, which earlier
-    # polls (possibly earlier daemon processes) recorded.
-    _, d = _store()
-    Store(state_dir=d).append_ci_attempt(5, CiAttempt("abc1234", ("unit",)))
-    assert Store(state_dir=d).get_ci_history(5) == (CiAttempt("abc1234", ("unit",)),)
-
-def test_ci_history_is_empty_before_any_attempt():
-    s, _ = _store()
-    assert s.get_ci_history(5) == ()
-
-def test_ci_history_keeps_only_the_last_five_attempts():
-    s, _ = _store()
-    for n in range(8):
-        s.append_ci_attempt(5, CiAttempt(f"sha{n}", ("unit",)))
-    assert [a.head_sha for a in s.get_ci_history(5)] == [f"sha{n}" for n in range(3, 8)]
-
-def test_ci_history_is_per_issue():
-    s, _ = _store()
-    s.append_ci_attempt(5, CiAttempt("aaa", ("unit",)))
-    s.append_ci_attempt(6, CiAttempt("bbb", ("unit",)))
-    assert [a.head_sha for a in s.get_ci_history(5)] == ["aaa"]
-    assert [a.head_sha for a in s.get_ci_history(6)] == ["bbb"]
-
-def test_a_corrupt_ci_history_file_reads_as_no_history():
-    # It is repair CONTEXT, not authority: damage costs the next leg its extra
-    # section, and must never raise out of a dispatch.
-    s, _ = _store()
-    for junk in ("not json at all", "{}", "[1, 2]", ""):
-        with open(s.issue_path(5, "ci-history"), "w") as f:
-            f.write(junk)
-        assert s.get_ci_history(5) == ()
-
-def test_appending_over_a_corrupt_ci_history_starts_a_fresh_record():
-    s, _ = _store()
-    with open(s.issue_path(5, "ci-history"), "w") as f:
-        f.write("}{ torn")
-    assert s.append_ci_attempt(5, CiAttempt("abc", ("unit",))) == (
-        CiAttempt("abc", ("unit",)),
-    )
-    assert s.get_ci_history(5) == (CiAttempt("abc", ("unit",)),)
-
-def test_an_operator_retry_unblock_also_forgets_the_attempt_history():
-    s, _ = _store()
-    _seed_legacy_ci_counter(s, 5, 3)
-    s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
-
-    assert not hasattr(s, "clear_retries")
-
-    assert s.get_ci_history(5) == (CiAttempt("abc", ("unit",)),)
-
-def test_advisory_ci_history_clear_does_not_mutate_retained_legacy_counter():
-    s, _ = _store()
-    _seed_legacy_ci_counter(s, 5, 2)
-    s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
-
-    s.clear_ci_history(5)
-
-    assert _legacy_ci_counter(s, 5) == 2
-    assert s.get_ci_history(5) == ()
-
-def test_a_merged_pr_forgets_its_attempt_history():
-    s, _ = _store()
-    s.append_ci_attempt(9, CiAttempt("abc", ("unit",)))
-    s.cleanup_pr(100, 9, merged=True)
-    assert s.get_ci_history(9) == ()
-
-def test_a_requeued_issue_does_not_inherit_the_dead_prs_attempt_history():
-    # A closed-unmerged requeue opens a NEW PR; carrying the old PR's attempts
-    # would tell its first repair leg it is mid-loop on failures it never had.
-    s, _ = _store()
-    s.append_ci_attempt(9, CiAttempt("abc", ("unit",)))
-    s.cleanup_pr(100, 9, merged=False)
-    assert s.get_ci_history(9) == ()
 
 # review M3/T2: the old `test_write_is_atomic_and_leaves_no_tmp_file` above
 # passed against a truncate-and-write implementation (it only ever checked
@@ -200,105 +122,16 @@ def test_ci_pending_escalated_head_marker_roundtrip():
     for name in ("get_ci_pending_escalated_head", "set_ci_pending_escalated_head", "get_update_branch_head", "set_update_branch_head"):
         assert not hasattr(s, name)
 
-def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
-    # The PR is gone; a stale marker under a recycled number would silently
-    # suppress the next PR's free re-run.
-    s, _ = _store()
-    from pathlib import Path
-    marker = Path(s.pr_path(100, "ci-rerun-head"))
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("sha-1")
-    s.cleanup_pr(100, 9, merged=True)
-    assert marker.read_text() == "sha-1"
 
 
-def test_clear_issue_removes_all():
-    s, _ = _store()
-    seed_retained_issue_file(s, 5, "session", "x")
-    _seed_legacy_ci_counter(s, 5, 2)
-    Path(s.issue_path(5, "rebase-retries")).write_text("1")
-    seed_retained_issue_file(s, 5, "resumed-at", "t")
-    seed_retained_issue_file(s, 5, "phase", "authored")
-    s._clear_issue_advisory(5)
-    assert retained_issue_file(s, 5, "session") == "x"
-    assert _legacy_ci_counter(s, 5) == 2
-    assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
-    assert retained_issue_file(s, 5, "phase") == "authored"           # retained stopped evidence
 
-def test_clear_issue_does_not_touch_pr_automerge_marker():
-    # review M4: `automerge` is a PR suffix now — clear_issue must not remove
-    # issue-N.automerge (the drift this fixes: that file was never written by
-    # anything, so removing it was a no-op masquerading as cleanup).
-    s, _ = _store()
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s._clear_issue_advisory(9)
-    assert Path(s.pr_path(100, "automerge")).exists()
 
-def test_cleaners_retain_retired_resolve_files_as_import_evidence():
-    # ADR 0015: resolve episodes live in SQLite. Stopped legacy files are the
-    # offline importer's evidence, so no cleaner or unblock may delete them.
-    s, root = _store()
-    retries = os.path.join(root, "issue-5.resolve-retries")
-    last_error = os.path.join(root, "issue-5.last-error")
-    for path, content in ((retries, "3"), (last_error, "tests failed")):
-        with open(path, "w", encoding="utf-8") as stream:
-            stream.write(content)
-    assert not hasattr(s, "clear_retries")
-    s.cleanup_pr(100, 5, merged=False)
-    s.cleanup_pr(100, 5, merged=True)
-    s._clear_issue_advisory(5)
-    with open(retries, encoding="utf-8") as stream:
-        assert stream.read() == "3"
-    with open(last_error, encoding="utf-8") as stream:
-        assert stream.read() == "tests failed"
-    assert not any(hasattr(s, name) for name in (
-        "get_resolve_retries", "set_resolve_retries", "reset_resolve_episode",
-        "get_last_resolve_error", "set_last_resolve_error",
-    ))
 
-def test_clear_pr_state():
-    s, _ = _store()
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s._clear_pr_advisory(100)
-    assert not Path(s.pr_path(100, "automerge")).exists()  # review M4: the real marker, now cleared
 
 # ── merged/closed-unmerged cleanup orchestration (review M4/D8) ────────────
-def test_cleanup_pr_merged_clears_full_issue_state_and_automerge_marker():
-    s, _ = _store()
-    seed_retained_issue_file(s, 9, "session", "sess-1")
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s.cleanup_pr(100, 9, merged=True)
-    assert retained_issue_file(s, 9, "session") == "sess-1"
-    assert not Path(s.pr_path(100, "automerge")).exists()
 
-def test_cleanup_pr_closed_unmerged_keeps_infra_deaths():
-    # review M4/D8 + handover §5.7: fewer retries after a human closed the PR
-    # is deliberate — only the resume-blocking markers clear.
-    s, _ = _store()
-    seed_retained_issue_file(s, 9, "session", "sess-1")
-    seed_retained_issue_file(s, 9, "phase", "authoring")
-    seed_retained_issue_file(s, 9, "resumed-at", "2026-09-01T00:00:00Z")
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s.cleanup_pr(100, 9, merged=False)
-    assert retained_issue_file(s, 9, "session") == "sess-1"
-    assert retained_issue_file(s, 9, "phase") == "authoring"
-    assert retained_issue_file(s, 9, "resumed-at") == "2026-09-01T00:00:00Z"
-    # closed-unmerged is silent on PR-side state (spec covers issue state only)
-    assert Path(s.pr_path(100, "automerge")).exists()
 
-def test_cleanup_pr_issueless_merged_only_clears_pr_state():
-    s, _ = _store()
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s.cleanup_pr(100, None, merged=True)
-    assert not Path(s.pr_path(100, "automerge")).exists()
 
-def test_cleanup_pr_issueless_unmerged_is_a_noop():
-    # anti-vacuity twin for the case above: an issueless closed-unmerged PR
-    # has no issue state to clear and cleanup_pr must not crash on None.
-    s, _ = _store()
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s.cleanup_pr(100, None, merged=False)
-    assert Path(s.pr_path(100, "automerge")).exists()
 
 # ── P1R-16: an issueless PR's NEGATED-key counters were never cleaned ───────
 # `domain.fix.breaker_key` falls back to the NEGATED pr number for a PR with
@@ -308,21 +141,7 @@ def test_cleanup_pr_issueless_unmerged_is_a_noop():
 # this namespace leaked forever — reachable in production any time an
 # issueless PR's fixer leg dies pre-result enough times to trip the infra
 # ceiling and then gets merged/closed.
-def test_cleanup_pr_issueless_merged_clears_the_negated_key_issue_state():
-    s, _ = _store()
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s.cleanup_pr(100, None, merged=True)
-    assert not Path(s.pr_path(100, "automerge")).exists()       # PR-side still clears (regression guard)
 
-def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
-    # anti-vacuity twin, mirroring the real-issue conservatism (handover
-    # §5.7): the closed-unmerged path clears only resume-blocking markers, so
-    # infra-deaths under the negated key must survive — proving the fix
-    # routes through clear_issue_resume_state, not a blanket clear_issue.
-    s, _ = _store()
-    Path(s.pr_path(100, "automerge")).write_text("")
-    s.cleanup_pr(100, None, merged=False)
-    assert Path(s.pr_path(100, "automerge")).exists()        # PR-side untouched, as before
 
 def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open():
     s, _ = _store()
@@ -332,24 +151,6 @@ def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open()
     s.save_predicted_paths(5, ["src/action.rs", "../outside.rs"])
     assert s.get_predicted_paths(5) == frozenset()
 
-def test_retired_review_files_survive_cleanup_as_import_evidence():
-    s, _ = _store()
-    evidence = {"session": "claude:review-session", "round": "19",
-                "last-sha": "a" * 40, "patch-id": "b" * 64,
-                "operator-guidance": "Scope: naïve parser — preserve assertions 🚫"}
-    for suffix, value in evidence.items():
-        with open(s.pr_path(100, suffix), "w", encoding="utf-8") as stream:
-            stream.write(value)
-    s._clear_pr_advisory(100)
-    s.cleanup_pr(100, 9, merged=True)
-    for suffix, value in evidence.items():
-        with open(s.pr_path(100, suffix), encoding="utf-8") as stream:
-            assert stream.read() == value
-    assert not any(hasattr(s, name) for name in (
-        "get_pr_session", "save_pr_session", "get_round", "set_round", "clear_pr_review",
-        "get_last_sha", "set_last_sha", "get_last_patch_id", "set_last_patch_id",
-        "get_operator_guidance", "set_operator_guidance", "clear_operator_guidance",
-    ))
 
 def test_store_has_no_retired_continuity_authority_surface():
     store = Store("/unused")

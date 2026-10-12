@@ -10,25 +10,14 @@ Failure contracts are explicit:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterable
 from datetime import datetime
-from pathlib import Path
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .actions import Action
-from .ci_history import CiAttempt
 from .events import TelemetryEvent
-from .contracts import (
-    BudgetScope,
-    LifecycleCommand,
-    Money,
-    PriceQuote,
-    ReservationId,
-    RunId,
-)
-from .world import IssueView, PRView, PullRequestDiff, WorldState
-from .resolve_workspace import ContractResetResult, ObservedResolveBase, EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
+from .contracts import RunId
+from .world import IssueView, PRView, PullRequestDiff
 
 T = TypeVar("T")
 
@@ -69,7 +58,6 @@ class WorkflowGitHubReads(GitHubReads, Protocol):
     def pr_diff(
         self, pr: int, base_oid: str, head_oid: str
     ) -> PullRequestDiff: ...
-    def build_world(self) -> WorldState: ...
     def review_comments(self, pr: int) -> str: ...
     def failed_run_log(self, head: str, run_ids: tuple[int, ...]) -> str: ...
 
@@ -83,11 +71,6 @@ class WorkflowState(Protocol):
     def save_predicted_paths(
         self, issue: int, paths: frozenset[str]
     ) -> None: ...
-    # Missing bounded context does not change admission authority.
-    def get_ci_history(self, issue: int) -> tuple[CiAttempt, ...]: ...
-    def append_ci_attempt(
-        self, issue: int, attempt: CiAttempt
-    ) -> tuple[CiAttempt, ...]: ...
 
 
 class ActionExecutor(Protocol):
@@ -106,29 +89,6 @@ class ActionExecutor(Protocol):
 
 
 
-@runtime_checkable
-class WorktreePort(Protocol):
-    """Local checkout ownership.
-
-    ``branch_for_issue`` returns ``None`` only when no checkout exists. Invalid
-    or unsafe paths and command failures raise; callers must not infer absence.
-    """
-
-    def ensure(self, issue: int, branch: str) -> str: ...
-    def remove(self, issue: int) -> None: ...
-    def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str | None: ...
-
-
-class FixWorktreePort(WorktreePort, Protocol):
-    def observe_and_pin_episode_base(self, repository: str, *, observed_at: datetime, approved_host: str = "github.com") -> ObservedResolveBase: ...
-
-    def prepare_episode_workspace(self, handoff: EpisodeWorkspaceHandoff, *, approved_host: str = "github.com") -> ContractResetResult: ...
-
-    def verify_episode_workspace(self, completed: EpisodeWorkspacePrepared, *, approved_host: str = "github.com") -> None: ...
-
-    def episode_workspace_path(self, completed: EpisodeWorkspacePrepared) -> str: ...
-
-
 class EventSink(Protocol):
     """Best-effort typed telemetry only; never a control-state reader.
 
@@ -145,35 +105,6 @@ class Clock(Protocol):
     def now(self) -> datetime: ...
     def monotonic_ns(self) -> int: ...
     def sleep(self, seconds: float) -> None: ...
-
-
-class AccountingStatus(str):
-    AVAILABLE = "available"
-    EXHAUSTED = "exhausted"
-    UNAVAILABLE = "unavailable"
-    CORRUPT = "corrupt"
-    CONFLICT = "conflict"
-
-
-class SpendAccount(Protocol):
-    """Transactional paid-admission authority.
-
-    Every mutation is idempotent. Expected exhaustion/unavailability/conflict
-    is returned as a typed disposition; malformed requests raise before I/O.
-    """
-
-    def snapshot(self, scope: BudgetScope) -> object: ...
-    def reserve(
-        self,
-        *,
-        run_id: RunId,
-        scope: BudgetScope,
-        quote: PriceQuote,
-        cap: Money,
-    ) -> object: ...
-    def settle(self, *, run_id: RunId, amount: Money, receipt_id: str) -> object: ...
-    def release(self, *, run_id: RunId, reason: str) -> object: ...
-    def reconcile(self, owner: str) -> object: ...
 
 
 class ProcessSupervisor(Protocol):
@@ -276,64 +207,3 @@ class CommandRecovery(Protocol):
     def drain_pending_commands(self) -> int: ...
 
 
-class ControlStore(Protocol):
-    """Transactional control authority.
-
-    Claims/receipts return ``False`` for an idempotent/conflicting repeat.
-    Corruption, schema, and storage failures raise and fail closed.
-    """
-
-    def transaction(self) -> AbstractContextManager[object]: ...
-    def claim(self, namespace: str, scope: str, key: str) -> bool: ...
-    def receipt(
-        self, namespace: str, scope: str, key: str, payload: Mapping[str, object]
-    ) -> bool: ...
-
-
-@runtime_checkable
-class PendingEffect(Protocol):
-    """One durable lifecycle command that is still owed to GitHub."""
-
-    @property
-    def command(self) -> LifecycleCommand: ...
-    @property
-    def state(self) -> str: ...
-
-
-@runtime_checkable
-class PendingEffectReads(Protocol):
-    """Read side of the durable lifecycle-command queue (ADR 0012).
-
-    Answers exactly one question — "is this remote write still owed?" — so a
-    caller can tell a write that was DEFERRED to the durable outbox from one
-    that was never committed at all. It never authorizes an effect and never
-    substitutes for the executor's own result. Optional: a composition without
-    it must treat an unconfirmed write as lost, which is the conservative
-    reading.
-    """
-
-    def pending_commands(
-        self,
-        *,
-        repository: str | None = None,
-        executor_identity: str | None = None,
-    ) -> tuple[PendingEffect, ...]: ...
-
-
-
-@runtime_checkable
-class PredictionReader(Protocol):
-    """Read path prediction; empty means absent, storage failures raise."""
-    def get_predicted_paths(self, issue: int) -> frozenset[str]: ...
-
-
-@runtime_checkable
-class ReviewPromptReads(Protocol):
-    """Read review context; transport failure raises."""
-    def review_comments(self, pr: int) -> str: ...
-
-
-@runtime_checkable
-class CiPromptReads(Protocol):
-    """Read CI failure context; transport failure raises."""
-    def failed_run_log(self, head: str, run_ids: tuple[int, ...]) -> str: ...

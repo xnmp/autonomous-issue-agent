@@ -6,7 +6,7 @@ from itertools import permutations
 from datetime import timedelta
 import pytest
 from tests.adapters.test_codex_child_usage import ROOT, CHILD, START, RATES, event, metadata, spawn, write
-from tests.adapters.test_accounting_runtime import _wrapper, Runtime, _publication_context_for_accounting_tests
+from tests.adapters.test_accounting_runtime import _wrapper, Runtime
 from tests.adapters import test_native_usage_accounting as native
 from issue_agent.adapters.codex_child_usage import CodexChildUsageMeter
 from issue_agent.adapters.codex_runner import read_rollout_usage
@@ -15,7 +15,6 @@ from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.contracts import Money
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.run_usage import price_run_usage, EstimatedRunUsage
-from tests.fakes.workflow_authority import resolve_snapshot
 
 def counter(tokens):
     return event('event_msg', {'type': 'token_count', 'info': {'total_token_usage': {'input_tokens': tokens, 'output_tokens': 0}}})
@@ -35,7 +34,7 @@ def test_delayed_linked_receipt_keeps_other_cumulative_spend_and_gap(tmp_path):
     observed = CodexChildUsageMeter(str(home), START, RATES, str(tmp_path)).sample(ROOT, 'sol', None, final=True)
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status='pushed', run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
-    wrapper.set_context('fix', 'RESOLVE', 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context('fix', 'RESOLVE', 1, 1)
     asyncio.run(wrapper.run(RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=2)))
     with store.transaction() as db:
         charge = tuple(db.execute('SELECT amount_micros,basis FROM charges').fetchone())
@@ -82,7 +81,7 @@ def test_delayed_child_receipt_does_not_hide_live_cap_overrun(tmp_path, monkeypa
     runner = replace(native.native_runner(tmp_path, native.native_executable(tmp_path), directory), log=logs.append)
     wrapper, store = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES, budget_policy=BudgetPolicy({('fix', 'RESOLVE'): Money('USD', cap)}))
-    wrapper.set_context('fix', 'RESOLVE', 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context('fix', 'RESOLVE', 1, 1)
     result = asyncio.run(wrapper.run(RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=cap / 1_000_000, env={'CODEX_HOME': str(tmp_path / 'codex')})))
     with store.transaction() as db:
         assert tuple(db.execute('SELECT amount_micros,basis FROM charges').fetchone()) == (charge, 'estimate')

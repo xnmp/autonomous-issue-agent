@@ -87,15 +87,7 @@ MAX_BUDGET_STATUS = "error_max_budget_usd"
 # cap has no headroom for the leg's reservation; never read from agent output.
 DAILY_HEADROOM_STATUS = "daily_headroom_exhausted"
 
-from .actions import (  # noqa: F401
-    Action,
-    ClearIssueState,
-    CloseIssue,
-    PostComment,
-    Relabel,
-    RemoveWorktree,
-    Target,
-)
+from .actions import Action, ClearIssueState, Relabel, RemoveWorktree, Target
 from .labels import Label
 from .lifecycle import attention_actions
 from .contracts import PricingBasis, WorkflowAttemptIdentity
@@ -321,6 +313,36 @@ def infra_class_failure(result: AgentResult) -> bool:
     )
 
 
+class LegClass(str, Enum):
+    """How one returned fix leg counts (design: only agent work is an attempt).
+
+    AGENT    the agent did work: one attempt.
+    ASKED    the agent returned asking a human for judgment: one attempt, and
+             the item stops for a human (derive's QUESTION stop).
+    MACHINE  the harness, provider or OS ended it: never an attempt; the item
+             backs off and the money caps bound the retries.
+    """
+
+    AGENT = "agent"
+    ASKED = "asked"
+    MACHINE = "machine"
+
+
+def classify_leg(result: "AgentResult", *, resumed: bool) -> LegClass:
+    """Classify a returned leg. A wall-cap hit is a machine failure on a fresh
+    session and an attempt on a resumed one: the item resumes once (the leg
+    runner resumes the latest machine end's session) and a second wall-cap on
+    that resume counts. A per-leg budget hit mid-run is agent work, and an
+    orderly harness teardown never is."""
+    if infra_class_failure(result) or result.exit_reason is ExitReason.OPERATOR_CANCELLED:
+        return LegClass.MACHINE
+    if result.exit_reason is ExitReason.WALL_TIMEOUT:
+        return LegClass.AGENT if resumed else LegClass.MACHINE
+    if not result.is_error and result.status == "blocked":
+        return LegClass.ASKED
+    return LegClass.AGENT
+
+
 def resumable_session(result: AgentResult) -> str:
     """The session a later leg may resume, or "" when this end left none usable."""
     if budget_exhausted(result.exit_reason) or (
@@ -454,38 +476,6 @@ class AgentResult:
         if isinstance(self.structured, dict) and name in self.structured:
             return bool(self.structured.get(name))
         return default
-
-
-def status_label(result: AgentResult) -> str:
-    """What a run ACTUALLY did, for the operator's log line — envelope first.
-
-    `result.status` is `structured_output.status`: the agent's own CLAIM about
-    itself, not an observation. The two can disagree, and did. Issue #501's first
-    resolve returned `is_error=True, exit_reason=agent_error` after 290s having
-    committed nothing, while declaring `status="success"` — and the log line,
-    which read `result.status or (…)`, printed:
-
-        agent #501: resolve — done (status=success, $1.93)
-
-    An operator (or a grep) reading that sees a clean success. `classify_outcome`
-    was never fooled — error wins there, which is why the harness correctly
-    requeued the issue — but the LOG, the thing humans actually read, said the
-    opposite of what happened. A monitoring surface that reports the agent's
-    self-assessment in place of the outcome is worse than no surface at all.
-
-    So: a failed envelope can never render as a bare success. The claim is still
-    shown, marked as a claim, because a disagreement between the two is itself
-    the interesting signal.
-    """
-    if not result.is_error:
-        return result.status or "ok"
-    reason = result.exit_reason.value if result.exit_reason else "error"
-    label = f"ERROR/{reason}"
-    if result.envelope_subtype and result.envelope_subtype != reason:
-        label += f":{result.envelope_subtype}"
-    if result.status:
-        label += f" (agent claimed {result.status!r})"
-    return label
 
 
 def classify_outcome(result: AgentResult) -> Outcome:
@@ -629,27 +619,6 @@ def resume_actions(
         return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
                                  unblock_prompt("**Agent still needs input:**", needs))
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)]
-
-
-def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
-    """Return a resumed PR-stage clarification to its PR lifecycle.
-
-    The linked issue already remains `ai-pr-open`; only the PR was blocked, so
-    changing the issue here would manufacture a second lifecycle state to keep
-    coherent. The PR stays blocked while the one-at-a-time dispatcher runs, so
-    a raised runner exception cannot strand an invented `ai-working` marker.
-    A daily-headroom refusal leaves the PR blocked with its reply unanswered.
-    """
-    if infra_death(result.exit_reason) or daily_headroom_wait(result):
-        return []
-    if budget_exhausted(result.exit_reason):
-        return pr_budget_actions(pr)
-    if classify_outcome(result) is Outcome.BLOCKED:
-        needs = result.needs or result.summary or "see logs"
-        return [
-            PostComment(Target.PR, pr, unblock_prompt("**Agent still needs input:**", needs)),
-        ]
-    return [Relabel(Target.PR, pr, Label.AI_BLOCKED, Label.AI_PR_OPEN)]
 
 
 @dataclass(frozen=True)

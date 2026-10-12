@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .actions import Action, AgentKind, MergePullRequest, PostComment, Relabel, RunAgent, Target, UpdateBranch
+from .actions import (
+    Action, AgentKind, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent, Target, UpdateBranch,
+)
 from .labels import Label
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, Refresh, Release,
+    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, OpenPR, Refresh, Release,
     StopReason, Wait, stop_tag, ATTEMPT_CAP, REVIEW_ROUND_CAP,
 )
 
@@ -22,9 +24,11 @@ _WHY = {
     StopReason.LIFETIME_CAP: "this issue has spent its lifetime budget; raising the cap is a grant.",
     StopReason.ATTEMPTS: f"{{act}} ran {ATTEMPT_CAP} times without progress since the last human activity.",
     StopReason.REVIEW_ROUNDS: f"the reviewer requested changes {REVIEW_ROUND_CAP} times; the dispute needs a human.",
+    StopReason.QUESTION: "the agent asked a question that needs a human's judgment (see its comment above).",
 }
 _HOW = {
     StopReason.LIFETIME_CAP: "Raise the per-issue budget, then reply here or remove the `needs-human` label.",
+    StopReason.QUESTION: "Reply here with the answer (the agent resumes with it), or remove the `needs-human` label.",
 }
 _DEFAULT_HOW = "Reply here or remove the `needs-human` label to release it."
 
@@ -51,6 +55,10 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
         return (MergePullRequest(key.number, state.head),)
     if isinstance(state, Refresh):
         return (UpdateBranch(key.number, state.head),)
+    if isinstance(state, OpenPR):
+        if key.target is not Target.ISSUE:
+            raise ValueError("a PR is opened exactly for an issue")
+        return (OpenPullRequest(key.number, state.branch),)
     if isinstance(state, Release):
         return (Relabel(key.target, key.number, remove=Label.NEEDS_HUMAN, add=None, harness_signal=True),)
     if isinstance(state, NeedsHuman):

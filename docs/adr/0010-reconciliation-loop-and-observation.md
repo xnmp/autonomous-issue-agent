@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/app/loop.py src/issue_agent/app/webhook.py src/issue_agent/app/world_probe.py src/issue_agent/adapters/github.py src/issue_agent/adapters/wake.py
+Governs: src/issue_agent/app/loop.py src/issue_agent/adapters/github.py
 
 ## Context
 
@@ -32,6 +32,10 @@ reconciliation continue.
 
 Crash/suspend recovery is a separate fail-closed trigger policy under ADR
 0006. Network fail-soft and quota admission do not become recovery arms.
+
+Slice 5b (2026-10-13) deleted the webhook wake and the world probe: every
+tick performs the full observation, and the poll interval is the only wake.
+The remaining paragraphs stand.
 
 ## Consequences
 

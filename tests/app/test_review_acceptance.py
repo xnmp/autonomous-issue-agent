@@ -34,10 +34,16 @@ from issue_agent.domain.review_workflow import (
     SupersededReviewRearm,
 )
 from issue_agent.domain.workflow import (
-    ClearGuidance, ContinueGrantedRearm, EvidenceUnavailable, OpenGate, SetGuidance, StopReason, WorkflowAbsent,
-    WorkflowCommitted, WorkflowMigrationRequired,
+    ClearGuidance,
+    ContinueGrantedRearm,
+    EvidenceUnavailable,
+    OpenGate,
+    SetGuidance,
+    StopReason,
+    WorkflowCommitted,
+    WorkflowMigrationRequired,
 )
-from tests.app.resolve_acceptance_harness import ScriptedProvider, run_until_exit
+from tests.app.acceptance_support import ScriptedProvider, run_until_exit
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.app.review_acceptance_harness import (
     ACTOR, BOT, KEY, NHR, PR, TRIGGER, child_environment, compose_review, create_review_deployment, diff_text,
@@ -1007,58 +1013,6 @@ def test_a_human_dismissal_release_buys_only_after_its_projection_is_verified(de
 
 
 # -- the fix role reads PR guidance from the review workflow, or defers ---------------------------
-
-def test_the_composed_fix_role_defers_a_repair_on_unreadable_review_guidance_then_uses_it(deployment):
-    from issue_agent.adapters.worktree import Worktrees
-    from issue_agent.app import roles
-    from issue_agent.domain.outcome import AgentResult
-
-    client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC, RC, RC)))
-    escalate(client)
-    client.request("request:scope", guidance=SetGuidance("Only judge the parser change."))
-    progress_until(client, lambda c: len(c.provider.tasks) == 3)
-    assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"  # the fixer now owes an address-review
-    from issue_agent.adapters.control_store import SQLiteControlStore
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row
-    from issue_agent.domain.workflow_identity import WorkflowFamily
-    from tests.adapters.test_continuation_admission import active, install_secondary
-    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
-    control = SQLiteControlStore(client.review.control.path)
-    control.initialize()
-    install_workflow(control, with_issue_recovery(resolve_snapshot(1)))
-    with control.transaction() as db:
-        primary = load_review_workflow_row(db, KEY)
-    assert primary is not None
-    component = active(KEY, WorkflowFamily.PR_REPAIR)
-    install_secondary(control, replace(primary, pr_repair=component), component)
-    with sqlite3.connect(client.review.control.path) as db:
-        committed = db.execute("SELECT episode_json FROM workflows WHERE target_number=?", (PR,)).fetchone()[0]
-        before_money = db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0]
-        before_issue = db.execute("SELECT * FROM workflows WHERE target_kind='issue' AND target_number=1").fetchone()
-        db.execute("UPDATE workflows SET episode_json='corrupt' WHERE target_number=?", (PR,))
-    cfg = deployment.config()
-    client.remote.link_pr(1, PR)
-    provider = ScriptedProvider([AgentResult(is_error=True, cost_usd=0.1, session_id="fix-1")])
-    log: list[str] = []
-    fix = roles.compose_fix_daemon(cfg, client.remote, Store(cfg.state_dir), Worktrees(str(deployment.target)),
-                                   provider, log=log.append)
-
-    def fix_tick() -> None:
-        deployment.advance(1)
-        fix.daemon.tick()
-        fix.daemon.wait_for_dispatches()
-    fix_tick()
-    # Deferred before any side effect: no paid leg, no worktree, no infra death.
-    assert provider.tasks == [] and any("ADDRESS_REVIEW #7 held: review guidance is unavailable" in line
-                                        for line in log)
-    assert not (deployment.target / ".claude" / "worktrees" / "issue-1").exists()
-    with sqlite3.connect(client.review.control.path) as db:
-        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == before_money
-        assert db.execute("SELECT * FROM workflows WHERE target_kind='issue' AND target_number=1").fetchone() == before_issue
-        db.execute("UPDATE workflows SET episode_json=? WHERE target_number=?", (committed, PR))
-    fix_tick()
-    assert len(provider.tasks) == 1 and "Only judge the parser change." in provider.tasks[0].intent.prompt, log
-
 
 # -- increment 6 re-review: escalation holds are fenced by hold facts, re-planned, signalled once ----
 

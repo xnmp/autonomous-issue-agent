@@ -18,10 +18,9 @@ from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.run_usage import price_run_usage
 from tests.adapters import test_native_usage_accounting as native
-from tests.adapters.test_accounting_runtime import Runtime, _wrapper, _publication_context_for_accounting_tests
+from tests.adapters.test_accounting_runtime import Runtime, _wrapper
 from tests.adapters.test_codex_child_usage import ROOT, CHILD, START, RATES, event, metadata, path, write
 from tests.adapters.test_settlement_regressions import counter, receipt, child_rollout
-from tests.fakes.workflow_authority import resolve_snapshot
 
 
 def priced_receipt(sid=ROOT):
@@ -52,7 +51,7 @@ def test_usable_provider_dollars_survive_an_unusaged_completed_request_and_journ
     observed = CodexChildUsageMeter(str(home), START, RATES, str(tmp_path)).sample(ROOT, "sol", None, final=True)
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (900, "estimate")
@@ -66,7 +65,7 @@ def test_mixed_request_evidence_stops_live_execution_at_the_same_settled_amount(
                               evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 2000)}))
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.002,
                                                  env={"CODEX_HOME": str(tmp_path / "codex")})))
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
@@ -189,7 +188,7 @@ def test_normal_return_keeps_provider_dollars_when_caps_and_token_card_are_absen
     observed = CodexChildUsageMeter(str(home), START, None, str(tmp_path)).sample(ROOT, "sol", None, final=True)
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=None, repository_cap=None, global_cap=None, issue_cap=None)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
     assert result.status == "pushed", result.summary
     with store.transaction() as db:
@@ -204,7 +203,7 @@ def test_normal_return_uses_the_same_frozen_mixed_price_as_the_live_meter_withou
     assert price_run_usage(observed, RATES) == Money("USD", 1100)
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=None, repository_cap=None, global_cap=None, issue_cap=None)
-    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis,rate_card_id FROM charges").fetchone()) == (1100, "estimate", "card")

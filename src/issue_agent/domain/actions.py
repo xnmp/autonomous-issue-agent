@@ -175,6 +175,24 @@ class MergePullRequest:
 
 
 @dataclass(frozen=True)
+class OpenPullRequest:
+    """Open the harness PR for a pushed `fix/<issue>-` branch that has none
+    (refactor decision Q11: the agent pushes, the harness opens). Idempotent
+    under `key`; GitHub itself refuses a second open PR for one head."""
+
+    issue: int
+    branch: str
+
+    def __post_init__(self) -> None:
+        if type(self.issue) is not int or self.issue <= 0 or not isinstance(self.branch, str) or not self.branch:
+            raise ValueError("opening a PR requires the issue and its pushed branch")
+
+    @property
+    def key(self) -> str:
+        return f"open-pr:{self.branch}"
+
+
+@dataclass(frozen=True)
 class UpdateBranch:
     """Bring a BEHIND (clean-but-stale) PR branch up to date with its base, so an
     already-armed auto-merge can complete. Cheap GitHub-side update (no worktree /
@@ -371,6 +389,7 @@ Action = Union[
     CloseIssue,
     EnableAutoMerge,
     MergePullRequest,
+    OpenPullRequest,
     UpdateBranch,
     RerunFailedChecks,
     CancelWorkflowRuns,
@@ -398,6 +417,7 @@ __all__ = [
     "CloseIssue",
     "EnableAutoMerge",
     "MergePullRequest",
+    "OpenPullRequest",
     "UpdateBranch",
     "RerunFailedChecks",
     "CancelWorkflowRuns",

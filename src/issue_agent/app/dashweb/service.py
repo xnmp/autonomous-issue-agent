@@ -36,7 +36,7 @@ from ...domain.events import (
     TelemetryEvent,
 )
 from .. import cli, config
-from ..resolve_control import load_operator_configuration, open_resolve_operator
+from ..review_control import load_operator_configuration
 from ..review_control import open_review_operator
 from . import snapshots
 from .ports import GitHubQueries
@@ -139,7 +139,6 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
     cfg = config.from_env({"REPO": repo, **configured})
     caps = {
         **{kind: max(0.0, cfg.fix_budget_usd) for kind in _FIX_BUDGET_KINDS},
-        "ROUTE": max(0.0, cfg.router_budget_usd),
         "REVIEW": max(0.0, cfg.review_budget_usd),
         "RE_REVIEW": max(0.0, cfg.review_budget_usd),
     }
@@ -200,7 +199,6 @@ class Backend:
         gh_enrichment_executor: ThreadPoolExecutor | None = None,
         effects_factory=build_operator_effects,
         control_db_path: str = "",
-        resolve_factory=open_resolve_operator,
         review_factory=open_review_operator,
     ):
         self.harness_root = harness_root or cli.HARNESS_ROOT
@@ -221,7 +219,6 @@ class Backend:
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
-        self._resolve_factory = resolve_factory
         self._review_factory = review_factory
 
     # ── journal side ──
@@ -569,29 +566,21 @@ class Backend:
             remove=remove,
         )
 
-    def _resolve_operator(self, name: str):
-        if not self.known(name):
-            raise ValueError(f"unknown deployment '{name}'")
-        return self._resolve_factory(name, harness_root=self.harness_root,
-                                     control_db_path=self.control_db_path, now=self.now_fn)
-
     def resolve_control(self, name: str, number: int, request_id: str | None = None) -> ResolveControl:
-        from .resolve_control import read_control, unavailable_control
+        """The resolve workflow was deleted with the fix decision (refactor
+        slice 5b); its operator surface stays unavailable until slice 5d
+        removes the route and the UI panel."""
+        from .resolve_control import unavailable_control
 
-        try:
-            return read_control(self._resolve_operator(name), number, request_id)
-        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
-            return unavailable_control(exc)
+        del name, number, request_id
+        return unavailable_control(RuntimeError("resolve control was removed with the fix workflow"))
 
     def resolve_command(self, name: str, number: int, body: ResolveCommand) -> CommandResult:
-        from .resolve_control import submit_control, unavailable_command
+        from .resolve_control import unavailable_command
 
-        # Reject malformed direct callers before opening configured authority.
+        del name, number
         body.command()
-        try:
-            return submit_control(self._resolve_operator(name), number, body)
-        except Exception as exc:  # noqa: BLE001 - storage or authority failure is a 503, never a crash
-            return unavailable_command(exc)
+        return unavailable_command(RuntimeError("resolve control was removed with the fix workflow"))
 
     def _review_operator(self, name: str):
         if not self.known(name):

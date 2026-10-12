@@ -370,29 +370,6 @@ run_role() {
   ) 2>&1 | timestamp_lines >>"$log" &
 }
 
-# Webhook push (#1): a fourth supervised process. `gh webhook forward` streams
-# deliveries; the forwarder turns each one into a wake-file touch per role, so
-# the daemons notice work in ~a second instead of at the reconcile interval.
-# Deliveries are wake signals only — nothing reads the payload — so a dead
-# forwarder is a latency regression, never a correctness one: the daemons keep
-# reconciling at RECONCILE_SECONDS. Restarted with a 60s backoff because the
-# common death is structural (extension not installed, token without
-# admin:repo_hook) and a tight relaunch loop would only spin on it.
-run_webhook() {
-  local log="$LOG_DIR/webhook-$NAME.log"
-  info "starting webhook forwarder → $log"
-  : > "$log"
-  (
-    cd "$HARNESS_ROOT"
-    while :; do
-      uv run --extra sdk \
-        python -m issue_agent.app.webhook || true
-      echo "webhook forwarder died — retrying in 60s (daemons stay on the reconcile cadence)"
-      sleep 60
-    done
-  ) 2>&1 | timestamp_lines >>"$log" &
-}
-
 # Keep the machine awake while the watchers run — on a sleeping Mac the poll loop
 # stalls and pickup latency balloons to "whenever it next wakes". `-w $$` ties the
 # assertion to THIS process: when point-at exits (Ctrl-C, crash), caffeinate sees
@@ -415,15 +392,6 @@ done
 
 [ "${#pids[@]}" -gt 0 ] || { red "no watchers started"; exit 1; }
 
-# After the watcher check on purpose: the forwarder is an accelerator, not a
-# watcher — it must never make "no watchers started" look like a healthy run.
-# Its pid is deliberately NOT in pids: the supervising subshell is an infinite
-# relaunch loop, so waiting on it would keep point-at alive forever after every
-# actual watcher exited (bounded ISSUE_AGENT_MAX_TICKS runs would never end).
-webhook_pid=""
-case "$(printf '%s' "${WEBHOOK_WAKE:-}" | tr '[:upper:]' '[:lower:]')" in
-  1|true|yes|on) run_webhook; webhook_pid="$!" ;;
-esac
 grn "✓ $ROLES watchers running against $REPO (Ctrl-C stops all). Tailing logs from $LOG_DIR:"
 echo
 # Follow all role logs together until the daemons exit or Ctrl-C.
@@ -431,15 +399,5 @@ tail -n +1 -F "$LOG_DIR"/*-"$NAME".log &
 tail_pid=$!
 watcher_status=0
 wait_for_watchers "${pids[@]}" || watcher_status=$?
-# TERM on the supervising subshell alone would orphan its uv→python→gh chain
-# (a headless forwarder touching wake files and holding a relay hook), so
-# sweep the whole descendant tree. Ctrl-C never gets here — the trap's
-# `kill 0` takes the process group down as one.
-kill_tree() {
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
-  kill "$1" 2>/dev/null || true
-}
-[ -n "$webhook_pid" ] && kill_tree "$webhook_pid"
 kill "$tail_pid" 2>/dev/null || true
 exit "$watcher_status"

@@ -18,8 +18,7 @@ from .checks import CIObservation, Observed, RequiredCheck, Unavailable
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
-from .identity import login_eq
-from .world import Check, Review, CIState
+from .world import Check, CIState
 
 
 @dataclass(frozen=True)
@@ -56,11 +55,6 @@ class Failed:
             raise ValueError("failed CI requires nonempty failures")
 
 
-def repair_evidence_incomplete(observation: CIObservation) -> bool:
-    result = reduce_ci(observation)
-    return isinstance(result, Unavailable) or (isinstance(result, Waiting) and isinstance(result.reason, MissingRequired))
-
-
 def gated_checks(observation: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
     if isinstance(observation, Unavailable):
         return ()
@@ -85,14 +79,6 @@ def reduce_ci(observation: CIObservation) -> Clear | Waiting | Failed | Unavaila
         return Waiting(Executing(pending) if any(c.state != "QUEUED" for c in pending) else Queued(pending))
     failures = tuple(c for c in eligible if c.bucket == "fail")
     return Failed(failures) if failures else Clear()
-
-
-def cancelled_ci_unverified(observation: CIObservation, cancelled_head: str, rerun_head: str) -> bool:
-    # Empty-policy green after our cancellation can mean every job was skipped;
-    # only spending the existing rerun relinquishes the cancellation's authority.
-    return (isinstance(observation, Observed) and not observation.policy
-        and observation.head == cancelled_head and observation.head != rerun_head
-        and isinstance(reduce_ci(observation), Clear))
 
 
 def _is_pending(check: Check) -> bool:
@@ -121,24 +107,6 @@ def parse_timestamp(raw: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def pending_checks(checks: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
-    """The gating checks currently holding `ci_state` at PENDING."""
-    if isinstance(checks, Observed) and isinstance((result := reduce_ci(checks)), Waiting) and isinstance(result.reason, MissingRequired):
-        return ()
-    return tuple(c for c in gated_checks(checks) if _is_pending(c))
-
-
-def executing_pending_checks(checks: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
-    """Pending checks that are not QUEUED: the ones a stall deadline may judge.
-
-    A QUEUED check has no runner yet. Saturated GitHub-hosted runners held tauri
-    jobs runnerless for 67-80 min (PRs #1065/#1070, 2026-10-11); timing that wait
-    cancelled healthy runs, lost their queue position, and escalated them to a
-    human. Every other pending state keeps its deadline and ceiling.
-    """
-    return tuple(c for c in pending_checks(checks) if c.state != "QUEUED")
-
-
 def failed_checks(
     checks: CIObservation | Iterable[Check]
 ) -> tuple[Check, ...]:
@@ -148,55 +116,6 @@ def failed_checks(
         result = reduce_ci(checks)
         return result.checks if isinstance(result, Failed) else ()
     return tuple(c for c in checks if c.bucket == "fail")
-
-
-def pending_age_seconds(
-    checks: CIObservation | Iterable[Check], now: str
-) -> float | None:
-    """Seconds since the NEWEST pending check started, or None when unknowable.
-
-    Measured from the newest (not oldest) start on purpose: a push adds fresh
-    check runs, so the newest start is the last moment CI demonstrably made
-    progress. That makes the clock reset on a new head commit for free, with no
-    stored per-SHA state — and it means a long, healthy pipeline whose jobs
-    start in sequence is judged on its most recent job, not on its first.
-
-    None when there is nothing pending, when no pending check has a parseable
-    `started_at`, or when `now` is unstamped/unparseable. A negative age (a
-    start in the future — clock skew between GitHub and this host) is returned
-    as-is and simply never breaches.
-    """
-    at = parse_timestamp(now)
-    if at is None:
-        return None
-    starts = [
-        t for c in executing_pending_checks(checks)
-        if (t := parse_timestamp(c.started_at)) is not None
-    ]
-    if not starts:
-        return None
-    return (at - max(starts)).total_seconds()
-
-
-def pending_deadline_breached(
-    checks: CIObservation | Iterable[Check], now: str, max_seconds: float
-) -> bool:
-    """True iff CI has been pending past `max_seconds` (#30).
-
-    `ci_state` returns PENDING while any check is queued/in-progress, and
-    PENDING deliberately OUTRANKS FAILURE (the #49 anti-loop rule). Nothing
-    bounded that wait: one job stuck IN_PROGRESS pins a PR forever, with no
-    escalation and no journal event — observed live, a windows job sitting 30+
-    minutes where the identical previous run took 4.
-
-    This adds the bound and nothing else; the precedence above is untouched.
-    `max_seconds <= 0` disables it, like every other breaker in the domain.
-    The comparison is `>=` so a deadline of exactly N fires at N.
-    """
-    if max_seconds <= 0:
-        return False
-    age = pending_age_seconds(checks, now)
-    return age is not None and age >= max_seconds
 
 
 def ci_state(checks: CIObservation | Iterable[Check]) -> CIState:
@@ -213,21 +132,3 @@ def ci_state(checks: CIObservation | Iterable[Check]) -> CIState:
     return CIState.OK if checks.reports else CIState.NONE
 
 
-def latest_other_review(reviews: Iterable[Review], fix_bot: str) -> Review | None:
-    """The most recently submitted review by someone OTHER than the fixer.
-
-    Port of watcher-lib.sh:latest_other_review. The fixer must never act on
-    (approve/merge against) its own review — GitHub rejects self-approval 422,
-    and auto-merge requires a genuinely independent approver. Reviews by the
-    fix bot are filtered out; the latest remaining one (by submitted_at) wins.
-    Returns None when no distinct actor has reviewed.
-
-    Identity comparison goes through `login_eq`, never `==`: a `FIX_BOT` written
-    with the `[bot]` suffix would otherwise never match the bare login gh reports
-    in the review author field, and the fixer would treat its OWN approval as an
-    independent one (review C1).
-    """
-    others = [r for r in reviews if not login_eq(r.author, fix_bot)]
-    if not others:
-        return None
-    return max(others, key=lambda r: r.submitted_at)

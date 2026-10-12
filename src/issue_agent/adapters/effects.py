@@ -6,8 +6,6 @@ import hashlib
 import json
 import sqlite3
 import sys
-from ..domain.ci import Clear, Failed, Waiting, Executing, MissingRequired, reduce_ci, cancelled_ci_unverified
-from ..domain.checks import Unavailable
 
 from dataclasses import fields, is_dataclass, replace
 from enum import Enum
@@ -28,8 +26,6 @@ from ..domain.actions import (
     UpdateBranch,
 )
 from ..domain.labels import Label
-from ..domain.fix import FixConfig, FixState, CiStallStep, ci_remediations, ci_remediation_marker, parse_cancel_marker
-from ..domain.world import WorldState
 from ..domain.eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from ..domain.lifecycle import (
     AllowedEligibility, completion_guard, completion_matches, issue_eligibility,
@@ -330,7 +326,6 @@ class GitHubEffectExecutor:
         repository: str,
         identity: str,
         config_version: str = "",
-        fix_config: FixConfig = FixConfig(fix_bot=""),
         retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
         journal: EventSink | None = None,
         alert_cmd: str = "",
@@ -343,7 +338,6 @@ class GitHubEffectExecutor:
         self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
-        self.fix_config = fix_config
         self.retry_ceiling = retry_ceiling
         self.journal = journal
         self.alert_cmd = alert_cmd
@@ -1813,34 +1807,13 @@ class GitHubEffectExecutor:
         return self._revision_matches(command)
 
     def _ci_action_qualifies(self, action, current) -> bool:
-        if not current.head_ref_oid:
-            raise UnknownEffectOutcome("current PR revision is unavailable")
-        if current.state != "OPEN" or current.head_ref_oid != action.head:
-            return False
-        result = reduce_ci(current.ci)
-        if isinstance(result, Unavailable):
-            raise UnknownEffectOutcome(result.reason)
-        state = FixState()
-        if isinstance(action, EscalateCiPending) or isinstance(result, Clear) and not current.ci.policy:
-            selected = self.store.read_pr_repair(WorkflowKey(self.repository, PullRequestRef(action.pr)))
-            if isinstance(selected, cc.SelectedPRRepair):
-                state = FixState(ci_cancel_head={action.pr: ci_remediation_marker(selected.component.state.ci_cancel)},
-                    ci_rerun_head={action.pr: ci_remediation_marker(selected.component.state.ci_rerun)})
-        if isinstance(action, EscalateCiPending):
-            world = WorldState(prs=(current,), now=self.store.now().isoformat())
-            return any(remedy.step is CiStallStep.ESCALATE for remedy in ci_remediations(world, self.fix_config, state))
-        unverified = cancelled_ci_unverified(current.ci, parse_cancel_marker(state.ci_cancel_head.get(action.pr, ""))[0],
-            parse_cancel_marker(state.ci_rerun_head.get(action.pr, ""))[0])
-        if isinstance(result, Waiting) and isinstance(result.reason, MissingRequired):
-            raise UnknownEffectOutcome("required reports have not arrived")
-        if isinstance(action, (EnableAutoMerge, UpdateBranch)):
-            return isinstance(result, Clear) and not unverified and (current.is_behind() if isinstance(action, UpdateBranch)
-                else current.merge_state.upper() == "CLEAN" or bool(current.ci.policy) and current.merge_state.upper() in {"HAS_HOOKS", "UNSTABLE"})
-        checks = (result.checks if isinstance(result, Failed) and isinstance(action, RerunFailedChecks)
-            else result.reason.checks if isinstance(result, Waiting) and isinstance(result.reason, Executing)
-            and isinstance(action, CancelWorkflowRuns) else ())
-        runs = {c.run_id for c in checks if c.state != "QUEUED"}
-        return bool(checks) and None not in runs and runs == set(action.run_ids)
+        """Never: merge, branch refresh, CI rerun/cancel and CI-pending
+        escalation commands were minted only by the deleted fix decision
+        (refactor slice 5b). The fix role now merges and refreshes directly
+        with a head match and re-derives every tick, so a persisted command
+        of these kinds is stale by construction."""
+        del action, current
+        return False
 
     def _revision_matches(self, command: LifecycleCommand) -> bool:
         if "pr_recovery" in command.payload:
@@ -1879,9 +1852,6 @@ class GitHubEffectExecutor:
             qualifies = self._ci_action_qualifies(action, current)
             if qualifies and isinstance(action, (RerunFailedChecks, CancelWorkflowRuns)):
                 qualifies = command.payload.get("tested_revision", action.head) == current.ci.tested_revision
-            if (not qualifies and isinstance(action, (EnableAutoMerge, UpdateBranch))
-                    and current.state == "OPEN" and current.head_ref_oid == action.head):
-                raise UnknownEffectOutcome("current CI withholds the pending merge or refresh")
             return qualifies
         if command.expected_revision is None:
             return True

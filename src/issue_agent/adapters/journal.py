@@ -351,6 +351,8 @@ class RunContext:
     dispatch_id: str = ""
     workflow: WorkflowBinding | None = None
     review_child: ReviewChildIdentity | None = None
+    # The PR head a fix leg was decided on (accounting records it per run).
+    head: str = ""
 
 
 def _run_correlation(
@@ -472,6 +474,7 @@ class JournalingRuntime:
         *,
         workflow: WorkflowBinding | None = None,
         review_child: ReviewChildIdentity | None = None,
+        head: str = "",
     ) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
         Mutable state on purpose: journaling and paid admission consume the
@@ -490,6 +493,7 @@ class JournalingRuntime:
             dispatch_id=uuid.uuid4().hex[:12],
             workflow=workflow,
             review_child=review_child,
+            head=head,
         ))
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
@@ -500,6 +504,7 @@ class JournalingRuntime:
                 claim_target=claim_target,
                 workflow=workflow,
                 **({"review_child": review_child} if review_child is not None else {}),
+                head=head,
             )
 
     @contextlib.contextmanager
@@ -527,6 +532,7 @@ class JournalingRuntime:
                 claim_target=previous.claim_target,
                 workflow=previous.workflow,
                 **({"review_child": previous.review_child} if previous.review_child is not None else {}),
+                head=previous.head,
             )
         try:
             yield
@@ -540,6 +546,7 @@ class JournalingRuntime:
                     claim_target=previous.claim_target,
                     workflow=previous.workflow,
                     **({"review_child": previous.review_child} if previous.review_child is not None else {}),
+                    head=previous.head,
                 )
             self._context.reset(token)
 

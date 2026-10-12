@@ -7,12 +7,11 @@ import pytest
 
 from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
 from issue_agent.domain.checks import Observed, RequiredCheck
-from issue_agent.domain.fix import FixConfig, FixState, should_automerge
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.world import Check
 from issue_agent.domain.workflow import EvidenceUnavailable, NoAuthorizedRemediation, OpenGate
-from tests.app.resolve_acceptance_harness import ScriptedProvider
+from tests.app.acceptance_support import ScriptedProvider
 from tests.app.review_acceptance_harness import (
     NHR, PR, compose_review, create_review_deployment, install_clock, isolate_authority, verdicts,
 )
@@ -27,28 +26,6 @@ def deployment(tmp_path, monkeypatch):
     result.activate()
     compose_review(result).activate_execution(monkeypatch)
     return result
-
-
-@pytest.mark.parametrize("bucket,required,mergeable", [
-    ("pending", True, False), ("fail", True, False), (None, True, False), ("pass", True, True),
-    (None, False, False),  # a target with no CI checks at all never merges on a model verdict
-])
-def test_model_approval_without_local_execution_still_requires_ci(
-    deployment, tmp_path, monkeypatch, bucket, required, mergeable,
-):
-    marker = tmp_path / "target-tests-ran"
-    monkeypatch.setenv("TEST_CMD", f"touch '{marker}'; exit 1")
-    monkeypatch.setenv("ALLOW_UNTESTED", "invalid-retired-review-waiver")
-    client = compose_review(deployment, provider=ScriptedProvider(verdicts("APPROVE")))
-    client.boot()
-    client.tick()
-    assert client.bot_reviews()[-1].state == "APPROVED"
-    assert not marker.exists()
-    pr = client.remote.get_pr(PR)
-    reports = () if bucket is None else (Check("required-unit", bucket=bucket, required=True),)
-    policy = frozenset({RequiredCheck("required-unit")}) if required else frozenset()
-    pr = replace(pr, merge_state="CLEAN", ci=Observed(pr.head_ref_oid, pr.head_ref_oid, policy, reports))
-    assert should_automerge(pr, FixState(), FixConfig(fix_bot="fix-bot")) is mergeable
 
 
 @pytest.mark.parametrize("mode", [ReviewMode.SINGLE, ReviewMode.DELEGATED, ReviewMode.MULTI])

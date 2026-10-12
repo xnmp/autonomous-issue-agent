@@ -83,21 +83,23 @@ def test_reconciled_first_trip_then_admission_leaves_no_refusal(planned_child, t
     journal, inner = runtime(store, child, AgentResult(False, status="reviewed", cost_usd=1),
                              tmp_path / "journal.jsonl")
     attempts = 0
+    reserve = store.reserve
 
-    def admit(proposed):
+    def tripping_reserve(proposed):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             return ReservationResult(AccountingDisposition.EXHAUSTED, None,
                                      Money.zero("USD"), proposed.quote.maximum_charge,
                                      Money("USD", 1_999_999), "transient trip", "repository")
-        return store.reserve(proposed)
+        return reserve(proposed)
 
     class Reconciler:
         def reconcile_stale_reservations(self):
             return 1
 
-    journal.inner = replace(journal.inner, admit=admit, reservation_reconciler=Reconciler())
+    store.reserve = tripping_reserve
+    journal.inner = replace(journal.inner, reservation_reconciler=Reconciler())
     journal.set_context("review", "REVIEW", 9, None, claim_target=-9,
                         workflow=child.round.binding.rejection, review_child=child)
     result = asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))

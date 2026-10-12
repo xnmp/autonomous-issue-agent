@@ -30,7 +30,7 @@ def test_rejection_only_activation_cannot_purchase_review(tmp_path, monkeypatch)
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, verdicts,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -54,7 +54,7 @@ def test_composed_single_review_settles_one_durable_execution_round(tmp_path, mo
     from tests.app.review_acceptance_harness import (
         KEY, compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch, verdicts,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path, ceiling=5)
     isolate_authority(deployment, monkeypatch)
@@ -120,7 +120,7 @@ def test_composed_review_modes_have_one_productive_outer_round(tmp_path, monkeyp
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch, verdicts,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -162,7 +162,7 @@ def test_composed_pin_deferrals_are_spaced_by_the_machine_backoff_without_a_stri
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch, verdicts,
     )
     from issue_agent.domain.outcome import ExitReason
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -199,7 +199,7 @@ def test_composed_failed_review_debits_once_for_all_launched_children(tmp_path, 
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -239,7 +239,7 @@ def test_composed_budget_and_infrastructure_stops_preserve_failure_allowance(tmp
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -266,7 +266,7 @@ def test_a_launched_provider_exception_retains_money_and_unresolved_evidence(tmp
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -298,7 +298,7 @@ def test_current_failure_ceiling_bounds_purchases_across_polls_and_issue_relink(
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path)
     isolate_authority(deployment, monkeypatch)
@@ -335,7 +335,7 @@ def test_a_paid_re_review_failure_preserves_display_then_productivity_resets_it(
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, verdicts,
     )
-    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.acceptance_support import ScriptedProvider
 
     deployment = create_review_deployment(tmp_path, ceiling=5)
     isolate_authority(deployment, monkeypatch)

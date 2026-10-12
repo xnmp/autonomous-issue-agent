@@ -11,7 +11,6 @@ from issue_agent.domain.outcome import (
     infra_death,
     offending_path,
     pr_budget_actions,
-    pr_resume_actions,
     resolve_followup,
 )
 from issue_agent.domain.actions import Relabel, Target
@@ -98,24 +97,6 @@ def test_unclassified_result_is_never_an_infra_death():
     assert infra_death(None) is False
 
 
-def test_pr_resume_infra_death_keeps_the_blocked_pr_unchanged():
-    actions = pr_resume_actions(
-        100, AgentResult(is_error=True, exit_reason=ExitReason.TRANSPORT_DEATH)
-    )
-    assert actions == []
-    assert AgentResult(is_error=True).exit_reason is None
-    assert AgentResult(is_error=True).usage is None
-
-def test_pr_resume_lifetime_cap_refusal_asks_for_a_cap_decision():
-    # The daily-window arm waits (test_fix_workflow); a lifetime refusal is
-    # deterministic, so the PR stays blocked under needs-budget-review.
-    actions = pr_resume_actions(100, AgentResult(
-        is_error=True, exit_reason=ExitReason.BUDGET_EXHAUSTED, envelope_subtype=MAX_BUDGET_STATUS))
-    assert actions == pr_budget_actions(100)
-    assert Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.AI_PR_OPEN) not in actions
-
-
-
 # ── deterministic deaths: the retry cannot win, so it must not be bought (#13) ─
 _BUFFER_DEATH = (
     "CLIJSONDecodeError: Fatal error in message reader: Failed to decode JSON: "
@@ -162,3 +143,42 @@ def test_offending_path_takes_the_last_tool_call_and_never_raises():
     assert offending_path("") == ""
     assert offending_path(None) == ""
     assert offending_path("Read(") == ""
+
+
+# ── classify_leg: what one returned fix leg counts as (slice 5b) ────────────
+import pytest
+
+from issue_agent.domain.outcome import LegClass, classify_leg
+
+
+@pytest.mark.parametrize("reason", [
+    ExitReason.TRANSPORT_DEATH, ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
+    ExitReason.OPERATOR_CANCELLED,
+])
+@pytest.mark.parametrize("resumed", [False, True])
+def test_a_harness_or_provider_death_is_never_an_attempt(reason, resumed):
+    result = AgentResult(is_error=True, status="", exit_reason=reason)
+    assert classify_leg(result, resumed=resumed) is LegClass.MACHINE
+
+
+def test_a_wall_cap_is_a_machine_end_once_then_an_attempt_on_the_resume():
+    capped = AgentResult(is_error=True, status="", exit_reason=ExitReason.WALL_TIMEOUT)
+    assert classify_leg(capped, resumed=False) is LegClass.MACHINE
+    assert classify_leg(capped, resumed=True) is LegClass.AGENT
+
+
+def test_a_blocked_return_is_a_question_and_an_error_is_agent_work():
+    assert classify_leg(_ok("blocked", needs="which API?"), resumed=False) is LegClass.ASKED
+    assert classify_leg(AgentResult(is_error=True, status="blocked"), resumed=False) is LegClass.AGENT
+    assert classify_leg(_ok("pushed"), resumed=False) is LegClass.AGENT
+    assert classify_leg(_ok("failed"), resumed=True) is LegClass.AGENT
+
+
+def test_a_per_leg_budget_hit_is_agent_work():
+    spent = AgentResult(is_error=True, status=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
+    assert classify_leg(spent, resumed=False) is LegClass.AGENT
+
+
+def test_unknown_or_garbage_status_counts_as_agent_work():
+    for status in ("", "pr_opened", "x" * 100_000, "BLOCKED"):
+        assert classify_leg(_ok(status), resumed=False) is LegClass.AGENT

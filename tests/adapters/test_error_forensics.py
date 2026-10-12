@@ -17,7 +17,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from issue_agent.adapters.agent_runner import error_forensics, result_to_agent_result
-from issue_agent.domain.outcome import AgentResult, ExitReason, status_label
+from issue_agent.domain.outcome import (
+    AgentResult,
+    ExitReason,
+)
 
 
 @dataclass
@@ -36,31 +39,6 @@ class _Result:
     session_id: str = "s1"
     total_cost_usd: float = 0.0
     usage: dict | None = None
-
-
-# ── the log line must not repeat a claim the envelope contradicts ────────────
-def test_a_failed_run_that_claims_success_is_not_reported_as_success():
-    """The #501 regression, verbatim."""
-    r = AgentResult(is_error=True, status="success",
-                    exit_reason=ExitReason.AGENT_ERROR,
-                    envelope_subtype="error_during_execution")
-    label = status_label(r)
-    assert not label.startswith("success")
-    assert "ERROR" in label
-    assert "agent_error" in label
-    assert "success" in label  # the claim is still visible, marked as a claim
-    assert "claimed" in label
-
-
-def test_a_genuine_success_still_reads_cleanly():
-    assert status_label(AgentResult(is_error=False, status="pr_opened")) == "pr_opened"
-    assert status_label(AgentResult(is_error=False)) == "ok"
-
-
-def test_an_errored_run_with_no_claim_still_names_the_reason():
-    r = AgentResult(is_error=True, exit_reason=ExitReason.WALL_TIMEOUT)
-    label = status_label(r)
-    assert "wall_timeout" in label and "claimed" not in label
 
 
 # ── the envelope's error kind is no longer shadowed by the agent's claim ─────

@@ -10,16 +10,37 @@ ambient mode). The review daemon's drain executes every accepted obligation.
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import os
+from types import MappingProxyType
 
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import SQLiteControlStore
+from ..adapters.env_file import source_env_file
 from ..adapters.github import GitHubGateway
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from ..adapters.store import Store
-from .config import HarnessConfig, owner_identity_for_target
-from .resolve_control import load_operator_configuration
+from ..domain.deployment import canonical_deployment_name
+from .config import HarnessConfig, from_env, owner_identity_for_target
 from .review_identity import review_identity
 from .review_runtime import configured_review_control
+
+
+def load_operator_configuration(name: str, *, harness_root: str) -> tuple[HarnessConfig, Mapping[str, str]]:
+    """Mutation scope comes from one launch snapshot, never per-field overlay fallbacks."""
+    if not isinstance(name, str) or not name or name != canonical_deployment_name(name) or name in (".", ".."):
+        raise ValueError("operator control requires a canonical deployment name")
+    snapshot = os.path.join(harness_root, "config", f".active.{name}.env")
+    env = source_env_file(snapshot, os.environ, assigned_only=True)
+    env.pop("AGENT_ENV", None)
+    if not env.get("REPO") or not env.get("TARGET_DIR"):
+        raise ValueError("operator control requires explicit repository and checkout in the active snapshot")
+    host = env.get("GH_HOST", "github.com")
+    if host != os.environ.get("GH_HOST", "github.com"):
+        raise ValueError("operator GitHub host differs from the deployment snapshot")
+    cfg = from_env(env)
+    cfg.validate()
+    if not cfg.repo or not cfg.target_dir or not os.path.isabs(cfg.target_dir):
+        raise ValueError("operator control requires an explicit repository checkout")
+    return cfg, MappingProxyType(env)
 
 
 def open_review_operator(

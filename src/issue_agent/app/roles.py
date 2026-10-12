@@ -27,18 +27,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ..adapters.agent_runner import AgentRunner
-from ..adapters.agent_publish import AgentPublicationBroker
-from ..adapters.control_store import (
-    ControlStoreError,
-    LegacySpendMigrationError,
-    ReservationRequest,
-    ReservationResult,
-    SQLiteControlStore,
-)
+from ..adapters.control_store import ControlStoreError, LegacySpendMigrationError, SQLiteControlStore
 from ..adapters.control_path import control_store_path
 from ..adapters.effects import GitHubEffectExecutor
-from ..adapters.accounting_runtime import AccountingRuntime
-from ..adapters.github import GitHubGateway, Identity
+from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
+from ..adapters.github import GitHubGateway
 from ..adapters.journal import (
     JournalingRuntime,
     Journal,
@@ -46,41 +39,20 @@ from ..adapters.journal import (
 )
 from ..adapters.store import Store
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
-from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import ReviewCheckouts, Worktrees
-from ..adapters.workflow_control import SQLiteWorkflowControl
 from ..adapters.review_effects import ReviewReads
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.review_workflow_control import review_family_activated
 from ..adapters.workflow_rows import WorkflowAuthorityError
 
-from ..domain.fix import (
-    FixConfig,
-    FixState,
-    InFlightFix,
-    breaker_key,
-    ci_remediation_marker,
-    decide_fix,
-    automerge_in_scope,
-    merge_preconditions_met,
-)
-from ..domain.review import REVIEW_APPROVED
+from ..domain.fix import breaker_key
+from ..domain.state import Harness
 from ..domain.review_dispatch_record import (
     AdmissionInFlight, AdmissionOutcome, AdmissionWithheld, WithheldReason,
 )
 from ..domain.labels import Label
-from ..domain.ci import CIState, ci_state, parse_timestamp
-from ..domain import continuation_components as cc
-from ..domain.workflow import (
-    ObservedIssue, WorkflowAbsent, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
-)
-from ..domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey, WorkflowWriter
-from ..domain.workflow_ports import WorkflowControl
-from ..domain.lifecycle import pr_lifecycle
-from ..domain import review as review_dom
-from ..domain.identity import login_eq
+from ..domain.workflow_identity import WorkflowWriter
 from ..domain.review import (
-    DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
     BoundReviewState,
     FixHold,
     IdentityMode,
@@ -90,11 +62,11 @@ from ..domain.review import (
     hold_review_dispatch,
 )
 from .planners.tasks import REVIEW_DIMENSIONS, FixTaskConfig, ReviewTaskConfig
-from ..domain.actions import AgentKind, NoOp, Relabel, ResetCiRetries, RunAgent, Target
+from ..domain.actions import Relabel, RunAgent, Target
 from ..adapters.runtime_plan import AgentRuntime
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.agent_task import RuntimeName
-from ..domain.contracts import BudgetScope, Money, EffectStatus
+from ..domain.contracts import BudgetScope, Money
 from ..domain.pricing import (
     BudgetPolicy,
     ModelRates,
@@ -110,13 +82,7 @@ from ..domain.events import (
     TelemetryEvent,
     TelemetryWarning,
 )
-from ..domain.ports import (
-    WorkflowControlError,
-    CommandRecovery,
-    PredictionReader,
-    SpendReconciler,
-    StaleReservationReconciler,
-)
+from ..domain.ports import CommandRecovery, SpendReconciler, StaleReservationReconciler
 from .config import (
     CodexRuntimeConfig,
     HarnessConfig,
@@ -129,10 +95,13 @@ from .config import (
 from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
 from .review_runtime import (
-    ActiveReviewRuntime, ReviewDispatchPlan, configured_review_control,
-    review_guidance_reader, current_review_failures,
+    ActiveReviewRuntime,
+    ReviewDispatchPlan,
+    configured_review_control,
+    current_review_failures,
 )
-from .workflows.resolve_rearm import ResolveRearmWorkflow
+from ..adapters.act import GitHubAct
+from .fix import FixFacts, FixLegs, FixSettings, decide_with, dispatch_item, lease_slots
 from .loop import Daemon
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
 
@@ -317,9 +286,7 @@ def _with_accounting(
     role: str,
     runtime_name: str,
     reconciler: _LateReservationReconciler | None = None,
-    *,
-    admit: Callable[[ReservationRequest], ReservationResult] | None = None,
-) -> AgentRuntime:
+) -> AccountingRuntime:
     money = (
         lambda value: Money.from_major("USD", value)
         if value > 0
@@ -339,11 +306,8 @@ def _with_accounting(
         _rate_table(cfg, runtime_name),
         spend_evidence_dir(_role_state_dir(cfg, role)),
         owner_id=_owner_identity(cfg, role),
-        github_host=os.environ.get("GH_HOST", "github.com"),
-        approved_base_branch=cfg.base_branch,
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
-        admit=admit,
     )
 
 
@@ -352,16 +316,8 @@ def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
         return Money.from_major("USD", value)
 
     limits: dict[tuple[str, str], Money] = {}
-    for kind in (
-        "RESOLVE",
-        "RESUME",
-        "PR_RESUME",
-        "ADDRESS_REVIEW",
-        "FIX_CI",
-        "REBASE",
-    ):
+    for kind in ("RESOLVE", "ADDRESS_REVIEW", "FIX_CI", "REBASE"):
         limits[("fix", kind)] = money(cfg.fix_budget_usd)
-    limits[("fix", "ROUTE")] = money(cfg.router_budget_usd)
     for kind in ("REVIEW", "RE_REVIEW"):
         limits[("review", kind)] = money(cfg.review_budget_usd)
     limits[("review", "REVIEW_GATE")] = money(cfg.review_gate_budget_usd)
@@ -428,15 +384,11 @@ def _rate_table(
 @dataclass(frozen=True)
 class EffectRecovery:
     actions: GitHubEffectExecutor
-    publications: AgentPublicationBroker
     reconcile_workflow: Callable[[], int] | None = None
 
     def drain_pending_commands(self) -> int:
         recovered = self.reconcile_workflow() if self.reconcile_workflow is not None else 0
-        return (
-            recovered + self.actions.drain_pending_commands()
-            + self.publications.drain_pending_commands()
-        )
+        return recovered + self.actions.drain_pending_commands()
 
 
 def _effects(
@@ -446,8 +398,6 @@ def _effects(
     repository: str,
     identity: str,
     config_version: str,
-    base_branch: str,
-    fix_config: FixConfig = FixConfig(fix_bot=""),
     retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
     journal: Journal | None = None,
     alert_cmd: str = "",
@@ -459,22 +409,12 @@ def _effects(
         repository=repository,
         identity=identity,
         config_version=config_version,
-        fix_config=fix_config,
         retry_ceiling=retry_ceiling,
         journal=journal,
         alert_cmd=alert_cmd,
         log=log,
     )
-    publications = AgentPublicationBroker(
-        control,
-        repository=repository,
-        base_branch=base_branch,
-        host=os.environ.get("GH_HOST", "github.com"),
-        config_version=config_version,
-        identity=f"{identity}:publication",
-        owner=identity,
-    )
-    return EffectRecovery(executor, publications)
+    return EffectRecovery(executor)
 
 
 @dataclass(frozen=True)
@@ -486,7 +426,7 @@ def _recovery(
     state_dir: str,
     cfg: HarnessConfig,
     control: SQLiteControlStore,
-    effects: EffectRecovery,
+    effects: CommandRecovery,
     role: str,
     worktrees: Worktrees | None = None,
     *,
@@ -741,26 +681,6 @@ class DispatchPathReservations:
             self._actions[action] = issue
             return True
 
-    def expand(self, issue: int, paths: frozenset[str]) -> bool:
-        """Atomically add router predictions; one colliding router loses."""
-        with self._lock:
-            expanded = self._paths.get(issue, frozenset()) | paths
-            if self._conflicts(issue, expanded):
-                return False
-            if (
-                self._control is not None
-                and not self._control.expand_dispatch_claim(
-                    self._repository,
-                    self._role,
-                    issue,
-                    self._owner_id,
-                    paths,
-                )
-            ):
-                return False
-            self._paths[issue] = expanded
-            return True
-
     def finish(self, action: RunAgent) -> None:
         with self._lock:
             issue = self._actions.pop(action, None)
@@ -783,13 +703,6 @@ class DispatchPathReservations:
         with self._lock:
             return any(action.number == number for action in self._actions)
 
-    def snapshot(self) -> tuple[InFlightFix, ...]:
-        with self._lock:
-            return tuple(
-                InFlightFix(issue, paths, exclusive=not paths)
-                for issue, paths in self._paths.items()
-            )
-
 
 def _log(name: str):
     import sys
@@ -803,16 +716,6 @@ def _log(name: str):
 
 def _onoff(enabled: bool) -> str:
     return "on" if enabled else "off"
-
-
-def fix_capability_line(*, auto_merge: bool, auto_rebase: bool,
-                        escalate_on_evidence: bool) -> str:
-    """One boot line saying what the fixer can DO in this configuration."""
-    return (
-        "fix: capabilities: resolve=on "
-        f"auto_merge={_onoff(auto_merge)} auto_rebase={_onoff(auto_rebase)} "
-        f"escalate_on_evidence={_onoff(escalate_on_evidence)} "
-    )
 
 
 def review_capability_line(*, can_approve: bool, adopt_unlabeled: bool) -> str:
@@ -829,26 +732,6 @@ def _journal(store: Store) -> Journal:
     """The role's plain JSONL journal, beside its other local state."""
 
     return Journal(os.path.join(store.state_dir, "journal.jsonl"))
-
-
-def _wake_check(cfg: HarnessConfig, store: Store):
-    """The role's push wake, or None when WEBHOOK_WAKE is off (poll only).
-
-    Watched beside the role's own state, like the journal: the forwarder touches
-    one wake file per role so a delivery wakes all three independently.
-
-    Interaction with the world probe: a webhook-shortened tick lands inside the
-    probe's TTL, and check_suite/status deliveries move NO issue/PR updated_at —
-    change_signature reads unchanged and the tick observes nothing. That is fine
-    for review (it does not read checks). For the FIXER the load-bearing
-    invariant is now `WorldProbe.read_signals`: since #163 the fixer DOES gate
-    with an ai-pr-open PR open, and a CI-completion wake turns into a build only
-    because that hook re-reads the head's CI directly and `fix_probe_safe`
-    refuses to gate on a changed reading. Remove or weaken that reading and
-    CI-completion wakes silently become no-ops until the TTL expires."""
-    if not cfg.webhook_wake:
-        return None
-    return WakeSignal(wake_path(store.state_dir)).pending
 
 
 def _spend_cfg(cfg: HarnessConfig, role: str) -> dict:
@@ -1170,211 +1053,58 @@ if frozenset(_REVIEW_RUNTIME_REGISTRY) != _SUPPORTED_REVIEW_RUNTIMES:
     raise RuntimeError("review runtime registry is not exhaustive")
 
 
-def _inject_predicted_paths(store: Store, world):
-    """Attach persisted router predictions to this tick's GitHub issue views.
+def _lifetime_capped(cfg: HarnessConfig, control: SQLiteControlStore) -> Callable[[int], bool]:
+    """Whether an issue can no longer afford one more fix leg under its
+    lifetime cap: the same arithmetic paid admission applies."""
+    if cfg.issue_spend_cap_usd <= 0:
+        return lambda _issue: False
+    cap = Money.from_major("USD", cfg.issue_spend_cap_usd)
+    leg = Money.from_major("USD", cfg.fix_budget_usd)
 
-    GitHub is the source of truth for labels and PR diffs, while predictions are
-    local, advisory routing state. Joining them here keeps the domain decision
-    pure and makes any unreadable state indistinguishable from no prediction.
-    """
-    if not isinstance(store, PredictionReader):
-        return world
-    issues = []
-    changed = False
-    for issue in world.issues:
+    def capped(issue: int) -> bool:
+        snapshot = control.snapshot(issue_budget_scope(cfg.repo, issue, "USD"))
+        if snapshot.disposition.value != "available":
+            raise ControlStoreError(f"issue #{issue} spend is unreadable: {snapshot.detail}")
+        return snapshot.committed.micros + leg.micros > cap.micros
+
+    return capped
+
+
+def _headroom(gate: Callable[[], str | None] | None) -> Callable[[], bool]:
+    """Daily/global headroom for one more leg. An unreadable ledger is no
+    headroom: free work continues, paid work waits silently (Q7)."""
+
+    def headroom() -> bool:
+        if gate is None:
+            return True
         try:
-            predicted = store.get_predicted_paths(issue.number)
-        except Exception:  # noqa: BLE001 — a hint must never stop a fix tick
-            predicted = frozenset()
-        combined = issue.predicted_paths | frozenset(predicted or ())
-        changed = changed or combined != issue.predicted_paths
-        issues.append(replace(issue, predicted_paths=combined))
-    return replace(world, issues=tuple(issues)) if changed else world
+            return gate() is None
+        except Exception:  # noqa: BLE001 - see docstring
+            return False
+
+    return headroom
 
 
-def _control_value(errors, key, reader, default, *, error_key=None):
-    try:
-        return reader(key)
-    except WorkflowControlError as exc:
-        errors[key if error_key is None else error_key] = str(exc)
-        return default
+class _NoCommands:
+    """The fix role queues no durable commands: every write is idempotent."""
 
-
-def _fix_state(
-    store: Store,
-    world,
-    inflight: tuple[InFlightFix, ...] = (),
-    *,
-    workflow_control: WorkflowControl | None = None,
-    available_runtimes: frozenset[str] = frozenset(),
-) -> FixState:
-    """Read the per-issue/PR orchestration state the fix decision needs."""
-    errors: dict[int, str] = {}
-
-    def read(key, reader, default, *, error_key=None):
-        return _control_value(errors, key, reader, default, error_key=error_key)
-
-    available_runtimes = available_runtimes or frozenset({store.runtime})
-    pr_issues = {breaker_key(p) for p in world.prs if breaker_key(p) > 0}
-    sessions = frozenset()
-    resumed = {}
-    pr_resumed = {}
-    pr_reply_errors = {}
-    # Retry counters are keyed by breaker_key(pr): the linked issue number, or the
-    # NEGATED PR number when a PR has no resolvable issue (Jira-keyed branch, no
-    # closing-ref). Must match the workflow's increment key exactly, else the
-    # breaker reads 0 forever and the retry loop never escalates (was PR #112).
-    keys = {breaker_key(p) for p in world.prs}
-    ci_retries: dict[int, int] = {}
-    ci_resets: dict[int, cc.CIEpisodeReset] = {}
-    # Full (review_at, count) tuple: the domain compares the stored timestamp
-    # against the CURRENT review's submitted_at so a superseding review reads
-    # as count 0 (see FixState.review_retries).
-    review_retries = {}
-    review_errors = {}
-    rebase_retries = {}
-    resolve_workflows: dict[int, WorkflowRead] = {}
-    if workflow_control is not None:
-        observed_at = parse_timestamp(world.now)
-        for issue in world.issues:
-            key = WorkflowKey(workflow_control.writer.repository, IssueRef(issue.number))
-            try:
-                workflow = workflow_control.load_workflow(key)
-                if isinstance(workflow, WorkflowAbsent):
-                    if observed_at is None:
-                        workflow = WorkflowUnavailable(key, "workflow discovery requires a timestamped issue observation")
-                    else:
-                        workflow = workflow_control.ensure_observed_workflow(
-                            ObservedIssue(key, issue, observed_at)
-                        ).snapshot
-                resolve_workflows[issue.number] = workflow
-            except (ValueError, sqlite3.Error) as exc:
-                resolve_workflows[issue.number] = WorkflowUnavailable(key, str(exc))
-        # A PR may remain observable when its issue fetch failed. Existing SQL
-        # handoff evidence can be read, but absence cannot initialize an unseen
-        # issue or authorize an issue-side effect.
-        for number in pr_issues - resolve_workflows.keys():
-            key = WorkflowKey(workflow_control.writer.repository, IssueRef(number))
-            try:
-                resolve_workflows[number] = workflow_control.load_workflow(key)
-            except (ValueError, sqlite3.Error) as exc:
-                resolve_workflows[number] = WorkflowUnavailable(key, str(exc))
-    sessions = sessions | frozenset(
-        number for number in pr_issues
-        if isinstance(workflow := resolve_workflows.get(number), WorkflowSnapshot)
-        and workflow.episode.continuation.session is not None
-        and workflow.episode.continuation.session.runtime in available_runtimes
-    )
-    for pr in world.prs:
-        number = breaker_key(pr)
-        try:
-            repair = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number))) if workflow_control is not None else None
-            if not isinstance(repair, cc.SelectedPRRepair):
-                raise ValueError("PR repair continuity is inactive or migration blocked")
-            pr_resumed[pr.number] = repair.component.state.consumed_reply_at
-            current_session = repair.component.state.session
-            if current_session is not None and current_session.runtime.value in available_runtimes and repair.component.state.branch == pr.head_ref_name:
-                sessions = sessions | {number}
-        except (ValueError, sqlite3.Error) as exc:
-            pr_reply_errors[pr.number] = str(exc)
-        try:
-            if workflow_control is None or number <= 0:
-                raise ValueError("CI issue recovery authority is unavailable")
-            selected = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
-            if not isinstance(selected, cc.SelectedIssueRecovery):
-                raise ValueError("CI issue recovery authority is inactive or migration blocked")
-            ci_retries[number] = selected.component.state.ci_failures
-            rebase_retries[number] = selected.component.state.rebase_failures
-            review_debt = selected.component.state.review_failures
-            if review_debt.count and not review_debt.review_at:
-                review_errors[number] = "review retry debt has no verified qualifying timestamp"
-            elif review_debt.pr is not None and review_debt.pr != PullRequestRef(pr.number):
-                review_errors[number] = "review retry debt belongs to another linked PR"
-            else:
-                review_retries[number] = (review_debt.review_at, review_debt.count)
-            if selected.component.state.ci_failures:
-                repair = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number)))
-                if isinstance(repair, cc.SelectedPRRepair) and pr.head_ref_oid:
-                    ci_resets[pr.number] = cc.CIEpisodeReset(selected.binding, selected.revision, repair.revision.fence, pr.head_ref_oid)
-        except (ValueError, sqlite3.Error) as exc:
-            errors[number] = str(exc)
-    leg_ends: dict[int, tuple] = {}
-    leg_history_errors: dict[int, str] = {}
-    for number in {issue.number for issue in world.issues} | pr_issues:
-        try:
-            if workflow_control is None:
-                raise ValueError("fix leg history is unavailable")
-            selected_issue = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
-            if not isinstance(selected_issue, cc.SelectedIssueRecovery):
-                raise ValueError("issue recovery authority is inactive or migration blocked")
-            leg_ends[number] = workflow_control.fix_leg_ends(number)
-        except (ValueError, sqlite3.Error, ControlStoreError) as exc:
-            # Holds THIS issue only (fail closed); the tick logs it as
-            # "fix leg history <n> held".
-            leg_history_errors[number] = str(exc)
-    # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
-    # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
-    # with no resolvable issue has check runs like any other.
-    ci_rerun_head = {}
-    ci_cancel_head = {}
-    ci_remediations = {}
-    ci_remediation_errors = {}
-    pending_ci_escalations = set()
-    cleanup_sources = {}
-    for pr in world.prs:
-        try:
-            if workflow_control is None:
-                raise ValueError("CI remediation PR repair authority is unavailable")
-            selected = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number)))
-            if not isinstance(selected, cc.SelectedPRRepair):
-                raise ValueError("CI remediation PR repair authority is inactive or migration blocked")
-            if pr.state in {"CLOSED", "MERGED"}:
-                cleanup_sources[pr.number] = cc.PRRepairCleanup(selected.binding, selected.revision, pr.head_ref_oid, pr.state == "MERGED")
-            rerun, cancel = selected.component.state.ci_rerun, selected.component.state.ci_cancel
-            ci_remediations[pr.number] = (rerun, cancel)
-            ci_rerun_head[pr.number] = ci_remediation_marker(rerun)
-            ci_cancel_head[pr.number] = ci_remediation_marker(cancel)
-            escalation = selected.component.state.pending_ci_escalation
-            if isinstance(escalation, cc.SettledPRRecoveryEffect) and escalation.receipt.status is EffectStatus.SUCCEEDED:
-                escalation_capture = escalation.owed.capture
-                pending_ci_escalations.add((pr.number, escalation_capture.decision_head
-                    if isinstance(escalation_capture, cc.PendingCIEscalationCapture) else escalation_capture.head))
-        except (ValueError, sqlite3.Error) as exc:
-            ci_remediation_errors[pr.number] = str(exc)
-    ci_pending_escalated = frozenset(pending_ci_escalations)
-    return FixState(
-        control_errors=errors,
-        sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
-        pr_reply_control_errors=pr_reply_errors,
-        ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
-        review_control_errors=review_errors,
-        rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
-        leg_ends=leg_ends, leg_history_errors=leg_history_errors, ci_rerun_head=ci_rerun_head,
-        ci_cancel_head=ci_cancel_head,
-        ci_remediations=ci_remediations, ci_remediation_errors=ci_remediation_errors,
-        ci_pending_escalated=ci_pending_escalated,
-        cleanup_sources=cleanup_sources,
-        inflight=inflight,
-    )
+    def drain_pending_commands(self) -> int:
+        return 0
 
 
 @dataclass(frozen=True)
 class FixDaemonComposition:
     """The fix role's composed authorities.
 
-    Exposed so acceptance tests drive the exact production wiring (drain and
-    recovery bindings, spend gate, worktree removal) instead of a
-    hand-copied replica that can drift from it.
+    Exposed so acceptance tests drive the exact production wiring (facts,
+    act, legs, recovery) instead of a hand-copied replica that can drift.
     """
 
     daemon: Daemon
     control: SQLiteControlStore
     journal: Journal
-    executor: Executor
-    effects: EffectRecovery
-    dispatcher: AgentDispatcher
-    workflow_control: SQLiteWorkflowControl
-    rearm: ResolveRearmWorkflow
+    act: GitHubAct
+    legs: FixLegs
     recovery: _RecoveryHooks
     owner_id: str
 
@@ -1385,9 +1115,8 @@ def build_fix_daemon(
     store: Store,
     worktrees: Worktrees,
     runner: AgentRunner,
-    fixer_busy=lambda: False,
 ) -> Daemon:
-    return compose_fix_daemon(cfg, gateway, store, worktrees, runner, fixer_busy).daemon
+    return compose_fix_daemon(cfg, gateway, store, worktrees, runner).daemon
 
 
 def compose_fix_daemon(
@@ -1396,354 +1125,84 @@ def compose_fix_daemon(
     store: Store,
     worktrees: Worktrees,
     runner: AgentRunner,
-    fixer_busy=lambda: False,
     *,
     log: Callable[[str], None] | None = None,
 ) -> FixDaemonComposition:
+    """observe -> derive -> policy -> act, with paid legs in a bounded pool."""
     log = log or _log("fix")
-    repo_cfg = cfg.repository
-    fix_runtime = cfg.fix_runtime
-    codex_runtime = cfg.codex_runtime
-    fix_cfg = FixConfig(
-        fix_bot=fix_runtime.bot,
-        identity_mode=repo_cfg.identity_mode,
-        auto_merge=cfg.auto_merge,
-        merge_method=cfg.merge_method,
-        ci_pending_max_seconds=cfg.ci_pending_max_seconds,
-        duplicate_pr_guard=cfg.duplicate_pr_guard,
-        ci_free_rerun=cfg.ci_free_rerun,
-        close_issue_on_merge=cfg.close_issue_on_merge,
-        max_ci_retries=fix_runtime.max_ci_retries,
-        max_review_retries=fix_runtime.max_review_retries,
-        auto_rebase_conflicts=fix_runtime.auto_rebase_conflicts,
-        max_rebase_retries=fix_runtime.max_rebase_retries,
-        max_resolve_retries=fix_runtime.max_resolve_retries,
-    )
     journal = _journal(store)
-    dcfg = DispatchConfig(
-        base_branch=repo_cfg.base_branch,
-        fix=FixTaskConfig(
-            repo_cfg.repo, repo_cfg.base_branch, cfg.agent_md,
-            fix_runtime.budget_usd, fix_runtime.model, fix_runtime.effort,
-            router_budget_usd=cfg.router_budget_usd,
-            runtime=cfg.fixer_runtime,
-        ),
-        max_review_rejections=cfg.max_review_rejections,
-        fix_mcp_config=fix_runtime.mcp_config,
-        harness_root=cfg.runtime_paths.harness_root,
-        log=log,
-        fix_bot=fix_runtime.bot,
-        fixer_runtime=cfg.fixer_runtime,
-        fix_model_routes=cfg.fix_model_routes,
-        available_fix_runtimes=cfg.fix_runtimes,
-        escalate_on_evidence=cfg.escalate_on_evidence,
-        max_ci_retries=fix_runtime.max_ci_retries,
-        max_review_retries=fix_runtime.max_review_retries,
-        max_rebase_retries=fix_runtime.max_rebase_retries,
-        **_spend_cfg(cfg, "fix"),
-    )
-    runtime_bindings = {
-        provider: _FIX_RUNTIME_REGISTRY[provider](cfg, codex_runtime, runner)
-        for provider in sorted(cfg.fix_runtimes, key=lambda provider: provider.value)
-    }
-    prepare_cwd = runtime_bindings[cfg.fixer_runtime].prepare_cwd if not cfg.fix_model_routes else None
-
+    fix_runtime = cfg.fix_runtime
+    binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](cfg, cfg.codex_runtime, runner)
     control = _control_store(cfg, cfg.state_dir, "fix")
-    dcfg = replace(dcfg, operator_guidance=review_guidance_reader(control, cfg.repo))
     owner_id = _owner_identity(cfg, "fix")
-    effect_executor = _effects(
-        gateway,
-        control,
+    settings = FixSettings(
         repository=cfg.repo,
-        identity=owner_id,
-        config_version=cfg.config_version,
-        fix_config=fix_cfg,
+        auto_merge=cfg.auto_merge,
         base_branch=cfg.base_branch,
-        retry_ceiling=cfg.effect_retry_ceiling,
-        journal=journal,
-        alert_cmd=cfg.alert_cmd,
+        runtime=cfg.fixer_runtime.value,
+        owner_id=owner_id,
+        harness=Harness(fix_bot=fix_runtime.bot, review_bot=cfg.review_bot),
+    )
+    reconciler = _LateReservationReconciler()
+    accounting = _with_accounting(
+        binding.runner, control, cfg, "fix", cfg.fixer_runtime.value, reconciler,
+    )
+    runtime = JournalingRuntime(
+        accounting, journal, repo=cfg.repo, role="fix",
+        runtime=cfg.fixer_runtime.value, state_dir=cfg.state_dir,
+    )
+    daemon_ref: dict[str, Daemon] = {}
+    act_ref: dict[str, GitHubAct] = {}
+    legs = FixLegs(
+        gateway, control, settings,
+        runtime=runtime,
+        accounting=accounting,
+        worktrees=worktrees,
+        task_config=FixTaskConfig(
+            cfg.repo, cfg.base_branch, cfg.agent_md, fix_runtime.budget_usd,
+            fix_runtime.model, fix_runtime.effort, runtime=cfg.fixer_runtime,
+        ),
+        post=lambda comment: act_ref["act"].post(comment),
+        prepare_cwd=binding.prepare_cwd,
         log=log,
     )
-    workflow_control = SQLiteWorkflowControl(
-        control, WorkflowWriter(cfg.repo, "fix", owner_id),
-        resolve_ceiling=cfg.max_resolve_retries,
-    )
-    def validate_cleanup_fix_state(action):
-        if action.pr is not None:
-            if action.source is None:
-                raise ValueError("PR cleanup requires selected SQL recovery provenance")
-            current = gateway.get_pr(action.pr)
-            if (current.state != ("MERGED" if action.merged else "CLOSED")
-                    or current.head_ref_oid != action.source.head):
-                raise ValueError("PR cleanup terminal/head observation changed")
-            workflow_control.validate_pr_repair_cleanup(WorkflowKey(cfg.repo, PullRequestRef(action.pr)), action.merged, action.source)
-
-    def cleanup_fix_state(action):
-        validate_cleanup_fix_state(action)
-        if action.pr is not None:
-            workflow_control.cleanup_pr_repair(WorkflowKey(cfg.repo, PullRequestRef(action.pr)), action.merged, action.source)
-        store.cleanup_pr(action.pr, action.issue, action.merged)
-
-    def reset_ci_episode(action: ResetCiRetries) -> None:
-        source = action.source
-        if source is None:
-            raise ValueError("CI reset lacks its selected green observation")
-        pr = gateway.get_pr(source.pr_fence.key.target.number)
-        current_pr = gateway.pr_for_issue(action.issue, require_unique=True)
-        if (breaker_key(pr) != action.issue or pr.head_ref_oid != source.head
-                or pr.state not in {"OPEN", "MERGED"}
-                or (pr.state != "MERGED" and ci_state(pr.ci) is not CIState.OK)
-                or current_pr != (pr.number if pr.state == "OPEN" else None)):
-            raise ValueError("CI reset no longer matches settled green PR/head linkage")
-        if workflow_control.reset_ci_episode(source):
-            store.clear_ci_history(action.issue)
-
-    executor = Executor(
-        gateway, remove_worktree=worktrees.remove, log=log,
-        clear_issue_state=cleanup_fix_state,
-        validate_cleanup=validate_cleanup_fix_state,
-        reset_ci_retries=reset_ci_episode,
-        journal=journal, alert_cmd=cfg.alert_cmd,
-        effect_executor=effect_executor.actions,
-    )
-    # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
-    # the Codex swap above) and the ledger is runtime-agnostic.
-    fix_reconciler = _LateReservationReconciler()
-    from ..adapters.workspace_admission import WorkspaceAdmission
-
-    from ..adapters.runtime_selection import SelectingRuntime
-
-    governed_runtimes = {
-        provider: _with_accounting(
-            binding.runner, control, cfg, "fix", provider.value,
-            fix_reconciler,
-            admit=WorkspaceAdmission(control, worktrees, os.environ.get("GH_HOST", "github.com")),
-        ) for provider, binding in runtime_bindings.items()
-    }
-    fix_runner = (SelectingRuntime(governed_runtimes, cfg.fixer_runtime)
-                  if cfg.fix_model_routes else governed_runtimes[cfg.fixer_runtime])
-    fix_runner = JournalingRuntime(
-        fix_runner,
-        journal,
-        repo=cfg.repo,
-        role="fix",
-        runtime=cfg.fixer_runtime.value,
-        state_dir=cfg.state_dir,
-    )
-    reservations = DispatchPathReservations(
-        control,
+    dispatch = CancellableAsyncDispatch(legs.run)
+    act = GitHubAct(
+        gateway, control,
         repository=cfg.repo,
-        role="fix",
-        owner_id=owner_id,
+        base_branch=cfg.base_branch,
+        merge_method=cfg.merge_method,
+        close_issue_on_merge=cfg.close_issue_on_merge,
+        marker=settings.harness.marker,
+        dispatch=dispatch, remove_worktree=worktrees.remove, log=log,
     )
-    dispatcher = AgentDispatcher(
-        dcfg, gateway, store, worktrees, fix_runner, executor,
-        prepare_cwd=prepare_cwd, journal=journal,
-        reserve_fix_paths=reservations.expand,
-        dispatch_claim_target=reservations.issue_for,
-        workflow_control=workflow_control,
+    act_ref["act"] = act
+    facts = FixFacts(
+        control, settings,
+        active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
+        headroom=_headroom(_control_spend_gate(cfg, control, fix_runtime.budget_usd)),
+        lifetime_capped=_lifetime_capped(cfg, control),
     )
-    from .resolve_control import compose_resolve_rearm
-
-    rearm_workflow = compose_resolve_rearm(
-        cfg, control, gateway, worktrees, store,
-        now=lambda: datetime.now(timezone.utc), log=log,
-        approved_host=os.environ.get("GH_HOST", "github.com"),
-    )
-
-    def reconcile_workflows() -> int:
-        # Both startup/wake recovery and every command drain use these same
-        # authorities, including when paid admission or world polling is held.
-        return dispatcher.fix_workflow.reconcile_returns() + rearm_workflow.reconcile()
-
-    executor.bind_workflow_reconciliation(reconcile_workflows)
-    effect_executor = replace(effect_executor, reconcile_workflow=reconcile_workflows)
-    dispatch_runtime = CancellableAsyncDispatch(
-        dispatcher.dispatch,
-        finished=reservations.finish,
-    )
-    executor.bind_dispatch(dispatch_runtime)
-
-    daemon_ref: dict[str, Daemon] = {}
-
-    issue_kinds = frozenset({AgentKind.RESOLVE, AgentKind.RESUME})
-
-    def dispatch_key(action: RunAgent):
-        # `decide` reserves every action from the observed world before tick()
-        # submits it. Reuse that exact identity; a second live GitHub lookup can
-        # disagree with a world-probe snapshot and defeat issue deduplication.
-        issue = reservations.issue_for(action)
-        if issue is None:
-            return (action.kind, action.number)
-        return (
-            ("issue", issue)
-            if issue > 0
-            else ("pr", action.number)
-        )
-
-    def action_reservation(
-        action: RunAgent, world
-    ) -> tuple[int, frozenset[str]]:
-        issues = {issue.number: issue for issue in world.issues}
-        prs = {pr.number: pr for pr in world.prs}
-        if action.kind in issue_kinds:
-            issue = action.number
-            view = issues.get(issue)
-            paths = (
-                view.declared_paths | view.predicted_paths
-                if view is not None
-                else frozenset()
-            )
-            return issue, paths
-        pr = prs.get(action.number)
-        issue = breaker_key(pr) if pr is not None else -action.number
-        view = issues.get(issue)
-        paths = (pr.changed_files if pr is not None else frozenset()) | (
-            view.declared_paths | view.predicted_paths
-            if view is not None
-            else frozenset()
-        )
-        return issue, paths
-
-    # Sampled by observe() immediately BEFORE the world fetch. A leg that
-    # finishes mid-fetch releases its reservation while the already-fetched
-    # world still shows its ai-working label; a post-fetch snapshot then reads
-    # "nothing active" against a stale world and reap_actions repairs an issue
-    # that was never orphaned (keifu #18/#25 dual-label race, 2026-08-02 —
-    # cost a duplicate route leg). Merging the pre-fetch sample fails toward
-    # "busy", which defers work by one poll instead of duplicating it.
-    pre_fetch_inflight: list[tuple[InFlightFix, ...]] = []
-
-    def decide(world):
-        # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
-        # record of what it was holding, which is the state hardest to diagnose.
-        # ONE FixState per tick, shared with the flake reporter — it is the same
-        # state decide_fix decides on, so the two can never describe different
-        # worlds (and the store reads happen once, not twice).
-        world = _inject_predicted_paths(store, world)
-        held = {f.issue: f for f in pre_fetch_inflight[0]} if pre_fetch_inflight else {}
-        held.update({f.issue: f for f in reservations.snapshot()})
-        inflight = tuple(held.values())
-        state = _fix_state(
-            store,
-            world,
-            inflight,
-            workflow_control=workflow_control,
-            available_runtimes=frozenset(provider.value for provider in cfg.fix_runtimes),
-        )
-        open_prs = {pr.number for pr in world.prs if pr.state == "OPEN"}
-        open_targets = {issue.number for issue in world.open_issues()} | {
-            breaker_key(pr) for pr in world.prs if pr.number in open_prs
-        }
-        for prefix, errors in (
-            ("workflow", state.control_errors),
-            ("address-review", state.review_control_errors),
-            ("fix leg history", state.leg_history_errors),
-        ):
-            for target, reason in errors.items():
-                if target in open_targets:
-                    log(f"{prefix} {target} held: {reason}")
-        for target, reason in state.pr_reply_control_errors.items():
-            if target in open_prs:
-                log(f"PR reply {target} held: {reason}")
-        migration_required = sorted(
-            target for target, workflow in state.resolve_workflows.items()
-            if target in open_targets and isinstance(workflow, WorkflowMigrationRequired)
-        )
-        if migration_required:
-            log(f"resolve workflows held ({len(migration_required)}): resolve_migration_required")
-        for target, workflow in state.resolve_workflows.items():
-            if target in open_targets and isinstance(workflow, WorkflowUnavailable):
-                log(f"resolve workflow {target} held: {workflow.reason}")
-        daemon = daemon_ref.get("daemon")
-        externally_busy = fixer_busy()
-        slots = (
-            daemon.available_dispatch_slots
-            if daemon is not None and not externally_busy
-            else 0
-        )
-        decided = decide_fix(
-            world,
-            fix_cfg,
-            state,
-            fixer_busy=bool(inflight) or externally_busy,
-            dispatch_slots=slots,
-        )
-        rejected: list[RunAgent] = []
-        rejected_issues: set[int] = set()
-        for action in decided:
-            if isinstance(action, NoOp) and action.reason:
-                log(action.reason)
-            if not isinstance(action, RunAgent):
-                continue
-            issue, paths = action_reservation(action, world)
-            if not reservations.reserve(action, issue, paths):
-                rejected.append(action)
-                rejected_issues.add(issue)
-                log(
-                    f"dispatch {action.kind.name} #{action.number}: deferred — "
-                    "path reservation changed during decision"
-                )
-        if not rejected:
-            return decided
-        return [
-            action
-            for action in decided
-            if action not in rejected
-            and not (
-                isinstance(action, Relabel)
-                and action.target is Target.ISSUE
-                and action.number in rejected_issues
-                and action.add is Label.AI_WORKING
-            )
-        ]
-
-    log(fix_capability_line(
-        auto_merge=fix_cfg.auto_merge,
-        auto_rebase=fix_cfg.auto_rebase_conflicts,
-        escalate_on_evidence=cfg.escalate_on_evidence,
-    ))
     recovery = _recovery(
-        cfg.state_dir,
-        cfg,
-        control,
-        effect_executor,
-        "fix",
-        worktrees,
-        owner_id=owner_id,
-        reconciler=fix_reconciler,
+        cfg.state_dir, cfg, control, _NoCommands(), "fix", worktrees,
+        owner_id=owner_id, reconciler=reconciler,
     )
-
-    def observe_with_prefetch_reservations():
-        pre_fetch_inflight[:] = [reservations.snapshot()]
-        return gateway.build_world()
-
     daemon = Daemon(
         "fix",
-        observe_with_prefetch_reservations,
-        decide,
-        executor,
+        gateway.build_fix_world,
+        decide_with(facts, settings, lease_slots(daemon_ref), log),
+        act,
         cfg.tick_interval_seconds,
         log,
         journal=journal,
-        tick_gate=_control_spend_gate(cfg, control, cfg.fix_budget_usd),
-        wake_check=_wake_check(cfg, store),
         dispatch_capacity=cfg.fix_dispatch_concurrency,
-        dispatch_key=dispatch_key,
-        cancel_active_dispatches=dispatch_runtime.cancel_all,
+        dispatch_key=lambda action: dispatch_item(action),
+        cancel_active_dispatches=dispatch.cancel_all,
         force_kill_dispatches=_force_kill(cfg, "fix", cfg.state_dir),
-        dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
         reconcile=recovery.reconcile,
-        prepare_shutdown=_shutdown_prepare(
-            control,
-            owner_id=owner_id,
-        ),
-        finalize=_shutdown_finalize(
-            control,
-            effect_executor,
-            owner_id=owner_id,
-        ),
+        prepare_shutdown=_shutdown_prepare(control, owner_id=owner_id),
+        finalize=_shutdown_finalize(control, _NoCommands(), owner_id=owner_id),
         terminalize=_shutdown_terminalize(
             control,
             CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
@@ -1753,10 +1212,10 @@ def compose_fix_daemon(
         ),
     )
     daemon_ref["daemon"] = daemon
-    return FixDaemonComposition(
-        daemon, control, journal, executor, effect_executor, dispatcher,
-        workflow_control, rearm_workflow, recovery, owner_id,
-    )
+    log(f"fix: capabilities: resolve=on merge={'on' if cfg.auto_merge else 'off'}")
+    return FixDaemonComposition(daemon, control, journal, act, legs, recovery, owner_id)
+
+
 def _review_unproductive_rounds(
     control: SQLiteControlStore, repository: str, world, errors: dict[int, str],
 ) -> dict[int, int]:
@@ -1908,7 +1367,6 @@ def compose_review_daemon(
         repository=cfg.repo,
         identity=owner_id,
         config_version=cfg.config_version,
-        base_branch=cfg.base_branch,
         retry_ceiling=cfg.effect_retry_ceiling,
         journal=journal,
         alert_cmd=cfg.alert_cmd,
@@ -1936,7 +1394,7 @@ def compose_review_daemon(
         effect_executor = replace(effect_executor, reconcile_workflow=runtime.reconcile)
     review_reconciler = _LateReservationReconciler()
     dispatcher = AgentDispatcher(
-        dcfg, gateway, store, None,
+        dcfg, gateway, store,
         JournalingRuntime(
             _with_accounting(
                 review_runner,
@@ -2128,7 +1586,6 @@ def compose_review_daemon(
     daemon = Daemon("review", gateway.build_review_world, decide, executor,
                   cfg.tick_interval_seconds, say, journal=journal,
                   tick_gate=_control_spend_gate(cfg, control, cfg.review_budget_usd),
-                  wake_check=_wake_check(cfg, store),
                   dispatch_capacity=1,
                   dispatch_key=lambda action: ("pr", action.number),
                   cancel_active_dispatches=dispatch_runtime.cancel_all,

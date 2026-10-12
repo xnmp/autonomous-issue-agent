@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import signal
@@ -466,7 +465,7 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
     assert store.leases() == ()
 
 
-def test_supervised_paid_command_carries_authority_outside_target_environment(
+def test_supervised_paid_command_scrubs_authority_from_the_target_environment(
     tmp_path,
 ) -> None:
     state_dir = tmp_path / "state"
@@ -476,23 +475,12 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
     run_id = RunId("authority-carrier")
     request = _reserve_paid_run(store, run_id)
     observed = tmp_path / "observed.json"
-    authority = {
-        "ISSUE_AGENT_BASE_BRANCH": "canary/live",
-        "ISSUE_AGENT_PUBLICATION_BRANCH": "fix/150-health",
-    }
-    bundle = base64.urlsafe_b64encode(
-        json.dumps(authority, separators=(",", ":")).encode()
-    ).decode()
     program = (
         "import json, os; "
         "from pathlib import Path; "
-        "from issue_agent.adapters.agent_publish import _process_environment; "
         f"Path({str(observed)!r}).write_text(json.dumps({{"
         "'child': {k: os.environ.get(k) for k in ("
-        "'ISSUE_AGENT_AUTHORITY_BUNDLE', 'ISSUE_AGENT_CONTROL_DB', "
-        "'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID', "
-        "'ISSUE_AGENT_BASE_BRANCH')}, "
-        "'carrier': _process_environment(os.getppid())}))"
+        "'ISSUE_AGENT_CONTROL_DB', 'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID')}}))"
     )
     command = supervisor.supervised_command(
         run_id,
@@ -508,8 +496,6 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
             "ISSUE_AGENT_CONTROL_DB": store.path,
             "ISSUE_AGENT_RUN_ID": str(run_id),
             "ISSUE_AGENT_OWNER_ID": request.owner_id,
-            "ISSUE_AGENT_BASE_BRANCH": "canary/live",
-            "ISSUE_AGENT_AUTHORITY_BUNDLE": bundle,
         },
         check=False,
         capture_output=True,
@@ -519,13 +505,10 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
     assert completed.returncode == 0, completed.stderr
     result = json.loads(observed.read_text())
     assert result["child"] == {
-        "ISSUE_AGENT_AUTHORITY_BUNDLE": None,
         "ISSUE_AGENT_CONTROL_DB": None,
         "ISSUE_AGENT_RUN_ID": None,
         "ISSUE_AGENT_OWNER_ID": None,
-        "ISSUE_AGENT_BASE_BRANCH": None,
     }
-    assert result["carrier"] == authority
 
     supervisor.kill_tree(run_id)
     store.release(run_id, "test complete")

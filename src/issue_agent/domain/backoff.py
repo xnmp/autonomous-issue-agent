@@ -47,6 +47,13 @@ class LegEnd:
     # The PR head the leg was dispatched on ("" for issue-stage legs). Lets
     # attempt counting key REVIEW legs to the head they reviewed.
     head: str = ""
+    # The agent returned asking a human for judgment (the outcome layer's
+    # ASKED class). Always False for a machine end.
+    asked: bool = False
+    # When the leg started, if known. Comments inside a leg's window are the
+    # agent's own (it posts acceptance criteria and test plans under the bot's
+    # login, without the harness marker), so they never reset attempts.
+    started_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -57,6 +64,13 @@ class LegEnd:
             raise ValueError("leg end requires an exact machine classification")
         if not isinstance(self.head, str):
             raise ValueError("leg end head must be a string")
+        if type(self.asked) is not bool or (self.asked and self.machine):
+            raise ValueError("only an agent end can have asked")
+        if self.started_at is not None and (
+            not isinstance(self.started_at, datetime) or self.started_at.utcoffset() is None
+            or self.started_at > self.ended_at
+        ):
+            raise ValueError("leg start must be an aware time no later than its end")
 
 
 def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime | None:

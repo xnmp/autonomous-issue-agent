@@ -8,7 +8,6 @@ import errno
 import json
 
 from issue_agent.adapters.github import (
-    _CLOSED_CLEANUP_LIMIT,
     _FAILED_LOG_BYTES,
     _FAILED_LOG_LINES,
     _INLINE_COMMENT_LIMIT,
@@ -29,21 +28,10 @@ from issue_agent.adapters.github import (
     parse_issue,
     parse_pr,
     parse_terminal_pr,
-    parse_world,
 )
-from issue_agent.domain.actions import (
-    ClearIssueState,
-    CloseIssue,
-    Relabel,
-    RemoveWorktree,
-    Target,
-)
-from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
-from issue_agent.domain.world import CIState, Comment
-from issue_agent.domain.ci import ci_state, parse_timestamp
-from issue_agent.domain.checks import Unavailable, Observed
-from tests.fakes.workflow_authority import resolve_snapshot
+from issue_agent.domain.world import Comment
+from issue_agent.domain.checks import Unavailable
 
 
 # ── parsers ────────────────────────────────────────────────────────────────
@@ -144,10 +132,6 @@ def test_parse_pr_checks_feed_ci_state():
     assert isinstance(pr.ci, Unavailable)
 
 
-def test_parse_world():
-    w = parse_world([{"number": 1, "state": "OPEN"}], [{"number": 2, "state": "MERGED"}])
-    assert len(w.issues) == 1 and len(w.prs) == 1
-    assert w.prs[0].state == "MERGED"
 
 
 def test_parse_issue_extracts_declared_paths():
@@ -200,16 +184,6 @@ def test_identity_ambient_is_none():
     assert Identity().env_token() is None
 
 
-def test_gateway_reports_scheduler_progress_after_each_bounded_call():
-    progress = []
-    gateway = GitHubGateway(
-        "o/r",
-        runner=lambda _argv, _token: '[{"number":7}]',
-        progress=lambda: progress.append("completed"),
-    )
-
-    assert gateway.list_issue_numbers("ai-ready") == [7]
-    assert progress == ["completed"]
 
 
 # ── gateway with a fake runner ────────────────────────────────────────────────
@@ -732,181 +706,16 @@ def test_has_open_blocker_fail_soft_on_error():
     assert gw.has_open_blocker(57) is False
 
 
-def test_build_world_enriches_only_ready_issues_with_blocker_gate():
-    # ai-ready #5 gets a blocked-by read; ai-working #6 does NOT (not gated).
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key and "ai-ready" in key:
-            return json.dumps([{"number": 5}])
-        if "issue list" in key and ("ai-working" in key or "ai-blocked" in key):
-            return json.dumps([{"number": 6}]) if "ai-working" in key else "[]"
-        if "pr list" in key:
-            return "[]"
-        if "issue view 5" in key:
-            return json.dumps({"number": 5, "state": "OPEN", "labels": [{"name": "ai-ready"}]})
-        if "issue view 6" in key:
-            return json.dumps({"number": 6, "state": "OPEN", "labels": [{"name": "ai-working"}]})
-        if "issues/5/dependencies/blocked_by" in key:
-            return json.dumps([42])
-        if "issues/5" in key:
-            return "1"
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    w = gw.build_world()
-    by_num = {i.number: i for i in w.issues}
-    assert by_num[5].blocked_by_open is True     # ready issue gated + blocked
-    assert by_num[5].open_blocker_numbers == (42,)
-    assert by_num[6].blocked_by_open is False    # working issue never gated
 
 
-def test_build_world_gates_issues_linked_from_an_open_pr_on_their_blockers():
-    # keifu #130/#157 (2026-08-03): the repair arm is gated on the same
-    # blocked-by read as admission, so an issue that already has an OPEN PR
-    # must pay it too — via the PR's closing reference (#130) or, absent one,
-    # its numeric branch (#157). An ai-working issue with no PR still doesn't.
-    calls = []
-
-    def runner(argv, token):
-        calls.append(" ".join(argv))
-        key = " ".join(argv)
-        if "issue list" in key and "ai-pr-open" in key:
-            return json.dumps([{"number": 130}, {"number": 157}])
-        if "issue list" in key and "ai-working" in key:
-            return json.dumps([{"number": 6}])
-        if "issue list" in key:
-            return "[]"
-        if "pr list" in key:
-            return json.dumps([{"number": 100, "state": "OPEN"},
-                               {"number": 101, "state": "OPEN"}])
-        if "pr view 100" in key:
-            return json.dumps({
-                "number": 100, "state": "OPEN", "labels": [{"name": "ai-pr-open"}],
-                "headRefName": "fix/999-unrelated",
-                "closingIssuesReferences": [{"number": 130}],
-            })
-        if "pr view 101" in key:
-            return json.dumps({
-                "number": 101, "state": "OPEN", "labels": [{"name": "ai-pr-open"}],
-                "headRefName": "fix/157-something", "closingIssuesReferences": [],
-            })
-        for n in (130, 157, 6):
-            if f"issue view {n}" in key:
-                return json.dumps({"number": n, "state": "OPEN",
-                                   "labels": [{"name": "ai-pr-open"}]})
-        if "issues/130/dependencies/blocked_by" in key:
-            return json.dumps([185])
-        if "issues/157/dependencies/blocked_by" in key:
-            return json.dumps([185, 186])
-        if "issues/130" in key or "issues/157" in key:
-            return "1"
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    by_num = {i.number: i for i in gw.build_world().issues}
-
-    # linked by closing reference…
-    assert by_num[130].blocked_by_open is True
-    assert by_num[130].open_blocker_numbers == (185,)
-    # …and linked only by a numeric branch name.
-    assert by_num[157].blocked_by_open is True
-    assert by_num[157].open_blocker_numbers == (185, 186)
-    # The un-linked, non-ready issue never pays the read.
-    assert by_num[6].blocked_by_open is False
-    assert by_num[6].open_blocker_numbers == ()
-    assert not any("issues/6" in c for c in calls)
 
 
-def test_build_world_does_not_gate_an_issue_whose_only_pr_is_closed():
-    # A non-OPEN PR gets no repair legs, so its issue buys nothing from the read.
-    calls = []
-
-    def runner(argv, token):
-        calls.append(" ".join(argv))
-        key = " ".join(argv)
-        if "issue list" in key and "ai-pr-open" in key and "closed" not in key:
-            return json.dumps([{"number": 130}])
-        if "issue list" in key:
-            return "[]"
-        if "pr list" in key:
-            return json.dumps([{"number": 100, "state": "MERGED"}])
-        if "pr view 100" in key:
-            return json.dumps({
-                "number": 100, "state": "MERGED", "labels": [{"name": "ai-pr-open"}],
-                "headRefName": "fix/130-x",
-            })
-        if "issue view 130" in key:
-            return json.dumps({"number": 130, "state": "OPEN",
-                               "labels": [{"name": "ai-pr-open"}]})
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert gw.build_world().issues[0].blocked_by_open is False
-    assert not any("dependencies/blocked_by" in c for c in calls)
 
 
-def test_build_world_survives_an_open_pr_with_no_resolvable_issue():
-    # A Jira-keyed branch and no closing reference: nothing to gate, and the
-    # linkage scan must not raise on it.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return "[]"
-        if "pr list" in key:
-            return json.dumps([{"number": 100, "state": "OPEN"}])
-        if "pr view 100" in key:
-            return json.dumps({
-                "number": 100, "state": "OPEN", "labels": [{"name": "ai-pr-open"}],
-                "headRefName": "feat/ACME-2468-thing",
-            })
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    w = gw.build_world()
-    assert [p.number for p in w.prs] == [100] and w.issues == ()
 
 
-def test_build_world_drops_an_open_pr_the_stale_search_still_labels():
-    # keifu PR #179 (2026-08-03): an operator park removed ai-pr-open, but the
-    # search-backed label list kept returning the PR for minutes, so every
-    # path-overlapping ai-ready issue stayed held on a PR the harness no longer
-    # owned. The per-PR fetch's labels are fresh — they are the authority.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return "[]"
-        if "pr list" in key:
-            return json.dumps([{"number": 179, "state": "OPEN"}])
-        if "pr view 179" in key:
-            return json.dumps({
-                "number": 179, "state": "OPEN",
-                "labels": [{"name": "ai-parked"}],
-                "files": [{"path": "src/app/mod.rs"}],
-            })
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert gw.build_world().prs == ()
 
 
-def test_build_world_keeps_a_merged_pr_still_wearing_the_label():
-    # The merge-cleanup arms exist to drain exactly this state; the freshness
-    # filter must only govern the OPEN slice.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return "[]"
-        if "pr list" in key:
-            return json.dumps([{"number": 60, "state": "MERGED"}])
-        if "pr view 60" in key:
-            return json.dumps({
-                "number": 60, "state": "MERGED",
-                "labels": [{"name": "ai-pr-open"}],
-            })
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert [p.number for p in gw.build_world().prs] == [60]
 
 
 # ── closing-reference graph for the duplicate-PR guard (#39) ─────────────────
@@ -957,20 +766,6 @@ def test_open_closing_refs_asks_for_every_open_pr_in_one_call():
     assert len(fr.calls) == 1                  # one call, no per-PR fetch
 
 
-def test_build_world_carries_closing_refs_into_the_world():
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return "[]"
-        if "closingIssuesReferences" in key:
-            return json.dumps([
-                {"number": 558, "author": {"login": "xnmp"},
-                 "closingIssuesReferences": [{"number": 554}]},
-            ])
-        return "[]"
-
-    w = GitHubGateway("o/r", runner=runner).build_world()
-    assert [(r.pr, r.issue, r.author) for r in w.closing_refs] == [(558, 554, "xnmp")]
 
 
 def test_open_closing_refs_fails_soft_to_empty():
@@ -1217,12 +1012,6 @@ def _fake_run_factory(rc, stderr):
     return _run
 
 
-_ROLLUP_ERR = (
-    "GraphQL: Resource not accessible by integration "
-    "(node.statusCheckRollup.nodes.0.commit.statusCheckRollup)"
-)
-
-
 def test_non_benign_gh_failure_stays_loud_without_debug(monkeypatch, capsys):
     """A REAL failure (e.g. a 422 self-approval on submit) must never be silenced —
     the whole reason the stderr write exists. Not a pr-checks/rollup error → loud."""
@@ -1459,13 +1248,6 @@ def _raising_runner(exc):
     return runner
 
 
-def test_build_world_propagates_gh_unavailable():
-    """A world built on a failed read is a lie. The builders must NOT degrade it
-    to an empty WorldState — that is exactly how a throttled poll came to see
-    zero issues and zero PRs."""
-    gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("rate-limit", "exceeded")))
-    with pytest.raises(GhUnavailable):
-        gw.build_world()
 
 
 def test_review_world_builder_propagates_gh_unavailable():
@@ -1521,44 +1303,12 @@ def _limit_of(argv):
     return argv[argv.index("--limit") + 1] if "--limit" in argv else None
 
 
-def test_list_issue_numbers_passes_limit_and_warns_on_truncation(capsys):
-    """review C2. Without --limit gh answers with the 30 NEWEST issues and looks
-    exactly like a complete answer, so past 30 ai-ready issues the OLDEST are
-    never dispatched — every poll, no error. The cap must be stated, and hitting
-    it must be loud."""
-    fr = FakeRunner({"issue list": [{"number": n} for n in range(1, _LIST_LIMIT + 1)]})
-    gw = GitHubGateway("o/r", runner=fr)
-    nums = gw.list_issue_numbers("ai-ready")
-    assert len(nums) == _LIST_LIMIT
-    assert _limit_of(fr.calls[0][0]) == str(_LIST_LIMIT)
-    err = capsys.readouterr().err
-    assert "TRUNCATED" in err and "ai-ready" in err
 
 
-def test_list_issue_numbers_no_warning_below_limit(capsys):
-    fr = FakeRunner({"issue list": [{"number": 1}, {"number": 2}]})
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.list_issue_numbers("ai-ready") == [1, 2]
-    assert capsys.readouterr().err == ""
 
 
-def test_list_pr_numbers_passes_limit_and_warns_on_truncation(capsys):
-    """review C2, PR half: past 30 open ai-pr-open PRs the oldest vanish from the
-    world, so their failing CI is never fixed and they never merge."""
-    fr = FakeRunner({"pr list": [{"number": n} for n in range(1, _LIST_LIMIT + 1)]})
-    gw = GitHubGateway("o/r", runner=fr)
-    nums = gw.list_pr_numbers("ai-pr-open")
-    assert len(nums) == _LIST_LIMIT
-    assert _limit_of(fr.calls[0][0]) == str(_LIST_LIMIT)
-    err = capsys.readouterr().err
-    assert "TRUNCATED" in err and "ai-pr-open" in err
 
 
-def test_list_pr_numbers_no_warning_below_limit(capsys):
-    fr = FakeRunner({"pr list": [{"number": 1}]})
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.list_pr_numbers("ai-pr-open") == [1]
-    assert capsys.readouterr().err == ""
 
 
 def test_pr_for_issue_passes_limit_and_warns_on_truncation(capsys):
@@ -1637,114 +1387,6 @@ def test_gh_rejects_a_list_subcommand_without_limit():
     assert len(fr.calls) == 3
 
 
-@pytest.mark.parametrize(
-    "build", ["build_world", "build_review_world"]
-)
-def test_every_world_builder_list_call_carries_a_limit(build):
-    """review C2 sweep across both builders — the observable contract, not the
-    guard: no world is ever built from a silently-capped listing."""
-    calls = []
-
-    def runner(argv, token):
-        calls.append(argv)
-        return "[]"
-
-    gw = GitHubGateway("o/r", runner=runner, review_adopt_unlabeled=True)
-    getattr(gw, build)()
-    lists = [a for a in calls if len(a) > 2 and a[2] == "list"]
-    assert lists, f"{build} made no list call"
-    for argv in lists:
-        assert _limit_of(argv) is not None, f"{build}: {' '.join(argv)} has no --limit"
-
-
-# ── review M19: one unreadable issue ≠ a dead poll ────────────────────────────
-def _issue_world_runner(bad, *, label="ai-working", raises=None):
-    """Two issues (#7, #8) carrying `label`; #7 is broken per `bad`/`raises`."""
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return json.dumps([{"number": 7}, {"number": 8}]) if label in key else "[]"
-        if "pr list" in key:
-            return "[]"
-        if "issue view 7" in key:
-            if raises is not None:
-                raise raises
-            return bad
-        if "issue view 8" in key:
-            return json.dumps({"number": 8, "state": "OPEN", "labels": [{"name": label}]})
-        return ""
-    return runner
-
-
-@pytest.mark.parametrize("bad", ["", "{}"])
-def test_build_world_survives_one_unreadable_issue(bad, capsys):
-    """review M19: `gh issue view` on an issue that was transferred, converted to a
-    discussion or locked answers empty/partial → parse_issue raises (AttributeError
-    / KeyError) → the exception used to leave the world-build generator and kill the
-    ENTIRE poll, every tick, permanently (the incident _safe_get_pr records, on the
-    other item type). Only the bad issue may be dropped."""
-    gw = GitHubGateway("o/r", runner=_issue_world_runner(bad))
-    w = gw.build_world()
-    assert [i.number for i in w.issues] == [8]
-    assert "skip issue #7" in capsys.readouterr().err
-
-
-def test_build_world_keeps_both_issues_when_both_are_readable(capsys):
-    # anti-vacuity twin: the isolation above is not just dropping everything.
-    gw = GitHubGateway(
-        "o/r",
-        runner=_issue_world_runner(json.dumps({"number": 7, "state": "OPEN", "labels": []})),
-    )
-    assert [i.number for i in gw.build_world().issues] == [7, 8]
-    assert capsys.readouterr().err == ""
-
-
-def test_build_world_isolates_a_timed_out_issue_but_not_a_rate_limit(capsys):
-    """review M19, blast radius — the exact twin of the PR test above. A single
-    wedged `gh issue view` recurs every poll while that issue exists, so isolating
-    it keeps every other issue dispatchable. A rate limit fails EVERY fetch, so
-    isolating it would rebuild the empty world V10 is about."""
-    timed_out = GhUnavailable("network", "gh timed out after 120s", timed_out=True)
-    gw = GitHubGateway("o/r", runner=_issue_world_runner(None, raises=timed_out))
-    assert [i.number for i in gw.build_world().issues] == [8]
-    assert "skip issue #7" in capsys.readouterr().err
-
-    throttled = _issue_world_runner(
-        None, raises=GhUnavailable("rate-limit", "API rate limit exceeded")
-    )
-    with pytest.raises(GhUnavailable):
-        GitHubGateway("o/r", runner=throttled).build_world()
-
-
-def test_build_world_isolates_a_wedged_blocker_read(capsys):
-    """A wedged `gh api …/dependencies/blocked_by` neither kills the poll nor
-    drops the issue: it marks the issue blocked with no witnesses (fail-closed
-    for BOTH admission and the PR repair arm) until a clean tick re-derives
-    the truth. Dropping used to be the safe direction when only
-    pick_ready_issue consumed the flag; the repair arm fails OPEN for a
-    missing issue, so a drop would have dispatched into the very wedge the
-    blocker tracks (adversarial review F1, 2026-08-03)."""
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return json.dumps([{"number": 7}, {"number": 8}]) if "ai-ready" in key else "[]"
-        if "pr list" in key:
-            return "[]"
-        if "issue view" in key:
-            return json.dumps(
-                {"number": int(argv[3]), "state": "OPEN", "labels": [{"name": "ai-ready"}]}
-            )
-        if "issues/7" in key:
-            raise GhUnavailable("network", "gh timed out after 120s", timed_out=True)
-        return "0"                      # #8: no declared blockers
-
-    gw = GitHubGateway("o/r", runner=runner)
-    world = gw.build_world()
-    assert [i.number for i in world.issues] == [7, 8]
-    seven = world.issues[0]
-    assert (seven.blocked_by_open, seven.open_blocker_numbers) == (True, ())
-    assert world.issues[1].blocked_by_open is False
-    assert "skip issue-blockers #7" in capsys.readouterr().err
 
 
 # ── PR conversation → review prompt (2026-08-08, tauri #613/#614) ─────────────
@@ -1996,68 +1638,15 @@ def test_format_review_comments_small_bodies_are_unaffected_by_the_cap():
     assert format_review_comments(raw) == "a.py:12 (rev): rename this"
 
 
-def test_change_signature_is_one_rest_point_and_fails_soft():
-    """The probe read: a single REST issues?per_page=1 call (issues list includes
-    PRs), returning number@updated_at — and "" (assume-changed) when gh answered
-    nothing, because a broken probe must degrade to building, never to sleeping."""
-    fr = FakeRunner({"api repos/o/r/issues?state=all&sort=updated": "531@2026-07-27T00:00:00Z\n"})
-    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
-    assert gw.change_signature() == "531@2026-07-27T00:00:00Z"
-    argv, token = fr.calls[0]
-    assert argv[1] == "api" and "per_page=1" in argv[2] and "sort=updated" in argv[2]
-    assert token == "t"
-
-    assert GitHubGateway("o/r", Identity(), runner=FakeRunner()).change_signature() == ""
 
 
 
 
-def test_merged_prs_in_the_world_get_the_cheap_fetch():
-    """The --state all label list serves STALE search results (merged PRs
-    unlabeled a day earlier still listed), and each stale entry was paying the
-    hang-class mergeable fetch + a checks call EVERY tick. A non-OPEN PR must
-    cost one plain view: no mergeable fields, no `gh pr checks`."""
-    pr_json = {"number": 540, "title": "t", "body": "", "headRefName": "fix/9-x",
-               "headRefOid": "", "baseRefName": "dev", "labels": [], "reviews": [],
-               "state": "MERGED", "closingIssuesReferences": [], "files": [],
-               "isDraft": False, "author": {"login": "b"}}
-    open_json = {**pr_json, "number": 541, "state": "OPEN",
-                 "labels": [{"name": "ai-pr-open"}]}
-    fr = FakeRunner({
-        "pr list --repo": [{"number": 540, "state": "MERGED"},
-                           {"number": 541, "state": "OPEN"}],
-        "pr view 540": pr_json,
-        "pr view 541": open_json,
-        "pr checks 541": [],
-        "issue list --repo": [],
-    })
-    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
-    world = gw.build_world()
-    assert {p.number for p in world.prs} == {540, 541}
-
-    view_540 = [a for a, _ in fr.calls if a[2:4] == ["view", "540"]]
-    view_541 = [a for a, _ in fr.calls if a[2:4] == ["view", "541"]]
-    assert view_540 and "mergeable" not in view_540[0][-1]   # cheap fields only
-    assert view_541 and "mergeable" in view_541[0][-1]       # open PR: full
-    assert not any(
-        "/commits/head-540/check-runs" in " ".join(a)
-        for a, _ in fr.calls
-    )
-    assert any(
-        "/branches/" in " ".join(a)
-        for a, _ in fr.calls
-    )
 
 
 # ── check start times + world timestamp (#30) ────────────────────────────────
-def test_build_world_stamps_the_poll_time():
-    # The domain may not read a clock, so the world it decides on carries one.
-    gw = GitHubGateway("o/r", runner=FakeRunner({"issue list": [], "pr list": []}))
-    assert parse_timestamp(gw.build_world().now) is not None
 
 
-def test_parse_world_is_unstamped_unless_told():
-    assert parse_world([], []).now == ""
 
 
 # ── merge cleanup end-to-end: merge → GitHub auto-close → next poll (#28) ─────
@@ -2067,245 +1656,13 @@ def test_parse_world_is_unstamped_unless_told():
 # loop never supplies, so all of them passed while zero issues in five
 # deployment days ever reached ai-done.
 
-def _gh_repo(issues, prs):
-    """A `gh` serving a whole described repo, list calls and view calls agreeing.
-
-    `issues`: {number: {"state", "labels", "stateReason"}} — served from whichever
-    `--label/--state` slice genuinely matches, so a test cannot smuggle an issue
-    into a world the real builder would not have fetched.
-    `prs`: {number: {"state", "labels", "issue", "listed"}} — `listed` is
-    deliberately independent of `labels`, because that is the live GitHub
-    behaviour this whole bug turns on: `gh pr list --label ai-pr-open --state all`
-    keeps serving merged PRs for about a day AFTER their label was removed (stale
-    search index), and only the per-PR view tells the truth."""
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            label = argv[argv.index("--label") + 1]
-            state = argv[argv.index("--state") + 1]
-            return json.dumps([
-                {"number": n} for n, i in sorted(issues.items())
-                if label in i["labels"]
-                and (state == "all" or state == i["state"].lower())
-            ])
-        if "pr list" in key:
-            state = argv[argv.index("--state") + 1]
-            return json.dumps([
-                {"number": n, "state": p["state"]} for n, p in sorted(prs.items())
-                if p.get("listed", True)
-                and (state == "all" or state.upper() == p["state"])
-            ])
-        if "issue view" in key:
-            n = int(argv[3])
-            i = issues[n]
-            return json.dumps({
-                "number": n, "title": "t", "body": "", "state": i["state"],
-                "stateReason": i.get("stateReason", ""),
-                "labels": [{"name": x} for x in i["labels"]],
-            })
-        if "pr view" in key:
-            n = int(argv[3])
-            p = prs[n]
-            return json.dumps({
-                "number": n, "title": "t", "body": f"Fixes #{p['issue']}",
-                "state": p["state"], "headRefName": f"fix/{p['issue']}-thing",
-                "headRefOid": "abc", "baseRefName": "dev",
-                "labels": [{"name": x} for x in p["labels"]],
-                "reviews": [], "files": [], "isDraft": False,
-                "author": {"login": "fix-bot"},
-                "closingIssuesReferences": [{"number": p["issue"]}],
-            })
-        return ""
-
-    return runner
-
-
-_CFG = FixConfig(fix_bot="fix-bot")
-
-
-def _decide(runner):
-    observed = GitHubGateway("o/r", runner=runner).build_world()
-    return decide_fix(
-        observed,
-        _CFG, FixState(resolve_workflows={i.number: resolve_snapshot(i.number) for i in observed.issues}),
-        fixer_busy=False,
-    )
-
-
-def test_merge_cleanup_runs_on_the_poll_after_github_auto_closed_the_issue():
-    """The invariant nothing covered: after a merge the issue ends up ai-done and
-    its worktree is gone. `Fixes #n` is mandatory (check-pr.sh), so GitHub closes
-    the issue at the instant of merge; the very next poll must still observe it."""
-    runner = _gh_repo(
-        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}},
-        prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
-    )
-    world = GitHubGateway("o/r", runner=runner).build_world()
-    assert 8 in {i.number for i in world.issues}, "closed ai-pr-open issue must be observable"
-
-    actions = decide_fix(world, _CFG, FixState(resolve_workflows={8: resolve_snapshot(8)}), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
-    assert RemoveWorktree(8) in actions
-    assert ClearIssueState(pr=50, issue=8, merged=True) in actions
-    # GitHub already closed it — re-closing would re-comment "Resolved by #50".
-    assert not any(isinstance(a, CloseIssue) for a in actions)
-
-
-def test_backlog_issue_whose_pr_lost_its_label_still_gets_cleaned_up():
-    """The shape the deployed backlog is ACTUALLY in, verified live: the
-    unconditional PR-side relabel already ran at merge+1, so the merged PR carries
-    no labels and `needs_cleanup` is False for it forever. Only the issue-driven
-    arm can reach these — without it the widened query would observe the same
-    stuck issues every poll and never drain them."""
-    actions = _decide(_gh_repo(
-        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}},
-        # still in the stale search index, but its real label set is empty
-        prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
-    ))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
-    assert RemoveWorktree(8) in actions
-    assert ClearIssueState(pr=None, issue=8, merged=True) in actions
-    assert not any(isinstance(a, CloseIssue) for a in actions)
-
-
-def test_backlog_issue_is_cleaned_up_even_when_the_pr_has_left_the_world():
-    # …and once the stale index expires the PR is not in `world.prs` at all.
-    actions = _decide(_gh_repo(
-        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}}, prs={},
-    ))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
-    assert RemoveWorktree(8) in actions
-
-
-def test_stranded_issue_repairs_itself_on_the_next_tick():
-    """Ordering/stranding: `cleanup_actions` emits the PR-side relabel
-    UNCONDITIONALLY, and the executor applies each action in its own try/except,
-    so a transient gh failure on the issue relabel at tick N leaves the issue
-    ai-pr-open with its only handle — the PR label — already gone. Tick N+1 is
-    exactly the backlog shape above, so the pipeline now has a retry loop it never
-    had."""
-    tick_n_plus_1 = _gh_repo(
-        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}},
-        prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
-    )
-    actions = _decide(tick_n_plus_1)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
-
-    # …and it is ONE-SHOT: the repair's own relabel removes ai-pr-open, which
-    # drops the issue out of both queries that feed the arm.
-    after = _decide(_gh_repo(
-        issues={8: {"state": "CLOSED", "labels": ["ai-done"]}},
-        prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
-    ))
-    assert not any(isinstance(a, RemoveWorktree) for a in after)
-    assert not any(isinstance(a, ClearIssueState) for a in after)
-
-
-def test_an_open_ai_pr_open_issue_that_was_never_closed_is_left_alone():
-    """The one ambiguous shape, deliberately not acted on: indistinguishable from
-    a healthy in-flight issue whose PR was dropped from this world by a transient
-    read failure. Acting would delete a live session's worktree."""
-    actions = _decide(_gh_repo(
-        issues={8: {"state": "OPEN", "labels": ["ai-pr-open"]}}, prs={},
-    ))
-    assert actions == []
-
-
-def test_a_human_reopen_is_relabelled_ai_done_and_never_re_closed():
-    """#10's recurrence signal is `open + ai-done + stateReason reopened`. An
-    operator reopening a stuck issue must survive the poll that repairs it —
-    ai-done is what MAKES the reopen legible to the steward, and re-closing it
-    within one poll would erase the truest guardrail the harness has."""
-    reopened = {"state": "OPEN", "labels": ["ai-pr-open"], "stateReason": "REOPENED"}
-    # (a) via the issue-driven arm — the PR is gone
-    actions = _decide(_gh_repo(issues={8: reopened}, prs={}))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
-    assert not any(isinstance(a, CloseIssue) for a in actions)
-    # (b) via the PR-driven arm — the merged PR is still labelled, so without the
-    # stateReason guard `close_issue_on_merge` would close the reopen outright.
-    actions = _decide(_gh_repo(
-        issues={8: reopened},
-        prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
-    ))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
-    assert not any(isinstance(a, CloseIssue) for a in actions)
-
-
-def test_an_in_flight_issue_is_never_touched_by_the_issue_driven_arm():
-    # Anti-vacuity for `covered`: the ordinary mid-flight shape is an OPEN
-    # ai-pr-open issue with an OPEN ai-pr-open PR. Nothing may fire on it.
-    actions = _decide(_gh_repo(
-        issues={8: {"state": "OPEN", "labels": ["ai-pr-open"]}},
-        prs={50: {"state": "OPEN", "labels": ["ai-pr-open"], "issue": 8}},
-    ))
-    assert not any(isinstance(a, RemoveWorktree) for a in actions)
-    assert not any(isinstance(a, ClearIssueState) for a in actions)
-    assert not any(
-        isinstance(a, Relabel) and a.target is Target.ISSUE for a in actions
-    )
-
-
-def test_widened_world_heals_the_backlog_without_stomping_a_fresh_dispatch():
-    """P1R-15 in the world the widening actually produces. #8 was just dispatched
-    (a dispatch MOVES the label ai-ready → ai-working, so it carries ai-working and
-    NOT ai-pr-open) while its own stale MERGED PR is still labelled; #9 is a
-    backlog issue being healed in the same tick. Both halves matter: drop the
-    widening and #9's cleanup vanishes; drop the gate and #8's live worktree is
-    deleted."""
-    actions = _decide(_gh_repo(
-        issues={
-            8: {"state": "OPEN", "labels": ["ai-working"]},
-            9: {"state": "CLOSED", "labels": ["ai-pr-open"]},
-        },
-        prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
-    ))
-    # the backlog issue is healed — this is what the widening buys
-    assert Relabel(Target.ISSUE, 9, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(9).binding) in actions
-    assert RemoveWorktree(9) in actions
-    # …and the freshly-dispatched issue is untouched
-    assert RemoveWorktree(8) not in actions
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) not in actions
-    assert not any(isinstance(a, ClearIssueState) and a.issue == 8 for a in actions)
-    # …while the PR-side arm, which is never stale, still fires.
-    assert Relabel(Target.PR, 50, Label.AI_PR_OPEN, None) in actions
-
-
-def test_closed_ai_pr_open_slice_is_bounded_below_the_list_limit():
-    """A repo with a backlog deeper than the cap must not turn one poll into
-    hundreds of `gh issue view` calls; it is worked off newest-first instead."""
-    fr = FakeRunner({"issue list": [], "pr list": []})
-    GitHubGateway("o/r", runner=fr).build_world()
-    closed = [
-        a for a, _ in fr.calls
-        if a[1:3] == ["issue", "list"] and "closed" in a and "ai-pr-open" in a
-    ]
-    assert len(closed) == 1
-    assert closed[0][closed[0].index("--limit") + 1] == str(_CLOSED_CLEANUP_LIMIT)
-    assert _CLOSED_CLEANUP_LIMIT < _LIST_LIMIT
-
-
-def test_closed_slice_truncation_is_loud_at_its_own_cap(capsys):
-    """The truncation guard must compare against the cap the CALL used, not
-    _LIST_LIMIT — otherwise a fully-saturated backlog slice is silent."""
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key and "--state closed" in key:
-            return json.dumps([{"number": n} for n in range(_CLOSED_CLEANUP_LIMIT)])
-        if "issue list" in key or "pr list" in key:
-            return "[]"
-        return json.dumps({"number": 1, "state": "CLOSED", "labels": []})
-
-    GitHubGateway("o/r", runner=runner).build_world()
-    assert "TRUNCATED" in capsys.readouterr().err
-
-
 # ── #48: a failed `gh pr checks` is UNKNOWN, not an empty world ──────────────
 
 
 def test_get_pr_marks_checks_unknown_when_the_read_fails():
     """The hole (#48): a swallowed non-infra CI read failure used to
     rebuild the PR with checks=() — indistinguishable from a no-CI repo, which
-    decide_fix treats as mergeable. The PR must instead say the checks were
+    the fix policy treats as mergeable. The PR must instead say the checks were
     never read this tick."""
     pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
     fr = FakeRunner({"pr view 100": pr_resp})  # policy read unmatched → unavailable
@@ -2454,12 +1811,6 @@ def _tail_runner(rows, views=None, calls=None):
     return runner
 
 
-def test_build_world_spends_no_pr_view_on_the_stale_unlabelled_tail():
-    calls = []
-    gw = GitHubGateway("o/r", runner=_tail_runner([_TERMINAL_ROW], calls=calls))
-    prs = gw.build_world().prs
-    assert [(p.number, p.state) for p in prs] == [(60, "MERGED")]
-    assert not [c for c in calls if "pr view" in c]
 
 
 def test_build_review_world_spends_no_pr_view_on_the_stale_unlabelled_tail():
@@ -2473,208 +1824,7 @@ def test_build_review_world_spends_no_pr_view_on_the_stale_unlabelled_tail():
     assert not [c for c in calls if "pr view" in c]
 
 
-def test_the_stale_tail_still_leaves_the_orphaned_cleanup_arm_free_to_repair():
-    """#28 class guardrail: the ISSUE-driven repair fires precisely because the
-    unlabelled merged PR does not "cover" its issue. Building that PR from the
-    list payload must not change which issues are covered."""
-    from issue_agent.domain.fix import orphaned_cleanup_actions
-
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return json.dumps([{"number": 12}])
-        if "pr list" in key:
-            return json.dumps([_TERMINAL_ROW])
-        if "issue view 12" in key:
-            return json.dumps({
-                "number": 12, "state": "CLOSED",
-                "labels": [{"name": "ai-pr-open"}],
-            })
-        return ""
-
-    world = GitHubGateway("o/r", runner=runner).build_world()
-    assert [type(a).__name__ for a in orphaned_cleanup_actions(world)] == [
-        "RemoveWorktree", "Relabel", "ClearIssueState",
-    ]
 
 
-def test_a_terminal_pr_still_wearing_the_label_is_fetched_and_drives_cleanup():
-    calls = []
-    row = {**_TERMINAL_ROW, "labels": [{"name": "ai-pr-open"}]}
-    gw = GitHubGateway(
-        "o/r",
-        runner=_tail_runner(
-            [row],
-            views={60: {"number": 60, "state": "MERGED",
-                        "labels": [{"name": "ai-pr-open"}]}},
-            calls=calls,
-        ),
-    )
-    prs = gw.build_world().prs
-    assert [(p.number, p.state, Label.AI_PR_OPEN in p.labels) for p in prs] == [
-        (60, "MERGED", True)
-    ]
-    assert [c for c in calls if "pr view 60" in c]
 
 
-# ── #163: the fixer's blind-spot reading (CI + mergeability over REST) ────────
-def _signal_runner(pull, checks=(), statuses=()):
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "/pulls/" in key:
-            return pull
-        if "/check-runs" in key:
-            return json.dumps([{"check_runs": list(checks)}])
-        if "/statuses" in key:
-            return json.dumps([list(statuses)])
-        return ""
-
-    return runner
-
-
-def _per_head_runner(per_head):
-    """A runner that serves a DIFFERENT pull object and check set per PR number,
-    so a reading is pinned to the head it was taken for."""
-    last = {"number": None}
-
-    def runner(argv, token):
-        key = " ".join(argv)
-        for number in per_head:
-            if f"/pulls/{number}" in key:
-                last["number"] = number
-                return per_head[number]["pull"]
-        if "/check-runs" in key:
-            return json.dumps(
-                [{"check_runs": per_head[last["number"]].get("checks", [])}]
-            )
-        if "/statuses" in key:
-            return json.dumps([[]])
-        return ""
-
-    return runner
-
-
-def test_head_signals_reads_ci_and_mergeability_for_each_head():
-    from issue_agent.domain.world import HeadRef
-
-    gw = GitHubGateway(
-        "o/r",
-        runner=_per_head_runner({
-            7: {
-                "pull": "OPEN\tfalse\ttrue\tclean\tsha7",
-                "checks": [
-                    {"name": "ci", "status": "completed", "conclusion": "success"}
-                ],
-            },
-            9: {
-                "pull": "OPEN\tfalse\tfalse\tdirty\tsha9",
-                "checks": [{"name": "ci", "status": "queued"}],
-            },
-        }),
-    )
-    signals = gw.head_signals((HeadRef(7), HeadRef(9)))
-    assert signals is not None
-    assert [(s.number, s.head_ref_oid) for s in signals] == [(7, "sha7"), (9, "sha9")]
-    assert signals[0].mergeable != signals[1].mergeable
-    assert signals[0].ci != signals[1].ci
-    assert [s.failing for s in signals] == [False, False]
-
-
-def test_one_unreadable_head_makes_the_whole_reading_unread():
-    """Partial coverage would let the predicate gate on a head it never saw."""
-    from issue_agent.domain.world import HeadRef
-
-    gw = GitHubGateway(
-        "o/r",
-        runner=_per_head_runner({
-            7: {"pull": "OPEN\tfalse\ttrue\tclean\tsha7"},
-            9: {"pull": "garbage"},
-        }),
-    )
-    assert gw.head_signals((HeadRef(7), HeadRef(9))) is None
-
-
-def test_a_rerun_that_lands_on_the_same_bucket_still_moves_the_reading():
-    """`startedAt` is the only field that separates a re-run from the original
-    when name/state/bucket are identical."""
-    from issue_agent.domain.world import HeadRef
-
-    def gw_for(started):
-        return GitHubGateway(
-            "o/r",
-            runner=_signal_runner(
-                "OPEN\tfalse\ttrue\tclean\tsha9",
-                checks=[{
-                    "name": "ci", "status": "completed", "conclusion": "success",
-                    "started_at": started,
-                }],
-            ),
-        )
-
-    first = gw_for("2026-08-09T10:00:00Z").head_signals((HeadRef(7),))
-    rerun = gw_for("2026-08-09T11:00:00Z").head_signals((HeadRef(7),))
-    assert first != rerun
-
-
-def test_a_timed_out_head_is_unread_and_does_not_kill_the_tick():
-    """One wedged `gh api` must not skip EVERY fix tick for as long as it stays
-    wedged — the read lives outside the build's per-PR isolation now."""
-    from issue_agent.domain.world import HeadRef
-
-    def wedged(argv, token):
-        raise GhUnavailable("network", "timeout", timed_out=True)
-
-    assert GitHubGateway("o/r", runner=wedged).head_signals((HeadRef(7),)) is None
-
-
-def test_a_systemic_gh_failure_still_propagates_to_the_skip_tick_arm():
-    """Anti-regression twin: a rate limit is not one head's problem."""
-    from issue_agent.domain.world import HeadRef
-
-    def throttled(argv, token):
-        raise GhUnavailable("rate-limit", "secondary limit")
-
-    with pytest.raises(GhUnavailable):
-        GitHubGateway("o/r", runner=throttled).head_signals((HeadRef(7),))
-
-
-def test_head_signals_flags_a_failing_check_so_the_tick_rebuilds():
-    from issue_agent.domain.world import HeadRef
-
-    gw = GitHubGateway(
-        "o/r",
-        runner=_signal_runner(
-            "OPEN\tfalse\ttrue\tunstable\tsha9",
-            checks=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
-        ),
-    )
-    assert gw.head_signals((HeadRef(7),))[0].failing is True
-
-
-def test_head_signals_are_none_when_a_head_is_unreadable():
-    from issue_agent.domain.world import HeadRef
-
-    short = GitHubGateway("o/r", runner=_signal_runner("OPEN\ttrue"))
-    assert short.head_signals((HeadRef(7),)) is None
-    no_sha = GitHubGateway("o/r", runner=_signal_runner("OPEN\tfalse\ttrue\tclean\t"))
-    assert no_sha.head_signals((HeadRef(7),)) is None
-
-    def broken_checks(argv, token):
-        if "/pulls/" in " ".join(argv):
-            return "OPEN\tfalse\ttrue\tclean\tsha9"
-        return "not json at all"
-
-    assert GitHubGateway("o/r", runner=broken_checks).head_signals(
-        (HeadRef(7),)
-    ) is None
-
-
-def test_head_signals_spend_nothing_without_heads():
-    calls = []
-
-    def runner(argv, token):
-        calls.append(argv)
-        return ""
-
-    assert GitHubGateway("o/r", runner=runner).head_signals(()) == ()
-    assert calls == []

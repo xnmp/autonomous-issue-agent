@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.domain.actions import (
-    AgentKind, MergePullRequest, PostComment, Relabel, RunAgent, Target, UpdateBranch,
+    AgentKind, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent, Target, UpdateBranch,
 )
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck, Unavailable
@@ -17,10 +17,10 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import actions
 from issue_agent.domain.refs import harness_branch_issue
 from issue_agent.domain.state import (
-    Backoff, Busy, Dispatch, Harness, ItemKey, Local, Merge, NeedsHuman, Refresh, Release, StopReason, Wait,
+    Backoff, Busy, Dispatch, Harness, ItemKey, Local, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason, Wait,
     WaitReason, derive, issue_key, pr_key, stop_tag,
 )
-from issue_agent.domain.world import Comment, IssueView, PRView, Push, Review, WorldState
+from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Push, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 NOW = T0 + timedelta(days=1)
@@ -309,6 +309,8 @@ def test_a_non_harness_comment_review_or_push_resets_attempts(change):
     {"pushes": (Push("fix-bot", iso(10)),)},
     {"pushes": (Push("Fix-Bot[bot] ", iso(10)),)},
     {"pushes": (Push("alice", ""),)},
+    {"pushes": (Push("", iso(10)),)},     # GitHub could not attribute the commit
+    {"pushes": (Push("  ", iso(10)),)},
 ])
 def test_harness_bot_or_untimed_events_do_not_reset(change):
     loc = local(pr_legs(*legs(FIX, 1, 2, 3)))
@@ -576,3 +578,131 @@ def test_many_items_derive_independently():
     assert len(states) == 2000
     assert states[issue_key(5)] == NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)
     assert states[issue_key(6)] == Dispatch(AgentKind.RESOLVE)
+
+
+
+# ── Agent questions (slice 5b) ───────────────────────────────────────────────
+
+def asked(kind: AgentKind, minute: float) -> LegEnd:
+    return LegEnd(kind, at(minute), False, asked=True)
+
+
+def test_an_agent_question_stops_the_item_for_a_human():
+    loc = local({issue_key(3): (asked(AgentKind.RESOLVE, 5),)})
+    states = derive(WorldState(issues=(issue(3),)), loc, H)
+    assert states == {issue_key(3): NeedsHuman(StopReason.QUESTION, iso(5))}
+    label, comment = actions(states, H)
+    assert label == Relabel(Target.ISSUE, 3, remove=None, add=Label.NEEDS_HUMAN, harness_signal=True)
+    assert isinstance(comment, PostComment) and stop_tag(StopReason.QUESTION) in comment.body
+    assert "Reply here with the answer" in comment.body
+
+
+def test_a_question_waits_once_labelled_and_a_reply_releases_it():
+    stopped = issue(3, Label.NEEDS_HUMAN, comments=(stop(StopReason.QUESTION, 6),))
+    loc = local({issue_key(3): (asked(AgentKind.RESOLVE, 5),)})
+    assert one(WorldState(issues=(stopped,)), loc) == Wait(WaitReason.NEEDS_HUMAN)
+    replied = issue(3, Label.NEEDS_HUMAN, comments=(stop(StopReason.QUESTION, 6), human(7, body="use X")))
+    assert one(WorldState(issues=(replied,)), loc) == Release()
+
+
+def test_after_release_the_answered_question_redispatches_with_a_fresh_count():
+    released = issue(3, comments=(stop(StopReason.QUESTION, 6), human(7)))
+    loc = local({issue_key(3): (*legs(AgentKind.RESOLVE, 1, 2), asked(AgentKind.RESOLVE, 5))})
+    assert one(WorldState(issues=(released,)), loc) == Dispatch(AgentKind.RESOLVE)
+
+
+def test_a_later_agent_leg_supersedes_an_old_question():
+    loc = local(pr_legs(asked(FIX, 1), *legs(FIX, 2)))
+    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD)
+
+
+def test_a_machine_end_after_a_question_does_not_hide_it():
+    loc = local(pr_legs(asked(FIX, 1), *legs(FIX, 2, machine=True)))
+    assert pr_state(pr(ci=RED), loc) == NeedsHuman(StopReason.QUESTION, iso(2))
+
+
+@pytest.mark.parametrize("bad", [
+    dict(machine=True, asked=True),
+    dict(machine=False, asked=1),
+    dict(machine=False, started_at=at(10)),                              # after the end
+    dict(machine=False, started_at=datetime(2026, 10, 1, 11, 0)),        # naive
+    dict(machine=False, started_at="2026-10-01T11:00:00Z"),
+])
+def test_leg_end_rejects_contradictory_question_or_window(bad):
+    machine = bad.pop("machine")
+    with pytest.raises(ValueError):
+        LegEnd(FIX, at(5), machine, **bad)
+
+
+# ── Own comments inside a leg (slice 5b) ─────────────────────────────────────
+
+def windowed(kind: AgentKind, start: float, end: float) -> LegEnd:
+    return LegEnd(kind, at(end), False, started_at=at(start))
+
+
+def test_the_agents_own_unmarked_comment_inside_its_leg_is_not_a_reset():
+    own = Comment("fix-bot", "Acceptance criteria: ...", iso(2.5))
+    loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
+    assert pr_state(pr(ci=RED, comments=(own,)), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(5), FIX)
+
+
+def test_the_same_comment_outside_every_leg_window_resets():
+    between = Comment("alice", "try the other approach", iso(3.5))
+    loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
+    assert pr_state(pr(ci=RED, comments=(between,)), loc) == Dispatch(FIX, HEAD)
+
+
+def test_a_comment_at_the_leg_start_instant_is_outside_the_window():
+    # The window is (start, end]: a human comment the leg was dispatched on is a reset.
+    edge = Comment("alice", "go", iso(4))
+    loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
+    assert pr_state(pr(ci=RED, comments=(edge,)), loc) == Dispatch(FIX, HEAD)
+
+
+# ── Publication: the agent pushes, the harness opens (Q11, slice 5b) ─────────
+
+def test_a_pushed_branch_without_a_pr_opens_one_for_free():
+    world = WorldState(issues=(issue(3),), branches=(Branch("fix/3-slug", iso(1)),))
+    loc = local({issue_key(3): legs(AgentKind.RESOLVE, 1, 2, 3)}, headroom=False)
+    states = derive(world, loc, H)
+    assert states == {issue_key(3): OpenPR("fix/3-slug")}
+    assert actions(states, H) == (OpenPullRequest(3, "fix/3-slug"),)
+
+
+def test_the_latest_committed_branch_wins_and_untimed_ones_lose():
+    branches = (Branch("fix/3-a", iso(5)), Branch("fix/3-b", iso(9)), Branch("fix/3-c", "not-a-time"))
+    assert one(WorldState(issues=(issue(3),), branches=branches)) == OpenPR("fix/3-b")
+
+
+def test_another_issues_branch_does_not_open_a_pr():
+    world = WorldState(issues=(issue(3),), branches=(Branch("fix/4-slug", iso(1)), Branch("feat/3-x", iso(1))))
+    assert one(world) == Dispatch(AgentKind.RESOLVE)
+
+
+def test_a_stopped_issue_with_a_pushed_branch_waits_for_the_human():
+    stopped = issue(3, Label.NEEDS_HUMAN, comments=(stop(StopReason.ATTEMPTS, 4),))
+    world = WorldState(issues=(stopped,), branches=(Branch("fix/3-slug", iso(1)),))
+    assert one(world) == Wait(WaitReason.NEEDS_HUMAN)
+
+
+def test_a_running_leg_defers_publication_until_it_returns():
+    world = WorldState(issues=(issue(3),), branches=(Branch("fix/3-slug", iso(1)),))
+    assert one(world, local(leases=frozenset({issue_key(3)}))) == Busy()
+
+
+def test_a_merged_harness_pr_retires_its_issue():
+    world = WorldState(issues=(issue(3),), prs=(pr(7, 3, state="MERGED"),))
+    assert derive(world, local(), H) == {}
+
+
+@pytest.mark.parametrize("branch", ["fix/3", "main", "", "fix/0-x"])
+def test_open_pr_state_requires_a_harness_branch(branch):
+    with pytest.raises(ValueError):
+        OpenPR(branch)
+
+
+def test_open_pull_request_action_is_keyed_by_branch_and_validated():
+    assert OpenPullRequest(3, "fix/3-slug").key == "open-pr:fix/3-slug"
+    for issue_number, branch in ((0, "fix/3-x"), (True, "fix/3-x"), (3, ""), (3, None)):
+        with pytest.raises(ValueError):
+            OpenPullRequest(issue_number, branch)  # type: ignore[arg-type]

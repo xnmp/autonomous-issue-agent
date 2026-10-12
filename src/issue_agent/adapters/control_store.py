@@ -15,7 +15,7 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -42,7 +42,6 @@ from ..domain.contracts import (
     ReservationId,
     SettlementRequest,
     RunId,
-    TokenUsage,
     WorkflowAttemptIdentity,
 )
 from ..domain.workflow_identity import FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier
@@ -67,7 +66,6 @@ from ..domain.review_workflow_policy import (
 )
 from ..domain.workflow_retry import (
     MAX_RELEVANT_AUTHORIZATIONS,
-    BeginRetry,
     DeclineRetry,
     grant_unavailable_void,
     RetryAbsenceRead,
@@ -80,7 +78,6 @@ from ..domain.workflow_reconciliation import (
     prewrite_evidence_gate_id, unavailable_prewrite_read, unavailable_reconciliation, unknown_outcome_history,
 )
 from ..domain.resolve_return import FinalizedResolveReturn
-from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.outcome import ExitReason
 from ..domain.repository import canonical_repository
 from ..domain.refs import issue_from_branch
@@ -91,7 +88,23 @@ from .deployment_authority import (
 from .review_effects import bound_submission_op, review_family_op
 from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import (
+    WorkflowAuthorityError,
+    active_families,
+    linked_issue_workflow_holds,
+    load_family_authority,
+    load_resolve_workflow_row,
+    load_review_workflow_row,
+    load_workflow_row,
+    load_workspace_ack,
+    read_review_submission_registration,
+    require_resolve_binding,
+    require_review_binding,
+    require_workflow_binding,
+    verified_review_completed_seal,
+    workflow_scope,
+    workflow_run_scope_bounds as workflow_run_scope_bounds,
+)
 
 SCHEMA_VERSION = 46
 
@@ -332,6 +345,23 @@ class AccountingDisposition(str, Enum):
     UNAVAILABLE = "unavailable"
     CORRUPT = "corrupt"
     CONFLICT = "conflict"
+
+
+# Per-run fix leg class, written before settlement (see `fix_runs`).
+FIX_LEG_NAMESPACE = "fix-leg"
+
+
+@dataclass(frozen=True)
+class FixRun:
+    """One ended fix run: what it was dispatched as and on, and its receipt."""
+
+    kind: str
+    number: int
+    issue: int
+    head: str
+    started_at: datetime | None
+    completed_at: datetime
+    receipt: Mapping[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -4267,62 +4297,6 @@ class SQLiteControlStore:
         except RetiredOwnerError:
             return False
 
-    def expand_dispatch_claim(
-        self,
-        repository: str,
-        role: str,
-        issue: int,
-        owner_id: str,
-        paths: frozenset[str],
-    ) -> bool:
-        """Add router-discovered paths without racing another deployment."""
-
-        target = _dispatch_claim_target(issue)
-        with self.transaction() as db:
-            owned = db.execute(
-                "SELECT paths_json FROM dispatch_claims "
-                "WHERE repository=? AND role=? AND target=? AND owner_id=?",
-                (repository, role, target, owner_id),
-            ).fetchone()
-            if owned is None:
-                return False
-            try:
-                expanded = frozenset(json.loads(owned["paths_json"])) | paths
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise CorruptControlStore(
-                    "dispatch claim contains invalid paths"
-                ) from exc
-            rows = db.execute(
-                "SELECT target, paths_json FROM dispatch_claims "
-                "WHERE repository=? AND role=? AND target<>?",
-                (repository, role, target),
-            ).fetchall()
-            for row in rows:
-                try:
-                    other_paths = frozenset(json.loads(row["paths_json"]))
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise CorruptControlStore(
-                        "dispatch claim contains invalid paths"
-                    ) from exc
-                if (
-                    not expanded
-                    or not other_paths
-                    or bool(expanded & other_paths)
-                ):
-                    return False
-            db.execute(
-                "UPDATE dispatch_claims SET paths_json=? "
-                "WHERE repository=? AND role=? AND target=? AND owner_id=?",
-                (
-                    _json(sorted(expanded)),
-                    repository,
-                    role,
-                    target,
-                    owner_id,
-                ),
-            )
-            return True
-
     def release_dispatch_claim(
         self,
         repository: str,
@@ -4454,29 +4428,72 @@ class SQLiteControlStore:
             return True
 
 
-    def fix_leg_ends(self, repository: str, issue: int) -> tuple[LegEnd, ...]:
-        """Every ended fix leg for one issue, classified machine or not.
+    def fix_runs(self, repository: str, issues: Iterable[int]) -> tuple[FixRun, ...]:
+        """Every ended fix run for these issues, with its leg receipt (if any).
 
-        The per-run `fix-infra-outcome` receipt carries the runtime's own
-        classification. A run ended without one never returned normally
-        (cancelled, reclaimed or released before any return): a machine end.
+        The `fix-leg` receipt carries the leg's class, written before
+        settlement. A run ended without one never returned (cancelled,
+        reclaimed, refused before admission): a machine end to its reader.
         """
+        wanted = sorted({n for n in issues if type(n) is int and n > 0})
+        if not wanted:
+            return ()
+        out: list[FixRun] = []
         with closing(self._connect()) as db, db:
-            rows = db.execute(
-                "SELECT r.kind, r.completed_at, "
-                "json_extract(k.payload_json,'$.value.fields.outcome.value') IS NOT 'returned_normal' AS machine "
-                "FROM runs r INDEXED BY runs_fix_issue_dispatch "
-                "LEFT JOIN dedupe_keys k ON k.namespace='fix-infra-outcome' AND k.scope=? AND k.key=r.run_id "
-                f"WHERE {_FIX_ISSUE_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? AND {_FIX_DISPATCH_ISSUE}=? "
-                "AND r.completed_at IS NOT NULL",
-                (repository, repository, issue),
-            ).fetchall()
-        return tuple(
-            LegEnd(kind, _parse_stamp(row["completed_at"]), bool(row["machine"]))
-            for row in rows if (kind := dispatched_kind(row["kind"])) is not None
-        )
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start:start + 500]
+                rows = db.execute(
+                    "SELECT r.kind, r.started_at, r.completed_at, r.dispatch_id, k.payload_json "
+                    "FROM runs r INDEXED BY runs_fix_issue_dispatch "
+                    "LEFT JOIN dedupe_keys k ON k.namespace=? AND k.scope=? AND k.key=r.run_id "
+                    f"WHERE {_FIX_ISSUE_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? "
+                    f"AND {_FIX_DISPATCH_ISSUE} IN ({','.join('?' for _ in chunk)}) "
+                    "AND r.completed_at IS NOT NULL",
+                    (FIX_LEG_NAMESPACE, repository, repository, *chunk),
+                ).fetchall()
+                for row in rows:
+                    dispatch = json.loads(row["dispatch_id"])
+                    try:
+                        receipt = json.loads(row["payload_json"]) if row["payload_json"] is not None else None
+                    except json.JSONDecodeError:
+                        receipt = None
+                    number = dispatch.get("number")
+                    head = dispatch.get("head")
+                    out.append(FixRun(
+                        str(row["kind"]),
+                        number if type(number) is int else dispatch["issue"],
+                        int(dispatch["issue"]),
+                        head if isinstance(head, str) else "",
+                        _parse_stamp(row["started_at"]) if row["started_at"] else None,
+                        _parse_stamp(row["completed_at"]),
+                        receipt if isinstance(receipt, dict) else None,
+                    ))
+        return tuple(out)
 
+    def claim_key(self, namespace: str, scope: str, key: str) -> str:
+        """Claim an idempotency key before its remote effect. Returns "new" when
+        this call claimed it, "claimed" when an earlier claim never confirmed
+        (the effect may or may not have landed: read it back), "done" when the
+        effect was confirmed."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (namespace, scope, key),
+            ).fetchone()
+            if row is not None:
+                return "done" if row["payload_json"] == '"done"' else "claimed"
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
+                (namespace, scope, key, _stamp(self._now()), '"claimed"'),
+            )
+            return "new"
 
+    def confirm_key(self, namespace: str, scope: str, key: str) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json='\"done\"' WHERE namespace=? AND scope=? AND key=?",
+                (namespace, scope, key),
+            )
 
     def snapshot(self, scope: BudgetScope) -> AccountingSnapshot:
         try:
@@ -5003,6 +5020,11 @@ class SQLiteControlStore:
 
 
     def _prepare_continuation_admissions(self, db: sqlite3.Connection, request: ReservationRequest) -> tuple[tuple, tuple]:
+        # Slice 5b: a fix leg is a plain leg with no continuation purchase, so
+        # the per-kind purchase shapes below bind only legacy purchases (5d
+        # deletes them with their last test producer).
+        if not request.continuations:
+            return (), ()
         from .workflow_rows import load_issue_aggregate
         updates, receipts = {}, []
         role = deployment_role(request.workload_repository, request.owner_id) if request.continuations else None
@@ -5208,8 +5230,6 @@ class SQLiteControlStore:
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
         if binding is None:
-            if role == "fix" and request.kind in _RESOLVE_PAID_KINDS and WorkflowFamily.RESOLVE.value in families:
-                raise WorkflowAuthorityError("activated resolve admission requires a captured workflow binding")
             # Once review rejection is active every paid review is bound, so
             # no unbound review run can overlap a re-arm (ADR 0015 quiescence).
             if (role == "review" and request.kind in _REVIEW_PAID_KINDS
@@ -6076,54 +6096,6 @@ class SQLiteControlStore:
                     or principal.authority.family is family and principal != admission.attempt.binding):
                 raise WorkflowAuthorityError("continuation return conflicts with its actual run binding")
         return captured[0], row
-
-    def _fix_infra_admission(self, db, run_id: RunId):
-        row = db.execute("SELECT continuations_json,dispatch_id,state,outcome FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
-        if row is None:
-            raise WorkflowAuthorityError("fix infrastructure evidence lacks its immutable run")
-        purchases = decode_workflow(row["continuations_json"], tuple)
-        if (len(purchases) > 3 or any(not isinstance(p, (cc.IssueInfraPurchase, cc.IssueRecoveryPurchase,
-                cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.IssueReviewPurchase, cc.IssueRebasePurchase,
-                cc.PRRepairPurchase)) for p in purchases)):
-            raise WorkflowAuthorityError("fix infrastructure run has malformed selected continuations")
-        selected = [p for p in purchases if p.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY]
-        if not selected:
-            return None
-        if len(selected) != 1:
-            raise WorkflowAuthorityError("fix infrastructure run has conflicting issue captures")
-        purchase = selected[0]
-        key = purchase.capture.binding.fence.key
-        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-            (key.repository, self._continuation_receipt_key(run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-        if raw is None:
-            raise WorkflowAuthorityError("fix infrastructure run lacks its exact issue admission")
-        captured = decode_workflow(raw[0], tuple)
-        if (len(captured) != 2 or captured[0] != purchase or not isinstance(captured[1], ContinuationAdmission)
-                or captured[1].attempt.run_id != run_id):
-            raise WorkflowAuthorityError("fix infrastructure admission conflicts with its run capture")
-        admission = captured[1]
-        _, provenance = self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        dispatch = json.loads(provenance["dispatch_id"])
-        if (not isinstance(dispatch, dict) or dispatch.get("role") != "fix"
-                or dispatch.get("repository") != key.repository or type(dispatch.get("issue")) is not int
-                or dispatch["issue"] != key.target.number or dispatch.get("leg_id") != admission.attempt.leg_id):
-            raise WorkflowAuthorityError("fix infrastructure admission differs from actual issue dispatch")
-        return admission, provenance, row, purchase
-
-    def record_fix_infra_return(self, run_id: RunId, writer) -> None:
-        """Record that a fix run returned normally. Any ended fix run without
-        this receipt (died, reclaimed, refused, machine-class return) is a
-        machine end to the backoff (`fix_leg_ends`)."""
-        with self.transaction() as db, self.mutation_savepoint(db):
-            captured = self._fix_infra_admission(db, run_id)
-            if captured is None:
-                return
-            admission, provenance, _, _ = captured
-            self._require_repair_writer(db, writer, admission, provenance["owner_id"])
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('fix-infra-outcome',?,?,?,?) "
-                       "ON CONFLICT(namespace,scope,key) DO NOTHING",
-                (admission.attempt.binding.fence.key.repository, str(run_id), _stamp(self._now()),
-                 encode_workflow(cc.FixInfraReceipt(admission, cc.FixInfraOutcome.RETURNED_NORMAL))))
 
     def _linked_issue_reply_admission(self, db, attempt: WorkflowAttemptIdentity, run):
         purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueReplyPurchase)]

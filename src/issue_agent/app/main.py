@@ -21,12 +21,11 @@ from ..adapters.control_store import (
     RetiredOwnerError,
 )
 from ..adapters.env_file import source_env_file
-from ..adapters.github import GhUnavailable, GitHubGateway, Identity
+from ..adapters.github import GitHubGateway, Identity
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from ..adapters.systemd_notify import SystemdNotifier
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
-from ..domain.world import HeadSignal, ProbeSignals, WorldState
 from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
 from ..domain.recovery import RecoveryArm, RecoveryTrigger, recovery_plan
@@ -40,7 +39,6 @@ from .roles import (
     process_supervision_state_dir,
 )
 from .review_identity import review_identity as _app_identity
-from .world_probe import WorldProbe, fix_probe_hooks
 
 
 def _load_agent_env(env: dict) -> dict:
@@ -210,38 +208,6 @@ def build_role(
     )
     worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
 
-    # Change-probe gate for the per-tick observe: 1 REST point on a quiet tick
-    # instead of a full ~14-point GraphQL world build (the 2026-07-26 rate-limit
-    # exhaustion — two daemons on one token at 20s polls). Review is gated
-    # unconditionally: its decide function reads nothing the signature is blind
-    # to (the reviewer ignores checks). The FIX daemon is gated CONDITIONALLY, via `probe_when`: its decide
-    # reads CI check states and mergeable/mergeStateStatus, which GitHub
-    # recomputes WITHOUT bumping any updated_at — but only an in-flight PR or a
-    # held issue produces those signals, so `fix_probe_safe` re-enables full
-    # builds for exactly the worlds where the blind spot bites, and lets an idle
-    # fixer coast on the cheap signature (new work always bumps updated_at).
-    def _probed(
-        daemon,
-        gw,
-        probe_when: Callable[[WorldState, ProbeSignals], bool] | None = None,
-        read_signals: (
-            Callable[[WorldState], tuple[HeadSignal, ...] | None] | None
-        ) = None,
-    ):
-        if not cfg.world_probe:
-            return daemon
-        probe = WorldProbe(
-            gw.change_signature,
-            float(cfg.world_probe_ttl_seconds),
-            probe_when=probe_when,
-            read_signals=read_signals,
-        )
-        # Daemon owns live pool state. The fix role's decision closure also
-        # retains this exact instance to read capacity and in-flight paths, so
-        # cloning it here would split observation from dispatch accounting.
-        daemon.observe = probe.gate(daemon.observe)
-        return daemon
-
     if role == "fix":
         gw = GitHubGateway(
             cfg.repo,
@@ -251,13 +217,7 @@ def build_role(
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.
         store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)
-        fix_daemon = build_fix_daemon(cfg, gw, store, worktrees, runner)
-        probe_when, read_signals = fix_probe_hooks(
-            lambda: bool(fix_daemon.active_dispatches), gw.head_signals
-        )
-        return _probed(
-            fix_daemon, gw, probe_when=probe_when, read_signals=read_signals
-        )
+        return build_fix_daemon(cfg, gw, store, worktrees, runner)
     if role == "review":
         gw = GitHubGateway(
             cfg.repo,
@@ -270,7 +230,7 @@ def build_role(
         # resume cannot preserve its read-only sandbox, and legacy Claude
         # session ids must never reach `codex exec resume`.
         store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime.value)
-        return _probed(build_review_daemon(cfg, gw, store, runner), gw)
+        return build_review_daemon(cfg, gw, store, runner)
     raise SystemExit(f"unknown role: {role!r} (use fix|review)")
 
 

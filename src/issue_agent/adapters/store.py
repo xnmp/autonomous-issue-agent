@@ -11,20 +11,9 @@ import os
 from dataclasses import dataclass
 
 from ..domain.agent_task import RuntimeName
-from ..domain.ci_history import (
-    CiAttempt,
-    append_attempt,
-    ci_history_payload,
-    parse_ci_history,
-)
 from ..domain.world import normalize_predicted_paths
-from ..domain.actions import Target
 from ..domain.ports import WorkflowControlError
 
-# Historical control files remain stopped-import evidence. Runtime cleanup
-# removes only the explicit advisory subsets; SQLite owns lifecycle state.
-_ISSUE_ADVISORY_SUFFIXES = ("predicted-paths", "ci-history")
-_PR_ADVISORY_SUFFIXES = ("automerge",)
 
 @dataclass(frozen=True)
 class Store:
@@ -95,60 +84,3 @@ class Store:
         else:
             self._remove(path)
 
-    def clear_ci_history(self, issue: int) -> None:
-        """Discard advisory context only after SQL closes the selected CI episode."""
-        self._remove(self.issue_path(issue, "ci-history"))
-
-    # ── CI attempt history (tauri PR #620) ──────────────────────────────────
-    # Bounded prompt context, separate from SQL eligibility and debt.
-    def get_ci_history(self, issue: int) -> tuple[CiAttempt, ...]:
-        """Recorded FIX_CI attempts, oldest first — () when absent or corrupt."""
-        try:
-            raw = json.loads(self._read(self.issue_path(issue, "ci-history")))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return ()
-        return parse_ci_history(raw)
-
-    def append_ci_attempt(
-        self, issue: int, attempt: CiAttempt
-    ) -> tuple[CiAttempt, ...]:
-        """Record one dispatched attempt, keeping the last CI_HISTORY_LIMIT.
-
-        Returns the persisted history so a caller can report what it wrote
-        rather than re-read it."""
-        history = append_attempt(self.get_ci_history(issue), attempt)
-        self._write(
-            self.issue_path(issue, "ci-history"),
-            json.dumps(ci_history_payload(history)),
-        )
-        return history
-
-
-
-    # ── advisory cleanup ──
-    def _clear_issue_advisory(self, issue: int) -> None:
-        """Selected SQL retirement cannot erase stopped control/import evidence."""
-        for suffix in _ISSUE_ADVISORY_SUFFIXES:
-            self._remove(self.issue_path(issue, suffix))
-
-    def _clear_pr_advisory(self, pr: int) -> None:
-        """Retire the obsolete merge hint; durable commands own completion."""
-        for suffix in _PR_ADVISORY_SUFFIXES:
-            self._remove(self.pr_path(pr, suffix))
-
-    def cleanup_pr(self, pr: int | None, issue: int | None, merged: bool) -> None:
-        """Retire advisory files after the selected SQL cleanup.
-
-        Stopped control files remain import evidence. Closed-unmerged requeue
-        changes continuity in SQL and clears only dead-PR diagnostic context. An issueless PR
-        addresses advisory issue metadata through its original negative key.
-        """
-        if pr is None and issue is None:
-            return  # nothing addressable — the caller has no key at all
-        issue_key = issue if issue is not None else -pr  # type: ignore[operator]
-        if merged:
-            if pr is not None:
-                self._clear_pr_advisory(pr)
-            self._clear_issue_advisory(issue_key)
-        else:
-            self.clear_ci_history(issue_key)

@@ -705,19 +705,3 @@ def test_replacement_checkpoint_cannot_be_committed_without_exact_admission_deri
         validate_resolve_transition(before, changed, ceiling=3, now=NOW)
 
 
-def test_resolve_rearm_preserves_legacy_attention_on_the_same_issue():
-    from issue_agent.domain.lifecycle import issue_escalation
-    from issue_agent.domain.workflow_policy import resolve_rearm_projection
-
-    state = exhausted()
-    number = state.revision.fence.key.target.number
-    legacy = issue_escalation(number, "infra ceiling", Label.AI_READY).actions()
-    labels = frozenset(action.add for action in legacy if isinstance(action, Relabel))
-    external = ("legacy fix attention",)
-    pending = start(state, external_holds=external).snapshot
-    projection = resolve_rearm_projection(pending, observed(state, labels=labels).issue,
-                                          external_holds=external)
-    assert projection.removed_labels == ()
-    assert projection.added_labels == (Label.NEEDS_HUMAN_REVIEW,)
-    assert (labels - set(projection.removed_labels)) | set(projection.added_labels) == labels
-    assert projection.workflow == pending.binding

@@ -12,17 +12,23 @@ Precedence, the single place it is defined (first match wins, per item):
 2. Lifetime    the issue spent its per-issue lifetime cap -> NeedsHuman (Wait
                once labelled). Money is a grant, so a reply cannot release it.
 3. needs-human labelled: a qualifying reply (Q8) -> Release, else Wait.
-4. Workflow    the PR touches `.github/` and no released workflow stop exists
+4. Question    the item's latest agent leg asked a human for judgment and no
+               stop comment follows it -> NeedsHuman (the leg already posted
+               its question; the stop is the single needs-human writer).
+5. Workflow    the PR touches `.github/` and no released workflow stop exists
                on it -> NeedsHuman.
-5. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
+6. Publication an issue with a pushed `fix/<issue>-` branch that never had a
+               PR -> OpenPR (free; the agent pushes, the harness opens, Q11).
+7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
                for another head -> Wait; red -> FIX_CI; pending -> Wait; green
                and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
                head -> ADDRESS_REVIEW; no bot verdict on head -> REVIEW; bot
                CHANGES_REQUESTED on head -> ADDRESS_REVIEW; bot APPROVED head ->
                Merge, unless a human's standing CHANGES_REQUESTED is on an
                older head (Wait) or mergeability is unknown (Wait).
-               Issue: `ai-ready`, open, no harness PR -> RESOLVE.
-6. Dispatch gates, for a Dispatch from step 5 only (merge/refresh are free):
+               Issue: `ai-ready`, open, no open or merged harness PR ->
+               RESOLVE.
+8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh are free):
                bot review rounds >= cap (ADDRESS_REVIEW on a bot verdict) ->
                NeedsHuman; attempts >= cap -> NeedsHuman; machine backoff ->
                Backoff; daily or global headroom short -> Wait (silent, Q7).
@@ -35,6 +41,8 @@ without progress does.
 
 Untrusted timestamps fail toward stopping: an unparseable one never resets a
 count or releases a stop, and an unparseable bot review still counts as a round.
+Likewise a push GitHub cannot attribute to a login (an unlinked commit email)
+is never a reset: only a push by a known non-harness login is.
 """
 
 from __future__ import annotations
@@ -53,7 +61,7 @@ from .ci import Clear, Failed, Waiting, parse_timestamp, reduce_ci
 from .identity import login_eq
 from .labels import Label
 from .refs import harness_branch_issue
-from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
+from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Branch, Comment, PRView, WorldState
 
 ATTEMPT_CAP = 3
 REVIEW_ROUND_CAP = 3
@@ -160,6 +168,7 @@ class StopReason(str, Enum):
     LIFETIME_CAP = "lifetime-cap"
     ATTEMPTS = "attempts"
     REVIEW_ROUNDS = "review-rounds"
+    QUESTION = "question"
 
 
 def stop_tag(reason: StopReason) -> str:
@@ -206,6 +215,17 @@ class Refresh:
 
 
 @dataclass(frozen=True)
+class OpenPR:
+    """A pushed harness branch has no PR yet: open it (free, no agent)."""
+
+    branch: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.branch, str) or harness_branch_issue(self.branch) is None:
+            raise ValueError("OpenPR requires a harness branch")
+
+
+@dataclass(frozen=True)
 class Release:
     """A qualifying reply released the stop: remove `needs-human`. The item
     proceeds next tick, with its counts reset past the released stop comment."""
@@ -249,7 +269,7 @@ class Backoff:
             raise ValueError("backoff requires a dispatchable act and an aware time")
 
 
-DerivedState = Dispatch | Merge | Refresh | Release | Wait | NeedsHuman | Busy | Backoff
+DerivedState = Dispatch | Merge | Refresh | OpenPR | Release | Wait | NeedsHuman | Busy | Backoff
 
 
 @dataclass(frozen=True)
@@ -259,20 +279,30 @@ class _Item:
     labels: frozenset[Label]
     comments: tuple[Comment, ...]
     pr: PRView | None = None
+    branches: tuple[Branch, ...] = ()
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
     """Every harness item in `world` mapped to its derived state.
 
     Items: each open harness PR (head branch `fix/<issue>-`, Q1), and each open
-    `ai-ready` issue with no open harness PR. Anything else is not the harness's.
+    `ai-ready` issue with no open or merged harness PR. Anything else is not
+    the harness's.
     """
     prs = [(p, n) for p in world.prs if p.state == "OPEN" and (n := harness_branch_issue(p.head_ref_name))]
-    with_pr = {n for _, n in prs}
+    # An open PR shadows its issue; a merged one means the issue is done, even
+    # while it stays open on a non-default base.
+    shadowed = {n for _, n in prs} | {
+        n for p in world.prs if p.state == "MERGED" and (n := harness_branch_issue(p.head_ref_name))
+    }
+    pushed: dict[int, list[Branch]] = {}
+    for b in world.branches:
+        if (n := harness_branch_issue(b.name)) is not None:
+            pushed.setdefault(n, []).append(b)
     items = [
-        _Item(issue_key(i.number), i.number, i.labels, i.comments)
+        _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())))
         for i in world.issues
-        if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in with_pr
+        if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p) for p, n in prs if p.number > 0]
     return {item.key: _decide(item, local, harness) for item in items}
 
@@ -303,15 +333,23 @@ def _decide(item: _Item, local: Local, harness: Harness) -> DerivedState:
             return Release()
         return Wait(WaitReason.NEEDS_HUMAN)
 
+    agent_legs = [leg for leg in legs if not leg.machine]
+    last_agent = max(agent_legs, key=lambda leg: leg.ended_at, default=None)
+    if last_agent is not None and last_agent.asked and not any(at > last_agent.ended_at for at, _ in stops):
+        return NeedsHuman(StopReason.QUESTION, anchor)
+
     pr = item.pr
     released_workflow = any(code == StopReason.WORKFLOW_PATH.value for _, code in stops)
     if pr is not None and touches_github(pr.changed_files) and not released_workflow:
         return NeedsHuman(StopReason.WORKFLOW_PATH, anchor)
+    if pr is None and item.branches:
+        return OpenPR(max(item.branches, key=lambda b: (parse_timestamp(b.committed_at) is not None,
+                                                        b.committed_at, b.name)).name)
 
     step = _pr_step(pr, harness) if pr is not None else Dispatch(AgentKind.RESOLVE)
     if not isinstance(step, Dispatch):
         return step
-    floor = _reset_floor(item, comments, last_stop, harness)
+    floor = _reset_floor(item, comments, last_stop, harness, legs)
     if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
             and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
             and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
@@ -403,12 +441,16 @@ def _human_comment(comment: Comment, harness: Harness) -> bool:
 
 
 def _reset_floor(
-    item: _Item, comments: list[tuple[datetime, Comment]], last_stop: datetime | None, harness: Harness
+    item: _Item, comments: list[tuple[datetime, Comment]], last_stop: datetime | None, harness: Harness,
+    legs: tuple[LegEnd, ...],
 ) -> datetime | None:
     """The latest reset event (Q3): a non-harness comment, review or push. A
     stop comment on an unlabelled item was released (reply or label removal),
-    so it is a reset too."""
-    events = [at for at, c in comments if _human_comment(c, harness)]
+    so it is a reset too. A comment inside one of the item's leg windows is the
+    agent's own (it comments under the bot's login without the marker)."""
+    windows = [(leg.started_at, leg.ended_at) for leg in legs if leg.started_at is not None]
+    events = [at for at, c in comments if _human_comment(c, harness)
+              and not any(start < at <= end for start, end in windows)]
     if last_stop is not None:
         events.append(last_stop)
     if item.pr is not None:
@@ -416,7 +458,7 @@ def _reset_floor(
                    if not harness.owns_login(r.author) and r.state.upper() not in ("", "PENDING")
                    and (at := parse_timestamp(r.submitted_at))]
         events += [at for p in item.pr.pushes
-                   if not harness.owns_login(p.actor) and (at := parse_timestamp(p.pushed_at))]
+                   if p.actor.strip() and not harness.owns_login(p.actor) and (at := parse_timestamp(p.pushed_at))]
     return max(events, default=None)
 
 
@@ -430,6 +472,6 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
 
 __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
-    "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "Release", "Wait", "NeedsHuman",
+    "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "Release", "Wait", "NeedsHuman",
     "Busy", "Backoff", "DerivedState", "derive", "touches_github",
 ]
