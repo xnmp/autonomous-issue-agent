@@ -111,7 +111,7 @@ from .workflow_rows import (
 )
 
 # Deployment barriers are always taken in this order (ADR 0015 acceptance).
-BARRIER_ROLES = ("fix", "review", "steward")
+BARRIER_ROLES = ("fix", "review")
 _OBSERVATION_NAMESPACE = "workflow-rearm-observation"
 _HOLD_OBSERVATION_NAMESPACE = "review-hold-observation"
 _FIRST_OBSERVATION_NAMESPACE = "review-first-observation"

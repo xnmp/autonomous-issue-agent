@@ -15,11 +15,9 @@ def test_issue_and_pr_histories_keep_distinct_targets_and_linkage():
     issue=parsed()
     pr=parsed(kind='FIX_CI',number=9)
     unlinked=parsed(kind='REBASE',number=9,issue=None,breaker_key=-9)
-    steward=parsed(role='steward',kind='GROOM')
     assert (issue.key.target,issue.family)==(IssueRef(7),WorkflowFamily.ISSUE_RECOVERY)
     assert (pr.key.target,pr.linked_issue)==(PullRequestRef(9),IssueRef(7))
     assert unlinked.key.target==PullRequestRef(9) and unlinked.linked_issue is None
-    assert steward.family is WorkflowFamily.STEWARD
 
 
 @pytest.mark.parametrize('change',[{'number':True},{'number':None},{'number':0},{'number':-7},

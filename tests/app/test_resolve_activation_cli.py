@@ -32,9 +32,8 @@ def deployment(tmp_path, monkeypatch):
         "REPO": "o/r", "TARGET_DIR": str(tmp_path / "checkout"),
         "STATE_DIR": str(tmp_path / "state" / "fix"),
         "REVIEW_STATE_DIR": str(tmp_path / "state" / "review"),
-        "STEWARD_STATE_DIR": str(tmp_path / "state" / "steward"),
         "CONTROL_AUTHORITY_ROOT": str(tmp_path / "authority"),
-        "ROLES": "fix review steward", "GH_HOST": "github.com", "MAX_RESOLVE_RETRIES": "3",
+        "ROLES": "fix review", "GH_HOST": "github.com", "MAX_RESOLVE_RETRIES": "3",
         "FIX_BOT": "fix-bot",
     }
     for key in (*env, "AGENT_ENV", "REPOINTED_FROM_DEPLOYMENTS"):
@@ -320,7 +319,7 @@ def test_rehearsal_copies_every_scanned_root(deployment, capsys, tmp_path):
     code, result, _ = run(capsys, "rehearse", "--copy-to", str(tmp_path / "rehearsal"))
     assert code == 0 and result["status"] == "rehearsed", result
     assert [i["issue"] for i in result["plan"]["imports"]] == [5, 7, 8]
-    assert [r["label"] for r in result["copy"]["legacy_roots"]] == ["fix", "review", "steward"]
+    assert [r["label"] for r in result["copy"]["legacy_roots"]] == ["fix", "review"]
     assert result["checks"]["different_plan_refused"] is True
 
 

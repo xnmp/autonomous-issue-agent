@@ -304,7 +304,7 @@ class Backend:
     def measurement(self, name: str, specification: dict) -> dict:
         from ..measurement import local_export
         cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
-        state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        state_dirs = (cfg.state_dir, cfg.review_state_dir)
         path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
         return local_export(path, cfg.repo, specification)
 
@@ -709,7 +709,7 @@ class Backend:
             if not self.known(name):
                 raise ValueError(f"unknown deployment '{name}'")
             cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
-            state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            state_dirs = (cfg.state_dir, cfg.review_state_dir)
             path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
             if self.control_db_path and os.path.realpath(self.control_db_path) != os.path.realpath(path):
                 raise ValueError("workflow family authority differs from the configured deployment")
@@ -737,7 +737,7 @@ class Backend:
         try:
             cfg, env = load_operator_configuration(name, harness_root=self.harness_root)
             repo = cfg.repo
-            state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            state_dirs = (cfg.state_dir, cfg.review_state_dir)
             path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
             if self.control_db_path and os.path.realpath(self.control_db_path) != os.path.realpath(path):
                 return False, "unblock control authority differs from the configured deployment"
@@ -763,7 +763,7 @@ class Backend:
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
         repo = cfg.repo
-        state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        state_dirs = (cfg.state_dir, cfg.review_state_dir)
         journal_paths = tuple(os.path.join(path, "journal.jsonl") for path in state_dirs)
         # Admission provenance must share mutation scope and bypass the UI cache.
         snapshot = self._deployment_snapshot(name, repo, cfg.target_dir, journal_paths, control.path)

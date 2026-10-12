@@ -190,13 +190,10 @@ def export_cohort(path: str, window):
 def execution_observation(db, repository, run, cutoff):
     from .workflow_codec import decode_workflow
     from ..domain.cohort import CompletedExecution, FailedExecution
-    from ..domain.continuation_components import StewardFailed, StewardStopped, StewardReturned, StewardPurchase
-    from ..domain.contracts import ContinuationAdmission, RunId
     from ..domain.resolve_return import ReturnedResolve
     from ..domain.review_return import ReturnedReviewChild
     from ..domain.review_execution import ReviewChildAdmission
     from ..domain.workflow import ResolveAdmission
-    from ..domain.workflow_identity import WorkflowFamily
 
     def receipt(namespace, key):
         row = db.execute("SELECT claimed_at,payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
@@ -211,8 +208,8 @@ def execution_observation(db, repository, run, cutoff):
 
     proofs, errors = [], []
     run_id = run["run_id"]
-    for namespace in ("workflow-return", "review-execution-return", "continuation-return"):
-        key = SQLiteControlStore._continuation_receipt_key(RunId(run_id), WorkflowFamily.STEWARD) if namespace == "continuation-return" else run_id
+    for namespace in ("workflow-return", "review-execution-return"):
+        key = run_id
         try:
             raw = receipt(namespace, key)
             if raw is None:
@@ -229,7 +226,7 @@ def execution_observation(db, repository, run, cutoff):
                     continue
                 failed = returned.is_error
                 reason = returned.exit_reason.value if returned.exit_reason is not None else returned.status or "agent_error"
-            elif namespace == "review-execution-return":
+            else:
                 returned = decode_workflow(raw, ReturnedReviewChild)
                 admission = decode_workflow(receipt("review-execution-admission", run_id), ReviewChildAdmission)
                 if (returned.run_id != run_id or admission.run_id != run_id or returned.child != admission.child
@@ -240,40 +237,6 @@ def execution_observation(db, repository, run, cutoff):
                     continue
                 failed = returned.result.is_error
                 reason = returned.result.exit_reason.value if returned.result.exit_reason is not None else returned.result.status or "agent_error"
-            else:
-                captured = decode_workflow(raw, tuple)
-                purchased = decode_workflow(receipt("continuation-admission", key), tuple)
-                if (len(captured) != 2 or len(purchased) != 2 or not isinstance(captured[0], ContinuationAdmission)
-                        or not isinstance(purchased[0], StewardPurchase)
-                        or captured[0] != purchased[1] or str(captured[0].attempt.run_id) != run_id
-                        or captured[0].attempt.binding.fence.key.repository != repository
-                        or purchased[0].capture.binding != captured[0].attempt.binding
-                        or purchased[0].capture.leg_id != captured[0].attempt.leg_id
-                        or purchased[0].capture.revision.version + 1 != captured[0].admission_version
-                        or not isinstance(captured[1], StewardReturned)
-                        or captured[1].source.admission != captured[0]
-                        or captured[1].source.lane != purchased[0].lane
-                        or captured[1].source.input_at != purchased[0].baseline_at
-                        or captured[1].source.content_signature != purchased[0].content_signature):
-                    raise ValueError("steward execution differs from its admitted source")
-                # Recovery can be refined in place; its original claimed_at
-                # cannot timestamp the current payload. The same transaction
-                # always appends this control transition to the SQL outbox.
-                witness = db.execute("SELECT MAX(committed_at) FROM event_outbox WHERE json_valid(event_json) "
-                    "AND json_extract(event_json,'$.type')='control.transition.committed.v1' "
-                    "AND json_extract(event_json,'$.data.entity_kind')='steward_return' "
-                    "AND json_extract(event_json,'$.data.entity_id')=? "
-                    "AND json_extract(event_json,'$.producer.repository')=? "
-                    "AND json_extract(event_json,'$.correlation.run_id')=?", (key, repository, run_id)).fetchone()[0]
-                if witness is None:
-                    raise ValueError("steward execution lacks its atomic observation timestamp")
-                observed = datetime.fromisoformat(witness.replace("Z", "+00:00"))
-                if observed.tzinfo is None:
-                    raise ValueError("steward execution observation timestamp is naive")
-                if observed > cutoff:
-                    continue
-                failed = isinstance(captured[1], (StewardFailed, StewardStopped))
-                reason = captured[1].kind.value if isinstance(captured[1], StewardFailed) else "paid_stall_ceiling"
             proofs.append(FailedExecution(reason, reference) if failed else CompletedExecution(reference))
         except (ValueError, TypeError, KeyError) as error:
             errors.append(f"invalid execution {namespace}:{key}: {error}")

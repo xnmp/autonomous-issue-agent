@@ -1404,25 +1404,6 @@ def ci_flake_keys(events) -> set[str]:
     return _emitted_block_keys(events, "ci_flake")
 
 
-def recurrence_keys(events) -> set[str]:
-    """The `block_key`s a `recurrence` event has ALREADY been emitted for.
-
-    Third instance of the same edge-trigger read (harness #10). A recurrence is
-    the most level-like of the three: a reopened issue stays reopened until
-    someone closes it, and the steward re-derives that fact on every fresh world
-    build, so an un-deduped emit would write the same line for days. The
-    recurrence RATE is the metric this journal has to answer, and a metric
-    computed by counting events is destroyed by duplicates — dedup here is a
-    correctness property, not just noise control.
-    """
-    return _emitted_block_keys(events, "recurrence")
-
-
-def groomed_keys(events) -> set[str]:
-    """Durable one-shot keys for harness-adjudicated steward grooming findings."""
-    return _emitted_block_keys(events, "groomed")
-
-
 def _cost(event: dict) -> float:
     try:
         return float(event.get("cost_usd", 0.0) or 0.0)
@@ -1453,8 +1434,6 @@ __all__ = [
     "read_events",
     "read_events_tail",
     "recent_runs",
-    "recurrence_keys",
-    "groomed_keys",
     "repeated_dispatch_warning",
     "spend_blocked_keys",
     "sum_issue",

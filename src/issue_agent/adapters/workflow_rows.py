@@ -404,8 +404,8 @@ def encode_workflow_episodes(snapshot: AnyWorkflowSnapshot | IssueWorkflowShell)
         return encode_workflow(snapshot)
     if isinstance(snapshot, ReviewWorkflowSnapshot):
         return encode_workflow(ReviewFamilyEpisodes(snapshot.authority, snapshot.episode, snapshot.execution, snapshot.pr_repair))
-    if not isinstance(snapshot.issue_recovery, cc.InactiveIssueRecovery) or not isinstance(snapshot.steward, cc.InactiveSteward):
-        return encode_workflow(IssueFamilyEpisodes(snapshot.authority, snapshot.episode, snapshot.issue_recovery, snapshot.steward))
+    if not isinstance(snapshot.issue_recovery, cc.InactiveIssueRecovery):
+        return encode_workflow(IssueFamilyEpisodes(snapshot.authority, snapshot.episode, snapshot.issue_recovery))
     return encode_workflow((snapshot.authority, snapshot.episode))
 
 
@@ -445,13 +445,8 @@ def initialize_new_continuations(db: sqlite3.Connection, snapshot: AnyWorkflowSn
             if selected:
                 snapshot = replace(snapshot, issue_recovery=cc.ActiveIssueRecovery(selected, cc.IssueRecoveryState()))
                 created.append(snapshot.issue_recovery)
-        if isinstance(snapshot.steward, cc.InactiveSteward):
-            selected = identity(WorkflowFamily.STEWARD)
-            if selected:
-                snapshot = replace(snapshot, steward=cc.ActiveSteward(selected, cc.StewardState()))
-                created.append(snapshot.steward)
     for component in created:
-        if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward)):
+        if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair)):
             insert_workflow_component(db, key, component.identity.authority, component.identity.episode_id)
     return snapshot
 
@@ -470,7 +465,6 @@ _FAMILY_TARGET_KIND = {
     WorkflowFamily.REVIEW_EXECUTION: "pr",
     WorkflowFamily.ISSUE_RECOVERY: "issue",
     WorkflowFamily.PR_REPAIR: "pr",
-    WorkflowFamily.STEWARD: "issue",
 }
 
 
@@ -496,7 +490,7 @@ def load_family_authority(db: sqlite3.Connection, family: WorkflowFamily, reposi
             return FamilyAuthority(family, row["epoch"])
         except (ValueError, TypeError) as exc:
             raise WorkflowAuthorityError(f"invalid {family.value} activation epoch: {exc}") from exc
-    if family in (WorkflowFamily.REVIEW_EXECUTION, WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD):
+    if family in (WorkflowFamily.REVIEW_EXECUTION, WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR):
         retained = (
             db.execute("SELECT 1 FROM workflow_components WHERE repository=? AND family=? LIMIT 1", (repository, family.value)).fetchone()
             or (db.execute("SELECT 1 FROM review_execution_rounds WHERE repository=? LIMIT 1", (repository,)).fetchone() if family is WorkflowFamily.REVIEW_EXECUTION else None)
@@ -1002,11 +996,11 @@ def _require_secondary_component(db: sqlite3.Connection, key: WorkflowKey, compo
         "SELECT epoch,episode_id FROM workflow_components WHERE repository=? AND target_kind=? AND target_number=? AND family=?",
         (*workflow_scope(key), family.value),
     ).fetchone()
-    if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward)):
+    if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair)):
         if component.identity.key != key or component.identity.authority != authority:
             raise WorkflowAuthorityError("continuation activation disagrees with its component")
         _require_component_index(db, workflow_scope(key), authority, component.identity.episode_id)
-    elif isinstance(component, (cc.BlockedIssueRecovery, cc.BlockedPRRepair, cc.BlockedSteward)):
+    elif isinstance(component, (cc.BlockedIssueRecovery, cc.BlockedPRRepair)):
         if component.key != key or component.authority != authority or indexed is not None:
             raise WorkflowAuthorityError("blocked continuation disagrees with its activation")
     elif indexed is not None:
@@ -1034,7 +1028,6 @@ def _load_issue_aggregate(db: sqlite3.Connection, key: WorkflowKey) -> WorkflowS
             if db.execute("SELECT 1 FROM workflow_components WHERE repository=? AND target_kind=? AND target_number=? AND family='resolve'", workflow_scope(key)).fetchone():
                 raise WorkflowAuthorityError("issue shell has unexpected resolve authority")
             _require_secondary_component(db, key, payload.issue_recovery, WorkflowFamily.ISSUE_RECOVERY)
-            _require_secondary_component(db, key, payload.steward, WorkflowFamily.STEWARD)
             return payload
     if load_family_authority(db, WorkflowFamily.RESOLVE, key.repository) is None:
         return None
@@ -1049,9 +1042,9 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
     scope = workflow_scope(key)
     try:
         family = decode_workflow(row["episode_json"], tuple | IssueFamilyEpisodes)
-        recovery, steward = cc.InactiveIssueRecovery(), cc.InactiveSteward()
+        recovery = cc.InactiveIssueRecovery()
         if isinstance(family, IssueFamilyEpisodes):
-            authority, episode, recovery, steward = family.authority, family.episode, family.issue_recovery, family.steward
+            authority, episode, recovery = family.authority, family.episode, family.issue_recovery
         elif len(family) == 2 and isinstance(family[0], FamilyAuthority) and isinstance(family[1], ResolveEpisode):
             authority, episode = family
         else:
@@ -1060,7 +1053,6 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
             raise WorkflowEncodingError("workflow activation epoch does not match its episode")
         _require_component_index(db, scope, authority, episode.episode_id)
         _require_secondary_component(db, key, recovery, WorkflowFamily.ISSUE_RECOVERY)
-        _require_secondary_component(db, key, steward, WorkflowFamily.STEWARD)
         gates = _load_gates(db, scope)
         intent_row = _latest_intent_row(db, scope)
         intent = None
@@ -1069,7 +1061,7 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
             _check_intent_index(intent_row, intent, {PendingRearm: "pending", CompletedRearm: "completed", SupersededRearm: "superseded", CancelledRearm: "cancelled"})
         snapshot = WorkflowSnapshot(
             WorkflowRevision(WorkflowFence(key, row["generation"]), row["version"]),
-            authority, episode, gates, intent, recovery, steward,
+            authority, episode, gates, intent, recovery,
         )
         if intent is not None:
             acknowledgement = load_workspace_ack(db, intent.handoff)
@@ -1707,7 +1699,6 @@ def persist_workflow_snapshot(db: sqlite3.Connection, after: AnyWorkflowSnapshot
     scope = workflow_scope(after.revision.fence.key)
     if isinstance(after, (WorkflowSnapshot, IssueWorkflowShell)):
         _require_secondary_component(db, after.revision.fence.key, after.issue_recovery, WorkflowFamily.ISSUE_RECOVERY)
-        _require_secondary_component(db, after.revision.fence.key, after.steward, WorkflowFamily.STEWARD)
     else:
         _require_secondary_component(db, after.revision.fence.key, after.pr_repair, WorkflowFamily.PR_REPAIR)
     if isinstance(after, ReviewWorkflowSnapshot) and isinstance(after.execution, (ActivatedReviewExecution, CurrentReviewExecution)):

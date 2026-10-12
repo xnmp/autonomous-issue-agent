@@ -45,7 +45,7 @@ class ContinuationAdmission:
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity) or self.attempt.binding.authority.family not in (
-            WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD,
+            WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR,
         ):
             raise ValueError("continuation admission requires a selected fixed component attempt")
         validate_workflow_integer(self.admission_version, "continuation admission version", minimum=1)
@@ -378,7 +378,6 @@ class CommandKind(str, Enum):
     UPDATE_BRANCH = "update_branch"
     RERUN_CHECKS = "rerun_checks"
     CANCEL_CHECKS = "cancel_checks"
-    ADD_DEPENDENCY = "add_dependency"
     SUBMIT_REVIEW = "submit_review"
     DISMISS_REVIEW = "dismiss_review"
     PUBLISH_BRANCH = "publish_branch"
@@ -389,8 +388,6 @@ class CommandKind(str, Enum):
     SET_REPOSITORY_AUTO_MERGE = "set_repository_auto_merge"
     DELETE_RELAY_HOOK = "delete_relay_hook"
     START_RELAY_FORWARD = "start_relay_forward"
-    CREATE_JIRA_ISSUE = "create_jira_issue"
-    TRANSITION_JIRA_ISSUE = "transition_jira_issue"
 
 
 @dataclass(frozen=True)

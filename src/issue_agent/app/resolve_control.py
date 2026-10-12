@@ -83,10 +83,10 @@ def open_resolve_operator(
     binding are always derived here.
     """
     cfg, env = load_operator_configuration(name, harness_root=harness_root)
-    if "fix" not in env.get("ROLES", "fix review steward").split():
+    if "fix" not in env.get("ROLES", "fix review").split():
         raise ValueError("resolve re-arm requires the configured fix role")
     host = env.get("GH_HOST", "github.com")
-    path = control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+    path = control_store_path((cfg.state_dir, cfg.review_state_dir),
                               authority_root=cfg.control_authority_root)
     if control_db_path and os.path.realpath(control_db_path) != os.path.realpath(path):
         raise ValueError("operator and deployment disagree on control authority")

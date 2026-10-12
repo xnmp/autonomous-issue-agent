@@ -277,7 +277,7 @@ def test_an_unopenable_operator_is_unavailable_for_reads_and_commands(escalated)
 
 
 @pytest.mark.parametrize("overrides,reason", [
-    ({"ROLES": "fix steward"}, "review role"),
+    ({"ROLES": "fix"}, "review role"),
     ({"REPO": ""}, "repository"),
 ])
 def test_a_snapshot_without_review_authority_never_opens_an_operator(escalated, overrides, reason):

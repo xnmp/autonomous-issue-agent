@@ -1,4 +1,4 @@
-"""Closed stopped-import decisions for the fixed fix and steward components."""
+"""Closed stopped-import decisions for the fixed fix components."""
 
 from __future__ import annotations
 
@@ -19,9 +19,7 @@ ISSUE_FIELDS = ("resumed-at", "resumes", "ci-retries", "review-retries", "rebase
                 "infra-deaths", "self-clears", "branch", "session", "model", "machine-block",
                 "budget-block", "self-clear-ceiling", "ci-history", "stall-sig")
 PR_FIELDS = ("resumed-at", "session", "model", "branch", "infra-deaths", "stall-sig", "ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head")
-STEWARD_FIELDS = ("triage-at", "groom-at", "groom-content", "steward-stalls-triage",
-                  "steward-stalls-groom", "infra-deaths")
-IMPORT_FAMILIES = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD)
+IMPORT_FAMILIES = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR)
 MAX_IMPORT_TARGETS = 4096
 
 
@@ -86,11 +84,10 @@ def parse_legacy_continuation_run(*, run_id: str, owner_id: str, kind: str,
     validate_workflow_integer(number, "historical dispatch number", minimum=1)
     issue_kinds = {"ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"}
     pr_kinds = {"PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"}
-    if role == "steward" and kind in {"TRIAGE", "GROOM"} or role == "fix" and kind in issue_kinds:
+    if role == "fix" and kind in issue_kinds:
         if type(issue) is not int or issue != number or type(counter) is not int or counter != issue:
             raise ValueError("issue dispatch has contradictory target provenance")
-        family = WorkflowFamily.STEWARD if role == "steward" else WorkflowFamily.ISSUE_RECOVERY
-        return LegacyContinuationRun(run_id, WorkflowKey(repository, IssueRef(issue)), family)
+        return LegacyContinuationRun(run_id, WorkflowKey(repository, IssueRef(issue)), WorkflowFamily.ISSUE_RECOVERY)
     if role != "fix" or kind not in pr_kinds or type(counter) is not int:
         raise ValueError("unsupported historical continuation leg")
     linked = None
@@ -120,8 +117,6 @@ def _plan_state_identity(state: ImportedState | None) -> object:
         return (_plan_state_identity(replace(state, ci_rerun=None, ci_cancel=None)), repr(state.ci_rerun), repr(state.ci_cancel))
     if isinstance(state, cc.IssueRecoveryState) and not state.review_failures.review_at and state.review_failures.pr is None and state.review_failures.pending is None:
         return repr(state).replace(f"review_failures={state.review_failures!r}", f"review_failures={state.review_failures.count}", 1)
-    if isinstance(state, cc.StewardState) and state.groom_content != cc.GroomContent():
-        return (repr(state), repr(state.groom_content))
     if isinstance(state, cc.PRRepairState) and (state.resumes or state.actual_model is not None):
         return (repr(state), state.resumes, repr(state.actual_model))
     return repr(state)
@@ -135,7 +130,7 @@ class LegacyContinuationRecord:
     fields: tuple[tuple[str, LegacyFile], ...]
 
     def __post_init__(self) -> None:
-        names = ISSUE_FIELDS if self.family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS if self.family is WorkflowFamily.PR_REPAIR else STEWARD_FIELDS
+        names = ISSUE_FIELDS if self.family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS
         if (not isinstance(self.family, WorkflowFamily) or self.family not in IMPORT_FAMILIES or not isinstance(self.key, WorkflowKey)
                 or not family_owns_target(self.family, self.key.target)
                 or not isinstance(self.root, str) or not 0 < len(self.root) <= 512
@@ -152,7 +147,7 @@ class LegacyContinuationRecord:
                              if name not in {"ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head"} or not isinstance(value, LegacyAbsent))))
 
 
-ImportedState = cc.IssueRecoveryState | cc.PRRepairState | cc.StewardState
+ImportedState = cc.IssueRecoveryState | cc.PRRepairState
 
 
 @dataclass(frozen=True)
@@ -166,7 +161,7 @@ class ContinuationImportTarget:
     authority_digest: str = digest(None)
 
     def __post_init__(self) -> None:
-        expected = cc.IssueRecoveryState if self.family is WorkflowFamily.ISSUE_RECOVERY else cc.PRRepairState if self.family is WorkflowFamily.PR_REPAIR else cc.StewardState
+        expected = cc.IssueRecoveryState if self.family is WorkflowFamily.ISSUE_RECOVERY else cc.PRRepairState
         if (not isinstance(self.family, WorkflowFamily) or self.family not in IMPORT_FAMILIES or not isinstance(self.key, WorkflowKey)
                 or not family_owns_target(self.family, self.key.target)
                 or self.revision is not None and (not isinstance(self.revision, WorkflowRevision) or self.revision.fence.key != self.key)
@@ -192,7 +187,7 @@ class ContinuationImportPlan:
     def __post_init__(self) -> None:
         if (canonical_workflow_repository(self.repository) != self.repository
                 or not isinstance(self.families, tuple) or any(not isinstance(f, WorkflowFamily) for f in self.families)
-                or self.families not in ((WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR), (WorkflowFamily.STEWARD,))
+                or self.families != (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR)
                 or not isinstance(self.targets, tuple) or len(self.targets) > MAX_IMPORT_TARGETS
                 or any(not isinstance(t, ContinuationImportTarget) or t.key.repository != self.repository
                        or t.family not in self.families for t in self.targets)
@@ -237,17 +232,7 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
         reason = source.reason if not isinstance(source, LegacyPresent) else ""
         if isinstance(source, LegacyPresent):
             text = source.text.strip()
-            if name == "groom-content":
-                if not re.fullmatch(r"[0-9a-f]{64}", text):
-                    reason = "malformed canonical title/body SHA-256 signature"
-            elif name in {"triage-at", "groom-at"}:
-                try:
-                    cc.StewardLaneState(baseline_at=text)
-                except ValueError as exc:
-                    reason = str(exc)
-                if not text:
-                    reason = "empty present continuation field"
-            elif name in {"ci-rerun-head", "ci-cancel-head"}:
+            if name in {"ci-rerun-head", "ci-cancel-head"}:
                 try:
                     head, separator, at = text.partition("@") if name == "ci-cancel-head" else (text, "", "")
                     cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
@@ -258,7 +243,7 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                     _imported_pr_recovery(record, name, text)
                 except (ValueError, TypeError) as exc:
                     reason = str(exc)
-            elif name in {"session", "model"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
+            elif name in {"session", "model"}:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name == "review-retries":
                 at, separator, number = text.rpartition(" ")
@@ -270,7 +255,7 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                         raise ValueError("qualifying review timestamp is absent")
                 except ValueError as exc:
                     reason = str(exc)
-            elif name in {"resumes", "ci-retries", "rebase-retries", "infra-deaths", "steward-stalls-triage", "steward-stalls-groom"}:
+            elif name in {"resumes", "ci-retries", "rebase-retries", "infra-deaths"}:
                 if not re.fullmatch(r"0|[1-9][0-9]{0,18}", text) or int(text) > 2**63 - 1:
                     reason = "malformed nonnegative bounded counter"
             elif not text:
@@ -280,9 +265,6 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             blockers.append(cc.ContinuationImportBlocker("legacy:" + digest((record.root, name)), f"{name}: {reason}"))
     if blockers:
         return tuple(blockers)
-    if values.get("groom-content") and not values.get("groom-at"):
-        return (cc.ContinuationImportBlocker("legacy:" + digest((record.root, "groom-content")),
-                "groom-content: signature has no matching observed groom-at"),)
     try:
         count = lambda name: int(values.get(name, "0"))
         if record.family is WorkflowFamily.ISSUE_RECOVERY:
@@ -291,22 +273,18 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             review_at, _, review_count = values.get("review-retries", " 0").rpartition(" ")
             return cc.IssueRecoveryState(values.get("resumed-at", ""), count("resumes"), values.get("branch", ""),
                                          count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"))
-        if record.family is WorkflowFamily.PR_REPAIR:
-            def imported(name):
-                text = values.get(name)
-                if text is None:
-                    return None
-                head, separator, at = text.partition("@") if name == "ci-cancel-head" else (text, "", "")
-                source = dict(record.fields)[name]
-                assert isinstance(source, LegacyPresent)
-                return cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
-            return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
-                                    infra_failures=count("infra-deaths"), ci_rerun=imported("ci-rerun-head"), ci_cancel=imported("ci-cancel-head"),
-                                    branch_refresh=_imported_pr_recovery(record, "update-branch-head", values["update-branch-head"]) if "update-branch-head" in values else None,
-                                    pending_ci_escalation=_imported_pr_recovery(record, "ci-pending-escalated-head", values["ci-pending-escalated-head"]) if "ci-pending-escalated-head" in values else None)
-        return cc.StewardState(cc.StewardLaneState(values.get("triage-at", ""), count("steward-stalls-triage"), count("infra-deaths")),
-                              cc.StewardLaneState(values.get("groom-at", ""), count("steward-stalls-groom"), count("infra-deaths")),
-                              cc.GroomContent(values.get("groom-content", ""), values.get("groom-content", "")))
+        def imported(name):
+            text = values.get(name)
+            if text is None:
+                return None
+            head, separator, at = text.partition("@") if name == "ci-cancel-head" else (text, "", "")
+            source = dict(record.fields)[name]
+            assert isinstance(source, LegacyPresent)
+            return cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
+        return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
+                                infra_failures=count("infra-deaths"), ci_rerun=imported("ci-rerun-head"), ci_cancel=imported("ci-cancel-head"),
+                                branch_refresh=_imported_pr_recovery(record, "update-branch-head", values["update-branch-head"]) if "update-branch-head" in values else None,
+                                pending_ci_escalation=_imported_pr_recovery(record, "ci-pending-escalated-head", values["ci-pending-escalated-head"]) if "ci-pending-escalated-head" in values else None)
     except (ValueError, TypeError) as exc:
         return (cc.ContinuationImportBlocker("legacy:" + record.source_digest, str(exc)),)
 
@@ -382,41 +360,4 @@ def review_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuatio
         comparisons.append((target.key, before, after))
     return tuple(comparisons)
 
-
-def triage_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, int], tuple[str, int]], ...]:
-    comparisons = []
-    for target in plan.targets:
-        if not isinstance(target.state, cc.StewardState):
-            continue
-        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.STEWARD)
-        if len(found) > 1:
-            raise ValueError("eligible triage shadow has ambiguous source ownership")
-        fields = dict(found[0].fields) if found else {}
-        baseline, stalls = fields.get("triage-at", LegacyAbsent()), fields.get("steward-stalls-triage", LegacyAbsent())
-        if not isinstance(baseline, (LegacyAbsent, LegacyPresent)) or not isinstance(stalls, (LegacyAbsent, LegacyPresent)):
-            raise ValueError("eligible triage shadow has unreadable selected input")
-        before = (baseline.text.strip() if isinstance(baseline, LegacyPresent) else "",
-                  int(stalls.text.strip()) if isinstance(stalls, LegacyPresent) else 0)
-        after = (target.state.triage.baseline_at, target.state.triage.stalls)
-        comparisons.append((target.key, before, after))
-    return tuple(comparisons)
-
-
-def groom_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, str, int], tuple[str, str, int]], ...]:
-    comparisons = []
-    for target in plan.targets:
-        if not isinstance(target.state, cc.StewardState):
-            continue
-        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.STEWARD)
-        if len(found) > 1:
-            raise ValueError("eligible groom shadow has ambiguous source ownership")
-        fields = dict(found[0].fields) if found else {}
-        values = tuple(fields.get(name, LegacyAbsent()) for name in ("groom-at", "groom-content", "steward-stalls-groom"))
-        if any(not isinstance(value, (LegacyAbsent, LegacyPresent)) for value in values):
-            raise ValueError("eligible groom shadow has unreadable selected input")
-        baseline, signature, stalls = tuple(value.text.strip() if isinstance(value, LegacyPresent) else "" for value in values)
-        before = (baseline, signature, int(stalls or "0"))
-        after = (target.state.groom.baseline_at, target.state.groom_content.successful, target.state.groom.stalls)
-        comparisons.append((target.key, before, after))
-    return tuple(comparisons)
 

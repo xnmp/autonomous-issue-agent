@@ -123,7 +123,6 @@ from ..domain.events import (
     LevelChanged,
     PathPrediction,
     Producer,
-    RecurrenceDetected,
     TelemetryEvent,
     TelemetryWarning,
 )
@@ -131,10 +130,8 @@ from ..domain.ports import (
     WorkflowControlError,
     CommandRecovery,
     EventSink,
-    IssueStateReasonReads,
     LevelState,
     PredictionReader,
-    RecentMergesReads,
     SpendReconciler,
     StaleReservationReconciler,
 )
@@ -159,15 +156,11 @@ from .world_reporter import WorldReporter
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
 
 
-def _ignore_world(_world: object) -> None:
-    return None
-
-
 def _spend_evidence_dirs(cfg: HarnessConfig) -> tuple[str, ...]:
     return tuple(
         spend_evidence_dir(os.path.abspath(path))
         for path in dict.fromkeys(
-            (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            (cfg.state_dir, cfg.review_state_dir)
         )
         if path
     )
@@ -177,7 +170,6 @@ def _role_state_dir(cfg: HarnessConfig, role: str) -> str:
     return {
         "fix": cfg.state_dir,
         "review": cfg.review_state_dir,
-        "steward": cfg.steward_state_dir,
     }[role]
 
 
@@ -279,7 +271,7 @@ def _control_store(
 
 def _control_store_path(cfg: HarnessConfig, state_dir: str) -> str:
     return control_store_path(
-        (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+        (cfg.state_dir, cfg.review_state_dir),
         fallback_state_dir=state_dir,
         authority_root=cfg.control_authority_root,
     )
@@ -1978,90 +1970,6 @@ def _ci_flake_reporter(
                 TelemetryEvent(
                     CiFlakeDetected(flake.head, key),
                     Correlation(pr=flake.pr),
-                )
-            )
-
-    return report
-
-
-def _recurrence_reporter(
-    journal: EventSink | None, gateway, repo: str, fix_bot: str, log, control=None
-):
-    """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
-
-    A merged PR is not ground truth that the problem is fixed. The truest
-    "losing power" signal is a resolved issue that comes back — and it is
-    invisible to review, which is why it gets recorded here rather than inferred
-    from the existing counters.
-
-    **Why `stateReason`, not "open again".** The harness merges to a non-default
-    base branch, so GitHub never auto-closes the referenced issue; the harness
-    closes it itself, and only when `close_issue_on_merge` is set. An ai-done
-    issue that is open therefore means either "a human reopened it" or "the close
-    has not happened / is not configured" — a distinction worth one gh call,
-    because the second case is every ai-done issue on a default deployment and
-    would journal a recurrence for each of them, forever.
-
-    Same two-channel shape as `_hold_reporter`: the LOG line fires every pass
-    (free, and answers "why is this labelled recurrence?" from any single poll),
-    the JOURNAL line once per issue — a reopen is a LEVEL that persists until
-    someone closes the issue again, and the recurrence RATE is computed by
-    counting these events, so duplicates would corrupt the metric rather than
-    merely add noise.
-
-    Cost: ZERO extra gh calls in the steady state. `issue_state_reason` is asked
-    only about issues that are BOTH open and ai-done — a set that is empty on a
-    healthy repo. A gateway without the method (a fake, a legacy adapter) yields
-    an inert reporter rather than an AttributeError out of the decide closure.
-    """
-    if not isinstance(gateway, IssueStateReasonReads):
-        return _ignore_world
-    seen: set[str] = set()
-
-    def report(world) -> None:
-        reopened = [
-            i.number for i in world.issues
-            if i.state == "open" and i.has(Label.AI_DONE)
-            and gateway.issue_state_reason(i.number) == "reopened"
-        ]
-        if not reopened:
-            return
-        # Only now is the merged list worth a call: it exists solely to name the
-        # PR that shipped the thing that came back.
-        shipped: dict[int, int] = {}
-        if isinstance(gateway, RecentMergesReads) and fix_bot:
-            try:
-                shipped = {
-                    m.issue: m.pr
-                    for m in (gateway.recently_merged_issues(fix_bot) or ())
-                }
-            except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
-                log(f"recurrence: could not read merged PRs ({exc})")
-        for number in reopened:
-            log(
-                f"RECURRENCE: issue #{number} was resolved and is open again "
-                "(reopened)"
-            )
-            key = f"recurrence:{repo}:{number}:reopen"
-            if key in seen:
-                continue
-            if control is not None and not control.claim("recurrence", repo, key):
-                continue
-            seen.add(key)
-            if journal is None:
-                continue
-            # of_issue == issue: a reopen is an issue recurring as ITSELF, which
-            # keeps one event shape for both kinds so the metric reads them
-            # together. No label and no comment here — the reopened issue is
-            # already the visible artifact, and the harness must never write to
-            # an issue a human just deliberately reopened.
-            journal.emit(
-                TelemetryEvent(
-                    RecurrenceDetected("reopen", number, key),
-                    Correlation(
-                        issue=number,
-                        pr=(shipped.get(number) or None),
-                    ),
                 )
             )
 

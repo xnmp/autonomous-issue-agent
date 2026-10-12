@@ -114,7 +114,6 @@ class ReviewDeployment:
             "REPO": REPO, "FIX_BOT": FIX_BOT, "REVIEW_BOT": BOT, "REVIEWER_RUNTIME": "claude",
             "REVIEW_MAX_REJECTIONS": str(self.ceiling), "TARGET_DIR": str(self.target),
             "STATE_DIR": str(self.root / "fix-state"), "REVIEW_STATE_DIR": str(self.root / "review-state"),
-            "STEWARD_STATE_DIR": str(self.root / "steward-state"),
         }
 
     def config(self) -> HarnessConfig:

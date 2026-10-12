@@ -97,11 +97,8 @@ def test_workflow_annotation_must_match_real_admission_pair(tmp_path):
 
 def admitted_components(tmp_path):
     from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.workflow import IssueWorkflowShell
     from issue_agent.domain.workflow_identity import WorkflowFamily
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.adapters.workflow_rows import workflow_scope
-    from tests.adapters.test_continuation_admission import active, install_secondary, money
+    from tests.adapters.test_continuation_admission import active, money
     from tests.adapters.test_workflow_admission import NOW as admitted_at, request
     from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
@@ -118,23 +115,6 @@ def admitted_components(tmp_path):
     assert store.reserve(paid).admitted
     assert store.settle(replace(money(paid.run_id), provider_receipt_id="codex:fixture:resolve")).disposition.value == "available"
 
-    revision = resolve_snapshot(8).revision
-    steward = active(revision.fence.key, WorkflowFamily.STEWARD)
-    shell = IssueWorkflowShell(revision, steward=steward)
-    with store.transaction() as db:
-        db.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)",
-                   (*workflow_scope(revision.fence.key), revision.fence.generation,
-                    revision.version, encode_workflow(shell)))
-    install_secondary(store, shell, steward)
-    selected = cc.select_steward(shell)
-    purchase = cc.StewardPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:triage"),
-                                  cc.StewardLane.TRIAGE, admitted_at.isoformat(), 3)
-    requested = request("triage", binding=selected.binding)
-    dispatch = {**json.loads(requested.dispatch_id), "role": "steward", "kind": "TRIAGE", "number": 8}
-    paid = replace(requested, workflow=selected.binding, owner_id="o/r:steward:test", kind="TRIAGE",
-                   dispatch_id=json.dumps(dispatch))
-    assert store.reserve_steward(paid, purchase).admitted
-    assert store.settle(money(paid.run_id)).disposition.value == "available"
     return store, admitted_at
 
 
@@ -147,17 +127,17 @@ def test_component_export_conserves_all_family_spend_and_accepts_exact_workflow_
     window = CohortWindow("o/r", admitted_at, admitted_at + timedelta(hours=1), admitted_at + timedelta(hours=2))
     before = open(store.path, "rb").read()
     result = export_cohort(store.path, window)
-    assert result["admitted_bindings_by_family"] == {"resolve": 1, "issue_recovery": 1, "steward": 1}
-    assert result["all_family_spend_micros_by_currency_basis"] == {"USD:provider_reported": 2}
+    assert result["admitted_bindings_by_family"] == {"resolve": 1, "issue_recovery": 1}
+    assert result["all_family_spend_micros_by_currency_basis"] == {"USD:provider_reported": 1}
     assert result["spend_micros_by_currency_basis"] == {"USD:provider_reported": 1}
     assert result["shared_binding_spend_micros"] == {"USD:provider_reported": 1}
     assert result["unassigned_spend_micros"] == {}
     assert not any("invalid admission" in gap for gap in result["coverage_gaps"])
     assert open(store.path, "rb").read() == before
-    binding = next(binding for binding in result["bindings"] if binding["family"] == "steward")
+    binding = next(binding for binding in result["bindings"] if binding["family"] == "issue_recovery")
     raw = dict(kind="workflow_measurement", record_id="component-profile", repository="o/r", actor="operator",
-               provenance="actual steward reservation", occurred_at=admitted_at.isoformat(), run_id="triage",
-               binding_ref=binding["binding_ref"], evidence_refs=["settled steward reservation"])
+               provenance="actual issue recovery reservation", occurred_at=admitted_at.isoformat(), run_id="resolve",
+               binding_ref=binding["binding_ref"], evidence_refs=["settled issue recovery reservation"])
     assert record_observation(store, parse_observation(raw), deployment="test", now=admitted_at)
 
 
@@ -170,7 +150,7 @@ def test_malformed_component_receipt_is_a_coverage_gap_and_cannot_authorize_anno
 
     store, admitted_at = admitted_components(tmp_path)
     with store.transaction() as db:
-        row = db.execute("SELECT key,payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND key LIKE '%:steward'").fetchone()
+        row = db.execute("SELECT key,payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND key LIKE '%:issue_recovery'").fetchone()
         purchase, admission = decode_workflow(row["payload_json"], tuple)
         if malformation == "empty":
             captured = ()
@@ -184,7 +164,7 @@ def test_malformed_component_receipt_is_a_coverage_gap_and_cannot_authorize_anno
         elif malformation == "version":
             captured = (purchase, replace(admission, admission_version=admission.admission_version + 1))
         elif malformation == "run":
-            captured = (purchase, replace(admission, attempt=replace(admission.attempt, run_id="resolve")))
+            captured = (purchase, replace(admission, attempt=replace(admission.attempt, run_id="other-run")))
         elif malformation == "key":
             captured = (purchase, admission)
         else:
@@ -193,10 +173,10 @@ def test_malformed_component_receipt_is_a_coverage_gap_and_cannot_authorize_anno
         if malformation == "key":
             db.execute("UPDATE dedupe_keys SET key='wrong-key' WHERE namespace='continuation-admission' AND key=?", (row["key"],))
     result = export_cohort(store.path, CohortWindow("o/r", admitted_at, admitted_at + timedelta(hours=1), admitted_at + timedelta(hours=2)))
-    assert "steward" not in result["admitted_bindings_by_family"]
+    assert "issue_recovery" not in result["admitted_bindings_by_family"]
     assert any("invalid admission continuation-admission" in gap for gap in result["coverage_gaps"])
     raw = dict(kind="workflow_measurement", record_id="invalid-component", repository="o/r", actor="operator",
-               provenance="malformed receipt", occurred_at=admitted_at.isoformat(), run_id="resolve" if malformation == "run" else "triage",
+               provenance="malformed receipt", occurred_at=admitted_at.isoformat(), run_id="resolve",
                binding_ref=binding_reference(encode_workflow(admission.attempt.binding)), evidence_refs=["invalid receipt"])
     with pytest.raises(ValueError, match="match an authoritative"):
         record_observation(store, parse_observation(raw), deployment="test", now=admitted_at)

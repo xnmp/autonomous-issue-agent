@@ -83,7 +83,7 @@ def test_configuration_change_cannot_redirect_unblock_files_or_effects(monkeypat
     def change_configuration(repo, state_dirs, **kwargs):
         captured_dirs.append(state_dirs)
         _active_values(tmp_path, REPO="other/repo", STATE_DIR=str(other_dirs["fix"]),
-                       REVIEW_STATE_DIR=str(other_dirs["review"]), STEWARD_STATE_DIR=str(other_dirs["steward"]),
+                       REVIEW_STATE_DIR=str(other_dirs["review"]),
                        REVIEW_BOT="replacement-bot", REVIEW_MAX_REJECTIONS="0")
         monkeypatch.setattr(cli, "journal_paths", lambda _: [str(path / "journal.jsonl") for path in other_dirs.values()])
         return factory(repo, state_dirs, **kwargs)

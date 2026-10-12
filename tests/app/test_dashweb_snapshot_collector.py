@@ -24,7 +24,7 @@ from issue_agent.domain.events import (
 # Fixed and in the past: `causation_time` may not run ahead of the writer's own
 # `observed_at`, which is the real clock.
 NOW = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
-ROLES = ("fix", "review", "steward")
+ROLES = ("fix", "review")
 
 
 def _journal_paths(tmp_path) -> list[str]:
@@ -135,7 +135,6 @@ def test_a_silent_deployment_still_goes_stale(tmp_path) -> None:
     assert [health.stale for health in live.deployment.health] == [
         False,
         True,
-        True,
     ]
 
     dead = collector.collect(**_kwargs(tmp_path, now=NOW + timedelta(seconds=90)))
@@ -181,7 +180,6 @@ def test_heartbeat_write_invalidates_the_cached_snapshot(tmp_path) -> None:
     assert [health.stale for health in after.deployment.health] == [
         False,
         False,
-        True,
     ]
 
 

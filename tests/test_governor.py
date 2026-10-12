@@ -42,39 +42,7 @@ def test_codex_review_hook_allows_only_the_review_bash_surface():
     assert hook.review_only_violation("curl https://example.test") is not None
 
 
-# ── read-only surfaces are per LEG ROLE, not one shared profile ──────────────
-# The steward's TRIAGE/GROOM legs are read-only like a review, but they read the
-# TRACKER and repository history to verify what their schema asks for. Running
-# them under the reviewer's profile blocked every such command with exit 2 while
-# the leg still settled spend and returned unverifiable "VERIFIED" fields.
-
-# Exactly the Bash surface planners/tasks.py TRIAGE_TOOLS grants and the
-# triage/groom prompts instruct.
-_TRIAGE_SURFACE = (
-    "gh issue view 42",
-    "gh issue list --state open --limit 50",
-    "gh search issues 'needs a User concept' --repo o/r",
-    "rg -n 'DashboardHealth' src/",
-    "git log --oneline -20",
-    "git show HEAD~1 --stat",
-    "git diff --stat",
-    "cat docs/adr/0012.md",
-    "ls src/",
-)
-
-
-@pytest.mark.parametrize("command", _TRIAGE_SURFACE)
-def test_a_codex_steward_may_run_its_whole_triage_surface(command):
-    assert hook.read_only_violation(command, "steward") is None
-
-
-@pytest.mark.parametrize("command", _TRIAGE_SURFACE)
-def test_the_reviewer_profile_is_not_widened_by_the_steward_one(command):
-    """Anti-vacuity: the steward's additions must NOT leak into review."""
-    if command.startswith(("git diff", "cat ", "ls ")):
-        return  # already the reviewer's surface
-    assert hook.read_only_violation(command, "review") is not None
-
+# ── read-only surface: an unrecognised leg role falls back to the reviewer ───
 
 @pytest.mark.parametrize(
     "command",
@@ -89,34 +57,11 @@ def test_the_reviewer_profile_is_not_widened_by_the_steward_one(command):
     ],
 )
 def test_no_read_only_role_may_mutate_anything(command):
-    for role in ("steward", "review", "", "not-a-role"):
+    for role in ("review", "", "not-a-role"):
         assert hook.read_only_violation(command, role) is not None, role
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "rg --pre ./scripts/release.sh -e X README.md",
-        "rg --pre=./x.sh -e y .",
-        "rg --pre-glob '*.md' --pre ./x.sh pattern",
-        "rg --hostname-bin ./h.sh pattern",
-        "rg --search-zip secret logs/",
-        "rg -z secret logs/",
-        "rg -iz secret logs/",  # clap clusters short flags
-    ],
-)
-def test_rg_may_not_spawn_subprocesses_in_a_read_only_leg(command):
-    """--pre and friends execute repo-resident binaries with the daemon's
-    ambient credentials — the exact escape the read-only profile exists to
-    prevent. An untrusted issue body instructing this form must exit 2."""
-    assert hook.read_only_violation(command, "steward") is not None
-
-
-def test_rg_after_double_dash_is_still_a_plain_search():
-    assert hook.read_only_violation("rg -n -- --pre", "steward") is None
-
-
-@pytest.mark.parametrize("role", ["steward", "review"])
+@pytest.mark.parametrize("role", ["review"])
 def test_pager_suppression_does_not_hide_the_git_verb(role):
     """`git --no-pager <verb>` is the same read-only verb; other globals
     (-c config injection) stay blocked."""
@@ -129,32 +74,16 @@ def test_pager_suppression_does_not_hide_the_git_verb(role):
 
 def test_the_fallback_message_names_the_unknown_role():
     """A propagation failure fails closed — but the message must say WHICH role
-    fell back, or the operator debugs the reviewer's config on a steward leg."""
-    message = hook.read_only_violation("gh issue list", "steward-ish")
-    assert message is not None and "steward-ish" in message
+    fell back, or the operator debugs the reviewer's config on the wrong leg."""
+    message = hook.read_only_violation("gh issue list", "ghost-role")
+    assert message is not None and "ghost-role" in message
 
 
 def test_an_unknown_leg_role_keeps_the_narrowest_profile():
     """Fail CLOSED: an unrecognised role means the env did not propagate, which
     must never widen the boundary."""
     assert hook.read_only_violation("gh issue list", "") is not None
-    assert hook.read_only_violation("gh issue list", "steward-ish") is not None
-    assert hook.read_only_violation("gh issue list", "steward") is None
-
-
-def test_the_hook_selects_the_profile_from_the_leg_role_env(monkeypatch):
-    """End to end through main()'s gate, not just the predicate: the role the
-    dispatching runner exports is what picks the surface."""
-    read_only = {"ISSUE_AGENT_REVIEW_READ_ONLY": "1"}
-
-    assert _drive_main(
-        monkeypatch, "gh issue view 42",
-        {**read_only, "ISSUE_AGENT_LEG_ROLE": "steward"},
-    ) == 0
-    assert _drive_main(
-        monkeypatch, "gh issue view 42",
-        {**read_only, "ISSUE_AGENT_LEG_ROLE": "review"},
-    ) == 2
+    assert hook.read_only_violation("gh issue list", "ghost-role") is not None
 
 
 # ── extract_commands: finds command nodes anywhere in the tree ────────────────

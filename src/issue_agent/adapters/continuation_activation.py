@@ -12,7 +12,7 @@ import sqlite3
 from ..domain import continuation_components as cc
 from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.continuation_import import (
-    ISSUE_FIELDS, PR_FIELDS, STEWARD_FIELDS, MAX_IMPORT_TARGETS,
+    ISSUE_FIELDS, PR_FIELDS, MAX_IMPORT_TARGETS,
     ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, digest,
 )
 from ..domain.resolve_activation import LegacyAbsent, LegacyPresent, LegacyUnreadable, MAX_LEGACY_FILE_BYTES
@@ -31,7 +31,7 @@ from .workflow_rows import (
     load_review_workflow_row, persist_workflow_snapshot, workflow_scope,
 )
 
-LEGACY_CONTINUATION_NAME = re.compile(r"(?:issue|pr)-.*\.(?:" + "|".join(set(ISSUE_FIELDS + PR_FIELDS + STEWARD_FIELDS)) + r")|(?:triage|groom)-.*\.(?:at|content)")
+LEGACY_CONTINUATION_NAME = re.compile(r"(?:issue|pr)-.*\.(?:" + "|".join(set(ISSUE_FIELDS + PR_FIELDS)) + r")")
 _NUMBER = re.compile(r"[1-9][0-9]{0,18}")
 MAX_SOURCE_BYTES = 4 * MAX_LEGACY_FILE_BYTES
 
@@ -61,24 +61,18 @@ def read_continuation_roots(repository: str, roots: LegacyRoots, families: tuple
                     listed += 1
                     if listed > MAX_IMPORT_TARGETS:
                         raise ResolveActivationRefused("selected continuation files exceed the inventory bound")
-                    if entry.name.startswith(("triage-", "groom-")):
-                        lane, tail = entry.name.split("-", 1)
-                        number, suffix = tail.rsplit(".", 1)
-                        family, target = WorkflowFamily.STEWARD, IssueRef
-                        field = lane + "-" + suffix
-                    else:
-                        kind, tail = entry.name.split("-", 1)
-                        number, field = tail.rsplit(".", 1)
-                        family = WorkflowFamily.STEWARD if field.startswith("steward-stalls-") or field == "infra-deaths" and (label == "steward" or label.startswith("extra:") and families == (WorkflowFamily.STEWARD,)) else WorkflowFamily.PR_REPAIR if kind == "pr" else WorkflowFamily.ISSUE_RECOVERY
-                        target = PullRequestRef if kind == "pr" else IssueRef
-                        if kind == "issue" and number.startswith("-") and field == "infra-deaths" and label != "steward":
-                            number, family, target = number[1:], WorkflowFamily.PR_REPAIR, PullRequestRef
+                    kind, tail = entry.name.split("-", 1)
+                    number, field = tail.rsplit(".", 1)
+                    family = WorkflowFamily.PR_REPAIR if kind == "pr" else WorkflowFamily.ISSUE_RECOVERY
+                    target = PullRequestRef if kind == "pr" else IssueRef
+                    if kind == "issue" and number.startswith("-") and field == "infra-deaths":
+                        number, family, target = number[1:], WorkflowFamily.PR_REPAIR, PullRequestRef
                     # Review-owned session/death files belong to its accepted importer.
                     if family not in families or label == "review" and (field == "infra-deaths" or entry.name.startswith("pr-") and field == "session"):
                         continue
                     if not _NUMBER.fullmatch(number) or int(number) > 2**63 - 1:
                         raise ResolveActivationRefused(f"unassigned continuation identity: {entry.name[:128]}")
-                    names = ISSUE_FIELDS if family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS if family is WorkflowFamily.PR_REPAIR else STEWARD_FIELDS
+                    names = ISSUE_FIELDS if family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS
                     if field not in names:
                         raise ResolveActivationRefused("selected continuation field has contradictory target ownership")
                     key = WorkflowKey(repository, target(int(number)))
@@ -92,7 +86,7 @@ def read_continuation_roots(repository: str, roots: LegacyRoots, families: tuple
                     file_sources.append((label, entry.name, fingerprint))
                     selected.setdefault((key, family), {}).setdefault(field, []).append((entry.name, source))
             for (key, family), fields in sorted(selected.items(), key=lambda x: (x[0][1].value, x[0][0].target.number)):
-                names = ISSUE_FIELDS if family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS if family is WorkflowFamily.PR_REPAIR else STEWARD_FIELDS
+                names = ISSUE_FIELDS if family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS
                 values = []
                 for name in names:
                     sources = sorted(fields.get(name, []), key=lambda item: item[0])
@@ -167,13 +161,13 @@ def verify_original_plan(db: sqlite3.Connection, plan: ContinuationImportPlan) -
         revision = WorkflowRevision(WorkflowFence(target.key, current[0]), current[1])
         if isinstance(payload, IssueWorkflowShell) and payload.revision != revision:
             raise ResolveActivationRefused("selected continuation shell lost its exact revision")
-        component = payload.issue_recovery if target.family is WorkflowFamily.ISSUE_RECOVERY else payload.steward if target.family is WorkflowFamily.STEWARD else payload.pr_repair
+        component = payload.issue_recovery if target.family is WorkflowFamily.ISSUE_RECOVERY else payload.pr_repair
         cc.validate_component_revision(component, revision, target.family)
         _require_secondary_component(db, target.key, component, target.family)
         if target.blockers:
             if component != imported_component(plan, target):
                 raise ResolveActivationRefused("accepted continuation migration blocker disappeared")
-        elif not isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward)):
+        elif not isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair)):
             raise ResolveActivationRefused("accepted selected continuation active authority disappeared")
     return True
 
@@ -184,15 +178,11 @@ def imported_component(plan: ContinuationImportPlan, target):
     if target.blockers:
         if target.family is WorkflowFamily.ISSUE_RECOVERY:
             return cc.BlockedIssueRecovery(target.key, authority, identity, target.blockers)
-        if target.family is WorkflowFamily.PR_REPAIR:
-            return cc.BlockedPRRepair(target.key, authority, identity, target.blockers)
-        return cc.BlockedSteward(target.key, authority, identity, target.blockers)
+        return cc.BlockedPRRepair(target.key, authority, identity, target.blockers)
     component_id = ContinuationComponentIdentity(target.key, authority, "import:" + identity)
     if target.family is WorkflowFamily.ISSUE_RECOVERY:
         return cc.ActiveIssueRecovery(component_id, target.state)
-    if target.family is WorkflowFamily.PR_REPAIR:
-        return cc.ActivePRRepair(component_id, target.state)
-    return cc.ActiveSteward(component_id, target.state)
+    return cc.ActivePRRepair(component_id, target.state)
 
 
 def continuation_inventory_digest(db: sqlite3.Connection, repository: str, families: tuple[WorkflowFamily, ...]) -> str:
@@ -290,9 +280,9 @@ def publish_continuation_import(db: sqlite3.Connection, plan: ContinuationImport
                 value = IssueWorkflowShell(WorkflowRevision(WorkflowFence(target.key, 0), 0))
                 db.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)", (*workflow_scope(target.key), 0, 0, encode_workflow_episodes(value)))
             component = imported_component(plan, target)
-            if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward)):
+            if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair)):
                 insert_workflow_component(db, target.key, component.identity.authority, component.identity.episode_id)
-            value = replace(value, **({"issue_recovery": component} if target.family is WorkflowFamily.ISSUE_RECOVERY else {"pr_repair": component} if target.family is WorkflowFamily.PR_REPAIR else {"steward": component}))
+            value = replace(value, **({"issue_recovery": component} if target.family is WorkflowFamily.ISSUE_RECOVERY else {"pr_repair": component}))
             current[target.key] = value
             db.execute("INSERT INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)", (plan.repository, target.family.value, plan.epoch, *workflow_scope(target.key)[1:], plan.source_digest, encode_workflow(target)))
         for value in current.values():

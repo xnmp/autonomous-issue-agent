@@ -38,7 +38,6 @@ from ..domain.repository import (
 )
 
 
-
 FIX_MODEL_TIER_ENV_KEYS = ("FIX_MODEL_LOW", "FIX_MODEL_MED", "FIX_MODEL_HIGH", "FIX_MODEL_XHIGH")
 
 
@@ -85,7 +84,7 @@ def prior_deployment_identities(
     cfg: HarnessConfig, role: str,
 ) -> tuple[tuple[str, str], ...]:
     """Exact prior repository/deployment identities authorized by config."""
-    if role not in ("fix", "review", "steward"):
+    if role not in ("fix", "review"):
         raise ValueError("prior deployment identities require configured role authority")
     candidates = list(cfg.repointed_from_deployments)
     if cfg.repo_input and cfg.repo_input != cfg.repo:

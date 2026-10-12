@@ -180,7 +180,6 @@ def test_boot_recovery_is_explicitly_sequenced_before_readiness(
     class Config:
         state_dir = str(tmp_path / "fix")
         review_state_dir = str(tmp_path / "review")
-        steward_state_dir = str(tmp_path / "steward")
 
         def validate(self):
             events.append("validate")
@@ -250,7 +249,6 @@ def test_missing_recovery_trigger_withholds_readiness(tmp_path, monkeypatch):
     class Config:
         state_dir = str(tmp_path / "fix")
         review_state_dir = str(tmp_path / "review")
-        steward_state_dir = str(tmp_path / "steward")
 
         def validate(self):
             return None
@@ -317,7 +315,6 @@ def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
         repointed_from_deployments = ()
         state_dir = str(tmp_path / "fix")
         review_state_dir = str(tmp_path / "review")
-        steward_state_dir = str(tmp_path / "steward")
 
         def validate(self):
             return None

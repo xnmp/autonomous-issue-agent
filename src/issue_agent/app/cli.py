@@ -3399,8 +3399,7 @@ def _cmd_workflow_activation(args, *, family: str) -> int:
     name = args.name or _resolve_context(args)[2]
     try:
         transport = continuation_activation if family == "fix" else review_execution_activation if family == "review-execution" else activation
-        scope = transport.activation_scope(name, harness_root=HARNESS_ROOT, extra_roots=tuple(args.legacy_state_dir),
-                                           **({"family": family} if family == "fix" else {}))
+        scope = transport.activation_scope(name, harness_root=HARNESS_ROOT, extra_roots=tuple(args.legacy_state_dir))
         if args.action in ("inventory", "shadow"):
             result = transport.inspect(scope, shadow=args.action == "shadow")
         elif args.action == "rehearse":

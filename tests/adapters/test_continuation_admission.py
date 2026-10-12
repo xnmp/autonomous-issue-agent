@@ -27,9 +27,7 @@ def active(key, family):
     identity = ContinuationComponentIdentity(key, FamilyAuthority(family, 1), "secondary:" + family.value)
     if family is WorkflowFamily.ISSUE_RECOVERY:
         return cc.ActiveIssueRecovery(identity, cc.IssueRecoveryState())
-    if family is WorkflowFamily.PR_REPAIR:
-        return cc.ActivePRRepair(identity, cc.PRRepairState())
-    return cc.ActiveSteward(identity, cc.StewardState())
+    return cc.ActivePRRepair(identity, cc.PRRepairState())
 
 
 def install_secondary(store, aggregate, component):
@@ -193,32 +191,6 @@ def test_activated_component_corruption_is_refused_without_money(recovery, corru
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
 
 
-def test_steward_only_shell_persists_and_admits_without_resolve_authority(tmp_path):
-    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
-    store.initialize()
-    revision = resolve_snapshot(7).revision
-    component = active(revision.fence.key, WorkflowFamily.STEWARD)
-    shell = IssueWorkflowShell(revision, steward=component)
-    with store.transaction() as db:
-        db.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)",
-                   (*workflow_scope(revision.fence.key), revision.fence.generation, revision.version, encode_workflow(shell)))
-    install_secondary(store, shell, component)
-    with store.transaction() as db:
-        assert isinstance(load_workflow_read(db, revision.fence.key), WorkflowMigrationRequired)
-    selected = cc.select_steward(shell)
-    purchase = cc.StewardPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:triage"),
-                                  cc.StewardLane.TRIAGE, NOW.isoformat(), 2)
-    requested = replace(request("triage"), workflow=selected.binding, owner_id="o/r:steward:test", kind="TRIAGE",
-        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "kind":"TRIAGE", "issue":7, "number":7, "leg_id":"leg:triage"}))
-    assert store.reserve_steward(requested, purchase).admitted
-    admitted = receipt(store, requested.run_id, WorkflowFamily.STEWARD)
-    output = cc.StewardState(triage=cc.StewardLaneState(stalls=1))
-    assert store.settle_steward(money(requested.run_id), admitted, output).disposition is AccountingDisposition.AVAILABLE
-    current = read(store, shell)
-    assert isinstance(current, IssueWorkflowShell) and current.steward.state.triage.stalls == 1
-    assert not hasattr(current, "episode")
-
-
 def test_pr_repair_allowance_and_actual_return_are_independent_of_rejection_episode(tmp_path):
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
@@ -344,7 +316,7 @@ def test_populated_schema35_upgrade_preserves_old_money_and_fences_old_binary(tm
         assert tuple(db.iterdump()) == before
 
 
-@pytest.mark.parametrize("family", [WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD])
+@pytest.mark.parametrize("family", [WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR])
 def test_active_component_aggregate_codec_roundtrip_requires_selected_fields(family):
     if family is WorkflowFamily.PR_REPAIR:
         base = replace(held(), gates=())
@@ -352,8 +324,8 @@ def test_active_component_aggregate_codec_roundtrip_requires_selected_fields(fam
         selected_field = "pr_repair"
     else:
         base = resolve_snapshot()
-        selected_field = "issue_recovery" if family is WorkflowFamily.ISSUE_RECOVERY else "steward"
-        aggregate = replace(base, **{selected_field: active(base.revision.fence.key, family)})
+        selected_field = "issue_recovery"
+        aggregate = replace(base, issue_recovery=active(base.revision.fence.key, family))
     raw = encode_workflow(aggregate)
     assert decode_workflow(raw, type(aggregate)) == aggregate
     malformed = json.loads(raw)
@@ -433,22 +405,6 @@ def test_actual_run_selection_and_binding_are_immutable_and_corruption_refuses_r
     with pytest.raises(WorkflowAuthorityError, match="actual run binding"):
         store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState())
     assert store.snapshot(requested.scope).settled.micros == 0
-
-
-def test_public_primary_reader_keeps_steward_shell_inactive_in_active_resolve_repository(recovery):
-    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-    from issue_agent.domain.workflow_identity import WorkflowWriter
-    store, _ = recovery
-    revision = resolve_snapshot(7).revision
-    component = active(revision.fence.key, WorkflowFamily.STEWARD)
-    shell = IssueWorkflowShell(revision, steward=component)
-    with store.transaction() as db:
-        db.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)",
-                   (*workflow_scope(revision.fence.key), revision.fence.generation, revision.version, encode_workflow_episodes(shell)))
-    install_secondary(store, shell, component)
-    control = SQLiteWorkflowControl(store, WorkflowWriter("o/r", "fix", "o/r:fix:test"), resolve_ceiling=3)
-    assert isinstance(control.load_workflow(revision.fence.key), WorkflowMigrationRequired)
-    assert isinstance(read(store, shell), IssueWorkflowShell)
 
 
 def test_stale_pr_return_preserves_continuity_then_current_work_proceeds_and_old_retry_is_inert(tmp_path):

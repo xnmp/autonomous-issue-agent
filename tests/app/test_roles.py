@@ -83,7 +83,6 @@ from issue_agent.app.roles import (
     _hold_reporter,
     _inject_predicted_paths,
     _prediction_outcome_reporter,
-    _recurrence_reporter,
     _journal,
     _owner_identity,
     _shutdown_finalize,
@@ -227,7 +226,6 @@ def test_boot_preflight_recovers_current_and_repointed_but_not_siblings(
         target_dir=prior_target,
         state_dir=shared,
         review_state_dir=shared,
-        steward_state_dir=shared,
     )
     current = replace(
         base,
@@ -311,7 +309,6 @@ def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
     state_root = tmp_path / "state"
     state = str(state_root / "fix")
     review_state = str(state_root / "review")
-    steward_state = str(state_root / "steward")
     prior_target = str(tmp_path / "prior")
     current_target = str(tmp_path / "current")
     old = HarnessConfig(
@@ -319,7 +316,6 @@ def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
         target_dir=prior_target,
         state_dir=state,
         review_state_dir=review_state,
-        steward_state_dir=steward_state,
     )
     current = replace(
         old,
@@ -1007,27 +1003,12 @@ def _bound_review_state(store, world):
     return BoundReviewState(owed=owed, unproductive_rounds=counts, control_errors=errors)
 
 
-
-
-
-
-
 def _open_pr(number=500, issue=9, sha="abc"):
     return observed_pr(
         number, head_ref_name=f"fix/{issue}-x", head_ref_oid=sha, closing_issue=issue,
         title="t", body="b", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN",
         author=FIX_BOT,
     )
-
-
-
-
-
-
-
-
-
-
 
 
 def test_a_currently_running_dispatch_is_not_a_machine_end(tmp_path):
@@ -1695,135 +1676,6 @@ def test_a_journaled_hold_explains_the_issue_decide_fix_actually_withheld(tmp_pa
     assert [e["issue"] for e in _holds_in(journal)] == [522]
 
 
-# ── reopen recurrences (harness #10) ─────────────────────────────────────────
-class _ReopenGateway:
-    """The two recurrence reads, scripted. Records every state-reason lookup so a
-    test can assert the steady state costs nothing."""
-
-    def __init__(self, reasons=None, merged=(), merges_raise=False):
-        self.reasons = reasons or {}
-        self.merged = merged
-        self.merges_raise = merges_raise
-        self.asked = []
-
-    def issue_state_reason(self, number):
-        self.asked.append(number)
-        return self.reasons.get(number, "")
-
-    def recently_merged_issues(self, author, limit=30):
-        if self.merges_raise:
-            raise RuntimeError("gh boom")
-        return self.merged
-
-
-class _Merged:
-    def __init__(self, issue, pr):
-        self.issue, self.pr = issue, pr
-
-
-def _resolved_world(*, state="open", label=Label.AI_DONE):
-    return WorldState(issues=(
-        IssueView(522, title="t", body="b", labels=frozenset({label}), state=state),
-    ))
-
-
-def _recurrences_in(journal):
-    return [e for e in read_events(journal.path) if e.get("event") == "recurrence"]
-
-
-def test_a_reopened_resolved_issue_is_journaled_once_and_logged_every_poll(tmp_path):
-    """AC: a reopened harness-resolved issue journals EXACTLY one recurrence
-    event, however many polls the reopen survives — while the log keeps saying so
-    every pass."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    gw = _ReopenGateway(reasons={522: "reopened"}, merged=(_Merged(522, 300),))
-    logs = []
-    report = _recurrence_reporter(journal, gw, "o/r", "fix-bot", logs.append)
-
-    report(_resolved_world())
-    report(_resolved_world())
-
-    assert _recurrences_in(journal) == [
-        {
-            "ts": _recurrences_in(journal)[0]["ts"], "event": "recurrence",
-            "kind": "reopen", "issue": 522, "of_issue": 522, "pr": 300,
-            "block_key": "recurrence:o/r:522:reopen",
-        }
-    ]
-    assert len(logs) == 2
-    assert all("#522" in ln and "reopened" in ln for ln in logs)
-
-
-def test_an_ai_done_issue_that_was_never_reopened_is_not_a_recurrence(tmp_path):
-    """The harness merges to a non-default base and closes issues itself, so
-    'ai-done and open' is ambiguous — only stateReason=reopened confirms it.
-    Without this every ai-done issue on a close_issue_on_merge=off deployment
-    would journal a recurrence."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    logs = []
-    _recurrence_reporter(
-        journal, _ReopenGateway(reasons={522: ""}), "o/r", "fix-bot", logs.append
-    )(_resolved_world())
-
-    assert _recurrences_in(journal) == [] and logs == []
-
-
-def test_only_resolved_open_issues_cost_a_state_reason_call(tmp_path):
-    """Zero extra gh calls in the steady state: a closed ai-done issue and an
-    open issue the harness never resolved are both never asked about."""
-    gw = _ReopenGateway(reasons={522: "reopened"})
-    report = _recurrence_reporter(None, gw, "o/r", "fix-bot", lambda _m: None)
-
-    report(_resolved_world(state="closed"))
-    report(_resolved_world(label=Label.AI_READY))
-
-    assert gw.asked == []
-
-
-def test_the_reopen_dedup_survives_a_daemon_restart(tmp_path):
-    """The recurrence RATE is computed by counting these events, so a duplicate
-    corrupts the metric — an in-process set alone would re-emit on every boot."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    gw = _ReopenGateway(reasons={522: "reopened"})
-    control = _control(tmp_path)
-    _recurrence_reporter(
-        journal, gw, "o/r", "fix-bot", lambda _m: None, control
-    )(_resolved_world())
-    _recurrence_reporter(
-        journal, gw, "o/r", "fix-bot", lambda _m: None, control
-    )(_resolved_world())
-
-    assert len(_recurrences_in(journal)) == 1
-
-
-def test_reopen_reporting_without_a_journal_still_logs(tmp_path):
-    """Observability must never add a failure mode: no journal → log only."""
-    logs = []
-    _recurrence_reporter(
-        None, _ReopenGateway(reasons={522: "reopened"}), "o/r", "fix-bot", logs.append
-    )(_resolved_world())
-    assert len(logs) == 1
-
-
-def test_an_unreadable_merged_list_still_records_the_reopen(tmp_path):
-    """The PR number is enrichment. Losing it must not lose the recurrence."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    gw = _ReopenGateway(reasons={522: "reopened"}, merges_raise=True)
-    _recurrence_reporter(journal, gw, "o/r", "fix-bot", lambda _m: None)(_resolved_world())
-
-    assert [e["pr"] for e in _recurrences_in(journal)] == [0]
-
-
-def test_a_gateway_without_the_recurrence_reads_is_inert(tmp_path):
-    """A fake or legacy adapter must yield an inert reporter, not an
-    AttributeError out of the decide closure."""
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    _recurrence_reporter(journal, object(), "o/r", "fix-bot", lambda _m: None)(
-        _resolved_world()
-    )
-    assert _recurrences_in(journal) == []
-
-
 # ── FIXER_RUNTIME=glm wiring (build_fix_daemon) ──────────────────────────────
 # The wrapping itself (env injection, task-env precedence) is proven in
 # tests/adapters/test_claude_profile.py; what these pin is the BUILD-TIME
@@ -1900,7 +1752,6 @@ def _role_state_env(tmp_path) -> dict[str, str]:
     return {
         "STATE_DIR": str(tmp_path / "state"),
         "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
-        "STEWARD_STATE_DIR": str(tmp_path / "steward-state"),
     }
 
 
@@ -2226,8 +2077,6 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
     assert not any(call[0] == "review" for call in gateway.calls)
     assert store.get_infra_deaths(150) == 0
     assert store.get_infra_deaths(151) == 0
-
-
 
 
 def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path, monkeypatch):

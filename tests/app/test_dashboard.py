@@ -29,7 +29,6 @@ from issue_agent.domain.events import (
     AgentRunStarted,
     Correlation,
     Producer,
-    RecurrenceDetected,
     WorldObserved,
 )
 
@@ -164,7 +163,6 @@ def test_parse_action_relabel_splits_added_and_removed():
 def test_parse_action_dispatch_numbers_issue_or_pr_by_kind():
     assert dash.parse_action("dispatch RESOLVE #7").target == "issue"
     assert dash.parse_action("dispatch REVIEW #90").target == "pr"
-    assert dash.parse_action("dispatch TRIAGE #7").target == "issue"
 
 
 def test_parse_action_clear_state_carries_merge_and_issue():
@@ -731,7 +729,7 @@ def test_health_keeps_the_journal_and_log_paths_for_drill_down():
 
 
 # ── merging + malformed input ─────────────────────────────────────────────────
-def test_all_three_journals_merge_into_one_issue_timeline(tmp_path):
+def test_fix_and_review_journals_merge_into_one_issue_timeline(tmp_path):
     fix = write_v2_run(
         tmp_path / "fix", cost_usd=1.0, minutes_ago=30
     )
@@ -744,21 +742,10 @@ def test_all_three_journals_merge_into_one_issue_timeline(tmp_path):
         cost_usd=2.0,
         minutes_ago=20,
     )
-    steward_log = EventLog(
-        str(tmp_path / "steward" / "events-v2.jsonl"),
-        Producer("deployment", "o/r", "steward", 100, "boot"),
-    )
-    steward_log.emit(
-        RecurrenceDetected("refiled", None),
-        correlation=Correlation(issue=7),
-        causation_time=NOW - timedelta(minutes=10),
-    )
-    steward = str(tmp_path / "steward" / "journal.jsonl")
-    dep = dash.collect("n", "o/r", [fix, review, steward], str(tmp_path / "logs"),
+    dep = dash.collect("n", "o/r", [fix, review], str(tmp_path / "logs"),
                        str(tmp_path / "ledger.jsonl"), now_fn=_now)
     (row,) = dep.issues
-    assert row.cost_usd == 3.0 and row.rounds == 1 and row.recurrences == 1
-    assert row.stage == "recurred"  # newest event across all three files wins
+    assert row.cost_usd == 3.0 and row.rounds == 1
 
 
 def test_malformed_and_empty_lines_are_skipped(tmp_path):

@@ -9,7 +9,7 @@ Two halves, the usual pure/impure split:
   * IMPURE GATEWAY — runs `gh` as a chosen identity (ambient / static PAT /
     GitHub-App installation token) and applies side-effects (relabel, comment,
     close, enable-auto-merge). The identity selection reproduces the bash
-    gh_fix / gh_review / gh_steward three-identity model.
+    gh_fix / gh_review identity model.
 
 Field names match what the bash queries (issue: number,title,body,labels,
 comments,updatedAt,author,state; pr: number,title,body,headRefName,headRefOid,
@@ -76,8 +76,7 @@ _LIST_LIMIT = 500
 # over consecutive polls. `domain.fix.orphaned_cleanup_actions` is what makes
 # that terminate: it relabels each observed issue to ai-done, which removes
 # ai-pr-open and drops it out of this query for good. Without that arm this
-# slice would re-fetch the same stuck issues every poll forever. Matches the
-# shape of build_steward_world's closed ai-done slice (also 100). Steady state
+# slice would re-fetch the same stuck issues every poll forever. Steady state
 # is an empty set and one cheap list call.
 _CLOSED_CLEANUP_LIMIT = 100
 
@@ -509,7 +508,7 @@ def parse_issue(d: dict) -> IssueView:
         author=author or "",
         # gh issue state is "OPEN"/"CLOSED"; WorldState uses lower-case open/closed.
         state=(d.get("state", "open") or "open").lower(),
-        # Same normalisation as `issue_state_reason` (GraphQL serves REOPENED).
+        # GraphQL serves REOPENED; compare against one casing.
         state_reason=str(d.get("stateReason") or "").lower(),
         # File paths the body names in backticks → the file-overlap gate.
         declared_paths=extract_declared_paths(body),
@@ -926,30 +925,6 @@ def build_update_branch_args(
         "-f",
         f"expected_head_sha={expected_head}",
     ]
-
-
-def build_blocker_id_args(repo: str, blocker: int) -> list[str]:
-    return ["api", f"repos/{repo}/issues/{blocker}", "--jq", ".id"]
-
-
-def build_add_blocked_by_args(repo: str, issue: int, blocker_id: int) -> list[str]:
-    return [
-        "api", f"repos/{repo}/issues/{issue}/dependencies/blocked_by",
-        "--method", "POST", "-F", f"issue_id={blocker_id}",
-    ]
-
-
-# ── recurrence context ──────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class MergedRef:
-    """One issue the harness has already shipped: the issue, the PR that closed
-    it, and when. The unit of `recently_merged_issues` — the "did this come back?"
-    reference set (harness #10)."""
-
-    issue: int
-    pr: int
-    title: str = ""
-    merged_at: str = ""
 
 
 # ── identity ────────────────────────────────────────────────────────────────
@@ -1646,84 +1621,6 @@ class GitHubGateway:
         )
         return WorldState(issues=(), prs=prs, now=build_time())
 
-    def build_triage_world(self) -> WorldState:
-        """All OPEN issues (the steward triages untriaged ones — those carrying no
-        lifecycle label — so it must see every open issue, not just labelled ones)
-        plus open PR metadata for the steward's ADR-citation reconciler."""
-        nums = self._gh_json(
-            ["issue", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number", "--limit", str(_LIST_LIMIT)]
-        ) or []
-        _warn_if_list_truncated("gh issue list --state open", len(nums))
-        issues = tuple(
-            i for n in sorted(int(x["number"]) for x in nums)
-            if (i := self._safe_get_issue(n)) is not None
-        )
-        return WorldState(
-            issues=issues,
-            prs=self._open_steward_prs(),
-            now=build_time(),
-        )
-
-    def _open_steward_prs(self) -> tuple[PRView, ...]:
-        """Open PR descriptions/files/comments, without mergeability or checks."""
-
-        rows = self._gh_json(
-            [
-                "pr",
-                "list",
-                "--repo",
-                self.repo,
-                "--state",
-                "open",
-                "--json",
-                "number",
-                "--limit",
-                str(_LIST_LIMIT),
-            ]
-        ) or []
-        _warn_if_list_truncated("gh pr list --state open (steward)", len(rows))
-        return tuple(
-            pr
-            for number in sorted(int(row["number"]) for row in rows)
-            if (
-                pr := self._safe_get_pr(
-                    number,
-                    mergeability=False,
-                    checks=False,
-                )
-            )
-            is not None
-        )
-
-    def build_steward_world(self) -> WorldState:
-        """Triage world (all open issues) PLUS recently-CLOSED ai-done issues, so
-        the Jira mirror can still post the final Done transition (a merged issue is
-        often closed before the steward next polls — build_triage_world's open-only
-        slice would miss it). The extra closed-issue query only runs when the
-        steward selects this builder (jira on), so a jira-off deployment pays
-        nothing."""
-        nums: dict[int, None] = {}
-        open_issues = self._gh_json(
-            ["issue", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number", "--limit", str(_LIST_LIMIT)]
-        ) or []
-        _warn_if_list_truncated("gh issue list --state open", len(open_issues))
-        for i in open_issues:
-            nums[int(i["number"])] = None
-        for i in (self._gh_json(
-            ["issue", "list", "--repo", self.repo, "--state", "closed",
-             "--label", "ai-done", "--json", "number", "--limit", "100"]
-        ) or []):
-            nums[int(i["number"])] = None
-        issues = tuple(
-            i for n in sorted(nums) if (i := self._safe_get_issue(n)) is not None
-        )
-        return WorldState(
-            issues=issues,
-            prs=self._open_steward_prs(),
-            now=build_time(),
-        )
 
     def pr_for_issue(self, issue: int, *, require_unique: bool = False) -> int | None:
         """Open PR whose head branch identifies this issue under domain policy.
@@ -1961,75 +1858,6 @@ class GitHubGateway:
         except Exception:  # noqa: BLE001 — a missing comment list must not block the fix
             return ""
 
-    # ── recurrence context (harness #10) ──
-    # Both of these exist to record that a shipped fix came back. Both are pure
-    # CONTEXT — advisory label/comment/journal, never a reopen or a dispatch — so
-    # both fail SOFT: a recurrence check that raises would take the steward's
-    # triage leg (or its whole poll) down with it, trading working triage for a
-    # metric. `MissingListLimit` still propagates; that is a bug here, not a
-    # runtime condition (review C2).
-    def recently_merged_issues(self, author: str, limit: int = 30) -> tuple[MergedRef, ...]:
-        """The issues `author`'s recently-MERGED PRs closed, newest PR first.
-
-        One entry per referenced issue (a PR closing two issues yields two), and
-        the issue's OWN number/title are used — the PR title describes the change,
-        the issue title describes the report, and a recurrence classifier is
-        matching a new report against old REPORTS.
-
-        `limit` is the PR page size and is deliberately small (K≈30 — the recent
-        past is what can plausibly recur), so `_warn_if_list_truncated` is NOT
-        called: truncation here is the intent, not a silent loss.
-        """
-        if not author.strip():
-            return ()
-        try:
-            data = self._gh_json(
-                ["pr", "list", "--repo", self.repo, "--state", "merged",
-                 "--author", author, "--json",
-                 "number,title,mergedAt,closingIssuesReferences",
-                 "--limit", str(limit)]
-            ) or []
-            out: list[MergedRef] = []
-            for p in data:  # type: ignore[union-attr]
-                pr = int(p.get("number") or 0)
-                merged_at = str(p.get("mergedAt") or "")
-                for ref in (p.get("closingIssuesReferences") or []):
-                    number = ref.get("number")
-                    if number:
-                        out.append(MergedRef(
-                            issue=int(number), pr=pr,
-                            title=str(ref.get("title") or ""), merged_at=merged_at,
-                        ))
-            return tuple(out)
-        except MissingListLimit:
-            raise
-        except Exception:  # noqa: BLE001 — see the section comment
-            return ()
-
-    def issue_state_reason(self, issue: int) -> str:
-        """An issue's `stateReason`, lower-cased ("reopened" | "completed" |
-        "not_planned" | ""). Lower-cased because GitHub serves the GraphQL enum
-        (REOPENED), and `parse_issue` already normalises `state` the same way —
-        callers should compare against one casing, not two.
-
-        This is the DETERMINISTIC half of the recurrence signal. It is needed at
-        all because the harness merges to a non-default base branch, so GitHub
-        never auto-closes the referenced issue and the harness closes it itself:
-        "ai-done and open again" is therefore ambiguous (it can simply mean the
-        close has not happened yet), and only `reopened` says a human deliberately
-        put it back. "" on any failure — an unreadable state reason means "no
-        evidence of a recurrence", which is the silent, correct default.
-        """
-        try:
-            d = self._gh_json(
-                ["issue", "view", str(issue), "--repo", self.repo,
-                 "--json", "stateReason"]
-            )
-            if not isinstance(d, dict):
-                return ""
-            return str(d.get("stateReason") or "").lower()
-        except Exception:  # noqa: BLE001 — see the section comment
-            return ""
 
     def submit_review(
         self, pr: int, event: str, body: str, head: str
@@ -2256,16 +2084,6 @@ class GitHubGateway:
             and self.disable_auto_merge(pr, current_head)
         )
 
-    def has_blocked_by(self, issue: int, blocker: int) -> bool:
-        data = self._gh_json(
-            [
-                "api",
-                f"repos/{self.repo}/issues/{issue}/dependencies/blocked_by",
-                "--jq",
-                "[.[].number]",
-            ]
-        )
-        return isinstance(data, list) and blocker in data
 
     def comment(self, kind: str, number: int, body: str) -> None:
         self._gh(build_comment_args(self.repo, kind, number, body))
@@ -2311,22 +2129,6 @@ class GitHubGateway:
             return updated and self.is_branch_updated(pr, expected_head)
         except Exception:
             return False
-
-    def add_blocked_by(self, issue: int, blocker: int) -> None:
-        """Create a native 'issue is blocked_by blocker' dependency. The POST wants
-        the blocker's NUMERIC id (not its issue number), so resolve that first.
-        Fail-soft: a missing blocker, an already-existing link (422), or any API
-        error is logged and swallowed — a dependency-wiring hiccup must never abort
-        the steward poll (the link is re-attempted next triage if still needed)."""
-        try:
-            blocker_id = self._gh_json(
-                build_blocker_id_args(self.repo, blocker)
-            )
-            if not blocker_id:
-                return
-            self._gh(build_add_blocked_by_args(self.repo, issue, int(blocker_id)))  # type: ignore[arg-type]
-        except Exception:
-            return
 
 
 def _subprocess_runner(argv: list[str], token: str | None) -> str:

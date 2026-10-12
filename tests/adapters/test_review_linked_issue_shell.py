@@ -62,8 +62,8 @@ def test_shell_issue_contributes_no_holds_and_does_not_raise(control):
 
 def test_shell_issue_with_secondary_continuity_contributes_no_holds(control):
     shell = insert_shell(control)
-    steward = active(ISSUE_KEY, WorkflowFamily.STEWARD)
-    install_secondary(control, replace(shell, steward=steward), steward)
+    recovery = active(ISSUE_KEY, WorkflowFamily.ISSUE_RECOVERY)
+    install_secondary(control, replace(shell, issue_recovery=recovery), recovery)
     assert holds_of(control) == ()
 
 
@@ -113,10 +113,10 @@ def test_shell_row_that_also_carries_a_resolve_component_is_local_corruption(con
 
 def test_shell_naming_an_unindexed_secondary_component_is_local_corruption(control):
     shell = insert_shell(control)
-    steward = active(ISSUE_KEY, WorkflowFamily.STEWARD)
+    recovery = active(ISSUE_KEY, WorkflowFamily.ISSUE_RECOVERY)
     with control.transaction() as db:
         db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",
-                   (encode_workflow_episodes(replace(shell, steward=steward)), *workflow_scope(ISSUE_KEY)))
+                   (encode_workflow_episodes(replace(shell, issue_recovery=recovery)), *workflow_scope(ISSUE_KEY)))
     with pytest.raises(WorkflowAuthorityError):
         holds_of(control)
 

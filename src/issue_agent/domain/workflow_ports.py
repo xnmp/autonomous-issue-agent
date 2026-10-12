@@ -1,11 +1,10 @@
 """Bound repository/owner ports for resolve and review-rejection workflow control; ADR 0015."""
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 from contextlib import AbstractContextManager
 
-from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
-from .continuation_components import CIEpisodeReset, SelectedIssueRecovery, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
-from .world import IssueView
+from .contracts import CommandId, WorkflowAttemptIdentity
+from .continuation_components import CIEpisodeReset, SelectedIssueRecovery, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff
 from .agent_task import RuntimeName
 from .backoff import LegEnd
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
@@ -25,14 +24,6 @@ from .review_workflow import ReviewWorkflowRead
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
 )
-
-
-@runtime_checkable
-class StewardControl(Protocol):
-    def read_steward(self, key: WorkflowKey) -> StewardSelection: ...
-    def steward_admission(self, attempt: WorkflowAttemptIdentity) -> StewardAttemptSource: ...
-    def record_steward_outcome(self, outcome: StewardReturned, commands: tuple[LifecycleCommand, ...] = ()) -> bool: ...
-    def complete_steward_delivery(self, source: StewardAttemptSource, observed: IssueView) -> bool: ...
 
 
 class WorkflowControl(Protocol):

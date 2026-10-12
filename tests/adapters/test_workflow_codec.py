@@ -592,7 +592,6 @@ def test_repeated_renewal_replaces_session_provenance_without_growing_an_ancestr
     assert max(map(len, receipts)) - min(map(len, receipts)) < 150
 
 
-
 def test_fixed_origin_and_default_rejection_grant_round_trip():
     from issue_agent.domain.review_execution import RenewedReviewExecutionOriginReceipt, renew_current_review_execution
     from issue_agent.domain.review_workflow import ReviewRejectionGrant
@@ -618,17 +617,3 @@ def test_capture_wire_roundtrips_and_retired_infra_ceiling_is_dropped_on_read():
         assert stamped == old and encode_workflow(stamped) == literal["capture_wire"]
 
 
-def test_literal_accepted_steward_purchase_preserves_wire_and_captured_policy():
-    from pathlib import Path
-    from issue_agent.domain import continuation_components as cc
-    literal = json.loads((Path(__file__).parents[1] / "fixtures/phase4-pre-t3-steward-purchase.json").read_text())
-    old = decode_workflow(literal["wire"], cc.StewardPurchase)
-    assert old.infra_ceiling is None
-    assert encode_workflow(old) == literal["wire"] and repr(old) == literal["repr"]
-    disabled = replace(old, infra_ceiling=0)
-    assert encode_workflow(disabled) != literal["wire"]
-    assert decode_workflow(encode_workflow(disabled), cc.StewardPurchase).infra_ceiling == 0
-    assert repr(disabled) == literal["repr"]
-    for malformed in (-1, True, 10**100, "3"):
-        with pytest.raises(ValueError):
-            replace(old, infra_ceiling=malformed)

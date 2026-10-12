@@ -233,32 +233,6 @@ def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
     s.cleanup_pr(100, 9, merged=True)
     assert marker.read_text() == "sha-1"
 
-def test_stopped_legacy_triage_baseline_remains_readable():
-    s, _ = _store()
-    Path(os.path.join(s.state_dir, "triage-7.at")).write_text("t_post")
-    assert Path(os.path.join(s.state_dir, "triage-7.at")).read_text() == "t_post"
-
-def test_stopped_groom_sources_survive_issue_cleanup():
-    s, _ = _store()
-    evidence = {os.path.join(s.state_dir, "groom-7.at"): "2026-10-01T00:00:00Z",
-                os.path.join(s.state_dir, "groom-7.content"): "a" * 64,
-                s.issue_path(7, "steward-stalls-groom"): "3"}
-    for path, value in evidence.items():
-        Path(path).write_text(value)
-    s._clear_issue_advisory(7)
-    assert {path: Path(path).read_text() for path in evidence} == evidence
-
-def test_jira_key_and_phase_roundtrip_and_cleared():
-    s, _ = _store()
-    assert s.get_jira_key(5) == "" and s.get_jira_phase(5) == ""
-    s.set_jira_key(5, "ABC-12")
-    s.set_jira_phase(5, "in_progress")
-    assert s.get_jira_key(5) == "ABC-12"
-    assert s.get_jira_phase(5) == "in_progress"
-    s.set_jira_key(5, "")                 # empty key is a no-op (don't clobber)
-    assert s.get_jira_key(5) == "ABC-12"
-    s._clear_issue_advisory(5)
-    assert s.get_jira_key(5) == "" and s.get_jira_phase(5) == ""
 
 def test_clear_issue_removes_all():
     s, _ = _store()
@@ -273,7 +247,7 @@ def test_clear_issue_removes_all():
     assert _legacy_ci_counter(s, 5) == 2
     assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
     assert retained_issue_file(s, 5, "phase") == "authored"           # retained stopped evidence
-    assert s.get_infra_deaths(5) == 1     # retained Jira/import evidence
+    assert s.get_infra_deaths(5) == 1     # retained import evidence
 
 def test_clear_issue_does_not_touch_pr_automerge_marker():
     # review M4: `automerge` is a PR suffix now — clear_issue must not remove

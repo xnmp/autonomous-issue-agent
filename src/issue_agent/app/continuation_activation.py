@@ -1,4 +1,4 @@
-"""Configured offline fix/steward import using existing barriers and copy layout."""
+"""Configured offline fix import using existing barriers and copy layout."""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ from ..adapters.workflow_codec import encode_workflow
 from ..adapters.workflow_rows import load_issue_aggregate, load_review_workflow_row, workflow_run_scope_bounds
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import (
-    ISSUE_FIELDS, PR_FIELDS, STEWARD_FIELDS, MAX_IMPORT_TARGETS,
-    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, classify_record, digest, ci_shadow, rebase_shadow, review_shadow, issue_reply_shadow, triage_shadow, groom_shadow,
+    ISSUE_FIELDS, PR_FIELDS, MAX_IMPORT_TARGETS,
+    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, classify_record, digest, ci_shadow, rebase_shadow, review_shadow, issue_reply_shadow,
 )
 from ..domain.refs import issue_from_branch
 from ..domain.resolve_activation import LegacyAbsent
@@ -50,20 +50,18 @@ class ContinuationActivationScope:
     gateway: object | None = None
 
 
-def activation_scope(name: str, *, harness_root: str, extra_roots: tuple[str, ...] = (), family: str = "fix") -> ContinuationActivationScope:
+def activation_scope(name: str, *, harness_root: str, extra_roots: tuple[str, ...] = ()) -> ContinuationActivationScope:
     cfg, env = load_operator_configuration(name, harness_root=harness_root)
-    if family not in {"fix", "steward"}:
-        raise ValueError("continuation activation selects fix or steward")
-    selected_root = cfg.state_dir if family == "fix" else cfg.steward_state_dir
+    selected_root = cfg.state_dir
     if not selected_root or not os.path.isabs(selected_root):
-        raise ValueError(f"{family} activation requires its explicit absolute configured state root")
-    path = control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir), authority_root=cfg.control_authority_root)
-    roots = tuple((role, value) for role, value in (("fix", cfg.state_dir), ("review", cfg.review_state_dir), ("steward", cfg.steward_state_dir)) if value)
+        raise ValueError("fix activation requires its explicit absolute configured state root")
+    path = control_store_path((cfg.state_dir, cfg.review_state_dir), authority_root=cfg.control_authority_root)
+    roots = tuple((role, value) for role, value in (("fix", cfg.state_dir), ("review", cfg.review_state_dir)) if value)
     if any(not os.path.isabs(value) for _, value in roots) or any(not os.path.isabs(value) or not os.path.isdir(value) for value in extra_roots):
         raise ValueError("continuation activation requires absolute configured or declared roots")
     roots += tuple((f"extra:{index}", value) for index, value in enumerate(extra_roots))
-    families = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR) if family == "fix" else (WorkflowFamily.STEWARD,)
-    gateway = GitHubGateway(cfg.repo, review_identity(dict(env))) if family == "fix" else None
+    families = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR)
+    gateway = GitHubGateway(cfg.repo, review_identity(dict(env)))
     return ContinuationActivationScope(name, cfg.repo, path, roots, selected_root, families, gateway)
 
 
@@ -151,7 +149,7 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
             keys = {key for key in keys if isinstance(key.target, IssueRef) or WorkflowFamily.PR_REPAIR in scope.families}
             if len(keys) > MAX_IMPORT_TARGETS:
                 raise ResolveActivationRefused("continuation target inventory exceeds its bound")
-            kinds = ("TRIAGE", "GROOM") if scope.families == (WorkflowFamily.STEWARD,) else ("ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
+            kinds = ("ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
             targets = []
             authority_sources = []
             for key in sorted(keys, key=lambda k: (type(k.target).__name__, k.target.number)):
@@ -162,11 +160,11 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
                 if isinstance(key.target, PullRequestRef) and current is None and not deferred:
                     raise ResolveActivationRefused(f"PR #{key.target.number}: canonical rejection workflow prerequisite is missing")
                 authority_sources.append((type(key.target).__name__, key.target.number, None if current is None else encode_workflow(current)))
-                selected_families = (WorkflowFamily.STEWARD,) if scope.families == (WorkflowFamily.STEWARD,) else (WorkflowFamily.ISSUE_RECOVERY,) if isinstance(key.target, IssueRef) else (WorkflowFamily.PR_REPAIR,)
+                selected_families = (WorkflowFamily.ISSUE_RECOVERY,) if isinstance(key.target, IssueRef) else (WorkflowFamily.PR_REPAIR,)
                 for family in selected_families:
                     found = tuple(r for r in records if r.key == key and r.family is family)
-                    names = ISSUE_FIELDS if family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS if family is WorkflowFamily.PR_REPAIR else STEWARD_FIELDS
-                    selected = found[0] if found else LegacyContinuationRecord(key, family, "steward" if family is WorkflowFamily.STEWARD else "fix", tuple((name, LegacyAbsent()) for name in names))
+                    names = ISSUE_FIELDS if family is WorkflowFamily.ISSUE_RECOVERY else PR_FIELDS
+                    selected = found[0] if found else LegacyContinuationRecord(key, family, "fix", tuple((name, LegacyAbsent()) for name in names))
                     value = classify_record(selected)
                     blockers = list(value) if isinstance(value, tuple) else []
                     prior_runs = tuple(run.run_id for run in histories.runs if run.key == key and run.family is family)
@@ -183,7 +181,7 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
                                 "review-retries: requires one verified current linked PR"))
                         else:
                             value = replace(value, review_failures=replace(value.review_failures, pr=PullRequestRef(prs[0])))
-                    if len(found) > 1 or found and selected.root not in (("steward",) if family is WorkflowFamily.STEWARD else ("fix",)) and not selected.root.startswith("extra:"):
+                    if len(found) > 1 or found and selected.root != "fix" and not selected.root.startswith("extra:"):
                         blockers.append(cc.ContinuationImportBlocker("roots:" + selected.source_digest, "duplicate or conflicting source owner"))
                     if key in linkage_blocks:
                         blockers.append(cc.ContinuationImportBlocker("linkage:" + digest(mappings), linkage_blocks[key]))
@@ -228,10 +226,6 @@ def inspect(scope: ContinuationActivationScope, *, shadow: bool) -> dict[str, ob
                                   for key, before, after in rebase_shadow(plan, records)]
         result["review_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
                                   for key, before, after in review_shadow(plan, records)]
-        result["triage_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
-                                   for key, before, after in triage_shadow(plan, records)]
-        result["groom_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
-                                  for key, before, after in groom_shadow(plan, records)]
     return result
 
 
@@ -245,7 +239,7 @@ def activate(scope: ContinuationActivationScope, *, confirm_plan_digest: str, pl
         if verify_original_plan(db, plan):
             return report(plan, status="already_active_with_this_plan")
     with ExitStack() as barriers:
-        for role in ("fix", "review", "steward"):
+        for role in ("fix", "review"):
             barriers.enter_context(deployment_effect_barrier(control.path, scope.repository, role))
         with control.transaction() as db:
             if verify_original_plan(db, plan):

@@ -59,7 +59,7 @@ def verify_configured_legacy_execution_import_sources(
     if cfg.repo != repository or not os.path.isabs(cfg.target_dir):
         raise ValueError("execution import requires a canonical repository and absolute checkout")
     configured_roots = tuple((role, path) for role, path in (
-        ("fix", cfg.state_dir), ("review", cfg.review_state_dir), ("steward", cfg.steward_state_dir),
+        ("fix", cfg.state_dir), ("review", cfg.review_state_dir),
     ) if path)
     if not cfg.review_state_dir or any(not os.path.isabs(path) for _, path in configured_roots):
         raise ValueError("execution import requires absolute configured state directories")
@@ -75,7 +75,7 @@ def verify_configured_legacy_execution_import_sources(
     observed_roots = tuple((root.label, root.configured_path, root.resolved_path)
                            for root in counters.roots.roots)
     expected_other_role_dirs = tuple(os.path.abspath(path) for path in
-                                     (cfg.state_dir, cfg.steward_state_dir) if path)
+                                     (cfg.state_dir,) if path)
     if (counters.review_state_dir != os.path.abspath(cfg.review_state_dir)
             or counters.other_role_state_dirs != expected_other_role_dirs
             or observed_roots not in (expected_roots, distinct_expected_roots)):

@@ -256,7 +256,7 @@ def test_a_huge_drift_list_is_bounded(tmp_path):
 
 
 def test_mixed_tiers_require_codex_even_with_all_role_defaults_claude(tmp_path):
-    env = {"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude", "STEWARD_RUNTIME": "claude",
+    env = {"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude",
            "FIX_MODEL_LOW": "codex:gpt-6-luna", "FIX_MODEL_MED": "codex:gpt-6.1-sol"}
     snapshot = "\n".join(f'{key}="{value}"' for key, value in env.items()) + "\n"
     findings = _findings(tmp_path, composed=env, snapshot=snapshot, which=_WHICH_CORE)

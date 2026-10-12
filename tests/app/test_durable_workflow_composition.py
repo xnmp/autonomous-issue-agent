@@ -197,62 +197,6 @@ def _compatible_sql_build_checkout(root: Path) -> Path:
     return checkout
 
 
-def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
-    with sqlite3.connect(path) as db:
-        tables = [row[0] for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
-            "AND name<>'schema_migrations'")]
-        return {name: tuple(sorted(repr(row) for row in db.execute(f'SELECT * FROM "{name}"')))
-                for name in tables}
-
-
-def _stopped_copy_index_rollback(path: Path) -> None:
-    """Explicit fixture-only schema43→38 rollback; every authority row survives."""
-    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
-    index_migrations = {
-        40: ("event_outbox_pending", "event_outbox_pending_destination", "lifecycle_review_generation_candidates"),
-        39: ("workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"),
-    }
-    charge_origin = next(item for item in _SCHEMA_MIGRATIONS if item.version == 41)
-    with sqlite3.connect(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        assert db.execute("DELETE FROM schema_migrations WHERE version=43").rowcount == 1
-        self_clear_index = next(item for item in _SCHEMA_MIGRATIONS if item.version == 38)
-        db.execute(self_clear_index.source)
-        assert db.execute("DELETE FROM schema_migrations WHERE version=42").rowcount == 1
-        assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (41, charge_origin.digest)
-        # The schema-38 build has no charge origin; every copied charge carries the default, so nothing is lost.
-        assert db.execute("SELECT count(*) FROM charges WHERE origin<>'normal_return'").fetchone()[0] == 0
-        db.execute("ALTER TABLE charges DROP COLUMN origin")
-        assert db.execute("DELETE FROM schema_migrations WHERE version=41").rowcount == 1
-    before = _copied_authoritative_rows(path)
-    with sqlite3.connect(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        definitions = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='index'"))
-        for version, names in index_migrations.items():
-            migration = next(item for item in _SCHEMA_MIGRATIONS if item.version == version)
-            assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (version, migration.digest)
-            statements = tuple(_sql_statements(migration.source))
-            assert len(statements) == len(names)
-            for name, statement in zip(names, statements, strict=True):
-                assert definitions[name] == statement.strip().removesuffix(";")
-            for name in names:
-                db.execute(f'DROP INDEX "{name}"')
-            assert db.execute("DELETE FROM schema_migrations WHERE version=? AND source_digest=?", (version, migration.digest)).rowcount == 1
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 38
-    assert _copied_authoritative_rows(path) == before
-
-
-def _forward_copy_indexes(path: Path, expected_rows: dict[str, tuple[str, ...]]) -> None:
-    SQLiteControlStore(str(path)).initialize()
-    assert _copied_authoritative_rows(path) == expected_rows
-    with sqlite3.connect(path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
-        assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name IN "
-            "('workflow_repair_owed','continuation_pr_admission_identity','reservations_active_workload')")} == {
-                "workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"}
-
-
 def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopped, capsys, tmp_path, monkeypatch):
     from issue_agent.domain.world import Check, Comment
     from dataclasses import replace

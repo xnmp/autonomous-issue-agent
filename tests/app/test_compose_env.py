@@ -583,7 +583,6 @@ def test_build_role_does_not_reload_env_when_already_provided(
 
             "STATE_DIR": str(state / "fix"),
             "REVIEW_STATE_DIR": str(state / "review"),
-            "STEWARD_STATE_DIR": str(state / "steward"),
         },
     )
     assert daemon is not None
@@ -668,7 +667,6 @@ def test_build_role_self_loads_env_when_called_standalone_without_one(
     state = tmp_path / "state"
     monkeypatch.setenv("STATE_DIR", str(state / "fix"))
     monkeypatch.setenv("REVIEW_STATE_DIR", str(state / "review"))
-    monkeypatch.setenv("STEWARD_STATE_DIR", str(state / "steward"))
     monkeypatch.delenv("AGENT_ENV", raising=False)
 
     daemon = main_module.build_role("fix")
@@ -737,7 +735,6 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
         'REPO="other/thing"\n'
         'STATE_DIR="/active/fix"\n'
         'REVIEW_STATE_DIR="/active/review"\n'
-        'STEWARD_STATE_DIR="/active/steward"\n'
     )
 
     result = _run_doctor({
@@ -746,7 +743,6 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
         "REPO": "other/thing",
         "STATE_DIR": "/active/fix",
         "REVIEW_STATE_DIR": "/active/review",
-        "STEWARD_STATE_DIR": "/active/steward",
     })
 
     assert "state-dir collision:" not in result.stdout

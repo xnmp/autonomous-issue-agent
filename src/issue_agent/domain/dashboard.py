@@ -43,7 +43,7 @@ def _utc_date(timestamp: float) -> date:
 
 
 # The three role daemons, in the order `journal_paths` returns their journals.
-ROLE_NAMES = ("fix", "review", "steward")
+ROLE_NAMES = ("fix", "review")
 
 # A daemon that has not journalled anything in this long is probably not
 # ticking. Generous relative to POLL_SECONDS=20 because a long resolve run emits
@@ -1719,8 +1719,6 @@ def _health(role, journal_path, log_path, events, now, stale_after_s) -> DaemonH
         # exactly the condition an operator is scanning the column for.
         stale=(last is None or (now - last).total_seconds() > stale_after_s),
     )
-
-
 
 
 def _int(value) -> int | None:

@@ -44,7 +44,6 @@ def _env(tmp_path, **extra):
         "TARGET_DIR": str(tmp_path / "checkout"),
         "STATE_DIR": str(tmp_path / "fix"),
         "REVIEW_STATE_DIR": str(tmp_path / "review"),
-        "STEWARD_STATE_DIR": str(tmp_path / "steward"),
     }
     env.update(extra)
     return env
@@ -55,7 +54,6 @@ def test_every_delivery_wakes_every_role(tmp_path):
     sigs = [
         WakeSignal(wake_path(env["STATE_DIR"])),
         WakeSignal(wake_path(env["REVIEW_STATE_DIR"])),
-        WakeSignal(wake_path(env["STEWARD_STATE_DIR"])),
     ]
     effects = FakeEffects()
     run(
@@ -63,7 +61,7 @@ def test_every_delivery_wakes_every_role(tmp_path):
         spawn=lambda *a, **k: FakeProc(['{"action":"opened"}\n']),
         effects_factory=_effects_factory(effects),
     )
-    assert [s.pending() for s in sigs] == [True, True, True]
+    assert [s.pending() for s in sigs] == [True, True]
     assert effects.events == [DEFAULT_EVENTS]
 
 

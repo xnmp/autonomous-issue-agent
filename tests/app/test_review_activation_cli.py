@@ -106,7 +106,7 @@ def test_compatible_old_marker_rehearses_and_activates_without_dropping_sources(
     flags = ('--legacy-state-dir', str(extra))
     code, report, error = run(capsys, 'shadow', *flags)
     assert code == 0 and report['status'] == 'ready', error
-    assert len(report['legacy_roots']) == 4
+    assert len(report['legacy_roots']) == 3
     code, rehearsal, error = run(capsys, 'rehearse', *flags, '--copy-to', str(tmp_path / 'compatible-copy'))
     assert code == 0 and all(rehearsal['checks'].values()), error
     assert dump(control) == before

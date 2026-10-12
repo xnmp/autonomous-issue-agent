@@ -17,7 +17,7 @@ issue-agent start
 
 `issue-agent start` creates or reuses a repo overlay, discovers `REPO`,
 `TARGET_DIR`, and (when omitted) a non-watch `TEST_CMD`, runs the preflight, and
-starts the selected fix/review/steward daemons in the foreground. Ctrl-C sends
+starts the selected fix/review daemons in the foreground. Ctrl-C sends
 the daemons through their bounded drain path.
 
 Useful commands:
@@ -70,11 +70,7 @@ Important fields:
   trusted test runner documents it as assertion failure; timeout, spawn, and
   signal exits can never satisfy the red-test gate.
 - `FIXER_RUNTIME=claude|codex|glm`;
-  `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only);
-  `STEWARD_RUNTIME=claude|codex` (triage/groom; Codex needs `TARGET_DIR` and
-  cannot run Jira sync — no MCP transport. An unset `STEWARD_TRIAGE_MODEL`
-  resolves to `sonnet` under claude and to the Codex runner's own default
-  under codex).
+  `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
 - Configure implementer tiers with `FIX_MODEL_LOW`, `FIX_MODEL_MED`,
   `FIX_MODEL_HIGH`, and `FIX_MODEL_XHIGH`, each as `runtime:model`. They map
@@ -99,7 +95,7 @@ Important fields:
   until its transcripts are no longer needed. Returning to a single provider
   can require a fresh PR repair session or leave an issue resume held.
   `FIX_MODEL` still pins fresh work to `FIXER_RUNTIME` and bypasses
-  classification. Review and steward model settings are independent.
+  classification. Review model settings are independent.
 - Unpinned implementers route by difficulty: `complex` uses Sol/Opus;
   `exceptional` uses Astra/Fable under Codex/Claude. Recurrence or two
   completed resolve/CI failures also select that exceptional ceiling. A pinned
@@ -402,7 +398,7 @@ plus `/commands`. Guards, size limits, request-ID replay and the status-code
 taxonomy are the resolve API's: 202 accepted durable intent, 200 canonical
 replay, 409 stale revision or reused identity, 422 invalid or refused, 503
 unavailable (always a typed body, never an empty gate list). Commands are
-accepted by the review owner's workflow authority under the fix→review→steward
+accepted by the review owner's workflow authority under the fix→review
 barriers; the HTTP request executes no GitHub effect. The review daemon's drain
 executes every accepted obligation. GET reads SQLite only.
 
@@ -459,7 +455,7 @@ Execution renewal uses a gate selection with `renew_execution` intent and the
 execution epoch/episode from GET. A `verdict` selection names the registered
 submission command, displayed gate ID, execution epoch/episode, and guidance;
 it releases only that eligible verdict. Neither changes unrelated holds.
-Fix, steward, and imported-hold releases are not offered in this increment.
+Fix and imported-hold releases are not offered in this increment.
 
 The release selections and cancellation:
 

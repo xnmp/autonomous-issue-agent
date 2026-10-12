@@ -208,18 +208,18 @@ def test_async_effect_finishes_before_owner_retirement_can_commit(
 ) -> None:
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
-    old_owner = "o/r:steward:deployment-1"
-    new_owner = "o/r:steward:deployment-2"
+    old_owner = "o/r:fix:deployment-1"
+    new_owner = "o/r:fix:deployment-2"
     runner = DurableEffectRunner(
         store,
-        DeploymentAuthority(store, "o/r", "steward", old_owner),
+        DeploymentAuthority(store, "o/r", "fix", old_owner),
         executor_identity=old_owner,
         now=lambda: NOW,
     )
     command = LifecycleCommand(
         CommandId("async-effect"),
         "effect:async",
-        CommandKind.CREATE_JIRA_ISSUE,
+        CommandKind.POST_COMMENT,
         "issue:1",
         "revision-1",
         {},
@@ -230,7 +230,7 @@ def test_async_effect_finishes_before_owner_retirement_can_commit(
     later = LifecycleCommand(
         CommandId("later-effect"),
         "effect:later",
-        CommandKind.CREATE_JIRA_ISSUE,
+        CommandKind.POST_COMMENT,
         "issue:2",
         "revision-1",
         {},
@@ -255,7 +255,7 @@ def test_async_effect_finishes_before_owner_retirement_can_commit(
         successor.initialize()
         successor.adopt_legacy_owner(
             "o/r",
-            "steward",
+            "fix",
             new_owner,
             prior_owner_ids=(old_owner,),
         )

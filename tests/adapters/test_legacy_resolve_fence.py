@@ -21,7 +21,7 @@ from tests.fakes.workflow_authority import install_workflow
 
 
 REPOSITORY = "o/r"
-ROLES = ("fix", "review", "steward")
+ROLES = ("fix", "review")
 
 
 def _activate(
@@ -222,7 +222,7 @@ def test_supplied_operator_control_is_reused_without_initialization(
 
     effects = build_operator_effects(
         REPOSITORY,
-        ("/state/fix", "/state/review", "/state/steward"),
+        ("/state/fix", "/state/review"),
         identity="o/r:dashboard",
         control=control,
     )
@@ -241,7 +241,7 @@ def test_supplied_operator_control_must_match_the_canonical_path(
     with pytest.raises(ValueError, match="established control authority"):
         build_operator_effects(
             REPOSITORY,
-            ("/state/fix", "/state/review", "/state/steward"),
+            ("/state/fix", "/state/review"),
             identity="o/r:dashboard",
             control=control,
         )

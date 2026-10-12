@@ -40,7 +40,7 @@ _LEGACY_NAME = re.compile(r"issue-(.*)\.(" + "|".join(re.escape(s) for s in LEGA
 _ISSUE_NUMBER = re.compile(r"[1-9][0-9]{0,18}")
 _ACTIVE_RUN_STATES = ("reserved", "starting", "running")
 _TERMINAL_COMMAND_STATES = ("succeeded", "permanent_failure")
-_ROLES = ("fix", "review", "steward")
+_ROLES = ("fix", "review")
 _FAMILY = WorkflowFamily.RESOLVE.value
 
 

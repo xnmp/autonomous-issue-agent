@@ -68,7 +68,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 44))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 45))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -128,6 +128,7 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
         43: ("CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target) "
              "WHERE state IN ('pending','executing','retryable_failure','unknown_outcome') "
              "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text'",),
+        44: (),
         42: (),
         41: ("ALTER TABLE charges DROP COLUMN origin",),
         40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
@@ -3857,3 +3858,57 @@ def test_v43_retires_pre_upgrade_self_clear_relabels_so_ai_blocked_waits_for_a_h
         assert db.execute("SELECT command_id FROM lifecycle_commands").fetchall() == [(str(ordinary.command_id),)]
         assert db.execute("SELECT name FROM sqlite_master WHERE name='lifecycle_self_clear_pending'").fetchall() == []
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
+    from issue_agent.adapters.control_store import _encoded_payload_digest
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+
+    store = _store(tmp_path)
+    state = resolve_snapshot(7)
+    install_workflow(store, state)
+    binding = encode_workflow(state.binding)
+
+    def command(db, command_id, payload):
+        db.execute(
+            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
+            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
+            "state,created_at,updated_at,workflow_binding_json) "
+            "VALUES (?,?,?,0,'post_comment','issue:7','r','legacy','o/r','owner',?,?,'succeeded',?,?,?)",
+            (command_id, command_id, command_id, payload, _encoded_payload_digest(payload, binding),
+             NOW.isoformat(), NOW.isoformat(), binding))
+        db.execute("INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,status,"
+                   "receipt_digest) VALUES (?,'owner','s','c','succeeded',?)", (command_id, "b" * 64))
+
+    def dedupe(db, namespace, key):
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at) VALUES (?,'o/r',?,?)",
+                   (namespace, key, NOW.isoformat()))
+
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 42)
+        command(db, "steward-cmd", json.dumps({"steward_guard": {"lane": "triage"}}))
+        command(db, "plain-cmd", json.dumps({"body": "hello"}))
+        for namespace, key in (("continuation-admission", "run-s:steward"), ("continuation-admission", "run-f:issue_recovery"),
+                               ("continuation-return", "run-s:steward"), ("groomed", "issue-7"),
+                               ("triage_close", "issue-7"), ("recurrence", "issue-7"), ("other", "issue-7")):
+            dedupe(db, namespace, key)
+        db.execute("INSERT INTO workflow_components VALUES ('o/r','issue',7,'steward',1,'steward-episode')")
+        db.execute("INSERT INTO runs(run_id,dispatch_id,kind,owner_id,state,config_version,provider_receipt_id) "
+                   "VALUES ('steward-run','d','TRIAGE','o/r:steward:x','completed','cfg','receipt-s')")
+        db.execute("INSERT INTO charges(run_id,provider_receipt_id,amount_micros,currency,basis,settled_at) "
+                   "VALUES ('steward-run','receipt-s',1234,'USD','provider_reported',?)", (NOW.isoformat(),))
+    store.initialize()
+
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 44
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert [row[0] for row in db.execute("SELECT command_id FROM lifecycle_commands")] == ["plain-cmd"]
+        assert [row[0] for row in db.execute("SELECT command_id FROM effect_receipts")] == ["plain-cmd"]
+        assert sorted(db.execute("SELECT namespace,key FROM dedupe_keys")) == [
+            ("continuation-admission", "run-f:issue_recovery"), ("other", "issue-7")]
+        assert db.execute("SELECT count(*) FROM workflow_components WHERE family='steward'").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM workflow_components WHERE family='resolve'").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM workflows").fetchone()[0] == 1
+        assert db.execute("SELECT r.run_id,c.amount_micros FROM runs r JOIN charges c USING(run_id)").fetchall() == [
+            ("steward-run", 1234)]

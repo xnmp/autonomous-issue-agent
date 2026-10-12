@@ -1,4 +1,4 @@
-"""review/steward identity resolution (`app.main._app_identity`).
+"""review identity resolution (`app.main._app_identity`).
 
 This had NO tests, and that is exactly how the bug below shipped. The first real
 deployment (xnmp/tauri-explorer, 2026-07-26) ran with PATH A from

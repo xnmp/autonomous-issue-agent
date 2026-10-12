@@ -64,13 +64,12 @@ _VALUES = (
     cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.PublicationIdentityEscalationCapture, cc.OwedPRRecoveryEffect,
     cc.SettledPRRecoveryEffect, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation,
     cc.FixInfraReceipt, cc.IssueInfraPurchase,
-    cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,
-    cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.GroomContent, cc.GroomNoFinding, cc.ContinuationImportBlocker,
-    cc.InactiveIssueRecovery, cc.InactivePRRepair, cc.InactiveSteward,
-    cc.BlockedIssueRecovery, cc.BlockedPRRepair, cc.BlockedSteward,
-    cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward,
+    cc.ContinuationImportBlocker,
+    cc.InactiveIssueRecovery, cc.InactivePRRepair,
+    cc.BlockedIssueRecovery, cc.BlockedPRRepair,
+    cc.ActiveIssueRecovery, cc.ActivePRRepair,
     w.IssueWorkflowShell, w.IssueFamilyEpisodes,
-    cc.ContinuationCapture, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase,
+    cc.ContinuationCapture, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase,
     EligibleZeroHistoryReviewImport, ReviewImportNoHistoryObserved, LegacyOpenPRCounterLink,
     migration.ReviewImportSource, migration.ReviewImportBlocker, migration.ReviewImportHistoryBlocked,
     migration.BlockedReviewExecutionMigration,
@@ -159,7 +158,7 @@ _ENUMS = (
     Target, EffectStatus,
     UsageSource, PricingBasis, ChargeOrigin,
     LifecycleOperation,
-    cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.StewardLane, cc.StewardFailureKind, cc.FixInfraOutcome,
+    cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.FixInfraOutcome,
     migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
@@ -196,13 +195,8 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "SettlementRequest": {"accounting_gap": "", "origin": {"type": "ChargeOrigin", "value": "normal_return"}},
-    "StewardState": {"groom_content": {"type": "GroomContent", "fields": {"attempted": "", "successful": ""}}},
-    "StewardAttemptSource": {"content_signature": ""},
-    "StewardPurchase": {"content_signature": "", "infra_ceiling": None},
-    "StewardLaneState": {"delivery_source": None, "attempted_at": ""},
     "WorkflowSnapshot": {
         "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}},
-        "steward": {"type": "InactiveSteward", "fields": {}},
     },
     "ReviewWorkflowSnapshot": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
     "ReviewFamilyEpisodes": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
@@ -255,7 +249,7 @@ def _encode(value: object, depth: int = 0) -> object:
             "type": ("ReviewWorkflowSnapshotV3" if type(value) is rw.ReviewWorkflowSnapshot and not isinstance(value.pr_repair, cc.InactivePRRepair)
                      else _CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
                      else "WorkflowSnapshotV2" if type(value) is w.WorkflowSnapshot and (
-                         not isinstance(value.issue_recovery, cc.InactiveIssueRecovery) or not isinstance(value.steward, cc.InactiveSteward))
+                         not isinstance(value.issue_recovery, cc.InactiveIssueRecovery))
                      else "ReviewFamilyEpisodesV2" if type(value) is rw.ReviewFamilyEpisodes and not isinstance(value.pr_repair, cc.InactivePRRepair)
                      else _CURRENT_ACTIVATED_EXECUTION_TAG if type(value) is rx.ActivatedReviewExecution
                      else _CURRENT_EXECUTION_AUTHORITY_TAG if type(value) is rx.CurrentReviewExecution
@@ -281,22 +275,13 @@ def _encode(value: object, depth: int = 0) -> object:
                         or field.name == "handoff" and value.handoff is None
                         or field.name == "advance_resume" and not value.advance_resume
                         or field.name == "head" and not value.head))
-                    and not (type(value) is cc.StewardLaneState and (
-                        field.name == "delivery_source" and value.delivery_source is None
-                        or field.name == "attempted_at" and not value.attempted_at))
-                    and not (type(value) in {cc.StewardAttemptSource, cc.StewardPurchase}
-                             and field.name == "content_signature" and not value.content_signature)
-                    and not (type(value) is cc.StewardPurchase and field.name == "infra_ceiling" and value.infra_ceiling is None)
-                    and not (type(value) is cc.StewardState and field.name == "groom_content"
-                             and value.groom_content == cc.GroomContent())
                     and (field.name not in {"expected_binding", "lineage_sha256"}
                      or getattr(value, field.name) is not None)
                     and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant))
-                    and not (field.name in {"issue_recovery", "steward", "pr_repair"}
-                             and isinstance(getattr(value, field.name), (cc.InactiveIssueRecovery, cc.InactiveSteward, cc.InactivePRRepair))
+                    and not (field.name in {"issue_recovery", "pr_repair"}
+                             and isinstance(getattr(value, field.name), (cc.InactiveIssueRecovery, cc.InactivePRRepair))
                              and (type(value) in (rw.ReviewWorkflowSnapshot, rw.ReviewFamilyEpisodes)
-                                  or type(value) is w.WorkflowSnapshot and isinstance(value.issue_recovery, cc.InactiveIssueRecovery)
-                                  and isinstance(value.steward, cc.InactiveSteward))))
+                                  or type(value) is w.WorkflowSnapshot and isinstance(value.issue_recovery, cc.InactiveIssueRecovery))))
             },
         }
     if isinstance(value, ZoneInfo):
@@ -394,9 +379,8 @@ def _decode(value: object, depth: int = 0) -> object:
         payload = {key: item for key, item in payload.items() if key not in _RETIRED_FIELDS[tag]}
     legacy: dict[str, object] = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
     field_names = _FIELD_NAMES[constructor]
-    required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}
-                if tag == "StewardLaneState" else field_names - legacy.keys())
-    if tag in {"SettlementRequest", "StewardLaneState", "StewardPurchase", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
+    required = field_names - legacy.keys()
+    if tag in {"SettlementRequest", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
         payload = {**legacy, **payload}
     if legacy and set(payload) == field_names - legacy.keys():
         payload = {**legacy, **payload}

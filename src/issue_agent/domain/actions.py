@@ -60,10 +60,6 @@ class AgentKind(Enum):
     REBASE = auto()          # wake the fixer to rebase a CONFLICTING PR onto base
     REVIEW = auto()          # review-pr.sh
     RE_REVIEW = auto()       # re-review-pr.sh
-    TRIAGE = auto()          # steward triage_once (per issue)
-    GROOM = auto()           # steward bounded issue grooming (per issue)
-    STEWARD_DRIVE = auto()   # steward drive_once
-    JIRA_SYNC = auto()       # steward: mirror an issue's lifecycle into its Jira ticket
 
 
 @dataclass(frozen=True)
@@ -283,19 +279,6 @@ class RunAgent:
 
 
 @dataclass(frozen=True)
-class AddDependency:
-    """Create a native GitHub 'blocked by' dependency: `issue` is blocked by
-    `blocker`. The steward emits this when triage finds `issue` cannot proceed
-    until work tracked by an ALREADY-OPEN `blocker` issue lands. The fixer's
-    existing dependency gate (has_open_blocker → pick_ready_issue) then holds
-    `issue` until `blocker` closes. Adapter is fail-soft (already-linked / missing
-    blocker must not crash the poll)."""
-
-    issue: int
-    blocker: int
-
-
-@dataclass(frozen=True)
 class RemoveWorktree:
     issue: int
 
@@ -370,7 +353,6 @@ Action = Union[
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
-    AddDependency,
     RerunFailedChecks,
     CancelWorkflowRuns,
     EscalateCiPending,
@@ -397,7 +379,6 @@ __all__ = [
     "CloseIssue",
     "EnableAutoMerge",
     "UpdateBranch",
-    "AddDependency",
     "RerunFailedChecks",
     "CancelWorkflowRuns",
     "EscalateCiPending",

@@ -2570,7 +2570,7 @@ def test_pr_only_repair_does_not_require_a_selected_resolve_authority_row(resolv
     with store._workflow_db.transaction() as db:
         current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
         db.execute("DELETE FROM workflow_components WHERE target_kind='issue' AND family='resolve'")
-        shell = IssueWorkflowShell(current.revision, current.issue_recovery, current.steward)
+        shell = IssueWorkflowShell(current.revision, current.issue_recovery)
         persist_workflow_snapshot(db, shell)
         if not resolve_activated:
             db.execute("DELETE FROM workflow_authority_epochs WHERE family='resolve'")

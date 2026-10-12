@@ -48,8 +48,7 @@ def execution_deployment(deployment, monkeypatch):
     monkeypatch.delenv("REVIEW_BOT", raising=False)
     env["REVIEW_BOT"] = "review-bot"
     write_snapshot(Path(env["STATE_DIR"]).parents[1], env)
-    for key in ("REVIEW_STATE_DIR", "STEWARD_STATE_DIR"):
-        Path(env[key]).mkdir(parents=True)
+    Path(env["REVIEW_STATE_DIR"]).mkdir(parents=True)
     authority = FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1)
     with control.transaction() as db:
         db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",

@@ -81,14 +81,13 @@ def sources(tmp_path):
         path.mkdir()
     cfg = HarnessConfig(
         repo="o/r", target_dir=str(current), state_dir=str(tmp_path / "fix-state"),
-        review_state_dir=str(root), steward_state_dir=str(tmp_path / "steward-state"),
+        review_state_dir=str(root),
         fix_bot="fixer", repointed_from_deployments=(("o/r", str(prior)),),
     )
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
     gateway = EmptyGateway()
-    roots = (("fix", cfg.state_dir), ("review", cfg.review_state_dir),
-             ("steward", cfg.steward_state_dir))
+    roots = (("fix", cfg.state_dir), ("review", cfg.review_state_dir))
     files = read_complete_legacy_execution_root_files(roots)
     links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
     assert isinstance(files, CompleteLegacyExecutionRootFiles)
@@ -143,7 +142,7 @@ def test_configured_import_revalidates_the_full_boot_owner_lineage(sources):
     assert len(observed.runs.runs) == 1
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, roots, files, links,
                                                review_state_dir=cfg.review_state_dir,
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
@@ -162,7 +161,7 @@ def test_configured_history_classifies_empty_pr_from_held_complete_sources(sourc
     with held_legacy_execution_counter_sources(
         control, gateway, cfg.repo, roots, files, links,
         review_state_dir=cfg.review_state_dir,
-        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+        other_role_state_dirs=(cfg.state_dir,),
     ) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
@@ -189,7 +188,7 @@ def test_configured_history_blocks_real_legacy_round_file(sources):
     with held_legacy_execution_counter_sources(
         control, gateway, cfg.repo, roots, files, links,
         review_state_dir=cfg.review_state_dir,
-        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+        other_role_state_dirs=(cfg.state_dir,),
     ) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
@@ -217,7 +216,7 @@ def test_declared_historical_pr_marker_holds_its_target_without_current_root_cre
     links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
     observed = _sql_sources(cfg, control, include_prior=True)
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, all_roots, files, links,
-        review_state_dir=cfg.review_state_dir, other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+        review_state_dir=cfg.review_state_dir, other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = classify_configured_legacy_review_import_history(cfg, db, held, observed, extra_roots=(str(old),))
@@ -246,7 +245,7 @@ def test_historical_marker_holds_only_its_pr_and_keeps_fresh_sibling_eligible(so
     recorded = RecordedPullRequest(ObservedPullRequest(key, 'a' * 40, PullRequestState.OPEN,
         frozenset({Label.AI_PR_OPEN}), CompleteReviews(()), datetime.now(timezone.utc)))
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, all_roots, files, links,
-        review_state_dir=cfg.review_state_dir, other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+        review_state_dir=cfg.review_state_dir, other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = assess_configured_review_execution_import_candidates(cfg, db, held, observed, (recorded,), extra_roots=(str(old), str(older)))
@@ -291,7 +290,7 @@ def test_configured_candidate_joins_every_retained_row_to_current_open_pr(source
     with held_legacy_execution_counter_sources(
         control, gateway, cfg.repo, roots, files, links,
         review_state_dir=cfg.review_state_dir,
-        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+        other_role_state_dirs=(cfg.state_dir,),
     ) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
@@ -329,7 +328,7 @@ def test_configured_candidate_blocks_terminal_retained_workflow(sources):
     with held_legacy_execution_counter_sources(
         control, gateway, cfg.repo, roots, files, links,
         review_state_dir=cfg.review_state_dir,
-        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+        other_role_state_dirs=(cfg.state_dir,),
     ) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
@@ -361,7 +360,7 @@ def test_configured_candidate_keeps_missing_remote_read_as_a_pr_blocker(sources)
     with held_legacy_execution_counter_sources(
         control, gateway, cfg.repo, roots, files, links,
         review_state_dir=cfg.review_state_dir,
-        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+        other_role_state_dirs=(cfg.state_dir,),
     ) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
@@ -392,7 +391,7 @@ def test_configured_import_refuses_a_substituted_legacy_root(sources, tmp_path):
 
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, roots, files, links,
                                                review_state_dir=str(substitute),
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
@@ -404,15 +403,14 @@ def test_configured_import_refuses_a_substituted_legacy_root(sources, tmp_path):
 def test_configured_import_accepts_shared_fix_and_review_directory(sources):
     cfg, control, gateway, _roots, _files, links = sources
     cfg = replace(cfg, state_dir=cfg.review_state_dir)
-    roots = (("fix", cfg.state_dir), ("review", cfg.review_state_dir),
-             ("steward", cfg.steward_state_dir))
+    roots = (("fix", cfg.state_dir), ("review", cfg.review_state_dir))
     files = read_complete_legacy_execution_root_files(roots)
     assert isinstance(files, CompleteLegacyExecutionRootFiles)
     observed = _sql_sources(cfg, control, include_prior=True)
 
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, roots, files, links,
                                                review_state_dir=cfg.review_state_dir,
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
@@ -432,7 +430,7 @@ def test_configured_import_requires_explicit_historical_root_declaration(sources
 
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, complete_roots, files, links,
                                                review_state_dir=cfg.review_state_dir,
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         assert [(item.source.root, item.source.key) for item in held.roots.values.counters] == [
             (f"extra:{old.resolve()}", -9),
@@ -480,7 +478,7 @@ def test_configured_import_refuses_an_inventory_omitting_prior_owner(sources):
     assert not observed.runs.runs
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, roots, files, links,
                                                review_state_dir=cfg.review_state_dir,
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
@@ -495,7 +493,7 @@ def test_configured_import_refuses_an_inventory_omitting_repo_alias_owners(sourc
     assert "O/R:review" in configured_prior_owner_ids(alias_cfg, "review")
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, roots, files, links,
                                                review_state_dir=cfg.review_state_dir,
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(alias_cfg, db, held, observed)
@@ -514,7 +512,7 @@ def test_configured_import_refuses_invalid_deployment_identity(sources, change):
     changed = replace(cfg, **change)
     with held_legacy_execution_counter_sources(control, gateway, cfg.repo, roots, files, links,
                                                review_state_dir=cfg.review_state_dir,
-                                               other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+                                               other_role_state_dirs=(cfg.state_dir,)) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             with pytest.raises(ValueError):

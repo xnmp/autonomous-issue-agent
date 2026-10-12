@@ -43,7 +43,7 @@ from .review_execution_counter_links import revalidate_complete_legacy_open_coun
 from .workflow_codec import encode_workflow
 from .workflow_rows import WorkflowAuthorityError
 
-_ROLES = ("fix", "review", "steward")
+_ROLES = ("fix", "review")
 _CURRENT_SCOPE: ContextVar[object | None] = ContextVar("legacy_execution_import_scope", default=None)
 _VERIFICATION_MINT = object()
 

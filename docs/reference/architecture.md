@@ -21,7 +21,7 @@ harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
 
 ## The shape
 
-Three role daemons — **fix**, **review**, **steward** — reconcile GitHub and
+Two role daemons — **fix** and **review** — reconcile GitHub and
 drive Claude, Codex, or GLM sessions. Each is assembled in `app/roles.py` from:
 
 ```
@@ -51,35 +51,7 @@ worktrees live below the hidden `.claude/worktrees` scratch path and that path i
 also excluded by the primary checkout's shared `.git/info/exclude`, but their type
 gate must be identical to the primary checkout's.
 
-Triage returns one of three dispositions: `ready`, `blocked`, or `close`.
-Closing is gated by `STEWARD_PROMOTE`, the same authority switch that gates
-promotion to `ai-ready`: a deployment that keeps a human on lifecycle decisions
-does not acquire autonomous closing by upgrading. A
-`close` verdict must carry both a concrete reason and a reopen condition; the
-steward then comments, closes the issue (`completed` only when the work actually
-shipped, otherwise `not_planned`), and applies the terminal `ai-closed` label —
-deliberately not `ai-done`, which means "a harness PR merged" and drives the
-reopen-based recurrence metric. A close missing either field, or a close on an
-issue whose `stateReason` is `reopened`, is refused and left open under
-`ai-triage` for a maintainer. Because `ai-closed` is not a lifecycle label, a
-human reopening a steward-closed issue puts it back into ordinary triage, and
-the next non-close disposition retires the stale marker. Existing deployments
-must create the `ai-closed` label (`issue-agent prepare-remote`) before enabling
-closing; the relabel fails otherwise and the issue re-enters triage until the
-ADR 0012 stall ceiling escalates it.
-
-The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
-advisory comments and the orthogonal `maybe-resolved` label for verified recent
-merge matches or stale references. A structured `duplicate_of` claim may close
-an issue only when `STEWARD_PROMOTE=1` and a separate harness-owned GitHub read
-proves the target is a different, closed issue. The close travels through the
-same durable `CloseIssue` rail as triage and always uses the harness-selected
-`completed` reason. Grooming is capped at five candidates per changed tick and
-persists a title/body signature after a successful delivery, preventing harness
-comments from self-amplifying spend.
-It also performs a free reconciliation over open PR metadata and posts one
-advisory flag when a changed path is governed by an ADR that the PR description
-does not cite. The shell governor is advisory defense-in-depth; durable
+The shell governor is advisory defense-in-depth; durable
 commands, captured-revision guards, SQLite ownership, and trusted readback
 are the publication authority.
 
@@ -308,7 +280,7 @@ pending operator intent and durable effect rail. Renewal requires complete
 old-episode quiescence and carries a compact origin/session reference, preserving
 rejection allowance and unrelated holds. The dashboard projects this SQL state
 and daemon-captured facts through its existing transport; polls never grant work.
-Store continuity/session/model/reply/phase and steward baseline APIs are retired.
+Store continuity/session/model/reply/phase APIs are retired.
 Current selected issue/PR components retain exact paid admission and outcome
 sources, while free remediation holds the existing command identity until its
 exact head/run/base receipt settles. Machine and budget recoveries share one
@@ -613,12 +585,11 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`,
-`domain/steward.py`, `domain/steward_stall.py`,
 `domain/supervision.py`,
-`domain/triage.py`, `domain/trust.py`, and
+`domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
-`domain/continuation_import.py` (closed stopped fix/steward source fields and typed import decisions),
+`domain/continuation_import.py` (closed stopped fix source fields and typed import decisions),
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
@@ -713,10 +684,10 @@ adapters live under `adapters/dashweb/`.
 `app/measurement.py` (local observation/export transport and cohort specification),
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
-`app/continuation_activation.py` (configured fixed fix/steward offline import, original-plan retry and copied rehearsal),
+`app/continuation_activation.py` (configured fixed fix offline import, original-plan retry and copied rehearsal),
 `app/review_execution_import.py` (configuration-bound legacy source checks and observational whole-repository zero-history import planning),
 `app/review_execution_import_remote.py` (configured complete PR, review and trusted-hold rereads under the import coordinator's barriers),
-`app/review_execution_activation.py` (configuration-bound offline planning and activation under fix/review/steward barriers, source and quiescence rechecks, atomic publication and SQL-only exact retry; operator transport and historical import remain pending),
+`app/review_execution_activation.py` (configuration-bound offline planning and activation under fix/review barriers, source and quiescence rechecks, atomic publication and SQL-only exact retry; operator transport and historical import remain pending),
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),

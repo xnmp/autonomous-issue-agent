@@ -24,7 +24,6 @@ from ..adapters.journal import alert
 from ..domain.actions import (
     LifecycleOperation,
     Action,
-    AddDependency,
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
@@ -64,7 +63,6 @@ _PRIVILEGED_ACTIONS = (
     CancelWorkflowRuns,
     RerunFailedChecks,
     EscalateCiPending,
-    AddDependency,
 )
 _DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
 
@@ -169,12 +167,6 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
             "head": action.head,
             "run_ids": list(action.run_ids),
         }
-    if isinstance(action, AddDependency):
-        return "add_dependency", "issue", action.issue, {
-            "type": "add_dependency",
-            "issue": action.issue,
-            "blocker": action.blocker,
-        }
     if isinstance(action, RemoveWorktree):
         return "remove_worktree", "worktree", action.issue, {
             "type": "remove_worktree", "issue": action.issue,
@@ -226,8 +218,6 @@ def _action_correlation(action: Action) -> Correlation:
         ),
     ):
         return Correlation(pr=action.pr)
-    if isinstance(action, AddDependency):
-        return Correlation(issue=action.issue)
     if isinstance(action, (RemoveWorktree,)):
         return Correlation(issue=action.issue)
     if isinstance(action, ClearIssueState):
@@ -235,7 +225,7 @@ def _action_correlation(action: Action) -> Correlation:
     if isinstance(action, ResetCiRetries):
         return Correlation(issue=action.issue)
     if isinstance(action, RunAgent):
-        issue_kinds = {"RESOLVE", "RESUME", "TRIAGE", "GROOM"}
+        issue_kinds = {"RESOLVE", "RESUME"}
         if action.number <= 0:
             return Correlation()
         if action.kind.name in issue_kinds:
@@ -395,8 +385,6 @@ class Executor:
             )
         if isinstance(action, EscalateCiPending):
             return f"escalate stalled CI PR #{action.pr} ({action.head[:7]})"
-        if isinstance(action, AddDependency):
-            return f"link #{action.issue} blocked-by #{action.blocker}"
         if isinstance(action, RemoveWorktree):
             return f"remove worktree for #{action.issue}"
         if isinstance(action, ClearIssueState):

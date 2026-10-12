@@ -19,7 +19,6 @@ from issue_agent.adapters.effects import (
 )
 from issue_agent.adapters.effects import UnknownEffectOutcome
 from issue_agent.domain.actions import (
-    AddDependency,
     CancelWorkflowRuns,
     CloseIssue,
     EnableAutoMerge,
@@ -48,7 +47,6 @@ class Gateway:
         self.auto_merge = set()
         self.run_attempt = 0
         self.run_states = {}
-        self.dependencies = set()
         self.reviews = set()
         self.advance_before_auto_merge = ""
         self.advance_before_update = ""
@@ -162,13 +160,6 @@ class Gateway:
     def is_branch_updated(self, pr, prior_head):
         del pr
         return self.head != prior_head
-
-    def add_blocked_by(self, issue, blocker):
-        self.calls.append(("dependency", issue, blocker))
-        self.dependencies.add((issue, blocker))
-
-    def has_blocked_by(self, issue, blocker):
-        return (issue, blocker) in self.dependencies
 
     def submit_review(self, pr, event, body, expected_head):
         if self.advance_before_review:
@@ -711,7 +702,6 @@ def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
     (
         Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING),
         PostComment(Target.ISSUE, 7, "work complete"),
-        AddDependency(7, 8),
     ),
 )
 def test_issue_lifecycle_mutations_capture_expected_revision(
@@ -1278,27 +1268,6 @@ def test_reconcile_outage_blocks_write_and_leaves_command_pending(
 
     assert store.pending_commands()[0].state == "pending"
     assert gateway.calls == []
-
-
-def test_ambiguous_dependency_is_reconciled_without_duplicate(tmp_path) -> None:
-    executor, gateway, store = _executor(tmp_path)
-    action = AddDependency(7, 8)
-    original = gateway.add_blocked_by
-
-    def committed_then_lost(*args):
-        original(*args)
-        raise RuntimeError("reply lost")
-
-    gateway.add_blocked_by = committed_then_lost
-    try:
-        executor.execute(action)
-    except RuntimeError:
-        pass
-    gateway.add_blocked_by = original
-
-    assert executor.execute(action)
-    assert gateway.calls == [("dependency", 7, 8)]
-    assert store.pending_commands() == ()
 
 
 def test_ambiguous_review_and_same_body_on_new_head_are_distinct(

@@ -80,7 +80,7 @@ def run(
     events = env.get("WEBHOOK_EVENTS") or DEFAULT_EVENTS
     wakes = [
         wake_path(d)
-        for d in (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        for d in (cfg.state_dir, cfg.review_state_dir)
         if d
     ]
     try:
@@ -89,7 +89,6 @@ def run(
             for path in (
                 cfg.state_dir,
                 cfg.review_state_dir,
-                cfg.steward_state_dir,
             )
             if path
         )
