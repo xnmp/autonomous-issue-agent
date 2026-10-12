@@ -529,6 +529,8 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
+`domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
+minimal-harness design; not yet wired, slice 5b replaces `decide_fix` with it),
 `domain/review.py`,
 `domain/supervision.py`,
 `domain/trust.py`, and

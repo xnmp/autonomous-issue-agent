@@ -130,6 +130,8 @@ class PostComment:
     # See Relabel.harness_signal.
     harness_signal: bool = False
     workflow: WorkflowBinding | None = None
+    # Idempotency key: act posts at most one comment per key. Empty = no dedupe.
+    key: str = ""
 
     def __post_init__(self) -> None:
         _validate_action_workflow(self.workflow, self.target, self.number)
@@ -156,6 +158,20 @@ class EnableAutoMerge:
     pr: int
     method: str
     head: str
+
+
+@dataclass(frozen=True)
+class MergePullRequest:
+    """Merge an approved, green PR now (refactor decision Q10). `head` is the
+    SHA the decision saw; act passes it as --match-head-commit so a push landing
+    after the decision is never merged unreviewed."""
+
+    pr: int
+    head: str
+
+    def __post_init__(self) -> None:
+        if type(self.pr) is not int or self.pr <= 0 or not isinstance(self.head, str) or not self.head:
+            raise ValueError("merge requires a PR number and the decided head")
 
 
 @dataclass(frozen=True)
@@ -261,6 +277,9 @@ class RunAgent:
     number: int = 0
     requires: Relabel | None = field(default=None, compare=False, repr=False)
     workflow: WorkflowBinding | None = None
+    # The PR head the dispatch was decided on ("" for issue-stage legs), so the
+    # leg and its idempotency key bind to the exact head (e.g. review:{pr}:{head}).
+    head: str = ""
 
     def __post_init__(self) -> None:
         if self.workflow is None:
@@ -351,6 +370,7 @@ Action = Union[
     PostComment,
     CloseIssue,
     EnableAutoMerge,
+    MergePullRequest,
     UpdateBranch,
     RerunFailedChecks,
     CancelWorkflowRuns,
@@ -377,6 +397,7 @@ __all__ = [
     "PostComment",
     "CloseIssue",
     "EnableAutoMerge",
+    "MergePullRequest",
     "UpdateBranch",
     "RerunFailedChecks",
     "CancelWorkflowRuns",

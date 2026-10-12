@@ -80,6 +80,16 @@ class Comment:
 
 
 @dataclass(frozen=True)
+class Push:
+    """A push to a PR's head branch: who pushed it and when. A push by anyone
+    but the harness is a reset event for attempt counting (refactor decision
+    Q3); the harness's own pushes are not, which keeps FIX_CI bounded."""
+
+    actor: str
+    pushed_at: str = ""
+
+
+@dataclass(frozen=True)
 class IssueView:
     number: int
     title: str = ""
@@ -170,6 +180,8 @@ class PRView:
     # "no files" from "files unread" reports a false zero (adversarial review
     # F4: the predicted-path hit rate is a primary metric).
     content_known: bool = True
+    # Head-branch pushes, any order. Empty = none observed.
+    pushes: tuple[Push, ...] = ()
 
     @property
     def checks(self) -> tuple[Check, ...]:
@@ -500,6 +512,7 @@ __all__ = [
     "Check",
     "Review",
     "Comment",
+    "Push",
     "IssueView",
     "PRView",
     "ClosingRef",

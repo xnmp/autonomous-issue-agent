@@ -61,6 +61,10 @@ class Label(str, Enum):
     # ADR 0012); no daemon ever adds or removes it.
     AI_PARKED = "ai-parked"
 
+    # The single stop of the two-label design (docs/open/2026-10-12-minimal-harness-design.md):
+    # only policy writes it; a human reply or removing it releases the item.
+    NEEDS_HUMAN = "needs-human"
+
     # Escalation.
     NEEDS_HUMAN_REVIEW = "needs-human-review"  # review/address-review exhausted
     # A runtime budget cap needs an operator to change the cap or resume from
