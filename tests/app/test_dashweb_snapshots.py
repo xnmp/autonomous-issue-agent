@@ -3268,6 +3268,78 @@ def test_a_projection_without_an_attention_label_keeps_the_journal_escalation():
     assert ask_of(card) == "rearm"
 
 
+@pytest.mark.parametrize("operation", ["release", "rearm"])
+@pytest.mark.parametrize("settlement", ["write", "present", "lost_reply", "refused"])
+def test_review_release_retires_board_attention_only_after_verified_relabel(tmp_path, operation, settlement):
+    from tests.adapters.test_review_effects import Rig, PR, accepted_rearm, commit_rearm, committed_release
+    from issue_agent.domain.events import EscalationRaised
+
+    def fault(point):
+        if settlement == "lost_reply" and point == "relabel_pr_applied":
+            raise TimeoutError("reply lost after label removal")
+
+    rig = Rig(tmp_path, fault=fault)
+    events = []
+    sequence = 0
+
+    def envelope(payload, correlation):
+        nonlocal sequence
+        sequence += 1
+        seq = sequence
+        return EventEnvelope(payload, f"event-{seq}", seq, rig.clock[0], rig.clock[0], seq,
+                             Producer("demo", "o/r", "review", 10, "boot"), correlation)
+
+    rig.store.bind_event_outbox(envelope, events.append)
+    events.append(envelope(WorldObserved("issue", 7, "issue", {
+        "present": True, "state": "OPEN", "labels": ["ai-pr-open"],
+    }), Correlation(issue=7)))
+    events.append(envelope(WorldObserved("pr", PR, "pr", {
+        "present": True, "state": "OPEN", "closing_issue": 7, "labels": ["ai-pr-open"],
+        "observation_truncated": True,
+    }), Correlation(pr=PR)))
+    events.append(envelope(EscalationRaised("pr", PR), Correlation(pr=PR)))
+
+    def board():
+        feeds = (("review", "/j/rev", "/l/rev", tuple(events)),)
+        dep = dash.build_deployment_v2("demo", "o/r", feeds, fold(events), lambda: rig.clock[0])
+        row = next(row for row in dep.issues if row.issue == 7)
+        return board_of(snapshots.issue_card(row, rig.clock[0], gh_issue={"title": "x"}))
+
+    assert board()["ask"] == "escalated"
+    rig.advance(60)
+    if operation == "release":
+        committed_release(rig)
+    else:
+        commit_rearm(rig.store, accepted_rearm())
+    if settlement == "present":
+        rig.remote.external_pr_change(PR, labels=["ai-pr-open"])
+    elif settlement == "refused":
+        rig.remote.external_pr_change(PR, labels=["needs-human-review", "ai-blocked"])
+    rig.drain()
+    if settlement == "lost_reply":
+        assert board()["ask"] == "escalated"
+        rig.advance(60)
+        rig.drain()
+    if settlement == "refused":
+        assert board()["ask"] == "escalated"
+        return
+    assert board().get("ask") is None
+    assert board()["status"] != "needs_you"
+
+    rig.advance(60)
+    events.append(envelope(EscalationRaised("pr", PR), Correlation(pr=PR)))
+    assert board()["ask"] == "escalated"
+    assert board()["status"] == "needs_you"
+    for truncated in (False, True):
+        rig.advance(60)
+        events.append(envelope(WorldObserved("pr", PR, f"absent-{truncated}", {
+            "present": True, "state": "OPEN", "closing_issue": 7, "labels": ["ai-pr-open"],
+            "observation_truncated": truncated,
+        }), Correlation(pr=PR)))
+        assert board()["ask"] == "escalated"
+        assert board()["status"] == "needs_you"
+
+
 @pytest.mark.parametrize("label,ask", [("needs-human-review", "escalated"), ("needs-budget-review", "budget")])
 def test_a_v2_escalation_label_from_the_world_projection_asks_the_operator(label, ask):
     observed = v2_event(
