@@ -71,7 +71,7 @@ class ConfiguredReviewExecutionActivation:
         cfg.validate()
         repository = canonical_workflow_repository(cfg.repo)
         expected = control_store_path(
-            (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+            (cfg.state_dir, cfg.review_state_dir),
             authority_root=cfg.control_authority_root,
         )
         if (cfg.repo != repository or not os.path.isabs(cfg.target_dir)
@@ -114,7 +114,6 @@ class ConfiguredReviewExecutionActivation:
             raise ValueError("execution activation requires complete typed root observations")
         configured = tuple((role, path) for role, path in (
             ("fix", self._cfg.state_dir), ("review", self._cfg.review_state_dir),
-            ("steward", self._cfg.steward_state_dir),
         ) if path)
         if (any(not os.path.isabs(path) for _, path in configured)
                 or not isinstance(extra_roots, tuple)
@@ -168,7 +167,7 @@ class ConfiguredReviewExecutionActivation:
         with held_legacy_execution_counter_sources(
             self._control, self._gateway, self._cfg.repo, self._roots(extra_roots, files), files, links,
             review_state_dir=self._cfg.review_state_dir,
-            other_role_state_dirs=tuple(path for path in (self._cfg.state_dir, self._cfg.steward_state_dir) if path),
+            other_role_state_dirs=tuple(path for path in (self._cfg.state_dir,) if path),
         ) as held:
             if not isinstance(held, HeldLegacyExecutionCounterSources):
                 raise ReviewExecutionActivationRefused(held.reason)
@@ -212,7 +211,7 @@ class ConfiguredReviewExecutionActivation:
         with held_legacy_execution_counter_sources(
             self._control, self._gateway, self._cfg.repo, self._roots(extra_roots, files), files, links,
             review_state_dir=self._cfg.review_state_dir,
-            other_role_state_dirs=tuple(path for path in (self._cfg.state_dir, self._cfg.steward_state_dir) if path),
+            other_role_state_dirs=tuple(path for path in (self._cfg.state_dir,) if path),
         ) as held:
             if not isinstance(held, HeldLegacyExecutionCounterSources):
                 raise ReviewExecutionActivationRefused(held.reason)
@@ -259,7 +258,7 @@ def activation_scope(name: str, *, harness_root: str, extra_roots: tuple[str, ..
     from .review_identity import review_identity
 
     cfg, env = load_operator_configuration(name, harness_root=harness_root)
-    if "review" not in env.get("ROLES", "fix review steward").split():
+    if "review" not in env.get("ROLES", "fix review").split():
         raise ValueError("execution activation requires the configured review role")
     gateway = GitHubGateway(cfg.repo, review_identity(dict(env)), review_pr_label=cfg.review_trigger_label,
                             review_adopt_unlabeled=cfg.review_adopt_unlabeled)
@@ -269,7 +268,7 @@ def activation_scope(name: str, *, harness_root: str, extra_roots: tuple[str, ..
 
 def _scope_roots(cfg: HarnessConfig, extra_roots: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
     configured = tuple((role, path) for role, path in (
-        ("fix", cfg.state_dir), ("review", cfg.review_state_dir), ("steward", cfg.steward_state_dir),
+        ("fix", cfg.state_dir), ("review", cfg.review_state_dir),
     ) if path)
     if (not cfg.review_state_dir or any(not os.path.isabs(path) for _, path in configured)
             or len(extra_roots) > MAX_LEGACY_EXECUTION_ROOTS
@@ -284,7 +283,7 @@ def _scope_control(scope: ReviewExecutionActivationScope, *, journal: bool = Fal
     from ..domain.events import Producer
 
     cfg = scope.cfg
-    control = SQLiteControlStore(control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+    control = SQLiteControlStore(control_store_path((cfg.state_dir, cfg.review_state_dir),
                                                   authority_root=cfg.control_authority_root))
     control.require_initialized()
     if journal:
@@ -456,7 +455,7 @@ def rehearse(scope: ReviewExecutionActivationScope, *, copy_to: str) -> dict[str
     names = re.compile(r"(?:pr-.*\.(?:session|round|last-sha|patch-id|operator-guidance))|(?:issue-.*\.infra-deaths)", re.DOTALL)
     legacy = tuple(sorted(os.path.join(root, item.name) for _, root in roots
                           for item in (os.scandir(root) if os.path.isdir(root) else ()) if names.fullmatch(item.name)))
-    control_path = control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+    control_path = control_store_path((cfg.state_dir, cfg.review_state_dir),
                                       authority_root=cfg.control_authority_root)
     # Opening the original through the writable store can checkpoint committed
     # WAL frames. Validate and migrate only the read-only backup's copy.
@@ -467,7 +466,7 @@ def rehearse(scope: ReviewExecutionActivationScope, *, copy_to: str) -> dict[str
     translated = {os.path.realpath(old): new for (_, old), (_, new) in zip(roots, copied.roots, strict=True)}
     translate = lambda path: translated[os.path.realpath(path)] if path else ""
     copied_cfg = replace(cfg, state_dir=translate(cfg.state_dir), review_state_dir=translate(cfg.review_state_dir),
-                         steward_state_dir=translate(cfg.steward_state_dir), control_authority_root=os.path.abspath(copy_to))
+                         control_authority_root=os.path.abspath(copy_to))
     copied_scope = replace(scope, cfg=copied_cfg, extra_roots=tuple(translate(path) for path in scope.extra_roots), liveness=lambda: ())
     copied_control = SQLiteControlStore(copied.control_path)
     copied_control.initialize()

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
 from .continuation_components import (
-    InactiveIssueRecovery, InactiveSteward, IssueRecoveryComponent, StewardComponent, validate_component_revision,
+    InactiveIssueRecovery, IssueRecoveryComponent, validate_component_revision,
 )
 from .workflow_identity import (
     MAX_DETAIL_CHARS, MAX_REARM_COMMANDS, MAX_WORKFLOW_GATES, FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily,
@@ -646,7 +646,6 @@ class WorkflowSnapshot:
     gates: tuple[UnresolvedGate, ...] = ()
     intent: RearmIntent | None = None
     issue_recovery: IssueRecoveryComponent = InactiveIssueRecovery()
-    steward: StewardComponent = InactiveSteward()
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(
@@ -658,7 +657,6 @@ class WorkflowSnapshot:
         if not isinstance(self.revision.fence.key.target, IssueRef):
             raise ValueError("resolve workflow requires an issue")
         validate_component_revision(self.issue_recovery, self.revision, WorkflowFamily.ISSUE_RECOVERY)
-        validate_component_revision(self.steward, self.revision, WorkflowFamily.STEWARD)
         continuation = self.episode.continuation
         if continuation.last_applied_admission_version > self.revision.version:
             raise ValueError("continuation cannot originate in a future admission")
@@ -765,13 +763,11 @@ class IssueWorkflowShell:
 
     revision: WorkflowRevision
     issue_recovery: IssueRecoveryComponent = InactiveIssueRecovery()
-    steward: StewardComponent = InactiveSteward()
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(self.revision.fence.key.target, IssueRef):
             raise ValueError("an inert issue shell requires its issue target revision")
         validate_component_revision(self.issue_recovery, self.revision, WorkflowFamily.ISSUE_RECOVERY)
-        validate_component_revision(self.steward, self.revision, WorkflowFamily.STEWARD)
 
 
 @dataclass(frozen=True)
@@ -779,7 +775,6 @@ class IssueFamilyEpisodes:
     authority: FamilyAuthority
     episode: ResolveEpisode
     issue_recovery: IssueRecoveryComponent
-    steward: StewardComponent
 
     def __post_init__(self) -> None:
         if not isinstance(self.authority, FamilyAuthority) or self.authority.family is not WorkflowFamily.RESOLVE:

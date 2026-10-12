@@ -1,6 +1,6 @@
 """The Action ADT.
 
-Decision functions (`decide_fix`, `decide_bound_review`, `decide_steward`) are pure:
+Decision functions (`decide_fix`, `decide_bound_review`) are pure:
 they take a `WorldState` (plus config) and return an ordered list of `Action`s.
 The orchestration layer interprets each Action against adapters
 (GitHub, AgentRunner, worktree). Keeping the decision as data — not direct
@@ -60,10 +60,6 @@ class AgentKind(Enum):
     REBASE = auto()          # wake the fixer to rebase a CONFLICTING PR onto base
     REVIEW = auto()          # review-pr.sh
     RE_REVIEW = auto()       # re-review-pr.sh
-    TRIAGE = auto()          # steward triage_once (per issue)
-    GROOM = auto()           # steward bounded issue grooming (per issue)
-    STEWARD_DRIVE = auto()   # steward drive_once
-    JIRA_SYNC = auto()       # steward: mirror an issue's lifecycle into its Jira ticket
 
 
 @dataclass(frozen=True)
@@ -258,9 +254,8 @@ class EscalatePRRecovery(EscalateCiPending):
 
 @dataclass(frozen=True)
 class RunAgent:
-    """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME/TRIAGE)
-    or PR (PR_RESUME/ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE
-    ignores it."""
+    """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME)
+    or PR (PR_RESUME/ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW)."""
 
     kind: AgentKind
     number: int = 0
@@ -280,19 +275,6 @@ class RunAgent:
             self.workflow.fence.key.target != PullRequestRef(self.number)
         ):
             raise ValueError("review dispatch must retain its workflow pull request identity")
-
-
-@dataclass(frozen=True)
-class AddDependency:
-    """Create a native GitHub 'blocked by' dependency: `issue` is blocked by
-    `blocker`. The steward emits this when triage finds `issue` cannot proceed
-    until work tracked by an ALREADY-OPEN `blocker` issue lands. The fixer's
-    existing dependency gate (has_open_blocker → pick_ready_issue) then holds
-    `issue` until `blocker` closes. Adapter is fail-soft (already-linked / missing
-    blocker must not crash the poll)."""
-
-    issue: int
-    blocker: int
 
 
 @dataclass(frozen=True)
@@ -370,7 +352,6 @@ Action = Union[
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
-    AddDependency,
     RerunFailedChecks,
     CancelWorkflowRuns,
     EscalateCiPending,
@@ -397,7 +378,6 @@ __all__ = [
     "CloseIssue",
     "EnableAutoMerge",
     "UpdateBranch",
-    "AddDependency",
     "RerunFailedChecks",
     "CancelWorkflowRuns",
     "EscalateCiPending",

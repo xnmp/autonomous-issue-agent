@@ -1,4 +1,4 @@
-"""A shell created while the resolve family is inactive (steward discovery) holds nothing."""
+"""A shell created while the resolve family is inactive holds nothing."""
 
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.workflow_rows import workflow_scope

@@ -1,6 +1,6 @@
-"""Entry point — `python -m issue_agent.app.main <fix|review|steward>`.
+"""Entry point — `python -m issue_agent.app.main <fix|review>`.
 
-Builds the identity (fixer = ambient/PAT; review+steward = GitHub App token), the
+Builds the identity (fixer = ambient/PAT; review = GitHub App token), the
 adapters, the governor hook, and runs the chosen role's daemon forever.
 """
 
@@ -36,7 +36,6 @@ from .config import HarnessConfig, describe_command, from_env, render_agent_md
 from .roles import (
     build_fix_daemon,
     build_review_daemon,
-    build_steward_daemon,
     migrate_legacy_spend,
     prior_process_supervision_state_dirs,
     process_supervision_state_dir,
@@ -175,7 +174,6 @@ def build_role(
     runner_state_dir = {
         "fix": cfg.state_dir,
         "review": cfg.review_state_dir,
-        "steward": cfg.steward_state_dir,
     }[role]
 
     # Resolved-config print (lean P5.1): every daemon start states what it
@@ -245,17 +243,14 @@ def build_role(
 
     # Change-probe gate for the per-tick observe: 1 REST point on a quiet tick
     # instead of a full ~14-point GraphQL world build (the 2026-07-26 rate-limit
-    # exhaustion — two daemons on one token at 20s polls). Review and steward are
-    # gated unconditionally: their decide functions read nothing the signature is
-    # blind to (the reviewer ignores checks; the steward never fetches PRs at
-    # all). The FIX daemon is gated CONDITIONALLY, via `probe_when`: its decide
+    # exhaustion — two daemons on one token at 20s polls). Review is gated
+    # unconditionally: its decide function reads nothing the signature is blind
+    # to (the reviewer ignores checks). The FIX daemon is gated CONDITIONALLY, via `probe_when`: its decide
     # reads CI check states and mergeable/mergeStateStatus, which GitHub
     # recomputes WITHOUT bumping any updated_at — but only an in-flight PR or a
     # held issue produces those signals, so `fix_probe_safe` re-enables full
     # builds for exactly the worlds where the blind spot bites, and lets an idle
     # fixer coast on the cheap signature (new work always bumps updated_at).
-    # Anything no signature can see (Jira-side edits the steward mirrors, when
-    # sync is on) is picked up at the probe's TTL reconciliation cadence.
     def _probed(
         daemon,
         gw,
@@ -307,20 +302,12 @@ def build_role(
         # session ids must never reach `codex exec resume`.
         store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime.value)
         return _probed(build_review_daemon(cfg, gw, store, runner), gw)
-    if role == "steward":
-        gw = GitHubGateway(
-            cfg.repo,
-            _app_identity(env, warn=_commit_log),
-            progress=scheduler_progress,
-        )
-        store = Store(cfg.steward_state_dir)
-        return _probed(build_steward_daemon(cfg, gw, store, runner), gw)
-    raise SystemExit(f"unknown role: {role!r} (use fix|review|steward)")
+    raise SystemExit(f"unknown role: {role!r} (use fix|review)")
 
 
 def _role(argv: list[str] | None) -> str:
     argv = argv if argv is not None else sys.argv[1:]
-    if not argv or argv[0] not in ("fix", "review", "steward"):
+    if not argv or argv[0] not in ("fix", "review"):
         raise SystemExit(ExitCode.INVALID_CONFIG)
     return argv[0]
 
@@ -379,7 +366,6 @@ def _serve(role: str) -> None:
     state_dir_key = {
         "fix": "STATE_DIR",
         "review": "REVIEW_STATE_DIR",
-        "steward": "STEWARD_STATE_DIR",
     }[role]
     try:
         _lock = acquire(  # noqa: F841 — kept alive for process lifetime
@@ -416,7 +402,6 @@ def _serve(role: str) -> None:
         state_dir = {
             "fix": cfg.state_dir,
             "review": cfg.review_state_dir,
-            "steward": cfg.steward_state_dir,
         }[role]
         if state_dir:
             recovered = _recover_pre_adapter_processes(

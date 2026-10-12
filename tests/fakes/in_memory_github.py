@@ -41,7 +41,6 @@ class InMemoryGitHub:
         # head -> {run_id: status}. Absent head = the runs are not this head's,
         # which is how the SHA guard on cancellation is exercised.
         self.run_states: dict[str, dict[int, str]] = {}
-        self.dependencies: set[tuple[int, int]] = set()
         self.submitted_reviews: set[tuple[int, str, str, str]] = set()
         self.diff_text = "diff text"
 
@@ -175,9 +174,6 @@ class InMemoryGitHub:
         for run_id in self.run_states.get(head, {}):
             self.run_states[head][run_id] = "completed"
 
-    def has_blocked_by(self, issue: int, blocker: int) -> bool:
-        return (issue, blocker) in self.dependencies
-
     def relabel_issue(
         self, issue: int, *, remove: Label | None = None, add: Label | None = None
     ) -> None:
@@ -292,7 +288,3 @@ class InMemoryGitHub:
             return True
         return False
 
-    def add_blocked_by(self, issue: int, blocker: int) -> None:
-        self._maybe_fail("add_blocked_by")
-        self.calls.append(("dependency", issue, blocker))
-        self.dependencies.add((issue, blocker))

@@ -436,7 +436,7 @@ function StepRow({
           </button>
         </td>
         {visible.has("role") ? <td>
-          <Chip tone={step.role === "steward" ? "meta" : "info"} square>
+          <Chip tone="info" square>
             {step.role ?? "—"}
           </Chip>
         </td> : null}

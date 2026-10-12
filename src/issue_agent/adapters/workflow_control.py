@@ -243,8 +243,7 @@ class SQLiteWorkflowControl:
                 snapshot = load_issue_aggregate(db, key)
                 if isinstance(snapshot, IssueWorkflowShell):
                     return (WorkflowMigrationRequired(key) if snapshot.revision.fence.generation != 0
-                            or isinstance(snapshot.issue_recovery, cc.BlockedIssueRecovery)
-                            or isinstance(snapshot.steward, cc.BlockedSteward) else WorkflowAbsent(key))
+                            or isinstance(snapshot.issue_recovery, cc.BlockedIssueRecovery) else WorkflowAbsent(key))
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
@@ -339,11 +338,10 @@ class SQLiteWorkflowControl:
             from ..domain.workflow import IssueWorkflowShell
             from .workflow_rows import encode_workflow_episodes, initialize_new_continuations
             if isinstance(prior, IssueWorkflowShell):
-                if (prior.revision.fence.generation != 0 or isinstance(prior.issue_recovery, cc.BlockedIssueRecovery)
-                        or isinstance(prior.steward, cc.BlockedSteward)):
+                if prior.revision.fence.generation != 0 or isinstance(prior.issue_recovery, cc.BlockedIssueRecovery):
                     raise WorkflowAuthorityError("historical issue migration hold prevents primary discovery")
                 snapshot = replace(snapshot, revision=replace(prior.revision, version=prior.revision.version + 1),
-                                   issue_recovery=prior.issue_recovery, steward=prior.steward)
+                                   issue_recovery=prior.issue_recovery)
                 db.execute("UPDATE workflows SET version=?,episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",
                            (snapshot.revision.version, encode_workflow_episodes(snapshot), *scope))
             else:
@@ -1267,7 +1265,7 @@ class SQLiteWorkflowControl:
     def _rearm_barriers(self):
         """Workspace I/O requires all resolve-adjacent deployments quiescent."""
         with ExitStack() as barriers:
-            for role in ("fix", "review", "steward"):
+            for role in ("fix", "review"):
                 barriers.enter_context(deployment_effect_barrier(
                     self._control.path, self.writer.repository, role,
                 ))
@@ -1275,9 +1273,6 @@ class SQLiteWorkflowControl:
 
     def _assert_target_quiescent(self, db: sqlite3.Connection, key: WorkflowKey) -> None:
         selected = load_issue_aggregate(db, key)
-        if selected is not None and isinstance(selected.steward, cc.ActiveSteward) and (
-                selected.steward.state.triage.pending_delivery or selected.steward.state.groom.pending_delivery):
-            raise WorkflowAuthorityError("target has an owed steward delivery")
         if isinstance(selected, WorkflowSnapshot) and isinstance(selected.issue_recovery, cc.ActiveIssueRecovery):
             self._control._require_issue_reply_projection(db, key, selected.issue_recovery.state.consumed_reply_at)
         lower, upper = workflow_run_scope_bounds(key)
@@ -1614,9 +1609,6 @@ class SQLiteWorkflowControl:
         if replayed is not None:
             return replayed
         if transition.snapshot.binding != prior.binding:
-            if isinstance(prior.steward, cc.ActiveSteward) and (
-                    prior.steward.state.triage.pending_delivery or prior.steward.state.groom.pending_delivery):
-                raise WorkflowAuthorityError("generation change has an owed steward delivery")
             if isinstance(prior.issue_recovery, cc.ActiveIssueRecovery):
                 self._control._require_issue_reply_projection(db, prior.binding.fence.key, prior.issue_recovery.state.consumed_reply_at)
         observations = self._validate_evidence(db, prior, transition)

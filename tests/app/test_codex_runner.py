@@ -281,7 +281,7 @@ def test_strict_schema_closes_objects_nested_under_array_combinators():
 def test_a_previously_optional_property_stays_sayable_as_null():
     """Strict mode forces every property into `required`. If that also made it
     non-nullable, a classifier could no longer express "no finding" — which is
-    the DEFAULT verdict for the steward's advisory fields."""
+    the DEFAULT verdict for advisory fields."""
     s = {
         "type": "object",
         "properties": {"kept": {"type": "string"}, "opt": {"type": "integer"}},
@@ -292,28 +292,6 @@ def test_a_previously_optional_property_stays_sayable_as_null():
     assert set(out["required"]) == {"kept", "opt"}
     assert out["properties"]["kept"]["type"] == "string", "required stays strict"
     assert out["properties"]["opt"]["type"] == ["integer", "null"]
-
-
-def test_the_groom_schema_admits_an_all_null_no_finding_object():
-    """GROOM_SCHEMA has NO required fields on purpose: forcing a value out of a
-    classifier reading attacker-controlled issue text makes it invent one, and
-    a fabricated `resolved_by` posts a false "already shipped" comment."""
-    from issue_agent.app.planners.schemas import GROOM_SCHEMA, TRIAGE_SCHEMA
-
-    groom = _strict_schema(GROOM_SCHEMA)
-    assert set(groom["required"]) == {
-        "resolved_by", "stale_reference", "disposition",
-    }
-    assert groom["properties"]["resolved_by"]["type"] == ["integer", "null"]
-    assert groom["properties"]["stale_reference"]["type"] == ["string", "null"]
-    disposition = groom["properties"]["disposition"]
-    assert disposition["type"] == ["object", "null"]
-    assert set(disposition["required"]) == {"kind", "issue", "reason"}
-
-    triage = _strict_schema(TRIAGE_SCHEMA)
-    assert triage["properties"]["recurrence_of"]["type"] == ["integer", "null"]
-    # A genuinely required field is NOT widened — a verdict must still be given.
-    assert triage["properties"]["verdict"]["type"] == "string"
 
 
 # ── parse_codex_envelope (pure) ──────────────────────────────────────────────────

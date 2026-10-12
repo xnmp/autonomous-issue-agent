@@ -7,7 +7,7 @@ lesson (a UTC-parsing bug once made the cache look permanently expired). So that
 decision is a pure function tested with an injected clock; the crypto/HTTP live
 behind injected callables.
 
-Used by the GitHubGateway for the review + steward identities (the App acts as
+Used by the GitHubGateway for the review identity (the App acts as
 its own `<app>[bot]`, distinct from the fixer → satisfies no-self-approval).
 """
 

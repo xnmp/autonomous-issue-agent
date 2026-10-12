@@ -35,7 +35,7 @@ function toneFor(e: JournalEvent): Tone {
   if (/(fail|error|block|escalat|dead|abort)/.test(k)) return "fail";
   if (/(start|running|tick)/.test(k)) return "running";
   if (/(done|merged|approve|settled|complete)/.test(k)) return "ok";
-  if (/(recurrence|triage|jira|steward)/.test(k)) return "meta";
+  if (/(recurrence)/.test(k)) return "meta";
   const st = typeof e.status === "string" ? e.status : null;
   return st ? statusTone(st) : "info";
 }

@@ -17,7 +17,6 @@ def test_role_state_directories_resolve_machine_control_database(tmp_path) -> No
         (
             "/deployment/state/fix",
             "/deployment/state/review",
-            "/deployment/state/steward",
         ),
         authority_root=str(authority),
     )

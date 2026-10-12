@@ -32,11 +32,10 @@ def deployment(tmp_path, monkeypatch):
         "REPO": "o/r", "TARGET_DIR": str(tmp_path / "checkout"),
         "STATE_DIR": str(tmp_path / "state" / "fix"),
         "REVIEW_STATE_DIR": str(tmp_path / "state" / "review"),
-        "STEWARD_STATE_DIR": str(tmp_path / "state" / "steward"),
         "CONTROL_AUTHORITY_ROOT": str(tmp_path / "authority"),
-        "ROLES": "fix review steward", "BASE_BRANCH": "release",
+        "ROLES": "fix review", "BASE_BRANCH": "release",
         "FIX_BOT_TOKEN": "isolated-fix-token", "FIX_BOT": "fix-bot", "GH_HOST": "git.example.test",
-        "FIXER_RUNTIME": "codex", "MAX_INFRA_DEATHS": "3",
+        "FIXER_RUNTIME": "codex",
     }
     for key in (*env, "AGENT_ENV", "REPOINTED_FROM_DEPLOYMENTS"):
         monkeypatch.delenv(key, raising=False)
@@ -156,7 +155,7 @@ def test_retired_fix_owner_cannot_be_reactivated_or_adopted(deployment):
 @pytest.mark.parametrize("key,value", [
     ("REPO", ""), ("REPO", "not/a/repository"),
     ("TARGET_DIR", ""), ("TARGET_DIR", "relative-checkout"),
-    ("ROLES", "review steward"), ("ROLES", ""),
+    ("ROLES", "review"), ("ROLES", ""),
 ])
 def test_invalid_active_scope_is_refused_before_authority_mutation(deployment, key, value):
     root, env, store, write = deployment

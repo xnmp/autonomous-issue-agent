@@ -1,4 +1,4 @@
-"""Shared review/steward GitHub identity composition."""
+"""Shared review GitHub identity composition."""
 
 from __future__ import annotations
 

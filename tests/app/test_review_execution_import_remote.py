@@ -46,7 +46,7 @@ def _sources(tmp_path):
     review.mkdir()
     cfg = HarnessConfig(
         repo="o/r", target_dir=str(checkout), state_dir=str(tmp_path / "fix"),
-        review_state_dir=str(review), steward_state_dir=str(tmp_path / "steward"),
+        review_state_dir=str(review),
         fix_bot="fixer",
     )
     control = SQLiteControlStore(str(tmp_path / "control.db"))

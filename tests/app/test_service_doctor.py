@@ -12,7 +12,7 @@ from issue_agent.app.service_doctor import (
     snapshot_drift_keys,
 )
 
-ROLES = ("fix-watcher", "review-watcher", "steward")
+ROLES = ("fix-watcher", "review-watcher")
 _WHICH_ALL = lambda binary, path=None: "/usr/bin/" + binary  # noqa: E731
 _WHICH_CORE = lambda binary, path=None: (  # noqa: E731
     "/usr/bin/" + binary if binary in ("git", "gh") else None
@@ -131,11 +131,11 @@ def test_everything_resolving_and_matching_yields_no_findings(tmp_path):
     ) == ()
 
 
-def test_a_partial_role_trio_is_an_error(tmp_path):
+def test_a_partial_role_pair_is_an_error(tmp_path):
     findings = _findings(tmp_path, roles=("fix-watcher",))
     assert any(
         f.level == "error"
-        and "review-watcher" in f.message and "steward" in f.message
+        and "review-watcher" in f.message
         for f in findings
     )
 
@@ -256,7 +256,7 @@ def test_a_huge_drift_list_is_bounded(tmp_path):
 
 
 def test_mixed_tiers_require_codex_even_with_all_role_defaults_claude(tmp_path):
-    env = {"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude", "STEWARD_RUNTIME": "claude",
+    env = {"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude",
            "FIX_MODEL_LOW": "codex:gpt-6-luna", "FIX_MODEL_MED": "codex:gpt-6.1-sol"}
     snapshot = "\n".join(f'{key}="{value}"' for key, value in env.items()) + "\n"
     findings = _findings(tmp_path, composed=env, snapshot=snapshot, which=_WHICH_CORE)

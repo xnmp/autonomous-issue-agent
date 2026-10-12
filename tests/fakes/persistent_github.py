@@ -21,7 +21,6 @@ from datetime import datetime
 import json
 from pathlib import Path
 import sqlite3
-from types import SimpleNamespace
 
 from issue_agent.adapters.github import ReviewReadUnavailable, parse_pr, parse_review_pages
 from issue_agent.domain.labels import Label
@@ -163,13 +162,6 @@ class PersistentGitHub:
         with self._connect() as db:
             row = db.execute("SELECT body FROM commit_messages WHERE pr = ?", (pr,)).fetchone()
         return () if row is None else tuple(json.loads(row[0]))
-
-    def recently_merged_issues(self, author: str, limit: int = 30):
-        return tuple(
-            SimpleNamespace(issue=pr.closing_issue, pr=pr.number, title=pr.title, merged_at="2026-09-13")
-            for pr in self.build_world().prs
-            if pr.state == "MERGED" and pr.author == author and pr.closing_issue
-        )[:limit]
 
     def _update(self, number: int, change: Callable[[dict], None]) -> None:
         with self._connect() as db:

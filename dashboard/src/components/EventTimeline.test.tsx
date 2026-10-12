@@ -15,14 +15,14 @@ describe("EventTimeline", () => {
           {
             ts: "2026-07-29T01:00:00Z",
             event: "action",
-            role: "steward",
+            role: "fix",
             desc: "comment issue #50: deployment verified",
           },
         ]}
       />,
     );
 
-    expect(screen.getByText("steward")).toBeVisible();
+    expect(screen.getByText("fix")).toBeVisible();
     expect(screen.getByText("comment issue #50: deployment verified")).toBeVisible();
   });
 

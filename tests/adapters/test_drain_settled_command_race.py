@@ -17,12 +17,10 @@ the command as drained, logs nothing, re-submits nothing, and the first
 actor's receipt survives untouched. States that cannot hold a verified success
 still raise, because there the receipt and the command genuinely disagree.
 
-Convergence is a claim about the OUTCOME, not just the status, because
-`reconcile_async`'s operation is not always read-only: the Jira workflow
-reconciles by running a paid search-then-create MCP leg. Two overlapping
-workflows can therefore create PROJ-100 and PROJ-101 under one command, and a
-silent False would let the caller persist the key the authoritative receipt
-does not name — an orphaned paid duplicate with no log line. Differing non-null
+Convergence is a claim about the OUTCOME, not just the status: a reconciling
+read need not be read-only, so two overlapping actors can create PROJ-100 and
+PROJ-101 under one command, and a silent False would let the caller persist the
+key the authoritative receipt does not name. Differing non-null
 `remote_object_id`s raise; a null on either side carries no evidence of
 disagreement and stays benign.
 """
@@ -249,10 +247,9 @@ def test_succeeded_command_holding_an_unknown_receipt_still_raises(tmp_path):
 
 
 def test_success_against_a_different_remote_object_raises(tmp_path):
-    """`reconcile_async`'s operation is not always read-only — the Jira
-    reconcile is a paid search-then-create. Two overlapping workflows that
-    created PROJ-100 and PROJ-101 have NOT converged, and answering False
-    would let the caller persist the key the receipt does not name."""
+    """Two overlapping actors that created PROJ-100 and PROJ-101 have NOT
+    converged, and answering False would let the caller persist the key the
+    receipt does not name."""
     store = _store(tmp_path)
     command = _review_command()
     store.enqueue_command(command)

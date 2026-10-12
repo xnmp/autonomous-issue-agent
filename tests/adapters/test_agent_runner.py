@@ -461,11 +461,11 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
 
 
 def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, tmp_path):
-    """Default-model review and steward receipts name the concrete SDK model."""
+    """Default-model review receipts name the concrete SDK model."""
     from tests.fakes.legacy_journal import Journal
     from issue_agent.adapters.journal import JournalingRuntime, read_events
 
-    for role, kind in (("review", "REVIEW"), ("steward", "TRIAGE"), ("steward", "GROOM")):
+    for role, kind in (("review", "REVIEW"),):
         init = type("InitMessage", (), {
             "subtype": "init", "data": {"model": "claude-opus-4-1"},
         })()

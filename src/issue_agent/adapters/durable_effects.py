@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Generic, Protocol, TypeVar
@@ -136,55 +136,6 @@ class DurableEffectRunner:
             raise
         self._commit_receipt(receipt)
         return outcome.value
-
-    async def execute_async(
-        self,
-        command: LifecycleCommand,
-        operation: Callable[[], Awaitable[EffectOutcome[T]]],
-    ) -> T:
-        """Async form that keeps effect authority across the awaited operation."""
-
-        with self.authority.effect():
-            self.control.begin_command(command.command_id)
-            started = self.now()
-            try:
-                outcome = await operation()
-                receipt = self._outcome_receipt(command, started, outcome)
-            except BaseException as exc:
-                self._commit_receipt(
-                    self._receipt(
-                        command,
-                        started,
-                        EffectStatus.UNKNOWN_OUTCOME,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-                raise
-            self._commit_receipt(receipt)
-            return outcome.value
-
-    async def reconcile_async(
-        self,
-        command: LifecycleCommand,
-        operation: Callable[[], Awaitable[EffectOutcome[T]]],
-    ) -> T:
-        """Reconcile ambiguity and receipt proven success under one authority."""
-
-        with self.authority.effect():
-            started = self.now()
-            outcome = await operation()
-            receipt = self._outcome_receipt(command, started, outcome)
-            if receipt.status is EffectStatus.SUCCEEDED:
-                # False = another actor settled the same success first, so the
-                # caller's answer is unchanged. Unlike `resolve_unknown`, the
-                # `operation` reconciled here is not necessarily read-only —
-                # the Jira workflow's is a paid search-then-create leg — so a
-                # discarded False must not be able to hide a duplicated
-                # creation. It cannot: the store RAISES instead of answering
-                # False when the surviving receipt names a different remote
-                # object than this one.
-                self.control.resolve_unknown_effect(receipt)
-            return outcome.value
 
     def record_existing(
         self,

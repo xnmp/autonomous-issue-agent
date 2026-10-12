@@ -91,14 +91,14 @@ def _sql_sources(cfg, control):
 
 @pytest.fixture
 def rig(tmp_path):
-    paths = {name: tmp_path / name for name in ("checkout", "fix", "review", "steward")}
+    paths = {name: tmp_path / name for name in ("checkout", "fix", "review")}
     for path in paths.values():
         path.mkdir()
     cfg = HarnessConfig(repo="o/r", target_dir=str(paths["checkout"]), state_dir=str(paths["fix"]),
-                        review_state_dir=str(paths["review"]), steward_state_dir=str(paths["steward"]),
+                        review_state_dir=str(paths["review"]),
                         control_authority_root=str(tmp_path / "authority"), fix_bot="fixer")
     control = SQLiteControlStore(control_store_path(
-        (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir), authority_root=cfg.control_authority_root,
+        (cfg.state_dir, cfg.review_state_dir), authority_root=cfg.control_authority_root,
     ))
     control.initialize()
     authority = FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1)
@@ -112,7 +112,7 @@ def rig(tmp_path):
             insert_workflow_component(db, key, authority, workflow.episode.episode_id)
     gateway = Gateway()
     store = Store(cfg.review_state_dir)
-    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir), ("steward", cfg.steward_state_dir)))
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir)))
     links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
     assert isinstance(files, CompleteLegacyExecutionRootFiles)
     assert isinstance(links, CompleteLegacyOpenCounterLinks)
@@ -294,7 +294,7 @@ def test_configuration_cannot_substitute_sql_or_review_authority(rig, tmp_path):
 def test_shared_role_root_accepts_the_complete_reviewed_representation(rig, deduplicate):
     cfg, control, gateway, store, _files, links, sql, _liveness, _activation = rig
     cfg = replace(cfg, state_dir=cfg.review_state_dir)
-    roots = (("fix", cfg.state_dir), ("review", cfg.review_state_dir), ("steward", cfg.steward_state_dir))
+    roots = (("fix", cfg.state_dir), ("review", cfg.review_state_dir))
     files = read_complete_legacy_execution_root_files(distinct_roots(roots) if deduplicate else roots)
     assert isinstance(files, CompleteLegacyExecutionRootFiles)
     activation = ConfiguredReviewExecutionActivation(cfg, control, gateway, store, liveness=lambda: ())
@@ -312,8 +312,7 @@ def test_mixed_activation_keeps_blocker_on_rediscovery_and_sql_only_retry(rig):
     from issue_agent.domain.review_execution import BlockedReviewExecutionMigration, CurrentReviewExecution
     cfg, control, gateway, _, _, links, sql, _, activation = rig
     (Path(cfg.review_state_dir) / "pr-9.round").write_text("3")
-    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
-                                                      ("steward", cfg.steward_state_dir)))
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir)))
     plan = activation.plan(files, links, sql)
     assert tuple(candidate.pr for candidate in plan.candidates) == (9, 10)
     assert not activation.activate(plan, files, links, sql).idempotent
@@ -341,8 +340,7 @@ def test_terminal_file_blocker_survives_later_first_discovery(rig):
     from issue_agent.domain.workflow_identity import WorkflowWriter
     cfg, control, gateway, _, _, links, sql, _, activation = rig
     Path(cfg.review_state_dir, "pr-11.round").write_text("4")
-    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
-                                                      ("steward", cfg.steward_state_dir)))
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir)))
     plan = activation.plan(files, links, sql)
     assert tuple(candidate.pr for candidate in plan.candidates) == (9, 10, 11)
     assert not activation.activate(plan, files, links, sql).idempotent
@@ -387,8 +385,7 @@ def test_pending_round_returns_refuse_first_publication_even_with_attributed_his
 def test_selected_blocker_corruption_refuses_reader_and_retry(rig, corruption):
     cfg, control, _gateway, _, _, links, sql, _, activation = rig
     Path(cfg.review_state_dir, "pr-9.round").write_text("3")
-    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
-                                                      ("steward", cfg.steward_state_dir)))
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir)))
     plan = activation.plan(files, links, sql)
     activation.activate(plan, files, links, sql)
     with control.transaction() as db:
@@ -412,8 +409,7 @@ def test_selected_blocker_corruption_refuses_reader_and_retry(rig, corruption):
 def test_activation_event_failure_rolls_back_terminal_and_eligible_publication(rig, failure):
     cfg, control, _, _, _, links, sql, _, activation = rig
     Path(cfg.review_state_dir, "pr-11.round").write_text("4")
-    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
-                                                      ("steward", cfg.steward_state_dir)))
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir)))
     plan = activation.plan(files, links, sql)
     now = datetime.now(timezone.utc)
     producer = Producer("offline-review", cfg.repo, "review", 123, "boot")

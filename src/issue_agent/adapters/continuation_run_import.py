@@ -156,7 +156,7 @@ def collect_continuation_runs(db: sqlite3.Connection, repository: str,
                               families: tuple[WorkflowFamily, ...]) -> LegacyContinuationRunSnapshot:
     if not db.in_transaction or canonical_workflow_repository(repository) != repository:
         raise ValueError("historical import requires a pinned transaction and canonical repository")
-    if families not in ((WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR), (WorkflowFamily.STEWARD,)):
+    if families != (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR):
         raise ValueError("historical import requires a closed configured family set")
     raw = _rows(db, "SELECT * FROM runs WHERE workflow_episode_key IS NULL ORDER BY run_id")
     predicate = " WHERE run_id IN (SELECT run_id FROM runs WHERE workflow_episode_key IS NULL) ORDER BY run_id"
@@ -201,11 +201,11 @@ def collect_continuation_runs(db: sqlite3.Connection, repository: str,
             if role == 'migration' and _migration_canary(run, rs, cs, ls, repository):
                 evidence.append((run, rs, cs, ls))
                 continue
+            # Historical runs of the deleted steward role stay attributable so
+            # they are skipped rather than refusing the fix import.
             if len(parts) != 3 or role not in {"fix", "review", "steward"} or not parts[2]:
                 raise ValueError("historical owner lacks attributable role")
-            if role != ("steward" if families == (WorkflowFamily.STEWARD,) else "fix"):
-                continue
-            if repo != repository or role == "review" or role != ("steward" if families == (WorkflowFamily.STEWARD,) else "fix"):
+            if repo != repository or role != "fix":
                 continue
             attributed = parse_legacy_continuation_run(run_id=rid, owner_id=owner, kind=kind,
                 dispatch_id=dispatch_id, workload_repository=repo)

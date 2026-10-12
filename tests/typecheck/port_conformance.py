@@ -14,7 +14,7 @@ from issue_agent.adapters.control_store import (
 )
 from issue_agent.adapters.dashweb.ghdata import GhReader
 from issue_agent.adapters.effects import GitHubEffectExecutor
-from issue_agent.adapters.github import GitHubGateway, MergedRef
+from issue_agent.adapters.github import GitHubGateway
 from issue_agent.adapters.journal import LegacyJournalLocator
 from issue_agent.adapters.process_supervisor import (
     ProcessSupervisor as DurableProcessSupervisor,
@@ -40,15 +40,12 @@ from issue_agent.domain.ports import (
     EventSink,
     FixWorktreePort,
     GitHubReads,
-    IssueStateReasonReads,
     LegacyJournal,
     LevelState,
     PendingEffect,
     PendingEffectReads,
     PredictionReader,
     ProcessSupervisor,
-    RecentlyMergedRef,
-    RecentMergesReads,
     RecoveryControl,
     RecoveryDisposition,
     RecoveryLease,
@@ -76,15 +73,12 @@ COVERED_PORTS = frozenset(
         "EventSink",
         "FixWorktreePort",
         "GitHubReads",
-            "IssueStateReasonReads",
         "LegacyJournal",
         "LevelState",
         "PendingEffect",
         "PendingEffectReads",
         "PredictionReader",
         "ProcessSupervisor",
-        "RecentlyMergedRef",
-        "RecentMergesReads",
         "RecoveryControl",
         "RecoveryDisposition",
         "RecoveryLease",
@@ -161,16 +155,6 @@ def workflow_github_reads(
     return gateway
 
 
-def issue_state_reason(
-    gateway: GitHubGateway,
-) -> IssueStateReasonReads:
-    return gateway
-
-
-def recent_merges(gateway: GitHubGateway) -> RecentMergesReads:
-    return gateway
-
-
 def review_prompts(gateway: GitHubGateway) -> ReviewPromptReads:
     return gateway
 
@@ -235,10 +219,6 @@ def legacy_journal(locator: LegacyJournalLocator) -> LegacyJournal:
 
 def prediction_reader(store: Store) -> PredictionReader:
     return store
-
-
-def recently_merged_ref(ref: MergedRef) -> RecentlyMergedRef:
-    return ref
 
 
 def recovery_lease(lease: Lease) -> RecoveryLease:

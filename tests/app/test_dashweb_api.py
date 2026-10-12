@@ -84,7 +84,6 @@ class StubBackend:
             },
             "cost_mix": {
                 "resolve_usd": 1.0, "review_usd": 0.0, "repair_usd": 0.0,
-                "steward_usd": 0.0,
             },
             "caps": {
                 "issue_cap_usd": None, "daily_cap_usd": None, "today_usd": 1.0,

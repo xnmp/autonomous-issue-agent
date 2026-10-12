@@ -132,11 +132,11 @@ def _read_counting(reader, path, parsed):
 def test_one_reader_serves_several_feeds_without_evicting_them(
     tmp_path,
 ) -> None:
-    """The dashboard reads three role feeds through one reader; reading one
+    """The dashboard reads two role feeds through one reader; reading one
     must not throw away the parses of the others (they are the whole saving)."""
 
     feeds = []
-    for role in ("fix", "review", "steward"):
+    for role in ("fix", "review"):
         (tmp_path / role).mkdir()
         path = tmp_path / role / "events-v2.jsonl"
         _write(path, range(20))

@@ -22,7 +22,6 @@ PRIVILEGED_EFFECT_ADAPTERS = frozenset(
 
 REMOTE_WRITES = frozenset(
     {
-        "add_blocked_by",
         "close_issue",
         "comment",
         "create_pr",
@@ -401,8 +400,6 @@ def test_orchestration_cannot_read_telemetry_for_control_state() -> None:
             "ci_flake_keys",
             "ci_pending_keys",
             "duplicate_pr_keys",
-            "groomed_keys",
-            "recurrence_keys",
         }
     )
     control_paths = (

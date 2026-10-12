@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Install the three launchd agents (macOS). Fills @HARNESS_ROOT@ / @CONFIG@ in
+# Install the two launchd agents (macOS). Fills @HARNESS_ROOT@ / @CONFIG@ in
 # the plist templates, copies them to ~/Library/LaunchAgents, and loads them.
 #
-#   bin/install-launchd.sh           # install + load all three
+#   bin/install-launchd.sh           # install + load both
 #   bin/install-launchd.sh uninstall        # unload + remove all
 #   bin/install-launchd.sh uninstall <name> # unload + remove AGENT_ENV deployment
 set -euo pipefail
@@ -32,11 +32,11 @@ plist_deployment_identity() {
     "$1" | head -n 1
 }
 
-units=(fix-watcher review-watcher steward)
+units=(fix-watcher review-watcher)
 DRY_RUN=0
 [ "${1:-}" != "--dry-run" ] || DRY_RUN=1
 case "${1:-}" in
-  --fix|--review|--steward)
+  --fix|--review)
     echo "partial launchd upgrades are unsafe: install all roles so every legacy writer stops before SQLite migration" >&2
     exit 2
     ;;

@@ -108,9 +108,6 @@ def _pending_state(store, kind: CommandKind):
     [
         (CommandKind.PUBLISH_BRANCH, "branch:o/r:fix/18-widget"),
         (CommandKind.OPEN_PULL_REQUEST, "pr:o/r:fix/18-widget"),
-        # A kind no executor in this build claims must behave the same way:
-        # skipped and REPORTED, never reconstructed and never dropped.
-        (CommandKind.CREATE_JIRA_ISSUE, "jira:WIDGET-1"),
     ],
 )
 def test_unowned_kind_stays_queued_and_is_reported_once(tmp_path, kind, target):

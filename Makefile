@@ -7,7 +7,7 @@ TEST_SUITE_JOBS ?= 3
 PYTEST_TIMING ?= --durations=10
 
 .PHONY: help test test-suites test-config-generated test-governor test-residuals test-hooks test-compose-env test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui dashboard \
-	        install point-at run-fix run-review run-steward demo-gate \
+	        install point-at run-fix run-review demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
 
@@ -24,9 +24,8 @@ help:
 	@echo "  make point-at REPO=<name>   compose config, preflight, ensure dev branch, and run all 3 daemons"
 	@echo "  make run-fix            run the Python fix watcher in the foreground (Ctrl-C to stop)"
 	@echo "  make run-review         run the Python review watcher in the foreground"
-	@echo "  make run-steward        run the Python steward in the foreground"
-	@echo "  make install-launchd AGENT_ENV=config/.active.<name>.env   install+load the 3 launchd agents (macOS)"
-	@echo "  make install-systemd AGENT_ENV=config/.active.<name>.env   install+enable the 3 systemd user units (Linux)"
+	@echo "  make install-launchd AGENT_ENV=config/.active.<name>.env   install+load the 2 launchd agents (macOS)"
+	@echo "  make install-systemd AGENT_ENV=config/.active.<name>.env   install+enable the 2 systemd user units (Linux)"
 	@echo "  make demo-init          create + seed the local demo target repo"
 	@echo "  make clean              remove caches and demo scratch"
 
@@ -143,9 +142,6 @@ run-fix:
 
 run-review:
 	@uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main review
-
-run-steward:
-	@uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main steward
 
 # Phase 5 acceptance gate — live end-to-end against a throwaway demo repo.
 demo-gate:

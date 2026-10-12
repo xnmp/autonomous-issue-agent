@@ -1,8 +1,7 @@
-"""Advisory files, worktree claims, and the explicitly retained Jira path.
+"""Advisory files and worktree claims.
 
 Selected lifecycle continuity, allowances, holds, and completion receipts live
-in SQLite. Historical control files are stopped-import evidence. Jira retains
-its existing infrastructure counter; its ticket mirrors remain advisory.
+in SQLite. Historical control files are stopped-import evidence.
 """
 
 from __future__ import annotations
@@ -25,12 +24,12 @@ from ..domain.ports import WorkflowControlError
 
 # Historical control files remain stopped-import evidence. Runtime cleanup
 # removes only the explicit advisory subsets; SQLite owns lifecycle state.
-_ISSUE_ADVISORY_SUFFIXES = ("jira", "jira-phase", "predicted-paths", "ci-history")
+_ISSUE_ADVISORY_SUFFIXES = ("predicted-paths", "ci-history")
 _PR_ADVISORY_SUFFIXES = ("automerge",)
 
 @dataclass(frozen=True)
 class Store:
-    """Filesystem advisory context and the retained Jira counter exception."""
+    """Filesystem advisory context and the dispatcher infrastructure counter."""
 
     state_dir: str
     # SQL-backed session projection still needs the configured receiving runtime.
@@ -157,7 +156,7 @@ class Store:
         return history
 
     # Legacy infra-death files, read only by the stopped review activation
-    # import and the steward's Jira gate; nothing writes them any more.
+    # import; nothing writes them any more.
     def get_infra_deaths(self, key: int) -> int:
         return self._read_int(self.issue_path(key, "infra-deaths"))
 
@@ -193,19 +192,6 @@ class Store:
         )
         self._write(path, json.dumps({"sig": sig, "since": since}))
 
-    # ── Jira mirror (JIRA_SYNC): the ticket key + the last phase we pushed ──
-    def get_jira_key(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "jira"))
-
-    def set_jira_key(self, issue: int, key: str) -> None:
-        if key:
-            self._write(self.issue_path(issue, "jira"), key)
-
-    def get_jira_phase(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "jira-phase"))
-
-    def set_jira_phase(self, issue: int, phase: str) -> None:
-        self._write(self.issue_path(issue, "jira-phase"), phase)
 
     # ── advisory cleanup ──
     def _clear_issue_advisory(self, issue: int) -> None:

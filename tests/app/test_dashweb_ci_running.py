@@ -4,7 +4,6 @@ from tests.domain.builders import observed_pr, with_checks
 
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
-import json
 
 import pytest
 
@@ -15,7 +14,6 @@ from issue_agent.domain.projection import fold
 from issue_agent.domain.labels import Label
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
-from issue_agent.adapters.github import GitHubGateway
 from issue_agent.app.config import from_env
 from issue_agent.app.roles import _reported_world
 from issue_agent.app.world_reporter import WorldReporter
@@ -114,34 +112,6 @@ def assert_http_signal(result, expected, group="in_flight"):
     assert (listed, detailed) == (expected, expected)
 
 
-def test_steward_same_head_preserves_known_ci_after_deduplicated_fixer_read(monkeypatch, tmp_path):
-    raw = {"number": 12, "state": "OPEN", "headRefOid": "current",
-        "closingIssuesReferences": [{"number": 7}]}
-
-    def runner(args, _token):
-        if args[1:3] == ["issue", "list"]:
-            return "[]"
-        if args[1:3] == ["pr", "list"]:
-            return '[{"number":12}]'
-        return json.dumps(raw)
-
-    gateway = GitHubGateway("o/r", runner=runner)
-    from issue_agent.domain.checks import Observed
-    monkeypatch.setattr("issue_agent.adapters.github.observe_checks", lambda _repo, p, _query:
-        Observed(p.head_ref_oid, p.head_ref_oid, frozenset(), (Check("build", "IN_PROGRESS", "pending"),)))
-    fixer_world = WorldState(prs=(gateway.get_pr(12),))
-    fix, _ = live_feed(tmp_path, "fix")
-    steward, _ = live_feed(tmp_path, "steward")
-    fix(fixer_world)
-    assert_http_signal(backend(monkeypatch, None, extra=reported_events(tmp_path)), "pending")
-    steward(gateway.build_triage_world())
-    assert_http_signal(backend(monkeypatch, None, extra=reported_events(tmp_path)), "pending")
-    before = reported_events(tmp_path)
-    fix(fixer_world)
-    assert reported_events(tmp_path) == before
-    assert_http_signal(backend(monkeypatch, None, extra=reported_events(tmp_path)), "pending")
-
-
 @pytest.mark.parametrize("removal", ["absence", "retirement"])
 @pytest.mark.parametrize("done", [False, True])
 def test_merged_ci_never_resurrects_after_feed_removal(monkeypatch, tmp_path, removal, done):
@@ -224,14 +194,14 @@ def test_production_collector_projects_reported_checks(monkeypatch, tmp_path):
     reported_pr(tmp_path, observed_pr(12, head_ref_oid="current", closing_issue=7,
         checks=(Check("build", "IN_PROGRESS", "pending"),)), 1)
     paths = []
-    for role in ("fix", "review", "steward"):
+    for role in ("fix", "review"):
         directory = tmp_path / role
         directory.mkdir()
         paths.append(str(directory / "journal.jsonl"))
     (tmp_path / "fix" / "events-v2.jsonl").write_text((tmp_path / "fix-1.jsonl").read_text())
-    steward, _ = live_feed(tmp_path, "steward")
-    steward(WorldState(issues=(IssueView(7, labels=frozenset({Label.AI_WORKING})),)))
-    (tmp_path / "steward" / "events-v2.jsonl").write_text((tmp_path / "steward.jsonl").read_text())
+    review, _ = live_feed(tmp_path, "review")
+    review(WorldState(issues=(IssueView(7, labels=frozenset({Label.AI_WORKING})),)))
+    (tmp_path / "review" / "events-v2.jsonl").write_text((tmp_path / "review.jsonl").read_text())
     result = backend(monkeypatch, None, ignore="build")
     monkeypatch.setattr(result, "snapshot", service.Backend.snapshot.__get__(result))
     monkeypatch.setattr(result, "overlay_field", lambda _name, key: {"REPO": "o/r", "TARGET_DIR": str(tmp_path)}[key])

@@ -24,7 +24,6 @@ from issue_agent.domain.events import (
     Producer,
     SpendBlocked,
     SpendRecorded,
-    TriageDispositionRecorded,
     WorldObserved,
 )
 from issue_agent.domain.labels import LIFECYCLE_LABELS
@@ -682,76 +681,6 @@ def test_issue_detail_uses_the_same_working_idle_partition_as_cards():
     assert detail["idle_active"] is True
 
 
-def test_backlog_dwell_before_admission_is_not_pipeline_idle():
-    # keifu #185 (2026-08-03): filed and triaged at 00:24, admitted and routed
-    # at 01:25. The card showed idle 1:00 the instant its resolve began. The
-    # clock anchors at the first fix-pipeline leg; the triage's own five
-    # minutes still count as work, the backlog hour around it counts as
-    # nothing.
-    events = [
-        {"ts": ts(hours=3), "event": "agent_run_start", "role": "steward",
-         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1"},
-        {"ts": ts(hours=2, minutes=55), "event": "agent_run", "role": "steward",
-         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1",
-         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
-         "duration_s": 300},
-        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
-         "kind": "ROUTE", "issue": 7, "number": 7, "dispatch": "d1"},
-        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
-         "kind": "ROUTE", "issue": 7, "number": 7, "dispatch": "d1",
-         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
-         "duration_s": 3600},
-    ]
-
-    card = snapshots.issue_card(row_for(events, 7), NOW)
-
-    assert card["working_s"] == 3_900
-    assert card["idle_s"] == 3_600
-    assert card["elapsed_s"] == 7_500
-    assert card["idle_active"] is True
-
-
-def test_a_triaged_issue_waiting_in_the_backlog_reports_no_idle():
-    events = [
-        {"ts": ts(hours=3), "event": "agent_run_start", "role": "steward",
-         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1"},
-        {"ts": ts(hours=2, minutes=55), "event": "agent_run", "role": "steward",
-         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1",
-         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
-         "duration_s": 300},
-    ]
-
-    card = snapshots.issue_card(row_for(events, 7), NOW)
-
-    assert card["elapsed_s"] == 300
-    assert card["working_s"] == 300
-    assert card["idle_s"] == 0
-    assert card["idle_active"] is False
-
-
-def test_a_groom_leg_is_pre_admission_like_triage():
-    events = [
-        {"ts": ts(hours=4), "event": "agent_run_start", "role": "steward",
-         "kind": "GROOM", "issue": 7, "number": 7, "dispatch": "g1"},
-        {"ts": ts(hours=3, minutes=50), "event": "agent_run", "role": "steward",
-         "kind": "GROOM", "issue": 7, "number": 7, "dispatch": "g1",
-         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
-         "duration_s": 600},
-        {"ts": ts(hours=1), "event": "agent_run_start", "role": "fix",
-         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
-        {"ts": ts(minutes=30), "event": "agent_run", "role": "fix",
-         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1",
-         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
-         "duration_s": 1800},
-    ]
-
-    card = snapshots.issue_card(row_for(events, 7), NOW)
-
-    assert card["elapsed_s"] == 4_200  # 600 grooming + the hour since resolve
-    assert card["working_s"] == 2_400
-    assert card["idle_s"] == 1_800
-
-
 def test_the_clock_anchors_on_the_first_leg_not_the_first_journal_line():
     # Was: elapsed measured from the row's first event, so any journal line
     # emitted before admission (a relabel, an observation) started the idle
@@ -772,34 +701,6 @@ def test_the_clock_anchors_on_the_first_leg_not_the_first_journal_line():
 
     assert card["elapsed_s"] == 7_200
     assert card["working_s"] == 3_600
-    assert card["idle_s"] == 3_600
-
-
-def test_a_stall_before_admission_does_not_shorten_the_pipeline_clock():
-    # The suspension correction applies to the anchored span only; the
-    # pre-admission contribution is leg runtime and has no gaps to correct.
-    events = [
-        {"ts": ts(hours=4), "event": "agent_run_start", "role": "steward",
-         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1"},
-        {"ts": ts(hours=3, minutes=55), "event": "agent_run", "role": "steward",
-         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1",
-         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
-         "duration_s": 300},
-        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "steward",
-         "issue": 7, "dispatch": "t1", "stall_started_at": ts(hours=3.5),
-         "suspended_seconds": 1800},
-        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
-         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
-        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
-         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1",
-         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
-         "duration_s": 3600},
-    ]
-
-    card = snapshots.issue_card(row_for(events, 7), NOW)
-
-    assert card["elapsed_s"] == 7_500
-    assert card["working_s"] == 3_900
     assert card["idle_s"] == 3_600
 
 
@@ -1065,91 +966,6 @@ def test_backlog_card_uses_journal_recurrence_count_when_available():
     assert card["recurrence_count"] == 2
 
 
-@pytest.mark.parametrize(
-    ("labels", "expected"),
-    [([], "raw"), (["ai-triage"], "processed")],
-)
-def test_backlog_card_preserves_pre_marker_steward_states(labels, expected):
-    card = snapshots.backlog_card({"number": 3, "labels": labels}, NOW)
-
-    assert card["steward_state"] == expected
-
-
-@pytest.mark.parametrize(
-    ("states", "expected"),
-    [
-        (["blocked_on_human_reply"], "blocked_on_human_reply"),
-        (["blocked_on_human_reply", "processed"], "processed"),
-    ],
-)
-def test_backlog_card_uses_the_latest_folded_triage_disposition(states, expected):
-    events = [
-        v2_event(
-            WorldObserved(
-                "issue", 3, "issue-hash",
-                {"present": True, "state": "OPEN", "labels": ["ai-triage"]},
-            ),
-            "world", 0, issue=3,
-        ),
-        *[
-            v2_event(
-                TriageDispositionRecorded(state),
-                f"triage-{index}", index, role="steward", issue=3,
-            )
-            for index, state in enumerate(states, start=1)
-        ],
-    ]
-    row = v2_deployment(events).issues[0]
-    card = snapshots.backlog_card(
-        {"number": 3, "labels": ["ai-triage"]}, NOW, row,
-    )
-
-    assert card["steward_state"] == expected
-    assert snapshots.backlog_card(
-        {"number": 3, "labels": []}, NOW, row,
-    )["steward_state"] == "raw"
-
-
-@pytest.mark.parametrize(
-    ("comments", "expected"),
-    [
-        (
-            [{"body": "**A quick check before we start** 🛠️\n\nQuestion"}],
-            "blocked_on_human_reply",
-        ),
-        (
-            [
-                {"body": "**A quick check before we start** 🛠️\n\nQuestion"},
-                {"body": "**Ready to build ✅**\n\nThanks"},
-            ],
-            "processed",
-        ),
-        ([{"body": ["malformed"]}, "not a comment"], "processed"),
-    ],
-)
-def test_backlog_card_migrates_pre_marker_state_from_folded_comments(
-    comments, expected,
-):
-    row = v2_deployment([
-        v2_event(
-            WorldObserved(
-                "issue", 3, "issue-hash",
-                {
-                    "present": True,
-                    "state": "OPEN",
-                    "labels": ["ai-triage"],
-                    "comments": comments,
-                },
-            ),
-            "world", 0, issue=3,
-        ),
-    ]).issues[0]
-
-    assert snapshots.backlog_card(
-        {"number": 3, "labels": ["ai-triage"]}, NOW, row,
-    )["steward_state"] == expected
-
-
 def test_backlog_card_survives_a_missing_created_at_and_list_shaped_comments():
     card = snapshots.backlog_card({"number": 3, "comments": [{}, {}]}, NOW)
     assert card["age_days"] is None and card["comments"] == 2
@@ -1302,7 +1118,7 @@ def test_overview_marks_only_the_selected_deployments_first_observed_day(monkeyp
     ]
 
 
-def test_cost_mix_splits_spend_into_the_four_leg_families():
+def test_cost_mix_splits_spend_into_the_three_leg_families():
     metrics = dash.build_metrics(
         build([RESOLVE, FIX_CI_1,
                {"ts": ts(hours=1), "event": "agent_run", "role": "review",
@@ -1311,8 +1127,7 @@ def test_cost_mix_splits_spend_into_the_four_leg_families():
         (), 0.0,
     )
     mix = snapshots.cost_mix(metrics)
-    assert mix == {"resolve_usd": 2.0, "review_usd": 3.0, "repair_usd": 1.0,
-                   "steward_usd": 0.0}
+    assert mix == {"resolve_usd": 2.0, "review_usd": 3.0, "repair_usd": 1.0}
 
 
 def test_metrics_json_exposes_first_pass_rate_as_none_before_any_verdict():
@@ -3378,28 +3193,6 @@ def test_a_parked_pending_issue_is_blocked_on_triage():
         "reason": "Parked for human review. Unpark it to hand it back to the harness.",
         "since_ts": None,
     }
-
-
-def test_a_steward_question_puts_a_backlog_row_on_the_board_blocked_on_triage():
-    events = [
-        v2_event(WorldObserved("issue", 3, "h", {"present": True, "state": "OPEN", "labels": ["ai-triage"]}),
-                 "world", 0, issue=3),
-        v2_event(TriageDispositionRecorded("blocked_on_human_reply"), "triage", 1, role="steward", issue=3),
-    ]
-    row = v2_deployment(events).issues[0]
-
-    card = snapshots.backlog_card({"number": 3, "labels": ["ai-triage"]}, NOW, row)
-
-    assert board_of(card)["on"] == {"kind": "triage", "why": "awaiting_reply"}
-    assert board_of(card)["since_ts"] is not None
-    assert card["rail"]["current"] == "triage"
-
-
-@pytest.mark.parametrize("labels", [[], ["ai-triage"]])
-def test_the_rest_of_the_backlog_stays_off_the_board(labels):
-    card = snapshots.backlog_card({"number": 3, "labels": labels}, NOW)
-
-    assert card["board"] is None and card["rail"] is None
 
 
 @pytest.mark.parametrize(

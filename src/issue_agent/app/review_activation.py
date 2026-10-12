@@ -83,14 +83,14 @@ def activation_scope(
     gateway: Callable[[HarnessConfig, Mapping[str, str]], object] | None = None,
 ) -> ReviewActivationScope:
     cfg, env = load_operator_configuration(name, harness_root=harness_root)
-    if "review" not in env.get("ROLES", "fix review steward").split():
+    if "review" not in env.get("ROLES", "fix review").split():
         raise ValueError("review activation requires the configured review role")
-    path = control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+    path = control_store_path((cfg.state_dir, cfg.review_state_dir),
                               authority_root=cfg.control_authority_root)
     if not cfg.review_state_dir or not os.path.isabs(cfg.review_state_dir):
         raise ValueError("review activation requires an explicit absolute REVIEW_STATE_DIR")
     configured = tuple((role, directory) for role, directory in (
-        ("fix", cfg.state_dir), ("review", cfg.review_state_dir), ("steward", cfg.steward_state_dir),
+        ("fix", cfg.state_dir), ("review", cfg.review_state_dir),
     ) if directory)
     for extra in extra_roots:
         if not os.path.isabs(extra) or not os.path.isdir(extra):

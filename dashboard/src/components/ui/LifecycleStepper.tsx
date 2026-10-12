@@ -30,7 +30,6 @@ export const CANONICAL: readonly { id: LifecycleStageId; label: string }[] = [
 
 function stageForKind(kind: string): LifecycleStageId | null {
   const normalized = kind.trim().toUpperCase();
-  if (["TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC"].includes(normalized)) return "triage";
   if (["RESOLVE", "RESUME", "ROUTE"].includes(normalized)) return "resolve";
   if (["REVIEW", "RE_REVIEW", "ADDRESS_REVIEW"].includes(normalized)) return "review";
   if (["FIX_CI", "REBASE", "CI"].includes(normalized)) return "ci";
@@ -40,7 +39,7 @@ function stageForKind(kind: string): LifecycleStageId | null {
 
 function stageForStatus(stage: string | null | undefined): LifecycleStageId | null {
   const normalized = stage?.trim().toLowerCase() ?? "";
-  if (/(triage|steward|backlog|route)/.test(normalized)) return "triage";
+  if (/(triage|backlog|route)/.test(normalized)) return "triage";
   if (/(review|address|change.*request)/.test(normalized)) return "review";
   if (/(\bci\b|check|rebase)/.test(normalized)) return "ci";
   if (/(merge|done|complete)/.test(normalized)) return "merge";

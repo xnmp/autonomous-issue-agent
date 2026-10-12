@@ -5,21 +5,20 @@ from dataclasses import replace
 import pytest
 
 from issue_agent.domain.continuation_components import (
-    ActiveIssueRecovery, ActivePRRepair, ActiveSteward, BlockedIssueRecovery, BlockedPRRepair, BlockedSteward,
-    ContinuationImportBlocker, ContinuationWatermarks, InactiveIssueRecovery, InactivePRRepair, InactiveSteward,
-    IssueRecoveryState, PRRepairState, RepairSession, SelectedIssueRecovery, SelectedPRRepair, SelectedSteward,
-    StewardLaneState, StewardState, continuation_return_is_current, select_issue_recovery, select_pr_repair, select_steward,
+    ActiveIssueRecovery, ActivePRRepair, BlockedIssueRecovery, BlockedPRRepair,
+    ContinuationImportBlocker, ContinuationWatermarks, InactiveIssueRecovery, InactivePRRepair,
+    IssueRecoveryState, PRRepairState, RepairSession, SelectedIssueRecovery, SelectedPRRepair,
+    continuation_return_is_current, select_issue_recovery, select_pr_repair,
 )
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
 from issue_agent.domain.contracts import CommandId, ContinuationAdmission, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow import (
-    IssueWorkflowShell, NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, WorkflowChanged,
-    WorkflowMigrationRequired, resolve_from_issue_aggregate,
+    NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, WorkflowChanged,
 )
 from issue_agent.domain.workflow_identity import (
     ContinuationComponentIdentity, FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily,
-    WorkflowFence, WorkflowKey, WorkflowRevision, target_family,
+    WorkflowFence, WorkflowKey, WorkflowRevision,
 )
 from tests.domain.test_workflow_policy import NOW, exhausted, start
 from tests.domain.test_review_workflow_policy import accept, gated
@@ -88,33 +87,27 @@ def test_pending_review_requires_exact_possible_component_provenance(mode):
         SelectedIssueRecovery(WorkflowRevision(fence, 1), component)
 
 
-def test_resolve_generation_advance_preserves_both_secondary_states_and_fences_old_returns():
+def test_resolve_generation_advance_preserves_recovery_state_and_fences_old_returns():
     state = exhausted()
     key = state.revision.fence.key
     recovery = ActiveIssueRecovery(identity(key, WorkflowFamily.ISSUE_RECOVERY),
                                    IssueRecoveryState(consumed_reply_at=NOW.isoformat(), resumes=2, ci_failures=3),
                                    ContinuationWatermarks(2, 1, state.revision.fence), (hold(),))
-    steward = ActiveSteward(identity(key, WorkflowFamily.STEWARD, "steward", 3),
-                            StewardState(triage=StewardLaneState(NOW.isoformat(), 4, 2, ("delivery:1",))),
-                            ContinuationWatermarks(2, 1, state.revision.fence), (hold(),))
-    state = replace(state, issue_recovery=recovery, steward=steward)
-    before_recovery, before_steward = select_issue_recovery(state), select_steward(state)
+    state = replace(state, issue_recovery=recovery)
+    before_recovery = select_issue_recovery(state)
     old_recovery = admission(before_recovery, 2)
-    old_steward = admission(before_steward, 2, "run:steward")
     assert continuation_return_is_current(before_recovery, old_recovery)
-    assert continuation_return_is_current(before_steward, old_steward)
     transition = start(state)
     assert isinstance(transition, WorkflowChanged)
     after = transition.snapshot
     assert after.revision.fence.generation == state.revision.fence.generation + 1
-    assert after.issue_recovery == recovery and after.steward == steward
+    assert after.issue_recovery == recovery
     assert after.episode.episode_id != state.episode.episode_id
-    current_recovery, current_steward = select_issue_recovery(after), select_steward(after)
-    assert current_recovery.binding.fence == current_steward.binding.fence == after.revision.fence
+    current_recovery = select_issue_recovery(after)
+    assert current_recovery.binding.fence == after.revision.fence
     assert current_recovery.binding.authority == recovery.identity.authority
     assert current_recovery.binding.episode_id == recovery.identity.episode_id
     assert not continuation_return_is_current(current_recovery, old_recovery)
-    assert not continuation_return_is_current(current_steward, old_steward)
 
 
 def test_review_generation_advance_preserves_repair_session_allowance_and_its_original_provenance():
@@ -141,22 +134,8 @@ def test_review_generation_advance_preserves_repair_session_allowance_and_its_or
     assert after.episode.episode_id == state.episode.episode_id
 
 
-def test_steward_only_shell_selects_no_resolve_allowance_or_episode():
-    key = WorkflowKey("o/r", IssueRef(7))
-    revision = WorkflowRevision(WorkflowFence(key, 2), 4)
-    steward = ActiveSteward(identity(key, WorkflowFamily.STEWARD), StewardState())
-    shell = IssueWorkflowShell(revision, steward=steward)
-    resolve = resolve_from_issue_aggregate(shell)
-    assert isinstance(resolve, WorkflowMigrationRequired)
-    assert resolve.family is WorkflowFamily.RESOLVE
-    assert isinstance(select_issue_recovery(shell), InactiveIssueRecovery)
-    assert isinstance(select_steward(shell), SelectedSteward)
-    assert not hasattr(shell, "episode") and not hasattr(shell, "authority")
-    assert target_family(key.target) is WorkflowFamily.RESOLVE
-
-
 @pytest.mark.parametrize("family,kind", [(WorkflowFamily.ISSUE_RECOVERY, IssueRef),
-                                        (WorkflowFamily.STEWARD, IssueRef), (WorkflowFamily.PR_REPAIR, PullRequestRef)])
+                                        (WorkflowFamily.PR_REPAIR, PullRequestRef)])
 def test_selected_component_identity_cannot_alias_target_kinds(family, kind):
     key = WorkflowKey("o/r", kind(7))
     value = identity(key, family)
@@ -173,14 +152,13 @@ def test_selected_component_identity_cannot_alias_target_kinds(family, kind):
 @pytest.mark.parametrize("family,blocked,active,state,inactive", [
     (WorkflowFamily.ISSUE_RECOVERY, BlockedIssueRecovery, ActiveIssueRecovery, IssueRecoveryState, InactiveIssueRecovery),
     (WorkflowFamily.PR_REPAIR, BlockedPRRepair, ActivePRRepair, PRRepairState, InactivePRRepair),
-    (WorkflowFamily.STEWARD, BlockedSteward, ActiveSteward, StewardState, InactiveSteward),
 ])
 def test_inactive_and_blocked_components_cannot_be_selected_as_active(family, blocked, active, state, inactive):
     key = WorkflowKey("o/r", PullRequestRef(7) if family is WorkflowFamily.PR_REPAIR else IssueRef(7))
     unavailable = blocked(key, FamilyAuthority(family, 2), "decision:blocked",
                           (ContinuationImportBlocker("configured-root:field", "unverified history"),))
     selected = {WorkflowFamily.ISSUE_RECOVERY: SelectedIssueRecovery,
-                WorkflowFamily.PR_REPAIR: SelectedPRRepair, WorkflowFamily.STEWARD: SelectedSteward}[family]
+                WorkflowFamily.PR_REPAIR: SelectedPRRepair}[family]
     revision = WorkflowRevision(WorkflowFence(key, 0), 2)
     for value in (inactive(), unavailable, None):
         with pytest.raises(ValueError):
@@ -214,8 +192,7 @@ def test_newer_admission_and_duplicate_return_cannot_apply_older_continuity():
 
 @pytest.mark.parametrize("value", [None, "not-a-time", "2026-10-01", "x" * 513])
 def test_unknown_reply_and_baseline_values_do_not_construct_empty_authority(value):
-    for state, field in ((IssueRecoveryState, "consumed_reply_at"), (PRRepairState, "consumed_reply_at"),
-                         (StewardLaneState, "baseline_at")):
+    for state, field in ((IssueRecoveryState, "consumed_reply_at"), (PRRepairState, "consumed_reply_at")):
         with pytest.raises(ValueError):
             state(**{field: value})
 

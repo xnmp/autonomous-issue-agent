@@ -28,7 +28,7 @@ import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
 import { Chip, Dot } from "./components/ui/Chip";
 import { HEALTH_LABEL, HEALTH_TONE, roleHealth, type Tone } from "./lib/semantics";
-import { boardItems, GROUP_META, isUntriaged, type BoardGroup } from "./features/issues/board";
+import { boardItems, GROUP_META, type BoardGroup } from "./features/issues/board";
 import {
   DASHBOARD_THEMES,
   type DashboardOptions,
@@ -287,9 +287,7 @@ export default function App() {
       const count = displayedIssues.data
         ? sub === "inflight"
           ? boardItems(displayedIssues.data).length
-          : sub === "untriaged"
-            ? displayedIssues.data.backlog.filter(isUntriaged).length
-            : displayedIssues.data[sub].length
+          : displayedIssues.data[sub].length
         : null;
       tabs.push({
         key: sub,

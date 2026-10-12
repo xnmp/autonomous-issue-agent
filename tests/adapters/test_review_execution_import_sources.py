@@ -100,13 +100,13 @@ def test_complete_counter_sources_keep_all_effect_barriers_through_sql_scope(sou
         assert {(item.counter.source.key, item.pr) for item in held.mapping.assignments} == {(7, 9), (-10, 10)}
         assert not held.mapping.unassigned
         assert len(held.source_digest) == 64
-        for role in ("fix", "review", "steward"):
+        for role in ("fix", "review"):
             with pytest.raises(BlockingIOError):
                 with deployment_effect_authority(control.path, "o/r", role, blocking=False):
                     pass
         with control.transaction() as db:
             assert db.execute("SELECT COUNT(*) FROM workflows").fetchone()[0] == 0
-    for role in ("fix", "review", "steward"):
+    for role in ("fix", "review"):
         with deployment_effect_authority(control.path, "o/r", role, blocking=False):
             pass
     with control._connect() as db:

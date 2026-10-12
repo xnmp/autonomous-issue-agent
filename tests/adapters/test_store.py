@@ -8,8 +8,6 @@ import pytest
 
 from issue_agent.adapters.store import HarnessMarkers, Store
 from issue_agent.domain.ci_history import CiAttempt
-from issue_agent.domain.triage import grooming_candidates, grooming_content
-from issue_agent.domain.world import IssueView, WorldState
 
 def _seed_legacy_ci_counter(store, issue, count):
     Path(store.issue_path(issue, "ci-retries")).write_text(str(count))
@@ -131,10 +129,10 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
 # collision the pid-suffixed tmp name exists to avoid.
 def test_write_leaves_no_tmp_file_after_success():
     s, root = _store()
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
 
-    assert s.get_jira_key(5) == "K-4"
-    assert os.path.exists(os.path.join(root, "issue-5.jira"))
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
+    assert os.path.exists(os.path.join(root, "issue-5.predicted-paths"))
     leftover = [f for f in os.listdir(root) if f.endswith(".tmp")]
     assert leftover == []
 
@@ -146,17 +144,17 @@ def test_write_survives_crash_before_replace(monkeypatch):
     # fail, so it would silently install the new (wrong-for-this-test) value
     # and this assertion would catch it.
     s, _ = _store()
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
 
     def _boom(_src, _dst):
         raise OSError("simulated crash before replace")
 
     monkeypatch.setattr(os, "replace", _boom)
     try:
-        s.set_jira_key(5, "K-9")
+        s.save_predicted_paths(5, ["src/b.py"])
     except OSError:
         pass
-    assert s.get_jira_key(5) == "K-4"
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
 
 def test_write_syncs_tmp_file_before_replace(monkeypatch):
     # review M3: fsync narrows the crash window a bare os.replace(tmp, path)
@@ -172,9 +170,9 @@ def test_write_syncs_tmp_file_before_replace(monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _tracking_fsync)
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
     assert calls, "Store._write must fsync the tmp file before os.replace"
-    assert s.get_jira_key(5) == "K-4"
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
 
 def test_tmp_name_is_pid_suffixed(monkeypatch):
     # review M3: two daemons (fix + review) sharing a STATE_DIR, or a
@@ -189,9 +187,9 @@ def test_tmp_name_is_pid_suffixed(monkeypatch):
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", _capture)
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
     assert str(os.getpid()) in seen["src"]
-    assert s.get_jira_key(5) == "K-4"
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
 
 def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     """An operator unblock resets the retry ceilings a wedge consumed — and
@@ -235,32 +233,6 @@ def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
     s.cleanup_pr(100, 9, merged=True)
     assert marker.read_text() == "sha-1"
 
-def test_stopped_legacy_triage_baseline_remains_readable():
-    s, _ = _store()
-    Path(os.path.join(s.state_dir, "triage-7.at")).write_text("t_post")
-    assert Path(os.path.join(s.state_dir, "triage-7.at")).read_text() == "t_post"
-
-def test_stopped_groom_sources_survive_issue_cleanup():
-    s, _ = _store()
-    evidence = {os.path.join(s.state_dir, "groom-7.at"): "2026-10-01T00:00:00Z",
-                os.path.join(s.state_dir, "groom-7.content"): "a" * 64,
-                s.issue_path(7, "steward-stalls-groom"): "3"}
-    for path, value in evidence.items():
-        Path(path).write_text(value)
-    s._clear_issue_advisory(7)
-    assert {path: Path(path).read_text() for path in evidence} == evidence
-
-def test_jira_key_and_phase_roundtrip_and_cleared():
-    s, _ = _store()
-    assert s.get_jira_key(5) == "" and s.get_jira_phase(5) == ""
-    s.set_jira_key(5, "ABC-12")
-    s.set_jira_phase(5, "in_progress")
-    assert s.get_jira_key(5) == "ABC-12"
-    assert s.get_jira_phase(5) == "in_progress"
-    s.set_jira_key(5, "")                 # empty key is a no-op (don't clobber)
-    assert s.get_jira_key(5) == "ABC-12"
-    s._clear_issue_advisory(5)
-    assert s.get_jira_key(5) == "" and s.get_jira_phase(5) == ""
 
 def test_clear_issue_removes_all():
     s, _ = _store()
@@ -275,7 +247,7 @@ def test_clear_issue_removes_all():
     assert _legacy_ci_counter(s, 5) == 2
     assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
     assert retained_issue_file(s, 5, "phase") == "authored"           # retained stopped evidence
-    assert s.get_infra_deaths(5) == 1     # retained Jira/import evidence
+    assert s.get_infra_deaths(5) == 1     # retained import evidence
 
 def test_clear_issue_does_not_touch_pr_automerge_marker():
     # review M4: `automerge` is a PR suffix now — clear_issue must not remove
@@ -406,17 +378,6 @@ def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open()
 
     s.save_predicted_paths(5, ["src/action.rs", "../outside.rs"])
     assert s.get_predicted_paths(5) == frozenset()
-
-def test_groom_content_digest_round_trips_and_damps_comment_only_updates():
-    s, _ = _store()
-    for body in ("Steps:\n1. click\n", "Steps:\r\n1. click\r\n"):
-        issue = IssueView(9, title="Login crashes", body=body, updated_at="after-comment")
-        Path(os.path.join(s.state_dir, "groom-9.content")).write_text(grooming_content(issue))
-        assert Path(os.path.join(s.state_dir, "groom-9.content")).read_text() == grooming_content(issue)
-        assert grooming_candidates(
-            WorldState(issues=(issue,)), {9: "before-comment"}, True,
-            {9: Path(os.path.join(s.state_dir, "groom-9.content")).read_text()},
-        ) == []
 
 def test_retired_review_files_survive_cleanup_as_import_evidence():
     s, _ = _store()

@@ -186,7 +186,6 @@ class Deployment:
             "TARGET_DIR": str(self.repo_root),
             "STATE_DIR": str(self.root / "fix-state"),
             "REVIEW_STATE_DIR": str(self.root / "review-state"),
-            "STEWARD_STATE_DIR": str(self.root / "steward-state"),
         }
 
     def config(self) -> HarnessConfig:

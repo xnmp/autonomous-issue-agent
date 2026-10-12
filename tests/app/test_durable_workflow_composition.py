@@ -34,8 +34,7 @@ from issue_agent.app import roles
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
-from issue_agent.app.planners.tasks import FixTaskConfig, TriageTaskConfig
-from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
+from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.app.workflows import fix as fix_workflow_module
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.contracts import EffectStatus, Money, daily_budget_scope
@@ -45,7 +44,6 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.lifecycle import LifecycleOperation, completion_guard
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.pricing import BudgetPolicy
-from issue_agent.domain.triage import TriageConfig
 from issue_agent.domain.workflow import ResolveAdmission
 from issue_agent.domain.resolve_split import ContractRevision, ContractResetResult
 from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowWriter
@@ -199,62 +197,6 @@ def _compatible_sql_build_checkout(root: Path) -> Path:
     return checkout
 
 
-def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
-    with sqlite3.connect(path) as db:
-        tables = [row[0] for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
-            "AND name<>'schema_migrations'")]
-        return {name: tuple(sorted(repr(row) for row in db.execute(f'SELECT * FROM "{name}"')))
-                for name in tables}
-
-
-def _stopped_copy_index_rollback(path: Path) -> None:
-    """Explicit fixture-only schema43→38 rollback; every authority row survives."""
-    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
-    index_migrations = {
-        40: ("event_outbox_pending", "event_outbox_pending_destination", "lifecycle_review_generation_candidates"),
-        39: ("workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"),
-    }
-    charge_origin = next(item for item in _SCHEMA_MIGRATIONS if item.version == 41)
-    with sqlite3.connect(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        assert db.execute("DELETE FROM schema_migrations WHERE version=43").rowcount == 1
-        self_clear_index = next(item for item in _SCHEMA_MIGRATIONS if item.version == 38)
-        db.execute(self_clear_index.source)
-        assert db.execute("DELETE FROM schema_migrations WHERE version=42").rowcount == 1
-        assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (41, charge_origin.digest)
-        # The schema-38 build has no charge origin; every copied charge carries the default, so nothing is lost.
-        assert db.execute("SELECT count(*) FROM charges WHERE origin<>'normal_return'").fetchone()[0] == 0
-        db.execute("ALTER TABLE charges DROP COLUMN origin")
-        assert db.execute("DELETE FROM schema_migrations WHERE version=41").rowcount == 1
-    before = _copied_authoritative_rows(path)
-    with sqlite3.connect(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        definitions = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='index'"))
-        for version, names in index_migrations.items():
-            migration = next(item for item in _SCHEMA_MIGRATIONS if item.version == version)
-            assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (version, migration.digest)
-            statements = tuple(_sql_statements(migration.source))
-            assert len(statements) == len(names)
-            for name, statement in zip(names, statements, strict=True):
-                assert definitions[name] == statement.strip().removesuffix(";")
-            for name in names:
-                db.execute(f'DROP INDEX "{name}"')
-            assert db.execute("DELETE FROM schema_migrations WHERE version=? AND source_digest=?", (version, migration.digest)).rowcount == 1
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 38
-    assert _copied_authoritative_rows(path) == before
-
-
-def _forward_copy_indexes(path: Path, expected_rows: dict[str, tuple[str, ...]]) -> None:
-    SQLiteControlStore(str(path)).initialize()
-    assert _copied_authoritative_rows(path) == expected_rows
-    with sqlite3.connect(path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
-        assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name IN "
-            "('workflow_repair_owed','continuation_pr_admission_identity','reservations_active_workload')")} == {
-                "workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"}
-
-
 def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopped, capsys, tmp_path, monkeypatch):
     from issue_agent.domain.world import Check, Comment
     from dataclasses import replace
@@ -378,120 +320,6 @@ print(json.dumps({str(number): encode_workflow((value.binding, value.revision, v
     assert dump(blocked.control) == newer_sql
     # No index-rollback read here: fix rows written after the self-clear fields
     # were deleted are not readable by the schema-38 build (forward-only).
-    assert dump(original) == before
-    assert {path.name: path.read_bytes() for path in state.iterdir()} == files
-
-
-@pytest.mark.parametrize("lane", ["TRIAGE", "GROOM"])
-def test_configured_copied_steward_dispatch_recovers_owed_verdict_without_repurchase(stopped, capsys, tmp_path, lane):
-    from issue_agent.app.planners.tasks import GroomTaskConfig
-    from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
-    _, original, env = stopped
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True)
-    for name in ("triage-7.at", "groom-7.at"):
-        (state / name).write_text("2026-09-13T00:00:00Z")
-    (state / "groom-7.content").write_text("a" * 64)
-    (state / "issue-7.steward-stalls-triage").write_text("1")
-    (state / "issue-7.steward-stalls-groom").write_text("1")
-    (state / "issue-8.steward-stalls-groom").write_text("unknown")
-    before = dump(original)
-    files = {path.name: path.read_bytes() for path in state.iterdir()}
-    code, shadow, error = continuation_command(capsys, "steward", "shadow")
-    assert code == 0, error
-    assert [(target["number"], target["eligible"]) for target in shadow["targets"]] == [(7, True), (8, False)]
-    copy = tmp_path / "configured-steward-cutover"
-    code, rehearsal, error = continuation_command(capsys, "steward", "rehearse", "--copy-to", str(copy))
-    assert code == 0 and all(rehearsal["checks"].values()), error
-    copied_control = copy / "issue-agent-control" / Path(original.path).name
-    copied_state = next(path.parent for path in (copy / "state").glob("*/triage-7.at"))
-    remote = PersistentGitHub(copy / "github.db")
-    remote.seed(issue(7, "ai-triage", updated_at="2026-09-14T00:00:00Z"))
-    remote.seed(issue(8, "ai-triage", updated_at="2026-09-14T00:00:00Z"))
-    remote.seed(issue(10, "ai-triage", updated_at="2026-09-14T00:00:00Z"))
-    remote.seed_pr(pr(300, state="MERGED", closing_issue=42, title="Original defect"))
-    verdict = {"verdict": "ready", "plain_summary": "clear", "acceptance_criteria": ["works"],
-               "creator_questions": [], "owner_questions": [], "blocked_by_issues": []}
-    provider = Provider(result=AgentResult(False, cost_usd=.01, structured=verdict if lane == "TRIAGE" else {"resolved_by": 42}))
-    kind = AgentKind.TRIAGE if lane == "TRIAGE" else AgentKind.GROOM
-    logs = []
-    def configured(provider, fault=lambda _: None, later=timedelta(0)):
-        control = SQLiteControlStore(str(copied_control), now=lambda: datetime.now(timezone.utc) + later)
-        control.initialize()
-        github = PersistentGitHub(copy / "github.db", fault=fault)
-        github.comment_author = "steward-bot"
-        events = EventLog(str(copy / "events.jsonl"), Producer("test", "o/r", "steward", os.getpid(), "copied-steward"))
-        control.bind_event_outbox(events.prepare, events.append_committed)
-        effects = GitHubEffectExecutor(github, control, repository="o/r", identity="o/r:steward", log=logs.append)
-        executor = Executor(github, effect_executor=effects, retry_delays=(), log=logs.append)
-        runtime = AccountingRuntime(provider, control, "o/r", "steward", None, None, None, "test", "claude",
-            BudgetPolicy({("steward", name): Money("USD", 750_000) for name in ("TRIAGE", "GROOM")}), owner_id="o/r:steward")
-        dispatcher = AgentDispatcher(DispatchConfig(repo="o/r", role="steward", deployment_owner_id="o/r:steward",
-            triage=TriageTaskConfig("steward-bot", triage_prompt="test"),
-            triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
-            groom=GroomTaskConfig("steward-bot"), fix_bot="fix-bot", log=logs.append),
-            github, Store(str(copied_state)), Worktrees(copy), runtime, executor, dedupe=control)
-        executor._run_agent = lambda action: asyncio.run(dispatcher.dispatch(action))
-        daemon = Daemon("steward", github.build_world, lambda _: [RunAgent(kind, number) for number in (7, 8, 10)], executor, log=logs.append)
-        return daemon, control, github
-    first, control, _ = configured(provider, fail_at("comment_applied"))
-    with pytest.raises(Crash):
-        first.tick()
-    assert len(provider.tasks) == 1
-    key = WorkflowKey("o/r", IssueRef(7))
-    owed = control.read_steward(key).component.state
-    selected_lane = owed.triage if lane == "TRIAGE" else owed.groom
-    sibling = owed.groom if lane == "TRIAGE" else owed.triage
-    assert selected_lane.pending_delivery and selected_lane.baseline_at == "2026-09-13T00:00:00Z"
-    restarted_provider = Provider()
-    restarted, current, github = configured(restarted_provider, later=UNKNOWN_READ_DELAY)
-    restarted.tick()
-    restarted.tick()
-    delivered = current.read_steward(key).component.state
-    completed_lane = delivered.triage if lane == "TRIAGE" else delivered.groom
-    assert not completed_lane.pending_delivery and completed_lane.baseline_at == github.get_issue(7).updated_at, "\n".join(logs)
-    assert (delivered.groom if lane == "TRIAGE" else delivered.triage) == sibling
-    assert restarted_provider.tasks == []
-    assert github.get_issue(7).has(Label.AI_READY if lane == "TRIAGE" else Label.MAYBE_RESOLVED)
-    assert len(github.get_issue(7).comments) == 1
-    assert isinstance(current.read_steward(WorkflowKey("o/r", IssueRef(8))), cc.BlockedSteward)
-    with sqlite3.connect(copied_control) as db:
-        assert db.execute("SELECT kind FROM runs").fetchall() == [(lane,)]
-        assert db.execute("SELECT amount_micros FROM charges").fetchall() == [(10_000,)]
-    import json
-    import subprocess
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    checkout = _compatible_sql_build_checkout(tmp_path)
-    script = '''
-import json, pathlib, sys
-import issue_agent
-from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.workflow_codec import encode_workflow
-from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
-assert pathlib.Path(issue_agent.__file__).is_relative_to(sys.argv[2])
-control = SQLiteControlStore(sys.argv[1])
-control.initialize()
-selected = control.read_steward(WorkflowKey("o/r", IssueRef(7)))
-print(json.dumps(encode_workflow((selected.binding, selected.revision, selected.component))))
-'''
-    def read_old_build():
-        return subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(Path(__file__).resolve().parents[2]),
-                               "python", "-c", script, str(copied_control), str(checkout)], cwd=checkout,
-                              env={**os.environ, "PYTHONPATH": str(checkout / "src")}, capture_output=True, text=True)
-    later_rows = _copied_authoritative_rows(copied_control)
-    newer_sql = dump(current)
-    refused = read_old_build()
-    assert refused.returncode != 0 and str(SCHEMA_VERSION) in refused.stderr and "38" in refused.stderr
-    assert dump(current) == newer_sql
-    _stopped_copy_index_rollback(copied_control)
-    later_sql = dump(current)
-    rollback = read_old_build()
-    assert rollback.returncode == 0, rollback.stderr
-    selected = current.read_steward(key)
-    assert json.loads(rollback.stdout) == encode_workflow((selected.binding, selected.revision, selected.component))
-    assert dump(current) == later_sql
-    _forward_copy_indexes(copied_control, later_rows)
     assert dump(original) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
@@ -1067,46 +895,6 @@ def test_observed_merged_pr_cleanup_finishes_close_unless_human_intervenes(tmp_p
         assert final.state_reason == "completed"
         assert len([call for call in human.calls if call[0] == "close"]) == 1
     assert client.provider.tasks == restarted.provider.tasks == []
-
-
-def test_triage_promotion_finishes_advisory_recurrence_after_own_transition(tmp_path):
-    seed(tmp_path)
-    remote = PersistentGitHub(tmp_path / "github.db")
-    remote.seed_pr(pr(300, state="MERGED", closing_issue=42, title="Original defect"))
-    provider = Provider(result=AgentResult(is_error=False, cost_usd=0.01, structured={
-        "verdict": "ready", "plain_summary": "clear", "acceptance_criteria": ["works"],
-        "creator_questions": [], "owner_questions": [], "blocked_by_issues": [],
-        "recurrence_of": 42,
-    }))
-    client = compose(tmp_path, role="steward", provider=provider)
-    state = Store(state_dir=str(tmp_path / "steward"))
-    from tests.fakes.accounted_steward import install_steward
-    install_steward(client.control, (7,))
-    client.remote.comment_author = "steward-bot"
-    runtime = AccountingRuntime(provider, client.control, "o/r", "steward", None, None, None, "test", "claude",
-        BudgetPolicy({("steward", "TRIAGE"): Money("USD", 750_000)}), owner_id="o/r:steward")
-    workflow = StewardWorkflow(
-        StewardWorkflowConfig(
-            triage=TriageTaskConfig("steward-bot", triage_prompt="test"),
-            triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
-            log=client.log.append, fix_bot="fix-bot", repo="o/r", dedupe=client.control, owner_id="o/r:steward",
-        ),
-        client.remote, state, runtime, client.daemon.executor,
-    )
-    client.daemon.executor._run_agent = lambda action: asyncio.run(workflow.triage(action.number))
-    client.daemon.decide = lambda _: [RunAgent(AgentKind.TRIAGE, 7)]
-    client.daemon.tick()
-    after = client.remote.get_issue(7)
-    assert after.has(Label.AI_READY), client.log
-    assert after.has(Label.RECURRENCE)
-    assert any("#42" in comment.body and "PR #300" in comment.body for comment in after.comments)
-    assert client.control.read_steward(resolve_snapshot(7).revision.fence.key).component.state.triage.baseline_at == after.updated_at
-    assert not Path(state.state_dir, "triage-7.at").exists()
-    restarted = compose(tmp_path, role="steward", decide=lambda _: [])
-    restarted.daemon.tick()
-    assert restarted.control.pending_commands() == ()
-    assert len(provider.tasks) == 1
-    assert restarted.remote.get_issue(7) == after
 
 
 def test_changed_issue_body_cannot_apply_obsolete_blocked_answer_or_reset_allowance(tmp_path):

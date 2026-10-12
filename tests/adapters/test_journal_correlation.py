@@ -76,9 +76,6 @@ def test_every_pr_numbered_kind_claims_its_pr(kind: str):
     [
         ("fix", "RESOLVE", 142, 142),
         ("fix", "RESUME", 142, 142),
-        ("steward", "TRIAGE", 142, 142),
-        ("steward", "GROOM", 142, 142),
-        ("steward", "STEWARD_DRIVE", 0, None),
         ("fix", "RESOLVE", 0, 142),
         ("review", "REVIEW", -1, 185),
         ("fix", "", 142, 142),

@@ -17,7 +17,7 @@ const repos = {
     target_dir: "/tmp/self",
     is_self: true,
     active: true,
-    roles: ["fix", "review", "steward"].map((name) => ({
+    roles: ["fix", "review"].map((name) => ({
       role: name, alive: true, stale: false, last_event_ts: NOW, last_event: "tick", events: 4, log_path: `/logs/${name}.log`,
     })),
     frecency: 1,
@@ -66,11 +66,11 @@ function card(issue: number, title: string, over: Record<string, unknown>) {
   };
 }
 
-function untriaged(issue: number, title: string, labels: string[], ageDays: number) {
+function backlogIssue(issue: number, title: string, labels: string[], ageDays: number) {
   return {
     issue, title, url: `https://github.com/openai/autonomous-issue-agent/issues/${issue}`, body: null, labels,
-    recurrence: false, recurrence_count: 0, steward_state: "raw", age_days: ageDays, age_s: ageDays * 86_400,
-    comments: 0, issue_type: null, difficulty: null, impact: null, board: null, rail: null,
+    recurrence: false, recurrence_count: 0, age_days: ageDays, age_s: ageDays * 86_400,
+    comments: 0, issue_type: null, difficulty: null, impact: null,
   };
 }
 
@@ -139,12 +139,8 @@ const boardIssues = {
   ],
   done: [],
   backlog: [
-    untriaged(1101, "settings: remember the last opened folder per window", ["enhancement"], 3),
-    untriaged(1102, "crash when dragging a tab onto a closed window on macOS", ["bug"], 0),
-    {
-      ...untriaged(1103, "already triaged: acceptance criteria and a test plan written", ["ai-triage"], 6),
-      steward_state: "processed",
-    },
+    backlogIssue(1101, "settings: remember the last opened folder per window", ["enhancement"], 3),
+    backlogIssue(1102, "crash when dragging a tab onto a closed window on macOS", ["bug"], 0),
   ],
   gh_ok: true,
   notifications: [],
@@ -354,21 +350,19 @@ test("opens a row from the keyboard through its title button", async ({ page }) 
   );
 });
 
-test("lists untriaged backlog issues on their own tab, off the board, each promotable", async ({ page }) => {
+test("lists backlog issues on their own tab, off the board, each promotable", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await openBoard(page);
-  await expect(page.getByRole("tab", { name: /Untriaged/ })).toContainText("2");
+  await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("2");
   await expect(page.locator(".board-row", { hasText: "remember the last opened folder" })).toHaveCount(0);
 
-  await page.getByRole("tab", { name: /Untriaged/ }).click();
+  await page.getByRole("tab", { name: /Backlog/ }).click();
   await expect(page.getByText("remember the last opened folder per window")).toBeVisible();
   await expect(page.getByText("crash when dragging a tab")).toBeVisible();
-  await expect(page.getByText("already triaged")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Promote to ai-ready #1101" })).toHaveText("Promote to ai-ready");
   await noSidewaysScroll(page);
-  await page.screenshot({ path: "../evidence/dashboard-issues-untriaged.png", fullPage: true, animations: "disabled" });
+  await page.screenshot({ path: "../evidence/dashboard-issues-backlog.png", fullPage: true, animations: "disabled" });
 
-  await page.getByRole("button", { name: "Promote to ai-ready #1101" }).click();
+  await page.getByRole("button", { name: "Promote #1101 to ai-ready" }).click();
   const promoted = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/issues/1101/promote"));
   await page.getByRole("button", { name: "Promote #1101", exact: true }).click();
   await promoted;

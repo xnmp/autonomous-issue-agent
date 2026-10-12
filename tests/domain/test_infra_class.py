@@ -18,7 +18,6 @@ from issue_agent.domain.outcome import (
     PROVIDER_REFUSED_SUBTYPE,
     resumable_session,
 )
-from issue_agent.domain.steward_stall import stall_charge
 
 
 def result(**kwargs) -> AgentResult:
@@ -149,24 +148,3 @@ def test_address_review_still_charges_a_round_that_ran():
         7, result(session_id="s", exit_reason=ExitReason.AGENT_ERROR)
     )
     assert out.bump_retry is True
-
-
-def test_steward_stall_keeps_its_own_exemption_list_unchanged():
-    """Moving `ADMISSION_REFUSAL_SUBTYPES` into `domain.outcome` is a pure
-    refactor: the steward's charges are exactly what they were."""
-    assert stall_charge(ExitReason.TRANSPORT_DEATH) == 0
-    assert stall_charge(ExitReason.KILLED_EXTERNALLY) == 0
-    assert stall_charge(ExitReason.AGENT_ERROR, "dispatch_claim_unavailable") == 0
-    assert stall_charge(ExitReason.AGENT_ERROR) == 1
-    assert stall_charge(ExitReason.BUDGET_EXHAUSTED) == 1
-
-
-def test_the_steward_still_charges_a_runtime_that_could_not_start():
-    """Deliberately NOT exempt here, unlike every fix-role counter. A zero
-    charge returns without recording the issue's baseline, so the issue stays
-    selected and the identical paid leg is bought every sweep — and the
-    steward's ceiling only counts legs that RAISED, so nothing would stop it.
-    Bounded-and-mislabelled beats unbounded-and-silent; the pre-existing
-    `infra_death` exemption has the same hole and wants the steward's own fix.
-    """
-    assert stall_charge(ExitReason.RUNTIME_UNAVAILABLE) == 1

@@ -53,8 +53,6 @@ _DETAIL_CONFIG_FIELDS = (
     "MAX_BUDGET_USD",
     "ROUTER_BUDGET_USD",
     "REVIEW_BUDGET_USD",
-    "STEWARD_TRIAGE_BUDGET_USD",
-    "JIRA_SYNC_BUDGET_USD",
     "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
 )
 _FIX_BUDGET_KINDS = (
@@ -147,9 +145,6 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
         "ROUTE": max(0.0, cfg.router_budget_usd),
         "REVIEW": max(0.0, cfg.review_budget_usd),
         "RE_REVIEW": max(0.0, cfg.review_budget_usd),
-        "TRIAGE": max(0.0, cfg.triage_budget_usd),
-        "GROOM": max(0.0, cfg.triage_budget_usd),
-        "JIRA_SYNC": max(0.0, cfg.jira_budget_usd),
     }
     return (
         caps,
@@ -304,7 +299,7 @@ class Backend:
     def measurement(self, name: str, specification: dict) -> dict:
         from ..measurement import local_export
         cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
-        state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        state_dirs = (cfg.state_dir, cfg.review_state_dir)
         path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
         return local_export(path, cfg.repo, specification)
 
@@ -709,7 +704,7 @@ class Backend:
             if not self.known(name):
                 raise ValueError(f"unknown deployment '{name}'")
             cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
-            state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            state_dirs = (cfg.state_dir, cfg.review_state_dir)
             path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
             if self.control_db_path and os.path.realpath(self.control_db_path) != os.path.realpath(path):
                 raise ValueError("workflow family authority differs from the configured deployment")
@@ -737,7 +732,7 @@ class Backend:
         try:
             cfg, env = load_operator_configuration(name, harness_root=self.harness_root)
             repo = cfg.repo
-            state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            state_dirs = (cfg.state_dir, cfg.review_state_dir)
             path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
             if self.control_db_path and os.path.realpath(self.control_db_path) != os.path.realpath(path):
                 return False, "unblock control authority differs from the configured deployment"
@@ -763,7 +758,7 @@ class Backend:
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
         repo = cfg.repo
-        state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        state_dirs = (cfg.state_dir, cfg.review_state_dir)
         journal_paths = tuple(os.path.join(path, "journal.jsonl") for path in state_dirs)
         # Admission provenance must share mutation scope and bypass the UI cache.
         snapshot = self._deployment_snapshot(name, repo, cfg.target_dir, journal_paths, control.path)
@@ -875,8 +870,8 @@ class Backend:
         Removing `ai-pr-open` is the whole mechanism: the fixer's world only
         contains ai-pr-open PRs, so the parked PR's paths leave the overlap
         serializer next tick and held pending issues dispatch. `ai-parked`
-        records the decision on issue and PRs — the steward will not re-triage
-        it, the dashboard shows it as a parked pending row. NOTE: unpark is a
+        records the decision on issue and PRs, and the dashboard shows it as a
+        parked pending row. NOTE: unpark is a
         RE-ARM, not a label-for-label reversal — escalation labels park
         stripped (ai-blocked / needs-*-review) stay gone, so the pipeline
         resumes review/CI legs on the PR (adversarial P2-5).

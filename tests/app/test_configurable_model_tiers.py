@@ -207,5 +207,5 @@ def test_cli_doctor_checks_codex_selected_only_by_a_tier(monkeypatch):
         return marker
     monkeypatch.setattr(cli, "report_codex_resolution", report)
     assert cli._doctor_codex_binary({"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude",
-        "STEWARD_RUNTIME": "claude", "FIX_MODEL_MED": "codex:gpt-6.1-sol"}) is marker
+        "FIX_MODEL_MED": "codex:gpt-6.1-sol"}) is marker
     assert selected == ["codex"]

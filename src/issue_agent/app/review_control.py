@@ -34,9 +34,9 @@ def open_review_operator(
     always derived here, exactly as the review daemon derives them.
     """
     cfg, env = load_operator_configuration(name, harness_root=harness_root)
-    if "review" not in env.get("ROLES", "fix review steward").split():
+    if "review" not in env.get("ROLES", "fix review").split():
         raise ValueError("review control requires the configured review role")
-    path = control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+    path = control_store_path((cfg.state_dir, cfg.review_state_dir),
                               authority_root=cfg.control_authority_root)
     if control_db_path and os.path.realpath(control_db_path) != os.path.realpath(path):
         raise ValueError("operator and deployment disagree on control authority")

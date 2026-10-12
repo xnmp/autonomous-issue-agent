@@ -187,14 +187,11 @@ def _strict_schema(schema: dict) -> dict:
 
     A property that was NOT required becomes nullable as it is forced into
     `required`. Optionality in these schemas is load-bearing, not incidental:
-    GROOM_SCHEMA has no required fields at all, and TRIAGE_SCHEMA's
-    `recurrence_of` is optional, precisely so an honest "no finding" stays
-    expressible. Making them mandatory-and-non-nullable put a classifier that
-    reads attacker-controlled issue text under pressure to INVENT a match — a
-    fabricated `resolved_by` drawn from the recent-merge list in its own prompt
-    passes the domain whitelist and posts a false "already shipped" comment.
-    Nullable keeps strict mode satisfied while leaving "nothing found" sayable;
-    every consumer already treats null exactly like absent.
+    an optional field keeps an honest "no finding" expressible, and making it
+    mandatory-and-non-nullable puts a model reading untrusted text under
+    pressure to INVENT a value. Nullable keeps strict mode satisfied while
+    leaving "nothing found" sayable; every consumer already treats null exactly
+    like absent.
     """
     if not isinstance(schema, dict):
         return schema

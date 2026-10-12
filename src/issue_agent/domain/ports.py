@@ -53,17 +53,6 @@ class GitHubReads(Protocol):
     def is_issue_closed(self, issue: int) -> bool: ...
 
 
-class RecentlyMergedRef(Protocol):
-    @property
-    def issue(self) -> int: ...
-    @property
-    def title(self) -> str: ...
-    @property
-    def pr(self) -> int: ...
-    @property
-    def merged_at(self) -> str: ...
-
-
 @runtime_checkable
 class WorkflowGitHubReads(GitHubReads, Protocol):
     """Read surface required by paid workflows.
@@ -84,17 +73,12 @@ class WorkflowGitHubReads(GitHubReads, Protocol):
     def build_world(self) -> WorldState: ...
     def review_comments(self, pr: int) -> str: ...
     def failed_run_log(self, head: str, run_ids: tuple[int, ...]) -> str: ...
-    def recently_merged_issues(
-        self, author: str, limit: int = 30
-    ) -> tuple[RecentlyMergedRef, ...]: ...
-
 
 class WorkflowState(Protocol):
-    """Advisory repair context and the retained Jira workflow path.
+    """Advisory repair context and the dispatcher infrastructure counter.
 
-    Selected lifecycle continuity uses typed SQL workflow control. Jira alone
-    retains its existing infrastructure counter; malformed counter reads fail
-    that path. CI history, predictions and Jira mirrors may return empty context.
+    Selected lifecycle continuity uses typed SQL workflow control. CI history
+    and predictions may return empty context.
     """
 
     def save_predicted_paths(
@@ -106,10 +90,6 @@ class WorkflowState(Protocol):
         self, issue: int, attempt: CiAttempt
     ) -> tuple[CiAttempt, ...]: ...
     def get_infra_deaths(self, key: int) -> int: ...
-    def get_jira_key(self, issue: int) -> str: ...
-    def set_jira_key(self, issue: int, key: str) -> None: ...
-    def get_jira_phase(self, issue: int) -> str: ...
-    def set_jira_phase(self, issue: int, phase: str) -> None: ...
 
 
 class ActionExecutor(Protocol):
@@ -427,18 +407,6 @@ class WorldObservationStore(Protocol):
 class PredictionReader(Protocol):
     """Read path prediction; empty means absent, storage failures raise."""
     def get_predicted_paths(self, issue: int) -> frozenset[str]: ...
-
-
-@runtime_checkable
-class IssueStateReasonReads(Protocol):
-    """Read GitHub state reason; transport failures raise."""
-    def issue_state_reason(self, issue: int) -> str: ...
-
-
-@runtime_checkable
-class RecentMergesReads(Protocol):
-    """Read recent merges; transport failure raises, no matches is empty."""
-    def recently_merged_issues(self, author: str) -> tuple[object, ...]: ...
 
 
 @runtime_checkable

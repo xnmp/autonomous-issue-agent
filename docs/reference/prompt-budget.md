@@ -33,4 +33,4 @@ Re-measured 2026-10-12 after the estimated-settlement rule: 8,260
 UTF-8 bytes and 1,099 whitespace-delimited words.
 
 Re-measured 2026-10-13 after machine failures stopped counting as attempt
-debt: 8,286 UTF-8 bytes and 1,103 whitespace-delimited words.
+debt: 8,339 UTF-8 bytes and 1,110 whitespace-delimited words.

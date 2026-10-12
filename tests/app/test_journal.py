@@ -32,7 +32,6 @@ from issue_agent.adapters.journal import (
     read_events,
     read_events_tail,
     recent_runs,
-    recurrence_keys,
     repeated_dispatch_warning,
     spend_blocked_keys,
     sum_issue,
@@ -411,7 +410,7 @@ def test_the_raise_path_death_settles_and_so_is_not_counted_here():
     """Anti-double-count. A pre-result transport death the PROCESS SURVIVED is
     already counted once, by the dispatcher's store bump; `JournalingRuntime`
     also writes it a settled `transport_death` line. Counting it here too would
-    halve `MAX_INFRA_DEATHS` for the failure mode it was tuned on."""
+    count one death twice."""
     events = [
         _start(NOW - timedelta(minutes=1)),
         _run(NOW, status="raised", is_error=True, exit_reason="transport_death",
@@ -1106,28 +1105,6 @@ def test_hold_keys_survives_a_round_trip_through_a_real_journal(tmp_path):
     journal.emit("hold", issue=522, reason="overlap", blocker="pr#123",
                  block_key="hold:o/r:522:overlap:pr#123")
     assert hold_keys(read_events_tail(journal.path)) == {"hold:o/r:522:overlap:pr#123"}
-
-
-def test_recurrence_keys_reads_only_keyed_recurrences():
-    events = [
-        {"event": "recurrence", "block_key": "recurrence:o/r:522:reopen"},
-        {"event": "recurrence", "kind": "reopen"},              # unkeyed → ignored
-        {"event": "hold", "block_key": "hold:o/r:522:overlap"},  # a different level
-    ]
-    assert recurrence_keys(events) == {"recurrence:o/r:522:reopen"}
-
-
-def test_recurrence_keys_survive_a_round_trip_through_a_real_journal(tmp_path):
-    """The dedup that matters spans daemon restarts, so it must read what
-    `Journal.emit` actually wrote — and the two KINDS must not collide."""
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    journal.emit("recurrence", kind="reopen", issue=522, of_issue=522, pr=9,
-                 block_key="recurrence:o/r:522:reopen")
-    journal.emit("recurrence", kind="refiled", issue=530, of_issue=522, pr=9,
-                 block_key="recurrence:o/r:530:refiled:522")
-    assert recurrence_keys(read_events_tail(journal.path)) == {
-        "recurrence:o/r:522:reopen", "recurrence:o/r:530:refiled:522",
-    }
 
 
 def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):

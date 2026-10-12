@@ -13,15 +13,13 @@ continuity writers. A2 whole-system acceptance and Phase 6's declared policy/
 independent-execution contracts are complete. Phase 5's offline contracts and
 live cutover are verified; actual unattended windows and readout remain pending.
 Current evidence is in the [execution record](../open/2026-10-05-phase-5-live-execution.md).
-Jira's explicitly retained legacy counter path is the sole
-runtime exception; its mirror context remains advisory.
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
 harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
 
 ## The shape
 
-Three role daemons — **fix**, **review**, **steward** — reconcile GitHub and
+Two role daemons — **fix** and **review** — reconcile GitHub and
 drive Claude, Codex, or GLM sessions. Each is assembled in `app/roles.py` from:
 
 ```
@@ -51,35 +49,7 @@ worktrees live below the hidden `.claude/worktrees` scratch path and that path i
 also excluded by the primary checkout's shared `.git/info/exclude`, but their type
 gate must be identical to the primary checkout's.
 
-Triage returns one of three dispositions: `ready`, `blocked`, or `close`.
-Closing is gated by `STEWARD_PROMOTE`, the same authority switch that gates
-promotion to `ai-ready`: a deployment that keeps a human on lifecycle decisions
-does not acquire autonomous closing by upgrading. A
-`close` verdict must carry both a concrete reason and a reopen condition; the
-steward then comments, closes the issue (`completed` only when the work actually
-shipped, otherwise `not_planned`), and applies the terminal `ai-closed` label —
-deliberately not `ai-done`, which means "a harness PR merged" and drives the
-reopen-based recurrence metric. A close missing either field, or a close on an
-issue whose `stateReason` is `reopened`, is refused and left open under
-`ai-triage` for a maintainer. Because `ai-closed` is not a lifecycle label, a
-human reopening a steward-closed issue puts it back into ordinary triage, and
-the next non-close disposition retires the stale marker. Existing deployments
-must create the `ai-closed` label (`issue-agent prepare-remote`) before enabling
-closing; the relabel fails otherwise and the issue re-enters triage until the
-ADR 0012 stall ceiling escalates it.
-
-The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
-advisory comments and the orthogonal `maybe-resolved` label for verified recent
-merge matches or stale references. A structured `duplicate_of` claim may close
-an issue only when `STEWARD_PROMOTE=1` and a separate harness-owned GitHub read
-proves the target is a different, closed issue. The close travels through the
-same durable `CloseIssue` rail as triage and always uses the harness-selected
-`completed` reason. Grooming is capped at five candidates per changed tick and
-persists a title/body signature after a successful delivery, preventing harness
-comments from self-amplifying spend.
-It also performs a free reconciliation over open PR metadata and posts one
-advisory flag when a changed path is governed by an ADR that the PR description
-does not cite. The shell governor is advisory defense-in-depth; durable
+The shell governor is advisory defense-in-depth; durable
 commands, captured-revision guards, SQLite ownership, and trusted readback
 are the publication authority.
 
@@ -103,7 +73,7 @@ tests pass.
    exclusively, so an old mutation either completes before retirement or fails
    its owner check after it. Peer effects remain concurrent and no SQLite
    transaction spans network I/O. This includes
-   CLI/dashboard labels, bootstrap settings, base-branch creation, Jira sync,
+   CLI/dashboard labels, bootstrap settings, base-branch creation,
    and webhook relay lifecycle. Paid agents publish branches and open PRs
    through `issue-agent-publish`; `AgentPublicationBroker` commits
    intent before the network call and reconciles remote state before retrying an
@@ -308,7 +278,7 @@ pending operator intent and durable effect rail. Renewal requires complete
 old-episode quiescence and carries a compact origin/session reference, preserving
 rejection allowance and unrelated holds. The dashboard projects this SQL state
 and daemon-captured facts through its existing transport; polls never grant work.
-Store continuity/session/model/reply/phase and steward baseline APIs are retired.
+Store continuity/session/model/reply/phase APIs are retired.
 Current selected issue/PR components retain exact paid admission and outcome
 sources, while free remediation holds the existing command identity until its
 exact head/run/base receipt settles. Machine and budget recoveries share one
@@ -390,8 +360,7 @@ that matters is not "wrong answer" but "loop that bills forever":
   machine end. Nothing is stored for it, and only the money caps bound the
   retries. Pre-admission refusals mint no run, so they retry each poll at $0.
 - `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — the reviewer's ceiling on paid rounds that
-  advanced nothing. `MAX_INFRA_DEATHS` survives only as the steward lanes'
-  ceiling and dies with the steward.
+  advanced nothing.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices streamed rollout counters and kills the process group on
   crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
@@ -523,7 +492,7 @@ is the sole env/coercion/choice table, drives `from_env`, and generates
 `config/agent.env.example`. The immutable config snapshot hash is recorded on
 every reservation and lifecycle command.
 
-Untrusted repository, issue, review, CI, and Jira text crosses into planners as
+Untrusted repository, issue, review, and CI text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
 Target `AGENTS.md` and `CLAUDE.md` files share one byte ceiling and one encoded
 untrusted block appended only to the user task for both providers. Codex
@@ -603,7 +572,7 @@ narrow conditions under which it may state a verdict rather than facts),
 `domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
 `domain/governor_policy.py`, `domain/git_remote.py`, `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
-legs), `domain/jira.py`,
+legs),
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
@@ -613,12 +582,11 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`,
-`domain/steward.py`, `domain/steward_stall.py`,
 `domain/supervision.py`,
-`domain/triage.py`, `domain/trust.py`, and
+`domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
-`domain/continuation_import.py` (closed stopped fix/steward source fields and typed import decisions),
+`domain/continuation_import.py` (closed stopped fix source fields and typed import decisions),
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
@@ -713,10 +681,10 @@ adapters live under `adapters/dashweb/`.
 `app/measurement.py` (local observation/export transport and cohort specification),
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
-`app/continuation_activation.py` (configured fixed fix/steward offline import, original-plan retry and copied rehearsal),
+`app/continuation_activation.py` (configured fixed fix offline import, original-plan retry and copied rehearsal),
 `app/review_execution_import.py` (configuration-bound legacy source checks and observational whole-repository zero-history import planning),
 `app/review_execution_import_remote.py` (configured complete PR, review and trusted-hold rereads under the import coordinator's barriers),
-`app/review_execution_activation.py` (configuration-bound offline planning and activation under fix/review/steward barriers, source and quiescence rechecks, atomic publication and SQL-only exact retry; operator transport and historical import remain pending),
+`app/review_execution_activation.py` (configuration-bound offline planning and activation under fix/review barriers, source and quiescence rechecks, atomic publication and SQL-only exact retry; operator transport and historical import remain pending),
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),

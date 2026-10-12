@@ -29,6 +29,23 @@ const RepoSummary = z
 const ReposPayload = z
   .object({ repos: z.array(RepoSummary), warnings: z.array(z.string()) })
   .passthrough();
+const BacklogCard = z
+  .object({
+    age_days: z.union([z.number(), z.null()]),
+    age_s: z.union([z.number(), z.null()]).optional(),
+    body: z.union([z.string(), z.null()]),
+    comments: z.union([z.number(), z.null()]),
+    difficulty: z.union([z.string(), z.null()]).optional(),
+    impact: z.union([z.string(), z.null()]).optional(),
+    issue: z.number().int(),
+    issue_type: z.union([z.string(), z.null()]).optional(),
+    labels: z.array(z.string()),
+    recurrence: z.boolean(),
+    recurrence_count: z.number().int(),
+    title: z.union([z.string(), z.null()]),
+    url: z.union([z.string(), z.null()]),
+  })
+  .passthrough();
 const BoardNeedsYou = z
   .object({
     ask: z.enum([
@@ -68,10 +85,7 @@ const BlockedOnOverlap = z
   })
   .passthrough();
 const BlockedOnTriage = z
-  .object({
-    kind: z.literal("triage"),
-    why: z.enum(["parked", "awaiting_reply"]),
-  })
+  .object({ kind: z.literal("triage"), why: z.literal("parked") })
   .passthrough();
 const BlockedOnQueue = z
   .object({
@@ -94,6 +108,9 @@ const BoardBlocked = z
     status: z.literal("blocked"),
   })
   .passthrough();
+const ModelBadge = z
+  .object({ effort: z.union([z.string(), z.null()]), model: z.string() })
+  .passthrough();
 const StageRail = z
   .object({
     ci_runs: z.number().int(),
@@ -104,38 +121,6 @@ const StageRail = z
     review_rounds: z.number().int(),
     steps: z.number().int(),
   })
-  .passthrough();
-const BacklogCard = z
-  .object({
-    age_days: z.union([z.number(), z.null()]),
-    age_s: z.union([z.number(), z.null()]).optional(),
-    board: z
-      .union([
-        z.discriminatedUnion("status", [
-          BoardNeedsYou,
-          BoardWorking,
-          BoardBlocked,
-        ]),
-        z.null(),
-      ])
-      .optional(),
-    body: z.union([z.string(), z.null()]),
-    comments: z.union([z.number(), z.null()]),
-    difficulty: z.union([z.string(), z.null()]).optional(),
-    impact: z.union([z.string(), z.null()]).optional(),
-    issue: z.number().int(),
-    issue_type: z.union([z.string(), z.null()]).optional(),
-    labels: z.array(z.string()),
-    rail: z.union([StageRail, z.null()]).optional(),
-    recurrence: z.boolean(),
-    recurrence_count: z.number().int(),
-    steward_state: z.enum(["raw", "processed", "blocked_on_human_reply"]),
-    title: z.union([z.string(), z.null()]),
-    url: z.union([z.string(), z.null()]),
-  })
-  .passthrough();
-const ModelBadge = z
-  .object({ effort: z.union([z.string(), z.null()]), model: z.string() })
   .passthrough();
 const CardStep = z
   .object({
@@ -659,7 +644,6 @@ const CostMix = z
     repair_usd: z.union([z.number(), z.null()]),
     resolve_usd: z.union([z.number(), z.null()]),
     review_usd: z.union([z.number(), z.null()]),
-    steward_usd: z.union([z.number(), z.null()]),
   })
   .passthrough();
 const EscalationReason = z
@@ -1332,6 +1316,7 @@ export const schemas = {
   RoleHealth,
   RepoSummary,
   ReposPayload,
+  BacklogCard,
   BoardNeedsYou,
   BoardWorking,
   BlockedOnIssue,
@@ -1340,9 +1325,8 @@ export const schemas = {
   BlockedOnTriage,
   BlockedOnQueue,
   BoardBlocked,
-  StageRail,
-  BacklogCard,
   ModelBadge,
+  StageRail,
   CardStep,
   IssueCard,
   ToastNotification,

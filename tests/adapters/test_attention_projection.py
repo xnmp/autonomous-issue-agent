@@ -15,7 +15,6 @@ from issue_agent.domain.outcome import (
     contract_escalation_actions, fix_ci_actions, pr_budget_actions,
     resolve_actions, resume_actions,
 )
-from issue_agent.domain.steward_stall import steward_stall_actions
 from tests.adapters.test_effects import _executor
 
 BLOCKED = AgentResult(is_error=False, status="blocked", needs="which API?", summary="clarify API")
@@ -42,10 +41,6 @@ BLOCKED = AgentResult(is_error=False, status="blocked", needs="which API?", summ
      Label.AI_WORKING, Label.AI_BLOCKED, False, "Budget review needed", True),
     (lambda: pr_budget_actions(7), Target.PR,
      None, Label.AI_BLOCKED, False, "Budget review needed", True),
-    (lambda: steward_stall_actions(7, "groom", 3, budget=False), Target.ISSUE,
-     None, Label.NEEDS_HUMAN_REVIEW, True, "groom leg failed 3", False),
-    (lambda: steward_stall_actions(7, "triage", 3, budget=True), Target.ISSUE,
-     None, Label.NEEDS_BUDGET_REVIEW, True, "triage leg reached", False),
 ])
 @pytest.mark.parametrize("delivery", ["fresh", "present", "lost_ack"])
 def test_attention_producer_plan_and_receipts(

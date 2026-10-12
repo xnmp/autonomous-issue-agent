@@ -40,8 +40,7 @@ env \
   GH_APP_ID='<your-app-id>' GH_APP_KEY_FILE="$scratch/missing-key" \
   GH_APP_INSTALL_ID=123 TARGET_DIR="$ROOT" AGENT_ENV="$scratch/outer.env" \
   STATE_DIR="$scratch/state" REVIEW_STATE_DIR="$scratch/review-state" \
-  STEWARD_STATE_DIR="$scratch/steward-state" \
-  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR CUSTOM_DEPLOY_KNOB" \
+  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR CUSTOM_DEPLOY_KNOB" \
   CUSTOM_DEPLOY_KNOB="leaks-unless-manifest-scrubbed" \
   sh -c "cd '$ROOT' && make --no-print-directory test-adapters"
 
@@ -63,7 +62,6 @@ env \
   AGENT_ENV="$scratch/outer.env" \
   STATE_DIR="$scratch/state" \
   REVIEW_STATE_DIR="$scratch/review-state" \
-  STEWARD_STATE_DIR="$scratch/steward-state" \
-  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR CUSTOM_DEPLOY_KNOB" \
+  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR CUSTOM_DEPLOY_KNOB" \
   CUSTOM_DEPLOY_KNOB="leaks-unless-manifest-scrubbed" \
   bash "$ROOT/tests/test_hooks.sh"

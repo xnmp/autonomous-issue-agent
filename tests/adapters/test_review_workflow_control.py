@@ -806,9 +806,9 @@ def test_acceptance_takes_every_barrier_in_order_reads_outside_sql_and_releases_
 
     _, result = rig.request(control=rig.control(gateway=Probing()))
     assert isinstance(result.snapshot.intent, PendingReviewRearm)
-    assert events[:3] == [("acquire", "fix"), ("acquire", "review"), ("acquire", "steward")]
-    assert ("read", None) in events[3:events.index(("release", "steward"))]
-    assert events[-3:] == [("release", "steward"), ("release", "review"), ("release", "fix")]
+    assert events[:2] == [("acquire", "fix"), ("acquire", "review")]
+    assert ("read", None) in events[2:events.index(("release", "review"))]
+    assert events[-2:] == [("release", "review"), ("release", "fix")]
     with deployment_effect_authority(rig.store.path, "o/r", "review", blocking=False):
         assert rig.drain() == 3  # effects run only after acceptance released the barriers
     assert rig.remote.review_state("r0") == "DISMISSED"
@@ -1865,8 +1865,8 @@ def test_other_generation_moving_paths_take_the_barriers_in_order(rig, monkeypat
             rig.remote.external_pr_change(PR, head_ref_oid=OTHER_HEAD)
             result = rig.reconcile()
     assert isinstance(result, WorkflowCommitted) and not result.idempotent
-    assert events == [("acquire", "fix"), ("acquire", "review"), ("acquire", "steward"),
-                      ("release", "steward"), ("release", "review"), ("release", "fix")]
+    assert events == [("acquire", "fix"), ("acquire", "review"),
+                      ("release", "review"), ("release", "fix")]
 
 
 def test_unreadable_pending_authority_is_reported_rescheduled_and_journaled(rig):

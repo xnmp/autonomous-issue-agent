@@ -64,66 +64,6 @@ def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
     assert cfg.review_model == "opus"
 
 
-def test_steward_runtime_defaults_to_claude_with_its_claude_model():
-    """Back-compat: an overlay written before STEWARD_RUNTIME existed must
-    resolve to exactly the runtime and model it resolved to before."""
-    cfg = from_env({"REPO": "x"})
-
-    assert cfg.steward_runtime.runtime == "claude"
-    assert cfg.steward_runtime.triage_model == "sonnet"
-
-
-def test_a_codex_steward_drops_the_claude_flavoured_default_model():
-    """`sonnet` is an Anthropic alias Codex cannot resolve. Unset means "let
-    the Codex runner choose", never "send the Claude default to Codex"."""
-    cfg = from_env({"REPO": "x", "STEWARD_RUNTIME": "codex"})
-
-    assert cfg.steward_runtime.runtime == "codex"
-    assert cfg.steward_runtime.triage_model is None
-
-
-@pytest.mark.parametrize("runtime", ["claude", "codex"])
-def test_an_explicit_steward_triage_model_survives_either_runtime(runtime):
-    cfg = from_env({
-        "REPO": "x", "STEWARD_RUNTIME": runtime,
-        "STEWARD_TRIAGE_MODEL": "gpt-5.6-terra",
-    })
-
-    assert cfg.steward_runtime.triage_model == "gpt-5.6-terra"
-
-
-@pytest.mark.parametrize("runtime", ["claude", "codex"])
-def test_an_explicitly_empty_triage_model_still_means_the_runtime_default(runtime):
-    """`STEWARD_TRIAGE_MODEL=""` meant None (let the runtime choose) before the
-    per-runtime default existed, and must keep meaning that. Only an ABSENT key
-    takes the default — otherwise a deliberate empty silently becomes
-    "sonnet"."""
-    cfg = from_env({
-        "REPO": "x", "STEWARD_RUNTIME": runtime, "STEWARD_TRIAGE_MODEL": "",
-    })
-
-    assert cfg.steward_runtime.triage_model is None
-
-
-@pytest.mark.parametrize("value", ["glm", "gpt5"])
-def test_steward_runtime_rejects_a_runtime_it_cannot_dispatch(value):
-    """An unsupported value must be reported and fall back to claude, never
-    silently select a runtime the steward has no binder for."""
-    cfg = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "STEWARD_RUNTIME": value})
-
-    _assert_each_knob_flagged_once(cfg.validation_errors(), {"STEWARD_RUNTIME"})
-    assert "must be one of ['claude', 'codex']" in cfg.validation_errors()[0]
-    assert cfg.steward_runtime.runtime == "claude"
-
-
-def test_an_empty_steward_runtime_reads_as_unset():
-    """Every other knob in this table treats "" as "not configured"."""
-    cfg = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "STEWARD_RUNTIME": ""})
-
-    assert cfg.validation_errors() == ()
-    assert cfg.steward_runtime.runtime == "claude"
-
-
 @pytest.mark.parametrize("mode", ["multi", "delegated"])
 def test_codex_reviewer_rejects_modes_it_cannot_execute(mode):
     cfg = from_env({
@@ -154,7 +94,6 @@ def test_every_operator_field_has_env_and_coercion_metadata():
         "agent_md",
         "control_authority_root",
         "repointed_from_deployments",
-        "triage_prompt",
         "codex_cost_per_mtok_cached_in",
         "parse_errors",
         "repo_input",
@@ -207,15 +146,8 @@ def test_defaults():
     assert c.base_branch == "dev"
     assert c.identity_mode == "three"
     assert c.auto_merge is True
-    assert c.steward_triage is True   # default-on; promote stays human
-    assert c.steward_promote is False
     assert c.poll_seconds == 20
     assert c.review_trigger_label == "ai-pr-open"  # default unchanged
-    # Jira sync defaults ON but inert (no project key), MCP spec path defaulted.
-    assert c.jira_sync is True
-    assert c.jira_project_key == ""
-    assert c.jira_mcp_config == "config/mcp/atlassian.json"
-    assert c.jira_mcp_tools == "mcp__atlassian__*"
 
 
 def test_custom_state_roots_keep_one_machine_accounting_authority(
@@ -231,7 +163,6 @@ def test_custom_state_roots_keep_one_machine_accounting_authority(
             "REPO": "o/one",
             "STATE_DIR": "/srv/one/fix",
             "REVIEW_STATE_DIR": "/srv/one/review",
-            "STEWARD_STATE_DIR": "/srv/one/steward",
         }
     )
     second = from_env(
@@ -239,7 +170,6 @@ def test_custom_state_roots_keep_one_machine_accounting_authority(
             "REPO": "o/two",
             "STATE_DIR": "/var/lib/two/fix",
             "REVIEW_STATE_DIR": "/var/lib/two/review",
-            "STEWARD_STATE_DIR": "/var/lib/two/steward",
         }
     )
 
@@ -293,19 +223,13 @@ def test_review_trigger_label_override():
 
 def test_bool_parsing():
     assert from_env({"REPO": "x", "AUTO_MERGE": "0"}).auto_merge is False
-    assert from_env({"REPO": "x", "STEWARD_TRIAGE": "1"}).steward_triage is True
-    assert from_env({"REPO": "x", "STEWARD_TRIAGE": "0"}).steward_triage is False  # default-on, opt-out
     assert from_env({"REPO": "x", "CLOSE_ISSUE_ON_MERGE": "false"}).close_issue_on_merge is False
-    assert from_env({"REPO": "x", "JIRA_SYNC": "0"}).jira_sync is False   # default-on, opt-out
-    assert from_env({"REPO": "x", "JIRA_PROJECT_KEY": "ABC"}).jira_project_key == "ABC"
 
 
 def test_models_and_budgets():
-    c = from_env({"REPO": "x", "FIX_MODEL": "opus", "REVIEW_BUDGET_USD": "2.5",
-                  "STEWARD_TRIAGE_MODEL": "sonnet"})
+    c = from_env({"REPO": "x", "FIX_MODEL": "opus", "REVIEW_BUDGET_USD": "2.5"})
     assert c.fix_model == "opus"
     assert c.review_budget_usd == 2.5
-    assert c.steward_triage_model == "sonnet"
 
 
 def test_empty_fix_model_is_none():
@@ -315,8 +239,6 @@ def test_empty_fix_model_is_none():
 def test_merge_method():
     c = from_env({"REPO": "x", "MERGE_METHOD": "merge"})
     assert c.merge_method == "merge"
-
-
 
 
 def test_edit_check_cmd():
@@ -412,15 +334,12 @@ def test_grouped_config_preserves_flat_env_mapping():
         "TARGET_DIR": "/repo",
         "STATE_DIR": "/state/fix",
         "REVIEW_STATE_DIR": "/state/review",
-        "STEWARD_STATE_DIR": "/state/steward",
         "WORKTREE_ROOT": "/worktrees",
         "HARNESS_ROOT_DIR": "/harness",
         "FIX_BOT": "fixer",
         "MAX_BUDGET_USD": "4.25",
         "REVIEW_MODE": "delegated",
         "REVIEW_TRIGGER_LABEL": "ai-review",
-        "STEWARD_OWNER": "@org/team",
-        "JIRA_PROJECT_KEY": "ABC",
         "CODEX_BIN": "codex-dev",
         "CODEX_MODEL": "gpt-next",
     })
@@ -430,16 +349,12 @@ def test_grouped_config_preserves_flat_env_mapping():
     assert c.repository.target_dir == "/repo"
     assert c.runtime_paths.state_dir == "/state/fix"
     assert c.runtime_paths.review_state_dir == "/state/review"
-    assert c.runtime_paths.steward_state_dir == "/state/steward"
     assert c.runtime_paths.worktree_root == "/worktrees"
     assert c.runtime_paths.harness_root == "/harness"
     assert c.fix_runtime.bot == "fixer"
     assert c.fix_runtime.budget_usd == 4.25
     assert c.review_runtime.mode is ReviewMode.DELEGATED
     assert c.review_runtime.trigger_label == "ai-review"
-    assert c.steward_runtime.owner == "@org/team"
-    assert c.jira_runtime.sync is True
-    assert c.jira_runtime.project_key == "ABC"
     assert c.codex_runtime.binary == "codex-dev"
     assert c.codex_runtime.model == "gpt-next"
     # Both session caps reach the codex runtime through the same grouped config the
@@ -533,17 +448,15 @@ def test_validation_rejects_invalid_budgets():
         "FIX_BOT": "fix-bot",
         "MAX_BUDGET_USD": "0",
         "REVIEW_BUDGET_USD": "-1",
-        "STEWARD_TRIAGE_BUDGET_USD": "0",
         "REVIEW_GATE_BUDGET_USD": "0",
         "REVIEW_DIMENSION_BUDGET_USD": "0",
         "REVIEW_VALIDATION_BUDGET_USD": "0",
-        "JIRA_SYNC_BUDGET_USD": "0",
     })
 
     _assert_each_knob_flagged_once(c.validation_errors(), {
-        "MAX_BUDGET_USD", "REVIEW_BUDGET_USD", "STEWARD_TRIAGE_BUDGET_USD",
+        "MAX_BUDGET_USD", "REVIEW_BUDGET_USD",
         "REVIEW_GATE_BUDGET_USD", "REVIEW_DIMENSION_BUDGET_USD",
-        "REVIEW_VALIDATION_BUDGET_USD", "JIRA_SYNC_BUDGET_USD",
+        "REVIEW_VALIDATION_BUDGET_USD",
     })
 
 
@@ -597,14 +510,6 @@ def test_glm_without_a_profile_is_a_config_error():
 def test_glm_settings_file_is_irrelevant_on_other_runtimes():
     c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "FIXER_RUNTIME": "claude"})
 
-    assert c.validation_errors() == ()
-
-
-def test_jira_sync_without_project_key_stays_valid_and_inert():
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "JIRA_SYNC": "1"})
-
-    assert c.jira_runtime.sync is True
-    assert c.jira_runtime.project_key == ""
     assert c.validation_errors() == ()
 
 
@@ -811,7 +716,6 @@ def test_state_dirs_default_per_repo():
     c = from_env({"REPO": "acme/widget"})
     assert c.state_dir.endswith("issue-agent/acme__widget")
     assert c.review_state_dir.endswith("review-agent/acme__widget")
-    assert c.steward_state_dir.endswith("steward-agent/acme__widget")
 
 
 def test_repo_slug_does_not_collide_when_either_segment_has_a_hyphen():
@@ -823,7 +727,6 @@ def test_repo_slug_does_not_collide_when_either_segment_has_a_hyphen():
     b = from_env({"REPO": "acme-app/b"})
     assert a.state_dir != b.state_dir
     assert a.review_state_dir != b.review_state_dir
-    assert a.steward_state_dir != b.steward_state_dir
 
 
 def test_repo_slug_is_case_insensitive_like_github_repo_identity():
@@ -837,7 +740,6 @@ def test_repo_slug_is_case_insensitive_like_github_repo_identity():
     assert a.repo_input == "Acme/Widget"
     assert a.state_dir == b.state_dir
     assert a.review_state_dir == b.review_state_dir
-    assert a.steward_state_dir == b.steward_state_dir
 
 
 def test_repo_slug_case_insensitivity_does_not_collapse_distinct_repos():
@@ -855,7 +757,6 @@ def test_state_dirs_do_not_collide_across_repos():
     b = from_env({"REPO": "acme/gadget"})
     assert a.state_dir != b.state_dir
     assert a.review_state_dir != b.review_state_dir
-    assert a.steward_state_dir != b.steward_state_dir
 
 
 def test_explicit_state_dir_still_wins_over_the_per_repo_default():
@@ -1016,14 +917,6 @@ def test_absence_of_fix_bot_check_would_have_validated_silently():
     assert errors != ()  # …but the dedicated check does
 
 
-def test_max_infra_deaths_default_and_override():
-    assert from_env({"REPO": "x"}).max_infra_deaths == 5
-    c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "2"})
-    assert c.max_infra_deaths == 2
-    assert c.steward_runtime.max_infra_deaths == 2
-    assert not hasattr(c.fix_runtime, "max_infra_deaths")  # machine failures never escalate fix work
-
-
 def test_sdk_max_buffer_default_clears_a_five_megabyte_read():
     # #13: the SDK's own 1MB ceiling is below one base64'd hi-DPI screenshot,
     # and blowing it kills the whole session's transport.
@@ -1042,12 +935,6 @@ def test_sdk_max_buffer_is_overridable_and_zero_means_the_sdk_default():
 def test_negative_sdk_max_buffer_is_a_config_error():
     c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "SDK_MAX_BUFFER_BYTES": "-1"})
     assert any("SDK_MAX_BUFFER_BYTES" in e for e in c.validation_errors())
-
-
-def test_max_infra_deaths_zero_is_a_valid_off_value():
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_INFRA_DEATHS": "0"})
-    assert c.max_infra_deaths == 0
-    assert c.validation_errors() == ()
 
 
 def test_fix_dispatch_concurrency_defaults_to_two_and_can_go_serial():

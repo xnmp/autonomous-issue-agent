@@ -106,7 +106,6 @@ def test_dashboard_label_actions_use_the_durable_operator_effect_port(
         lambda _name: [
             "/state/fix/journal.jsonl",
             "/state/review/journal.jsonl",
-            "/state/steward/journal.jsonl",
         ],
     )
 
@@ -116,12 +115,12 @@ def test_dashboard_label_actions_use_the_durable_operator_effect_port(
     assert factory_calls == [
         (
             "o/r",
-            ("/state/fix", "/state/review", "/state/steward"),
+            ("/state/fix", "/state/review"),
             "o/r:dashboard",
         ),
         (
             "o/r",
-            ("/state/fix", "/state/review", "/state/steward"),
+            ("/state/fix", "/state/review"),
             "o/r:dashboard",
         ),
     ]
@@ -250,7 +249,7 @@ def _unblock_backend(
     applied_by_target=None,
     effective_by_target=None,
 ):
-    """A Backend whose three role state dirs are real, with a journalled row
+    """A Backend whose role state dirs are real, with a journalled row
     that links issue 7 to `prs` and a GitHub reader that answers with
     `issue_labels`/`pr_labels`."""
     from issue_agent.app import cli
@@ -327,10 +326,10 @@ def _unblock_backend(
     _active_values(
         tmp_path, REPO="o/r", TARGET_DIR=str(target),
         STATE_DIR=str(dirs["fix"]), REVIEW_STATE_DIR=str(dirs["review"]),
-        STEWARD_STATE_DIR=str(dirs["steward"]), CONTROL_AUTHORITY_ROOT=authority_root,
+        CONTROL_AUTHORITY_ROOT=authority_root,
         FIX_BOT="fixer[bot]", REVIEW_BOT=review_bot,
         GH_HOST=os.environ.get("GH_HOST", "github.com"),
-        ROLES="fix review steward",
+        ROLES="fix review",
     )
     control = SQLiteControlStore(control_path.canonical_control_store_path(authority_root=authority_root))
     control.initialize()

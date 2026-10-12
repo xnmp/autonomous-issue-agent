@@ -25,7 +25,7 @@ class CohortWindow:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repository", canonical_repository(self.repository))
-        if not isinstance(self.primary_family, str) or self.primary_family not in {"resolve", "review_execution", "issue_recovery", "pr_repair", "steward"}:
+        if not isinstance(self.primary_family, str) or self.primary_family not in {"resolve", "review_execution", "issue_recovery", "pr_repair"}:
             raise ValueError("invalid primary family")
         if not isinstance(self.selection, str) or self.selection not in {"new_admissions", "include_inherited"}:
             raise ValueError("invalid cohort selection")

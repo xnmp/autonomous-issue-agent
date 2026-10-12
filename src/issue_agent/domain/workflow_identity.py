@@ -82,7 +82,6 @@ class WorkflowFamily(str, Enum):
     REVIEW_EXECUTION = "review_execution"
     ISSUE_RECOVERY = "issue_recovery"
     PR_REPAIR = "pr_repair"
-    STEWARD = "steward"
 
 
 def target_family(target: WorkflowTarget) -> WorkflowFamily:
@@ -97,7 +96,7 @@ def target_family(target: WorkflowTarget) -> WorkflowFamily:
 def family_owns_target(family: WorkflowFamily, target: WorkflowTarget) -> bool:
     if not isinstance(family, WorkflowFamily) or not isinstance(target, (IssueRef, PullRequestRef)):
         raise ValueError("family ownership requires a typed family and target")
-    if family in (WorkflowFamily.RESOLVE, WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.STEWARD):
+    if family in (WorkflowFamily.RESOLVE, WorkflowFamily.ISSUE_RECOVERY):
         return isinstance(target, IssueRef)
     return isinstance(target, PullRequestRef)
 
@@ -161,7 +160,7 @@ class ContinuationComponentIdentity:
 
     def __post_init__(self) -> None:
         if (not isinstance(self.key, WorkflowKey) or not isinstance(self.authority, FamilyAuthority)
-                or self.authority.family not in (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD)
+                or self.authority.family not in (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR)
                 or not family_owns_target(self.authority.family, self.key.target)):
             raise ValueError("continuation identity requires its fixed family and target")
         validate_workflow_identifier(self.episode_id, "continuation episode")
@@ -175,11 +174,11 @@ class ContinuationComponentIdentity:
 @dataclass(frozen=True)
 class WorkflowWriter:
     repository: str
-    role: Literal["fix", "review", "steward"]
+    role: Literal["fix", "review"]
     owner_id: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repository", canonical_workflow_repository(self.repository))
-        if self.role not in ("fix", "review", "steward"):
+        if self.role not in ("fix", "review"):
             raise ValueError("workflow writer requires a deployment role")
         validate_workflow_identifier(self.owner_id, "workflow writer owner")

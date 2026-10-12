@@ -50,7 +50,7 @@ def _parse_makefile_targets(text: str) -> dict[str, list[str]]:
 def test_makefile_exposes_only_python_watchers():
     targets = _parse_makefile_targets(_read("Makefile"))
 
-    for role in ("fix", "review", "steward"):
+    for role in ("fix", "review"):
         assert f"run-{role}" in targets
         assert f"run-{role}-sh" not in targets
         recipe = " ".join(targets[f"run-{role}"])
@@ -99,7 +99,6 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
     units = {
         "ops/systemd/issue-agent-fix-watcher.service": "fix",
         "ops/systemd/issue-agent-review-watcher.service": "review",
-        "ops/systemd/issue-agent-steward.service": "steward",
     }
 
     for path, role in units.items():
@@ -155,7 +154,6 @@ def test_launchd_plists_run_python_from_harness_root_with_target_dir_env():
     plists = {
         "ops/launchd/dev.issue-agent.fix-watcher.plist": "fix",
         "ops/launchd/dev.issue-agent.review-watcher.plist": "review",
-        "ops/launchd/dev.issue-agent.steward.plist": "steward",
     }
 
     for path, role in plists.items():

@@ -3,7 +3,7 @@ import { ConfirmModal } from "./ui/Modal";
 /**
  * The one confirmation before an issue is promoted to ai-ready: the fixer
  * picks it up on its next tick and starts spending, wherever the operator
- * asked for it (the backlog, the untriaged list, a triage-blocked row).
+ * asked for it (the backlog).
  */
 export function PromoteConfirm({
   issue,

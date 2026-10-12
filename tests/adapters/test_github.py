@@ -20,8 +20,6 @@ from issue_agent.adapters.github import (
     MissingListLimit,
     format_pr_discussion,
     format_review_comments,
-    build_add_blocked_by_args,
-    build_blocker_id_args,
     build_close_issue_args,
     build_comment_args,
     build_enable_auto_merge_args,
@@ -307,11 +305,6 @@ def test_write_command_builders_are_pure_contracts():
         "pr", "merge", "100", "--repo", "o/r", "--squash", "--delete-branch",
         "--match-head-commit", "head",
     ]
-    assert build_blocker_id_args("o/r", 42) == ["api", "repos/o/r/issues/42", "--jq", ".id"]
-    assert build_add_blocked_by_args("o/r", 7, 5551234) == [
-        "api", "repos/o/r/issues/7/dependencies/blocked_by",
-        "--method", "POST", "-F", "issue_id=5551234",
-    ]
 
 
 def test_relabel_builds_correct_argv():
@@ -458,27 +451,6 @@ def test_update_branch_refuses_to_advance_when_legacy_arm_cannot_be_revoked():
     assert not any(argv[1] == "api" for argv, _ in fr.calls)
 
 
-def test_add_blocked_by_resolves_id_then_posts():
-    # #7 blocked_by #42: first resolve #42's numeric id, then POST it.
-    fr = FakeRunner({"api repos/o/r/issues/42": "5551234"})
-    gw = GitHubGateway("o/r", runner=fr)
-    gw.add_blocked_by(7, 42)
-    assert len(fr.calls) == 2
-    id_argv, _ = fr.calls[0]
-    assert id_argv[1] == "api" and id_argv[2] == "repos/o/r/issues/42" and ".id" in id_argv
-    post_argv, _ = fr.calls[1]
-    assert post_argv[2] == "repos/o/r/issues/7/dependencies/blocked_by"
-    assert "POST" in post_argv and "issue_id=5551234" in post_argv
-
-
-def test_add_blocked_by_failsoft_when_blocker_missing():
-    # blocker id lookup returns "" → no POST, no raise.
-    fr = FakeRunner()  # every call → ""
-    gw = GitHubGateway("o/r", runner=fr)
-    gw.add_blocked_by(7, 42)
-    assert len(fr.calls) == 1  # only the id lookup; POST skipped
-
-
 def test_submit_review_returns_true_on_success():
     # gh `api ... POST` prints the created-review JSON on success → non-empty → True.
     fr = FakeRunner({"api repos/o/r/pulls/100/reviews": {"id": 1, "state": "APPROVED"}})
@@ -551,8 +523,6 @@ def test_get_issue_parses_response():
     gw = GitHubGateway("o/r", runner=fr)
     iss = gw.get_issue(5)
     assert iss.number == 5 and iss.has(Label.AI_READY)
-
-
 
 
 def test_get_pr_checks_are_head_bound_and_keep_only_latest_attempt():
@@ -664,12 +634,6 @@ def test_review_world_pr_view_omits_mergeability_fields():
     assert "mergeable" in v2[v2.index("--json") + 1]
 
 
-
-
-
-
-
-
 def test_review_world_survives_one_failing_pr_fetch():
     """One PR whose `gh pr view` returns empty (hung/killed → parse_pr(None) raises)
     must NOT abort the whole poll: the other PRs still populate the world, so a
@@ -692,72 +656,7 @@ def test_review_world_survives_one_failing_pr_fetch():
     assert [p.number for p in w.prs] == [900]  # 374 dropped, 900 survived
 
 
-def test_build_steward_world_includes_open_and_closed_ai_done_and_open_prs():
-    # open issue list returns #5; closed-ai-done list returns #9. The world must
-    # union them so the final Done transition isn't missed on an already-closed issue.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key and "--state open" in key:
-            return json.dumps([{"number": 5}])
-        if "issue list" in key and "--state closed" in key:
-            assert "ai-done" in argv          # closed query is scoped to ai-done
-            return json.dumps([{"number": 9}])
-        if "issue view 5" in key:
-            return json.dumps({"number": 5, "state": "OPEN", "labels": [{"name": "ai-ready"}]})
-        if "issue view 9" in key:
-            return json.dumps({"number": 9, "state": "CLOSED", "labels": [{"name": "ai-done"}]})
-        if "pr list" in key:
-            return json.dumps([{"number": 12}])
-        if "pr view 12" in key:
-            assert "pr checks" not in key
-            return json.dumps(
-                {
-                    "number": 12,
-                    "state": "OPEN",
-                    "body": "change",
-                    "files": [{"path": "src/auth/token.py"}],
-                }
-            )
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    w = gw.build_steward_world()
-    assert sorted(i.number for i in w.issues) == [5, 9]
-    assert [pr.number for pr in w.prs] == [12]
-
-
 # ── P0.7: loud warning when a world-building list hits the --limit cap ────────
-def test_build_triage_world_warns_when_issue_list_hits_limit(capsys):
-    # exactly _LIST_LIMIT items: gh gives no "there were more" signal short of
-    # pagination, so a count that HITS the cap is the only observable proxy for
-    # truncation — this must be LOUD (FAILURE-MODES #66), not silently dropped.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return json.dumps([{"number": n} for n in range(1, _LIST_LIMIT + 1)])
-        if "issue view" in key:
-            return json.dumps({"number": int(argv[3]), "state": "OPEN"})
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    w = gw.build_triage_world()
-    assert len(w.issues) == _LIST_LIMIT
-    err = capsys.readouterr().err
-    assert "TRUNCATED" in err and str(_LIST_LIMIT) in err
-
-
-def test_build_triage_world_no_warning_when_issue_list_below_limit(capsys):
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key:
-            return json.dumps([{"number": 1}, {"number": 2}])
-        if "issue view" in key:
-            return json.dumps({"number": int(argv[3]), "state": "OPEN"})
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    gw.build_triage_world()
-    assert capsys.readouterr().err == ""
 
 
 def test_list_all_open_pr_numbers_warns_when_pr_list_hits_limit(capsys):
@@ -1324,10 +1223,6 @@ _ROLLUP_ERR = (
 )
 
 
-
-
-
-
 def test_non_benign_gh_failure_stays_loud_without_debug(monkeypatch, capsys):
     """A REAL failure (e.g. a 422 self-approval on submit) must never be silenced —
     the whole reason the stderr write exists. Not a pr-checks/rollup error → loud."""
@@ -1573,13 +1468,10 @@ def test_build_world_propagates_gh_unavailable():
         gw.build_world()
 
 
-@pytest.mark.parametrize(
-    "build", ["build_review_world", "build_triage_world", "build_steward_world"]
-)
-def test_all_world_builders_propagate_gh_unavailable(build):
+def test_review_world_builder_propagates_gh_unavailable():
     gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503")))
     with pytest.raises(GhUnavailable):
-        getattr(gw, build)()
+        gw.build_review_world()
 
 
 def test_review_world_isolates_a_timed_out_pr_but_not_a_rate_limit(capsys):
@@ -1746,10 +1638,10 @@ def test_gh_rejects_a_list_subcommand_without_limit():
 
 
 @pytest.mark.parametrize(
-    "build", ["build_world", "build_review_world", "build_triage_world", "build_steward_world"]
+    "build", ["build_world", "build_review_world"]
 )
 def test_every_world_builder_list_call_carries_a_limit(build):
-    """review C2 sweep across all four builders — the observable contract, not the
+    """review C2 sweep across both builders — the observable contract, not the
     guard: no world is ever built from a silently-capped listing."""
     calls = []
 
@@ -1853,28 +1745,6 @@ def test_build_world_isolates_a_wedged_blocker_read(capsys):
     assert (seven.blocked_by_open, seven.open_blocker_numbers) == (True, ())
     assert world.issues[1].blocked_by_open is False
     assert "skip issue-blockers #7" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("build", ["build_triage_world", "build_steward_world"])
-def test_steward_issue_worlds_survive_one_unreadable_issue(build, capsys):
-    # review M19: the steward/triage polls read EVERY open issue, so they are the
-    # most likely to meet the one bad one.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "issue list" in key and "--state open" in key:
-            return json.dumps([{"number": 7}, {"number": 8}])
-        if "issue list" in key:
-            return "[]"
-        if "issue view 7" in key:
-            return "{}"                                   # KeyError in parse_issue
-        if "issue view 8" in key:
-            return json.dumps({"number": 8, "state": "OPEN"})
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    w = getattr(gw, build)()
-    assert [i.number for i in w.issues] == [8]
-    assert "skip issue #7" in capsys.readouterr().err
 
 
 # ── PR conversation → review prompt (2026-08-08, tauri #613/#614) ─────────────
@@ -2140,70 +2010,6 @@ def test_change_signature_is_one_rest_point_and_fails_soft():
     assert GitHubGateway("o/r", Identity(), runner=FakeRunner()).change_signature() == ""
 
 
-
-
-# ── recurrence context (harness #10) ─────────────────────────────────────────
-def test_recently_merged_issues_reports_one_entry_per_closed_issue():
-    """One MergedRef per REFERENCED ISSUE, carrying the issue's own number and
-    title (a recurrence matches a new report against old REPORTS, not against the
-    PR titles that resolved them)."""
-    fr = FakeRunner({"pr list": [
-        {"number": 300, "title": "fix: null token", "mergedAt": "2026-07-20T10:00:00Z",
-         "closingIssuesReferences": [{"number": 42, "title": "Login crashes on null token"},
-                                     {"number": 43, "title": "Session drops"}]},
-        {"number": 301, "title": "chore: bump", "mergedAt": "2026-07-21T10:00:00Z",
-         "closingIssuesReferences": []},
-    ]})
-    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
-
-    merged = gw.recently_merged_issues("fix-bot", limit=30)
-
-    assert [(m.issue, m.pr, m.title) for m in merged] == [
-        (42, 300, "Login crashes on null token"),
-        (43, 300, "Session drops"),
-    ]
-    assert merged[0].merged_at == "2026-07-20T10:00:00Z"
-    argv = [a for a, _ in fr.calls][0]
-    assert "--author" in argv and "fix-bot" in argv
-    assert argv[argv.index("--limit") + 1] == "30"
-    assert "merged" in argv
-
-
-def test_recently_merged_issues_fails_soft():
-    """Advisory context may never kill the leg it enriches: an unreadable list,
-    garbage JSON, or no author at all is simply "no reference set"."""
-    def boom(argv, token):
-        raise RuntimeError("gh boom")
-
-    assert GitHubGateway("o/r", runner=boom).recently_merged_issues("fix-bot") == ()
-    assert GitHubGateway(
-        "o/r", runner=lambda a, t: "not json"
-    ).recently_merged_issues("fix-bot") == ()
-    # no author → no reference set, and NO gh call at all
-    calls = []
-    gw = GitHubGateway("o/r", runner=lambda a, t: calls.append(a) or "[]")
-    assert gw.recently_merged_issues("") == ()
-    assert calls == []
-
-
-def test_issue_state_reason_normalises_the_graphql_enum():
-    fr = FakeRunner({"issue view 522": {"stateReason": "REOPENED"}})
-    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
-    assert gw.issue_state_reason(522) == "reopened"
-
-
-def test_issue_state_reason_fails_soft_to_no_evidence():
-    """"" means "no evidence of a recurrence" — the silent, correct default. A
-    completed close must never read as a reopen."""
-    fr = FakeRunner({"issue view 522": {"stateReason": "COMPLETED"}})
-    assert GitHubGateway("o/r", runner=fr).issue_state_reason(522) == "completed"
-
-    def boom(argv, token):
-        raise RuntimeError("gh boom")
-
-    assert GitHubGateway("o/r", runner=boom).issue_state_reason(522) == ""
-    assert GitHubGateway("o/r", runner=lambda a, t: "").issue_state_reason(522) == ""
-    assert GitHubGateway("o/r", runner=lambda a, t: "null").issue_state_reason(522) == ""
 
 
 def test_merged_prs_in_the_world_get_the_cheap_fetch():
@@ -2496,10 +2302,6 @@ def test_closed_slice_truncation_is_loud_at_its_own_cap(capsys):
 # ── #48: a failed `gh pr checks` is UNKNOWN, not an empty world ──────────────
 
 
-
-
-
-
 def test_get_pr_marks_checks_unknown_when_the_read_fails():
     """The hole (#48): a swallowed non-infra CI read failure used to
     rebuild the PR with checks=() — indistinguishable from a no-CI repo, which
@@ -2509,10 +2311,6 @@ def test_get_pr_marks_checks_unknown_when_the_read_fails():
     fr = FakeRunner({"pr view 100": pr_resp})  # policy read unmatched → unavailable
     pr = GitHubGateway("o/r", runner=fr).get_pr(100)
     assert pr.checks == () and isinstance(pr.ci, Unavailable)
-
-
-
-
 
 
 def test_a_skipped_checks_call_is_unread_not_empty():

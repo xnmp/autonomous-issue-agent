@@ -107,7 +107,7 @@ class EscalationSignals:
     """Evidence that the previous configuration under-delivered.
 
     All three are already recorded by the harness — no new sensors (#16):
-    `recurrence` is the advisory label the steward applies (#10),
+    `recurrence` is the advisory recurrence label (#10),
     `resolve_retries` is the fixer's own non-infra failure counter, and
     `review_rounds` is how many CHANGES_REQUESTED reviews are outstanding on
     the PR (`domain.review.count_outstanding_change_requests`, derived from

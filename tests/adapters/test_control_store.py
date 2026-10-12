@@ -68,7 +68,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 44))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 45))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -128,6 +128,7 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
         43: ("CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target) "
              "WHERE state IN ('pending','executing','retryable_failure','unknown_outcome') "
              "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text'",),
+        44: (),
         42: (),
         41: ("ALTER TABLE charges DROP COLUMN origin",),
         40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
@@ -3857,3 +3858,161 @@ def test_v43_retires_pre_upgrade_self_clear_relabels_so_ai_blocked_waits_for_a_h
         assert db.execute("SELECT command_id FROM lifecycle_commands").fetchall() == [(str(ordinary.command_id),)]
         assert db.execute("SELECT name FROM sqlite_master WHERE name='lifecycle_self_clear_pending'").fetchall() == []
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
+    from issue_agent.adapters.control_store import _encoded_payload_digest
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+
+    store = _store(tmp_path)
+    state = resolve_snapshot(7)
+    install_workflow(store, state)
+    binding = encode_workflow(state.binding)
+    steward, fix = "o/r:steward:x", "o/r:fix:y"
+    # A steward leg still in flight when the role was deleted, beside a live fix leg.
+    assert store.reserve(dataclasses.replace(_request(1), owner_id=steward)).disposition is AccountingDisposition.AVAILABLE
+    assert store.reserve(dataclasses.replace(_request(2, cap=200), owner_id=fix)).disposition is AccountingDisposition.AVAILABLE
+
+    def command(db, command_id, payload, executor="owner"):
+        db.execute(
+            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
+            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
+            "state,created_at,updated_at,workflow_binding_json) "
+            "VALUES (?,?,?,0,'post_comment','issue:7','r','legacy','o/r',?,?,?,'succeeded',?,?,?)",
+            (command_id, command_id, command_id, executor, payload, _encoded_payload_digest(payload, binding),
+             NOW.isoformat(), NOW.isoformat(), binding))
+        db.execute("INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,status,"
+                   "receipt_digest) VALUES (?,?,'s','c','succeeded',?)", (command_id, executor, "b" * 64))
+
+    def claim(db, role, owner, run_id):
+        db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,"
+                   "paths_json,claimed_at,occurrence_id) VALUES ('o/r',?,'issue:9','RESOLVE',?,1,1,'[]',?,?)",
+                   (role, owner, NOW.isoformat(), f"occurrence-{role}"))
+        db.execute("INSERT INTO dispatch_claim_runs VALUES ('o/r',?,'issue:9',?,?)", (role, run_id, NOW.isoformat()))
+
+    def dedupe(db, namespace, key):
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at) VALUES (?,'o/r',?,?)",
+                   (namespace, key, NOW.isoformat()))
+
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 42)
+        command(db, "steward-cmd", json.dumps({"steward_guard": {"lane": "triage"}}))
+        command(db, "plain-cmd", json.dumps({"body": "hello"}))
+        command(db, "steward-plain-cmd", json.dumps({"body": "hello"}), executor=steward)
+        db.execute("UPDATE runs SET state='running', started_at=? WHERE run_id='run-1'", (NOW.isoformat(),))
+        db.execute("INSERT INTO leases VALUES ('run-1','dispatch-1',?,123,123,99,?)", (steward, NOW.isoformat()))
+        claim(db, "steward", steward, "run-1")
+        claim(db, "fix", fix, "run-2")
+        for event_id, destination, emitted in (("steward-pending", "deployment-a:o/r:steward", None),
+                                               ("steward-emitted", "deployment-a:o/r:steward", NOW.isoformat()),
+                                               ("fix-pending", "deployment-a:o/r:fix", None)):
+            db.execute("INSERT INTO event_outbox(event_id,destination,event_json,committed_at,emitted_at) "
+                       "VALUES (?,?,'{}',?,?)", (event_id, destination, NOW.isoformat(), emitted))
+        for namespace, key in (("continuation-admission", "run-s:steward"), ("continuation-admission", "run-f:issue_recovery"),
+                               ("continuation-return", "run-s:steward"), ("groomed", "issue-7"),
+                               ("triage_close", "issue-7"), ("recurrence", "issue-7"), ("other", "issue-7")):
+            dedupe(db, namespace, key)
+        db.execute("INSERT INTO workflow_components VALUES ('o/r','issue',7,'steward',1,'steward-episode')")
+        db.execute("INSERT INTO runs(run_id,dispatch_id,kind,owner_id,state,config_version,provider_receipt_id) "
+                   "VALUES ('steward-run','d','TRIAGE','o/r:steward:x','completed','cfg','receipt-s')")
+        db.execute("INSERT INTO charges(run_id,provider_receipt_id,amount_micros,currency,basis,settled_at) "
+                   "VALUES ('steward-run','receipt-s',1234,'USD','provider_reported',?)", (NOW.isoformat(),))
+    store.initialize()
+
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 44
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert [row[0] for row in db.execute("SELECT command_id FROM lifecycle_commands")] == ["plain-cmd"]
+        assert [row[0] for row in db.execute("SELECT command_id FROM effect_receipts")] == ["plain-cmd"]
+        assert sorted(db.execute("SELECT namespace,key FROM dedupe_keys")) == [
+            ("continuation-admission", "run-f:issue_recovery"), ("other", "issue-7")]
+        assert db.execute("SELECT count(*) FROM workflow_components WHERE family='steward'").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM workflow_components WHERE family='resolve'").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM workflows").fetchone()[0] == 1
+        assert db.execute("SELECT r.run_id,c.amount_micros FROM runs r JOIN charges c USING(run_id)").fetchall() == [
+            ("steward-run", 1234)]
+        assert db.execute("SELECT role FROM dispatch_claims").fetchall() == [("fix",)]
+        assert db.execute("SELECT role,run_id FROM dispatch_claim_runs").fetchall() == [("fix", "run-2")]
+        assert sorted(db.execute("SELECT r.run_id,r.state,r.outcome,b.state FROM runs r "
+                                 "JOIN budget_reservations b USING(run_id)")) == [
+            ("run-1", "abandoned", "spend_unmeasured_released", "released"),
+            ("run-2", "reserved", None, "active")]
+        assert db.execute("SELECT run_id FROM leases").fetchall() == []
+        assert sorted(row[0] for row in db.execute("SELECT event_id FROM event_outbox")) == [
+            "fix-pending", "steward-emitted"]
+
+
+def test_migration_44_rewrites_steward_out_of_episode_json_on_both_branches(tmp_path):
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+
+    store = _store(tmp_path)
+    install_workflow(store, resolve_snapshot(7))
+    install_workflow(store, resolve_snapshot(8))
+    fake = {"type": "ActiveSteward", "fields": {"identity": {"type": "X", "fields": {}}}}
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 43)
+        rows = {n: json.loads(e) for n, e in db.execute("SELECT target_number,episode_json FROM workflows")}
+        pair = rows[7]["value"]
+        collapsing = {"format": 1, "value": {"type": "IssueFamilyEpisodes", "fields": {
+            "authority": pair[0], "episode": pair[1],
+            "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}}, "steward": fake}}}
+        shell = {"format": 1, "value": {"type": "IssueWorkflowShell", "fields": {
+            "authority": "a", "issue_recovery": {"type": "ActiveIssueRecovery", "fields": {}}, "steward": fake}}}
+        db.execute("UPDATE workflows SET episode_json=? WHERE target_number=7", (json.dumps(collapsing, separators=(",", ":")),))
+        db.execute("UPDATE workflows SET episode_json=? WHERE target_number=8", (json.dumps(shell, separators=(",", ":")),))
+        original_pair = json.dumps(rows[7], separators=(",", ":"))
+    store.initialize()
+    with sqlite3.connect(store.path) as db:
+        after = dict(db.execute("SELECT target_number,episode_json FROM workflows"))
+    assert json.loads(after[7]) == json.loads(original_pair)
+    kept = json.loads(after[8])["value"]
+    assert "steward" not in kept["fields"] and kept["fields"]["issue_recovery"]["type"] == "ActiveIssueRecovery"
+
+
+def test_migration_44_releases_unstarted_and_unreconciled_steward_runs(tmp_path):
+    store = _store(tmp_path)
+    steward = "o/r:steward:x"
+    for index, cap in ((1, 100), (2, 200)):
+        assert store.reserve(dataclasses.replace(_request(index, cap=cap), owner_id=steward)).admitted
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 43)
+        db.execute("UPDATE runs SET state='completed', outcome='spend_unreconciled', started_at=?, completed_at=? "
+                   "WHERE run_id='run-2'", (NOW.isoformat(), NOW.isoformat()))
+        db.execute("UPDATE reservation_recovery SET policy='reconcile_only' WHERE run_id='run-2'")
+    store.initialize()
+    with sqlite3.connect(store.path) as db:
+        assert sorted(db.execute("SELECT r.run_id,r.state,r.outcome,b.state FROM runs r "
+                                 "JOIN budget_reservations b USING(run_id)")) == [
+            ("run-1", "cancelled", "unlaunched_released", "released"),
+            ("run-2", "completed", "spend_unmeasured_released", "released")]
+    store.integrity_check()
+    SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+
+
+def test_cross_scope_adoption_refuses_without_mutation(tmp_path):
+    store = _store(tmp_path)
+    assert store.reserve(dataclasses.replace(_request(1), owner_id="o/r:fix:old")).admitted
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    for wrong_owner in ("elsewhere/repo:fix:old", "o/r:review:old"):
+        with pytest.raises(ValueError):
+            store.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=(wrong_owner,))
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before
+
+
+def test_adopted_existing_process_lease_retry_is_inert(tmp_path):
+    store = _store(tmp_path)
+    request = dataclasses.replace(_request(1), owner_id="o/r:fix:old")
+    assert store.reserve(request).admitted
+    store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
+                                 pid=123, pgid=123, process_start_ticks=456)
+    store.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=("o/r:fix:old",))
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    lease = store.register_process_lease(request.run_id, expected_owner_id="o/r:fix:new",
+                                         pid=123, pgid=123, process_start_ticks=456)
+    assert lease.owner_id == "o/r:fix:new"
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before

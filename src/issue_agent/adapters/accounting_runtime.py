@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import uuid
 import contextvars
-import asyncio
 import hashlib
 import json
 from collections.abc import Callable
@@ -371,15 +370,6 @@ class AccountingRuntime(AgentRuntime):
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
         continuations = ()
-        if task.steward_input is not None:
-            selected = task.steward_input
-            if (self.role != "steward" or kind != selected.lane.value.upper()
-                    or number != selected.selection.binding.fence.key.target.number
-                    or issue != number or workflow != selected.selection.binding):
-                return self._refused("selected steward input requires its exact lane and issue context")
-            capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
-            continuations = (cc.StewardPurchase(capture, selected.lane, selected.input_at, selected.stall_ceiling,
-                                               selected.content_signature, selected.infra_ceiling),)
         if task.issue_reply is not None:
             selected = task.issue_reply
             if isinstance(selected, cc.LinkedPRIssueReplyInput):
@@ -489,8 +479,7 @@ class AccountingRuntime(AgentRuntime):
                    if task.pr_repair_input is not None and task.pr_repair_input.rebase is not None else {}),
                 **({"pr_reply": encode_workflow((task.pr_repair_input.reply.reply_at, task.pr_repair_input.reply.body))}
                    if task.pr_repair_input is not None and task.pr_repair_input.reply is not None else {}),
-                **({"breaker_key": retry_key} if not any(
-                    isinstance(purchase, cc.StewardPurchase) for purchase in continuations) else {}),
+                "breaker_key": retry_key,
                 "claim_target": target,
                 "cwd": (
                     str(Path(task.cwd).resolve())
@@ -656,18 +645,8 @@ class AccountingRuntime(AgentRuntime):
         )
         try:
             result = await self.inner.run(runtime_task)
-        except BaseException as exc:
+        except BaseException:
             self._recover_or_release(run_id)
-            if self.role == "steward" and not isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                from ..domain.outcome import deterministic_death
-                deterministic = deterministic_death(f"{type(exc).__name__}: {exc}",
-                    str(getattr(exc, "harness_last_trace", "") or ""))
-                try:
-                    self.store.record_steward_recovery(run_id,
-                        cc.StewardFailureKind.DETERMINISTIC if deterministic is not None else cc.StewardFailureKind.RECLAIMED,
-                        WorkflowWriter(self.repository, "steward", self.owner_id or f"{self.repository}:steward"))
-                except Exception:
-                    pass
             raise
         if self.role == "fix" and not infra_class_failure(result):
             # Only a normal return is recorded: every other ended fix run, with

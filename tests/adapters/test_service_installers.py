@@ -230,7 +230,7 @@ def test_service_uninstall_preserves_every_definition_when_stop_fails(
         else home / "Library/LaunchAgents"
     )
     artifacts = tuple(artifact_dir.glob("*"))
-    assert len(artifacts) == (4 if systemd else 3)
+    assert len(artifacts) == (3 if systemd else 2)
 
     env["FAIL_UNINSTALL_PATTERN"] = "review-watcher"
     uninstall = subprocess.run(
@@ -263,7 +263,7 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
 
     assert result.returncode == 0, result.stderr
     units = sorted((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 4
+    assert len(units) == 3
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
     role_units = tuple(
         unit for unit in units
@@ -288,7 +288,7 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     dashboard = home / ".config/systemd/user/issue-agent-dashboard.service"
     assert "Environment=AGENT_ENV=" not in dashboard.read_text()
     assert "Environment=TARGET_DIR=" not in dashboard.read_text()
-    assert result.stdout.count("active (running)") == 4
+    assert result.stdout.count("active (running)") == 3
 
 
 def test_systemd_dashboard_install_is_singleton_and_latest_install_wins(tmp_path):
@@ -318,7 +318,7 @@ def test_systemd_dashboard_install_is_singleton_and_latest_install_wins(tmp_path
     dashboards = tuple(unit_dir.glob("issue-agent-dashboard.service"))
     assert len(dashboards) == 1
     assert f"ExecStart={latest_uv} " in dashboards[0].read_text()
-    assert len(tuple(unit_dir.glob("*.service"))) == 7
+    assert len(tuple(unit_dir.glob("*.service"))) == 5
     calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
     assert calls.count("restart issue-agent-dashboard.service") == 2
 
@@ -344,9 +344,9 @@ def test_systemd_dashboard_port_conflict_preserves_installed_roles(tmp_path):
     assert "PID 4242 (python issue-agent dashboard)" in result.stderr
     assert "Stop the manual `issue-agent dashboard`" in result.stderr
     units = tuple((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 3
+    assert len(units) == 2
     assert all(path.name != "issue-agent-dashboard.service" for path in units)
-    assert result.stdout.count("active (running)") == 3
+    assert result.stdout.count("active (running)") == 2
 
 
 def test_systemd_installer_rolls_back_if_unit_is_not_running(tmp_path):
@@ -372,7 +372,7 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
     unit_dir = home / ".config/systemd/user"
     unit_dir.mkdir(parents=True)
     for deployment in ("my-app", "other-app"):
-        for role in ("fix-watcher", "review-watcher", "steward"):
+        for role in ("fix-watcher", "review-watcher"):
             (unit_dir / f"issue-agent-{role}-{deployment}.service").write_text(
                 deployment
             )
@@ -393,11 +393,11 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(unit_dir.glob("*.service"))
-    assert len(remaining) == 4
+    assert len(remaining) == 3
     assert dashboard in remaining
     assert sum(
         path.name.endswith("-other-app.service") for path in remaining
-    ) == 3
+    ) == 2
 
 
 @pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
@@ -465,7 +465,6 @@ def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
     services = (
         "issue-agent-fix-watcher",
         "issue-agent-review-watcher",
-        "issue-agent-steward",
     )
     for service in services:
         (unit_dir / f"{service}.service").write_text("legacy-unsuffixed")
@@ -532,9 +531,9 @@ def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
     )
     assert second.returncode == 0, second.stderr
     units = tuple((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 7
-    assert sum(path.name.endswith("-acme-app.service") for path in units) == 3
-    assert sum(path.name.endswith("-other-app.service") for path in units) == 3
+    assert len(units) == 5
+    assert sum(path.name.endswith("-acme-app.service") for path in units) == 2
+    assert sum(path.name.endswith("-other-app.service") for path in units) == 2
 
     collision = subprocess.run(
         ["bash", str(ROOT / "bin/install-systemd.sh")],
@@ -591,7 +590,7 @@ def test_systemd_same_name_repoint_replaces_all_units_atomically(
     assert second.returncode == 0, second.stderr
     unit_dir = home / ".config/systemd/user"
     units = tuple(unit_dir.glob("*.service"))
-    assert len(units) == 4
+    assert len(units) == 3
     role_units = tuple(
         path for path in units
         if path.name != "issue-agent-dashboard.service"
@@ -647,16 +646,16 @@ def test_systemd_second_checkout_preserves_same_repo_deployment(
 
     assert second.returncode == 0, second.stderr
     units = tuple((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 7
-    assert sum(path.name.endswith("-acme-app.service") for path in units) == 3
+    assert len(units) == 5
+    assert sum(path.name.endswith("-acme-app.service") for path in units) == 2
     assert sum(
         path.name.endswith("-acme-app-wt.service") for path in units
-    ) == 3
+    ) == 2
     calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
     assert not any(
         call == f"stop issue-agent-{role}-acme-app.service"
         for call in calls[len(calls) // 2 :]
-        for role in ("fix-watcher", "review-watcher", "steward")
+        for role in ("fix-watcher", "review-watcher")
     )
 
 
@@ -671,7 +670,6 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     names = (
         "issue-agent-fix-watcher",
         "issue-agent-review-watcher",
-        "issue-agent-steward",
     )
     for name in names:
         (unit_dir / f"{name}-target-repo.service").write_text("known-good")
@@ -706,7 +704,6 @@ def test_systemd_failed_cutover_restores_legacy_units(tmp_path):
     services = (
         "issue-agent-fix-watcher",
         "issue-agent-review-watcher",
-        "issue-agent-steward",
     )
     for service in services:
         (unit_dir / f"{service}-target-repo.service").write_text(
@@ -741,7 +738,7 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
 
     assert result.returncode == 0, result.stderr
     plists = sorted((home / "Library/LaunchAgents").glob("*.plist"))
-    assert len(plists) == 3
+    assert len(plists) == 2
     assert all(
         plistlib.loads(plist.read_bytes())["ProgramArguments"][0] == str(uv)
         for plist in plists
@@ -798,7 +795,7 @@ def test_launchd_same_name_repoint_replaces_all_loaded_jobs_atomically(
     assert second.returncode == 0, second.stderr
     launch_agents = home / "Library/LaunchAgents"
     plists = tuple(launch_agents.glob("*.plist"))
-    assert len(plists) == 3
+    assert len(plists) == 2
     assert all(path.name.endswith(".acme-app.plist") for path in plists)
     assert all(
         plistlib.loads(path.read_bytes())["EnvironmentVariables"]["TARGET_DIR"]
@@ -828,7 +825,7 @@ def test_launchd_stable_identity_migrates_and_uninstalls_checksum_jobs(
     config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
     launch_agents = home / "Library/LaunchAgents"
     launch_agents.mkdir(parents=True)
-    units = ("fix-watcher", "review-watcher", "steward")
+    units = ("fix-watcher", "review-watcher")
     predecessor_paths = tuple(
         launch_agents / f"dev.issue-agent.{unit}.123456.plist"
         for unit in units
@@ -899,7 +896,7 @@ def test_launchd_failed_stable_cutover_restores_checksum_predecessors(
     config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
     launch_agents = home / "Library/LaunchAgents"
     launch_agents.mkdir(parents=True)
-    units = ("fix-watcher", "review-watcher", "steward")
+    units = ("fix-watcher", "review-watcher")
     predecessor_paths = tuple(
         launch_agents / f"dev.issue-agent.{unit}.123456.plist"
         for unit in units
@@ -945,7 +942,7 @@ def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
     ).stdout.split()[0]
     launch_agents = home / "Library/LaunchAgents"
     launch_agents.mkdir(parents=True)
-    for role in ("fix-watcher", "review-watcher", "steward"):
+    for role in ("fix-watcher", "review-watcher"):
         (launch_agents / f"dev.issue-agent.{role}.{checksum}.plist").write_text(
             "current"
         )
@@ -967,7 +964,7 @@ def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(launch_agents.glob("*.plist"))
-    assert len(remaining) == 3
+    assert len(remaining) == 2
     assert all(path.name.endswith(".999999.plist") for path in remaining)
 
 
@@ -981,7 +978,6 @@ def test_launchd_upgrade_unloads_and_removes_unsuffixed_legacy_jobs(
     labels = (
         "dev.issue-agent.fix-watcher",
         "dev.issue-agent.review-watcher",
-        "dev.issue-agent.steward",
     )
     for label in labels:
         (launch_agents / f"{label}.plist").write_text("legacy")
@@ -1039,7 +1035,7 @@ def test_launchd_refuses_loaded_current_job_without_rollback_plist(
     )
 
 
-@pytest.mark.parametrize("selector", ("--fix", "--review", "--steward"))
+@pytest.mark.parametrize("selector", ("--fix", "--review"))
 def test_launchd_refuses_partial_migration_cutover(tmp_path, selector):
     env, home, _uv = _environment(tmp_path, systemd=False)
 
@@ -1073,7 +1069,6 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
     labels = (
         "dev.issue-agent.fix-watcher",
         "dev.issue-agent.review-watcher",
-        "dev.issue-agent.steward",
     )
     for label in labels:
         (launch_agents / f"{label}.{checksum}.plist").write_text("known-good")
@@ -1127,7 +1122,6 @@ def test_launchd_stops_every_current_writer_before_swapping_config(
     labels = (
         f"dev.issue-agent.fix-watcher.{checksum}",
         f"dev.issue-agent.review-watcher.{checksum}",
-        f"dev.issue-agent.steward.{checksum}",
     )
     for label in labels:
         (launch_agents / f"{label}.plist").write_text("known-good")

@@ -22,7 +22,7 @@ issue-agent-publish = "issue_agent.adapters.agent_publish:main"
 # PyJWT[crypto] backs the GitHub App installation-token mint (adapters/app_token).
 # tree-sitter(+bash) back the in-process bash governor (plugin/hooks/bash_governor.py),
 # which adapters/governor imports at module load — so it is required for EVERY role
-# (fix/review/steward), not just the fixer. Declared here (not only as Makefile
+# (fix/review), not just the fixer. Declared here (not only as Makefile
 # `--with`) so `python -m issue_agent.app.main <role>` works after a plain install.
 sdk = [
     "claude-agent-sdk>=0.2.158",

@@ -63,7 +63,7 @@ export type ReviewCommand = OperatorCommand<Schema["ReviewExpected"]>;
 export type ReviewCommandResult = Schema["ReviewCommandResult"];
 export type ReviewGuidance = Schema["ResumeGate"]["guidance"];
 
-export type RoleName = "fix" | "review" | "steward";
+export type RoleName = "fix" | "review";
 export type VerificationStatus =
   | "VERIFIED"
   | "MISBEHAVED"

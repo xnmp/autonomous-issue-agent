@@ -38,7 +38,7 @@ from .workflow_rows import WorkflowAuthorityError, persist_workflow_snapshot, wo
 
 LEGACY_REVIEW_NAME = re.compile(r"pr-(.*)\.(" + "|".join(re.escape(s) for s in LEGACY_SUFFIXES) + r")", re.DOTALL)
 _PR_NUMBER = re.compile(r"[1-9][0-9]{0,18}")
-_ROLES = ("fix", "review", "steward")
+_ROLES = ("fix", "review")
 _FAMILY = WorkflowFamily.REVIEW_REJECTIONS.value
 _PLAN_NAMESPACE = "review-activation-plan"
 
@@ -72,8 +72,6 @@ def read_open_pull_requests(gateway: object, repository: str) -> OpenPullRequest
         raise
     except Exception as exc:  # noqa: BLE001 - remote failures are unavailable evidence
         return OpenPullRequestsUnavailable(_printable(f"{type(exc).__name__}: {exc}")[:512])
-
-
 
 
 class ReviewActivationRefused(WorkflowAuthorityError):

@@ -113,10 +113,10 @@ anchored to the server's `elapsed_s` plus the age of that response.
 **Colour.** Hex values appear only in `styles/tokens.css`. Components speak
 *tones* (`ok | running | fail | info | meta | link | neutral`), so the contract's
 semantic mapping — green = ok/done/approve, yellow = running/pending,
-red = failed/escalated/blocked, blue = info/queued, magenta = steward/meta and
+red = failed/escalated/blocked, blue = info/queued, magenta = meta and
 the self-repo, cyan = links/models — holds structurally rather than by
-convention. The cost-mix categorical slots (blue / bright cyan / yellow /
-bright magenta, in that fixed order, never re-sorted by size) were checked with
+convention. The cost-mix categorical slots (blue / bright cyan /
+yellow, in that fixed order, never re-sorted by size) were checked with
 the dataviz palette validator against the panel surface: CVD separation,
 normal-vision floor and 3:1 contrast all pass. The lightness-band and
 chroma-floor checks fail by construction — a desaturated terminal theme cannot

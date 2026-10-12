@@ -14,7 +14,6 @@ def config(tmp_path):
         repo="o/r",
         state_dir=state,
         review_state_dir=str(tmp_path / "review"),
-        steward_state_dir=str(tmp_path / "steward"),
     )
 
 

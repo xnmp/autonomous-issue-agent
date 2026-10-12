@@ -6,7 +6,7 @@ proposal's prior to equal it, re-derives the proposal from facts it mints from
 its own rows (bound SUBMIT_REVIEW receipts, durable pull request observations,
 accepted operator audits) and persists workflow, intent, lifecycle commands
 and outbox together. Operator acceptance and re-arm reconciliation take the
-exclusive deployment barriers (fix, review, steward), read GitHub read-only
+exclusive deployment barriers (fix, review), read GitHub read-only
 through the review gateway with no SQL transaction open, and release every
 barrier before any effect runner can execute; nothing here writes remotely.
 """
@@ -111,7 +111,7 @@ from .workflow_rows import (
 )
 
 # Deployment barriers are always taken in this order (ADR 0015 acceptance).
-BARRIER_ROLES = ("fix", "review", "steward")
+BARRIER_ROLES = ("fix", "review")
 _OBSERVATION_NAMESPACE = "workflow-rearm-observation"
 _HOLD_OBSERVATION_NAMESPACE = "review-hold-observation"
 _FIRST_OBSERVATION_NAMESPACE = "review-first-observation"
@@ -265,7 +265,7 @@ class SQLiteReviewWorkflowControl:
 
     @contextmanager
     def _barriers(self) -> Iterator[None]:
-        """Exclusive fix, review and steward barriers; no SQL transaction is held while waiting.
+        """Exclusive fix and review barriers; no SQL transaction is held while waiting.
 
         Every effect runner holds its role's barrier shared, so acceptance
         waits for an executing effect to finish (or become durable

@@ -19,7 +19,6 @@ from issue_agent.adapters.effects import (
 )
 from issue_agent.adapters.effects import UnknownEffectOutcome
 from issue_agent.domain.actions import (
-    AddDependency,
     CancelWorkflowRuns,
     CloseIssue,
     EnableAutoMerge,
@@ -34,7 +33,6 @@ from issue_agent.domain.fix import FixConfig
 from issue_agent.domain.eligibility import LifecycleOperation
 from issue_agent.domain.lifecycle import completion_guard
 from issue_agent.domain.world import IssueView, Comment
-from issue_agent.domain.triage import TriageConfig, TriageVerdict, close_actions
 
 
 class Gateway:
@@ -49,7 +47,6 @@ class Gateway:
         self.auto_merge = set()
         self.run_attempt = 0
         self.run_states = {}
-        self.dependencies = set()
         self.reviews = set()
         self.advance_before_auto_merge = ""
         self.advance_before_update = ""
@@ -163,13 +160,6 @@ class Gateway:
     def is_branch_updated(self, pr, prior_head):
         del pr
         return self.head != prior_head
-
-    def add_blocked_by(self, issue, blocker):
-        self.calls.append(("dependency", issue, blocker))
-        self.dependencies.add((issue, blocker))
-
-    def has_blocked_by(self, issue, blocker):
-        return (issue, blocker) in self.dependencies
 
     def submit_review(self, pr, event, body, expected_head):
         if self.advance_before_review:
@@ -712,7 +702,6 @@ def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
     (
         Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING),
         PostComment(Target.ISSUE, 7, "work complete"),
-        AddDependency(7, 8),
     ),
 )
 def test_issue_lifecycle_mutations_capture_expected_revision(
@@ -1281,27 +1270,6 @@ def test_reconcile_outage_blocks_write_and_leaves_command_pending(
     assert gateway.calls == []
 
 
-def test_ambiguous_dependency_is_reconciled_without_duplicate(tmp_path) -> None:
-    executor, gateway, store = _executor(tmp_path)
-    action = AddDependency(7, 8)
-    original = gateway.add_blocked_by
-
-    def committed_then_lost(*args):
-        original(*args)
-        raise RuntimeError("reply lost")
-
-    gateway.add_blocked_by = committed_then_lost
-    try:
-        executor.execute(action)
-    except RuntimeError:
-        pass
-    gateway.add_blocked_by = original
-
-    assert executor.execute(action)
-    assert gateway.calls == [("dependency", 7, 8)]
-    assert store.pending_commands() == ()
-
-
 def test_ambiguous_review_and_same_body_on_new_head_are_distinct(
     tmp_path,
 ) -> None:
@@ -1481,65 +1449,6 @@ def test_boot_drain_cannot_claim_another_repository_or_role_command(
     assert owner.drain_pending_commands() == 1
     assert owner_gateway.calls == [("comment", "issue", 4, "owned")]
 
-
-# ── steward triage `close` disposition (keifu #143) ───────────────────────────
-def test_steward_close_actions_are_durable_commands_with_receipts(tmp_path) -> None:
-    """The close is a remote lifecycle mutation, so it rides the same durable
-    command + receipt path as every other relabel/comment — not a direct gh call."""
-    executor, gateway, store = _executor(tmp_path)
-    verdict = TriageVerdict(
-        verdict="close",
-        close_reason="PR #170 already ships this.",
-        reopen_if="the export still fails after PR #170",
-        close_state_reason="completed",
-    )
-
-    actions = close_actions(143, "alice", verdict, TriageConfig(steward_bot="sb"))
-    for action in actions:
-        assert executor.execute(action)
-
-    assert gateway.calls == [
-        ("comment", "issue", 143, actions[0].comment),
-        ("relabel", "issue", 143, None, "ai-closed"),
-        ("relabel", "issue", 143, "ai-triage", None),
-        ("close", 143, "completed", ""),
-    ]
-    assert gateway.issue_closure(143) == (True, "completed")
-    assert store.pending_commands() == ()
-    with store._connect() as db:
-        kinds = tuple(
-            row[0]
-            for row in db.execute(
-                "SELECT kind FROM lifecycle_commands ORDER BY occurrence"
-            )
-        )
-        statuses = tuple(
-            row[0] for row in db.execute("SELECT status FROM effect_receipts")
-        )
-    assert kinds == ("close_issue",)
-    assert statuses == ("succeeded",)
-
-
-def test_a_replayed_steward_close_neither_re_comments_nor_re_closes(tmp_path) -> None:
-    """A daemon restart mid-close must converge, not post a second obituary."""
-    executor, gateway, store = _executor(tmp_path)
-    verdict = TriageVerdict(
-        verdict="close",
-        close_reason="Duplicate of #12.",
-        reopen_if="#12 is closed without covering this",
-    )
-    actions = close_actions(143, "alice", verdict, TriageConfig(steward_bot="sb"))
-
-    for _ in range(2):
-        for action in actions:
-            executor.execute(action)
-
-    assert gateway.calls == [
-        ("comment", "issue", 143, actions[0].comment),
-        ("relabel", "issue", 143, None, "ai-closed"),
-        ("relabel", "issue", 143, "ai-triage", None),
-        ("close", 143, "not_planned", ""),
-    ]
 
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
 def test_cancelling_wedged_runs_is_receipted_like_any_other_remote_mutation(

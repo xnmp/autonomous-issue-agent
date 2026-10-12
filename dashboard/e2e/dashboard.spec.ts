@@ -18,7 +18,7 @@ const repos = {
       target_dir: "/tmp/self",
       is_self: true,
       active: true,
-      roles: [role("fix"), role("review"), role("steward")],
+      roles: [role("fix"), role("review")],
       frecency: 1,
       last_activity_ts: "2026-07-29T08:00:00Z",
       in_flight: 0,
@@ -129,7 +129,6 @@ const issues = {
     labels: ["feature", "effort:medium", "impact:high"],
     recurrence: false,
     recurrence_count: 0,
-    steward_state: "raw",
     age_days: 0,
     age_s: 1800,
     comments: 2,
@@ -204,8 +203,7 @@ const round3Issues = {
       issue: 119,
       title: "Add OAuth token refresh diagnostics",
       url: "https://github.com/openai/autonomous-issue-agent/issues/119",
-      labels: ["ai-triage", "feature", "effort:medium", "impact:high"],
-      steward_state: "processed",
+      labels: ["feature", "effort:medium", "impact:high"],
     },
     issues.backlog[0],
   ],
@@ -251,7 +249,7 @@ const round3Overview = {
       detail: "waiting for the retention window",
     },
   ],
-  health: ["fix", "review", "steward"].map((name, index) => ({
+  health: ["fix", "review"].map((name, index) => ({
     ...role(name),
     last_event_ts: `2026-08-09T07:${55 + index}:00Z`,
   })),
@@ -431,7 +429,7 @@ const issue = {
     {
       ts: "2026-07-29T07:59:00Z",
       event: "action",
-      role: "steward",
+      role: "fix",
       desc: "comment issue #50: verification recorded",
     },
   ],
@@ -795,7 +793,7 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(taskDetail.getByText("claude-sonnet-5")).toBeVisible();
 
   await page.getByRole("tab", { name: /^Events ·/ }).click();
-  await expect(page.getByText("by steward")).toBeVisible();
+  await expect(page.getByText("by fix")).toBeVisible();
   await expect(page.getByText(/comment issue #50/)).toBeVisible();
 
   await page.getByRole("tab", { name: "Overview" }).click();
@@ -881,8 +879,7 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
   });
 
   await page.getByRole("tab", { name: /Backlog/ }).click();
-  await expect(page.getByText("AC + test plan written")).toBeVisible();
-  await expect(page.getByText("awaiting steward")).toBeVisible();
+  await expect(page.getByText("Add OAuth token refresh diagnostics")).toBeVisible();
   await page.screenshot({
     path: "../evidence-facelift/after-issues-backlog.png",
     fullPage: true,
@@ -937,7 +934,7 @@ test("serves a validated operator workflow through FastAPI and the production bu
   await expect(page.locator(".stepdetail")).toBeVisible();
   expect((await page.locator(".stepdetail").boundingBox())?.width).toBeGreaterThan(700);
   await page.getByRole("tab", { name: /^Events ·/ }).click();
-  await expect(page.getByText("by steward")).toBeVisible();
+  await expect(page.getByText("by fix")).toBeVisible();
   await page.screenshot({
     path: "../evidence/dashboard-issue-tasks.png",
     fullPage: true,
