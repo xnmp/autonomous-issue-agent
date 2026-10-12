@@ -1098,3 +1098,29 @@ def test_route_model_degrades_an_unknown_runtime_to_the_claude_table():
     from issue_agent.app.planners.tasks import MODEL_TIERS, route_model
 
     assert route_model("complex", "no-such-runtime") == MODEL_TIERS["claude"]["complex"]
+
+
+# Incident: docs/open/issues/review-no-resultmessage-background-tasks.md — a
+# backgrounded Bash/Task ends the Claude stream with no ResultMessage, losing
+# the paid leg's verdict. Every role's launch options must disable it, and a
+# task env cannot turn it back on.
+@pytest.mark.parametrize(
+    "plan",
+    [
+        build_resolve_task(
+            5, U("t"), U("b"), "/wt", replace(FIX_CFG, model="claude-sonnet-5")
+        ),
+        build_review_task(
+            7, U("t"), U("b"), U("diff"), ReviewTaskConfig(repo="o/r", review_prompt="r")
+        ),
+    ],
+    ids=["fix", "review"],
+)
+@pytest.mark.parametrize("task_env", [{}, {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"}])
+def test_claude_launch_options_disable_background_tasks(plan, task_env):
+    from issue_agent.adapters.agent_runner import build_option_kwargs
+    from issue_agent.app.planners.run import compose_runtime_plan
+
+    runtime_plan = replace(compose_runtime_plan(plan), env=task_env)
+    kwargs = build_option_kwargs(runtime_plan)
+    assert kwargs["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"

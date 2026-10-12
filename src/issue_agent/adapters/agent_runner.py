@@ -138,9 +138,14 @@ def build_option_kwargs(
         kwargs["fork_session"] = True
     # Commit attribution: author/committer name carries the leg's model. Task
     # env still wins so an explicit override stays an override.
-    env = {**git_identity_env(task.model), **task.env}
-    if env:
-        kwargs["env"] = env
+    # Background tasks are off for every role and cannot be overridden: a
+    # backgrounded Bash/Task ends the stream with no terminal ResultMessage, a
+    # paid verdict-less leg (docs/open/issues/review-no-resultmessage-background-tasks.md).
+    kwargs["env"] = {
+        **git_identity_env(task.model),
+        **task.env,
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    }
     if task.mcp_servers:
         kwargs["mcp_servers"] = {m.name: m.config for m in task.mcp_servers}
     if task.subagents:

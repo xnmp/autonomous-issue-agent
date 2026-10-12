@@ -988,9 +988,10 @@ def test_task_env_override_beats_identity():
     assert kw["env"]["GIT_COMMITTER_NAME"] == "Harness - m"
 
 
-def test_no_model_no_task_env_emits_no_env():
+def test_no_model_emits_no_git_identity():
     kw = build_option_kwargs(RuntimePlan(prompt="p"))
-    assert "env" not in kw
+    assert "GIT_AUTHOR_NAME" not in kw["env"]
+    assert "GIT_COMMITTER_NAME" not in kw["env"]
 
 
 # ── CLI resolution (keifu 2026-08-03: venv rebuilt under a live daemon) ───────
