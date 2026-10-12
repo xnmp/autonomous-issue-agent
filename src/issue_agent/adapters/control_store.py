@@ -11006,12 +11006,7 @@ class SQLiteControlStore:
         if receipt.status is EffectStatus.SUCCEEDED:
             self._event(
                 db,
-                ActionApplied(
-                    str(receipt.command_id),
-                    command.kind.value,
-                    command.target,
-                    command.kind.value,
-                ),
+                _command_applied_event(command),
                 correlation=_command_correlation(command),
             )
         else:
@@ -11605,6 +11600,28 @@ def _command_payload_digest(command: LifecycleCommand, payload: str) -> str:
 def _encoded_payload_digest(payload: str, binding: str | None) -> str:
     identity = payload if binding is None else payload + "\n" + binding
     return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _command_applied_event(command: LifecycleCommand) -> ActionApplied:
+    # Typed projections bypass the app's Action executor; their durable success
+    # must carry the same label moves so the dashboard can retire attention.
+    if command.kind is CommandKind.RELABEL:
+        correlation = _command_correlation(command)
+        number = correlation.issue or correlation.pr
+        if number is not None:
+            target = "issue" if correlation.issue is not None else "pr"
+            moves: dict[str, JsonValue] = {}
+            display_moves = []
+            for field, plural, sign in (("remove", "removes", "-"), ("add", "adds", "+")):
+                extra = command.payload.get(plural)
+                values = (command.payload.get(field), *(extra if isinstance(extra, (list, tuple)) else ()))
+                labels = list(dict.fromkeys(value for value in values if isinstance(value, str)))
+                moves[field] = labels
+                display_moves.extend(f"{sign}{label}" for label in labels)
+            return ActionApplied(str(command.command_id), "relabel", target,
+                                 f"relabel {target} #{number}: {' '.join(display_moves) or '(no-op)'}",
+                                 number, moves)
+    return ActionApplied(str(command.command_id), command.kind.value, command.target, command.kind.value)
 
 
 def _command_correlation(command: LifecycleCommand) -> Correlation:
