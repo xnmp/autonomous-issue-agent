@@ -51,6 +51,7 @@ export function IssuesBoard({
   items,
   loading,
   onRefresh,
+  onOpenIssue,
   showProjectedCost = true,
   showDurationSeconds = true,
 }: {
@@ -58,6 +59,7 @@ export function IssuesBoard({
   items: BoardItem[];
   loading: boolean;
   onRefresh: () => void;
+  onOpenIssue: (issue: number) => void;
   showProjectedCost?: boolean;
   showDurationSeconds?: boolean;
 }) {
@@ -133,6 +135,7 @@ export function IssuesBoard({
                       open={open.has(item.issue)}
                       onToggle={() => toggle(item.issue)}
                       onRefresh={onRefresh}
+                      onOpenIssue={onOpenIssue}
                       display={display}
                     />
                   ))}
@@ -151,6 +154,7 @@ function BoardRow({
   open,
   onToggle,
   onRefresh,
+  onOpenIssue,
   display,
 }: {
   repo: string;
@@ -158,6 +162,7 @@ function BoardRow({
   open: boolean;
   onToggle: () => void;
   onRefresh: () => void;
+  onOpenIssue: (issue: number) => void;
   display: Display;
 }) {
   const { board } = item;
@@ -170,7 +175,9 @@ function BoardRow({
     <div className={`board-item${open ? " open" : ""}`}>
       <div
         className="board-row board-grid"
+        role="button"
         tabIndex={0}
+        aria-label={`Issue #${item.issue}${item.title ? `: ${item.title}` : ""}`}
         aria-expanded={open}
         aria-controls={open ? drawerId : undefined}
         onClick={onToggle}
@@ -201,7 +208,7 @@ function BoardRow({
           {item.rail ? (
             <LifecycleStepper
               rail={railNodes(item.rail)}
-              tone={railTone(item)}
+              tone={GROUP_META[board.status].tone}
               live={item.rail.live || live}
               label={`Issue #${item.issue} stage`}
             />
@@ -215,14 +222,18 @@ function BoardRow({
         </span>
         <span className="board-chev" aria-hidden="true">›</span>
       </div>
-      {open ? <BoardDrawer id={drawerId} repo={repo} item={item} onRefresh={onRefresh} display={display} /> : null}
+      {open ? (
+        <BoardDrawer
+          id={drawerId}
+          repo={repo}
+          item={item}
+          onRefresh={onRefresh}
+          onOpenIssue={onOpenIssue}
+          display={display}
+        />
+      ) : null}
     </div>
   );
-}
-
-/** A triage wait is the operator's to clear, so its rail reads as an alarm too. */
-function railTone(item: BoardItem) {
-  return operatorOwned(item.board) ? "fail" : GROUP_META[item.board.status].tone;
 }
 
 function BoardDrawer({
@@ -230,12 +241,14 @@ function BoardDrawer({
   repo,
   item,
   onRefresh,
+  onOpenIssue,
   display,
 }: {
   id: string;
   repo: string;
   item: BoardItem;
   onRefresh: () => void;
+  onOpenIssue: (issue: number) => void;
   display: Display;
 }) {
   const { board, card } = item;
@@ -277,6 +290,11 @@ function BoardDrawer({
         )}
       </div>
       <Facts item={item} card={card} display={display} />
+      {/* Navigation, not an action: the issue page keeps the step table and
+          per-PR review controls the board leaves out. */}
+      <button type="button" className="board-linkbtn board-openfull" onClick={() => onOpenIssue(item.issue)}>
+        Open full issue
+      </button>
       <Action repo={repo} item={item} prs={prs} onRefresh={onRefresh} onDetailRefresh={detail.refresh} />
     </div>
   );

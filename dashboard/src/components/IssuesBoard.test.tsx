@@ -275,6 +275,25 @@ describe("issues board drawer", () => {
     expect(within(drawer).getByText("gpt-6.1-sol")).toBeVisible();
   });
 
+  it("opens the dashboard's own issue page from the drawer", async () => {
+    stubFetch();
+    const onOpenIssue = vi.fn();
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({ in_flight: [card(185, needs("escalated", null))] })}
+        onOpenIssue={onOpenIssue}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Issue #185: Issue 185 title" }));
+    await userEvent.click(within(document.getElementById("board-drawer-185") as HTMLElement)
+      .getByRole("button", { name: "Open full issue" }));
+
+    expect(onOpenIssue).toHaveBeenCalledWith(185);
+  });
+
   it("expands the history in place to every step and collapses it again", async () => {
     stubFetch();
     renderBoard({ in_flight: [card(181, needs("escalated", null))] });
@@ -325,7 +344,9 @@ describe("issues board drawer", () => {
 });
 
 describe("issues board actions", () => {
-  const secondary = /^(Open PR|Close PR|Close issue|Park|Review holds|Open full issue)$/;
+  // "Open full issue" is navigation to the dashboard's issue page, not an
+  // action on the issue, so it is not counted here.
+  const secondary = /^(Open PR|Close PR|Close issue|Park|Review holds)$/;
 
   it.each([
     ["escalated", "Open issue"],

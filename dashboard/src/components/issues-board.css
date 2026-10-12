@@ -359,6 +359,10 @@
 .board-linkbtn:hover {
   text-decoration: underline;
 }
+.board-openfull {
+  justify-self: start;
+  margin-bottom: 0;
+}
 .board-visits {
   display: grid;
   gap: var(--space-3);

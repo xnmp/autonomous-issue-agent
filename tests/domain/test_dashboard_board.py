@@ -125,14 +125,31 @@ def test_a_passing_review_run_that_decided_nothing_does_not_move_on():
     assert track.current is Stage.REVIEW
 
 
-@pytest.mark.parametrize("stage_kind,stage", [("RE_REVIEW", Stage.REVIEW), ("FIX_CI", Stage.CI)])
-def test_a_rebase_is_a_repair_inside_the_stage_in_progress(stage_kind, stage):
+def test_a_ci_fix_before_any_approval_is_no_rewind_from_ci():
+    # PR opens, CI fails, the fixer repairs it, then review asks for changes:
+    # the patch never reached the CI stage, so nothing was sent back from it.
     track = stage_track(steps(
-        ("RESOLVE", O.DONE), (stage_kind, O.DONE), ("REBASE", O.DONE), ("PR_RESUME", O.DONE),
+        ("RESOLVE", O.DONE), ("CI", O.FAILED), ("FIX_CI", O.DONE),
+        ("REVIEW", O.CHANGES_REQUESTED, True), ("FIX_CI", O.RUNNING),
     ))
 
-    assert [visit.stage for visit in track.visits] == [Stage.RESOLVE, stage]
-    assert [chip.kind for chip in track.visits[-1].chips] == [stage_kind, "REBASE", "PR_RESUME"]
+    assert visit_shape(track) == [
+        ("resolve", [("RESOLVE", "done", 1), ("CI", "failed", 1), ("FIX_CI", "done", 1)]),
+        ("review", [("REVIEW", "changes_requested", 1), ("FIX_CI", "running", 1)]),
+    ]
+    assert (track.current, track.furthest) == (Stage.REVIEW, Stage.REVIEW)
+    assert track.ci_runs == 1
+
+
+@pytest.mark.parametrize("decision,stage", [(O.CHANGES_REQUESTED, Stage.REVIEW), (O.PASSED, Stage.CI)])
+def test_a_rebase_is_a_repair_inside_the_stage_in_progress(decision, stage):
+    track = stage_track(steps(
+        ("RESOLVE", O.DONE), ("REVIEW", decision, True), ("FIX_CI", O.DONE),
+        ("REBASE", O.DONE), ("PR_RESUME", O.DONE),
+    ))
+
+    assert [visit.stage for visit in track.visits][-1] is stage
+    assert [chip.kind for chip in track.visits[-1].chips][-2:] == ["REBASE", "PR_RESUME"]
     assert track.current is stage
 
 
@@ -209,9 +226,9 @@ def test_failed_review_runs_decide_nothing_and_count_no_round():
 
 
 def test_a_very_long_history_folds_in_order_with_exact_counts():
+    # Approved, then CI fails and its fix sends the patch back to review.
     cycle = [
-        ("REVIEW", O.CHANGES_REQUESTED, True),
-        ("ADDRESS_REVIEW", O.DONE),
+        ("REVIEW", O.PASSED, True),
         ("CI", O.FAILED),
         ("FIX_CI", O.DONE),
     ]
@@ -219,7 +236,7 @@ def test_a_very_long_history_folds_in_order_with_exact_counts():
 
     track = stage_track(steps(*history))
 
-    assert track.steps == 602
+    assert track.steps == 452
     assert (track.review_rounds, track.ci_runs, track.resolve_attempts) == (150, 150, 1)
     assert len(track.visits) == 1 + 2 * 150 + 1
     assert track.current is Stage.MERGE
@@ -436,6 +453,8 @@ def test_every_combination_of_facts_yields_exactly_one_group():
         (True, 0.5, None),
         ("9", 1.0, None),
         (1e300, 1e-300, None),
+        (10**400, 1.0, None),
+        (5, 10**400, None),
     ],
 )
 def test_overspend_alarms_only_at_twice_the_projection(cost, budget, ratio):

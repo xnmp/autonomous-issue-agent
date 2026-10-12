@@ -1810,8 +1810,6 @@ _STAGE_OF_KIND: Mapping[str, Stage] = {
     **{kind: Stage.TRIAGE for kind in ("TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC", "GROOM")},
     **{kind: Stage.RESOLVE for kind in ("RESOLVE", "RESUME", "ROUTE")},
     **{kind: Stage.REVIEW for kind in ("REVIEW", "RE_REVIEW", "ADDRESS_REVIEW")},
-    "FIX_CI": Stage.CI,
-    CI_RUN_KIND: Stage.CI,
     MERGE_KIND: Stage.MERGE,
 }
 _RESOLVE_ATTEMPT_KINDS = frozenset({"RESOLVE", "RESUME"})
@@ -1824,6 +1822,9 @@ def stage_of_kind(kind: str) -> Stage | None:
     are operator interventions and any kind this build does not know. A rebase
     is never a stage of its own: it adds a CI run (a new head), and it returns
     the issue to Review only when a reviewer runs again on the changed patch.
+
+    CI runs and FIX_CI legs also inherit: CI fails and is fixed on every head,
+    approved or not, and only an approval enters the CI stage (`stage_track`).
     """
     return _STAGE_OF_KIND.get(kind.strip().upper())
 
@@ -1896,9 +1897,9 @@ def stage_track(steps: Iterable[TrackStep]) -> StageTrack:
 
     CI runs alongside review on every head, but the CI stage is what follows
     an approval: an approving review decision moves the stage in progress to
-    CI, and a CI run observed before the patch is approved stays in the stage
-    in progress. Otherwise every PR whose checks report before its first
-    review would read as having been sent back from CI.
+    CI, and a CI run or CI fix before the patch is approved stays in the stage
+    in progress. Otherwise every PR whose checks fail before its first review
+    would read as having been sent back from CI.
 
     Counts:
       resolve attempts — RESOLVE and RESUME runs, whatever their outcome;
@@ -1916,8 +1917,7 @@ def stage_track(steps: Iterable[TrackStep]) -> StageTrack:
     in_progress = Stage.TRIAGE
     for step in ordered:
         kind = step.kind.strip().upper()
-        if kind != CI_RUN_KIND:
-            in_progress = stage_of_kind(kind) or in_progress
+        in_progress = stage_of_kind(kind) or in_progress
         if not visits or visits[-1][0] is not in_progress:
             visits.append((in_progress, []))
         chips = visits[-1][1]
@@ -2291,7 +2291,7 @@ def board_status(facts: BoardFacts) -> BoardStatus:
         return Blocked(
             OnTriage("awaiting_reply"),
             "Waiting on triage",
-            "The steward asked the author a question. Set a priority to queue it.",
+            "The steward asked the author a question. It waits for their reply.",
             triage.since,
         )
     if facts.ci == "pending":
@@ -2345,4 +2345,8 @@ def overspend_ratio(cost_usd: object, budget_usd: object) -> float | None:
 def _finite(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        number = float(value)
+    except OverflowError:  # an int beyond float range is no usable figure
+        return None
+    return number if math.isfinite(number) else None

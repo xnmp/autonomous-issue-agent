@@ -3333,6 +3333,19 @@ def test_a_superseded_head_whose_checks_never_settled_is_not_still_running():
     assert ci_chips == [{"kind": "CI", "outcome": "done", "count": 1}]
 
 
+def test_heads_with_no_checks_reported_are_not_ci_runs():
+    # A repo without CI reports `none` on every head; `unknown` is unreadable.
+    events = [_pr_observed("a", "none", 60), _pr_observed("b", "none", 50),
+              _pr_observed("c", "unknown", 40), _pr_observed("d", "none", 35),
+              _pr_observed("d", "failure", 30)]
+
+    detail = snapshots.issue_detail(row_view(events), NOW)
+
+    assert detail["rail"]["ci_runs"] == 1
+    ci_chips = [chip for visit in detail["history"] for chip in visit["steps"] if chip["kind"] == "CI"]
+    assert ci_chips == [{"kind": "CI", "outcome": "failed", "count": 1}]
+
+
 def test_the_detail_carries_the_full_harness_message_not_the_row_line():
     detail = snapshots.issue_detail(row_view([BREAKER_COMMENT, ESCALATION]), NOW)
 

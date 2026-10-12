@@ -317,7 +317,7 @@ export default function App() {
             {card?.board ? (
               <Chip
                 tone={BOARD_TONE[card.board.status]}
-                pulse={card.board.status === "working"}
+                pulse={card.board.status === "working" && card.board.activity === "agent"}
               >
                 {GROUP_META[card.board.status].label}
               </Chip>

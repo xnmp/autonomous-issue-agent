@@ -80,7 +80,7 @@ const boardIssues = {
         status: "needs_you", ask: "rearm", headline: "Re-arm or close",
         reason: "Resolve failed 3× without opening a PR.", since_ts: ago(30 * 24 * 60),
       },
-      rail: rail({ current: "resolve", furthest: "resolve", resolve_attempts: 3, review_rounds: 0, steps: 6 }),
+      rail: rail({ current: "resolve", furthest: "resolve", resolve_attempts: 3, review_rounds: 0, steps: 4 }),
     }),
     card(1082, "feat(git-graph): create/merge/approve PR actions from the graph", {
       ...pr(1088),
@@ -98,7 +98,7 @@ const boardIssues = {
         status: "working", activity: "ci", headline: "CI running",
         reason: "Approved on review round 5.", since_ts: ago(41),
       },
-      rail: rail({ current: "ci", furthest: "ci", review_rounds: 5, ci_runs: 3, steps: 16 }),
+      rail: rail({ current: "ci", furthest: "ci", review_rounds: 5, ci_runs: 3, steps: 14 }),
     }),
     card(1083, "feat(git-graph): jump to merge-base/fork point of two branches", {
       ...pr(1090),
@@ -107,7 +107,7 @@ const boardIssues = {
         status: "working", activity: "agent", headline: "Addressing review",
         reason: "Review round 1 asked for changes.", since_ts: ago(4),
       },
-      rail: rail({ current: "review", furthest: "review", review_rounds: 1, steps: 5, live: true }),
+      rail: rail({ current: "review", furthest: "review", review_rounds: 1, steps: 4, live: true }),
     }),
   ],
   pending: [
@@ -137,12 +137,32 @@ const boardIssues = {
   warnings: [],
 };
 
-const visits = [
-  { stage: "resolve", steps: [{ kind: "ROUTE", outcome: "done", count: 1 }, { kind: "RESOLVE", outcome: "done", count: 1 }] },
-  { stage: "review", steps: [{ kind: "REVIEW", outcome: "changes_requested", count: 1 }, { kind: "ADDRESS_REVIEW", outcome: "done", count: 1 }, { kind: "RE_REVIEW", outcome: "passed", count: 1 }] },
-  { stage: "ci", steps: [{ kind: "CI", outcome: "failed", count: 1 }, { kind: "FIX_CI", outcome: "done", count: 2 }] },
-  { stage: "review", steps: [{ kind: "RE_REVIEW", outcome: "changes_requested", count: 3 }, { kind: "ADDRESS_REVIEW", outcome: "done", count: 1 }, { kind: "REBASE", outcome: "running", count: 1 }] },
-];
+// Each history is the fold the row's rail summarises: its visit stages, step
+// total, review decisions and CI runs agree with that rail.
+const step = (kind: string, outcome: string, count = 1) => ({ kind, outcome, count });
+const resolved = { stage: "resolve", steps: [step("ROUTE", "done"), step("RESOLVE", "done")] };
+const histories: Record<number, unknown[]> = {
+  710: [{ stage: "resolve", steps: [step("ROUTE", "done"), step("RESOLVE", "failed", 3)] }],
+  1082: [
+    resolved,
+    { stage: "review", steps: [step("REVIEW", "changes_requested"), step("ADDRESS_REVIEW", "done"), step("RE_REVIEW", "passed")] },
+    { stage: "ci", steps: [step("CI", "failed"), step("FIX_CI", "done"), step("CI", "failed"), step("FIX_CI", "done")] },
+    { stage: "review", steps: [step("RE_REVIEW", "changes_requested", 3), step("ADDRESS_REVIEW", "done"), step("CI", "passed")] },
+  ],
+  993: [
+    resolved,
+    {
+      stage: "review",
+      steps: [
+        step("REVIEW", "changes_requested"), step("ADDRESS_REVIEW", "done"), step("CI", "failed"), step("FIX_CI", "done"),
+        step("RE_REVIEW", "changes_requested", 3), step("ADDRESS_REVIEW", "done"), step("CI", "failed"), step("FIX_CI", "done"),
+        step("RE_REVIEW", "passed"),
+      ],
+    },
+    { stage: "ci", steps: [step("CI", "running")] },
+  ],
+  1083: [resolved, { stage: "review", steps: [step("REVIEW", "changes_requested"), step("ADDRESS_REVIEW", "running")] }],
+};
 
 function detail(issue: number) {
   const row = boardIssues.in_flight.find((item) => item.issue === issue);
@@ -151,7 +171,7 @@ function detail(issue: number) {
     cost_usd: row?.cost_usd ?? null, elapsed_s: 6_000, working_s: 1_320, idle_s: 4_680, idle_active: false,
     leg_running: false, steps: [], events: [], warnings: [],
     rail: row?.rail ?? null,
-    history: visits,
+    history: histories[issue] ?? [],
     harness_message: issue === 1082
       ? "**Agent needs input:** the merge action needs a confirmation dialog. Should it reuse the existing modal, or a new inline confirm?\n\nTwo other issues are blocked on this one."
       : "**Circuit breaker:** resolve failed 3× without opening a PR. This episode is held; an explicit harness re-arm is required to grant another allowance.",
@@ -255,8 +275,8 @@ for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844
         expect(Math.abs(box!.x - before[index]!.x)).toBeLessThanOrEqual(0.5);
         expect(Math.abs(box!.y - before[index]!.y)).toBeLessThanOrEqual(0.5);
       }
-      await expect(drawer.getByRole("button", { name: "Show 4 earlier steps" })).toBeVisible();
-      await drawer.getByRole("button", { name: "Show 4 earlier steps" }).click();
+      await expect(drawer.getByRole("button", { name: "Show 6 earlier steps" })).toBeVisible();
+      await drawer.getByRole("button", { name: "Show 6 earlier steps" }).click();
       await expect(drawer.locator(".board-visit")).toHaveCount(4);
       await expect(drawer.locator(".board-actions").getByRole("link")).toHaveText(["Open issue"]);
       await noSidewaysScroll(page);

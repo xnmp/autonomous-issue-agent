@@ -1761,12 +1761,17 @@ def _ci_run_steps(row: dash.IssueRow) -> list[dash.TrackStep]:
             newest_head[number] = head
         if not (isinstance(head, str) and head and isinstance(summary, Mapping)):
             continue
+        ci = str(summary.get("state") or "")
+        # `none` (no checks reported) and `unknown` are not runs: a repo
+        # without CI must not read as a PR that keeps failing it.
+        if ci not in _CI_OUTCOME:
+            continue
         key = (number, head)
         first.setdefault(key, dash.parse_ts(event.get("ts")))
-        state[key] = str(summary.get("state") or "")
+        state[key] = ci
     steps = []
     for key, stamp in first.items():
-        outcome = _CI_OUTCOME.get(state[key], dash.StepOutcome.DONE)
+        outcome = _CI_OUTCOME[state[key]]
         if outcome is dash.StepOutcome.RUNNING and newest_head.get(key[0]) != key[1]:
             outcome = dash.StepOutcome.DONE
         steps.append(dash.TrackStep(dash.CI_RUN_KIND, outcome, stamp))

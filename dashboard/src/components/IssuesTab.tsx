@@ -245,6 +245,7 @@ export function IssuesTab({
           items={filteredBoard}
           loading={issues.loading}
           onRefresh={issues.refresh}
+          onOpenIssue={onOpenIssue}
           showProjectedCost={showProjectedCost}
           showDurationSeconds={showDurationSeconds}
         />
