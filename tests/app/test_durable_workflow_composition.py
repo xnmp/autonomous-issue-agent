@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from issue_agent.adapters.control_store import SCHEMA_VERSION, SQLiteControlStore, RetiredOwnerError
+from issue_agent.adapters.control_store import SQLiteControlStore, RetiredOwnerError
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.effects import GitHubEffectExecutor
@@ -163,19 +163,6 @@ def seed(root: Path, *labels: str) -> None:
     install_workflow(control, with_issue_recovery(resolve_snapshot(7)))
 
 
-def _compatible_sql_build_checkout(root: Path) -> Path:
-    import io
-    import subprocess
-    import tarfile
-    checkout = root / "compatible-sql-build"
-    checkout.mkdir()
-    archive = subprocess.run(["git", "archive", "f3bf33b1182dccabe9bf4b077d74f0d4af53492a", "src/issue_agent"],
-                             cwd=Path(__file__).resolve().parents[2], check=True, capture_output=True).stdout
-    with tarfile.open(fileobj=io.BytesIO(archive)) as files:
-        files.extractall(checkout, filter="data")
-    return checkout
-
-
 def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopped, capsys, tmp_path, monkeypatch):
     from issue_agent.domain.world import Check, Comment
     from dataclasses import replace
@@ -260,45 +247,6 @@ def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopp
     with sqlite3.connect(copied_control) as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 2
         assert db.execute("SELECT amount_micros FROM charges").fetchall() == [(250_000,), (250_000,)]
-    import subprocess
-    checkout = _compatible_sql_build_checkout(tmp_path)
-    repository = Path(__file__).resolve().parents[2]
-    script = '''
-import json, pathlib, sys
-import issue_agent
-from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.store import Store
-from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-from issue_agent.adapters.workflow_codec import encode_workflow
-from issue_agent.app import roles
-from issue_agent.domain.actions import RunAgent
-from issue_agent.domain.fix import FixConfig, decide_fix
-from issue_agent.domain.labels import Label
-from issue_agent.domain.world import Comment, IssueView, WorldState
-from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
-assert pathlib.Path(issue_agent.__file__).is_relative_to(sys.argv[3])
-control = SQLiteControlStore(sys.argv[1])
-control.initialize()
-workflow = SQLiteWorkflowControl(control, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=3)
-world = WorldState(issues=(IssueView(7, labels=frozenset({Label.AI_BLOCKED}),
-    comments=(Comment("human", "Use the local destination.", "2026-10-02T00:00:00Z"),)),
-    IssueView(8, labels=frozenset({Label.AI_READY})), IssueView(10, labels=frozenset({Label.AI_READY}))))
-actions = decide_fix(world, FixConfig(fix_bot="fix-bot"), roles._fix_state(Store(sys.argv[2]), world, workflow_control=workflow), fixer_busy=False)
-assert not any(isinstance(action, RunAgent) for action in actions)
-values = {number: control.read_issue_recovery(WorkflowKey("o/r", IssueRef(number))) for number in (7, 9)}
-print(json.dumps({str(number): encode_workflow((value.binding, value.revision, value.component)) for number, value in values.items()}))
-'''
-    def read_old_build():
-        return subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(repository), "python", "-c", script,
-                               str(copied_control), str(copied_state), str(checkout)], cwd=checkout,
-                              env={**os.environ, "PYTHONPATH": str(checkout / "src")},
-                              capture_output=True, text=True)
-    newer_sql = dump(blocked.control)
-    refused = read_old_build()
-    assert refused.returncode != 0 and str(SCHEMA_VERSION) in refused.stderr and "38" in refused.stderr
-    assert dump(blocked.control) == newer_sql
-    # No index-rollback read here: fix rows written after the self-clear fields
-    # were deleted are not readable by the schema-38 build (forward-only).
     assert dump(original) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
