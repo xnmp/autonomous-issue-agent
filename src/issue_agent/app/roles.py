@@ -62,13 +62,8 @@ from ..domain.fix import (
     FixState,
     InFlightFix,
     breaker_key,
-    ci_flakes,
-    CiStallStep,
-    ci_remediations,
     ci_remediation_marker,
     decide_fix,
-    duplicate_pr_guards,
-    issue_holds,
     automerge_in_scope,
     merge_preconditions_met,
 )
@@ -115,12 +110,6 @@ from ..domain.pricing import (
 )
 from ..domain.recovery import RecoveryTrigger
 from ..domain.events import (
-    CiFlakeDetected,
-    CiPendingDeadline,
-    Correlation,
-    DuplicatePrPrevented,
-    LevelChanged,
-    PathPrediction,
     Producer,
     TelemetryEvent,
     TelemetryWarning,
@@ -128,8 +117,6 @@ from ..domain.events import (
 from ..domain.ports import (
     WorkflowControlError,
     CommandRecovery,
-    EventSink,
-    LevelState,
     PredictionReader,
     SpendReconciler,
     StaleReservationReconciler,
@@ -151,7 +138,6 @@ from .review_runtime import (
 )
 from .workflows.resolve_rearm import ResolveRearmWorkflow
 from .loop import Daemon
-from .world_reporter import WorldReporter
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
 
 
@@ -651,17 +637,6 @@ def _shutdown_terminalize(
     return terminalize
 
 
-def _reported_world(
-    observe: Callable,
-    control: SQLiteControlStore,
-    cfg: HarnessConfig,
-    role: str,
-    log: Callable[[str], None],
-) -> Callable:
-    deployment = _deployment_identity(cfg, role)
-    return WorldReporter(control, deployment, log).wrap(observe)
-
-
 class CancellableAsyncDispatch:
     """Run one dispatch coroutine per worker thread with cooperative shutdown.
 
@@ -1084,10 +1059,6 @@ def _bind_codex_fix_runtime(
     _runner: AgentRuntime,
 ) -> _FixRuntimeBinding:
     from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
-    from ..adapters.codex_runner import (
-        codex_budget_not_enforced_warning,
-        codex_cost_blindspot_warning,
-    )
 
     log = _log("fix")
     runner = _build_codex_runner(
@@ -1106,25 +1077,6 @@ def _bind_codex_fix_runtime(
         if reason is not None
         else "codex: runtime ready (bin + key present)"
     )
-    blindspot = codex_cost_blindspot_warning(
-        cost_per_mtok_in=runtime_config.cost_per_mtok_in,
-        cost_per_mtok_out=runtime_config.cost_per_mtok_out,
-        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-        max_runtime=runtime_config.max_runtime,
-        unpriced_cached_models=runtime_config.unpriced_cached_models,
-    )
-    if blindspot is not None:
-        log(blindspot)
-    budget_notice = codex_budget_not_enforced_warning(
-        fix_budget_usd=cfg.fix_budget_usd,
-        max_runtime=runtime_config.max_runtime,
-        enforced=runtime_config.enforce_budget,
-        priced=runtime_config.budget_priceable,
-        pricing_gap=runtime_config.budget_pricing_gap,
-    )
-    if budget_notice is not None:
-        log(budget_notice)
     prepare_cwd = partial(
         write_codex_home,
         agents_md=cfg.agent_md,
@@ -1220,10 +1172,6 @@ def _bind_codex_review_runtime(
     _runner: AgentRuntime,
 ) -> _ReviewRuntimeBinding:
     from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
-    from ..adapters.codex_runner import (
-        codex_budget_not_enforced_warning,
-        codex_cost_blindspot_warning,
-    )
 
     log = _log("review")
     runner = _build_codex_runner(
@@ -1242,28 +1190,6 @@ def _bind_codex_review_runtime(
         if reason is not None
         else "codex: runtime ready (bin + key present)"
     )
-    blindspot = codex_cost_blindspot_warning(
-        cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
-        cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
-        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-        max_runtime=cfg.codex_runtime.max_runtime,
-        runtime_name="REVIEWER_RUNTIME",
-        unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
-    )
-    if blindspot is not None:
-        log(blindspot)
-    budget_notice = codex_budget_not_enforced_warning(
-        fix_budget_usd=runtime_config.budget_usd,
-        max_runtime=cfg.codex_runtime.max_runtime,
-        enforced=cfg.codex_runtime.enforce_budget,
-        priced=cfg.codex_runtime.budget_priceable,
-        pricing_gap=cfg.codex_runtime.budget_pricing_gap,
-        budget_name="REVIEW_BUDGET_USD",
-        runtime_name="REVIEWER_RUNTIME",
-    )
-    if budget_notice is not None:
-        log(budget_notice)
     execution_cwd = cfg.target_dir
     if not execution_cwd:
         log(
@@ -1325,64 +1251,6 @@ def _inject_predicted_paths(store: Store, world):
         changed = changed or combined != issue.predicted_paths
         issues.append(replace(issue, predicted_paths=combined))
     return replace(world, issues=tuple(issues)) if changed else world
-
-
-def _prediction_outcome_reporter(
-    journal: EventSink | None, repo: str, store: Store, log, control=None
-):
-    """Journal each terminal PR's predicted-versus-actual files exactly once.
-
-    This runs before cleanup clears the per-issue prediction state. The event is
-    intentionally raw sets plus their intersection: operators can calculate hit
-    rate and inspect false positives without another GitHub read.
-    """
-    seen: set[str] = set()
-
-    def report(world) -> None:
-        if not isinstance(store, PredictionReader):
-            return
-        for pr in world.prs:
-            if pr.state not in ("MERGED", "CLOSED") or pr.closing_issue is None:
-                continue
-            # `changed_files` UNREAD is not "no files changed": the terminal-PR
-            # fast path (#163) builds a view without them, and this claim is
-            # durable and deduped, so a false 0/N would permanently corrupt the
-            # predicted-path hit rate (adversarial review F4).
-            if not pr.content_known:
-                continue
-            try:
-                predicted = frozenset(
-                    store.get_predicted_paths(pr.closing_issue) or ()
-                )
-            except Exception:  # noqa: BLE001 — observability is fail-open
-                continue
-            if not predicted:
-                continue
-            key = f"path-prediction:{repo}:{pr.closing_issue}:{pr.number}"
-            if key in seen:
-                continue
-            if control is not None and not control.claim("path-prediction", repo, key):
-                continue
-            seen.add(key)
-            matched = predicted & pr.changed_files
-            log(
-                f"PATH PREDICTION: issue #{pr.closing_issue} / PR #{pr.number} — "
-                f"{len(matched)}/{len(predicted)} predicted files changed"
-            )
-            if journal is not None:
-                journal.emit(
-                    TelemetryEvent(
-                        PathPrediction(
-                            tuple(sorted(predicted)),
-                            tuple(sorted(pr.changed_files)),
-                            tuple(sorted(matched)),
-                            key,
-                        ),
-                        Correlation(issue=pr.closing_issue, pr=pr.number),
-                    )
-                )
-
-    return report
 
 
 def _control_value(errors, key, reader, default, *, error_key=None):
@@ -1549,411 +1417,6 @@ def _fix_state(
         cleanup_sources=cleanup_sources,
         inflight=inflight,
     )
-
-
-def _hold_reporter(
-    journal: EventSink | None,
-    repo: str,
-    log,
-    issue_is_blocked: Callable[[int], bool] | None = None,
-    control: LevelState | None = None,
-):
-    """Report defer begin/clear transitions without steady-state tick noise.
-
-    `pick_ready_issue` skips an ai-ready issue whose files overlap an in-flight
-    PR, or that has an open GitHub dependency — silently, which is
-    indistinguishable from a fixer that is simply broken (harness #6: a hold on
-    #522 cost ~30 minutes of live investigation before anyone could tell which
-    it was).
-
-    The schema-v2 world projection is the durable source for dashboard levels.
-    This reporter keeps only process-local edge memory; telemetry is never read
-    to reconstruct orchestration state.
-    """
-    active: dict[tuple[int, str, int | None, int | None], dict] | None = None
-
-    def key_for(hold) -> tuple[int, str, int | None, int | None]:
-        return (hold.issue, hold.reason, hold.blocker_pr, hold.blocker_issue)
-
-    def fields_for(key):
-        issue, reason, blocker_pr, blocker_issue = key
-        if reason == "human":
-            return {
-                "issue": issue,
-                "reason": reason,
-                "blocker": "human",
-            }
-        return {
-            "issue": issue,
-            "reason": reason,
-            "blocker_pr": blocker_pr,
-            "blocker_issue": blocker_issue,
-        }
-
-    def stored_key(key) -> str:
-        issue, reason, blocker_pr, blocker_issue = key
-        return f"{issue}:{reason}:{blocker_pr or ''}:{blocker_issue or ''}"
-
-    def key_from_fields(fields) -> tuple[int, str, int | None, int | None]:
-        return (
-            int(fields["issue"]),
-            str(fields["reason"]),
-            fields.get("blocker_pr"),
-            fields.get("blocker_issue"),
-        )
-
-    def waiting_label(key) -> str:
-        issue, reason, blocker_pr, blocker_issue = key
-        if reason == "human":
-            return f"issue #{issue} waiting on human input"
-        if blocker_pr is not None:
-            return f"issue #{issue} waiting on PR #{blocker_pr}"
-        if blocker_issue is not None:
-            if reason == "blocker":
-                return f"issue #{issue} blocked by #{blocker_issue}"
-            return f"issue #{issue} waiting on #{blocker_issue}"
-        return f"issue #{issue} waiting on an open dependency"
-
-    def report(world, inflight=()) -> dict[int, str]:
-        nonlocal active
-        if active is None:
-            if control is not None:
-                active = {
-                    key_from_fields(fields): dict(fields)
-                    for fields in control.load_level_state("holds", repo).values()
-                }
-            else:
-                active = {}
-
-        current = {
-            key_for(hold): hold for hold in issue_holds(world, tuple(inflight))
-        }
-        current.update({
-            (issue.number, "human", None, None): issue
-            for issue in world.open_issues()
-            if issue.has(Label.AI_BLOCKED)
-        })
-        observed_issue_numbers = {issue.number for issue in world.issues}
-        for key, event in active.items():
-            if key[1] != "human" or key[0] in observed_issue_numbers:
-                continue
-            if issue_is_blocked is None:
-                current[key] = event
-                continue
-            try:
-                still_blocked = issue_is_blocked(key[0])
-            except Exception as exc:  # noqa: BLE001 - unread is not an unblock
-                log(f"issue #{key[0]} human-wait probe failed: {exc}")
-                current[key] = event
-            else:
-                if still_blocked:
-                    current[key] = event
-        for key in current.keys() - active.keys():
-            message = waiting_label(key)
-            log(f"DEFERRED: {message}; dispatches once that clears")
-            if journal is not None:
-                fields = fields_for(key)
-                journal.emit(
-                    TelemetryEvent(
-                        LevelChanged(
-                            f"hold:{stored_key(key)}",
-                            "waiting",
-                            str(fields["reason"]),
-                            fields,
-                        ),
-                        Correlation(issue=key[0]),
-                    )
-                )
-            active[key] = fields_for(key)
-
-        for key in active.keys() - current.keys():
-            message = waiting_label(key)
-            log(
-                f"{message.replace(' waiting on ', ' no longer waiting on ')}; "
-                "eligible for dispatch"
-            )
-            if journal is not None:
-                fields = fields_for(key)
-                journal.emit(
-                    TelemetryEvent(
-                        LevelChanged(
-                            f"hold:{stored_key(key)}",
-                            "cleared",
-                            str(fields["reason"]),
-                            fields,
-                        ),
-                        Correlation(issue=key[0]),
-                    )
-                )
-            active.pop(key, None)
-        if control is not None:
-            control.replace_level_state(
-                "holds",
-                repo,
-                {stored_key(key): fields for key, fields in active.items()},
-            )
-        reasons: dict[int, str] = {}
-        for key in current:
-            reason = waiting_label(key).removeprefix(f"issue #{key[0]} ")
-            reasons[key[0]] = "; ".join(filter(None, (reasons.get(key[0]), reason)))
-        return reasons
-
-    return report
-
-
-def _ci_stall_reporter(
-    journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
-):
-    """Build the per-poll reporter for a CI pending-deadline breach (#30).
-
-    The escalation itself is `decide_fix`'s (a comment + needs-human-review);
-    this is the machine-readable half. Without it a wedged check leaves NO
-    trace: a pending PR dispatches no leg, so no retry counter moves and no
-    `agent_run` is written, and "the PR simply never moves and nothing anywhere
-    says why" was the whole complaint.
-
-    Same two-channel shape as `_hold_reporter`, and reads the SAME pure
-    derivation `decide_fix` escalates on, so the journal cannot disagree with
-    the action. The LOG line fires every poll it is derivable; the JOURNAL line
-    fires once per (PR, head SHA) — a re-push that wedges again is a new stall,
-    the same stuck run is not. In practice the escalation relabel takes the PR
-    out of the fixer's set on the first breach, so this dedup is the backstop
-    for the poll where that relabel fails, and for the daemon restarts a hot
-    reload produces.
-    """
-    seen: set[str] = set()
-
-    def report(world, state: FixState) -> None:
-        for remedy in ci_remediations(world, fix_cfg, state):
-            stall = remedy.stall
-            if stall.checks or stall.seconds:
-                checks = ", ".join(stall.checks) or "unnamed"
-                log(
-                    f"CI STALL: PR #{stall.pr} has been pending {stall.seconds}s "
-                    f"({checks}) \u2014 pending deadline breached; "
-                    f"{remedy.step.value}: {remedy.detail}"
-                )
-            else:
-                # The cancel-aftermath arm carries no pending clock and no
-                # pinning checks; reporting it as "pending 0s" would describe a
-                # state that never existed.
-                log(
-                    f"CI CANCEL AFTERMATH: PR #{stall.pr} ({stall.head[:7]}) "
-                    f"reads green after a cancel \u2014 {remedy.step.value}"
-                )
-            # The STEP is part of the key: cancel, the wait it opens and the
-            # escalation that bounds it are three distinct facts about one head,
-            # and ADR 0012 wants the wait journalled \u2014 once, not every poll.
-            key = f"ci-pending:{repo}:{stall.pr}:{stall.head}:{remedy.step.value}"
-            if key in seen:
-                continue
-            if control is not None and not control.claim("ci-pending", repo, key):
-                continue
-            seen.add(key)
-            if journal is None:
-                continue
-            correlation = Correlation(issue=remedy.issue or None, pr=stall.pr)
-            if remedy.step is not CiStallStep.ESCALATE:
-                # `ci_pending_deadline` counts ESCALATIONS — escalation rate is
-                # a named power guardrail, and a rate counted from duplicated
-                # events is not a rate. A wedge the harness heals itself must
-                # therefore NOT emit one, or the change would appear to worsen
-                # the very guardrail it protects (adversarial review S4). The
-                # self-healing steps get their own code instead.
-                journal.emit(
-                    TelemetryEvent(
-                        TelemetryWarning(
-                            "ci_stall_step",
-                            f"stalled CI: {remedy.step.value}",
-                            {
-                                "head": stall.head,
-                                "seconds": stall.seconds,
-                                "step": remedy.step.value,
-                                "detail": remedy.detail,
-                                "run_ids": list(remedy.run_ids),
-                                "block_key": key,
-                            },
-                        ),
-                        correlation,
-                    )
-                )
-                continue
-            journal.emit(
-                TelemetryEvent(
-                    CiPendingDeadline(
-                        stall.head,
-                        stall.seconds,
-                        tuple(stall.checks),
-                        key,
-                    ),
-                    correlation,
-                )
-            )
-
-    return report
-
-
-def _duplicate_pr_reporter(
-    journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
-):
-    """Build the per-poll reporter for the duplicate-PR guard (#39).
-
-    The refusal itself is `decide_fix`'s (a comment + ai-ready → ai-blocked);
-    this is the machine-readable half, and it reads the SAME pure derivation the
-    decision does, so the journal cannot disagree with the action.
-
-    The metric #39 moves is "wasted duplicate resolves" — one in five issues on
-    the night it was found — and these events ARE the count of resolves not
-    bought. Two channels, as everywhere else here: the LOG line every poll the
-    condition holds (normally exactly one, since the relabel clears it), the
-    JOURNAL line once per (issue, PR).
-    """
-    seen: set[str] = set()
-
-    def report(world) -> None:
-        for dup in duplicate_pr_guards(world, fix_cfg):
-            log(
-                f"DUPLICATE PR: issue #{dup.issue} is ai-ready but open PR "
-                f"#{dup.pr} already closes it — skipping the resolve and "
-                "moving the issue to ai-blocked"
-            )
-            key = f"duplicate-pr:{repo}:{dup.issue}:{dup.pr}"
-            if key in seen:
-                continue
-            if control is not None and not control.claim("duplicate-pr", repo, key):
-                continue
-            seen.add(key)
-            if journal is None:
-                continue
-            journal.emit(
-                TelemetryEvent(
-                    DuplicatePrPrevented(dup.author, key),
-                    Correlation(issue=dup.issue, pr=dup.pr),
-                )
-            )
-
-    return report
-
-
-def _stall_reporter(journal: EventSink | None, store: Store, log):
-    """No silent forever: any watched target whose observable signature has
-    not changed for a whole stall threshold emits an escalating
-    `target_stalled` TelemetryWarning — regardless of WHY it is stuck.
-
-    2026-08-01's run produced three unrelated stall shapes (CI
-    merge deadlock, receipt-dead-ended visual resolve, uncounted review
-    deferrals); each per-path fix is necessary, but this watchdog is the
-    boundary measurement that catches the classes nobody has met yet.
-    Telemetry only — it never mutates lifecycle, so a false positive costs a
-    journal line, never a blocked leg. One emit per (target, level) per
-    process; a restart re-announces the current level once, which is the
-    correct behaviour for an operator attaching to a fresh log."""
-    from ..domain.liveness import detect_stalls
-
-    emitted: set[tuple[str, int]] = set()
-
-    def report(world, holds: Mapping[int, str] | None = None) -> None:
-        seen: dict[str, tuple[str, str]] = {}
-        for pr in world.prs:
-            if pr.state == "OPEN":
-                sig, since = store.get_stall_marker("pr", pr.number)
-                if sig:
-                    seen[f"pr:{pr.number}"] = (sig, since)
-        for issue in world.issues:
-            if issue.state == "open":
-                sig, since = store.get_stall_marker("issue", issue.number)
-                if sig:
-                    seen[f"issue:{issue.number}"] = (sig, since)
-        stalls, next_seen = detect_stalls(world, seen)
-        for key, marker in next_seen.items():
-            if seen.get(key) != marker:
-                kind, _, num = key.partition(":")
-                store.set_stall_marker(kind, int(num), marker[0], marker[1])
-        for stall in stalls:
-            dedupe = (f"{stall.kind}:{stall.number}", stall.level)
-            if dedupe in emitted:
-                continue
-            emitted.add(dedupe)
-            minutes = int(stall.age_seconds // 60)
-            reason = holds.get(stall.number) if stall.kind == "issue" and isinstance(holds, Mapping) else None
-            suffix = (
-                f"deferred: {reason}" if isinstance(reason, str) and reason.strip()
-                else "nothing is moving it"
-            )
-            log(
-                f"STALL: {stall.kind} #{stall.number} unchanged for "
-                f"{minutes} min (level {stall.level}) — {suffix}"
-            )
-            if journal is None:
-                continue
-            try:
-                journal.emit(
-                    TelemetryEvent(
-                        TelemetryWarning(
-                            "target_stalled",
-                            f"{stall.kind} #{stall.number} unchanged for "
-                            f"{minutes} min",
-                            {
-                                "kind": stall.kind,
-                                "level": stall.level,
-                                "age_seconds": int(stall.age_seconds),
-                            },
-                        ),
-                        Correlation(
-                            pr=stall.number if stall.kind == "pr" else None,
-                            issue=(
-                                stall.number
-                                if stall.kind == "issue"
-                                else None
-                            ),
-                        ),
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 — telemetry must not block the tick
-                log(f"stall for {stall.kind} #{stall.number} not journalled ({exc})")
-
-    return report
-
-
-def _ci_flake_reporter(
-    journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
-):
-    """Build the per-poll reporter for a CONFIRMED flake (#38).
-
-    `ci_rerun` (written by the Executor) says a free re-run fired; this says it
-    WORKED — the checks that would have bought a $13–29 FIX_CI leg went green on
-    a re-run of the identical commit. That is only observable one CI cycle after
-    the fact, from world state, which is why it is a reporter over
-    `domain.fix.ci_flakes` rather than an event some code path emits inline.
-
-    Counting these against `ci_rerun` gives the flake rate the issue's metric
-    needs (repair-leg share of spend), so the JOURNAL line is deduped per
-    (PR, head) — the derivation stays true for every poll until the PR merges.
-    """
-    seen: set[str] = set()
-
-    def report(world, state) -> None:
-        for flake in ci_flakes(world, fix_cfg, state):
-            log(
-                f"CI FLAKE: PR #{flake.pr} went green on a re-run of the same "
-                f"commit ({flake.head[:7]}) — no CI-fix leg was dispatched"
-            )
-            key = f"ci-flake:{repo}:{flake.pr}:{flake.head}"
-            if key in seen:
-                continue
-            if control is not None and not control.claim("ci-flake", repo, key):
-                continue
-            seen.add(key)
-            if journal is None:
-                continue
-            journal.emit(
-                TelemetryEvent(
-                    CiFlakeDetected(flake.head, key),
-                    Correlation(pr=flake.pr),
-                )
-            )
-
-    return report
 
 
 @dataclass(frozen=True)
@@ -2162,28 +1625,6 @@ def compose_fix_daemon(
     )
     executor.bind_dispatch(dispatch_runtime)
 
-    report_holds = _hold_reporter(
-        journal,
-        cfg.repo,
-        log,
-        issue_is_blocked=lambda issue: gateway.get_issue(issue).has(
-            Label.AI_BLOCKED
-        ),
-        control=control,
-    )
-    report_prediction_outcomes = _prediction_outcome_reporter(
-        journal, cfg.repo, store, log, control
-    )
-    report_ci_stalls = _ci_stall_reporter(
-        journal, cfg.repo, fix_cfg, log, control
-    )
-    report_duplicates = _duplicate_pr_reporter(
-        journal, cfg.repo, fix_cfg, log, control
-    )
-    report_ci_flakes = _ci_flake_reporter(
-        journal, cfg.repo, fix_cfg, log, control
-    )
-    report_stalls = _stall_reporter(journal, store, log)
     daemon_ref: dict[str, Daemon] = {}
 
     issue_kinds = frozenset({AgentKind.RESOLVE, AgentKind.RESUME})
@@ -2275,12 +1716,6 @@ def compose_fix_daemon(
         for target, workflow in state.resolve_workflows.items():
             if target in open_targets and isinstance(workflow, WorkflowUnavailable):
                 log(f"resolve workflow {target} held: {workflow.reason}")
-        holds = report_holds(world, inflight)
-        report_prediction_outcomes(world)
-        report_ci_stalls(world, state)
-        report_duplicates(world)
-        report_ci_flakes(world, state)
-        report_stalls(world, holds)
         daemon = daemon_ref.get("daemon")
         externally_busy = fixer_busy()
         slots = (
@@ -2339,13 +1774,9 @@ def compose_fix_daemon(
         owner_id=owner_id,
         reconciler=fix_reconciler,
     )
-    reported_world = _reported_world(
-        gateway.build_world, control, cfg, "fix", log
-    )
-
     def observe_with_prefetch_reservations():
         pre_fetch_inflight[:] = [reservations.snapshot()]
-        return reported_world()
+        return gateway.build_world()
 
     daemon = Daemon(
         "fix",
@@ -2434,106 +1865,6 @@ def _fix_holds(control, repository: str, world, now: datetime) -> dict[int, FixH
             max(0.0, (now - claim.claimed_at).total_seconds()),
         )
     return holds
-
-
-# The deferral is an OPEN level; both ways out of it are CLOSING levels the
-# projection's `_open_levels` recognises. "forced" would read as a level still
-# open, which is the opposite of what a forced dispatch means.
-_HOLD_OPEN = "waiting"
-_HOLD_FORCED = "stopped"
-_HOLD_RELEASED = "cleared"
-
-
-def _fix_hold_reporter(journal: EventSink | None, repo: str, log, control=None):
-    """Journal review deferrals at most once per (PR, blocking claim) (#176).
-
-    Same shape as the fixer's hold reporter: the emitted set is persisted as
-    level state, so a deferral spanning many ticks is one event and survives a
-    restart. Telemetry only — every control-store interaction here is contained,
-    because a journalling failure must not take down the review tick that
-    `_fix_holds` went out of its way to keep dispatching.
-    """
-    active: dict[str, str] | None = None
-
-    def _load() -> dict[str, str]:
-        if control is None:
-            return {}
-        try:
-            return {
-                key: str(fields.get("state") or "")
-                for key, fields in control.load_level_state(
-                    "review_fix_hold", repo
-                ).items()
-            }
-        except Exception:  # noqa: BLE001 - see docstring: telemetry only
-            return {}
-
-    def _emit(key: str, state: str, pr: int, attributes) -> None:
-        if journal is None:
-            return
-        journal.emit(
-            TelemetryEvent(
-                LevelChanged(
-                    f"review_fix_hold:{key}", state, "fix_leg_active", attributes
-                ),
-                Correlation(pr=pr),
-            )
-        )
-
-    def report(deferred, forced) -> None:
-        nonlocal active
-        if active is None:
-            active = _load()
-        held = {
-            f"{hold.pr}:{hold.claim_key}": (state, hold)
-            for state, holds in ((_HOLD_OPEN, deferred), (_HOLD_FORCED, forced))
-            for hold in holds
-        }
-        current = {key: state for key, (state, _hold) in held.items()}
-        for key, (state, hold) in held.items():
-            if active.get(key) == state:
-                continue
-            if state == _HOLD_OPEN:
-                log(
-                    f"DEFERRED: review of PR #{hold.pr} waits on fix claim "
-                    f"{hold.claim_key}; dispatches once that leg finishes"
-                )
-            else:
-                log(
-                    f"review of PR #{hold.pr} dispatched despite fix claim "
-                    f"{hold.claim_key} ({hold.held_seconds:.0f}s): deferral "
-                    "ceiling reached"
-                )
-            _emit(
-                key,
-                state,
-                hold.pr,
-                {
-                    "blocker_pr": hold.pr,
-                    "blocking_claim": hold.claim_key,
-                    "held_seconds": round(hold.held_seconds, 3),
-                },
-            )
-        for key, previous in active.items():
-            if key in current or previous == _HOLD_FORCED:
-                continue  # a forced hold already emitted its closing level
-            pr = int(key.split(":", 1)[0])
-            log(f"review of PR #{pr} no longer waits on a fix leg")
-            _emit(key, _HOLD_RELEASED, pr, {"blocker_pr": pr})
-        if current == active:
-            return  # the common case: no write transaction on a quiet poll
-        if control is not None:
-            try:
-                control.replace_level_state(
-                    "review_fix_hold",
-                    repo,
-                    {key: {"state": state} for key, state in current.items()},
-                )
-            except Exception:  # noqa: BLE001 - see docstring: telemetry only
-                return  # keep memory on the last persisted set and retry next tick
-        active = dict(current)
-
-    return report
 
 
 @dataclass(frozen=True)
@@ -2698,9 +2029,6 @@ def compose_review_daemon(
     )
     executor.bind_dispatch(dispatch_runtime)
 
-    report_fix_holds = _fix_hold_reporter(
-        journal, cfg.repo, say, control
-    )
     migration_reported_at: datetime | None = None
 
     def decide_actions(world) -> tuple[list, ReviewDispatchPlan | None]:
@@ -2771,7 +2099,6 @@ def compose_review_daemon(
             _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
             ceiling_seconds=fix_hold_ceiling_seconds(cfg.agent_max_runtime),
         )
-        report_fix_holds(plan.deferred, plan.forced)
         for hold in plan.deferred:
             admissions[hold.pr] = AdmissionWithheld(
                 WithheldReason.FIX_CLAIM, f"a fix run still holds this pull request's issue ({int(hold.held_seconds)}s)")
@@ -2864,10 +2191,7 @@ def compose_review_daemon(
     else:
         say("review execution recovery unavailable: the gateway cannot read pull request reviews")
 
-    daemon = Daemon("review", _reported_world(
-                      gateway.build_review_world, control, cfg, "review",
-                      say
-                  ), decide, executor,
+    daemon = Daemon("review", gateway.build_review_world, decide, executor,
                   cfg.tick_interval_seconds, say, journal=journal,
                   tick_gate=_control_spend_gate(cfg, control, cfg.review_budget_usd),
                   wake_check=_wake_check(cfg, store),

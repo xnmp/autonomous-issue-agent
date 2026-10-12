@@ -41,7 +41,6 @@ from issue_agent.domain.ports import (
     FixWorktreePort,
     GitHubReads,
     LegacyJournal,
-    LevelState,
     PendingEffect,
     PendingEffectReads,
     PredictionReader,
@@ -74,7 +73,6 @@ COVERED_PORTS = frozenset(
         "FixWorktreePort",
         "GitHubReads",
         "LegacyJournal",
-        "LevelState",
         "PendingEffect",
         "PendingEffectReads",
         "PredictionReader",
@@ -116,10 +114,6 @@ def control_store(store: SQLiteControlStore) -> ControlStore:
 
 
 def recovery_control(store: SQLiteControlStore) -> RecoveryControl:
-    return store
-
-
-def level_state(store: SQLiteControlStore) -> LevelState:
     return store
 
 

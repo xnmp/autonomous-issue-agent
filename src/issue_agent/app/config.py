@@ -270,11 +270,6 @@ class CodexRuntimeConfig:
         """Whether every configured model path has complete dollar pricing."""
         return not self.budget_pricing_gap
 
-    @property
-    def unpriced_cached_models(self) -> tuple[str, ...]:
-        """Models whose cache tier prices at $0 — cached spend is invisible."""
-        return tuple(model for model, rate in self.cost_per_mtok_cached_in if rate <= 0)
-
 
 @dataclass(frozen=True)
 class HarnessConfig:

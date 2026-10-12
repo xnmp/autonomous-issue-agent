@@ -906,7 +906,7 @@ def test_repoint_permanently_fences_the_prior_owner_from_authority(
     assert refused.disposition is AccountingDisposition.UNAVAILABLE
     assert "retired" in refused.detail
     with pytest.raises(RetiredOwnerError, match="deployment-2"):
-        old_store.replace_level_state("fix", "o/r", {})
+        old_store.claim("retired-owner-probe", "o/r", "write")
 
     current_store.bind_active_owner(current_owner)
     assert current_store.claim_dispatch(

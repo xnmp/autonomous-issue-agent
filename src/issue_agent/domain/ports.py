@@ -346,22 +346,6 @@ class PendingEffectReads(Protocol):
     ) -> tuple[PendingEffect, ...]: ...
 
 
-@runtime_checkable
-class LevelState(Protocol):
-    """Restart-safe level memory; corrupt/unavailable reads fail closed."""
-
-    def load_level_state(
-        self, namespace: str, scope: str
-    ) -> Mapping[str, Mapping[str, JsonValue]]: ...
-
-    def replace_level_state(
-        self,
-        namespace: str,
-        scope: str,
-        values: Mapping[str, Mapping[str, JsonValue]],
-    ) -> None: ...
-
-
 class WorldObservationStore(Protocol):
     """Persist committed observation hashes.
 

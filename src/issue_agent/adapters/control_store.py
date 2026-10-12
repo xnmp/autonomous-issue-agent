@@ -4813,61 +4813,6 @@ class SQLiteControlStore:
             )
             return True
 
-    def load_level_state(
-        self, namespace: str, scope: str
-    ) -> dict[str, dict[str, JsonValue]]:
-        """Read a named level snapshot; malformed persisted payload fails closed."""
-
-        if not namespace or not scope:
-            raise ValueError("level namespace and scope are required")
-        with closing(self._connect()) as db, db:
-            rows = db.execute(
-                "SELECT key, payload_json FROM level_state "
-                "WHERE namespace=? AND scope=? ORDER BY key",
-                (namespace, scope),
-            ).fetchall()
-        result: dict[str, dict[str, JsonValue]] = {}
-        for row in rows:
-            try:
-                payload = json.loads(row["payload_json"])
-            except json.JSONDecodeError as exc:
-                raise CorruptControlStore(
-                    f"invalid level payload for {namespace}/{scope}/{row['key']}"
-                ) from exc
-            if not isinstance(payload, dict):
-                raise CorruptControlStore(
-                    f"level payload for {namespace}/{scope}/{row['key']} "
-                    "is not an object"
-                )
-            result[str(row["key"])] = payload
-        return result
-
-    def replace_level_state(
-        self,
-        namespace: str,
-        scope: str,
-        values: Mapping[str, Mapping[str, JsonValue]],
-    ) -> None:
-        """Atomically replace a restart-safe level snapshot."""
-
-        if not namespace or not scope:
-            raise ValueError("level namespace and scope are required")
-        if any(not key for key in values):
-            raise ValueError("level keys are required")
-        updated_at = _stamp(self._now())
-        with self.transaction() as db:
-            db.execute(
-                "DELETE FROM level_state WHERE namespace=? AND scope=?",
-                (namespace, scope),
-            )
-            db.executemany(
-                "INSERT INTO level_state(namespace, scope, key, payload_json, "
-                "updated_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    (namespace, scope, key, _json(payload), updated_at)
-                    for key, payload in sorted(values.items())
-                ),
-            )
 
     def fix_leg_ends(self, repository: str, issue: int) -> tuple[LegEnd, ...]:
         """Every ended fix leg for one issue, classified machine or not.

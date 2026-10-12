@@ -874,34 +874,6 @@ class JournalingRuntime:
                     ),
                 )
             )
-            telemetry_warning = str(
-                getattr(result, "telemetry_warning", "") or ""
-            )
-            if telemetry_warning:
-                self.journal.emit(
-                    TelemetryEvent(
-                        TelemetryWarning(
-                            "runtime",
-                            telemetry_warning,
-                            {
-                                "role": ctx.role,
-                                "kind": ctx.kind,
-                                "number": ctx.number,
-                                "model": (
-                                    task.model
-                                    or getattr(result, "model", "")
-                                    or ""
-                                ),
-                            },
-                        ),
-                        _run_correlation(
-                            ctx,
-                            run_id,
-                            leg_id,
-                            result.session_id or None,
-                        ),
-                    )
-                )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run ({exc})\n")
 

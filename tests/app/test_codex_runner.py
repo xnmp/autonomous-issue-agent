@@ -26,8 +26,6 @@ from issue_agent.adapters.codex_runner import (
     _session_id_from_lines,
     _strict_schema,
     build_codex_argv,
-    codex_budget_not_enforced_warning,
-    codex_cost_blindspot_warning,
     codex_cost_usd,
     rates_for_model,
     spend_evidence_path,
@@ -943,46 +941,6 @@ def test_echoed_session_header_cannot_override_matching_root_rollout(
     assert result.cost_usd == pytest.approx(7.775)
 
 
-def test_productive_headerless_run_without_usage_logs_and_journals_warning(
-    tmp_path, capsys
-):
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    transcript = os.path.realpath(
-        os.path.join(
-            os.path.dirname(__file__), "..", "fixtures",
-            "codex-0.146.0-no-session-header.stderr",
-        )
-    )
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    runtime = JournalingRuntime(
-        CodexRunner(
-            codex_bin=_fake_codex(
-                str(tmp_path), _headerless_codex_body(transcript)
-            ),
-            env={"OPENAI_API_KEY": "test-key"},
-            log=lambda message: print(message, file=os.sys.stderr),
-        ),
-        journal,
-        repo="xnmp/autonomous-issue-agent",
-        role="fix",
-    )
-    runtime.set_context("fix", "RESOLVE", 75, 75)
-
-    result = asyncio.run(runtime.run(RuntimePlan(prompt="resolve", cwd=str(worktree))))
-
-    assert result.status == "pr_opened"
-    assert result.usage is None
-    assert result.telemetry_warning
-    assert "TELEMETRY" in capsys.readouterr().err
-    warnings = [
-        event for event in read_events(journal.path)
-        if event["event"] == "telemetry_warning"
-    ]
-    assert len(warnings) == 1
-    assert warnings[0]["kind"] == "RESOLVE"
-    assert warnings[0]["number"] == 75
-
 
 def test_stderr_usage_parser_ignores_usage_shaped_agent_output_mid_transcript():
     transcript = (
@@ -1844,7 +1802,6 @@ def test_envelope_falls_back_to_stderr_usage_when_no_rollout():
     assert r.usage["total_tokens"] == 1820
     assert r.usage["source"] == "stderr"
     assert r.cost_usd == 0
-    assert "untrusted telemetry" in r.telemetry_warning
 
 
 def test_cost_defaults_cached_input_to_one_tenth_of_the_input_rate():
@@ -1895,7 +1852,6 @@ def test_envelope_carries_cost_and_usage_when_rates_are_set():
         "cache_read_input_tokens": 12000, "cache_creation_input_tokens": 0,
         "source": "stderr",
     }
-    assert "excluded from pricing" in r.telemetry_warning
 
 
 def test_envelope_cost_stays_zero_when_rates_are_unset():
@@ -2080,8 +2036,8 @@ def test_the_issue_cap_is_reachable_on_codex_only_load():
 
 
 def test_zeroing_the_rates_makes_the_issue_cap_unreachable_again():
-    """Anti-vacuity twin of the above, and the reason zeroing still earns the
-    blindspot warning: no price table → no ledger line → no cap, ever."""
+    """Anti-vacuity twin of the above: no price table → no ledger line → no
+    cap, ever."""
     cfg = from_env({
         "REPO": "x", "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0",
     })
@@ -2091,95 +2047,10 @@ def test_zeroing_the_rates_makes_the_issue_cap_unreachable_again():
         cost_per_mtok_out=cfg.codex_cost_per_mtok_out,
     )
     assert per_run * 10_000 < cfg.issue_spend_cap_usd
-    assert codex_cost_blindspot_warning(
-        cost_per_mtok_in=cfg.codex_cost_per_mtok_in,
-        cost_per_mtok_out=cfg.codex_cost_per_mtok_out,
-        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-    ) is not None
 
 
-# ── D12: the ONE startup warning when caps are armed but pricing is not ───────
-def test_blindspot_warning_fires_when_caps_are_armed_without_a_price_table():
-    w = codex_cost_blindspot_warning(
-        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
-        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0, max_runtime=2700.0,
-    )
-    assert w is not None
-    assert "CODEX_COST_PER_MTOK_IN/OUT" in w
-    assert "$0.00" in w and "NEITHER cap can ever fire" in w
-    # D12's second sentence: codex has no per-session budget analogue, so the
-    # wall cap is the only bound on one run.
-    assert "no per-session budget" in w and "2700s" in w
 
 
-def test_blindspot_warning_names_the_missing_wall_cap_when_it_is_unset():
-    w = codex_cost_blindspot_warning(
-        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
-        issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0, max_runtime=0.0,
-    )
-    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS is unset" in w
-    assert "issue=$25.00" in w and "daily=" not in w  # only the armed cap is named
-
-
-def test_no_blindspot_warning_once_the_rates_are_configured():
-    # Anti-vacuity 1: pricing set → caps CAN see codex spend → silence.
-    assert codex_cost_blindspot_warning(
-        cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
-        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0,
-    ) is None
-
-
-def test_no_blindspot_warning_when_no_cap_is_armed():
-    # Anti-vacuity 2: no cap → nothing is being misled about.
-    assert codex_cost_blindspot_warning(
-        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
-        issue_spend_cap_usd=0.0, daily_spend_cap_usd=0.0,
-    ) is None
-
-
-def test_blindspot_warning_still_fires_on_a_half_configured_price_table():
-    # Pricing only the input side still under-counts every run — the same blind
-    # spot in weaker form, so it must not buy silence.
-    assert codex_cost_blindspot_warning(
-        cost_per_mtok_in=1.25, cost_per_mtok_out=0.0,
-        issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0,
-    ) is not None
-
-
-# ── #29: "MAX_BUDGET_USD bounds nothing here" must not hide behind pricing ────
-# The clause used to live inside the blindspot warning, which returns early once
-# rates are set — so the operators who had configured pricing CORRECTLY were the
-# only ones who never saw it. Observed on keifu 2026-07-28: a $28.74 resolve
-# against MAX_BUDGET_USD=20, exit_reason=ok, and zero grep matches in the logs.
-
-
-def test_the_budget_warning_fires_even_when_pricing_is_fully_configured():
-    w = codex_budget_not_enforced_warning(fix_budget_usd=20.0, max_runtime=3600.0)
-    assert w is not None
-    assert "MAX_BUDGET_USD=$20.00" in w and "NOT ENFORCED" in w
-    assert "3600s" in w
-
-
-def test_the_budget_warning_is_independent_of_the_price_table():
-    """The two surfaces answer different questions; configuring one must not
-    silence the other."""
-    priced = dict(cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
-                  issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0)
-    assert codex_cost_blindspot_warning(**priced) is None
-    assert codex_budget_not_enforced_warning(
-        fix_budget_usd=20.0, max_runtime=3600.0
-    ) is not None
-
-
-def test_the_budget_warning_names_the_missing_wall_cap():
-    w = codex_budget_not_enforced_warning(fix_budget_usd=20.0, max_runtime=0.0)
-    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS is unset" in w
-
-
-def test_no_budget_warning_when_no_budget_is_configured():
-    # Anti-vacuity: with no budget set there is no number being misreported.
-    assert codex_budget_not_enforced_warning(fix_budget_usd=0.0, max_runtime=3600.0) is None
 
 
 # ── #43: each leg is priced with the model it actually ran ───────────────────

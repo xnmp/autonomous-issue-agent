@@ -801,7 +801,6 @@ def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_pa
             is_error=False,
             cost_usd=1.0,
             model="claude-opus-4-1",
-            telemetry_warning="missing usage",
         ),
     )
 
@@ -813,7 +812,6 @@ def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_pa
     } == {
         "agent_run_start": "opus",
         "agent_run": "opus",
-        "telemetry_warning": "opus",
     }
     assert read_events(ledger) == []
 
