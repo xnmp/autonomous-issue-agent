@@ -426,16 +426,6 @@ def test_parked_outranks_an_escalation_and_reads_as_a_red_triage_wait():
     assert status.headline == "Waiting on triage"
 
 
-def test_a_steward_question_is_blocked_on_triage_below_holds():
-    question = dash.TriageHold("awaiting_reply", at(1))
-
-    assert dash.board_status(BoardFacts(track=EMPTY, triage=question)).on == OnTriage("awaiting_reply")  # type: ignore[union-attr]
-    held = dash.board_status(BoardFacts(
-        track=EMPTY, triage=question, hold=dash.Hold(OnIssue(1082), at(0)),
-    ))
-    assert isinstance(held, dash.Blocked) and held.on == OnIssue(1082)
-
-
 @pytest.mark.parametrize(
     "on,headline",
     [

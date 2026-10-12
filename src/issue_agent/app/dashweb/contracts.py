@@ -133,7 +133,6 @@ class CostMix(Contract):
     resolve_usd: float | None
     review_usd: float | None
     repair_usd: float | None
-    steward_usd: float | None
 
 
 class Caps(Contract):
@@ -264,7 +263,7 @@ class BlockedOnOverlap(Contract):
 
 class BlockedOnTriage(Contract):
     kind: Literal["triage"]
-    why: Literal["parked", "awaiting_reply"]
+    why: Literal["parked"]
 
 
 class BlockedOnQueue(Contract):
@@ -391,16 +390,9 @@ class BacklogCard(Contract):
     age_days: int | None
     age_s: int | None = None
     comments: int | None
-    steward_state: Literal[
-        "raw", "processed", "blocked_on_human_reply"
-    ]
     issue_type: str | None = None
     difficulty: str | None = None
     impact: str | None = None
-    # Present only while the steward waits on the author: that row is also on
-    # the issues board, blocked on triage.
-    board: BoardStatus | None = None
-    rail: StageRail | None = None
 
 
 class ToastNotification(Contract):

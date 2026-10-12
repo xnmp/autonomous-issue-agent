@@ -182,7 +182,6 @@ class RepositoryConfig:
 class RuntimePathsConfig:
     state_dir: str
     review_state_dir: str
-    steward_state_dir: str
     worktree_root: str
     harness_root: str
 
@@ -223,30 +222,6 @@ class ReviewRuntimeConfig:
     dimension_budget_usd: float
     validation_budget_usd: float
     max_unproductive_rounds: int
-
-
-@dataclass(frozen=True)
-class StewardRuntimeConfig:
-    bot: str
-    runtime: RuntimeName
-    triage_enabled: bool
-    promote: bool
-    owner: str
-    triage_prompt: str
-    triage_model: str | None
-    triage_budget_usd: float
-    groom_enabled: bool
-    max_infra_deaths: int
-
-
-@dataclass(frozen=True)
-class JiraRuntimeConfig:
-    sync: bool
-    project_key: str
-    cloud_id: str
-    mcp_config: str
-    mcp_tools: str
-    budget_usd: float
 
 
 @dataclass(frozen=True)
@@ -316,10 +291,8 @@ class HarnessConfig:
     identity_mode: IdentityMode = IdentityMode.THREE
     fix_bot: str = ""
     review_bot: str = "my-reviewer-bot[bot]"
-    steward_bot: str = "my-reviewer-bot[bot]"
     state_dir: str = ""
     review_state_dir: str = ""
-    steward_state_dir: str = ""
     control_authority_root: str = ""
     # Explicit ancestry produced only by `issue-agent start --write-config`.
     # It authorizes adopting and reaping those exact prior deployments during
@@ -336,7 +309,7 @@ class HarnessConfig:
     # work up to this bound (the path-overlap serializer still keeps same-path
     # and path-unknown legs exclusive). Default 2 since 2026-08-02: with one
     # slot a single ADDRESS_REVIEW leg held the whole deployment while other
-    # PRs' repairs queued behind it. Review and steward dispatch remain
+    # PRs' repairs queued behind it. Review dispatch remains
     # synchronous. Set FIX_DISPATCH_CONCURRENCY=1 to restore serial dispatch.
     fix_dispatch_concurrency: int = 2
     # Webhook push (#1): `gh webhook forward` runs as a supervised fourth
@@ -348,7 +321,7 @@ class HarnessConfig:
     # best-effort, and a dead forwarder must degrade to today's behaviour).
     webhook_wake: bool = False
     reconcile_seconds: int = 300
-    # Change-probe gate on review/steward world builds (app/world_probe.py):
+    # Change-probe gate on review world builds (app/world_probe.py):
     # 1 REST point asks "did any issue/PR update?" before paying ~14 GraphQL
     # points for a full build. The fixer is NEVER probed regardless of this
     # flag — its decide reads CI/mergeability, which the probe cannot see.
@@ -439,16 +412,11 @@ class HarnessConfig:
     # gpt-6.1-sol keeps the independent check at least as strong as the fixer;
     # a reviewer at the fixer's own tier approved/cycled at parity.
     review_model: str | None = "gpt-6.1-sol"
-    steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
     router_budget_usd: float = 1.0
     # $15 not $8 since 2026-08-09: the sol default reviews at ~2.5x terra's
     # token rates; $8 sized for terra would clip sol mid-review.
     review_budget_usd: float = 15.0
-    # $2 not $0.75 since 2026-08-09: real triage legs (AC + test plan + repo
-    # orientation) exhausted $0.75 mid-run (tauri #635, budget_exhausted at 4
-    # turns) and burned their retries re-doing the same partial work.
-    triage_budget_usd: float = 2.0
     # REVIEW_MODE: single (default) | multi | delegated.
     #   multi  — the /code-review fan-out (skip-gate → parallel dimension
     #            specialists → per-finding adversarial validation → synthesis).
@@ -484,21 +452,8 @@ class HarnessConfig:
     review_gate_budget_usd: float = 0.10
     review_dimension_budget_usd: float = 0.75
     review_validation_budget_usd: float = 0.20
-    steward_triage: bool = True
-    # Grooming is opt-in; validated duplicate closure also needs STEWARD_PROMOTE.
-    steward_groom: bool = False
-    # Reserved explicit opt-in for future body rewrites; grooming never edits
-    # issue bodies, regardless of this setting.
-    steward_groom_edit: bool = False
-    steward_promote: bool = False
-    # Handle triage @-mentions for OWNER-level (technical/architectural) questions —
-    # e.g. "add a User to the domain model". Resolution order (roles.py): the target
-    # repo's CODEOWNERS default owners, else this STEWARD_OWNER, else none (logged,
-    # never silent). A user (@alice) or team (@org/maintainers).
-    steward_owner: str = ""
     agent_md: str = ""
     review_prompt: str = ""
-    triage_prompt: str = ""
     # Fast deterministic check run after every file edit (PostToolUse hook), e.g.
     # "npx tsc --noEmit" / "pyrefly check". Blank → no edit-time check.
     edit_check_cmd: str = ""
@@ -516,17 +471,6 @@ class HarnessConfig:
     # to the fixer. Relative config paths resolve against harness_root.
     fix_mcp_config: str = ""
     harness_root: str = ""
-    # Jira sync (steward mirrors each GitHub issue into a Jira ticket + transitions
-    # its status as the lifecycle label moves). Default ON, but INERT until
-    # jira_project_key is set — so it's enabled out of the box yet harmless on a repo
-    # with no Jira project configured. Reaches Jira via the Atlassian MCP (the
-    # `config/mcp/atlassian.json` spec), attached only to the steward.
-    jira_sync: bool = True
-    jira_project_key: str = ""
-    jira_cloud_id: str = ""
-    jira_mcp_config: str = "config/mcp/atlassian.json"
-    jira_mcp_tools: str = "mcp__atlassian__*"
-    jira_budget_usd: float = 0.50
     # Fixer runtime: "claude" (default, Claude Agent SDK), "codex" (OpenAI Codex
     # CLI, e.g. GPT-5.5), or "glm" (GLM via Z.ai's Anthropic-compatible endpoint —
     # the SAME Claude SDK runner with the profile's env injected). Only the FIXER
@@ -536,11 +480,6 @@ class HarnessConfig:
     # for the recommended mixed-runtime posture that preserves independent
     # implementer/reviewer failure modes.
     reviewer_runtime: RuntimeName = RuntimeName.CODEX
-    # STEWARD_RUNTIME: which runtime the steward's TRIAGE/GROOM legs run on.
-    # Claude stays the default so existing deployments are byte-identical after
-    # this knob exists. Named `_name` because `steward_runtime` is already the
-    # composed StewardRuntimeConfig property.
-    steward_runtime_name: RuntimeName = RuntimeName.CLAUDE
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
     codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
@@ -738,7 +677,6 @@ class HarnessConfig:
         return RuntimePathsConfig(
             state_dir=self.state_dir,
             review_state_dir=self.review_state_dir,
-            steward_state_dir=self.steward_state_dir,
             worktree_root=self.worktree_root,
             harness_root=self.harness_root,
         )
@@ -779,32 +717,6 @@ class HarnessConfig:
             dimension_budget_usd=self.review_dimension_budget_usd,
             validation_budget_usd=self.review_validation_budget_usd,
             max_unproductive_rounds=self.max_unproductive_review_rounds,
-        )
-
-    @property
-    def steward_runtime(self) -> StewardRuntimeConfig:
-        return StewardRuntimeConfig(
-            bot=self.steward_bot,
-            runtime=self.steward_runtime_name,
-            triage_enabled=self.steward_triage,
-            promote=self.steward_promote,
-            owner=self.steward_owner,
-            triage_prompt=self.triage_prompt,
-            triage_model=self.steward_triage_model,
-            triage_budget_usd=self.triage_budget_usd,
-            groom_enabled=self.steward_groom,
-            max_infra_deaths=self.max_infra_deaths,
-        )
-
-    @property
-    def jira_runtime(self) -> JiraRuntimeConfig:
-        return JiraRuntimeConfig(
-            sync=self.jira_sync,
-            project_key=self.jira_project_key,
-            cloud_id=self.jira_cloud_id,
-            mcp_config=self.jira_mcp_config,
-            mcp_tools=self.jira_mcp_tools,
-            budget_usd=self.jira_budget_usd,
         )
 
     @property
@@ -924,11 +836,9 @@ class HarnessConfig:
             ("MAX_BUDGET_USD", self.fix_budget_usd),
             ("ROUTER_BUDGET_USD", self.router_budget_usd),
             ("REVIEW_BUDGET_USD", self.review_budget_usd),
-            ("STEWARD_TRIAGE_BUDGET_USD", self.triage_budget_usd),
             ("REVIEW_GATE_BUDGET_USD", self.review_gate_budget_usd),
             ("REVIEW_DIMENSION_BUDGET_USD", self.review_dimension_budget_usd),
             ("REVIEW_VALIDATION_BUDGET_USD", self.review_validation_budget_usd),
-            ("JIRA_SYNC_BUDGET_USD", self.jira_budget_usd),
         ):
             _require_positive(errors, name, value)
         if (self.fixer_runtime is RuntimeName.GLM or any(value.strip().startswith("glm:") for value in (self.fix_model_low, self.fix_model_med, self.fix_model_high, self.fix_model_xhigh))) and not self.glm_settings_file.strip():
@@ -1064,9 +974,6 @@ class HarnessConfig:
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
-            f"steward={self.steward_runtime_name.value} "
-            f"triage_model={model(self.steward_triage_model)} "
-            f"triage_budget=${self.triage_budget_usd:.2f}",
             f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
             f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
             f"ci_pending="
@@ -1202,7 +1109,6 @@ def _require_positive(errors: list[str], name: str, value: int | float) -> None:
 _INTERNAL_CONFIG_FIELDS = frozenset(
     {
         "agent_md",
-        "triage_prompt",
         "codex_cost_per_mtok_cached_in",
         "control_authority_root",
         "parse_errors",
@@ -1214,10 +1120,7 @@ _ENV_NAME_OVERRIDES = {
     "fix_budget_usd": "MAX_BUDGET_USD",
     "router_budget_usd": "ROUTER_BUDGET_USD",
     "max_review_rejections": "REVIEW_MAX_REJECTIONS",
-    "triage_budget_usd": "STEWARD_TRIAGE_BUDGET_USD",
     "harness_root": "HARNESS_ROOT_DIR",
-    "jira_budget_usd": "JIRA_SYNC_BUDGET_USD",
-    "steward_runtime_name": "STEWARD_RUNTIME",
     "agent_idle_timeout": "AGENT_IDLE_TIMEOUT_SECONDS",
     "agent_max_runtime": "AGENT_MAX_RUNTIME_SECONDS",
     "codex_backoff_base": "CODEX_BACKOFF_BASE_SECONDS",
@@ -1228,18 +1131,15 @@ _COERCE_OVERRIDES: dict[str, str] = {
     "identity_mode": "identity_mode",
     "state_dir": "state_dir",
     "review_state_dir": "state_dir",
-    "steward_state_dir": "state_dir",
     "fix_effort": "effort",
     "review_model": "review_model",
     "review_mode": "review_mode",
     "review_prompt": "stripped",
-    "steward_triage_model": "optional_string",
     "review_gate_model": "optional_string",
     "review_validation_model": "optional_string",
     "review_scout_model": "optional_string",
     "fixer_runtime": "runtime",
     "reviewer_runtime": "runtime",
-    "steward_runtime_name": "runtime",
     "codex_cost_per_mtok": "rate_table",
 }
 _CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -1248,7 +1148,6 @@ _CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
     "review_mode": tuple(item.value for item in ReviewMode),
     "fixer_runtime": tuple(item.value for item in RuntimeName),
     "reviewer_runtime": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
-    "steward_runtime_name": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
 }
 
 
@@ -1540,7 +1439,7 @@ def _repo_slug(repo: str) -> str:
 
 
 def _default_state_dir(repo: str, role_dir: str) -> str:
-    """Default STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR (review M5/D7): the
+    """Default STATE_DIR/REVIEW_STATE_DIR (review M5/D7): the
     old default was per-role but not per-repo, so two repos' fix daemons shared
     `issue-N.session` etc. — issue #5 in repo B would resume repo A's
     transcript. Nothing real is deployed yet, so the default itself moves
@@ -1551,7 +1450,7 @@ def _default_state_dir(repo: str, role_dir: str) -> str:
 
 def default_state_dir(repo: str, role_dir: str) -> str:
     """The state dir a daemon derives when the overlay carries no explicit
-    STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR — the public seam for
+    STATE_DIR/REVIEW_STATE_DIR — the public seam for
     read-side callers (status/dashboard journal discovery). Canonicalizes the
     repo the same way from_env does, so a raw overlay REPO value ("owner/name",
     URL forms, case variants) lands on the SAME directory the daemon writes.
@@ -1637,28 +1536,6 @@ def _authoritative_env(e: dict) -> dict:
     return e if parsed is None else parsed
 
 
-def _runtime_default_model(
-    env: dict,
-    field_name: str,
-    *,
-    claude_default: object,
-    is_claude: bool,
-) -> str | None:
-    """Resolve a model knob whose DEFAULT depends on the selected runtime.
-
-    Three distinct states, deliberately not two: absent (take the runtime's
-    default), present-and-empty (None — "let the runtime choose"), and present
-    (verbatim). Collapsing the middle state into the first is how an explicit
-    `KEY=""` starts meaning something other than what it meant before.
-    """
-    raw = env.get(_env_name(field_name))
-    if raw is not None:
-        return str(raw).strip() or None
-    if not is_claude:
-        return None
-    return str(claude_default) if claude_default is not None else None
-
-
 def from_env(env: dict | None = None) -> HarnessConfig:
     """Build one immutable snapshot from the metadata-backed config table."""
 
@@ -1667,9 +1544,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     special = {
         "state_dir",
         "review_state_dir",
-        "steward_state_dir",
         "review_model",
-        "steward_triage_model",
         "codex_cost_per_mtok",
     }
     values: dict[str, object] = {}
@@ -1690,9 +1565,6 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     reviewer_runtime = values["reviewer_runtime"]
     if not isinstance(reviewer_runtime, RuntimeName):
         raise RuntimeError("reviewer runtime metadata did not produce RuntimeName")
-    steward_runtime = values["steward_runtime_name"]
-    if not isinstance(steward_runtime, RuntimeName):
-        raise RuntimeError("steward runtime metadata did not produce RuntimeName")
 
     values.update(
         state_dir=(
@@ -1703,10 +1575,6 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             str(_metadata_value(e, "review_state_dir", errors))
             or _default_state_dir(repo, "review-agent")
         ),
-        steward_state_dir=(
-            str(_metadata_value(e, "steward_state_dir", errors))
-            or _default_state_dir(repo, "steward-agent")
-        ),
         review_model=(
             str(e.get(_env_name("review_model")) or "")
             or (
@@ -1714,22 +1582,6 @@ def from_env(env: dict | None = None) -> HarnessConfig:
                 if reviewer_runtime is RuntimeName.CLAUDE
                 else _dc_default("review_model")
             )
-        ),
-        # An explicit STEWARD_TRIAGE_MODEL always wins, and only an ABSENT one
-        # resolves per runtime. The dataclass default is a Claude alias
-        # ("sonnet"), which Codex rejects outright, so under
-        # STEWARD_RUNTIME=codex an unset knob means None — the Codex runner then
-        # uses CODEX_MODEL, else its own built-in default.
-        #
-        # PRESENT-but-empty keeps its pre-existing `optional_string` meaning,
-        # None ("use the runtime's own default"), on BOTH runtimes. Folding it
-        # into the absent case would silently turn a deliberate
-        # STEWARD_TRIAGE_MODEL="" into "sonnet".
-        steward_triage_model=_runtime_default_model(
-            e,
-            "steward_triage_model",
-            claude_default=_dc_default("steward_triage_model"),
-            is_claude=steward_runtime is RuntimeName.CLAUDE,
         ),
     )
     rates, cached_rates = _coerce_rate_tables(

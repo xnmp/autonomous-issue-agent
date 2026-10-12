@@ -78,15 +78,13 @@
   /* ---- categorical series (cost mix) ----
    * Slot order is FIXED and never cycled. Validated with the dataviz palette
    * validator against the --panel surface: CVD separation, normal-vision floor
-   * and contrast all PASS in this order (blue -> bright cyan -> yellow ->
-   * bright magenta). The lightness/chroma-band checks fail by construction —
+   * and contrast all PASS in this order (blue -> bright cyan -> yellow). The lightness/chroma-band checks fail by construction —
    * a desaturated terminal theme cannot satisfy them — so every chart that
    * uses these also ships a legend + direct labels (secondary encoding).
    */
   --series-1: var(--c-blue); /* resolve */
   --series-2: var(--c-cyan-br); /* review  */
   --series-3: var(--c-yellow); /* repair  */
-  --series-4: var(--c-magenta-br); /* steward */
 
   /* ---- meter severity (utilization) ---- */
   --meter-low: var(--c-green);

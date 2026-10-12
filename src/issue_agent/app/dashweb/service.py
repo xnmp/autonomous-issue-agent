@@ -53,8 +53,6 @@ _DETAIL_CONFIG_FIELDS = (
     "MAX_BUDGET_USD",
     "ROUTER_BUDGET_USD",
     "REVIEW_BUDGET_USD",
-    "STEWARD_TRIAGE_BUDGET_USD",
-    "JIRA_SYNC_BUDGET_USD",
     "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
 )
 _FIX_BUDGET_KINDS = (
@@ -147,9 +145,6 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
         "ROUTE": max(0.0, cfg.router_budget_usd),
         "REVIEW": max(0.0, cfg.review_budget_usd),
         "RE_REVIEW": max(0.0, cfg.review_budget_usd),
-        "TRIAGE": max(0.0, cfg.triage_budget_usd),
-        "GROOM": max(0.0, cfg.triage_budget_usd),
-        "JIRA_SYNC": max(0.0, cfg.jira_budget_usd),
     }
     return (
         caps,
@@ -875,8 +870,8 @@ class Backend:
         Removing `ai-pr-open` is the whole mechanism: the fixer's world only
         contains ai-pr-open PRs, so the parked PR's paths leave the overlap
         serializer next tick and held pending issues dispatch. `ai-parked`
-        records the decision on issue and PRs — the steward will not re-triage
-        it, the dashboard shows it as a parked pending row. NOTE: unpark is a
+        records the decision on issue and PRs, and the dashboard shows it as a
+        parked pending row. NOTE: unpark is a
         RE-ARM, not a label-for-label reversal — escalation labels park
         stripped (ai-blocked / needs-*-review) stay gone, so the pipeline
         resumes review/CI legs on the PR (adversarial P2-5).

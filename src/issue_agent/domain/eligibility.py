@@ -15,10 +15,8 @@ class LifecycleOperation(str, Enum):
     MERGE = "merge"
     UPDATE_BRANCH = "update_branch"
     REMEDIATE_CI = "remediate_ci"
-    TRIAGE = "triage"
     GROOM = "groom"
     COMPLETE_RESOLVE = "complete_resolve"
-    COMPLETE_TRIAGE = "complete_triage"
     CLOSE = "close"
     CLOSE_MERGED = "close_merged"
 

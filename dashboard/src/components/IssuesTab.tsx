@@ -38,7 +38,7 @@ import {
   usd,
 } from "../lib/format";
 import { shortModel } from "../lib/models";
-import { boardItems, isUntriaged, matchesQuery } from "../features/issues/board";
+import { boardItems, matchesQuery } from "../features/issues/board";
 import { Chip } from "./ui/Chip";
 import { StepBadge } from "./ui/StepBadge";
 import { TableFilter } from "./ui/TableFilter";
@@ -74,8 +74,7 @@ interface IssuesTabProps {
 }
 
 /**
- * The two column sets; the in-flight board has none, and the untriaged list
- * is the backlog table over the issues the steward has not looked at yet.
+ * The two column sets; the in-flight board has none.
  */
 type TableSub = "done" | "backlog";
 type Visibility = Record<TableSub, Record<string, boolean>>;
@@ -92,7 +91,6 @@ const COLUMN_CHOICES: Record<TableSub, ColumnChoice[]> = {
     { key: "merged", label: "Date" },
   ],
   backlog: [
-    { key: "steward", label: "Steward state" },
     { key: "type", label: "Type" },
     { key: "difficulty", label: "Difficulty" },
     { key: "impact", label: "Impact" },
@@ -146,12 +144,11 @@ export function IssuesTab({
     inflight: "",
     done: "",
     backlog: "",
-    untriaged: "",
   });
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
-  const table: TableSub | null = sub === "inflight" ? null : sub === "untriaged" ? "backlog" : sub;
+  const table: TableSub | null = sub === "inflight" ? null : sub;
   const query = queries[sub];
   const normalizedQuery = query.trim().toLowerCase();
   const visible = useMemo(
@@ -177,22 +174,15 @@ export function IssuesTab({
     () => filterCards(data?.backlog ?? [], normalizedQuery),
     [data?.backlog, normalizedQuery],
   );
-  const untriaged = useMemo(() => (data?.backlog ?? []).filter(isUntriaged), [data?.backlog]);
-  const filteredUntriaged = useMemo(
-    () => filterCards(untriaged, normalizedQuery),
-    [untriaged, normalizedQuery],
-  );
   const sourceCount = {
     inflight: allBoard.length,
     done: data?.done.length ?? 0,
     backlog: data?.backlog.length ?? 0,
-    untriaged: untriaged.length,
   }[sub];
   const filteredCount = {
     inflight: filteredBoard.length,
     done: filteredDone.length,
     backlog: filteredBacklog.length,
-    untriaged: filteredUntriaged.length,
   }[sub];
   const hasMatches = !normalizedQuery || filteredCount > 0;
   // Persisted by the handler, never by the state updater: React may invoke an
@@ -227,7 +217,7 @@ export function IssuesTab({
       {/* The visible <h1> was removed by design; screen-reader heading
           navigation still needs the page identified. */}
       <h1 className="sr-only">
-        {{ inflight: "In-flight issues", done: "Done issues", backlog: "Backlog", untriaged: "Untriaged issues" }[sub]}
+        {{ inflight: "In-flight issues", done: "Done issues", backlog: "Backlog" }[sub]}
       </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
       {table !== null ? (
@@ -290,23 +280,6 @@ export function IssuesTab({
           visible={visible}
           onRefresh={issues.refresh}
           onPromotion={onBacklogPromotion}
-        />
-      ) : null}
-
-      {/* Untriaged issues are on neither the board (it holds in-flight and
-          queued work) nor hidden: promoting one is the triage decision. */}
-      {sub === "untriaged" && hasMatches ? (
-        <BacklogTable
-          repo={repo}
-          cards={filteredUntriaged}
-          loading={issues.loading}
-          ghOk={ghOk}
-          visible={visible}
-          onRefresh={issues.refresh}
-          onPromotion={onBacklogPromotion}
-          storageKey="issues-untriaged"
-          promoteLabel="Promote to ai-ready"
-          emptyText="no untriaged backlog issues"
         />
       ) : null}
     </div>
@@ -454,8 +427,6 @@ function BacklogTable({
   onRefresh,
   onPromotion,
   storageKey = "issues-backlog",
-  promoteLabel,
-  emptyText,
 }: {
   repo: string;
   cards: BacklogCard[];
@@ -465,9 +436,6 @@ function BacklogTable({
   onRefresh: () => void;
   onPromotion: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
   storageKey?: string;
-  /** A labelled promote button where promoting is the row's one action. */
-  promoteLabel?: string;
-  emptyText?: string;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [promote, setPromote] = useState<BacklogCard | null>(null);
@@ -475,7 +443,6 @@ function BacklogTable({
   const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
-    steward: (card) => card.steward_state,
     type: (card) => card.issue_type,
     difficulty: (card) => card.difficulty,
     impact: (card) => card.impact,
@@ -486,13 +453,10 @@ function BacklogTable({
   }, { key: "issue", direction: "asc" }, storageKey, sortableAndShown);
   if (loading) return <SkeletonRows what="backlog" rows={5} />;
   if (cards.length === 0) {
-    return <EmptyState>{ghOk ? (emptyText ?? "no unlabelled open issues — the backlog is clear") : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
+    return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
   }
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue", width: 350 },
-    ...(visible.has("steward")
-      ? [{ key: "steward", label: "Steward state", width: 180 }]
-      : []),
     ...(visible.has("type") ? [{ key: "type", label: "Type", width: 100 }] : []),
     ...(visible.has("difficulty") ? [{ key: "difficulty", label: "Difficulty", width: 120 }] : []),
     ...(visible.has("impact") ? [{ key: "impact", label: "Impact", width: 100 }] : []),
@@ -532,8 +496,6 @@ function BacklogTable({
           <tbody>
             {sorted.rows.map((card) => {
               const open = expanded === card.issue;
-              const blocked = card.steward_state === "blocked_on_human_reply";
-              const processed = card.steward_state === "processed";
               return (
                 <Fragment key={card.issue}>
                   <tr
@@ -550,18 +512,16 @@ function BacklogTable({
                           <div className="row-wrap">
                             <IssueNumber issue={card.issue} url={card.url} />
                             <button
-                              className={promoteLabel ? "btn btn-xs btn-primary" : "btn btn-xs promote-icon"}
+                              className="btn btn-xs promote-icon"
                               title={`Promote #${card.issue} to ai-ready`}
-                              // A labelled button's accessible name starts with
-                              // its visible text (WCAG 2.5.3 label in name).
-                              aria-label={promoteLabel ? `${promoteLabel} #${card.issue}` : `Promote #${card.issue} to ai-ready`}
+                              aria-label={`Promote #${card.issue} to ai-ready`}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 setError(null);
                                 setPromote(card);
                               }}
                             >
-                              {promoteLabel ?? "↑"}
+                              ↑
                             </button>
                           </div>
                           <span
@@ -573,22 +533,6 @@ function BacklogTable({
                         </div>
                       </div>
                     </td>
-                    {visible.has("steward") ? (
-                      <td>
-                        <div className="steward-state">
-                          <Chip tone={blocked ? "fail" : processed ? "meta" : "neutral"} square>
-                            {blocked
-                              ? "awaiting human reply"
-                              : processed ? "triaged" : "raw intake"}
-                          </Chip>
-                          {blocked ? null : (
-                            <span className={processed ? "steward-ready" : "faint"}>
-                              {processed ? "AC + test plan written" : "awaiting steward"}
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                    ) : null}
                     {visible.has("type") ? (
                       <td><TriageValue value={card.issue_type} tone={issueTypeTone(card.issue_type)} axis="type" /></td>
                     ) : null}

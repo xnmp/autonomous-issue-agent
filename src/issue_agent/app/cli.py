@@ -3042,15 +3042,11 @@ def cmd_ready(args) -> int:
 
 
 REMOTE_LABELS = (
-    "ai-triage",
     "ai-ready",
     "ai-working",
     "ai-blocked",
     "ai-pr-open",
     "ai-done",
-    "ai-closed",
-    "ai-suggestion",
-    "maybe-resolved",
     "needs-budget-review",
     "trivial",
     "minor",

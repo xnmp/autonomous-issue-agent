@@ -43,7 +43,7 @@ def mcp_servers_from_file(
     `McpServer(name, spec, tools)` per server, all sharing the `tools` allow-glob.
     Relative `path` resolves against `harness_root`. Blank path or a missing/garbled
     file → () with a log line (fail-soft; never raises). Shared by the CI-fix
-    check-matching path and the steward's Jira (Atlassian) MCP."""
+    check-matching path."""
     if not path:
         return ()
     if not os.path.isabs(path) and harness_root:

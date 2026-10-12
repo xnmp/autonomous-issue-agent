@@ -35,7 +35,6 @@ import { ResolveControls } from "./resolve/ResolveControls";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { tipProps } from "./ui/Tip";
 import { ErrorBanner, SkeletonRows } from "./ui/Feedback";
-import { PromoteConfirm } from "./PromoteConfirm";
 import "./issues-board.css";
 
 /** The reader's display options, from the options menu. */
@@ -508,29 +507,6 @@ function ActionControl({
             {action.label}
           </button>
           {error ? <ErrorBanner message={error} /> : null}
-        </>
-      );
-    case "promote":
-      // ai-ready is what moves a triage-blocked issue: the fixer admits it
-      // on its next tick, so the row leaves Blocked.
-      return (
-        <>
-          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => setRevealed(true)}>
-            {action.label}
-          </button>
-          {revealed ? (
-            <PromoteConfirm
-              issue={item.issue}
-              title={item.title}
-              busy={busy}
-              error={error}
-              onConfirm={() => void run(() => api.promote(repo, item.issue)).then((ok) => ok && setRevealed(false))}
-              onCancel={() => {
-                setRevealed(false);
-                setError(null);
-              }}
-            />
-          ) : null}
         </>
       );
     case "rearm":

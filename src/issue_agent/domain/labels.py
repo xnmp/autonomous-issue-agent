@@ -27,44 +27,37 @@ class Label(str, Enum):
     # Reviewer trigger for an EXTERNAL repo (PRs not produced by this harness).
     # A separate `review` process can be pointed at any repo and told to look at
     # PRs carrying this tag instead of `ai-pr-open` (REVIEW_TRIGGER_LABEL). Kept
-    # out of LIFECYCLE_LABELS below — that set governs the steward's ISSUE triage,
-    # not PR selection.
+    # out of LIFECYCLE_LABELS below — that set describes ISSUE pipeline
+    # position, not PR selection.
     AI_REVIEW = "ai-review"        # human-tagged: "reviewer-bot, please review this PR"
     NO_AI_REVIEW = "no-ai-review"  # human opt-OUT: never auto-adopt this PR for review
 
-    # ADVISORY marker: this issue re-reports something the harness already shipped
-    # (a literal reopen, or a new issue the triage classifier judged a refiling).
+    # ADVISORY marker: this issue re-reports something the harness already shipped.
     # Deliberately OUT of LIFECYCLE_LABELS: a recurrence is an OBSERVATION, not a
     # pipeline position, so labelling an issue must not make it look "triaged" nor
     # remove it from any selection set. Nothing is ever auto-reopened or
     # auto-dispatched from it — a false positive costs one label removal.
     RECURRENCE = "recurrence"
-    # Advisory steward marker: recent merged work may already satisfy this open
-    # issue. A human decides whether to close it; it is never lifecycle state.
+    # Advisory marker: recent merged work may already satisfy this open issue.
+    # A human decides whether to close it; it is never lifecycle state.
     MAYBE_RESOLVED = "maybe-resolved"
 
-    # Terminal marker for an issue the STEWARD closed straight out of triage
-    # (already fixed elsewhere, duplicate, invalid, resolved by a merged PR).
-    # Deliberately NOT ai-done: ai-done means "a harness PR merged for this
-    # issue", and `roles._recurrence_reporter` selects exactly open + ai-done +
-    # stateReason=reopened to journal a regression of SHIPPED work. A steward
-    # close ships no code, so reusing ai-done would book every human reopen of a
-    # wontfix as a harness recurrence and corrupt that guardrail metric. Kept out
-    # of LIFECYCLE_LABELS below so a reopened issue is an untriaged candidate
-    # again — a human putting it back means triage starts over.
+    # Terminal marker for an issue closed without a harness merge (written by the
+    # deleted steward role; still honoured as terminal on existing issues).
+    # Deliberately NOT ai-done: ai-done means "a harness PR merged for this issue".
     AI_CLOSED = "ai-closed"
 
-    # Steward outputs (never auto-promoted; a human disposes).
-    AI_TRIAGE = "ai-triage"        # steward has seen it; awaiting author / human promote
-    AI_SUGGESTION = "ai-suggestion"  # steward-filed suggestion issue
+    # Written by the deleted steward role. Kept because issue labels are captured
+    # in persisted completion/hold guards, which must keep decoding.
+    AI_TRIAGE = "ai-triage"
+    AI_SUGGESTION = "ai-suggestion"  # suggestion issue; never auto-promoted
     NEEDS_DESIGN = "needs-design"  # an ADR must be approved first
 
     # Operator parked: a human owns this issue's PR(s) indefinitely, and the
     # queue must stop waiting for them. Removing ai-pr-open is what actually
     # frees the overlap serializer (the fixer's world only contains ai-pr-open
-    # PRs); ai-parked records WHY the label went missing, keeps the steward
-    # from re-triaging the issue, and gives the dashboard a lane to show it
-    # in. Written only by the dashboard's park action (operator-owned,
+    # PRs); ai-parked records WHY the label went missing and gives the
+    # dashboard a lane to show it in. Written only by the dashboard's park action (operator-owned,
     # ADR 0012); no daemon ever adds or removes it.
     AI_PARKED = "ai-parked"
 
@@ -91,10 +84,7 @@ ADVISORY_LABELS: frozenset[Label] = frozenset(
 )
 
 
-# The labels that mean "this issue is already somewhere in the pipeline". The
-# steward's triage candidate set is exactly the OPEN issues carrying NONE of
-# these (ai-triage included — see triage.py for why it's allowed back in).
-# Mirrors the jq `select(... | not)` in steward.sh:triage_once.
+# The labels that mean "this issue is already somewhere in the pipeline".
 LIFECYCLE_LABELS: frozenset[Label] = frozenset(
     {
         Label.AI_READY,

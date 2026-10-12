@@ -634,7 +634,7 @@ class FixtureBackend:
                 "target_dir": "/tmp/self",
                 "is_self": True,
                 "active": True,
-                "roles": [role("fix"), role("review"), role("steward")],
+                "roles": [role("fix"), role("review")],
                 "frecency": 1,
                 "last_activity_ts": "2026-07-29T08:00:00Z",
                 "in_flight": 0,
@@ -786,7 +786,7 @@ class FixtureBackend:
             "events": [{
                 "ts": "2026-07-29T07:59:00Z",
                 "event": "action",
-                "role": "steward",
+                "role": "fix",
                 "desc": "comment issue #50: verification recorded",
             }],
             "warnings": [],

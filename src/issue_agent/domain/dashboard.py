@@ -27,7 +27,6 @@ from .events import (
     RecurrenceDetected,
     SpendBlocked,
     SpendRecorded,
-    TriageDispositionRecorded,
     WorldObserved,
     JsonValue,
     encode_event,
@@ -56,9 +55,9 @@ STALE_AFTER_S = 1800.0
 RESOLVE_KINDS = frozenset({"RESOLVE", "RESUME", "ROUTE"})
 REVIEW_KINDS = frozenset({"REVIEW", "RE_REVIEW"})
 REPAIR_KINDS = frozenset({"FIX_CI", "ADDRESS_REVIEW", "REBASE"})
-STEWARD_KINDS = frozenset({"TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC"})
-# Kinds whose `number` is an ISSUE; everything else numbers a PR.
-ISSUE_NUMBERED = RESOLVE_KINDS | STEWARD_KINDS
+# Kinds whose `number` is an ISSUE; everything else numbers a PR. Historical
+# journals still carry legs of the deleted steward role, which numbered issues.
+ISSUE_NUMBERED = RESOLVE_KINDS | {"TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC"}
 
 
 # ── action-desc parsing ───────────────────────────────────────────────────────
@@ -454,10 +453,9 @@ class Metrics:
         """Rearm+other interventions per merged PR; None when nothing merged.
 
         `policy` is excluded from the headline ratio on purpose: a hand promote
-        exists because STEWARD_PROMOTE=0 is a chosen gate, so charging it here
-        would make a deliberate configuration read as harness unreliability.
-        It stays in `interventions_by_class` so the choice remains visible and
-        the day the gate opens, the drop is attributable.
+        is a chosen gate, so charging it here would make a deliberate
+        configuration read as harness unreliability. It stays in
+        `interventions_by_class` so the choice remains visible.
 
         None rather than 0.0 when `done_issues` is 0: "nobody intervened" and
         "nothing merged to divide by" are opposite readings of the same day.
@@ -970,8 +968,6 @@ def _dashboard_event_view(
                 "suspended_seconds": payload.suspended_ms / 1000,
             }
         )
-    elif isinstance(payload, TriageDispositionRecorded):
-        view["event"] = "triage_disposition"
     else:
         view["event"] = event.type
     return view
@@ -1053,7 +1049,6 @@ _STAGE_RUNNING = {
     "FIX_CI": "fixing CI",
     "ADDRESS_REVIEW": "addressing review",
     "REBASE": "rebasing",
-    "TRIAGE": "triaging",
 }
 
 
@@ -1354,12 +1349,12 @@ def first_pass_verdicts(rows) -> tuple[int, int]:
 #            dismissal, priority nudge). Closest available stand-in for the
 #            gap class until ADR 0013 lands causes.
 #   policy — a chosen gate rather than a defect: promoting an issue to ai-ready
-#            by hand exists only because STEWARD_PROMOTE=0.
+#            by hand is the operator's admission gate.
 #   other  — an operator event this grammar does not recognise. An unclassified
 #            intervention is still an intervention, so it is counted, never
 #            dropped; a growing `other` means the grammar owes a class.
 #
-# Manual gh-side work (answering a triage question, closing an issue by hand)
+# Manual gh-side work (closing an issue by hand)
 # reaches the harness as an observed world fact, not as an operator event, and
 # is therefore NOT in this count. The number is a floor on human involvement.
 INTERVENTION_REARM = "rearm"
@@ -1413,8 +1408,8 @@ class InterventionItem:
 _REARM_ACTION_KINDS = frozenset({"operator_unblock", "operator_dismiss_review"})
 _REARM_COMMAND_PREFIXES = ("operator-unblock:", "operator-dismiss-review:")
 _RELABEL_ACTION_KIND = "operator_relabel"
-# Hand-adding the promotion label is doing the steward's job for it, which is
-# exactly what STEWARD_PROMOTE=0 asks a human to do. Deliberately narrow: some
+# Hand-adding the promotion label is the operator's admission gate.
+# Deliberately narrow: some
 # other lifecycle label arriving from an operator endpoint is a new behaviour
 # nobody has classified, and `other` is where it should surface.
 _POLICY_ADD_LABELS = frozenset({Label.AI_READY.value})
@@ -1805,7 +1800,6 @@ CI_RUN_KIND = "CI"
 MERGE_KIND = "MERGE"
 
 _STAGE_OF_KIND: Mapping[str, Stage] = {
-    **{kind: Stage.TRIAGE for kind in ("TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC", "GROOM")},
     **{kind: Stage.RESOLVE for kind in ("RESOLVE", "RESUME", "ROUTE")},
     **{kind: Stage.REVIEW for kind in ("REVIEW", "RE_REVIEW", "ADDRESS_REVIEW")},
     MERGE_KIND: Stage.MERGE,
@@ -1985,7 +1979,7 @@ class OnOverlap:
     pr: int | None = None
 
 
-TriageWhy = Literal["parked", "awaiting_reply"]
+TriageWhy = Literal["parked"]
 
 
 @dataclass(frozen=True)
@@ -2121,10 +2115,6 @@ _RUNNING_HEADLINE: Mapping[str, str] = {
     "FIX_CI": "Fixing CI",
     "REBASE": "Rebasing",
     "PR_RESUME": "Resuming",
-    "TRIAGE": "Triaging",
-    "GROOM": "Grooming",
-    "STEWARD_DRIVE": "Triaging",
-    "JIRA_SYNC": "Syncing Jira",
 }
 
 # Framing the harness puts around its own escalation comments
@@ -2346,12 +2336,11 @@ def board_status(facts: BoardFacts) -> BoardStatus:
          since the harness's newest review: Needs you when the operator
          merges, Working when the harness or GitHub's auto-merge does;
       5. a hold on another issue or PR, or a file overlap;
-      6. the steward is waiting on the author's reply;
-      7. CI is running on the current head;
-      8. stalled: no leg, hold or escalation, yet nothing changed for a whole
+      6. CI is running on the current head;
+      7. stalled: no leg, hold or escalation, yet nothing changed for a whole
          stall threshold, so the harness stopped without escalating;
-      9. queued for the fixer;
-     10. otherwise the harness owns the next move.
+      8. queued for the fixer;
+      9. otherwise the harness owns the next move.
     """
     triage = facts.triage
     if triage is not None and triage.why == "parked":
@@ -2375,13 +2364,6 @@ def board_status(facts: BoardFacts) -> BoardStatus:
         return _merge_ready(facts, facts.merge_ready)
     if facts.hold is not None:
         return _blocked_on(facts.hold)
-    if triage is not None:
-        return Blocked(
-            OnTriage("awaiting_reply"),
-            "Waiting on triage",
-            "The steward asked the author a question. Promote it to queue it anyway.",
-            triage.since,
-        )
     if facts.ci == "pending":
         reason = (
             f"{_approved_line(facts.track)}."

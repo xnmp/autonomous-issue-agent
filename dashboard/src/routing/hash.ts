@@ -9,15 +9,14 @@
 
 import { useCallback, useSyncExternalStore } from "react";
 
-export type IssuesSub = "inflight" | "done" | "backlog" | "untriaged";
+export type IssuesSub = "inflight" | "done" | "backlog";
 
-export const ISSUES_SUBS: IssuesSub[] = ["inflight", "done", "backlog", "untriaged"];
+export const ISSUES_SUBS: IssuesSub[] = ["inflight", "done", "backlog"];
 
 export const ISSUES_SUB_LABELS: Record<IssuesSub, string> = {
   inflight: "In flight",
   done: "Done",
   backlog: "Backlog",
-  untriaged: "Untriaged",
 };
 
 export type Route =
@@ -28,7 +27,7 @@ export type Route =
   | { view: "issue"; repo: string; issue: number };
 
 function isSub(s: string | undefined): s is IssuesSub {
-  return s === "inflight" || s === "done" || s === "backlog" || s === "untriaged";
+  return s === "inflight" || s === "done" || s === "backlog";
 }
 
 export function parseHash(hash: string): Route {

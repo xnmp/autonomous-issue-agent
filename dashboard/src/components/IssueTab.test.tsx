@@ -266,8 +266,8 @@ describe("IssueTab", () => {
               idle_active: false,
               steps: [{
                 idx: 0,
-                kind: "TRIAGE",
-                role: "steward",
+                kind: "RESOLVE",
+                role: "fix",
                 state: "ok",
                 model: "gpt-5.6-terra",
                 status: "done",
@@ -297,10 +297,10 @@ describe("IssueTab", () => {
     render(<IssueTab repo="demo" issue={34} />);
 
     // Click the status cell, not the disclosure chevron — the whole row toggles.
-    await screen.findByRole("button", { name: "Triage" });
+    await screen.findByRole("button", { name: "Resolve" });
     await userEvent.click(screen.getByText("2:22"));
     // The Summary pane is the default and narrates what the task DID —
-    // the steward's triage labels — not the raw event soup.
+    // the triage labels — not the raw event soup.
     expect(
       await screen.findByText("relabel issue #34: +difficulty:medium +impact:high"),
     ).toBeVisible();

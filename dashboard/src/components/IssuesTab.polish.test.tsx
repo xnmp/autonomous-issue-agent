@@ -44,10 +44,9 @@ const backlog: BacklogCard = {
   title: "The board is hard to read",
   url: "https://github.com/o/r/issues/63",
   body: "long body",
-  labels: ["type:enhancement", "difficulty:complex", "ai-triage"],
+  labels: ["type:enhancement", "difficulty:complex"],
   recurrence: false,
   recurrence_count: 0,
-  steward_state: "processed",
   age_days: 1,
   comments: 0,
   issue_type: "enhancement",
@@ -242,36 +241,6 @@ describe("page chrome", () => {
 });
 
 describe("backlog triage taxonomy", () => {
-  it("keeps steward state explicit without row-level highlighting", () => {
-    const { container } = board("backlog", {
-      backlog: [
-        backlog,
-        {
-          ...backlog,
-          issue: 64,
-          title: "Unprocessed intake",
-          labels: [],
-          steward_state: "raw",
-        },
-        {
-          ...backlog,
-          issue: 65,
-          title: "Needs clarification",
-          steward_state: "blocked_on_human_reply",
-        },
-      ],
-    });
-
-    expect(screen.getByText("AC + test plan written")).toBeVisible();
-    expect(screen.getByText("awaiting steward")).toBeVisible();
-    expect(screen.getByText("awaiting human reply")).toHaveClass("chip-fail");
-    expect(screen.queryByText("steward questions need answers")).not.toBeInTheDocument();
-    expect(screen.getAllByText("awaiting human reply")).toHaveLength(1);
-    expect(container.querySelector(".backlog-processed")).not.toBeInTheDocument();
-    expect(container.querySelector(".backlog-raw")).not.toBeInTheDocument();
-    expect(container.querySelector(".backlog-blocked")).not.toBeInTheDocument();
-  });
-
   it("colours each axis value and its matching label with one mapping", () => {
     board("backlog", { backlog: [backlog] });
 

@@ -42,10 +42,6 @@ PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
 _DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
 _PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
-# Legs the steward runs before an issue is admitted to the fix pipeline. An
-# issue can be triaged and then wait hours in the backlog for `ai-ready`, and
-# that wait belongs to the operator's queue, not to the pipeline's clock.
-_PRE_ADMISSION_KINDS = dash.STEWARD_KINDS | {"GROOM"}
 
 # Compact-row text budget: one line, bounded, for prose the harness did not
 # author (agent summaries, escalation comments, operator input).
@@ -1136,11 +1132,8 @@ def _leg_intervals(
 def _pipeline_anchor(
     spans: list[tuple[str, datetime, datetime]],
 ) -> datetime | None:
-    """Where the pipeline clock starts: the first non-steward leg."""
-    return min(
-        (b for kind, b, _ in spans if kind not in _PRE_ADMISSION_KINDS),
-        default=None,
-    )
+    """Where the pipeline clock starts: the first leg."""
+    return min((b for _, b, _ in spans), default=None)
 
 
 def _duration_breakdown(
@@ -1155,11 +1148,8 @@ def _duration_breakdown(
     The work clock ticks only while a leg is actually running (#34 sat
     "awaiting merge" with a ticking work clock and 6h of invented work).
 
-    The wall clock anchors at the first fix-pipeline leg, not the issue's first
-    event. Pre-admission legs contribute their own runtime and nothing around
-    it: keifu #185 (2026-08-03) was triaged at 00:24 and admitted at 01:25, and
-    charged that backlog hour to idle the moment its resolve began. Queueing
-    for admission is not pipeline idleness.
+    The wall clock anchors at the first leg, not the issue's first event:
+    queueing for admission is not pipeline idleness.
     """
     if start is None:
         return None, None, None, False
@@ -1168,14 +1158,9 @@ def _duration_breakdown(
     raw_working = _total_seconds(work_intervals)
     anchor = _pipeline_anchor(spans)
     if anchor is None:
-        if spans:
-            # Triaged and sitting in the backlog: the pipeline clock has not
-            # started, so there is no span for idleness to live in.
-            return raw_working, raw_working, 0.0, False
         # No legs at all: nothing to anchor on, so the issue's own window is
         # the only measure available.
         anchor = start
-    pre_seconds = _total_seconds(_clip_intervals(work_intervals, start, anchor))
     wall_seconds = max(0.0, (end - anchor).total_seconds())
     suspended, suspended_while_working = _suspension_partition(
         row,
@@ -1183,7 +1168,7 @@ def _duration_breakdown(
         _clip_intervals(work_intervals, anchor, end),
         window=(anchor, end),
     )
-    elapsed = pre_seconds + max(0.0, wall_seconds - suspended)
+    elapsed = max(0.0, wall_seconds - suspended)
     working = min(elapsed, max(0.0, raw_working - suspended_while_working))
     idle = max(0.0, elapsed - working)
     idle_active = not row.done and not row.running
@@ -1992,12 +1977,10 @@ def _active_stall(row: dash.IssueRow | None, deferral: str | None) -> dash.Stall
     return active
 
 
-def _triage_since(row: dash.IssueRow | None, event_name: str, action_type: str | None = None) -> datetime | None:
+def _parked_since(row: dash.IssueRow | None) -> datetime | None:
     for event in reversed(row.events if row is not None else ()):
-        if event.get("event") != event_name:
-            continue
         action = event.get("action")
-        if action_type is None or (isinstance(action, Mapping) and action.get("type") == action_type):
+        if event.get("event") == "action" and isinstance(action, Mapping) and action.get("type") == "operator_park":
             return dash.parse_ts(event.get("ts"))
     return None
 
@@ -2107,7 +2090,6 @@ def board_status(
     gh_pr: dict | None = None,
     harness_merges: Callable[[str], bool] = _never_harness,
     queued: bool = False,
-    triage_reply: bool = False,
 ) -> dash.BoardStatus:
     """Gather one row's board facts and let the domain decide its group.
 
@@ -2117,10 +2099,8 @@ def board_status(
     label_set = {str(label) for label in labels} | _labels_set(gh_pr)
     hold, deferral = _board_hold(row)
     triage = (
-        dash.TriageHold("parked", _triage_since(row, "action", "operator_park"))
+        dash.TriageHold("parked", _parked_since(row))
         if "ai-parked" in label_set
-        else dash.TriageHold("awaiting_reply", _triage_since(row, "triage_disposition"))
-        if triage_reply
         else None
     )
     ci = _pr_ci_state(gh_pr, row) if row is not None else None
@@ -2355,16 +2335,7 @@ def backlog_card(
 ) -> dict:
     labels = labels_of(issue)
     recurrence_count = max(row.recurrences if row else 0, int("recurrence" in labels))
-    steward_state = backlog_steward_state(labels, row)
-    # Only a steward question puts a backlog row on the board: the rest of the
-    # backlog waits on nobody in particular and would flood it.
-    triage_blocked = steward_state == "blocked_on_human_reply"
-    track = stage_track(row) if row is not None else dash.stage_track(())
     return {
-        "board": board_json(board_status(
-            row, track, labels=labels, gh_issue=issue, triage_reply=True,
-        )) if triage_blocked else None,
-        "rail": rail_json(track, False) if triage_blocked else None,
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
         "url": issue.get("url"),
@@ -2375,51 +2346,10 @@ def backlog_card(
         "age_days": age_days(issue.get("createdAt"), now),
         "age_s": age_seconds(issue.get("createdAt"), now),
         "comments": _comment_count(issue.get("comments")),
-        "steward_state": steward_state,
         "issue_type": _label_value(labels, ("type:",), exact=("bug", "feature")),
         "difficulty": _label_value(labels, ("difficulty:", "effort:")),
         "impact": _label_value(labels, ("impact:",)),
     }
-
-
-def backlog_steward_state(labels: list[str], row: dash.IssueRow | None) -> str:
-    """Return the latest durable steward disposition for a backlog issue.
-
-    ``triage_disposition`` is minted by the steward after the verdict actions
-    succeed; issue authors cannot forge it through labels or comment prose. The
-    label fallback preserves the processed state for journals predating the
-    marker, but only a marker can claim that a human reply is outstanding. A
-    removed ``ai-triage`` label retires every historical disposition.
-    """
-    if "ai-triage" not in labels:
-        return "raw"
-    if row is not None:
-        for event in reversed(row.events):
-            if event.get("event") != "triage_disposition":
-                continue
-            state = event.get("triage_state")
-            if state in {"processed", "blocked_on_human_reply"}:
-                return str(state)
-        # Pre-marker deployments still expose GitHub's durable comment thread
-        # through the schema-v2 world fold. The fixed headers are an explicitly
-        # untrusted, presentation-only migration hint: unlike the harness-minted
-        # event above, they can never authorize or trigger an effect.
-        comments = row.facts.get("comments")
-        if isinstance(comments, (list, tuple)):
-            for comment in reversed(comments):
-                if not isinstance(comment, Mapping):
-                    continue
-                body = comment.get("body")
-                if not isinstance(body, str):
-                    continue
-                if body.startswith("**A quick check before we start**"):
-                    return "blocked_on_human_reply"
-                if body.startswith((
-                    "**Ready to build ✅**",
-                    "**Triage needs a human here**",
-                )):
-                    return "processed"
-    return "processed"
 
 
 def _label_value(
@@ -2792,14 +2722,13 @@ def escalation_reasons(deployment: dash.Deployment) -> list[dict]:
 
 
 def cost_mix(metrics: dash.Metrics) -> dict:
-    """Spend split into the four families the Direction section tracks. Kinds in
+    """Spend split into the three families the Direction section tracks. Kinds in
     none of them land nowhere by design — `by_kind` already reports them
     verbatim, and inventing a fifth bucket would hide a new leg family."""
     families = {
         "resolve_usd": dash.RESOLVE_KINDS,
         "review_usd": dash.REVIEW_KINDS,
         "repair_usd": dash.REPAIR_KINDS,
-        "steward_usd": dash.STEWARD_KINDS,
     }
     return {
         field: round(

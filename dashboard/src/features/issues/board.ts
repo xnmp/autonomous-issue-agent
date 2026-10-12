@@ -6,7 +6,6 @@
  */
 
 import type {
-  BacklogCard,
   IssueCard,
   IssuesPayload,
   PendingCard,
@@ -101,11 +100,11 @@ function queued(priority: PendingCard["priority"]): BoardStatus {
 }
 
 /**
- * In-flight, queued and triage-blocked backlog rows as one list. An issue
+ * In-flight and queued rows as one list. An issue
  * appears once: a lane earlier in that order wins, because it carries more
  * of the issue's state.
  */
-export function boardItems(payload: Pick<IssuesPayload, "in_flight" | "pending" | "backlog"> | null | undefined): BoardItem[] {
+export function boardItems(payload: Pick<IssuesPayload, "in_flight" | "pending"> | null | undefined): BoardItem[] {
   if (!payload) return [];
   const seen = new Set<number>();
   const items: BoardItem[] = [];
@@ -120,9 +119,6 @@ export function boardItems(payload: Pick<IssuesPayload, "in_flight" | "pending" 
   }
   for (const card of payload.pending ?? []) {
     add(fromPendingCard(card, card.board ?? queued(card.priority)));
-  }
-  for (const card of payload.backlog ?? []) {
-    if (card.board) add(fromBacklogCard(card, card.board));
   }
   return items;
 }
@@ -149,21 +145,6 @@ function fromPendingCard(card: PendingCard, board: BoardStatus): BoardItem {
     url: card.url,
     pr: card.pr ?? null,
     prUrl: card.pr_url ?? null,
-    board,
-    rail: card.rail ?? null,
-    labels: card.labels ?? [],
-    tier: null,
-    card: null,
-  };
-}
-
-function fromBacklogCard(card: BacklogCard, board: BoardStatus): BoardItem {
-  return {
-    issue: card.issue,
-    title: card.title,
-    url: card.url,
-    pr: null,
-    prUrl: null,
     board,
     rail: card.rail ?? null,
     labels: card.labels ?? [],
@@ -325,13 +306,6 @@ export function railNodes(rail: StageRail): RailNode[] {
   });
 }
 
-/* ------------------------------------------------------------ untriaged */
-
-/** A backlog issue the steward has not looked at yet (no ai-triage label). */
-export function isUntriaged(card: BacklogCard): boolean {
-  return card.steward_state === "raw";
-}
-
 /* ------------------------------------------------------------ history */
 
 export const HISTORY_TAIL = 6;
@@ -399,8 +373,7 @@ export type PrimaryAction =
   | { kind: "budget"; label: "Approve spend" }
   | { kind: "open_issue"; label: "Open issue" }
   | { kind: "open_pr"; label: "Open PR" }
-  | { kind: "unpark"; label: "Unpark" }
-  | { kind: "promote"; label: "Promote to ai-ready" };
+  | { kind: "unpark"; label: "Unpark" };
 
 /**
  * At most one action per row, and only where the operator is what moves it:
@@ -420,9 +393,7 @@ export function primaryAction(board: BoardStatus): PrimaryAction | null {
     }
   }
   if (board.status === "blocked" && board.on.kind === "triage") {
-    return board.on.why === "parked"
-      ? { kind: "unpark", label: "Unpark" }
-      : { kind: "promote", label: "Promote to ai-ready" };
+    return { kind: "unpark", label: "Unpark" };
   }
   return null;
 }

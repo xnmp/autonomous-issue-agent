@@ -450,8 +450,6 @@ export interface components {
             age_days: number | null;
             /** Age S */
             age_s?: number | null;
-            /** Board */
-            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
             /** Body */
             body: string | null;
             /** Comments */
@@ -466,16 +464,10 @@ export interface components {
             issue_type?: string | null;
             /** Labels */
             labels: string[];
-            rail?: components["schemas"]["StageRail"] | null;
             /** Recurrence */
             recurrence: boolean;
             /** Recurrence Count */
             recurrence_count: number;
-            /**
-             * Steward State
-             * @enum {string}
-             */
-            steward_state: "raw" | "processed" | "blocked_on_human_reply";
             /** Title */
             title: string | null;
             /** Url */
@@ -542,9 +534,10 @@ export interface components {
             kind: "triage";
             /**
              * Why
+             * @constant
              * @enum {string}
              */
-            why: "parked" | "awaiting_reply";
+            why: "parked";
         } & {
             [key: string]: unknown;
         };
@@ -716,8 +709,6 @@ export interface components {
             resolve_usd: number | null;
             /** Review Usd */
             review_usd: number | null;
-            /** Steward Usd */
-            steward_usd: number | null;
         } & {
             [key: string]: unknown;
         };

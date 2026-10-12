@@ -2,7 +2,7 @@ import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
-import type { BacklogCard, IssueCard, IssuesPayload, PendingCard } from "../api/types";
+import type { IssueCard, IssuesPayload, PendingCard } from "../api/types";
 import type { BoardStatus, StageRail, StageVisit } from "../features/issues/board";
 import { IssuesTab } from "./IssuesTab";
 
@@ -185,21 +185,6 @@ describe("issues board groups", () => {
     await userEvent.click(chip(/2 Needs you/));
     expect(screen.getAllByRole("region")).toHaveLength(3);
     expect(screen.getAllByText("Nothing here right now.")).toHaveLength(2);
-  });
-
-  it("gives a triage wait a red, operator-owned headline", () => {
-    stubFetch();
-    renderBoard({
-      backlog: [{
-        issue: 140, title: "Needs a decision", url: null, body: null, labels: ["ai-triage"], recurrence: false,
-        recurrence_count: 0, steward_state: "blocked_on_human_reply", age_days: 1, comments: 1,
-        board: { status: "blocked", on: { kind: "triage", why: "awaiting_reply" }, headline: "Waiting on triage", reason: "The steward asked a question.", since_ts: "2026-10-11T12:00:00Z" },
-        rail: rail({ current: "triage", furthest: "triage", steps: 0, review_rounds: 0, ci_runs: 0 }),
-      } as BacklogCard],
-    });
-
-    expect(within(section("Blocked")).getByText("Waiting on triage").closest(".board-say")).toHaveClass("board-say-owned");
-    expect(within(row("Needs a decision")).getByText("1d")).toHaveClass("board-wait-stale");
   });
 });
 
@@ -428,52 +413,6 @@ describe("issues board actions", () => {
 
     expect(calls.filter(({ method }) => method === "POST").map(({ url }) => url)).toEqual(["/api/repos/demo/issues/220/unpark"]);
     expect(refresh).toHaveBeenCalled();
-  });
-
-  it("promotes a triage question to ai-ready through the promote endpoint, after a confirmation", async () => {
-    const calls = stubFetch();
-    renderBoard({
-      backlog: [{
-        issue: 230, title: "Asked a question", url: null, body: null, labels: [], recurrence: false, recurrence_count: 0,
-        steward_state: "blocked_on_human_reply", age_days: null, comments: null,
-        board: { status: "blocked", on: { kind: "triage", why: "awaiting_reply" }, headline: "Waiting on triage", reason: "", since_ts: null },
-        rail: rail({ steps: 0 }),
-      } as BacklogCard],
-    });
-
-    await userEvent.click(row("Asked a question"));
-    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready" }));
-    expect(calls.filter(({ method }) => method === "POST")).toEqual([]);
-    await userEvent.click(screen.getByRole("button", { name: "Promote #230" }));
-
-    const writes = calls.filter(({ method }) => method === "POST");
-    expect(writes.map(({ url }) => url)).toEqual(["/api/repos/demo/issues/230/promote"]);
-    await vi.waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-  });
-
-  it("forgets a failed promotion's error once the confirmation is cancelled", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(
-      JSON.stringify({ detail: "issue is closed" }),
-      { status: 409, headers: { "Content-Type": "application/json" } },
-    )));
-    renderBoard({
-      backlog: [{
-        issue: 231, title: "Asked another question", url: null, body: null, labels: [], recurrence: false, recurrence_count: 0,
-        steward_state: "blocked_on_human_reply", age_days: null, comments: null,
-        board: { status: "blocked", on: { kind: "triage", why: "awaiting_reply" }, headline: "Waiting on triage", reason: "", since_ts: null },
-        rail: rail({ steps: 0 }),
-      } as BacklogCard],
-    });
-
-    await userEvent.click(row("Asked another question"));
-    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready" }));
-    await userEvent.click(screen.getByRole("button", { name: "Promote #231" }));
-    expect(await screen.findByText("issue is closed")).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready" }));
-
-    expect(screen.getByRole("dialog")).toBeVisible();
-    expect(screen.queryByText("issue is closed")).not.toBeInTheDocument();
   });
 
   it("re-arms through the issue's guarded resolve controls, never a direct write", async () => {

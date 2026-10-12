@@ -1,11 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { BacklogCard, IssueCard, IssuesPayload, PendingCard } from "../../api/types";
+import type { IssueCard, IssuesPayload, PendingCard } from "../../api/types";
 import {
   boardItems,
   countLabel,
   groupItems,
   historyView,
-  isUntriaged,
   overspendOf,
   primaryAction,
   railNodes,
@@ -46,20 +45,15 @@ const rail = (over: Partial<StageRail> = {}): StageRail => ({
 });
 
 describe("boardItems", () => {
-  it("merges in-flight, queued and triage-blocked backlog rows, each issue once", () => {
+  it("merges in-flight and queued rows, each issue once", () => {
     const items = boardItems(payload({
       in_flight: [card(1, working), card(9, null, { done: true })],
       pending: [{ issue: 1, title: "dup", url: null, labels: [], priority: null, held: false, hold_reason: null, overlap: null, board: queued } as PendingCard,
         { issue: 2, title: "queued", url: null, labels: [], priority: "P2", held: false, hold_reason: null, overlap: null } as PendingCard],
-      backlog: [
-        { issue: 3, title: "asked", url: null, body: null, labels: [], recurrence: false, recurrence_count: 0, steward_state: "blocked_on_human_reply", age_days: null, comments: null,
-          board: { status: "blocked", on: { kind: "triage", why: "awaiting_reply" }, headline: "Waiting on triage", reason: "", since_ts: null } },
-        { issue: 4, title: "raw", url: null, body: null, labels: [], recurrence: false, recurrence_count: 0, steward_state: "raw", age_days: null, comments: null },
-      ],
     }));
 
     expect(items.map((item) => [item.issue, item.board.status])).toEqual([
-      [1, "working"], [2, "blocked"], [3, "blocked"],
+      [1, "working"], [2, "blocked"],
     ]);
     expect(items.find((item) => item.issue === 1)?.title).toBe("Issue 1");
   });
@@ -214,7 +208,7 @@ describe("historyView", () => {
 });
 
 describe("primaryAction", () => {
-  it("gives Needs you and triage-blocked rows exactly one action, and every other row none", () => {
+  it("gives Needs you and parked rows exactly one action, and every other row none", () => {
     expect(primaryAction(needs(null, "rearm"))?.label).toBe("Re-arm");
     expect(primaryAction(needs(null, "budget"))?.label).toBe("Approve spend");
     expect(primaryAction(needs(null, "merge"))?.label).toBe("Open PR");
@@ -222,7 +216,6 @@ describe("primaryAction", () => {
       expect(primaryAction(needs(null, ask))?.label).toBe("Open issue");
     }
     expect(primaryAction({ ...queued, on: { kind: "triage", why: "parked" } })?.label).toBe("Unpark");
-    expect(primaryAction({ ...queued, on: { kind: "triage", why: "awaiting_reply" } })?.label).toBe("Promote to ai-ready");
     expect(primaryAction(queued)).toBeNull();
     expect(primaryAction({ ...queued, on: { kind: "issue", issue: 4 } })).toBeNull();
     expect(primaryAction(working)).toBeNull();
@@ -235,14 +228,5 @@ describe("the rail in words", () => {
       .toBe("Review, round 5; Resolve 2 attempts; CI 3 runs");
     expect(railSummary(railNodes(rail({ current: "triage", furthest: "triage", review_rounds: 0, resolve_attempts: 0 }))))
       .toBe("Triage");
-  });
-});
-
-describe("isUntriaged", () => {
-  it("is only a backlog issue the steward has not seen", () => {
-    const backlog = (steward_state: string) => ({ steward_state }) as BacklogCard;
-    expect(isUntriaged(backlog("raw"))).toBe(true);
-    expect(isUntriaged(backlog("processed"))).toBe(false);
-    expect(isUntriaged(backlog("blocked_on_human_reply"))).toBe(false);
   });
 });

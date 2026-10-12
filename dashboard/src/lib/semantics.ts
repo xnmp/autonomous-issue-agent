@@ -4,7 +4,7 @@
  * Tones are the only colour vocabulary components speak (they become
  * `chip-<tone>` classes / `var(--<tone>)`), so the contract's mapping —
  * green = ok/done/approve, yellow = running/pending, red = failed/escalated/
- * blocked, blue = informational/queued, magenta = steward/meta/self,
+ * blocked, blue = informational/queued, magenta = meta/self,
  * cyan = links/models — holds everywhere by construction.
  */
 
@@ -26,10 +26,6 @@ const KIND_LABEL: Record<string, string> = {
   FIX_CI: "Fix CI",
   ADDRESS_REVIEW: "Address review",
   REBASE: "Rebase",
-  TRIAGE: "Triage",
-  STEWARD_DRIVE: "Steward",
-  JIRA_SYNC: "Jira sync",
-  GROOM: "Groom",
   CI: "CI",
   MERGE: "Merge",
 };
@@ -41,15 +37,13 @@ export function kindLabel(kind: string): string {
 export const RESOLVE_KINDS = new Set(["RESOLVE", "RESUME", "ROUTE"]);
 export const REVIEW_KINDS = new Set(["REVIEW", "RE_REVIEW"]);
 export const REPAIR_KINDS = new Set(["FIX_CI", "ADDRESS_REVIEW", "REBASE"]);
-export const STEWARD_KINDS = new Set(["TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC"]);
 
-export type LegFamily = "resolve" | "review" | "repair" | "steward" | "other";
+export type LegFamily = "resolve" | "review" | "repair" | "other";
 
 export function familyOf(kind: string): LegFamily {
   if (RESOLVE_KINDS.has(kind)) return "resolve";
   if (REVIEW_KINDS.has(kind)) return "review";
   if (REPAIR_KINDS.has(kind)) return "repair";
-  if (STEWARD_KINDS.has(kind)) return "steward";
   return "other";
 }
 
@@ -74,7 +68,7 @@ export function stateTone(state: StepState | null | undefined): Tone {
 /**
  * Steps the operator performed, not the harness: they cost nothing and are
  * named in prose by the backend (`unblock`, `relabel (operator)`). They read as
- * `meta` — the same tone the contract already reserves for steward/self work —
+ * `meta` — the same tone the contract already reserves for self work —
  * so a human intervention is never mistaken for an agent leg.
  */
 export const OPERATOR_STEP_KINDS = new Set([
@@ -248,7 +242,7 @@ export function verificationSummary(parts: {
 
 /* -------------------------------------------- backlog triage taxonomy ---
  *
- * Three orthogonal axes the steward writes as GitHub labels. ONE mapping,
+ * Three orthogonal axes carried as GitHub labels. ONE mapping,
  * consumed by both the backlog columns and the label chips, so a row can never
  * say two different things about the same value:
  *
@@ -263,8 +257,7 @@ export function verificationSummary(parts: {
  *
  * Every table is total: an unrecognised word tones neutral rather than
  * guessing, because these values come from operator-authored labels.
- * `enhancement` is a frontend rendering concern only — the steward taxonomy
- * that mints the labels is untouched.
+ * `enhancement` is a frontend rendering concern only.
  */
 
 const TYPE_TONES: Record<string, Tone> = {
@@ -453,7 +446,7 @@ export interface MixSlice {
 
 /**
  * Fixed slot order, validated with the dataviz validator against --panel:
- * blue / bright-cyan / yellow / bright-magenta pass CVD separation, the
+ * blue / bright-cyan / yellow pass CVD separation, the
  * normal-vision floor and 3:1 contrast. Never reorder by size.
  */
 export function mixSlices(mix: CostMix | null): MixSlice[] {
@@ -462,6 +455,5 @@ export function mixSlices(mix: CostMix | null): MixSlice[] {
     { family: "resolve", label: "Resolve", usd: at(mix?.resolve_usd), varName: "--series-1" },
     { family: "review", label: "Review", usd: at(mix?.review_usd), varName: "--series-2" },
     { family: "repair", label: "Repair", usd: at(mix?.repair_usd), varName: "--series-3" },
-    { family: "steward", label: "Steward", usd: at(mix?.steward_usd), varName: "--series-4" },
   ];
 }

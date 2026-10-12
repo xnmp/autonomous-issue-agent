@@ -280,35 +280,6 @@
             ],
             "title": "Age S"
           },
-          "board": {
-            "anyOf": [
-              {
-                "discriminator": {
-                  "mapping": {
-                    "blocked": "#/components/schemas/BoardBlocked",
-                    "needs_you": "#/components/schemas/BoardNeedsYou",
-                    "working": "#/components/schemas/BoardWorking"
-                  },
-                  "propertyName": "status"
-                },
-                "oneOf": [
-                  {
-                    "$ref": "#/components/schemas/BoardNeedsYou"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BoardWorking"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BoardBlocked"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Board"
-          },
           "body": {
             "anyOf": [
               {
@@ -375,16 +346,6 @@
             "title": "Labels",
             "type": "array"
           },
-          "rail": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/StageRail"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "recurrence": {
             "title": "Recurrence",
             "type": "boolean"
@@ -392,15 +353,6 @@
           "recurrence_count": {
             "title": "Recurrence Count",
             "type": "integer"
-          },
-          "steward_state": {
-            "enum": [
-              "raw",
-              "processed",
-              "blocked_on_human_reply"
-            ],
-            "title": "Steward State",
-            "type": "string"
           },
           "title": {
             "anyOf": [
@@ -434,8 +386,7 @@
           "recurrence",
           "recurrence_count",
           "age_days",
-          "comments",
-          "steward_state"
+          "comments"
         ],
         "title": "BacklogCard",
         "type": "object"
@@ -582,9 +533,9 @@
             "type": "string"
           },
           "why": {
+            "const": "parked",
             "enum": [
-              "parked",
-              "awaiting_reply"
+              "parked"
             ],
             "title": "Why",
             "type": "string"
@@ -1188,24 +1139,12 @@
               }
             ],
             "title": "Review Usd"
-          },
-          "steward_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Steward Usd"
           }
         },
         "required": [
           "resolve_usd",
           "review_usd",
-          "repair_usd",
-          "steward_usd"
+          "repair_usd"
         ],
         "title": "CostMix",
         "type": "object"
