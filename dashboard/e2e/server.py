@@ -814,7 +814,7 @@ class FixtureBackend:
             return rc.InactiveControl(status="inactive", repository=RESOLVE_REPO, issue=number,
                 fix_recovery=(rc.IssueRecoveryAvailable(status="available", family="issue_recovery", generation=2,
                     version=8, resumes=4, ci_failures=3, review_failures=2, rebase_failures=5, infra_failures=6,
-                    self_clears=1, holds=["machine", "budget"]) if number == 99 else None))
+                    holds=["workflow"]) if number == 99 else None))
         return self._resolve.control(number, request_id)
 
     def resolve_command(self, _name: str, number: int, body: rc.ResolveCommand) -> rc.CommandResult:

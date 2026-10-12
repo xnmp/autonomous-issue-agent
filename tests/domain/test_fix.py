@@ -2997,6 +2997,25 @@ def test_a_new_head_gets_a_fresh_free_re_run():
     ]
 
 
+@pytest.mark.parametrize("observed, expected", [
+    (world(issues=[issue(5, "ai-ready")]), (AgentKind.RESOLVE, 5)),
+    (world(prs=[_red_pr()]), (AgentKind.FIX_CI, 100)),
+])
+def test_short_daily_headroom_waits_silently_then_dispatches_when_it_returns(observed, expected):
+    # Decision #7: a short daily/global window is a wait, not a hold. Nothing is
+    # paid for, nothing is labelled, and the same world dispatches once the
+    # window has headroom again.
+    rerun_spent = {100: "sha-1"}
+
+    short = decide_fix(observed, CFG, FixState(ci_rerun_head=rerun_spent, daily_headroom_short=True),
+                       fixer_busy=False)
+    assert _run_agents(short) == []
+    assert not any(isinstance(a, (Relabel, PostComment)) for a in short)
+
+    restored = decide_fix(observed, CFG, FixState(ci_rerun_head=rerun_spent), fixer_busy=False)
+    assert [(a.kind, a.number) for a in _run_agents(restored)] == [expected]
+
+
 def test_pending_checks_after_a_re_run_dispatch_nothing():
     # The re-run flips the checks to PENDING and the existing
     # pending-outranks-failure rule waits — no leg, no second re-run.
@@ -3109,8 +3128,6 @@ def test_spent_free_rerun_cannot_launch_paid_repair_without_capacity():
     ({"reviews": (Review("CHANGES_REQUESTED", "review-bot", "t1"),)}, FixState(), ()),
     ({}, FixState(ci_remediation_errors={100: "unreadable remediation"}), ()),
     ({}, FixState(infra_control_errors={100: "unreadable recovery"}), ()),
-    ({}, FixState(machine_control_errors={100: "unreadable machine block"}), ()),
-    ({}, FixState(budget_control_errors={100: "unreadable budget block"}), ()),
     ({"head_ref_oid": ""}, FixState(), ()),
     ({"checks": (Check("unit", bucket="fail"),)}, FixState(), ()),
 ])

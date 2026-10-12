@@ -328,8 +328,7 @@ class IssueRecoveryAvailable(ClosedContract):
     review_failures: Counter
     rebase_failures: Counter
     infra_failures: Counter
-    self_clears: Counter
-    holds: list[Literal["machine", "budget", "workflow"]]
+    holds: list[Literal["workflow"]]
 
 
 class PRRepairAvailable(ClosedContract):

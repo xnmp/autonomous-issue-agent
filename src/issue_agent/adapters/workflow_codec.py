@@ -36,7 +36,6 @@ from ..domain.labels import Label
 from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
-from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker, MachineClearProjection, BudgetClearProjection, BudgetWorld, BudgetLimitObservation
 from ..domain.actions import Target
 from ..domain.contracts import EffectReceipt, EffectStatus
 from ..domain.outcome import Adjudication
@@ -51,19 +50,9 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 
-def decode_self_clear_projection(payload: object) -> MachineClearProjection | BudgetClearProjection:
-    if not isinstance(payload, str):
-        raise ValueError("self-clear projection requires a bounded encoded value")
-    value = decode_workflow(payload, object)
-    if not isinstance(value, (MachineClearProjection, BudgetClearProjection)):
-        raise ValueError("self-clear command requires its fixed recovery projection")
-    return value
-
 _VALUES = (
     EvidenceSchedule, EffectReceipt,
-    MachineClearProjection, BudgetClearProjection, BudgetWorld, BudgetLimitObservation,
-    BudgetScope, BudgetBlock, cc.RefusedBudgetBlock,
-    MachineBlock, cc.RecordedMachineBlock,
+    BudgetScope,
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
     cc.IssueRebasePurchase, cc.RebaseRepairResult,
     cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
@@ -167,7 +156,7 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
-    MachineBlocker, Target, EffectStatus,
+    Target, EffectStatus,
     UsageSource, PricingBasis, ChargeOrigin,
     LifecycleOperation,
     cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.StewardLane, cc.StewardFailureKind, cc.FixInfraOutcome,
@@ -207,10 +196,6 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "SettlementRequest": {"accounting_gap": "", "origin": {"type": "ChargeOrigin", "value": "normal_return"}},
-    "BudgetWorld": {"config_version": ""},
-    "MachineClearProjection": {"binding": None},
-    "BudgetClearProjection": {"binding": None},
-    "BudgetLimitObservation": {"budget_scope": None},
     "StewardState": {"groom_content": {"type": "GroomContent", "fields": {"attempted": "", "successful": ""}}},
     "StewardAttemptSource": {"content_signature": ""},
     "StewardPurchase": {"content_signature": "", "infra_ceiling": None},
@@ -225,8 +210,8 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "ActiveReconciliation": {"reexecutions": 0},
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None, "ci_rerun": None, "ci_cancel": None, "branch_refresh": None, "pending_ci_escalation": None},
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
-    "PRRepairResult": {"ci": None, "review": None, "rebase": None, "machine_block": None},
-    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None, "budget_block": None, "self_clear_ceiling_reported": False},
+    "PRRepairResult": {"ci": None, "review": None, "rebase": None},
+    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None},
     "ContinuationCapture": {"fix_infra_ceiling": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
@@ -242,6 +227,15 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "CompletedReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
     "SupersededReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
     "CancelledReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
+}
+
+# Self-clear state (machine/budget holds and their allowance) was deleted
+# without a migration; rows persisted before then still carry it. Dropped
+# before decoding, so their retired nested variants are never constructed.
+_RETIRED_FIELDS: dict[str, frozenset[str]] = {
+    "IssueRecoveryState": frozenset({"self_clears", "machine_block", "budget_block", "self_clear_ceiling_reported"}),
+    "PRRepairState": frozenset({"self_clears"}),
+    "PRRepairResult": frozenset({"machine_block"}),
 }
 
 
@@ -276,17 +270,12 @@ def _encode(value: object, depth: int = 0) -> object:
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None or field.name in {"ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation"} and getattr(value, field.name) is None))
                     and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
-                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block", "budget_block"} and getattr(value, field.name) is None)
-                    and not (type(value) is cc.IssueRecoveryState and field.name == "self_clear_ceiling_reported" and not value.self_clear_ceiling_reported)
-                    and not (type(value) is BudgetWorld and field.name == "config_version" and not value.config_version)
+                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode"} and getattr(value, field.name) is None)
                     and not (type(value) is SettlementRequest and field.name == "accounting_gap" and not value.accounting_gap)
                     and not (type(value) is SettlementRequest and field.name == "origin" and value.origin is ChargeOrigin.NORMAL_RETURN)
-                    and not (type(value) is BudgetLimitObservation and field.name == "budget_scope" and value.budget_scope is None)
-                    and not (type(value) in {MachineClearProjection, BudgetClearProjection} and field.name == "binding" and value.binding is None)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
                         or field.name == "review" and value.review is None
-                        or field.name == "rebase" and value.rebase is None
-                        or field.name == "machine_block" and value.machine_block is None))
+                        or field.name == "rebase" and value.rebase is None))
                     and not (type(value) is cc.PRRepairPurchase and (field.name == "branch" and not value.branch
                         or field.name == "handoff" and value.handoff is None
                         or field.name == "advance_resume" and not value.advance_resume
@@ -400,11 +389,8 @@ def _decode(value: object, depth: int = 0) -> object:
     payload = value.get("fields")
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
-    if tag == "MachineClearProjection" and "ignored_checks" in payload:
-        if not isinstance(payload["ignored_checks"], str):
-            raise WorkflowEncodingError("legacy ignored check policy is malformed")
-        # Old commands/receipts requalify through today's policy at the effect boundary.
-        payload = {key: item for key, item in payload.items() if key != "ignored_checks"}
+    if tag in _RETIRED_FIELDS:
+        payload = {key: item for key, item in payload.items() if key not in _RETIRED_FIELDS[tag]}
     legacy: dict[str, object] = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
     field_names = _FIELD_NAMES[constructor]
     required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}

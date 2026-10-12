@@ -622,9 +622,7 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
-`domain/review.py`, `domain/self_clear.py`
-(level-triggered retirement of machine-checkable blocks — #180 publication/checks
-blockers and #168 budget headroom — with a per-issue self-clear ceiling),
+`domain/review.py`,
 `domain/steward.py`, `domain/steward_stall.py`,
 `domain/supervision.py`,
 `domain/triage.py`, `domain/trust.py`, and

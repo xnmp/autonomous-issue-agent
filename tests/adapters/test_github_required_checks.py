@@ -203,23 +203,6 @@ def test_only_the_known_rulesets_capability_403_means_no_rulesets(monkeypatch, m
     assert _subprocess_runner(["gh", "api", "--paginate", "--slurp", "repos/o/r/rules/branches/dev"], None) == expected
 
 
-def test_prechange_self_clear_payload_requalifies_against_current_policy():
-    from issue_agent.adapters.workflow_codec import encode_workflow, decode_self_clear_projection
-    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker, MachineClearProjection, machine_clear_evidence
-    from issue_agent.domain.actions import Target
-    from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowFence, WorkflowRevision
-    revision = WorkflowRevision(WorkflowFence(WorkflowKey("o/r", IssueRef(7)), 1), 1)
-    proof = MachineClearProjection(revision, MachineBlock(7, Target.PR, 3, 3, MachineBlocker.CHECKS, "head"), "head")
-    persisted = json.loads(encode_workflow(proof))
-    # Exact pre-deploy field shape, shared by command payloads and receipt proofs.
-    persisted["value"]["fields"]["ignored_checks"] = "^unit$"
-    decoded = decode_self_clear_projection(json.dumps(persisted))
-    assert decoded == proof
-    pr = gateway(branch={"protected": False}, pages=[page([report(conclusion="FAILURE", isRequired=False)])]).get_pr(3)
-    assert not machine_clear_evidence(pr, decoded.block)
-    assert "ignored_checks" not in encode_workflow(decoded)
-
-
 @pytest.mark.parametrize("ordered", [True, False])
 def test_empty_policy_successful_rerun_supersedes_old_failure_across_pages(ordered):
     old = report(id="old", databaseId=10, conclusion="FAILURE")

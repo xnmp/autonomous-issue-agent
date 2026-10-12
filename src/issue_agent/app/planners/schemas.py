@@ -16,16 +16,8 @@ FIX_SCHEMA: dict = {
         "status": {"type": "string", "enum": ["pr_opened", "pushed", "blocked", "failed"]},
         "summary": {"type": "string"},
         "needs": {"type": "string", "description": "if blocked, exactly what is needed"},
-        "blocker": {
-            "type": "string",
-            "enum": ["none", "clarification", "publication", "checks"],
-            "description": (
-                "Agent-written, untrusted selector of a harness-observed predicate; "
-                "never authorization to clear. none unless status is blocked"
-            ),
-        },
     },
-    "required": ["status", "ticket_key", "summary", "blocker"],
+    "required": ["status", "ticket_key", "summary"],
 }
 
 # Author leg (test/interface writer, when AUTHOR_TESTS_SPLIT is on). The author

@@ -19,7 +19,6 @@ from issue_agent.app.config import from_env, owner_identity_for_target
 from issue_agent.domain.actions import Target
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.labels import Label
-from issue_agent.domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from issue_agent.domain.workflow import ObservedIssue
 from issue_agent.domain.world import IssueView
 from tests.adapters.test_workflow_control import NOW
@@ -233,7 +232,7 @@ def _compose(deployment):
     return workflow, cfg, store, issue
 
 
-def test_composed_holds_preserve_labels_machine_budget_and_sql_infra_episode(deployment):
+def test_composed_holds_preserve_labels_and_sql_infra_episode(deployment):
     workflow, cfg, store, issue = _compose(deployment)
     labels = frozenset({Label.AI_BLOCKED, Label.AI_PARKED, Label.NEEDS_BUDGET_REVIEW})
     observed = replace(issue, issue=replace(issue.issue, labels=labels))
@@ -246,12 +245,8 @@ def test_composed_holds_preserve_labels_machine_budget_and_sql_infra_episode(dep
     assert "infrastructure failure ceiling" not in workflow.external_holds(issue)
     control = deployment[2]
     seed_infra_outcome(control, 1, cc.FixInfraOutcome.RECLAIMED, owner_id=workflow.control.writer.owner_id, reclaim=True)
-    from tests.fakes.accounted_workflow import seed_imported_machine_hold
-    seed_imported_machine_hold(control, MachineBlock(1, Target.PR, 11, 11, MachineBlocker.CHECKS, "head"))
-    from tests.fakes.accounted_workflow import seed_imported_budget_hold
-    seed_imported_budget_hold(control, BudgetBlock(1, Target.ISSUE, 1, 10, "repository", 5))
     assert set(workflow.external_holds(observed)) == {label.value for label in labels} | {
-        "infrastructure failure ceiling", "machine blocker", "budget blocker",
+        "infrastructure failure ceiling",
     }
     unrelated = replace(issue, key=resolve_snapshot(2).binding.fence.key, issue=replace(issue.issue, number=2))
     assert workflow.external_holds(unrelated) == ()

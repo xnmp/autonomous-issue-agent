@@ -21,8 +21,6 @@ from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan
 from ..domain import continuation_components as cc
-from ..domain.self_clear import MachineBlocker
-from ..domain.actions import Target
 from ..domain.contracts import (
     BudgetScope,
     Money,
@@ -36,9 +34,9 @@ from ..domain.contracts import (
     daily_budget_scope,
 )
 from ..domain.outcome import (
-    AdmissionBudgetBlock,
     AgentResult,
     ExitReason,
+    DAILY_HEADROOM_STATUS,
     MAX_BUDGET_STATUS,
     RETURN_REFUSED_STATUS,
     pre_admission_refusal,
@@ -548,18 +546,6 @@ class AccountingRuntime(AgentRuntime):
         # The daemon itself must not be registered as the reservation lease:
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
-        if (self.role == "fix" and reservation.disposition is AccountingDisposition.EXHAUSTED
-                and any(p.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY for p in continuations)):
-            try:
-                refusal = self.store.record_fix_budget_refusal(request)
-            except Exception as exc:  # noqa: BLE001 - unknown refusal authority cannot mint available money
-                return _return_refused(f"fix budget refusal authority unavailable: {exc}")
-            if refusal is None:
-                return _return_refused("fix budget or authority changed before final refusal")
-            reservation = ReservationResult(AccountingDisposition.EXHAUSTED, None,
-                Money(refusal.currency, refusal.committed_micros),
-                Money(refusal.currency, refusal.reservation_micros), Money(refusal.currency, refusal.cap_micros),
-                "final captured fix budget refusal", refusal.scope)
         if review_child is not None and reservation.disposition is AccountingDisposition.EXHAUSTED:
             try:
                 refusal = self.store.record_review_admission_refusal(request)
@@ -578,35 +564,20 @@ class AccountingRuntime(AgentRuntime):
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
                 return _return_refused(reservation.detail or reservation.disposition.value)
-            headroom = max(
-                0, reservation.cap.micros - reservation.committed.micros
-            )
+            # Time restores daily headroom, so that refusal waits label-free
+            # (DAILY_HEADROOM_STATUS); a lifetime issue cap needs a decision.
+            daily = (reservation.disposition is AccountingDisposition.EXHAUSTED
+                     and (reservation.tripped_dimension or primary.scope.dimension) in {"repository", "global"})
+            status = DAILY_HEADROOM_STATUS if daily else MAX_BUDGET_STATUS
             return AgentResult(
                 is_error=True,
-                status=MAX_BUDGET_STATUS,
-                envelope_subtype=MAX_BUDGET_STATUS,
+                status=status,
+                envelope_subtype=status,
                 summary=(
                     "paid admission blocked: "
                     f"{reservation.disposition.value} ({reservation.detail})"
                 ),
-                structured={
-                    "budget_block": {
-                        "scope": reservation.tripped_dimension or primary.scope.dimension,
-                        "committed_micros": reservation.committed.micros,
-                        "reservation_micros": reservation.requested.micros,
-                        "cap_micros": reservation.cap.micros,
-                        "old_headroom_micros": headroom,
-                        "currency": reservation.cap.currency,
-                    }
-                },
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
-                admission_budget_block=AdmissionBudgetBlock(
-                    reservation.tripped_dimension or primary.scope.dimension,
-                    reservation.requested.micros,
-                    reservation.cap.micros,
-                    reservation.committed.micros,
-                    reservation.cap.currency,
-                ),
             )
         if self.require_dispatch_claim and not self.store.bind_dispatch_claim(
             self.repository,
@@ -883,19 +854,7 @@ class AccountingRuntime(AgentRuntime):
             rebase = (cc.RebaseRepairResult(self.store.rebase_repair_admission(attempt),
                 cc.RebaseCharge.NOT_ATTEMPT if budget_exhausted(result.exit_reason) or infra_class_failure(result) else cc.RebaseCharge.ATTEMPT)
                 if repair_input.rebase is not None else None)
-            machine_block = None
-            if (result.status == "blocked" and repair_input.head
-                    and not infra_class_failure(result) and not budget_exhausted(result.exit_reason)):
-                try:
-                    blocker = MachineBlocker(result.field("blocker"))
-                except ValueError:
-                    pass
-                else:
-                    source = self.store.fix_issue_admission(run_id)
-                    machine_block = cc.RecordedMachineBlock(source.attempt.binding.fence.key.target.number,
-                        Target.PR, attempt.binding.fence.key.target.number, attempt.binding.fence.key.target.number,
-                        blocker, repair_input.head, source)
-            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci, review, rebase, machine_block), writer)
+            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci, review, rebase), writer)
         elif returned_review is not None:
             settlement = self.store.settle_review_return(request, returned_review)
         elif returned is None:

@@ -124,12 +124,6 @@ from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money, EffectStatus
-from ..domain.self_clear import (
-    BudgetBlock,
-    BudgetLimitObservation,
-    BudgetWorld,
-    budget_recovery_limits,
-)
 from ..domain.pricing import (
     BudgetPolicy,
     ModelRates,
@@ -534,10 +528,7 @@ def _effects(
     identity: str,
     config_version: str,
     base_branch: str,
-    repository_cap: Money | None = None,
-    global_cap: Money | None = None,
     fix_config: FixConfig = FixConfig(fix_bot=""),
-    issue_cap: Money | None = None,
     retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
     journal: TypedJournal | None = None,
     alert_cmd: str = "",
@@ -550,9 +541,6 @@ def _effects(
         identity=identity,
         config_version=config_version,
         fix_config=fix_config,
-        repository_cap=repository_cap,
-        global_cap=global_cap,
-        issue_cap=issue_cap,
         retry_ceiling=retry_ceiling,
         journal=journal,
         alert_cmd=alert_cmd,
@@ -1030,26 +1018,15 @@ def _spend_cfg(cfg: HarnessConfig, role: str) -> dict:
     }
 
 
-def _control_spend_gate(
-    cfg: HarnessConfig, control: SQLiteControlStore
-) -> Callable[[], str | None] | None:
-    """Fast-path daily admission over the same authority as reservation."""
-
-    caps = tuple(
-        (repository, dimension, cap)
-        for repository, dimension, cap in (
-            (cfg.repo, "repository", cfg.daily_spend_cap_usd),
-            ("*", "global", cfg.global_daily_spend_cap_usd),
-        )
-        if cap > 0
-    )
-    if not caps:
-        return None
-
-    def gate() -> str | None:
-        now = datetime.now(timezone.utc)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        for repository, dimension, cap_usd in caps:
+def _daily_spend(cfg: HarnessConfig, control: SQLiteControlStore):
+    """Today's committed spend per configured daily cap, read lazily."""
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for repository, dimension, cap_usd in (
+        (cfg.repo, "repository", cfg.daily_spend_cap_usd),
+        ("*", "global", cfg.global_daily_spend_cap_usd),
+    ):
+        if cap_usd > 0:
             scope = BudgetScope(
                 repository,
                 dimension,
@@ -1059,7 +1036,19 @@ def _control_spend_gate(
                 start + timedelta(days=1),
                 ZoneInfo("UTC"),
             )
-            snapshot = control.snapshot(scope)
+            yield dimension, cap_usd, control.snapshot(scope)
+
+
+def _control_spend_gate(
+    cfg: HarnessConfig, control: SQLiteControlStore
+) -> Callable[[], str | None] | None:
+    """Fast-path daily admission over the same authority as reservation."""
+
+    if cfg.daily_spend_cap_usd <= 0 and cfg.global_daily_spend_cap_usd <= 0:
+        return None
+
+    def gate() -> str | None:
+        for dimension, cap_usd, snapshot in _daily_spend(cfg, control):
             if snapshot.disposition.value != "available":
                 return (
                     "ACCOUNTING "
@@ -1075,6 +1064,19 @@ def _control_spend_gate(
         return None
 
     return gate
+
+
+def _daily_headroom_short(cfg: HarnessConfig, control: SQLiteControlStore) -> bool:
+    """Whether one fix leg's reservation no longer fits a daily cap.
+
+    Unavailable accounting is the tick gate's to report, not a headroom wait.
+    """
+    reservation = Money.from_major("USD", cfg.fix_budget_usd).micros
+    return any(
+        snapshot.disposition.value == "available"
+        and snapshot.committed.micros + reservation > Money.from_major("USD", cap_usd).micros
+        for _dimension, cap_usd, snapshot in _daily_spend(cfg, control)
+    )
 
 
 def _first_gate(
@@ -1831,40 +1833,6 @@ def _fix_state(
         except (ValueError, sqlite3.Error) as exc:
             ci_remediation_errors[pr.number] = str(exc)
     ci_pending_escalated = frozenset(pending_ci_escalations)
-    issue_keys = {
-        *[i.number for i in world.issues],
-        *[key for p in world.prs if (key := breaker_key(p)) > 0],
-    }
-    machine_blocks = {}
-    machine_revisions = {}
-    budget_blocks = {}
-    budget_revisions = {}
-    budget_errors = {}
-    machine_errors = {}
-    self_clear_counts = {}
-    self_clear_bindings = {}
-    ceiling_reported = set()
-    for issue in issue_keys:
-        try:
-            if workflow_control is None:
-                raise ValueError("machine hold authority is unavailable")
-            selected = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(issue)))
-            if not isinstance(selected, cc.SelectedIssueRecovery):
-                raise ValueError("machine hold authority is inactive or migration blocked")
-            self_clear_counts[issue] = selected.component.state.self_clears
-            self_clear_bindings[issue] = selected.binding
-            if selected.component.state.self_clear_ceiling_reported:
-                ceiling_reported.add(issue)
-            if selected.component.state.machine_block is not None:
-                machine_blocks[issue] = selected.component.state.machine_block
-                machine_revisions[issue] = selected.revision
-            if selected.component.state.budget_block is not None:
-                budget_blocks[issue] = selected.component.state.budget_block
-                budget_revisions[issue] = selected.revision
-        except (ValueError, sqlite3.Error) as exc:
-            machine_errors[issue] = str(exc)
-            budget_errors[issue] = str(exc)
-    self_clear_ceiling_reported = frozenset(ceiling_reported)
     return FixState(
         control_errors=errors,
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
@@ -1878,69 +1846,7 @@ def _fix_state(
         ci_pending_escalated=ci_pending_escalated,
         cleanup_sources=cleanup_sources,
         inflight=inflight,
-        machine_blocks=machine_blocks,
-        machine_revisions=machine_revisions,
-        machine_control_errors=machine_errors,
-        budget_blocks=budget_blocks,
-        budget_revisions=budget_revisions,
-        budget_control_errors=budget_errors,
-        self_clear_counts=self_clear_counts,
-        self_clear_bindings=self_clear_bindings,
-        self_clear_ceiling_reported=self_clear_ceiling_reported,
     )
-
-
-def _budget_self_clear_worlds(
-    control: SQLiteControlStore,
-    cfg: HarnessConfig,
-    world,
-    stored: dict[int, BudgetBlock],
-) -> tuple[dict[int, BudgetBlock], dict[int, BudgetWorld]]:
-    """Observe caps only for harness-authored budget-block markers.
-
-    GitHub labels are a cross-check and may select a full or half-cleared
-    transition, but they never synthesize the admission evidence (ADR 0012).
-    """
-
-    targets: dict[int, tuple[Target, int]] = {}
-    issues = {issue.number: issue for issue in world.issues}
-    prs = {pr.number: pr for pr in world.prs}
-    for issue, block in stored.items():
-        observed = (
-            issues.get(block.number)
-            if block.target is Target.ISSUE
-            else prs.get(block.number)
-        )
-        if observed is not None and (
-            observed.has(Label.AI_BLOCKED)
-            or observed.has(Label.NEEDS_BUDGET_REVIEW)
-        ):
-            targets[issue] = (block.target, block.number)
-
-    blocks = dict(stored)
-    now = datetime.now(timezone.utc)
-    worlds: dict[int, BudgetWorld] = {}
-    for issue, (target, number) in targets.items():
-        def cap(value: float) -> Money | None:
-            return Money.from_major("USD", value) if value > 0 else None
-        scopes = budget_recovery_limits(cfg.repo, issue, now,
-            cap(cfg.daily_spend_cap_usd), cap(cfg.global_daily_spend_cap_usd), cap(cfg.issue_spend_cap_usd))
-        observations: list[BudgetLimitObservation] = []
-        complete = True
-        for scope, cap in scopes:
-            snapshot = control.snapshot(scope)
-            disposition = snapshot.disposition.value
-            complete = complete and disposition == "available"
-            observations.append(BudgetLimitObservation(
-                scope.dimension,
-                disposition,
-                snapshot.committed.micros,
-                cap.micros,
-                scope.currency,
-                scope,
-            ))
-        worlds[issue] = BudgetWorld(tuple(observations), complete, cfg.config_version)
-    return blocks, worlds
 
 
 def _hold_reporter(
@@ -2546,9 +2452,6 @@ def compose_fix_daemon(
         config_version=cfg.config_version,
         fix_config=fix_cfg,
         base_branch=cfg.base_branch,
-        repository_cap=Money.from_major("USD", cfg.daily_spend_cap_usd) if cfg.daily_spend_cap_usd > 0 else None,
-        global_cap=Money.from_major("USD", cfg.global_daily_spend_cap_usd) if cfg.global_daily_spend_cap_usd > 0 else None,
-        issue_cap=Money.from_major("USD", cfg.issue_spend_cap_usd) if cfg.issue_spend_cap_usd > 0 else None,
         retry_ceiling=cfg.effect_retry_ceiling,
         journal=journal,
         alert_cmd=cfg.alert_cmd,
@@ -2589,24 +2492,11 @@ def compose_fix_daemon(
         if workflow_control.reset_ci_episode(source):
             store.clear_ci_history(action.issue)
 
-    def discard_machine(action):
-        if action.revision is None:
-            raise ValueError("machine discard lacks its selected SQL revision")
-        control.retire_machine_block(action.revision)
-
-    def discard_budget(action):
-        if action.revision is None:
-            raise ValueError("budget discard lacks its selected SQL revision")
-        control.retire_budget_block(action.revision)
-
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
         clear_issue_state=cleanup_fix_state,
         validate_cleanup=validate_cleanup_fix_state,
         reset_ci_retries=reset_ci_episode,
-        mark_self_clear_ceiling=control.mark_self_clear_ceiling,
-        discard_machine_block=discard_machine,
-        discard_budget_block=discard_budget,
         journal=journal, alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )
@@ -2782,14 +2672,7 @@ def compose_fix_daemon(
         for target, workflow in state.resolve_workflows.items():
             if target in open_targets and isinstance(workflow, WorkflowUnavailable):
                 log(f"resolve workflow {target} held: {workflow.reason}")
-        budget_blocks, budget_worlds = _budget_self_clear_worlds(
-            control, cfg, world, state.budget_blocks
-        )
-        state = replace(
-            state,
-            budget_blocks=budget_blocks,
-            budget_worlds=budget_worlds,
-        )
+        state = replace(state, daily_headroom_short=_daily_headroom_short(cfg, control))
         holds = report_holds(world, inflight)
         report_prediction_outcomes(world)
         report_ci_stalls(world, state)

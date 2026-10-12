@@ -156,32 +156,53 @@ def issue_ci_state(files, issue=5):
         return cc.select_issue_recovery(aggregate).component.state
 
 
-def test_machine_block_return_survives_sql_reopen_and_exact_result_retry(tmp_path):
-    from issue_agent.adapters.control_store import SQLiteControlStore
-    from issue_agent.adapters.store import Store
-    from issue_agent.domain.self_clear import MachineBlocker, BudgetBlock
-    from issue_agent.domain.actions import Target
-    files = Store(str(tmp_path / "state"))
-    budget = BudgetBlock(5, Target.PR, 100, 10000, "issue", 100000)
-    workflow, files, inner, _ = active_ci_workflow(AgentResult(
-        is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01), files)
-    from tests.fakes.accounted_workflow import seed_imported_budget_hold
-    seed_imported_budget_hold(files._workflow_db, budget)
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
+_LEGACY_ISSUE_FIELDS = {
+    "self_clears": 2, "self_clear_ceiling_reported": True,
+    # Shapes as persisted by deployed daemons before self-clear was deleted.
+    "machine_block": {"type": "RecordedMachineBlock", "fields": {
+        "blocked_head": "d" * 40, "blocker": {"type": "MachineBlocker", "value": "checks"},
+        "issue": 5, "number": 100, "pr": 100, "source": None, "target": {"type": "Target", "value": 2}}},
+    "budget_block": {"type": "RefusedBudgetBlock", "fields": {"scope": "repository", "cap_micros": 1}},
+}
+
+
+def _inject_retired_self_clear_fields(store):
+    import json
+
+    retired = {"IssueRecoveryState": _LEGACY_ISSUE_FIELDS, "PRRepairState": {"self_clears": 1}}
+
+    def legacy(node: object) -> object:
+        if isinstance(node, list):
+            return [legacy(value) for value in node]
+        if not isinstance(node, dict):
+            return node
+        rewritten = {key: legacy(value) for key, value in node.items()}
+        fields = rewritten.get("fields")
+        extra = retired.get(str(node.get("type")))
+        return {**rewritten, "fields": {**fields, **extra}} if extra and isinstance(fields, dict) else rewritten
+
+    injected = 0
+    with store.transaction() as db:
+        for rowid, raw in db.execute("SELECT rowid, episode_json FROM workflows").fetchall():
+            rewritten = json.dumps(legacy(json.loads(raw)), sort_keys=True, separators=(",", ":"))
+            if rewritten != raw:
+                db.execute("UPDATE workflows SET episode_json=? WHERE rowid=?", (rewritten, rowid))
+                injected += 1
+    return injected
+
+
+def test_rows_persisted_with_retired_self_clear_state_load_and_the_issue_proceeds():
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", session_id="legacy", cost_usd=.01))
+    before = issue_ci_state(files)
+    assert _inject_retired_self_clear_fields(files._workflow_db) > 0
+
+    assert issue_ci_state(files) == before
+    assert files._workflow_authority.read_pr_repair(key) is not None
     asyncio.run(workflow.fix_ci(100))
-    reopened = SQLiteControlStore(files._workflow_db.path)
-    key = WorkflowKey("o/r", IssueRef(5))
-    block = reopened.read_issue_recovery(key).component.state.machine_block
-    assert block is not None and block.blocker is MachineBlocker.CHECKS
-    assert block.blocked_head == "a" * 40 and block.pr == 100
-    assert reopened.read_issue_recovery(key).component.state.budget_block == budget
-    with reopened.transaction() as db:
-        returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
-    reopened.settle_pr_repair_result(returned, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"))
-    assert reopened.read_issue_recovery(key).component.state.machine_block == block
     assert len(inner.tasks) == 1
-    with reopened.transaction() as db:
-        assert db.execute("SELECT COUNT(*), SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
 
 
 def test_fix_infra_return_and_exact_recovery_count_one_issue_death():
@@ -357,6 +378,48 @@ def pr_reply_workflow(*, establish_session=True, body="Use A."):
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(
         Comment("alice", body, "2026-10-02T00:00:01Z"),))
     return workflow, files, inner, key
+
+
+def test_result_naming_an_old_blocker_is_an_ordinary_question_held_until_a_human_reply():
+    # The retired `blocker` field once minted a machine hold the harness released
+    # by itself when CI went green. It is now ignored: the agent asked a question,
+    # so only a qualifying human reply resumes the PR.
+    from issue_agent.app.roles import _fix_state
+    from issue_agent.domain.actions import AgentKind, Relabel, RunAgent
+    from issue_agent.domain.fix import FixConfig, decide_fix
+    from issue_agent.domain.labels import Label
+    from issue_agent.domain.world import Comment, IssueView, WorldState
+    workflow, files, inner, _ = active_ci_workflow(AgentResult(
+        is_error=False, status="blocked", needs="Which CI permissions?", structured={"blocker": "checks"},
+        session_id="selected-pr-session", cost_usd=.01))
+    workflow.gateway.issues[5] = IssueView(5, title="Choose an option")
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
+    asyncio.run(workflow.fix_ci(100))
+    seed_retained_issue_file(files, 5, "session", "selected-pr-session")
+    assert ("relabel", "pr", 100, None, Label.AI_BLOCKED.value) in [
+        call[:5] for call in workflow.gateway.calls if call[0] == "relabel"]
+    question = next(call[3] for call in workflow.gateway.calls if call[:3] == ("comment", "pr", 100))
+    green = observed_pr(100, head_ref_name="fix/5-remote", head_ref_oid="a" * 40, closing_issue=5,
+        author="fix-bot", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
+        checks=(Check("tests", bucket="pass"),),
+        comments=(Comment("fix-bot", question, "2026-10-02T00:00:00Z"),))
+    cfg = FixConfig(fix_bot="fix-bot")
+
+    def decide(pr, now):
+        world = WorldState(prs=(pr,), now=now)
+        state = _fix_state(files, world, workflow_control=files._workflow_authority,
+            available_runtimes=frozenset({"claude"}))
+        return decide_fix(world, cfg, state, fixer_busy=False)
+
+    for tick in range(3):
+        actions = decide(green, f"2026-10-02T0{tick + 1}:00:00Z")
+        assert not any(isinstance(action, RunAgent) for action in actions)
+        assert not any(isinstance(action, Relabel) and action.number == 100
+                       and action.remove == Label.AI_BLOCKED for action in actions)
+
+    replied = replace(green, comments=green.comments + (
+        Comment("alice", "Grant the workflow write permission.", "2026-10-02T05:00:00Z"),))
+    assert RunAgent(AgentKind.PR_RESUME, 100) in decide(replied, "2026-10-02T06:00:00Z")
 
 
 def test_duplicate_pr_reply_purchases_one_resume_and_keeps_issue_marker_independent():
@@ -767,7 +830,7 @@ def test_rebase_charges_sql_allowance_and_exact_retry_preserves_sibling_debt():
     with files._workflow_db.transaction() as db:
         aggregate = load_issue_aggregate(db, issue_key)
         siblings = replace(aggregate.issue_recovery.state, ci_failures=2,
-            review_failures=cc.ReviewRetryState(count=3), resumes=4, infra_failures=5, self_clears=6)
+            review_failures=cc.ReviewRetryState(count=3), resumes=4, infra_failures=5)
         persist_workflow_snapshot(db, replace(aggregate, issue_recovery=replace(aggregate.issue_recovery, state=siblings)))
     asyncio.run(workflow.rebase(100))
     assert len(inner.tasks) == 1
@@ -1265,7 +1328,7 @@ def test_ci_green_reset_is_exact_and_preserves_sibling_allowances():
     with files._workflow_db.transaction() as db:
         current = load_issue_aggregate(db, issue_key)
         siblings = replace(current.issue_recovery.state, resumes=2, review_failures=cc.ReviewRetryState(count=3), rebase_failures=4,
-                           infra_failures=5, self_clears=6)
+                           infra_failures=5)
         persist_workflow_snapshot(db, replace(current, issue_recovery=replace(current.issue_recovery, state=siblings)))
     asyncio.run(workflow.fix_ci(100))
     control = files._workflow_authority
@@ -2085,64 +2148,6 @@ def test_actual_normal_return_resets_episode_and_settles_unreadable_spend_as_est
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 1
 
 
-def test_machine_retirement_is_selected_and_preserves_budget_hold(tmp_path):
-    import pytest
-    from issue_agent.adapters.store import Store
-    from issue_agent.domain.self_clear import BudgetBlock
-    from issue_agent.domain.actions import Target
-    files = Store(str(tmp_path / "state"))
-    budget = BudgetBlock(5, Target.PR, 100, 10000, "issue", 100000)
-    workflow, files, _, _ = active_ci_workflow(AgentResult(
-        is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01), files)
-    from tests.fakes.accounted_workflow import seed_imported_budget_hold
-    seed_imported_budget_hold(files._workflow_db, budget)
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
-    asyncio.run(workflow.fix_ci(100))
-    control = files._workflow_db
-    key = WorkflowKey("o/r", IssueRef(5))
-    selected = control.read_issue_recovery(key)
-    with pytest.raises(ValueError, match="cause/head"):
-        control.retire_machine_block(selected.revision, blocker="publication", blocked_head="a" * 40)
-    assert control.read_issue_recovery(key) == selected
-    control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
-    assert control.read_issue_recovery(key).component.state.machine_block is None
-    assert control.read_issue_recovery(key).component.state.budget_block == budget
-    with pytest.raises(ValueError, match="stale"):
-        control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
-    assert control.read_issue_recovery(key).component.state.self_clears == 0
-
-
-def test_stale_pr_machine_return_settles_without_installing_old_head(monkeypatch):
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-    from issue_agent.domain.workflow_identity import WorkflowRevision
-    workflow, files, inner, key = active_ci_workflow(AgentResult(
-        is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01))
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="old-head")
-    control = files._workflow_db
-    settle = control.settle_pr_repair
-    monkeypatch.setattr(control, "settle_pr_repair", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")))
-    with pytest.raises(RuntimeError, match="interrupted"):
-        asyncio.run(workflow.fix_ci(100))
-    with control.transaction() as db:
-        current = load_review_workflow_row(db, key)
-        persist_workflow_snapshot(db, replace(current, revision=WorkflowRevision(
-            replace(current.revision.fence, generation=1), current.revision.version + 1)))
-    monkeypatch.setattr(control, "settle_pr_repair", settle)
-    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
-    issue_key = WorkflowKey("o/r", IssueRef(5))
-    assert control.read_issue_recovery(issue_key).component.state.machine_block is None
-    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="new-head")
-    inner.result = replace(inner.result, structured={"blocker": "publication"})
-    asyncio.run(workflow.fix_ci(100))
-    newer = control.read_issue_recovery(issue_key)
-    assert newer.component.state.machine_block.blocked_head == "new-head"
-    assert newer.component.state.machine_block.blocker.value == "publication"
-    assert files._workflow_authority.reconcile_pr_repair_returns() == 0
-    assert control.read_issue_recovery(issue_key) == newer
-    with control.transaction() as db:
-        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
-
-
 @pytest.mark.parametrize("changed_head", [None, "", "another-head"])
 def test_actual_ci_purchase_cannot_bypass_owed_remediation_with_paired_head(monkeypatch, changed_head):
     from issue_agent.adapters.effects import GitHubEffectExecutor
@@ -2176,7 +2181,7 @@ def test_actual_ci_purchase_cannot_bypass_owed_remediation_with_paired_head(monk
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
-def test_actual_final_budget_refusal_persists_sql_hold_without_paid_debit(monkeypatch, tmp_path):
+def test_lifetime_issue_cap_refusal_escalates_for_a_cap_decision_without_paid_debit(monkeypatch, tmp_path):
     from issue_agent.adapters.store import Store
     from issue_agent.adapters.control_store import SQLiteControlStore
     from issue_agent.domain.contracts import Money
@@ -2191,12 +2196,11 @@ def test_actual_final_budget_refusal_persists_sql_hold_without_paid_debit(monkey
     asyncio.run(workflow.fix_ci(100))
     reopened = SQLiteControlStore(files._workflow_db.path)
     state = reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state
-    block = getattr(state, "budget_block", None)
-    assert block is not None
-    assert block.scope == "issue:5" and block.cap_micros == 0 and block.reservation_micros > 0
     assert state.ci_failures == before.component.state.ci_failures
     assert state.consumed_reply_at == before.component.state.consumed_reply_at
     assert inner.tasks == []
+    labels = {add for call in workflow.gateway.calls if call[:3] == ("relabel", "pr", 100) for add in call[4:] if add}
+    assert {"ai-blocked", "needs-budget-review"} <= labels
     with reopened.transaction() as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
@@ -2213,7 +2217,7 @@ def test_dashboard_recovery_projection_reads_same_selected_debt_as_admission():
     assert view["ci_failures"] == issue.component.state.ci_failures == 1
     assert view["version"] == issue.revision.version
     pr = recovery_control(files._workflow_authority.read_pr_repair(key)).model_dump()
-    assert pr["family"] == "pr_repair" and "ci_failures" not in pr and "self_clears" not in pr
+    assert pr["family"] == "pr_repair" and "ci_failures" not in pr
     assert pr["pending_effects"] == []
     inactive = recovery_control(cc.InactivePRRepair()).model_dump()
     assert inactive["status"] == "inactive" and "ci_failures" not in inactive
