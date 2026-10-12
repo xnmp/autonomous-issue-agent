@@ -245,3 +245,14 @@ def test_composed_holds_are_labels_and_machine_deaths_never_hold(deployment):
     seed_infra_outcome(control, 1, owner_id=workflow.control.writer.owner_id, reclaim=True)
     assert workflow.external_holds(issue) == ()
     assert set(workflow.external_holds(observed)) == {label.value for label in labels}
+
+
+@pytest.mark.parametrize("reader", ["read_issue_recovery", "fix_leg_ends"])
+def test_unavailable_hold_reader_is_not_treated_as_clear(deployment, monkeypatch, reader):
+    """The re-arm refuses on the same unreadable authority the fixer holds on."""
+    workflow, cfg, store, issue = _compose(deployment)
+    def unavailable(*args, **kwargs):
+        raise ValueError("hold authority unavailable")
+    monkeypatch.setattr(SQLiteControlStore, reader, unavailable)
+    with pytest.raises(ValueError, match="hold authority unavailable"):
+        workflow.external_holds(issue)
