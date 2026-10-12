@@ -44,8 +44,25 @@ def current_workflow(store, key):
         return workflow_rows.load_review_workflow_row(db, key)
 
 
+def _failed_round(rig):
+    """One settled no-progress round, so a later verdict has allowance to reset."""
+    store, snapshot, gateway, selection, control = rig
+    plan = control.preflight(replace(selection, request_id="preflight:failed"))
+    planned = stage(plan)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, planned)
+    proposed = admission_request(planned.children[0], index=9)
+    assert store.reserve(proposed).admitted
+    register(store, proposed)
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+    store.settle_review_return(settlement(proposed, amount=6), returned(
+        store, proposed, result=AgentResult(True, status="error", exit_reason=ExitReason.AGENT_ERROR)))
+    control.finalize_completed_round(plan.round.round_id)
+    return store, snapshot, gateway, replace(selection, expected=current(store, selection).revision), control
+
+
 @pytest.fixture(params=("copied", "paid"))
 def current_verdict(rig, monkeypatch, request):
+    rig = _failed_round(rig)
     if request.param == "copied":
         store, gateway, selection, control, plan, command = confirmed_copy(rig)
     else:
@@ -72,7 +89,7 @@ def current_verdict(rig, monkeypatch, request):
 
 def test_current_verdict_records_baseline_resets_allowance_and_retries_once(current_verdict):
     store, key, control, workflow, plan, command, before = current_verdict
-    assert before.execution.state.failures == 3 and before.execution.state.pin_deferrals == 2
+    assert before.execution.state.failures == 1
     result = workflow.record_review(command.command_id)
     assert isinstance(result, WorkflowCommitted)
     with store.transaction() as db:
@@ -81,9 +98,8 @@ def test_current_verdict_records_baseline_resets_allowance_and_retries_once(curr
         assert after.execution.state.failures == 0 and after.execution.state.pin_deferrals == 0
         assert after.execution.state.productive_sequence == plan.round.sequence
         assert after.execution.baseline.through_sequence == plan.round.sequence
-        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == int(bool(plan.children))
-        if plan.children:
-            assert db.execute("SELECT SUM(amount_micros) FROM charges").fetchone()[0] == 12
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1 + int(bool(plan.children))
+        assert db.execute("SELECT SUM(amount_micros) FROM charges").fetchone()[0] == 6 + 12 * bool(plan.children)
     assert isinstance(control.finalize_completed_round(plan.round.round_id).outcome.disposition,
                       PaidReviewProgress if plan.children else CopiedReviewProgress)
     assert workflow.record_review(command.command_id).idempotent
@@ -151,7 +167,7 @@ def test_current_unsupported_renewed_origin_remains_held_with_its_records_intact
         with pytest.raises(workflow_rows.WorkflowAuthorityError, match="origin"):
             load_review_workflow_row(db, key)
         assert db.total_changes == count_before
-        assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 2
 
 
 @pytest.mark.parametrize("source", ["submission_marker", "effect", "outcome"])
@@ -229,6 +245,8 @@ def test_current_unpaid_abandonment_closes_without_spend_or_allowance_changes(ri
 def test_caught_inner_productive_failure_cannot_commit_the_rejection_half(current_verdict, stage):
     store, key, _, workflow, plan, command, before = current_verdict
     with store.transaction() as db:
+        prior_keys = db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace IN "
+            "('review-recorded-submission','review-round-outcome','workflow-transition')").fetchone()[0]
         proposed = record_review(before, load_bound_review_submission(db, command.command_id))
         assert isinstance(proposed, WorkflowChanged)
         table, operation, condition = {
@@ -245,7 +263,7 @@ def test_caught_inner_productive_failure_cannot_commit_the_rejection_half(curren
         assert db.execute("SELECT closure_json,outcome_json FROM review_execution_rounds WHERE round_id=?",
                           (plan.round.round_id,)).fetchone()[:] == (None, None)
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace IN "
-                          "('review-recorded-submission','review-round-outcome','workflow-transition')").fetchone()[0] == 0
+                          "('review-recorded-submission','review-round-outcome','workflow-transition')").fetchone()[0] == prior_keys
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                    ("test-outer", "o/r", "after", store.now().isoformat(), "{}"))
     with store.transaction() as db:
@@ -374,46 +392,3 @@ def test_current_late_paid_return_after_four_generations_preserves_one_charge_an
     assert store.settle_review_return(payment, delayed).idempotent
     assert control.finalize_completed_round(old.round.round_id) == result
     assert store.snapshot(proposed.scope).committed.micros == 12
-
-
-@pytest.mark.parametrize("missing_marker", [False, True])
-@pytest.mark.parametrize("marker_revision", ["precondition", "joint", "future"])
-def test_stopped_conversion_requires_legacy_live_productivity_joint_marker(current_verdict, missing_marker, marker_revision):
-    from issue_agent.adapters.workflow_rows import convert_legacy_review_execution, read_review_outcome_receipt
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.domain.review_execution import ActivatedReviewExecution
-    from issue_agent.domain.review_rounds import CurrentReviewOutcomeReceipt
-
-    store, key, _, workflow, plan, command, before = current_verdict
-    assert isinstance(workflow.record_review(command.command_id), WorkflowCommitted)
-    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    with store.transaction() as db:
-        after = load_review_workflow_row(db, key)
-        receipt = read_review_outcome_receipt(db, key.repository, plan.round.round_id)
-        assert isinstance(receipt, CurrentReviewOutcomeReceipt)
-        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-outcome' AND scope=? AND key=?",
-                   (encode_workflow((receipt.facts, receipt.outcome)), key.repository, plan.round.round_id))
-        if marker_revision != "precondition":
-            marker = after.revision if marker_revision == "joint" else replace(after.revision, version=after.revision.version + 1)
-            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-recorded-submission' AND key=?",
-                       (encode_workflow(marker), str(command.command_id)))
-        held = replace(after, execution=ActivatedReviewExecution(
-            before.execution.origin, before.execution.baseline, after.execution.state, after.execution.last_sequence,
-        ))
-        persist_workflow_snapshot(db, held)
-        if missing_marker:
-            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-recorded-submission' AND key=?",
-                       (str(command.command_id),))
-            retained = tuple(db.iterdump())
-            with pytest.raises(WorkflowAuthorityError, match="joint settlement"):
-                convert_legacy_review_execution(db, key)
-            assert tuple(db.iterdump()) == retained
-        elif marker_revision == "future":
-            retained = tuple(db.iterdump())
-            with pytest.raises(WorkflowAuthorityError, match="concurrency precondition"):
-                convert_legacy_review_execution(db, key)
-            assert tuple(db.iterdump()) == retained
-        else:
-            converted = convert_legacy_review_execution(db, key)
-            assert converted.execution.state == after.execution.state
-            assert load_review_workflow_row(db, key) == converted

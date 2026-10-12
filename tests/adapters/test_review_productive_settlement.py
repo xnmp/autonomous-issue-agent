@@ -196,55 +196,6 @@ def test_current_registered_review_facts_keeps_refused_copy_with_later_paid_stag
     assert result.plan.round == plan.round
 
 
-def test_import_blocks_forged_copy_of_paid_stage_without_reconstructing_productivity(rig):
-    store, _, gateway, selection, control = rig
-    plan = control.preflight(selection)
-    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
-    command = command_for(current(store, selection), patch_id="0" * 64)
-    control.register_submission(plan.round.round_id, current(store, selection).revision,
-                                command, ReviewSubmissionKind.PAID)
-    with store.transaction() as db:
-        row = db.execute("SELECT plan_json FROM review_execution_rounds WHERE repository='o/r'").fetchone()
-        persisted = decode_workflow(row["plan_json"], ReviewRoundPlan)
-        copied = replace(persisted.submissions[0], kind=ReviewSubmissionKind.COPIED)
-        db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE repository='o/r'",
-                   (encode_workflow(replace(persisted, submissions=(copied,))),))
-        row = db.execute("SELECT payload_json FROM dedupe_keys "
-                         "WHERE namespace='review-round-submission' AND scope='o/r'").fetchone()
-        registration = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
-        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace LIKE 'review-round-submission%' "
-                   "AND scope='o/r'", (encode_workflow(replace(registration, submission=copied)),))
-
-    from issue_agent.adapters.review_execution_activation import read_complete_legacy_review_rounds
-    from issue_agent.domain.review_execution_history_import import classify_review_import_history, ReviewImportHistoryBlocked
-    from tests.domain.test_review_execution_history_import import _sources
-    mapping, deaths, commands, _ = _sources(prs=(9,))
-    with store.transaction() as db:
-        raw_rounds = read_complete_legacy_review_rounds(db, "o/r")
-    blocked, = classify_review_import_history(mapping, deaths, commands, raw_rounds)
-    assert blocked.pr == 9 and isinstance(blocked, ReviewImportHistoryBlocked)
-    assert any(source.identity == plan.round.round_id for blocker in blocked.blockers for source in blocker.sources)
-
-
-@pytest.mark.parametrize("oversized", ["command", "effect"])
-def test_import_raw_source_blocks_changed_oversized_command_or_effect(rig, oversized):
-    from issue_agent.adapters.review_execution_activation import read_complete_legacy_review_submissions
-    from issue_agent.domain.review_execution_activation import BlockedLegacyReviewSubmissions
-    store, _, _, _, _, command = confirmed_copy(rig)
-    with store.transaction() as db:
-        if oversized == "command":
-            db.execute("UPDATE lifecycle_commands SET payload_json=? WHERE command_id=?",
-                       ("x" * 65537, str(command.command_id)))
-        else:
-            db.execute("UPDATE effect_receipts SET error=? WHERE command_id=?",
-                       ("x" * 65537, str(command.command_id)))
-        before = db.total_changes
-        result = read_complete_legacy_review_submissions(db, "o/r")
-        assert db.total_changes == before
-    assert isinstance(result, BlockedLegacyReviewSubmissions)
-    assert "bound" in result.reason
-
-
 @pytest.mark.parametrize("altered", ["command_id", "digest", "idempotency", "config", "owner"])
 def test_current_registered_review_facts_requires_exact_command_registration(rig, altered):
     store, gateway, _, _, _, command = confirmed_copy(rig)
@@ -942,6 +893,9 @@ def test_refused_ceiling_replays_the_refusal_after_marker_failure(rig):
 
 def test_refused_ceiling_reload_requires_its_exact_observation(rig):
     store, gateway, selection, _, plan, command = confirmed_escalation(rig, cause="ceiling")
+    # A later read than the first observation, whose evidence the execution origin owns.
+    later = store.now() + timedelta(seconds=1)
+    store._now = lambda: later
     assert isinstance(workflow_for(store, gateway).settle_submission(command.command_id), WorkflowRejected)
     with store.transaction() as db:
         row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-ceiling-productivity' "

@@ -19,10 +19,6 @@ from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain.review_evidence import EvidenceSchedule
 from ..domain import review_execution as rx
-from ..domain import review_execution_migration as migration
-from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport
-from ..domain.review_execution_history_import import ReviewImportNoHistoryObserved
-from ..domain.review_execution_counter_mapping import LegacyOpenPRCounterLink
 from ..domain import review_rounds as rr
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
@@ -31,7 +27,6 @@ from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
 from ..domain.contracts import BudgetScope, WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, ChargeOrigin, SettlementRequest
 from ..domain import continuation_components as cc
-from ..domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
 from ..domain.labels import Label
 from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
 from ..domain.world import Comment, IssueView
@@ -54,22 +49,16 @@ _VALUES = (
     cc.IssueRebasePurchase, cc.RebaseRepairResult,
     cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
     IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.PRRepairUnreturned, cc.RepairHandoff,
-    ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState, cc.PRBlankReplySource,
-    cc.CIRemediationCapture, cc.OwedCIRemediation, cc.SettledCIRemediation, cc.ImportedCIRemediation,
+    cc.CIRemediationCapture, cc.OwedCIRemediation, cc.SettledCIRemediation,
     cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.PublicationIdentityEscalationCapture, cc.OwedPRRecoveryEffect,
-    cc.SettledPRRecoveryEffect, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation,
+    cc.SettledPRRecoveryEffect,
     cc.FixInfraReceipt, cc.IssueInfraPurchase,
-    cc.ContinuationImportBlocker,
     cc.InactiveIssueRecovery, cc.InactivePRRepair,
-    cc.BlockedIssueRecovery, cc.BlockedPRRepair,
     cc.ActiveIssueRecovery, cc.ActivePRRepair,
     w.IssueWorkflowShell, w.IssueFamilyEpisodes,
     cc.ContinuationCapture, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase,
-    EligibleZeroHistoryReviewImport, ReviewImportNoHistoryObserved, LegacyOpenPRCounterLink,
-    migration.ReviewImportSource, migration.ReviewImportBlocker, migration.ReviewImportHistoryBlocked,
-    migration.BlockedReviewExecutionMigration,
     RearmObservation,
     workspace.ResolveWorkspaceObserved, w.ResolveRearmAcceptance,
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
@@ -97,7 +86,7 @@ _VALUES = (
     w.AuthorizedOperatorCommand, w.ObservedTransition, w.WorkflowRejected,
     # Review-rejection family (ADR 0015 review slice).
     rw.CountedReview, rw.CountingRule, rw.ReviewRejectionCeiling, rw.ReviewRearmPreflight,
-    rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ImportedBaseline, rw.ReviewedBaseline,
+    rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ReviewedBaseline,
     rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection, rw.ReviewProjectionPlan,
     rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
     rw.ReviewRejectionGrant, rw.ReviewExecutionRenewalGrant, rw.ReviewVerdictReleaseGrant,
@@ -114,7 +103,7 @@ _VALUES = (
     rx.ReviewChildAdmission, rx.ReviewUnlaunchedRelease, rx.ReviewChildAdmissionRefusal, rx.ReviewChildLaunchRegistration,
     review_return.ReviewReturnedEnvelope, review_return.ReturnedReviewChild,
     review_return.ReviewRuntimePreflightStop,
-    rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.RenewedReviewSessionSource, rx.NoReviewSession,
+    rx.LaunchedReviewChild, rx.RenewedReviewSessionSource, rx.NoReviewSession,
     rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
     rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,
     rx.PaidReviewProgress, rx.CopiedReviewProgress, rx.AddReviewStrike,
@@ -125,9 +114,8 @@ _VALUES = (
     rx.ReviewExecutionState, rx.ReviewExecutionBoundaryCursor,
     rx.ReviewExecutionCheckpoint, rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
     rx.ReviewExecutionTransitionProofSource,
-    rx.ReviewExecutionOrigin, rx.ImportedReviewExecutionOriginReceipt,
+    rx.ReviewExecutionOrigin,
     rx.InitializedReviewExecutionOriginReceipt, rx.RenewedReviewExecutionOriginReceipt,
-    rx.ImportedReviewExecutionDecision,
     rx.ExecutionNotActivated, rx.ActivatedReviewExecution, rx.CurrentReviewExecution,
     rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
     rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
@@ -152,7 +140,6 @@ _ENUMS = (
     UsageSource, PricingBasis, ChargeOrigin,
     LifecycleOperation,
     cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.FixInfraOutcome,
-    migration.ReviewImportBlockerKind,
     ExitReason,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
     w.RetryDisposition, w.RemediationOperation,

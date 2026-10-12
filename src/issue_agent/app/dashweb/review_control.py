@@ -21,9 +21,9 @@ from ...domain.review_rearm import (
     UnreadableHoldRestoration,
 )
 from ...domain.review_rejection import MAX_COUNTED_REVIEWS, ReviewProjectionRefused, ReviewRejectionCeiling
-from ...domain.review_execution import CurrentReviewExecution, BlockedReviewExecutionMigration
+from ...domain.review_execution import CurrentReviewExecution
 from ...domain.review_workflow import (
-    BoundReviewSubmission, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm,
+    CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm,
     ReviewRearmIntent, SupersededReviewRearm,
 )
 from ...domain.review_workflow_policy import (
@@ -227,10 +227,8 @@ def _continuation(view: ReviewControlView) -> wire.ReviewContinuation:
     return wire.ReviewReviewedBaseline(
         kind="reviewed_baseline", head_sha=continuation.head_sha, patch_id=continuation.patch_id,
         reviewed_generation=continuation.reviewed_generation,
-        source=(wire.ReviewBoundSubmission(kind="bound_submission", command_id=source.command_id,
-                                           generation=source.binding.fence.generation)
-                if isinstance(source, BoundReviewSubmission) else
-                wire.ReviewImportedBaseline(kind="imported", evidence_id=source.evidence_id)),
+        source=wire.ReviewBoundSubmission(kind="bound_submission", command_id=source.command_id,
+                                          generation=source.binding.fence.generation),
     )
 
 
@@ -241,11 +239,6 @@ def unavailable_review_control(error: BaseException) -> wire.ReviewUnavailableCo
 
 def _execution(view: ReviewControlView) -> wire.ReviewExecution:
     execution = view.snapshot.execution
-    if isinstance(execution, BlockedReviewExecutionMigration):
-        return wire.ReviewExecutionBlocked(kind="blocked", execution_epoch=execution.authority.epoch,
-            blockers=[wire.ReviewMigrationBlocker(kind=blocker.kind.value,
-                sources=[wire.ReviewMigrationSource(kind=source.kind, identity=source.identity, digest=source.digest)
-                         for source in blocker.sources]) for blocker in execution.history.blockers])
     if not isinstance(execution, CurrentReviewExecution):
         return wire.ReviewExecutionInactive()
     choices = [wire.ReviewGate(gate_id=gate.gate_id, state="open", opened_generation=gate.opened_generation,

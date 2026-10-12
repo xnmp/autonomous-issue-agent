@@ -3,8 +3,8 @@
 Status: Accepted; selected runtime continuity superseded by
 [ADR 0015](0015-generation-fenced-gate-rearm.md) and
 [ADR 0016](0016-phase-4-current-state-authority.md). Phase 4 whole-system
-acceptance is complete under A2; retained files are stopped-import evidence
-except for the explicitly preserved Jira counter path described below.
+acceptance is complete under A2; retained files are inert except for the
+explicitly preserved Jira counter path described below.
 Date: 2026-08-01
 Governs: src/issue_agent/adapters/store.py src/issue_agent/app/workflows/fix.py src/issue_agent/app/workflows/review.py src/issue_agent/adapters/worktree.py
 
@@ -29,9 +29,8 @@ Continuation authority is deliberately split by fact type:
 - `Store` supplies bounded CI prompt history, predicted paths, stall telemetry
   and Jira mirror context. Jira alone retains its existing raw infrastructure
   counter and abandoned-run gate by explicit user decision; new SQL
-  TRIAGE/GROOM lane deaths do not update that counter. Stopped import readers
-  may inspect retained control files once; ordinary selected runtime reads
-  cannot use them to grant or refuse continuation.
+  TRIAGE/GROOM lane deaths do not update that counter. Selected runtime reads
+  cannot use retained control files to grant or refuse continuation.
 - Git worktrees and commits own implementation content; `.harness/` files are
   claims and never lifecycle or authorization receipts.
 - SQLite remains the authority for paid admission, run ownership, commands,

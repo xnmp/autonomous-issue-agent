@@ -28,7 +28,7 @@ from .workflow import (
     _command_ids, _count, _items, _text, _time,
 )
 from .review_evidence import is_review_evidence_gate
-from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, BlockedReviewExecutionMigration, ReviewExecutionComponent, renew_current_review_execution
+from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, ReviewExecutionComponent, renew_current_review_execution
 from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
@@ -38,7 +38,7 @@ __all__ = [
     "ReviewRejectionGrant", "ReviewExecutionRenewalGrant", "ReviewVerdictReleaseGrant", "ReviewRearmGrant",
     "ReviewExecutionCeiling", "ReviewVerdictHold",
     "MAX_COUNTED_REVIEWS", "MAX_OBSERVED_REVIEWS", "CountedReview", "CountingRule", "ReviewRearmPreflight", "ReviewRejectionCeiling",
-    "FreshReviewRequired", "BoundReviewSubmission", "ImportedBaseline", "ReviewedBaseline", "ReviewContinuation",
+    "FreshReviewRequired", "BoundReviewSubmission", "ReviewedBaseline", "ReviewContinuation",
     "ReviewEpisode", "DismissCountedReview", "RequireFreshReview", "EnsureReviewProjection", "ReviewRearmOperation",
     "ReviewProjectionPlan",
     "PendingReviewRearm", "CompletedReviewRearm", "SupersededReviewRearm", "CancelledReviewRearm",
@@ -100,31 +100,19 @@ class BoundReviewSubmission:
 
 
 @dataclass(frozen=True)
-class ImportedBaseline:
-    """A legacy reviewed-head/patch file recorded as activation import evidence."""
-    evidence_id: str
-
-    def __post_init__(self) -> None:
-        _text(self.evidence_id, "imported baseline evidence")
-
-
-BaselineSource = BoundReviewSubmission | ImportedBaseline
-
-
-@dataclass(frozen=True)
 class ReviewedBaseline:
     head_sha: str
     patch_id: str
     reviewed_generation: int
-    source: BaselineSource
+    source: BoundReviewSubmission
 
     def __post_init__(self) -> None:
         validate_commit_sha(self.head_sha, "reviewed head")
         _patch_id(self.patch_id)
         _count(self.reviewed_generation, "reviewed generation")
-        if not isinstance(self.source, (BoundReviewSubmission, ImportedBaseline)):
+        if not isinstance(self.source, BoundReviewSubmission):
             raise ValueError("reviewed baseline requires typed provenance")
-        if isinstance(self.source, BoundReviewSubmission) and self.source.binding.fence.generation != self.reviewed_generation:
+        if self.source.binding.fence.generation != self.reviewed_generation:
             raise ValueError("a bound review cannot establish another generation's baseline")
 
 
@@ -423,14 +411,12 @@ class ReviewWorkflowSnapshot:
         if self.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
             raise ValueError("this snapshot supports only review rejections")
         validate_component_revision(self.pr_repair, self.revision, WorkflowFamily.PR_REPAIR)
-        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution, BlockedReviewExecutionMigration)):
+        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution)):
             raise ValueError("review snapshot requires a typed execution component")
         if isinstance(self.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
             binding = self.execution.binding.rejection
             if binding != WorkflowBinding(self.revision.fence, self.authority, self.episode.episode_id):
                 raise ValueError("execution component disagrees with the review workflow binding")
-        if isinstance(self.execution, BlockedReviewExecutionMigration) and self.execution.key != self.revision.fence.key:
-            raise ValueError("blocked migration belongs to another review target")
         if not isinstance(self.revision.fence.key.target, PullRequestRef):
             raise ValueError("review rejection workflow requires a pull request")
         generation = self.revision.fence.generation
@@ -540,7 +526,7 @@ class ReviewFamilyEpisodes:
             raise ValueError("review family envelope requires rejection authority")
         if not isinstance(self.episode, ReviewEpisode):
             raise ValueError("review family envelope requires its rejection episode")
-        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution, BlockedReviewExecutionMigration)):
+        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution)):
             raise ValueError("review family envelope requires a typed execution component")
         if isinstance(self.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
             parent = self.execution.binding.rejection

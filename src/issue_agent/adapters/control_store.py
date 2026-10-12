@@ -56,7 +56,7 @@ from ..domain.workflow import (
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.agent_task import RuntimeName
-from ..domain.review_execution import BlockedReviewExecutionMigration, CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
+from ..domain.review_execution import CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
 from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan, classify_normal_review_return
@@ -3201,12 +3201,6 @@ class SQLiteControlStore:
                 raise ControlStoreError("continuation lease conflicts with its actual run identity")
             self._assert_owner_active(db, lease.owner_id)
             self._require_continuation_launch(db, lease.run_id)
-            if run["workflow_binding_json"] is not None:
-                captured = decode_workflow(run["workflow_binding_json"], WorkflowBinding)
-                if captured.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-                    snapshot = load_review_workflow_row(db, captured.fence.key)
-                    if snapshot is not None and isinstance(snapshot.execution, BlockedReviewExecutionMigration):
-                        raise ControlStoreError("review execution migration is blocked")
             db.execute(
                 "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, "
                 "process_start_ticks, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3394,12 +3388,6 @@ class SQLiteControlStore:
                     f"reserved run owner changed from {expected_owner_id!r} "
                     f"to {run['owner_id']!r} before process registration"
                 )
-            if run["workflow_binding_json"] is not None:
-                captured = decode_workflow(run["workflow_binding_json"], WorkflowBinding)
-                if captured.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-                    snapshot = load_review_workflow_row(db, captured.fence.key)
-                    if snapshot is not None and isinstance(snapshot.execution, BlockedReviewExecutionMigration):
-                        raise ControlStoreError("review execution migration is blocked")
             review_admission = None
             if review_attached:
                 if not review_child_identity_proven:
@@ -4006,33 +3994,6 @@ class SQLiteControlStore:
             )
             if updated.rowcount != 1:
                 raise KeyError(str(run_id))
-
-    def abandoned_dispatch_counts(self, owner_id: str) -> dict[int, int]:
-        """Return durable crash counts keyed by the domain breaker target.
-
-        New admissions encode their target in ``dispatch_id``. Historical
-        opaque ids are ignored: JSONL remains telemetry and is never a fallback
-        control database.
-        """
-
-        if not owner_id:
-            raise ValueError("run owner identity is required")
-        with closing(self._connect()) as db, db:
-            owners = self._recovery_owners(db, owner_id)
-            rows = db.execute(
-                "SELECT dispatch_id FROM runs "
-                f"WHERE owner_id IN ({','.join('?' for _ in owners)}) AND state='abandoned' ORDER BY completed_at",
-                owners,
-            ).fetchall()
-        counts: dict[int, int] = {}
-        for row in rows:
-            try:
-                payload = json.loads(row["dispatch_id"])
-                target = int(payload["breaker_key"])
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                continue
-            counts[target] = counts.get(target, 0) + 1
-        return counts
 
     def claim(
         self,
@@ -5348,8 +5309,7 @@ class SQLiteControlStore:
                 sealed_at is None or sealed_at.version > snapshot.revision.version):
             raise WorkflowAuthorityError("review child planning lacks an applicable completed seal")
         try:
-            from .continuation_activation import retain_deferred_pr_repair
-            require_review_execution_eligibility(retain_deferred_pr_repair(db, snapshot), plan.head_sha, plan.failure_ceiling)
+            require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
         from .review_execution_control import SQLiteReviewExecutionControl
@@ -5983,20 +5943,11 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("selected repair continuity lost its exact applied output receipt")
 
     def _require_ci_remediation_projection(self, db, selected: cc.SelectedPRRepair) -> None:
-        from ..domain.continuation_import import ContinuationImportTarget
         key = selected.binding.fence.key
         for field, kind in (("ci_rerun", CommandKind.RERUN_CHECKS), ("ci_cancel", CommandKind.CANCEL_CHECKS),
                             ("branch_refresh", CommandKind.UPDATE_BRANCH), ("pending_ci_escalation", CommandKind.RELABEL)):
             remedy = getattr(selected.component.state, field)
             if remedy is None:
-                continue
-            if isinstance(remedy, (cc.ImportedCIRemediation, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation)):
-                row = db.execute("SELECT decision_json FROM workflow_activation_imports WHERE repository=? AND family=? "
-                    "AND epoch=? AND target_kind=? AND target_number=?", (key.repository, WorkflowFamily.PR_REPAIR.value,
-                    selected.binding.authority.epoch, *workflow_scope(key)[1:])).fetchone()
-                imported = decode_workflow(row[0], ContinuationImportTarget) if row is not None else None
-                if imported is None or not isinstance(imported.state, cc.PRRepairState) or getattr(imported.state, field) != remedy:
-                    raise WorkflowAuthorityError("imported CI remediation lost its exact original decision")
                 continue
             owed = remedy if isinstance(remedy, (cc.OwedCIRemediation, cc.OwedPRRecoveryEffect)) else remedy.owed
             row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
@@ -7299,7 +7250,6 @@ class SQLiteControlStore:
         self._assert_owner_active(db, command.executor_identity)
         self._validate_workflow_command(
             db, command, registering_review_submission=registering_review_submission,
-            allow_blocked_submission_retry=True,
         )
         row = db.execute(
             "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
@@ -7434,7 +7384,7 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("PR recovery authority is unavailable")
             self._require_ci_remediation_projection(db, selected)
             remedy = selected.component.state.branch_refresh if base is not None else selected.component.state.pending_ci_escalation
-            if remedy is None or isinstance(remedy, (cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation)):
+            if remedy is None:
                 return None
             owed = remedy if isinstance(remedy, cc.OwedPRRecoveryEffect) else remedy.owed
             capture = owed.capture
@@ -7511,7 +7461,7 @@ class SQLiteControlStore:
             self._require_ci_remediation_projection(db, selected)
             field = "ci_rerun" if kind is CommandKind.RERUN_CHECKS else "ci_cancel"
             remedy = getattr(selected.component.state, field)
-            if remedy is None or isinstance(remedy, cc.ImportedCIRemediation):
+            if remedy is None:
                 return None
             owed = remedy if isinstance(remedy, cc.OwedCIRemediation) else remedy.owed
             if owed.capture.head != head:
@@ -7547,7 +7497,6 @@ class SQLiteControlStore:
     def _validate_workflow_command(
         self, db: sqlite3.Connection, command: LifecycleCommand, *,
         registering_review_submission: bool = False,
-        allow_blocked_submission_retry: bool = False,
     ) -> None:
         if "pr_recovery" in command.payload:
             self._selected_pr_recovery(db, command)
@@ -7600,13 +7549,6 @@ class SQLiteControlStore:
                 review_family_op(command)
                 bound_submission_op(command)
                 review_snapshot = require_review_binding(db, binding, allow_gated=True)
-                if (command.kind is CommandKind.SUBMIT_REVIEW
-                        and isinstance(review_snapshot.execution, BlockedReviewExecutionMigration)):
-                    prior = db.execute("SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
-                                       (command.idempotency_key,)).fetchone() if allow_blocked_submission_retry else None
-                    if (prior is None or prior["state"] not in ("succeeded", "permanent_failure")
-                            or _command_from_row(prior) != command):
-                        raise WorkflowAuthorityError("review execution migration is blocked")
                 if (command.kind is CommandKind.SUBMIT_REVIEW
                         and isinstance(review_snapshot.execution, CurrentReviewExecution)):
                     if not registering_review_submission:

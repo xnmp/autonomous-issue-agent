@@ -13,7 +13,7 @@ from issue_agent.domain.contracts import CommandId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import (
     MAX_COUNTED_REVIEWS, BoundReviewSubmission, CompleteReviews, CountedReview, CountingRule, FreshReviewRequired,
-    ImportedBaseline, ObservedPullRequest, PartialReviews, PendingReviewRearm, PullRequestAbsent, PullRequestState,
+    ObservedPullRequest, PartialReviews, PendingReviewRearm, PullRequestAbsent, PullRequestState,
     PullRequestUnavailable, ReviewEpisode, ReviewRearmPreflight, ReviewRejectionCeiling, ReviewWorkflowSnapshot,
     ReviewedBaseline, SubmittedReviewFact, SubmittedReviewState,
 )
@@ -63,7 +63,6 @@ def test_reviewed_baseline_and_episode_json_roundtrip():
     state = ReviewWorkflowSnapshot(revision(1, 3), REVIEW, ReviewEpisode(EPISODE, "multi\nline", reviewed()))
     roundtrip(state, ReviewWorkflowSnapshot)
     roundtrip((state.authority, state.episode), tuple)
-    roundtrip(ReviewedBaseline(HEAD, PATCH, 4, ImportedBaseline("legacy:patch-id")), ReviewedBaseline)
 
 
 def test_operator_audit_observations_and_reads_roundtrip():

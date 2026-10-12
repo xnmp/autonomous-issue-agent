@@ -6,7 +6,7 @@ import pytest
 
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.review_execution import (
-    CurrentReviewExecution, ImportedReviewSession, NoReviewSession,
+    CurrentReviewExecution, NoReviewSession, ReviewExecutionOrigin, ReviewExecutionOriginKind,
     ReusableReviewSession, RenewedReviewExecutionOriginReceipt, RenewedReviewSessionSource,
     ReviewExecutionCheckpoint, renew_current_review_execution,
 )
@@ -57,10 +57,11 @@ def test_renewal_preserves_handle_and_display_but_resets_only_execution_allowanc
     snapshot, _ = exhausted(*active())
     old = snapshot.execution
     assert isinstance(old, CurrentReviewExecution)
+    origin = ReviewExecutionOrigin(ReviewExecutionOriginKind.RENEWED, "origin:renewed")
     session = (NoReviewSession() if handle is None else ReusableReviewSession(
-        RuntimeName.CLAUDE, handle, ImportedReviewSession("import:session")))
+        RuntimeName.CLAUDE, handle, RenewedReviewSessionSource(origin.evidence_id)))
     state = replace(old.state, pin_deferrals=3, displayed_round=7, session=session)
-    old = replace(old, baseline=replace(old.baseline, state=state), state=state)
+    old = replace(old, origin=origin, baseline=replace(old.baseline, state=state), state=state)
     after, receipt = renew_current_review_execution(old, snapshot.revision, next_binding(snapshot), "renew:1")
     assert after.state.failures == 0 and after.state.pin_deferrals == 0
     assert after.state.displayed_round == 7
@@ -92,26 +93,6 @@ def test_fixed_renewal_request_refuses_malformed_captured_execution(epoch, episo
     with pytest.raises(ValueError):
         RequestReviewExecutionRenewal("renew:1", snapshot.revision, "gate:1", KeepGuidance(), epoch, episode,
                                      expected_binding=snapshot.binding)
-
-
-def test_blocked_migration_cannot_get_an_implicit_execution_reset():
-    from issue_agent.domain.review_execution_migration import (
-        BlockedReviewExecutionMigration, ReviewImportBlocker, ReviewImportBlockerKind,
-        ReviewImportHistoryBlocked, ReviewImportSource,
-    )
-    from issue_agent.domain.workflow_identity import FamilyAuthority, WorkflowFamily
-
-    snapshot, selection = exhausted(*active())
-    request = renewal_request(snapshot, selection.observation)
-    source = ReviewImportSource("file", "unattributed-counter", "a" * 64)
-    history = ReviewImportHistoryBlocked(snapshot.revision.fence.key.target.number,
-        (ReviewImportBlocker(ReviewImportBlockerKind.UNASSIGNED_COUNTER, (source,)),))
-    blocked = BlockedReviewExecutionMigration(snapshot.revision.fence.key,
-        FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, request.execution_epoch), history, "b" * 64, "c" * 64)
-    snapshot = replace(snapshot, execution=blocked)
-    result = accept_fixed(snapshot, request, selection.observation)
-    assert isinstance(result, WorkflowRejected) and "migration-blocked" in result.reason
-    assert snapshot.execution == blocked
 
 
 def test_execution_renewal_grant_refuses_reusing_its_old_episode():

@@ -101,26 +101,6 @@ def test_a_requeued_issue_does_not_inherit_the_dead_prs_attempt_history():
     s.cleanup_pr(100, 9, merged=False)
     assert s.get_ci_history(9) == ()
 
-def _seed_infra_deaths(s, key, count):
-    """Legacy infra-death evidence; no runtime path writes these any more."""
-    Path(s.issue_path(key, "infra-deaths")).write_text(str(count))
-
-
-def test_malformed_numeric_state_blocks_reads_and_increments():
-    s, root = _store()
-    for path in (
-        s.issue_path(5, "resumes"),
-        s.issue_path(5, "ci-retries"),
-        s.issue_path(5, "infra-deaths"),
-    ):
-        with open(path, "w") as f:
-            f.write("not-an-int")
-
-    with pytest.raises(ValueError, match="control unavailable"):
-        s.get_infra_deaths(5)
-    with open(os.path.join(root, "issue-5.resumes")) as f:
-        assert f.read() == "not-an-int"
-
 # review M3/T2: the old `test_write_is_atomic_and_leaves_no_tmp_file` above
 # passed against a truncate-and-write implementation (it only ever checked
 # that one hardcoded, non-pid-suffixed ".tmp" path was absent — a truncating
@@ -198,14 +178,12 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     _seed_legacy_ci_counter(s, 5, 3)
     Path(s.issue_path(5, "review-retries")).write_text("2026-01-01T00:00:00Z 2")
     Path(s.issue_path(5, "rebase-retries")).write_text("1")
-    _seed_infra_deaths(s, 5, 5)
 
     assert not hasattr(s, "clear_retries")
 
     assert _legacy_ci_counter(s, 5) == 3
     assert Path(s.issue_path(5, "review-retries")).read_text() == "2026-01-01T00:00:00Z 2"
     assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
-    assert s.get_infra_deaths(5) == 5
 
 def test_clear_retries_on_an_untouched_key_is_a_no_op_not_an_error():
     s, _ = _store()
@@ -241,13 +219,11 @@ def test_clear_issue_removes_all():
     Path(s.issue_path(5, "rebase-retries")).write_text("1")
     seed_retained_issue_file(s, 5, "resumed-at", "t")
     seed_retained_issue_file(s, 5, "phase", "authored")
-    _seed_infra_deaths(s, 5, 1)
     s._clear_issue_advisory(5)
     assert retained_issue_file(s, 5, "session") == "x"
     assert _legacy_ci_counter(s, 5) == 2
     assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
     assert retained_issue_file(s, 5, "phase") == "authored"           # retained stopped evidence
-    assert s.get_infra_deaths(5) == 1     # retained import evidence
 
 def test_clear_issue_does_not_touch_pr_automerge_marker():
     # review M4: `automerge` is a PR suffix now — clear_issue must not remove
@@ -290,11 +266,9 @@ def test_clear_pr_state():
 def test_cleanup_pr_merged_clears_full_issue_state_and_automerge_marker():
     s, _ = _store()
     seed_retained_issue_file(s, 9, "session", "sess-1")
-    _seed_infra_deaths(s, 9, 1)
     Path(s.pr_path(100, "automerge")).write_text("")
     s.cleanup_pr(100, 9, merged=True)
     assert retained_issue_file(s, 9, "session") == "sess-1"
-    assert s.get_infra_deaths(9) == 1
     assert not Path(s.pr_path(100, "automerge")).exists()
 
 def test_cleanup_pr_closed_unmerged_keeps_infra_deaths():
@@ -304,14 +278,11 @@ def test_cleanup_pr_closed_unmerged_keeps_infra_deaths():
     seed_retained_issue_file(s, 9, "session", "sess-1")
     seed_retained_issue_file(s, 9, "phase", "authoring")
     seed_retained_issue_file(s, 9, "resumed-at", "2026-09-01T00:00:00Z")
-    _seed_infra_deaths(s, 9, 1)
     Path(s.pr_path(100, "automerge")).write_text("")
     s.cleanup_pr(100, 9, merged=False)
     assert retained_issue_file(s, 9, "session") == "sess-1"
     assert retained_issue_file(s, 9, "phase") == "authoring"
     assert retained_issue_file(s, 9, "resumed-at") == "2026-09-01T00:00:00Z"
-    # anti-vacuity twin: prove these are KEPT, not "everything got cleared"
-    assert s.get_infra_deaths(9) == 1
     # closed-unmerged is silent on PR-side state (spec covers issue state only)
     assert Path(s.pr_path(100, "automerge")).exists()
 
@@ -340,10 +311,8 @@ def test_cleanup_pr_issueless_unmerged_is_a_noop():
 def test_cleanup_pr_issueless_merged_clears_the_negated_key_issue_state():
     s, _ = _store()
     Path(s.pr_path(100, "automerge")).write_text("")
-    _seed_infra_deaths(s, -100, 1)          # the negated-PR breaker key
     s.cleanup_pr(100, None, merged=True)
     assert not Path(s.pr_path(100, "automerge")).exists()       # PR-side still clears (regression guard)
-    assert s.get_infra_deaths(-100) == 1           # retained legacy debt is evidence, not a runtime reset
 
 def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
     # anti-vacuity twin, mirroring the real-issue conservatism (handover
@@ -352,10 +321,8 @@ def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
     # routes through clear_issue_resume_state, not a blanket clear_issue.
     s, _ = _store()
     Path(s.pr_path(100, "automerge")).write_text("")
-    _seed_infra_deaths(s, -100, 1)
     s.cleanup_pr(100, None, merged=False)
     assert Path(s.pr_path(100, "automerge")).exists()        # PR-side untouched, as before
-    assert s.get_infra_deaths(-100) == 1           # kept — same conservatism as a real issue
 
 def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open():
     s, _ = _store()

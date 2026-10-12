@@ -26,10 +26,6 @@ from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.review_workflow_control import (
     BARRIER_ROLES, SQLiteReviewWorkflowControl, release_refused_gate_id,
 )
-from issue_agent.adapters.review_execution_activation import (
-    read_legacy_review_owner_lineage,
-    read_legacy_review_submission_page,
-)
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, workflow_scope
 from issue_agent.domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, RunId
@@ -46,10 +42,6 @@ from issue_agent.domain.review_workflow_policy import (
     ReleaseProjectionPending, ReviewHeld, ReviewNotOwed, ReviewOwed, SubmissionUnresolved, open_review_ceiling,
     record_review,
     reconcile_review_ceiling, request_review_rearm, review_rearm_observation_gate_id,
-)
-from issue_agent.domain.review_execution_activation import (
-    LegacyReviewOwnerLineage,
-    LegacyReviewSubmissionSource,
 )
 from issue_agent.domain.workflow import (
     AuthorizeAbsentRetry, CancelRearm, ContinueGrantedRearm, EvidenceUnavailable, KeepGuidance, OpenGate,
@@ -277,7 +269,6 @@ def test_first_observation_after_execution_activation_mints_durable_origin(rig):
     assert rig.control().ensure_observed_workflow(PR_KEY) == WorkflowCommitted(first.snapshot, idempotent=True)
     assert rig.query("SELECT COUNT(*) FROM workflow_components WHERE family='review_execution'")[0][0] == 1
     assert rig.query("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-origin'")[0][0] == 1
-    assert rig.query("SELECT COUNT(*) FROM workflow_activation_imports WHERE family='review_execution'")[0][0] == 0
 
 
 def test_initialized_origin_uses_one_claim_time_at_freshness_boundary(rig):
@@ -344,7 +335,7 @@ def test_execution_initialization_rolls_back_if_activation_is_aliased(rig):
     "missing_origin", "changed_origin", "aliased_origin", "missing_observation",
     "changed_observation", "aliased_observation", "missing_plan", "changed_plan",
     "changed_source", "changed_inventory", "oversized_source", "changed_epoch",
-    "changed_early_activation", "import_conflict",
+    "changed_early_activation",
 ))
 def test_initialized_execution_read_refuses_broken_ancestry(rig, corruption):
     rig.activate()
@@ -383,12 +374,9 @@ def test_initialized_execution_read_refuses_broken_ancestry(rig, corruption):
                        ("x" * 262145,))
         elif corruption == "changed_epoch":
             db.execute("UPDATE workflow_authority_epochs SET epoch=4 WHERE family='review_execution'")
-        elif corruption == "changed_early_activation":
+        else:
             db.execute("UPDATE workflow_authority_epochs SET activated_at=? WHERE family='review_execution'",
                        ((NOW - timedelta(seconds=1)).isoformat(),))
-        else:
-            db.execute("INSERT INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)",
-                       ("o/r", "review_execution", 3, "pr", PR, "source", "{}"))
     with pytest.raises(WorkflowAuthorityError):
         rig.restart().load_workflow(PR_KEY)
 

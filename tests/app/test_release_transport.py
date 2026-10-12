@@ -148,8 +148,12 @@ def test_partial_dismissal_cancel_continue_finishes_one_fresh_review_obligation(
     assert dump(rig.store.path) == saved
 
 
+@pytest.mark.parametrize("current_execution_rig", [False], indirect=True)
 def test_canonical_execution_renewal_survives_origin_validation_after_restart(tmp_path, current_execution_rig):
+    from tests.adapters.test_review_execution_renewal_transactions import exhaust_with_three_settled_returns
+
     store, before, gateway, _, _ = current_execution_rig
+    exhaust_with_three_settled_returns(current_execution_rig)
     path = "/api/repos/demo/pulls/9/review-control"
     from issue_agent.domain.review_dispatch_record import DecisionBasis, DecisionRead, ReviewNotAdmitted
     control = workflow_control(current_execution_rig)

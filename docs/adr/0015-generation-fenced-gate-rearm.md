@@ -410,6 +410,10 @@ cannot mint an allowance renewal or authorize review dismissal.
 
 ## Migration and rollback
 
+> Superseded in part (slice 5a, 2026-10-13): offline family activation and legacy
+> import were deleted; family state is initialized only by a target's live first
+> observation.
+
 Schema changes are additive and versioned by the parent in the next available
 control-store migrations (v19 installs workflow foundations; v20 indexes admitted
 episode work and backfills only validated immutable historical bindings; v21
@@ -459,8 +463,7 @@ that slice's accepted commit. There is never a dual reader choosing whichever
 gives a permissive result. During the protected window this runtime may remain
 unstartable for live selected scopes; acceptance of implementation does not
 authorize their activation.
-Retained import evidence and epochs are permanent audit/fencing data, not
-feature flags. Mark this ADR accepted only for implemented, reviewed slices,
+Epochs are permanent audit/fencing data, not feature flags. Mark this ADR accepted only for implemented, reviewed slices,
 and annotate ADR 0009 with the exact partial supersession then.
 
 ## Acceptance

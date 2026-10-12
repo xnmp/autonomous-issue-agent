@@ -98,8 +98,6 @@ def unavailable_command(error: BaseException) -> wire.CommandResult:
 def recovery_control(selection: cc.IssueRecoverySelection | cc.PRRepairSelection) -> wire.RecoveryControl:
     if isinstance(selection, (cc.InactiveIssueRecovery, cc.InactivePRRepair)):
         return wire.RecoveryUnavailable(status="inactive", reason="Fix recovery authority is inactive.")
-    if isinstance(selection, (cc.BlockedIssueRecovery, cc.BlockedPRRepair)):
-        return wire.RecoveryUnavailable(status="migration_required", reason="Fix recovery import requires an operator decision.")
     component = selection.component
     state = component.state
     if isinstance(state, cc.IssueRecoveryState):

@@ -110,7 +110,7 @@ def test_abandoned_round_with_refused_copy_commits_unlaunched_outcome(rig):
     assert result.outcome.disposition == ReviewUnlaunchedRound(
         control.read_round_facts(plan.round.round_id).closure_receipt,
     )
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
 
 
 def test_unresolved_submission_records_bounded_wait_and_later_settles(rig):
@@ -139,7 +139,7 @@ def test_unresolved_submission_records_bounded_wait_and_later_settles(rig):
     store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
                                       EffectStatus.PERMANENT_FAILURE, error="head changed"))
     assert control.reconcile_review_rounds().finalized == (plan.round.round_id,)
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
 
 
 def test_command_attempt_progress_resets_recovery_wait_ceiling(rig):
@@ -194,7 +194,7 @@ def test_abandoned_round_with_refused_child_commits_unlaunched_outcome(rig):
     result = control.finalize_abandoned_round(plan.round.round_id)
     assert isinstance(result, FinalizedReviewRound)
     assert isinstance(result.outcome.disposition, ReviewUnlaunchedRound)
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
 
 
 @pytest.mark.parametrize("corruption", ["source", "receipt", "closure"])

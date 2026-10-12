@@ -76,7 +76,7 @@ def test_sealed_parent_loss_keeps_completed_seal_and_terminalizes_unadmitted_chi
     assert result.outcome.disposition == ReviewRoundCancelled(
         ReviewCancellationReason.UNPAID_ABANDONMENT, facts.closure_receipt,
     )
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
     before = dump(store)
     assert not store.reserve(request(child)).admitted
     assert control.reconcile_review_rounds().finalized == ()
@@ -446,7 +446,7 @@ def test_full_pending_suffix_allows_money_settlement_and_existing_round_recovery
     assert sweep.blocked == ()
     assert store.snapshot(paid[0].scope).committed.micros == 24
     assert store.snapshot(paid[0].scope).reserved.micros == 0
-    assert current(store, selection).execution.state.failures == 5
+    assert current(store, selection).execution.state.failures == 2
     before = dump(store)
     assert control.reconcile_review_rounds().finalized == ()
     assert dump(store) == before
@@ -485,7 +485,7 @@ def test_recovery_limit_holds_new_allocation_but_retry_and_valid_settlement_clea
     assert not store.settle_review_return(settlement(paid), returned(store, paid, result=failure)).idempotent
     assert control.reconcile_review_rounds().finalized == (plan.round.round_id,)
     assert control.pending_recovery_hold(key) is None
-    assert current(store, selection).execution.state.failures == 4
+    assert current(store, selection).execution.state.failures == 1
     next_plan = control.preflight(replace(fresh, expected=current(store, selection).revision))
     assert next_plan.round.sequence == 2
     assert store.snapshot(paid.scope).committed.micros == 12

@@ -96,6 +96,10 @@ every intervening generation; test recovery after several advances explicitly.
 
 ## Import and compatibility
 
+> Superseded in part (slice 5a, 2026-10-13): offline family activation and legacy
+> import were deleted; family state is initialized only by a target's live first
+> observation.
+
 Use stopped-writer barriers, complete configured roots, bounded parsing,
 current complete remote observations and one final source recheck. These are
 one-time import duties, not periodic admission audits.

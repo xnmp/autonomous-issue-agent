@@ -49,7 +49,7 @@ from ..domain.review_evidence import (
     unavailable_evidence, unavailable_first_observation,
 )
 from ..domain.review_execution import (
-    initialized_review_execution, BlockedReviewExecutionMigration,
+    initialized_review_execution,
     CurrentReviewExecution, CompletedReviewExecutionRound, freeze_current_review_generation,
     renew_current_review_execution,
 )
@@ -113,7 +113,6 @@ from .workflow_rows import (
     persist_workflow_snapshot, read_review_submission_registration, workflow_run_scope_bounds, workflow_scope,
     REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     insert_initialized_review_execution_origin, insert_workflow_component, encode_workflow_episodes,
-    load_review_execution_import_decision,
     read_current_review_pending, REVIEW_EXECUTION_ORIGIN_NAMESPACE, _read_current_round_outcome,
 )
 
@@ -768,23 +767,12 @@ class SQLiteReviewWorkflowControl:
                 raise WorkflowAuthorityError("review workflow migration is required")
             prior = load_review_workflow_row(db, key)
             if prior is not None:
-                from .continuation_activation import retain_deferred_pr_repair
-                after = retain_deferred_pr_repair(db, prior)
-                if after != prior:
-                    after = replace(after, revision=replace(prior.revision, version=prior.revision.version + 1))
-                    persist_workflow_snapshot(db, after)
-                    return WorkflowCommitted(after)
                 return WorkflowCommitted(prior, idempotent=True)
             execution_authority = load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository)
             snapshot = initial_review_workflow(key, authority)
             origin_receipt = None
             origin_claimed_at = None
-            retained_decision = load_review_execution_import_decision(db, key)
-            if isinstance(retained_decision, BlockedReviewExecutionMigration):
-                snapshot = replace(snapshot, execution=retained_decision)
-            elif retained_decision is not None:
-                raise WorkflowAuthorityError("imported review target lost its workflow")
-            elif execution_authority is not None:
+            if execution_authority is not None:
                 origin_claimed_at = self._now()
                 if not isinstance(recorded.observation.reviews, CompleteReviews):
                     raise WorkflowAuthorityError("execution initialization requires a complete first observation")
@@ -836,7 +824,7 @@ class SQLiteReviewWorkflowControl:
                        (encode_workflow_episodes(snapshot), *workflow_scope(key)))
             insert_workflow_component(db, key, authority, snapshot.episode.episode_id)
             observed_id = self._insert_evidence(db, key, recorded)
-            if execution_authority is not None and not isinstance(snapshot.execution, BlockedReviewExecutionMigration):
+            if execution_authority is not None:
                 if origin_receipt is None or origin_claimed_at is None:
                     raise WorkflowAuthorityError("execution initialization lost its origin evidence")
                 if observed_id != origin_receipt.observation_evidence_id:

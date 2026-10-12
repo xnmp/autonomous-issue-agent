@@ -5,8 +5,8 @@ from dataclasses import replace
 import pytest
 
 from issue_agent.domain.continuation_components import (
-    ActiveIssueRecovery, ActivePRRepair, BlockedIssueRecovery, BlockedPRRepair,
-    ContinuationImportBlocker, ContinuationWatermarks, InactiveIssueRecovery, InactivePRRepair,
+    ActiveIssueRecovery, ActivePRRepair,
+    ContinuationWatermarks, InactiveIssueRecovery, InactivePRRepair,
     IssueRecoveryState, PRRepairState, RepairSession, SelectedIssueRecovery, SelectedPRRepair,
     continuation_return_is_current, select_issue_recovery, select_pr_repair,
 )
@@ -149,18 +149,16 @@ def test_selected_component_identity_cannot_alias_target_kinds(family, kind):
         WorkflowBinding(WorkflowFence(other, 3), value.authority, value.episode_id)
 
 
-@pytest.mark.parametrize("family,blocked,active,state,inactive", [
-    (WorkflowFamily.ISSUE_RECOVERY, BlockedIssueRecovery, ActiveIssueRecovery, IssueRecoveryState, InactiveIssueRecovery),
-    (WorkflowFamily.PR_REPAIR, BlockedPRRepair, ActivePRRepair, PRRepairState, InactivePRRepair),
+@pytest.mark.parametrize("family,active,state,inactive", [
+    (WorkflowFamily.ISSUE_RECOVERY, ActiveIssueRecovery, IssueRecoveryState, InactiveIssueRecovery),
+    (WorkflowFamily.PR_REPAIR, ActivePRRepair, PRRepairState, InactivePRRepair),
 ])
-def test_inactive_and_blocked_components_cannot_be_selected_as_active(family, blocked, active, state, inactive):
+def test_inactive_components_cannot_be_selected_as_active(family, active, state, inactive):
     key = WorkflowKey("o/r", PullRequestRef(7) if family is WorkflowFamily.PR_REPAIR else IssueRef(7))
-    unavailable = blocked(key, FamilyAuthority(family, 2), "decision:blocked",
-                          (ContinuationImportBlocker("configured-root:field", "unverified history"),))
     selected = {WorkflowFamily.ISSUE_RECOVERY: SelectedIssueRecovery,
                 WorkflowFamily.PR_REPAIR: SelectedPRRepair}[family]
     revision = WorkflowRevision(WorkflowFence(key, 0), 2)
-    for value in (inactive(), unavailable, None):
+    for value in (inactive(), None):
         with pytest.raises(ValueError):
             selected(revision, value)
     with pytest.raises(ValueError):

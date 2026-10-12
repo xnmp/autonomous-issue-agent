@@ -1145,8 +1145,7 @@ class FixWorkflow:
             raise WorkflowAuthorityError("CI remediation repair context authority is inactive")
         remedy = selected.component.state.ci_rerun
         rerun_head = (remedy.capture.head if isinstance(remedy, cc.OwedCIRemediation)
-                      else remedy.owed.capture.head if isinstance(remedy, cc.SettledCIRemediation)
-                      else remedy.head if isinstance(remedy, cc.ImportedCIRemediation) else "")
+                      else remedy.owed.capture.head if isinstance(remedy, cc.SettledCIRemediation) else "")
         current = task_builders.with_pr_repair_context(
             task, p,
             rerun_head=rerun_head,

@@ -88,7 +88,6 @@ class WorkflowState(Protocol):
     def append_ci_attempt(
         self, issue: int, attempt: CiAttempt
     ) -> tuple[CiAttempt, ...]: ...
-    def get_infra_deaths(self, key: int) -> int: ...
 
 
 class ActionExecutor(Protocol):

@@ -128,7 +128,6 @@ def test_relink_after_the_dispatch_claim_check_defers_before_any_paid_work(deplo
         client.tick()
     assert client.provider.tasks == [] and client.charges() == [] and client.bot_reviews() == []
     assert any("issue linkage changed during dispatch" in line for line in client.log)
-    assert Store(client.cfg.review_state_dir).get_infra_deaths(-PR) == 0
     client.tick()
     assert len(client.provider.tasks) == 1 and len(client.charges()) == 1
     assert client.bot_reviews()[-1].state == "APPROVED"
@@ -612,7 +611,6 @@ def test_a_lost_submission_is_held_visibly_and_one_operator_grant_buys_exactly_o
     client.tick()
     progress_until(client, lambda c: "RetryAuthorizationRequired" in c.gate_causes(), limit=8, minutes=30)
     assert len(client.provider.tasks) == 1 and client.submissions() == []
-    assert Store(client.cfg.review_state_dir).get_infra_deaths(-PR) == 0  # a hold, not a death
     (gate,) = client.gates()
     lost[0] = False
     state = client.state()
@@ -1054,7 +1052,6 @@ def test_the_composed_fix_role_defers_a_repair_on_unreadable_review_guidance_the
     assert provider.tasks == [] and any("ADDRESS_REVIEW #7 held: review guidance is unavailable" in line
                                         for line in log)
     assert not (deployment.target / ".claude" / "worktrees" / "issue-1").exists()
-    assert Store(cfg.state_dir).get_infra_deaths(1) == 0
     with sqlite3.connect(client.review.control.path) as db:
         assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == before_money
         assert db.execute("SELECT * FROM workflows WHERE target_kind='issue' AND target_number=1").fetchone() == before_issue

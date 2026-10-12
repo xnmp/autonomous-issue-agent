@@ -62,7 +62,7 @@ def test_composed_sweep_finalizes_sealed_completed_round_after_refusal(planned):
 
     assert sweep.finalized == (child.round.round_id,)
     assert sweep.blocked == ()
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
     assert control.reconcile_review_rounds().finalized == ()
 
 

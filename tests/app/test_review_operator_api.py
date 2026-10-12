@@ -133,13 +133,17 @@ def escalated(deployment):
 # -- reads -------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("current_execution_rig", [False], indirect=True)
 def test_current_execution_http_poll_stale_renewal_and_original_request_replay_are_bound_and_inert(
     tmp_path, current_execution_rig,
 ):
     from issue_agent.domain.review_dispatch_record import DecisionBasis, DecisionRead, ReviewNotAdmitted
-    from tests.adapters.test_review_execution_renewal_transactions import workflow_control
+    from tests.adapters.test_review_execution_renewal_transactions import (
+        exhaust_with_three_settled_returns, workflow_control,
+    )
 
     store, before, gateway, selection, _ = current_execution_rig
+    exhaust_with_three_settled_returns(current_execution_rig)
     control = workflow_control(current_execution_rig)
     control.record_dispatch_decision(selection.observation.key, ReviewNotAdmitted(("execution exhausted",)),
         DecisionBasis(gateway.view.head_ref_oid, selection.observation.state, gateway.view.labels, ()),
@@ -1204,14 +1208,18 @@ def test_the_family_status_names_the_active_families(bare):
     assert active.json() == {"status": "available", "repository": REPO, "active_families": ["review_rejections"]}
 
 
+@pytest.mark.parametrize("current_execution_rig", [False], indirect=True)
 def test_closed_operator_transport_captures_fixed_execution_identity_and_returns_accepted_state(current_execution_rig):
     from pydantic import TypeAdapter
     from issue_agent.app.dashweb.review_contracts import ReviewCommand
     from issue_agent.app.dashweb.review_control import submit_review_control
 
-    from tests.adapters.test_review_execution_renewal_transactions import renewal_request, workflow_control
+    from tests.adapters.test_review_execution_renewal_transactions import (
+        exhaust_with_three_settled_returns, renewal_request, workflow_control,
+    )
 
     rig = current_execution_rig
+    exhaust_with_three_settled_returns(rig)
     request = renewal_request(rig)
     binding = request.expected_binding
     body = TypeAdapter(ReviewCommand).validate_python({

@@ -14,7 +14,6 @@ from tests.fakes.accounted_workflow import machine_ends
 
 import asyncio
 import dataclasses
-from pathlib import Path
 import pytest
 
 from issue_agent.adapters.journal import record_fields
@@ -1037,12 +1036,10 @@ def test_resume_error_is_not_a_machine_end(tmp_path):
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
 
 
-def test_linked_pr_infra_return_is_an_issue_machine_end_without_mutating_orphan_file(tmp_path):
+def test_linked_pr_infra_return_is_an_issue_machine_end(tmp_path):
     store = Store(str(tmp_path))
-    Path(store.issue_path(-100, "infra-deaths")).write_text("1")
     gw = FakeGateway(prs={100: _review_pr()})
     asyncio.run(_workflow(gw, store, FakeRunner(_death())).address_review(100))
-    assert store.get_infra_deaths(-100) == 1
     assert machine_ends(store) == [True]
 
 

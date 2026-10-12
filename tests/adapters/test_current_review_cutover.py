@@ -1,13 +1,12 @@
-"""Current admission cutover preserves stopped conversion and held recovery."""
+"""Current admission keeps a held prior execution held through recovery."""
 
 from dataclasses import replace
-import sqlite3
 from pathlib import Path
 
 import pytest
 
 from issue_agent.adapters.workflow_rows import (
-    ReviewExecutionHeld, WorkflowAuthorityError, convert_legacy_review_execution,
+    ReviewExecutionHeld,
     load_review_workflow_row, persist_workflow_snapshot,
 )
 from issue_agent.adapters.workflow_codec import encode_workflow
@@ -33,24 +32,6 @@ def hold_prior(store, snapshot):
         with pytest.raises(ReviewExecutionHeld):
             load_review_workflow_row(db, snapshot.revision.fence.key)
     return held, retained
-
-
-def test_stopped_conversion_is_bounded_idempotent_and_refuses_live_claims(rig):
-    store, snapshot, _, selection, _ = rig
-    held, retained = hold_prior(store, snapshot)
-    with store.transaction() as db:
-        with pytest.raises(WorkflowAuthorityError, match="quiescent"):
-            convert_legacy_review_execution(db, selection.expected.fence.key)
-        assert db.execute("SELECT episode_json FROM workflows WHERE target_kind='pr'").fetchone()[0] == retained
-    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    with store.transaction() as db:
-        converted = convert_legacy_review_execution(db, selection.expected.fence.key)
-        assert isinstance(converted.execution, CurrentReviewExecution)
-        assert converted.revision == held.revision
-        assert converted.execution.state == held.execution.state
-        before = tuple(db.iterdump())
-        assert convert_legacy_review_execution(db, selection.expected.fence.key) == converted
-        assert tuple(db.iterdump()) == before
 
 
 @pytest.mark.parametrize("productive", [False, True])
@@ -103,25 +84,6 @@ def test_held_prior_refuses_admission_but_settles_money_and_round_once(rig, prod
         assert workflow_for(store, gateway).settle_submission(command.command_id) is None
 
 
-def test_caught_stopped_conversion_failure_preserves_held_authority_and_outer_work(rig):
-    store, snapshot, _, selection, _ = rig
-    _, retained = hold_prior(store, snapshot)
-    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    with store.transaction() as db:
-        db.execute("CREATE TEMP TRIGGER fail_conversion BEFORE UPDATE ON workflow_components "
-                   "BEGIN SELECT RAISE(ABORT,'caught conversion failure'); END")
-        with pytest.raises(sqlite3.IntegrityError, match="caught conversion failure"):
-            convert_legacy_review_execution(db, selection.expected.fence.key)
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)", (
-            "test-outer", "o/r", "committed", store.now().isoformat(), "{}",
-        ))
-    with store.transaction() as db:
-        assert db.execute("SELECT episode_json FROM workflows WHERE target_kind='pr'").fetchone()[0] == retained
-        assert db.execute("SELECT key FROM dedupe_keys WHERE namespace='test-outer'").fetchone()[0] == "committed"
-        with pytest.raises(ReviewExecutionHeld):
-            load_review_workflow_row(db, selection.expected.fence.key)
-
-
 def test_finalization_exact_retry_survives_malformed_current_authority(rig):
     store, _, _, selection, control = rig
     plan = control.preflight(selection)
@@ -154,7 +116,6 @@ def test_schema34_legacy_file_mutations_do_not_regain_current_review_authority(r
     Path(legacy.issue_path(-9, "infra-deaths")).write_text("0")
     Path(legacy.pr_path(9, "round")).write_text(str(10**12))
     Path(legacy.pr_path(9, "session")).write_text("claude:foreign-session")
-    assert legacy.get_infra_deaths(-9) == 0
     assert Path(legacy.pr_path(9, "round")).read_text() == str(10**12)
     store.initialize()
     assert current(store, selection) == before

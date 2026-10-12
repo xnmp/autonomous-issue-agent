@@ -54,6 +54,21 @@ def install_workflow(store, snapshot):
             )
 
 
+def seed_family_epoch(db, repository: str, family: WorkflowFamily, activated_at, *, epoch: int = 1) -> None:
+    """A family's authority epoch and plan evidence, as the deleted offline
+    activation left them.
+
+    Seed it before a target's first observation, which then initializes the
+    family's state through the live path.
+    """
+    import hashlib
+    digest = lambda label: hashlib.sha256(f"fixture {family.value} {label}".encode()).hexdigest()  # noqa: E731
+    db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
+               (repository, family.value, epoch, digest("source"), digest("inventory"), activated_at.isoformat()))
+    db.execute("INSERT INTO workflow_activation_evidence VALUES (?,?,?,?,?)",
+               (repository, family.value, epoch, 0, digest("plan")))
+
+
 def retained_issue_file(store, issue: int, suffix: str) -> str:
     """Observe retained fixture bytes without consulting runtime continuity."""
     from pathlib import Path
