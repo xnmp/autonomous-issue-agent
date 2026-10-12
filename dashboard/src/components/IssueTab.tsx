@@ -13,6 +13,7 @@ import {
 import { clockTime, duration, localTime, num, tokens, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
+import { Icon } from "./ui/Icon";
 import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
@@ -210,11 +211,13 @@ export function IssueTab({
                     title={`open PR #${pr.number} on GitHub`}
                   >
                     <Chip tone={prStateTone(pr.state)} square>
+                      <Icon name="git-pull-request" size={12} />
                       PR #{pr.number}
                     </Chip>
                   </a>
                 ) : (
                   <Chip key={pr.number} tone={prStateTone(pr.state)} square>
+                    <Icon name="git-pull-request" size={12} />
                     PR #{pr.number}
                   </Chip>
                 ),

@@ -225,7 +225,7 @@ describe("long-table filtering", () => {
     );
 
     expect(screen.getByText("Parked pull request")).toBeVisible();
-    expect(screen.getByText("PR #179")).toBeVisible();
+    expect(screen.getByRole("link", { name: "PR #179" })).toBeVisible();
     expect(screen.queryByText("Waiting issue 0")).not.toBeInTheDocument();
     expect(screen.getByText("1/11")).toBeVisible();
   });
