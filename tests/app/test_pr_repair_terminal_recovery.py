@@ -36,6 +36,8 @@ def _workflow(lane):
     pr = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
     if lane == "review":
         pr = replace(pr, reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-10-02T00:00:01Z", body="fix it"),))
+    if lane == "rebase":  # a rebase is only ever selected for a conflicting PR
+        pr = replace(pr, mergeable="CONFLICTING")
     workflow.gateway.prs[100] = pr
     return workflow, files, inner, key
 

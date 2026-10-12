@@ -66,6 +66,8 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
         asyncio.run(dispatcher.fix_workflow.fix_ci(100))
         runner.tasks.clear()
         runner.result = replace(runner.result, session_id="continued")
+    if kind == AgentKind.REBASE:  # only a conflicting PR is ever rebased
+        gateway.prs[100] = replace(gateway.prs[100], mergeable="CONFLICTING")
     asyncio.run(dispatcher.dispatch(RunAgent(kind, 100)))
 
     task = runner.tasks[0]
@@ -128,7 +130,7 @@ def test_repair_reads_guidance_from_its_single_configured_owner(tmp_path):
     (tmp_path / "fix" / "pr-100.operator-guidance").write_text("Wrong scope in fix store")
     runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
     dispatcher = _ci_dispatcher(
-        Gateway(prs={100: observed_pr(100, head_ref_name="fix/5-x", closing_issue=5)}),
+        Gateway(prs={100: observed_pr(100, head_ref_name="fix/5-x", closing_issue=5, mergeable="CONFLICTING")}),
         fix_store, runner, operator_guidance=guidance,
     )
     asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.REBASE, 100)))

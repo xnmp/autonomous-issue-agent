@@ -1744,7 +1744,13 @@ def decide_fix(
                     actions.append(ResetCiRetries(held_issue, state.ci_resets.get(pr.number)))
             continue
         lifecycle = pr_lifecycle(pr)
-        if repair_evidence_incomplete(pr.ci) and (not lifecycle.is_blocked or isinstance(pr.ci, Unavailable)):
+        # The conflict arms below (rebase, issueless escalation) read no CI, and
+        # GitHub runs no pull_request checks on a conflicting head, so waiting
+        # for that evidence wedged approved tauri #1068 for hours.
+        conflict_repair = cfg.auto_rebase_conflicts and pr.is_conflicting() and not lifecycle.is_blocked
+        if repair_evidence_incomplete(pr.ci) and not conflict_repair and (
+            not lifecycle.is_blocked or isinstance(pr.ci, Unavailable)
+        ):
             continue
         if lifecycle.is_blocked:
             # PR-stage blockers are answered on the PR, while the saved agent

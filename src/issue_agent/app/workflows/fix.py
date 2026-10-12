@@ -84,7 +84,7 @@ from ...domain.effort import (
 )
 from ...domain.labels import Label
 from ...domain import continuation_components as cc
-from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility
+from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility, pr_eligibility
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
 from ...domain.trust import as_untrusted, untrusted_block
@@ -1585,10 +1585,18 @@ class FixWorkflow:
                 else action for action in actions
             ])
 
-    def _dispatch_pr(self, pr: int, issue_hint: int | None):
-        """Bind fresh PR state to the issue captured by its claim (ADR 0008)."""
+    def _dispatch_pr(self, pr: int, issue_hint: int | None, *, conflict_repair: bool = False):
+        """Bind fresh PR state to the issue captured by its claim (ADR 0008).
+        A conflict repair reads no CI (see decide_fix), but only while the
+        fresh PR still conflicts and carries no lifecycle hold."""
         current = self.gateway.get_pr(pr)
-        if repair_evidence_incomplete(current.ci) and (not current.has(Label.AI_BLOCKED) or isinstance(current.ci, Unavailable)):
+        if conflict_repair:
+            if not current.is_conflicting() or not isinstance(
+                pr_eligibility(current, LifecycleOperation.REPAIR), AllowedEligibility
+            ):
+                self.cfg.log(f"PR #{pr}: rebase withheld; the fresh PR no longer conflicts or is held")
+                return None
+        elif repair_evidence_incomplete(current.ci) and (not current.has(Label.AI_BLOCKED) or isinstance(current.ci, Unavailable)):
             self.cfg.log(f"PR #{pr}: repair withheld until required-check evidence is complete")
             return None
         if issue_hint is None:
@@ -1924,7 +1932,7 @@ class FixWorkflow:
     async def rebase(
         self, pr: int, *, issue_hint: int | None = None
     ) -> None:
-        dispatch = self._dispatch_pr(pr, issue_hint)
+        dispatch = self._dispatch_pr(pr, issue_hint, conflict_repair=True)
         if dispatch is None:
             return
         p, issue = dispatch
