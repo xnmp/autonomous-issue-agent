@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from issue_agent.app.codex_resolution import Finding
-from issue_agent.domain.review import IdentityMode
+from issue_agent.domain.identity import IdentityMode
 
 # GitHub's per-account GraphQL budget. Not configurable and not probed: it is
 # GitHub's published figure for a user-owned token, and the check exists to be

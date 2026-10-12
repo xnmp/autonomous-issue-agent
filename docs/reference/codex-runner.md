@@ -39,15 +39,14 @@ cache-blind pending #89, so operators should treat its dollar figure as a
 conservative token meter. Settled `role=review` journal rows retain task/result
 model and rollout usage, enabling cost-mix analysis by runtime/model.
 
-Codex review supports `REVIEW_MODE=single` only. `multi` and `delegated` rely
-on Claude aliases and SDK subagents, so configuration rejects those combinations
-instead of silently dropping legs. The reviewer runs in the operator checkout
-under Codex's read-only sandbox, which contains filesystem mutation. Because Codex's resume grammar cannot carry a sandbox
-setting, every Codex re-review and in-leg transport retry is intentionally a
-fresh session; it receives the prior verdict as context and cannot regain a
-writable resume mode. The CODEX_HOME is prepared only immediately before a
-review leg in the explicit `TARGET_DIR`; daemon construction never mutates the
-process cwd, and an unset target fails closed instead of using an implicit cwd.
+The reviewer runs in a detached checkout of `TARGET_DIR` pinned to the
+reviewed head, under Codex's read-only sandbox, which contains filesystem
+mutation. Because Codex's resume grammar cannot carry a sandbox setting, every
+Codex review and in-leg transport retry is intentionally a fresh session and
+cannot regain a writable resume mode. The CODEX_HOME is prepared only
+immediately before a review leg, in that pinned checkout; daemon construction
+never mutates the process cwd, and an unset target fails closed instead of
+using an implicit cwd.
 
 The Codex reviewer has no image-rendering tool in this read-only surface. It
 cannot substantiate `evidence/` screenshots required by visual acceptance

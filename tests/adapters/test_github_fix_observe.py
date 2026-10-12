@@ -138,7 +138,7 @@ def test_a_malformed_ref_list_is_incomplete(bad):
 def test_an_issue_whose_branch_cannot_be_judged_waits_out_of_the_world():
     runner = GraphQL({"issues": page([issue_node(5), issue_node(6)]), "pullRequests": page([]),
                       "refs": page([ref("5-x", ahead=None), ref("6-y")])})
-    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [i.number for i in world.issues] == [6]
     assert world.branches == (Branch("fix/6-y", "2026-10-01T00:00:00Z"),)
 
@@ -188,7 +188,7 @@ def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
         "pullRequests": page([pr_node(headRefName="feature/x")]),  # not a harness PR: never fetched further
         "refs": page([ref("5-null-token")]),
     })
-    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [i.number for i in world.issues] == [5, 4]
     assert [(p.number, p.state) for p in world.prs] == [(9, "MERGED")]
     assert world.branches == (Branch("fix/5-null-token", "2026-10-01T00:00:00Z"),)
@@ -198,14 +198,14 @@ def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
 def test_an_issue_with_unreadable_comments_is_skipped_not_misread():
     broken = issue_node(6, comments={"totalCount": 3, "pageInfo": {"hasPreviousPage": False}, "nodes": []})
     runner = GraphQL({"issues": page([issue_node(5), broken]), "pullRequests": page([]), "refs": page([])})
-    assert [i.number for i in GitHubGateway("o/r", runner=runner).build_fix_world("dev").issues] == [5]
+    assert [i.number for i in GitHubGateway("o/r", runner=runner).build_world("dev").issues] == [5]
 
 
 def test_a_top_level_connection_past_its_page_bound_skips_the_tick():
     first = {"issues": page([], more=True, cursor="c0"), "pullRequests": page([]), "refs": page([])}
     more = [{"issues": page([], more=True, cursor=f"c{i}")} for i in range(1, 12)]
     with pytest.raises(FixObservationIncomplete, match="issues exceed"):
-        GitHubGateway("o/r", runner=GraphQL(first, *more)).build_fix_world("dev")
+        GitHubGateway("o/r", runner=GraphQL(first, *more)).build_world("dev")
 
 
 @pytest.mark.parametrize("answer", [
@@ -215,14 +215,14 @@ def test_a_top_level_connection_past_its_page_bound_skips_the_tick():
 def test_an_errored_or_partial_answer_skips_the_tick(answer):
     gateway = GitHubGateway("o/r", runner=lambda argv, token: json.dumps(answer))
     with pytest.raises(FixObservationIncomplete):
-        gateway.build_fix_world("dev")
+        gateway.build_world("dev")
 
 
 def test_an_unreadable_open_pr_still_shadows_its_issue_with_no_head():
     runner = GraphQL({"issues": page([issue_node(5)]),
                       "pullRequests": page([pr_node(labels={"totalCount": 2, "nodes": []})]),
                       "refs": page([])})
-    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [(p.number, p.head_ref_oid, p.content_known) for p in world.prs] == [(100, "", False)]
 
 
@@ -290,7 +290,7 @@ def _used(query: str) -> set[str]:
 
 def test_every_paged_query_declares_exactly_the_variables_it_uses_and_is_sent_them():
     runner = PagedGitHub()
-    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert len(runner.calls) == 7  # first read, refs page 2, 5 nested pages
     for query, variables in runner.calls:
         assert _declared(query) == _used(query) == set(variables), query
@@ -302,7 +302,7 @@ def test_every_paged_query_declares_exactly_the_variables_it_uses_and_is_sent_th
 ])
 def test_a_nested_page_selects_its_connection_only_on_the_owners_type(connection, owners):
     runner = PagedGitHub()
-    GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    GitHubGateway("o/r", runner=runner).build_world("dev")
     pages = [q for q, _ in runner.calls if q.startswith("query($id") and f"{{{connection}(" in q]
     head = re.compile(r"query\(\$id:ID!,\$cursor:String!\)\{node\(id:\$id\)\{\.\.\. on (\w+)\{" + connection + r"\(")
     assert sorted(m.group(1) for q in pages if (m := head.match(q))) == owners
@@ -310,7 +310,7 @@ def test_a_nested_page_selects_its_connection_only_on_the_owners_type(connection
 
 
 def test_paged_connections_are_read_in_full():
-    world = GitHubGateway("o/r", runner=PagedGitHub()).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=PagedGitHub()).build_world("dev")
     (issue,) = world.issues
     harness = next(p for p in world.prs if p.state == "OPEN")
     assert [c.body for c in issue.comments] == ["older"]
@@ -320,10 +320,10 @@ def test_paged_connections_are_read_in_full():
 
 
 def test_a_merged_pr_on_a_later_cross_reference_page_still_retires_its_issue():
-    world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=3)).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=3)).build_world("dev")
     assert [(p.number, p.state) for p in world.prs if p.state == "MERGED"] == [(9, "MERGED")]
 
 
 def test_cross_references_past_their_bound_skip_the_issue_rather_than_read_as_unmerged():
-    world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=50)).build_fix_world("dev")
+    world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=50)).build_world("dev")
     assert world.issues == () and not any(p.state == "MERGED" for p in world.prs)

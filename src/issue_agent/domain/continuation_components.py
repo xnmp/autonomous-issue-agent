@@ -342,14 +342,6 @@ class PRRepairState:
             validate_workflow_integer(getattr(self, name), name)
 
 
-def retire_pr_repair_continuity(state: PRRepairState, merged: bool) -> PRRepairState:
-    if not isinstance(state, PRRepairState) or type(merged) is not bool:
-        raise ValueError("repair retirement requires typed continuity and terminal outcome")
-    # A closed-unmerged requeue clears only resume-blocking state. Remembered
-    # branch/model, fork count and existing failure debt retain their old meaning.
-    return PRRepairState() if merged else replace(state, session=None, consumed_reply_at="", blank_reply=None)
-
-
 @dataclass(frozen=True)
 class PRRepairCleanup:
     binding: WorkflowBinding
@@ -514,14 +506,6 @@ def select_issue_recovery(aggregate) -> IssueRecoverySelection:
     return SelectedIssueRecovery(aggregate.revision, component) if isinstance(component, ActiveIssueRecovery) else component
 
 
-def select_pr_repair(aggregate) -> PRRepairSelection:
-    from .review_workflow import ReviewWorkflowSnapshot
-    if not isinstance(aggregate, ReviewWorkflowSnapshot):
-        raise ValueError("PR repair selection requires a PR aggregate")
-    component = aggregate.pr_repair
-    return SelectedPRRepair(aggregate.revision, component) if isinstance(component, ActivePRRepair) else component
-
-
 def continuation_return_is_current(selection: SelectedIssueRecovery | SelectedPRRepair,
                                    admission: ContinuationAdmission) -> bool:
     if not isinstance(selection, (SelectedIssueRecovery, SelectedPRRepair)) or not isinstance(admission, ContinuationAdmission):
@@ -648,20 +632,6 @@ class IssueCIPurchase:
         validate_workflow_integer(self.ceiling, "CI allowance ceiling", minimum=1)
 
 
-@dataclass(frozen=True)
-class CIRepairInput:
-    selection: SelectedIssueRecovery
-    pr: PullRequestRef
-    head: str
-    ceiling: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.selection, SelectedIssueRecovery):
-            raise ValueError("CI input requires selected issue recovery")
-        IssueCIPurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "validation"),
-                        self.pr, self.head, self.ceiling)
-
-
 class CICharge(str, Enum):
     ATTEMPT = "attempt"
     NOT_ATTEMPT = "not_attempt"
@@ -693,21 +663,6 @@ class IssueReviewPurchase:
         _timestamp(self.review_at, "selected qualifying review")
         if not self.review_at:
             raise ValueError("review repair requires a qualifying review timestamp")
-
-
-@dataclass(frozen=True)
-class ReviewRepairInput:
-    selection: SelectedIssueRecovery
-    pr: PullRequestRef
-    head: str
-    review_at: str
-    ceiling: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.selection, SelectedIssueRecovery):
-            raise ValueError("review input requires selected issue recovery")
-        IssueReviewPurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "validation"),
-                            self.pr, self.head, self.review_at, self.ceiling)
 
 
 class ReviewCharge(str, Enum):
@@ -756,21 +711,6 @@ class IssueRebasePurchase:
     def __post_init__(self) -> None:
         IssueCIPurchase(self.capture, self.pr, self.head, self.ceiling)
         validate_workflow_text(self.branch, "selected rebase branch")
-
-
-@dataclass(frozen=True)
-class RebaseRepairInput:
-    selection: SelectedIssueRecovery
-    pr: PullRequestRef
-    head: str
-    branch: str
-    ceiling: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.selection, SelectedIssueRecovery):
-            raise ValueError("rebase input requires selected issue recovery")
-        IssueRebasePurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "validation"),
-                            self.pr, self.head, self.branch, self.ceiling)
 
 
 class RebaseCharge(str, Enum):
@@ -839,73 +779,6 @@ class RepairHandoff:
         validate_workflow_text(self.branch, "resolve handoff branch")
         if not isinstance(self.runtime, RuntimeName):
             raise ValueError("resolve handoff requires typed runtime")
-
-
-@dataclass(frozen=True)
-class PRReplyInput:
-    reply_at: str
-    body: str
-
-    def __post_init__(self) -> None:
-        _timestamp(self.reply_at, "selected PR reply")
-        validate_workflow_text(self.body, "selected PR reply body", limit=65536)
-        if not self.reply_at or not self.body.strip():
-            raise ValueError("paid PR reply requires its exact timestamp and nonblank content")
-
-
-@dataclass(frozen=True)
-class PRRepairInput:
-    selection: SelectedPRRepair
-    branch: str
-    runtime: RuntimeName
-    handoff: RepairHandoff | None = None
-    ci: CIRepairInput | None = None
-    review: ReviewRepairInput | None = None
-    rebase: RebaseRepairInput | None = None
-    reply: PRReplyInput | None = None
-    head: str = ""
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
-            raise ValueError("repair input requires selected authority and runtime")
-        validate_workflow_text(self.branch, "current remote repair branch")
-        validate_workflow_text(self.head, "current remote repair head", limit=256, empty=True)
-        if self.reply is not None and (self.ci is not None or self.review is not None or self.rebase is not None
-                or not isinstance(self.reply, PRReplyInput)
-                or not reply_advances(self.reply.reply_at, self.selection.component.state.consumed_reply_at)):
-            raise ValueError("PR reply is consumed, stale or mixed with another repair lane")
-        if self.rebase is not None and (self.ci is not None or self.review is not None
-                or not isinstance(self.rebase, RebaseRepairInput)
-                or self.rebase.pr != self.selection.binding.fence.key.target or self.rebase.branch != self.branch
-                or self.rebase.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
-            raise ValueError("rebase input differs from selected repair PR, branch or lane")
-        if self.review is not None and (self.ci is not None or not isinstance(self.review, ReviewRepairInput)
-                or self.review.pr != self.selection.binding.fence.key.target
-                or self.review.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
-            raise ValueError("review input differs from selected repair PR/repository or lane")
-        if self.ci is not None and (not isinstance(self.ci, CIRepairInput)
-                or self.ci.pr != self.selection.binding.fence.key.target
-                or self.ci.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
-            raise ValueError("CI input differs from selected repair PR/repository")
-        if self.handoff is not None and (not isinstance(self.handoff, RepairHandoff) or self.handoff.branch != self.branch
-                or self.handoff.runtime is not self.runtime or self.handoff.pr != self.selection.binding.fence.key.target):
-            raise ValueError("repair handoff differs from selected branch/runtime")
-
-    @property
-    def session(self) -> RepairSession | RepairHandoff | None:
-        state = self.selection.component.state
-        session = state.session
-        if session is not None and session.runtime is self.runtime and state.branch == self.branch:
-            return session
-        return self.handoff if state.actual_model is None else None
-
-    @property
-    def model(self) -> str:
-        state = self.selection.component.state
-        model = state.actual_model
-        if model is not None and model.runtime is self.runtime:
-            return model.model
-        return self.session.model if self.session is not None else ""
 
 
 @dataclass(frozen=True)
@@ -1060,18 +933,3 @@ def consume_issue_recovery(selection: SelectedIssueRecovery, purchase: IssueReco
     return replace(component, state=state, watermarks=component.watermarks.admit(version, selection.revision.fence))
 
 
-def consume_pr_repair(selection: SelectedPRRepair, purchase: PRRepairPurchase, version: int) -> ActivePRRepair:
-    if selection.binding != purchase.capture.binding or selection.revision != purchase.capture.revision:
-        raise ValueError("PR repair capture is stale")
-    component = selection.component
-    if (component.gates or (component.watermarks.last_admitted > component.watermarks.last_applied
-                           and component.watermarks.last_admitted_fence == selection.revision.fence)
-            or getattr(component.state, purchase.allowance.value) >= purchase.ceiling
-            or purchase.reply_at and not reply_advances(purchase.reply_at, component.state.consumed_reply_at)):
-        raise ValueError("PR repair purchase is held, consumed or exhausted")
-    state = replace(component.state, consumed_reply_at=purchase.reply_at, blank_reply=None) if purchase.reply_at else component.state
-    if purchase.handoff is not None:
-        state = replace(state, resumes=max(state.resumes, purchase.handoff.resumes))
-    if purchase.advance_resume:
-        state = replace(state, resumes=state.resumes + 1)
-    return replace(component, state=state, watermarks=component.watermarks.admit(version, selection.revision.fence))

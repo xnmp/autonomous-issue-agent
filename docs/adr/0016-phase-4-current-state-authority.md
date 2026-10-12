@@ -1,10 +1,11 @@
 # ADR 0016 — Phase 4 current-state authority
 
-Status: Accepted implementation, 2026-10-03. Selected runtime authority and
-replacement removals passed A2 whole-system review, copied rehearsal, dashboard
-outcome checks and the final full gate. Phases 5 and 6 remain pending.
+Status: Superseded by slice 5c (2026-10-13), which deleted the review
+execution and rejection families this decision governs. Accepted
+implementation, 2026-10-03; the resolve-family rows it shares remain inert
+until slice 5d.
 
-Governs: src/issue_agent/domain/review_execution.py src/issue_agent/adapters/workflow_rows.py src/issue_agent/adapters/review_execution_control.py src/issue_agent/adapters/review_workflow_control.py src/issue_agent/adapters/control_store.py
+Governs: src/issue_agent/adapters/workflow_rows.py src/issue_agent/adapters/control_store.py
 
 ## Problem
 

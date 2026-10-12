@@ -1,5 +1,6 @@
-"""Pure mappers of the fix role (slice 5b): recorded runs to derive's leg
-ends, leases, the dispatch budget per tick, and the human reply text."""
+"""Pure mappers of the tick (slices 5b/5c): recorded legs of either role to
+derive's leg ends, leases, the fix role's dispatch budget per tick, and the
+human reply text."""
 
 from __future__ import annotations
 
@@ -7,10 +8,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from issue_agent.adapters.control_store import FixRun
-from issue_agent.app.fix import (
-    fix_actions, human_reply, leased_items, leg_end, local_legs, run_item,
-)
+from issue_agent.adapters.control_store import LegRun
+from issue_agent.app.fix import fix_actions, human_reply
+from issue_agent.app.tick import Facts, leased_items, leg_end, local_legs, run_item
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
@@ -22,10 +22,10 @@ T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 H = Harness("fix-bot", "review-bot")
 
 
-def run(kind="RESOLVE", number=5, issue=5, head="", leg="agent", minute=1, started=0, **kw) -> FixRun:
+def run(kind="RESOLVE", number=5, issue=5, head="", leg="agent", minute=1, started=0, **kw) -> LegRun:
     receipt = kw.pop("receipt", {"leg": leg, "session": "s1", "runtime": "claude"} if leg else None)
     start = T0 + timedelta(minutes=started) if started is not None else None
-    return FixRun(kind, number, issue, head, start, T0 + timedelta(minutes=minute), receipt)
+    return LegRun(kind, number, issue, head, start, T0 + timedelta(minutes=minute), receipt)
 
 
 # ── recorded runs → leg ends ─────────────────────────────────────────────────
@@ -37,7 +37,7 @@ def run(kind="RESOLVE", number=5, issue=5, head="", leg="agent", minute=1, start
     (run("PR_RESUME", number=100), None),
     (run("ROUTE"), None),                # the deleted classifier leg belongs to no item
     (run("RESOLVE", issue=0), None),
-    (run("REVIEW", number=100), None),   # the review role's legs are not the fix role's
+    (run("REVIEW", number=100), pr_key(100)),  # both roles derive from every leg
     (run("FIX_CI", number=0), None),
 ])
 def test_each_run_belongs_to_its_issue_or_pr_item(recorded, item):
@@ -71,8 +71,8 @@ def test_an_agent_receipt_carries_no_question():
     assert end is not None and end.question is None
 
 
-@pytest.mark.parametrize("kind", ["RESUME", "PR_RESUME", "ROUTE", "REVIEW", "UNKNOWN_KIND", ""])
-def test_runs_of_no_fix_act_are_no_leg_end(kind):
+@pytest.mark.parametrize("kind", ["RESUME", "PR_RESUME", "ROUTE", "RE_REVIEW", "UNKNOWN_KIND", ""])
+def test_runs_of_no_act_are_no_leg_end(kind):
     assert leg_end(run(kind)) is None
 
 
@@ -81,11 +81,12 @@ def test_an_inconsistent_start_is_dropped_but_the_end_still_counts():
     assert end is not None and end.started_at is None
 
 
-def test_local_legs_group_by_item_in_end_order():
+def test_local_legs_group_both_roles_legs_by_item_in_end_order():
     legs = local_legs([run("FIX_CI", number=100, minute=3), run("RESOLVE", minute=1),
                        run("FIX_CI", number=100, minute=2), run("REVIEW", number=100, minute=4)])
     assert set(legs) == {issue_key(5), pr_key(100)}
-    assert [e.ended_at.minute for e in legs[pr_key(100)]] == [2, 3]
+    assert [(e.kind, e.ended_at.minute) for e in legs[pr_key(100)]] == [
+        (AgentKind.FIX_CI, 2), (AgentKind.FIX_CI, 3), (AgentKind.REVIEW, 4)]
 
 
 def test_leases_cover_own_dispatches_and_other_holders_issues_only():
@@ -153,10 +154,10 @@ def test_no_reply_is_empty():
 
 
 
-# ── FixFacts (round 2) ───────────────────────────────────────────────────────
+# ── Facts (round 2) ───────────────────────────────────────────────────────
 
 class _Control:
-    def fix_runs(self, repository, issues):
+    def leg_runs(self, repository, issues):
         return ()
 
     def active_dispatch_claims(self, repository, role):
@@ -167,13 +168,11 @@ class _Control:
 
 
 def test_an_unreadable_lifetime_read_holds_paid_work_and_says_so():
-    from issue_agent.app.fix import FixFacts, FixSettings
-
     def unreadable(_issue):
         raise RuntimeError("spend snapshot unavailable")
 
     lines: list[str] = []
-    facts = FixFacts(_Control(), FixSettings("o/r", True, "dev", "claude", "owner", H), active=lambda: (),
+    facts = Facts(_Control(), "o/r", active=lambda: (),
                      headroom=lambda: True, lifetime_capped=unreadable, log=lines.append, now=lambda: T0)
     loc = facts(WorldState(issues=(IssueView(5, labels=frozenset({Label.AI_READY})),)))
     assert loc.headroom is False and loc.lifetime_capped == frozenset()

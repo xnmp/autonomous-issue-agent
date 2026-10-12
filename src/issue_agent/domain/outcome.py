@@ -468,16 +468,6 @@ class AgentResult:
             return self.structured.get(name, default) or default
         return default
 
-    def field_bool(self, name: str, default: bool = False) -> bool:
-        """Read a boolean structured-output field (review gate `reviewable`,
-        validator `confirmed`). A missing/non-dict envelope → default; a present
-        value is coerced with normal truthiness so a JSON true/false passes
-        through unchanged."""
-        if isinstance(self.structured, dict) and name in self.structured:
-            return bool(self.structured.get(name))
-        return default
-
-
 def classify_outcome(result: AgentResult) -> Outcome:
     """Port of agent/lib.sh:claude_outcome. Error wins; then map status."""
     if result.is_error:

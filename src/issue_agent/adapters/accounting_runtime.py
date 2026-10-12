@@ -34,16 +34,14 @@ from ..domain.outcome import (
     resumable_session,
 )
 from ..domain.policy import question_text
+from ..domain.review import parse_verdict
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
 from ..domain.workflow_identity import WorkflowBinding
-from .workflow_codec import WorkflowEncodingError, encode_workflow
-from ..domain.agent_task import RuntimeName, run_input_fingerprint
-from ..domain.review_execution import ReviewChildIdentity, review_child_budget_leg
-from ..domain.review_return import ReturnedReviewChild, review_returned_envelope
+from ..domain.agent_task import run_input_fingerprint
 from .control_store import (
-    FIX_LEG_NAMESPACE,
+    LEG_NAMESPACE,
     AccountingDisposition,
     BudgetLimit,
     ReservationRequest,
@@ -52,6 +50,7 @@ from .control_store import (
     SettlementRequest,
 )
 
+_LEG_ROLES = frozenset({"fix", "review"})
 _UNLIMITED_ACCOUNTING_MICROS = 9_000_000_000_000_000_000
 _SUMMARY_LIMIT = 20000
 
@@ -74,11 +73,11 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     _context: contextvars.ContextVar[
-        tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None, str, bool]
+        tuple[int | None, str, int, int | None, WorkflowBinding | None, str, bool]
     ] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}",
-            default=(None, "", 0, None, None, None, "", False),
+            default=(None, "", 0, None, None, "", False),
         ),
         init=False,
         repr=False,
@@ -102,7 +101,6 @@ class AccountingRuntime(AgentRuntime):
         claim_target: int | None = None,
         *,
         workflow: WorkflowBinding | None = None,
-        review_child: ReviewChildIdentity | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None:
@@ -110,17 +108,7 @@ class AccountingRuntime(AgentRuntime):
             raise ValueError("accounting context head must be text and resumed an exact bool")
         if workflow is not None and not isinstance(workflow, WorkflowBinding):
             raise ValueError("accounting context requires a validated workflow binding")
-        if review_child is not None and (
-            not isinstance(review_child, ReviewChildIdentity)
-            or role != "review"
-            or self.role != "review"
-            or kind not in {"REVIEW", "RE_REVIEW"}
-            or workflow != review_child.round.binding.rejection
-        ):
-            raise ValueError("accounting review child requires its bound review context")
-        if review_child is not None:
-            RuntimeName(self.runtime_name)
-        self._context.set((issue, kind, number, claim_target, workflow, review_child, head, resumed))
+        self._context.set((issue, kind, number, claim_target, workflow, head, resumed))
 
     def _reserve_reclaiming_dead_headroom(
         self,
@@ -156,15 +144,15 @@ class AccountingRuntime(AgentRuntime):
         return _return_refused(detail)
 
     def record_refused_leg(self) -> None:
-        """Record a fix refusal before admission as an ordinary zero-cost run.
+        """Record a refusal before admission as an ordinary zero-cost run.
 
         A refusal buys nothing and mints no paid run, so without this row the
-        fix backoff never saw it and the item re-dispatched every poll with a
-        claim relabel each time (#262, tauri PR #1019). Cancelled, released and
-        receipt-less, the row reads as a machine end and nothing else counts it.
+        backoff never saw it and the item re-dispatched every poll (#262,
+        tauri PR #1019). Cancelled, released and receipt-less, the row reads
+        as a machine end and nothing else counts it.
         """
         issue, kind, number, *_, head, _resumed = self._context.get()
-        if self.role != "fix" or issue is None or not kind:
+        if self.role not in _LEG_ROLES or issue is None or not kind:
             return
         run_id = RunId(uuid.uuid4().hex)
         dispatch_id = json.dumps({"repository": self.repository, "role": self.role, "kind": kind, "issue": issue,
@@ -181,11 +169,10 @@ class AccountingRuntime(AgentRuntime):
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return self._refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
-        issue, kind, number, claim_target, workflow, review_child, head, resumed = self._context.get()
-        if self.role == "fix" and (workflow is not None or review_child is not None):
-            return self._refused("a fix leg is a plain leg: no workflow binding")
-        # ADR 0008: paid admission binds the decision-side target unchanged;
-        # review convergence remains PR-owned even when spend is issue-scoped.
+        issue, kind, number, claim_target, workflow, head, resumed = self._context.get()
+        if self.role in _LEG_ROLES and workflow is not None:
+            return self._refused("a role's leg is a plain leg: no workflow binding")
+        # ADR 0008: paid admission binds the decision-side target unchanged.
         target = (
             claim_target
             if claim_target is not None
@@ -198,16 +185,11 @@ class AccountingRuntime(AgentRuntime):
             and self._caps_armed()
         ):
             return self._blocked("codex pricing is unavailable")
-        issue_less_review = self.role == "review" and number > 0
-        if (
-            self.issue_cap is not None
-            and issue is None
-            and not issue_less_review
-        ):
+        if self.issue_cap is not None and issue is None:
             return self._blocked("issue spend scope is unavailable")
         limits = list(self._limits(now, issue))
         primary, *additional = limits
-        budget_kind = review_child_budget_leg(review_child, kind or "") if review_child is not None else kind or ""
+        budget_kind = kind or ""
         try:
             maximum = self.budget_policy.maximum_for(
                 self.role, budget_kind
@@ -267,27 +249,11 @@ class AccountingRuntime(AgentRuntime):
             kind or "paid",
             self.owner_id or f"{self.repository}:{self.role}",
             workflow=workflow,
-            review_child=review_child,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
-        if review_child is not None and reservation.disposition is AccountingDisposition.EXHAUSTED:
-            try:
-                refusal = self.store.record_review_admission_refusal(request)
-            except Exception as exc:  # noqa: BLE001 - uncertain authority cannot become a budget verdict
-                return self._refused(f"review child refusal authority unavailable: {exc}")
-            if refusal is None:
-                return self._refused("review child budget or authority changed before final refusal")
-            reservation = ReservationResult(
-                AccountingDisposition.EXHAUSTED, None,
-                Money(refusal.currency, refusal.committed_micros),
-                Money(refusal.currency, refusal.requested_micros),
-                Money(refusal.currency, refusal.cap_micros),
-                f"final planned-child refusal receipt {refusal.receipt_id}",
-                refusal.limit_dimension,
-            )
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
                 return self._refused(reservation.detail or reservation.disposition.value)
@@ -339,7 +305,6 @@ class AccountingRuntime(AgentRuntime):
             "ISSUE_AGENT_CONTROL_DB": self.store.path,
             "ISSUE_AGENT_REPOSITORY": self.repository,
             "ISSUE_AGENT_OWNER_ID": request.owner_id,
-            **({"ISSUE_AGENT_REVIEW_CHILD": "1"} if review_child is not None else {}),
         }
         runtime_task = replace(task, env={**task.env, **authority})
         try:
@@ -347,11 +312,12 @@ class AccountingRuntime(AgentRuntime):
         except BaseException:
             self._recover_or_release(run_id)
             raise
-        if self.role == "fix":
-            # The leg's class, recorded before settlement: a fix run that ends
+        if self.role in _LEG_ROLES:
+            # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
             leg = classify_leg(result, resumed=resumed)
-            self.store.receipt(FIX_LEG_NAMESPACE, self.repository, str(run_id), {
+            verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
+            self.store.receipt(LEG_NAMESPACE, self.repository, str(run_id), {
                 "leg": leg.value,
                 "session": resumable_session(result),
                 "runtime": self.runtime_name,
@@ -360,6 +326,9 @@ class AccountingRuntime(AgentRuntime):
                 # The question the QUESTION stop comment embeds: recorded with
                 # the leg so no separate post can lose it.
                 **({"question": question_text(result.needs)} if leg is LegClass.ASKED else {}),
+                # A review's parsed verdict: the harness submits it (and can
+                # resubmit it after a crash) without buying the review again.
+                **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
             })
         result = replace(
             result,
@@ -368,38 +337,13 @@ class AccountingRuntime(AgentRuntime):
                 if workflow is not None else None
             ),
         )
-        review_return = None
-        if review_child is not None:
-            try:
-                review_return = ReturnedReviewChild(
-                    review_child, str(run_id), request.owner_id, RuntimeName(self.runtime_name),
-                    review_returned_envelope(result), datetime.now(timezone.utc),
-                )
-                encode_workflow(review_return)
-            except (ValueError, WorkflowEncodingError) as exc:
-                self.store.record_reservation_retained(
-                    run_id, "review returned output cannot be durably captured",
-                )
-                raise RuntimeError("review returned output cannot be durably captured") from exc
-        return self._settle_result(
-            run_id, task.model or result.model or reserved_model, result,
-            returned_review=review_return,
-        )
+        return self._settle_result(run_id, task.model or result.model or reserved_model, result)
 
     def _blocked(self, detail: str) -> AgentResult:
         self.record_refused_leg()
         return _blocked(detail)
 
-    def _settle_result(
-        self, run_id: RunId, model: str | None, result: AgentResult, *,
-        returned_review: ReturnedReviewChild | None = None,
-    ) -> AgentResult:
-        if returned_review is not None:
-            stopped = self.store.settle_review_preflight_stop(returned_review)
-            if stopped is not None:
-                if stopped.disposition is not AccountingDisposition.AVAILABLE:
-                    raise RuntimeError("review preflight stop settlement failed closed")
-                return result
+    def _settle_result(self, run_id: RunId, model: str | None, result: AgentResult) -> AgentResult:
         observed = result.run_usage
         gap = observed.detail if isinstance(observed, EstimatedRunUsage) else ""
         usage = None
@@ -462,10 +406,7 @@ class AccountingRuntime(AgentRuntime):
             usage, card.rate_card_id if card else None, card.version if card else None,
             gap,
         )
-        if returned_review is not None:
-            settlement = self.store.settle_review_return(request, returned_review)
-        else:
-            settlement = self.store.settle(request)
+        settlement = self.store.settle(request)
         if settlement.disposition is not AccountingDisposition.AVAILABLE:
             raise RuntimeError(
                 f"accounting settlement failed closed: {settlement.detail}"

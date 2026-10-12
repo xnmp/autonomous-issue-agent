@@ -195,8 +195,9 @@ source_modules = [
     "issue_agent.app.main",
     "issue_agent.app.loop",
     "issue_agent.app.roles",
-    "issue_agent.app.dispatch",
-    "issue_agent.app.execute",
+    "issue_agent.app.tick",
+    "issue_agent.app.fix",
+    "issue_agent.app.review",
     "issue_agent.app.workflows",
 ]
 forbidden_modules = ["fastapi", "uvicorn"]

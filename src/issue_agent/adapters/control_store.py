@@ -23,7 +23,6 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
 from ..domain import continuation_components as cc
 from .codex_child_usage import NativeFailure
 from ..domain.contracts import ContinuationAdmission
@@ -44,7 +43,7 @@ from ..domain.contracts import (
     RunId,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier
+from ..domain.workflow_identity import FamilyAuthority, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
     ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
@@ -54,16 +53,6 @@ from ..domain.workflow import (
     CompletedRearm, PendingRearm, ResolveAdmission, ResolveEpisode, ResolveStage, WorkflowSnapshot,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
-from ..domain.agent_task import RuntimeName
-from ..domain.review_execution import CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
-from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
-from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
-from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan, classify_normal_review_return
-from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
-from ..domain.review_workflow_policy import (
-    ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
-    bound_submission_owed, escalation_signal_identity,
-)
 from ..domain.workflow_retry import (
     MAX_RELEVANT_AUTHORIZATIONS,
     DeclineRetry,
@@ -78,30 +67,21 @@ from ..domain.workflow_reconciliation import (
     prewrite_evidence_gate_id, unavailable_prewrite_read, unavailable_reconciliation, unknown_outcome_history,
 )
 from ..domain.resolve_return import FinalizedResolveReturn
-from ..domain.outcome import ExitReason
 from ..domain.repository import canonical_repository
 from ..domain.refs import issue_from_branch
 from .deployment_authority import (
     deployment_effect_barrier, deployment_effect_authority,
     deployment_role,
 )
-from .review_effects import bound_submission_op, review_family_op
-from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import (
     WorkflowAuthorityError,
     active_families,
-    linked_issue_workflow_holds,
-    load_family_authority,
     load_resolve_workflow_row,
-    load_review_workflow_row,
     load_workflow_row,
     load_workspace_ack,
-    read_review_submission_registration,
     require_resolve_binding,
-    require_review_binding,
     require_workflow_binding,
-    verified_review_completed_seal,
     workflow_scope,
     workflow_run_scope_bounds as workflow_run_scope_bounds,
 )
@@ -113,54 +93,6 @@ def workflow_episode_key(binding: WorkflowBinding) -> str:
     """An indexed projection of immutable admission scope, not an allowance."""
     return json.dumps((*workflow_scope(binding.fence.key), binding.authority.family.value,
                        binding.authority.epoch, binding.episode_id), ensure_ascii=False, separators=(",", ":"))
-
-
-def _review_child_key(child: ReviewChildIdentity) -> str:
-    return json.dumps((child.round.round_id, child.child_id), separators=(",", ":"))
-
-
-def _indexed_review_child_admission(
-    db: sqlite3.Connection, repository: str, child: ReviewChildIdentity,
-) -> ReviewChildAdmission | None:
-    indexed = db.execute(
-        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-child-admission' "
-        "AND scope=? AND key=?", (repository, _review_child_key(child)),
-    ).fetchone()
-    if indexed is None:
-        return None
-    admission = decode_workflow(indexed["payload_json"], ReviewChildAdmission)
-    run_receipt = db.execute(
-        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
-        "AND scope=? AND key=?", (repository, admission.run_id),
-    ).fetchone()
-    if admission.child != child or run_receipt is None or run_receipt["payload_json"] != indexed["payload_json"]:
-        raise WorkflowAuthorityError("review child admission index disagrees with its run receipt")
-    return admission
-
-
-def _review_request_fingerprint(request: ReservationRequest) -> str:
-    def limit_fields(limit: BudgetLimit) -> tuple[object, ...]:
-        scope = limit.scope
-        return (scope.repository, scope.dimension, scope.currency, scope.period_id,
-                _stamp(scope.period_start), _stamp(scope.period_end), str(scope.period_timezone),
-                limit.cap.micros)
-
-    quote = request.quote
-    payload = (
-        str(request.reservation_id), str(request.run_id), request.dispatch_id,
-        request.workload_repository, request.kind, request.owner_id, request.config_version,
-        encode_workflow(request.workflow), encode_workflow(request.review_child),
-        quote.model, quote.rate_card_id, quote.rate_card_version,
-        _stamp(quote.effective_at), quote.maximum_charge.currency, quote.maximum_charge.micros,
-        tuple(limit_fields(limit) for limit in (
-            BudgetLimit(request.scope, request.cap), *request.additional_limits,
-        )),
-    )
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-
-
-def _review_refusal_receipt_id(refusal: ReviewChildAdmissionRefusal) -> str:
-    return hashlib.sha256(encode_workflow(replace(refusal, receipt_id="pending")).encode()).hexdigest()
 
 
 def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool:
@@ -246,17 +178,6 @@ def require_workspace_predecessor(db: sqlite3.Connection, snapshot: WorkflowSnap
     return latest
 
 
-def proven_unlaunched_run(db: sqlite3.Connection, run_id: RunId) -> bool:
-    row = db.execute(
-        "SELECT 1 FROM runs r JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
-        "WHERE r.run_id=? AND r.state='cancelled' AND r.outcome='unlaunched_released' AND b.state='released' "
-        "AND rr.policy='spawn_pending' AND r.provider_receipt_id IS NULL "
-        "AND NOT EXISTS(SELECT 1 FROM charges c WHERE c.run_id=r.run_id) "
-        "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)", (str(run_id),),
-    ).fetchone()
-    return row is not None
-
-
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -268,59 +189,21 @@ _REVIEW_PAID_KINDS = frozenset({"REVIEW", "RE_REVIEW"})
 # ADR 0015 review slice: the only effects a review-rejection re-arm or review
 # completion may own. The PR target and each command's exact guard are
 # enforced separately at enqueue (review_family_op, bound_submission_op).
-_REVIEW_FAMILY_COMMAND_KINDS = frozenset({CommandKind.DISMISS_REVIEW, CommandKind.RELABEL, CommandKind.SUBMIT_REVIEW})
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
 # One operator signal per review escalation (increment 6 N2): claimed by
 # escalation identity, and each succeeded hold projection is examined once.
-ESCALATION_SIGNAL_NAMESPACE = "review-escalation-signal"
-ESCALATION_SIGNAL_COMMAND_NAMESPACE = "review-escalation-signal-command"
 # An escalation whose signal is owed although no succeeded receipt of its own
 # will carry it: its hold was found already on GitHub, its re-plans were
 # exhausted, or its restoration was contested (written by the review workflow
 # control). Scoped by the owing executor identity, so the executor's owner
 # lineage filters the rows in SQL before any claim limit applies.
-ESCALATION_SIGNAL_OWED_NAMESPACE = "review-escalation-signal-owed"
-ESCALATION_SIGNAL_REASONS = frozenset({"hold_verified", "projection_exhausted", "hold_contested"})
 # A malformed owed record is quarantined once, per row (same scope and key),
 # and journalled: at-most-once paging never wedges every drain on one corrupt
 # row, and a well-formed signal of the same escalation is still sent.
-ESCALATION_SIGNAL_QUARANTINE_NAMESPACE = "review-escalation-signal-quarantined"
-
-
-def owe_escalation_signal(
-    db: sqlite3.Connection, *, executor_identity: str, escalation: str, pr: int, reason: str, at: datetime,
-) -> None:
-    """Record, once, that this escalation's operator signal is owed; the executor's claim sends it."""
-    if reason not in ESCALATION_SIGNAL_REASONS:
-        raise ValueError(f"unknown escalation signal reason: {reason!r}")
-    if type(pr) is not int or pr < 1:
-        raise ValueError("an escalation signal names a pull request number")
-    if not executor_identity or not escalation:
-        raise ValueError("an escalation signal names its executor and its escalation")
-    db.execute(
-        "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-        (ESCALATION_SIGNAL_OWED_NAMESPACE, executor_identity, escalation, at.isoformat(),
-         json.dumps({"pr": pr, "reason": reason}, sort_keys=True)),
-    )
-
 class ControlStoreError(RuntimeError):
     pass
-
-
-def _owed_escalation_signal(raw: str) -> tuple[int, str] | str:
-    """An owed signal's (pull request, reason), or why the record is malformed."""
-    try:
-        payload = json.loads(raw)
-        number, reason = payload["pr"], payload["reason"]
-    except (ValueError, TypeError, KeyError) as exc:
-        return f"unparseable owed signal: {type(exc).__name__}: {str(exc)[:200]}"
-    if type(number) is not int or number < 1:
-        return "owed signal names no pull request number"
-    if not isinstance(reason, str) or reason not in ESCALATION_SIGNAL_REASONS:
-        return "owed signal names an unknown reason"
-    return number, reason
 
 
 class IncompatibleSchema(ControlStoreError):
@@ -347,13 +230,13 @@ class AccountingDisposition(str, Enum):
     CONFLICT = "conflict"
 
 
-# Per-run fix leg class, written before settlement (see `fix_runs`).
-FIX_LEG_NAMESPACE = "fix-leg"
+# Per-run leg class, written before settlement (see `leg_runs`).
+LEG_NAMESPACE = "leg"
 
 
 @dataclass(frozen=True)
-class FixRun:
-    """One ended fix run: what it was dispatched as and on, and its receipt."""
+class LegRun:
+    """One ended leg of either role: what it was dispatched as and on, and its receipt."""
 
     kind: str
     number: int
@@ -487,7 +370,6 @@ class ReservationRequest:
     kind: str = "paid"
     owner_id: str = "reservation"
     workflow: WorkflowBinding | None = None
-    review_child: ReviewChildIdentity | None = None
     continuations: tuple[cc.ContinuationPurchase, ...] = ()
 
     def __post_init__(self) -> None:
@@ -509,12 +391,6 @@ class ReservationRequest:
             raise ValueError("reservation workflow binding must match its workload repository")
         if any(item.capture.binding.fence.key.repository != workload_repository for item in self.continuations):
             raise ValueError("reservation continuation belongs to another repository")
-        if self.review_child is not None and (
-            not isinstance(self.review_child, ReviewChildIdentity)
-            or self.workflow != self.review_child.round.binding.rejection
-            or self.kind not in _REVIEW_PAID_KINDS
-        ):
-            raise ValueError("planned review child requires its matching rejection binding and review leg")
         if self.scope.currency != self.quote.maximum_charge.currency:
             raise ValueError("reservation scope and quote currency differ")
         if self.cap.currency != self.scope.currency:
@@ -1197,9 +1073,10 @@ def _backfill_workflow_components_v25(db: sqlite3.Connection) -> None:
             if len(family) != 2 or not isinstance(family[0], FamilyAuthority):
                 raise ValueError("legacy workflow family is malformed")
             authority, episode = family
+            # Pre-v25 review-rejection rows no longer decode (slice 5c deleted
+            # the family): such a store refuses this migration as incompatible.
             expected = (
                 WorkflowFamily.RESOLVE if row["target_kind"] == "issue" and isinstance(episode, ResolveEpisode)
-                else WorkflowFamily.REVIEW_REJECTIONS if row["target_kind"] == "pr" and isinstance(episode, ReviewEpisode)
                 else None
             )
             if authority.family is not expected:
@@ -1319,6 +1196,11 @@ _FIX_ISSUE_DISPATCH = """CASE WHEN json_valid(dispatch_id) THEN
     AND json_extract(dispatch_id,'$.issue')>0 ELSE 0 END
     AND kind IN ('ROUTE','RESOLVE','RESUME','AUTHOR','IMPLEMENT','ADJUDICATE',
                  'PR_RESUME','FIX_CI','ADDRESS_REVIEW','REBASE')"""
+# Every leg derive counts: fix legs (above) and the review role's REVIEW legs.
+_LEG_DISPATCH = f"""({_FIX_ISSUE_DISPATCH} OR (CASE WHEN json_valid(dispatch_id) THEN
+    json_type(dispatch_id)='object' AND json_extract(dispatch_id,'$.role')='review'
+    AND json_type(dispatch_id,'$.issue')='integer' AND json_extract(dispatch_id,'$.issue')>0 ELSE 0 END
+    AND kind='REVIEW'))"""
 _FIX_DISPATCH_REPOSITORY = "CASE WHEN json_valid(dispatch_id) THEN json_extract(dispatch_id,'$.repository') END"
 _FIX_DISPATCH_ISSUE = "CASE WHEN json_valid(dispatch_id) THEN json_extract(dispatch_id,'$.issue') END"
 
@@ -2557,18 +2439,14 @@ class SQLiteControlStore:
                 barriers.enter_context(deployment_effect_barrier(self.path, repository, role))
             with closing(self._connect()) as db:
                 db.execute("BEGIN")
-                active = active_families(db, repository)
-                if WorkflowFamily.RESOLVE in active:
+                # A retained review-family epoch is inert since slice 5c (the
+                # family is deleted), so only resolve authority refuses.
+                if WorkflowFamily.RESOLVE in active_families(db, repository):
                     raise WorkflowAuthorityError("legacy unblock is retired for active resolve control; use a typed re-arm command")
-                # Family-scoped reads no longer count PR rows as resolve
-                # authority; the legacy unblock still never crosses them
-                # (ADR 0015: never two authorities, no fallback).
-                if active:
-                    raise WorkflowAuthorityError("legacy unblock is retired for active review rejection control; use a typed re-arm command")
             yield
 
     def active_workflow_families(self, repository: str) -> tuple[WorkflowFamily, ...]:
-        """The families activated for a repository, read-only: exactly what `legacy_resolve_authority` refuses on."""
+        """The families activated for a repository, read-only. Only resolve makes `legacy_resolve_authority` refuse."""
         from ..domain.workflow_identity import canonical_workflow_repository
 
         self.require_initialized()
@@ -3195,8 +3073,6 @@ class SQLiteControlStore:
         if outcome == "unlaunched_released":
             raise ValueError("never-launched evidence can only be minted by reservation release")
         with self.transaction() as db:
-            if self._has_review_preflight_stop(db, run_id):
-                raise ControlStoreError("review preflight stop requires atomic accounting completion")
             row = db.execute(
                 "SELECT state, outcome, provider_receipt_id FROM runs WHERE run_id=?",
                 (str(run_id),),
@@ -3220,12 +3096,10 @@ class SQLiteControlStore:
     def register_lease(self, lease: Lease) -> None:
         with self.transaction() as db:
             run = db.execute(
-                "SELECT state,review_round_id,workflow_binding_json,continuations_json,owner_id,dispatch_id FROM runs WHERE run_id=?", (str(lease.run_id),),
+                "SELECT state,workflow_binding_json,continuations_json,owner_id,dispatch_id FROM runs WHERE run_id=?", (str(lease.run_id),),
             ).fetchone()
             if run is None or run["state"] in {"completed", "cancelled", "abandoned"}:
                 raise ControlStoreError("process lease requires a nonterminal run")
-            if run["review_round_id"] is not None:
-                raise ControlStoreError("review child requires guarded process registration")
             if run["continuations_json"] != encode_workflow(()) and (lease.owner_id != run["owner_id"] or lease.dispatch_id != run["dispatch_id"]):
                 raise ControlStoreError("continuation lease conflicts with its actual run identity")
             self._assert_owner_active(db, lease.owner_id)
@@ -3270,71 +3144,20 @@ class SQLiteControlStore:
             or type(process_start_ticks) is not int or process_start_ticks <= 0
         ):
             raise ValueError("live process identity is required")
-        scope = self._review_launch_scope(run_id)
-        if scope is None:
-            return self._register_process_lease(
-                run_id, expected_owner_id=expected_owner_id, pid=pid, pgid=pgid,
-                process_start_ticks=process_start_ticks,
-            )
-        repository, round_id, had_lease = scope
-        with deployment_effect_authority(
-            self.path, repository, deployment_role(repository, expected_owner_id), blocking=False,
-        ):
-            child_identity_proven = False
-            if not had_lease:
-                from .process_supervisor import ProcessSupervisor
-                try:
-                    same_group = os.getpgid(pid) == pgid
-                except OSError:
-                    same_group = False
-                if not same_group or not ProcessSupervisor.matches_identity(pid, process_start_ticks):
-                    raise ControlStoreError("review launch process identity is not live")
-                child_identity_proven = True
-            parent_identity = self._review_round_parent_identity(repository, round_id)
-            return self._register_process_lease(
-                run_id, expected_owner_id=expected_owner_id, pid=pid, pgid=pgid,
-                process_start_ticks=process_start_ticks, review_scope=(repository, round_id),
-                review_parent_identity=parent_identity,
-                review_child_identity_proven=child_identity_proven,
-            )
-
-    def _review_launch_scope(self, run_id: RunId) -> tuple[str, str, bool] | None:
-        with closing(self._connect()) as db:
-            row = db.execute(
-                "SELECT b.workload_repository,r.review_round_id,l.run_id AS leased FROM runs r "
-                "JOIN budget_reservations b ON b.run_id=r.run_id "
-                "LEFT JOIN leases l ON l.run_id=r.run_id WHERE r.run_id=?",
-                (str(run_id),),
-            ).fetchone()
-        return ((row["workload_repository"], row["review_round_id"], row["leased"] is not None)
-                if row is not None and row["review_round_id"] is not None else None)
-
-    def _review_round_parent_identity(self, repository: str, round_id: str) -> tuple[int, int] | None:
-        with closing(self._connect()) as db:
-            row = db.execute(
-                "SELECT dc.owner_pid,dc.owner_start_ticks FROM review_execution_rounds rr "
-                "JOIN dispatch_claims dc ON dc.repository=rr.repository AND dc.occurrence_id=rr.claim_occurrence_id "
-                "WHERE rr.round_id=? AND rr.repository=? AND dc.role='review'",
-                (round_id, repository),
-            ).fetchone()
-        if row is None:
-            return None
-        from .process_supervisor import ProcessSupervisor
-        identity = (row["owner_pid"], row["owner_start_ticks"])
-        return identity if ProcessSupervisor.matches_identity(*identity) else None
+        return self._register_process_lease(
+            run_id, expected_owner_id=expected_owner_id, pid=pid, pgid=pgid,
+            process_start_ticks=process_start_ticks,
+        )
 
     def _register_process_lease(
         self, run_id: RunId, *, expected_owner_id: str, pid: int, pgid: int,
-        process_start_ticks: int, review_scope: tuple[str, str] | None = None,
-        review_parent_identity: tuple[int, int] | None = None,
-        review_child_identity_proven: bool = False,
+        process_start_ticks: int,
     ) -> Lease:
         with self.transaction() as db:
             self._assert_owner_active(db, expected_owner_id)
             run = db.execute(
                 "SELECT dispatch_id, kind, owner_id, state, workflow_binding_json, "
-                "workflow_episode_key, review_round_id, review_child_id "
-                "FROM runs WHERE run_id=?",
+                "workflow_episode_key FROM runs WHERE run_id=?",
                 (str(run_id),),
             ).fetchone()
             if run is None:
@@ -3345,19 +3168,6 @@ class SQLiteControlStore:
                 raise ControlStoreError(
                     f"process lease cannot attach to terminal run: {run_id}"
                 )
-            review_attached = run["review_round_id"] is not None or run["review_child_id"] is not None
-            if review_attached and (
-                review_scope is None or run["review_round_id"] != review_scope[1]
-                or run["review_child_id"] is None
-            ):
-                raise ControlStoreError("review launch lacks its captured round scope")
-            if review_scope is not None and not review_attached:
-                raise ControlStoreError("review launch scope changed before process registration")
-            if review_attached and db.execute(
-                "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-preflight-stop' "
-                "AND scope=? AND key=?", (review_scope[0], str(run_id)),
-            ).fetchone() is not None:
-                raise ControlStoreError("review preflight stop fenced child launch")
             existing = db.execute(
                 "SELECT dispatch_id, owner_id, pid, pgid, process_start_ticks, "
                 "started_at FROM leases WHERE run_id=?",
@@ -3382,7 +3192,7 @@ class SQLiteControlStore:
                         incoming_group_matches = os.getpgid(pid) == pgid
                     except OSError:
                         incoming_group_matches = False
-                    if (review_attached or existing["owner_id"] != expected_owner_id
+                    if (existing["owner_id"] != expected_owner_id
                             or run["owner_id"] != expected_owner_id
                             or existing["dispatch_id"] != run["dispatch_id"]
                             or not incoming_group_matches
@@ -3392,17 +3202,12 @@ class SQLiteControlStore:
                         raise ControlStoreError(f"conflicting live process lease for run: {run_id}")
                     self._require_continuation_launch(db, run_id)
                     # A transport retry shares its paid run. It can replace
-                    # ownership only after the prior process group is gone;
-                    # attached review children retain their immutable receipt.
+                    # ownership only after the prior process group is gone.
                     started_at = _parse_stamp(_stamp(self._now()))
                     db.execute("UPDATE leases SET pid=?,pgid=?,process_start_ticks=?,started_at=? WHERE run_id=?",
                                (pid, pgid, process_start_ticks, _stamp(started_at), str(run_id)))
                     return Lease(run_id, run["dispatch_id"], expected_owner_id,
                                  pid, pgid, started_at, process_start_ticks)
-                if review_attached:
-                    self._require_review_launch_receipt(
-                        db, run_id, review_scope[0], run, existing,
-                    )
                 return Lease(
                     run_id,
                     existing["dispatch_id"],
@@ -3416,13 +3221,6 @@ class SQLiteControlStore:
                 raise RetiredOwnerError(
                     f"reserved run owner changed from {expected_owner_id!r} "
                     f"to {run['owner_id']!r} before process registration"
-                )
-            review_admission = None
-            if review_attached:
-                if not review_child_identity_proven:
-                    raise ControlStoreError("review launch lacks a live registered process")
-                review_admission = self._require_review_launch_admission(
-                    db, run_id, review_scope[0], run, review_parent_identity,
                 )
             self._require_continuation_launch(db, run_id)
             started_at = _parse_stamp(_stamp(self._now()))
@@ -3458,122 +3256,7 @@ class SQLiteControlStore:
                 "reason=NULL, updated_at=? WHERE run_id=?",
                 (_stamp(started_at), str(run_id)),
             )
-            if review_admission is not None:
-                launch = ReviewChildLaunchRegistration(
-                    review_admission, f"review-execution-launch:{run_id}",
-                    lease.dispatch_id, pid, pgid, process_start_ticks, started_at,
-                )
-                db.execute(
-                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                    "VALUES ('review-execution-launch',?,?,?,?)",
-                    (review_scope[0], str(run_id), _stamp(started_at), encode_workflow(launch)),
-                )
             return lease
-
-    @staticmethod
-    def _load_review_launch_admission(
-        db: sqlite3.Connection, run_id: RunId, repository: str, run: sqlite3.Row,
-    ) -> ReviewChildAdmission:
-        receipt = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
-            "AND scope=? AND key=?",
-            (repository, str(run_id)),
-        ).fetchone()
-        budget = db.execute(
-            "SELECT reservation_id,workload_repository,state FROM budget_reservations WHERE run_id=?",
-            (str(run_id),),
-        ).fetchone()
-        if receipt is None or budget is None:
-            raise ControlStoreError("review launch lacks its admission or reservation")
-        try:
-            admission = decode_workflow(receipt["payload_json"], ReviewChildAdmission)
-            indexed = _indexed_review_child_admission(db, repository, admission.child)
-        except WorkflowEncodingError as exc:
-            raise ControlStoreError("review launch admission receipt is unreadable") from exc
-        except WorkflowAuthorityError as exc:
-            raise ControlStoreError(str(exc)) from exc
-        binding = admission.child.round.binding.rejection
-        if (indexed != admission or admission.run_id != str(run_id)
-                or admission.reservation_id != budget["reservation_id"]
-                or budget["workload_repository"] != repository or admission.owner_id != run["owner_id"]
-                or admission.child.round.round_id != run["review_round_id"]
-                or admission.child.child_id != run["review_child_id"]
-                or run["workflow_binding_json"] != encode_workflow(binding)
-                or run["workflow_episode_key"] != workflow_episode_key(binding)
-                or run["kind"] not in _REVIEW_PAID_KINDS):
-            raise ControlStoreError("review launch disagrees with its admitted run")
-        return admission
-
-    def _require_review_launch_admission(
-        self, db: sqlite3.Connection, run_id: RunId, repository: str,
-        run: sqlite3.Row, parent_identity: tuple[int, int] | None,
-    ) -> ReviewChildAdmission:
-        if run["state"] != "reserved":
-            raise ControlStoreError("review launch requires a still reserved run")
-        if db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
-            "AND scope=? AND key=?", (repository, str(run_id)),
-        ).fetchone() is not None:
-            raise ControlStoreError("review run already has a launch registration")
-        admission = self._load_review_launch_admission(db, run_id, repository, run)
-        budget = db.execute(
-            "SELECT state FROM budget_reservations WHERE run_id=?", (str(run_id),),
-        ).fetchone()
-        recovery = db.execute(
-            "SELECT policy FROM reservation_recovery WHERE run_id=?", (str(run_id),),
-        ).fetchone()
-        if (budget is None or budget["state"] != "active" or recovery is None
-                or recovery["policy"] != "spawn_pending"):
-            raise ControlStoreError("review launch requires an active unlaunched reservation")
-        snapshot = require_review_binding(db, admission.child.round.binding.rejection)
-        if (admission.admitted_revision.fence != snapshot.revision.fence
-                or admission.admitted_revision.version > snapshot.revision.version):
-            raise ControlStoreError("review launch admission revision is stale or impossible")
-        try:
-            dispatch = json.loads(run["dispatch_id"])
-        except (TypeError, ValueError) as exc:
-            raise ControlStoreError("review launch dispatch identity is unreadable") from exc
-        if not isinstance(dispatch, dict):
-            raise ControlStoreError("review launch dispatch identity is malformed")
-        selection = self._require_review_child_authority(
-            db, repository, run["owner_id"], admission.child, run["kind"],
-            dispatch, snapshot, parent_identity,
-        )
-        if admission.claim_occurrence_id != selection.claim_occurrence_id:
-            raise ControlStoreError("review launch changed its parent claim occurrence")
-        target = (f"issue:{selection.claim_target}" if selection.claim_target > 0
-                  else f"pr:{-selection.claim_target}")
-        if db.execute(
-            "SELECT 1 FROM dispatch_claim_runs WHERE repository=? AND role='review' "
-            "AND target=? AND run_id=?",
-            (repository, target, str(run_id)),
-        ).fetchone() is None:
-            raise ControlStoreError("review launch lost its parent claim/run link")
-        return admission
-
-    def _require_review_launch_receipt(
-        self, db: sqlite3.Connection, run_id: RunId, repository: str,
-        run: sqlite3.Row, lease: sqlite3.Row,
-    ) -> None:
-        admission = self._load_review_launch_admission(db, run_id, repository, run)
-        receipt = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
-            "AND scope=? AND key=?", (repository, str(run_id)),
-        ).fetchone()
-        if receipt is None:
-            raise ControlStoreError("review process lease lacks its immutable launch receipt")
-        try:
-            recorded = decode_workflow(receipt["payload_json"], ReviewChildLaunchRegistration)
-            expected = ReviewChildLaunchRegistration(
-                admission, f"review-execution-launch:{run_id}", run["dispatch_id"],
-                lease["pid"], lease["pgid"], lease["process_start_ticks"],
-                _parse_stamp(lease["started_at"]),
-            )
-        except (WorkflowEncodingError, ValueError, TypeError) as exc:
-            raise ControlStoreError("review launch receipt is unreadable") from exc
-        if (recorded != expected or lease["dispatch_id"] != run["dispatch_id"]
-                or lease["owner_id"] != run["owner_id"] or run["state"] != "running"):
-            raise ControlStoreError("review launch receipt disagrees with its live lease")
 
     def release_lease(self, run_id: RunId) -> None:
         with self.transaction() as db:
@@ -3798,55 +3481,18 @@ class SQLiteControlStore:
         self,
         run_id: RunId,
         reason: str,
-        *,
-        returned_review: ReturnedReviewChild | None = None,
     ) -> bool:
-        """Retain uncertain spend, or capture its return after reconciliation wins."""
+        """Retain uncertain spend."""
 
         if not reason:
             raise ValueError("reservation retention reason is required")
-        if returned_review is not None and (
-            not isinstance(returned_review, ReturnedReviewChild)
-            or returned_review.run_id != str(run_id)
-        ):
-            raise ValueError("retained review return requires its exact run")
         with self.transaction() as db:
             row = db.execute(
                 "SELECT b.state,b.workload_repository,r.dispatch_id FROM budget_reservations b "
                 "JOIN runs r ON r.run_id=b.run_id WHERE b.run_id=?",
                 (str(run_id),),
             ).fetchone()
-            review_return = (
-                self._review_return_authority(db, returned_review)
-                if returned_review is not None else None
-            )
-            if row is None:
-                if returned_review is not None:
-                    raise ControlStoreError("review return lacks its paid reservation")
-                return False
-            stop = db.execute(
-                "SELECT payload_json FROM dedupe_keys "
-                "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
-                (row["workload_repository"], str(run_id)),
-            ).fetchone()
-            if stop is not None:
-                stopped = decode_workflow(stop["payload_json"], ReviewRuntimePreflightStop)
-                if (stopped.admission.run_id != str(run_id)
-                        or (returned_review is not None and stopped.result != returned_review.result)):
-                    raise ControlStoreError("review retained return disagrees with its runtime preflight stop")
-                return True
-            if row["state"] == "settled" and review_return is not None:
-                charge = db.execute(
-                    "SELECT 1 FROM charges WHERE run_id=?", (str(run_id),),
-                ).fetchone()
-                if charge is None:
-                    raise ControlStoreError("settled review return lacks its actual charge")
-                if not review_return[1]:
-                    self._insert_review_return(db, review_return[0], returned_review)
-                return False
-            if row["state"] != "active":
-                if returned_review is not None:
-                    raise ControlStoreError("review return has no retainable or settled reservation")
+            if row is None or row["state"] != "active":
                 return False
             now = _stamp(self._now())
             db.execute(
@@ -3868,8 +3514,6 @@ class SQLiteControlStore:
                 (now, str(run_id)),
             )
             db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
-            if review_return is not None and not review_return[1]:
-                self._insert_review_return(db, review_return[0], returned_review)
             return True
 
     def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool:
@@ -4414,28 +4058,29 @@ class SQLiteControlStore:
             return True
 
 
-    def fix_runs(self, repository: str, issues: Iterable[int]) -> tuple[FixRun, ...]:
-        """Every ended fix run for these issues, with its leg receipt (if any).
+    def leg_runs(self, repository: str, issues: Iterable[int]) -> tuple[LegRun, ...]:
+        """Every ended leg of either role for these issues, with its receipt (if any).
 
-        The `fix-leg` receipt carries the leg's class, written before
-        settlement. A run ended without one never returned (cancelled,
-        reclaimed, refused before admission): a machine end to its reader.
+        The `leg` receipt carries the leg's class, written before settlement.
+        A run ended without one never returned (cancelled, reclaimed, refused
+        before admission): a machine end to its reader. Both roles read every
+        leg: a leg of either role holds its item busy and breaks attempt runs.
         """
         wanted = sorted({n for n in issues if type(n) is int and n > 0})
         if not wanted:
             return ()
-        out: list[FixRun] = []
+        out: list[LegRun] = []
         with closing(self._connect()) as db, db:
             for start in range(0, len(wanted), 500):
                 chunk = wanted[start:start + 500]
                 rows = db.execute(
                     "SELECT r.kind, r.started_at, r.completed_at, r.dispatch_id, k.payload_json "
-                    "FROM runs r INDEXED BY runs_fix_issue_dispatch "
+                    "FROM runs r "
                     "LEFT JOIN dedupe_keys k ON k.namespace=? AND k.scope=? AND k.key=r.run_id "
-                    f"WHERE {_FIX_ISSUE_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? "
+                    f"WHERE {_LEG_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? "
                     f"AND {_FIX_DISPATCH_ISSUE} IN ({','.join('?' for _ in chunk)}) "
                     "AND r.completed_at IS NOT NULL",
-                    (FIX_LEG_NAMESPACE, repository, repository, *chunk),
+                    (LEG_NAMESPACE, repository, repository, *chunk),
                 ).fetchall()
                 for row in rows:
                     dispatch = json.loads(row["dispatch_id"])
@@ -4445,7 +4090,7 @@ class SQLiteControlStore:
                         receipt = None
                     number = dispatch.get("number")
                     head = dispatch.get("head")
-                    out.append(FixRun(
+                    out.append(LegRun(
                         str(row["kind"]),
                         number if type(number) is int else dispatch["issue"],
                         int(dispatch["issue"]),
@@ -4513,142 +4158,11 @@ class SQLiteControlStore:
         try:
             with deployment_effect_authority(self.path, request.workload_repository,
                                              deployment_role(request.workload_repository, request.owner_id), blocking=False):
-                parent_identity = self._review_parent_identity(request) if request.review_child is not None else None
-                return self._reserve(request, lease=lease, review_parent_identity=parent_identity)
+                return self._reserve(request, lease=lease)
         except (OSError, sqlite3.DatabaseError) as exc:
             return ReservationResult(AccountingDisposition.UNAVAILABLE, None,
                 Money.zero(request.scope.currency), request.quote.maximum_charge,
                 request.cap, f"deployment effect authority unavailable: {exc}")
-
-    def record_review_admission_refusal(
-        self, request: ReservationRequest,
-    ) -> ReviewChildAdmissionRefusal | None:
-        """Record a final cap trip only while the planned child is still eligible.
-
-        The earlier exhausted result is advisory. This transaction repeats both
-        authority and every cap check after reconciliation and races with reserve
-        under SQLite's write lock.
-        """
-        child = request.review_child
-        if child is None:
-            raise ValueError("review refusal requires a planned child")
-        self.integrity_check()
-        with deployment_effect_authority(
-            self.path, request.workload_repository,
-            deployment_role(request.workload_repository, request.owner_id), blocking=False,
-        ):
-            parent_identity = self._review_parent_identity(request)
-            with self.transaction() as db:
-                key = _review_child_key(child)
-                fingerprint = _review_request_fingerprint(request)
-                prior = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-refusal' "
-                    "AND scope=? AND key=?",
-                    (request.workload_repository, key),
-                ).fetchone()
-                if prior is not None:
-                    refusal = decode_workflow(prior["payload_json"], ReviewChildAdmissionRefusal)
-                    recorded = load_review_preflight_record(
-                        db, request.workload_repository, request.owner_id, child.round.round_id,
-                    )
-                    limits = (BudgetLimit(request.scope, request.cap), *request.additional_limits)
-                    matching_limit = any(
-                        (refusal.limit_repository, refusal.limit_dimension, refusal.limit_period_id,
-                         refusal.limit_period_start, refusal.limit_period_end, refusal.limit_period_timezone,
-                         refusal.currency, refusal.cap_micros) == (
-                             limit.scope.repository, limit.scope.dimension, limit.scope.period_id,
-                             limit.scope.period_start, limit.scope.period_end, str(limit.scope.period_timezone),
-                             limit.scope.currency, limit.cap.micros,
-                         ) for limit in limits
-                    )
-                    workflow_row = db.execute(
-                        "SELECT generation,version FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
-                        workflow_scope(child.round.binding.rejection.fence.key),
-                    ).fetchone()
-                    if (refusal.child != child or refusal.owner_id != request.owner_id
-                            or refusal.request_fingerprint != fingerprint
-                            or refusal.run_id != str(request.run_id)
-                            or refusal.reservation_id != str(request.reservation_id)
-                            or refusal.receipt_id != _review_refusal_receipt_id(refusal)
-                            or refusal.requested_micros != request.quote.maximum_charge.micros
-                            or not matching_limit or recorded is None
-                            or refusal.claim_occurrence_id != recorded[0].claim_occurrence_id
-                            or workflow_row is None
-                            or (workflow_row["generation"] == refusal.refused_revision.fence.generation
-                                and workflow_row["version"] < refusal.refused_revision.version)):
-                        raise WorkflowAuthorityError("review child has a conflicting refusal receipt")
-                    return refusal
-                if _indexed_review_child_admission(
-                    db, request.workload_repository, child,
-                ) is not None or db.execute(
-                    "SELECT 1 FROM runs WHERE review_round_id=? AND review_child_id=?",
-                    (child.round.round_id, child.child_id),
-                ).fetchone() or db.execute(
-                    "SELECT 1 FROM runs WHERE run_id=?", (str(request.run_id),),
-                ).fetchone():
-                    raise WorkflowAuthorityError("review child already has a paid admission")
-                self._assert_owner_active(db, request.owner_id)
-                snapshot = self._validate_workflow_reservation(
-                    db, request, review_parent_identity=parent_identity,
-                )
-                if not isinstance(snapshot, ReviewWorkflowSnapshot):
-                    raise WorkflowAuthorityError("review refusal requires active execution authority")
-                recorded = load_review_preflight_record(
-                    db, request.workload_repository, request.owner_id, child.round.round_id,
-                )
-                if recorded is None:
-                    raise WorkflowAuthorityError("review refusal lost its preflight receipt")
-                requested = request.quote.maximum_charge
-                for limit in (BudgetLimit(request.scope, request.cap), *request.additional_limits):
-                    settled, reserved = self._balance(db, limit.scope)
-                    committed = settled + reserved
-                    if committed + requested.micros <= limit.cap.micros:
-                        continue
-                    revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
-                    now = self._now()
-                    refusal = ReviewChildAdmissionRefusal(
-                        child, "pending", str(request.run_id), str(request.reservation_id),
-                        recorded[0].claim_occurrence_id, revision, request.owner_id, fingerprint,
-                        limit.scope.repository, limit.scope.dimension, limit.scope.period_id,
-                        limit.scope.period_start, limit.scope.period_end, str(limit.scope.period_timezone),
-                        limit.scope.currency, committed, requested.micros, limit.cap.micros, now,
-                    )
-                    refusal = replace(refusal, receipt_id=_review_refusal_receipt_id(refusal))
-                    changed = db.execute(
-                        "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=? "
-                        "AND generation=? AND version=?",
-                        (revision.version, *workflow_scope(revision.fence.key), revision.fence.generation,
-                         snapshot.revision.version),
-                    ).rowcount
-                    if changed != 1:
-                        raise WorkflowAuthorityError("review refusal lost the aggregate version")
-                    db.execute(
-                        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                        "VALUES ('review-execution-refusal',?,?,?,?)",
-                        (request.workload_repository, key, _stamp(now), encode_workflow(refusal)),
-                    )
-                    return refusal
-                return None
-
-    def _review_parent_identity(self, request: ReservationRequest) -> tuple[int, int] | None:
-        """Probe the selected parent outside SQLite's write transaction."""
-        if request.review_child is None:
-            return None
-        with closing(self._connect()) as db:
-            db.execute("BEGIN")
-            if db.execute("SELECT 1 FROM budget_reservations WHERE run_id=?", (str(request.run_id),)).fetchone():
-                return None
-            row = db.execute(
-                "SELECT dc.owner_pid,dc.owner_start_ticks FROM review_execution_rounds rr "
-                "JOIN dispatch_claims dc ON dc.repository=rr.repository AND dc.occurrence_id=rr.claim_occurrence_id "
-                "WHERE rr.round_id=? AND rr.repository=? AND dc.role='review'",
-                (request.review_child.round.round_id, request.workload_repository),
-            ).fetchone()
-        if row is None:
-            return None
-        from .process_supervisor import ProcessSupervisor
-        identity = (row["owner_pid"], row["owner_start_ticks"])
-        return identity if ProcessSupervisor.matches_identity(*identity) else None
 
     @contextmanager
     def workspace_entry_authority(self, request: ReservationRequest) -> Iterator[EpisodeWorkspacePrepared | None]:
@@ -4682,11 +4196,8 @@ class SQLiteControlStore:
     def _reserve(
         self, request: ReservationRequest, *, lease: Lease | None = None,
         workspace_verified: EpisodeWorkspacePrepared | None = None,
-        review_parent_identity: tuple[int, int] | None = None,
     ) -> ReservationResult:
         requested = request.quote.maximum_charge
-        if request.review_child is not None and lease is not None:
-            raise ValueError("planned review admission cannot register a process lease")
         if lease is not None and (
             lease.run_id != request.run_id
             or lease.dispatch_id != request.dispatch_id
@@ -4728,7 +4239,6 @@ class SQLiteControlStore:
                     )
                 workflow_snapshot = self._validate_workflow_reservation(
                     db, request, workspace_verified=workspace_verified,
-                    review_parent_identity=review_parent_identity,
                 )
                 continuation_updates, continuation_receipts = self._prepare_continuation_admissions(db, request)
                 committed = Money.zero(request.scope.currency)
@@ -4751,9 +4261,7 @@ class SQLiteControlStore:
                             limit.scope.dimension,
                         )
                 now = _stamp(self._now())
-                if isinstance(workflow_snapshot, ReviewWorkflowSnapshot):
-                    self._record_review_admission(db, request, workflow_snapshot, now)
-                elif workflow_snapshot is not None:
+                if workflow_snapshot is not None:
                     self._record_workflow_admission(db, request, workflow_snapshot, now)
                 from .workflow_rows import persist_workflow_snapshot
                 for aggregate in continuation_updates:
@@ -4766,8 +4274,8 @@ class SQLiteControlStore:
                     )
                 db.execute(
                     "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
-                    "config_version, workflow_binding_json, workflow_episode_key,review_round_id,review_child_id,continuations_json) "
-                    "VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?)",
+                    "config_version, workflow_binding_json, workflow_episode_key,continuations_json) "
+                    "VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)",
                     (
                         str(request.run_id),
                         request.dispatch_id,
@@ -4776,8 +4284,6 @@ class SQLiteControlStore:
                         request.config_version,
                         encode_workflow(request.workflow) if request.workflow is not None else None,
                         workflow_episode_key(request.workflow) if request.workflow is not None else None,
-                        request.review_child.round.round_id if request.review_child is not None else None,
-                        request.review_child.child_id if request.review_child is not None else None,
                         encode_workflow(request.continuations),
                     ),
                 )
@@ -4819,21 +4325,6 @@ class SQLiteControlStore:
                     ") VALUES (?, 'spawn_pending', NULL, ?)",
                     (str(request.run_id), now),
                 )
-                if request.review_child is not None:
-                    recorded = load_review_preflight_record(
-                        db, request.workload_repository, request.owner_id,
-                        request.review_child.round.round_id,
-                    )
-                    if recorded is None:
-                        raise WorkflowAuthorityError("review admission lost its preflight receipt")
-                    selection = recorded[0]
-                    target = (f"issue:{selection.claim_target}" if selection.claim_target > 0
-                              else f"pr:{-selection.claim_target}")
-                    db.execute(
-                        "INSERT INTO dispatch_claim_runs(repository,role,target,run_id,bound_at) "
-                        "VALUES (?,'review',?,?,?)",
-                        (request.workload_repository, target, str(request.run_id), now),
-                    )
                 for limit in limits:
                     db.execute(
                         "INSERT INTO reservation_limits("
@@ -4978,12 +4469,10 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("continuation launch lost its exact run admission")
             admission = captured[1]
             key = admission.attempt.binding.fence.key
-            aggregate = load_review_workflow_row(db, key) if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
-            selection = (cc.select_pr_repair(aggregate) if family is WorkflowFamily.PR_REPAIR else
-                         cc.select_issue_recovery(aggregate)) if aggregate is not None else None
-            if isinstance(selection, cc.SelectedPRRepair) and isinstance(purchase, cc.PRRepairPurchase) and purchase.branch:
-                self._validate_pr_repair_sources(db, selection)
-            if (not isinstance(selection, (cc.SelectedIssueRecovery, cc.SelectedPRRepair))
+            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
+            aggregate = None if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
+            selection = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            if (not isinstance(selection, cc.SelectedIssueRecovery)
                     or getattr(aggregate, "gates", ()) or selection.component.gates
                     or not (selection.binding == admission.attempt.binding and admission.admission_version <= selection.revision.version
                             if isinstance(purchase, cc.IssueInfraPurchase) else cc.ci_return_is_current(selection, admission) if isinstance(purchase, cc.IssueCIPurchase)
@@ -4998,12 +4487,6 @@ class SQLiteControlStore:
         if not isinstance(purchase, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase)):
             raise ValueError("issue recovery reservation requires its typed purchase")
         return self.reserve(replace(request, continuations=(purchase,)))
-
-    def reserve_pr_repair(self, request: ReservationRequest, purchase: cc.PRRepairPurchase) -> ReservationResult:
-        if not isinstance(purchase, cc.PRRepairPurchase):
-            raise ValueError("PR repair reservation requires its typed purchase")
-        return self.reserve(replace(request, continuations=(purchase,)))
-
 
     def _prepare_continuation_admissions(self, db: sqlite3.Connection, request: ReservationRequest) -> tuple[tuple, tuple]:
         # Slice 5b: a fix leg is a plain leg with no continuation purchase, so
@@ -5117,8 +4600,7 @@ class SQLiteControlStore:
                         raise WorkflowAuthorityError("linked PR issue reply disagrees with its actual PR context")
                 elif inputs[2] != purchase.branch or dispatch.get("number") != key.target.number or issue_from_branch(purchase.branch) != key.target.number:
                     raise WorkflowAuthorityError("issue reply disagrees with its selected issue branch")
-            aggregate = (load_review_workflow_row(db, key) if isinstance(purchase, cc.PRRepairPurchase)
-                         else load_issue_aggregate(db, key))
+            aggregate = None if isinstance(purchase, cc.PRRepairPurchase) else load_issue_aggregate(db, key)
             if aggregate is None or aggregate.revision != capture.revision:
                 raise WorkflowAuthorityError("captured continuation aggregate is absent or stale")
             if getattr(aggregate, "gates", ()):
@@ -5146,46 +4628,6 @@ class SQLiteControlStore:
                         WorkflowAttemptIdentity(capture.binding, request.run_id, capture.leg_id), version)) if isinstance(purchase, cc.IssueCIPurchase)
                         else cc.consume_issue_recovery(selection, purchase, version) if isinstance(purchase, cc.IssueRecoveryPurchase) else cc.consume_issue_reply(selection, purchase, version)),
                                         revision=WorkflowRevision(aggregate.revision.fence, version))
-                elif isinstance(purchase, cc.PRRepairPurchase):
-                    if request.kind == "FIX_CI":
-                        current_repair = cc.select_pr_repair(aggregate)
-                        if isinstance(current_repair, cc.SelectedPRRepair) and any(
-                            isinstance(remedy, cc.OwedCIRemediation) and remedy.capture.head == purchase.head
-                            for remedy in (current_repair.component.state.ci_rerun, current_repair.component.state.ci_cancel)):
-                            raise ValueError("paid CI repair cannot bypass an owed exact-head remediation")
-                    selection = cc.select_pr_repair(aggregate)
-                    if not isinstance(selection, cc.SelectedPRRepair):
-                        raise ValueError("PR repair is inactive or migration blocked")
-                    if purchase.branch:
-                        self._validate_pr_repair_sources(db, selection)
-                    if request.kind == "PR_RESUME" and purchase.reply_at:
-                        dispatch = json.loads(request.dispatch_id)
-                        raw_reply = decode_workflow(dispatch.get("pr_reply"), tuple) if isinstance(dispatch, dict) else ()
-                        if len(raw_reply) != 2:
-                            raise WorkflowAuthorityError("PR resume lacks its exact selected reply")
-                        reply = cc.PRReplyInput(*raw_reply)
-                        if (dispatch.get("repository") != key.repository or dispatch.get("role") != "fix"
-                                or dispatch.get("kind") != "PR_RESUME" or type(dispatch.get("number")) is not int
-                                or dispatch.get("number") != key.target.number or dispatch.get("leg_id") != capture.leg_id
-                                or request.workflow != capture.binding or reply.reply_at != purchase.reply_at):
-                            raise WorkflowAuthorityError("PR reply differs from its exact admitted context")
-                        repair = cc.PRRepairInput(selection, purchase.branch, RuntimeName(dispatch.get("runtime")),
-                                                 purchase.handoff, reply=reply)
-                        if repair.session is None:
-                            raise WorkflowAuthorityError("nonblank PR reply has no compatible selected session")
-                    if purchase.handoff is not None:
-                        from .workflow_control import SQLiteWorkflowControl
-                        from ..domain.workflow_identity import WorkflowWriter
-                        dispatch = json.loads(request.dispatch_id)
-                        source_issue = purchase.handoff.source.binding.fence.key.target.number
-                        if dispatch.get("issue") != source_issue:
-                            raise WorkflowAuthorityError("repair handoff differs from actual linked issue")
-                        bound = SQLiteWorkflowControl(self, WorkflowWriter(key.repository, "fix", request.owner_id), resolve_ceiling=0)
-                        verified = bound._pr_repair_handoff(db, source_issue, key.target, purchase.branch, purchase.handoff.runtime)
-                        if verified != purchase.handoff:
-                            raise WorkflowAuthorityError("repair handoff changed before paid admission")
-                    after = replace(after, pr_repair=cc.consume_pr_repair(selection, purchase, version),
-                                    revision=WorkflowRevision(aggregate.revision.fence, version))
             except (ValueError, TypeError) as exc:
                 raise WorkflowAuthorityError(str(exc)) from exc
             updates[key] = after
@@ -5196,8 +4638,7 @@ class SQLiteControlStore:
     def _validate_workflow_reservation(
         self, db: sqlite3.Connection, request: ReservationRequest, *,
         workspace_verified: EpisodeWorkspacePrepared | None = None,
-        review_parent_identity: tuple[int, int] | None = None,
-    ) -> WorkflowSnapshot | ReviewWorkflowSnapshot | None:
+    ) -> WorkflowSnapshot | None:
         binding = request.workflow
         if binding is not None and binding.authority.family in (
             WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR,
@@ -5205,60 +4646,15 @@ class SQLiteControlStore:
             if not any(item.capture.binding == binding for item in request.continuations):
                 raise WorkflowAuthorityError("secondary workflow admission requires its captured consumption")
             return None
-        families = {family.value for family in active_families(db, request.workload_repository)}
-        if binding is None and not families & {
-            WorkflowFamily.RESOLVE.value, WorkflowFamily.REVIEW_REJECTIONS.value,
-            WorkflowFamily.REVIEW_EXECUTION.value,
-        }:
-            return
+        if binding is None:
+            # A plain leg (both roles since slices 5b/5c) carries no workflow.
+            return None
+        if binding.authority.family is not WorkflowFamily.RESOLVE:
+            raise WorkflowAuthorityError("only resolve workflows admit bound legs")
         try:
             role = deployment_role(request.workload_repository, request.owner_id)
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
-        if binding is None:
-            # Once review rejection is active every paid review is bound, so
-            # no unbound review run can overlap a re-arm (ADR 0015 quiescence).
-            if (role == "review" and request.kind in _REVIEW_PAID_KINDS
-                    and families & {WorkflowFamily.REVIEW_REJECTIONS.value,
-                                    WorkflowFamily.REVIEW_EXECUTION.value}):
-                raise WorkflowAuthorityError("activated review admission requires a captured workflow binding")
-            return
-        if binding.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-            if role != "review" or request.kind not in _REVIEW_PAID_KINDS:
-                raise WorkflowAuthorityError("review rejection admission requires the review owner's review leg")
-            try:
-                snapshot = require_review_binding(db, binding)
-                dispatch = json.loads(request.dispatch_id)
-            except (ValueError, TypeError) as exc:
-                raise WorkflowAuthorityError(str(exc)) from exc
-            if (not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository
-                    or type(dispatch.get("number")) is not int or dispatch["number"] != binding.fence.key.target.number):
-                raise WorkflowAuthorityError("paid review identity disagrees with its workflow")
-            issue = dispatch.get("issue")
-            if issue is not None:
-                if type(issue) is not int or not 0 < issue < 2**63:
-                    raise WorkflowAuthorityError("paid review linked issue identity is malformed")
-                holds = linked_issue_workflow_holds(db, WorkflowKey(binding.fence.key.repository, IssueRef(issue)))
-                if holds:
-                    raise WorkflowAuthorityError(f"linked issue #{issue}: {'; '.join(holds)}")
-            if isinstance(snapshot.execution, CurrentReviewExecution):
-                if request.review_child is None:
-                    raise WorkflowAuthorityError("active review execution requires a planned child")
-                if _indexed_review_child_admission(
-                    db, request.workload_repository, request.review_child,
-                ) is not None:
-                    raise WorkflowAuthorityError("review child already has a paid admission")
-                self._require_review_child_authority(
-                    db, request.workload_repository, request.owner_id, request.review_child,
-                    request.kind, dispatch, snapshot, review_parent_identity,
-                )
-                return snapshot
-            if request.review_child is not None:
-                raise WorkflowAuthorityError("review execution child belongs to an inactive component")
-            # The run row records the captured binding (and so its generation);
-            # this transaction proved it current and ungated. Review has no
-            # ordered continuation to receipt, unlike resolve.
-            return None
         if role != "fix":
             raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
         try:
@@ -5280,78 +4676,6 @@ class SQLiteControlStore:
             return snapshot
         except (ValueError, TypeError) as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
-
-    def _require_review_child_authority(
-        self, db: sqlite3.Connection, repository: str, owner_id: str,
-        child: ReviewChildIdentity, kind: str, dispatch: dict[str, object],
-        snapshot: ReviewWorkflowSnapshot, parent_identity: tuple[int, int] | None,
-    ) -> ReviewPreflightSelection:
-        if parent_identity is None or not isinstance(snapshot.execution, CurrentReviewExecution):
-            raise WorkflowAuthorityError("review child admission lacks its live parent or execution authority")
-        key = _review_child_key(child)
-        if db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-refusal' AND scope=? AND key=?",
-            (repository, key),
-        ).fetchone():
-            raise WorkflowAuthorityError("review child has a final admission refusal")
-        recorded = load_review_preflight_record(
-            db, repository, owner_id, child.round.round_id,
-        )
-        if recorded is None:
-            raise WorkflowAuthorityError("review child admission lacks its exact preflight receipt")
-        selection, _, plan, row = recorded
-        planning = decode_workflow(
-            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
-        )
-        if (child.round.binding != snapshot.execution.binding or child not in plan.children
-                or row["closure_json"] is not None or row["outcome_json"] is not None):
-            raise WorkflowAuthorityError("review child is unplanned, stale or finalized")
-        sealed_at = verified_review_completed_seal(
-            db, repository, owner_id, selection.claim_occurrence_id, plan, planning,
-        )
-        if isinstance(planning, ReviewPlanningSealed) and not isinstance(planning.conclusion, ReviewPlanningComplete):
-            raise WorkflowAuthorityError("review parent stopped planning and fenced child admission")
-        if not isinstance(planning, ReviewPlanningOpen) and (
-                sealed_at is None or sealed_at.version > snapshot.revision.version):
-            raise WorkflowAuthorityError("review child planning lacks an applicable completed seal")
-        try:
-            require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
-        except ValueError as exc:
-            raise WorkflowAuthorityError(str(exc)) from exc
-        from .review_execution_control import SQLiteReviewExecutionControl
-        recovery_hold = SQLiteReviewExecutionControl._pending_recovery_hold_in_tx(db, snapshot.execution)
-        if recovery_hold is not None:
-            raise WorkflowAuthorityError(recovery_hold)
-        if (dispatch.get("repository") != repository or dispatch.get("role") != "review"
-                or dispatch.get("runtime") != plan.runtime.value
-                or type(dispatch.get("number")) is not int
-                or dispatch.get("number") != child.round.binding.rejection.fence.key.target.number
-                or type(dispatch.get("claim_target")) is not int
-                or dispatch.get("kind") != kind or dispatch.get("claim_target") != selection.claim_target
-                or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]
-                or (selection.claim_target > 0 and dispatch.get("issue") != selection.claim_target)
-                or (selection.claim_target < 0 and dispatch.get("issue") is not None)):
-            raise WorkflowAuthorityError("review child dispatch identity disagrees with its preflight")
-        require_review_parent_claim(
-            db, repository, owner_id, selection.claim_occurrence_id,
-            selection.claim_target, probed_identity=parent_identity,
-        )
-        from .review_dispatch_holds import review_release_projection, unresolved_review_submissions
-        from ..domain.review_rearm import ReleaseStatus
-        from ..domain.workflow_identity import WorkflowWriter
-        issue = dispatch.get("issue")
-        if issue is not None and (type(issue) is not int or not 0 < issue < 2**63):
-            raise WorkflowAuthorityError("review child linked issue identity is malformed")
-        if issue is not None and linked_issue_workflow_holds(db, WorkflowKey(repository, IssueRef(issue))):
-            raise WorkflowAuthorityError("review child admission is held by linked issue workflow")
-        if unresolved_review_submissions(db, self, snapshot.binding):
-            raise WorkflowAuthorityError("review child admission is held by unresolved submission")
-        release = review_release_projection(
-            db, WorkflowWriter(repository, "review", owner_id), snapshot,
-        )
-        if release is not None and release.status is not ReleaseStatus.VERIFIED:
-            raise WorkflowAuthorityError("review child admission is held by release projection")
-        return selection
 
     @staticmethod
     def _record_workflow_admission(
@@ -5389,43 +4713,6 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError(f"invalid workflow admission: {exc}") from exc
 
     @staticmethod
-    def _record_review_admission(
-        db: sqlite3.Connection, request: ReservationRequest,
-        snapshot: ReviewWorkflowSnapshot, now: str,
-    ) -> None:
-        child = request.review_child
-        if child is None or not isinstance(snapshot.execution, CurrentReviewExecution):
-            raise WorkflowAuthorityError("review admission requires an active planned child")
-        recorded = load_review_preflight_record(
-            db, request.workload_repository, request.owner_id, child.round.round_id,
-        )
-        if recorded is None:
-            raise WorkflowAuthorityError("review admission lost its preflight receipt")
-        revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
-        admission = ReviewChildAdmission(
-            child, str(request.run_id), str(request.reservation_id),
-            recorded[0].claim_occurrence_id, revision, request.owner_id,
-        )
-        changed = db.execute(
-            "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=? "
-            "AND generation=? AND version=?",
-            (revision.version, *workflow_scope(revision.fence.key), revision.fence.generation,
-             snapshot.revision.version),
-        ).rowcount
-        if changed != 1:
-            raise WorkflowAuthorityError("review admission lost the aggregate version")
-        db.execute(
-            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-            "VALUES ('review-execution-admission',?,?,?,?)",
-            (request.workload_repository, str(request.run_id), now, encode_workflow(admission)),
-        )
-        db.execute(
-            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-            "VALUES ('review-execution-child-admission',?,?,?,?)",
-            (request.workload_repository, _review_child_key(child), now, encode_workflow(admission)),
-        )
-
-    @staticmethod
     def _reservation_request_matches(
         db: sqlite3.Connection,
         prior: sqlite3.Row,
@@ -5437,7 +4724,7 @@ class SQLiteControlStore:
 
         run = db.execute(
             "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json, "
-            "workflow_episode_key,review_round_id,review_child_id,continuations_json "
+            "workflow_episode_key,continuations_json "
             "FROM runs WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
@@ -5459,44 +4746,7 @@ class SQLiteControlStore:
                         or captured[1].admission_version != purchase.capture.revision.version + 1):
                     return False
         if request.workflow is not None and request.workflow.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-            if (run["workflow_episode_key"] != workflow_episode_key(request.workflow)
-                    or run["workflow_binding_json"] != encode_workflow(request.workflow)):
-                return False
-            receipt = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
-                "AND scope=? AND key=?",
-                (request.workload_repository, str(request.run_id)),
-            ).fetchone()
-            if request.review_child is None:
-                if receipt is not None or run["review_round_id"] is not None or run["review_child_id"] is not None:
-                    return False
-            else:
-                if (receipt is None or run["review_round_id"] != request.review_child.round.round_id
-                        or run["review_child_id"] != request.review_child.child_id):
-                    return False
-                admission = decode_workflow(receipt["payload_json"], ReviewChildAdmission)
-                if _indexed_review_child_admission(
-                    db, request.workload_repository, request.review_child,
-                ) != admission:
-                    return False
-                recorded = load_review_preflight_record(
-                    db, request.workload_repository, request.owner_id,
-                    request.review_child.round.round_id,
-                )
-                current = db.execute(
-                    "SELECT generation,version FROM workflows WHERE repository=? AND target_kind='pr' AND target_number=?",
-                    (request.workload_repository, request.workflow.fence.key.target.number),
-                ).fetchone()
-                if (recorded is None or current is None
-                        or current["generation"] != admission.admitted_revision.fence.generation
-                        or admission.admitted_revision.version > current["version"]
-                        or admission.child != request.review_child
-                        or admission.run_id != str(request.run_id)
-                        or admission.reservation_id != str(request.reservation_id)
-                        or admission.claim_occurrence_id != recorded[0].claim_occurrence_id
-                        or admission.owner_id != request.owner_id
-                        or admission.admitted_revision.fence != request.workflow.fence):
-                    return False
+            return False
         elif request.workflow is not None and request.workflow.authority.family is WorkflowFamily.RESOLVE:
             if run["workflow_episode_key"] != workflow_episode_key(request.workflow):
                 return False
@@ -5565,8 +4815,6 @@ class SQLiteControlStore:
                 "state",
                 "config_version",
                 "workflow_binding_json",
-                "review_round_id",
-                "review_child_id",
             )
         )
         expected_run = (
@@ -5576,8 +4824,6 @@ class SQLiteControlStore:
             "running" if lease is not None else "reserved",
             request.config_version,
             encode_workflow(request.workflow) if request.workflow is not None else None,
-            request.review_child.round.round_id if request.review_child is not None else None,
-            request.review_child.child_id if request.review_child is not None else None,
         )
         actual_limits = [
             tuple(row)
@@ -5638,14 +4884,6 @@ class SQLiteControlStore:
         if not isinstance(state, cc.IssueRecoveryState):
             raise ValueError("issue recovery return requires typed state")
         return self._settle_continuation(request, admission, state, WorkflowFamily.ISSUE_RECOVERY)
-
-    def settle_pr_repair(self, request: SettlementRequest, admission: ContinuationAdmission,
-                         state: cc.PRRepairState, *, writer=None) -> SettlementResult:
-        if not isinstance(state, cc.PRRepairState):
-            raise ValueError("PR repair return requires typed state")
-        if state.session is not None and state.session.source != admission:
-            raise ValueError("PR repair return session requires its exact admission")
-        return self._settle_continuation(request, admission, state, WorkflowFamily.PR_REPAIR, writer=writer)
 
     def pr_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
         with self.transaction() as db:
@@ -5733,258 +4971,6 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError("repair output conflicts with its admitted attempt")
         self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
         return admission
-    def capture_pr_repair_result(self, returned: cc.PRRepairResult, writer) -> None:
-        if not isinstance(returned, cc.PRRepairResult):
-            raise ValueError("repair capture requires typed returned evidence")
-        admission = returned.admission
-        key = admission.attempt.binding.fence.key
-        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.PR_REPAIR)
-        encoded = encode_workflow(returned)
-        with self.transaction() as db:
-            purchase, run = self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
-            self._require_repair_writer(db, writer, admission, run["owner_id"])
-            if run["reservation_state"] == "released" and run["started_at"] is None:
-                raise WorkflowAuthorityError("unlaunched repair cannot produce paid output")
-            dispatch = json.loads(run['dispatch_id'])
-            linked_reply = self._linked_issue_reply_admission(db, admission.attempt, run)
-            ci_purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueCIPurchase)]
-            if bool(ci_purchases) != (returned.ci is not None) or returned.ci is not None and returned.ci.admission != self._ci_repair_admission(db, admission.attempt):
-                raise WorkflowAuthorityError("CI result differs from its selected issue admission")
-            review_purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueReviewPurchase)]
-            if bool(review_purchases) != (returned.review is not None) or returned.review is not None and returned.review.admission != self._review_repair_admission(db, admission.attempt):
-                raise WorkflowAuthorityError("review result differs from its selected issue admission")
-            rebase_purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueRebasePurchase)]
-            if bool(rebase_purchases) != (returned.rebase is not None) or returned.rebase is not None and returned.rebase.admission != self._rebase_repair_admission(db, admission.attempt):
-                raise WorkflowAuthorityError("rebase result differs from its selected issue admission")
-            if (not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch
-                    or returned.state.branch != purchase.branch
-                    or dispatch.get('kind') != ('PR_RESUME' if purchase.reply_at or linked_reply is not None else 'REBASE' if returned.rebase is not None else 'ADDRESS_REVIEW' if returned.review is not None else 'FIX_CI') or dispatch.get('number') != key.target.number
-                    or dispatch.get('runtime') != returned.state.actual_model.runtime.value):
-                raise WorkflowAuthorityError("repair output changed its admitted branch, lane or runtime")
-            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
-                (key.repository, receipt_key)).fetchone()
-            if prior is not None:
-                if prior[0] != encoded:
-                    raise WorkflowAuthorityError("repair result conflicts with its immutable receipt")
-                return
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('pr-repair-result',?,?,?,?)",
-                (key.repository, receipt_key, _stamp(self._now()), encoded))
-            acknowledged = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                (key.repository, receipt_key)).fetchone()
-            if acknowledged is not None and decode_workflow(acknowledged[0], tuple) == (admission, cc.PRRepairUnreturned(admission)):
-                # Recovery already consumed the workflow effects. Capture and
-                # money must commit together; no pending workflow selects this run.
-                settled = self._settle(db, returned.settlement)
-                if settled.disposition is not AccountingDisposition.AVAILABLE:
-                    raise WorkflowAuthorityError(settled.detail)
-
-    def settle_pr_repair_result(self, returned: cc.PRRepairResult, writer) -> SettlementResult:
-        # Capture survives an interrupted money/continuity transaction. Restart
-        # uses this exact output and charge, never an in-memory provider envelope.
-        self.capture_pr_repair_result(returned, writer)
-        return self.settle_pr_repair(returned.settlement, returned.admission, returned.state, writer=writer)
-
-    def reconcile_pr_repair_returns(self, writer) -> int:
-        from .workflow_rows import load_issue_aggregate, load_review_workflow_row
-        with self.transaction() as db:
-            self._assert_owner_active(db, writer.owner_id)
-            lineage = self._owner_lineage(db, writer.repository, writer.owner_id)
-            owners = ",".join("?" for _ in lineage)
-            # Money may have settled independently of state classification.
-            # Current component sources retain those obligations; stale runs
-            # need recovery only while their money is still active.
-            run_ids = {row[0] for row in db.execute(
-                "SELECT b.run_id FROM budget_reservations b JOIN runs r USING(run_id) "
-                f"WHERE b.workload_repository=? AND b.state='active' AND r.owner_id IN ({owners})",
-                (writer.repository, *lineage))}
-            current = db.execute(
-                "SELECT target_kind,target_number FROM workflows WHERE repository=? AND "
-                + _REPAIR_CURRENT_OWED + " ORDER BY target_kind,target_number", (writer.repository,)).fetchall()
-            for row in current:
-                key = WorkflowKey(writer.repository, IssueRef(row["target_number"]) if row["target_kind"] == "issue"
-                                  else PullRequestRef(row["target_number"]))
-                try:
-                    if isinstance(key.target, IssueRef):
-                        aggregate = load_issue_aggregate(db, key)
-                        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
-                        if isinstance(selected, cc.SelectedIssueRecovery):
-                            state = selected.component.state
-                            for admission in (state.pending_ci, state.pending_rebase, state.review_failures.pending):
-                                if admission is not None:
-                                    self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-                                    run_ids.add(str(admission.attempt.run_id))
-                    else:
-                        aggregate = load_review_workflow_row(db, key)
-                        selected = cc.select_pr_repair(aggregate) if aggregate is not None else cc.InactivePRRepair()
-                        if not isinstance(selected, cc.SelectedPRRepair):
-                            continue
-                        marks = selected.component.watermarks
-                        if marks.last_admitted <= marks.last_applied or marks.last_admitted_fence is None:
-                            continue
-                        binding = selected.component.identity.bind(marks.last_admitted_fence)
-                        receipts = db.execute(
-                            f"SELECT payload_json FROM dedupe_keys WHERE {_REPAIR_ADMISSION} "
-                            f"AND scope=? AND json_extract(payload_json,'{_REPAIR_BINDING}')=json_extract(?,'$.value') "
-                            f"AND json_extract(payload_json,'{_REPAIR_VERSION}')=? LIMIT 2",
-                            (writer.repository, encode_workflow(binding), marks.last_admitted)).fetchall()
-                        if len(receipts) != 1:
-                            continue
-                        captured = decode_workflow(receipts[0][0], tuple)
-                        if len(captured) != 2 or not isinstance(captured[1], ContinuationAdmission):
-                            continue
-                        admission = captured[1]
-                        if admission.attempt.binding != binding or admission.admission_version != marks.last_admitted:
-                            continue
-                        self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
-                        run_ids.add(str(admission.attempt.run_id))
-                except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
-                    # Invalid selected evidence remains held; it cannot prevent
-                    # an independently authorized peer from recovering.
-                    continue
-            rows = []
-            for run_id in run_ids:
-                receipt_key = self._continuation_receipt_key(RunId(run_id), WorkflowFamily.PR_REPAIR)
-                row = db.execute(
-                    "SELECT raw.payload_json,raw.claimed_at,raw.key,r.run_id FROM dedupe_keys raw "
-                    "LEFT JOIN dedupe_keys done ON done.namespace='continuation-return' AND done.scope=raw.scope AND done.key=raw.key "
-                    "JOIN runs r ON r.run_id=? "
-                    f"WHERE raw.namespace='pr-repair-result' AND raw.scope=? AND raw.key=? AND r.owner_id IN ({owners}) AND done.key IS NULL",
-                    (run_id, writer.repository, receipt_key, *lineage)).fetchone()
-                if row is not None:
-                    rows.append(row)
-            unreturned = sorted(run_id for run_id in run_ids if self._pr_repair_unreturned(db, RunId(run_id), lineage))
-        completed = 0
-        for run_id in unreturned:
-            if completed >= 32:
-                break
-            try:
-                completed += int(self._acknowledge_unreturned_pr_repair(RunId(run_id), writer))
-            except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
-                continue
-        for row in sorted(rows, key=lambda item: (item["claimed_at"], item["key"])):
-            if completed >= 32:
-                break
-            try:
-                returned = decode_workflow(row["payload_json"], cc.PRRepairResult)
-                if (str(returned.admission.attempt.run_id) != row["run_id"]
-                        or returned.admission.attempt.binding.fence.key.repository != writer.repository
-                        or self._continuation_receipt_key(returned.admission.attempt.run_id,
-                            WorkflowFamily.PR_REPAIR) != row["key"]):
-                    continue
-                settled = self.settle_pr_repair_result(returned, writer)
-                completed += int(settled.disposition is AccountingDisposition.AVAILABLE)
-            except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
-                continue
-        return completed
-
-    def _pr_repair_unreturned(self, db, run_id: RunId, lineage: tuple[str, ...]) -> bool:
-        """A launched repair is terminal, quiescent and settled/released, with no return."""
-        owners = ",".join("?" for _ in lineage)
-        repair_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
-        return db.execute(
-            "SELECT 1 FROM runs r JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
-            f"WHERE r.run_id=? AND r.owner_id IN ({owners}) AND r.state IN ('completed','cancelled','abandoned') "
-            "AND r.started_at IS NOT NULL "
-            "AND r.outcome IS NOT 'unlaunched_released' AND rr.policy IN ('running','reconcile_only') "
-            "AND b.state IN ('released','settled') "
-            "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id) "
-            "AND NOT EXISTS(SELECT 1 FROM dispatch_claim_runs d WHERE d.run_id=r.run_id) "
-            "AND NOT EXISTS(SELECT 1 FROM lifecycle_commands c WHERE "
-            "c.kind IN ('publish_branch','open_pull_request','update_pull_request_body') "
-            "AND c.state NOT IN ('succeeded','permanent_failure') "
-            "AND CAST(json_extract(c.payload_json,'$.run_id') AS TEXT)=r.run_id) "
-            "AND NOT EXISTS(SELECT 1 FROM dedupe_keys k WHERE k.namespace IN ('pr-repair-result','continuation-return') "
-            "AND k.scope=b.workload_repository AND k.key=?)",
-            (str(run_id), *lineage, repair_key)).fetchone() is not None
-
-    def _acknowledge_unreturned_pr_repair(self, run_id: RunId, writer) -> bool:
-        with self.transaction() as db, self.mutation_savepoint(db):
-            self._assert_owner_active(db, writer.owner_id)
-            # Re-proved in the mutating transaction: a return, lease or claim
-            # observed after selection keeps the ordinary path authoritative.
-            if not self._pr_repair_unreturned(db, run_id, self._owner_lineage(db, writer.repository, writer.owner_id)):
-                return False
-            run = db.execute("SELECT owner_id,continuations_json FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
-            purchases = [item for item in decode_workflow(run["continuations_json"], tuple)
-                         if isinstance(item, cc.PRRepairPurchase) and item.branch]
-            if len(purchases) != 1:
-                return False
-            purchase = purchases[0]
-            admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-            self._require_repair_writer(db, writer, admission, run["owner_id"])
-            self._finish_pr_repair_without_return(db, run_id, launched=True)
-            return True
-
-
-    def _validate_pr_repair_sources(self, db, selected: cc.SelectedPRRepair) -> None:
-        state = selected.component.state
-        self._require_ci_remediation_projection(db, selected)
-        blank = state.blank_reply
-        if blank is not None:
-            receipt_key = hashlib.sha256(encode_workflow((selected.binding.fence.key, blank.reply_at)).encode()).hexdigest()
-            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-reply-noop' AND scope=? AND key=?",
-                (selected.binding.fence.key.repository, receipt_key)).fetchone()
-            receipt = decode_workflow(row[0], tuple) if row is not None else ()
-            if (blank.binding.fence.key != selected.binding.fence.key or blank.binding.authority != selected.binding.authority
-                    or blank.binding.episode_id != selected.binding.episode_id
-                    or blank.binding.fence.generation > selected.binding.fence.generation
-                    or len(receipt) != 3 or receipt[:2] != (blank.binding, blank.reply_at)
-                    or not isinstance(receipt[2], str) or len(receipt[2].encode()) > 65536 or receipt[2].strip()):
-                raise WorkflowAuthorityError("selected blank PR reply lost its exact consumption receipt")
-        proofs: dict[ContinuationAdmission, cc.PRRepairState] = {}
-        for reference, field in ((state.session, "session"), (state.actual_model, "actual_model")):
-            if reference is None:
-                continue
-            source = reference.source
-            if source not in proofs:
-                self._continuation_return_admission(db, source, WorkflowFamily.PR_REPAIR)
-                row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                    (selected.binding.fence.key.repository, self._continuation_receipt_key(source.attempt.run_id, WorkflowFamily.PR_REPAIR))).fetchone()
-                payload = decode_workflow(row[0], tuple) if row is not None else ()
-                if len(payload) != 2 or payload[0] != source or not isinstance(payload[1], cc.PRRepairState):
-                    raise WorkflowAuthorityError("selected repair continuity lost its exact applied output receipt")
-                proofs[source] = payload[1]
-            if getattr(proofs[source], field) != reference:
-                raise WorkflowAuthorityError("selected repair continuity lost its exact applied output receipt")
-
-    def _require_ci_remediation_projection(self, db, selected: cc.SelectedPRRepair) -> None:
-        key = selected.binding.fence.key
-        for field, kind in (("ci_rerun", CommandKind.RERUN_CHECKS), ("ci_cancel", CommandKind.CANCEL_CHECKS),
-                            ("branch_refresh", CommandKind.UPDATE_BRANCH), ("pending_ci_escalation", CommandKind.RELABEL)):
-            remedy = getattr(selected.component.state, field)
-            if remedy is None:
-                continue
-            owed = remedy if isinstance(remedy, (cc.OwedCIRemediation, cc.OwedPRRecoveryEffect)) else remedy.owed
-            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
-            command = _command_from_row(row) if row is not None else None
-            if (command is None or command.kind is not kind or command.repository != key.repository
-                    or command.target != f"pr:{key.target.number}"
-                    or (decode_workflow(command.payload.get("ci_remediation"), cc.CIRemediationCapture) if isinstance(owed, cc.OwedCIRemediation)
-                        else self._pr_recovery_capture(command)) != owed.capture
-                    or owed.capture.binding.fence.key != key or owed.capture.binding.authority != selected.binding.authority
-                    or owed.capture.binding.episode_id != selected.binding.episode_id
-                    or owed.capture.binding.fence.generation > selected.binding.fence.generation):
-                raise WorkflowAuthorityError("CI remediation lost its exact selected command")
-            if isinstance(remedy, (cc.SettledCIRemediation, cc.SettledPRRecoveryEffect)):
-                proof = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(owed.command_id),)).fetchone()
-                actual = EffectReceipt(CommandId(proof["command_id"]), proof["executor_identity"], _parse_stamp(proof["started_at"]),
-                    _parse_stamp(proof["completed_at"]), EffectStatus(proof["status"]), proof["remote_object_id"],
-                    proof["remote_revision"], proof["error"]) if proof is not None else None
-                if actual != remedy.receipt or row["state"] != remedy.receipt.status.value:
-                    raise WorkflowAuthorityError("settled CI remediation lost its exact terminal receipt")
-            elif row["state"] not in {"pending", "executing", "unknown_outcome", "retryable_failure"}:
-                raise WorkflowAuthorityError("owed CI remediation contradicts its durable command state")
-
-    def read_pr_repair(self, key: WorkflowKey) -> cc.PRRepairSelection:
-        from .workflow_rows import load_review_workflow_row
-        with self.transaction() as db:
-            aggregate = load_review_workflow_row(db, key)
-            selected = cc.select_pr_repair(aggregate) if aggregate is not None else cc.InactivePRRepair()
-            if isinstance(selected, cc.SelectedPRRepair):
-                self._validate_pr_repair_sources(db, selected)
-            return selected
-
     def read_issue_recovery(self, key: WorkflowKey) -> cc.IssueRecoverySelection:
         from .workflow_rows import load_issue_aggregate
         with self.transaction() as db:
@@ -6010,42 +4996,6 @@ class SQLiteControlStore:
                         or pending.attempt.binding.fence.generation > selected.revision.fence.generation):
                     raise WorkflowAuthorityError("pending rebase lacks its selected admitted provenance")
             return selected
-
-    def reset_ci_episode(self, source: cc.CIEpisodeReset, writer) -> bool:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        if not isinstance(source, cc.CIEpisodeReset):
-            raise ValueError("CI reset requires its exact green observation")
-        key = source.binding.fence.key
-        encoded = encode_workflow(source)
-        receipt_key = hashlib.sha256(encoded.encode()).hexdigest()
-        with self.transaction() as db, self.mutation_savepoint(db):
-            if writer.repository != key.repository or writer.role != "fix":
-                raise WorkflowAuthorityError("CI reset belongs to another deployment")
-            self._assert_owner_active(db, writer.owner_id)
-            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='ci-episode-reset' AND scope=? AND key=?",
-                               (key.repository, receipt_key)).fetchone()
-            if prior is not None:
-                if prior[0] != encoded:
-                    raise WorkflowAuthorityError("CI reset conflicts with its original observation")
-                return False
-            aggregate = load_issue_aggregate(db, key)
-            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-            pr = load_review_workflow_row(db, source.pr_fence.key)
-            if (not isinstance(selected, cc.SelectedIssueRecovery) or selected.binding != source.binding
-                    or aggregate.revision != source.revision or pr is None or pr.revision.fence != source.pr_fence):
-                raise WorkflowAuthorityError("CI reset observation is stale or unavailable")
-            component = selected.component
-            if component.state.pending_ci is not None and component.state.pending_ci.attempt.binding == selected.binding:
-                raise WorkflowAuthorityError("CI reset waits for the selected admitted attempt")
-            if not component.state.ci_failures:
-                raise WorkflowAuthorityError("CI reset has no spent allowance")
-            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
-                issue_recovery=replace(component, state=replace(component.state, ci_failures=0)))
-            persist_workflow_snapshot(db, after)
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('ci-episode-reset',?,?,?,?)",
-                       (key.repository, receipt_key, _stamp(self._now()), encoded))
-            return True
-
 
     def _require_repair_writer(self, db, writer, admission, historical_owner):
         from .workflow_commit import owns_command
@@ -6201,30 +5151,21 @@ class SQLiteControlStore:
                 self._apply_rebase_result(db, rebase)
             if linked_reply is not None:
                 self._finish_linked_issue_reply(db, linked_reply)
-            aggregate = load_review_workflow_row(db, key) if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
-            selection = (cc.select_pr_repair(aggregate) if family is WorkflowFamily.PR_REPAIR else
-                         cc.select_issue_recovery(aggregate)) if aggregate is not None else None
-            if isinstance(selection, (cc.SelectedIssueRecovery, cc.SelectedPRRepair)) and cc.continuation_return_is_current(selection, admission):
+            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
+            aggregate = None if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
+            selection = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            if isinstance(selection, cc.SelectedIssueRecovery) and cc.continuation_return_is_current(selection, admission):
                 component = selection.component
                 watermarks = replace(component.watermarks, last_applied=admission.admission_version)
                 revision = WorkflowRevision(aggregate.revision.fence, aggregate.revision.version + 1)
-                if isinstance(selection, cc.SelectedIssueRecovery):
-                    from ..domain.workflow import IssueWorkflowShell
-                    if not isinstance(aggregate, (WorkflowSnapshot, IssueWorkflowShell)):
-                        raise WorkflowAuthorityError("issue return lost its issue aggregate")
-                    applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
-                                      ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci,
-                                      review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
-                                      pending_rebase=component.state.pending_rebase)
-                    after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
-                elif isinstance(selection, cc.SelectedPRRepair):
-                    if not isinstance(aggregate, ReviewWorkflowSnapshot):
-                        raise WorkflowAuthorityError("repair return lost its PR aggregate")
-                    applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
-                                      blank_reply=component.state.blank_reply,
-                                      ci_rerun=component.state.ci_rerun, ci_cancel=component.state.ci_cancel,
-                                      branch_refresh=component.state.branch_refresh, pending_ci_escalation=component.state.pending_ci_escalation)
-                    after = replace(aggregate, revision=revision, pr_repair=replace(component, state=applied, watermarks=watermarks))
+                from ..domain.workflow import IssueWorkflowShell
+                if not isinstance(aggregate, (WorkflowSnapshot, IssueWorkflowShell)):
+                    raise WorkflowAuthorityError("issue return lost its issue aggregate")
+                applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
+                                  ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci,
+                                  review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
+                                  pending_rebase=component.state.pending_rebase)
+                after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
                 persist_workflow_snapshot(db, after)
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
                        (key.repository, receipt_key, _stamp(self._now()), encoded))
@@ -6314,503 +5255,9 @@ class SQLiteControlStore:
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
                    (key.repository, receipt_key, _stamp(self._now()), encoded))
 
-    def record_review_runtime_preflight_stop(
-        self, run_id: RunId, expected_owner_id: str, result: ReviewReturnedEnvelope,
-    ) -> ReviewRuntimePreflightStop:
-        """Retain the Codex harness branch that returned before any child spawn."""
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT r.*,b.workload_repository,b.state AS budget_state, "
-                "rr.policy AS recovery_policy FROM runs r "
-                "JOIN budget_reservations b USING(run_id) "
-                "JOIN reservation_recovery rr USING(run_id) WHERE r.run_id=?",
-                (str(run_id),),
-            ).fetchone()
-            if row is None or row["review_round_id"] is None:
-                raise ControlStoreError("review preflight stop lacks an attached paid child")
-            repository = row["workload_repository"]
-            admission = self._load_review_launch_admission(db, run_id, repository, row)
-            recorded = load_review_preflight_record(
-                db, repository, expected_owner_id, admission.child.round.round_id,
-            )
-            if (admission.owner_id != expected_owner_id or recorded is None
-                    or admission.child not in recorded[2].children
-                    or recorded[2].runtime is not RuntimeName.CODEX):
-                raise ControlStoreError("review preflight stop disagrees with its admission or runtime")
-            if (row["started_at"] is not None
-                    or db.execute("SELECT 1 FROM leases WHERE run_id=?", (str(run_id),)).fetchone()
-                    or db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
-                                  "AND scope=? AND key=?", (repository, str(run_id))).fetchone()):
-                raise ControlStoreError("review preflight stop contradicts a child launch")
-            receipt_id = f"review-execution-preflight-stop:{run_id}"
-            prior = db.execute(
-                "SELECT payload_json FROM dedupe_keys "
-                "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
-                (repository, str(run_id)),
-            ).fetchone()
-            if prior is not None:
-                stopped = decode_workflow(prior["payload_json"], ReviewRuntimePreflightStop)
-                if stopped.admission != admission or stopped.result != result:
-                    raise ControlStoreError("review preflight stop conflicts with its immutable receipt")
-                return stopped
-            if (row["state"] != "reserved"
-                    or row["budget_state"] != "active" or row["recovery_policy"] != "spawn_pending"
-                    or db.execute("SELECT 1 FROM leases WHERE run_id=?", (str(run_id),)).fetchone()
-                    or db.execute("SELECT 1 FROM charges WHERE run_id=?", (str(run_id),)).fetchone()
-                    or db.execute("SELECT 1 FROM dedupe_keys WHERE namespace IN "
-                                  "('review-execution-launch','review-execution-return') "
-                                  "AND scope=? AND key=?", (repository, str(run_id))).fetchone()):
-                raise ControlStoreError("review preflight stop has contradictory launch or money evidence")
-            stopped = ReviewRuntimePreflightStop(
-                admission, receipt_id, result, _parse_stamp(_stamp(self._now())),
-            )
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                "VALUES ('review-execution-preflight-stop',?,?,?,?)",
-                (repository, str(run_id), _stamp(stopped.stopped_at), encode_workflow(stopped)),
-            )
-            return stopped
-
-    def settle_review_return(
-        self, request: SettlementRequest, returned: ReturnedReviewChild,
-    ) -> SettlementResult:
-        """Commit review output with its exact settled charge, or neither."""
-        if not isinstance(returned, ReturnedReviewChild) or str(request.run_id) != returned.run_id:
-            raise ValueError("review settlement requires the returned child's run")
-        with self.transaction() as db:
-            self._assert_owner_active(db, returned.owner_id)
-            repository, prior = self._review_return_authority(db, returned)
-            settled = self._settle(db, request)
-            if settled.disposition is AccountingDisposition.AVAILABLE:
-                charge = db.execute(
-                    "SELECT provider_receipt_id FROM charges WHERE run_id=?", (returned.run_id,),
-                ).fetchone()
-                if charge is None:
-                    raise ControlStoreError("review return settlement lacks its actual charge")
-                if not prior:
-                    self._insert_review_return(db, repository, returned)
-            return settled
-
-    def settle_review_preflight_stop(
-        self, returned: ReturnedReviewChild,
-    ) -> SettlementResult | None:
-        """Settle a verified local Codex stop as zero with its raw return."""
-        if not isinstance(returned, ReturnedReviewChild):
-            raise ValueError("review preflight settlement requires a typed return")
-        with self.transaction() as db:
-            run = db.execute(
-                "SELECT b.workload_repository,b.state AS budget_state,r.state AS run_state, "
-                "r.outcome,r.provider_receipt_id,r.started_at,rr.policy FROM budget_reservations b "
-                "JOIN runs r USING(run_id) JOIN reservation_recovery rr USING(run_id) "
-                "WHERE b.run_id=?", (returned.run_id,),
-            ).fetchone()
-            if run is None:
-                return None
-            repository = run["workload_repository"]
-            row = db.execute(
-                "SELECT payload_json FROM dedupe_keys "
-                "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
-                (repository, returned.run_id),
-            ).fetchone()
-            if row is None:
-                return None
-            stopped = decode_workflow(row["payload_json"], ReviewRuntimePreflightStop)
-            if (stopped.admission.child != returned.child
-                    or stopped.admission.owner_id != returned.owner_id
-                    or returned.runtime is not RuntimeName.CODEX
-                    or stopped.result != returned.result):
-                raise ControlStoreError("review preflight settlement disagrees with its stop")
-            canonical = replace(returned, returned_at=stopped.stopped_at)
-            source, prior = self._review_return_authority(db, canonical)
-            if source != repository:
-                raise ControlStoreError("review preflight settlement changed repository")
-            receipt_id = f"codex:preflight-stop:{returned.run_id}"
-            charge = db.execute(
-                "SELECT provider_receipt_id,amount_micros,currency,basis,usage_json, "
-                "rate_card_id,rate_card_version FROM charges WHERE run_id=?",
-                (returned.run_id,),
-            ).fetchone()
-            if prior and (
-                run["run_state"] != "completed" or run["outcome"] != "settled"
-                or run["budget_state"] != "settled" or charge is None
-                or run["provider_receipt_id"] != receipt_id
-                or tuple(charge) != (receipt_id, 0, "USD", PricingBasis.SYNTHETIC.value,
-                                    None, None, None)
-            ):
-                raise ControlStoreError("review preflight replay disagrees with its settled charge")
-            if not prior and (
-                run["run_state"] != "reserved" or run["budget_state"] != "active"
-                or run["policy"] != "spawn_pending" or run["started_at"] is not None
-                or run["provider_receipt_id"] is not None
-                or charge is not None
-            ):
-                raise ControlStoreError("review preflight stop lost its pending zero-settlement state")
-            request = SettlementRequest(
-                RunId(returned.run_id), Money.zero("USD"), PricingBasis.SYNTHETIC,
-                receipt_id, None, None, None,
-            )
-            settled = self._settle(db, request, review_stop=True)
-            if settled.disposition is not AccountingDisposition.AVAILABLE:
-                raise ControlStoreError("review preflight stop cannot settle its zero charge")
-            if not prior:
-                self._insert_review_return(db, repository, canonical)
-            return settled
-
-    def returned_review_child(
-        self, repository: str, run_id: RunId,
-    ) -> ReturnedReviewChild | None:
-        repository = canonical_repository(repository)
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
-                "AND scope=? AND key=?", (repository, str(run_id)),
-            ).fetchone()
-            if row is None:
-                return None
-            returned = decode_workflow(row["payload_json"], ReturnedReviewChild)
-            if returned.run_id != str(run_id) or self._review_return_authority(db, returned) != (repository, True):
-                raise ControlStoreError("review return lookup disagrees with its admitted run")
-            return returned
-
-    def read_review_child_evidence(
-        self, repository: str, owner_id: str, round_id: str,
-    ) -> tuple[ReviewChildEvidence, ...]:
-        """Read one planned round's child facts from indexed, transaction-local proof.
-
-        Non-striking or otherwise unclassified launched results remain pending
-        until a specific durable disposition exists. This read grants no
-        outer-round outcome.
-        """
-        repository = canonical_repository(repository)
-        validate_workflow_identifier(round_id, "review round")
-        validate_workflow_identifier(owner_id, "review owner")
-        with self.transaction() as db:
-            return self._read_review_child_evidence(db, repository, owner_id, round_id)
-
-    @staticmethod
-    def _read_review_child_evidence(
-        db: sqlite3.Connection, repository: str, owner_id: str, round_id: str,
-    ) -> tuple[ReviewChildEvidence, ...]:
-        stored = load_review_preflight_record(db, repository, owner_id, round_id)
-        if stored is None:
-            raise ControlStoreError("review child evidence lacks its canonical preflight")
-        selection, _, plan, _ = stored
-        revision_row = db.execute(
-            "SELECT generation,version FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
-            workflow_scope(plan.round.binding.rejection.fence.key),
-        ).fetchone()
-        if revision_row is None:
-            raise ControlStoreError("review child evidence lost its workflow aggregate")
-        revision = WorkflowRevision(
-            WorkflowFence(plan.round.binding.rejection.fence.key, revision_row["generation"]),
-            revision_row["version"],
-        )
-        return SQLiteControlStore._read_planned_review_child_evidence(
-            db, repository, owner_id, selection, plan, revision,
-        )
-
-    @staticmethod
-    def _read_planned_review_child_evidence(
-        db: sqlite3.Connection, repository: str, owner_id: str,
-        selection: ReviewPreflightSelection, plan: ReviewRoundPlan, revision: WorkflowRevision,
-    ) -> tuple[ReviewChildEvidence, ...]:
-        # Callers must have loaded the canonical preflight and current revision
-        # in this SQL snapshot; the public reader above always does so itself.
-        round_id = plan.round.round_id
-
-        def revision_recorded(recorded: WorkflowRevision) -> bool:
-            return (recorded.fence.generation < revision.fence.generation
-                    or (recorded.fence.generation == revision.fence.generation
-                        and recorded.version <= revision.version))
-
-        runs = db.execute(
-            "SELECT r.*,b.workload_repository,b.state AS budget_state,b.currency AS budget_currency,b.release_reason,"
-            "rr.policy AS recovery_policy FROM runs r "
-            "JOIN budget_reservations b USING(run_id) "
-            "JOIN reservation_recovery rr USING(run_id) "
-            "WHERE r.review_round_id=?", (round_id,),
-        ).fetchall()
-        planned = {child.child_id: child for child in plan.children}
-        indexed_runs = {run["review_child_id"]: run for run in runs}
-        if (len(runs) > len(plan.children) or len(indexed_runs) != len(runs)
-                or any(child_id not in planned for child_id in indexed_runs)):
-            raise ControlStoreError("review round contains an unplanned or duplicate paid child")
-        evidence: list[ReviewChildEvidence] = []
-        for child in plan.children:
-            refusal_row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-refusal' "
-                "AND scope=? AND key=?", (repository, _review_child_key(child)),
-            ).fetchone()
-            indexed = _indexed_review_child_admission(db, repository, child)
-            run = indexed_runs.get(child.child_id)
-            if refusal_row is not None:
-                refusal = decode_workflow(refusal_row["payload_json"], ReviewChildAdmissionRefusal)
-                if (indexed is not None or run is not None or refusal.child != child
-                        or refusal.owner_id != owner_id
-                        or refusal.claim_occurrence_id != selection.claim_occurrence_id
-                        or not revision_recorded(refusal.refused_revision)
-                        or refusal.receipt_id != _review_refusal_receipt_id(refusal)
-                        or db.execute("SELECT 1 FROM runs WHERE run_id=?", (refusal.run_id,)).fetchone()):
-                    raise ControlStoreError("review refusal conflicts with this planned child")
-                evidence.append(ReviewChildRefused(child, refusal.receipt_id))
-                continue
-            if indexed is None:
-                if run is not None:
-                    raise ControlStoreError("review paid child lost its admission index")
-                evidence.append(ReviewChildPending(child))
-                continue
-            if (run is None or run["run_id"] != indexed.run_id
-                    or indexed.claim_occurrence_id != selection.claim_occurrence_id
-                    or indexed.owner_id != owner_id or not revision_recorded(indexed.admitted_revision)):
-                raise ControlStoreError("review child admission disagrees with its round")
-            admission = SQLiteControlStore._load_review_launch_admission(db, RunId(indexed.run_id), repository, run)
-            if admission != indexed:
-                raise ControlStoreError("review child admission changed during evidence read")
-            release_row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-release' "
-                "AND scope=? AND key=?", (repository, indexed.run_id),
-            ).fetchone()
-            released = proven_unlaunched_run(db, RunId(indexed.run_id))
-            if release_row is not None or released:
-                if release_row is None or not released:
-                    raise ControlStoreError("review unlaunched release lacks matching durable proof")
-                proof = decode_workflow(release_row["payload_json"], ReviewUnlaunchedRelease)
-                release_reason = run["release_reason"]
-                if (proof.admission != indexed or not isinstance(release_reason, str)
-                        or proof.reason_digest != hashlib.sha256(release_reason.encode()).hexdigest()
-                        or _stamp(proof.released_at) != run["completed_at"]
-                        or db.execute(
-                            "SELECT 1 FROM dedupe_keys WHERE namespace IN ('review-execution-launch',"
-                            "'review-execution-preflight-stop','review-execution-return') "
-                            "AND scope=? AND key=?", (repository, indexed.run_id),
-                        ).fetchone() is not None):
-                    raise ControlStoreError("review release contradicts its admitted child")
-                evidence.append(ReviewChildReleased(child, indexed.run_id, proof.receipt_id))
-                continue
-            stop_row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-preflight-stop' "
-                "AND scope=? AND key=?", (repository, indexed.run_id),
-            ).fetchone()
-            if stop_row is not None:
-                stopped = decode_workflow(stop_row["payload_json"], ReviewRuntimePreflightStop)
-                if (stopped.admission != indexed or plan.runtime is not RuntimeName.CODEX
-                        or run["started_at"] is not None
-                        or db.execute(
-                            "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
-                            "AND scope=? AND key=?", (repository, indexed.run_id),
-                        ).fetchone() is not None
-                        or db.execute("SELECT 1 FROM leases WHERE run_id=?", (indexed.run_id,)).fetchone()):
-                    raise ControlStoreError("review preflight stop disagrees with planned child")
-                return_row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
-                    "AND scope=? AND key=?", (repository, indexed.run_id),
-                ).fetchone()
-                if return_row is None:
-                    if (run["state"] != "reserved" or run["budget_state"] != "active"
-                            or run["recovery_policy"] != "spawn_pending"
-                            or run["provider_receipt_id"] is not None
-                            or db.execute("SELECT 1 FROM charges WHERE run_id=?", (indexed.run_id,)).fetchone()):
-                        raise ControlStoreError("pending review stop has contradictory accounting state")
-                    evidence.append(ReviewChildPending(child))
-                    continue
-                returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
-                if SQLiteControlStore._review_return_authority(db, returned) != (repository, True):
-                    raise ControlStoreError("review stop return disagrees with its admission")
-                charge = db.execute(
-                    "SELECT provider_receipt_id,amount_micros,currency,basis,usage_json,"
-                    "rate_card_id,rate_card_version FROM charges WHERE run_id=?", (indexed.run_id,),
-                ).fetchone()
-                receipt_id = f"codex:preflight-stop:{indexed.run_id}"
-                if (run["state"] != "completed" or run["outcome"] != "settled"
-                        or run["budget_state"] != "settled" or run["provider_receipt_id"] != receipt_id
-                        or charge is None or tuple(charge) != (receipt_id, 0, "USD", PricingBasis.SYNTHETIC.value,
-                                                           None, None, None)
-                        or returned.result != stopped.result or returned.returned_at != stopped.stopped_at):
-                    raise ControlStoreError("review preflight stop lacks its exact zero settlement")
-                evidence.append(ReviewChildSettledWithoutLaunch(
-                    child, indexed.run_id, receipt_id, stopped.receipt_id,
-                    ReviewPreparationFailure(ReviewPreparationKind.RUNTIME, stopped.receipt_id),
-                ))
-                continue
-            launch_row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
-                "AND scope=? AND key=?", (repository, indexed.run_id),
-            ).fetchone()
-            return_row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
-                "AND scope=? AND key=?", (repository, indexed.run_id),
-            ).fetchone()
-            if launch_row is None:
-                if return_row is not None or run["started_at"] is not None or run["state"] == "running":
-                    raise ControlStoreError("review child has execution evidence without guarded launch")
-            else:
-                launch = decode_workflow(launch_row["payload_json"], ReviewChildLaunchRegistration)
-                if (launch.admission != indexed or launch.dispatch_id != run["dispatch_id"]
-                        or run["started_at"] is None
-                        or launch.registered_at != _parse_stamp(run["started_at"])):
-                    raise ControlStoreError("review child launch disagrees with its admitted run")
-                if return_row is not None:
-                    returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
-                    if SQLiteControlStore._review_return_authority(db, returned) != (repository, True):
-                        raise ControlStoreError("review child return disagrees with its guarded launch")
-                    charge = db.execute(
-                        "SELECT provider_receipt_id,amount_micros,currency,basis FROM charges WHERE run_id=?",
-                        (indexed.run_id,),
-                    ).fetchone()
-                    if (charge is None) != (run["budget_state"] != "settled"):
-                        raise ControlStoreError("review return and budget disagree with settled charge")
-                    if charge is not None:
-                        if (run["provider_receipt_id"] != charge["provider_receipt_id"]
-                                or charge["currency"] != run["budget_currency"]
-                                or type(charge["amount_micros"]) is not int or charge["amount_micros"] < 0):
-                            raise ControlStoreError("review return charge disagrees with its admitted run")
-                        try:
-                            PricingBasis(charge["basis"])
-                        except ValueError as exc:
-                            raise ControlStoreError("review return has an invalid charge basis") from exc
-                        if (run["state"] == "completed" and run["outcome"] in
-                                ("settled", "spend_unreconciled")):
-                            launched = LaunchedReviewChild(child, indexed.run_id, launch.receipt_id)
-                            result = classify_normal_review_return(launched, plan.runtime, returned.result)
-                            if returned.result.exit_reason is ExitReason.OPERATOR_CANCELLED:
-                                intent = db.execute(
-                                    "SELECT dispatch_id,kind,reason FROM run_cancellation_intents WHERE run_id=?",
-                                    (indexed.run_id,),
-                                ).fetchone()
-                                if intent is not None:
-                                    if intent["dispatch_id"] != run["dispatch_id"] or intent["kind"] != run["kind"]:
-                                        raise ControlStoreError("review cancellation intent disagrees with its run")
-                                    if (intent["reason"] == "shutdown_deadline_spend_unknown"
-                                            and returned.result.is_error):
-                                        result = ReviewChildCancelled(
-                                            ReviewCancellationReason.SHUTDOWN,
-                                            f"run-cancellation-intent:{indexed.run_id}",
-                                        )
-                            if result is not None:
-                                evidence.append(ReviewChildReturned(
-                                    launched, f"review-execution-return:{indexed.run_id}", result,
-                                ))
-                                continue
-            evidence.append(ReviewChildPending(child))
-        return tuple(evidence)
-
-    @staticmethod
-    def _review_return_authority(
-        db: sqlite3.Connection, returned: ReturnedReviewChild,
-    ) -> tuple[str, bool]:
-        row = db.execute(
-            "SELECT r.*,b.workload_repository,l.run_id AS leased, "
-            "l.dispatch_id AS lease_dispatch_id,l.owner_id AS lease_owner_id, "
-            "l.pid AS lease_pid,l.pgid AS lease_pgid, "
-            "l.process_start_ticks AS lease_start_ticks, "
-            "l.started_at AS lease_started_at FROM runs r "
-            "JOIN budget_reservations b ON b.run_id=r.run_id "
-            "LEFT JOIN leases l ON l.run_id=r.run_id WHERE r.run_id=?",
-            (returned.run_id,),
-        ).fetchone()
-        if row is None or row["review_round_id"] is None:
-            raise ControlStoreError("review return lacks its attached paid run")
-        repository = row["workload_repository"]
-        admission = SQLiteControlStore._load_review_launch_admission(
-            db, RunId(returned.run_id), repository, row,
-        )
-        if (returned.child != admission.child or returned.owner_id != admission.owner_id
-                or returned.run_id != admission.run_id):
-            raise ControlStoreError("review return disagrees with its exact child admission")
-        recorded = load_review_preflight_record(
-            db, repository, returned.owner_id, returned.child.round.round_id,
-        )
-        if recorded is None or returned.child not in recorded[2].children or recorded[2].runtime != returned.runtime:
-            raise ControlStoreError("review return disagrees with its planned runtime or child")
-        launch = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
-            "AND scope=? AND key=?", (repository, returned.run_id),
-        ).fetchone()
-        if launch is None:
-            if row["leased"] is not None or row["state"] == "running" or row["started_at"] is not None:
-                raise ControlStoreError("review return lost its registered launch receipt")
-        else:
-            registered = decode_workflow(launch["payload_json"], ReviewChildLaunchRegistration)
-            if (registered.admission != admission or registered.dispatch_id != row["dispatch_id"]
-                    or registered.receipt_id != f"review-execution-launch:{returned.run_id}"
-                    or row["started_at"] is None
-                    or registered.registered_at != _parse_stamp(row["started_at"])):
-                raise ControlStoreError("review return launch receipt disagrees with its admission")
-            if row["leased"] is not None and (
-                row["lease_dispatch_id"] != registered.dispatch_id
-                or row["lease_owner_id"] != admission.owner_id
-                or row["lease_pid"] != registered.pid
-                or row["lease_pgid"] != registered.pgid
-                or row["lease_start_ticks"] != registered.process_start_ticks
-                or _parse_stamp(row["lease_started_at"]) != registered.registered_at
-            ):
-                raise ControlStoreError("review return launch receipt disagrees with its live lease")
-        stop = db.execute(
-            "SELECT payload_json FROM dedupe_keys "
-            "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
-            (repository, returned.run_id),
-        ).fetchone()
-        if stop is not None:
-            stopped = decode_workflow(stop["payload_json"], ReviewRuntimePreflightStop)
-            if (stopped.admission != admission or stopped.result != returned.result
-                    or launch is not None or row["started_at"] is not None or row["leased"] is not None):
-                raise ControlStoreError("review return contradicts its runtime preflight stop")
-        prior = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
-            "AND scope=? AND key=?", (repository, returned.run_id),
-        ).fetchone()
-        if prior is not None:
-            if decode_workflow(prior["payload_json"], ReturnedReviewChild) != returned:
-                raise ControlStoreError("review return conflicts with its immutable receipt")
-            return repository, True
-        return repository, False
-
-    @staticmethod
-    def _insert_review_return(
-        db: sqlite3.Connection, repository: str, returned: ReturnedReviewChild,
-    ) -> None:
-        db.execute(
-            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-            "VALUES ('review-execution-return',?,?,?,?)",
-            (repository, returned.run_id, _stamp(returned.returned_at), encode_workflow(returned)),
-        )
-
-    def reconcile_review_preflight_stop(self, run_id: RunId) -> bool:
-        """Complete a pending local stop after its caller disappeared."""
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT d.payload_json FROM dedupe_keys d "
-                "JOIN budget_reservations b ON b.workload_repository=d.scope AND b.run_id=d.key "
-                "WHERE d.namespace='review-execution-preflight-stop' AND d.key=?",
-                (str(run_id),),
-            ).fetchone()
-            if row is None:
-                return False
-            stopped = decode_workflow(row["payload_json"], ReviewRuntimePreflightStop)
-        returned = ReturnedReviewChild(
-            stopped.admission.child, str(run_id), stopped.admission.owner_id,
-            RuntimeName.CODEX, stopped.result, stopped.stopped_at,
-        )
-        settled = self.settle_review_preflight_stop(returned)
-        return settled is not None and settled.disposition is AccountingDisposition.AVAILABLE
-
-    @staticmethod
-    def _has_review_preflight_stop(db: sqlite3.Connection, run_id: RunId) -> bool:
-        return db.execute(
-            "SELECT 1 FROM budget_reservations b JOIN dedupe_keys d "
-            "ON d.namespace='review-execution-preflight-stop' "
-            "AND d.scope=b.workload_repository AND d.key=b.run_id "
-            "WHERE b.run_id=?", (str(run_id),),
-        ).fetchone() is not None
-
     def _settle(
-        self, db: sqlite3.Connection, request: SettlementRequest, *, review_stop: bool = False,
+        self, db: sqlite3.Connection, request: SettlementRequest,
     ) -> SettlementResult:
-        if not review_stop and self._has_review_preflight_stop(db, request.run_id):
-            return SettlementResult(
-                AccountingDisposition.CONFLICT, request.amount,
-                detail="review preflight stop requires its atomic zero settlement",
-            )
         recovery_receipt = request.origin is ChargeOrigin.RECOVERY_ESTIMATE
         reservation = db.execute(
             "SELECT b.state, b.maximum_micros, b.currency, r.dispatch_id, r.started_at "
@@ -6995,9 +5442,6 @@ class SQLiteControlStore:
             raise ValueError("retained reservation release reason is required")
         cutoff = _stamp(retained_before)
         with self.transaction() as db:
-            if self._has_review_preflight_stop(db, run_id):
-                return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
-                                     detail="review preflight stop awaits accounting capture")
             row = db.execute(
                 "SELECT b.state AS reservation_state, b.release_reason, "
                 "rr.policy, rr.updated_at AS recovery_updated_at, "
@@ -7062,52 +5506,6 @@ class SQLiteControlStore:
             )
             return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
-    def _finish_unlaunched_pr_repair(self, db, run_id: RunId) -> None:
-        self._finish_pr_repair_without_return(db, run_id, launched=False)
-
-    def _finish_pr_repair_without_return(self, db, run_id: RunId, *, launched: bool) -> None:
-        # A launched run without a captured return is a machine end, never an
-        # attempt (#994: cancelled rebases walked a PR to its ceiling). The
-        # paired allowance is released uncharged; the repair side records no
-        # output, session or settlement.
-        from .workflow_rows import persist_workflow_snapshot
-        run = db.execute("SELECT continuations_json,dispatch_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
-        for purchase in decode_workflow(run[0], tuple):
-            if isinstance(purchase, cc.IssueRebasePurchase):
-                admission = self._rebase_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-                self._apply_rebase_result(db, cc.RebaseRepairResult(admission,
-                    cc.RebaseCharge.NOT_ATTEMPT if launched else cc.RebaseCharge.NOT_LAUNCHED))
-                continue
-            if isinstance(purchase, cc.IssueReviewPurchase):
-                admission = self._review_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-                self._apply_review_result(db, cc.ReviewRepairResult(admission,
-                    cc.ReviewCharge.NOT_ATTEMPT if launched else cc.ReviewCharge.NOT_LAUNCHED))
-                continue
-            if isinstance(purchase, cc.IssueCIPurchase):
-                admission = self._ci_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-                self._apply_ci_result(db, cc.CIRepairResult(admission,
-                    cc.CICharge.NOT_ATTEMPT if launched else cc.CICharge.NOT_LAUNCHED))
-                continue
-            if not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch:
-                continue
-            admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-            linked_reply = self._linked_issue_reply_admission(db, admission.attempt, run)
-            if linked_reply is not None:
-                self._finish_linked_issue_reply(db, linked_reply)
-            key = admission.attempt.binding.fence.key
-            receipt_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
-            if db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?", (key.repository, receipt_key)).fetchone():
-                raise WorkflowAuthorityError("repair without a return contradicts a captured paid output")
-            aggregate = load_review_workflow_row(db, key)
-            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-            if isinstance(selected, cc.SelectedPRRepair) and cc.continuation_return_is_current(selected, admission):
-                after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
-                    pr_repair=replace(selected.component, watermarks=replace(selected.component.watermarks, last_applied=admission.admission_version)))
-                persist_workflow_snapshot(db, after)
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-                (key.repository, receipt_key, _stamp(self._now()), encode_workflow((admission,
-                    cc.PRRepairUnreturned(admission) if launched else cc.PRRepairNotLaunched(admission)))))
-
     def _release(
         self,
         db: sqlite3.Connection,
@@ -7118,9 +5516,6 @@ class SQLiteControlStore:
             "SELECT state, release_reason FROM budget_reservations WHERE run_id=?",
             (str(run_id),),
         ).fetchone()
-        if self._has_review_preflight_stop(db, run_id):
-            return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
-                                 detail="review preflight stop awaits accounting capture")
         if reservation is None:
             return ReleaseResult(
                 AccountingDisposition.CONFLICT,
@@ -7147,29 +5542,11 @@ class SQLiteControlStore:
             )
         now = _stamp(self._now())
         never_launched = db.execute(
-            "SELECT r.review_round_id FROM runs r JOIN reservation_recovery rr USING(run_id) "
+            "SELECT 1 FROM runs r JOIN reservation_recovery rr USING(run_id) "
             "WHERE r.run_id=? AND r.state IN ('reserved','starting') AND rr.policy='spawn_pending' "
             "AND r.provider_receipt_id IS NULL AND NOT EXISTS(SELECT 1 FROM charges c WHERE c.run_id=r.run_id) "
             "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)", (str(run_id),),
         ).fetchone()
-        review_release: ReviewUnlaunchedRelease | None = None
-        repository: str | None = None
-        if never_launched is not None and never_launched["review_round_id"] is not None:
-            repository = db.execute(
-                "SELECT workload_repository FROM budget_reservations WHERE run_id=?", (str(run_id),),
-            ).fetchone()["workload_repository"]
-            run = db.execute("SELECT * FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
-            admission = self._load_review_launch_admission(db, run_id, repository, run)
-            if db.execute(
-                "SELECT 1 FROM dedupe_keys WHERE namespace IN ('review-execution-launch',"
-                "'review-execution-preflight-stop','review-execution-return') AND scope=? AND key=?",
-                (repository, str(run_id)),
-            ).fetchone() is not None:
-                raise ControlStoreError("unlaunched review release contradicts retained execution evidence")
-            review_release = ReviewUnlaunchedRelease(
-                admission, f"review-execution-release:{run_id}",
-                hashlib.sha256(reason.encode()).hexdigest(), _parse_stamp(now),
-            )
         db.execute(
             "UPDATE budget_reservations SET state='released', release_reason=?, "
             "updated_at=? WHERE run_id=?",
@@ -7183,14 +5560,6 @@ class SQLiteControlStore:
             ("unlaunched_released" if never_launched is not None else "released", now, str(run_id)),
         )
         db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
-        if review_release is not None and repository is not None:
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                "VALUES ('review-execution-release',?,?,?,?)",
-                (repository, str(run_id), now, encode_workflow(review_release)),
-            )
-        if never_launched is not None:
-            self._finish_unlaunched_pr_repair(db, run_id)
         return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def enqueue_command(self, command: LifecycleCommand) -> PendingCommand:
@@ -7198,17 +5567,14 @@ class SQLiteControlStore:
             return self._enqueue_command(db, command)
 
     def _enqueue_command(
-        self, db: sqlite3.Connection, command: LifecycleCommand, *,
-        registering_review_submission: bool = False,
+        self, db: sqlite3.Connection, command: LifecycleCommand,
     ) -> PendingCommand:
         """Use the existing outbox inside either a command or workflow transaction."""
         payload = _json(command.payload)
         digest = _command_payload_digest(command, payload)
         now = _stamp(self._now())
         self._assert_owner_active(db, command.executor_identity)
-        self._validate_workflow_command(
-            db, command, registering_review_submission=registering_review_submission,
-        )
+        self._validate_workflow_command(db, command)
         row = db.execute(
             "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
             (command.idempotency_key,),
@@ -7257,211 +5623,19 @@ class SQLiteControlStore:
                 _encoded_command_binding(command),
             ),
         )
-        if "ci_remediation" in command.payload:
-            self._record_ci_remediation(db, command)
-        if "pr_recovery" in command.payload:
-            self._record_pr_recovery(db, command)
         return PendingCommand(command, "pending", 0)
-
-    @staticmethod
-    def _pr_recovery_capture(command):
-        from .effects import action_from_command
-        from ..domain.actions import UpdateBranch, EscalateCiPending, EscalatePRRecovery
-        value = decode_workflow(command.payload.get("pr_recovery"), object)
-        if not isinstance(value, (cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.PublicationIdentityEscalationCapture)):
-            raise WorkflowAuthorityError("PR recovery requires its fixed captured variant")
-        action = action_from_command(command)
-        exact = ((isinstance(value, cc.BranchRefreshCapture) and isinstance(action, UpdateBranch)
-                  and (action.head, action.base) == (value.head, value.base))
-                 or (isinstance(value, cc.PendingCIEscalationCapture) and isinstance(action, EscalateCiPending)
-                     and (action.head, action.body) == (value.decision_head, value.body))
-                 or (isinstance(value, cc.PublicationIdentityEscalationCapture) and isinstance(action, EscalatePRRecovery)
-                     and action.capture == value and action.cause == "publication_identity"))
-        if (not exact or command.workflow is not None or command.expected_revision != value.head
-                or command.repository != value.binding.fence.key.repository
-                or command.target != f"pr:{value.binding.fence.key.target.number}"
-                or deployment_role(command.repository, command.executor_identity) != "fix"):
-            raise WorkflowAuthorityError("PR recovery differs from its exact captured command/head/base")
-        return value
-
-    def _selected_pr_recovery(self, db, command):
-        from .workflow_rows import load_review_workflow_row
-        capture = self._pr_recovery_capture(command)
-        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
-        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-        if not isinstance(selected, cc.SelectedPRRepair) or selected.binding != capture.binding:
-            raise WorkflowAuthorityError("PR recovery binding is no longer current")
-        return aggregate, selected, capture
-
-    def _record_pr_recovery(self, db, command):
-        from .workflow_rows import persist_workflow_snapshot
-        aggregate, selected, capture = self._selected_pr_recovery(db, command)
-        field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
-        before = getattr(selected.component.state, field)
-        prior = before.owed.capture if isinstance(before, cc.SettledPRRecoveryEffect) else before.capture if isinstance(before, cc.OwedPRRecoveryEffect) else before
-        if isinstance(before, cc.OwedPRRecoveryEffect) and (isinstance(capture, cc.PublicationIdentityEscalationCapture) or isinstance(prior, cc.PublicationIdentityEscalationCapture)):
-            raise WorkflowAuthorityError("unfinished PR recovery predecessor must reconcile before replacement")
-        if (prior is not None and self._pr_recovery_subject(prior) == self._pr_recovery_subject(capture)
-                and not (isinstance(before, cc.SettledPRRecoveryEffect)
-                    and before.receipt.status is EffectStatus.PERMANENT_FAILURE
-                    and isinstance(capture, cc.PendingCIEscalationCapture))):
-            raise WorkflowAuthorityError("this head/base already owns its PR recovery effect")
-        state = replace(selected.component.state, **{field: cc.OwedPRRecoveryEffect(command.command_id, capture)})
-        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
-            pr_repair=replace(selected.component, state=state)))
 
     def _command_reconciliation_binding(self, db, command):
         if command.workflow is not None:
             return command.workflow
-        if command.payload.get("cause") != "publication_identity":
-            raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
-        _, selected, capture = self._selected_pr_recovery(db, command)
-        if not isinstance(capture, cc.PublicationIdentityEscalationCapture) or selected.component.state.pending_ci_escalation != cc.OwedPRRecoveryEffect(command.command_id, capture):
-            raise WorkflowAuthorityError("publication reconciliation requires its exact owed capture")
-        return capture.binding
-
-    def validate_pr_recovery(self, command):
-        with self.transaction() as db:
-            _, selected, capture = self._selected_pr_recovery(db, command)
-            field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
-            if getattr(selected.component.state, field) != cc.OwedPRRecoveryEffect(command.command_id, capture):
-                raise WorkflowAuthorityError("PR recovery is not its exact owed command")
-
-    @staticmethod
-    def _pr_recovery_subject(capture):
-        if isinstance(capture, cc.PublicationIdentityEscalationCapture):
-            return ("publication_identity", capture.binding, capture.head, capture.expected_branch, capture.issue)
-        return ("branch_refresh", capture.head, capture.base) if isinstance(capture, cc.BranchRefreshCapture) else ("pending_ci", capture.decision_head)
-
-    def current_pr_recovery_command(self, repository, pr, head, base=None, escalation_capture=None):
-        from .workflow_rows import load_review_workflow_row
-        with self.transaction() as db:
-            aggregate = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
-            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-            if not isinstance(selected, cc.SelectedPRRepair):
-                raise WorkflowAuthorityError("PR recovery authority is unavailable")
-            self._require_ci_remediation_projection(db, selected)
-            remedy = selected.component.state.branch_refresh if base is not None else selected.component.state.pending_ci_escalation
-            if remedy is None:
-                return None
-            owed = remedy if isinstance(remedy, cc.OwedPRRecoveryEffect) else remedy.owed
-            capture = owed.capture
-            requested = self._pr_recovery_subject(escalation_capture) if escalation_capture is not None else ("branch_refresh", head, base) if base is not None else ("pending_ci", head)
-            if self._pr_recovery_subject(capture) != requested and not ((escalation_capture is not None or isinstance(capture, cc.PublicationIdentityEscalationCapture)) and isinstance(remedy, cc.OwedPRRecoveryEffect)):
-                return None
-            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
-            return PendingCommand(_command_from_row(row), row["state"], row["attempts"], row["refusals"])
-
-    def _settle_pr_recovery(self, db, command, receipt):
-        from .workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-        if receipt.status not in {EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE}:
-            return
-        capture = self._pr_recovery_capture(command)
-        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
-        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-        if (not isinstance(selected, cc.SelectedPRRepair) or selected.binding.authority != capture.binding.authority
-                or selected.binding.episode_id != capture.binding.episode_id
-                or selected.binding.fence.generation < capture.binding.fence.generation):
-            return
-        field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
-        owed = getattr(selected.component.state, field)
-        if owed != cc.OwedPRRecoveryEffect(command.command_id, capture):
-            return
-        normalized = replace(receipt, started_at=_parse_stamp(_stamp(receipt.started_at)), completed_at=_parse_stamp(_stamp(receipt.completed_at)))
-        state = replace(selected.component.state, **{field: cc.SettledPRRecoveryEffect(owed, normalized)})
-        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
-            pr_repair=replace(selected.component, state=state)))
-
-    def _selected_ci_remediation(self, db, command):
-        from .workflow_rows import load_review_workflow_row
-        capture = decode_workflow(command.payload["ci_remediation"], cc.CIRemediationCapture)
-        if (command.kind not in {CommandKind.RERUN_CHECKS, CommandKind.CANCEL_CHECKS}
-                or command.workflow is not None or command.repository != capture.binding.fence.key.repository
-                or command.target != f"pr:{capture.binding.fence.key.target.number}"
-                or deployment_role(command.repository, command.executor_identity) != "fix"
-                or command.expected_revision != capture.head or command.payload.get("head") != capture.head
-                or command.payload.get("run_ids") != list(capture.run_ids)
-                or command.kind is CommandKind.CANCEL_CHECKS and command.payload.get("decided_at", "") != capture.decided_at):
-            raise WorkflowAuthorityError("CI remediation command differs from its exact captured PR/head/runs")
-        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
-        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-        if not isinstance(selected, cc.SelectedPRRepair) or selected.binding != capture.binding:
-            raise WorkflowAuthorityError("CI remediation PR repair binding is no longer current")
-        return aggregate, selected, capture
-
-    def _record_ci_remediation(self, db, command) -> None:
-        from .workflow_rows import persist_workflow_snapshot
-        aggregate, selected, capture = self._selected_ci_remediation(db, command)
-        field = "ci_rerun" if command.kind is CommandKind.RERUN_CHECKS else "ci_cancel"
-        before = getattr(selected.component.state, field)
-        prior_capture = (before.capture if isinstance(before, cc.OwedCIRemediation)
-                         else before.owed.capture if isinstance(before, cc.SettledCIRemediation) else before)
-        if prior_capture is not None and prior_capture.head == capture.head:
-            raise WorkflowAuthorityError("this head already owns its one CI remediation command")
-        state = replace(selected.component.state, **{field: cc.OwedCIRemediation(command.command_id, capture)})
-        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
-            pr_repair=replace(selected.component, state=state)))
-
-    def validate_ci_remediation(self, command) -> None:
-        with self.transaction() as db:
-            _, selected, capture = self._selected_ci_remediation(db, command)
-            field = "ci_rerun" if command.kind is CommandKind.RERUN_CHECKS else "ci_cancel"
-            if getattr(selected.component.state, field) != cc.OwedCIRemediation(command.command_id, capture):
-                raise WorkflowAuthorityError("CI remediation is not its current owed command")
-
-    def current_ci_remediation_command(self, repository, pr, kind, head, run_ids) -> PendingCommand | None:
-        from .workflow_rows import load_review_workflow_row
-        with self.transaction() as db:
-            aggregate = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
-            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-            if not isinstance(selected, cc.SelectedPRRepair):
-                raise WorkflowAuthorityError("CI remediation PR repair authority is unavailable")
-            self._require_ci_remediation_projection(db, selected)
-            field = "ci_rerun" if kind is CommandKind.RERUN_CHECKS else "ci_cancel"
-            remedy = getattr(selected.component.state, field)
-            if remedy is None:
-                return None
-            owed = remedy if isinstance(remedy, cc.OwedCIRemediation) else remedy.owed
-            if owed.capture.head != head:
-                return None
-            if owed.capture.run_ids != run_ids:
-                raise WorkflowAuthorityError("this head's CI remediation belongs to another exact run set")
-            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
-            return PendingCommand(_command_from_row(row), row["state"], row["attempts"], row["refusals"])
-
-    def _settle_ci_remediation(self, db, command, receipt) -> None:
-        from .workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-        if receipt.status not in {EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE}:
-            return
-        capture = decode_workflow(command.payload["ci_remediation"], cc.CIRemediationCapture)
-        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
-        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-        if (not isinstance(selected, cc.SelectedPRRepair)
-                or selected.binding.authority != capture.binding.authority
-                or selected.binding.episode_id != capture.binding.episode_id
-                or selected.binding.fence.key != capture.binding.fence.key
-                or selected.binding.fence.generation < capture.binding.fence.generation):
-            return
-        field = "ci_rerun" if command.kind is CommandKind.RERUN_CHECKS else "ci_cancel"
-        owed = getattr(selected.component.state, field)
-        if not isinstance(owed, cc.OwedCIRemediation) or owed != cc.OwedCIRemediation(command.command_id, capture):
-            return
-        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
-            pr_repair=replace(selected.component, state=replace(selected.component.state,
-                **{field: cc.SettledCIRemediation(owed, replace(receipt,
-                    started_at=_parse_stamp(_stamp(receipt.started_at)),
-                    completed_at=_parse_stamp(_stamp(receipt.completed_at))))}))))
+        raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
 
     def _validate_workflow_command(
-        self, db: sqlite3.Connection, command: LifecycleCommand, *,
-        registering_review_submission: bool = False,
+        self, db: sqlite3.Connection, command: LifecycleCommand,
     ) -> None:
-        if "pr_recovery" in command.payload:
-            self._selected_pr_recovery(db, command)
-            return
-        if "ci_remediation" in command.payload:
-            self._selected_ci_remediation(db, command)
-            return
+        if "pr_recovery" in command.payload or "ci_remediation" in command.payload:
+            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
+            raise ControlStoreError("PR recovery commands have no workflow authority")
         binding = command.workflow
         publication = command.kind in {CommandKind.PUBLISH_BRANCH, CommandKind.OPEN_PULL_REQUEST, CommandKind.UPDATE_PULL_REQUEST_BODY}
         captured_run = self._publication_command_run(db, command) if publication else None
@@ -7484,54 +5658,14 @@ class SQLiteControlStore:
             ).fetchone() is not None:
                 if deployment_role(command.repository, command.executor_identity) == "fix":
                     raise ControlStoreError("activated issue command requires captured workflow authority")
-            if command.kind is CommandKind.SUBMIT_REVIEW and load_family_authority(
-                db, WorkflowFamily.REVIEW_REJECTIONS, command.repository,
-            ) is not None:
-                # ADR 0015: an activated review family has one submission path. An
-                # unbound verdict would neither fence by generation nor settle a
-                # baseline, so it could double-post beside a bound one.
-                raise ControlStoreError("activated review submission requires captured workflow authority")
             return
         self._assert_owner_active(db, command.executor_identity)
         try:
             role = deployment_role(command.repository, command.executor_identity)
-            if binding.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-                if role != "review":
-                    raise WorkflowAuthorityError("review rejection commands require the repository's review owner")
-                # Allowlist, not a denylist: publication, issue and merge kinds
-                # can never ride on review-family authority.
-                if command.kind not in _REVIEW_FAMILY_COMMAND_KINDS:
-                    raise WorkflowAuthorityError(f"review rejection workflow cannot enqueue {command.kind.value} commands")
-                # A review relabel or dismissal without its decodable guard is
-                # unrepresentable in the outbox, not merely skipped by the executor.
-                review_family_op(command)
-                bound_submission_op(command)
-                review_snapshot = require_review_binding(db, binding, allow_gated=True)
-                if (command.kind is CommandKind.SUBMIT_REVIEW
-                        and isinstance(review_snapshot.execution, CurrentReviewExecution)):
-                    if not registering_review_submission:
-                        registration = read_review_submission_registration(
-                            db, command.repository, str(command.command_id),
-                        )
-                        if (registration is None
-                                or registration.round.binding != review_snapshot.execution.binding
-                                or registration.round.binding.rejection != binding
-                                or registration.submission.command_id != str(command.command_id)
-                                or registration.owner_id != command.executor_identity
-                                or registration.command_digest != _command_payload_digest(command, _json(command.payload))
-                                or registration.idempotency_key != command.idempotency_key
-                                or registration.config_version != command.config_version):
-                            raise WorkflowAuthorityError(
-                                "active review execution submission requires atomic round registration"
-                            )
-                if command.target != f"pr:{binding.fence.key.target.number}":
-                    raise WorkflowAuthorityError("review rejection command target disagrees with its pull request")
-                return
             if role != "fix":
                 raise WorkflowAuthorityError("resolve commands require the repository's fix owner")
-            if binding.authority.family is WorkflowFamily.PR_REPAIR:
-                self._validate_pr_repair_publication(db, command, captured_run)
-                return
+            if binding.authority.family is not WorkflowFamily.RESOLVE:
+                raise WorkflowAuthorityError("only resolve workflows bind commands")
             require_resolve_binding(db, binding, allow_gated=True)
             if command.target.startswith("issue:") and command.target != f"issue:{binding.fence.key.target.number}":
                 raise WorkflowAuthorityError("issue command target disagrees with its workflow")
@@ -7539,50 +5673,6 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("publication command lacks its captured run authority")
         except (ValueError, TypeError) as exc:
             raise ControlStoreError(str(exc)) from exc
-
-    def _validate_pr_repair_publication(
-        self, db: sqlite3.Connection, command: LifecycleCommand,
-        captured_run: sqlite3.Row | None,
-    ) -> None:
-        binding = command.workflow
-        if (binding is None or captured_run is None
-                or command.kind not in {CommandKind.PUBLISH_BRANCH, CommandKind.UPDATE_PULL_REQUEST_BODY}):
-            raise WorkflowAuthorityError("PR repair authority only publishes its admitted branch or existing PR body")
-        aggregate = load_review_workflow_row(db, binding.fence.key)
-        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
-        if (not isinstance(selected, cc.SelectedPRRepair) or selected.binding != binding
-                or selected.component.gates):
-            raise WorkflowAuthorityError("PR repair publication authority is stale, held or unavailable")
-        self._validate_pr_repair_sources(db, selected)
-        dispatch = json.loads(captured_run["dispatch_id"])
-        leg = dispatch.get("leg_id")
-        if (not isinstance(leg, str) or not leg
-                or captured_run["kind"] not in {"FIX_CI", "ADDRESS_REVIEW", "REBASE", "PR_RESUME"}
-                or dispatch.get("kind") != captured_run["kind"]
-                or type(dispatch.get("number")) is not int
-                or dispatch["number"] != binding.fence.key.target.number):
-            raise WorkflowAuthorityError("PR repair publication differs from its admitted target or leg")
-        attempt = WorkflowAttemptIdentity(binding, RunId(command.payload["run_id"]), leg)
-        admission = self._pr_repair_admission(db, attempt)
-        purchase, _ = self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
-        if (not isinstance(purchase, cc.PRRepairPurchase)
-                or not purchase.branch or purchase.branch != command.payload.get("branch")
-                or selected.component.state.branch and selected.component.state.branch != purchase.branch
-                or selected.component.watermarks.last_admitted != admission.admission_version
-                or selected.component.watermarks.last_admitted_fence != binding.fence):
-            raise WorkflowAuthorityError("PR repair publication lost its exact admitted branch")
-        issue = dispatch.get("issue")
-        if (type(issue) is not int or issue <= 0 or issue_from_branch(purchase.branch) != issue
-                or purchase.handoff is not None
-                and purchase.handoff.source.binding.fence.key.target.number != issue):
-            raise WorkflowAuthorityError("PR repair publication differs from its captured linked issue")
-        if command.kind is CommandKind.PUBLISH_BRANCH:
-            if command.target != f"branch:{command.repository}:{purchase.branch}":
-                raise WorkflowAuthorityError("PR repair publication target differs from its admitted branch")
-        elif (command.target != f"pull-request-body:{command.repository}:{binding.fence.key.target.number}"
-                or type(command.payload.get("number")) is not int
-                or command.payload["number"] != binding.fence.key.target.number):
-            raise WorkflowAuthorityError("PR repair publication target differs from its existing pull request")
 
     @staticmethod
     def _publication_command_run(db: sqlite3.Connection, command: LifecycleCommand) -> sqlite3.Row | None:
@@ -7688,8 +5778,6 @@ class SQLiteControlStore:
                 command.executor_identity,
                 command.workflow,
             )
-            if "pr_recovery" in repeated.payload:
-                self._record_pr_recovery(db, repeated)
             db.execute(
                 "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
                 "logical_key, occurrence, kind, target, expected_revision, "
@@ -7827,71 +5915,6 @@ class SQLiteControlStore:
             if not isinstance(json.loads(row["payload_json"]), dict):
                 raise WorkflowAuthorityError("retired command evidence is malformed")
 
-    def claim_escalation_signals(
-        self, repository: str, executor_identity: str, *, limit: int = 32,
-    ) -> tuple[int, ...]:
-        """Claim each review escalation's one operator signal; the pull requests to alert on.
-
-        An escalation is signalled once its attention hold is verified on
-        GitHub, whichever path settled that projection SUCCEEDED: the direct
-        write, a scheduled or reconciliation read after a lost reply, or a
-        restart's recovery. An escalation whose signal is owed without such
-        a receipt (its hold found already present, its re-plans exhausted,
-        its restoration contested) is signalled too. One signal per
-        escalation identity (a verdict's submission, a ceiling's gate), so a
-        restored or re-planned hold never re-pages. Rows written by a
-        retired predecessor of this executor are this executor's to send;
-        every other executor's rows are filtered before the limit, so they
-        never starve these. A malformed owed record is quarantined and
-        journalled once (`escalation_signal_malformed`), never re-read, and
-        never blocks the well-formed rows. The journal event commits with the
-        claim; the caller's alert after commit is best-effort, as every alert.
-        """
-        if type(limit) is not int or not 1 <= limit <= 128:
-            raise ValueError("escalation signal claim limit must be between 1 and 128")
-        repository = canonical_repository(repository)
-        claimed: list[int] = []
-        with self.transaction() as db:
-            self._assert_owner_active(db, executor_identity)
-            lineage = self._owner_lineage(db, repository, executor_identity)
-            owners = ",".join("?" for _ in lineage)
-            rows = db.execute(
-                f"SELECT * FROM lifecycle_commands c WHERE c.repository=? AND c.executor_identity IN ({owners}) "
-                "AND c.kind=? AND c.state=? AND (c.idempotency_key LIKE ? OR c.idempotency_key LIKE ?) "
-                "AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? AND d.scope=c.repository "
-                "AND d.key=c.command_id) ORDER BY c.created_at LIMIT ?",
-                (repository, *lineage, CommandKind.RELABEL.value, EffectStatus.SUCCEEDED.value,
-                 ESCALATION_PROJECTION_PREFIX + "%", HOLD_RESTORE_PREFIX + "%", ESCALATION_SIGNAL_COMMAND_NAMESPACE,
-                 limit),
-            ).fetchall()
-            for row in rows:
-                command = _command_from_row(row)
-                self._claim_key(db, ESCALATION_SIGNAL_COMMAND_NAMESPACE, repository, str(command.command_id), {})
-                identity = escalation_signal_identity(command)
-                kind, _, number = command.target.partition(":")
-                if identity is not None and kind == "pr" and number.isdigit():
-                    if self._claim_key(db, ESCALATION_SIGNAL_NAMESPACE, repository, identity, {"pr": int(number)}):
-                        claimed.append(int(number))
-            for row in db.execute(
-                f"SELECT e.scope, e.key, e.payload_json FROM dedupe_keys e WHERE e.namespace=? "
-                f"AND e.scope IN ({owners}) "
-                "AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? AND d.scope=? AND d.key=e.key) "
-                "AND NOT EXISTS (SELECT 1 FROM dedupe_keys q WHERE q.namespace=? AND q.scope=e.scope AND q.key=e.key) "
-                "ORDER BY e.claimed_at, e.key LIMIT ?",
-                (ESCALATION_SIGNAL_OWED_NAMESPACE, *lineage, ESCALATION_SIGNAL_NAMESPACE, repository,
-                 ESCALATION_SIGNAL_QUARANTINE_NAMESPACE, limit),
-            ).fetchall():
-                parsed = _owed_escalation_signal(row["payload_json"])
-                if isinstance(parsed, str):
-                    self._claim_key(db, ESCALATION_SIGNAL_QUARANTINE_NAMESPACE, row["scope"], row["key"],
-                                    {"error": parsed})
-                    continue
-                number, reason = parsed
-                if self._claim_key(db, ESCALATION_SIGNAL_NAMESPACE, repository, row["key"],
-                                   {"pr": number, "reason": reason}):
-                    claimed.append(number)
-        return tuple(claimed)
-
     @classmethod
     def _recovery_owners(cls, db: sqlite3.Connection, owner_id: str) -> tuple[str, ...]:
         cls._assert_owner_active(db, owner_id)
@@ -7920,32 +5943,6 @@ class SQLiteControlStore:
             lineage.extend(found)
             frontier = found
         return tuple(lineage)
-
-    def _claim_key(self, db: sqlite3.Connection, namespace: str, scope: str, key: str, payload: dict) -> bool:
-        return db.execute(
-            "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-            (namespace, scope, key, self._now().isoformat(), json.dumps(payload, sort_keys=True)),
-        ).rowcount == 1
-
-    def unsettled_sibling_dismissals(self, command: LifecycleCommand) -> int:
-        """How many dismissals its re-arm still requires that have not succeeded.
-
-        A review re-arm's trigger projection waits on them: restoring the
-        trigger while a counted review may still stand would drop the visible
-        needs-human-review hold of a re-arm that can still stop (ADR 0015).
-        Retired obligations never hold it; a projection outside a re-arm
-        (a ceiling release) has no siblings.
-        """
-        with closing(self._connect()) as db:
-            row = db.execute(
-                "SELECT COUNT(*) FROM workflow_rearm_commands projection "
-                "JOIN workflow_rearm_commands sibling ON sibling.request_id=projection.request_id "
-                "JOIN lifecycle_commands dismissal ON dismissal.command_id=sibling.command_id "
-                "WHERE projection.command_id=? AND sibling.disposition='required' AND dismissal.kind=? "
-                "AND dismissal.state != ?",
-                (str(command.command_id), CommandKind.DISMISS_REVIEW.value, EffectStatus.SUCCEEDED.value),
-            ).fetchone()
-        return int(row[0])
 
     def runnable_commands(
         self, *, repository: str, executor_identity: str,
@@ -8082,7 +6079,7 @@ class SQLiteControlStore:
 
     def _retire_workflow_command(
         self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand,
-        current: AnyWorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
+        current: WorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
     ) -> CommandReconciliation:
         """One receipt/history boundary for rearm retirement and supersession."""
         binding = command.workflow
@@ -8359,17 +6356,6 @@ class SQLiteControlStore:
         return int(db.execute("SELECT unavailable_reads FROM workflow_retry_authorizations WHERE authorization_id=?",
                               (grant.authorization_id,)).fetchone()[0])
 
-    def bound_review_submission(self, command_id: CommandId) -> ReviewSubmissionReceipt | CeilingEscalation | None:
-        """Harness-minted evidence of one verified, generation-bound SUBMIT_REVIEW.
-
-        Only this store's own command row and SUCCEEDED receipt can yield it,
-        never agent output: the reviewed head and patch identity come from the
-        command the executor submitted, and an escalation keeps its cause so a
-        ceiling decision can tell it apart. None until the receipt succeeds.
-        """
-        with closing(self._connect()) as db:
-            return load_bound_review_submission(db, command_id)
-
     @staticmethod
     def _prewrite_read(row: sqlite3.Row) -> ActiveReconciliation | None:
         raw = row["prewrite_read_json"]
@@ -8489,17 +6475,13 @@ class SQLiteControlStore:
     def _workspace_projection_ready(db: sqlite3.Connection, command: LifecycleCommand) -> bool:
         """Whether a re-arm obligation may execute now; other commands always may.
 
-        Dispatches on the binding's family: resolve obligations also wait for
-        their verified workspace handoff; review obligations have none.
+        Resolve obligations also wait for their verified workspace handoff.
         """
         association = db.execute(
             "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?",
             (str(command.command_id),),
         ).fetchone()
-        pending_type = (
-            PendingReviewRearm if command.workflow is not None
-            and command.workflow.authority.family is WorkflowFamily.REVIEW_REJECTIONS else PendingRearm
-        )
+        pending_type = PendingRearm
         if association is None:
             if command.workflow is not None:
                 current = load_workflow_row(db, command.workflow.fence.key)
@@ -8777,34 +6759,14 @@ class SQLiteControlStore:
             return RetryBegan(ConsumedRetryAuthorization(stored, attempt))
 
     @staticmethod
-    def _effect_owed(db: sqlite3.Connection, command: LifecycleCommand, current: AnyWorkflowSnapshot) -> bool:
-        """Whether the workflow still owes a granted command's effect, read in the spend's transaction.
-
-        Only a bound review submission can stop being owed: a newer verdict
-        at the same head that landed (or was recorded) makes a re-write a
-        stale second verdict (ADR 0015).
-        """
-        submission = bound_submission_op(command)
-        if submission is None:
-            return True
-        binding = command.workflow
-        if binding is None or not isinstance(current, ReviewWorkflowSnapshot):
-            raise WorkflowAuthorityError("a bound review submission requires its review workflow")
-        settled_sibling = False
-        for sibling in db.execute(
-            "SELECT * FROM lifecycle_commands WHERE repository=? AND target=? AND kind=? AND command_id<>? "
-            "AND state='succeeded'",
-            (command.repository, command.target, CommandKind.SUBMIT_REVIEW.value, str(command.command_id)),
-        ).fetchall():
-            other = _command_from_row(sibling)
-            if other.workflow == binding and other.expected_revision == submission.head:
-                settled_sibling = True
-                break
-        return bound_submission_owed(current, binding, submission.head, submission.patch_id,
-                                     settled_sibling=settled_sibling)
+    def _effect_owed(db: sqlite3.Connection, command: LifecycleCommand, current: WorkflowSnapshot) -> bool:
+        """Whether the workflow still owes a granted command's effect. Only a
+        bound review submission could stop being owed, and the review family
+        that bound them was deleted in slice 5c."""
+        return True
 
     def _decline_retry(
-        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand, current: AnyWorkflowSnapshot,
+        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand, current: WorkflowSnapshot,
         stored: UnconsumedRetryAuthorization, expected: ReconciliationOnly, read: RetryAbsenceRead,
         decision: DeclineRetry,
     ) -> ClosedRetryAuthorization:
@@ -9047,14 +7009,9 @@ class SQLiteControlStore:
         if command_row is None:
             raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
         command = _command_from_row(command_row)
-        if "pr_recovery" in command.payload:
-            if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
-                raise WorkflowAuthorityError("PR recovery receipt requires its captured attempt owner")
-            self._settle_pr_recovery(db, command, receipt)
-        if "ci_remediation" in command.payload:
-            if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
-                raise WorkflowAuthorityError("CI remediation receipt requires its captured attempt owner")
-            self._settle_ci_remediation(db, command, receipt)
+        if "pr_recovery" in command.payload or "ci_remediation" in command.payload:
+            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
+            raise WorkflowAuthorityError("PR recovery commands have no workflow authority")
         # Retiring/adopting a deployment changes the command executor, not the
         # identity that actually began this attempt and may receipt its result.
         if command.workflow is not None and (not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]):
@@ -9400,8 +7357,6 @@ class SQLiteControlStore:
         return int(settled), int(reserved)
 
     def _connect(self, *, create: bool = False) -> sqlite3.Connection:
-        from .sql_read_budget import BudgetedSqlConnection
-
         mode = "rwc" if create else "rw"
         uri = f"{Path(self.path).as_uri()}?mode={mode}"
         try:
@@ -9410,7 +7365,6 @@ class SQLiteControlStore:
                 timeout=self.busy_timeout_ms / 1000,
                 isolation_level=None,
                 uri=True,
-                factory=BudgetedSqlConnection,
             )
         except sqlite3.OperationalError as exc:
             if not create and not os.path.exists(self.path):
@@ -9479,12 +7433,9 @@ def load_retry_authorization_facts(
     ).fetchone()
     current = load_workflow_row(db, binding.fence.key)
     intent = current.intent if current is not None else None
-    # Review obligations carry no workspace handoff; their readiness is the
-    # pending intent alone.
     workspace_ready = link is not None and (
         isinstance(intent, PendingRearm) and intent.request_id == link["request_id"]
         and load_workspace_ack(db, intent.handoff) is not None
-        or isinstance(intent, PendingReviewRearm) and intent.request_id == link["request_id"]
     )
     prior = tuple(_retry_authorization_from_row(item) for item in db.execute(
         "SELECT * FROM workflow_retry_authorizations WHERE command_id=? "
@@ -9518,45 +7469,6 @@ def load_retry_authorization_facts(
         last_attempt_at=datetime.fromisoformat(attempted) if attempted is not None else None,
         authorized_attempts=int(attempts), execution_refusal=refusal,
     )
-
-
-def load_bound_review_submission(
-    db: sqlite3.Connection, command_id: CommandId,
-) -> ReviewSubmissionReceipt | CeilingEscalation | None:
-    """`SQLiteControlStore.bound_review_submission` inside the caller's transaction.
-
-    The receipt identity is the GitHub review the executor matched by its
-    command marker (`remote_object_id`); the store already refuses one review
-    as the receipt of two submissions, so a baseline names its actual review.
-    """
-    row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
-    if row is None:
-        raise KeyError(str(command_id))
-    receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command_id),)).fetchone()
-    command = _command_from_row(row)
-    binding = command.workflow
-    if (command.kind is not CommandKind.SUBMIT_REVIEW or binding is None
-            or binding.authority.family is not WorkflowFamily.REVIEW_REJECTIONS):
-        return None
-    if row["state"] != EffectStatus.SUCCEEDED.value or receipt is None or receipt["status"] != EffectStatus.SUCCEEDED.value:
-        return None
-    try:
-        op = bound_submission_op(command)
-        assert op is not None
-        review = receipt["remote_object_id"]
-        if not isinstance(review, str) or not review:
-            raise ValueError("the receipt does not name the review it matched")
-        submission = BoundReviewSubmission(command.command_id, binding)
-        receipt_id = f"github-review:{review}"
-        assert op.patch_id is not None
-        if op.escalate_cause == "ceiling":
-            return CeilingEscalation(submission, op.head, receipt_id, "ceiling", op.rule)
-        # A verdict ESCALATE is the reviewer's verdict on its head: a baseline
-        # that also carries the attention hold (`record_escalated_review`).
-        return ReviewSubmissionReceipt(submission, op.head, op.patch_id, receipt_id,
-                                       escalated=op.escalate_cause == "verdict")
-    except (KeyError, TypeError, ValueError) as exc:
-        raise WorkflowAuthorityError(f"bound review submission evidence is malformed: {exc}") from exc
 
 
 def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:

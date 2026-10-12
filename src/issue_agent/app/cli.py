@@ -124,11 +124,8 @@ def parse_remote_url(url: str) -> str:
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR",
     "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
-    "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
-    # Read by the dashboard's operator re-arm: which login's change requests
-    # count toward the rejection ceiling, how many of them it takes, and the
-    # same App → token identity the review daemon used to author them.
-    "REVIEW_BOT", "REVIEW_MAX_REJECTIONS", "REVIEW_BOT_TOKEN",
+    "FIXER_RUNTIME", "REVIEWER_RUNTIME",
+    "REVIEW_BOT", "REVIEW_BOT_TOKEN",
     "GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE", "GH_APP_TOKEN_CACHE",
     REPOINT_HISTORY_ENV,
 )
@@ -425,7 +422,6 @@ def synth_repo_env(
     base_branch: str = "dev",
     base_branch_note: str = "",
     base_branch_suggestion: str = "",
-    review_mode: str = "",
     max_budget: str = "",
     review_budget: str = "",
     repointed_from_deployments: tuple[tuple[str, str], ...] = (),
@@ -464,7 +460,6 @@ def synth_repo_env(
             f"{_q(_encoded_repoint_history(repointed_from_deployments))}",
         ]
     opt = [
-        ("REVIEW_MODE", review_mode),
         ("MAX_BUDGET_USD", max_budget),
         ("REVIEW_BUDGET_USD", review_budget),
     ]
@@ -1459,7 +1454,7 @@ def cmd_start(args) -> int:
         content = synth_repo_env(
             repo=repo, target_dir=target_dir, name=name,
             base_branch=base_branch, base_branch_note=base_note,
-            base_branch_suggestion=base_suggestion, review_mode=args.review_mode or "",
+            base_branch_suggestion=base_suggestion,
             max_budget=args.max_budget or "", review_budget=args.review_budget or "",
             repointed_from_deployments=repoint_history,
         )
@@ -2594,7 +2589,6 @@ def build_parser() -> argparse.ArgumentParser:
              "repo default branch, then 'dev')",
     )
     sp.add_argument("--no-init", action="store_true", help="don't auto-run init on first start; error instead")
-    sp.add_argument("--review-mode", default="", choices=["", "single", "multi", "delegated"], help="reviewer strategy")
     sp.add_argument("--max-budget", default="", help="MAX_BUDGET_USD per fix session")
     sp.add_argument("--review-budget", default="", help="REVIEW_BUDGET_USD per review")
     sp.add_argument("--max-ticks", type=int, default=None, help="bound each daemon's loop (dry run/CI)")

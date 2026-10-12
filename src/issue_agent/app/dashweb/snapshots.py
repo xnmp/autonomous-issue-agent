@@ -505,11 +505,7 @@ def _review_excerpt(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
     return _bounded_excerpt(selected[2])
 
 
-def _review_contexts(
-    row: dash.IssueRow,
-    unproductive_cap: int | None,
-    unproductive_counts: Mapping[int, int | None] | None,
-) -> list[dict | None]:
+def _review_contexts(row: dash.IssueRow) -> list[dict | None]:
     contexts: list[dict | None] = [None] * len(row.legs)
     rejections: dict[int | None, int] = {}
     for index, leg in enumerate(row.legs):
@@ -529,8 +525,6 @@ def _review_contexts(
                 and verdict.decision is ReviewDecision.REQUEST_CHANGES
                 else None
             ),
-            "unproductive_rounds": (unproductive_counts or {}).get(leg.number),
-            "unproductive_cap": unproductive_cap,
         }
     return contexts
 
@@ -656,17 +650,11 @@ def detailed_steps(
     row: dash.IssueRow,
     *,
     budget_caps: Mapping[str, float] | None = None,
-    unproductive_round_cap: int | None = None,
-    unproductive_round_counts: Mapping[int, int | None] | None = None,
     gh_prs: Mapping[int, Mapping] | None = None,
 ) -> list[dict]:
     """One row per leg plus operator interventions, in timestamp order.
     Not collapsed: the drill-down's whole job is showing the retries."""
-    review_contexts = _review_contexts(
-        row,
-        unproductive_round_cap,
-        unproductive_round_counts,
-    )
+    review_contexts = _review_contexts(row)
     change_contexts = _change_contexts(row, gh_prs)
     steps = []
     for idx, leg in enumerate(row.legs):
@@ -2944,8 +2932,6 @@ def issue_detail(
     gh_prs: dict[int, dict] | None = None,
     *,
     budget_caps: Mapping[str, float] | None = None,
-    unproductive_round_cap: int | None = None,
-    unproductive_round_counts: Mapping[int, int | None] | None = None,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
@@ -2988,8 +2974,6 @@ def issue_detail(
         "steps": detailed_steps(
             row,
             budget_caps=budget_caps,
-            unproductive_round_cap=unproductive_round_cap,
-            unproductive_round_counts=unproductive_round_counts,
             gh_prs=gh_prs,
         ),
         "events": list(row.events),

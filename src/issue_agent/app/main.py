@@ -222,13 +222,8 @@ def build_role(
         gw = GitHubGateway(
             cfg.repo,
             _app_identity(env, warn=_commit_log),
-            review_pr_label=cfg.review_trigger_label,
-            review_adopt_unlabeled=cfg.review_adopt_unlabeled,
             progress=scheduler_progress,
         )
-        # A runtime flip must cold-start review legs too.  In particular, Codex
-        # resume cannot preserve its read-only sandbox, and legacy Claude
-        # session ids must never reach `codex exec resume`.
         store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime.value)
         return build_review_daemon(cfg, gw, store, runner)
     raise SystemExit(f"unknown role: {role!r} (use fix|review)")

@@ -6,14 +6,11 @@ step's state — never on how the aggregation stores it.
 
 import time
 from dataclasses import replace
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from issue_agent.adapters.dashweb import ghdata, system
-from issue_agent.adapters.store import Store
-from tests.adapters.test_review_execution_control import rig as current_review_rig
 from issue_agent.app.dashweb import service, snapshots
 from issue_agent.domain import dashboard as dash
 from issue_agent.domain.labels import LIFECYCLE_LABELS
@@ -1985,19 +1982,12 @@ def test_review_context_labels_leg_verdicts_and_uses_authoritative_round_count()
         events=(first, observed_first, failed, second, observed_second),
     )
 
-    steps = snapshots.detailed_steps(
-        row,
-        unproductive_round_cap=5,
-        unproductive_round_counts={12: 4},
-    )
+    steps = snapshots.detailed_steps(row)
 
     assert steps[0]["review"]["verdict_excerpt"] == first_body
     assert steps[0]["review"]["rejection"] == 1
-    assert steps[1]["review"]["unproductive_rounds"] == 4
     assert steps[2]["review"]["rejection"] == 2
-    assert steps[2]["review"]["unproductive_rounds"] == 4
     assert "rejection_cap" not in steps[2]["review"]
-    assert steps[2]["review"]["unproductive_cap"] == 5
     assert len(steps[2]["review"]["verdict_excerpt"]) == 500
     assert steps[2]["review"]["verdict_excerpt"].endswith("…")
 
@@ -2354,12 +2344,11 @@ def test_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch):
     assert card["pr_state"] == "open" and card["pr_review_state"] is None
 
 
-def test_issue_detail_uses_cached_deployment_leg_and_unproductive_caps(monkeypatch):
+def test_issue_detail_uses_cached_deployment_leg_caps(monkeypatch):
     backend = stub_backend(monkeypatch)
     configured = {
         "MAX_BUDGET_USD": "6.5",
         "REVIEW_BUDGET_USD": "2.5",
-        "MAX_UNPRODUCTIVE_REVIEW_ROUNDS": "2",
     }
     reads = []
     monkeypatch.setattr(
@@ -2375,39 +2364,7 @@ def test_issue_detail_uses_cached_deployment_leg_and_unproductive_caps(monkeypat
     resolve, review = detail["steps"]
     assert resolve["budget_cap_usd"] == 6.5
     assert review["budget_cap_usd"] == 2.5
-    assert review["review"]["unproductive_cap"] == 2
     assert len(reads) == len(service._DETAIL_CONFIG_FIELDS)
-
-
-def test_issue_detail_reads_current_execution_allowance_and_ignores_retired_file_counters(
-    monkeypatch, tmp_path, current_review_rig,
-):
-    from tests.adapters.test_review_execution_control import dump
-    from tests.adapters.test_review_execution_renewal_transactions import exhaust_with_three_settled_returns
-
-    exhaust_with_three_settled_returns(current_review_rig)
-    store, _, _, _, _ = current_review_rig
-    backend = stub_backend(monkeypatch)
-    backend.control_db_path = store.path
-    original = backend.snapshot("demo")
-    deployment = build([RESOLVE, {**REVIEW_LEG, "number": 9}])
-    backend.snapshot = lambda _name: replace(original, deployment=deployment)
-    review_dir = tmp_path / "review"
-    review_dir.mkdir()
-    files = Store(str(review_dir))
-    Path(files.issue_path(7, "infra-deaths")).write_text("2")
-    Path(files.issue_path(-9, "infra-deaths")).write_text("1")
-    before = dump(store)
-
-    first = backend.issue("demo", 7)
-    assert first is not None
-    assert first["steps"][1]["review"]["unproductive_rounds"] == 3
-    Path(files.issue_path(7, "infra-deaths")).write_text("99")
-    Path(files.issue_path(-9, "infra-deaths")).write_text("99")
-    second = backend.issue("demo", 7)
-    assert second is not None
-    assert second["steps"][1]["review"]["unproductive_rounds"] == 3
-    assert dump(store) == before
 
 
 def test_cards_carry_the_verification_reason_for_issue_and_pr(monkeypatch):
@@ -2564,7 +2521,7 @@ def test_a_re_armed_row_with_a_lifetime_escalation_does_not_alarm():
 
 def _harness_merges_governed(branch: str) -> bool:
     from issue_agent.domain.fix import harness_merges_branch
-    from issue_agent.domain.review import IdentityMode
+    from issue_agent.domain.identity import IdentityMode
 
     return harness_merges_branch(branch, auto_merge=True, identity_mode=IdentityMode.THREE)
 

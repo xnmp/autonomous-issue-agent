@@ -16,7 +16,6 @@ class Refusing:
 
 
 def _completed_payloads(tmp_path, result):
-    from tests.app.test_dispatch import FakeRunner  # noqa: F401  (task shape reuse)
     from issue_agent.adapters.runtime_plan import RuntimePlan
 
     journal = Journal(str(tmp_path / "journal.jsonl"))

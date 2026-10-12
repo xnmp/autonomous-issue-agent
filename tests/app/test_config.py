@@ -13,7 +13,7 @@ from issue_agent.app.config import (
     render_agent_md,
 )
 from issue_agent.app.main import _load_agent_env
-from issue_agent.domain.review import IdentityMode, ReviewMode
+from issue_agent.domain.identity import IdentityMode
 
 
 def test_metadata_backed_choices_drive_parsing_and_the_example():
@@ -36,11 +36,6 @@ def test_metadata_backed_choices_drive_parsing_and_the_example():
     assert 'MERGE_METHOD="squash"  # choices: squash|merge|rebase' in example
 
 
-def test_review_mode_defaults_single():
-    assert from_env({"REPO": "x"}).review_mode is ReviewMode.SINGLE
-    assert from_env({"REPO": "x"}).review_scout_model == "sonnet"
-
-
 def test_reviewer_runtime_defaults_to_codex_at_the_fixer_tier_or_above():
     """The deployment default is visible in the task-producing config, not
     merely documented in an example overlay. Sol + $15 since 2026-08-09: the
@@ -58,29 +53,6 @@ def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
 
     assert cfg.reviewer_runtime == "claude"
     assert cfg.review_model == "opus"
-
-
-@pytest.mark.parametrize("mode", ["multi", "delegated"])
-def test_codex_reviewer_rejects_modes_it_cannot_execute(mode):
-    cfg = from_env({
-        "REPO": "o/r", "FIX_BOT": "fix-bot", "REVIEWER_RUNTIME": "codex",
-        "REVIEW_MODE": mode,
-    })
-
-    with pytest.raises(ValueError, match="REVIEW_MODE=single"):
-        cfg.validate()
-
-
-def test_review_mode_delegated_and_scout_override():
-    c = from_env({"REPO": "x", "REVIEW_MODE": "delegated", "REVIEW_SCOUT_MODEL": "haiku"})
-    assert c.review_mode is ReviewMode.DELEGATED
-    assert c.review_scout_model == "haiku"
-
-
-def test_removed_review_multi_agent_alias_is_ignored():
-    assert from_env(
-        {"REPO": "x", "REVIEW_MULTI_AGENT": "1"}
-    ).review_mode is ReviewMode.SINGLE
 
 
 def test_every_operator_field_has_env_and_coercion_metadata():
@@ -143,7 +115,6 @@ def test_defaults():
     assert c.identity_mode == "three"
     assert c.auto_merge is True
     assert c.poll_seconds == 20
-    assert c.review_trigger_label == "ai-pr-open"  # default unchanged
 
 
 def test_custom_state_roots_keep_one_machine_accounting_authority(
@@ -210,11 +181,6 @@ def test_malformed_repoint_history_fails_config_validation(raw):
 
     with pytest.raises(ValueError, match="REPOINTED_FROM_DEPLOYMENTS"):
         cfg.validate()
-
-
-def test_review_trigger_label_override():
-    c = from_env({"REPO": "o/ext", "REVIEW_TRIGGER_LABEL": "ai-review"})
-    assert c.review_trigger_label == "ai-review"
 
 
 def test_bool_parsing():
@@ -321,8 +287,7 @@ def test_grouped_config_preserves_flat_env_mapping():
         "HARNESS_ROOT_DIR": "/harness",
         "FIX_BOT": "fixer",
         "MAX_BUDGET_USD": "4.25",
-        "REVIEW_MODE": "delegated",
-        "REVIEW_TRIGGER_LABEL": "ai-review",
+        "REVIEW_MODEL": "opus",
         "CODEX_BIN": "codex-dev",
         "CODEX_MODEL": "gpt-next",
     })
@@ -336,8 +301,7 @@ def test_grouped_config_preserves_flat_env_mapping():
     assert c.runtime_paths.harness_root == "/harness"
     assert c.fix_runtime.bot == "fixer"
     assert c.fix_runtime.budget_usd == 4.25
-    assert c.review_runtime.mode is ReviewMode.DELEGATED
-    assert c.review_runtime.trigger_label == "ai-review"
+    assert c.review_runtime.model == "opus"
     assert c.codex_runtime.binary == "codex-dev"
     assert c.codex_runtime.model == "gpt-next"
     # Both session caps reach the codex runtime through the same grouped config the
@@ -393,23 +357,14 @@ def _assert_each_knob_flagged_once(errors: tuple[str, ...], expected_knobs: set[
     assert len(errors) == len(expected_knobs)
 
 
-def test_validation_rejects_invalid_poll_seconds_and_rejection_ceiling():
+def test_validation_rejects_invalid_poll_seconds():
     c = from_env({
         "REPO": "x",
         "FIX_BOT": "fix-bot",
         "POLL_SECONDS": "0",
-        "REVIEW_MAX_REJECTIONS": "-4",
     })
 
-    _assert_each_knob_flagged_once(c.validation_errors(), {"POLL_SECONDS", "REVIEW_MAX_REJECTIONS"})
-
-
-def test_review_rejection_ceiling_fits_one_rearm_dismissal_fan_out():
-    for value, rejected in (("0", False), ("4", False), ("63", False), ("64", True), ("1000000", True)):
-        config = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "REVIEW_MAX_REJECTIONS": value})
-        errors = [error for error in config.validation_errors() if "REVIEW_MAX_REJECTIONS" in error]
-        assert bool(errors) is rejected
-        assert not rejected or "<= 63" in errors[0]
+    _assert_each_knob_flagged_once(c.validation_errors(), {"POLL_SECONDS"})
 
 
 def test_validation_rejects_invalid_budgets():
@@ -418,16 +373,9 @@ def test_validation_rejects_invalid_budgets():
         "FIX_BOT": "fix-bot",
         "MAX_BUDGET_USD": "0",
         "REVIEW_BUDGET_USD": "-1",
-        "REVIEW_GATE_BUDGET_USD": "0",
-        "REVIEW_DIMENSION_BUDGET_USD": "0",
-        "REVIEW_VALIDATION_BUDGET_USD": "0",
     })
 
-    _assert_each_knob_flagged_once(c.validation_errors(), {
-        "MAX_BUDGET_USD", "REVIEW_BUDGET_USD",
-        "REVIEW_GATE_BUDGET_USD", "REVIEW_DIMENSION_BUDGET_USD",
-        "REVIEW_VALIDATION_BUDGET_USD",
-    })
+    _assert_each_knob_flagged_once(c.validation_errors(), {"MAX_BUDGET_USD", "REVIEW_BUDGET_USD"})
 
 
 def test_validation_rejects_invalid_runtime_settings():

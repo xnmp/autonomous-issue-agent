@@ -1,7 +1,7 @@
 """The fix role: observe -> derive -> policy -> act (refactor slice 5b).
 
-One tick reads GitHub (`GitHubGateway.build_fix_world`) and the local facts
-GitHub cannot hold (`FixFacts`), derives every item's state, maps it to
+One tick reads GitHub (`GitHubGateway.build_world`) and the local facts
+GitHub cannot hold (`tick.Facts`), derives every item's state, maps it to
 Actions, and executes them (`adapters.act.GitHubAct`). Nothing about an item's lifecycle is
 stored here: the run table records ended legs, the dedupe table records which
 idempotent writes landed, and everything else is re-derived next tick.
@@ -17,82 +17,23 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
-from ..adapters.control_store import FixRun
+from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, MergePullRequest, RunAgent
-from ..domain.backoff import LegEnd, dispatched_kind
+from ..domain.backoff import dispatched_kind
 from ..domain.ci import failed_checks, parse_timestamp
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
-from ..domain.policy import actions as policy_actions, question_text
+from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue, slugify
-from ..domain.state import DerivedState, Harness, ItemKey, Local, Wait, WaitReason, derive, issue_key, pr_key
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Wait, WaitReason
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from .planners import tasks
+from .tick import Choose, dispatch_item, leg_class, run_item
 from .workflows.base import run_leg
 
-# Pre-5b run kinds (RESUME, PR_RESUME, ROUTE) belong to no act: under the
-# cutover rule those legs simply stop counting.
-_FIX_ACTS = frozenset({AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.ADDRESS_REVIEW})
-
-
-def run_item(run: FixRun) -> ItemKey | None:
-    """The item a recorded fix run belongs to: its issue for issue-stage legs,
-    its PR for PR-stage legs."""
-    kind = dispatched_kind(run.kind)
-    if kind is AgentKind.RESOLVE and run.issue > 0:
-        return issue_key(run.issue)
-    if kind in _FIX_ACTS and kind is not AgentKind.RESOLVE and run.number > 0:
-        return pr_key(run.number)
-    return None
-
-
-def leg_end(run: FixRun) -> LegEnd | None:
-    """A recorded run as derive's `LegEnd`. A run without a `fix-leg` receipt
-    never returned (died, reclaimed, refused before launch): a machine end."""
-    kind = dispatched_kind(run.kind)
-    if kind not in _FIX_ACTS or run.completed_at.utcoffset() is None:
-        return None
-    leg = _leg(run)
-    started = run.started_at
-    if started is not None and (started.utcoffset() is None or started > run.completed_at):
-        started = None
-    question = question_text((run.receipt or {}).get("question")) if leg is LegClass.ASKED else None
-    return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started)
-
-
-def _leg(run: FixRun) -> LegClass:
-    """A run's recorded class; no readable receipt is a machine end."""
-    raw = run.receipt.get("leg") if run.receipt is not None else None
-    return next((c for c in (LegClass.AGENT, LegClass.ASKED) if raw == c.value), LegClass.MACHINE)
-
-
-def local_legs(runs: Iterable[FixRun]) -> dict[ItemKey, tuple[LegEnd, ...]]:
-    out: dict[ItemKey, list[LegEnd]] = {}
-    for run in runs:
-        key, end = run_item(run), leg_end(run)
-        if key is not None and end is not None:
-            out.setdefault(key, []).append(end)
-    return {key: tuple(sorted(ends, key=lambda e: e.ended_at)) for key, ends in out.items()}
-
-
-def dispatch_item(action: RunAgent) -> ItemKey:
-    return issue_key(action.number) if action.kind is AgentKind.RESOLVE else pr_key(action.number)
-
-
-def leased_items(active: Iterable[RunAgent], held_issues: Iterable[int]) -> frozenset[ItemKey]:
-    """Items with a leg in flight: this process's dispatches, plus every issue
-    another process (or an orphaned child) holds a live fix claim or lease on."""
-    return frozenset(dispatch_item(a) for a in active) | frozenset(
-        issue_key(n) for n in held_issues if type(n) is int and n > 0
-    )
-
-
-def item_issues(world: WorldState) -> frozenset[int]:
-    return frozenset(i.number for i in world.issues if i.number > 0) | frozenset(
-        n for p in world.prs if (n := harness_branch_issue(p.head_ref_name)) is not None
-    )
+_FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 
 
 def fix_actions(
@@ -131,65 +72,6 @@ class FixSettings:
     runtime: str
     owner_id: str
     harness: Harness
-
-
-class FixFacts:
-    """The local facts derive needs, read from SQLite each tick. A failed run
-    or lease read raises: the daemon skips the tick rather than deciding
-    blind. A failed lifetime-spend read is no headroom instead: paid legs wait
-    silently and free work (merge, open, refresh, stops) goes on."""
-
-    def __init__(
-        self,
-        control,
-        settings: FixSettings,
-        *,
-        active: Callable[[], Iterable[RunAgent]],
-        headroom: Callable[[], bool],
-        lifetime_capped: Callable[[int], bool],
-        log: Callable[[str], None],
-        now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-    ) -> None:
-        self.control = control
-        self.settings = settings
-        self.active = active
-        self.headroom = headroom
-        self.lifetime_capped = lifetime_capped
-        self.log = log
-        self.now = now
-
-    def held_issues(self) -> set[int]:
-        repo = self.settings.repository
-        held = {c.target_key for c in self.control.active_dispatch_claims(repo, "fix")}
-        for lease in self.control.leases():
-            try:
-                dispatch = json.loads(lease.dispatch_id)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(dispatch, dict) and dispatch.get("role") == "fix" and dispatch.get("repository") == repo:
-                held.add(dispatch.get("issue"))
-        return held
-
-    def __call__(self, world: WorldState) -> Local:
-        # `active` is sampled before the run read, so a leg ending between the
-        # two reads is busy (still active) rather than free with its end
-        # unseen. A leg that ended after GitHub was read is seen here but its
-        # push may not be in `world`: derive holds it busy (end > world.now).
-        active = tuple(self.active())
-        issues = item_issues(world)
-        runs = self.control.fix_runs(self.settings.repository, issues)
-        try:
-            capped: frozenset[int] | None = frozenset(n for n in issues if self.lifetime_capped(n))
-        except Exception as exc:  # noqa: BLE001 - see the class docstring
-            self.log(f"fix: lifetime spend unreadable, paid legs wait this tick: {exc}")
-            capped = None
-        return Local(
-            now=self.now(),
-            legs=local_legs(runs),
-            leases=leased_items(active, self.held_issues()),
-            headroom=capped is not None and self.headroom(),
-            lifetime_capped=capped or frozenset(),
-        )
 
 
 class FixLegs:
@@ -250,12 +132,14 @@ class FixLegs:
             self.control.release_dispatch_claim(repo, "fix", issue, owner)
 
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
-        runs = sorted(self.control.fix_runs(self.settings.repository, (issue,)), key=lambda r: r.completed_at)
+        # The review role's legs are not this role's sessions to continue.
+        runs = sorted((r for r in self.control.leg_runs(self.settings.repository, (issue,))
+                       if dispatched_kind(r.kind) in _FIX_ACTS), key=lambda r: r.completed_at)
         mine = [r for r in runs if run_item(r) == item]
         # The newest agent leg, the rule derive uses: machine and transport
         # deaths after it neither drop its question nor reset resume-once.
-        last = next((i for i in range(len(mine) - 1, -1, -1) if _leg(mine[i]) is not LegClass.MACHINE), -1)
-        asked = mine[last] if last >= 0 and _leg(mine[last]) is LegClass.ASKED else None
+        last = next((i for i in range(len(mine) - 1, -1, -1) if leg_class(mine[i]) is not LegClass.MACHINE), -1)
+        asked = mine[last] if last >= 0 and leg_class(mine[last]) is LegClass.ASKED else None
         # Resume once (classify_leg): continue the newest machine end since that
         # leg that left a session; a wall cap on the continuation is an attempt.
         cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r])), None)
@@ -295,7 +179,7 @@ class FixLegs:
         recovered = self.worktrees.branch_for_issue(issue, fallback)
         return recovered if recovered and harness_branch_issue(recovered) == issue else fallback
 
-    def _session(self, runs: list[FixRun]) -> str:
+    def _session(self, runs: list[LegRun]) -> str:
         for run in reversed(runs):
             receipt = run.receipt or {}
             session = receipt.get("session")
@@ -304,7 +188,7 @@ class FixLegs:
         return ""
 
     def _task(
-        self, action: RunAgent, subject, cwd: str, runs: list[FixRun], cut_off: FixRun | None, asked: FixRun | None,
+        self, action: RunAgent, subject, cwd: str, runs: list[LegRun], cut_off: LegRun | None, asked: LegRun | None,
     ):
         """`cut_off` is the machine end this leg continues; `asked` the agent
         leg whose question a human has since answered."""
@@ -359,35 +243,16 @@ def _soft(read: Callable[[], str], log: Callable[[str], None]) -> str:
         return ""
 
 
-def decide_with(
-    facts: Callable[[WorldState], Local],
-    settings: FixSettings,
-    slots: Callable[[], int],
-    log: Callable[[str], None],
-) -> Callable[[WorldState], list[Action]]:
-    def decide(world: WorldState) -> list[Action]:
-        states = derive(world, facts(world), settings.harness)
+def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
+    def choose(world: WorldState, states: Mapping[ItemKey, DerivedState], slots: int) -> tuple[Action, ...]:
         prs = {p.number: p for p in world.prs}
         for key, state in sorted(states.items(), key=lambda kv: kv[0].sort_key):
             if state == Wait(WaitReason.MERGEABILITY_UNKNOWN) and (pr := prs.get(key.number)) is not None:
                 # Approved and green but not mergeable now: BLOCKED waits on a human (branch protection).
                 log(f"fix: PR #{key.number} waits to merge: mergeable={pr.mergeable or '?'} "
                     f"state={pr.merge_state or '?'}")
-        chosen = list(fix_actions(states, settings.harness, slots(), merge=settings.auto_merge))
-        for action in chosen:
-            log(f"fix: {action!r}")
-        return chosen
-    return decide
+        return fix_actions(states, settings.harness, slots, merge=settings.auto_merge)
+    return choose
 
 
-def lease_slots(daemon_ref: Mapping[str, object]) -> Callable[[], int]:
-    def slots() -> int:
-        daemon = daemon_ref.get("daemon")
-        return int(getattr(daemon, "available_dispatch_slots", 0)) if daemon is not None else 0
-    return slots
-
-
-__all__ = [
-    "FixFacts", "FixLegs", "FixSettings", "decide_with", "dispatch_item", "fix_actions", "human_reply",
-    "item_issues", "leased_items", "leg_end", "local_legs", "run_item",
-]
+__all__ = ["FixLegs", "FixSettings", "fix_actions", "fix_choose", "human_reply"]

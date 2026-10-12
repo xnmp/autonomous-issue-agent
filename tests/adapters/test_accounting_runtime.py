@@ -237,110 +237,6 @@ def test_production_runtime_releases_admission_when_claim_is_missing(
     assert store.active_reservation_runs() == ()
 
 
-def test_issue_less_review_keeps_repository_and_global_caps(tmp_path) -> None:
-    runtime = Runtime(
-        AgentResult(
-            False,
-            status="reviewed",
-            cost_usd=1,
-            session_id="review-receipt",
-            usage={"input_tokens": 100, "output_tokens": 10},
-        )
-    )
-    store = SQLiteControlStore(str(tmp_path / "control.db"))
-    store.initialize()
-    wrapper = AccountingRuntime(
-        runtime,
-        store,
-        "o/r",
-        "review",
-        Money("USD", 5_000_000),
-        Money("USD", 10_000_000),
-        Money("USD", 25_000_000),
-        "cfg",
-        "claude",
-        BudgetPolicy({("review", "REVIEW"): Money("USD", 2_000_000)}),
-        _rates(),
-    )
-    wrapper.set_context("review", "REVIEW", 42, None)
-
-    result = asyncio.run(
-        wrapper.run(
-            RuntimePlan("review", model="gpt-test", max_budget_usd=2)
-        )
-    )
-
-    assert result.status == "reviewed"
-    assert runtime.calls == 1
-    with store._connect() as db:
-        scopes = {
-            tuple(row)
-            for row in db.execute(
-                "SELECT repository, dimension FROM budget_reservations "
-                "UNION ALL "
-                "SELECT repository, dimension FROM reservation_limits"
-            )
-        }
-    assert scopes == {("o/r", "repository"), ("*", "global")}
-
-
-def test_issue_less_review_binds_pr_claim_without_issue_budget_scope(
-    tmp_path,
-) -> None:
-    runtime = Runtime(
-        AgentResult(
-            False,
-            status="reviewed",
-            usage={"input_tokens": 1, "output_tokens": 1},
-        )
-    )
-    wrapper, store = _wrapper(tmp_path, runtime)
-    owner = "o/r:review:deployment"
-    wrapper = dataclasses.replace(
-        wrapper,
-        role="review",
-        owner_id=owner,
-        require_dispatch_claim=True,
-        budget_policy=BudgetPolicy(
-            {("review", "REVIEW"): Money("USD", 2_000_000)}
-        ),
-    )
-    assert store.claim_dispatch(
-        "o/r",
-        "review",
-        -42,
-        "REVIEW",
-        owner,
-    )
-    wrapper.set_context(
-        "review",
-        "REVIEW",
-        42,
-        None,
-        claim_target=-42,
-    )
-
-    result = asyncio.run(
-        wrapper.run(
-            RuntimePlan("review", model="gpt-test", max_budget_usd=2)
-        )
-    )
-
-    assert result.status == "reviewed"
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM dispatch_claim_runs "
-            "WHERE repository='o/r' AND role='review' AND target='pr:42'"
-        ).fetchone()[0] == 1
-        dimensions = {
-            row[0]
-            for row in db.execute(
-                "SELECT dimension FROM reservation_limits"
-            )
-        }
-    assert dimensions == {"repository"}
-
-
 def test_issue_less_multi_review_preserves_pr_claim_across_leg_context(
     tmp_path,
 ) -> None:
@@ -838,7 +734,7 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
     )
 
     # A machine failure is no attempt: the ended run carries no leg receipt.
-    assert [run.receipt for run in store.fix_runs("o/r", (1,))] == [None]
+    assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
 
 
 def test_malformed_usage_settles_zero_estimate_without_changing_work_result(
@@ -908,7 +804,7 @@ def test_non_codex_runtime_exception_releases_after_completed_teardown(
     )
 
     # A machine failure is no attempt: the ended run carries no leg receipt.
-    assert [run.receipt for run in store.fix_runs("o/r", (1,))] == [None]
+    assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
 
 
 def test_runtime_exception_after_child_registration_retains_reservation(
@@ -1083,7 +979,7 @@ def test_fix_admission_refusal_is_a_daily_wait_only_for_daily_caps(tmp_path, cap
     with store.transaction() as db:
         assert [tuple(row) for row in db.execute("SELECT state, outcome FROM runs")] == [("cancelled", "admission_refused")]
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
-    assert [run.receipt for run in store.fix_runs("o/r", (1,))] == [None]
+    assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
 
 
 @pytest.mark.parametrize("invalid", [None, True, -1, 1.5, "12", 10**100])

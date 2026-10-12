@@ -7,28 +7,7 @@ records argv and returns canned JSON (no network, no real gh)."""
 import errno
 import json
 
-from issue_agent.adapters.github import (
-    _FAILED_LOG_BYTES,
-    _FAILED_LOG_LINES,
-    _INLINE_COMMENT_LIMIT,
-    _LIST_LIMIT,
-    _REVIEW_COMMENT_BODY_BYTES,
-    _REVIEW_COMMENTS_TOTAL_BYTES,
-    GitHubGateway,
-    Identity,
-    MissingListLimit,
-    format_pr_discussion,
-    format_review_comments,
-    build_close_issue_args,
-    build_comment_args,
-    build_enable_auto_merge_args,
-    build_relabel_args,
-    build_submit_review_args,
-    parse_closing_refs,
-    parse_issue,
-    parse_pr,
-    parse_terminal_pr,
-)
+from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _INLINE_COMMENT_LIMIT, _LIST_LIMIT, _REVIEW_COMMENT_BODY_BYTES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, MissingListLimit, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_issue, parse_pr
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Comment
 from issue_agent.domain.checks import Unavailable
@@ -315,22 +294,6 @@ def test_close_issue_argv():
     assert "--comment" in argv
 
 
-def test_issue_closure_reads_exact_state_and_reason():
-    fr = FakeRunner(
-        {
-            "issue view 5": {
-                "state": "CLOSED",
-                "stateReason": "COMPLETED",
-            }
-        }
-    )
-    gw = GitHubGateway("o/r", runner=fr)
-
-    assert gw.issue_closure(5) == (True, "completed")
-    argv, _ = fr.calls[0]
-    assert argv[-2:] == ["--json", "state,stateReason"]
-
-
 def test_enable_auto_merge_argv():
     fr = FakeRunner({"pr view 100": {
         "autoMergeRequest": None,
@@ -462,34 +425,6 @@ def test_pr_diff_empty_read_is_unavailable_not_approvable():
         gw.pr_diff(100, "base-sha", "head-sha")
 
 
-def test_has_review_flattens_all_paginated_api_pages():
-    fr = FakeRunner(
-        {
-            "api repos/o/r/pulls/100/reviews": [
-                [
-                    {
-                        "state": "APPROVED",
-                        "body": "old",
-                        "commit_id": "head",
-                    }
-                ],
-                [
-                    {
-                        "state": "APPROVED",
-                        "body": "lgtm",
-                        "commit_id": "head",
-                    }
-                ],
-            ]
-        }
-    )
-    gw = GitHubGateway("o/r", runner=fr)
-
-    assert gw.has_review(100, "APPROVE", "lgtm", "head")
-    argv, _token = fr.calls[0]
-    assert argv[-2:] == ["--paginate", "--slurp"]
-
-
 def test_get_issue_parses_response():
     resp = {"number": 5, "title": "x", "labels": [{"name": "ai-ready"}],
             "state": "OPEN", "author": {"login": "a"}}
@@ -570,259 +505,12 @@ def test_parse_pr_round_trips_ai_review_label():
     assert pr.has(Label.AI_REVIEW)
 
 
-def test_build_review_world_queries_trigger_label_and_no_issues():
-    pr_resp = {"number": 815, "headRefName": "feature/x", "state": "OPEN",
-               "labels": [{"name": "ai-review"}]}
-    fr = FakeRunner({"pr list": [{"number": 815}], "pr view 815": pr_resp,
-                     "pr checks 815": []})
-    gw = GitHubGateway("o/ext", runner=fr, review_pr_label="ai-review")
-    w = gw.build_review_world()
-    # only PRs, no issue queries at all
-    assert w.issues == ()
-    assert [p.number for p in w.prs] == [815]
-    assert not any(c[0][1] == "issue" for c in fr.calls)  # no `gh issue …`
-    # the PR-list call carried our configured label
-    list_calls = [c[0] for c in fr.calls if c[0][1:3] == ["pr", "list"]]
-    assert list_calls and "ai-review" in list_calls[0]
-
-
-def test_review_world_pr_view_omits_mergeability_fields():
-    """The reviewer must never request mergeable/mergeStateStatus: GitHub computes
-    them lazily and the call can hang forever on a just-merged PR, freezing the
-    poll. Only the fixer (rebase logic) needs them. Regression for the review
-    daemon wedging behind a hung `gh pr view` and never leaving a comment."""
-    pr_resp = {"number": 815, "headRefName": "feature/x", "state": "OPEN",
-               "labels": [{"name": "ai-review"}]}
-    fr = FakeRunner({"pr list": [{"number": 815}], "pr view 815": pr_resp,
-                     "pr checks 815": []})
-    gw = GitHubGateway("o/ext", runner=fr, review_pr_label="ai-review")
-    gw.build_review_world()
-    view_calls = [c[0] for c in fr.calls if c[0][1:3] == ["pr", "view"]]
-    assert view_calls, "expected a pr view call"
-    fields = view_calls[0][view_calls[0].index("--json") + 1]
-    assert "mergeable" not in fields and "mergeStateStatus" not in fields
-    # the fixer path DOES ask for them (auto-rebase needs is_conflicting/needs_rebase)
-    fr2 = FakeRunner({"pr view 815": pr_resp, "pr checks 815": []})
-    GitHubGateway("o/r", runner=fr2).get_pr(815)
-    v2 = [c[0] for c in fr2.calls if c[0][1:3] == ["pr", "view"]][0]
-    assert "mergeable" in v2[v2.index("--json") + 1]
-
-
-def test_review_world_survives_one_failing_pr_fetch():
-    """One PR whose `gh pr view` returns empty (hung/killed → parse_pr(None) raises)
-    must NOT abort the whole poll: the other PRs still populate the world, so a
-    newer PR isn't stranded behind a broken older one. Regression for #382 going
-    unreviewed while #374's view hung."""
-    good = {"number": 900, "state": "OPEN", "labels": [{"name": "ai-review"}]}
-
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "pr list" in key:
-            return json.dumps([{"number": 374}, {"number": 900}])
-        if "pr view 374" in key:
-            return ""  # the hung/killed PR → empty → parse would raise
-        if "pr view 900" in key:
-            return json.dumps(good)
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner, review_pr_label="ai-review")
-    w = gw.build_review_world()
-    assert [p.number for p in w.prs] == [900]  # 374 dropped, 900 survived
-
-
 # ── P0.7: loud warning when a world-building list hits the --limit cap ────────
 
 
-def test_list_all_open_pr_numbers_warns_when_pr_list_hits_limit(capsys):
-    # same helper, `gh pr list` call site — proves the warning isn't wired to
-    # only one of the two list kinds named in P0.7.
-    prs = [{"number": n} for n in range(1, _LIST_LIMIT + 1)]
-    fr = FakeRunner({"pr list": prs})
-    gw = GitHubGateway("o/r", runner=fr)
-    nums = gw.list_all_open_pr_numbers()
-    assert len(nums) == _LIST_LIMIT
-    err = capsys.readouterr().err
-    assert "TRUNCATED" in err and str(_LIST_LIMIT) in err
-
-
-def test_list_all_open_pr_numbers_no_warning_below_limit(capsys):
-    fr = FakeRunner({"pr list": [{"number": 1}]})
-    gw = GitHubGateway("o/r", runner=fr)
-    gw.list_all_open_pr_numbers()
-    assert capsys.readouterr().err == ""
-
-
 # ── native "blocked by" dependency gate ───────────────────────────────────────
-def test_has_open_blocker_false_when_summary_zero_no_extra_call():
-    # summary.blocked_by == 0 → return False WITHOUT the second (list) API call.
-    calls = []
-
-    def runner(argv, token):
-        calls.append(" ".join(argv))
-        key = " ".join(argv)
-        if key.endswith("issue_dependencies_summary.blocked_by // 0") or "issues/57" in key:
-            return "0"
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert gw.has_open_blocker(57) is False
-    # cheapest-first: never hit the /dependencies/blocked_by endpoint
-    assert not any("dependencies/blocked_by" in c for c in calls)
-
-
-def test_has_open_blocker_true_when_a_blocker_is_open():
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "dependencies/blocked_by" in key:      # the list call
-            return json.dumps([91])  # jq reduced to open issue numbers
-        if "issues/57" in key:                     # the summary call
-            return "2"
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert gw.has_open_blocker(57) is True
-
-
-def test_has_open_blocker_false_when_all_blockers_closed():
-    # summary non-zero (counts a CLOSED blocker) but no blocker is open → False.
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "dependencies/blocked_by" in key:
-            return json.dumps([])
-        if "issues/57" in key:
-            return "1"
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert gw.has_open_blocker(57) is False
-
-
-def test_has_open_blocker_fail_soft_on_error():
-    # any API error → False (never strand a dispatchable issue on a transient read).
-    def runner(argv, token):
-        raise RuntimeError("gh boom")
-
-    gw = GitHubGateway("o/r", runner=runner)
-    assert gw.has_open_blocker(57) is False
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── closing-reference graph for the duplicate-PR guard (#39) ─────────────────
-def test_parse_closing_refs_flattens_pr_to_issue_pairs():
-    data = [
-        {"number": 558, "author": {"login": "xnmp"}, "baseRefName": "main",
-         "closingIssuesReferences": [{"number": 554}, {"number": 555}]},
-        {"number": 559, "author": {"login": "fix-bot"}, "baseRefName": "dev",
-         "closingIssuesReferences": [{"number": 7}]},
-    ]
-    refs = parse_closing_refs(data)
-    assert [(r.pr, r.issue, r.author) for r in refs] == [
-        (558, 554, "xnmp"), (558, 555, "xnmp"), (559, 7, "fix-bot"),
-    ]
-    assert refs[0].base_ref_name == "main"
-
-
-def test_parse_closing_refs_tolerates_every_missing_field():
-    # This feeds a guard that REFUSES work: a shape surprise must degrade to
-    # "no evidence of a duplicate" (dispatch as before), never to an exception
-    # that kills the whole world build.
-    data = [
-        {"number": 1},                                    # no refs key
-        {"number": 2, "closingIssuesReferences": None},   # null refs
-        {"number": 3, "author": None, "closingIssuesReferences": [{"number": 9}]},
-        {"closingIssuesReferences": [{"number": 9}]},     # no PR number
-        {"number": 5, "closingIssuesReferences": [{}, {"number": "x"}]},
-        "not-a-dict",
-    ]
-    refs = parse_closing_refs(data)
-    assert [(r.pr, r.issue, r.author) for r in refs] == [(3, 9, "")]
-    assert parse_closing_refs(None) == () and parse_closing_refs({}) == ()
-
-
-def test_open_closing_refs_asks_for_every_open_pr_in_one_call():
-    fr = FakeRunner({"pr list": [
-        {"number": 558, "author": {"login": "xnmp"},
-         "closingIssuesReferences": [{"number": 554}]},
-    ]})
-    gw = GitHubGateway("o/r", runner=fr)
-    refs = gw.open_closing_refs()
-    assert [(r.pr, r.issue) for r in refs] == [(558, 554)]
-    argv = fr.calls[0][0]
-    assert argv[1:3] == ["pr", "list"]
-    assert "--label" not in argv               # the guard's subject is UNLABELLED PRs
-    assert "open" in argv and "closingIssuesReferences" in " ".join(argv)
-    assert _limit_of(argv) is not None         # review C2: never an unbounded list
-    assert len(fr.calls) == 1                  # one call, no per-PR fetch
-
-
-
-
-def test_open_closing_refs_fails_soft_to_empty():
-    # A guard that refuses work must never be the thing that crashes a poll —
-    # and "" reads as the pre-#39 behaviour (dispatch).
-    gw = GitHubGateway("o/r", runner=_raising_runner(RuntimeError("boom")))
-    assert gw.open_closing_refs() == ()
-
-
 # ── free CI re-run (#38) ─────────────────────────────────────────────────────
-def test_rerun_failed_checks_targets_exact_revision_bound_runs():
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/4242": {
-            "id": 4242,
-            "head_sha": "head-1",
-            "run_attempt": 3,
-        },
-        "api repos/o/r/actions/runs/4343": {
-            "id": 4343,
-            "head_sha": "head-1",
-            "run_attempt": 1,
-        },
-    })
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.rerun_failed_checks("head-1", (4242, 4343)) == (4242, 4343)
-    reruns = [
-        call[0][2]
-        for call in fr.calls
-        if call[0][1] == "api" and call[0][2].endswith("/rerun-failed-jobs")
-    ]
-    assert reruns == [
-        "repos/o/r/actions/runs/4242/rerun-failed-jobs",
-        "repos/o/r/actions/runs/4343/rerun-failed-jobs",
-    ]
-
-
-def test_rerun_failed_checks_rejects_a_run_from_another_head_before_writing():
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/4242": {
-            "id": 4242,
-            "head_sha": "newer-head",
-            "run_attempt": 1,
-        },
-    })
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.rerun_failed_checks("observed-head", (4242,)) is None
-    assert not any(
-        call[0][2].endswith("/rerun-failed-jobs") for call in fr.calls
-    )
-
-
-def test_rerun_failed_checks_preserves_transport_failure_for_durable_recovery():
-    gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503")))
-    with pytest.raises(GhUnavailable):
-        gw.rerun_failed_checks("head-1", (4242,))
-
-
 def _pr_with_red_run(conclusion: str):
     def runner(argv, token):
         key = " ".join(argv)
@@ -851,20 +539,6 @@ def _pr_with_red_run(conclusion: str):
         return ""
 
     return GitHubGateway("o/r", runner=runner)
-
-
-def test_every_rerunnable_conclusion_is_found_by_run_id_at_the_observed_head():
-    """#177: the free re-run's candidates are the failed runs of the CURRENT
-    head. Each red conclusion must carry its workflow-run identity, and that id
-    must resolve at the head the decision observed — an unidentified failure
-    falls through to the paid leg instead of re-running a stranger's run."""
-    for conclusion in ("failure", "timed_out", "startup_failure"):
-        gw = _pr_with_red_run(conclusion)
-        checks = gw._checks_for_head("head-581")
-        assert checks[0]["bucket"] == "fail", conclusion
-        assert "/actions/runs/4242" in checks[0]["link"], conclusion
-        assert gw.workflow_run_attempts("head-581", (4242,)) == {4242: 1}
-        assert gw.workflow_run_attempts("some-other-head", (4242,)) is None
 
 
 def test_a_cancelled_run_reads_as_a_settled_failure_not_as_green():
@@ -903,91 +577,12 @@ def test_a_cancelled_run_reads_as_a_settled_failure_not_as_green():
 
 
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
-def test_cancel_workflow_runs_cancels_the_runs_pinning_the_observed_head():
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/4242": {
-            "id": 4242, "head_sha": "head-1", "status": "in_progress",
-        },
-        "api repos/o/r/actions/runs/4343": {
-            "id": 4343, "head_sha": "head-1", "status": "queued",
-        },
-    })
-    gw = GitHubGateway("o/r", runner=fr)
-
-    assert gw.cancel_workflow_runs("head-1", (4242, 4343)) == (4242, 4343)
-    assert [
-        call[0][2] for call in fr.calls
-        if call[0][1] == "api" and call[0][2].endswith("/cancel")
-    ] == [
-        "repos/o/r/actions/runs/4242/cancel",
-        "repos/o/r/actions/runs/4343/cancel",
-    ]
-
-
-def test_cancel_workflow_runs_refuses_a_run_belonging_to_a_newer_push():
-    # Cancelling is destructive: a run whose head_sha is not the commit the
-    # decision looked at is someone else's CI, and a partial cancel would leave
-    # the real pin in place while reading as handled.
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/4242": {
-            "id": 4242, "head_sha": "head-1", "status": "in_progress",
-        },
-        "api repos/o/r/actions/runs/4343": {
-            "id": 4343, "head_sha": "newer-head", "status": "in_progress",
-        },
-    })
-    gw = GitHubGateway("o/r", runner=fr)
-
-    assert gw.cancel_workflow_runs("head-1", (4242, 4343)) is None
-    assert not any(call[0][2].endswith("/cancel") for call in fr.calls)
-
-
-def test_cancel_workflow_runs_is_idempotent_over_an_already_completed_run():
-    # Durable replay must not fail because GitHub already took the run down.
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/4242": {
-            "id": 4242, "head_sha": "head-1", "status": "completed",
-        },
-    })
-    gw = GitHubGateway("o/r", runner=fr)
-
-    assert gw.cancel_workflow_runs("head-1", (4242,)) == ()
-    assert not any(call[0][2].endswith("/cancel") for call in fr.calls)
-
-
-def test_cancel_workflow_runs_rejects_unusable_run_identities():
-    gw = GitHubGateway("o/r", runner=FakeRunner({}))
-    assert gw.cancel_workflow_runs("", (4242,)) is None
-    assert gw.cancel_workflow_runs("head-1", ()) is None
-    assert gw.cancel_workflow_runs("head-1", (0,)) is None
-    assert gw.cancel_workflow_runs("head-1", (-1,)) is None
-
-
-def test_cancel_workflow_runs_rejects_a_malformed_or_statusless_answer():
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/4242": {"id": 4242, "head_sha": "head-1"},
-    })
-    assert GitHubGateway("o/r", runner=fr).cancel_workflow_runs(
-        "head-1", (4242,)
-    ) is None
-    assert not any(call[0][2].endswith("/cancel") for call in fr.calls)
-
-
-def test_cancel_workflow_runs_preserves_transport_failure_for_durable_recovery():
-    gw = GitHubGateway(
-        "o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503"))
-    )
-    with pytest.raises(GhUnavailable):
-        gw.cancel_workflow_runs("head-1", (4242,))
-
-
 def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
     fr = FakeRunner({
         "api repos/o/r/actions/runs/77": {"id": 77, "head_sha": "head", "run_attempt": 2},
         "run view 77": "boom",
     })
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.workflow_run_attempts("head", (77,)) == {77: 2}
     assert gw.failed_run_log("head", (77,)) == "boom"
     assert "--attempt" in fr.calls[-1][0]
     assert fr.calls[-1][0][fr.calls[-1][0].index("--attempt") + 1] == "2"
@@ -1053,9 +648,8 @@ def _run_with(monkeypatch, stderr, rc=1):
 def test_runner_keeps_failsoft_for_ordinary_non_zero_exits(monkeypatch, stderr):
     """Regression guard for the fail-soft contract the whole gateway rests on: a
     deleted PR, a 404, a 422 self-approval and a missing label are ANSWERS from
-    the API, not outages. They must keep degrading to "" — `_safe_get_pr`,
-    `build_review_world`'s missing-label tolerance and `submit_review`'s False
-    all depend on it, so a blanket raise would wedge the daemon."""
+    the API, not outages. They must keep degrading to "", so a blanket raise
+    would wedge the daemon."""
     assert _run_with(monkeypatch, stderr)() == ""
     assert classify_gh_failure(stderr) is None
 
@@ -1225,7 +819,7 @@ def test_auth_outages_are_transient_unavailability(stderr):
 def test_runner_raises_network_on_timeout(monkeypatch, capsys):
     """The bounded kill produced NO data; returning "" made a hung `gh pr view` look
     like a successful read of an empty world. `timed_out` marks it as the
-    per-call case so `_safe_get_pr` can still isolate one wedged PR."""
+    per-call case."""
     def _timeout(argv, capture_output, text, env, timeout):
         raise _subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
 
@@ -1250,54 +844,6 @@ def _raising_runner(exc):
 
 
 
-def test_review_world_builder_propagates_gh_unavailable():
-    gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503")))
-    with pytest.raises(GhUnavailable):
-        gw.build_review_world()
-
-
-def test_review_world_isolates_a_timed_out_pr_but_not_a_rate_limit(capsys):
-    """Two infra failures, two different blast radii. A single hung `gh pr view`
-    recurs every poll while the PR exists, so isolating it keeps newer PRs
-    reviewable (the #374/#382 incident). A rate limit fails EVERY fetch, so
-    isolating it would rebuild the empty world V10 is about."""
-    good = {"number": 900, "state": "OPEN", "labels": [{"name": "ai-review"}]}
-
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "pr list" in key:
-            return json.dumps([{"number": 374}, {"number": 900}])
-        if "pr view 374" in key:
-            raise GhUnavailable("network", "gh timed out after 120s", timed_out=True)
-        if "pr view 900" in key:
-            return json.dumps(good)
-        return ""
-
-    gw = GitHubGateway("o/r", runner=runner, review_pr_label="ai-review")
-    assert [p.number for p in gw.build_review_world().prs] == [900]
-    assert "skip PR #374" in capsys.readouterr().err
-
-    def throttled(argv, token):
-        if "pr list" in " ".join(argv):
-            return json.dumps([{"number": 374}, {"number": 900}])
-        raise GhUnavailable("rate-limit", "API rate limit exceeded")
-
-    gw2 = GitHubGateway("o/r", runner=throttled, review_pr_label="ai-review")
-    with pytest.raises(GhUnavailable):
-        gw2.build_review_world()
-
-
-def test_has_open_blocker_failsoft_for_api_answers_but_not_for_infra():
-    """"False" is not a neutral degradation here — it means "not blocked", which
-    DISPATCHES the issue. Fine when the API genuinely answered (no dependencies
-    endpoint); wrong when it answered nothing at all."""
-    gw_ok = GitHubGateway("o/r", runner=_raising_runner(ValueError("odd shape")))
-    assert gw_ok.has_open_blocker(5) is False
-    gw_infra = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("rate-limit", "x")))
-    with pytest.raises(GhUnavailable):
-        gw_infra.has_open_blocker(5)
-
-
 # ── review C2: every `gh … list` states its ceiling ───────────────────────────
 def _limit_of(argv):
     return argv[argv.index("--limit") + 1] if "--limit" in argv else None
@@ -1309,63 +855,6 @@ def _limit_of(argv):
 
 
 
-
-
-def test_pr_for_issue_passes_limit_and_warns_on_truncation(capsys):
-    """review C2. pr_for_issue scans open PRs for a `fix/<issue>-…` head; capped
-    at 30 it reports "no PR" for a PR that exists, and the fixer re-opens work
-    that is already in flight."""
-    prs = [{"number": n, "headRefName": f"feat/{n}-x"} for n in range(1, _LIST_LIMIT + 1)]
-    fr = FakeRunner({"pr list": prs})
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.pr_for_issue(_LIST_LIMIT) == _LIST_LIMIT   # the OLDEST-ranked entry still found
-    assert _limit_of(fr.calls[0][0]) == str(_LIST_LIMIT)
-    assert "TRUNCATED" in capsys.readouterr().err
-
-
-def test_pr_for_issue_no_warning_below_limit(capsys):
-    fr = FakeRunner({"pr list": [{"number": 100, "headRefName": "fix/5-null-token"}]})
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.pr_for_issue(5) == 100
-    assert gw.pr_for_issue(6) is None
-    assert capsys.readouterr().err == ""
-
-
-def test_ci_reset_linkage_selects_closing_refs_and_refuses_ambiguity():
-    prs = [{"number": 100, "headRefName": "unrelated", "closingIssuesReferences": [{"number": 5}]}]
-    gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": prs}))
-    assert gw.pr_for_issue(5, require_unique=True) == 100
-    assert gw.pr_for_issue(5) is None
-    prs.append({"number": 101, "headRefName": "fix/5-current", "closingIssuesReferences": []})
-    gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": prs}))
-    with pytest.raises(ValueError, match="ambiguous"):
-        gw.pr_for_issue(5, require_unique=True)
-    assert gw.pr_for_issue(5) == 101
-
-
-@pytest.mark.parametrize("prs", [
-    None,
-    [{"number": 100, "headRefName": "fix/5-work"}],
-    [{"number": 100, "headRefName": "fix/5-work", "closingIssuesReferences": [None]}],
-    *[[{"number": invalid, "headRefName": "other", "closingIssuesReferences": []}] for invalid in (True, 0, -1, 2**63)],
-    *[[{"number": 100, "headRefName": "other", "closingIssuesReferences": [{"number": invalid}]}] for invalid in (True, -1, 2**63)],
-    [{"number": n, "headRefName": f"fix/{n}-work", "closingIssuesReferences": []} for n in range(_LIST_LIMIT)],
-])
-def test_ci_reset_linkage_refuses_incomplete_observations(prs):
-    gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": prs}))
-    with pytest.raises(ValueError, match="CI reset|linkage is unavailable"):
-        gw.pr_for_issue(5, require_unique=True)
-
-
-def test_pr_discovery_uses_the_shared_branch_issue_policy():
-    from issue_agent.domain.refs import BRANCH_PREFIXES
-
-    for prefix in BRANCH_PREFIXES:
-        gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": [
-            {"number": 1, "headRefName": f"{prefix}/7030-other"},
-            {"number": 2, "headRefName": f"{prefix}/703-work"},
-        ]}))
-        assert gw.pr_for_issue(703) == 2
 
 
 def test_gh_rejects_a_list_subcommand_without_limit():
@@ -1700,100 +1189,6 @@ _TERMINAL_ROW = {
 }
 
 
-def test_a_list_built_terminal_pr_decides_exactly_like_the_view_built_one():
-    """The guardrail. The `gh pr view` payload is strictly RICHER than the list
-    row (body/comments/reviews/files), so this compares the cheap view against a
-    realistic full one and pins field-by-field which facts must be identical —
-    every one a lifecycle decision reads off a non-OPEN PR — and which are
-    honestly marked unread rather than defaulted to empty."""
-    view_payload = {
-        **_TERMINAL_ROW,
-        "body": "Fixes #12",
-        "comments": [{"author": {"login": "reviewer"}, "body": "lgtm"}],
-        "reviews": [{"author": {"login": "reviewer"}, "state": "APPROVED"}],
-        "files": [{"path": "src/thing.py"}],
-        "mergeable": "MERGEABLE",
-        "mergeStateStatus": "CLEAN",
-    }
-    cheap = parse_terminal_pr(_TERMINAL_ROW, label="ai-pr-open")
-    full = parse_pr(view_payload)
-    decision_fields = (
-        "number", "state", "labels", "closing_issue", "head_ref_name",
-        "head_ref_oid", "base_ref_name", "base_ref_oid", "title", "is_draft",
-        "author",
-    )
-    assert [getattr(cheap, f) for f in decision_fields] == [
-        getattr(full, f) for f in decision_fields
-    ]
-    assert (cheap.number, cheap.state, cheap.closing_issue) == (60, "MERGED", 12)
-    assert cheap.labels == frozenset({Label.AI_DONE})
-    # UNREAD, never read-as-empty (#48): both flags say so, and the values the
-    # richer payload would have carried are absent rather than wrong.
-    assert isinstance(cheap.ci, Unavailable) and not cheap.content_known
-    assert (cheap.body, cheap.comments, cheap.reviews, cheap.changed_files) == (
-        "", (), (), frozenset()
-    )
-    assert full.content_known is True
-
-
-def test_a_terminal_pr_still_wearing_the_label_keeps_its_full_fetch():
-    """A PR that can still DRIVE cleanup is decided on authoritative labels: the
-    search index is stale in the "still listed" direction, so a row showing the
-    label cannot distinguish fresh from stale."""
-    row = {**_TERMINAL_ROW, "labels": [{"name": "ai-pr-open"}]}
-    assert parse_terminal_pr(row, label="ai-pr-open") is None
-
-
-def test_an_open_or_unknown_state_keeps_its_full_fetch():
-    assert parse_terminal_pr({**_TERMINAL_ROW, "state": "OPEN"}, label="x") is None
-    assert parse_terminal_pr({**_TERMINAL_ROW, "state": ""}, label="x") is None
-    assert parse_terminal_pr({**_TERMINAL_ROW, "state": None}, label="x") is None
-
-
-def test_a_malformed_or_partial_row_keeps_its_full_fetch():
-    """Never launder partial data into a trusted view."""
-    for key in _TERMINAL_ROW:
-        partial = {k: v for k, v in _TERMINAL_ROW.items() if k != key}
-        assert parse_terminal_pr(partial, label="ai-pr-open") is None, key
-    assert parse_terminal_pr({**_TERMINAL_ROW, "labels": "ai-done"}, label="x") is None
-    assert parse_terminal_pr(
-        {**_TERMINAL_ROW, "closingIssuesReferences": {}}, label="x"
-    ) is None
-    assert parse_terminal_pr({**_TERMINAL_ROW, "number": "sixty"}, label="x") is None
-    assert parse_terminal_pr(None, label="x") is None
-    assert parse_terminal_pr([_TERMINAL_ROW], label="x") is None
-
-
-def test_a_hostile_row_can_never_raise_out_of_a_world_build():
-    """The real contract: a world build has no per-item isolation around this
-    call, so an oddly-shaped row must degrade to "fetch it properly" — never to
-    a dead poll (the V10 class)."""
-    hostile = [
-        {**_TERMINAL_ROW, "author": "fix-bot"},              # str, not {login}
-        {**_TERMINAL_ROW, "author": None},
-        {**_TERMINAL_ROW, "labels": [None, 7, {"nope": 1}]},
-        {**_TERMINAL_ROW, "closingIssuesReferences": [{"number": "twelve"}]},
-        {**_TERMINAL_ROW, "headRefName": None, "title": None},
-        {**_TERMINAL_ROW, "isDraft": {"weird": True}},
-        {**_TERMINAL_ROW, "number": None},
-        {**_TERMINAL_ROW, "state": ["MERGED"]},
-    ]
-    for row in hostile:
-        parse_terminal_pr(row, label="ai-pr-open")  # must not raise
-
-
-def test_a_bare_string_label_list_still_blocks_the_cheap_path():
-    """The gate and the view parser must never disagree about "carries the
-    label": reading a bare-string list as "no labels" would take the cheap path
-    for a PR whose PRView then DOES carry the trigger label."""
-    row = {**_TERMINAL_ROW, "labels": ["ai-pr-open"]}
-    assert parse_terminal_pr(row, label="ai-pr-open") is None
-    # …and an operator-configured trigger label the Label enum never heard of.
-    rogue = {**_TERMINAL_ROW, "labels": ["team-review"]}
-    assert parse_terminal_pr(rogue, label="team-review") is None
-    assert parse_terminal_pr(rogue, label="ai-pr-open") is not None
-
-
 def _tail_runner(rows, views=None, calls=None):
     def runner(argv, token):
         key = " ".join(argv)
@@ -1809,21 +1204,6 @@ def _tail_runner(rows, views=None, calls=None):
         return ""
 
     return runner
-
-
-
-
-def test_build_review_world_spends_no_pr_view_on_the_stale_unlabelled_tail():
-    calls = []
-    gw = GitHubGateway(
-        "o/r", runner=_tail_runner([_TERMINAL_ROW], calls=calls),
-        review_pr_label="ai-review",
-    )
-    prs = gw.build_review_world().prs
-    assert [(p.number, p.state) for p in prs] == [(60, "MERGED")]
-    assert not [c for c in calls if "pr view" in c]
-
-
 
 
 

@@ -7,7 +7,7 @@ import hashlib
 from .contracts import CommandId
 from .workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, EvidenceUnavailable,
-    NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
+    NoAuthorizedRemediation, OpenGate, ReconciliationOnly,
     ReconciliationPolicy, RemediationAttempted, RemediationOperation,
     RemediationOutcome, RemoteOutcomeUncertain, RetiredSettledCommand,
     RetiredUncertainCommand, RetryAuthorizationRequired,
@@ -100,22 +100,6 @@ def absent_reexecution(history: ActiveReconciliation) -> ActiveReconciliation:
     return replace(history, reexecutions=history.reexecutions + 1)
 
 
-def reexecution_exhausted(
-    history: ActiveReconciliation, now: datetime, policy: ReconciliationPolicy = ReconciliationPolicy(),
-) -> bool:
-    """Whether proven absence may still re-execute an unresolved command.
-
-    Unknown outcomes charge no refusals, so without this bound an
-    unknown -> absent -> re-execute cycle never ends. At the re-execution or
-    age ceiling the command expires to reconciliation-only, where absence
-    needs an operator grant (ADR 0015; ADR 0012 loops carry a ceiling).
-    """
-    if not isinstance(history, ActiveReconciliation) or not isinstance(policy, ReconciliationPolicy):
-        raise ValueError("re-execution bound requires pre-expiry history and a policy")
-    return (history.reexecutions >= policy.maximum_reexecutions
-            or (now - history.unresolved_since).total_seconds() >= policy.maximum_age_seconds)
-
-
 def reconciliation_due(state: CommandReconciliation, now: datetime) -> bool:
     if isinstance(state, RetiredSettledCommand):
         return False
@@ -186,18 +170,6 @@ def prewrite_evidence_gate_id(command_id: CommandId) -> str:
     """The one visible hold a command's unavailable pre-write reads can open."""
     validate_workflow_identifier(command_id, "command")
     return _PREWRITE_GATE_PREFIX + hashlib.sha256(str(command_id).encode()).hexdigest()
-
-
-def is_prewrite_gate(gate: object) -> bool:
-    """Whether a gate is a pre-write evidence hold: its command has not written.
-
-    Such a hold lives only as long as its command can still begin. A
-    transition that makes the command unable to begin (a generation advance,
-    retirement) removes it with that transition (ADR 0012/0015).
-    """
-    opened = gate.gate if isinstance(gate, RearmingGate) else gate
-    return (isinstance(opened, OpenGate) and isinstance(opened.cause, EvidenceUnavailable)
-            and opened.gate_id.startswith(_PREWRITE_GATE_PREFIX))
 
 
 def unavailable_prewrite_read(

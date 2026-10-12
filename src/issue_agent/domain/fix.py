@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from .identity import IdentityMode
 from .refs import is_governed_branch
-from .world import PRView, issue_for_pr
 
 
 def harness_merges_branch(
@@ -24,13 +23,3 @@ def harness_merges_branch(
     )
 
 
-def _issue_for_pr(pr: PRView) -> int | None:
-    """Linked issue: the shared linkage rule (closing-ref, then branch number)."""
-    return issue_for_pr(pr)
-
-
-def breaker_key(pr: PRView) -> int:
-    """Stable per-PR key: the linked issue number, or the NEGATED PR number
-    for a PR with no resolvable issue, so it cannot collide with issue N."""
-    n = _issue_for_pr(pr)
-    return n if n is not None else -pr.number

@@ -23,12 +23,12 @@ Two role daemons — **fix** and **review** — reconcile GitHub and
 drive Claude, Codex, or GLM sessions. Each is assembled in `app/roles.py` from:
 
 ```
-observe   gateway.build_*_world()    the GitHub slice this role needs
-decide    a PURE function            world + config + state → list[Action]
-execute   Executor.execute()         the ONE place writes happen
-dispatch  AgentDispatcher            RunAgent → an actual paid agent session
-control   SQLiteControlStore         leases, spend, dedup, commands, receipts
-effects   effect adapters            narrow privileged mutation boundaries
+observe   gateway.build_world()      one bounded GitHub observation
+derive    state.derive (PURE)        world + local SQLite facts → per-item state
+policy    policy.actions (PURE)      states → list[Action]; each role keeps its own
+act       GitHubAct.execute()        the ONE place writes happen (adapters/act.py)
+legs      FixLegs / ReviewLegs       RunAgent → an actual paid agent session
+control   SQLiteControlStore         leases, spend, dedup, runs, receipts
 ```
 
 The layering is hexagonal and **machine-enforced** (import-linter contracts
@@ -56,13 +56,13 @@ These are what adversarial review and live deployments identified as
 load-bearing. A refactor that breaks one of them is a regression even if the
 tests pass.
 
-1. **Decisions are data.** `decide_*` returns `Action` tuples; nothing in
+1. **Decisions are data.** `derive` and `policy` return states and `Action`
+   tuples; nothing in
    `domain/` performs a write. This is why adding escalation alerting and the
    journal were one-place changes.
-2. **One privileged write funnel.** Harness lifecycle mutations become durable
-   `LifecycleCommand`s and are executed by `GitHubEffectExecutor` or
-   `GitHubOperatorEffects` with an idempotency key, expected revision, and
-   receipt. `DurableEffectRunner` alone owns the command transition/receipt
+2. **One privileged write funnel.** Operator lifecycle mutations become durable
+   `LifecycleCommand`s and are executed by `GitHubOperatorEffects` with an
+   idempotency key, expected revision, and receipt. `DurableEffectRunner` alone owns the command transition/receipt
    protocol, including reconcile-first async effects. Command/receipt identities
    may be subsystem-namespaced for recovery and attribution, but authority is
    always checked against the base deployment owner. Deployment-scoped effects
@@ -71,8 +71,8 @@ tests pass.
    its owner check after it. Peer effects remain concurrent and no SQLite
    transaction spans network I/O. This includes
    CLI/dashboard labels, bootstrap settings and base-branch creation.
-   The fix role is the exception since slice 5b
-   (ADR 0001 amendment): `adapters/act.py` executes its Actions directly, each
+   The role daemons are the exception since slices 5b and 5c
+   (ADR 0001 amendment): `adapters/act.py` executes their Actions directly, each
    write naturally idempotent or keyed in SQLite and confirmed by a GitHub
    read-back. Fix agents push their own branch with git; the harness opens the
    PR from it, once. Credential isolation remains separately trigger-gated,
@@ -82,9 +82,9 @@ tests pass.
    from an adapter.
 4. **"I couldn't look" is not "nothing to do."** `GhUnavailable` and
    `OpenPrLookup`'s tri-state exist so an unreachable API can never be mistaken
-   for an empty world. Per-item fetch isolation (`_safe_get_pr`/`_safe_get_issue`)
-   drops one bad item, not the whole poll — but propagates systemic failures
-   like rate limits, which would otherwise fake an empty world.
+   for an empty world. An incomplete observation skips the item or the tick
+   and propagates systemic failures like rate limits, which would otherwise
+   fake an empty world.
 5. **Incident comments.** Comments here carry the failure they prevent, often
    with a PR number. They are the densest defence in the codebase. When you move
    code, move its comment verbatim.
@@ -99,8 +99,7 @@ through the existing human-review path. Reviewer legs do not execute target test
 
 The fixer has no publication gates and no command governor (slice 6a; ADR 0011
 superseded). TDD is prompt guidance in `plugin/AGENT.md`. What a fixer pushes
-is judged by CI and the independent reviewer; existing-test edits in the diff
-(`domain/diff_tests.py`) are listed for the reviewer as untrusted evidence.
+is judged by CI and the independent reviewer.
 
 ## Operational state, telemetry, and money
 
@@ -231,25 +230,21 @@ workflow routing and paid admission. A fresh PR read may validate that target
 but cannot replace it; changed linkage defers to a new observation. An issueless
 PR is claimed by negative PR number without manufacturing a per-issue spend
 scope (ADR 0008).
-Review execution allowance belongs to the SQL PR execution episode, so a
-later closing-link edit cannot erase an already-paid unproductive round.
-Current review authority stores a generation-local checkpoint and an ordered,
-bounded unresolved suffix. Immutable round, child admission/launch/return,
-money settlement and submission receipts retain exact retry and recovery
-evidence outside that aggregate. Late older-generation results settle their
-actual spend without resetting current allowance or reviving a session.
-An unresolved round whose existing recovery observations reach their limit
-holds new rounds and paid work; settlement and exact retries remain available.
+The review role (slice 5c) owes a REVIEW leg when CI is green on a harness PR's
+head and the review bot has no standing verdict on that head. The leg reads the
+exact head (a detached checkout and the revision-bound diff), and `GitHubAct`
+submits the parsed verdict as one review on that commit, keyed
+`review:{pr}:{head}` in the dedupe table and read back first, so a crash after
+submission never posts a second review. The verdict is also kept on the leg's
+run receipt: a verdict whose submission never landed is resubmitted without
+buying the review again. An unparseable verdict is an attempt, and derive caps
+attempts per head; everything else the review produces (labels, stop comments,
+merge) is the fix role's.
 
 Offline family activation and legacy import were deleted (slice 5a). A family
 epoch's plan evidence remains authority; a target's family state is initialized
 only by its live first observation.
 
-Execution renewal and selected confirmed verdict release use the existing
-pending operator intent and durable effect rail. Renewal requires complete
-old-episode quiescence and carries a compact origin/session reference, preserving
-rejection allowance and unrelated holds. The dashboard projects this SQL state
-and daemon-captured facts through its existing transport; polls never grant work.
 Store continuity/session/model/reply/phase APIs are retired.
 Current selected issue/PR components retain exact paid admission and outcome
 sources, while free remediation holds the existing command identity until its
@@ -304,7 +299,6 @@ recent activity is never promoted into proof that a role is alive or dead.
 Every paid run is bounded by layered breakers, because the failure mode
 that matters is not "wrong answer" but "loop that bills forever":
 
-- per-leg retry counters (`ci`, `review`, `rebase`, `resolve`) → escalate at cap
 - machine failures (provider overload or quota, OOM, a killed, cancelled or
   unreturned process, a runtime that never started, a refusal before
   admission) are never attempts and never escalate. The next fix dispatch of
@@ -314,8 +308,9 @@ that matters is not "wrong answer" but "loop that bills forever":
   `fix-infra-outcome` receipt; a run ended without a normal-return receipt is a
   machine end. Nothing is stored for it, and only the money caps bound the
   retries. Pre-admission refusals mint no run, so they retry each poll at $0.
-- `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — the reviewer's ceiling on paid rounds that
-  advanced nothing.
+- derived attempt caps (`domain/state.py`): consecutive agent legs of one act
+  without progress, REVIEW counted per head, and bot change-request rounds,
+  each stopping at `needs-human`; nothing is stored for them.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices streamed rollout counters and kills the process group on
   crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
@@ -324,10 +319,9 @@ that matters is not "wrong answer" but "loop that bills forever":
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
 
-An adopted PR that genuinely has no closing issue omits only the inapplicable
-issue scope; its review legs still reserve against repository and global caps.
-A missing issue on issue-scoped fix work remains a fail-closed attribution
-error.
+Both roles' legs are issue-scoped: the review role reviews only harness PRs,
+whose branch names their issue. A missing issue remains a fail-closed
+attribution error.
 
 Provider-billed runtimes settle their reported cost. Subscription runtimes
 whose provider reports zero use the configured versioned rate card as an
@@ -387,8 +381,7 @@ after registration is recoverable through the same authoritative run record.
 A transport retry can replace that run's process lease only under the same
 active owner and dispatch, after the kernel proves the prior process group is
 absent and the new identity is live. It revalidates continuation admission and
-journals the replacement. Attached review children keep their immutable launch
-receipt and cannot use this replacement path.
+journals the replacement.
 
 Each deployment has a role/repository/checkout-scoped lock and a stable
 deployment identity. Locks live in a private per-user host runtime directory,
@@ -507,13 +500,11 @@ policies use the test-merge revision when it has checks, otherwise the head.
 Empty policies retain head report selection and escalate unverified green
 after same-head cancellation until the free rerun is spent. Unavailable reads
 leave durable escalations owed; settled Clear obsoletes other CI escalations),
-`domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
+`domain/contracts.py`, `domain/dashboard.py`,
 `domain/eligibility.py`
 (action-specific allowed/held/invalid results and immutable completion facts;
 shared by lifecycle policy and durable action payloads without an import cycle),
-`domain/effort.py`, `domain/diff_tests.py`
-(the harness-attested capability manifest: what the boot probe saw, and the
-narrow conditions under which it may state a verdict rather than facts),
+`domain/effort.py`,
 `domain/events.py`, `domain/fix.py`,
 `domain/git_remote.py`, `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
@@ -526,44 +517,27 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
-minimal-harness design; the fix role runs on it since slice 5b),
-`domain/review.py`,
+minimal-harness design; the fix role runs on it since slice 5b and the review
+role since slice 5c),
+`domain/review.py` (a REVIEW leg's verdict: the agent's claim, parsed into an
+exact APPROVE or REQUEST_CHANGES with a bounded body, or nothing),
 `domain/supervision.py`,
 `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
-`domain/workflow_ports.py`, `domain/workflow_policy.py`,
+`domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`,
-`domain/review_linkage.py`,
-`domain/review_execution.py` (pure current execution authority and bounded ordered unresolved-suffix fold),
-`domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
-`domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
-`domain/review_return.py` (bounded, unclassified review child result evidence),
-`domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
-`domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
-`domain/review_evidence.py`, `domain/deployment.py`
+`domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
-incremental gate/re-arm authority migration; the PR-owned review-rejection
-family has its own snapshot, continuation and handoff-free intents, sharing only
-the gate values and transition envelopes with resolve, and its pure policy counts
-rejections with one selector and authorizes dismissal of exactly the gate's
-observed set; workspace handoffs are explicit
-preparation obligations, not AUTHOR evidence or independent execution authority;
-an operator retry authorization buys exactly one execution of an existing
-reconciliation-only command after harness-proven absence; an unreadable
-review-history or linked-issue read backs off to a visible,
-never-approving hold; linked issue lifecycle and SQL holds are joined into review
-admission, operator facts and applicable effects; the review daemon's plan records its own per-pull-request dispatch
-decision, with the facts and the read it came from and an as-of time, which the
-operator view renders instead of deciding; the view offers each gate's commands
-or refuses them with the reason the snapshot or that recorded decision already
-proves, refusing commands on a recorded merged pull request while a closed
-pull request retains its lever subject to fresh acceptance reads).
+resolve gate/re-arm authority; workspace handoffs are explicit preparation
+obligations, not AUTHOR evidence or independent execution authority; slice 5d
+deletes this resolve workflow family, which no role reads since slice 5b).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
-`adapters/accounting_runtime.py`, `adapters/act.py` (the fix role's `act` step:
-idempotent or keyed-and-read-back GitHub writes, no command queue),
+`adapters/accounting_runtime.py`, `adapters/act.py` (both roles' `act` step:
+idempotent or keyed-and-read-back GitHub writes, including the review bot's
+one review per head, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_home.py`, `adapters/codex_runner.py`,
@@ -578,17 +552,7 @@ idempotent or keyed-and-read-back GitHub writes, no command queue),
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
-`adapters/repository_guidance.py`, `adapters/review_linkage.py`,
-`adapters/sql_read_budget.py` (opt-in transaction result-byte/row meter and temporary SQLite value bound; page and point queries bound engine work separately),
-`adapters/review_effects.py` (guarded review dismissal and PR projection
-commands executed by the review owner),
-`adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
-`adapters/review_execution_claims.py` (exact parent claim and lifecycle receipt validation),
-`adapters/review_execution_control.py` (review-round preflight, source-backed registration and abandoned-round recovery),
-`adapters/review_round_sources.py` (transaction-local reconstruction of child, planning and submission receipts),
-`adapters/review_workflow_control.py` (the review owner's generation-fenced
-commit boundary: store-minted facts, barrier-ordered acceptance, bounded
-re-arm reconciliation and the ceiling-release projection fact),
+`adapters/repository_guidance.py`,
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
@@ -600,22 +564,19 @@ adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
 `app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
-`app/dispatch.py` (the review role's paid-leg dispatcher),
-`app/execute.py`, `app/fix.py` (the fix role: local facts from SQLite, the
-derive → policy tick, and one paid leg per dispatch), `app/identity_pools.py`,
+`app/fix.py` (the fix role: one paid leg per dispatch, resuming the right
+session), `app/identity_pools.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
-`app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
-`app/review_runtime.py` (the active review family's dispatch plan, bound
-submission authority, trusted external holds and fix-side guidance read, and the
-one review-control composition the daemon and the operator transport share),
-`app/review_control.py` (the review owner's operator composition from the
-launch snapshot for the PR-scoped dashboard API),
+`app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
+dispatches, runs one leg pinned to the head, and submits the parsed verdict
+once, resubmitting a stored verdict free when its submission never landed),
+`app/review_identity.py`, `app/roles.py`,
+`app/tick.py` (the tick both roles share: local facts from SQLite and
+derive → policy → choose),
 and `app/service_doctor.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid
 workflow sequencing and the single `run_leg` path are in `app/workflows/`;
-its shared completion helper revalidates current facts between confirmed
-effects, while the durable executor retains those facts across command retries;
 the web composition/read-model boundary is in `app/dashweb/`.
 
 ## Where the detail lives

@@ -12,14 +12,13 @@ from issue_agent.adapters.control_store import AccountingDisposition, SQLiteCont
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_rows import (
     WorkflowAuthorityError, encode_workflow_episodes, insert_workflow_component, load_issue_aggregate,
-    load_review_workflow_row, persist_workflow_snapshot, workflow_scope,
+    persist_workflow_snapshot, workflow_scope,
 )
 from issue_agent.domain import continuation_components as cc
 from issue_agent.domain.contracts import Money, PricingBasis
 from issue_agent.domain.workflow import WorkflowSnapshot
 from issue_agent.domain.workflow_identity import ContinuationComponentIdentity, FamilyAuthority, WorkflowFamily, WorkflowRevision
 from tests.adapters.test_workflow_admission import NOW, request
-from tests.fakes.review_workflow import held
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 
@@ -191,29 +190,6 @@ def test_activated_component_corruption_is_refused_without_money(recovery, corru
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
 
 
-def test_pr_repair_allowance_and_actual_return_are_independent_of_rejection_episode(tmp_path):
-    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
-    store.initialize()
-    base = replace(held(), gates=())
-    install_workflow(store, base)
-    component = active(base.revision.fence.key, WorkflowFamily.PR_REPAIR)
-    aggregate = replace(base, pr_repair=component)
-    install_secondary(store, aggregate, component)
-    selected = cc.select_pr_repair(aggregate)
-    purchase = cc.PRRepairPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:repair"),
-                                  allowance=cc.RepairAllowance.INFRA, ceiling=1)
-    requested = replace(request("repair"), workflow=selected.binding)
-    assert store.reserve_pr_repair(requested, purchase).admitted
-    admitted = receipt(store, requested.run_id, WorkflowFamily.PR_REPAIR)
-    output = cc.PRRepairState(infra_failures=1)
-    assert store.settle_pr_repair(money(requested.run_id), admitted, output).disposition is AccountingDisposition.AVAILABLE
-    with store.transaction() as db:
-        current = load_review_workflow_row(db, base.revision.fence.key)
-    assert current.episode == base.episode and current.pr_repair.state.infra_failures == 1
-    capture = cc.ContinuationCapture(cc.select_pr_repair(current).binding, current.revision, "leg:repair2")
-    assert not store.reserve_pr_repair(replace(request("repair2"), workflow=capture.binding), replace(purchase, capture=capture)).admitted
-
-
 def test_current_launch_and_exact_registered_retry_preserve_fences(recovery):
     store, aggregate = recovery
     selected = purchase(aggregate)
@@ -316,16 +292,10 @@ def test_populated_schema35_upgrade_preserves_old_money_and_fences_old_binary(tm
         assert tuple(db.iterdump()) == before
 
 
-@pytest.mark.parametrize("family", [WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR])
-def test_active_component_aggregate_codec_roundtrip_requires_selected_fields(family):
-    if family is WorkflowFamily.PR_REPAIR:
-        base = replace(held(), gates=())
-        aggregate = replace(base, pr_repair=active(base.revision.fence.key, family))
-        selected_field = "pr_repair"
-    else:
-        base = resolve_snapshot()
-        selected_field = "issue_recovery"
-        aggregate = replace(base, issue_recovery=active(base.revision.fence.key, family))
+def test_active_component_aggregate_codec_roundtrip_requires_selected_fields():
+    base = resolve_snapshot()
+    selected_field = "issue_recovery"
+    aggregate = replace(base, issue_recovery=active(base.revision.fence.key, WorkflowFamily.ISSUE_RECOVERY))
     raw = encode_workflow(aggregate)
     assert decode_workflow(raw, type(aggregate)) == aggregate
     malformed = json.loads(raw)
@@ -405,40 +375,6 @@ def test_actual_run_selection_and_binding_are_immutable_and_corruption_refuses_r
     with pytest.raises(WorkflowAuthorityError, match="actual run binding"):
         store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState())
     assert store.snapshot(requested.scope).settled.micros == 0
-
-
-def test_stale_pr_return_preserves_continuity_then_current_work_proceeds_and_old_retry_is_inert(tmp_path):
-    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
-    store.initialize()
-    base = replace(held(), gates=())
-    install_workflow(store, base)
-    component = active(base.revision.fence.key, WorkflowFamily.PR_REPAIR)
-    original = replace(base, pr_repair=component)
-    install_secondary(store, original, component)
-    selected = cc.select_pr_repair(original)
-    purchase = cc.PRRepairPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:repair"), ceiling=2)
-    first = replace(request("repair"), workflow=selected.binding)
-    assert store.reserve_pr_repair(first, purchase).admitted
-    old = receipt(store, first.run_id, WorkflowFamily.PR_REPAIR)
-    with store.transaction() as db:
-        current = load_review_workflow_row(db, base.revision.fence.key)
-        moved = replace(current, revision=WorkflowRevision(replace(current.revision.fence, generation=1), 2))
-        persist_workflow_snapshot(db, moved)
-    assert store.settle_pr_repair(money(first.run_id), old, cc.PRRepairState()).disposition is AccountingDisposition.AVAILABLE
-    with store.transaction() as db:
-        current = load_review_workflow_row(db, base.revision.fence.key)
-    assert current == moved
-    capture = cc.ContinuationCapture(cc.select_pr_repair(current).binding, current.revision, "leg:repair2")
-    second = replace(request("repair2"), workflow=capture.binding)
-    assert store.reserve_pr_repair(second, replace(purchase, capture=capture)).admitted
-    newest = receipt(store, second.run_id, WorkflowFamily.PR_REPAIR)
-    assert store.settle_pr_repair(money(second.run_id), newest, cc.PRRepairState(infra_failures=1)).disposition is AccountingDisposition.AVAILABLE
-    with store.transaction() as db:
-        completed = load_review_workflow_row(db, base.revision.fence.key)
-    assert completed.pr_repair.state.infra_failures == 1
-    assert store.settle_pr_repair(money(first.run_id), old, cc.PRRepairState()).idempotent
-    with store.transaction() as db:
-        assert load_review_workflow_row(db, base.revision.fence.key) == completed
 
 
 def test_v36_preserves_all_accepted_predecessor_migration_bytes():

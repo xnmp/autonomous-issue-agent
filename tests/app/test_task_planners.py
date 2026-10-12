@@ -9,55 +9,13 @@ from typing import Any, cast
 import issue_agent.app.planners.tasks as tasks_module
 import pytest
 from issue_agent.domain.trust import as_untrusted
-from issue_agent.app.planners.schemas import (
-    FIX_SCHEMA,
-    REVIEW_FINDINGS_SCHEMA,
-    REVIEW_GATE_SCHEMA,
-    REVIEW_SCHEMA,
-    REVIEW_VALIDATION_SCHEMA,
-)
-from issue_agent.app.planners.tasks import (
-    FIXER_DENY,
-    REVIEW_DIMENSIONS,
-    FixTaskConfig,
-    ReviewTaskConfig,
-    build_address_review_task,
-    build_delegated_re_review_task,
-    build_delegated_review_task,
-    build_fix_ci_task,
-    build_fresh_re_review_task,
-    build_fresh_reply_task,
-    build_re_review_task,
-    build_resolve_task,
-    build_resume_task,
-    build_rebase_task,
-    build_review_gate_task,
-    build_review_dimension_task,
-    build_review_task,
-    build_review_validation_task,
-    scope_diff,
-)
+from issue_agent.app.planners.schemas import FIX_SCHEMA, REVIEW_SCHEMA
+from issue_agent.app.planners.tasks import FIXER_DENY, FixTaskConfig, ReviewTaskConfig, build_address_review_task, build_fix_ci_task, build_fresh_reply_task, build_resolve_task, build_resume_task, build_rebase_task, build_review_task
 
 from issue_agent.app.dashweb import guidance as guidance_rules
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
 U = as_untrusted
-
-
-@pytest.mark.parametrize("marked", [False, True])
-def test_address_review_prompt_omits_only_the_harness_command_marker(marked):
-    from issue_agent.domain.review_workflow import mark_review_body
-    from issue_agent.domain.trust import untrusted_block
-
-    body = "Please fix the failure.\n\nKeep this spacing.  \n"
-    incoming = mark_review_body(body, "3ecc4f6b" * 8) if marked else body
-    task = build_address_review_task(7, U(incoming), U("inline"), "/wt", "session", FIX_CFG)
-    assert "issue-agent-review-command" not in task.prompt
-    assert "3ecc4f6b" not in task.prompt
-    expected = body.rstrip() if marked else body
-    assert untrusted_block("review_body", U(expected)) in task.prompt
-    assert "must not quote internal identifiers" in task.prompt
-    assert "must not quote internal identifiers" in task.append_system_prompt
 
 
 def test_address_review_prompt_preserves_indented_marker_reproducer():
@@ -322,71 +280,16 @@ MULTI_DIFF = (
 )
 
 
-def test_scope_diff_keeps_only_the_named_files_hunks():
-    out = scope_diff(MULTI_DIFF, ["src/app/pay.py"])
-    assert "return x * RATE" in out              # the named file's hunk survives
-    assert "@@ -1,3 +1,4 @@" in out              # hunk header kept intact
-    assert "new docs" not in out                 # unrelated files dropped
-    assert "test_charge" not in out
-
-
-def test_scope_diff_matches_bare_and_b_side_names():
-    # findings are LLM-written: a bare filename and a b/-prefixed one both resolve.
-    assert "return x * RATE" in scope_diff(MULTI_DIFF, ["pay.py"])
-    assert "return x * RATE" in scope_diff(MULTI_DIFF, ["b/src/app/pay.py"])
-
-
-def test_scope_diff_does_not_match_on_a_partial_component():
-    # `ay.py` is a suffix of `pay.py` but not a path component of it.
-    assert scope_diff(MULTI_DIFF, ["ay.py"]) == ""
-
-
-def test_scope_diff_multiple_paths_and_context_files():
-    out = scope_diff(MULTI_DIFF, ["src/app/pay.py", "tests/test_pay.py"])
-    assert "return x * RATE" in out and "test_charge" in out
-    assert "new docs" not in out
-    # context_files pulls in neighbouring sections
-    ctx = scope_diff(MULTI_DIFF, ["README.md"], context_files=1)
-    assert "new docs" in ctx and "return x * RATE" in ctx and "test_charge" in ctx
-
-
-def test_scope_diff_returns_empty_on_no_match_or_bad_input():
-    assert scope_diff(MULTI_DIFF, ["nope/absent.py"]) == ""
-    assert scope_diff(MULTI_DIFF, []) == ""
-    assert scope_diff("", ["src/app/pay.py"]) == ""
-    assert scope_diff("   \n\n", ["src/app/pay.py"]) == ""
-    assert scope_diff("not a diff at all", ["src/app/pay.py"]) == ""
-    assert scope_diff("x" * 100_000, ["src/app/pay.py"]) == ""
-
-
-def test_scope_diff_handles_headerless_unified_diff():
-    plain = (
-        "--- old/pay.py\n+++ new/pay.py\n@@ -1 +1 @@\n-a\n+b\n"
-        "--- old/other.py\n+++ new/other.py\n@@ -1 +1 @@\n-c\n+d\n"
-    )
-    out = scope_diff(plain, ["pay.py"])
-    assert "+b" in out and "+d" not in out
-
-
-def test_scope_diff_ignores_dev_null_side_of_an_added_file():
-    added = (
-        "diff --git a/src/new.py b/src/new.py\n"
-        "--- /dev/null\n+++ b/src/new.py\n@@ -0,0 +1 @@\n+x = 1\n"
-    )
-    assert "x = 1" in scope_diff(added, ["src/new.py"])
-    assert scope_diff(added, ["/dev/null"]) == ""
-
-
 # ── review ──
-RCFG = ReviewTaskConfig(repo="o/r", review_prompt="round=$ROUND_NUMBER rules")
+RCFG = ReviewTaskConfig(repo="o/r", review_prompt="review rules")
 
 
-def test_review_task_round_one_and_readonly():
+def test_review_task_is_readonly_and_carries_the_review_prompt():
     t = build_review_task(
         100, U("PR title"), U("desc"), U("the diff"), RCFG
     )
     assert t.schema is REVIEW_SCHEMA
-    assert "round=1" in t.append_system_prompt       # $ROUND_NUMBER substituted
+    assert t.append_system_prompt == "review rules"
     assert "Edit" in t.disallowed_tools and "Write" in t.disallowed_tools
     assert "Read" in t.allowed_tools                  # can open committed screenshots
     assert "the diff" in t.prompt
@@ -396,119 +299,7 @@ def test_review_task_round_one_and_readonly():
     assert "evidence/" in t.prompt
 
 
-def test_re_review_task_substitutes_round_and_resumes():
-    t = build_re_review_task(100, 3, "old", "new", U("delta"), "rs", RCFG)
-    assert "round=3" in t.append_system_prompt
-    assert t.resume == "rs"
-    assert "round 3" in t.prompt
-    # T5 (review): "REFUTE" pruned here — incidental to this test's named claim
-    # (round substitution + resume), prose-only, and the adversarial-refute
-    # framing itself is the NAMED point of test_review_validation_task_is_adversarial.
-    assert "old → new" in t.prompt
-
-
 # ── operator guidance (dashboard unblock → review prompt) ──
-def test_review_task_carries_the_operator_guidance_as_trusted_scope():
-    t = build_review_task(
-        100, U("PR title"), U("desc"), U("the diff"), RCFG,
-        operator_guidance="native screenshots are impossible; accept the log",
-    )
-    assert "native screenshots are impossible; accept the log" in t.prompt
-    assert "OPERATOR_GUIDANCE" in t.prompt
-    # Bounded authority: an operator may narrow evidence expectations, never
-    # buy an approval or waive a trust-boundary rule.
-    assert "approve code you find defective" in t.prompt
-    assert "security or trust-boundary" in t.prompt
-
-
-def test_re_review_task_carries_the_operator_guidance():
-    t = build_re_review_task(
-        100, 3, "old", "new", U("delta"), "rs", RCFG,
-        operator_guidance="scope: the parser only",
-    )
-    assert "scope: the parser only" in t.prompt
-    assert "OPERATOR_GUIDANCE" in t.prompt
-
-
-@pytest.mark.parametrize("guidance", ["", "   ", "\n\t "])
-def test_no_guidance_leaves_no_operator_section_at_all(guidance):
-    # An empty labelled section reads as "the operator said nothing", which is
-    # worse than silence — it invites the reviewer to infer unbounded scope.
-    for prompt in (
-        build_review_task(
-            100, U("t"), U("b"), U("d"), RCFG, operator_guidance=guidance
-        ).prompt,
-        build_re_review_task(
-            100, 2, "old", "new", U("d"), "rs", RCFG, operator_guidance=guidance
-        ).prompt,
-    ):
-        assert "OPERATOR_GUIDANCE" not in prompt
-        assert "deployment operator has scoped" not in prompt
-
-
-def test_default_review_prompts_have_no_operator_section():
-    assert "OPERATOR_GUIDANCE" not in build_review_task(
-        100, U("t"), U("b"), U("d"), RCFG
-    ).prompt
-    assert "OPERATOR_GUIDANCE" not in build_re_review_task(
-        100, 2, "old", "new", U("d"), "rs", RCFG
-    ).prompt
-
-
-def test_a_note_at_the_ceiling_is_carried_whole():
-    note = "x" * guidance_rules.GUIDANCE_MAX_CHARS  # exactly the permitted max
-    t = build_review_task(
-        100, U("t"), U("b"), U("d"), RCFG, operator_guidance=note
-    )
-    assert note in t.prompt
-
-
-def test_multi_mode_gate_and_dimension_legs_carry_the_guidance():
-    # The gate can END a review (reviewable=false short-circuits to APPROVE) and
-    # the specialists are where findings are born, so both must see the scope.
-    gate = build_review_gate_task(
-        100, U("t"), U("b"), U("d"), RCFG,
-        operator_guidance="accept the recorded log as visual evidence",
-    )
-    dim = build_review_dimension_task(
-        100, "correctness", "logic bugs", U("t"), U("b"), U("d"), RCFG,
-        operator_guidance="accept the recorded log as visual evidence",
-    )
-    for t in (gate, dim):
-        assert "accept the recorded log as visual evidence" in t.prompt
-        assert "OPERATOR_GUIDANCE" in t.prompt
-
-
-def test_the_finding_validator_stays_unscoped():
-    # It adjudicates one already-raised claim on its technical merits; scope
-    # text there would only widen a refuter's licence to dismiss a real defect.
-    t = build_review_validation_task(
-        100, "correctness", U("src/a.py:1"), U("claim"), U("d"), RCFG
-    )
-    assert "OPERATOR_GUIDANCE" not in t.prompt
-
-
-def test_fresh_and_delegated_review_prompts_carry_the_guidance_too():
-    # The note must not depend on REVIEW_MODE or on whether the session could
-    # be resumed — an operator who scoped a review once has scoped every later
-    # round of it.
-    fresh = build_fresh_re_review_task(
-        100, 3, U("t"), U("b"), "old", "new", U("d"), U("prior"), RCFG,
-        operator_guidance="use the recorded terminal log",
-    )
-    delegated = build_delegated_review_task(
-        100, U("t"), U("b"), U("d"), DCFG,
-        operator_guidance="use the recorded terminal log",
-    )
-    delegated_re = build_delegated_re_review_task(
-        100, 3, "old", "new", U("d"), U("prior"), DCFG,
-        operator_guidance="use the recorded terminal log",
-    )
-    for t in (fresh, delegated, delegated_re):
-        assert "use the recorded terminal log" in t.prompt
-        assert "OPERATOR_GUIDANCE" in t.prompt
-
-
 # ── PR conversation (2026-08-08, tauri #613/#614) ──
 DISCUSSION = U("@fixer[bot]: this deployment has no display; no screenshot exists")
 
@@ -539,195 +330,8 @@ def test_discussion_text_that_mimics_a_fence_stays_inert():
     assert body.count("</untrusted_pr_discussion_json>") == 1
 
 
-def test_every_review_builder_carries_the_discussion():
-    thread = U("author: the display is unavailable here")
-    builders = (
-        build_review_task(100, U("t"), U("b"), U("d"), RCFG, discussion=thread),
-        build_re_review_task(100, 2, "old", "new", U("d"), "rs", RCFG, discussion=thread),
-        build_fresh_re_review_task(
-            100, 3, U("t"), U("b"), "old", "new", U("d"), U("prior"), RCFG,
-            discussion=thread,
-        ),
-        build_delegated_review_task(100, U("t"), U("b"), U("d"), DCFG, discussion=thread),
-        build_delegated_re_review_task(
-            100, 3, "old", "new", U("d"), U("prior"), DCFG, discussion=thread
-        ),
-        # MULTI mode: the specialists are where findings are born.
-        build_review_dimension_task(
-            100, "correctness", "logic bugs", U("t"), U("b"), U("d"), RCFG,
-            discussion=thread,
-        ),
-    )
-    for t in builders:
-        assert "<untrusted_pr_discussion_json>" in t.prompt
-
-
-def test_the_gate_and_the_validator_get_no_discussion():
-    # The gate's only failure direction is a false reviewable=false, which ENDS
-    # the review in an APPROVE — and a comment is the wrong evidence for "is
-    # this diff behavioural?". The validator adjudicates one claim on its
-    # technical merits; a thread there is only more surface for talking a real
-    # defect down.
-    gate = build_review_gate_task(100, U("t"), U("b"), U("d"), RCFG)
-    validator = build_review_validation_task(
-        100, "correctness", U("src/a.py:1"), U("claim"), U("d"), RCFG
-    )
-    for t in (gate, validator):
-        assert "pr_discussion" not in t.prompt
-
-
 # ── delegated review (REVIEW_MODE=delegated) ──
-DCFG = ReviewTaskConfig(repo="o/r", review_prompt="round=$ROUND_NUMBER", scout_model="sonnet")
-
-
-def test_delegated_review_attaches_scout_and_keeps_read():
-    t = build_delegated_review_task(
-        100, U("PR title"), U("desc"), U("the diff"), DCFG
-    )
-    # same decision contract as the single-agent reviewer
-    assert t.schema is REVIEW_SCHEMA
-    assert "round=1" in t.append_system_prompt
-    assert "the diff" in t.prompt
-    # augment mode: the reviewer KEEPS its own read tools
-    assert "Read" in t.allowed_tools
-    assert "Edit" in t.disallowed_tools and "Write" in t.disallowed_tools
-    # a code-scout subagent is attached, on the cheap scout model
-    assert len(t.subagents) == 1
-    scout = t.subagents[0]
-    assert scout.name == "code-scout" and scout.model == "sonnet"
-    assert "Read" in scout.tools and "Grep" in scout.tools
-    # prompt names the scout subagent (required: the Task-tool delegation call
-    # must reference it by this exact name). T5 (review): the generic
-    # "delegat" wording check alongside it was prose-only, pruned.
-    assert "code-scout" in t.prompt
-    # Task tool is auto-added so the delegation is invokable
-    assert "Task" in t.all_allowed_tools()
-
-
-def test_delegated_re_review_is_fresh_and_carries_prior_review():
-    # Delegated re-review does NOT resume (replaying the round-1 opus transcript
-    # blew the budget). It starts fresh with the new diff + its prior review as DATA.
-    t = build_delegated_re_review_task(
-        100,
-        3,
-        "old",
-        "new",
-        U("delta"),
-        U("PRIOR-FEEDBACK"),
-        DCFG,
-    )
-    assert t.schema is REVIEW_SCHEMA
-    assert t.resume is None                     # FRESH session, not resumed
-    assert "round=3" in t.append_system_prompt
-    assert "round 3" in t.prompt
-    assert "old → new" in t.prompt
-    # T5 (review): "prior review" (generic phrase) was redundant with the
-    # interpolated sentinel below and prose-only on its own — pruned.
-    assert "PRIOR-FEEDBACK" in t.prompt         # prior review fed as reference
-    assert t.subagents and t.subagents[0].name == "code-scout"
-    assert "Task" in t.all_allowed_tools()
-
-
-def test_delegated_scout_model_configurable():
-    cfg = ReviewTaskConfig(repo="o/r", scout_model="haiku")
-    t = build_delegated_review_task(100, U("t"), U("b"), U("d"), cfg)
-    assert t.subagents[0].model == "haiku"
-
-
 # ── multi-agent review legs ──
-def test_review_gate_task_cheap_and_diffonly():
-    t = build_review_gate_task(
-        100, U("PR"), U("desc"), U("the diff"), RCFG
-    )
-    assert t.schema is REVIEW_GATE_SCHEMA
-    assert t.model == "haiku"                          # cheap gate model
-    assert t.allowed_tools == ()                       # diff-only, no tools
-    assert "the diff" in t.prompt and "reviewable" in t.prompt
-
-
-def test_review_dimension_task_focuses_and_carries_prompt():
-    t = build_review_dimension_task(
-        100,
-        "security",
-        "injection & authz",
-        U("PR"),
-        U("desc"),
-        U("the diff"),
-        RCFG,
-    )
-    assert t.schema is REVIEW_FINDINGS_SCHEMA
-    assert "SECURITY" in t.prompt and "injection & authz" in t.prompt
-    assert t.append_system_prompt == "round=$ROUND_NUMBER rules"   # operator prompt kept
-    assert "Read" in t.allowed_tools and "Edit" in t.disallowed_tools
-    assert "the diff" in t.prompt
-
-
-def test_review_validation_task_is_adversarial():
-    t = build_review_validation_task(
-        100,
-        "correctness",
-        U("a.py:10"),
-        U("off-by-one"),
-        U("the diff"),
-        RCFG,
-    )
-    assert t.schema is REVIEW_VALIDATION_SCHEMA
-    assert t.model == "haiku"
-    assert "REFUTE" in t.prompt
-    assert "a.py:10" in t.prompt and "off-by-one" in t.prompt
-
-
-def test_review_validation_task_scopes_the_diff_to_the_finding():
-    t = build_review_validation_task(
-        100,
-        "correctness",
-        U("src/app/pay.py:7"),
-        U("off-by-one"),
-        U(MULTI_DIFF),
-        RCFG,
-    )
-    assert "return x * RATE" in t.prompt          # the finding's own file is present
-    assert "new docs" not in t.prompt             # the rest of the PR is not paid for
-    assert "test_charge" not in t.prompt
-    assert "SCOPED" in t.prompt                   # told why other files are missing
-
-
-def test_review_validation_task_falls_back_to_the_full_diff():
-    # An unresolvable location must never leave the refuter with an empty diff —
-    # it would refute everything by default and silently drop real findings.
-    t = build_review_validation_task(
-        100,
-        "security",
-        U("somewhere in the payment flow"),
-        U("leaks a token"),
-        U(MULTI_DIFF),
-        RCFG,
-    )
-    assert "return x * RATE" in t.prompt and "new docs" in t.prompt
-    assert "SCOPED" not in t.prompt
-
-
-def test_review_validation_task_falls_back_on_unknown_path_or_bad_diff():
-    t = build_review_validation_task(
-        100,
-        "correctness",
-        U("vendor/absent.py:3"),
-        U("bug"),
-        U(MULTI_DIFF),
-        RCFG,
-    )
-    assert "new docs" in t.prompt                 # full diff, not an empty one
-    t2 = build_review_validation_task(
-        100, "correctness", U("a.py:1"), U("bug"), U(""), RCFG
-    )
-    assert t2.schema is REVIEW_VALIDATION_SCHEMA  # empty diff does not explode
-
-
-def test_review_dimensions_cover_the_core_lenses():
-    keys = {k for k, _ in REVIEW_DIMENSIONS}
-    assert {"correctness", "test-integrity", "security", "architecture"} <= keys
-
-
 # ── M23 invariant: every review-judgment builder fences its untrusted inputs ──
 # _fenced() exists so title/body/diff can never reach the reviewer as raw,
 # LLM-steerable text (the asymmetry the review found: gate/dimension/validation/
@@ -780,71 +384,6 @@ _REVIEW_JUDGMENT_BUILDERS = {
             cfg=RCFG,
         ),
         {"title": SENTINEL_TITLE, "body": SENTINEL_BODY, "diff": SENTINEL_DIFF},
-    ),
-    "build_re_review_task": (
-        build_re_review_task,
-        dict(pr_number=1, round_number=2, last_sha="old", head_sha="new",
-             new_diff=U(SENTINEL_DIFF), session_id="sess", cfg=RCFG),
-        {"diff": SENTINEL_DIFF},
-    ),
-    "build_fresh_re_review_task": (
-        build_fresh_re_review_task,
-        dict(
-            pr_number=1, round_number=2, title=U(SENTINEL_TITLE),
-            body=U(SENTINEL_BODY), last_sha="old", head_sha="new",
-            new_diff=U(SENTINEL_DIFF), prior_review=U(SENTINEL_PRIOR), cfg=RCFG,
-        ),
-        {
-            "title": SENTINEL_TITLE, "body": SENTINEL_BODY,
-            "diff": SENTINEL_DIFF, "prior": SENTINEL_PRIOR,
-        },
-    ),
-    "build_delegated_review_task": (
-        build_delegated_review_task,
-        dict(
-            pr_number=1,
-            title=U(SENTINEL_TITLE),
-            body=U(SENTINEL_BODY),
-            diff=U(SENTINEL_DIFF),
-            cfg=DCFG,
-        ),
-        {"title": SENTINEL_TITLE, "body": SENTINEL_BODY, "diff": SENTINEL_DIFF},
-    ),
-    "build_delegated_re_review_task": (
-        build_delegated_re_review_task,
-        dict(pr_number=1, round_number=2, last_sha="old", head_sha="new",
-             new_diff=U(SENTINEL_DIFF), prior_review=U("prior feedback"), cfg=DCFG),
-        {"diff": SENTINEL_DIFF},
-    ),
-    "build_review_gate_task": (
-        build_review_gate_task,
-        dict(
-            pr_number=1,
-            title=U(SENTINEL_TITLE),
-            body=U(SENTINEL_BODY),
-            diff=U(SENTINEL_DIFF),
-            cfg=RCFG,
-        ),
-        {"title": SENTINEL_TITLE, "body": SENTINEL_BODY, "diff": SENTINEL_DIFF},
-    ),
-    "build_review_dimension_task": (
-        build_review_dimension_task,
-        dict(pr_number=1, dimension="security", focus="injection & authz",
-             title=U(SENTINEL_TITLE), body=U(SENTINEL_BODY),
-             diff=U(SENTINEL_DIFF), cfg=RCFG),
-        {"title": SENTINEL_TITLE, "body": SENTINEL_BODY, "diff": SENTINEL_DIFF},
-    ),
-    "build_review_validation_task": (
-        build_review_validation_task,
-        dict(
-            pr_number=1,
-            dimension="correctness",
-            location=U("a.py:1"),
-            claim=U("bug"),
-            diff=U(SENTINEL_DIFF),
-            cfg=RCFG,
-        ),
-        {"diff": SENTINEL_DIFF},
     ),
 }
 

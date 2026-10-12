@@ -11,10 +11,7 @@ from issue_agent.domain.workflow import (
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
 )
-from issue_agent.domain.workflow_reconciliation import (
-    absent_reconciliation, absent_reexecution, reconciliation_due, reexecution_exhausted,
-    unavailable_reconciliation, unknown_outcome_history,
-)
+from issue_agent.domain.workflow_reconciliation import absent_reconciliation, absent_reexecution, reconciliation_due, unavailable_reconciliation, unknown_outcome_history
 
 NOW = datetime(2026, 9, 14, tzinfo=timezone.utc)
 BINDING = WorkflowBinding(WorkflowFence(WorkflowKey("o/r", IssueRef(7)), 1), FamilyAuthority(WorkflowFamily.RESOLVE, 1), "episode")
@@ -162,27 +159,6 @@ def test_absence_reconciliation_rejects_naive_clock():
         absent(expired.state, now=NOW.replace(tzinfo=None))
 
 
-@pytest.mark.parametrize("age, exhausted", [
-    (timedelta(0), False), (timedelta(seconds=3599), False),
-    (timedelta(seconds=3600), True), (timedelta(days=365), True),
-])
-def test_absent_re_execution_is_bounded_by_the_unresolved_age(age, exhausted):
-    history = ActiveReconciliation(NOW, NOW + timedelta(seconds=30), 0)
-    assert reexecution_exhausted(history, NOW + age) is exhausted
-
-
-def test_re_execution_bound_follows_a_tighter_policy():
-    history = ActiveReconciliation(NOW, NOW, 0)
-    policy = ReconciliationPolicy(maximum_age_seconds=60)
-    assert reexecution_exhausted(history, NOW + timedelta(seconds=60), policy)
-
-
-@pytest.mark.parametrize("history", [None, "active", ReconciliationOnly(ActiveReconciliation(NOW, NOW, 1), "gate")])
-def test_re_execution_bound_rejects_anything_but_pre_expiry_history(history):
-    with pytest.raises(ValueError):
-        reexecution_exhausted(history, NOW)
-
-
 def test_repeated_unknowns_back_off_exponentially_per_re_execution_and_keep_their_age():
     history = unknown_outcome_history(None, NOW)
     assert history == ActiveReconciliation(NOW, NOW + timedelta(seconds=30), 0)
@@ -210,12 +186,6 @@ def test_an_unknown_never_pulls_a_later_scheduled_read_earlier():
 def test_unknown_scheduling_rejects_malformed_inputs(prior, now):
     with pytest.raises(ValueError):
         unknown_outcome_history(prior, now)
-
-
-@pytest.mark.parametrize("reexecutions, exhausted", [(0, False), (3, False), (4, True), (10**6, True)])
-def test_re_executions_are_capped_by_count_before_the_age_ceiling(reexecutions, exhausted):
-    history = ActiveReconciliation(NOW, NOW, 0, reexecutions)
-    assert reexecution_exhausted(history, NOW + timedelta(seconds=1)) is exhausted
 
 
 def test_failed_reads_and_the_ceiling_read_keep_the_re_execution_count():

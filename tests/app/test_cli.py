@@ -540,15 +540,13 @@ def test_synth_repo_env_minimal_keys():
 def test_synth_repo_env_roundtrips_through_from_env():
     text = cli.synth_repo_env(
         repo="o/r", target_dir="/t", name="r", base_branch="main",
-        review_mode="delegated", max_budget="10.00",
+        max_budget="10.00",
     )
     cfg = from_env(_source_env(text))
     assert cfg.repo == "o/r"
     assert cfg.target_dir == "/t"
     assert cfg.base_branch == "main"
     assert cfg.fix_budget_usd == 10.00
-    from issue_agent.domain.review import ReviewMode
-    assert cfg.review_mode is ReviewMode.DELEGATED
 
 
 def test_synth_repo_env_records_exact_repoint_lineage():
@@ -850,7 +848,7 @@ def test_check_overlay_mismatch_target_dir_fallback_when_no_repo_recorded(tmp_pa
 def _start_args(**overrides) -> argparse.Namespace:
     base = dict(
         repo="", target_dir="", name="", roles=None, base_branch="dev",
-        no_init=True, review_mode="",
+        no_init=True,
         max_budget="", review_budget="", max_ticks=None, write_config=False,
         worktree=False, worktree_path="",
     )

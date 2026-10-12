@@ -10,9 +10,6 @@ from issue_agent.domain.outcome import (
     resolve_actions,
     resume_actions,
 )
-from issue_agent.domain.review import (
-    review_submission,
-)
 
 
 def _ok(status="pr_opened", **kw):
@@ -130,31 +127,6 @@ def test_fix_ci_blocked_adds_blocked():
 
 
 # ── review submission tail (args: decision, body, prior_rejections, max_rejections) ──
-def test_review_approve():
-    s = review_submission(
-        "APPROVE", "lgtm", 0, 4,
-    )
-    assert s.event == "APPROVE" and s.escalate is False
-
-
-def test_review_request_changes():
-    s = review_submission(
-        "REQUEST_CHANGES", "fix x", 1, 4,
-    )
-    assert s.event == "REQUEST_CHANGES" and s.escalate is False
-
-
-def test_review_escalate_comments_and_flags():
-    s = review_submission(
-        "ESCALATE", "still broken", 3, 4,
-    )
-    assert s.event == "COMMENT" and s.escalate is True
-    # The body names the verdict, not exhausted rounds (keifu #177: verdict
-    # escalations phrased as round exhaustion read like a fencepost bug).
-    assert "returned ESCALATE" in s.body
-    assert "rounds of requested changes" not in s.body
-
-
 # ── infra death: the session never happened, so no leg may act on it ──────────
 def _killed(**kw):
     return AgentResult(is_error=True, exit_reason=ExitReason.KILLED_EXTERNALLY, **kw)

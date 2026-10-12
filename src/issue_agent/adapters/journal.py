@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.contracts import Money
 from ..domain.workflow_identity import WorkflowBinding
-from ..domain.review_execution import ReviewChildIdentity
 from ..domain.dashboard import ISSUE_NUMBERED
 from ..domain.events import (
     ActionApplied,
@@ -350,7 +349,6 @@ class RunContext:
     claim_target: int | None = None
     dispatch_id: str = ""
     workflow: WorkflowBinding | None = None
-    review_child: ReviewChildIdentity | None = None
     # The PR head a fix leg was decided on (accounting records it per run).
     head: str = ""
     # A fix leg continuing a wall-capped leg (the resume-once rule's input).
@@ -475,7 +473,6 @@ class JournalingRuntime:
         claim_target: int | None = None,
         *,
         workflow: WorkflowBinding | None = None,
-        review_child: ReviewChildIdentity | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None:
@@ -495,7 +492,6 @@ class JournalingRuntime:
             claim_target=claim_target,
             dispatch_id=uuid.uuid4().hex[:12],
             workflow=workflow,
-            review_child=review_child,
             head=head,
             resumed=resumed,
         ))
@@ -507,7 +503,6 @@ class JournalingRuntime:
                 issue,
                 claim_target=claim_target,
                 workflow=workflow,
-                **({"review_child": review_child} if review_child is not None else {}),
                 head=head,
                 resumed=resumed,
             )
@@ -531,12 +526,11 @@ class JournalingRuntime:
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
                 previous.role,
-                previous.kind if previous.review_child is not None else kind,
+                kind,
                 previous.number,
                 previous.issue,
                 claim_target=previous.claim_target,
                 workflow=previous.workflow,
-                **({"review_child": previous.review_child} if previous.review_child is not None else {}),
                 head=previous.head,
                 resumed=previous.resumed,
             )
@@ -551,8 +545,7 @@ class JournalingRuntime:
                     previous.issue,
                     claim_target=previous.claim_target,
                     workflow=previous.workflow,
-                    **({"review_child": previous.review_child} if previous.review_child is not None else {}),
-                    head=previous.head,
+                        head=previous.head,
                     resumed=previous.resumed,
                 )
             self._context.reset(token)

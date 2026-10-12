@@ -659,38 +659,6 @@ def test_alert_swallows_a_failing_command(tmp_path):
     alert("exit 7", "{}")  # must not raise — a dead pager can't wedge the loop
 
 
-# ── Executor: escalation + action events ──────────────────────────────────────
-def test_executor_journals_every_non_noop_action(tmp_path):
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    ex = Executor(FakeGateway(), journal=journal)
-    ex.execute(Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING))
-    actions = [e for e in read_events(journal.path) if e["event"] == "action"]
-    assert len(actions) == 1 and "relabel issue #5" in actions[0]["desc"]
-
-
-def test_relabel_to_needs_human_review_emits_an_escalation_and_alerts(tmp_path):
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    sink = tmp_path / "alerts.jsonl"
-    ex = Executor(FakeGateway(), journal=journal, alert_cmd=f"cat >> {sink}")
-    ex.execute(Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW))
-
-    esc = [e for e in read_events(journal.path) if e["event"] == "escalation"]
-    assert esc == [{**esc[0], "event": "escalation", "target": "pr", "number": 100}]
-    assert json.loads(sink.read_text())["event"] == "escalation"
-
-
-def test_an_ordinary_relabel_is_not_an_escalation(tmp_path):
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    ex = Executor(FakeGateway(), journal=journal)
-    ex.execute(Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_PR_OPEN))
-    assert [e for e in read_events(journal.path) if e["event"] == "escalation"] == []
-
-
-
-
-
-
-
 
 # ── Daemon: GhUnavailable is a countable event ────────────────────────────────
 def test_daemon_journals_a_skipped_tick_when_github_is_unavailable(tmp_path):

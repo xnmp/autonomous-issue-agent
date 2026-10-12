@@ -608,7 +608,7 @@ def test_concurrent_role_boot_serializes_schema_migrations(
             else EXPECTED_SCHEMA_VERSIONS
         )
         if starting_version == "v24":
-            assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 2
+            assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 1
             assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 0
 
 
@@ -2400,35 +2400,6 @@ def test_a_claim_with_an_unreadable_row_is_skipped(tmp_path) -> None:
     assert store.active_dispatch_claims("o/r", "fix") == ()
 
 
-def _selected_review_claim_request(store, request):
-    from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, PullRequestRef
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
-    from tests.fakes.review_workflow import held
-    from tests.adapters.test_continuation_admission import active, install_secondary
-
-    issue = with_issue_recovery(resolve_snapshot(42))
-    install_workflow(store, issue)
-    primary = dataclasses.replace(held(key=WorkflowKey("o/r", PullRequestRef(7))), gates=())
-    component = active(primary.revision.fence.key, WorkflowFamily.PR_REPAIR)
-    primary = dataclasses.replace(primary, pr_repair=component)
-    install_workflow(store, primary)
-    install_secondary(store, primary, component)
-    selected_issue = cc.select_issue_recovery(issue)
-    selected_pr = cc.select_pr_repair(primary)
-    leg = "leg:bound-review"
-    head, review_at = "a" * 40, "2026-10-02T00:00:01Z"
-    return dataclasses.replace(request, workflow=selected_pr.binding, continuations=(
-        cc.PRRepairPurchase(cc.ContinuationCapture(selected_pr.binding, selected_pr.revision, leg),
-            allowance=cc.RepairAllowance.REVIEW, ceiling=3, branch="fix/42-claim", advance_resume=True),
-        cc.IssueReviewPurchase(cc.ContinuationCapture(selected_issue.binding, selected_issue.revision, leg),
-            PullRequestRef(7), head, review_at, 3)),
-        dispatch_id=json.dumps({"repository": "o/r", "role": "fix", "kind": "ADDRESS_REVIEW",
-            "number": 7, "issue": 42, "runtime": "claude", "leg_id": leg,
-            "review_input": encode_workflow((head, review_at))}))
-
-
 def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> None:
     """A claim is taken at decision time and bound to a run later. Keying the
     observation on the run id changed it mid-hold, which double-journalled one
@@ -2443,7 +2414,6 @@ def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> N
         owner_id=owner,
         kind="ADDRESS_REVIEW",
     )
-    request = _selected_review_claim_request(store, request)
     assert store.claim_dispatch(
         "o/r", "fix", 42, "ADDRESS_REVIEW", owner
     )
@@ -2473,7 +2443,6 @@ def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
         owner_id=owner,
         kind="ADDRESS_REVIEW",
     )
-    request = _selected_review_claim_request(store, request)
     assert store.claim_dispatch(
         "o/r", "fix", 42, "ADDRESS_REVIEW", owner
     )
@@ -2495,30 +2464,27 @@ def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
 
 
 def _seed_v24_workflow_history(store):
+    """A v24 store with one resolve row and a live claim. Review-family rows
+    (deleted in slice 5c) are no longer a migratable history."""
     from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.domain.review_workflow import FreshReviewRequired, ReviewEpisode
     from issue_agent.domain.workflow import ResolveEpisode
     from issue_agent.domain.workflow_identity import FamilyAuthority, WorkflowFamily
 
     resolve = encode_workflow((FamilyAuthority(WorkflowFamily.RESOLVE, 2),
                                ResolveEpisode("resolve:legacy", 4, "prior failure", "resolve guidance")))
-    review = encode_workflow((FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 3),
-                              ReviewEpisode("review:legacy", "review guidance\nexact", FreshReviewRequired(2))))
     with closing(sqlite3.connect(store.path)) as db, db:
         _historical_fixture(db, 24)
-        for family, epoch in (("resolve", 2), ("review_rejections", 3)):
-            db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r', ?, ?, 'source', 'inventory', ?)",
-                       (family, epoch, NOW.isoformat()))
-        for kind, number, payload in (("issue", 7, resolve), ("pr", 9, review)):
-            db.execute("INSERT INTO workflows VALUES ('o/r', ?, ?, 2, 11, ?)", (kind, number, payload))
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r', 'resolve', 2, 'source', 'inventory', ?)",
+                   (NOW.isoformat(),))
+        db.execute("INSERT INTO workflows VALUES ('o/r', 'issue', 7, 2, 11, ?)", (resolve,))
         db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,paths_json,claimed_at) "
                    "VALUES ('o/r','review','pr:9','REVIEW','legacy-owner',123,456,'[]',?)", (NOW.isoformat(),))
-    return resolve, review
+    return resolve
 
 
 def test_v25_backfills_only_validated_legacy_components_and_preserves_claim_occurrence_on_restart(tmp_path):
     store = _store(tmp_path)
-    resolve, review = _seed_v24_workflow_history(store)
+    resolve = _seed_v24_workflow_history(store)
     reopened = SQLiteControlStore(store.path, now=lambda: NOW)
     reopened.initialize()
     with sqlite3.connect(store.path) as db:
@@ -2536,8 +2502,8 @@ def test_v25_backfills_only_validated_legacy_components_and_preserves_claim_occu
         assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM workflow_authority_epochs WHERE family='review_execution'").fetchone()[0] == 0
         before = tuple(db.iterdump())
-    assert rows == [("issue", 2, 11, resolve), ("pr", 2, 11, review)]
-    assert components == [("issue", 7, "resolve", 2, "resolve:legacy"), ("pr", 9, "review_rejections", 3, "review:legacy")]
+    assert rows == [("issue", 2, 11, resolve)]
+    assert components == [("issue", 7, "resolve", 2, "resolve:legacy")]
     assert isinstance(occurrence, str) and occurrence
     reopened.initialize()
     with sqlite3.connect(store.path) as db:
@@ -2548,15 +2514,17 @@ def test_v25_backfills_only_validated_legacy_components_and_preserves_claim_occu
 @pytest.mark.parametrize("corruption", ["invalid_json", "wrong_target_family", "missing_epoch", "different_epoch"])
 def test_v25_invalid_legacy_authority_rolls_back_schema_and_all_component_backfill(tmp_path, corruption):
     store = _store(tmp_path)
-    resolve, _ = _seed_v24_workflow_history(store)
+    resolve = _seed_v24_workflow_history(store)
     with sqlite3.connect(store.path) as db:
-        if corruption in {"invalid_json", "wrong_target_family"}:
-            db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
-                       ("not valid json" if corruption == "invalid_json" else resolve,))
+        if corruption == "invalid_json":
+            db.execute("UPDATE workflows SET episode_json='not valid json' WHERE target_kind='issue'")
+        elif corruption == "wrong_target_family":
+            # A resolve episode on a pull request (formerly the review family's target).
+            db.execute("INSERT INTO workflows VALUES ('o/r', 'pr', 9, 2, 11, ?)", (resolve,))
         elif corruption == "missing_epoch":
-            db.execute("DELETE FROM workflow_authority_epochs WHERE family='review_rejections'")
+            db.execute("DELETE FROM workflow_authority_epochs WHERE family='resolve'")
         else:
-            db.execute("UPDATE workflow_authority_epochs SET epoch=4 WHERE family='review_rejections'")
+            db.execute("UPDATE workflow_authority_epochs SET epoch=4 WHERE family='resolve'")
         before = tuple(db.iterdump())
     with pytest.raises(IncompatibleSchema, match="historical workflow component"):
         SQLiteControlStore(store.path, now=lambda: NOW).initialize()
@@ -2582,7 +2550,7 @@ def test_v25_interrupted_nonempty_backfill_restarts_without_partial_authority(tm
         assert tuple(db.iterdump()) == before
     SQLiteControlStore(store.path, now=lambda: NOW).initialize()
     with sqlite3.connect(store.path) as db:
-        assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 1
         assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == EXPECTED_SCHEMA_VERSIONS[-1]
 
 
@@ -2601,18 +2569,18 @@ def test_a_v24_binary_refuses_v25_without_rewriting_authority(tmp_path, monkeypa
         assert tuple(db.iterdump()) == before
 
 
-@pytest.mark.parametrize("kind,number", [("issue", 7), ("pr", 9)])
 @pytest.mark.parametrize("corruption", ["deleted", "epoch", "episode"])
-def test_v25_component_index_corruption_refuses_authoritative_reads_without_repair(tmp_path, kind, number, corruption):
-    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_workflow_read
-    from issue_agent.domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey
+def test_v25_component_index_corruption_refuses_authoritative_reads_without_repair(tmp_path, corruption):
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_workflow_row
+    from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
 
     store = _store(tmp_path)
     _seed_v24_workflow_history(store)
     store.initialize()
-    key = WorkflowKey("o/r", IssueRef(number) if kind == "issue" else PullRequestRef(number))
+    kind = "issue"
+    key = WorkflowKey("o/r", IssueRef(7))
     with store.transaction() as db:
-        assert load_workflow_read(db, key).episode.episode_id == f"{'resolve' if kind == 'issue' else 'review'}:legacy"
+        assert load_workflow_row(db, key).episode.episode_id == "resolve:legacy"
         if corruption == "deleted":
             db.execute("DELETE FROM workflow_components WHERE target_kind=?", (kind,))
         elif corruption == "epoch":
@@ -2621,106 +2589,7 @@ def test_v25_component_index_corruption_refuses_authoritative_reads_without_repa
             db.execute("UPDATE workflow_components SET episode_id='other-episode' WHERE target_kind=?", (kind,))
         before = tuple(db.iterdump())
         with pytest.raises(WorkflowAuthorityError, match="component index"):
-            load_workflow_read(db, key)
-        assert tuple(db.iterdump()) == before
-
-
-@pytest.mark.parametrize("retained", ["index", "activation", "both"])
-def test_v25_inactive_review_cannot_load_with_retained_execution_authority(tmp_path, retained):
-    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_workflow_read
-    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
-
-    store = _store(tmp_path)
-    _seed_v24_workflow_history(store)
-    store.initialize()
-    with store.transaction() as db:
-        if retained in {"activation", "both"}:
-            db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_execution',5,'source','inventory',?)",
-                       (NOW.isoformat(),))
-        if retained in {"index", "both"}:
-            db.execute("INSERT INTO workflow_components VALUES ('o/r','pr',9,'review_execution',5,'execution:legacy')")
-        before = tuple(db.iterdump())
-        with pytest.raises(WorkflowAuthorityError, match="execution"):
-            load_workflow_read(db, WorkflowKey("o/r", PullRequestRef(9)))
-        assert tuple(db.iterdump()) == before
-
-
-class _ExecutionGateway:
-    """PR 9 open with no reviews: the read its first observation records."""
-
-    def get_pr(self, number, *, mergeability=False, checks=False):
-        from issue_agent.domain.labels import Label
-        from tests.domain.builders import observed_pr
-        return observed_pr(number, head_ref_oid="b" * 40, labels=frozenset({Label.AI_PR_OPEN}))
-
-    def pull_request_reviews(self, number):
-        from issue_agent.domain.review_workflow import CompleteReviews
-        return CompleteReviews(())
-
-
-def _activate_execution_fixture(store, gateway=None, *, execution=True, baseline=False):
-    """PR 9's current execution, minted by its live first observation."""
-    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-    from issue_agent.domain.review_workflow import BoundReviewSubmission, ReviewedBaseline
-    from issue_agent.domain.labels import Label
-    from issue_agent.domain.review_execution import CurrentReviewExecution
-    from issue_agent.domain.review_rejection import CountingRule
-    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey, WorkflowWriter
-    from tests.fakes.workflow_authority import seed_family_epoch
-
-    key = WorkflowKey("o/r", PullRequestRef(9))
-    with store.transaction() as db:
-        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',3,'source','inventory',?)",
-                   (NOW.isoformat(),))
-        if execution:
-            seed_family_epoch(db, "o/r", WorkflowFamily.REVIEW_EXECUTION, NOW, epoch=5)
-    control = SQLiteReviewWorkflowControl(
-        store, WorkflowWriter("o/r", "review", "o/r:review:test"), gateway=gateway or _ExecutionGateway(),
-        ceiling=3, trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot"),
-    )
-    committed = control.ensure_observed_workflow(key)
-    with store.transaction() as db:
-        current = load_review_workflow_row(db, key)
-    assert current == committed.snapshot and isinstance(current.execution, CurrentReviewExecution) is execution
-    if not baseline:
-        return current
-    # Stands in for a prior same-generation round whose landed review of a*40
-    # covered patch c*64, so copied submissions are reachable. The round and
-    # command rows are omitted: paths that read the selected verdict refuse.
-    current = dataclasses.replace(current, episode=dataclasses.replace(current.episode, continuation=ReviewedBaseline(
-        "a" * 40, "c" * 64, current.revision.fence.generation,
-        BoundReviewSubmission(CommandId("review-submission:prior-round"), current.binding))))
-    with store.transaction() as db:
-        persist_workflow_snapshot(db, current)
-        assert load_review_workflow_row(db, key) == current
-    return current
-
-
-@pytest.mark.parametrize("corruption", ["missing_index", "index_epoch", "index_episode", "missing_activation",
-                                         "activation_epoch", "parent_generation", "missing_index_and_activation"])
-def test_v25_active_execution_requires_matching_canonical_index_and_activation(tmp_path, corruption):
-    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
-
-    store = _store(tmp_path)
-    original = _activate_execution_fixture(store)
-    with store.transaction() as db:
-        if corruption in {"missing_index", "missing_index_and_activation"}:
-            db.execute("DELETE FROM workflow_components WHERE family='review_execution'")
-        if corruption in {"missing_activation", "missing_index_and_activation"}:
-            db.execute("DELETE FROM workflow_activation_evidence WHERE family='review_execution'")
-            db.execute("DELETE FROM workflow_authority_epochs WHERE family='review_execution'")
-        if corruption == "index_epoch":
-            db.execute("UPDATE workflow_components SET epoch=6 WHERE family='review_execution'")
-        elif corruption == "index_episode":
-            db.execute("UPDATE workflow_components SET episode_id='other-execution' WHERE family='review_execution'")
-        elif corruption == "activation_epoch":
-            db.execute("UPDATE workflow_authority_epochs SET epoch=6 WHERE family='review_execution'")
-        elif corruption == "parent_generation":
-            db.execute("UPDATE workflows SET generation=3 WHERE target_kind='pr'")
-        before = tuple(db.iterdump())
-        with pytest.raises(WorkflowAuthorityError):
-            load_review_workflow_row(db, original.revision.fence.key)
+            load_workflow_row(db, key)
         assert tuple(db.iterdump()) == before
 
 
@@ -3052,103 +2921,10 @@ def test_v41_preserves_existing_money_and_only_marks_identifiable_legacy_recover
     assert restarted.snapshot(_scope()).settled == Money("USD", 51 if origin is ChargeOrigin.RECOVERY_ESTIMATE else 50)
 
 
-def test_retiring_synthetic_execution_rejection_keeps_model_verdict_holds(tmp_path):
-    from issue_agent.adapters.control_store import _encoded_payload_digest
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-    from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
-    from issue_agent.domain.review_rejection import ReviewVerdictHold
-    from issue_agent.domain.workflow import NoAuthorizedRemediation, OpenGate
-    from tests.domain.test_review_workflow_policy import fresh
-    from tests.fakes.workflow_authority import install_workflow
-
-    store = _store(tmp_path)
-    state = fresh()
-    retired = OpenGate("verdict:test-rejection", state.revision.fence.generation,
-                       ReviewVerdictHold("historical-test-rejection", "a" * 40),
-                       NoAuthorizedRemediation("retired execution evidence"))
-    retained = OpenGate("verdict:model-rejection", state.revision.fence.generation,
-                        ReviewVerdictHold("historical-model-rejection", "a" * 40),
-                        NoAuthorizedRemediation("human judgment"))
-    install_workflow(store, state)
-    with store.transaction() as db:
-        persist_workflow_snapshot(db, dataclasses.replace(state, gates=(retired, retained)))
-    with sqlite3.connect(store.path) as db:
-        _historical_fixture(db, 41)
-        op = BoundReviewSubmissionOp(state.revision.fence.key.target.number, "REQUEST_CHANGES", "legacy",
-                                     "a" * 40, "review-bot", "b" * 64, None)
-        payload = json.dumps(dict(op.payload(), test_evidence_ref="legacy"))
-        binding = encode_workflow(state.binding)
-        db.execute(
-            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
-            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
-            "state,created_at,updated_at,workflow_binding_json) "
-            "VALUES ('historical-test-rejection','legacy-key','legacy-key',0,'submit_review',?,"
-            "?,'legacy','o/r','review-owner',?,?,'pending',?,?,?)",
-            (f"pr:{state.revision.fence.key.target.number}", "a" * 40, payload,
-             _encoded_payload_digest(payload, binding), NOW.isoformat(), NOW.isoformat(), binding),
-        )
-    store.initialize()
-    with store.transaction() as db:
-        loaded = load_review_workflow_row(db, state.revision.fence.key)
-    assert loaded is not None and loaded.gates == (retained,)
-
-
-def test_migration_42_retires_retry_grant_attached_to_a_retired_renewal(tmp_path):
-    from issue_agent.adapters.control_store import _encoded_payload_digest
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
-    from issue_agent.domain.workflow import EvidenceUnavailable, NoAuthorizedRemediation, OpenGate
-    from tests.domain.test_review_workflow_policy import fresh
-    from tests.fakes.workflow_authority import install_workflow
-
-    store = _store(tmp_path)
-    state = fresh()
-    gen = state.revision.fence.generation
-    held = OpenGate("ordinary-test:legacy", gen, EvidenceUnavailable("independent operator tests", NOW, 12, "x"),
-                    NoAuthorizedRemediation("retired"))
-    retry = OpenGate("retry:obligation", gen, EvidenceUnavailable("relabel outcome", NOW, 1, "x"),
-                     NoAuthorizedRemediation("retry"))
-    install_workflow(store, state)
-    with store.transaction() as db:
-        persist_workflow_snapshot(db, dataclasses.replace(state, gates=(held, retry)))
-    pr = state.revision.fence.key.target.number
-    binding = encode_workflow(state.binding)
-    with sqlite3.connect(store.path) as db:
-        _historical_fixture(db, 41)
-        payload = json.dumps({"labels": "x"})
-        db.execute(
-            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
-            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
-            "state,created_at,updated_at,workflow_binding_json) VALUES ('obligation','k','k',0,'relabel',?,"
-            "'r','legacy','o/r','review-owner',?,?,'unknown_outcome',?,?,?)",
-            (f"pr:{pr}", payload, _encoded_payload_digest(payload, binding), NOW.isoformat(), NOW.isoformat(), binding))
-        db.execute("INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,status,"
-                   "remote_object_id,receipt_digest) VALUES ('obligation','review-owner','s','c','unknown_outcome',NULL,?)",
-                   ("b" * 64,))
-        db.execute("UPDATE workflow_gates SET state='rearming' WHERE gate_id=?", (held.gate_id,))
-        db.execute("INSERT INTO workflow_rearms VALUES ('legacy-renewal','o/r','pr',?,?,?,?,'pending','d','a','i')",
-                   (pr, held.gate_id, gen, gen + 1))
-        db.execute("INSERT INTO workflow_rearm_commands VALUES ('legacy-renewal','relabel','obligation','required','{}')")
-        db.execute("INSERT INTO workflow_evidence VALUES ('absence-1','o/r','pr',?,'obligation','absence','{}')", (pr,))
-        db.execute("INSERT INTO workflow_retry_authorizations(authorization_id,request_id,command_id,gate_id,"
-                   "association_kind,binding_json,evidence_id,request_digest,actor_json,generation,unavailable_reads,accepted_at) "
-                   "VALUES ('grant-1','legacy-renewal','obligation',?,'rearm','{}','absence-1','d','{}',?,0,?)",
-                   (retry.gate_id, gen, NOW.isoformat()))
-        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
-    store.initialize()
-    with sqlite3.connect(store.path) as db:
-        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == EXPECTED_SCHEMA_VERSIONS[-1]
-        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert db.execute("SELECT count(*) FROM workflow_retry_authorizations").fetchone()[0] == 0
-
-
 def test_v43_retires_pre_upgrade_self_clear_relabels_so_ai_blocked_waits_for_a_human(tmp_path):
-    from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
+    from issue_agent.adapters.effects import command_for_action
     from issue_agent.domain.actions import Relabel, Target
     from issue_agent.domain.labels import Label
-    from tests.domain.builders import observed_pr
-    from tests.fakes.in_memory_github import InMemoryGitHub
 
     store = _store(tmp_path)
     clear = command_for_action(Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.AI_PR_OPEN, "head"),
@@ -3163,13 +2939,6 @@ def test_v43_retires_pre_upgrade_self_clear_relabels_so_ai_blocked_waits_for_a_h
         _historical_fixture(db, 42)
     store.initialize()
 
-    gateway = InMemoryGitHub(prs={number: observed_pr(number, head_ref_oid="head",
-                                                      labels=frozenset({Label.AI_BLOCKED}))
-                                  for number in (100, 200)})
-    GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix",
-                         log=lambda _: None).drain_pending_commands()
-    assert gateway.prs[100].labels == frozenset({Label.AI_BLOCKED})
-    assert gateway.prs[200].labels == frozenset({Label.AI_PR_OPEN}), "ordinary relabels still drain"
     with sqlite3.connect(store.path) as db:
         assert db.execute("SELECT command_id FROM lifecycle_commands").fetchall() == [(str(ordinary.command_id),)]
         assert db.execute("SELECT name FROM sqlite_master WHERE name='lifecycle_self_clear_pending'").fetchall() == []

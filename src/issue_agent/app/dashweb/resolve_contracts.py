@@ -101,12 +101,6 @@ class ResumeGate(ClosedContract):
     guidance: Guidance
 
 
-class RenewExecution(ResumeGate):
-    kind: Literal["renew_execution"]
-    execution_epoch: Positive
-    execution_episode: Identifier
-
-
 class RetryAbsent(ClosedContract):
     kind: Literal["retry_absent"]
     command_id: Identifier
@@ -116,13 +110,7 @@ class RetryAbsent(ClosedContract):
 class GateSelection(ClosedContract):
     kind: Literal["gate"]
     gate_id: Identifier
-    intent: Annotated[ResumeGate | RenewExecution | RetryAbsent, Field(discriminator="kind")]
-
-
-class VerdictSelection(RenewExecution):
-    kind: Literal["verdict"]
-    gate_id: Identifier
-    submission_command_id: Identifier
+    intent: Annotated[ResumeGate | RetryAbsent, Field(discriminator="kind")]
 
 
 class StoppedGrantSelection(ClosedContract):
@@ -134,7 +122,7 @@ class ReleaseBody(ClosedContract):
     operation: Literal["release"]
     request_id: Identifier
     expected: OperatorExpected
-    selection: Annotated[GateSelection | VerdictSelection | StoppedGrantSelection, Field(discriminator="kind")]
+    selection: Annotated[GateSelection | StoppedGrantSelection, Field(discriminator="kind")]
 
     def command(self) -> w.OperatorCommand:
         expected = self.expected.revision()
@@ -150,14 +138,7 @@ class ReleaseBody(ClosedContract):
             assert isinstance(intent, ResumeGate)
             guidance = (w.SetGuidance(intent.guidance.text) if isinstance(intent.guidance, SetGuidance)
                         else w.ClearGuidance() if isinstance(intent.guidance, ClearGuidance) else w.KeepGuidance())
-            if isinstance(selected, VerdictSelection):
-                return w.RequestReviewVerdictRelease(self.request_id, expected, selected.gate_id, guidance,
-                    selected.execution_epoch, selected.execution_episode, w.CommandId(selected.submission_command_id), expected_binding=binding)
-            elif isinstance(intent, RenewExecution):
-                return w.RequestReviewExecutionRenewal(self.request_id, expected, selected.gate_id, guidance,
-                    intent.execution_epoch, intent.execution_episode, expected_binding=binding)
-            else:
-                return w.RequestRearm(self.request_id, expected, selected.gate_id, guidance, expected_binding=binding)
+            return w.RequestRearm(self.request_id, expected, selected.gate_id, guidance, expected_binding=binding)
 
 
 class ResolveGateSelection(GateSelection):
@@ -217,10 +198,6 @@ def legacy_release(value, release_type):
 
 ResolveCommand = Annotated[ResolveRelease | CancelRearm, Field(discriminator="operation"),
                            BeforeValidator(lambda value: legacy_release(value, ResolveRelease))]
-
-
-def requested_rearm(body: ResolveRelease | CancelRearm) -> str | None:
-    return None if isinstance(body.command(), w.AuthorizeAbsentRetry) else body.request_id
 
 
 class ResolveCeiling(ClosedContract):
@@ -390,3 +367,20 @@ class CommandResult(ClosedContract):
     outcome: Literal["accepted", "replayed", "conflict", "rejected", "unavailable"]
     reason: str
     control: ResolveControl
+
+
+class WorkflowFamiliesAvailable(ClosedContract):
+    """The repository's activated workflow families; the legacy unblock is retired while any is active."""
+    status: Literal["available"]
+    repository: str
+    active_families: list[Literal["resolve", "review_rejections"]]
+
+
+class WorkflowFamiliesUnavailable(ClosedContract):
+    status: Literal["unavailable"]
+    reason: str
+
+
+WorkflowFamilies = Annotated[
+    WorkflowFamiliesAvailable | WorkflowFamiliesUnavailable, Field(discriminator="status"),
+]

@@ -51,7 +51,6 @@ from ..domain.outcome import (
     declared_status,
     no_session_evidence,
 )
-from ..domain.review_return import review_returned_envelope
 
 
 # Model the CodexRunner defaults to when neither CODEX_MODEL nor a task's `model`
@@ -1331,13 +1330,6 @@ class CodexRunner(AgentRuntime):
                 summary=reason,
                 exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
             )
-            if task.env.get("ISSUE_AGENT_REVIEW_CHILD") == "1":
-                from .control_store import SQLiteControlStore
-
-                run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
-                SQLiteControlStore(task.env["ISSUE_AGENT_CONTROL_DB"]).record_review_runtime_preflight_stop(
-                    run_id, task.env["ISSUE_AGENT_OWNER_ID"], review_returned_envelope(stopped),
-                )
             return stopped
 
         # Review M17: the per-run scratch dir used to be an un-removed mkdtemp, so
@@ -1412,11 +1404,8 @@ class CodexRunner(AgentRuntime):
             self._native_rates(self._resolved_model(task)), task.cwd or os.getcwd(),
         )
         native_meter.seed_baseline(baseline_sid, baseline_usage)
-        # An attached review child has one immutable launch receipt per run.
-        # A second supervised exec under that run cannot register a process.
-        attached_review_child = task.env.get("ISSUE_AGENT_REVIEW_CHILD") == "1"
-        transport_retries = 0 if attached_review_child else self.transport_retries
-        rate_limit_retries = 0 if attached_review_child else self.max_rate_limit_retries
+        transport_retries = self.transport_retries
+        rate_limit_retries = self.max_rate_limit_retries
         while True:
             # Review M17: truncate the envelope BEFORE each attempt. Codex writes
             # `-o` only when a turn completes, so a retry after a mid-turn drop

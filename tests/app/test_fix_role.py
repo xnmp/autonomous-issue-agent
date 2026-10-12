@@ -54,7 +54,7 @@ class FakeGitHub:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ── observation ──
-    def build_fix_world(self, base: str) -> WorldState:
+    def build_world(self, base: str) -> WorldState:
         with self.lock:
             now = _now()
             return WorldState(
@@ -358,7 +358,7 @@ def test_a_machine_death_is_no_attempt_and_backs_off(role):
 
     assert tick(composed) == []  # backing off: no redispatch, no stop
     assert Label.NEEDS_HUMAN not in gh.prs[100].labels
-    runs = composed.control.fix_runs("o/r", (5,))
+    runs = composed.control.leg_runs("o/r", (5,))
     assert len(runs) == 1 and runs[0].receipt is None
 
 
@@ -429,15 +429,15 @@ def test_a_question_stops_for_a_human_and_the_reply_resumes_the_same_session(rol
 
 @pytest.fixture
 def later(monkeypatch):
-    """Moves the fix role's clock past every machine backoff."""
-    import issue_agent.app.fix as fix_module
+    """Moves the roles' tick clock past every machine backoff."""
+    import issue_agent.app.tick as tick_module
 
     class Later(datetime):
         @classmethod
         def now(cls, tz=None):
             return datetime.now(tz) + timedelta(hours=2)
 
-    return lambda: monkeypatch.setattr(fix_module, "datetime", Later)
+    return lambda: monkeypatch.setattr(tick_module, "datetime", Later)
 
 
 def test_a_leg_ending_while_github_is_read_is_not_dispatched_again(role):
@@ -556,7 +556,7 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     assert tick(composed) == []  # a machine end: backing off, no attempt
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)
-    legs = [r.receipt["leg"] for r in sorted(composed.control.fix_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    legs = [r.receipt["leg"] for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
             if r.receipt is not None]
     assert legs == ["machine", "agent"]
 
@@ -574,7 +574,7 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)  # dies, no receipt
     assert dispatched(tick(composed), AgentKind.FIX_CI)  # continues the wall-capped session
-    runs = sorted(composed.control.fix_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    runs = sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
     assert [r.receipt["leg"] if r.receipt else None for r in runs] == ["machine", None, "agent"]
     assert agent.tasks[2].resume == "s-wall"
 

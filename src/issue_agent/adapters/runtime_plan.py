@@ -17,7 +17,6 @@ from ..domain.agent_task import RunIntent, RuntimeName
 from ..domain.effort import Effort
 from ..domain.outcome import AgentResult
 from ..domain.workflow_identity import WorkflowBinding
-from ..domain.review_execution import ReviewChildIdentity
 
 
 @dataclass(frozen=True)
@@ -166,7 +165,6 @@ class ContextualRuntime(AgentRuntime, Protocol):
         claim_target: int | None = None,
         *,
         workflow: WorkflowBinding | None = None,
-        review_child: ReviewChildIdentity | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None: ...

@@ -36,7 +36,7 @@ def backend(monkeypatch, enrichment):
         result, "_deferred_gh_context", lambda *_args: (({}, enrichment, []), True)
     )
     monkeypatch.setattr(result, "verification", lambda: {"rows": []})
-    monkeypatch.setattr(result, "_cached_detail_limits", lambda *_args: ({}, 0))
+    monkeypatch.setattr(result, "_cached_detail_limits", lambda *_args: {})
     monkeypatch.setattr(service.cli, "deployment_env_field", lambda _name, _field: "")
     return result
 

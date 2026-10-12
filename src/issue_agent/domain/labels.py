@@ -24,11 +24,8 @@ class Label(str, Enum):
     AI_PR_OPEN = "ai-pr-open"      # a PR exists (also applied to the PR itself)
     AI_DONE = "ai-done"            # merged
 
-    # Reviewer trigger for an EXTERNAL repo (PRs not produced by this harness).
-    # A separate `review` process can be pointed at any repo and told to look at
-    # PRs carrying this tag instead of `ai-pr-open` (REVIEW_TRIGGER_LABEL). Kept
-    # out of LIFECYCLE_LABELS below — that set describes ISSUE pipeline
-    # position, not PR selection.
+    # Retired review-selection labels (slice 5c reviews harness branches
+    # only); still named so existing GitHub labels parse.
     AI_REVIEW = "ai-review"        # human-tagged: "reviewer-bot, please review this PR"
     NO_AI_REVIEW = "no-ai-review"  # human opt-OUT: never auto-adopt this PR for review
 
@@ -75,17 +72,6 @@ class Label(str, Enum):
     P1 = "P1"
     P2 = "P2"
     P3 = "P3"
-
-
-# Observations that coexist with pipeline state. A durable receipt for one of
-# these must never supersede a lifecycle relabel on the same GitHub target.
-ADVISORY_LABELS: frozenset[Label] = frozenset(
-    {
-        Label.RECURRENCE,
-        Label.MAYBE_RESOLVED,
-        Label.NEEDS_BUDGET_REVIEW,
-    }
-)
 
 
 # The labels that mean "this issue is already somewhere in the pipeline".
