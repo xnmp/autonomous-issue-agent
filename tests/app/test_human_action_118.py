@@ -30,7 +30,8 @@ def test_pr_query_collects_human_action_inputs():
 
     gh.prs("o/r")
 
-    fields = calls[0][calls[0].index("--json") + 1]
+    open_call = next(call for call in calls if call[call.index("--state") + 1] == "open")
+    fields = open_call[open_call.index("--json") + 1]
     for field in (
         "reviewDecision",
         "statusCheckRollup",
