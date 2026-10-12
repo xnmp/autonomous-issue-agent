@@ -44,6 +44,9 @@ class LegEnd:
     kind: AgentKind
     ended_at: datetime
     machine: bool
+    # The PR head the leg was dispatched on ("" for issue-stage legs). Lets
+    # attempt counting key REVIEW legs to the head they reviewed.
+    head: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -52,6 +55,8 @@ class LegEnd:
             raise ValueError("leg end requires an aware end time")
         if type(self.machine) is not bool:
             raise ValueError("leg end requires an exact machine classification")
+        if not isinstance(self.head, str):
+            raise ValueError("leg end head must be a string")
 
 
 def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime | None:

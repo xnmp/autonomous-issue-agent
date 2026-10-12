@@ -320,6 +320,98 @@ def test_attempts_after_the_latest_reset_still_reach_the_cap():
     assert pr_state(pr(ci=RED, comments=(human(10),)), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(13), FIX)
 
 
+# ── Attempt runs (Q21) ───────────────────────────────────────────────────────
+
+def seq(*steps: tuple[AgentKind, str] | tuple[AgentKind, str, bool]) -> dict:
+    """Legs one minute apart, oldest first: (kind, head[, machine])."""
+    return pr_legs(*(LegEnd(s[0], at(i), s[2] if len(s) > 2 else False, head=s[1]) for i, s in enumerate(steps)))
+
+
+def test_fix_ci_red_fix_red_three_times_caps():
+    loc = local(seq((FIX, "a"), (FIX, "b"), (FIX, HEAD)))
+    assert pr_state(pr(ci=RED), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(2), FIX)
+
+
+def test_alternating_successful_rebases_and_reviews_never_cap():
+    rebase = AgentKind.REBASE
+    loc = local(seq((rebase, "a"), (REVIEW, "b"), (rebase, "b"), (REVIEW, "c"), (rebase, "c")))
+    assert pr_state(pr(mergeable="CONFLICTING"), loc) == Dispatch(rebase, HEAD)
+    assert pr_state(pr(), loc) == Dispatch(REVIEW, HEAD)
+
+
+def test_reviews_of_four_different_heads_never_cap():
+    loc = local(seq((REVIEW, "a"), (REVIEW, "b"), (REVIEW, "c"), (REVIEW, "d")))
+    assert pr_state(pr(), loc) == Dispatch(REVIEW, HEAD)
+
+
+def test_three_reviews_of_the_same_head_cap():
+    loc = local(seq((REVIEW, "a"), (REVIEW, HEAD), (REVIEW, HEAD), (REVIEW, HEAD)))
+    assert pr_state(pr(), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), REVIEW)
+
+
+def test_machine_legs_inside_a_run_neither_break_nor_count():
+    loc = local(seq((FIX, "a"), (FIX, "a", True), (REVIEW, "a", True), (FIX, "b"), (FIX, "b", True), (FIX, HEAD)))
+    assert pr_state(pr(ci=RED), local(loc.legs, now=at(100))) == NeedsHuman(StopReason.ATTEMPTS, iso(5), FIX)
+    two = local(seq((FIX, "a"), (FIX, "a", True), (FIX, HEAD)), now=at(100))
+    assert pr_state(pr(ci=RED), two) == Dispatch(FIX, HEAD)
+
+
+def test_another_acts_agent_leg_ends_the_run():
+    loc = local(seq((FIX, "a"), (FIX, "b"), (AgentKind.ADDRESS_REVIEW, "b"), (FIX, HEAD)))
+    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD)
+
+
+def test_leg_end_head_must_be_a_string():
+    with pytest.raises(ValueError):
+        LegEnd(FIX, T0, False, head=None)  # type: ignore[arg-type]
+
+
+# ── Human CHANGES_REQUESTED (Q22) ────────────────────────────────────────────
+
+APPROVED_BY_BOT = review("APPROVED", 5)
+
+
+def test_human_change_request_on_head_dispatches_address_review_before_bot_review():
+    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice"),))) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=(APPROVED_BY_BOT, review("CHANGES_REQUESTED", 6, author="alice")))) == Dispatch(ADDR, HEAD)
+
+
+def test_human_change_request_driven_address_review_counts_attempts_not_bot_rounds():
+    bot_rounds = tuple(review("CHANGES_REQUESTED", m, head=f"old{m}") for m in (1, 2, 3))
+    view = pr(reviews=(*bot_rounds, review("CHANGES_REQUESTED", 4, author="alice")))
+    assert pr_state(view) == Dispatch(ADDR, HEAD)  # three bot rounds, yet no rounds stop
+    after_review = local({pr_key(7): tuple(LegEnd(ADDR, at(10 + m), False, head=HEAD) for m in range(3))})
+    assert pr_state(view, after_review) == NeedsHuman(StopReason.ATTEMPTS, iso(12), ADDR)
+
+
+def test_human_change_request_on_an_older_head_blocks_merge():
+    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice", head="old"), APPROVED_BY_BOT))
+    assert pr_state(view) == Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
+
+
+def test_human_change_request_on_an_older_head_still_lets_the_bot_review_the_new_head():
+    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice", head="old"),))
+    assert pr_state(view) == Dispatch(REVIEW, HEAD)
+
+
+@pytest.mark.parametrize("clearing", ["APPROVED", "DISMISSED"])
+def test_a_later_approval_or_dismissal_by_the_same_human_clears_it(clearing):
+    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice", head="old"),
+                       review(clearing, 2, author="Alice", head="old"), APPROVED_BY_BOT))
+    assert pr_state(view) == Merge(HEAD)
+
+
+def test_another_humans_approval_or_a_comment_does_not_clear_it():
+    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice", head="old"),
+                       review("APPROVED", 2, author="bob"), review("COMMENTED", 3, author="alice"), APPROVED_BY_BOT))
+    assert pr_state(view) == Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
+
+
+def test_harness_reviewers_are_not_humans():
+    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="fix-bot", head="old"), APPROVED_BY_BOT))
+    assert pr_state(view) == Merge(HEAD)
+
+
 # ── Review rounds (Q2) ───────────────────────────────────────────────────────
 
 def test_third_bot_change_request_stops_instead_of_addressing():

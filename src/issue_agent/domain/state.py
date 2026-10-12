@@ -16,14 +16,22 @@ Precedence, the single place it is defined (first match wins, per item):
                on it -> NeedsHuman.
 5. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
                for another head -> Wait; red -> FIX_CI; pending -> Wait; green
-               and BEHIND -> Refresh; no bot verdict on head -> REVIEW; bot
+               and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
+               head -> ADDRESS_REVIEW; no bot verdict on head -> REVIEW; bot
                CHANGES_REQUESTED on head -> ADDRESS_REVIEW; bot APPROVED head ->
-               Merge (Wait while mergeability is unknown).
+               Merge, unless a human's standing CHANGES_REQUESTED is on an
+               older head (Wait) or mergeability is unknown (Wait).
                Issue: `ai-ready`, open, no harness PR -> RESOLVE.
 6. Dispatch gates, for a Dispatch from step 5 only (merge/refresh are free):
-               review rounds >= cap (ADDRESS_REVIEW) -> NeedsHuman; attempts
-               >= cap -> NeedsHuman; machine backoff -> Backoff; daily or
-               global headroom short -> Wait (silent: time clears it, Q7).
+               bot review rounds >= cap (ADDRESS_REVIEW on a bot verdict) ->
+               NeedsHuman; attempts >= cap -> NeedsHuman; machine backoff ->
+               Backoff; daily or global headroom short -> Wait (silent, Q7).
+
+Attempts for act A (Q21) are the tail run of A's agent legs after the reset
+floor: machine legs are skipped, any other act's agent leg ends the run, and
+REVIEW counts only legs on the current head. Progress (an act changing, or a
+review of a new head) therefore never trips the cap; repeating one act
+without progress does.
 
 Untrusted timestamps fail toward stopping: an unparseable one never resets a
 count or releases a stop, and an unparseable bot review still counts as a round.
@@ -53,6 +61,7 @@ DISPATCHABLE = frozenset({
     AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.REVIEW, AgentKind.ADDRESS_REVIEW,
 })
 _MAX_MARKER = 200
+_STANDING = frozenset({REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, "DISMISSED"})
 _STOP_TAG_RE = re.compile(r"<!-- needs-human:([a-z-]+) -->")
 
 
@@ -142,6 +151,7 @@ class WaitReason(str, Enum):
     CI_UNKNOWN = "ci-unknown"
     CI_PENDING = "ci-pending"
     MERGEABILITY_UNKNOWN = "mergeability-unknown"
+    HUMAN_CHANGES_REQUESTED = "human-changes-requested"
     HEADROOM = "headroom"
 
 
@@ -302,11 +312,11 @@ def _decide(item: _Item, local: Local, harness: Harness) -> DerivedState:
     if not isinstance(step, Dispatch):
         return step
     floor = _reset_floor(item, comments, last_stop, harness)
-    if step.act is AgentKind.ADDRESS_REVIEW and pr is not None and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP:
+    if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
+            and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
+            and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
         return NeedsHuman(StopReason.REVIEW_ROUNDS, anchor)
-    attempts = sum(1 for leg in legs if leg.kind is step.act and not leg.machine
-                   and (floor is None or leg.ended_at > floor))
-    if attempts >= ATTEMPT_CAP:
+    if _attempts(legs, step, floor) >= ATTEMPT_CAP:
         return NeedsHuman(StopReason.ATTEMPTS, anchor, step.act)
     until = machine_backoff_until(legs, step.act)
     if until is not None and until > local.now:
@@ -335,11 +345,16 @@ def _pr_step(pr: PRView, harness: Harness) -> DerivedState:
     # Before review: updating moves the head, which would void a review on it.
     if pr.is_behind():
         return Refresh(head)
+    human_heads = _human_change_requests(pr, harness)
+    if head in human_heads:
+        return Dispatch(AgentKind.ADDRESS_REVIEW, head)
     verdict = _bot_verdict_on_head(pr, harness)
     if verdict is None:
         return Dispatch(AgentKind.REVIEW, head)
     if verdict == REVIEW_CHANGES_REQUESTED:
         return Dispatch(AgentKind.ADDRESS_REVIEW, head)
+    if human_heads:
+        return Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
     if pr.mergeable.upper() != "MERGEABLE":
         return Wait(WaitReason.MERGEABILITY_UNKNOWN)
     return Merge(head)
@@ -353,6 +368,34 @@ def _bot_verdict_on_head(pr: PRView, harness: Harness) -> str | None:
         and r.state.upper() in (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
     ]
     return max(verdicts)[3] if verdicts else None
+
+
+def _human_change_requests(pr: PRView, harness: Harness) -> frozenset[str]:
+    """Heads carrying a non-harness reviewer's standing CHANGES_REQUESTED: that
+    reviewer's latest APPROVED/CHANGES_REQUESTED/DISMISSED review is a change
+    request. A later approval or dismissal by the same reviewer clears it."""
+    latest: dict[str, tuple[bool, str, int, str, str]] = {}
+    for i, r in enumerate(pr.reviews):
+        state = r.state.upper()
+        if harness.owns_login(r.author) or not r.author.strip() or state not in _STANDING:
+            continue
+        rank = (parse_timestamp(r.submitted_at) is not None, r.submitted_at, i, state, r.commit_id)
+        who = r.author.strip().casefold()
+        latest[who] = max(latest.get(who, rank), rank)
+    return frozenset(commit for _, _, _, state, commit in latest.values() if state == REVIEW_CHANGES_REQUESTED)
+
+
+def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) -> int:
+    run = 0
+    for leg in sorted(legs, key=lambda leg: leg.ended_at, reverse=True):
+        if floor is not None and leg.ended_at <= floor:
+            break
+        if leg.machine:
+            continue
+        if leg.kind is not step.act or (step.act is AgentKind.REVIEW and leg.head != step.head):
+            break
+        run += 1
+    return run
 
 
 def _human_comment(comment: Comment, harness: Harness) -> bool:

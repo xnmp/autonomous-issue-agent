@@ -83,7 +83,9 @@ class Comment:
 class Push:
     """A push to a PR's head branch: who pushed it and when. A push by anyone
     but the harness is a reset event for attempt counting (refactor decision
-    Q3); the harness's own pushes are not, which keeps FIX_CI bounded."""
+    Q3); the harness's own pushes are not, which keeps FIX_CI bounded. The
+    observe adapter sources it from the head commit's author login and date in
+    the same GraphQL query (Q24)."""
 
     actor: str
     pushed_at: str = ""
