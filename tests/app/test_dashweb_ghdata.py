@@ -187,6 +187,21 @@ def test_pr_reads_run_in_parallel_and_keep_full_open_facts_over_light_history():
             assert {"comments", "statusCheckRollup", "latestReviews", "reviews"} <= fields
 
 
+@pytest.mark.parametrize("open_newer", [False, True])
+def test_the_pr_read_github_updated_last_wins_when_the_two_reads_disagree(open_newer):
+    stale, fresh = "2026-10-12T07:00:00Z", "2026-10-12T07:05:00Z"
+    full = {"number": 12, "state": "OPEN", "headRefOid": "old", "updatedAt": fresh if open_newer else stale,
+            "reviews": [{"state": "APPROVED", "commit": {"oid": "old"}}]}
+    light = {"number": 12, "state": "MERGED", "mergedAt": fresh, "headRefOid": "new",
+             "updatedAt": stale if open_newer else fresh}
+
+    def run(argv):
+        return json.dumps([full] if argv[argv.index("--state") + 1] == "open" else [light]), ""
+
+    payload, error = ghdata.GhReader(run=run).prs("o/r")
+    assert error == "" and ghdata.index_by_number(payload) == {12: full if open_newer else light}
+
+
 @pytest.mark.parametrize("failed_state", ["open", "all"])
 @pytest.mark.parametrize("failure", [("", "HTTP 504"), ("not json", "")])
 def test_either_pr_read_failure_discards_the_pr_payload(failed_state, failure):

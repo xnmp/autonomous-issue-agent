@@ -204,7 +204,7 @@ class GhReader:
         error = history[1] or opened[1]
         if error:
             return None, error
-        return list({**index_by_number(history[0]), **index_by_number(opened[0])}.values()), ""
+        return merge_pr_reads(history[0], opened[0]), ""
 
     def pr(self, repo: str, number: int) -> tuple[object | None, str]:
         """One PR's change history, fetched only for the issue detail view."""
@@ -213,6 +213,18 @@ class GhReader:
             repo,
             ["pr", "view", str(number), "--json", PR_DETAIL_FIELDS],
         )
+
+
+def merge_pr_reads(history, opened) -> list[dict]:
+    """The two reads are cached and fetched independently, so a PR can be OPEN
+    in one and already MERGED, or on a newer head, in the other. The row GitHub
+    updated last wins; the full open row is kept only when it is not the stale one."""
+    merged = index_by_number(history)
+    for number, row in index_by_number(opened).items():
+        light = merged.get(number)
+        if light is None or str(row.get("updatedAt") or "") >= str(light.get("updatedAt") or ""):
+            merged[number] = row
+    return list(merged.values())
 
 
 def index_by_number(payload) -> dict[int, dict]:
