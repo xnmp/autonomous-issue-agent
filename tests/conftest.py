@@ -2,20 +2,27 @@
 
 The bash suites unset the deployment knobs at their top; the pytest tiers had
 no equivalent, so a developer's (or a self-hosted fixer's) exported deployment
-knobs flipped adapter-test verdicts — verified live on 2026-07-29. The
-composed deployment also names every knob it set in HARNESS_DEPLOY_KNOBS.
+knobs flipped adapter-test verdicts — verified live on 2026-07-29. One source
+of truth for the static floor: point-at's RTC_SCRUB_STATIC, which compose-env
+also parses; the composed deployment names every other knob it set in
+HARNESS_DEPLOY_KNOBS.
 """
 
 import os
+import re
 import signal
+from pathlib import Path
 
 import pytest
 
-_DEPLOYMENT_KNOBS = (
-    "BASE_BRANCH", "GH_APP_ID", "GH_APP_KEY_FILE", "GH_APP_INSTALL_ID",
-    "TARGET_DIR", "AGENT_ENV", "ISSUE_AGENT_DEPLOYMENT_ID",
+_SCRUB_FLOOR = re.search(
+    r'^(?:export )?RTC_SCRUB_STATIC="(.*)"$',
+    (Path(__file__).resolve().parents[1] / "bin" / "point-at.sh").read_text(),
+    re.MULTILINE,
 )
-for _knob in (*_DEPLOYMENT_KNOBS, *os.environ.get("HARNESS_DEPLOY_KNOBS", "").split(), "HARNESS_DEPLOY_KNOBS"):
+assert _SCRUB_FLOOR is not None, "bin/point-at.sh lost its RTC_SCRUB_STATIC floor"
+for _knob in (*_SCRUB_FLOOR.group(1).split(), *os.environ.get("HARNESS_DEPLOY_KNOBS", "").split(),
+              "HARNESS_DEPLOY_KNOBS"):
     os.environ.pop(_knob, None)
 
 
