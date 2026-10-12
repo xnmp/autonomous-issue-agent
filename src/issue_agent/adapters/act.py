@@ -28,7 +28,6 @@ from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
 
 _COMMENT_NAMESPACE = "fix-comment"
-_RESOLVE_RUN_KINDS = frozenset({"RESOLVE", "RESUME"})
 _PR_BODY_LIMIT = 60000
 
 
@@ -145,7 +144,7 @@ class GitHubAct:
         an untrusted claim, used only as the PR description."""
         runs = [
             r for r in self.control.fix_runs(self.repository, (issue,))
-            if r.kind in _RESOLVE_RUN_KINDS and r.receipt is not None and isinstance(r.receipt.get("summary"), str)
+            if r.kind == "RESOLVE" and r.receipt is not None and isinstance(r.receipt.get("summary"), str)
         ]
         latest = max(runs, key=lambda r: r.completed_at, default=None)
         return str(latest.receipt["summary"]) if latest is not None and latest.receipt is not None else ""

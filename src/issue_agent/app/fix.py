@@ -33,11 +33,8 @@ from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from .planners import tasks
 from .workflows.base import run_leg
 
-# Run kinds written before slice 5b map onto the acts they continued; ROUTE
-# was an advisory classifier leg, never a dispatch.
-_LEGACY_KIND = {"RESUME": AgentKind.RESOLVE}
-_ISSUE_RUN_KINDS = frozenset({"RESOLVE", "RESUME"})
-_PR_RUN_KINDS = frozenset({"FIX_CI", "REBASE", "ADDRESS_REVIEW", "PR_RESUME"})
+# Pre-5b run kinds (RESUME, PR_RESUME, ROUTE) belong to no act: under the
+# cutover rule those legs simply stop counting.
 _FIX_ACTS = frozenset({AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.ADDRESS_REVIEW})
 _QUESTION_LIMIT = 4000
 
@@ -45,9 +42,10 @@ _QUESTION_LIMIT = 4000
 def run_item(run: FixRun) -> ItemKey | None:
     """The item a recorded fix run belongs to: its issue for issue-stage legs,
     its PR for PR-stage legs."""
-    if run.kind in _ISSUE_RUN_KINDS and run.issue > 0:
+    kind = dispatched_kind(run.kind)
+    if kind is AgentKind.RESOLVE and run.issue > 0:
         return issue_key(run.issue)
-    if run.kind in _PR_RUN_KINDS and run.number > 0:
+    if kind in _FIX_ACTS and kind is not AgentKind.RESOLVE and run.number > 0:
         return pr_key(run.number)
     return None
 
@@ -55,8 +53,8 @@ def run_item(run: FixRun) -> ItemKey | None:
 def leg_end(run: FixRun) -> LegEnd | None:
     """A recorded run as derive's `LegEnd`. A run without a `fix-leg` receipt
     never returned (died, reclaimed, refused before launch): a machine end."""
-    kind = _LEGACY_KIND.get(run.kind) or dispatched_kind(run.kind)
-    if kind is None or kind is AgentKind.ROUTE or run.completed_at.utcoffset() is None:
+    kind = dispatched_kind(run.kind)
+    if kind not in _FIX_ACTS or run.completed_at.utcoffset() is None:
         return None
     leg = run.receipt.get("leg") if run.receipt is not None else None
     started = run.started_at

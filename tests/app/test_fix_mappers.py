@@ -32,9 +32,9 @@ def run(kind="RESOLVE", number=5, issue=5, head="", leg="agent", minute=1, start
 
 @pytest.mark.parametrize("recorded,item", [
     (run("RESOLVE"), issue_key(5)),
-    (run("RESUME"), issue_key(5)),       # a pre-5b reply leg continued RESOLVE
+    (run("RESUME"), None),               # pre-5b kinds stop counting at the cutover
     (run("FIX_CI", number=100), pr_key(100)),
-    (run("PR_RESUME", number=100), pr_key(100)),
+    (run("PR_RESUME", number=100), None),
     (run("ROUTE"), None),                # the deleted classifier leg belongs to no item
     (run("RESOLVE", issue=0), None),
     (run("REVIEW", number=100), None),   # the review role's legs are not the fix role's
@@ -60,10 +60,9 @@ def test_an_asked_receipt_is_an_agent_end_that_asked():
     assert end is not None and (end.machine, end.asked) == (False, True)
 
 
-def test_legacy_resume_runs_map_to_resolve_and_route_runs_are_dropped():
-    assert leg_end(run("RESUME")).kind is AgentKind.RESOLVE
-    assert leg_end(run("ROUTE")) is None
-    assert leg_end(run("UNKNOWN_KIND")) is None
+@pytest.mark.parametrize("kind", ["RESUME", "PR_RESUME", "ROUTE", "REVIEW", "UNKNOWN_KIND", ""])
+def test_runs_of_no_fix_act_are_no_leg_end(kind):
+    assert leg_end(run(kind)) is None
 
 
 def test_an_inconsistent_start_is_dropped_but_the_end_still_counts():
