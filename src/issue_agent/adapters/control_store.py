@@ -2387,7 +2387,24 @@ WHERE provider_receipt_id='terminal-estimate:' || run_id
     OR (basis IN ('estimate','reconciled') AND provider_receipt_id LIKE 'codex-recovered:%'
         AND substr(provider_receipt_id,-length(run_id)-1)=':' || run_id);
 """),
+    # Review-time test evidence is retired by deletion, never parsed. An
+    # unresolved approval whose payload still names `test_evidence_ref` is
+    # forgotten with its unclosed round registration; GitHub stays authority
+    # and the reopened round is abandoned by recovery, so the head is reviewed
+    # afresh.
     SchemaMigration(42, """
+CREATE TEMP TABLE retired_review_submissions AS
+    SELECT c.repository,c.command_id,json_extract(d.payload_json,'$.value.fields.round.fields.round_id') AS round_id
+    FROM lifecycle_commands c LEFT JOIN dedupe_keys d
+        ON d.namespace='review-round-submission' AND d.scope=c.repository AND d.key=c.command_id
+    WHERE c.kind='submit_review' AND json_type(c.payload_json,'$.test_evidence_ref') IS NOT NULL
+        AND (c.state IN ('pending','executing','retryable_failure','unknown_outcome')
+            OR c.state='succeeded' AND NOT EXISTS (
+                SELECT 1 FROM dedupe_keys s WHERE s.scope=c.repository AND s.key=c.command_id
+                    AND s.namespace IN ('review-recorded-submission','review-submission-settled')))
+        AND NOT EXISTS (SELECT 1 FROM review_execution_rounds r
+            WHERE r.round_id=json_extract(d.payload_json,'$.value.fields.round.fields.round_id')
+                AND (r.closure_json IS NOT NULL OR r.outcome_json IS NOT NULL));
 CREATE TEMP TABLE retired_review_gates AS
     SELECT g.gate_id FROM workflow_gates g
     WHERE g.target_kind='pr' AND (
@@ -2408,6 +2425,25 @@ DELETE FROM workflow_rearm_commands WHERE request_id IN (
 DELETE FROM workflow_rearms WHERE gate_id IN (SELECT gate_id FROM retired_review_gates);
 DELETE FROM workflow_gates WHERE gate_id IN (SELECT gate_id FROM retired_review_gates);
 DROP TABLE retired_review_gates;
+UPDATE review_execution_rounds SET
+    plan_json=json_set(plan_json,'$.value.fields.submissions',json((
+        SELECT json_group_array(json(s.value)) FROM json_each(plan_json,'$.value.fields.submissions') s
+        WHERE json_extract(s.value,'$.fields.command_id') NOT IN (SELECT command_id FROM retired_review_submissions)
+    ))),
+    planning_json='{"format":1,"value":{"fields":{},"type":"ReviewPlanningOpen"}}'
+WHERE round_id IN (SELECT round_id FROM retired_review_submissions);
+DELETE FROM dedupe_keys WHERE namespace IN ('review-round-seal','review-round-abandonment',
+    'review-round-recovery-wait','review-round-recovery-block')
+    AND (scope,key) IN (SELECT repository,round_id FROM retired_review_submissions);
+DELETE FROM dedupe_keys WHERE namespace IN ('review-round-submission','review-round-submission-index')
+    AND (scope,json_extract(payload_json,'$.value.fields.submission.fields.command_id'))
+        IN (SELECT repository,command_id FROM retired_review_submissions);
+DELETE FROM workflow_retry_authorizations WHERE command_id IN (SELECT command_id FROM retired_review_submissions);
+DELETE FROM workflow_rearm_commands WHERE command_id IN (SELECT command_id FROM retired_review_submissions);
+DELETE FROM workflow_evidence WHERE command_id IN (SELECT command_id FROM retired_review_submissions);
+DELETE FROM effect_receipts WHERE command_id IN (SELECT command_id FROM retired_review_submissions);
+DELETE FROM lifecycle_commands WHERE command_id IN (SELECT command_id FROM retired_review_submissions);
+DROP TABLE retired_review_submissions;
 DELETE FROM dedupe_keys WHERE namespace IN (
     'review-round-test-intent', 'review-round-test-invocation',
     'review-round-test-completion', 'review-round-test-evidence'

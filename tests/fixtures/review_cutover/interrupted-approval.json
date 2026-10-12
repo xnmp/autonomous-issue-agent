@@ -1,0 +1,11 @@
+{
+  "base": "acb1e42d936063b8a72091d3455e4cc8e4ac3fb5",
+  "heads": [
+    "38cb3395762c439062d884b0f9d5bd4872414a19",
+    "96ad8de0ebd764f6e70b0c481ea0dcd94bd4ade0",
+    "eb735cba61c1f478f16256ae1235c585f93426a2",
+    "c260b19a233ea2f213a9b98769700606b7127de8"
+  ],
+  "command_state": "unknown_outcome",
+  "root": "/tmp/slice1-fixture-interrupted-approval"
+}
