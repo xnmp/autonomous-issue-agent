@@ -3,7 +3,7 @@
 import json
 import threading
 
-from issue_agent.adapters.journal import Journal, read_events
+from issue_agent.adapters.journal import Journal, read_events, read_events_tail
 from issue_agent.domain.events import Correlation, EscalationRaised, TelemetryEvent, TelemetryWarning
 
 
@@ -48,3 +48,39 @@ def test_concurrent_writers_never_interleave_a_line(tmp_path):
 
     lines = [json.loads(line) for line in path.read_text().splitlines()]
     assert sorted(line["issue"] for line in lines) == list(range(1, 17))
+
+
+def test_a_record_with_embedded_newlines_is_still_exactly_one_line(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    body = "line one\nline two\r\n\nline four"
+    journal = Journal(str(path))
+
+    journal.emit(TelemetryEvent(TelemetryWarning("w", body), Correlation()))
+    journal.emit(TelemetryEvent(EscalationRaised("pr", 7), Correlation(pr=7)))
+
+    raw = path.read_text()
+    assert raw.count("\n") == 2
+    assert json.loads(raw.splitlines()[0])["warning"] == body
+
+
+def test_the_journal_is_private_to_the_operator(tmp_path):
+    path = tmp_path / "state" / "journal.jsonl"
+
+    Journal(str(path)).emit(TelemetryEvent(EscalationRaised("pr", 7), Correlation(pr=7)))
+
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_the_tail_reader_stops_at_its_bound_and_keeps_the_newest_lines(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    path.write_text("".join(json.dumps({"event": "e", "n": n, "pad": "x" * 100}) + "\n" for n in range(1000)))
+    bound = path.stat().st_size // 4
+
+    tail = read_events_tail(str(path), max_bytes=bound)
+
+    assert 0 < len(tail) < 300
+    assert tail[-1]["n"] == 999
+    assert [e["n"] for e in tail] == list(range(1000 - len(tail), 1000))  # contiguous, no torn first line
+    assert len(read_events_tail(str(path))) == 1000
+    assert read_events_tail(str(tmp_path / "missing.jsonl")) == []

@@ -274,8 +274,15 @@ class Journal:
             with self._lock:
                 parent = os.path.dirname(self.path)
                 if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with open(self.path, "a", encoding="utf-8") as stream:
+                    os.makedirs(parent, mode=0o700, exist_ok=True)
+                # 0600: the journal carries agent summaries and error text
+                # from possibly private repos.
+                fd = os.open(
+                    self.path,
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                    0o600,
+                )
+                with os.fdopen(fd, "a", encoding="utf-8") as stream:
                     stream.write(line + "\n")
         except Exception as exc:  # noqa: BLE001 - a log line never fails a tick
             sys.stderr.write(
@@ -845,6 +852,31 @@ def read_events(path: str) -> list[dict]:
     except OSError:
         return []
     return _parse_lines(lines)
+
+
+# A per-poll reader must not re-parse the whole journal every refresh (keifu
+# 2026-08-02: one polling tab pinned a core, cost growing with install age).
+# 1 MiB is days of a busy daemon; older history drops off the board.
+_TAIL_BYTES = 1 << 20
+
+
+def read_events_tail(path: str, max_bytes: int | None = None) -> list[dict]:
+    """`read_events` over at most the LAST `max_bytes` of the file. The first
+    line of the window is dropped when it did not start at byte 0, because a
+    mid-line seek would hand the parser a truncated object."""
+    window = _TAIL_BYTES if max_bytes is None else max_bytes
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            start = max(0, fh.tell() - max(0, window))
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return []
+    text = blob.decode("utf-8", errors="replace")
+    if start > 0:
+        _, _, text = text.partition("\n")
+    return _parse_lines(text.splitlines())
 
 
 def parse_ts(value) -> datetime | None:

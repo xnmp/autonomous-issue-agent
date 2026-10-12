@@ -252,7 +252,7 @@ usage provenance, and rate-card identity.
 At boot and after a suspension gap, recovery runs in a fixed order: kill known
 orphan groups, reclaim dead leases, reconcile unsettled spend, release only
 reservations durably proven never launched, drain commands through receipt
-verification, and emit abandoned-run corrections. A run that may have reached
+verification. A run that may have reached
 a paid provider remains fail-closed until positive settlement evidence exists.
 Completed runs that returned without trusted usage or a provider charge are a
 separate liveness case: recovery retries provider reconciliation through the
@@ -341,7 +341,7 @@ returned-result completion needs no other gate holding the workflow; the
 store's own execution-authority check must pass; retired commands are never
 authorizable. The absence must postdate the command's uncertainty and its last
 authorized attempt. Authorized attempts are bounded: one per grant and three
-per command over its life (the last one is journaled as `ceiling_reached`). A
+per command over its life (the last one reaches the ceiling and no further grant is possible). A
 second grant while one is open, or a reused ID with different content,
 conflicts (409); an evidence ID that already backed a grant, a command whose
 original decision was judged inapplicable, or a command at its ceiling is
@@ -523,8 +523,8 @@ and the dashboard only read it. It carries:
 
 The record is the view's projection, never dispatch authority. The departed
 reads run in the plan, before admission; after admission only pure
-construction and one SQLite write run, and any failure there is logged and
-journalled (`review_dispatch_record` `record_failed`) at most once per 15
+construction and one SQLite write run, and any failure there is logged
+(`review_dispatch_record` `record_failed`) at most once per 15
 minutes with the count it suppressed. It never changes or drops an admitted
 review.
 
@@ -539,8 +539,7 @@ most 4 such reads per tick. A failed read keeps the last good facts of the
 pull request's own read (a closed one stays shown closed, as of that read) and
 adds `read_failure`; with no such facts it records `deferred`. Consecutive
 failures back off 15 min, 30 min, 1 h, 2 h, 4 h, then every 6 h from the latest
-failure. The control journal records `review_departed_read` `read_failed` at
-the first failure and `read_backoff_ceiling` when the backoff reaches 6 h; a
+failure. A
 successful read clears the failure. Only a read decides that a
 pull request is closed. `daemon.state = unrecorded` means no tick has recorded
 it yet.
@@ -555,8 +554,7 @@ releases the gate the same way.
 
 Contested hold. An open ceiling's `needs-human-review` hold is restored when an
 actor removes it, at most three times. After that the ceiling reads
-`hold.state = contested`: the harness stops restoring the label and journals
-`hold_contested` once. The operator is signalled at most once per escalation.
+`hold.state = contested`: the harness stops restoring the label. The operator is signalled at most once per escalation.
 The gate alone still holds every review.
 It exits when the gate closes, through a completed re-arm, a human dismissal
 of the counted reviews, or a disabled ceiling; `hold_contest_cleared` is

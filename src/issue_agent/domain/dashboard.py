@@ -1103,15 +1103,20 @@ def build_deployment(
     settled_today_usd: float | None = None,
     settled_today_unavailable: bool = False,
     to_local_date: Callable[[float], date] = _utc_date,
+    heartbeats: Mapping[str, datetime | None] | None = None,
 ) -> Deployment:
     """Assemble one deployment's report. Pure: `feeds` is
-    `(role, journal_path, log_path, events)` tuples already read off disk.
+    `(role, journal_path, log_path, events)` tuples already read off disk;
+    `heartbeats` maps role to its daemon's last scheduler heartbeat.
     """
     if now_fn is None:
         raise ValueError("build_deployment requires an injected clock")
     now = now_fn()
     health = tuple(
-        _health(role, journal, log, events, now, stale_after_s)
+        _health(
+            role, journal, log, events, now, stale_after_s,
+            (heartbeats or {}).get(role),
+        )
         for role, journal, log, events in feeds
     )
     merged: list[dict] = []
@@ -1155,8 +1160,14 @@ def build_deployment(
     )
 
 
-def _health(role, journal_path, log_path, events, now, stale_after_s) -> DaemonHealth:
+def _health(
+    role, journal_path, log_path, events, now, stale_after_s, heartbeat=None
+) -> DaemonHealth:
+    # An idle daemon journals only state changes, so a quiet poll loop is
+    # visible only through its heartbeat (docs/field-verification.md:52).
     timestamps = [ts for ts in (parse_ts(e.get("ts")) for e in events) if ts]
+    if heartbeat is not None:
+        timestamps.append(heartbeat)
     last = max(timestamps) if timestamps else None
     last_event = ""
     if events:

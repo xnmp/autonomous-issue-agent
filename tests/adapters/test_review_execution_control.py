@@ -349,7 +349,7 @@ def test_gateway_read_occurs_outside_sql_write_lock_and_same_request_race_commit
     assert_unpaid(store)
 
 
-def test_receipt_write_failure_rolls_back_round_revision_and_outbox_together(rig):
+def test_receipt_write_failure_rolls_back_round_and_revision_together(rig):
     store, _, _, selection, control = rig
     with store.transaction() as db:
         db.execute("CREATE TRIGGER refuse_preflight_receipt BEFORE INSERT ON dedupe_keys "

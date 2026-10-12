@@ -21,7 +21,6 @@ class Journal:
     """Test fixture for producing historical JSONL consumed by read-only tools."""
 
     path: str
-    monthly_rotation: bool = False
     canonical: bool = False
 
     def emit(self, event: str | TelemetryEvent, **fields: object) -> None:
@@ -36,31 +35,7 @@ class Journal:
             parent = os.path.dirname(self.path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            if self.monthly_rotation:
-                self._rotate_monthly()
             with open(self.path, "a", encoding="utf-8") as stream:
                 stream.write(line + "\n")
         except Exception as exc:  # telemetry fixtures preserve fail-soft behavior
             sys.stderr.write(f"journal: dropped {event!r} event ({exc})\n")
-
-    def _rotate_monthly(self) -> None:
-        try:
-            modified = datetime.fromtimestamp(
-                os.path.getmtime(self.path),
-                tz=timezone.utc,
-            )
-        except FileNotFoundError:
-            return
-        current = datetime.now(timezone.utc)
-        if (modified.year, modified.month) == (current.year, current.month):
-            return
-        root, extension = os.path.splitext(self.path)
-        archive = f"{root}.{modified:%Y-%m}{extension}"
-        suffix = 1
-        while os.path.exists(archive):
-            archive = f"{root}.{modified:%Y-%m}.{suffix}{extension}"
-            suffix += 1
-        try:
-            os.rename(self.path, archive)
-        except FileNotFoundError:
-            pass

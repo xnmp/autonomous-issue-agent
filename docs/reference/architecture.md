@@ -145,14 +145,12 @@ when the old lease-before-exec contract proves they never launched. Paid child
 registration carries the launcher's immutable expected owner and checks it in
 the lease transaction, while a normal completion that races dead-lease spend
 recovery replaces its recovered charge with the normal return's evidence and
-corrects the false abandonment, atomically with output capture. The accounting
-journal records the correction and reverses the old spend projection before
-adding the replacement; replay keeps one charge. Read-only spend projections validate the current migration
+corrects the false abandonment, atomically with output capture. Replay keeps one charge. Read-only spend projections validate the current migration
 history, SQLite quick check, foreign keys, and semantic invariants before
 showing authoritative current-day values.
 Completed legs settle from the sum of usable request receipts, otherwise streamed
 usage at the captured rate card, otherwise zero for interrupted/unusable requests.
-Partial evidence produces `basis=estimate` and an accounting gap journal event;
+Partial evidence produces `basis=estimate`;
 the reserved maximum is never charged as an estimate. Terminal, lease-free legacy
 `accounting_unavailable` rows follow the same idempotent boot recovery transaction.
 Live work retains its reservation and stops its process group on a metering
@@ -188,13 +186,13 @@ existing ceiling of 32 completions per reconciliation pass.
 PR-repair acknowledgment crash/concurrency matrix (ADR 0003, ADR 0016):
 selection is read-only and releases its transaction before acknowledgment.
 The mutation transaction re-proves eligibility; SQLite's writer serialization
-orders competing capture against that recheck and the paired state/receipt/outbox
+orders competing capture against that recheck and the paired state/receipt
 writes. No process or network operation runs inside either transaction.
 
 | Interruption or competing writer | Durable outcome and retry | Behavioral test in `tests/app/` |
 |---|---|---|
 | After candidate selection, before mutation | No state changed; the next reconciliation reselects and acknowledges once. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-selection]` |
-| During paired state/receipt/outbox writes | The transaction/savepoint rolls back both components and receipts; retry completes once. | `test_pr_repair_terminal_recovery_guards.py::test_acknowledgment_rolls_back_both_components_and_receipts_on_write_failure` |
+| During paired state/receipt writes | The transaction/savepoint rolls back both components and receipts; retry completes once. | `test_pr_repair_terminal_recovery_guards.py::test_acknowledgment_rolls_back_both_components_and_receipts_on_write_failure` |
 | Commit succeeds but the caller never receives the return | Both components and the distinct acknowledgment remain committed; retry adds no debt or receipt. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-commit]` |
 | Normal result captured after selection, before acknowledgment's recheck | Capture wins; acknowledgment returns false without mutation. The next ordinary pass applies the real result/session exactly once. | `test_pr_repair_recovery_interleavings.py::test_capture_between_selection_and_acknowledgment_wins` |
 | Acknowledgment commits before normal capture | The real result is captured, money is corrected, and acknowledged workflow effects remain consumed. | `test_pr_repair_terminal_recovery.py::test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack`; `test_pr_repair_terminal_recovery_guards.py::test_settled_recovery_preserves_prior_session_and_money_and_accepts_late_capture` |
@@ -351,15 +349,14 @@ usage and deduplicated receipt totals, after subtracting pre-launch usage. Froze
 Each receipt uses its usable provider dollars, otherwise its frozen token price;
 frozen rates price only the cumulative remainder after subtracting receipt tokens. The same
 observation drives the live cap watchdog and terminal settlement, so delayed
-receipts cannot discard another request's spend. Missing/unusable evidence contributes zero
-and journals an estimate gap; live metering faults stop the process group when
+receipts cannot discard another request's spend. Missing/unusable evidence contributes zero; live metering faults stop the process group when
 cap enforcement cannot be established. Complete terminal records are parsed even
 without their final newline; an unparseable tail contributes zero.
 
 Recovery bounds all root and child evidence by the harness-owned invocation start
 and `runs.completed_at`. A later leg's resumed usage cannot enter the ended run.
 Legacy version-1 evidence prices usable parent usage at its frozen scalar rates;
-missing native-child metadata journals a gap instead of erasing parent spend.
+missing native-child metadata contributes no child spend and never erases parent spend.
 Version-2 evidence uses the captured native card. Repeated recovery keeps one
 charge. A late real return supersedes a recovery estimate using signed correction
 events and durable output capture, including after repair unreturned acknowledgment.

@@ -10,7 +10,8 @@ from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 from ..adapters.control_store import read_settled_spend
-from ..adapters.journal import read_events
+from ..adapters.heartbeat import read_heartbeat_time
+from ..adapters.journal import read_events, read_events_tail
 from ..domain.dashboard import (
     ActionFact,
     BlockedRun,
@@ -103,7 +104,7 @@ def collect(
             role,
             path,
             os.path.join(log_dir, f"{role}-{name}.log"),
-            tuple(read_events(path)),
+            tuple(read_events_tail(path)),
         )
         for role, path in zip(ROLE_NAMES, tuple(journal_paths))
     )
@@ -118,6 +119,12 @@ def collect(
         settled_today_usd,
         settled_today_unavailable,
         to_local_date,
+        heartbeats={
+            role: read_heartbeat_time(
+                os.path.join(os.path.dirname(path), "heartbeat.json")
+            )
+            for role, path in zip(ROLE_NAMES, tuple(journal_paths))
+        },
     )
 
 

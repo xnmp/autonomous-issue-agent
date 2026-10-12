@@ -36,5 +36,5 @@ Re-measured 2026-10-13 after machine failures stopped counting as attempt
 debt: 8,339 UTF-8 bytes and 1,110 whitespace-delimited words.
 
 Re-measured 2026-10-13 after slice 6a deleted the fixer gates and governor
-and slice 8a deleted the telemetry layer: 7,908 UTF-8 bytes and 1,060
+and slice 8a deleted the telemetry layer: 7,895 UTF-8 bytes and 1,059
 whitespace-delimited words.

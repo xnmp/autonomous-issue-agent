@@ -16,7 +16,7 @@ from issue_agent.domain.review_dispatch_record import (
     CLOSED_PROMPT_SECONDS, CLOSED_RECONFIRM_SECONDS, DECISION_CONFIRM_SECONDS, DEPARTED_CONFIRM_SECONDS,
     MAX_DEPARTED_BACKOFF_SECONDS, AdmissionInFlight, AdmissionWithheld, DecisionBasis, DecisionRead, DecisionUpdate,
     DepartedReadFailed, DepartedReadFailure, RecordedReviewDecision, ReviewDeferred, ReviewInFlight,
-    ReviewNotAdmitted, ReviewTerminal, ReviewWithheld, WithheldReason, admitted_decision, departed_backoff_at_ceiling,
+    ReviewNotAdmitted, ReviewTerminal, ReviewWithheld, WithheldReason, admitted_decision,
     departed_backoff_seconds, departed_read_after, departed_read_due, next_decision_record,
     record_departed_read_failure, record_review_decision,
 )
@@ -214,7 +214,6 @@ def test_a_successful_read_ends_the_failure_run_at_once():
 def test_failed_departed_reads_back_off_exponentially_to_the_ceiling():
     waits = [departed_backoff_seconds(n) for n in range(1, 9)]
     assert waits == [900, 1800, 3600, 7200, 14400, 21600, 21600, 21600]
-    assert [n for n in range(1, 40) if departed_backoff_at_ceiling(n)] == [6]
     assert departed_backoff_seconds(10**6) == MAX_DEPARTED_BACKOFF_SECONDS
     record = record_departed_read_failure(None, PR_KEY, "read failed", NOW)
     for _ in range(4):

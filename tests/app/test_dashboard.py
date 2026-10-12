@@ -864,3 +864,37 @@ def test_cli_dashboard_writes_nothing_but_the_html(tmp_path, monkeypatch):
     assert cli.cmd_dashboard(_args()) == 0
     assert {p: os.stat(p).st_mtime_ns for p in (journal,)} == before
     assert sorted(str(p) for p in tmp_path.rglob("*")) == listing_before
+
+
+def _heartbeat(role_dir: Path, updated_at: datetime) -> None:
+    (role_dir / "heartbeat.json").write_text(json.dumps(
+        {"state": "running", "pid": 1, "in_flight": [], "updated_at": updated_at.isoformat()}))
+
+
+def test_an_idle_daemon_with_a_fresh_heartbeat_is_not_stale(tmp_path):
+    # An idle daemon journals only state changes; its heartbeat is the only
+    # sign of a live poll loop (docs/field-verification.md).
+    paths = [write_run(tmp_path / role, role=role, minutes_ago=31) for role in ("fix", "review")]
+    _heartbeat(tmp_path / "fix", NOW)
+
+    dep = dash.collect("n", "o/r", paths, str(tmp_path / "logs"),
+                       str(tmp_path / "ledger.jsonl"), now_fn=_now)
+
+    stale = {h.role: h.stale for h in dep.health}
+    assert stale["fix"] is False
+    assert stale["review"] is True  # no heartbeat: the old journal line alone decides
+
+
+def test_a_dashboard_read_covers_only_the_journal_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr("issue_agent.adapters.journal._TAIL_BYTES", 4096)
+    path = tmp_path / "fix" / "journal.jsonl"
+    path.parent.mkdir()
+    path.write_text("".join(
+        json.dumps({"ts": at(100 - n), "event": "tick_gated", "n": n}) + "\n" for n in range(100)))
+
+    dep = dash.collect("n", "o/r", [str(path)], str(tmp_path / "logs"),
+                       str(tmp_path / "ledger.jsonl"), now_fn=_now)
+
+    (fix,) = [h for h in dep.health if h.role == "fix"]
+    assert 0 < fix.events < 100
+    assert fix.last_ts == NOW - timedelta(minutes=1)
