@@ -40,6 +40,7 @@ import {
 import { shortModel } from "../lib/models";
 import { boardItems, matchesQuery } from "../features/issues/board";
 import { Chip } from "./ui/Chip";
+import { Icon } from "./ui/Icon";
 import { StepBadge } from "./ui/StepBadge";
 import { TableFilter } from "./ui/TableFilter";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
@@ -769,6 +770,7 @@ function PrLink({ card }: { card: PrLinkCard }) {
         review?.label,
       ].filter(Boolean).join(" · ")}
     >
+      <Icon name="git-pull-request" size={12} />
       <span>PR #{card.pr}</span>
       {review ? (
         <span className={`pr-review-mark tone-${review.tone}`} role="img" aria-label={review.label}>

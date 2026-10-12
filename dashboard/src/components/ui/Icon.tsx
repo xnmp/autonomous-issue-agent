@@ -8,6 +8,7 @@ export type IconName =
   | "check-circle"
   | "close"
   | "copy"
+  | "git-pull-request"
   | "inbox"
   | "play"
   | "settings";
@@ -38,6 +39,14 @@ const paths: Record<IconName, React.ReactNode> = {
     <>
       <rect x="8" y="8" width="11" height="11" rx="2" />
       <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
+    </>
+  ),
+  "git-pull-request": (
+    <>
+      <circle cx="6" cy="6" r="2.6" />
+      <circle cx="18" cy="18" r="2.6" />
+      <path d="M6 8.6V21M13 6h3a2 2 0 0 1 2 2v7.4" />
+      <path d="m15.5 3.5-2.5 2.5 2.5 2.5" />
     </>
   ),
   inbox: (

@@ -142,6 +142,7 @@
 .board-refs {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-4);
   margin-top: 3px;
   color: var(--ink-muted);
@@ -152,7 +153,12 @@
   color: var(--ink-muted);
 }
 .board-refs .board-pr {
-  color: var(--ink-faint);
+  min-height: 18px;
+  padding: 0 6px 0 4px;
+  gap: 3px;
+}
+.board-refs .board-pr-link:hover .board-pr {
+  background: color-mix(in srgb, var(--chip-c) 24%, transparent);
 }
 .board-overspend {
   color: var(--fail);

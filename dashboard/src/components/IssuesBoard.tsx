@@ -29,6 +29,8 @@ import {
 import { ago, duration, usd } from "../lib/format";
 import { liveClocks, useNow, useSnapshotOffset } from "../lib/clock";
 import { kindLabel } from "../lib/semantics";
+import { Chip } from "./ui/Chip";
+import { Icon } from "./ui/Icon";
 import { reviewablePullRequests } from "./review/model";
 import { useLegacyUnblockRefusal } from "./review/use-legacy-unblock";
 import { ResolveControls } from "./resolve/ResolveControls";
@@ -564,17 +566,23 @@ function IssueLink({ issue, url }: { issue: number; url: string | null }) {
 }
 
 function PrNumber({ pr, url }: { pr: number; url: string | null }) {
-  if (!url) return <span className="board-pr num">PR #{pr}</span>;
+  const badge = (
+    <Chip tone="meta" square className="board-pr">
+      <Icon name="git-pull-request" size={12} />
+      <span className="sr-only">PR </span>#{pr}
+    </Chip>
+  );
+  if (!url) return badge;
   return (
     <a
-      className="board-pr num"
+      className="board-pr-link"
       href={url}
       target="_blank"
       rel="noreferrer"
       title="open pull request on GitHub"
       onClick={(event) => event.stopPropagation()}
     >
-      PR #{pr}
+      {badge}
     </a>
   );
 }
