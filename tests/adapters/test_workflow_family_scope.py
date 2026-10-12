@@ -12,7 +12,6 @@ from issue_agent.adapters.control_store import (
     AccountingDisposition, ControlStoreError, ReservationRequest, SQLiteControlStore, workflow_episode_key,
 )
 from issue_agent.adapters.effects import command_for_action
-from issue_agent.adapters.resolve_activation import read_inventory
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.workflow_commit import insert_pending_rearm
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
@@ -213,16 +212,6 @@ def test_resolve_reconciliation_never_schedules_a_pending_review_rearm(store):
     with closing(store._connect()) as db:
         unavailable = db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='workflow-rearm-observation'").fetchone()[0]
     assert unavailable == 0
-
-
-def test_resolve_activation_inventory_ignores_review_family_rows(store):
-    install_workflow(store, resolve_snapshot())
-    install_review(store, pending())
-    bound_run(store, held().binding, "review-run", REVIEWER)
-    drop_activation(store, WorkflowFamily.RESOLVE)
-    with closing(store._connect()) as db:
-        retained = read_inventory(db, "o/r").retained_targets
-    assert retained == ("issue:1",)
 
 
 def test_legacy_unblock_stays_closed_across_the_review_family(store):

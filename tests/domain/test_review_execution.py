@@ -15,11 +15,9 @@ from issue_agent.domain.review_execution import (
     AddReviewStrike,
     ClearReviewSession,
     CopiedReviewProgress,
-    ImportedReviewExecutionDecision,
-    ImportedReviewExecutionOriginReceipt,
     InitializedReviewExecutionOriginReceipt,
+    RenewedReviewSessionSource,
     initialized_review_execution,
-    ImportedReviewSession,
     LaunchedReviewChild,
     NoReviewSession,
     PaidReviewProgress,
@@ -75,24 +73,6 @@ from issue_agent.domain.workflow_identity import (
 
 
 MAX_INTEGER = 2**63 - 1
-
-
-def test_imported_origin_contract_rejects_noninitial_or_malformed_activation_evidence():
-    origin = ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:1")
-    initial = checkpoint()
-    receipt = ImportedReviewExecutionOriginReceipt(
-        origin, initial, "a" * 64, "b" * 64, "c" * 64, "d" * 64,
-    )
-    decision = ImportedReviewExecutionDecision(origin, initial, "a" * 64, "b" * 64)
-    assert receipt.checkpoint == decision.checkpoint
-    with pytest.raises(ValueError, match="initial checkpoint"):
-        replace(receipt, checkpoint=checkpoint(through=1))
-    with pytest.raises(ValueError, match="SHA-256"):
-        replace(receipt, inventory_digest="x" * 64)
-    with pytest.raises(ValueError, match="initial origin and checkpoint"):
-        replace(decision, origin=ReviewExecutionOrigin(ReviewExecutionOriginKind.RENEWED, "origin:2"))
-    with pytest.raises(ValueError, match="SHA-256"):
-        replace(decision, source_digest="")
 
 
 def binding(generation=0):
@@ -299,7 +279,7 @@ def test_counters_saturate_at_the_integer_bound_instead_of_wrapping_or_refusing_
     *(ReviewRoundCancelled(reason, f"cancel:{reason.value}") for reason in ReviewCancellationReason),
 ])
 def test_refusal_never_launched_release_and_operator_cancellation_preserve_the_allowance(disposition):
-    session = ReusableReviewSession(RuntimeName.CLAUDE, "retained", ImportedReviewSession("legacy:verified"))
+    session = ReusableReviewSession(RuntimeName.CLAUDE, "retained", RenewedReviewSessionSource("legacy:verified"))
     before = checkpoint(failures=2, pin_deferrals=3, displayed_round=7, session=session)
     result = project_review_execution(before, (ReviewRoundOutcome(round_id(1), disposition),))
     assert result.state == before.state
@@ -334,7 +314,7 @@ def test_gate_and_free_copied_progress_preserve_session_and_displayed_round():
 @pytest.mark.parametrize("runtime", list(RuntimeName))
 @pytest.mark.parametrize("supports_resume,preserves_sandbox", [(True, True), (True, False), (False, True), (False, False)])
 def test_session_reuse_requires_same_runtime_and_sandbox_preserving_resume(runtime, supports_resume, preserves_sandbox):
-    session = ReusableReviewSession(RuntimeName.CLAUDE, "session", ImportedReviewSession("legacy:verified"))
+    session = ReusableReviewSession(RuntimeName.CLAUDE, "session", RenewedReviewSessionSource("legacy:verified"))
     capabilities = replace(RUNTIME_CAPABILITIES[runtime], supports_resume=supports_resume,
                            resume_preserves_sandbox=preserves_sandbox)
     selected = compatible_review_session(session, runtime, capabilities)
@@ -411,7 +391,7 @@ def test_counter_and_watermark_fields_require_bounded_integers(bad):
 def test_external_identifiers_and_receipt_references_are_validated(bad):
     for construct in (lambda: ReviewRoundIdentity(binding(), bad, 1),
                       lambda: ReviewExecutionBinding(binding().rejection, 1, bad),
-                      lambda: ImportedReviewSession(bad), lambda: CopiedReviewProgress(bad),
+                      lambda: RenewedReviewSessionSource(bad), lambda: CopiedReviewProgress(bad),
                       lambda: ReviewPinDeferred(bad), lambda: ReviewAdmissionRefused(bad),
                       lambda: ReviewReservationReleased("reservation", bad)):
         with pytest.raises(ValueError):
@@ -421,7 +401,7 @@ def test_external_identifiers_and_receipt_references_are_validated(bad):
 @pytest.mark.parametrize("marker", ["multi", "github-review", "codex-review"])
 def test_legacy_mode_markers_never_become_reusable_sessions(marker):
     with pytest.raises(ValueError, match="mode markers"):
-        ReusableReviewSession(RuntimeName.CLAUDE, marker, ImportedReviewSession("legacy:verified"))
+        ReusableReviewSession(RuntimeName.CLAUDE, marker, RenewedReviewSessionSource("legacy:verified"))
 
 
 @pytest.mark.parametrize("kind", [ReviewChildKind.GATE, ReviewChildKind.DIMENSION, ReviewChildKind.VALIDATOR])
@@ -441,7 +421,7 @@ def test_session_update_requires_this_rounds_exact_launched_producer():
     same_round_other_run = replace(launched(outcome.round), run_id="unlisted-run")
     with pytest.raises(ValueError, match="this outcome"):
         replace(outcome, session=ClearReviewSession(same_round_other_run))
-    imported = ReusableReviewSession(RuntimeName.CLAUDE, "imported", ImportedReviewSession("legacy:verified"))
+    imported = ReusableReviewSession(RuntimeName.CLAUDE, "imported", RenewedReviewSessionSource("legacy:verified"))
     with pytest.raises(ValueError, match="launched reviewer"):
         ReplaceReviewSession(imported)
 
@@ -493,7 +473,7 @@ def test_outcome_and_projection_validate_launch_and_session_capture_against_thei
         ReviewExecutionState(binding(1), session=session, session_sequence=2)
     with pytest.raises(ValueError, match="future outcome"):
         checkpoint(through=1, session=session, session_sequence=2)
-    imported = ReusableReviewSession(RuntimeName.CLAUDE, "legacy", ImportedReviewSession("legacy:verified"))
+    imported = ReusableReviewSession(RuntimeName.CLAUDE, "legacy", RenewedReviewSessionSource("legacy:verified"))
     with pytest.raises(ValueError, match="precedes"):
         ReviewExecutionState(binding(), session=imported, session_sequence=1)
 
@@ -599,15 +579,6 @@ def test_checkpoint_cannot_cover_unallocated_rounds_or_disagree_with_its_complet
 
 
 @pytest.mark.parametrize("origin", [ReviewExecutionOriginKind.INITIALIZED, ReviewExecutionOriginKind.RENEWED])
-def test_imported_session_can_only_enter_an_imported_execution_origin(origin):
-    session = ReusableReviewSession(RuntimeName.CLAUDE, "legacy:session", ImportedReviewSession("import:session"))
-    accepted = activated(origin=ReviewExecutionOriginKind.IMPORTED, failures=4, pin_deferrals=7, session=session)
-    assert accepted.state.failures == 4 and accepted.state.pin_deferrals == 7 and accepted.state.session == session
-    with pytest.raises(ValueError, match="imported execution origin"):
-        replace(accepted, origin=ReviewExecutionOrigin(origin, "new:origin"))
-
-
-@pytest.mark.parametrize("origin", [ReviewExecutionOriginKind.INITIALIZED, ReviewExecutionOriginKind.RENEWED])
 @pytest.mark.parametrize("field", ["failures", "pin_deferrals"])
 def test_new_execution_origin_cannot_invent_prior_failure_or_pin_history(origin, field):
     with pytest.raises(ValueError, match="fresh execution origin"):
@@ -649,7 +620,7 @@ def test_snapshot_and_family_envelope_require_an_explicit_typed_execution_compon
 def current_execution(**state):
     initial = checkpoint(**state)
     return CurrentReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:verified"),
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.INITIALIZED, "origin:verified"),
         initial, initial.state, 0, 0,
     )
 
@@ -670,7 +641,7 @@ def allocate_pending(execution, count):
      copied(3), productive(4, handle="latest"), failed(5)),
 ])
 def test_generation_local_reduction_matches_full_ordered_oracle_for_every_delivery_order(outcomes):
-    initial = current_execution(failures=3, pin_deferrals=2, policy=ReviewExecutionPolicy(1))
+    initial = current_execution(policy=ReviewExecutionPolicy(1))
     for delivery in permutations(outcomes):
         execution, pending = allocate_pending(initial, len(outcomes))
         delivered = ()
@@ -686,7 +657,7 @@ def test_generation_local_reduction_matches_full_ordered_oracle_for_every_delive
 
 
 def test_generation_local_open_gap_completion_keeps_later_debit_and_session_clear():
-    execution, pending = allocate_pending(current_execution(failures=4), 3)
+    execution, pending = allocate_pending(current_execution(), 3)
     for outcome in (productive(3, clear=True, display=3), failed(2)):
         result = finalize_current_review_round(execution, pending, outcome)
         execution, pending = result.execution, result.pending
@@ -708,7 +679,7 @@ def test_generation_local_open_gap_completion_keeps_later_debit_and_session_clea
 
 
 def test_current_generation_advance_freezes_open_gap_projection_and_releases_suffix_capacity():
-    execution, pending = allocate_pending(current_execution(failures=2), 3)
+    execution, pending = allocate_pending(current_execution(), 3)
     result = finalize_current_review_round(execution, pending, productive(2, handle="cleared", display=7))
     result = finalize_current_review_round(result.execution, result.pending, failed(3))
     old_execution = result.execution
@@ -836,6 +807,5 @@ def test_current_authority_refuses_foreign_baseline_future_watermarks_and_invent
         replace(current, state=replace(current.state, productive_sequence=2), last_sequence=1)
     with pytest.raises(ValueError, match="completed baseline"):
         replace(current, state=replace(current.state, failures=9))
-    imported = current_execution(failures=2)
     with pytest.raises(ValueError, match="fresh execution"):
-        replace(imported, origin=ReviewExecutionOrigin(ReviewExecutionOriginKind.INITIALIZED, "new"))
+        current_execution(failures=2)

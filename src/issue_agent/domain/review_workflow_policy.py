@@ -1400,7 +1400,7 @@ def _request_fixed_review_rearm(
 ) -> WorkflowTransition:
     execution = snapshot.execution
     if not isinstance(execution, CurrentReviewExecution):
-        return _reject(WorkflowRejection.INVALID_SCOPE, "migration-blocked or inactive execution cannot be reset")
+        return _reject(WorkflowRejection.INVALID_SCOPE, "an inactive execution cannot be reset")
     if (command.execution_epoch, command.execution_episode) != (
         execution.binding.execution_epoch, execution.binding.execution_episode,
     ):

@@ -1416,24 +1416,16 @@ def _activate_review_fixture(cfg, gateway=None):
         db.execute("INSERT INTO workflow_authority_epochs VALUES (?, ?, 1, 'fixture', 'fixture', ?)",
                    (cfg.repo, WorkflowFamily.REVIEW_REJECTIONS.value, datetime.now(timezone.utc).isoformat()))
     if gateway is not None:
-        from issue_agent.app.review_execution_activation import (
-            ConfiguredReviewExecutionActivation, ReviewExecutionActivationScope, _observed_scope_sources,
-        )
         from issue_agent.app.review_runtime import configured_review_control
         from issue_agent.app.config import owner_identity_for_target
         from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+        from tests.fakes.workflow_authority import seed_family_epoch
+        with control.transaction() as db:
+            seed_family_epoch(db, cfg.repo, WorkflowFamily.REVIEW_EXECUTION, datetime.now(timezone.utc))
         workflow = configured_review_control(cfg, control, gateway, Store(cfg.review_state_dir),
                                             owner_identity_for_target(cfg.repo, cfg.target_dir, "review"))
         for pr in gateway.build_review_world().prs:
             workflow.ensure_observed_workflow(WorkflowKey(cfg.repo, PullRequestRef(pr.number)))
-        gateway.repo = cfg.repo
-        gateway.get_review_pull_request = gateway.get_pr
-        gateway._gh_json = lambda _: [[{"number": pr.number, "state": "open"}
-                                      for pr in gateway.build_review_world().prs]]
-        scope = ReviewExecutionActivationScope("fixture", cfg, gateway)
-        files, links, sql = _observed_scope_sources(scope, control)
-        activation = ConfiguredReviewExecutionActivation(cfg, control, gateway, Store(cfg.review_state_dir), liveness=lambda: ())
-        activation.activate(activation.plan(files, links, sql), files, links, sql)
     return control
 
 
@@ -1757,8 +1749,6 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
                and a.number == observed.number and a.workflow is not None for a in actions)
     assert runner.tasks == []
     assert not any(call[0] == "review" for call in gateway.calls)
-    assert store.get_infra_deaths(150) == 0
-    assert store.get_infra_deaths(151) == 0
 
 
 

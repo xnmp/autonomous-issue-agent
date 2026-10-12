@@ -13,10 +13,9 @@ from issue_agent.adapters.workflow_rows import (
     WorkflowAuthorityError, load_review_workflow_row,
     persist_workflow_snapshot, read_current_review_pending,
 )
-from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.review_execution import (
-    CurrentReviewExecution, ReviewExecutionCheckpoint, ImportedReviewSession,
-    ReusableReviewSession, NoReviewSession, advance_current_review_generation,
+    CurrentReviewExecution, ReviewExecutionCheckpoint,
+    NoReviewSession, advance_current_review_generation,
 )
 from issue_agent.domain.workflow import WorkflowMutation
 from issue_agent.domain.workflow_identity import WorkflowRevision
@@ -120,24 +119,9 @@ def test_current_retry_requires_the_same_immutable_receipt_contract_as_active_re
             control._write_current_outcome_in_tx(db, facts, before.revision)
 
 
-def test_current_imported_session_requires_its_actual_origin_after_baseline_advances(current_rig):
+def test_current_generation_carry_requires_the_transition_session_clear_and_cutoff(current_rig):
     store, key, control, facts, before = current_rig
-    with store.transaction() as db:
-        control._write_current_outcome_in_tx(db, facts, before.revision)
-        completed = load_review_workflow_row(db, key)
-        invented = ReusableReviewSession(RuntimeName.CLAUDE, "invented-session", ImportedReviewSession("invented-evidence"))
-        state = replace(completed.execution.state, session=invented)
-        invalid = replace(completed.execution, state=state, baseline=replace(completed.execution.baseline, state=state))
-        persist_workflow_snapshot(db, replace(completed, execution=invalid))
-        with pytest.raises(WorkflowAuthorityError, match="verified origin"):
-            load_review_workflow_row(db, key)
-
-
-@pytest.mark.parametrize("session", [NoReviewSession(), ReusableReviewSession(
-    RuntimeName.CLAUDE, "invented-session", ImportedReviewSession("invented-evidence")),
-])
-def test_current_generation_carry_requires_the_transition_session_clear_and_cutoff(current_rig, session):
-    store, key, control, facts, before = current_rig
+    session = NoReviewSession()
     with store.transaction() as db:
         control._write_current_outcome_in_tx(db, facts, before.revision)
         completed = load_review_workflow_row(db, key)

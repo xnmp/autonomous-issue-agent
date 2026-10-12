@@ -20,7 +20,8 @@ from issue_agent.domain.review_preflight import ReviewPreflightSelection
 from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PartialReviews, PullRequestState
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.world import IssueView, PRView
-from tests.adapters.test_control_store import _activate_execution_fixture, _seed_v24_workflow_history, _store
+from tests.adapters.test_control_store import _activate_execution_fixture, _store
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 OWNER = "o/r:review:test"
 
@@ -58,16 +59,15 @@ class Gateway:
 
 
 @pytest.fixture
-def rig(tmp_path):
+def rig(tmp_path, request):
+    """PR 9's live execution; indirect param False drops the covered-patch baseline."""
     store = _store(tmp_path)
-    _seed_v24_workflow_history(store)
-    store.initialize()
-    with store.transaction() as db:
-        snapshot = _activate_execution_fixture(db)
-    assert store.release_dispatch_claim("o/r", "review", -9, "legacy-owner")
+    gateway = Gateway()
+    snapshot = _activate_execution_fixture(store, gateway, baseline=getattr(request, "param", True))
+    install_workflow(store, resolve_snapshot(7))
+    gateway.calls.clear()
     assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
     occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
-    gateway = Gateway()
     selection = ReviewPreflightSelection("preflight:1", snapshot.revision, snapshot.execution.binding, occurrence, -9,
                                         ObservedPullRequest(snapshot.revision.fence.key, gateway.view.head_ref_oid,
                                                             PullRequestState.OPEN, gateway.view.labels, gateway.reviews, store.now()),
@@ -129,7 +129,7 @@ def test_next_preflight_requires_current_aggregate_revision_and_allocates_next_s
     updated = current(store, selection)
     second = control.preflight(replace(stale, expected=updated.revision))
     assert second.round.sequence == 2
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
     assert_unpaid(store)
 
 
@@ -217,6 +217,7 @@ def test_pending_capacity_open_gap_and_reordered_paid_returns_survive_restart(ri
     # isolates adapter refusal, money and recovery without another long history.
     monkeypatch.setattr(review_preflight, 'MAX_EXECUTION_SUFFIX', 2)
     store, initial, gateway, selection, control = rig
+    selection = replace(selection, failure_ceiling=initial.execution.state.failures + 2)
     rounds = []
     children = []
     pending_measurements = []
@@ -430,12 +431,10 @@ def test_claim_replaced_during_gateway_read_cannot_allocate_using_old_occurrence
     assert_unpaid(store)
 
 
-@pytest.mark.parametrize("refusal", ["ceiling", "held_pr", "missing_trigger", "already_reviewed", "retired_owner"])
+@pytest.mark.parametrize("refusal", ["held_pr", "missing_trigger", "already_reviewed", "retired_owner"])
 def test_policy_or_retired_authority_refusal_never_allocates_a_round(rig, refusal):
     store, _, gateway, selection, control = rig
-    if refusal == "ceiling":
-        selection = replace(selection, failure_ceiling=3)
-    elif refusal == "retired_owner":
+    if refusal == "retired_owner":
         with store.transaction() as db:
             db.execute("INSERT INTO retired_owners VALUES (?,?,'o/r','review',?)",
                        (OWNER, "o/r:review:successor", store.now().isoformat()))
@@ -478,64 +477,30 @@ def test_review_opt_out_and_parked_labels_hold_even_when_trigger_remains(rig, la
     assert_unpaid(store)
 
 
-@pytest.mark.parametrize("status", ["executing", "unknown_outcome", "succeeded"])
-def test_unresolved_or_landed_unapplied_submission_prevents_another_preflight(tmp_path, status):
-    from issue_agent.adapters.effects import bound_review_command_id
-    from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
-    from issue_agent.domain.contracts import CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
-    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
-
-    store = _store(tmp_path)
-    _seed_v24_workflow_history(store)
-    store.initialize()
-    with store.transaction() as db:
-        before_activation = load_review_workflow_row(db, WorkflowKey("o/r", PullRequestRef(9)))
-    assert before_activation is not None
-    op = BoundReviewSubmissionOp(9, "APPROVE", "approved", "b" * 40, "review-bot", "c" * 64, None)
-    command_id = bound_review_command_id(op, before_activation.binding)
-    command = LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW, "pr:9", "b" * 40,
-                               op.payload(), repository="o/r", executor_identity=OWNER, workflow=before_activation.binding)
-    store.enqueue_command(command)
-    store.begin_command(command_id)
-    if status != "executing":
-        assert store.record_effect(EffectReceipt(command_id, OWNER, store.now(), store.now(), EffectStatus(status),
-                                                remote_object_id="landed-review" if status == "succeeded" else None,
-                                                error=None if status == "succeeded" else "lost response"))
-    with store.transaction() as db:
-        snapshot = _activate_execution_fixture(db)
-    assert store.release_dispatch_claim("o/r", "review", -9, "legacy-owner")
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
-    occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
-    gateway = Gateway()
-    selection = ReviewPreflightSelection(
-        "preflight:1", snapshot.revision, snapshot.execution.binding, occurrence, -9,
-        ObservedPullRequest(snapshot.revision.fence.key, gateway.view.head_ref_oid,
-                            PullRequestState.OPEN, gateway.view.labels, gateway.reviews, store.now()),
-        Label.AI_PR_OPEN, ReviewMode.SINGLE, RuntimeName.CLAUDE, 5,
-    )
-    control = SQLiteReviewExecutionControl(store, WorkflowWriter("o/r", "review", OWNER), gateway)
-    before = dump(store)
-    with pytest.raises(WorkflowAuthorityError):
-        control.preflight(selection)
-    assert dump(store) == before
-    assert current(store, selection) == snapshot
-
-
 def test_pending_current_generation_release_projection_blocks_preflight(rig):
-    from issue_agent.domain.review_workflow import ReviewProjectionPlan
-    from issue_agent.domain.review_workflow_policy import _relabel, review_release_command_id
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.workflow import WorkflowCommitted
+    from tests.adapters.test_review_productive_settlement import confirmed_escalation
 
-    store, snapshot, _, selection, control = rig
-    command_id = review_release_command_id(selection.expected.fence.key, selection.expected.fence.generation)
-    projection = ReviewProjectionPlan(command_id, Label.NEEDS_HUMAN_REVIEW, Label.AI_PR_OPEN)
-    command = _relabel(snapshot, projection, "workflow:release:2", selection.observation.head_sha,
-                       selection.observation.labels, executor_identity=OWNER)
-    store.enqueue_command(command)
+    store, gateway, selection, control, _, command = confirmed_escalation(rig, cause="ceiling")
+
+    def workflow(ceiling):
+        return SQLiteReviewWorkflowControl(store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway,
+                                           ceiling=ceiling, trigger_label=Label.AI_PR_OPEN,
+                                           rule=CountingRule("review-bot[bot]"))
+
+    assert isinstance(workflow(1).settle_submission(command.command_id), WorkflowCommitted)
+    assert isinstance(workflow(0).reconcile_ceiling(selection.expected.fence.key), WorkflowCommitted)
+    released = current(store, selection)
+    assert released.revision.fence.generation == selection.expected.fence.generation + 1
+    selection = replace(selection, request_id="preflight:after-release", expected=released.revision,
+                        binding=released.execution.binding)
     before = dump(store)
-    with pytest.raises(WorkflowAuthorityError):
+    with pytest.raises(WorkflowAuthorityError, match="unverified release projection"):
         control.preflight(selection)
     assert dump(store) == before
-    assert current(store, selection) == snapshot
+    assert current(store, selection) == released
 
 
 def test_exact_preflight_replay_after_child_stage_planning_is_inert(rig):

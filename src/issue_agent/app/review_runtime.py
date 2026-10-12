@@ -26,7 +26,6 @@ from ..adapters.review_effects import (
 from ..adapters.review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl, read_review_guidance
 from ..domain.review import PostedReview, posted_review
-from ..domain.continuation_components import BlockedPRRepair
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
 from ..domain.actions import AgentKind
@@ -44,7 +43,7 @@ from ..domain.review_dispatch_record import (
 from ..domain.review_evidence import ReviewEvidenceKind
 from ..domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from ..domain.review_execution import (
-    BlockedReviewExecutionMigration, CurrentReviewExecution, ReviewChildIdentity, ReviewChildKind,
+    CurrentReviewExecution, ReviewChildIdentity, ReviewChildKind,
     compatible_review_session,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
@@ -398,12 +397,8 @@ class ActiveReviewRuntime:
             if excluded is None:
                 errors[pr.number] = reason
             return ReviewDeferred(reason)
-        if isinstance(state.pr_repair, BlockedPRRepair):
-            held[pr.number] = "historical_pr_repair_migration_blocked"
-            return ReviewDeferred(held[pr.number])
         if not isinstance(state.execution, CurrentReviewExecution):
-            reason = ("review_execution_migration_blocked" if isinstance(state.execution, BlockedReviewExecutionMigration)
-                      else "review_execution_migration_required")
+            reason = "review_execution_migration_required"
             held[pr.number] = reason
             return ReviewDeferred(reason)
         recovery_hold = self.execution.pending_recovery_hold(key)

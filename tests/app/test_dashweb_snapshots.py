@@ -2383,7 +2383,9 @@ def test_issue_detail_reads_current_execution_allowance_and_ignores_retired_file
     monkeypatch, tmp_path, current_review_rig,
 ):
     from tests.adapters.test_review_execution_control import dump
+    from tests.adapters.test_review_execution_renewal_transactions import exhaust_with_three_settled_returns
 
+    exhaust_with_three_settled_returns(current_review_rig)
     store, _, _, _, _ = current_review_rig
     backend = stub_backend(monkeypatch)
     backend.control_db_path = store.path

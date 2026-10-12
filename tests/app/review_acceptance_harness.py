@@ -228,22 +228,11 @@ class ReviewComposition:
         return current
 
     def activate_execution(self, monkeypatch) -> None:
-        from issue_agent.app.review_execution_activation import (
-            ConfiguredReviewExecutionActivation, ReviewExecutionActivationScope, _observed_scope_sources,
-        )
+        from tests.fakes.workflow_authority import seed_family_epoch
 
+        with self.review.control.transaction() as db:
+            seed_family_epoch(db, REPO, WorkflowFamily.REVIEW_EXECUTION, self.deployment.clock.now())
         self.workflow.ensure_observed_workflow(KEY)
-        remote = self.remote
-        monkeypatch.setattr(remote, "repo", self.cfg.repo, raising=False)
-        monkeypatch.setattr(remote, "get_review_pull_request", remote.get_pr, raising=False)
-        monkeypatch.setattr(remote, "_gh_json", lambda _: [[{"number": pr.number, "state": "open"}
-                             for pr in remote.build_review_world().prs if pr.state == "OPEN"]], raising=False)
-        scope = ReviewExecutionActivationScope("acceptance", self.cfg, remote)
-        files, links, sql = _observed_scope_sources(scope, self.review.control)
-        activation = ConfiguredReviewExecutionActivation(self.cfg, self.review.control, remote,
-                                                         Store(self.cfg.review_state_dir), liveness=lambda: ())
-        plan = activation.plan(files, links, sql)
-        activation.activate(plan, files, links, sql)
 
     def gates(self) -> list:
         return [gate.gate if isinstance(gate, RearmingGate) else gate for gate in self.state().gates]

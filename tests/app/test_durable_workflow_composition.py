@@ -45,8 +45,6 @@ from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from tests.domain.builders import issue, pr
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
-from tests.app.test_continuation_activation_cli import command as continuation_command, stopped
-from tests.app.test_resolve_activation_cli import deployment, dump, run as resolve_command
 
 
 class Crash(BaseException):
@@ -156,94 +154,6 @@ def seed(root: Path, *labels: str) -> None:
     control.initialize()
     from tests.fakes.workflow_authority import with_issue_recovery
     install_workflow(control, with_issue_recovery(resolve_snapshot(7)))
-
-
-def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopped, capsys, tmp_path, monkeypatch):
-    from issue_agent.domain.world import Check, Comment
-    from dataclasses import replace
-    from issue_agent.domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey
-    from tests.fakes.review_workflow import held
-    state, original, _ = stopped
-    for number in (7, 8, 9):
-        (state / f"issue-{number}.resolve-retries").write_text("0")
-    (state / "issue-7.resumes").write_text("1")
-    (state / "issue-7.resumed-at").write_text("2026-10-01T00:00:00Z")
-    (state / "issue-7.ci-retries").write_text("2")
-    (state / "issue-7.stall-sig").write_text('{"sig":"old-observation","since":"2026-10-01T00:00:00Z"}')
-    (state / "issue-8.resumes").write_text("unknown")
-    install_workflow(original, replace(held(key=WorkflowKey("o/r", PullRequestRef(90))), gates=()))
-    (state / "pr-90.ci-rerun-head").write_text("copy-head")
-    code, primary, error = resolve_command(capsys, "shadow")
-    assert code == 0, error
-    code, _, error = resolve_command(capsys, "activate", "--confirm-plan-digest", primary["plan"]["plan_digest"])
-    assert code == 0, error
-    (state / "issue-9.resolve-retries").unlink()
-    before = dump(original)
-    files = {path.name: path.read_bytes() for path in state.iterdir()}
-    code, shadow, error = continuation_command(capsys, "fix", "shadow")
-    assert code == 0, error
-    assert {(target["family"], target["number"], target["eligible"]) for target in shadow["targets"]} == {
-        ("issue_recovery", 7, True), ("issue_recovery", 8, False), ("issue_recovery", 9, True), ("pr_repair", 90, True)}
-    copy = tmp_path / "configured-cutover"
-    code, rehearsal, error = continuation_command(capsys, "fix", "rehearse", "--copy-to", str(copy))
-    assert code == 0 and all(rehearsal["checks"].values()), error
-    copied_control = copy / "issue-agent-control" / Path(original.path).name
-    copied_state = next(path.parent for path in (copy / "state").glob("*/issue-7.resumes"))
-    remote = PersistentGitHub(copy / "github.db")
-    reply = "2026-10-02T00:00:00Z"
-    remote.seed(issue(7, "ai-blocked", updated_at=reply,
-                      comments=(Comment("human", "Use the local destination.", reply),)))
-    remote.seed(issue(8, "ai-ready"))
-    remote.seed(issue(10, "ai-ready"))
-    returned = False
-    def provider_returned():
-        nonlocal returned
-        returned = True
-    def crash_after_capture(point):
-        if returned and point == "read":
-            raise Crash("copied paid return before remote followup")
-    first = compose(copy, control_path=copied_control, state_dir=copied_state,
-                    fault=crash_after_capture, provider=Provider(provider_returned,
-                    AgentResult(False, status="blocked", needs="Which local directory?", session_id="copied-session", cost_usd=.25)))
-    try:
-        first.daemon.tick()
-    except Crash:
-        pass
-    else:
-        pytest.fail(repr((first.dispatched, first.log)))
-    assert len(first.provider.tasks) == 1
-    selected = first.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
-    assert (selected.component.state.consumed_reply_at, selected.component.state.resumes,
-            selected.component.state.ci_failures) == (reply, 2, 2)
-    restarted = compose(copy, control_path=copied_control, state_dir=copied_state)
-    assert len(restarted.workflow.pending_returns()) == 1
-    restarted.daemon.tick()
-    assert restarted.workflow.pending_returns() == ()
-    assert restarted.remote.get_issue(7).has(Label.AI_BLOCKED)
-    assert any("Which local directory?" in comment.body for comment in restarted.remote.get_issue(7).comments)
-    for number in (7, 8, 10):
-        (copied_state / f"issue-{number}.resumes").write_text("0")
-        (copied_state / f"issue-{number}.resumed-at").write_text("")
-    restarted.daemon.tick()
-    assert restarted.provider.tasks == []
-    assert restarted.remote.get_issue(8).has(Label.AI_READY)
-    assert restarted.remote.get_issue(10).has(Label.AI_READY)
-    remote.seed(issue(9, "ai-pr-open", updated_at=reply))
-    remote.seed_pr(pr(90, "ai-pr-open", head_ref_oid="copy-head", closing_issue=9,
-                      checks=(Check("tests", bucket="fail"),)))
-    monkeypatch.setattr(accounting_runtime, "_fix_publication_context", lambda _role, cwd:
-        accounting_runtime._FixPublicationContext(str(Path(cwd).resolve()), "fix/90-x", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin"))
-    blocked = compose(copy, control_path=copied_control, state_dir=copied_state,
-                      provider=Provider(result=AgentResult(False, status="blocked", needs="Publication denied",
-                      structured={"blocker": "publication"}, session_id="copied-ci-session", cost_usd=.25)))
-    blocked.daemon.tick()
-    assert len(blocked.provider.tasks) == 1
-    assert blocked.remote.get_pr(90).has(Label.AI_BLOCKED)
-    with sqlite3.connect(copied_control) as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 2
-        assert db.execute("SELECT amount_micros FROM charges").fetchall() == [(250_000,), (250_000,)]
-    assert dump(original) == before
-    assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
 
 def fail_at(point: str):

@@ -1284,33 +1284,6 @@ def test_storage_write_faults_fail_paid_admission_closed(
     assert message in result.detail
 
 
-def test_abandoned_run_counts_come_from_control_state_not_telemetry(tmp_path):
-    store = _store(tmp_path)
-    request = dataclasses.replace(
-        _request(1),
-        dispatch_id=json.dumps({"breaker_key": 42}),
-        kind="RESOLVE",
-        owner_id="o/r:fix",
-    )
-    assert store.reserve(request).admitted
-    store.register_lease(
-        Lease(
-            request.run_id,
-            request.dispatch_id,
-            "o/r:fix:999",
-            999,
-            999,
-            NOW,
-        )
-    )
-
-    assert store.reclaim_dead_leases(lambda _pid, _start: False) == (
-        request.run_id,
-    )
-    assert store.release(request.run_id, "spend_unknown").disposition.value == "available"
-    assert store.abandoned_dispatch_counts("o/r:fix") == {42: 1}
-
-
 def test_shutdown_intent_preserves_active_spend_for_recovery(tmp_path):
     store = _store(tmp_path)
     request = dataclasses.replace(
@@ -2555,15 +2528,14 @@ def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
 
 def _seed_v24_workflow_history(store):
     from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.domain.review_workflow import ImportedBaseline, ReviewEpisode, ReviewedBaseline
+    from issue_agent.domain.review_workflow import FreshReviewRequired, ReviewEpisode
     from issue_agent.domain.workflow import ResolveEpisode
     from issue_agent.domain.workflow_identity import FamilyAuthority, WorkflowFamily
 
     resolve = encode_workflow((FamilyAuthority(WorkflowFamily.RESOLVE, 2),
                                ResolveEpisode("resolve:legacy", 4, "prior failure", "resolve guidance")))
     review = encode_workflow((FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 3),
-                              ReviewEpisode("review:legacy", "review guidance\nexact", ReviewedBaseline(
-                                  "a" * 40, "c" * 64, 2, ImportedBaseline("import:review")))))
+                              ReviewEpisode("review:legacy", "review guidance\nexact", FreshReviewRequired(2))))
     with closing(sqlite3.connect(store.path)) as db, db:
         _historical_fixture(db, 24)
         for family, epoch in (("resolve", 2), ("review_rejections", 3)):
@@ -2705,62 +2677,55 @@ def test_v25_inactive_review_cannot_load_with_retained_execution_authority(tmp_p
         assert tuple(db.iterdump()) == before
 
 
-def _activate_legacy_execution_fixture(db):
-    from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.adapters.workflow_rows import (
-        insert_imported_review_execution_origin, load_legacy_review_workflow_row,
-    )
-    from issue_agent.domain.review_execution import (
-        ActivatedReviewExecution, ImportedReviewExecutionDecision,
-        ImportedReviewExecutionOriginReceipt, ReviewExecutionBinding,
-        ReviewExecutionCheckpoint, ReviewExecutionOrigin, ReviewExecutionOriginKind,
-        ReviewExecutionPolicy, ReviewExecutionState,
-    )
-    from issue_agent.domain.review_workflow import ReviewFamilyEpisodes
-    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
+class _ExecutionGateway:
+    """PR 9 open with no reviews: the read its first observation records."""
+
+    def get_pr(self, number, *, mergeability=False, checks=False):
+        from issue_agent.domain.labels import Label
+        from tests.domain.builders import observed_pr
+        return observed_pr(number, head_ref_oid="b" * 40, labels=frozenset({Label.AI_PR_OPEN}))
+
+    def pull_request_reviews(self, number):
+        from issue_agent.domain.review_workflow import CompleteReviews
+        return CompleteReviews(())
+
+
+def _activate_execution_fixture(store, gateway=None, *, execution=True, baseline=False):
+    """PR 9's current execution, minted by its live first observation."""
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+    from issue_agent.domain.review_workflow import BoundReviewSubmission, ReviewedBaseline
+    from issue_agent.domain.labels import Label
+    from issue_agent.domain.review_execution import CurrentReviewExecution
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey, WorkflowWriter
+    from tests.fakes.workflow_authority import seed_family_epoch
 
     key = WorkflowKey("o/r", PullRequestRef(9))
-    prior = load_legacy_review_workflow_row(db, key)
-    assert prior is not None
-    state = ReviewExecutionState(ReviewExecutionBinding(prior.binding, 5, "execution:legacy"), failures=3, pin_deferrals=2)
-    execution = ActivatedReviewExecution(ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "import:execution"),
-                                         ReviewExecutionCheckpoint(0, state, ReviewExecutionPolicy(1)), state, 0)
-    snapshot = dataclasses.replace(prior, execution=execution)
-    db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
-               (encode_workflow(ReviewFamilyEpisodes(prior.authority, prior.episode, execution)),))
-    source_digest = hashlib.sha256(b"fixture:execution:sources").hexdigest()
-    inventory_digest = hashlib.sha256(b"fixture:execution:inventory").hexdigest()
-    plan_digest = hashlib.sha256(b"fixture:execution:plan").hexdigest()
-    import_json = encode_workflow(ImportedReviewExecutionDecision(
-        execution.origin, execution.checkpoint, plan_digest, source_digest,
-    ))
-    db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_execution',5,?,?,?)",
-               (source_digest, inventory_digest, NOW.isoformat()))
-    db.execute("INSERT INTO workflow_activation_evidence VALUES ('o/r','review_execution',5,0,?)",
-               (plan_digest,))
-    db.execute("INSERT INTO workflow_components VALUES ('o/r','pr',9,'review_execution',5,'execution:legacy')")
-    db.execute("INSERT INTO workflow_activation_imports VALUES ('o/r','review_execution',5,'pr',9,?,?)",
-               (source_digest, import_json))
-    insert_imported_review_execution_origin(
-        db, "o/r", ImportedReviewExecutionOriginReceipt(
-            execution.origin, execution.checkpoint, plan_digest, source_digest,
-            inventory_digest, hashlib.sha256(import_json.encode()).hexdigest(),
-        ), claimed_at=NOW,
+    with store.transaction() as db:
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',3,'source','inventory',?)",
+                   (NOW.isoformat(),))
+        if execution:
+            seed_family_epoch(db, "o/r", WorkflowFamily.REVIEW_EXECUTION, NOW, epoch=5)
+    control = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", "o/r:review:test"), gateway=gateway or _ExecutionGateway(),
+        ceiling=3, trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot"),
     )
-    assert load_legacy_review_workflow_row(db, key) == snapshot
-    return snapshot
-
-
-def _activate_execution_fixture(db):
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
-    from issue_agent.domain.review_execution import CurrentReviewExecution
-
-    legacy = _activate_legacy_execution_fixture(db)
-    current = dataclasses.replace(legacy, execution=CurrentReviewExecution(
-        legacy.execution.origin, legacy.execution.checkpoint, legacy.execution.state, 0, 0,
-    ))
-    persist_workflow_snapshot(db, current)
-    assert load_review_workflow_row(db, current.revision.fence.key) == current
+    committed = control.ensure_observed_workflow(key)
+    with store.transaction() as db:
+        current = load_review_workflow_row(db, key)
+    assert current == committed.snapshot and isinstance(current.execution, CurrentReviewExecution) is execution
+    if not baseline:
+        return current
+    # Stands in for a prior same-generation round whose landed review of a*40
+    # covered patch c*64, so copied submissions are reachable. The round and
+    # command rows are omitted: paths that read the selected verdict refuse.
+    current = dataclasses.replace(current, episode=dataclasses.replace(current.episode, continuation=ReviewedBaseline(
+        "a" * 40, "c" * 64, current.revision.fence.generation,
+        BoundReviewSubmission(CommandId("review-submission:prior-round"), current.binding))))
+    with store.transaction() as db:
+        persist_workflow_snapshot(db, current)
+        assert load_review_workflow_row(db, key) == current
     return current
 
 
@@ -2770,14 +2735,11 @@ def test_v25_active_execution_requires_matching_canonical_index_and_activation(t
     from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
 
     store = _store(tmp_path)
-    _seed_v24_workflow_history(store)
-    store.initialize()
+    original = _activate_execution_fixture(store)
     with store.transaction() as db:
-        original = _activate_execution_fixture(db)
         if corruption in {"missing_index", "missing_index_and_activation"}:
             db.execute("DELETE FROM workflow_components WHERE family='review_execution'")
         if corruption in {"missing_activation", "missing_index_and_activation"}:
-            db.execute("DELETE FROM workflow_activation_imports WHERE family='review_execution'")
             db.execute("DELETE FROM workflow_activation_evidence WHERE family='review_execution'")
             db.execute("DELETE FROM workflow_authority_epochs WHERE family='review_execution'")
         if corruption == "index_epoch":
@@ -2791,97 +2753,6 @@ def test_v25_active_execution_requires_matching_canonical_index_and_activation(t
         before = tuple(db.iterdump())
         with pytest.raises(WorkflowAuthorityError):
             load_review_workflow_row(db, original.revision.fence.key)
-        assert tuple(db.iterdump()) == before
-
-
-@pytest.mark.parametrize("corruption", (
-    "missing_origin", "changed_origin", "oversized_origin", "aliased_origin", "aliased_activation",
-    "aliased_activation_epoch",
-    "malformed_claim", "different_claim", "changed_plan", "changed_import",
-    "forged_decision", "missing_import", "foreign_episode",
-))
-def test_active_execution_requires_exact_imported_origin_sources(tmp_path, corruption):
-    from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
-    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
-    from issue_agent.domain.review_execution import (
-        ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
-    )
-
-    store = _store(tmp_path)
-    _seed_v24_workflow_history(store)
-    store.initialize()
-    with store.transaction() as db:
-        snapshot = _activate_execution_fixture(db)
-        if corruption == "missing_origin":
-            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-origin'")
-        elif corruption == "changed_origin":
-            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-execution-origin'")
-        elif corruption == "oversized_origin":
-            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-origin'",
-                       ("x" * 262145,))
-        elif corruption == "aliased_origin":
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                       "SELECT CAST(namespace AS BLOB),scope,key,claimed_at,payload_json FROM dedupe_keys "
-                       "WHERE namespace='review-execution-origin'")
-        elif corruption == "aliased_activation":
-            db.execute("INSERT INTO workflow_authority_epochs "
-                       "SELECT CAST(repository AS BLOB),family,epoch,source_digest,inventory_digest,activated_at "
-                       "FROM workflow_authority_epochs WHERE family='review_execution'")
-        elif corruption == "aliased_activation_epoch":
-            db.execute("INSERT INTO workflow_activation_evidence "
-                       "SELECT repository,family,CAST(epoch AS BLOB),ceiling,plan_digest "
-                       "FROM workflow_activation_evidence WHERE family='review_execution'")
-        elif corruption == "malformed_claim":
-            db.execute("UPDATE dedupe_keys SET claimed_at='invalid' WHERE namespace='review-execution-origin'")
-        elif corruption == "different_claim":
-            db.execute("UPDATE dedupe_keys SET claimed_at=? WHERE namespace='review-execution-origin'",
-                       ((NOW + timedelta(seconds=1)).isoformat(),))
-        elif corruption == "changed_plan":
-            db.execute("UPDATE workflow_activation_evidence SET plan_digest=? WHERE family='review_execution'",
-                       ("f" * 64,))
-        elif corruption == "changed_import":
-            db.execute("UPDATE workflow_activation_imports SET decision_json='{}' WHERE family='review_execution'")
-        elif corruption == "forged_decision":
-            raw = db.execute("SELECT decision_json FROM workflow_activation_imports "
-                             "WHERE family='review_execution'").fetchone()["decision_json"]
-            decision = decode_workflow(raw, ImportedReviewExecutionDecision)
-            changed_decision = dataclasses.replace(
-                decision, checkpoint=dataclasses.replace(
-                    decision.checkpoint, state=dataclasses.replace(
-                        decision.checkpoint.state, failures=decision.checkpoint.state.failures + 1,
-                    ),
-                ),
-            )
-            forged_json = encode_workflow(changed_decision)
-            db.execute("UPDATE workflow_activation_imports SET decision_json=? "
-                       "WHERE family='review_execution'", (forged_json,))
-            receipt_row = db.execute("SELECT payload_json FROM dedupe_keys "
-                                     "WHERE namespace='review-execution-origin'").fetchone()
-            receipt = decode_workflow(receipt_row["payload_json"], ImportedReviewExecutionOriginReceipt)
-            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-origin'",
-                       (encode_workflow(dataclasses.replace(
-                           receipt, import_decision_digest=hashlib.sha256(forged_json.encode()).hexdigest(),
-                       )),))
-        elif corruption == "missing_import":
-            db.execute("DELETE FROM workflow_activation_imports WHERE family='review_execution'")
-        else:
-            source = db.execute("SELECT payload_json FROM dedupe_keys "
-                                "WHERE namespace='review-execution-origin'").fetchone()
-            receipt = decode_workflow(source["payload_json"], ImportedReviewExecutionOriginReceipt)
-            initial = receipt.checkpoint.state
-            foreign = dataclasses.replace(
-                initial.binding, execution_episode="execution:foreign",
-            )
-            changed = dataclasses.replace(
-                receipt, checkpoint=dataclasses.replace(
-                    receipt.checkpoint, state=dataclasses.replace(initial, binding=foreign),
-                ),
-            )
-            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-origin'",
-                       (encode_workflow(changed),))
-        before = tuple(db.iterdump())
-        with pytest.raises(WorkflowAuthorityError, match="origin"):
-            load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before
 
 

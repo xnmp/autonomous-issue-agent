@@ -23,8 +23,6 @@ from ..domain.review_execution import (
     CopiedReviewProgress,
     ExecutionNotActivated,
     PaidReviewProgress,
-    ImportedReviewExecutionDecision,
-    ImportedReviewExecutionOriginReceipt,
     InitializedReviewExecutionOriginReceipt,
     RenewedReviewExecutionOriginReceipt,
     initialized_review_execution,
@@ -33,14 +31,13 @@ from ..domain.review_execution import (
     ReviewExecutionOriginKind,
     ReviewRoundOutcome,
     same_execution_episode,
-    CurrentReviewExecution, BlockedReviewExecutionMigration,
+    CurrentReviewExecution,
     OpenReviewExecutionRound,
     CompletedReviewExecutionRound,
     PendingReviewExecutionRound,
     review_generation_receipt_id,
     reduce_current_review_execution,
 )
-from ..domain.review_execution_activation import MAX_LEGACY_SQL_TEXT_BYTES
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
     ReviewSealedParentAbandoned,
@@ -419,9 +416,6 @@ def initialize_new_continuations(db: sqlite3.Connection, snapshot: AnyWorkflowSn
         authority = load_family_authority(db, family, key.repository)
         if authority is None:
             return None
-        if db.execute("SELECT 1 FROM workflow_activation_imports WHERE repository=? AND family=? AND target_kind=? AND target_number=?",
-                      (key.repository, family.value, *workflow_scope(key)[1:])).fetchone():
-            raise WorkflowAuthorityError("historical continuation decision cannot initialize fresh state")
         evidence = db.execute("SELECT plan_digest FROM workflow_activation_evidence WHERE repository=? AND family=? AND epoch=? "
                               "AND typeof(plan_digest)='text' AND length(CAST(plan_digest AS BLOB))=64",
                               (key.repository, family.value, authority.epoch)).fetchone()
@@ -431,8 +425,6 @@ def initialize_new_continuations(db: sqlite3.Connection, snapshot: AnyWorkflowSn
         episode = "fresh:" + hashlib.sha256(encode_workflow((snapshot.revision.fence, authority, evidence[0])).encode()).hexdigest()
         return ContinuationComponentIdentity(key, authority, episode)
     if isinstance(snapshot, ReviewWorkflowSnapshot):
-        from .continuation_activation import retain_deferred_pr_repair
-        snapshot = retain_deferred_pr_repair(db, snapshot)
         if isinstance(snapshot.pr_repair, cc.InactivePRRepair):
             selected = identity(WorkflowFamily.PR_REPAIR)
             if selected:
@@ -494,7 +486,6 @@ def load_family_authority(db: sqlite3.Connection, family: WorkflowFamily, reposi
         retained = (
             db.execute("SELECT 1 FROM workflow_components WHERE repository=? AND family=? LIMIT 1", (repository, family.value)).fetchone()
             or (db.execute("SELECT 1 FROM review_execution_rounds WHERE repository=? LIMIT 1", (repository,)).fetchone() if family is WorkflowFamily.REVIEW_EXECUTION else None)
-            or db.execute("SELECT 1 FROM workflow_activation_imports WHERE repository=? AND family=? LIMIT 1", (repository, family.value)).fetchone()
         )
     else:
         retained = (
@@ -542,8 +533,7 @@ def _row_or_absence(db: sqlite3.Connection, key: WorkflowKey, family: WorkflowFa
             or db.execute("SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? LIMIT 1",
                           workflow_run_scope_bounds(key)).fetchone()
         )
-        imported = db.execute("SELECT 1 FROM workflow_activation_imports WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
-        if retained is not None or imported is not None:
+        if retained is not None:
             raise WorkflowAuthorityError("workflow is missing despite retained target authority")
     return activation, row
 
@@ -576,23 +566,6 @@ def _latest_intent_row(db: sqlite3.Connection, scope: tuple[str, str, int]) -> s
 def _check_intent_index(intent_row: sqlite3.Row, intent: RearmIntent | ReviewRearmIntent, states: dict[type, str]) -> None:
     if intent_row["request_id"] != intent.request_id or intent_row["gate_id"] != intent.gate_id or intent_row["to_generation"] != intent.to_generation or intent_row["state"] != states[type(intent)]:
         raise WorkflowEncodingError("rearm index disagrees with its validated payload")
-
-
-def insert_imported_review_execution_origin(
-    db: sqlite3.Connection, repository: str, receipt: ImportedReviewExecutionOriginReceipt,
-    *, claimed_at: datetime,
-) -> None:
-    """Publish an imported origin in the transaction that publishes its component."""
-    if (not isinstance(receipt, ImportedReviewExecutionOriginReceipt)
-            or receipt.checkpoint.state.binding.rejection.fence.key.repository != repository
-            or not isinstance(claimed_at, datetime) or claimed_at.tzinfo is None
-            or claimed_at.utcoffset() is None):
-        raise ValueError("imported origin requires matching typed activation evidence")
-    db.execute(
-        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-        (REVIEW_EXECUTION_ORIGIN_NAMESPACE, repository, receipt.origin.evidence_id,
-         claimed_at.isoformat(), encode_workflow(receipt)),
-    )
 
 
 def insert_initialized_review_execution_origin(
@@ -633,57 +606,9 @@ def _unique_text_identity_rowid(
     return rows[0]["rowid"]
 
 
-def load_review_execution_import_decision(
-    db: sqlite3.Connection, key: WorkflowKey,
-) -> ImportedReviewExecutionDecision | BlockedReviewExecutionMigration | None:
-    """Read one retained target decision under its exact active execution epoch."""
-    scope = workflow_scope(key)
-    family = WorkflowFamily.REVIEW_EXECUTION
-    row = db.execute(
-        "SELECT CASE WHEN typeof(epoch)='integer' THEN epoch END AS epoch,"
-        "CASE WHEN typeof(source_digest)='text' AND length(CAST(source_digest AS BLOB))=64 "
-        "THEN source_digest END AS source_digest,typeof(decision_json) AS payload_type,"
-        "length(CAST(decision_json AS BLOB)) AS payload_bytes FROM workflow_activation_imports "
-        "WHERE repository IN (?,CAST(? AS BLOB)) AND target_kind IN (?,CAST(? AS BLOB)) "
-        "AND target_number IN (?,CAST(? AS BLOB)) AND family IN (?,CAST(? AS BLOB)) LIMIT 2",
-        (scope[0], scope[0], scope[1], scope[1], scope[2], scope[2], family.value, family.value),
-    ).fetchone()
-    if row is None:
-        return None
-    authority = load_family_authority(db, family, key.repository)
-    if (authority is None or row["epoch"] != authority.epoch or row["payload_type"] != "text"
-            or type(row["payload_bytes"]) is not int or not 0 < row["payload_bytes"] <= MAX_WORKFLOW_PAYLOAD_BYTES):
-        raise WorkflowAuthorityError("review execution target decision is absent, malformed or stale")
-    rowid = _unique_text_identity_rowid(
-        db, "workflow_activation_imports", (("repository", key.repository), ("family", family.value),
-                                           ("target_kind", scope[1])),
-        (("epoch", authority.epoch), ("target_number", scope[2])), source="review migration decision",
-    )
-    payload = db.execute("SELECT decision_json FROM workflow_activation_imports WHERE rowid=?", (rowid,)).fetchone()[0]
-    decision = decode_workflow(payload, ImportedReviewExecutionDecision | BlockedReviewExecutionMigration)
-    activation = db.execute(
-        "SELECT CASE WHEN typeof(source_digest)='text' AND length(CAST(source_digest AS BLOB))=64 "
-        "THEN source_digest END AS source_digest FROM workflow_authority_epochs WHERE repository=? AND family=? AND epoch=?",
-        (key.repository, family.value, authority.epoch),
-    ).fetchone()
-    evidence = db.execute(
-        "SELECT CASE WHEN typeof(plan_digest)='text' AND length(CAST(plan_digest AS BLOB))=64 "
-        "THEN plan_digest END AS plan_digest FROM workflow_activation_evidence WHERE repository=? AND family=? AND epoch=?",
-        (key.repository, family.value, authority.epoch),
-    ).fetchone()
-    target_key = decision.key if isinstance(decision, BlockedReviewExecutionMigration) else decision.checkpoint.state.binding.rejection.fence.key
-    epoch = decision.authority.epoch if isinstance(decision, BlockedReviewExecutionMigration) else decision.checkpoint.state.binding.execution_epoch
-    if (target_key != key or epoch != authority.epoch or encode_workflow(decision) != payload
-            or activation is None or evidence is None or decision.source_digest != row["source_digest"]
-            or decision.source_digest != activation["source_digest"]
-            or decision.activation_plan_digest != evidence["plan_digest"]):
-        raise WorkflowAuthorityError("review execution target decision conflicts with its activation")
-    return decision
-
-
 def _read_execution_origin(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
-) -> tuple[ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt | RenewedReviewExecutionOriginReceipt, datetime]:
+) -> tuple[InitializedReviewExecutionOriginReceipt | RenewedReviewExecutionOriginReceipt, datetime]:
     origin_id = execution.origin.evidence_id
     origin_rowid = _unique_text_identity_rowid(
         db, "dedupe_keys", (("namespace", REVIEW_EXECUTION_ORIGIN_NAMESPACE),
@@ -712,9 +637,7 @@ def _read_execution_origin(
         claimed = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
         if claimed.tzinfo is None or claimed.utcoffset() is None:
             raise ValueError("origin claim has no timezone")
-        receipt_type = (ImportedReviewExecutionOriginReceipt
-                        if execution.origin.kind is ReviewExecutionOriginKind.IMPORTED
-                        else InitializedReviewExecutionOriginReceipt
+        receipt_type = (InitializedReviewExecutionOriginReceipt
                         if execution.origin.kind is ReviewExecutionOriginKind.INITIALIZED
                         else RenewedReviewExecutionOriginReceipt
                         if execution.origin.kind is ReviewExecutionOriginKind.RENEWED else None)
@@ -836,14 +759,6 @@ def _check_initialized_execution_origin(
             raise ValueError("activation source or time is malformed")
     except (TypeError, ValueError, AttributeError) as exc:
         raise WorkflowAuthorityError("initialized execution origin activation is unreadable") from exc
-    import_rows = db.execute(
-        "SELECT rowid FROM workflow_activation_imports WHERE repository IN (?,CAST(? AS BLOB)) "
-        "AND family IN (?,CAST(? AS BLOB)) AND target_kind IN (?,CAST(? AS BLOB)) "
-        "AND target_number IN (?,CAST(? AS BLOB)) LIMIT 1",
-        (scope[0], scope[0], family, family, scope[1], scope[1], scope[2], scope[2]),
-    ).fetchone()
-    if import_rows is not None:
-        raise WorkflowAuthorityError("initialized execution origin conflicts with an import")
     observation_rowid = _unique_text_identity_rowid(
         db, "workflow_evidence", (("evidence_id", captured.observation_evidence_id),),
     )
@@ -871,70 +786,6 @@ def _check_initialized_execution_origin(
             raise ValueError("observation does not prove fresh first discovery")
     except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("initialized execution origin observation is unreadable") from exc
-
-
-def _check_imported_execution_origin(
-    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
-    captured: ImportedReviewExecutionOriginReceipt, claimed: datetime,
-) -> None:
-    family = WorkflowFamily.REVIEW_EXECUTION.value
-    activation_rowid = _unique_text_identity_rowid(
-        db, "workflow_authority_epochs", (("repository", scope[0]), ("family", family)),
-    )
-    evidence_rowid = _unique_text_identity_rowid(
-        db, "workflow_activation_evidence", (("repository", scope[0]), ("family", family)),
-        (("epoch", execution.binding.execution_epoch),),
-    )
-    import_rowid = _unique_text_identity_rowid(
-        db, "workflow_activation_imports",
-        (("repository", scope[0]), ("family", family), ("target_kind", scope[1])),
-        (("target_number", scope[2]),),
-    )
-    activation = db.execute(
-        "SELECT epoch,source_digest,inventory_digest,activated_at FROM workflow_authority_epochs "
-        "WHERE rowid=? AND repository=? AND family=? AND length(CAST(source_digest AS BLOB))<=64 "
-        "AND length(CAST(inventory_digest AS BLOB))<=64 "
-        "AND length(CAST(activated_at AS BLOB))<=64",
-        (activation_rowid, scope[0], family),
-    ).fetchone()
-    evidence = db.execute(
-        "SELECT plan_digest FROM workflow_activation_evidence "
-        "WHERE rowid=? AND repository=? AND family=? AND epoch=?",
-        (evidence_rowid, scope[0], family, execution.binding.execution_epoch),
-    ).fetchone()
-    imported = db.execute(
-        "SELECT epoch,source_digest,decision_json FROM workflow_activation_imports "
-        "WHERE rowid=? AND repository=? AND family=? AND target_kind=? AND target_number=? "
-        "AND length(CAST(source_digest AS BLOB))<=64 "
-        "AND length(CAST(decision_json AS BLOB))<=?",
-        (import_rowid, scope[0], family, scope[1], scope[2], MAX_WORKFLOW_PAYLOAD_BYTES),
-    ).fetchone()
-    if activation is None or evidence is None or imported is None:
-        raise WorkflowAuthorityError("review execution origin lost its activation or import source")
-    try:
-        activated = datetime.fromisoformat(activation["activated_at"].replace("Z", "+00:00"))
-        decision = decode_workflow(imported["decision_json"], ImportedReviewExecutionDecision)
-        if (activated.tzinfo is None or activated.utcoffset() is None
-                or encode_workflow(decision) != imported["decision_json"]):
-            raise ValueError("origin activation decision or time is not canonical")
-    except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
-        raise WorkflowAuthorityError("review execution origin activation decision is unreadable") from exc
-    if (claimed != activated
-            or type(activation["epoch"]) is not int
-            or activation["epoch"] != execution.binding.execution_epoch
-            or activation["source_digest"] != captured.source_digest
-            or activation["inventory_digest"] != captured.inventory_digest
-            or evidence["plan_digest"] != captured.activation_plan_digest
-            or imported["epoch"] != execution.binding.execution_epoch
-            or imported["source_digest"] != captured.source_digest
-            or type(imported["decision_json"]) is not str
-            or decision.origin != captured.origin
-            or decision.checkpoint != captured.checkpoint
-            or decision.activation_plan_digest != captured.activation_plan_digest
-            or decision.source_digest != captured.source_digest
-            or hashlib.sha256(imported["decision_json"].encode()).hexdigest()
-            != captured.import_decision_digest):
-        raise WorkflowAuthorityError("review execution origin lost its activation or import source")
 
 
 def _check_active_round_source_budget(
@@ -984,7 +835,7 @@ def _check_active_round_source_budget(
                 or type(row["largest_json"]) is not int
                 or row["largest_json"] > MAX_WORKFLOW_PAYLOAD_BYTES
                 or type(row["largest_identity"]) is not int
-                or row["largest_identity"] > MAX_LEGACY_SQL_TEXT_BYTES
+                or row["largest_identity"] > 65536
                 or source_bytes + size > max_source_bytes):
             raise WorkflowAuthorityError("review execution round index exceeds its source byte bound")
         source_bytes += size
@@ -1000,9 +851,6 @@ def _require_secondary_component(db: sqlite3.Connection, key: WorkflowKey, compo
         if component.identity.key != key or component.identity.authority != authority:
             raise WorkflowAuthorityError("continuation activation disagrees with its component")
         _require_component_index(db, workflow_scope(key), authority, component.identity.episode_id)
-    elif isinstance(component, (cc.BlockedIssueRecovery, cc.BlockedPRRepair)):
-        if component.key != key or component.authority != authority or indexed is not None:
-            raise WorkflowAuthorityError("blocked continuation disagrees with its activation")
     elif indexed is not None:
         raise WorkflowAuthorityError("activated continuation lacks its exact component payload")
 
@@ -1074,19 +922,6 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
         raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc
 
 
-def load_legacy_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
-    """Stopped conversion and retired-mechanism tests; never new-work admission."""
-    from .sql_read_budget import BudgetedSqlConnection, SqlReadBudgetExceeded, bounded_sql_source_reads
-
-    if isinstance(db, BudgetedSqlConnection) and db.in_transaction and sqlite3.sqlite_version_info >= (3, 43, 0):
-        try:
-            with bounded_sql_source_reads(db, 2**27):
-                return _load_review_workflow_row(db, key)
-        except SqlReadBudgetExceeded as exc:
-            raise WorkflowAuthorityError(str(exc)) from exc
-    return _load_review_workflow_row(db, key)
-
-
 def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
     """Canonical current authority; legacy components remain explicitly held."""
     from .sql_read_budget import SqlReadBudgetExceeded, bounded_sql_source_reads
@@ -1096,59 +931,6 @@ def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Review
             return _load_review_workflow_row(db, key, current_state=True)
     except SqlReadBudgetExceeded as exc:
         raise WorkflowAuthorityError(str(exc)) from exc
-
-
-def convert_legacy_review_execution(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot:
-    """Stopped operator conversion of a single bounded component without ancestry."""
-    from .control_store import SQLiteControlStore
-
-    with SQLiteControlStore.mutation_savepoint(db):
-        return _convert_legacy_review_execution(db, key)
-
-
-def _convert_legacy_review_execution(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot:
-    if not db.in_transaction:
-        raise WorkflowAuthorityError("execution conversion requires the stopped acceptance transaction")
-    try:
-        current = load_review_workflow_row(db, key)
-    except ReviewExecutionHeld as held:
-        current = held.snapshot
-    if current is None or isinstance(current.execution, ExecutionNotActivated):
-        raise WorkflowAuthorityError("execution conversion requires an activated component")
-    if isinstance(current.execution, CurrentReviewExecution):
-        return current
-    prior = current.execution
-    if (prior.boundaries or prior.checkpoint.boundary_cursor is not None
-            or prior.checkpoint_receipt is not None or prior.checkpoint.through_sequence != 0
-            or prior.last_sequence > MAX_EXECUTION_SUFFIX):
-        raise WorkflowAuthorityError("prior execution ancestry is unsupported; its data remains held")
-    for statement in (
-        "SELECT 1 FROM dispatch_claims WHERE repository=? LIMIT 1",
-        "SELECT 1 FROM budget_reservations WHERE state='active' "
-        "AND (repository=? OR workload_repository=? OR repository='*' AND workload_repository='*') LIMIT 1",
-        "SELECT 1 FROM lifecycle_commands WHERE repository=? "
-        "AND state NOT IN ('succeeded','permanent_failure') LIMIT 1",
-        "SELECT 1 FROM runs r LEFT JOIN budget_reservations b ON b.run_id=r.run_id "
-        "WHERE (r.state IN ('reserved','starting','running') "
-        "OR EXISTS (SELECT 1 FROM leases l WHERE l.run_id=r.run_id)) "
-        "AND (b.repository=? OR b.workload_repository=? OR b.run_id IS NULL "
-        "OR b.repository='*' AND b.workload_repository='*') LIMIT 1",
-    ):
-        parameters = (key.repository,) * statement.count("?")
-        if db.execute(statement, parameters).fetchone() is not None:
-            raise WorkflowAuthorityError("execution conversion requires quiescent claims, money and commands")
-    # Verification is stopped and capped to one initial generation. Runtime
-    # admission never invokes this historical reader or trusts its fallback.
-    verified = load_legacy_review_workflow_row(db, key)
-    if verified != current:
-        raise WorkflowAuthorityError("prior execution changed during stopped conversion")
-    converted = replace(current, execution=CurrentReviewExecution(
-        prior.origin, prior.checkpoint, prior.state, 0, prior.last_sequence,
-    ))
-    persist_workflow_snapshot(db, converted)
-    if load_review_workflow_row(db, key) != converted:
-        raise WorkflowAuthorityError("converted execution failed current readback")
-    return converted
 
 
 def read_current_review_pending(
@@ -1457,9 +1239,7 @@ def _check_current_execution(
     )
 
     origin, claimed = _read_execution_origin(db, scope, execution)
-    if isinstance(origin, ImportedReviewExecutionOriginReceipt):
-        _check_imported_execution_origin(db, scope, execution, origin, claimed)
-    elif isinstance(origin, RenewedReviewExecutionOriginReceipt):
+    if isinstance(origin, RenewedReviewExecutionOriginReceipt):
         _check_renewed_execution_origin(db, scope, origin)
     else:
         _check_initialized_execution_origin(db, scope, execution, origin, claimed)
@@ -1563,12 +1343,6 @@ def _load_review_workflow_row(
             _require_component_index(
                 db, scope, execution_authority, execution.binding.execution_episode,
             )
-        elif isinstance(execution, BlockedReviewExecutionMigration):
-            if (execution.authority != execution_authority
-                    or load_review_execution_import_decision(db, key) != execution
-                    or db.execute("SELECT 1 FROM workflow_components WHERE repository=? AND target_kind=? "
-                                  "AND target_number=? AND family=?", (*scope, WorkflowFamily.REVIEW_EXECUTION.value)).fetchone() is not None):
-                raise WorkflowEncodingError("blocked migration lost its exact retained decision")
         elif execution_authority is not None:
             raise WorkflowEncodingError("activated review execution component is absent")
         elif db.execute(
@@ -1653,8 +1427,6 @@ def require_review_binding(
     db: sqlite3.Connection, binding: WorkflowBinding, *, allow_gated: bool = False,
 ) -> ReviewWorkflowSnapshot:
     snapshot = load_review_workflow_row(db, binding.fence.key)
-    if isinstance(snapshot.execution if snapshot is not None else None, BlockedReviewExecutionMigration) and not allow_gated:
-        raise WorkflowAuthorityError("review execution migration is blocked")
     return _require_current(snapshot, binding, allow_gated=allow_gated)
 
 

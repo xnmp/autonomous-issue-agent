@@ -234,7 +234,7 @@ class SQLiteWorkflowControl:
                 snapshot = load_issue_aggregate(db, key)
                 if isinstance(snapshot, IssueWorkflowShell):
                     return (WorkflowMigrationRequired(key) if snapshot.revision.fence.generation != 0
-                            or isinstance(snapshot.issue_recovery, cc.BlockedIssueRecovery) else WorkflowAbsent(key))
+                            else WorkflowAbsent(key))
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
@@ -326,7 +326,7 @@ class SQLiteWorkflowControl:
             from ..domain.workflow import IssueWorkflowShell
             from .workflow_rows import encode_workflow_episodes, initialize_new_continuations
             if isinstance(prior, IssueWorkflowShell):
-                if prior.revision.fence.generation != 0 or isinstance(prior.issue_recovery, cc.BlockedIssueRecovery):
+                if prior.revision.fence.generation != 0:
                     raise WorkflowAuthorityError("historical issue migration hold prevents primary discovery")
                 snapshot = replace(snapshot, revision=replace(prior.revision, version=prior.revision.version + 1),
                                    issue_recovery=prior.issue_recovery)

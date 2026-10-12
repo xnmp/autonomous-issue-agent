@@ -210,19 +210,7 @@ class SettledCIRemediation:
             raise ValueError("settled CI remediation requires its exact verified terminal receipt")
 
 
-@dataclass(frozen=True)
-class ImportedCIRemediation:
-    head: str
-    decided_at: str
-    import_identity: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.head, "imported CI remediation head")
-        _timestamp(self.decided_at, "imported CI cancellation decision")
-        validate_workflow_identifier(self.import_identity, "CI remediation import identity")
-
-
-CIRemediation = OwedCIRemediation | SettledCIRemediation | ImportedCIRemediation
+CIRemediation = OwedCIRemediation | SettledCIRemediation
 
 
 @dataclass(frozen=True)
@@ -313,28 +301,6 @@ class SettledPRRecoveryEffect:
 
 
 @dataclass(frozen=True)
-class ImportedBranchRefresh:
-    head: str
-    base: str
-    import_identity: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.head, "imported branch refresh head")
-        validate_workflow_text(self.base, "imported branch refresh base", empty=True)
-        validate_workflow_identifier(self.import_identity, "branch refresh import identity")
-
-
-@dataclass(frozen=True)
-class ImportedPendingCIEscalation:
-    head: str
-    import_identity: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.head, "imported pending CI head")
-        validate_workflow_identifier(self.import_identity, "pending CI import identity")
-
-
-@dataclass(frozen=True)
 class PRRepairState:
     consumed_reply_at: str = ""
     branch: str = ""
@@ -348,8 +314,8 @@ class PRRepairState:
     blank_reply: PRBlankReplySource | None = field(default=None, repr=False)
     ci_rerun: CIRemediation | None = field(default=None, repr=False)
     ci_cancel: CIRemediation | None = field(default=None, repr=False)
-    branch_refresh: OwedPRRecoveryEffect | SettledPRRecoveryEffect | ImportedBranchRefresh | None = field(default=None, repr=False)
-    pending_ci_escalation: OwedPRRecoveryEffect | SettledPRRecoveryEffect | ImportedPendingCIEscalation | None = field(default=None, repr=False)
+    branch_refresh: OwedPRRecoveryEffect | SettledPRRecoveryEffect | None = field(default=None, repr=False)
+    pending_ci_escalation: OwedPRRecoveryEffect | SettledPRRecoveryEffect | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed PR reply")
@@ -358,11 +324,11 @@ class PRRepairState:
             raise ValueError("PR repair continuity requires a typed session")
         validate_workflow_integer(self.resumes, "repair resumes")
         for remediation in (self.ci_rerun, self.ci_cancel):
-            if remediation is not None and not isinstance(remediation, (OwedCIRemediation, SettledCIRemediation, ImportedCIRemediation)):
+            if remediation is not None and not isinstance(remediation, (OwedCIRemediation, SettledCIRemediation)):
                 raise ValueError("CI remediation requires fixed typed provenance")
-        for remedy, captured, imported in ((self.branch_refresh, BranchRefreshCapture, ImportedBranchRefresh),
-                                           (self.pending_ci_escalation, (PendingCIEscalationCapture, PublicationIdentityEscalationCapture), ImportedPendingCIEscalation)):
-            if remedy is None or isinstance(remedy, imported):
+        for remedy, captured in ((self.branch_refresh, BranchRefreshCapture),
+                                 (self.pending_ci_escalation, (PendingCIEscalationCapture, PublicationIdentityEscalationCapture))):
+            if remedy is None:
                 continue
             owed = remedy.owed if isinstance(remedy, SettledPRRecoveryEffect) else remedy
             if not isinstance(owed, OwedPRRecoveryEffect) or not isinstance(owed.capture, captured):
@@ -399,26 +365,6 @@ class PRRepairCleanup:
         validate_workflow_identifier(self.head, "retired PR head")
 
 
-@dataclass(frozen=True)
-class ContinuationImportBlocker:
-    source: str
-    reason: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.source, "continuation import source")
-        validate_workflow_text(self.reason, "continuation import blocker")
-
-
-def _blocked(key: WorkflowKey, authority: FamilyAuthority, family: WorkflowFamily,
-             decision_id: str, blockers: tuple[ContinuationImportBlocker, ...]) -> None:
-    from .workflow_identity import family_owns_target
-    if not isinstance(key, WorkflowKey) or not isinstance(authority, FamilyAuthority) or authority.family is not family or not family_owns_target(family, key.target):
-        raise ValueError("blocked continuation must name its exact target and family authority")
-    validate_workflow_identifier(decision_id, "continuation migration decision")
-    if not isinstance(blockers, tuple) or not 1 <= len(blockers) <= MAX_WORKFLOW_GATES or any(not isinstance(x, ContinuationImportBlocker) for x in blockers):
-        raise ValueError("blocked continuation requires bounded source-specific blockers")
-
-
 def _active(identity: ContinuationComponentIdentity, family: WorkflowFamily, state: object, state_type: type,
             watermarks: ContinuationWatermarks, gates: tuple[UnresolvedGate, ...]) -> None:
     from .workflow import OpenGate, RearmingGate
@@ -434,17 +380,6 @@ def _active(identity: ContinuationComponentIdentity, family: WorkflowFamily, sta
 @dataclass(frozen=True)
 class InactiveIssueRecovery:
     pass
-
-
-@dataclass(frozen=True)
-class BlockedIssueRecovery:
-    key: WorkflowKey
-    authority: FamilyAuthority
-    decision_id: str
-    blockers: tuple[ContinuationImportBlocker, ...]
-
-    def __post_init__(self) -> None:
-        _blocked(self.key, self.authority, WorkflowFamily.ISSUE_RECOVERY, self.decision_id, self.blockers)
 
 
 @dataclass(frozen=True)
@@ -467,17 +402,6 @@ class ActiveIssueRecovery:
 @dataclass(frozen=True)
 class InactivePRRepair:
     pass
-
-
-@dataclass(frozen=True)
-class BlockedPRRepair:
-    key: WorkflowKey
-    authority: FamilyAuthority
-    decision_id: str
-    blockers: tuple[ContinuationImportBlocker, ...]
-
-    def __post_init__(self) -> None:
-        _blocked(self.key, self.authority, WorkflowFamily.PR_REPAIR, self.decision_id, self.blockers)
 
 
 @dataclass(frozen=True)
@@ -504,21 +428,19 @@ class ActivePRRepair:
                 raise ValueError("repair session disagrees with applied component provenance")
 
 
-IssueRecoveryComponent = InactiveIssueRecovery | BlockedIssueRecovery | ActiveIssueRecovery
-PRRepairComponent = InactivePRRepair | BlockedPRRepair | ActivePRRepair
+IssueRecoveryComponent = InactiveIssueRecovery | ActiveIssueRecovery
+PRRepairComponent = InactivePRRepair | ActivePRRepair
 
 def validate_component_revision(component: object, revision: WorkflowRevision, family: WorkflowFamily) -> None:
     types: tuple[type, ...]
     if family is WorkflowFamily.ISSUE_RECOVERY:
-        types = (InactiveIssueRecovery, BlockedIssueRecovery, ActiveIssueRecovery)
+        types = (InactiveIssueRecovery, ActiveIssueRecovery)
     elif family is WorkflowFamily.PR_REPAIR:
-        types = (InactivePRRepair, BlockedPRRepair, ActivePRRepair)
+        types = (InactivePRRepair, ActivePRRepair)
     else:
         raise ValueError("continuation family must be one of the fixed components")
     if not isinstance(revision, WorkflowRevision) or not isinstance(component, types):
         raise ValueError("aggregate requires its fixed typed continuation component")
-    if isinstance(component, (BlockedIssueRecovery, BlockedPRRepair)) and component.key != revision.fence.key:
-        raise ValueError("blocked component belongs to a different target")
     if isinstance(component, (ActiveIssueRecovery, ActivePRRepair)) and (
         component.identity.key != revision.fence.key
         or component.watermarks.last_admitted > revision.version
@@ -581,8 +503,8 @@ class SelectedPRRepair:
         return self.component.identity.bind(self.revision.fence)
 
 
-IssueRecoverySelection = InactiveIssueRecovery | BlockedIssueRecovery | SelectedIssueRecovery
-PRRepairSelection = InactivePRRepair | BlockedPRRepair | SelectedPRRepair
+IssueRecoverySelection = InactiveIssueRecovery | SelectedIssueRecovery
+PRRepairSelection = InactivePRRepair | SelectedPRRepair
 
 def select_issue_recovery(aggregate) -> IssueRecoverySelection:
     from .workflow import IssueWorkflowShell, WorkflowSnapshot

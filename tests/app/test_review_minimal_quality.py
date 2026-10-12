@@ -1,10 +1,7 @@
 """Review verdicts, required CI and retirement of local execution evidence."""
 
 from dataclasses import replace
-import json
-from pathlib import Path
 import sqlite3
-import subprocess
 
 import pytest
 
@@ -15,10 +12,9 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.world import Check
 from issue_agent.domain.workflow import EvidenceUnavailable, NoAuthorizedRemediation, OpenGate
-from issue_agent.app.config import deployment_identity_for_target
 from tests.app.resolve_acceptance_harness import ScriptedProvider
 from tests.app.review_acceptance_harness import (
-    NHR, PR, ReviewDeployment, compose_review, create_review_deployment, install_clock, isolate_authority, verdicts,
+    NHR, PR, compose_review, create_review_deployment, install_clock, isolate_authority, verdicts,
 )
 from tests.adapters.test_control_store import _historical_fixture
 
@@ -104,66 +100,3 @@ def test_legacy_receipts_and_execution_hold_are_discarded_before_next_tick(deplo
     restarted.tick()
     assert restarted.bot_reviews()[-1].state == "APPROVED"
     assert len(restarted.provider.tasks) == 1
-
-
-@pytest.fixture
-def interrupted_schema41(tmp_path, monkeypatch):
-    """A schema-41 deployment captured from origin/dev 8251a37.
-
-    Its APPROVE command carries the retired `test_evidence_ref`; the reply was
-    lost after GitHub published the review, leaving it `unknown_outcome`.
-    """
-    fixtures = Path(__file__).parents[1] / "fixtures" / "review_cutover"
-    metadata = json.loads((fixtures / "interrupted-approval.json").read_text())
-    target = tmp_path / "target"
-    subprocess.run(["git", "clone", "--quiet", str(fixtures / "interrupted-approval.bundle"), str(target)], check=True)
-    result = ReviewDeployment(tmp_path, target, metadata["base"], tuple(metadata["heads"]))
-    isolate_authority(result, monkeypatch)
-    install_clock(result, monkeypatch)
-    from issue_agent.adapters.control_store import SQLiteControlStore
-    SQLiteControlStore(result.control_path, now=result.clock.now).initialize()
-    result.github()
-    sql = (fixtures / "interrupted-approval.control.sql").read_text()
-    # Deployment identities hash the checkout path, so the captured owner
-    # stays in this deployment's lineage only under the same rewrite.
-    captured, restored = Path(metadata["root"]) / "target", target
-    for role in ("fix", "review", "steward"):
-        sql = sql.replace(deployment_identity_for_target("o/r", str(captured), role),
-                          deployment_identity_for_target("o/r", str(restored), role))
-    with sqlite3.connect(result.control_path) as db:
-        _historical_fixture(db, 41)
-        db.executescript(sql.replace(metadata["root"], str(tmp_path)))
-        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 41
-    with sqlite3.connect(result.github_path) as db:
-        db.execute("DELETE FROM clock")
-        db.executescript((fixtures / "interrupted-approval.github.sql").read_text())
-    (tmp_path / "clock-offset").write_text("60")
-    return result
-
-
-@pytest.mark.parametrize("posted", [False, True])
-def test_interrupted_schema41_submission_is_retired_and_next_tick_reviews(interrupted_schema41, posted):
-    """GitHub stays authority: the forgotten approval's head is reviewed afresh.
-
-    A published approval is not reconciled through the retired payload, so it
-    is posted again on the same head; an unpublished one is posted once.
-    """
-    deployment = interrupted_schema41
-    with sqlite3.connect(deployment.control_path) as db:
-        (payload,) = db.execute("SELECT payload_json FROM lifecycle_commands WHERE kind='submit_review'").fetchone()
-        assert "test_evidence_ref" in json.loads(payload)
-    if not posted:
-        with sqlite3.connect(deployment.github_path) as db:
-            db.execute("DELETE FROM reviews")
-    restarted = compose_review(deployment, provider=ScriptedProvider(verdicts("APPROVE", "APPROVE")))
-    restarted.boot()
-    restarted.tick(3)
-    assert len(restarted.provider.tasks) == 1
-    head = restarted.remote.get_pr(PR).head_ref_oid
-    assert [(r.state, r.commit_id) for r in restarted.bot_reviews()] == [("APPROVED", head)] * (2 if posted else 1)
-    with sqlite3.connect(deployment.control_path) as db:
-        assert db.execute("SELECT count(*) FROM lifecycle_commands WHERE kind='submit_review' "
-                          "AND state<>'succeeded'").fetchone() == (0,)
-        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert not any(marker in line for line in restarted.log for marker in (
-        "SubmissionUnresolved", "invalid workflow authority", "could not be recovered"))

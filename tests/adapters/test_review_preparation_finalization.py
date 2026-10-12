@@ -137,7 +137,7 @@ def test_gate_write_failure_rolls_back_closure_projection_and_preparation_receip
         control.finalize_completed_round(child.round.round_id)
 
     assert dump(store) == before
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
 
 
 def test_preparation_requires_a_bounded_reconciliation_reader(stopped_round):
@@ -149,7 +149,7 @@ def test_preparation_requires_a_bounded_reconciliation_reader(stopped_round):
         uncomposed.finalize_completed_round(child.round.round_id)
 
     assert dump(store) == before
-    assert current(store, selection).execution.state.failures == 3
+    assert current(store, selection).execution.state.failures == 0
 
 
 def test_preparation_refuses_controller_without_a_local_reader(stopped_round):

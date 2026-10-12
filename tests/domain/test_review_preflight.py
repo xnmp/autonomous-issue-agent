@@ -34,7 +34,7 @@ def active():
     binding = ReviewExecutionBinding(WorkflowBinding(revision.fence, authority, episode.episode_id), 1, "execution:1")
     state = ReviewExecutionState(binding)
     execution = CurrentReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:1"),
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.INITIALIZED, "origin:1"),
         ReviewExecutionCheckpoint(0, state), state, 0, 0,
     )
     snapshot = ReviewWorkflowSnapshot(revision, authority, episode, execution=execution)
@@ -49,7 +49,8 @@ def exhausted(snapshot, selection):
     state = replace(snapshot.execution.state, failures=5)
     from issue_agent.domain.review_execution import CurrentReviewExecution
     assert isinstance(snapshot.execution, CurrentReviewExecution)
-    execution = replace(snapshot.execution, baseline=replace(snapshot.execution.baseline, state=state), state=state)
+    execution = replace(snapshot.execution, baseline=replace(snapshot.execution.baseline, through_sequence=1, state=state),
+                        state=state, last_sequence=1)
     return replace(snapshot, execution=execution), selection
 
 
@@ -69,14 +70,16 @@ def test_preflight_allocates_one_unpaid_round_from_current_snapshot():
                                             (RuntimeName.GLM, ReviewSessionReuse.FRESH),
                                             (RuntimeName.CODEX, ReviewSessionReuse.FRESH)])
 def test_current_session_reuse_requires_same_runtime_and_preserved_sandbox(runtime, expected):
-    from issue_agent.domain.review_execution import ImportedReviewSession, ReusableReviewSession
+    from issue_agent.domain.review_execution import RenewedReviewSessionSource, ReusableReviewSession
 
     snapshot, selection = active()
-    state = replace(snapshot.execution.state,
-                    session=ReusableReviewSession(RuntimeName.CLAUDE, "old-compatible-session", ImportedReviewSession("import:verified")))
+    origin = ReviewExecutionOrigin(ReviewExecutionOriginKind.RENEWED, "origin:renewed")
+    state = replace(snapshot.execution.state, session=ReusableReviewSession(
+        RuntimeName.CLAUDE, "old-compatible-session", RenewedReviewSessionSource(origin.evidence_id)))
     from issue_agent.domain.review_execution import CurrentReviewExecution
     assert isinstance(snapshot.execution, CurrentReviewExecution)
-    execution = replace(snapshot.execution, baseline=replace(snapshot.execution.baseline, state=state), state=state)
+    execution = replace(snapshot.execution, origin=origin,
+                        baseline=replace(snapshot.execution.baseline, state=state), state=state)
     snapshot = replace(snapshot, execution=execution)
     plan = plan_review_preflight(snapshot, replace(selection, runtime=runtime), now=NOW)
     assert plan.session_reuse is expected
@@ -102,27 +105,3 @@ def test_preflight_refuses_invalid_claim_identity_and_inactive_execution():
         replace(selection, claim_target=-10)
     with pytest.raises(ValueError, match="activation"):
         plan_review_preflight(replace(snapshot, execution=ExecutionNotActivated()), selection, now=NOW)
-
-
-def test_preflight_distinguishes_blocked_migration_from_missing_activation():
-    from issue_agent.domain.review_execution_migration import (
-        BlockedReviewExecutionMigration, ReviewImportBlocker, ReviewImportBlockerKind,
-        ReviewImportHistoryBlocked, ReviewImportSource,
-    )
-    snapshot, selection = active()
-    key = snapshot.revision.fence.key
-    blocked = BlockedReviewExecutionMigration(key, FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, 2),
-        ReviewImportHistoryBlocked(key.target.number, (ReviewImportBlocker(ReviewImportBlockerKind.ORIGIN,
-            (ReviewImportSource("round", "retained-round", "a" * 64),)),)), "b" * 64, "c" * 64)
-    with pytest.raises(ValueError, match="migration is blocked"):
-        plan_review_preflight(replace(snapshot, execution=blocked), selection, now=NOW)
-
-
-def test_historical_pr_repair_hold_refuses_review_despite_current_execution():
-    from issue_agent.domain.continuation_components import BlockedPRRepair, ContinuationImportBlocker
-
-    snapshot, selection = active()
-    blocked = BlockedPRRepair(KEY, FamilyAuthority(WorkflowFamily.PR_REPAIR, 1), "historical-import",
-                              (ContinuationImportBlocker("run:old", "unverified repair chronology"),))
-    with pytest.raises(ValueError, match="historical PR repair migration is blocked"):
-        plan_review_preflight(replace(snapshot, pr_repair=blocked), selection, now=NOW)

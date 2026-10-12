@@ -10,7 +10,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import (
     MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, BoundReviewSubmission, CancelledReviewRearm, CompleteReviews,
     CompletedReviewRearm, CountedReview, DismissCountedReview, EnsureReviewProjection, FreshReviewRequired,
-    ImportedBaseline, ObservedPullRequest, PartialReviews, PendingReviewRearm, PullRequestAbsent, PullRequestState,
+    ObservedPullRequest, PartialReviews, PendingReviewRearm, PullRequestAbsent, PullRequestState,
     PullRequestUnavailable, RequireFreshReview, ReviewEpisode, ReviewProjectionPlan, ReviewRearmPreflight,
     ReviewRejectionCeiling,
     ReviewWorkflowSnapshot, ReviewedBaseline, SubmittedReviewFact, SubmittedReviewState, SupersededReviewRearm,
@@ -189,14 +189,12 @@ def test_bound_submission_requires_a_review_family_binding():
         BoundReviewSubmission(CommandId("submit:1"), resolve_binding)
     with pytest.raises(ValueError):
         BoundReviewSubmission(CommandId(""), review_binding())
-    with pytest.raises(ValueError):
-        ImportedBaseline("")
 
 
 @pytest.mark.parametrize("head, patch", [("", PATCH), ("A" * 40, PATCH), (HEAD, "a" * 40), (HEAD, "C" * 64), (HEAD, "")])
 def test_reviewed_baseline_requires_full_head_and_patch_digests(head, patch):
     with pytest.raises(ValueError):
-        ReviewedBaseline(head, patch, 1, ImportedBaseline("import:1"))
+        ReviewedBaseline(head, patch, 1, baseline(1).source)
 
 
 def test_bound_review_cannot_establish_another_generations_baseline():
@@ -204,7 +202,7 @@ def test_bound_review_cannot_establish_another_generations_baseline():
         ReviewedBaseline(HEAD, PATCH, 2, BoundReviewSubmission(CommandId("submit:1"), review_binding(1)))
     with pytest.raises(ValueError, match="typed provenance"):
         ReviewedBaseline(HEAD, PATCH, 1, "import:1")  # type: ignore[arg-type]
-    assert ReviewedBaseline(HEAD, PATCH, 5, ImportedBaseline("import:1")).reviewed_generation == 5
+    assert ReviewedBaseline(HEAD, PATCH, 5, baseline(5).source).reviewed_generation == 5
 
 
 def test_review_episode_bounds_guidance_and_owns_its_baseline():
@@ -376,8 +374,6 @@ def test_reviewed_baseline_belongs_only_to_the_current_generation():
     assert state.episode.continuation.reviewed_generation == 1
     with pytest.raises(ValueError, match="current generation"):
         ReviewWorkflowSnapshot(revision(2, 2), REVIEW, ReviewEpisode(EPISODE, "", baseline(1)))
-    with pytest.raises(ValueError, match="current generation"):
-        ReviewWorkflowSnapshot(revision(2, 2), REVIEW, ReviewEpisode(EPISODE, "", ReviewedBaseline(HEAD, PATCH, 1, ImportedBaseline("i"))))
     with pytest.raises(ValueError, match="future generation"):
         ReviewWorkflowSnapshot(revision(1, 1), REVIEW, ReviewEpisode(EPISODE, "", FreshReviewRequired(2)))
 
@@ -506,7 +502,6 @@ def test_record_review_establishes_a_bound_baseline_of_the_current_generation():
 
 
 @pytest.mark.parametrize("changes, match", [
-    ({"source": ImportedBaseline("import:1")}, "bound baseline"),
     ({"audit": ObservedTransition(("other-evidence",))}, "bound submission evidence"),
     ({"audit": authorized(CancelRearm("c", revision(1, 1), "r", "why"))}, "bound submission evidence"),
 ])
@@ -815,12 +810,12 @@ def test_pending_review_rearm_requires_a_ceiling_or_an_earlier_stopped_decision(
         replace(pending(), gates=(RearmingGate(own, "request:1"),))
 
 
-IMPORTED = ReviewedBaseline(HEAD, PATCH, 0, ImportedBaseline("import:1"))
+BOUND_BASELINE = baseline(0)
 
 
 @pytest.mark.parametrize("mutation, prior, after, audit", [
     (WorkflowMutation.OPEN_GATE, ReviewWorkflowSnapshot(revision(0, 0), REVIEW, ReviewEpisode(EPISODE)),
-     ReviewWorkflowSnapshot(revision(0, 1), REVIEW, ReviewEpisode(EPISODE, "", IMPORTED), (ceiling_gate(),)),
+     ReviewWorkflowSnapshot(revision(0, 1), REVIEW, ReviewEpisode(EPISODE, "", BOUND_BASELINE), (ceiling_gate(),)),
      ObservedTransition(("ceiling:1",))),
     (WorkflowMutation.RECONCILE_REARM, pending(),
      replace(completed(), episode=ReviewEpisode(EPISODE, "fix the flaky test", baseline(1))),
@@ -839,12 +834,6 @@ def test_only_a_recorded_review_or_accepted_rearm_changes_the_continuation(mutat
         return
     with pytest.raises(ValueError, match="only a recorded review, an accepted rearm or a ceiling release"):
         WorkflowChanged(prior.revision, mutation, after, audit, prior=prior)
-
-
-def test_imported_baseline_survives_only_by_preservation():
-    prior = ReviewWorkflowSnapshot(revision(0, 0), REVIEW, ReviewEpisode(EPISODE, "", IMPORTED))
-    after = replace(prior, revision=revision(0, 1), gates=(ceiling_gate(),))
-    assert WorkflowChanged(prior.revision, WorkflowMutation.OPEN_GATE, after, ObservedTransition(("x",)), prior=prior)
 
 
 @pytest.mark.parametrize("remove, add", [

@@ -21,6 +21,8 @@ from issue_agent.domain.workflow_identity import WorkflowWriter
 from tests.adapters.test_review_execution_control import OWNER, current, dump, rig  # noqa: F401
 
 ACTOR = OperatorActor("operator:test", "test")
+# Renewal selects the baseline's verdict, so it cannot run over the stand-in baseline.
+without_baseline = pytest.mark.parametrize("rig", [False], indirect=True)
 
 
 def test_repeated_public_control_polling_does_not_initialize_clear_or_rearm_execution(rig):
@@ -55,7 +57,12 @@ def renewal_request(rig, request_id="renew:1"):
     )
 
 
-def exhaust_with_three_settled_returns(rig):
+def _counts(store, *tables):
+    with store.transaction() as db:
+        return tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables)
+
+
+def exhaust_with_three_settled_returns(rig, label="later", first=1):
     from issue_agent.domain.actions import AgentKind
     from issue_agent.domain.outcome import AgentResult, ExitReason
     from tests.adapters.test_review_execution_admission import request
@@ -69,12 +76,12 @@ def exhaust_with_three_settled_returns(rig):
             assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
         occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
         snapshot = current(store, selection)
-        round = execution.preflight(replace(selection, request_id=f"later:failure:{index}",
+        round = execution.preflight(replace(selection, request_id=f"{label}:failure:{index}",
             expected=snapshot.revision, binding=snapshot.execution.binding, claim_occurrence_id=occurrence,
             observation=replace(selection.observation, observed_at=store.now()), failure_ceiling=3))
         child_stage = stage(round)
         execution.register_stage(round.round.round_id, current(store, selection).revision, child_stage)
-        paid = request(child_stage.children[0], index=index + 1)
+        paid = request(child_stage.children[0], index=index + first)
         assert store.reserve(paid).admitted
         register(store, paid)
         execution.seal_completed_planning(round.round.round_id, current(store, selection).revision)
@@ -84,8 +91,12 @@ def exhaust_with_three_settled_returns(rig):
         assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
 
 
+@without_baseline
 def test_public_renewal_resets_only_execution_and_exact_retry_is_sql_only_after_restart(rig):
-    store, before, gateway, selection, _ = rig
+    store, _, gateway, selection, _ = rig
+    exhaust_with_three_settled_returns(rig)
+    before = current(store, selection)
+    counts = _counts(store, "lifecycle_commands", "budget_reservations", "runs")
     command = renewal_request(rig)
     result = workflow_control(rig).request_rearm(command, ACTOR)
     assert isinstance(result, WorkflowCommitted) and not result.idempotent
@@ -97,10 +108,8 @@ def test_public_renewal_resets_only_execution_and_exact_retry_is_sql_only_after_
     assert after.execution.binding.execution_episode != before.execution.binding.execution_episode
     assert after.execution.state.displayed_round == before.execution.state.displayed_round
     assert after.intent.authorized == after.intent.dismissals == ()
-    with store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM lifecycle_commands").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert _counts(store, "lifecycle_commands", "budget_reservations", "runs") == (
+        counts[0] + 1, counts[1], counts[2])
     saved = dump(store)
     gateway.calls.clear()
     assert workflow_control(rig).request_rearm(command, ACTOR) == WorkflowCommitted(after, idempotent=True)
@@ -110,8 +119,10 @@ def test_public_renewal_resets_only_execution_and_exact_retry_is_sql_only_after_
     assert current(store, selection) == after and dump(store) == saved
 
 
+@without_baseline
 def test_current_renewal_read_does_not_traverse_the_previous_origin(rig):
     store, before, _, selection, _ = rig
+    exhaust_with_three_settled_returns(rig)
     result = workflow_control(rig).request_rearm(renewal_request(rig), ACTOR)
     assert isinstance(result, WorkflowCommitted)
     with store.transaction() as db:
@@ -120,9 +131,11 @@ def test_current_renewal_read_does_not_traverse_the_previous_origin(rig):
     assert current(store, selection) == result.snapshot
 
 
+@without_baseline
 @pytest.mark.parametrize("source", ["origin", "request"])
 def test_current_renewal_refuses_a_missing_selected_origin_or_request(rig, source):
     store, _, _, selection, _ = rig
+    exhaust_with_three_settled_returns(rig)
     command = renewal_request(rig)
     result = workflow_control(rig).request_rearm(command, ACTOR)
     assert isinstance(result, WorkflowCommitted)
@@ -278,6 +291,7 @@ def test_unknown_selected_verdict_returns_typed_refusal_without_writes(rig):
     assert dump(store) == saved
 
 
+@without_baseline
 @pytest.mark.parametrize("cancel_continue", [False, True])
 def test_lost_projection_reply_restart_and_continue_never_renew_twice(rig, tmp_path, cancel_continue):
     from issue_agent.adapters.effects import GitHubEffectExecutor
@@ -288,6 +302,8 @@ def test_lost_projection_reply_restart_and_continue_never_renew_twice(rig, tmp_p
     from tests.adapters.test_review_workflow_control import raising
 
     store, _, gateway, selection, _ = rig
+    exhaust_with_three_settled_returns(rig)
+    reservations = _counts(store, "budget_reservations")
     clock = [store.now()]
     store._now = lambda: clock[0]
     lost = {"relabel_pr_applied"}
@@ -350,9 +366,9 @@ def test_lost_projection_reply_restart_and_continue_never_renew_twice(rig, tmp_p
     assert remote.get_pr(9).labels == frozenset({Label.AI_PR_OPEN})
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-origin'").fetchone()[0] == 2
-        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0
+    assert _counts(store, "budget_reservations") == reservations
     if not cancel_continue:
-        exhaust_with_three_settled_returns(rig)
+        exhaust_with_three_settled_returns(rig, "renewed", first=4)
         exhausted = current(store, selection)
         assert exhausted.execution.state.failures == 3
         next_grant = control().request_rearm(renewal_request(rig, "renew:later-exhaustion"), ACTOR)
@@ -361,11 +377,15 @@ def test_lost_projection_reply_restart_and_continue_never_renew_twice(rig, tmp_p
         assert next_grant.snapshot.execution.state.failures == 0
         assert next_grant.snapshot.intent.grant.previous_episode == granted.renewed_episode
         with store.transaction() as db:
-            assert db.execute("SELECT SUM(amount_micros) FROM charges").fetchone()[0] == 18
+            assert db.execute("SELECT SUM(amount_micros) FROM charges").fetchone()[0] == 36
 
 
+@without_baseline
 def test_origin_write_error_rolls_back_renewal_when_caller_catches_and_commits(rig, monkeypatch):
     store, _, _, _, _ = rig
+    exhaust_with_three_settled_returns(rig)
+    tables = ("workflow_rearms", "lifecycle_commands", "budget_reservations", "workflow_evidence")
+    counts = _counts(store, *tables)
     control = workflow_control(rig)
     command = renewal_request(rig)
     saved = current(store, rig[3])
@@ -385,6 +405,6 @@ def test_origin_write_error_rolls_back_renewal_when_caller_catches_and_commits(r
     assert current(store, rig[3]) == saved
     with store.transaction() as db:
         assert db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='test'").fetchone() is not None
-        for table in ("workflow_rearms", "lifecycle_commands", "budget_reservations", "workflow_evidence"):
-            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    assert _counts(store, *tables) == counts
+    with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='workflow-request'").fetchone()[0] == 0

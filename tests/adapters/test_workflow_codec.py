@@ -220,26 +220,25 @@ def review_v24_proposal():
     return fixture, proposal
 
 
-def activated_review_execution(state, *, imported=False):
+def activated_review_execution(state):
     from issue_agent.domain.agent_task import RuntimeName
     from issue_agent.domain.review_execution import (
-        ActivatedReviewExecution, ImportedReviewSession, LaunchedReviewChild, ReusableReviewSession,
+        ActivatedReviewExecution, LaunchedReviewChild, ReusableReviewSession,
         ReviewChildIdentity, ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint,
         ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
         ReviewRoundIdentity,
     )
 
     binding = ReviewExecutionBinding(state.binding, 3, "execution:codec")
-    source = (ImportedReviewSession("import:codec") if imported else
-              LaunchedReviewChild(ReviewChildIdentity(ReviewRoundIdentity(binding, "round:codec", 4),
-                                                       "review", "reviewer", ReviewChildKind.REVIEWER),
-                                  "run:codec", "launch:codec"))
+    source = LaunchedReviewChild(ReviewChildIdentity(ReviewRoundIdentity(binding, "round:codec", 4),
+                                                     "review", "reviewer", ReviewChildKind.REVIEWER),
+                                 "run:codec", "launch:codec")
     execution = ReviewExecutionState(binding, failures=2, pin_deferrals=7,
                                      session=ReusableReviewSession(RuntimeName.CLAUDE, "session:codec", source),
-                                     session_sequence=0 if imported else 4, displayed_round=3,
+                                     session_sequence=4, displayed_round=3,
                                      display_sequence=4, productive_sequence=4)
     checkpoint = ReviewExecutionCheckpoint(6, execution, ReviewExecutionPolicy(free_pin_deferrals=1))
-    return ActivatedReviewExecution(ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:codec"),
+    return ActivatedReviewExecution(ReviewExecutionOrigin(ReviewExecutionOriginKind.INITIALIZED, "origin:codec"),
                                     checkpoint, execution, 6)
 
 
@@ -368,7 +367,7 @@ def test_review_snapshot_wire_evolution_never_synthesizes_missing_current_author
         decode_workflow(json.dumps(raw), ReviewWorkflowSnapshot)
 
 
-@pytest.mark.parametrize("variant", ["inactive", "active_imported", "active_launched"])
+@pytest.mark.parametrize("variant", ["inactive", "active_launched"])
 def test_review_family_envelope_and_snapshot_preserve_execution_policy_and_provenance(variant):
     from issue_agent.domain.review_execution import ActivatedReviewExecution
     from issue_agent.domain.review_workflow import ReviewFamilyEpisodes, ReviewWorkflowSnapshot
@@ -377,7 +376,7 @@ def test_review_family_envelope_and_snapshot_preserve_execution_policy_and_prove
     state = proposal.snapshot
     assert isinstance(state, ReviewWorkflowSnapshot)
     if variant != "inactive":
-        state = replace(state, execution=activated_review_execution(state, imported=variant == "active_imported"))
+        state = replace(state, execution=activated_review_execution(state))
     envelope = ReviewFamilyEpisodes(state.authority, state.episode, state.execution)
     recovered = decode_workflow(encode_workflow(envelope), ReviewFamilyEpisodes)
     recovered_state = decode_workflow(encode_workflow(state), ReviewWorkflowSnapshot)
@@ -495,18 +494,20 @@ def test_historical_observation_replay_accepts_equivalent_caller_gate_order():
 def test_repeated_renewal_replaces_session_provenance_without_growing_an_ancestry_chain():
     from issue_agent.domain.agent_task import RuntimeName
     from issue_agent.domain.review_execution import (
-        CurrentReviewExecution, ImportedReviewSession, ReusableReviewSession, RenewedReviewSessionSource,
+        CurrentReviewExecution, ReusableReviewSession, RenewedReviewSessionSource,
         ReviewExecutionCheckpoint, renew_current_review_execution,
     )
     from tests.domain.test_review_execution_rearm import next_binding
     from tests.domain.test_review_preflight import active, exhausted
 
     snapshot, _ = exhausted(*active())
-    old = snapshot.execution
-    assert isinstance(old, CurrentReviewExecution)
-    state = replace(old.state, session=ReusableReviewSession(
-        RuntimeName.CLAUDE, "original-session", ImportedReviewSession("import:session")))
-    old = replace(old, baseline=replace(old.baseline, state=state), state=state)
+    assert isinstance(snapshot.execution, CurrentReviewExecution)
+    # A session reused across renewals is first carried by a renewed origin.
+    old, _ = renew_current_review_execution(snapshot.execution, snapshot.revision, next_binding(snapshot), "renew:seed")
+    snapshot = replace(snapshot, revision=replace(snapshot.revision, fence=old.binding.rejection.fence), execution=old)
+    state = replace(old.state, failures=5, session=ReusableReviewSession(
+        RuntimeName.CLAUDE, "original-session", RenewedReviewSessionSource(old.origin.evidence_id)))
+    old = replace(old, state=state, baseline=ReviewExecutionCheckpoint(1, state), last_sequence=1)
     receipts = []
     for index in range(100):
         after, receipt = renew_current_review_execution(old, snapshot.revision, next_binding(snapshot), f"renew:{index}")

@@ -45,28 +45,13 @@ class Store:
     # ids and counters, but advisory history may contain Unicode,
     # and a daemon started under a C/POSIX locale would otherwise fail to write
     # (or mis-read) the same file a UTF-8 shell wrote. `errors="replace"` on the
-    # advisory reads preserve byte-damaged notes. Control records use strict
-    # decoding so a damaged marker cannot grant a fresh attempt.
+    # advisory reads preserve byte-damaged notes.
     def _read(self, path: str) -> str:
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 return f.read().strip()
         except (FileNotFoundError, OSError):
             return ""
-
-    def _read_control(self, path: str) -> str | None:
-        try:
-            with open(path, encoding="utf-8") as stream:
-                # Control files hold scalar markers or small typed records;
-                # advisory prose has a separate read contract.
-                raw = stream.read(65537)
-                if len(raw) > 65536:
-                    raise WorkflowControlError(path, "control record exceeds 65536-character limit")
-                return raw.strip()
-        except FileNotFoundError:
-            return None
-        except (OSError, UnicodeError) as exc:
-            raise WorkflowControlError(path, f"unreadable control record: {exc}") from exc
 
     def _write(self, path: str, value: str) -> None:
         # review M3: pid-suffix the tmp name — two daemons sharing a STATE_DIR
@@ -75,8 +60,7 @@ class Store:
         # other's write mid-flight. flush()+fsync() before os.replace closes
         # the crash window where a torn/zero-length tmp file (data still in
         # the page cache, not on disk) could get installed at `path` by a
-        # power loss / kill between write() and replace() — see _read_int's
-        # comment for which counter that silently resets.
+        # power loss / kill between write() and replace().
         os.makedirs(self.state_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -92,21 +76,6 @@ class Store:
             pass
         except OSError as exc:
             raise WorkflowControlError(path, f"control record removal failed: {exc}") from exc
-
-    def _read_int(self, path: str, default: int = 0) -> int:
-        raw = self._read_control(path)
-        if raw is None:
-            return default
-        return self._counter(raw, path)
-
-    @staticmethod
-    def _counter(raw: str, path: str) -> int:
-        if not raw.isascii() or not raw.isdecimal() or len(raw) > 19:
-            raise WorkflowControlError(path, "malformed nonnegative counter; repair the record")
-        value = int(raw)
-        if value > 2**63 - 1:
-            raise WorkflowControlError(path, "counter exceeds the supported integer range")
-        return value
 
     # ── router path predictions ─────────────────────────────────────────────
     def get_predicted_paths(self, issue: int) -> frozenset[str]:
@@ -154,10 +123,6 @@ class Store:
         )
         return history
 
-    # Legacy infra-death files, read only by the stopped review activation
-    # import; nothing writes them any more.
-    def get_infra_deaths(self, key: int) -> int:
-        return self._read_int(self.issue_path(key, "infra-deaths"))
 
 
     # ── advisory cleanup ──

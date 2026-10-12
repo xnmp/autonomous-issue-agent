@@ -6,7 +6,6 @@ no runtime authority until the execution family is explicitly activated.
 """
 
 from __future__ import annotations
-from .review_execution_migration import BlockedReviewExecutionMigration
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -239,14 +238,6 @@ class LaunchedReviewChild:
 
 
 @dataclass(frozen=True)
-class ImportedReviewSession:
-    evidence_id: str
-
-    def __post_init__(self) -> None:
-        identifier(self.evidence_id, "imported session evidence")
-
-
-@dataclass(frozen=True)
 class RenewedReviewSessionSource:
     evidence_id: str
 
@@ -263,13 +254,13 @@ class NoReviewSession:
 class ReusableReviewSession:
     runtime: RuntimeName
     handle: str
-    source: LaunchedReviewChild | ImportedReviewSession | RenewedReviewSessionSource
+    source: LaunchedReviewChild | RenewedReviewSessionSource
 
     def __post_init__(self) -> None:
         if not isinstance(self.runtime, RuntimeName):
             raise ValueError("review session requires its runtime")
         validate_review_session_handle(self.handle)
-        if not isinstance(self.source, (LaunchedReviewChild, ImportedReviewSession, RenewedReviewSessionSource)):
+        if not isinstance(self.source, (LaunchedReviewChild, RenewedReviewSessionSource)):
             raise ValueError("review session requires verified source provenance")
         if isinstance(self.source, LaunchedReviewChild) and self.source.child.kind is not ReviewChildKind.REVIEWER:
             raise ValueError("only a reviewer invocation can supply the reusable session")
@@ -569,7 +560,7 @@ class ReviewExecutionState:
                 source.child.round.binding != self.binding or source.child.round.sequence != self.session_sequence
             ):
                 raise ValueError("session projection disagrees with its producer binding or sequence")
-            if isinstance(source, (ImportedReviewSession, RenewedReviewSessionSource)) and self.session_sequence != 0:
+            if isinstance(source, RenewedReviewSessionSource) and self.session_sequence != 0:
                 raise ValueError("an origin-carried session precedes this episode's execution rounds")
 
 
@@ -613,7 +604,6 @@ class ReviewExecutionCheckpoint:
 
 class ReviewExecutionOriginKind(str, Enum):
     INITIALIZED = "initialized"
-    IMPORTED = "imported"
     RENEWED = "renewed"
 
 
@@ -626,31 +616,6 @@ class ReviewExecutionOrigin:
         if not isinstance(self.kind, ReviewExecutionOriginKind):
             raise ValueError("execution origin requires a typed cause")
         identifier(self.evidence_id, "execution origin evidence")
-
-
-@dataclass(frozen=True)
-class ImportedReviewExecutionOriginReceipt:
-    """Immutable activation ancestry for an imported sequence-zero checkpoint."""
-
-    origin: ReviewExecutionOrigin
-    checkpoint: ReviewExecutionCheckpoint
-    activation_plan_digest: str
-    source_digest: str
-    inventory_digest: str
-    import_decision_digest: str
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.origin, ReviewExecutionOrigin)
-                or self.origin.kind is not ReviewExecutionOriginKind.IMPORTED):
-            raise ValueError("imported execution origin requires an imported cause")
-        if (not isinstance(self.checkpoint, ReviewExecutionCheckpoint)
-                or self.checkpoint.through_sequence != 0
-                or self.checkpoint.boundary_cursor is not None):
-            raise ValueError("imported execution origin requires its initial checkpoint")
-        for name in ("activation_plan_digest", "source_digest", "inventory_digest", "import_decision_digest"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-                raise ValueError(f"imported execution origin {name} requires a SHA-256 digest")
 
 
 @dataclass(frozen=True)
@@ -713,28 +678,6 @@ def initialized_review_execution(
 
 
 @dataclass(frozen=True)
-class ImportedReviewExecutionDecision:
-    """The activation plan's selected imported execution starting state."""
-
-    origin: ReviewExecutionOrigin
-    checkpoint: ReviewExecutionCheckpoint
-    activation_plan_digest: str
-    source_digest: str
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.origin, ReviewExecutionOrigin)
-                or self.origin.kind is not ReviewExecutionOriginKind.IMPORTED
-                or not isinstance(self.checkpoint, ReviewExecutionCheckpoint)
-                or self.checkpoint.through_sequence != 0
-                or self.checkpoint.boundary_cursor is not None):
-            raise ValueError("imported execution decision requires its initial origin and checkpoint")
-        for name in ("activation_plan_digest", "source_digest"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-                raise ValueError(f"imported execution decision {name} requires a SHA-256 digest")
-
-
-@dataclass(frozen=True)
 class ExecutionNotActivated:
     pass
 
@@ -777,10 +720,7 @@ class ActivatedReviewExecution:
         if (not self.boundaries and self.checkpoint.through_sequence == self.last_sequence
                 and self.checkpoint.state != self.state):
             raise ValueError("execution state disagrees with its completed checkpoint")
-        if isinstance(self.state.session, ReusableReviewSession) and isinstance(self.state.session.source, ImportedReviewSession):
-            if self.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
-                raise ValueError("an imported session requires an imported execution origin")
-        if self.last_sequence == 0 and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
+        if self.last_sequence == 0:
             if self.state.failures or self.state.pin_deferrals or not isinstance(self.state.session, NoReviewSession):
                 raise ValueError("a fresh execution origin cannot invent failures or a reusable session")
 
@@ -824,15 +764,11 @@ class CurrentReviewExecution:
             raise ValueError("current execution state disagrees with its completed baseline")
         for state in (self.baseline.state, self.state):
             if (isinstance(state.session, ReusableReviewSession)
-                    and isinstance(state.session.source, ImportedReviewSession)
-                    and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED):
-                raise ValueError("an imported session requires an imported execution origin")
-            if (isinstance(state.session, ReusableReviewSession)
                     and isinstance(state.session.source, RenewedReviewSessionSource)
                     and (self.origin.kind is not ReviewExecutionOriginKind.RENEWED
                          or state.session.source.evidence_id != self.origin.evidence_id)):
                 raise ValueError("a renewed session requires its exact renewed origin")
-        if (self.last_sequence == 0 and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED
+        if (self.last_sequence == 0
                 and (self.state.failures or self.state.pin_deferrals
                      or not isinstance(self.state.session, NoReviewSession)
                      and not isinstance(self.state.session.source, RenewedReviewSessionSource))):
@@ -909,7 +845,7 @@ def renew_current_review_execution(
     return CurrentReviewExecution(origin, checkpoint, state, 0, 0), receipt
 
 
-ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution | CurrentReviewExecution | BlockedReviewExecutionMigration
+ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution | CurrentReviewExecution
 
 
 @dataclass(frozen=True)
