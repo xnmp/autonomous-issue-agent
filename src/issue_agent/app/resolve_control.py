@@ -46,10 +46,6 @@ def compose_resolve_rearm(
         deaths = selected.component.state.infra_failures
         if breaker_tripped(deaths, cfg.max_infra_deaths):
             holds += ("infrastructure failure ceiling",)
-        if selected.component.state.machine_block is not None:
-            holds += ("machine blocker",)
-        if selected.component.state.budget_block is not None:
-            holds += ("budget blocker",)
         return holds
 
     workflow = SQLiteWorkflowControl(control, WorkflowWriter(cfg.repo, "fix", owner),

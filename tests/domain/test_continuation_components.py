@@ -66,7 +66,7 @@ def test_fix_infra_ordering_preserves_newer_episode_and_every_sibling_field():
     from issue_agent.domain import continuation_components as cc
     key = WorkflowKey("o/r", IssueRef(5))
     component = ActiveIssueRecovery(identity(key, WorkflowFamily.ISSUE_RECOVERY),
-        IssueRecoveryState(resumes=2, remembered_branch="fix/5-x", ci_failures=3, rebase_failures=4, self_clears=1),
+        IssueRecoveryState(resumes=2, remembered_branch="fix/5-x", ci_failures=3, rebase_failures=4),
         gates=(hold(),))
     selected = SelectedIssueRecovery(WorkflowRevision(WorkflowFence(key, 0), 10), component)
     old = admission(selected, 1, "old")

@@ -7,7 +7,7 @@ Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/operator_e
 ## Decision
 
 Agent prompts, repository text, CI output, and agent-written files are
-untrusted claims. They are encoded through `adapters/untrusted.py`; they never
+untrusted claims. They are encoded through `domain/trust.py`; they never
 directly authorize publication. GitHub mutations are represented as durable,
 idempotency-keyed `LifecycleCommand`s and executed by the narrow daemon or
 operator effects adapter. An unknown remote outcome is reconciled before retry.

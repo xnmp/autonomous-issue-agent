@@ -3,8 +3,6 @@ from issue_agent.adapters.github import GitHubGateway
 from issue_agent.domain.ci import ci_state
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.world import WorldState
-from issue_agent.domain.actions import Target
-from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
 
 def report(name='unit', identity=10, conclusion='SUCCESS', workflow='CI', event='push', state='COMPLETED', start=None):
     return {'__typename':'CheckRun','id':str(identity),'databaseId':identity,'name':name,
@@ -42,8 +40,7 @@ def run_case(case, *, head_nodes, merge_nodes=None, merge_state='CLEAN', spent=F
     gateway=GitHubGateway('o/r',runner=runner)
     view=gateway.get_pr(7)
     observation=view.ci if hasattr(view,'ci') else view.checks
-    state=FixState(ci_rerun_head={7:'head'} if spent else {}, ci_retries={7:retries},
-        machine_blocks={7:MachineBlock(7,Target.PR,7,7,MachineBlocker.CHECKS,'head')} if blocked else {})
+    state=FixState(ci_rerun_head={7:'head'} if spent else {}, ci_retries={7:retries})
     actions=decide_fix(WorldState(prs=(view,),now='2026-10-12T02:00:00Z'),FixConfig(fix_bot='fix-bot'),state,fixer_busy=False)
     return {'case':case,'ci':ci_state(observation).value,'checks':[[c.name,c.bucket,c.run_id] for c in view.checks],
         'actions':[type(a).__name__+(':'+a.kind.name if hasattr(a,'kind') else '') for a in actions]}

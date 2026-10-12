@@ -1015,7 +1015,7 @@ export interface components {
             /** Generation */
             generation: number;
             /** Holds */
-            holds: ("machine" | "budget" | "workflow")[];
+            holds: "workflow"[];
             /** Infra Failures */
             infra_failures: number;
             /** Rebase Failures */
@@ -1024,8 +1024,6 @@ export interface components {
             resumes: number;
             /** Review Failures */
             review_failures: number;
-            /** Self Clears */
-            self_clears: number;
             /**
              * Status
              * @constant

@@ -15,12 +15,11 @@ export function FixRecoveryView({ recovery }: { recovery?: Recovery | null }) {
         <dt>Review failures</dt><dd>{recovery.review_failures}</dd>
         <dt>Rebase failures</dt><dd>{recovery.rebase_failures}</dd>
         <dt>Infrastructure failures</dt><dd>{recovery.infra_failures}</dd>
-        <dt>Self clears</dt><dd>{recovery.self_clears} / 3</dd>
         </>}
       </dl>
       {recovery.family === "issue_recovery"
         ? <p>{recovery.holds.length ? `Recovery holds: ${recovery.holds.join(", ")}.` : "No recorded recovery holds."}</p>
-        : <p>{recovery.workflow_held ? "PR continuity held." : "No recorded PR continuity holds."} Repair allowance and machine/budget holds belong to issue recovery.</p>}
+        : <p>{recovery.workflow_held ? "PR continuity held." : "No recorded PR continuity holds."} Repair allowance belongs to issue recovery.</p>}
       {recovery.family === "pr_repair" && recovery.pending_effects.length > 0 && <p role="status">Awaiting verified completion: {recovery.pending_effects.map((effect) => effect.replaceAll("_", " ")).join(", ")}.</p>}
       <p className="resolve-status-note">Current SQL state used by scheduling and admission. Other checks still apply.</p>
     </>}

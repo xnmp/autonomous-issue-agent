@@ -132,17 +132,17 @@ def test_current_duplicate_return_applies_once_and_retains_consumption(recovery)
     before = read(store, aggregate)
     with store.transaction() as db:
         persist_workflow_snapshot(db, replace(before, revision=replace(before.revision, version=before.revision.version + 1), issue_recovery=replace(
-            before.issue_recovery, state=replace(before.issue_recovery.state, self_clears=2))))
+            before.issue_recovery, state=replace(before.issue_recovery.state, ci_failures=2))))
     output = cc.IssueRecoveryState()
     assert store.settle_issue_recovery(money(request.run_id), admission, output).disposition is AccountingDisposition.AVAILABLE
     current = read(store, aggregate)
-    assert current.issue_recovery.state.self_clears == 2
+    assert current.issue_recovery.state.ci_failures == 2
     assert current.issue_recovery.state.resumes == 1
     assert current.issue_recovery.state.consumed_reply_at == selected.reply_at
     assert store.settle_issue_recovery(money(request.run_id), admission, output).idempotent
     assert read(store, aggregate) == current
     with pytest.raises(WorkflowAuthorityError, match="immutable result"):
-        store.settle_issue_recovery(money(request.run_id), admission, replace(output, self_clears=1))
+        store.settle_issue_recovery(money(request.run_id), admission, replace(output, ci_failures=1))
     assert store.snapshot(request.scope).settled.micros == 1
 
 
@@ -536,7 +536,7 @@ def test_primary_hold_refuses_fresh_launch_but_preserves_exact_retry_and_actual_
                     NoAuthorizedRemediation("reconcile"))
     with store.transaction() as db:
         held = replace(current, revision=replace(current.revision, version=current.revision.version + 1), gates=(gate,),
-                       issue_recovery=replace(current.issue_recovery, state=replace(current.issue_recovery.state, self_clears=1)))
+                       issue_recovery=replace(current.issue_recovery, state=replace(current.issue_recovery.state, ci_failures=1)))
         persist_workflow_snapshot(db, held)
     with pytest.raises(WorkflowAuthorityError, match="stale or held"):
         store.register_process_lease(requested.run_id, expected_owner_id=requested.owner_id,
@@ -545,7 +545,7 @@ def test_primary_hold_refuses_fresh_launch_but_preserves_exact_retry_and_actual_
     assert read(store, aggregate) == held
     assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState()).disposition is AccountingDisposition.AVAILABLE
     completed = read(store, aggregate)
-    assert completed.gates == held.gates and completed.issue_recovery.state.self_clears == 1
+    assert completed.gates == held.gates and completed.issue_recovery.state.ci_failures == 1
     assert store.snapshot(requested.scope).settled.micros == 1
 
 
@@ -559,7 +559,10 @@ def test_empty_review_value_roundtrips_as_typed_root_but_old_issue_field_keeps_s
     old = '{"format":1,"value":{"type":"IssueRecoveryState","fields":{"consumed_reply_at":"","resumes":0,"remembered_branch":"","ci_failures":0,"review_failures":3,"rebase_failures":0,"infra_failures":0,"self_clears":0}}}'
     decoded = decode_workflow(old, cc.IssueRecoveryState)
     assert decoded.review_failures == cc.ReviewRetryState(count=3)
-    assert encode_workflow(decoded) == json.dumps(json.loads(old), sort_keys=True, separators=(",", ":"))
+    # The retired self-clear count is dropped on read; the scalar field stays.
+    expected = json.loads(old)
+    del expected["value"]["fields"]["self_clears"]
+    assert encode_workflow(decoded) == json.dumps(expected, sort_keys=True, separators=(",", ":"))
 
 
 def test_generic_issue_settlement_preserves_classified_infrastructure_episode(recovery):

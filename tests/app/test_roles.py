@@ -3414,3 +3414,20 @@ def test_clear_current_policy_obsoletes_cancel_even_when_its_run_still_reports(t
     actions = decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
     assert any(isinstance(a, EnableAutoMerge) for a in actions)
     assert not any(isinstance(a, EscalateCiPending) for a in actions)
+
+
+@pytest.mark.parametrize("cap_usd, blocked", [(5.0, True), (10.0, False), (50.0, False)])
+def test_spend_gate_holds_paid_dispatch_when_one_leg_no_longer_fits_the_daily_cap(tmp_path, cap_usd, blocked):
+    # Decision #7: a daily cap smaller than one leg's reservation is a reported
+    # tick-gate wait, never a silent one and never an admission refusal label.
+    from issue_agent.app.roles import _control_spend_gate
+
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), daily_spend_cap_usd=cap_usd)
+    gate = _control_spend_gate(cfg, control, 10.0)
+    assert gate is not None
+    reason = gate()
+    assert (reason is not None) is blocked
+    if blocked:
+        assert "repository daily spend cap reached" in reason and "$10.00 leg / $5.00" in reason

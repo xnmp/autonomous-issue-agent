@@ -3109,8 +3109,6 @@ def test_spent_free_rerun_cannot_launch_paid_repair_without_capacity():
     ({"reviews": (Review("CHANGES_REQUESTED", "review-bot", "t1"),)}, FixState(), ()),
     ({}, FixState(ci_remediation_errors={100: "unreadable remediation"}), ()),
     ({}, FixState(infra_control_errors={100: "unreadable recovery"}), ()),
-    ({}, FixState(machine_control_errors={100: "unreadable machine block"}), ()),
-    ({}, FixState(budget_control_errors={100: "unreadable budget block"}), ()),
     ({"head_ref_oid": ""}, FixState(), ()),
     ({"checks": (Check("unit", bucket="fail"),)}, FixState(), ()),
 ])

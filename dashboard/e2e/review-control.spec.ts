@@ -252,8 +252,8 @@ test("existing control panel shows selected recovery debt and owed effects witho
   await expect(debt.getByRole("button")).toHaveCount(0);
   const issuePanel = page.getByRole("region", { name: /Resolve control #99/ });
   await expect(issuePanel).toContainText("Resolve authority is inactive");
-  await expect(issuePanel.locator(".resolve-facts dd")).toHaveText(["4", "3", "2", "5", "6", "1 / 3"]);
-  await expect(issuePanel).toContainText("Recovery holds: machine, budget.");
+  await expect(issuePanel.locator(".resolve-facts dd")).toHaveText(["4", "3", "2", "5", "6"]);
+  await expect(issuePanel).toContainText("Recovery holds: workflow.");
   for (const width of [320, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 900 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

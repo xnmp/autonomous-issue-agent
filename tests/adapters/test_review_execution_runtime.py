@@ -13,7 +13,7 @@ from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money, RunId
-from issue_agent.domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
+from issue_agent.domain.outcome import AgentResult, DAILY_HEADROOM_STATUS, ExitReason
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.review_rounds import ReviewChildReturned
 from tests.adapters.test_review_execution_admission import planned, refusal_receipt
@@ -68,12 +68,10 @@ def test_final_budget_trip_records_refusal_and_never_launches_child(planned_chil
     result = asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))
 
     assert not inner.called
-    assert result.status == MAX_BUDGET_STATUS and result.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert result.status == DAILY_HEADROOM_STATUS and result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     refusal = refusal_receipt(store, child)
     assert refusal is not None and refusal.cap_micros == 1_999_999
     assert refusal.requested_micros == 2_000_000
-    assert result.admission_budget_block is not None
-    assert result.admission_budget_block.cap_micros == refusal.cap_micros
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0

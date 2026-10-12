@@ -58,7 +58,9 @@ There are four policy classes, defined here so retry callers cannot drift:
   `error_max_budget_usd`) is also a non-strike, but it is actionable: the resolve
   path blocks the issue for a cap review and labels it `needs-budget-review`.
   The graceful wind-down handover is therefore preserved for the next deliberately
-  resumed leg rather than being discarded in an automatic retry loop.
+  resumed leg rather than being discarded in an automatic retry loop. The one
+  exception is an admission refused for daily repository/global headroom
+  (`DAILY_HEADROOM_STATUS`): time clears it, so the leg waits label-free.
 
 ## Why the fourth class exists (keifu #130, 2026-08-02)
 
@@ -85,6 +87,9 @@ from dataclasses import dataclass, replace
 from enum import Enum
 
 MAX_BUDGET_STATUS = "error_max_budget_usd"
+# Harness-minted by the accounting runtime when a daily repository or global
+# cap has no headroom for the leg's reservation; never read from agent output.
+DAILY_HEADROOM_STATUS = "daily_headroom_exhausted"
 
 from .actions import (  # noqa: F401
     Action,
@@ -178,6 +183,11 @@ def budget_exhausted(reason: ExitReason | None) -> bool:
     automatic reaper retry used for a transient process or gateway death.
     """
     return reason is ExitReason.BUDGET_EXHAUSTED
+
+
+def daily_headroom_wait(result: "AgentResult") -> bool:
+    """Admission found no daily headroom; the leg waits for the window to roll."""
+    return budget_exhausted(result.exit_reason) and result.envelope_subtype == DAILY_HEADROOM_STATUS
 
 
 def runtime_unavailable(reason: ExitReason | None) -> bool:
@@ -381,31 +391,6 @@ def offending_path(last_trace: str) -> str:
 
 
 @dataclass(frozen=True)
-class AdmissionBudgetBlock:
-    """Harness-authored facts from a paid-admission denial.
-
-    Agent structured output is not allowed to populate this field. It is minted
-    only by the accounting adapter after its authoritative reservation check.
-    """
-
-    scope: str
-    reservation_micros: int
-    cap_micros: int
-    committed_micros: int
-    currency: str
-
-    def __post_init__(self) -> None:
-        if not self.scope or not self.currency:
-            raise ValueError("admission budget facts require scope and currency")
-        if min(
-            self.reservation_micros,
-            self.cap_micros,
-            self.committed_micros,
-        ) < 0:
-            raise ValueError("admission budget facts cannot be negative")
-
-
-@dataclass(frozen=True)
 class AgentResult:
     """Normalised result of a headless agent run (the SDK ResultMessage, or the
     CLI JSON envelope). Adapter populates this; the domain reads only this.
@@ -462,11 +447,6 @@ class AgentResult:
     # structurally missing telemetry. Journaling persists this as a dedicated
     # warning event; blank means the runtime observed no telemetry fault.
     telemetry_warning: str = ""
-    # Harness-authored admission evidence. Unlike `structured`, this cannot be
-    # supplied by the agent and is the only budget result allowed to authorize
-    # a future cap re-evaluation. Last for positional compatibility with the
-    # established result envelope.
-    admission_budget_block: AdmissionBudgetBlock | None = None
     # Minted by accounting from captured admission context, never model output.
     workflow_attempt: WorkflowAttemptIdentity | None = None
     # Runtime-authored only: structured model output cannot supply accounting.
@@ -579,23 +559,20 @@ def pr_budget_actions(pr: int) -> list[Action]:
     """Stop a budget-capped PR-repair leg (address-review / fix-ci / rebase)
     for an operator cap review — the #98 class on the PR path (#155).
 
-    A BUDGET_EXHAUSTED here is very often a DETERMINISTIC admission rejection
-    (settled daily spend + one full reservation no longer fits the cap), so
-    retrying is guaranteed to fail at $0 while marching the review/CI breaker:
-    observed live 2026-08-02 (keifu PRs #171/#174 walked to needs-human-review
-    on three instant `error_max_budget_usd` rejections each). A cap decision,
-    not an agent breaker, controls continuation. ai-blocked stops re-dispatch;
-    needs-budget-review names WHICH decision unblocks it (remove both labels
-    after raising the cap, or wait for the daily window to roll)."""
+    A per-issue lifetime refusal is DETERMINISTIC, so retrying is guaranteed
+    to fail at $0 while marching the review/CI breaker: observed live
+    2026-08-02 (keifu PRs #171/#174 walked to needs-human-review on three
+    instant `error_max_budget_usd` rejections each). A cap decision, not an
+    agent breaker, controls continuation. ai-blocked stops re-dispatch;
+    needs-budget-review names WHICH decision unblocks it. Daily headroom is not
+    routed here: `daily_headroom_wait` results wait label-free."""
     return attention_actions(
         Target.PR, pr, None, Label.AI_BLOCKED,
         unblock_prompt(
             "**Agent needs input:**",
             "**Budget review needed:** the repair leg hit its configured "
-            "spend cap (or the daily cap left no admission headroom for "
-            "its reservation) before finishing. Raise the cap or wait for "
-            "the daily window, then remove `ai-blocked` and "
-            "`needs-budget-review` to resume.",
+            "spend cap before finishing. Raise the cap, then remove "
+            "`ai-blocked` and `needs-budget-review` to resume.",
         ),
     ) + [Relabel(Target.PR, pr, None, Label.NEEDS_BUDGET_REVIEW)]
 
@@ -628,6 +605,8 @@ def resolve_actions(
     # Checked AFTER the ground-truth PR branch: how the session died says nothing
     # about whether a PR exists on GitHub, and a real PR must never be stranded
     # unlabelled just because the session was killed a second after opening it.
+    if daily_headroom_wait(result):
+        return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
     if budget_exhausted(result.exit_reason):
         return budget_actions(issue)
     if infra_death(result.exit_reason):
@@ -666,6 +645,8 @@ def author_actions(issue: int, result: AgentResult) -> list[Action]:
     fu = author_followup(result)
     if fu is AuthorFollowup.AUTHORED:
         return []  # stay ai-working; dispatcher persists phase=authored
+    if daily_headroom_wait(result):
+        return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
     if budget_exhausted(result.exit_reason):
         return budget_actions(issue)
     # The same guard the other three tails carry (review M15) — this leg was the
@@ -768,9 +749,12 @@ def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
     changing the issue here would manufacture a second lifecycle state to keep
     coherent. The PR stays blocked while the one-at-a-time dispatcher runs, so
     a raised runner exception cannot strand an invented `ai-working` marker.
+    A daily-headroom refusal leaves the PR blocked with its reply unanswered.
     """
-    if infra_death(result.exit_reason):
+    if infra_death(result.exit_reason) or daily_headroom_wait(result):
         return []
+    if budget_exhausted(result.exit_reason):
+        return pr_budget_actions(pr)
     if classify_outcome(result) is Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
@@ -818,7 +802,7 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
     if budget_exhausted(result.exit_reason):
         # Not an attempt either — and frequently deterministic (admission
         # rejection). Route to the budget surface instead of the breaker.
-        return AddressReviewOutcome(pr_budget_actions(pr), bump_retry=False)
+        return AddressReviewOutcome([] if daily_headroom_wait(result) else pr_budget_actions(pr), bump_retry=False)
     if classify_outcome(result) is Outcome.BLOCKED:
         body = (
             "**Agent needs clarification on review:**\n\n"
@@ -845,7 +829,7 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
     if budget_exhausted(result.exit_reason):
         # Same rule as address-review: a cap decision, not the CI breaker,
         # controls continuation (#155 — the caller also skips its retry bump).
-        return pr_budget_actions(pr)
+        return [] if daily_headroom_wait(result) else pr_budget_actions(pr)
     if classify_outcome(result) is Outcome.BLOCKED:
         # Post the agent's 'needs' alongside the label, same as the resolve
         # path's blocked arm. Without it a blocked rebase/fix-ci escalated to a

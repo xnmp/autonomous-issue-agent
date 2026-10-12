@@ -68,7 +68,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 43))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 44))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -125,6 +125,9 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        43: ("CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target) "
+             "WHERE state IN ('pending','executing','retryable_failure','unknown_outcome') "
+             "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text'",),
         42: (),
         41: ("ALTER TABLE charges DROP COLUMN origin",),
         40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
@@ -3818,6 +3821,39 @@ def test_migration_42_retires_retry_grant_attached_to_a_retired_renewal(tmp_path
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
     store.initialize()
     with sqlite3.connect(store.path) as db:
-        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 42
+        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == EXPECTED_SCHEMA_VERSIONS[-1]
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert db.execute("SELECT count(*) FROM workflow_retry_authorizations").fetchone()[0] == 0
+
+
+def test_v43_retires_pre_upgrade_self_clear_relabels_so_ai_blocked_waits_for_a_human(tmp_path):
+    from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
+    from issue_agent.domain.actions import Relabel, Target
+    from issue_agent.domain.labels import Label
+    from tests.domain.builders import observed_pr
+    from tests.fakes.in_memory_github import InMemoryGitHub
+
+    store = _store(tmp_path)
+    clear = command_for_action(Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.AI_PR_OPEN, "head"),
+                               repository="o/r", executor_identity="o/r:fix")
+    store.enqueue_command(dataclasses.replace(
+        clear, command_id=CommandId("predeploy-self-clear"), idempotency_key="legacy:self-clear",
+        payload={**clear.payload, "self_clear": json.dumps({"format": 1, "value": "opaque"})}))
+    ordinary = store.enqueue_command(command_for_action(
+        Relabel(Target.PR, 200, Label.AI_BLOCKED, Label.AI_PR_OPEN, "head"),
+        repository="o/r", executor_identity="o/r:fix")).command
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 42)
+    store.initialize()
+
+    gateway = InMemoryGitHub(prs={number: observed_pr(number, head_ref_oid="head",
+                                                      labels=frozenset({Label.AI_BLOCKED}))
+                                  for number in (100, 200)})
+    GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix",
+                         log=lambda _: None).drain_pending_commands()
+    assert gateway.prs[100].labels == frozenset({Label.AI_BLOCKED})
+    assert gateway.prs[200].labels == frozenset({Label.AI_PR_OPEN}), "ordinary relabels still drain"
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT command_id FROM lifecycle_commands").fetchall() == [(str(ordinary.command_id),)]
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='lifecycle_self_clear_pending'").fetchall() == []
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []

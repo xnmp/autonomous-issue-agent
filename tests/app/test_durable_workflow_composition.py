@@ -211,7 +211,7 @@ def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
 
 
 def _stopped_copy_index_rollback(path: Path) -> None:
-    """Explicit fixture-only schema42→38 rollback; every authority row survives."""
+    """Explicit fixture-only schema43→38 rollback; every authority row survives."""
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
     index_migrations = {
         40: ("event_outbox_pending", "event_outbox_pending_destination", "lifecycle_review_generation_candidates"),
@@ -220,6 +220,9 @@ def _stopped_copy_index_rollback(path: Path) -> None:
     charge_origin = next(item for item in _SCHEMA_MIGRATIONS if item.version == 41)
     with sqlite3.connect(path) as db:
         db.execute("BEGIN IMMEDIATE")
+        assert db.execute("DELETE FROM schema_migrations WHERE version=43").rowcount == 1
+        self_clear_index = next(item for item in _SCHEMA_MIGRATIONS if item.version == 38)
+        db.execute(self_clear_index.source)
         assert db.execute("DELETE FROM schema_migrations WHERE version=42").rowcount == 1
         assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (41, charge_origin.digest)
         # The schema-38 build has no charge origin; every copied charge carries the default, so nothing is lost.
@@ -334,15 +337,11 @@ def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopp
                       structured={"blocker": "publication"}, session_id="copied-ci-session", cost_usd=.25)))
     blocked.daemon.tick()
     assert len(blocked.provider.tasks) == 1
-    hold = blocked.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(9))).component.state.machine_block
-    assert hold is not None and hold.blocked_head == "copy-head"
     assert blocked.remote.get_pr(90).has(Label.AI_BLOCKED)
     with sqlite3.connect(copied_control) as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 2
         assert db.execute("SELECT amount_micros FROM charges").fetchall() == [(250_000,), (250_000,)]
-    import json
     import subprocess
-    from issue_agent.adapters.workflow_codec import encode_workflow
     checkout = _compatible_sql_build_checkout(tmp_path)
     repository = Path(__file__).resolve().parents[2]
     script = '''
@@ -375,20 +374,12 @@ print(json.dumps({str(number): encode_workflow((value.binding, value.revision, v
                                str(copied_control), str(copied_state), str(checkout)], cwd=checkout,
                               env={**os.environ, "PYTHONPATH": str(checkout / "src")},
                               capture_output=True, text=True)
-    later_rows = _copied_authoritative_rows(copied_control)
     newer_sql = dump(blocked.control)
     refused = read_old_build()
     assert refused.returncode != 0 and str(SCHEMA_VERSION) in refused.stderr and "38" in refused.stderr
     assert dump(blocked.control) == newer_sql
-    _stopped_copy_index_rollback(copied_control)
-    later_sql = dump(blocked.control)
-    rollback = read_old_build()
-    assert rollback.returncode == 0, rollback.stderr
-    current = {number: blocked.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(number))) for number in (7, 9)}
-    assert json.loads(rollback.stdout) == {str(number): encode_workflow((value.binding, value.revision, value.component))
-                                         for number, value in current.items()}
-    assert dump(blocked.control) == later_sql
-    _forward_copy_indexes(copied_control, later_rows)
+    # No index-rollback read here: fix rows written after the self-clear fields
+    # were deleted are not readable by the schema-38 build (forward-only).
     assert dump(original) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
@@ -505,111 +496,6 @@ print(json.dumps(encode_workflow((selected.binding, selected.revision, selected.
     _forward_copy_indexes(copied_control, later_rows)
     assert dump(original) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
-
-
-@pytest.mark.parametrize("adopted_owner", [False, True])
-def test_machine_recovery_remote_success_crash_reconciles_one_shared_sql_clear(tmp_path, adopted_owner):
-    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
-    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
-    from tests.fakes.accounted_workflow import seed_imported_machine_hold
-    seed(tmp_path, "ai-pr-open")
-    remote = PersistentGitHub(tmp_path / "github.db")
-    remote.seed_pr(pr(70, "ai-pr-open", "ai-blocked", closing_issue=7, head_ref_oid="same-head"))
-    first = compose(tmp_path, fault=fail_at("relabel_pr_applied"))
-    seed_imported_machine_hold(first.control, MachineBlock(7, Target.PR, 70, 70, MachineBlocker.PUBLICATION, "same-head"))
-    with pytest.raises(Crash):
-        first.daemon.tick()
-    restarted = compose(tmp_path)
-    if adopted_owner:
-        restarted.control.adopt_legacy_owner("o/r", "fix", "o/r:fix:successor", prior_owner_ids=("o/r:fix",))
-        with pytest.raises(RetiredOwnerError):
-            first.effects.drain_pending_commands()
-        assert restarted.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state.self_clears == 0
-        successor = GitHubEffectExecutor(remote, restarted.control, repository="o/r", identity="o/r:fix:successor")
-        assert successor.drain_pending_commands() == 1
-        assert successor.drain_pending_commands() == 0
-    else:
-        for _ in range(3):
-            restarted.daemon.tick()
-    selected = restarted.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
-    assert selected.component.state.machine_block is None
-    assert selected.component.state.self_clears == 1
-    assert restarted.remote.get_pr(70).labels == frozenset({Label.AI_PR_OPEN})
-    assert first.provider.tasks == restarted.provider.tasks == []
-    assert not (tmp_path / "fix" / "issue-7.self-clears").exists()
-
-
-@pytest.mark.parametrize("changed_head", [False, True])
-@pytest.mark.parametrize("adopted_owner", [False, True])
-def test_machine_recovery_partial_projection_does_not_charge_until_exact_head_completion(tmp_path, changed_head, adopted_owner, monkeypatch):
-    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
-    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
-    from tests.fakes.accounted_workflow import seed_imported_machine_hold
-    seed(tmp_path, "ai-pr-open")
-    remote = PersistentGitHub(tmp_path / "github.db")
-    remote.seed_pr(pr(70, "ai-blocked", closing_issue=7, head_ref_oid="same-head"))
-    first = compose(tmp_path)
-    write = first.remote.relabel
-    def partially_apply(kind, number, remove, add):
-        write(kind, number, None, add)
-        raise Crash("lost after adding resume label, before blocked removal")
-    monkeypatch.setattr(first.remote, "relabel", partially_apply)
-    seed_imported_machine_hold(first.control, MachineBlock(7, Target.PR, 70, 70, MachineBlocker.PUBLICATION, "same-head"))
-    with pytest.raises(Crash):
-        first.daemon.tick()
-    assert remote.get_pr(70).labels == frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED})
-    selected = first.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
-    assert selected.component.state.machine_block is not None and selected.component.state.self_clears == 0
-    if changed_head:
-        remote.external_pr_change(70, head_ref_oid="newer-head")
-    restarted = compose(tmp_path)
-    if adopted_owner:
-        restarted.control.adopt_legacy_owner("o/r", "fix", "o/r:fix:successor", prior_owner_ids=("o/r:fix",))
-        with pytest.raises(RetiredOwnerError):
-            first.effects.drain_pending_commands()
-        successor = GitHubEffectExecutor(remote, restarted.control, repository="o/r", identity="o/r:fix:successor")
-        for _ in range(3):
-            successor.drain_pending_commands()
-    else:
-        for _ in range(3):
-            restarted.daemon.tick()
-    state = restarted.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state
-    if changed_head:
-        assert state.machine_block is not None and state.self_clears == 0
-        assert restarted.remote.get_pr(70).has(Label.AI_BLOCKED)
-    else:
-        assert state.machine_block is None and state.self_clears == 1
-        assert restarted.remote.get_pr(70).labels == frozenset({Label.AI_PR_OPEN})
-    assert first.provider.tasks == restarted.provider.tasks == []
-
-
-@pytest.mark.parametrize("changed", ["head", "checks", "checks-unavailable"])
-def test_machine_recovery_rechecks_exact_head_and_checks_before_remote_mutation(tmp_path, changed):
-    from dataclasses import asdict
-    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
-    from issue_agent.domain.world import Check
-    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
-    from tests.fakes.accounted_workflow import seed_imported_machine_hold
-    seed(tmp_path, "ai-pr-open")
-    remote = PersistentGitHub(tmp_path / "github.db")
-    remote.seed_pr(pr(70, "ai-pr-open", "ai-blocked", closing_issue=7, head_ref_oid="same-head",
-                      checks=(Check("unit", bucket="pass"),)))
-    client = compose(tmp_path)
-    seed_imported_machine_hold(client.control, MachineBlock(7, Target.PR, 70, 70, MachineBlocker.CHECKS, "same-head"))
-    actions = client.daemon.decide(remote.build_world())
-    assert len(actions) == 1 and isinstance(actions[0], Relabel)
-    if changed == "head":
-        remote.external_pr_change(70, head_ref_oid="newer-head")
-    elif changed == "checks":
-        remote.external_pr_change(70, checks=[asdict(Check("unit", bucket="pending"))])
-    else:
-        remote.external_pr_change(70, checks_known=False)
-    assert not client.daemon.executor.execute_all(actions)
-    state = client.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state
-    assert state.machine_block is not None and state.self_clears == 0
-    assert remote.get_pr(70).has(Label.AI_BLOCKED)
-    assert not any(call[0] == "relabel_pr" for call in remote.calls)
-    assert client.provider.tasks == []
 
 
 def fail_at(point: str):

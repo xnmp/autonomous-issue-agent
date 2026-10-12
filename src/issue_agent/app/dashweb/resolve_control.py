@@ -107,9 +107,7 @@ def recovery_control(selection: cc.IssueRecoverySelection | cc.PRRepairSelection
             status="available", family="issue_recovery", generation=selection.revision.fence.generation,
             version=selection.revision.version, resumes=state.resumes, ci_failures=state.ci_failures,
             review_failures=state.review_failures.count, rebase_failures=state.rebase_failures,
-            infra_failures=state.infra_failures, self_clears=state.self_clears,
-            holds=(["machine"] if state.machine_block else []) + (["budget"] if state.budget_block else [])
-                  + (["workflow"] if component.gates else []))
+            infra_failures=state.infra_failures, holds=["workflow"] if component.gates else [])
     return wire.PRRepairAvailable(
         status="available", family="pr_repair", generation=selection.revision.fence.generation,
         version=selection.revision.version, resumes=state.resumes, workflow_held=bool(component.gates),

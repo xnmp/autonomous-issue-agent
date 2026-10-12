@@ -416,12 +416,11 @@ const IssueRecoveryAvailable = z.object({
   ci_failures: z.number().int().gte(0).lte(9007199254740991),
   family: z.literal("issue_recovery"),
   generation: z.number().int().gte(0).lte(9007199254740991),
-  holds: z.array(z.enum(["machine", "budget", "workflow"])),
+  holds: z.array(z.literal("workflow")),
   infra_failures: z.number().int().gte(0).lte(9007199254740991),
   rebase_failures: z.number().int().gte(0).lte(9007199254740991),
   resumes: z.number().int().gte(0).lte(9007199254740991),
   review_failures: z.number().int().gte(0).lte(9007199254740991),
-  self_clears: z.number().int().gte(0).lte(9007199254740991),
   status: z.literal("available"),
   version: z.number().int().gte(0).lte(9007199254740991),
 });

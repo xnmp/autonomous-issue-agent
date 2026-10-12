@@ -38,12 +38,6 @@ from .actions import (
     NoOp,
     Target,
 )
-from .self_clear import (
-    BudgetBlock,
-    BudgetWorld,
-    MachineBlock,
-    self_clear_actions,
-)
 from .ci import (
     cancelled_ci_unverified,
     repair_evidence_incomplete,
@@ -202,16 +196,6 @@ class FixState:
     # operator deliberately restoring ai-pr-open while the same check runs.
     ci_pending_escalated: frozenset[tuple[int, str]] = frozenset()
     cleanup_sources: Mapping[int, cc.PRRepairCleanup] = field(default_factory=dict)
-    machine_blocks: dict[int, MachineBlock] = field(default_factory=dict)
-    machine_revisions: dict[int, cc.WorkflowRevision] = field(default_factory=dict)
-    machine_control_errors: Mapping[int, str] = field(default_factory=dict)
-    budget_blocks: dict[int, BudgetBlock] = field(default_factory=dict)
-    budget_revisions: dict[int, cc.WorkflowRevision] = field(default_factory=dict)
-    budget_control_errors: Mapping[int, str] = field(default_factory=dict)
-    budget_worlds: dict[int, BudgetWorld] = field(default_factory=dict)
-    self_clear_counts: dict[int, int] = field(default_factory=dict)
-    self_clear_bindings: dict[int, cc.WorkflowBinding] = field(default_factory=dict)
-    self_clear_ceiling_reported: frozenset[int] = frozenset()
     # A bad per-target record must not mint a default allowance or hide peers.
     control_errors: Mapping[int, str] = field(default_factory=dict)
 
@@ -1550,30 +1534,6 @@ def decide_fix(
         issue for issue in world.issues
         if isinstance(state.resolve_workflows.get(issue.number), WorkflowSnapshot)
     ))
-    retiring = self_clear_actions(
-        issue_world,
-        state.machine_blocks,
-        state.budget_blocks,
-        state.budget_worlds,
-        state.self_clear_counts,
-        state.self_clear_ceiling_reported,
-        machine_revisions=state.machine_revisions,
-        budget_revisions=state.budget_revisions,
-        self_clear_bindings=state.self_clear_bindings,
-    )
-    actions.extend(retiring)
-    retiring_issues = {
-        action.issue for action in retiring if hasattr(action, "issue")
-    }
-    retiring_issues.update(action.self_clear.block.issue for action in retiring
-        if isinstance(action, Relabel) and action.self_clear is not None)
-    retiring_prs = {
-        action.number
-        for action in retiring
-        if hasattr(action, "target")
-        and action.target is Target.PR
-        and hasattr(action, "number")
-    }
 
     active_issues = frozenset(active.issue for active in state.inflight)
     gated_issues = frozenset(
@@ -1625,7 +1585,7 @@ def decide_fix(
     issues_by_number = {issue.number: issue for issue in world.issues}
 
     def target_available(issue: int) -> bool:
-        if issue in state.infra_control_errors or issue in state.machine_control_errors or issue in state.budget_control_errors:
+        if issue in state.infra_control_errors:
             return False
         return all(active.issue != issue for active in inflight)
 
@@ -1650,7 +1610,7 @@ def decide_fix(
         return view.declared_paths | view.predicted_paths
 
     # Only the fixer's OWN PRs are actionable here — see `fixer_prs`.
-    open_prs = [p for p in fixer_prs(world, cfg) if p.number not in retiring_prs]
+    open_prs = list(fixer_prs(world, cfg))
     pr_resume_replies = {
         pr: (issue, reply_at)
         for pr, issue, reply_at in prs_needing_resume(world, state, cfg)
@@ -1942,8 +1902,6 @@ def decide_fix(
                 AllowedEligibility,
             ):
                 continue
-            if n in retiring_issues:
-                continue
             if not remaining:
                 break
             paths = issue_paths(n)
@@ -1972,8 +1930,6 @@ def decide_fix(
         issue for issue in world.issues
         if issue.number not in guarded
         and issue.number not in state.infra_control_errors
-        and issue.number not in state.machine_control_errors
-        and issue.number not in state.budget_control_errors
         and isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
         and not workflow.gates
     ))
@@ -2071,8 +2027,8 @@ def _bind_issue_actions(actions: list[Action], state: FixState) -> list[Action]:
     """Retain the decision snapshot through claims and all issue effects.
 
     Missing authority drops the affected command, never late-binds it at the
-    executor. Self-clear projections, PR-only commands and paid PR repair
-    retain their own family authority.
+    executor. PR-only commands and paid PR repair retain their own family
+    authority.
     """
     bound: list[Action] = []
     for action in actions:
@@ -2085,8 +2041,6 @@ def _bind_issue_actions(actions: list[Action], state: FixState) -> list[Action]:
                 if action.requires is not None else None
             )
             bound.append(replace(action, requires=claim, workflow=workflow.binding))
-        elif isinstance(action, Relabel) and action.self_clear is not None:
-            bound.append(action)
         elif isinstance(action, CloseIssue) or (
             isinstance(action, (Relabel, PostComment)) and action.target is Target.ISSUE
         ):

@@ -199,10 +199,6 @@ class SQLiteWorkflowControl:
         self._scope(source.binding.fence.key)
         return self._control.reset_ci_episode(source, self.writer)
 
-    def reset_rebase_allowance(self, source: cc.RebaseAllowanceReset) -> bool:
-        self._scope(source.binding.fence.key)
-        return self._control.reset_rebase_allowance(source, self.writer)
-
     def consume_blank_pr_reply(self, binding: WorkflowBinding, reply_at: str, body: str) -> bool:
         from .workflow_rows import load_review_workflow_row, persist_workflow_snapshot
         if (not isinstance(binding, WorkflowBinding) or binding.authority.family is not WorkflowFamily.PR_REPAIR

@@ -21,10 +21,9 @@ from typing import TYPE_CHECKING, Literal, Union
 
 from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
-from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding, WorkflowRevision
+from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding
 if TYPE_CHECKING:
     from .continuation_components import CIEpisodeReset, PRRepairCleanup, PublicationIdentityEscalationCapture
-    from .self_clear import MachineClearProjection, BudgetClearProjection
 
 
 class Target(Enum):
@@ -100,23 +99,9 @@ class Relabel:
     # edits cannot supersede it, while hold/terminal/intervention labels, a
     # close/reopen or a linked PR do.
     hold_guard: IssueHoldGuard | None = None
-    self_clear: MachineClearProjection | BudgetClearProjection | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _validate_action_workflow(self.workflow, self.target, self.number)
-        if self.self_clear is not None:
-            from .self_clear import MachineClearProjection, BudgetClearProjection
-            if not isinstance(self.self_clear, (MachineClearProjection, BudgetClearProjection)):
-                raise ValueError("self-clear relabel requires typed recovery evidence")
-            block = self.self_clear.block
-            expected_add = Label.AI_READY if self.target is Target.ISSUE else Label.AI_PR_OPEN
-            if (block.target is not self.target or block.number != self.number or self.add is not expected_add
-                    or self.adds or self.comment or self.harness_signal or self.workflow is not None
-                    or not set(self.removed_labels) <= {Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}
-                    or not self.removed_labels):
-                raise ValueError("self-clear relabel does not match its selected recovery projection")
-            if isinstance(self.self_clear, MachineClearProjection) and self.removed_labels != (Label.AI_BLOCKED,):
-                raise ValueError("machine recovery may remove only its shared blocked projection")
         if not isinstance(self.adds, tuple) or any(not isinstance(label, Label) for label in self.adds):
             raise ValueError("additional labels must be a tuple of labels")
         if self.hold_guard is not None and (
@@ -375,70 +360,6 @@ class ResetCiRetries:
 
 
 @dataclass(frozen=True)
-class FinalizeMachineBlockRetirement:
-    """Commit local self-clear state after the observed label move landed."""
-
-    issue: int
-    target: Target
-    number: int
-    blocker: str
-    blocked_head: str
-    observed_head: str
-    revision: WorkflowRevision | None = None
-
-
-@dataclass(frozen=True)
-class FinalizeBudgetBlockRetirement:
-    """Commit local budget self-clear state after both labels were removed."""
-
-    issue: int
-    target: Target
-    number: int
-    scope: str
-    old_headroom_micros: int | None
-    new_headroom_micros: int | None
-    reservation_micros: int
-    cap_micros: int | None
-    currency: str
-    revision: WorkflowRevision | None = None
-
-
-@dataclass(frozen=True)
-class ReportSelfClearCeiling:
-    """One-shot journal edge when a fourth automatic clear is withheld."""
-
-    issue: int
-    target: Target
-    number: int
-    blocker: str
-    ceiling: int
-    revision: WorkflowRevision | None = None
-
-    def __post_init__(self) -> None:
-        if self.revision is not None and (not isinstance(self.revision, WorkflowRevision)
-                or not isinstance(self.revision.fence.key.target, IssueRef)
-                or self.revision.fence.key.target.number != self.issue):
-            raise ValueError("self-clear report revision must name its selected issue")
-
-
-@dataclass(frozen=True)
-class DiscardSelfClearMarker:
-    """Retire a marker after presence proves its remote block is already gone."""
-
-    issue: int
-    marker: str
-    revision: WorkflowRevision | None = None
-
-    def __post_init__(self) -> None:
-        if self.marker not in {"machine", "budget"}:
-            raise ValueError("self-clear discard requires a fixed selected cause")
-        if self.revision is not None and (not isinstance(self.revision, WorkflowRevision)
-                or not isinstance(self.revision.fence.key.target, IssueRef)
-                or self.revision.fence.key.target.number != self.issue):
-            raise ValueError("self-clear discard revision must name its selected issue")
-
-
-@dataclass(frozen=True)
 class NoOp:
     reason: str = ""
 
@@ -457,10 +378,6 @@ Action = Union[
     RemoveWorktree,
     ClearIssueState,
     ResetCiRetries,
-    FinalizeMachineBlockRetirement,
-    FinalizeBudgetBlockRetirement,
-    ReportSelfClearCeiling,
-    DiscardSelfClearMarker,
     NoOp,
 ]
 
@@ -489,10 +406,6 @@ __all__ = [
     "RemoveWorktree",
     "ClearIssueState",
     "ResetCiRetries",
-    "FinalizeMachineBlockRetirement",
-    "FinalizeBudgetBlockRetirement",
-    "ReportSelfClearCeiling",
-    "DiscardSelfClearMarker",
     "NoOp",
     "Action",
 ]

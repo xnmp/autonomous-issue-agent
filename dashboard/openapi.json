@@ -2338,9 +2338,8 @@
           },
           "holds": {
             "items": {
+              "const": "workflow",
               "enum": [
-                "machine",
-                "budget",
                 "workflow"
               ],
               "type": "string"
@@ -2372,12 +2371,6 @@
             "title": "Review Failures",
             "type": "integer"
           },
-          "self_clears": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Self Clears",
-            "type": "integer"
-          },
           "status": {
             "const": "available",
             "enum": [
@@ -2403,7 +2396,6 @@
           "review_failures",
           "rebase_failures",
           "infra_failures",
-          "self_clears",
           "holds"
         ],
         "title": "IssueRecoveryAvailable",

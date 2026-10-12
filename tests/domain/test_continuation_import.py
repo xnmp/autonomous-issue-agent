@@ -104,17 +104,18 @@ def test_malformed_legacy_ci_debt_is_source_specifically_blocked(value):
 
 def test_pre_f4_issue_plan_digest_survives_pending_ci_evolution():
     from issue_agent.domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
-    # Captured using accepted 0014d93's IssueRecoveryState, before pending_ci.
+    # Re-pinned when slice 2 deleted the self-clear fields from the state repr;
+    # pending_ci (repr=False) must still leave it unchanged.
     target = ContinuationImportTarget(WorkflowKey("o/r", IssueRef(7)), WorkflowFamily.ISSUE_RECOVERY,
         None, "a" * 64, cc.IssueRecoveryState(ci_failures=3, resumes=2))
     plan = ContinuationImportPlan("o/r", (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR),
         1, "a" * 64, "c" * 64, "d" * 64, (target,))
-    assert plan.plan_digest == "33e8ce0f8ae7de17109c46f1775f6ee76d993f063767a5c523b15915b78b1555"
+    assert plan.plan_digest == "b3e49be872df1d86711f46ed9238ed7a191368e7bffbd0bf8de8e7de72e72e9f"
 
 
 @pytest.mark.parametrize("field,value", [("resumes", ""), ("resumes", "-1"), ("resumes", "1.5"), ("resumes", "1" * 1000),
                                          ("resumed-at", "yesterday"), ("resumed-at", "2026-10-01"),
-                                         ("session", "codex:handle"), ("model", "codex:model"), ("machine-block", "unknown")])
+                                         ("session", "codex:handle"), ("model", "codex:model")])
 def test_unknown_or_malformed_selected_fields_are_blocked(field, value):
     result = classify_record(record(**{field: value}))
     assert isinstance(result, tuple) and result
@@ -213,67 +214,3 @@ def test_rebase_shadow_rejects_ambiguous_selected_source():
     assert rebase_shadow(plan, (original,)) == ((original.key, 2, 2),)
     with pytest.raises(ValueError, match="ambiguous source ownership"):
         rebase_shadow(plan, (original, original))
-
-
-def test_machine_hold_import_preserves_fixed_cause_head_and_target():
-    import json
-    from issue_agent.domain.actions import Target
-    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
-    payload = json.dumps(dict(target="PR", number=11, pr=11, blocker="checks", blocked_head="head"))
-    state = classify_record(record(**{"machine-block": payload}))
-    assert isinstance(state, cc.IssueRecoveryState)
-    assert state.machine_block == MachineBlock(7, Target.PR, 11, 11, MachineBlocker.CHECKS, "head")
-
-
-@pytest.mark.parametrize("payload", ["{}", "null", '{"target":"PR"}', "x" * 4097,
-    '{"target":"PR","number":11,"pr":12,"blocker":"checks","blocked_head":"head"}',
-    '{"target":"PR","number":true,"pr":true,"blocker":"checks","blocked_head":"head"}'])
-def test_machine_import_refuses_incomplete_or_unbounded_selected_evidence(payload):
-    result = classify_record(record(**{"machine-block": payload}))
-    assert isinstance(result, tuple) and all("machine-block" in blocker.reason for blocker in result)
-
-
-def test_budget_hold_import_preserves_fixed_reservation_scope_and_currency():
-    import json
-    from issue_agent.domain.actions import Target
-    from issue_agent.domain.self_clear import BudgetBlock
-    payload = json.dumps(dict(target="ISSUE", number=7, reservation_micros=2_000_000,
-        scope="issue:7", cap_micros=5_000_000, old_headroom_micros=250_000, currency="USD"))
-    state = classify_record(record(**{"budget-block": payload}))
-    assert isinstance(state, cc.IssueRecoveryState)
-    assert state.budget_block == BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000, 250_000, "USD")
-
-
-@pytest.mark.parametrize("field,value", [("scope", ""), ("scope", "mystery"), ("scope", "issue:99"),
-    ("scope", "x" * 513), ("cap_micros", -1), ("cap_micros", True), ("cap_micros", 2**63),
-    ("reservation_micros", None), ("currency", ""), ("currency", "usd"), ("currency", None),
-    ("number", 8), ("old_headroom_micros", -1)])
-def test_budget_import_refuses_only_selected_malformed_evidence(field, value):
-    import json
-    payload = dict(target="ISSUE", number=7, reservation_micros=2_000_000,
-        scope="issue:7", cap_micros=5_000_000, old_headroom_micros=250_000, currency="USD")
-    payload[field] = value
-    result = classify_record(record(**{"budget-block": json.dumps(payload)}))
-    assert isinstance(result, tuple) and all("budget-block" in blocker.reason for blocker in result)
-
-
-@pytest.mark.parametrize("payload", ["{}", "null", '{"target":"ISSUE"}', "x" * 4097])
-def test_budget_import_requires_bounded_complete_evidence(payload):
-    result = classify_record(record(**{"budget-block": payload}))
-    assert isinstance(result, tuple) and all("budget-block" in blocker.reason for blocker in result)
-
-
-@pytest.mark.parametrize("count,reported", [(0, False), (2, False), (3, True), (9, True)])
-def test_shared_self_clear_import_preserves_count_and_ceiling_report(count, reported):
-    fields = {"self-clears": str(count)}
-    if reported:
-        fields["self-clear-ceiling"] = "1"
-    state = classify_record(record(**fields))
-    assert isinstance(state, cc.IssueRecoveryState)
-    assert (state.self_clears, state.self_clear_ceiling_reported) == (count, reported)
-
-
-@pytest.mark.parametrize("count,marker", [(2, "1"), (3, ""), (3, "0"), (3, "true"), (3, "2")])
-def test_shared_self_clear_import_refuses_malformed_or_contradictory_report(count, marker):
-    state = classify_record(record(**{"self-clears": str(count), "self-clear-ceiling": marker}))
-    assert isinstance(state, tuple) and state
