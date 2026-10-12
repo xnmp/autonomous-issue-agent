@@ -24,8 +24,7 @@ def issue_from_branch(branch: str) -> int | None:
 
 
 def is_governed_branch(branch: str) -> bool:
-    """True iff the branch carries harness work (a governed prefix). Mirrors the
-    case guard in check-push.sh / check-branch-name.sh."""
+    """True iff the branch carries harness work (a governed prefix)."""
     return bool(_BRANCH_RE.match(branch or "")) or any(
         (branch or "").startswith(p + "/") for p in BRANCH_PREFIXES
     )

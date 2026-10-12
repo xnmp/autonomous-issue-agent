@@ -730,7 +730,7 @@ def test_rebase_shadow_and_copy_preserve_debt_without_raw_runtime_fallback(stopp
     assert dump(control) == before and {path.name: path.read_bytes() for path in state.iterdir()} == raw
 
 
-@pytest.mark.parametrize("kind", ["ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"])
+@pytest.mark.parametrize("kind", ["ROUTE", "RESOLVE", "RESUME", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"])
 def test_stopped_fix_import_blocks_attributed_pre_f7_paid_history(stopped, capsys, kind):
     from issue_agent.domain.contracts import RunId
     from issue_agent.adapters.control_store import workflow_episode_key

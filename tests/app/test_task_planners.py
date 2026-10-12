@@ -10,10 +10,7 @@ import pytest
 from issue_agent.adapters.runtime_plan import McpServer
 from issue_agent.domain.trust import as_untrusted
 from issue_agent.app.planners.schemas import (
-    ADJUDICATE_SCHEMA,
-    AUTHOR_SCHEMA,
     FIX_SCHEMA,
-    IMPLEMENT_SCHEMA,
     REVIEW_FINDINGS_SCHEMA,
     REVIEW_GATE_SCHEMA,
     REVIEW_SCHEMA,
@@ -26,13 +23,10 @@ from issue_agent.app.planners.tasks import (
     FixTaskConfig,
     ReviewTaskConfig,
     build_address_review_task,
-    build_adjudicate_task,
-    build_author_task,
     build_delegated_re_review_task,
     build_delegated_review_task,
     build_fix_ci_task,
     build_fresh_re_review_task,
-    build_implement_task,
     build_fresh_reply_task,
     build_re_review_task,
     build_resolve_task,
@@ -48,7 +42,6 @@ from issue_agent.app.planners.tasks import (
 
 from issue_agent.app.dashweb import guidance as guidance_rules
 from issue_agent.domain.ci_history import CiAttempt
-from issue_agent.domain import environment as domain_env
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
 U = as_untrusted
@@ -99,7 +92,6 @@ def test_resolve_task():
 
 @pytest.mark.parametrize("builder,args", [
     (build_resolve_task, (5, U("title"), U("body"), "/wt")),
-    (build_implement_task, (5, U("title"), U("body"), "/wt")),
     (build_resume_task, (U("reply"), "/wt", "session")),
     (build_fresh_reply_task, (5, U("title"), U("body"), U("reply"), "/wt")),
     (build_address_review_task, (7, U("review"), U("inline"), "/wt", "session")),
@@ -119,13 +111,8 @@ def test_publishing_task_authorizes_bounded_native_review_in_user_prompt(builder
     assert "one evidence-capture child" in authorization
     assert "Obtain PASS from the initial reviewer or, after fixing a FAIL, a fresh verifier before publishing" in authorization
     assert "separate paid CLI sessions" in authorization
-    assert "publication gates still apply" in authorization
+    assert "existing tests and evidence requirements still apply" in authorization
     assert "<untrusted_" not in authorization
-
-
-def test_nonpublishing_author_does_not_gain_native_review_authorization():
-    task = build_author_task(5, U("title"), U("body"), "/wt", replace(FIX_CFG, runtime="codex"))
-    assert "user explicitly authorizes" not in task.prompt
 
 
 def test_review_prompt_makes_the_reviewer_the_sole_evidence_verifier():
@@ -142,68 +129,6 @@ def test_raw_text_cannot_cross_the_prompt_boundary():
         build_resolve_task(
             5, cast(Any, "raw"), U("body"), "/wt/issue-5", FIX_CFG
         )
-
-
-def test_author_task_writes_tests_not_impl():
-    t = build_author_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
-    assert t.schema is AUTHOR_SCHEMA          # terminal is tests_authored, not pr_opened
-    assert t.append_system_prompt.startswith("AGENTMD")
-    assert t.cwd == "/wt/issue-5"
-    assert t.resume is None                   # fresh session
-    # T5 (review): "AUTHOR" / "Do NOT write the implementation" were prose-only —
-    # no code parses them, and AUTHOR_SCHEMA already proves this is the author
-    # builder. "tests_authored" is the one REQUIRED marker: `author_followup`
-    # (domain/outcome.py) branches on this literal status string.
-    assert "tests_authored" in t.prompt
-
-
-def test_implement_task_is_fresh_and_test_immutable():
-    t = build_implement_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
-    assert t.schema is IMPLEMENT_SCHEMA       # opens PR OR petitions → implement schema
-    assert t.resume is None                   # FRESH session, NOT a resume of the author
-    # T5 (review): "IMPLEMENTER" / "do NOT modify … test files" were prose-only —
-    # IMPLEMENT_SCHEMA already proves builder identity, and test-immutability is
-    # actually ENFORCED by the PR gate's test-immutability check, not by this
-    # prompt's wording (the prompt only informs the agent of a rule the gate
-    # already guarantees).
-    assert "Fixes #5" in t.prompt             # interpolated issue number
-    assert "contract_change" in t.prompt      # required marker: ImplementFollowup parses it
-
-
-def test_implement_task_carries_uphold_note():
-    t = build_implement_task(
-        5,
-        U("t"),
-        U("b"),
-        "/wt",
-        FIX_CFG,
-        uphold_note=U("the AC is correct because X"),
-    )
-    # T5 (review): "UPHELD" alone was prose (a heading word); the interpolated
-    # note content below is the real contract this test is named for.
-    assert "the AC is correct because X" in t.prompt
-
-
-def test_adjudicate_task_is_blind_to_impl():
-    t = build_adjudicate_task(
-        5,
-        U("Null token"),
-        U("crashes"),
-        U("test asserts the wrong layer"),
-        "/wt/issue-5",
-        FIX_CFG,
-    )
-    assert t.schema is ADJUDICATE_SCHEMA
-    assert t.resume is None                   # fresh session
-    assert "test asserts the wrong layer" in t.prompt  # the objection is DATA in the prompt
-    # T5 (review): "adjudicating" (role label, redundant with ADJUDICATE_SCHEMA)
-    # and "Default to UPHELD" (a bias-polarity instruction unrelated to this
-    # test's namesake claim) were prose-only, pruned. "do NOT see the
-    # implementer's code" is kept: it is this test's whole point, and the
-    # real blindness MECHANISM (worktree reset before this leg runs) lives in
-    # app/workflows/fix.py, not in this module, so this is the only place that
-    # documents the agent is TOLD it is blind.
-    assert "do NOT see the implementer's code" in t.prompt
 
 
 def test_resume_task_carries_session_and_reply():
@@ -358,11 +283,6 @@ def _every_fixer_task():
     from issue_agent.app.planners.tasks import build_rebase_task
     return {
         "resolve": build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG),
-        "author": build_author_task(5, U("t"), U("b"), "/wt", FIX_CFG),
-        "implement": build_implement_task(5, U("t"), U("b"), "/wt", FIX_CFG),
-        "adjudicate": build_adjudicate_task(
-            5, U("t"), U("b"), U("obj"), "/wt", FIX_CFG
-        ),
         "resume": build_resume_task(U("reply"), "/wt", "s1", FIX_CFG),
         "address_review": build_address_review_task(
             9, U("rb"), U("il"), "/wt", "s1", FIX_CFG
@@ -382,7 +302,7 @@ def test_every_fixer_leg_carries_the_deny_list():
 
 def test_deny_list_blocks_exfiltration_and_credential_paths():
     denied = set(FIXER_DENY)
-    # outbound network the governor cannot see inside
+    # outbound network
     assert {"WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"} <= denied
     # credential + raw-API escape hatches around the gh guardrails
     assert {"Bash(gh auth:*)", "Bash(gh secret:*)", "Bash(gh api:*)"} <= denied
@@ -444,10 +364,9 @@ def test_fresh_legs_still_get_the_full_agent_md():
             f"{name} dropped AGENT.md"
         )
         assert "still applies" not in task.append_system_prompt.lower(), name
-    for name in ("resolve", "author", "implement", "adjudicate"):
-        prompt = _every_fixer_task()[name].append_system_prompt
-        assert prompt.startswith("AGENTMD"), name
-        assert "AUTONOMY CONTRACT" in prompt, name
+    prompt = _every_fixer_task()["resolve"].append_system_prompt
+    assert prompt.startswith("AGENTMD")
+    assert "AUTONOMY CONTRACT" in prompt
 
 
 # ── diff scoping (P4.2) ──
@@ -661,7 +580,7 @@ def test_fresh_and_delegated_review_prompts_carry_the_guidance_too():
         assert "OPERATOR_GUIDANCE" in t.prompt
 
 
-# ── PR conversation + environment manifest (2026-08-08, tauri #613/#614) ──
+# ── PR conversation (2026-08-08, tauri #613/#614) ──
 DISCUSSION = U("@fixer[bot]: this deployment has no display; no screenshot exists")
 
 
@@ -726,103 +645,6 @@ def test_the_gate_and_the_validator_get_no_discussion():
     )
     for t in (gate, validator):
         assert "pr_discussion" not in t.prompt
-
-
-HEADLESS = domain_env.manifest(
-    domain_env.EnvironmentObservation(), domain_env.WEBKITGTK_STACK
-)
-UNDECLARED = domain_env.manifest(domain_env.EnvironmentObservation())
-MANIFEST_CFG = replace(RCFG, environment_manifest=HEADLESS)
-
-
-def test_review_builders_state_the_manifest_as_harness_fact():
-    t = build_review_task(100, U("t"), U("b"), U("d"), MANIFEST_CFG)
-    assert "harness-attested fact, not a claim by any author" in t.prompt
-    assert "CANNOT be produced in this environment" in t.prompt
-    assert "Do not require evidence this manifest rules out" in t.prompt
-
-
-def test_an_undeclared_stack_states_facts_without_telling_anyone_to_skip_e2e():
-    # The probe covers one toolchain; on any other, "skip the e2e tier" would be
-    # a harness-attested falsehood. Facts still ride along — they are true.
-    rcfg = replace(RCFG, environment_manifest=UNDECLARED)
-    fcfg = replace(FIX_CFG, environment_manifest=UNDECLARED)
-    review = build_review_task(100, U("t"), U("b"), U("d"), rcfg).prompt
-    fix = build_resolve_task(5, U("t"), U("b"), "/wt", fcfg).append_system_prompt
-    for prompt in (review, fix):
-        assert "harness-attested" in prompt
-        assert "no X display" in prompt
-        assert "CANNOT be produced" not in prompt
-    assert "Do not require evidence this manifest rules out" not in review
-    assert "Never raise an operator block" not in fix
-
-
-def test_the_manifest_never_lands_inside_an_untrusted_fence():
-    # It is harness-owned FACT: fenced, it would read as one more party's claim.
-    t = build_review_task(
-        100, U("t"), U("b"), U("d"), MANIFEST_CFG, discussion=DISCUSSION
-    )
-    fenced = t.prompt[t.prompt.index("<untrusted_pr_discussion_json>"):]
-    assert "harness-attested" not in fenced
-    assert t.prompt.index("harness-attested") < t.prompt.index(
-        "<untrusted_pr_discussion_json>"
-    )
-
-
-def test_every_review_builder_carries_the_manifest():
-    dcfg = replace(DCFG, environment_manifest=HEADLESS)
-    builders = (
-        build_review_task(100, U("t"), U("b"), U("d"), MANIFEST_CFG),
-        build_re_review_task(100, 2, "old", "new", U("d"), "rs", MANIFEST_CFG),
-        build_fresh_re_review_task(
-            100, 3, U("t"), U("b"), "old", "new", U("d"), U("prior"), MANIFEST_CFG
-        ),
-        build_delegated_review_task(100, U("t"), U("b"), U("d"), dcfg),
-        build_delegated_re_review_task(
-            100, 3, "old", "new", U("d"), U("prior"), dcfg
-        ),
-        build_review_gate_task(100, U("t"), U("b"), U("d"), MANIFEST_CFG),
-        build_review_dimension_task(
-            100, "correctness", "logic bugs", U("t"), U("b"), U("d"), MANIFEST_CFG
-        ),
-    )
-    for t in builders:
-        assert "ENVIRONMENT — harness-attested fact" in t.prompt
-
-
-@pytest.mark.parametrize(
-    "manifest",
-    [
-        domain_env.EnvironmentManifest(),
-        domain_env.EnvironmentManifest(text="   "),
-    ],
-)
-def test_an_unknown_environment_attests_nothing(manifest):
-    # Absent must not read as "every kind of evidence is possible" — when the
-    # probe cannot run, the prompt says nothing at all.
-    rcfg = replace(RCFG, environment_manifest=manifest)
-    fcfg = replace(FIX_CFG, environment_manifest=manifest)
-    assert "ENVIRONMENT" not in build_review_task(
-        100, U("t"), U("b"), U("d"), rcfg
-    ).prompt
-    assert "ENVIRONMENT" not in build_resolve_task(
-        5, U("t"), U("b"), "/wt", fcfg
-    ).append_system_prompt
-
-
-def test_fixer_legs_carry_the_complementary_instruction():
-    fcfg = replace(FIX_CFG, environment_manifest=HEADLESS)
-    legs = (
-        build_resolve_task(5, U("t"), U("b"), "/wt", fcfg),
-        build_address_review_task(100, U("rev"), U("inline"), "/wt", "s1", fcfg),
-        build_fix_ci_task(100, U("checks"), U("log"), "/wt", "s1", fcfg),
-    )
-    for t in legs:
-        prompt = t.append_system_prompt
-        assert "CANNOT be produced in this environment" in prompt
-        assert "not producible in this environment (harness manifest)" in prompt
-        # The dead end this fixes: the block channel the reviewer cannot read.
-        assert "Never raise an operator block solely to report unproducibility" in prompt
 
 
 # ── delegated review (REVIEW_MODE=delegated) ──
@@ -1138,8 +960,8 @@ def test_every_review_judgment_builder_fences_its_untrusted_inputs():
 # review comments are writable by ANY user with read access to the repo (not
 # just the PR author), and a CI log echoes attacker-influenced PR titles/branch
 # names verbatim; the consumer here is the FIXER running under
-# `permission_mode=bypassPermissions` with a governor that only inspects git/gh
-# argv shapes, so `curl … | sh` embedded in either input was ungoverned. Fields
+# `permission_mode=bypassPermissions` with no command filter, so `curl … | sh`
+# embedded in either input is runnable. Fields
 # discovered BY NAME so a future fixer input-carrying builder is automatically
 # pulled into the completeness check, instead of shipping unguarded.
 _FIXER_REPAIR_BUILDER_NAME_RE = re.compile(r"^build_(address_review|fix_ci)_task$")
@@ -1276,3 +1098,29 @@ def test_route_model_degrades_an_unknown_runtime_to_the_claude_table():
     from issue_agent.app.planners.tasks import MODEL_TIERS, route_model
 
     assert route_model("complex", "no-such-runtime") == MODEL_TIERS["claude"]["complex"]
+
+
+# Incident: docs/open/issues/review-no-resultmessage-background-tasks.md — a
+# backgrounded Bash/Task ends the Claude stream with no ResultMessage, losing
+# the paid leg's verdict. Every role's launch options must disable it, and a
+# task env cannot turn it back on.
+@pytest.mark.parametrize(
+    "plan",
+    [
+        build_resolve_task(
+            5, U("t"), U("b"), "/wt", replace(FIX_CFG, model="claude-sonnet-5")
+        ),
+        build_review_task(
+            7, U("t"), U("b"), U("diff"), ReviewTaskConfig(repo="o/r", review_prompt="r")
+        ),
+    ],
+    ids=["fix", "review"],
+)
+@pytest.mark.parametrize("task_env", [{}, {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"}])
+def test_claude_launch_options_disable_background_tasks(plan, task_env):
+    from issue_agent.adapters.agent_runner import build_option_kwargs
+    from issue_agent.app.planners.run import compose_runtime_plan
+
+    runtime_plan = replace(compose_runtime_plan(plan), env=task_env)
+    kwargs = build_option_kwargs(runtime_plan)
+    assert kwargs["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"

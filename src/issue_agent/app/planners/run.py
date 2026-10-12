@@ -8,7 +8,6 @@ from ...adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
 from ...domain.agent_task import RunIntent, RuntimeName
 from ...domain.effort import Effort
 from ...domain.resolve_return import ResolveInputs
-from ...domain.resolve_split import AdjudicationInput, ReauthorInput, SplitContext, SplitImplement, SplitInput
 from ...domain.continuation_components import IssueReplyInput, LinkedPRIssueReplyInput, PRRepairInput
 
 
@@ -27,7 +26,6 @@ class PlannedRun:
     subagents: tuple[SubagentDef, ...]
     env: dict[str, str]
     resolve_inputs: ResolveInputs | None
-    split_input: SplitInput | None
     issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None
     pr_repair_input: PRRepairInput | None
 
@@ -51,7 +49,6 @@ class PlannedRun:
         intent: RunIntent | None = None,
         runtime: RuntimeName | None = None,
         resolve_inputs: ResolveInputs | None = None,
-        split_input: SplitInput | None = None,
         issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None = None,
         pr_repair_input: PRRepairInput | None = None,
     ) -> None:
@@ -80,9 +77,6 @@ class PlannedRun:
         if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
             raise ValueError("resolve completion inputs must be validated")
         object.__setattr__(self, "resolve_inputs", resolve_inputs)
-        if split_input is not None and (resolve_inputs is None or not isinstance(split_input, (SplitContext, SplitImplement, AdjudicationInput, ReauthorInput))):
-            raise ValueError("split launch requires validated stage and completion inputs")
-        object.__setattr__(self, "split_input", split_input)
         if issue_reply is not None and not isinstance(issue_reply, (IssueReplyInput, LinkedPRIssueReplyInput)):
             raise ValueError("issue reply launch inputs must be validated")
         object.__setattr__(self, "issue_reply", issue_reply)
@@ -137,7 +131,6 @@ def compose_runtime_plan(plan: PlannedRun) -> RuntimePlan:
         subagents=plan.subagents,
         env=plan.env,
         resolve_inputs=plan.resolve_inputs,
-        split_input=plan.split_input,
         issue_reply=plan.issue_reply,
         pr_repair_input=plan.pr_repair_input,
     )

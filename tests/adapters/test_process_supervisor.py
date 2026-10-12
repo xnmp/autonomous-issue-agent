@@ -491,8 +491,7 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
         "'child': {k: os.environ.get(k) for k in ("
         "'ISSUE_AGENT_AUTHORITY_BUNDLE', 'ISSUE_AGENT_CONTROL_DB', "
         "'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID', "
-        "'ISSUE_AGENT_BASE_BRANCH', 'ISSUE_AGENT_EVENT_LOG', "
-        "'ISSUE_AGENT_DURABLE_PUBLISH', 'ISSUE_AGENT_LEG_ROLE')}, "
+        "'ISSUE_AGENT_BASE_BRANCH', 'ISSUE_AGENT_EVENT_LOG')}, "
         "'carrier': _process_environment(os.getppid())}))"
     )
     command = supervisor.supervised_command(
@@ -512,8 +511,6 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
             "ISSUE_AGENT_BASE_BRANCH": "canary/live",
             "ISSUE_AGENT_EVENT_LOG": str(tmp_path / "events.jsonl"),
             "ISSUE_AGENT_AUTHORITY_BUNDLE": bundle,
-            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-            "ISSUE_AGENT_LEG_ROLE": "fix",
         },
         check=False,
         capture_output=True,
@@ -529,8 +526,6 @@ def test_supervised_paid_command_carries_authority_outside_target_environment(
         "ISSUE_AGENT_OWNER_ID": None,
         "ISSUE_AGENT_BASE_BRANCH": None,
         "ISSUE_AGENT_EVENT_LOG": None,
-        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-        "ISSUE_AGENT_LEG_ROLE": "fix",
     }
     assert result["carrier"] == authority
 
@@ -698,7 +693,6 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
         '[ -z "${GH_TOKEN:-}" ] || exit 9\n'
         '[ "${TEST_CMD:-}" = "uv run pytest" ] || exit 10\n'
         '[ -z "${ISSUE_AGENT_AUTHORITY_BUNDLE:-}" ] || exit 11\n'
-        '[ "${ISSUE_AGENT_DURABLE_PUBLISH:-}" = "1" ] || exit 12\n'
         '[ "${CARGO_INCREMENTAL:-}" = "0" ] || exit 13\n'
         '[ "${CARGO_TARGET_DIR:-}" = "/operator/shared-cargo-target" ] || exit 14\n'
         '[ "${CARGO_BUILD_JOBS:-}" = "2" ] || exit 15\n'
@@ -718,15 +712,11 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
             "GH_TOKEN": "must-not-reach-child",
             "TEST_CMD": "uv run pytest",
             "ISSUE_AGENT_AUTHORITY_BUNDLE": "must-stay-in-carrier",
-            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
             "CARGO_INCREMENTAL": "0",
             "CARGO_TARGET_DIR": "/operator/shared-cargo-target",
             "CARGO_BUILD_JOBS": "2",
             "PW_WORKERS": "1",
-            CHILD_ENV_MANIFEST: (
-                "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE "
-                "ISSUE_AGENT_DURABLE_PUBLISH"
-            ),
+            CHILD_ENV_MANIFEST: "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE",
         },
     )
     deadline = time.monotonic() + 3

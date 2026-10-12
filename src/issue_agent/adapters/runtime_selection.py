@@ -1,7 +1,6 @@
 """Select a governed provider stack before its accounting admission."""
 
 from collections.abc import Mapping
-from contextvars import ContextVar
 from types import MappingProxyType
 
 from .runtime_plan import AgentRuntime, ContextualRuntime, RunIdentityRuntime, RuntimePlan
@@ -17,16 +16,10 @@ class SelectingRuntime:
             raise ValueError("default runtime must be available")
         self.runtimes = MappingProxyType(dict(runtimes))
         self.default = default
-        self._workflow = ContextVar[WorkflowBinding | None](f"selected_workflow_{id(self)}", default=None)
-
-    @property
-    def workflow_binding(self) -> WorkflowBinding | None:
-        return self._workflow.get()
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None,
                     claim_target: int | None = None, *, workflow: WorkflowBinding | None = None,
                     review_child: ReviewChildIdentity | None = None) -> None:
-        self._workflow.set(workflow)
         for runtime in self.runtimes.values():
             if isinstance(runtime, ContextualRuntime):
                 runtime.set_context(role, kind, number, issue, claim_target,

@@ -8,7 +8,6 @@ from .continuation_components import CIEpisodeReset, SelectedIssueRecovery, Issu
 from .agent_task import RuntimeName
 from .backoff import LegEnd
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
-from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
 from .resolve_rearm import PendingResolveRearm, ResolveControlRead, UnavailableResolveRearm
 from .workflow import (
@@ -83,12 +82,6 @@ class WorkflowControl(Protocol):
 
     def return_effect_authority(self, returned: ReturnedResolve) -> AbstractContextManager[None]: ...
 
-    def reauthor_reset_intent(self, binding: WorkflowBinding, input_fingerprint: str) -> ReauthorResetIntent | None: ...
-
-    def contract_reset_authority(self, intent: ResetIntent) -> AbstractContextManager[ContractResetCompleted | None]: ...
-
-    def complete_contract_reset(self, completed: ContractResetCompleted) -> ContractResetCompleted: ...
-
     def rearm_authority(self, expected: WorkflowRevision, *, binding: WorkflowBinding | None = None) -> AbstractContextManager[WorkflowSnapshot]: ...
 
     def observe_workspace(
@@ -123,7 +116,6 @@ class WorkflowControl(Protocol):
         self, returned: ReturnedResolve, issue: ObservedIssue,
         linkage: NoLinkedPr | LinkedPrPresent,
         *, cleanup: ResolveCleanupCompleted | None = None,
-        contract_revision: ContractRevision | None = None,
     ) -> WorkflowCommitted | WorkflowConflict: ...
 
     def lookup_rearm(

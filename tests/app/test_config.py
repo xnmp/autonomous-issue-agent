@@ -241,9 +241,6 @@ def test_merge_method():
     assert c.merge_method == "merge"
 
 
-def test_edit_check_cmd():
-    assert from_env({"REPO": "x"}).edit_check_cmd == ""  # default off
-    assert from_env({"REPO": "x", "EDIT_CHECK_CMD": "npx tsc --noEmit"}).edit_check_cmd == "npx tsc --noEmit"
 
 
 def test_retry_caps():
@@ -309,12 +306,10 @@ def test_an_unset_shell_command_is_reported_as_empty_not_as_quotes():
     assert describe_command("", empty="none") == "none"
 
 
-def test_describe_shows_the_real_alert_and_edit_check_commands():
-    c = from_env({"REPO": "o/r", "ALERT_CMD": "notify-send 'harness capped'",
-                  "EDIT_CHECK_CMD": "cargo check --quiet"})
+def test_describe_shows_the_real_alert_command():
+    c = from_env({"REPO": "o/r", "ALERT_CMD": "notify-send 'harness capped'"})
     d = c.describe()
 
-    assert "cargo check --quiet" in d
     assert "notify-send 'harness capped'" in d or 'notify-send' in d
 
 
@@ -419,19 +414,12 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
         "MAX_REVIEW_RETRIES": "-2",
         "MAX_REBASE_RETRIES": "-3",
         "REVIEW_MAX_REJECTIONS": "-4",
-        "MAX_CONTRACT_ROUNDS": "-5",
     })
 
     _assert_each_knob_flagged_once(c.validation_errors(), {
         "POLL_SECONDS", "MAX_CI_RETRIES", "MAX_REVIEW_RETRIES",
-        "MAX_REBASE_RETRIES", "REVIEW_MAX_REJECTIONS", "MAX_CONTRACT_ROUNDS",
+        "MAX_REBASE_RETRIES", "REVIEW_MAX_REJECTIONS",
     })
-
-
-def test_contract_round_limit_matches_durable_context_capacity():
-    for value, rejected in (("4", False), ("5", True), ("1000000", True)):
-        config = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_CONTRACT_ROUNDS": value})
-        assert any("MAX_CONTRACT_ROUNDS" in error for error in config.validation_errors()) is rejected
 
 
 def test_review_rejection_ceiling_fits_one_rearm_dismissal_fan_out():
@@ -1172,19 +1160,19 @@ def test_file_value_wins_over_inherited_value(tmp_path):
 
 
 def test_shell_escaped_values_survive_the_file_read(tmp_path):
-    # compose-env.sh writes `printf '%s=%q'`, so a real TEST_CMD/EDIT_CHECK_CMD
-    # lands backslash-escaped. Mis-parsing one breaks every gate.
+    # compose-env.sh writes `printf '%s=%q'`, so a real command value such as
+    # ALERT_CMD lands backslash-escaped.
     env_file = tmp_path / "active.env"
     cmd = "set -e; (cd backend && uv run pytest) && pnpm exec tsc -b"
     quoted = subprocess.run(
-        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "EDIT_CHECK_CMD", cmd],
+        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "ALERT_CMD", cmd],
         capture_output=True, text=True, check=True,
     ).stdout
     env_file.write_text(f"REPO=o/r\n{quoted}\n")
 
     c = from_env({"AGENT_ENV": str(env_file)})
 
-    assert c.edit_check_cmd == cmd
+    assert c.alert_cmd == cmd
 
 
 def test_unparseable_agent_env_file_falls_back_to_process_env(tmp_path):

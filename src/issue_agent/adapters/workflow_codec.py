@@ -38,9 +38,6 @@ from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
 from ..domain.actions import Target
 from ..domain.contracts import EffectReceipt, EffectStatus
-from ..domain.outcome import Adjudication
-from ..domain.effort import Effort
-from ..domain import resolve_split as split
 from ..domain import resolve_workspace as workspace
 from ..domain.resolve_rearm import RearmObservation
 from ..domain.resolve_return import ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted
@@ -78,17 +75,13 @@ _VALUES = (
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
     workspace.PriorResolveAdmission, workspace.EpisodeWorkspaceHandoff,
     workspace.PrepareResolveWorkspace, workspace.EpisodeWorkspacePrepared,
-    split.ContractRevision, split.ContractBaseline, split.UnavailableContractRevision,
-    split.SplitSelection, split.SplitReply, split.AdjudicationStep, split.SplitContext,
-    split.SplitImplement, split.NeedsAdjudication, split.ContractResetIntent,
-    split.ContractResetResult, split.ContractResetCompleted, split.AdjudicationInput,
-    split.ReauthorResetIntent, split.ReauthorInput,
+    workspace.ContractRevision, workspace.ContractResetResult,
     ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted,
     identity.IssueRef, identity.PullRequestRef, identity.WorkflowKey,
     identity.WorkflowFence, identity.FamilyAuthority, identity.WorkflowRevision,
     identity.WorkflowBinding, WorkflowAttemptIdentity,
     Comment, IssueView, w.ObservedIssue, w.NoLinkedPr, w.LinkedPrPresent, w.ResolveRearmPreflight,
-    w.ResolveSession, w.FreshResolve, w.AuthoredResolve, w.ResolveAdmission,
+    w.ResolveSession, w.FreshResolve, w.ResolveAdmission,
     w.ResolveEpisode, w.ResolveCeiling, w.RemoteOutcomeUncertain, w.RetryAuthorizationRequired,
     w.EvidenceUnavailable, w.RearmNeedsDecision, w.NoAuthorizedRemediation,
     w.RemediationAttempted, w.OpenGate, w.RearmingGate,
@@ -160,7 +153,7 @@ _ENUMS = (
     LifecycleOperation,
     cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.FixInfraOutcome,
     migration.ReviewImportBlockerKind,
-    ExitReason, Adjudication, Effort,
+    ExitReason,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
     w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
@@ -206,10 +199,7 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
     "PRRepairResult": {"ci": None, "review": None, "rebase": None},
     "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None},
-    "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
-    "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
-    "ResolveAttemptResult": {"split": None},
-    "ReturnedResolve": {"split_input": None, "verdict": "", "rationale": "", "contract_revision": None},
+    "ResolveAdmission": {"workspace_handoff_id": None},
     # Review facts observed before command markers were parsed name no command.
     "SubmittedReviewFact": {"review_command": None},
     "RequestRearm": {"expected_binding": None},

@@ -30,10 +30,10 @@ def test_raw_return_retains_paid_identity_and_question_without_classifying():
 
 @pytest.mark.parametrize("field,value", [
     ("is_error", None), ("is_error", 1), ("stage", "RESOLVE"),
-    ("stage", ResolveStage.ADJUDICATE), ("inputs", None),
+    ("stage", ResolveStage.ROUTE), ("inputs", None),
     ("exit_reason", "success"), ("returned_at", datetime(2026, 9, 23)),
     ("summary", "x" * 65537), ("needs", "bad\x00text"),
-], ids=["null-error", "integer-error", "raw-stage", "split-stage", "null-inputs", "raw-exit", "naive-time", "huge-summary", "nul-needs"])
+], ids=["null-error", "integer-error", "raw-stage", "route-stage", "null-inputs", "raw-exit", "naive-time", "huge-summary", "nul-needs"])
 def test_malformed_return_cannot_become_recovery_authority(field, value):
     with pytest.raises(ValueError):
         replace(returned(), **{field: value})

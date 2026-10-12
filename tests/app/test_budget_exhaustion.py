@@ -9,9 +9,8 @@ from issue_agent.domain.events import BudgetPathEntered
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import IssueView
-from issue_agent.domain.workflow import AuthoredResolve
 
-from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
+from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees
 from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state, seed_resolve, machine_ends
 
 
@@ -28,8 +27,6 @@ def workflow(gateway, store, runner, **overrides):
         base_branch="dev",
         fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
         fork_threshold=5,
-        author_tests_split=False,
-        max_contract_rounds=2,
         fix_mcp_config="",
         harness_root="",
         log=lambda _message: None,
@@ -100,33 +97,3 @@ def test_budget_outcome_preserves_existing_episode_strikes_and_session():
     assert resolve_state(store, 5).episode.continuation == before.episode.continuation
 
 
-def test_split_author_budget_exhaustion_uses_the_budget_path():
-    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
-    store = FakeStore()
-    journal = RecordingJournal()
-
-    asyncio.run(workflow(
-        gateway, store, FakeRunner(budget_result()), author_tests_split=True, journal=journal,
-    ).resolve(5))
-
-    assert_budget_path(gateway, store, journal, "author")
-
-
-def test_split_implementer_budget_exhaustion_uses_the_budget_path():
-    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
-    store = FakeStore()
-    journal = RecordingJournal()
-    runner = SeqRunner([
-        AgentResult(is_error=False, status="tests_authored", session_id="author-session", cost_usd=0.1),
-        budget_result(),
-    ])
-
-    asyncio.run(workflow(
-        gateway, store, runner, author_tests_split=True, journal=journal,
-    ).resolve(5))
-
-    assert_budget_path(gateway, store, journal, "implement", legs=2)
-    checkpoint = resolve_state(store, 5).episode.continuation
-    assert isinstance(checkpoint, AuthoredResolve)
-    assert checkpoint.author_admission.input_fingerprint is not None
-    assert len(runner.tasks) == 2

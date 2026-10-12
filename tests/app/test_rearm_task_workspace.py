@@ -14,8 +14,8 @@ import pytest
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.contracts import CommandId
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.resolve_split import ContractResetResult
 from issue_agent.domain.resolve_workspace import (
+    ContractResetResult,
     EpisodeWorkspaceHandoff,
     EpisodeWorkspacePrepared,
     NoPriorResolveAdmission,

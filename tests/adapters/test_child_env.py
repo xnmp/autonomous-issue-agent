@@ -37,7 +37,7 @@ def test_provider_specific_auth_key_can_be_admitted_explicitly():
     assert selected == {"CUSTOM_PROVIDER_KEY": "secret"}
 
 
-def test_paid_child_keeps_advisory_markers_without_control_authority():
+def test_paid_child_receives_no_control_plane_values():
     selected = without_supervisor_authority(
         {
             "PATH": "/bin",
@@ -46,13 +46,7 @@ def test_paid_child_keeps_advisory_markers_without_control_authority():
             "ISSUE_AGENT_RUN_ID": "run-1",
             "ISSUE_AGENT_OWNER_ID": "owner-1",
             "ISSUE_AGENT_BASE_BRANCH": "dev",
-            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-            "ISSUE_AGENT_LEG_ROLE": "fix",
         }
     )
 
-    assert selected == {
-        "PATH": "/bin",
-        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-        "ISSUE_AGENT_LEG_ROLE": "fix",
-    }
+    assert selected == {"PATH": "/bin"}

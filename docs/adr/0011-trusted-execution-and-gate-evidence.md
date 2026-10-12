@@ -1,6 +1,6 @@
 # ADR 0011 — Trusted execution and gate evidence
 
-Status: Accepted
+Status: Superseded by slice 6a (2026-10): the fixer gates, governor and hook stack were deleted.
 Date: 2026-08-01
 Governs: src/issue_agent/domain/gate.py src/issue_agent/adapters/child_env.py src/issue_agent/adapters/codex_hook.py src/issue_agent/adapters/governor.py src/issue_agent/adapters/worktree.py plugin/hooks/checks/
 

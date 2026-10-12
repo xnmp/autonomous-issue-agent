@@ -20,7 +20,6 @@ from ..domain.outcome import AgentResult
 from ..domain.workflow_identity import WorkflowBinding
 from ..domain.review_execution import ReviewChildIdentity
 from ..domain.resolve_return import ResolveInputs
-from ..domain.resolve_split import AdjudicationInput, ReauthorInput, SplitContext, SplitImplement, SplitInput
 from ..domain.continuation_components import IssueReplyInput, LinkedPRIssueReplyInput, PRRepairInput
 
 
@@ -64,7 +63,6 @@ class RuntimePlan:
     context_prefix: str
     context_suffix: str
     resolve_inputs: ResolveInputs | None
-    split_input: SplitInput | None
     issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None
     pr_repair_input: PRRepairInput | None
 
@@ -90,7 +88,6 @@ class RuntimePlan:
         context_prefix: str = "",
         context_suffix: str = "",
         resolve_inputs: ResolveInputs | None = None,
-        split_input: SplitInput | None = None,
         issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None = None,
         pr_repair_input: PRRepairInput | None = None,
     ) -> None:
@@ -125,9 +122,6 @@ class RuntimePlan:
         if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
             raise ValueError("resolve completion inputs must be validated")
         object.__setattr__(self, "resolve_inputs", resolve_inputs)
-        if split_input is not None and (resolve_inputs is None or not isinstance(split_input, (SplitContext, SplitImplement, AdjudicationInput, ReauthorInput))):
-            raise ValueError("split launch requires validated stage and completion inputs")
-        object.__setattr__(self, "split_input", split_input)
         if issue_reply is not None and not isinstance(issue_reply, (IssueReplyInput, LinkedPRIssueReplyInput)):
             raise ValueError("issue reply launch inputs must be validated")
         object.__setattr__(self, "issue_reply", issue_reply)
@@ -181,9 +175,6 @@ class AgentRuntime(Protocol):
 
 @runtime_checkable
 class ContextualRuntime(AgentRuntime, Protocol):
-    @property
-    def workflow_binding(self) -> WorkflowBinding | None: ...
-
     def set_context(
         self,
         role: str,

@@ -4,7 +4,6 @@ from tests.domain.builders import observed_pr
 
 import contextlib
 import dataclasses
-import hashlib
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -15,13 +14,10 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
 from issue_agent.adapters.effects import GitHubEffectExecutor
-from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.workflows.fix import FixWorkflow
-from issue_agent.app.workflows import fix as fix_workflow_module
 from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable, UnknownModelPolicy
 from issue_agent.domain.workflow import FreshResolve, ResolveSession
-from issue_agent.domain.resolve_split import AdjudicationInput, ContractRevision
 from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
 from issue_agent.domain.world import PRView
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
@@ -56,14 +52,14 @@ class AccountedFixtureWorkflow(FixWorkflow):
         inner = original.inner if isinstance(original, JournalingRuntime) else original
         maximum = self.cfg.fix.max_budget_usd
         limits = {("fix", stage): Money.from_major("USD", maximum) for stage in (
-            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "FIX_CI", "ADDRESS_REVIEW", "REBASE",
+            "RESOLVE", "RESUME", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE",
         )}
         limits[("fix", "ROUTE")] = Money.from_major("USD", self.cfg.fix.router_budget_usd)
         accounted = AccountingRuntime(
             inner, self.store._workflow_db, "o/r", "fix", None, None, None, "fixture", self._resolve_runtime_name(),
             BudgetPolicy(limits), RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
                                             ModelRates(1, 1, 1, 1)),
-            owner_id="o/r:fix:fixture", max_contract_rounds=self.cfg.max_contract_rounds,
+            owner_id="o/r:fix:fixture",
         )
         if self.cfg.available_fix_runtimes:
             from issue_agent.adapters.runtime_selection import SelectingRuntime
@@ -92,27 +88,6 @@ class AccountedFixtureWorkflow(FixWorkflow):
 
         def captured_publication(role, cwd):
             return dataclasses.replace(publication, cwd=cwd, branch=selected_workspaces.get(cwd, publication.branch))
-        contract_head = ""
-
-        def captured_revision(_cwd, _issue, capture, branch):
-            nonlocal contract_head
-            latest_task = inner.tasks[-1] if getattr(inner, "tasks", None) else None
-            latest_result = None
-            if getattr(inner, "results", None):
-                index = min(len(inner.tasks) - 1, len(inner.results) - 1)
-                latest_result = inner.results[index]
-            elif hasattr(inner, "result"):
-                latest_result = inner.result
-            revised = (
-                latest_task is not None
-                and isinstance(latest_task.split_input, AdjudicationInput)
-                and latest_result is not None
-                and latest_result.field("verdict") == "revised"
-            )
-            if not contract_head or revised:
-                contract_head = hashlib.sha256(capture.encode()).hexdigest()
-            return ContractRevision(branch, contract_head)
-
         try:
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(self.worktrees, "ensure", side_effect=selected_workspace))
@@ -121,17 +96,6 @@ class AccountedFixtureWorkflow(FixWorkflow):
                     "_fix_publication_context",
                     side_effect=captured_publication,
                 ))
-                if not isinstance(self.worktrees, Worktrees):
-                    stack.enter_context(patch.object(
-                        accounting_runtime,
-                        "capture_contract_revision",
-                        side_effect=captured_revision,
-                    ))
-                    stack.enter_context(patch.object(
-                        fix_workflow_module,
-                        "verify_contract_revision",
-                        side_effect=lambda _cwd, _issue, revision: revision,
-                    ))
                 yield
         finally:
             self.runner = original
@@ -233,7 +197,7 @@ def seed_review_retry(store, at, count, issue=5):
 
 
 def attach_workflow_authority(
-    gw, store, *, resolve_ceiling=20, max_contract_rounds=2, pr_repair=False
+    gw, store, *, resolve_ceiling=20, pr_repair=False
 ):
     # Every gateway instance models a fresh authoritative observation. Some
     # tests deliberately reuse one control store across several instances, so
@@ -261,7 +225,6 @@ def attach_workflow_authority(
             store._workflow_db,
             WorkflowWriter("o/r", "fix", "o/r:fix:fixture"),
             resolve_ceiling=resolve_ceiling,
-            max_contract_rounds=max_contract_rounds,
         ))
     if pr_repair:
         install_pr_repair_authority(gw, store)

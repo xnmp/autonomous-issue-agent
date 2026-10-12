@@ -31,7 +31,7 @@ from ...domain.agent_task import (
     RuntimeCapabilities,
     RuntimeName,
 )
-from ...domain.gate import modified_existing_tests_from_diff
+from ...domain.diff_tests import modified_existing_tests_from_diff
 from ...domain.fix import breaker_key
 from ...domain.identity import login_eq
 from ...domain.refs import issue_from_branch
@@ -128,8 +128,8 @@ class ReviewWorkflowConfig:
     reviewer_capabilities: RuntimeCapabilities = RUNTIME_CAPABILITIES[
         RuntimeName.CLAUDE
     ]
-    # Codex ignores RuntimePlan's SDK-only tool policy, so it must run only after
-    # its read-only governor is installed in this explicit checkout.  An empty
+    # Codex ignores RuntimePlan's SDK-only tool policy; it runs in its read-only
+    # sandbox under a CODEX_HOME prepared for this explicit checkout.  An empty
     # cwd is a containment failure, never permission to fall back to os.getcwd().
     execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
@@ -244,7 +244,7 @@ class ReviewWorkflow:
             return AgentResult(
                 is_error=True,
                 status="containment_unavailable",
-                summary="Codex review needs an explicit TARGET_DIR for its governor hook",
+                summary="Codex review needs an explicit TARGET_DIR for its CODEX_HOME",
             )
         if isinstance(self.runner, ContextualRuntime):
             self.runner.set_context("review", bound.kind.name, pr,
@@ -266,12 +266,10 @@ class ReviewWorkflow:
         )
 
     def _prepare_task(self, task, pr: int = 0, head_sha: str = ""):
-        """Pin the leg's cwd to the reviewed head, then install Codex's review
-        governor immediately before each agent leg.
+        """Pin the leg's cwd to the reviewed head, then prepare Codex's
+        CODEX_HOME for that directory immediately before each agent leg.
 
-        A builder-time write can mutate whichever checkout happens to run a
-        test, including an in-flight fixer worktree — so the hook install
-        happens here, into the same directory the leg will execute in. That
+        The preparation is keyed by the directory the leg will execute in. That
         directory is the per-PR pinned checkout when configured (the verdict
         binds `head_sha`; the code the reviewer reads must be that SHA, not
         the operator's live checkout), else the configured target checkout.
@@ -303,12 +301,12 @@ class ReviewWorkflow:
                     status=_PIN_DEFERRED_STATUS,
                     summary=f"review #{pr}: pinned checkout unavailable",
                 )
-        if not self.cfg.reviewer_capabilities.requires_external_governor:
+        if not self.cfg.reviewer_capabilities.requires_prepared_home:
             return replace(task, cwd=cwd) if cwd else task
         if not cwd or self.cfg.prepare_cwd is None:
             self.cfg.log(
                 "review: Codex containment unavailable — set TARGET_DIR to the "
-                "review checkout; refusing to run without a governor hook"
+                "review checkout; refusing to run without a prepared CODEX_HOME"
             )
             return None
         try:

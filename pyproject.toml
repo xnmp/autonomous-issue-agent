@@ -20,15 +20,9 @@ issue-agent-publish = "issue_agent.adapters.agent_publish:main"
 # extra so the domain layer + its tests stay installable with zero third-party deps.
 [project.optional-dependencies]
 # PyJWT[crypto] backs the GitHub App installation-token mint (adapters/app_token).
-# tree-sitter(+bash) back the in-process bash governor (plugin/hooks/bash_governor.py),
-# which adapters/governor imports at module load — so it is required for EVERY role
-# (fix/review), not just the fixer. Declared here (not only as Makefile
-# `--with`) so `python -m issue_agent.app.main <role>` works after a plain install.
 sdk = [
     "claude-agent-sdk>=0.2.158",
     "pyjwt[crypto]>=2.8",
-    "tree-sitter>=0.21",
-    "tree-sitter-bash>=0.21",
 ]
 dev = [
     "pytest>=8",
@@ -36,8 +30,6 @@ dev = [
     "claude-agent-sdk>=0.2.158",
     "pyjwt[crypto]>=2.8",
     "import-linter>=2.0",
-    "tree-sitter>=0.21",
-    "tree-sitter-bash>=0.21",
     # fastapi.testclient is httpx-backed; the full development gate includes
     # the optional dashboard transport so its endpoint contracts execute.
     "httpx>=0.27",
@@ -172,7 +164,7 @@ missing-attribute = "error"
 # (app → adapters → domain). A violation here is a design regression, not a
 # style nit — `make arch` (in `make test`) fails the build on it.
 [tool.importlinter]
-root_packages = ["issue_agent", "plugin"]
+root_packages = ["issue_agent"]
 # Required so the "forbidden" contract can reason about imports of external
 # packages (claude_agent_sdk / openai) leaving the domain layer.
 include_external_packages = true
@@ -195,15 +187,6 @@ forbidden_modules = [
     "issue_agent.app",
     "claude_agent_sdk",
     "openai",
-]
-
-[[tool.importlinter.contracts]]
-name = "Plugin hooks depend only on the domain core"
-type = "forbidden"
-source_modules = ["plugin"]
-forbidden_modules = [
-    "issue_agent.adapters",
-    "issue_agent.app",
 ]
 
 [[tool.importlinter.contracts]]

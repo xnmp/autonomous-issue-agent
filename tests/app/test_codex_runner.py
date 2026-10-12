@@ -42,11 +42,7 @@ from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.app.config import from_env
-from issue_agent.app.planners.schemas import (
-    AUTHOR_SCHEMA,
-    FIX_SCHEMA,
-    IMPLEMENT_SCHEMA,
-)
+from issue_agent.app.planners.schemas import FIX_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.effort import Effort
@@ -96,7 +92,8 @@ def test_argv_basic_shape():
     assert argv[:2] == ["codex", "exec"]
     assert argv[-1] == "do it"  # prompt is last positional
     assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
-    assert "--dangerously-bypass-hook-trust" in argv
+    # A hook supplied by the target checkout must never be auto-trusted.
+    assert "--dangerously-bypass-hook-trust" not in argv
     # No model configured anywhere → NO -m flag: `-m ""` is not "the default",
     # and with no -m codex uses the provider's own default (in OAuth mode, the
     # subscription's current model).
@@ -201,7 +198,6 @@ def test_argv_resume_omits_exec_only_flags():
     # -o / --output-schema ARE legal on resume and must survive (else no envelope)
     assert argv[argv.index("-o") + 1] == "/tmp/o.json"
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
-    assert "--dangerously-bypass-hook-trust" in argv  # governor stays on
 
 
 def test_argv_nonresume_keeps_sandbox_and_cd():
@@ -758,7 +754,7 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     codex_home = tmp_path / "codex-home"
-    # HookPreparingRuntime sets CODEX_HOME on the task, not on the daemon.
+    # CodexHomeRuntime sets CODEX_HOME on the task, not on the daemon.
     # The runner must read the same isolated profile its child writes even when
     # the ambient operator profile points elsewhere.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "wrong-ambient-home"))
@@ -2302,7 +2298,7 @@ def test_an_aborted_run_still_reports_its_model():
 # status of a COMPLETED FORCE-PUSH — was missing, so that leg could be re-run on
 # resume. Pin the vocabulary here so a schema change breaks loudly.
 _FIXER_TERMINAL_STATUSES = frozenset(
-    {"pr_opened", "pushed", "blocked", "failed", "tests_authored", "contract_change"}
+    {"pr_opened", "pushed", "blocked", "failed"}
 )
 # `done` is in no schema; agent/lib.sh and classify_outcome still accept it, so a
 # codex run that emits it must still count as real output.
@@ -2312,9 +2308,7 @@ _LEGACY_OK_ALIASES = frozenset({"done"})
 def test_fixer_status_vocabulary_is_exactly_the_schemas_union():
     """Drift alarm: if a leg's schema gains or loses a terminal status, this
     fails and whoever changed it must re-check the retry guard below."""
-    union = set()
-    for schema in (FIX_SCHEMA, AUTHOR_SCHEMA, IMPLEMENT_SCHEMA):
-        union |= set(schema["properties"]["status"]["enum"])
+    union = set(FIX_SCHEMA["properties"]["status"]["enum"])
     assert union == set(_FIXER_TERMINAL_STATUSES)
 
 

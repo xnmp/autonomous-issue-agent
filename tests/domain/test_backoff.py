@@ -64,11 +64,6 @@ def test_no_history_means_no_wait():
     assert machine_backoff_until((), AgentKind.RESOLVE) is None
 
 
-@pytest.mark.parametrize("run_kind", ["AUTHOR", "IMPLEMENT", "ADJUDICATE", "RESOLVE"])
-def test_resolve_family_legs_back_off_the_resolve_dispatch(run_kind):
-    assert dispatched_kind(run_kind) is AgentKind.RESOLVE
-
-
 def test_a_normal_router_leg_before_each_dying_resolve_does_not_reset_the_streak():
     """Routing runs a cheap ROUTE leg before every unpinned RESOLVE. It returns
     normally; only the RESOLVE leg that ended the dispatch counts, so twenty

@@ -115,5 +115,4 @@ specs), plus the SDK-port planning docs (`refactor-sdk.md`,
 completed.
 
 The archived specs describe deleted bash watchers and are not accurate about
-the Python path. `plugin/hooks/checks/` is still live for Codex mode and is
-pinned against the Python gate by `tests/test_gate_parity.py`.
+the Python path. The `plugin/hooks/` gate stack was deleted in slice 6a.

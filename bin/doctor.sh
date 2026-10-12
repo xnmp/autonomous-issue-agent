@@ -38,7 +38,7 @@ for c in claude gh jq git uv; do
 done
 
 # #156: the installer used to shim only `issue-agent` while pyproject declares
-# `issue-agent-publish` too — the executable the governor instructs every fixer
+# `issue-agent-publish` too — the executable AGENT.md instructs every fixer
 # to publish through — so paid resolve legs blocked on a missing binary. Gated
 # on `issue-agent` resolving: that (and only that) means this box runs the
 # INSTALLED flavour, so a dev checkout that never ran `make install` stays
@@ -50,14 +50,6 @@ if command -v issue-agent >/dev/null 2>&1; then
   else
     bad "issue-agent-publish not on PATH though issue-agent is — stale/partial install, re-run 'make install'"
   fi
-fi
-
-echo "== governor self-test =="
-if command -v uv >/dev/null 2>&1; then
-  out=$(printf '{"tool_input":{"command":"git commit --no-verify -m x"}}' | uv run --quiet "$HARNESS_ROOT/plugin/hooks/bash_governor.py" 2>&1); rc=$?
-  if [ "$rc" -eq 2 ]; then ok "governor blocks --no-verify (exit 2)"; else bad "governor did NOT block bypass (rc=$rc)"; fi
-else
-  warn "uv missing → governor degraded (fails open)"
 fi
 
 echo "== config =="
@@ -75,8 +67,8 @@ echo "== config snapshot (config/.active.<name>.env) =="
 # dropped any var the files assign to the value the launching shell already had)
 # keeps that broken file until somebody re-runs point-at — and `install-systemd.sh`
 # copies it, so the omission survives reboots. The observed symptom was total:
-# TEST_CMD missing → the gate resolves no test command → every push and every
-# `gh pr create` denied, forever, with nothing anywhere saying why.
+# an assigned variable silently missing from the daemons' environment, with
+# nothing anywhere saying why.
 #
 # The check recomposes the two SOURCE files in a subshell and compares the
 # variable NAMES against the snapshot. That expectation is derived independently
@@ -129,7 +121,7 @@ for _ACTIVE_ENV in "${_ACTIVE_FILES[@]}"; do
       <(printf '%s\n' "$_snapshot_names" | sed '/^$/d' | sort -u) | tr '\n' ' ')"
     _missing_names="${_missing_names%"${_missing_names##*[![:space:]]}"}"
     if [ -n "$_missing_names" ]; then
-      bad "config/$_ACTIVE_BASE is STALE — it omits $(printf '%s' "$_missing_names" | wc -w | tr -d ' ') variable(s) that config/shared.env or config/repos/$_ACTIVE_NAME.env assign: $_missing_names — regenerate it with 'make point-at REPO=$_ACTIVE_NAME' (or 'issue-agent start'). A snapshot written by the pre-P0R-1 compose-env.sh drops assigned vars silently; if TEST_CMD is among them the gate denies every push and 'gh pr create' until this is fixed."
+      bad "config/$_ACTIVE_BASE is STALE — it omits $(printf '%s' "$_missing_names" | wc -w | tr -d ' ') variable(s) that config/shared.env or config/repos/$_ACTIVE_NAME.env assign: $_missing_names — regenerate it with 'make point-at REPO=$_ACTIVE_NAME' (or 'issue-agent start'). A snapshot written by the pre-P0R-1 compose-env.sh drops assigned vars silently, and the daemons run without them until this is fixed."
     else
       ok "config/$_ACTIVE_BASE matches config/shared.env + repos/$_ACTIVE_NAME.env"
     fi
@@ -292,12 +284,9 @@ if command -v gh >/dev/null 2>&1; then
   [ -n "$who" ] && ok "gh authenticated as $who" || bad "gh not authenticated (run: gh auth login)"
   if [ -n "$REPO" ]; then
     gh repo view "$REPO" --json name >/dev/null 2>&1 && ok "can read $REPO" || bad "cannot access repo $REPO"
-    # The push gate (wave P0-B/B6) probes `gh pr list` per gated push and FAILS
-    # CLOSED on error — an unauthed/broken gh here means every governed-branch
-    # push is denied forever, not silently allowed. Assert the probe works now.
     gh pr list -R "$REPO" --state open --limit 1 --json number >/dev/null 2>&1 \
-      && ok "gh pr list works ($REPO) — push-gate probe healthy" \
-      || bad "gh pr list failed for $REPO — the fail-closed push gate would deny every governed push (fix gh auth/network first)"
+      && ok "gh pr list works ($REPO)" \
+      || bad "gh pr list failed for $REPO (fix gh auth/network first)"
 
     # Everything above ran as the FIXER (ambient gh auth). The reviewer uses a
     # different identity, and nothing checked it could reach the repo at all —
@@ -459,7 +448,7 @@ echo "== CI on the base branch =="
 #   A. `ci_state` returns CIState.NONE when a PR has no checks, and
 #      domain/fix.py:315/:340 treat NONE EXACTLY like OK. So a repo whose
 #      workflows never trigger on the base branch gets fully autonomous merges
-#      with zero CI verification — the local TEST_CMD gate is all that is left,
+#      with zero CI verification — only the reviewer is left,
 #      and nothing anywhere says so. keifu was in precisely this state: CI
 #      triggered on `main` while every PR targets `chong-dev`, so `gh run list`
 #      was empty and five merged PRs had received zero checks between them.
@@ -690,40 +679,13 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$TARGET_DIR" ]; then
 fi
 
 echo "== project commands =="
+# TEST_CMD is read only by point-at's base-branch probe; agents choose and run
+# their own tests, and the reviewer and CI judge them.
 if [ -n "${TEST_CMD:-}" ]; then
-  ok "TEST_CMD=$TEST_CMD (the gate runs THIS; it wins over the agent's .harness/test-cmd — review P1R-18)"
-  # The #63 fork-bomb bound is an env counter (HARNESS_GATE_DEPTH) stamped into
-  # every gate child. A TEST_CMD that resets its own environment erases it and
-  # re-arms unbounded recursion on a self-hosted target. The gate already
-  # scrubs deployment knobs itself — env -i wrappers are never needed.
-  case "$TEST_CMD" in
-    *"env -i"*|*"HARNESS_GATE_DEPTH"*)
-      warn "TEST_CMD wraps itself in 'env -i' (or touches HARNESS_GATE_DEPTH) — this erases the gate's re-entrancy counter and can re-arm the #63 fork bomb on a self-hosted target. The gate already scrubs deployment knobs from the child env; drop the wrapper." ;;
-  esac
-  [ "${RED_MUST_FAIL:-1}" = 0 ] \
-    && warn "RED_MUST_FAIL=0 — the anti-tautological-test (red-fail) gate is OFF; a test that passes without the change won't be caught"
+  ok "TEST_CMD=$TEST_CMD (point-at probes it on a pristine base branch)"
 else
-  # Corrected claim (review M6/§4): with no TEST_CMD the gate does NOT "run no
-  # tests" — it falls back to the agent's own .harness/test-cmd, and if that is
-  # missing too it fails CLOSED (denies every push and `gh pr create`) unless
-  # ALLOW_UNTESTED=1. Both are worse than they sound: the fallback is a command
-  # the gated agent chose, and the fail-closed path halts the harness.
-  if [ "${ALLOW_UNTESTED:-0}" = 1 ]; then
-    warn "TEST_CMD unset + ALLOW_UNTESTED=1 → if the agent writes no .harness/test-cmd, the test gate AND the anti-tautological-test (red-fail) gate are BOTH skipped. Set TEST_CMD to arm them."
-  else
-    warn "TEST_CMD unset → the gate falls back to the agent-written .harness/test-cmd, and denies every push / 'gh pr create' when that is missing too (fail-closed; ALLOW_UNTESTED=1 is the opt-out). Set TEST_CMD so the command the gate runs is yours, not the agent's."
-  fi
+  ok "TEST_CMD unset → point-at skips its base-branch probe"
 fi
-# Corrected claim (review M6/§4): this used to print "✓ LINT_CMD set" while the
-# rule ran on the codex path ONLY — the default SDK path had no equivalent, so
-# the ✓ described a command nothing executed. It is now enforced by both
-# (domain/gate.py:check_project_commands), which is what makes the ✓ true.
-[ -n "${LINT_CMD:-}" ] \
-  && ok "LINT_CMD=$LINT_CMD (blocks a commit on failure)" \
-  || warn "LINT_CMD unset (commit gate won't lint)"
-[ -n "${TYPECHECK_CMD:-}" ] \
-  && ok "TYPECHECK_CMD=$TYPECHECK_CMD (blocks a commit on failure)" \
-  || warn "TYPECHECK_CMD unset (commit gate won't typecheck)"
 
 # Codex receives the harness contract as developer authority and target-owned
 # AGENTS/CLAUDE guidance as separately encoded, untrusted user-task data. The

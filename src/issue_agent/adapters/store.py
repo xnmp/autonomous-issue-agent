@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from dataclasses import dataclass
 
 from ..domain.agent_task import RuntimeName
@@ -220,70 +219,3 @@ class Store:
             self._clear_issue_advisory(issue_key)
         else:
             self.clear_ci_history(issue_key)
-
-# ── worktree .harness/ claims and local test command ──────────────────────────
-class HarnessMarkers:
-    """Reads non-authoritative `.harness/` claims and the local test command.
-
-    Claims may schedule stricter verification but never prove a gate condition.
-    `root` is the worktree path (cwd).
-    """
-
-    def __init__(self, root: str):
-        self.root = root
-        self.dir = os.path.join(root, ".harness")
-        # One tracked-check subprocess per marker per instance, not per read:
-        # this runs on the PreToolUse hot path (every agent Bash call).
-        self._tracked_cache: dict[str, bool] = {}
-
-    def _path(self, name: str) -> str:
-        return os.path.join(self.dir, name)
-
-    def _read(self, name: str) -> str:
-        if self._tracked(name):
-            return ""
-        try:
-            with open(self._path(name)) as f:
-                return f.read()
-        except (FileNotFoundError, OSError):
-            return ""
-
-    def _tracked(self, name: str) -> bool:
-        """A marker TRACKED by git is repo history, not this session's claim —
-        and repo history is agent/merge-writable input to the gate's own teeth.
-        Keifu #167→#156 (2026-08-01): a committed .harness/test-cmd merged into
-        the base and every downstream worktree's trusted red-fail gate silently
-        ran another issue's single test. Tracked markers are therefore ignored
-        outright (the diff-level deny rule stops NEW commits; this closes the
-        read against history that predates it). Unknowable (git failed) reads
-        as untracked — the marker is non-authoritative either way."""
-        cached = self._tracked_cache.get(name)
-        if cached is not None:
-            return cached
-        try:
-            tracked = (
-                subprocess.run(
-                    [
-                        "git", "-C", self.root, "ls-files",
-                        "--error-unmatch", f".harness/{name}",
-                    ],
-                    capture_output=True,
-                    timeout=10,
-                ).returncode
-                == 0
-            )
-        except Exception:  # noqa: BLE001 — unknowable ⇒ preserve old behaviour
-            tracked = False
-        self._tracked_cache[name] = tracked
-        return tracked
-
-    def test_cmd(self) -> str | None:
-        """First non-blank line of .harness/test-cmd (prc_resolve_test_cmd's
-        marker side). None when absent so the resolver falls back to env."""
-        raw = self._read("test-cmd")
-        if not raw:
-            return None
-        for line in raw.replace("\r", "").splitlines():
-            if line.strip():
-                return line.strip()
-        return None

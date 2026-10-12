@@ -15,8 +15,8 @@ cd /path/to/target-repository
 issue-agent start
 ```
 
-`issue-agent start` creates or reuses a repo overlay, discovers `REPO`,
-`TARGET_DIR`, and (when omitted) a non-watch `TEST_CMD`, runs the preflight, and
+`issue-agent start` creates or reuses a repo overlay, discovers `REPO` and
+`TARGET_DIR`, runs the preflight, and
 starts the selected fix/review daemons in the foreground. Ctrl-C sends
 the daemons through their bounded drain path.
 
@@ -64,11 +64,8 @@ Important fields:
   started after reboot exits cleanly instead of reacquiring work. Use a
   different `--name` for another repository; do not hand-author the lineage.
 - `FIX_BOT` must differ from `REVIEW_BOT` in three-identity mode.
-- `TEST_CMD` must terminate. The trusted executor bounds it, scrubs deployment
-  controls, stamps recursion depth, and kills the full process group on timeout.
-- `GATE_TEST_FAILURE_EXIT_CODES` defaults to `1`. Add a code only when the
-  trusted test runner documents it as assertion failure; timeout, spawn, and
-  signal exits can never satisfy the red-test gate.
+- `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
+  gate runs it. It must terminate.
 - `FIXER_RUNTIME=claude|codex|glm`;
   `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
@@ -88,8 +85,8 @@ Important fields:
   supported. Malformed selections and known model/provider mismatches fail
   configuration validation. A configured ladder uses Low for classification
   and Med if classification fails. Each purchase uses its selected provider's
-  hooks and accounting; Claude and Codex remain available while overrides are
-  enabled so changing a tier preserves existing sessions, split stages and PR
+  accounting; Claude and Codex remain available while overrides are
+  enabled so changing a tier preserves existing sessions and PR
   repairs. Clearing every tier override restores single-provider operation;
   finish existing cross-provider work first or retain an explicit override
   until its transcripts are no longer needed. Returning to a single provider
@@ -218,16 +215,14 @@ to the exact repository and role identity; a different repo/role daemon cannot
 claim them from the shared control store. A branch publication also refuses to
 run if the remote moved after its expected revision was captured.
 
-The shell governor is advisory defense-in-depth. It denies governed commands it
-cannot resolve, but it is not the authorization boundary. Current runtime
-children still inherit publication capability, so use only trusted inbound
+There is no command governor and no fixer publication gate (slice 6a). Current
+runtime children still inherit publication capability, so use only trusted inbound
 issues/reviews/CI text. The credential-free artifact publisher is deliberately
 trigger-gated on untrusted-repo onboarding; see
 `docs/reference/capability-authority-matrix.md`.
 
-Agent-written gate markers are claims. Tests and remote facts are re-derived by
-trusted code. Live enforcement uses `GateResult` and `OpenPrLookup`; an
-unavailable or indeterminate observation never becomes allow.
+Agent-written files are claims. Remote facts are re-derived by trusted code; CI
+and the independent reviewer judge the pushed head.
 
 ## State, recovery, and accounting
 
@@ -701,12 +696,10 @@ make typecheck
 make test-domain
 make test-adapters
 make test-app
-make test-hooks
-make test-governor
 ```
 
 `make test` is the required submission gate. The suite includes import/purity
-contracts, runtime and gate parity, convergence, transactional accounting
+contracts, convergence, transactional accounting
 races, recovery/supervision, schema-v2 projection, and service artifact tests.
 `config/agent.env.example` is generated from `HarnessConfig` metadata; update
 the field definition and regenerate with

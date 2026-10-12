@@ -11,8 +11,8 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.lifecycle import completion_guard, issue_escalation, pr_escalation
 from issue_agent.domain.eligibility import LifecycleOperation
 from issue_agent.domain.outcome import (
-    AgentResult, address_review_actions, author_actions, budget_actions,
-    contract_escalation_actions, fix_ci_actions, pr_budget_actions,
+    AgentResult, address_review_actions, budget_actions,
+    fix_ci_actions, pr_budget_actions,
     resolve_actions, resume_actions,
 )
 from tests.adapters.test_effects import _executor
@@ -25,11 +25,7 @@ BLOCKED = AgentResult(is_error=False, status="blocked", needs="which API?", summ
      Label.AI_REVIEW, Label.NEEDS_HUMAN_REVIEW, False, "CI ceiling", False),
     (lambda: issue_escalation(7, "resolve ceiling", Label.AI_READY).actions(), Target.ISSUE,
      Label.AI_READY, Label.NEEDS_HUMAN_REVIEW, False, "resolve ceiling", False),
-    (lambda: contract_escalation_actions(7, "objection", "trail"), Target.ISSUE,
-     Label.AI_WORKING, Label.NEEDS_HUMAN_REVIEW, False, "objection", False),
     (lambda: resolve_actions(7, BLOCKED, None), Target.ISSUE,
-     Label.AI_WORKING, Label.AI_BLOCKED, False, "which API?", False),
-    (lambda: author_actions(7, BLOCKED), Target.ISSUE,
      Label.AI_WORKING, Label.AI_BLOCKED, False, "which API?", False),
     (lambda: resume_actions(7, BLOCKED, None), Target.ISSUE,
      Label.AI_WORKING, Label.AI_BLOCKED, False, "which API?", False),

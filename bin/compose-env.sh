@@ -151,8 +151,7 @@ done < <(env -0)
 #     overlay declaration and is ignored;
 #   floor — a name in the static scrub floor (TEST_CMD, BASE_BRANCH, ...) can
 #     never pass through: that floor is the #63 defense's last line. The
-#     canonical list is parsed from point-at.sh's RTC_SCRUB_STATIC (the bash
-#     copy the drift test pins to governor.TARGET_CMD_SCRUB_KNOBS) — parse
+#     canonical list is parsed from point-at.sh's RTC_SCRUB_STATIC — parse
 #     failure is fatal, never open;
 #   shell-critical — names that alter how the composing shell or the gate
 #     wrappers themselves execute (PATH & friends, the scrub lists, the depth

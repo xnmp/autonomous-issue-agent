@@ -1,4 +1,4 @@
-"""ADR 0011 child environment, with ADR 0005 ancestor authority retention."""
+"""Agent child environment, with ADR 0005 ancestor authority retention."""
 
 from __future__ import annotations
 
@@ -68,15 +68,8 @@ _PUBLICATION_CREDENTIAL_KEYS = frozenset(
     }
 )
 
-# ADR 0005: the supervised launcher retains ISSUE_AGENT_* control-plane values.
-# Provider processes receive only the two advisory markers their governor must
-# evaluate.  An allowlist makes future authority keys scrubbed by default.
-AGENT_VISIBLE_ISSUE_AGENT_KEYS = frozenset(
-    {
-        "ISSUE_AGENT_DURABLE_PUBLISH",
-        "ISSUE_AGENT_LEG_ROLE",
-    }
-)
+# ADR 0005: the supervised launcher retains ISSUE_AGENT_* control-plane values;
+# provider processes receive none of them.
 
 
 def without_supervisor_authority(environment: Mapping[str, str]) -> dict[str, str]:
@@ -85,10 +78,7 @@ def without_supervisor_authority(environment: Mapping[str, str]) -> dict[str, st
     return {
         key: value
         for key, value in environment.items()
-        if (
-            not key.startswith("ISSUE_AGENT_")
-            or key in AGENT_VISIBLE_ISSUE_AGENT_KEYS
-        )
+        if not key.startswith("ISSUE_AGENT_")
     }
 
 

@@ -533,30 +533,22 @@ def test_synth_repo_env_minimal_keys():
     assert env["TARGET_DIR"] == "/repos/myapp"
     assert env["BASE_BRANCH"] == "dev"
     assert "issue-agent-myapp" in env["STATE_DIR"]
-    # No optional flags → no TEST_CMD etc emitted.
+    # The harness never writes TEST_CMD: it is only the operator's point-at probe.
     assert "TEST_CMD" not in env
 
 
 def test_synth_repo_env_roundtrips_through_from_env():
     text = cli.synth_repo_env(
         repo="o/r", target_dir="/t", name="r", base_branch="main",
-        test_cmd="pytest -q", review_mode="delegated", max_budget="10.00",
+        review_mode="delegated", max_budget="10.00",
     )
     cfg = from_env(_source_env(text))
     assert cfg.repo == "o/r"
     assert cfg.target_dir == "/t"
     assert cfg.base_branch == "main"
-    # from_env reads TEST_CMD via env, but MAX_BUDGET_USD / REVIEW_MODE land on cfg.
     assert cfg.fix_budget_usd == 10.00
     from issue_agent.domain.review import ReviewMode
     assert cfg.review_mode is ReviewMode.DELEGATED
-
-
-def test_synth_repo_env_quotes_special_chars():
-    # A TEST_CMD with quotes/$() must survive single-quoting intact.
-    cmd = "set -e; R=$(git rev-parse --show-toplevel); (cd \"$R\" && pytest)"
-    text = cli.synth_repo_env(repo="o/r", target_dir="/t", name="r", test_cmd=cmd)
-    assert _source_env(text)["TEST_CMD"] == cmd
 
 
 def test_synth_repo_env_records_exact_repoint_lineage():
@@ -650,22 +642,6 @@ def test_harness_root_points_at_checkout():
     assert os.path.isfile(os.path.join(cli.HARNESS_ROOT, "bin", "point-at.sh"))
 
 
-# ── test-command discovery ────────────────────────────────────────────────────
-def test_has_toolchain_signature_true_for_pyproject(tmp_path):
-    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
-    assert cli._has_toolchain_signature(str(tmp_path)) is True
-
-
-def test_has_toolchain_signature_true_for_glob_go_test(tmp_path):
-    (tmp_path / "foo_test.go").write_text("package x\n")
-    assert cli._has_toolchain_signature(str(tmp_path)) is True
-
-
-def test_has_toolchain_signature_false_for_bare_repo(tmp_path):
-    (tmp_path / "README.md").write_text("# hi\n")
-    assert cli._has_toolchain_signature(str(tmp_path)) is False
-
-
 def _fake_proc(stdout, returncode=0):
     class P:
         pass
@@ -673,72 +649,6 @@ def _fake_proc(stdout, returncode=0):
     p.stdout = stdout
     p.returncode = returncode
     return p
-
-
-def test_discover_test_cmd_skips_llm_when_no_signature(tmp_path, monkeypatch):
-    # No signature file → must NOT spend an LLM call; returns '' immediately.
-    # (_has_toolchain_signature is exercised directly by its own tests above.)
-    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: False)
-    called = {"n": 0}
-
-    def spy(*a, **k):
-        called["n"] += 1
-        return _fake_proc("uv run pytest\n")
-
-    monkeypatch.setattr(cli.subprocess, "run", spy)
-    assert cli.discover_test_cmd(str(tmp_path)) == ""
-    assert called["n"] == 0
-
-
-def test_discover_test_cmd_returns_command(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_proc("TEST_CMD: uv run pytest\n"))
-    assert cli.discover_test_cmd(str(tmp_path)) == "uv run pytest"
-
-
-def test_discover_test_cmd_no_tests_sentinel(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
-    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_proc("TEST_CMD: NO_TESTS\n"))
-    assert cli.discover_test_cmd(str(tmp_path)) == ""
-
-
-def test_discover_test_cmd_fail_soft_on_missing_claude(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
-
-    def boom(*a, **k):
-        raise FileNotFoundError("claude")
-
-    monkeypatch.setattr(cli.subprocess, "run", boom)
-    assert cli.discover_test_cmd(str(tmp_path)) == ""
-
-
-# ── _parse_test_cmd_reply: robust to weak-model prose / fences ────────────────
-def test_parse_test_cmd_plain():
-    assert cli._parse_test_cmd_reply("TEST_CMD: uv run pytest") == "uv run pytest"
-
-
-def test_parse_test_cmd_ignores_prose_prefix():
-    # The real failure mode observed: model echoes a prose line first.
-    reply = "Standard test command with uv:\nTEST_CMD: uv run pytest -q"
-    assert cli._parse_test_cmd_reply(reply) == "uv run pytest -q"
-
-
-def test_parse_test_cmd_last_marker_wins():
-    reply = "TEST_CMD: <the command>\nTEST_CMD: pnpm exec vitest run"
-    assert cli._parse_test_cmd_reply(reply) == "pnpm exec vitest run"
-
-
-def test_parse_test_cmd_no_tests():
-    assert cli._parse_test_cmd_reply("TEST_CMD: NO_TESTS") == ""
-
-
-def test_parse_test_cmd_missing_marker_is_empty():
-    assert cli._parse_test_cmd_reply("i could not find any tests, sorry") == ""
-
-
-def test_parse_test_cmd_monorepo_composite():
-    cmd = "set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec tsc -b)"
-    assert cli._parse_test_cmd_reply(f"TEST_CMD: {cmd}") == cmd
 
 
 # ── review M11: status merges STATE_DIR/REVIEW_STATE_DIR ────
@@ -1130,10 +1040,9 @@ def test_check_overlay_mismatch_target_dir_fallback_when_no_repo_recorded(tmp_pa
 def _start_args(**overrides) -> argparse.Namespace:
     base = dict(
         repo="", target_dir="", name="", roles=None, base_branch="dev",
-        test_cmd="", no_init=True, edit_check_cmd="", review_mode="",
+        no_init=True, review_mode="",
         max_budget="", review_budget="", max_ticks=None, write_config=False,
         worktree=False, worktree_path="",
-        no_verify_test_cmd=False, lint_cmd="", typecheck_cmd="",
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -1415,74 +1324,6 @@ def test_cmd_start_reuses_matching_overlay_no_warning(tmp_path, monkeypatch, cap
     captured = capsys.readouterr()
     assert "reusing config/repos/app.env" in captured.out
     assert captured.err == ""
-
-
-def test_cmd_start_write_config_stops_existing_deployment_before_rewrite(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    overlay = tmp_path / "app.env"
-    original = overlay.read_text()
-    events: list[tuple[str, str]] = []
-
-    def stop(name: str) -> int:
-        events.append((f"stop:{name}", overlay.read_text()))
-        return 0
-
-    def execve(*_args) -> None:
-        events.append(("exec", overlay.read_text()))
-
-    monkeypatch.setattr(cli, "_stop_deployment", stop)
-    monkeypatch.setattr(cli.os, "execve", execve)
-
-    rc = cli.cmd_start(
-        _start_args(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            write_config=True,
-            test_cmd="make test",
-            no_verify_test_cmd=True,
-        )
-    )
-
-    assert rc is None
-    assert events[0] == ("stop:app", original)
-    assert events[1][0] == "exec"
-    assert events[1][1] != original
-    assert "TEST_CMD='make test'" in events[1][1]
-
-
-def test_cmd_start_write_config_preserves_overlay_when_quiescence_fails(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    overlay = tmp_path / "app.env"
-    original = overlay.read_text()
-    execve_calls: list[tuple] = []
-    monkeypatch.setattr(cli, "_stop_deployment", lambda _name: 1)
-    monkeypatch.setattr(
-        cli.os,
-        "execve",
-        lambda *args: execve_calls.append(args),
-    )
-
-    rc = cli.cmd_start(
-        _start_args(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            write_config=True,
-            test_cmd="make test",
-            no_verify_test_cmd=True,
-        )
-    )
-
-    assert rc == 1
-    assert overlay.read_text() == original
-    assert execve_calls == []
 
 
 def test_cmd_stop_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
@@ -2145,66 +1986,6 @@ def test_uninstall_service_all_is_explicit_and_unscoped(monkeypatch) -> None:
             "uninstall",
         ]
     ]
-
-
-# ── TEST_CMD verification (a wrong command wedges the whole gate) ──────────────
-def test_verify_reports_a_passing_suite():
-    check = cli.verify_test_cmd("true", "/tmp", run=lambda c, cwd, t: 0)
-    assert check.passed and not check.timed_out
-
-
-def test_verify_reports_a_failing_suite_without_masking_it():
-    """A red suite must be REPORTED, never silently swapped for the
-    ALLOW_UNTESTED fallback — that would trade a loud problem (the gate denies
-    pushes until you fix it) for a silent one (a gate with no teeth)."""
-    check = cli.verify_test_cmd("false", "/tmp", run=lambda c, cwd, t: 1)
-    assert not check.passed and not check.timed_out and check.exit_code == 1
-
-
-def test_verify_detects_watch_mode_as_a_timeout():
-    """The signature failure: `vitest` instead of `vitest run` never exits, so
-    the gate hangs GATE_TEST_TIMEOUT_S on every push and then denies it."""
-    def _hang(cmd, cwd, timeout):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
-    check = cli.verify_test_cmd("vitest", "/tmp", timeout_s=0.1, run=_hang)
-    assert check.timed_out and check.exit_code is None
-
-
-def test_verify_survives_a_runner_that_explodes():
-    """Verification is best-effort: it must never be the reason `start` fails."""
-    def _boom(cmd, cwd, timeout):
-        raise OSError("no shell")
-    assert cli.verify_test_cmd("x", "/tmp", run=_boom).exit_code == -1
-
-
-def test_verify_runs_the_command_the_GATE_would_run():
-    """Anti-vacuity on the whole feature: verifying a DIFFERENT invocation than
-    the gate uses would prove nothing. The gate does
-    `subprocess.run(cmd, shell=True, cwd=<repo>)`, so the command string must
-    reach the runner intact and with the repo as cwd."""
-    seen = {}
-
-    def _spy(cmd, cwd, timeout):
-        seen.update(cmd=cmd, cwd=cwd, timeout=timeout)
-        return 0
-
-    cli.verify_test_cmd("set -e; (cd api && pytest)", "/repo/root", run=_spy)
-    assert seen["cmd"] == "set -e; (cd api && pytest)"
-    assert seen["cwd"] == "/repo/root"
-    assert seen["timeout"] > 0
-
-
-def test_report_names_watch_mode_and_the_slow_suite_alternative(capsys):
-    cli.report_test_cmd_check("vitest", cli.TestCmdCheck(exit_code=None, seconds=180.0))
-    out = capsys.readouterr()
-    combined = out.out + out.err
-    assert "WATCH MODE" in combined and "GATE_TEST_TIMEOUT_S" in combined
-
-
-def test_report_tells_you_a_red_suite_blocks_the_fixer(capsys):
-    cli.report_test_cmd_check("pytest", cli.TestCmdCheck(exit_code=1, seconds=3.0))
-    combined = "".join(capsys.readouterr())
-    assert "denies every push" in combined
 
 
 def test_ready_routes_operator_label_through_durable_effects(
@@ -2981,187 +2762,7 @@ def test_detect_review_bot_tolerates_gh_failure_and_malformed_json(monkeypatch):
     assert cli.detect_review_bot("/t", "fix-bot") == ""
 
 
-# ── toolchain-specific trusted red-test exit codes ────────────────────────────
-def test_gate_failure_exit_codes_for_cargo():
-    assert cli.gate_failure_exit_codes("cargo test --all") == "101"
-
-
-def test_gate_failure_exit_codes_left_default_for_other_toolchains():
-    assert cli.gate_failure_exit_codes("uv run pytest -q") == ""
-    assert cli.gate_failure_exit_codes("pnpm exec vitest run") == ""
-    assert cli.gate_failure_exit_codes("") == ""
-
-
-def test_gate_failure_exit_codes_tolerates_an_unparseable_command():
-    assert cli.gate_failure_exit_codes("cargo test 'unbalanced") == "101"
-
-
-# ── doctor: declared red-test exit codes vs. the runners TEST_CMD actually runs
-def test_doctor_warns_when_cargos_failure_code_is_not_trusted():
-    """tauri 2026-08-08: `… && cargo test` under the default set {1} reads every
-    assertion failure (101) as INFRA_ERROR, so the red-fail gate never converges."""
-    findings = cli.test_failure_exit_code_findings(
-        "npm run build && cargo test --workspace", None, "tauri"
-    )
-
-    assert [f.level for f in findings] == ["warn"]
-    assert "cargo test" in findings[0].message
-    assert "101" in findings[0].message
-    assert 'GATE_TEST_FAILURE_EXIT_CODES="1 101"' in findings[0].message
-    assert "config/repos/tauri.env" in findings[0].message
-
-
-def test_doctor_warns_that_make_fails_with_2_not_1():
-    """GNU make exits 2 on a failing recipe — this harness's own `make test`
-    deployment would deadlock the red-fail gate under the default set {1}."""
-    findings = cli.test_failure_exit_code_findings("make test", None, "self")
-
-    assert [f.level for f in findings] == ["warn"]
-    assert "'make'" in findings[0].message
-    assert "exit 2" in findings[0].message
-    assert 'GATE_TEST_FAILURE_EXIT_CODES="1 2"' in findings[0].message
-
-
-def test_doctor_is_silent_when_every_runner_code_is_declared():
-    assert cli.test_failure_exit_code_findings("cargo test", "1 101", "tauri") == ()
-    assert cli.test_failure_exit_code_findings("uv run pytest -q", None, "app") == ()
-    assert cli.test_failure_exit_code_findings("bunx vitest run", "1", "app") == ()
-    assert cli.test_failure_exit_code_findings("make test", "1,2", "self") == ()
-
-
-def test_doctor_says_nothing_without_a_test_command():
-    assert cli.test_failure_exit_code_findings("", None, "app") == ()
-    assert cli.test_failure_exit_code_findings("   ", "1 101", "app") == ()
-
-
-def test_doctor_errors_on_a_malformed_declaration():
-    """Parity with the gate: a malformed or reserved-code declaration trusts
-    NOTHING (adapters/worktree.py), so even pytest's 1 stops being evidence."""
-    findings = cli.test_failure_exit_code_findings("uv run pytest -q", "oops", "app")
-
-    assert findings[0].level == "error"
-    assert "fails closed" in findings[0].message
-    assert 'GATE_TEST_FAILURE_EXIT_CODES="1"' in findings[0].message
-    assert any("pytest" in f.message for f in findings)
-
-
-def test_doctor_errors_on_an_empty_declaration_with_no_known_runner():
-    """Total deadlock and no runner to hang the warning on: the empty trusted set
-    is itself the finding. A PRESENT-but-empty key is a declaration, not an
-    absent one, and the gate parses it to the empty set."""
-    findings = cli.test_failure_exit_code_findings("./run-everything.sh", "", "app")
-
-    assert [f.level for f in findings] == ["error"]
-    assert "fails closed" in findings[0].message
-
-
-def test_doctor_treats_a_reserved_infrastructure_code_as_fail_closed():
-    findings = cli.test_failure_exit_code_findings("cargo test", "1 124", "tauri")
-
-    assert findings[0].level == "error"
-    assert "fails closed" in findings[0].message
-
-
-def test_doctor_reports_every_runner_a_sequenced_test_cmd_drives():
-    findings = cli.test_failure_exit_code_findings(
-        "npm test && cargo test", None, "mixed"
-    )
-
-    assert len(findings) == 1  # npm's 1 is already trusted; cargo's 101 is not
-    assert "cargo test" in findings[0].message
-
-
-def test_doctor_finds_runners_behind_a_wrapper_or_a_path():
-    assert cli.test_cmd_runners("uv run pytest -q") == (("pytest", 1),)
-    assert cli.test_cmd_runners("./node_modules/.bin/vitest run") == (("vitest", 1),)
-    assert cli.test_cmd_runners("make test") == (("make", 2),)
-    assert cli.test_cmd_runners("cargo test 'unbalanced") == (("cargo test", 101),)
-    assert cli.test_cmd_runners("./run-everything.sh") == ()
-
-
-def test_doctor_exit_code_check_reads_absent_and_empty_declarations_apart(capsys):
-    """The composed env distinguishes 'key not set' (harness default applies)
-    from 'key set to empty' (a declaration the gate fails closed on)."""
-    absent = cli._doctor_test_failure_exit_codes({"TEST_CMD": "pytest"}, "app")
-    empty = cli._doctor_test_failure_exit_codes(
-        {"TEST_CMD": "pytest", "GATE_TEST_FAILURE_EXIT_CODES": ""}, "app"
-    )
-
-    assert absent == ()
-    assert [f.level for f in empty] == ["error", "warn"]
-    assert "fails closed" in capsys.readouterr().err
-
-
-# ── discovery probe: lint + typecheck alongside the test command ──────────────
-def test_parse_discovery_reply_reads_all_three_commands():
-    reply = (
-        "TEST_CMD: cargo test\n"
-        "LINT_CMD: cargo fmt --check && cargo clippy -- -D warnings\n"
-        "TYPECHECK_CMD: NO_TYPECHECK\n"
-    )
-    found = cli.parse_discovery_reply(reply)
-    assert found.test_cmd == "cargo test"
-    assert found.lint_cmd == "cargo fmt --check && cargo clippy -- -D warnings"
-    assert found.typecheck_cmd == ""
-
-
-def test_parse_discovery_reply_tolerates_a_reply_with_only_a_test_command():
-    found = cli.parse_discovery_reply("TEST_CMD: uv run pytest")
-    assert found.test_cmd == "uv run pytest"
-    assert found.lint_cmd == ""
-    assert found.typecheck_cmd == ""
-
-
-def test_parse_discovery_reply_honours_the_absence_sentinels():
-    found = cli.parse_discovery_reply(
-        "TEST_CMD: NO_TESTS\nLINT_CMD: NO_LINT\nTYPECHECK_CMD: NO_TYPECHECK\n"
-    )
-    assert (found.test_cmd, found.lint_cmd, found.typecheck_cmd) == ("", "", "")
-
-
-def test_discover_repo_commands_returns_every_command(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
-    monkeypatch.setattr(
-        cli.subprocess, "run",
-        lambda *a, **k: _fake_proc(
-            "TEST_CMD: uv run pytest\nLINT_CMD: ruff check\nTYPECHECK_CMD: pyrefly check\n"
-        ),
-    )
-    found = cli.discover_repo_commands(str(tmp_path))
-    assert found.lint_cmd == "ruff check"
-    assert found.typecheck_cmd == "pyrefly check"
-
-
-def test_discover_repo_commands_fail_soft_without_claude(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
-
-    def boom(*a, **k):
-        raise OSError("claude: not found")
-
-    monkeypatch.setattr(cli.subprocess, "run", boom)
-    assert cli.discover_repo_commands(str(tmp_path)) == cli.DiscoveredCommands()
-
-
-# ── overlay: the new discovered/inferred keys ─────────────────────────────────
-def test_synth_repo_env_writes_lint_typecheck_and_exit_codes():
-    text = cli.synth_repo_env(
-        repo="o/r", target_dir="/t", name="r",
-        test_cmd="cargo test", lint_cmd="cargo clippy -- -D warnings",
-        typecheck_cmd="", gate_test_failure_exit_codes="101",
-    )
-    env = _source_env(text)
-    assert env["LINT_CMD"] == "cargo clippy -- -D warnings"
-    assert env["GATE_TEST_FAILURE_EXIT_CODES"] == "101"
-    assert "TYPECHECK_CMD" not in env
-
-
-def test_synth_repo_env_omits_exit_codes_when_the_default_is_right():
-    env = _source_env(
-        cli.synth_repo_env(repo="o/r", target_dir="/t", name="r", test_cmd="pytest")
-    )
-    assert "GATE_TEST_FAILURE_EXIT_CODES" not in env
-
-
+# ── overlay: inferred keys ────────────────────────────────────────────────────
 def test_synth_repo_env_records_base_branch_provenance():
     text = cli.synth_repo_env(
         repo="o/r", target_dir="/t", name="r", base_branch="main",
@@ -3171,7 +2772,7 @@ def test_synth_repo_env_records_base_branch_provenance():
     assert _source_env(text)["BASE_BRANCH"] == "main"
 
 
-# ── cmd_start first-run discovery ─────────────────────────────────────────────
+# ── cmd_start first-run base-branch inference ────────────────────────────────────────────
 def _fresh_start_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
     shared = tmp_path / "shared.env"
@@ -3179,6 +2780,70 @@ def _fresh_start_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
     monkeypatch.setattr(cli.os, "execve", lambda *a: None)
     return Path(cli.REPOS_DIR) / "app.env"
+
+
+def test_cmd_start_write_config_stops_existing_deployment_before_rewrite(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    overlay = tmp_path / "app.env"
+    original = overlay.read_text()
+    events: list[tuple[str, str]] = []
+
+    def stop(name: str) -> int:
+        events.append((f"stop:{name}", overlay.read_text()))
+        return 0
+
+    def execve(*_args) -> None:
+        events.append(("exec", overlay.read_text()))
+
+    monkeypatch.setattr(cli, "_stop_deployment", stop)
+    monkeypatch.setattr(cli.os, "execve", execve)
+
+    rc = cli.cmd_start(
+        _start_args(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            write_config=True,
+        )
+    )
+
+    assert rc is None
+    assert events[0] == ("stop:app", original)
+    assert events[1][0] == "exec"
+    assert events[1][1] != original
+    assert _source_env(events[1][1])["REPO"] == "acme/app"
+
+
+def test_cmd_start_write_config_preserves_overlay_when_quiescence_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    overlay = tmp_path / "app.env"
+    original = overlay.read_text()
+    execve_calls: list[tuple] = []
+    monkeypatch.setattr(cli, "_stop_deployment", lambda _name: 1)
+    monkeypatch.setattr(
+        cli.os,
+        "execve",
+        lambda *args: execve_calls.append(args),
+    )
+
+    rc = cli.cmd_start(
+        _start_args(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            write_config=True,
+        )
+    )
+
+    assert rc == 1
+    assert overlay.read_text() == original
+    assert execve_calls == []
 
 
 def test_cmd_start_never_adopts_an_inferred_base_branch_unattended(
@@ -3193,7 +2858,7 @@ def test_cmd_start_never_adopts_an_inferred_base_branch_unattended(
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+        base_branch=None,
     ))
 
     text = overlay.read_text()
@@ -3212,7 +2877,7 @@ def test_cmd_start_records_no_suggestion_when_nothing_was_inferred(
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+        base_branch=None,
     ))
 
     text = overlay.read_text()
@@ -3231,7 +2896,7 @@ def test_cmd_start_never_infers_over_an_explicit_base_branch(tmp_path, monkeypat
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch="release", test_cmd="pytest", no_verify_test_cmd=True,
+        base_branch="release",
     ))
 
     assert _source_env(overlay.read_text())["BASE_BRANCH"] == "release"
@@ -3257,8 +2922,7 @@ def test_cmd_start_write_config_preserves_the_existing_base_branch(
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, write_config=True, test_cmd="pytest",
-        no_verify_test_cmd=True,
+        base_branch=None, write_config=True,
     ))
 
     assert _source_env(overlay.read_text())["BASE_BRANCH"] == "release-2"
@@ -3277,8 +2941,7 @@ def test_cmd_start_write_config_honours_an_explicit_base_branch_override(
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch="main", write_config=True, test_cmd="pytest",
-        no_verify_test_cmd=True,
+        base_branch="main", write_config=True,
     ))
 
     assert _source_env(overlay.read_text())["BASE_BRANCH"] == "main"
@@ -3292,7 +2955,7 @@ def test_cmd_start_confirms_the_inferred_base_branch_on_a_tty(tmp_path, monkeypa
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+        base_branch=None,
     ))
 
     assert _source_env(overlay.read_text())["BASE_BRANCH"] == "trunk"
@@ -3308,7 +2971,7 @@ def test_cmd_start_adopts_a_confirmed_base_branch_on_a_tty(tmp_path, monkeypatch
 
     cli.cmd_start(_start_args(
         repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+        base_branch=None,
     ))
 
     text = overlay.read_text()
@@ -3316,141 +2979,10 @@ def test_cmd_start_adopts_a_confirmed_base_branch_on_a_tty(tmp_path, monkeypatch
     assert "# BASE_BRANCH inferred from 9/10 of the last merged PRs." in text
 
 
-def test_cmd_start_writes_cargos_assertion_exit_code(tmp_path, monkeypatch):
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("main", "history"))
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, test_cmd="cargo test", no_verify_test_cmd=True,
-    ))
-
-    assert _source_env(overlay.read_text())["GATE_TEST_FAILURE_EXIT_CODES"] == "101"
-
-
-# ── LINT_CMD/TYPECHECK_CMD: trusted gate inputs, confirmed + trial-run ────────
-def _discovery(**over):
-    return cli.DiscoveredCommands(
-        test_cmd=over.get("test_cmd", "uv run pytest"),
-        lint_cmd=over.get("lint_cmd", "ruff check"),
-        typecheck_cmd=over.get("typecheck_cmd", "pyrefly check"),
-    )
-
-
-def test_cmd_start_writes_discovered_checks_only_as_suggestions_unattended(
-    tmp_path, monkeypatch, capsys
-):
-    """A model-authored command that BLOCKS every commit cannot go live with
-    nobody to confirm it (ADR 0012 provenance): it is written inert."""
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(cli, "discover_repo_commands", lambda _t: _discovery())
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None, no_verify_test_cmd=True,
-    ))
-
-    text = overlay.read_text()
-    env = _source_env(text)
-    assert env["TEST_CMD"] == "uv run pytest"
-    assert "LINT_CMD" not in env
-    assert "TYPECHECK_CMD" not in env
-    assert "# LINT_CMD='ruff check'" in text
-    assert "# TYPECHECK_CMD='pyrefly check'" in text
-    assert "no terminal to confirm" in capsys.readouterr().out
-
-
-def test_cmd_start_promotes_a_confirmed_check_that_passes_its_trial_run(
-    tmp_path, monkeypatch
-):
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(
-        cli, "discover_repo_commands", lambda _t: _discovery(typecheck_cmd=""),
-    )
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", _Answers(["", ""]))
-    monkeypatch.setattr(
-        cli, "verify_check_cmd", lambda *a, **k: cli.TestCmdCheck(exit_code=0, seconds=1.0)
-    )
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
-    ))
-
-    assert _source_env(overlay.read_text())["LINT_CMD"] == "ruff check"
-
-
-def test_cmd_start_demotes_a_check_that_fails_its_trial_run(
-    tmp_path, monkeypatch, capsys
-):
-    """A lint command that is already red would block EVERY commit the fixer
-    makes — the exact wedge TEST_CMD verification exists to prevent."""
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(
-        cli, "discover_repo_commands", lambda _t: _discovery(typecheck_cmd=""),
-    )
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", _Answers(["", ""]))
-    monkeypatch.setattr(
-        cli, "verify_check_cmd", lambda *a, **k: cli.TestCmdCheck(exit_code=1, seconds=2.0)
-    )
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
-    ))
-
-    text = overlay.read_text()
-    assert "LINT_CMD" not in _source_env(text)
-    assert "# LINT_CMD='ruff check'" in text
-    assert "block EVERY commit" in capsys.readouterr().err
-
-
-def test_cmd_start_skips_a_check_the_operator_declines(tmp_path, monkeypatch):
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(
-        cli, "discover_repo_commands", lambda _t: _discovery(typecheck_cmd=""),
-    )
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", _Answers(["-", ""]))
-    monkeypatch.setattr(
-        cli, "verify_check_cmd", lambda *a, **k: cli.TestCmdCheck(exit_code=0, seconds=1.0)
-    )
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
-    ))
-
-    assert "LINT_CMD" not in _source_env(overlay.read_text())
-
-
-def test_cmd_start_writes_an_operator_supplied_lint_command_live(
-    tmp_path, monkeypatch
-):
-    """An explicit flag is already an operator decision — no confirmation needed,
-    and discovery must not override it."""
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(cli, "discover_repo_commands", lambda _t: _discovery())
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
-        lint_cmd="make lint", typecheck_cmd="make types",
-        test_cmd="pytest", no_verify_test_cmd=True,
-    ))
-
-    env = _source_env(overlay.read_text())
-    assert env["LINT_CMD"] == "make lint"
-    assert env["TYPECHECK_CMD"] == "make types"
-
-
 def test_cmd_start_does_not_rediscover_when_reusing_an_overlay(
     tmp_path, monkeypatch, capsys
 ):
-    """Discovery and inference are first-run only: a reused overlay is authority."""
+    """Base-branch inference is first-run only: a reused overlay is authority."""
     _prep_mismatch_overlay(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.os, "execve", lambda *a: None)
 
@@ -3458,7 +2990,6 @@ def test_cmd_start_does_not_rediscover_when_reusing_an_overlay(
         raise AssertionError("must not probe on overlay reuse")
 
     monkeypatch.setattr(cli, "detect_base_branch", refuse)
-    monkeypatch.setattr(cli, "discover_repo_commands", refuse)
 
     cli.cmd_start(_start_args(repo="acme/app", target_dir="/srv/acme-app", name="app"))
 
@@ -3521,16 +3052,6 @@ def test_main_exits_130_on_keyboard_interrupt(monkeypatch, capsys):
     assert "aborted" in capsys.readouterr().err
 
 
-def test_start_parser_exposes_the_check_command_overrides():
-    args = cli.build_parser().parse_args(
-        ["start", "--lint-cmd", "make lint", "--typecheck-cmd", "make types"]
-    )
-    assert args.lint_cmd == "make lint"
-    assert args.typecheck_cmd == "make types"
-    # None, not "dev": only an ABSENT flag may be inferred/preserved.
-    assert args.base_branch is None
-
-
 def test_start_parses_with_no_name_flag():
     """argparse runs `type` over the string default too: this used to abort every
     `issue-agent start`/`status`/`stop` that did not pass --name."""
@@ -3545,69 +3066,6 @@ def test_start_still_rejects_a_non_canonical_name():
 
 
 # ── discovered check commands must be check-mode, and trialed off the tree ────
-@pytest.mark.parametrize("cmd, fragment", [
-    ("cargo fmt", "cargo fmt"),
-    ("cargo fmt --all", "cargo fmt"),
-    ("prettier --write .", "prettier"),
-    ("npx prettier -w src", "prettier"),
-    ("black .", "black"),
-    ("ruff format", "ruff format"),
-    ("isort .", "isort"),
-    ("gofmt -w ./...", "gofmt"),
-    ("goimports -w .", "goimports"),
-    ("dotnet format", "dotnet format"),
-])
-def test_mutating_check_command_rejects_rewriting_shapes(cmd, fragment):
-    """A formatter that rewrites the tree EXITS 0, so no trial run can catch it —
-    the shape has to be rejected statically."""
-    assert fragment in cli.mutating_check_command(cmd)
-
-
-@pytest.mark.parametrize("cmd", [
-    "cargo fmt --check && cargo clippy -- -D warnings",
-    "prettier --check .",
-    "black --check .",
-    "ruff format --diff && ruff check",
-    "isort --check-only .",
-    "gofmt -l .",
-    "dotnet format --verify-no-changes",
-    "ruff check",
-    "tsc --noEmit",
-    "eslint .",
-])
-def test_mutating_check_command_accepts_check_mode_shapes(cmd):
-    assert cli.mutating_check_command(cmd) == ""
-
-
-def test_cmd_start_demotes_a_mutating_formatter_without_running_it(
-    tmp_path, monkeypatch, capsys
-):
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(
-        cli, "discover_repo_commands",
-        lambda _t: cli.DiscoveredCommands(test_cmd="pytest", lint_cmd="cargo fmt"),
-    )
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", _Answers([""]))
-
-    def refuse(*a, **k):
-        raise AssertionError("a mutating command must never be executed")
-
-    monkeypatch.setattr(cli, "verify_check_cmd", refuse)
-    monkeypatch.setattr(cli, "verify_test_cmd", refuse)
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
-        test_cmd="pytest", no_verify_test_cmd=True,
-    ))
-
-    text = overlay.read_text()
-    assert "LINT_CMD" not in _source_env(text)
-    assert "# LINT_CMD='cargo fmt'" in text
-    assert "not check-mode" in capsys.readouterr().err
-
-
 def _init_git_repo(path):
     """A real one-commit repo — the trial-run tests need genuine git worktrees."""
     path.mkdir(parents=True, exist_ok=True)
@@ -3619,70 +3077,6 @@ def _init_git_repo(path):
         subprocess.run(["git", *argv], cwd=path, env=env, check=True,
                        capture_output=True)
     return path
-
-
-def test_verify_check_cmd_runs_off_the_operator_checkout(tmp_path):
-    """The trial must never execute a model-authored command where a human may be
-    mid-edit: it runs in a throwaway worktree, which is gone afterwards."""
-    repo = _init_git_repo(tmp_path / "repo")
-    seen: list[str] = []
-
-    def fake_run(cmd, cwd, timeout):
-        seen.append(cwd)
-        Path(cwd, "tracked.txt").write_text("MUTATED\n")
-        return 0
-
-    check = cli.verify_check_cmd("whatever", str(repo), run=fake_run)
-
-    assert check is not None and check.passed
-    assert seen and os.path.realpath(seen[0]) != os.path.realpath(repo)
-    assert (repo / "tracked.txt").read_text() == "pristine\n"
-    assert not os.path.exists(seen[0])  # cleaned up
-
-
-def test_verify_check_cmd_refuses_rather_than_using_the_real_tree(tmp_path):
-    """No worktree (not a git repo) → the command is NOT run at all. None is a
-    refusal, and the caller must not read it as a pass."""
-    plain = tmp_path / "plain"
-    plain.mkdir()
-
-    def refuse(*_a, **_k):
-        raise AssertionError("must not run the command outside a worktree")
-
-    assert cli.verify_check_cmd("whatever", str(plain), run=refuse) is None
-
-
-def test_cmd_start_leaves_the_operator_tree_untouched_when_trialing_a_check(
-    tmp_path, monkeypatch
-):
-    """End-to-end: a discovered lint command that rewrites whatever tree it runs
-    in must not reach the operator's working copy."""
-    repo = _init_git_repo(tmp_path / "repo")
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-    monkeypatch.setattr(
-        cli, "discover_repo_commands",
-        lambda _t: cli.DiscoveredCommands(lint_cmd="ruff check"),
-    )
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", _Answers(["", ""]))
-
-    def mutating_gate_runner(cmd, cwd, timeout):
-        Path(cwd, "tracked.txt").write_text("MUTATED\n")
-        return 0
-
-    real_verify = cli.verify_check_cmd
-    monkeypatch.setattr(
-        cli, "verify_check_cmd",
-        lambda cmd, target, *a, **k: real_verify(cmd, target, run=mutating_gate_runner),
-    )
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir=str(repo), name="app", base_branch=None,
-    ))
-
-    assert (repo / "tracked.txt").read_text() == "pristine\n"
-    assert _source_env(overlay.read_text())["LINT_CMD"] == "ruff check"
 
 
 def test_gh_login_rejects_a_literal_null_from_jq(monkeypatch):

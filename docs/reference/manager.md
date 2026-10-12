@@ -153,15 +153,10 @@ about paid runners, not a harness fix).
   the `operator-action` label.
 - **`gh` label/state searches are stale for recently closed objects** —
   verify with a direct `gh issue view` before acting on a search result.
-- **Pre-launch overlay checklist grew two entries (2026-08-08)**:
-  `GATE_TEST_FAILURE_EXIT_CODES` must cover every runner in TEST_CMD (cargo
-  fails with 101, make with 2 — doctor now errors/warns on gaps, but the
-  overlay is where the fix goes) and `EVIDENCE_STACK` should be declared when
-  the target's live-evidence toolchain is known (lets the environment manifest
-  attest "cannot produce live evidence here" as a verdict, ending
-  unproducible-evidence review wedges without a scope note). Entrypoint drift
-  no longer needs a manual `make install` — `issue-agent start` self-heals it
-  unless another deployment is live.
+- **Entrypoint drift no longer needs a manual `make install`** —
+  `issue-agent start` self-heals it unless another deployment is live.
+  (`GATE_TEST_FAILURE_EXIT_CODES` and `EVIDENCE_STACK` were deleted with the
+  fixer gates in slice 6a; stale overlay keys are ignored.)
 - **The dashboard unblock endpoint is keyed by ISSUE number, not PR number**
   (`/api/repos/<name>/issues/<issue>/unblock`) — posting the PR number returns
   "issue #N is not open". The optional `guidance` field scopes the next review

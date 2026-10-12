@@ -4,16 +4,14 @@ import json
 
 import pytest
 
-from issue_agent.domain.agent_task import RunIntent, run_input_fingerprint
 from issue_agent.adapters.workflow_codec import (
     MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow,
 )
 from issue_agent.domain.workflow import (
-    AuthoredResolve, ResolveAdmission, ResolveSession, ResolveStage,
     NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, ResolveEpisode, RetryAuthorizationRequired,
     WorkflowSnapshot,
 )
-from issue_agent.domain.contracts import ChargeOrigin, CommandId, Money, PricingBasis, RunId, SettlementRequest, WorkflowAttemptIdentity
+from issue_agent.domain.contracts import ChargeOrigin, CommandId, Money, PricingBasis, RunId, SettlementRequest
 from issue_agent.domain.resolve_return import PendingResolveReturn, ReturnedResolve
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
@@ -94,35 +92,6 @@ def test_unclassified_return_roundtrip_retains_exact_provider_evidence():
     assert decode_workflow(encode_workflow(receipt), ReturnedResolve) == receipt
     pending = PendingResolveReturn(receipt, receipt.returned_at, 2, "read unavailable")
     assert decode_workflow(encode_workflow(pending), PendingResolveReturn) == pending
-
-
-def test_split_reply_routing_and_contract_provenance_survive_restart():
-    from tests.domain.test_resolve_split import split_example
-    from issue_agent.domain.resolve_split import SplitImplement
-    original = split_example()
-    recovered = decode_workflow(encode_workflow(original), SplitImplement)
-    assert recovered.context.human_reply == "Keep the old API."
-    assert recovered.context.selection.model == "model"
-    assert recovered.baseline.revision.head_sha == "a" * 40
-    assert recovered.source == original.source
-
-
-def test_old_ordinary_return_does_not_gain_split_authority():
-    from tests.domain.test_resolve_return import returned
-    receipt = returned()
-    raw = json.loads(encode_workflow(receipt))
-    for field in ("split_input", "verdict", "rationale", "contract_revision"):
-        del raw["value"]["fields"][field]
-    recovered = decode_workflow(json.dumps(raw), ReturnedResolve)
-    assert recovered == receipt
-
-
-def test_partially_missing_new_receipt_fields_are_not_treated_as_legacy():
-    from tests.domain.test_resolve_return import returned
-    raw = json.loads(encode_workflow(returned()))
-    del raw["value"]["fields"]["split_input"]
-    with pytest.raises(WorkflowEncodingError):
-        decode_workflow(json.dumps(raw), ReturnedResolve)
 
 
 @pytest.mark.parametrize("kind", ["request", "continue", "cancel", "retry"])
@@ -213,46 +182,6 @@ def test_nested_constructor_rejects_future_gate_generation():
     raw["value"]["fields"]["gates"][0]["fields"]["opened_generation"] = 100
     with pytest.raises(WorkflowEncodingError):
         decode_workflow(json.dumps(raw), WorkflowSnapshot)
-
-
-@pytest.mark.parametrize("with_session", [False, True])
-def test_authored_checkpoint_and_independent_session_order_survive_roundtrip(with_session):
-    state = snapshot()
-    author = WorkflowAttemptIdentity(state.binding, RunId("author"), "author-leg")
-    source = ResolveAdmission(author, replace(state.revision, version=5), ResolveStage.AUTHOR,
-                              input_fingerprint=run_input_fingerprint(RunIntent("Author issue 7 contract")))
-    implement = WorkflowAttemptIdentity(state.binding, RunId("implement"), "implement-leg")
-    session = ResolveSession(implement, "session:id", "codex", "<runtime-default>") if with_session else None
-    checkpoint = AuthoredResolve(source, 8, session)
-    state = replace(state, episode=replace(state.episode, continuation=checkpoint))
-    recovered = decode_workflow(encode_workflow(state), WorkflowSnapshot)
-    assert recovered == state
-    assert recovered.episode.continuation.author_admission == source
-    assert recovered.episode.continuation.last_applied_admission_version == 8
-    assert recovered.episode.continuation.session == session
-
-
-def test_other_admitted_stage_cannot_be_deserialized_as_authored_checkpoint():
-    state = snapshot()
-    source = ResolveAdmission(WorkflowAttemptIdentity(state.binding, RunId("run"), "leg"),
-                              replace(state.revision, version=5), ResolveStage.AUTHOR,
-                              input_fingerprint=run_input_fingerprint(RunIntent("Author issue 7 contract")))
-    raw = json.loads(encode_workflow(AuthoredResolve(source, 5)))
-    raw["value"]["fields"]["author_admission"]["fields"]["stage"]["value"] = "IMPLEMENT"
-    with pytest.raises(WorkflowEncodingError):
-        decode_workflow(json.dumps(raw), AuthoredResolve)
-
-
-@pytest.mark.parametrize("fingerprint", [None, "", True, 123, "a" * 63, "a" * 65, "G" * 64])
-def test_checkpoint_without_valid_input_provenance_cannot_be_recovered(fingerprint):
-    state = snapshot()
-    source = ResolveAdmission(WorkflowAttemptIdentity(state.binding, RunId("author"), "author-leg"),
-                              replace(state.revision, version=5), ResolveStage.AUTHOR,
-                              input_fingerprint=run_input_fingerprint(RunIntent("Author issue 7 contract")))
-    raw = json.loads(encode_workflow(AuthoredResolve(source, 5)))
-    raw["value"]["fields"]["author_admission"]["fields"]["input_fingerprint"] = fingerprint
-    with pytest.raises(WorkflowEncodingError):
-        decode_workflow(json.dumps(raw), AuthoredResolve)
 
 
 def test_histories_persisted_before_re_execution_counting_decode_as_none_spent():

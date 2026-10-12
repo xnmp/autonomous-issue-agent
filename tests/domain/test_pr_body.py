@@ -1,7 +1,6 @@
 import pytest
 
 from issue_agent.domain.pr_body import complete_pr_body, issue_acceptance_criteria
-from issue_agent.domain.gate import check_image_sizes
 
 
 @pytest.mark.parametrize("body", ["", "narrative", "  narrative", "Closes #420", "Fixes other/repo#42"])
@@ -71,11 +70,6 @@ def test_absent_contract_does_not_invent_criteria(comments):
 def test_large_contract_is_preserved_for_the_publication_boundary_to_bound():
     criterion = "- " + "é" * 100_000
     assert issue_acceptance_criteria(f"## Acceptance Criteria\n{criterion}", []) == criterion
-
-
-@pytest.mark.parametrize("size,allowed", [(700 * 1024 - 1, True), (700 * 1024, True), (700 * 1024 + 1, False)])
-def test_image_size_cap_remains_at_700kb(size, allowed):
-    assert check_image_sizes((("evidence/screenshot.png", size),), 700 * 1024).ok is allowed
 
 
 @pytest.mark.parametrize("underline", ["-------------------", "===", "  ---"])

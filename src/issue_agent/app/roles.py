@@ -39,7 +39,6 @@ from ..adapters.control_store import (
 from ..adapters.control_path import control_store_path
 from ..adapters.effects import GitHubEffectExecutor
 from ..adapters.accounting_runtime import AccountingRuntime
-from ..adapters.environment import boot_manifest
 from ..adapters.event_log import EventLog
 from ..adapters.typed_journal import TypedJournal
 from ..adapters.github import GitHubGateway, Identity
@@ -384,7 +383,6 @@ def _with_accounting(
         approved_base_branch=cfg.base_branch,
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
-        max_contract_rounds=cfg.max_contract_rounds,
         admit=admit,
     )
 
@@ -401,9 +399,6 @@ def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
         "ADDRESS_REVIEW",
         "FIX_CI",
         "REBASE",
-        "AUTHOR",
-        "IMPLEMENT",
-        "ADJUDICATE",
     ):
         limits[("fix", kind)] = money(cfg.fix_budget_usd)
     limits[("fix", "ROUTE")] = money(cfg.router_budget_usd)
@@ -1016,16 +1011,10 @@ def _build_codex_runner(
     """Build either role's Codex adapter from the single runtime config.
 
     Fix and review deliberately differ only in their capability boundary: fixes
-    need the git-capable sandbox plus a worktree-installed governor, while a
-    review is read-only. Keeping every transport, rollout-pricing, and budget
-    option here prevents a new Codex accounting control reaching one paid role
-    while silently skipping the other.
-
-    `leg_role` states which side of that boundary the leg is on, in the leg's own
-    process environment. The governor needs it because read-only-ness is declared
-    by a generated hook script at the reviewer's cwd, and a fixer worktree nested
-    under that cwd resolves to the same script (#113). The dispatching runner is
-    the only place that knows the role for certain, so it says so here.
+    need the git-capable sandbox, while a review is read-only. Keeping every
+    transport, rollout-pricing, and budget option here prevents a new Codex
+    accounting control reaching one paid role while silently skipping the other.
+    `leg_role` names the role's process-supervision state.
     """
     from ..adapters.codex_runner import CodexProvider, CodexRunner
     from ..adapters.process_supervisor import ProcessSupervisor
@@ -1042,7 +1031,6 @@ def _build_codex_runner(
         ),
         sandbox=sandbox,
         resume_on_retry=resume_on_retry,
-        env={"ISSUE_AGENT_LEG_ROLE": leg_role},
         reasoning_effort=runtime.reasoning_effort,
         inject_system_prompt=inject_system_prompt,
         log=log,
@@ -1095,7 +1083,7 @@ def _bind_codex_fix_runtime(
     runtime_config: CodexRuntimeConfig,
     _runner: AgentRuntime,
 ) -> _FixRuntimeBinding:
-    from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
+    from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
     from ..adapters.codex_runner import (
         codex_budget_not_enforced_warning,
         codex_cost_blindspot_warning,
@@ -1138,17 +1126,13 @@ def _bind_codex_fix_runtime(
     if budget_notice is not None:
         log(budget_notice)
     prepare_cwd = partial(
-        write_hook_config,
+        write_codex_home,
         agents_md=cfg.agent_md,
-        base_branch=cfg.base_branch,
-        repository=cfg.repo,
-        edit_check_cmd=cfg.edit_check_cmd,
-        log=log,
         state_dir=cfg.state_dir,
         auth_file=runner.oauth_auth_file(),
     )
     return _FixRuntimeBinding(
-        HookPreparingRuntime(runner, prepare_cwd),
+        CodexHomeRuntime(runner, prepare_cwd),
         prepare_cwd,
     )
 
@@ -1235,7 +1219,7 @@ def _bind_codex_review_runtime(
     runtime_config: ReviewRuntimeConfig,
     _runner: AgentRuntime,
 ) -> _ReviewRuntimeBinding:
-    from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
+    from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
     from ..adapters.codex_runner import (
         codex_budget_not_enforced_warning,
         codex_cost_blindspot_warning,
@@ -1284,23 +1268,19 @@ def _bind_codex_review_runtime(
     if not execution_cwd:
         log(
             "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
-            "TARGET_DIR so its read-only governor has an explicit checkout"
+            "TARGET_DIR so its read-only leg has an explicit checkout"
         )
         return _ReviewRuntimeBinding(
             runner,
             runtime_preflight=lambda: "REVIEWER_RUNTIME=codex requires TARGET_DIR",
         )
     prepare_cwd = partial(
-        write_hook_config,
-        review_only=True,
-        base_branch=cfg.base_branch,
-        repository=cfg.repo,
-        log=log,
+        write_codex_home,
         state_dir=cfg.review_state_dir,
         auth_file=runner.oauth_auth_file(),
     )
     return _ReviewRuntimeBinding(
-        HookPreparingRuntime(runner, prepare_cwd),
+        CodexHomeRuntime(runner, prepare_cwd),
         execution_cwd,
         prepare_cwd,
         runner.preflight,
@@ -2044,16 +2024,9 @@ def compose_fix_daemon(
             repo_cfg.repo, repo_cfg.base_branch, cfg.agent_md,
             fix_runtime.budget_usd, fix_runtime.model, fix_runtime.effort,
             router_budget_usd=cfg.router_budget_usd,
-            # Harness-attested, probed once per daemon process (ADR 0012
-            # provenance: the boot probe, never PR content). "" when the probe
-            # could not run → the prompts say nothing rather than attest a
-            # capability that may not hold.
-            environment_manifest=boot_manifest(cfg.evidence_stack),
             runtime=cfg.fixer_runtime,
         ),
         max_review_rejections=cfg.max_review_rejections,
-        author_tests_split=fix_runtime.author_tests_split,
-        max_contract_rounds=fix_runtime.max_contract_rounds,
         fix_mcp_config=fix_runtime.mcp_config,
         harness_root=cfg.runtime_paths.harness_root,
         log=log,
@@ -2092,7 +2065,6 @@ def compose_fix_daemon(
     workflow_control = SQLiteWorkflowControl(
         control, WorkflowWriter(cfg.repo, "fix", owner_id),
         resolve_ceiling=cfg.max_resolve_retries,
-        max_contract_rounds=fix_runtime.max_contract_rounds,
     )
     def validate_cleanup_fix_state(action):
         if action.pr is not None:
@@ -2624,10 +2596,6 @@ def compose_review_daemon(
             dimension_budget_usd=review_runtime.dimension_budget_usd,
             validation_budget_usd=review_runtime.validation_budget_usd,
             scout_model=review_runtime.scout_model,
-            # Same harness-attested manifest the fixer carries, so both sides
-            # of a review round argue from one set of facts about the machine
-            # (2026-08-08 tauri #613/#614).
-            environment_manifest=boot_manifest(cfg.evidence_stack),
         ),
         max_review_rejections=review_runtime.max_rejections,
         review_bot=review_runtime.bot,

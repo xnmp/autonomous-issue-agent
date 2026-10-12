@@ -68,7 +68,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 45))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 46))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -125,6 +125,8 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        45: ("CREATE INDEX runs_adjudication_episode ON runs(workflow_episode_key) WHERE kind='ADJUDICATE' "
+             "AND NOT(state='cancelled' AND outcome IS 'unlaunched_released' AND provider_receipt_id IS NULL)",),
         43: ("CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target) "
              "WHERE state IN ('pending','executing','retryable_failure','unknown_outcome') "
              "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text'",),
@@ -3921,7 +3923,7 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
     store.initialize()
 
     with sqlite3.connect(store.path) as db:
-        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 44
+        assert db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 45
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
         assert [row[0] for row in db.execute("SELECT command_id FROM lifecycle_commands")] == ["plain-cmd"]
         assert [row[0] for row in db.execute("SELECT command_id FROM effect_receipts")] == ["plain-cmd"]

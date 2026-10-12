@@ -1,4 +1,4 @@
-"""Exact workspace obligations for a new resolve allowance, not AUTHOR evidence.
+"""Exact workspace obligations for a new resolve allowance.
 
 Adapters establish upstream observation and predecessor absence. Construction
 checks scope, but does not itself grant permission to mutate a checkout.
@@ -11,11 +11,46 @@ import json
 
 from .contracts import WorkflowAttemptIdentity
 from .refs import issue_from_branch
-from .resolve_split import ContractResetResult, ContractRevision, validate_git_object_id
 from .workflow_identity import (
     WorkflowBinding, WorkflowFamily, canonical_workflow_repository, validate_workflow_identifier,
     validate_workflow_integer,
 )
+
+
+def validate_git_object_id(value: str) -> None:
+    if not isinstance(value, str) or len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("revision requires a complete Git object ID")
+
+
+@dataclass(frozen=True)
+class ContractRevision:
+    """An exact commit on an issue-owned branch."""
+
+    branch: str
+    head_sha: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.branch, "contract branch")
+        if issue_from_branch(self.branch) is None:
+            raise ValueError("contract revision requires an issue-owned branch")
+        validate_git_object_id(self.head_sha)
+
+
+@dataclass(frozen=True)
+class ContractResetResult:
+    """A checkout restored to `revision`, displaced work kept at `archive_ref`."""
+
+    revision: ContractRevision
+    archive_ref: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.revision, ContractRevision):
+            raise ValueError("contract reset requires a verified revision")
+        validate_workflow_identifier(self.archive_ref, "retained work reference")
+        prefix = "refs/issue-agent/contract-reset/"
+        suffix = self.archive_ref.removeprefix(prefix)
+        if not self.archive_ref.startswith(prefix) or len(suffix) != 64 or any(char not in "0123456789abcdef" for char in suffix):
+            raise ValueError("reset archive must use the harness-owned reference namespace")
 
 
 def _time(value: datetime) -> None:

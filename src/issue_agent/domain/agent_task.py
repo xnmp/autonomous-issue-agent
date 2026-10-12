@@ -33,7 +33,7 @@ class RuntimeCapabilities:
     resume_preserves_sandbox: bool
     renders_images: bool
     native_budget_enforcement: bool
-    requires_external_governor: bool
+    requires_prepared_home: bool
     supported_task_fields: frozenset[str]
     def supports(self, field_name: str) -> bool:
         return field_name in self.supported_task_fields
@@ -64,7 +64,7 @@ RUNTIME_CAPABILITIES = {
         resume_preserves_sandbox=True,
         renders_images=True,
         native_budget_enforcement=True,
-        requires_external_governor=False,
+        requires_prepared_home=False,
         supported_task_fields=TASK_FIELD_NAMES,
     ),
     RuntimeName.CODEX: RuntimeCapabilities(
@@ -72,7 +72,7 @@ RUNTIME_CAPABILITIES = {
         resume_preserves_sandbox=False,
         renders_images=True,
         native_budget_enforcement=False,
-        requires_external_governor=True,
+        requires_prepared_home=True,
         supported_task_fields=TASK_FIELD_NAMES
         - {
             "allowed_tools",
@@ -87,7 +87,7 @@ RUNTIME_CAPABILITIES = {
         resume_preserves_sandbox=True,
         renders_images=True,
         native_budget_enforcement=True,
-        requires_external_governor=False,
+        requires_prepared_home=False,
         supported_task_fields=TASK_FIELD_NAMES,
     ),
 }

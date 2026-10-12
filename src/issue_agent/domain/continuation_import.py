@@ -82,7 +82,7 @@ def parse_legacy_continuation_run(*, run_id: str, owner_id: str, kind: str,
     if type(number) is not int:
         raise ValueError("historical dispatch number must be an integer")
     validate_workflow_integer(number, "historical dispatch number", minimum=1)
-    issue_kinds = {"ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"}
+    issue_kinds = {"ROUTE", "RESOLVE", "RESUME"}
     pr_kinds = {"PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"}
     if role == "fix" and kind in issue_kinds:
         if type(issue) is not int or issue != number or type(counter) is not int or counter != issue:

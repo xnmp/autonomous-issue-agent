@@ -7,7 +7,7 @@ copy from the current directory, synthesizes (or reuses) the per-repo overlay
 proxy check → single-instance guard → run all three watchers under one trap).
 
 Why a checkout-resident CLI and not a PyPI wheel: the daemon walks `__file__` up
-to the harness root to load `plugin/AGENT.md`, `plugin/hooks/bash_governor.py`,
+to the harness root to load `plugin/AGENT.md`
 and `config/mcp/*.json` — none of which ship in the wheel. `bin/install.sh`
 installs this editable so `HARNESS_ROOT` (below) still resolves those siblings.
 
@@ -28,7 +28,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -37,10 +36,6 @@ from datetime import datetime, timezone
 from ..adapters.env_file import source_env_file
 from ..adapters.heartbeat import heartbeat_liveness, read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
-from ..domain.contracts import (
-    DEFAULT_TEST_FAILURE_EXIT_CODES,
-    parse_test_failure_exit_codes,
-)
 from ..domain.dashboard import STALE_AFTER_S
 from ..domain.deployment import canonical_deployment_name
 from ..domain.repository import canonical_repository, repository_equal
@@ -129,7 +124,7 @@ def parse_remote_url(url: str) -> str:
 # elsewhere in this module.
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR",
-    "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
+    "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
     "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
     *FIX_MODEL_TIER_ENV_KEYS,
     # Read by the dashboard's operator re-arm: which login's change requests
@@ -432,12 +427,6 @@ def synth_repo_env(
     base_branch: str = "dev",
     base_branch_note: str = "",
     base_branch_suggestion: str = "",
-    suggestions: tuple[tuple[str, str], ...] = (),
-    test_cmd: str = "",
-    lint_cmd: str = "",
-    typecheck_cmd: str = "",
-    gate_test_failure_exit_codes: str = "",
-    edit_check_cmd: str = "",
     review_mode: str = "",
     max_budget: str = "",
     review_budget: str = "",
@@ -477,10 +466,6 @@ def synth_repo_env(
             f"{_q(_encoded_repoint_history(repointed_from_deployments))}",
         ]
     opt = [
-        ("TEST_CMD", test_cmd),
-        ("LINT_CMD", lint_cmd),
-        ("TYPECHECK_CMD", typecheck_cmd),
-        ("EDIT_CHECK_CMD", edit_check_cmd),
         ("REVIEW_MODE", review_mode),
         ("MAX_BUDGET_USD", max_budget),
         ("REVIEW_BUDGET_USD", review_budget),
@@ -490,36 +475,6 @@ def synth_repo_env(
         for key, value in opt:
             if value:
                 lines.append(f"{key}={_q(value)}")
-    if gate_test_failure_exit_codes:
-        lines += [
-            "",
-            "# Exit codes this toolchain uses for an ASSERTION failure (trusted red);"
-            " any other non-zero is an infrastructure/build error.",
-            f"GATE_TEST_FAILURE_EXIT_CODES={_q(gate_test_failure_exit_codes)}",
-        ]
-    if suggestions:
-        # Detected, NOT applied. These commands block every commit once set, and
-        # their author here is a model, not the operator — so they stay inert
-        # until a human reads them (ADR 0012: a trusted gate input needs
-        # harness-side or operator provenance, and discovery has neither).
-        lines += [
-            "",
-            "# Detected but NOT applied — each of these BLOCKS every commit once",
-            "# set. Review, then uncomment to adopt.",
-        ]
-        for key, value in suggestions:
-            lines.append(f"# {key}={_q(value)}")
-    if not test_cmd:
-        # The tests gate is fail-CLOSED (check_tests): with no TEST_CMD and no
-        # opt-out, every pr-create/push would be denied. A repo that genuinely
-        # has no tests gets the explicit operator opt-out written into its
-        # overlay — loud (the NO TESTS banner already fired) but not wedged.
-        lines += [
-            "",
-            "# No test suite discovered. The PR/push gates fail closed without a",
-            "# TEST_CMD; this opt-out keeps them passable. REMOVE once tests exist.",
-            "ALLOW_UNTESTED=1",
-        ]
     return "\n".join(lines) + "\n"
 
 
@@ -919,120 +874,6 @@ def detect_review_bot(target_dir: str, fixer_login: str, sample: int = 10) -> st
     return Counter(logins).most_common(1)[0][0] if logins else ""
 
 
-def gate_failure_exit_codes(test_cmd: str) -> str:
-    """Which exit codes count as TRUSTED red-test evidence for this toolchain, or
-    '' to keep the harness default of 1. `cargo test` reports assertion failures
-    as 101 and reserves 1 for build/usage errors, so the default set would accept
-    a compile failure as an honest failing test."""
-    try:
-        tokens = shlex.split(test_cmd)
-    except ValueError:
-        tokens = test_cmd.split()
-    return "101" if tokens and os.path.basename(tokens[0]) == "cargo" else ""
-
-
-# ── declared vs. required red-test exit codes (doctor) ───────────────────────
-# tauri, 2026-08-08: a TEST_CMD ending in `cargo test` under the default trusted
-# set {1} makes every honest assertion failure (101) read as INFRA_ERROR, so the
-# red-fail gate can never be satisfied and every seam issue deadlocks. Caught by
-# the operator; doctor now says it. `cargo test` reserves 1 for build/usage
-# errors and reports assertion failures as 101; GNU make exits 2 when a recipe
-# fails (1 only under --question), so a `make test` deployment — this harness's
-# own — is in the same trap; the rest use the portable 1.
-_RUNNER_FAILURE_EXIT_CODES: tuple[tuple[tuple[str, ...], int], ...] = (
-    (("cargo", "test"), 101),
-    (("go", "test"), 1),
-    (("npm", "test"), 1),
-    (("bun", "test"), 1),
-    (("bunx", "vitest"), 1),
-    (("pytest",), 1),
-    (("vitest",), 1),
-    (("jest",), 1),
-    (("make",), 2),
-)
-
-
-def _test_cmd_tokens(test_cmd: str) -> tuple[str, ...]:
-    """TEST_CMD as bare command words. An unbalanced quote still has to be read
-    (an operator's half-written command is exactly when this check matters)."""
-    try:
-        tokens = shlex.split(test_cmd)
-    except ValueError:
-        tokens = test_cmd.split()
-    return tuple(os.path.basename(token) for token in tokens)
-
-
-def test_cmd_runners(test_cmd: str) -> tuple[tuple[str, int], ...]:
-    """Every known runner in TEST_CMD with the exit code it reports an asserted
-    failure as, in command order and without duplicates. A sequenced command
-    (`npm test && cargo test`) runs several; each one's contract must hold."""
-    tokens = _test_cmd_tokens(test_cmd)
-    found: list[tuple[str, int]] = []
-    for index in range(len(tokens)):
-        for words, code in _RUNNER_FAILURE_EXIT_CODES:
-            if tuple(tokens[index:index + len(words)]) != words:
-                continue
-            entry = (" ".join(words), code)
-            if entry not in found:
-                found.append(entry)
-            break
-    return tuple(found)
-
-
-def test_failure_exit_code_findings(
-    test_cmd: str, declared_raw: str | None, name: str
-) -> tuple[Finding, ...]:
-    """Doctor's findings about GATE_TEST_FAILURE_EXIT_CODES vs TEST_CMD.
-
-    Empty when TEST_CMD is unset or every runner's failure code is trusted.
-    `declared_raw` is the deployment's raw declaration and None means the key is
-    ABSENT: only then does the harness default apply. A key that is PRESENT and
-    empty is a declaration the gate parses to the empty set (adapters/worktree.py
-    reads it the same way), so it must reach the parser rather than be papered
-    over with the default here.
-
-    An empty trusted set is an error, not a warning: nothing at all can count as
-    red-test evidence, so every red-fail check deadlocks regardless of which
-    runner TEST_CMD drives — reported even when no runner is recognised.
-    """
-    if not test_cmd.strip():
-        return ()
-    raw = DEFAULT_TEST_FAILURE_EXIT_CODES if declared_raw is None else declared_raw
-    declared = parse_test_failure_exit_codes(raw)
-    runners = test_cmd_runners(test_cmd)
-    missing = tuple(
-        (runner, code) for runner, code in runners if code not in declared
-    )
-    if declared and not missing:
-        return ()
-    wanted = sorted(declared | {code for _, code in missing}) or [
-        int(DEFAULT_TEST_FAILURE_EXIT_CODES)
-    ]
-    remedy = (
-        f"set GATE_TEST_FAILURE_EXIT_CODES=\"{' '.join(str(c) for c in wanted)}\" "
-        f"in config/repos/{name}.env"
-    )
-    findings: list[Finding] = []
-    if not declared:
-        findings.append(Finding(
-            "error",
-            f"GATE_TEST_FAILURE_EXIT_CODES={raw!r} is empty, malformed, or names "
-            "a reserved infrastructure code, so the gate fails closed: NO exit "
-            "code counts as trusted red-test evidence and every red-fail check "
-            f"deadlocks — {remedy}",
-        ))
-    for runner, code in missing:
-        findings.append(Finding(
-            "warn",
-            f"TEST_CMD runs '{runner}', which reports an asserted failure as "
-            f"exit {code}, but GATE_TEST_FAILURE_EXIT_CODES trusts "
-            f"{{{', '.join(str(c) for c in sorted(declared)) or 'nothing'}}} — "
-            "the red-fail gate reads a genuine test failure as INFRA_ERROR and "
-            f"never converges; {remedy}",
-        ))
-    return tuple(findings)
-
-
 def _ask(prompt: str, default: str = "") -> str:
     """One operator question. EOF (piped stdin, Ctrl-D) takes the default rather
     than exploding mid-wizard."""
@@ -1042,448 +883,6 @@ def _ask(prompt: str, default: str = "") -> str:
     except EOFError:
         value = ""
     return value or default
-
-
-# ── repo-command discovery (cheap LLM probe) ──────────────────────────────────
-# Signature files that tell us a checkable toolchain exists AT ALL — test, lint,
-# or typecheck. Cheap gate BEFORE spending an LLM call: if none of these are
-# anywhere in the tree the probe is skipped entirely (and, with no test command,
-# the banner fires). The list covers lint/format/typecheck configs too, because
-# the probe now answers for those as well and a repo can carry a linter without
-# carrying a test suite. Kept broad, not exhaustive — the LLM does the precise
-# read; this only decides "worth asking?".
-_TOOLCHAIN_SIGNS = (
-    "pytest.ini", "tox.ini", "conftest.py", "pyproject.toml", "setup.cfg",
-    "package.json", "vitest.config", "jest.config", "playwright.config",
-    "go.mod", "Cargo.toml", "build.gradle", "pom.xml", "Makefile", "justfile",
-    "phpunit.xml", "Gemfile", "*_test.go", "*.test.ts", "*.spec.ts",
-    "ruff.toml", ".ruff.toml", "mypy.ini", "pyrefly.toml", ".flake8",
-    ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.yml",
-    "eslint.config.js", "eslint.config.mjs", "biome.json", ".golangci.yml",
-    "clippy.toml", "rustfmt.toml", ".rustfmt.toml", "tsconfig.json",
-    ".pre-commit-config.yaml",
-)
-
-_TEST_CMD_MARKER = "TEST_CMD:"
-_LINT_CMD_MARKER = "LINT_CMD:"
-_TYPECHECK_CMD_MARKER = "TYPECHECK_CMD:"
-_TEST_DISCOVERY_PROMPT = """\
-You are inspecting a git repository to find the shell command an autonomous \
-agent's PR gate will run as the repo's test suite (non-interactive: it must \
-EXIT, never watch-mode).
-
-The gate uses this command as a REVERT DETECTOR: it reverts implementation \
-files and requires the command to go red. So the command must be able to fail \
-for a change in ANY language/tier of source the repo contains — a repo with a \
-JS frontend and a Rust/Go/Python backend needs BOTH suites composed, or changes \
-on the uncovered side can never be gated (e.g. a Tauri app needs its `vitest`/\
-`jest` suite AND `cd src-tauri && cargo test`).
-
-Rules:
-- Inspect config files (pyproject.toml, package.json scripts, Makefile, tox.ini, \
-go.mod, Cargo.toml, etc.) and the test layout.
-- Return a command that runs from the repo root and exits with non-zero if ANY \
-composed sub-suite fails.
-- Compose multiple suites/tiers with `set -e` (e.g. \
-`set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec vitest run)`).
-- INCLUDE every unit/integration suite whose source the repo contains.
-- EXCLUDE tiers that are slow or flaky by construction: performance/benchmark \
-assertions, load tests, and e2e suites that need a live app/display/server — \
-they flake under load and stall the gate. Beware package.json `test` scripts \
-that chain a perf tier onto the unit run (e.g. `vitest run && vitest run -c \
-vitest.perf.config.ts`); in that case invoke the unit runner directly instead \
-of the script.
-- For JS/TS prefer the non-watch form (`vitest run`, `jest`, `pnpm test` only if it \
-is non-watch). NEVER return a bare `vitest`/`jest --watch`.
-
-Also report the repo's LINT and TYPECHECK commands, if it has them. Those two \
-run on every commit the agent makes, so they must be CHECK-MODE: terminating, \
-non-mutating, and non-zero on a violation. NEVER a formatter that rewrites files \
-(`cargo fmt` alone, `black .`, `prettier --write`) — use the check form \
-(`cargo fmt --check`, `ruff format --check`). Sources: CI workflow yaml, \
-package.json scripts, Makefile/justfile targets, pyproject/Cargo config. \
-Compose a language's lint and format check with `&&` (e.g. \
-`cargo fmt --check && cargo clippy -- -D warnings`).
-
-Your ENTIRE reply must be EXACTLY three lines, nothing before or after:
-  TEST_CMD: <the command>
-  LINT_CMD: <the command>
-  TYPECHECK_CMD: <the command>
-Use the sentinel when — and only when — the repo has nothing of that kind:
-  TEST_CMD: NO_TESTS
-  LINT_CMD: NO_LINT
-  TYPECHECK_CMD: NO_TYPECHECK
-A repo whose typechecking is inseparable from its build or its test run (Rust, \
-Go) has no separate typecheck command: reply NO_TYPECHECK rather than duplicating \
-the test command.
-
-Do not explain. Do not use code fences. Each line must start with its marker."""
-
-
-def _has_toolchain_signature(target_dir: str) -> bool:
-    """Fast pre-check: does any known test/lint/typecheck signature file exist?
-    Uses git ls-files (respects .gitignore, fast) with a plain-walk fallback."""
-    listing = _run(["git", "ls-files"], cwd=target_dir)
-    names = listing.split("\n") if listing else []
-    if not names:
-        for root, _dirs, files in os.walk(target_dir):
-            if ".git" in root:
-                continue
-            names.extend(files)
-    basenames = {os.path.basename(n) for n in names}
-    for sign in _TOOLCHAIN_SIGNS:
-        if sign.startswith("*"):
-            suf = sign[1:]
-            if any(n.endswith(suf) for n in names):
-                return True
-        elif sign in basenames:
-            return True
-    return False
-
-
-@dataclass(frozen=True)
-class DiscoveredCommands:
-    """What one discovery probe found. Absent commands are ''."""
-
-    test_cmd: str = ""
-    lint_cmd: str = ""
-    typecheck_cmd: str = ""
-
-
-def discover_repo_commands(target_dir: str, model: str = "haiku") -> DiscoveredCommands:
-    """Find the repo's test/lint/typecheck commands via a cheap read-only LLM
-    probe. Empty fields mean the repo genuinely has none (or the probe is
-    unavailable — fail-soft: a missing `claude` must not block `start`). Never
-    raises.
-
-    Cheap by construction: a signature-file pre-check skips the LLM call entirely
-    for repos with no test toolchain, and the call itself is Haiku + read-only
-    tools (Read/Glob/Grep) so it can't mutate anything. All three commands come
-    from ONE call — lint and typecheck are read off the same repo inspection the
-    test command already pays for."""
-    if not target_dir or not os.path.isdir(target_dir):
-        return DiscoveredCommands()
-    if not _has_toolchain_signature(target_dir):
-        return DiscoveredCommands()  # no toolchain → don't spend a call
-    try:
-        proc = subprocess.run(
-            [
-                "claude", "-p", _TEST_DISCOVERY_PROMPT,
-                "--model", model,
-                "--allowed-tools", "Read", "Glob", "Grep",
-                "--permission-mode", "bypassPermissions",
-            ],
-            cwd=target_dir, capture_output=True, text=True, timeout=180,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return DiscoveredCommands()  # claude absent/timed out — proceed without
-    if proc.returncode != 0:
-        return DiscoveredCommands()
-    return parse_discovery_reply(proc.stdout or "")
-
-
-def discover_test_cmd(target_dir: str, model: str = "haiku") -> str:
-    """The test command alone (`discover_repo_commands().test_cmd`)."""
-    return discover_repo_commands(target_dir, model).test_cmd
-
-
-def _parse_marked_line(text: str, marker: str, sentinel: str) -> str:
-    """Extract one `MARKER: <cmd>` line. Robust to a stray prose line or a code
-    fence the model adds despite instructions: we scan for the LAST marker line
-    (weak models sometimes echo the instruction first) and take everything after
-    the marker. The sentinel (or an empty command) → ''."""
-    cmd = ""
-    for line in text.splitlines():
-        line = line.strip().strip("`").strip()
-        if line.startswith(marker):
-            cmd = line[len(marker):].strip()
-    if not cmd or cmd.upper() == sentinel:
-        return ""
-    return cmd
-
-
-def parse_discovery_reply(text: str) -> DiscoveredCommands:
-    """Read the probe's three marker lines. A reply missing a line simply yields
-    '' for it — an old/weak model that answers only TEST_CMD still works."""
-    return DiscoveredCommands(
-        test_cmd=_parse_marked_line(text, _TEST_CMD_MARKER, "NO_TESTS"),
-        lint_cmd=_parse_marked_line(text, _LINT_CMD_MARKER, "NO_LINT"),
-        typecheck_cmd=_parse_marked_line(text, _TYPECHECK_CMD_MARKER, "NO_TYPECHECK"),
-    )
-
-
-def _parse_test_cmd_reply(text: str) -> str:
-    return _parse_marked_line(text, _TEST_CMD_MARKER, "NO_TESTS")
-
-
-# ── test-command VERIFICATION (does the discovered command actually work?) ────
-# Discovery is an LLM guess, and until now it was written into the overlay
-# unverified — the one config value whose wrongness wedges the whole harness.
-# The three realistic failures all present identically to the operator (every
-# PR denied) but only after a paid session has already run:
-#   * watch-mode (`vitest` not `vitest run`) — hangs until GATE_TEST_TIMEOUT_S
-#     (600s) and is then reported as a FAILING run;
-#   * a binary that is not installed (`pnpm` on a machine without it) — 127;
-#   * a command that assumes a different cwd or a missing service.
-# Running it ONCE at setup turns the guess into a fact, and costs the same as
-# the run the gate will do on the very first push anyway.
-_VERIFY_TIMEOUT_S = 180.0
-
-
-@dataclass(frozen=True)
-class TestCmdCheck:
-    """Outcome of trial-running a candidate TEST_CMD. `exit_code is None` means
-    it never finished — the watch-mode signature."""
-
-    exit_code: int | None
-    seconds: float
-
-    @property
-    def timed_out(self) -> bool:
-        return self.exit_code is None
-
-    @property
-    def passed(self) -> bool:
-        return self.exit_code == 0
-
-
-def verify_test_cmd(
-    cmd: str, target_dir: str, timeout_s: float = _VERIFY_TIMEOUT_S, run=None
-) -> TestCmdCheck:
-    """Trial-run `cmd` the way the GATE will run it — via
-    `governor.run_target_command` (env scrub + #63 re-entrancy bound +
-    process-group containment), in the repo root, bounded by a timeout.
-    Anything else would verify a command the gate never issues. `run` is
-    injectable so tests never execute a real suite. Never raises: a
-    verification that blows up must not block `start`. A recursion refusal
-    surfaces as exit -1 (failed)."""
-    started = time.monotonic()
-
-    def _gate_runner(c: str, cwd: str, t: float) -> int:
-        from ..adapters.governor import run_target_command
-
-        rc, _ = run_target_command(c, cwd, t, capture=True)
-        if rc is None:
-            return -1
-        if rc == 124:
-            raise subprocess.TimeoutExpired(c, t)
-        return rc
-
-    runner = run or _gate_runner
-    try:
-        code = runner(cmd, target_dir, timeout_s)
-    except subprocess.TimeoutExpired:
-        return TestCmdCheck(exit_code=None, seconds=time.monotonic() - started)
-    except Exception:  # noqa: BLE001 — verification is best-effort, never fatal
-        return TestCmdCheck(exit_code=-1, seconds=time.monotonic() - started)
-    return TestCmdCheck(exit_code=code, seconds=time.monotonic() - started)
-
-
-def report_test_cmd_check(cmd: str, check: TestCmdCheck) -> None:
-    """Tell the operator what the trial run proved. A FAILING suite is reported
-    but NOT treated as a reason to drop the command: the alternative is the
-    ALLOW_UNTESTED fallback, which trades a loud problem for a silent one (a
-    gate with no teeth). The operator is told exactly what to fix."""
-    if check.passed:
-        ok(f"verified TEST_CMD ({check.seconds:.0f}s): the suite runs and passes")
-        return
-    if check.timed_out:
-        warn(
-            f"TEST_CMD did not finish within {_VERIFY_TIMEOUT_S:.0f}s: {cmd}\n"
-            "    If this is WATCH MODE the gate will hang on every push and then "
-            "deny it — use the non-watch form (`vitest run`, `jest --ci`).\n"
-            "    If your suite is just slow, that is fine: raise "
-            "GATE_TEST_TIMEOUT_S above its real runtime."
-        )
-        return
-    warn(
-        f"TEST_CMD exited {check.exit_code} on a clean checkout: {cmd}\n"
-        "    The tests gate denies every push and `gh pr create` while this "
-        "fails, so the fixer would burn a session and then be blocked.\n"
-        "    Fix the suite, or correct TEST_CMD in the overlay before starting."
-    )
-
-
-# A DENY-LIST of command shapes that REWRITE the tree, not an allow-list of safe
-# ones: anything not named here is still trialed, so this cannot certify a
-# command as harmless. It exists because the mutating and check-mode spellings of
-# a formatter differ by one flag, a model asked for "the lint command" reaches
-# for the mutating one, and a formatter that rewrites the tree EXITS 0 — so the
-# trial run cannot catch it and it would be promoted live on a green result.
-# Each entry: (label, does this command appear?, flags that make it check-mode,
-# flags that make it mutating).
-_MUTATING_CHECK_SHAPES: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
-    ("cargo fmt", r"\bcargo\s+fmt\b", (r"--check",), ()),
-    ("ruff format", r"\bruff\s+format\b", (r"--check", r"--diff"), ()),
-    ("black", r"\bblack\b", (r"--check", r"--diff"), ()),
-    ("isort", r"\bisort\b", (r"--check", r"--check-only", r"--diff"), ()),
-    ("dotnet format", r"\bdotnet\s+format\b", (r"--verify-no-changes",), ()),
-    ("prettier", r"\bprettier\b", (), (r"--write", r"(?<![\w-])-w(?![\w-])")),
-    ("gofmt", r"\bgofmt\b", (), (r"(?<![\w-])-w(?![\w-])",)),
-    ("goimports", r"\bgoimports\b", (), (r"(?<![\w-])-w(?![\w-])",)),
-)
-
-
-def mutating_check_command(cmd: str) -> str:
-    """Why `cmd` must not be run or promoted as a check command, or '' if no known
-    mutating shape matches. A gate command has to be a QUESTION about the tree; one
-    that rewrites it would edit the operator's checkout on every commit the gate
-    fires — and would pass its own trial run while doing so."""
-    for label, trigger, check_flags, write_flags in _MUTATING_CHECK_SHAPES:
-        if not re.search(trigger, cmd):
-            continue
-        if check_flags and not any(re.search(flag, cmd) for flag in check_flags):
-            return f"`{label}` REWRITES files without {' or '.join(check_flags)}"
-        if any(re.search(flag, cmd) for flag in write_flags):
-            return f"`{label}` was given a write flag, so it REWRITES files"
-    return ""
-
-
-def _disposable_worktree(target_dir: str) -> str:
-    """A throwaway detached worktree of the target's HEAD, or '' if one cannot be
-    made. Callers must pass it to `_discard_worktree`."""
-    try:
-        root = tempfile.mkdtemp(prefix="issue-agent-trial-")
-    except OSError:
-        return ""
-    path = os.path.join(root, "wt")
-    try:
-        result = subprocess.run(
-            ["git", "worktree", "add", "--detach", path, "HEAD"],
-            cwd=target_dir, capture_output=True, text=True, timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        shutil.rmtree(root, ignore_errors=True)
-        return ""
-    if result.returncode != 0:
-        shutil.rmtree(root, ignore_errors=True)
-        return ""
-    return path
-
-
-def _discard_worktree(target_dir: str, path: str) -> None:
-    """Remove a disposable worktree and its temp root. Best-effort: a leftover
-    directory must not fail `start`."""
-    for argv in (["worktree", "remove", "--force", path], ["worktree", "prune"]):
-        try:
-            subprocess.run(
-                ["git", *argv], cwd=target_dir, capture_output=True, text=True,
-                timeout=60,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
-    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
-
-
-def verify_check_cmd(
-    cmd: str, target_dir: str, timeout_s: float = _VERIFY_TIMEOUT_S, run=None
-) -> TestCmdCheck | None:
-    """Trial-run a DISCOVERED check command in a disposable worktree of the
-    target's HEAD, never in the operator's working copy. None means it was not
-    run at all (no worktree could be made) — which is a refusal, not a pass:
-    the command is model-authored, and executing it against a tree a human may be
-    mid-edit on is not a risk this step is allowed to take to answer a question.
-
-    TEST_CMD keeps verifying in the real checkout: it is the command the gate
-    itself will run there, so a trial elsewhere would verify something else."""
-    worktree = _disposable_worktree(target_dir)
-    if not worktree:
-        return None
-    try:
-        return verify_test_cmd(cmd, worktree, timeout_s, run=run)
-    finally:
-        _discard_worktree(target_dir, worktree)
-
-
-def resolve_check_command(
-    key: str,
-    flag_value: str,
-    discovered: str,
-    target_dir: str,
-    *,
-    interactive: bool,
-    verify: bool = True,
-) -> tuple[str, str]:
-    """Decide what LINT_CMD/TYPECHECK_CMD the overlay may carry LIVE, and what it
-    may only suggest. Returns (live, suggestion) — at most one is non-empty.
-
-    These are trusted gate inputs: once set, each one BLOCKS every commit the
-    fixer makes. A discovered value's author is a model, so it carries no
-    operator or harness provenance (ADR 0012) and cannot be promoted on its own.
-    It becomes live only after the operator confirms it AND it survives the same
-    bounded trial run TEST_CMD gets; where that confirmation cannot happen
-    (non-TTY) it is written as an inert comment instead. An explicit flag is
-    already an operator decision and is written live."""
-    if flag_value:
-        return flag_value, ""
-    if not discovered:
-        return "", ""
-    mutating = mutating_check_command(discovered)
-    if mutating:
-        warn(
-            f"discovered {key} is not check-mode: {mutating}.\n"
-            f"    A gate command must ASK about the tree, not rewrite it — and a "
-            "formatter that rewrites it still exits 0, so no trial run would "
-            "catch this.\n"
-            f"    Recorded as a commented suggestion only: {discovered}"
-        )
-        return "", discovered
-    if not interactive:
-        info(
-            f"detected a candidate {key} but there is no terminal to confirm it — "
-            "recording it as a commented suggestion only."
-        )
-        return "", discovered
-    answer = _ask(f"{key} (Enter to accept, type a replacement, or '-' to skip)", discovered)
-    if answer == "-":
-        info(f"{key} skipped — the commit gate will not run it.")
-        return "", discovered
-    if not verify:
-        return answer, ""
-    info(f"trial-running {key} in a throwaway worktree (up to {_VERIFY_TIMEOUT_S:.0f}s)…")
-    check = verify_check_cmd(answer, target_dir)
-    if check is None:
-        warn(
-            f"could not create a disposable worktree to trial {key} safely, so it "
-            "was NOT run.\n"
-            "    Recorded as a commented suggestion instead — running a "
-            "model-authored command in your working copy is not an acceptable way "
-            "to answer this."
-        )
-        return "", answer
-    if check.passed:
-        ok(f"verified {key} ({check.seconds:.0f}s)")
-        return answer, ""
-    outcome = (
-        f"did not finish within {_VERIFY_TIMEOUT_S:.0f}s"
-        if check.timed_out else f"exited {check.exit_code}"
-    )
-    warn(
-        f"{key} {outcome} on a clean checkout: {answer}\n"
-        "    Setting it would block EVERY commit the fixer makes, so it is "
-        "recorded as a commented suggestion instead.\n"
-        f"    Fix it (or correct the command), then set {key} in the overlay."
-    )
-    return "", answer
-
-
-def _no_tests_banner() -> None:
-    """Loud, impossible-to-miss warning that the target repo has no test suite —
-    the PR gate, the red-must-fail gate, and the reviewer's test run all lose
-    their teeth without one."""
-    W = 64
-    bar = "!" * W
-
-    def row(text: str, code: str) -> None:
-        body = f"!!  {text}".ljust(W - 2) + "!!"
-        print(_c(code, body))
-
-    print(_c("31", bar))
-    row("THIS REPO HAS NO TESTS", "31")
-    row("The PR gate, red-must-fail gate, and reviewer test run", "33")
-    row("all have NO teeth — merged code is unverified by tests.", "33")
-    row("Pass --test-cmd '<cmd>' if discovery missed your suite.", "33")
-    print(_c("31", bar))
 
 
 # ── harness worktree (isolate from the primary checkout) ─────────────────────
@@ -2061,46 +1460,7 @@ def cmd_start(args) -> int:
                     "recording explicit repoint lineage for "
                     f"{len(repoint_history)} prior deployment(s)"
                 )
-        # Resolve TEST_CMD: explicit flag wins; else probe the repo with a cheap
-        # read-only LLM search. Empty result → the repo has no tests: proceed, but
-        # LOUDLY. Only done when synthesizing a fresh overlay (not on reuse).
         interactive = sys.stdin.isatty()
-        test_cmd = args.test_cmd or ""
-        lint_flag = getattr(args, "lint_cmd", "") or ""
-        typecheck_flag = getattr(args, "typecheck_cmd", "") or ""
-        discovered = DiscoveredCommands()
-        if not (test_cmd and lint_flag and typecheck_flag):
-            wanted = [
-                label for label, supplied in (
-                    ("test", test_cmd), ("lint", lint_flag), ("typecheck", typecheck_flag)
-                ) if not supplied
-            ]
-            info(f"searching the repo for its {'/'.join(wanted)} command(s)…")
-            discovered = discover_repo_commands(target_dir)
-            if not test_cmd:
-                test_cmd = discovered.test_cmd
-                if test_cmd:
-                    ok(f"discovered TEST_CMD: {test_cmd}")
-                else:
-                    _no_tests_banner()
-        suggestions: list[tuple[str, str]] = []
-        # LINT_CMD/TYPECHECK_CMD are commit-blocking gate inputs, so a DISCOVERED
-        # one is confirmed and trial-run before it can go live; anything that
-        # fails either step is written as an inert comment (see
-        # resolve_check_command).
-        verify_checks = not getattr(args, "no_verify_test_cmd", False)
-        lint_cmd, lint_suggestion = resolve_check_command(
-            "LINT_CMD", lint_flag, discovered.lint_cmd, target_dir,
-            interactive=interactive, verify=verify_checks,
-        )
-        typecheck_cmd, typecheck_suggestion = resolve_check_command(
-            "TYPECHECK_CMD", typecheck_flag, discovered.typecheck_cmd, target_dir,
-            interactive=interactive, verify=verify_checks,
-        )
-        if lint_suggestion:
-            suggestions.append(("LINT_CMD", lint_suggestion))
-        if typecheck_suggestion:
-            suggestions.append(("TYPECHECK_CMD", typecheck_suggestion))
         # BASE_BRANCH: an explicit --base-branch wins; else a previously written
         # value is preserved (a regenerate must not silently re-point a
         # deployment's merge target); else infer from where this repo's merged PRs
@@ -2139,20 +1499,10 @@ def cmd_start(args) -> int:
                         f"recent PRs merge into '{base_suggestion}' ({detected_note})"
                         " — keeping BASE_BRANCH=dev; pass --base-branch to adopt it."
                     )
-        # Verify whatever we ended up with — discovered OR hand-supplied. A typo
-        # in --test-cmd wedges the gate exactly as badly as a bad guess, and this
-        # is the last moment before the value is written into the overlay and
-        # starts denying pushes.
-        if test_cmd and not getattr(args, "no_verify_test_cmd", False):
-            info(f"trial-running the test command (up to {_VERIFY_TIMEOUT_S:.0f}s)…")
-            report_test_cmd_check(test_cmd, verify_test_cmd(test_cmd, target_dir))
         content = synth_repo_env(
             repo=repo, target_dir=target_dir, name=name,
             base_branch=base_branch, base_branch_note=base_note,
-            base_branch_suggestion=base_suggestion, suggestions=tuple(suggestions),
-            test_cmd=test_cmd, lint_cmd=lint_cmd, typecheck_cmd=typecheck_cmd,
-            gate_test_failure_exit_codes=gate_failure_exit_codes(test_cmd),
-            edit_check_cmd=args.edit_check_cmd or "", review_mode=args.review_mode or "",
+            base_branch_suggestion=base_suggestion, review_mode=args.review_mode or "",
             max_budget=args.max_budget or "", review_budget=args.review_budget or "",
             repointed_from_deployments=repoint_history,
         )
@@ -2173,9 +1523,6 @@ def cmd_start(args) -> int:
         ok(f"wrote config/repos/{name}.env  (repo={repo}, target={target_dir})")
     else:
         ok(f"reusing config/repos/{name}.env  (pass --write-config to regenerate)")
-        # Reused overlay with no TEST_CMD → still warn loudly (teeth matter).
-        if not read_repo_env_field(overlay, "TEST_CMD"):
-            _no_tests_banner()
 
     env = dict(os.environ)
     if args.roles:
@@ -2916,10 +2263,9 @@ def cmd_doctor(args) -> int:
             env["TARGET_DIR"] = target_dir
         warn(f"no overlay config/repos/{name}.env yet — checking config/shared.env "
              f"against the detected repo. `issue-agent start` writes the overlay "
-             f"(TEST_CMD, BASE_BRANCH, state dirs); re-run doctor after that.")
+             f"(BASE_BRANCH, state dirs); re-run doctor after that.")
     composed = _composed_env(env)
     _doctor_codex_binary(composed)
-    exit_codes = _doctor_test_failure_exit_codes(composed, name)
     identity = _doctor_identity_pools(composed)
     services = _doctor_installed_services(composed, name)
     rc = subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
@@ -2929,7 +2275,7 @@ def cmd_doctor(args) -> int:
     # returning doctor.sh's 0 for it is the false green this check replaces.
     if rc == 0 and (drift or any(
         f.level == "error"
-        for f in tuple(identity.findings) + exit_codes + services
+        for f in tuple(identity.findings) + services
     )):
         return 1
     return rc
@@ -2976,24 +2322,6 @@ def _doctor_identity_pools(composed: dict) -> IdentityPoolReport:
     token share one 5,000-point/hour pool (both keifu, 2026-08-02)."""
     info("identity and rate-limit pools")
     return report_identity_pools(composed)
-
-
-def _doctor_test_failure_exit_codes(composed: dict, name: str) -> tuple[Finding, ...]:
-    """Report runners in TEST_CMD whose assertion-failure exit code the gate does
-    not trust. doctor.sh only echoes TEST_CMD; it cannot parse the declaration
-    the Python gate enforces. The raw value is passed through verbatim — absent
-    (None) and present-but-empty mean different things to the gate."""
-    declared = composed.get("GATE_TEST_FAILURE_EXIT_CODES")
-    findings = test_failure_exit_code_findings(
-        composed.get("TEST_CMD") or "",
-        declared if declared is None else str(declared),
-        name,
-    )
-    if findings:
-        info("project commands: red-test exit codes")
-        for finding in findings:
-            (err if finding.level == "error" else warn)(finding.message)
-    return findings
 
 
 def _doctor_codex_binary(composed: dict) -> CodexResolutionReport | None:
@@ -3217,7 +2545,7 @@ def cmd_init(args) -> int:
 
     print(_c("36", "▸ issue-agent init — creating config/shared.env (global identity + secrets)"))
     print("  Press Enter to accept the [default]. These are repo-INDEPENDENT; per-repo")
-    print("  knobs (REPO/TARGET_DIR/TEST_CMD) are written by `issue-agent start`.\n")
+    print("  knobs (REPO/TARGET_DIR/BASE_BRANCH) are written by `issue-agent start`.\n")
 
     ask = _ask
 
@@ -3466,12 +2794,7 @@ def build_parser() -> argparse.ArgumentParser:
         "start",
         help="start the watchers against this repo (foreground)",
         description="Start the watchers in the FOREGROUND (Ctrl-C stops all; logs "
-        "tail live). First run auto-creates config/shared.env via `init`. If "
-        "--test-cmd is omitted, a cheap read-only LLM probe discovers the repo's "
-        "test command; a repo with no tests proceeds behind a loud warning. The "
-        "resolved command is then trial-run once (--no-verify-test-cmd skips it) "
-        "so watch-mode or a missing binary is caught here rather than by every "
-        "push being denied later.",
+        "tail live). First run auto-creates config/shared.env via `init`.",
     )
     add_context_flags(sp)
     sp.add_argument("--roles", nargs="+", choices=ROLES, help="subset to run (default: both)")
@@ -3481,25 +2804,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="base branch for PRs (default: inferred from merged PRs, then the "
              "repo default branch, then 'dev')",
     )
-    sp.add_argument("--test-cmd", default="", help="TEST_CMD (arms the PR/red-fail gate); omit to auto-discover")
-    sp.add_argument(
-        "--lint-cmd", default="",
-        help="LINT_CMD (blocks a commit on failure); omit to auto-discover, which "
-             "requires confirmation and a passing trial run before it is written",
-    )
-    sp.add_argument(
-        "--typecheck-cmd", default="",
-        help="TYPECHECK_CMD (blocks a commit on failure); omit to auto-discover, "
-             "which requires confirmation and a passing trial run before it is written",
-    )
-    sp.add_argument(
-        "--no-verify-test-cmd", action="store_true",
-        help="skip the one trial run of TEST_CMD and of any confirmed "
-             "LINT_CMD/TYPECHECK_CMD (those runs catch watch-mode and missing "
-             "binaries before they deny every push or block every commit)",
-    )
     sp.add_argument("--no-init", action="store_true", help="don't auto-run init on first start; error instead")
-    sp.add_argument("--edit-check-cmd", default="", help="EDIT_CHECK_CMD (post-edit typecheck)")
     sp.add_argument("--review-mode", default="", choices=["", "single", "multi", "delegated"], help="reviewer strategy")
     sp.add_argument("--max-budget", default="", help="MAX_BUDGET_USD per fix session")
     sp.add_argument("--review-budget", default="", help="REVIEW_BUDGET_USD per review")

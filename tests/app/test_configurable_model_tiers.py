@@ -135,17 +135,6 @@ def test_pr_repair_handoff_and_followup_keep_original_provider():
     assert (runner.tasks[0].runtime, runner.tasks[0].resume) == (RuntimeName.CLAUDE, "claude-repaired")
 
 
-def test_split_author_and_implement_share_one_configured_provider_choice():
-    runner = SeqRunner([AgentResult(False, structured={"tier": "complex"}),
-                        AgentResult(False, status="tests_authored", session_id="authored"),
-                        AgentResult(False, status="pr_opened", session_id="implemented")])
-    asyncio.run(configured_workflow(FakeGateway(issues={5: IssueView(5)}), FakeStore(), runner,
-        author_tests_split=True).resolve(5))
-    assert len(runner.tasks) == 3
-    assert [(task.runtime, task.model) for task in runner.tasks[1:]] == [
-        (RuntimeName.CLAUDE, "claude-opus-5-5"), (RuntimeName.CLAUDE, "claude-opus-5-5")]
-
-
 @pytest.mark.parametrize("value", [None, 1, [], {}])
 def test_external_route_parser_rejects_non_text(value):
     with pytest.raises(ValueError, match="text"):

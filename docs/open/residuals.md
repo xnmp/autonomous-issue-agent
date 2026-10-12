@@ -27,19 +27,12 @@ commands, remote readback, and receipts. Publication environment variables are
 removed from supervised child commands, but the model still runs as the daemon
 OS account and inherits its home-directory surface. Environment scrubbing does
 not prevent recovery through filesystem or local-socket access
-(`CRED-HOME`). An agent-local hook therefore remains defense-in-depth, not an
-authorization boundary.
-
-The resolver denies parse errors, excessive syntax depth, functions, dynamic
-command positions, supported interpreter `-c` forms, obscuring wrappers, and
-all governed commands it recognizes. It does **not** close arbitrary indirect
-execution. The accepted holes are:
-
-- script-file execution through `bash file.sh` or `./file.sh`
-  (`GOV-SCRIPT-FILE`);
-- util-linux `script -c` (`GOV-SCRIPT-C`);
-- `node`/`perl`/`ruby -e` (`GOV-INTERPRETER-E`);
-- `git rebase --exec` (`GOV-REBASE-EXEC`).
+(`CRED-HOME`). Slice 6a (2026-10) deleted the command governor and the
+agent-local hook stack outright, so there is no in-process command filter at
+all: the agent can run any command its OS account can. Until slice 6b, the PR
+base, the branch and `Fixes #N` therefore depend on the agent following
+`AGENT.md`: nothing forces it through `issue-agent-publish`, and merge does not
+check the PR base. Slices 6a and 6b deploy together.
 
 **Consequence:** do not point this at a repository whose inbound issue, PR,
 review, or CI text is supplied by people you do not trust. The trigger-gated
@@ -48,16 +41,14 @@ publisher; see ADR 0001 and the capability matrix.
 
 ### 1.2 Agent-written claims are not authorization evidence
 
-The PR gate no longer reads `.harness/ac-posted`, `test-plan-posted`, or
-`adversarial-verdict`. Acceptance criteria remain visible in the PR body,
-test results come from the trusted executor, and adversarial review is process
-discipline rather than self-attestation.
+The harness reads no agent-written `.harness/` claims. Acceptance criteria
+remain visible in the PR body, and adversarial review is process discipline
+rather than self-attestation.
 
 Visual-evidence marker/receipt bookkeeping was removed in #327; reviewers judge
-screenshot outcomes. `.harness/test-cmd` remains an agent-selected
-fallback when the operator supplies no `TEST_CMD` (`CLAIM-TEST-CMD`), but it
-never supplies the execution result. That claim alone does not authorize
-publication.
+screenshot outcomes. Slice 6a deleted the publication gates, so no harness-run
+test result gates publication either; CI and the independent reviewer judge
+the pushed head.
 
 ### 1.3 The first real GitHub canary is complete
 
@@ -116,7 +107,6 @@ stayed lean. Full table in `docs/history/2026-07-25-improvement-plan.md` §4.
 | P4.9 cross-leg prompt-cache sharing | `agent_run.usage.cache_read_input_tokens` ≈ 0 across real runs |
 | P4.1 model routing (`build_router_task` is dead code kept for this) | median cost of `trivial`-labelled issues ≳ $1 |
 | P4.2/P4.3 review cost work | review legs are a top-2 ledger line |
-| P3.2 governor tiers | before onboarding any repo with untrusted inbound issues (see §1.2) |
 | Webhook push (`gh webhook forward`) + poll demoted to slow reconciler (#1) | GraphQL rate limiting recurs despite POLL_SECONDS=60 and the ETag pre-check (first hit 2026-07-26, review+steward on one token at 20s polls) |
 
 ---
@@ -130,11 +120,8 @@ Detail in the 2026-07-25 review §6. The plan deliberately gates all of it on
 operating experience: none of it is required for correctness, and the shape of
 the right abstraction depends on which legs actually get added.
 
-Two smaller ones worth doing whenever the files are next touched:
+One smaller one worth doing whenever the files are next touched:
 
-- `build_gate_context` / `main.py` should take `lint_cmd`/`typecheck_cmd`/`adr_dir`
-  directly, so `governor.complete_gate_context` can be deleted (it fills fields
-  the builder leaves at named inert sentinels, so removing it is a no-op).
 - Historical schema-v1 JSONL readers remain only as a read-only dashboard/status
   converter. They are never queried for admission, deduplication, process
   ownership, or effect authorization.

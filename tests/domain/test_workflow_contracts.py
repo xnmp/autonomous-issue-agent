@@ -3,15 +3,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from issue_agent.domain.agent_task import RunIntent, run_input_fingerprint
 from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow import (
     AuthorizedOperatorCommand, CancelRearm, KeepGuidance, OperatorActor,
     RequestRearm, ResolveAttemptResult, ResolveEpisode, ResolveResultKind,
     WorkflowChanged, WorkflowMutation, WorkflowSnapshot,
     ResolveRearmAcceptance, ResolveRearmPreflight, ObservedIssue, NoLinkedPr,
-    AuthoredResolve, FreshResolve, ResolveAdmission, ResolveSession, ResolveStage,
-    adjudication_allowed,
+    FreshResolve, ResolveAdmission, ResolveSession, ResolveStage,
 )
 from issue_agent.domain.world import IssueView
 from issue_agent.domain.workflow_identity import (
@@ -100,12 +98,10 @@ def test_result_cannot_authorize_changes_to_another_attempt_scope(wrong_binding)
 
 def continuation_state():
     state = snapshot()
-    source = WorkflowAttemptIdentity(state.binding, RunId("author"), "author-leg")
+    source = WorkflowAttemptIdentity(state.binding, RunId("resolve"), "resolve-leg")
     session = ResolveSession(source, "session:with:separator", "codex", "<runtime-default>")
-    admission = ResolveAdmission(source, replace(state.revision, version=1), ResolveStage.AUTHOR,
-                                 input_fingerprint=run_input_fingerprint(RunIntent("Author issue 7 contract")))
     return replace(state, revision=replace(state.revision, version=1),
-                   episode=replace(state.episode, continuation=AuthoredResolve(admission, 1, session)))
+                   episode=replace(state.episode, continuation=FreshResolve(session, 1)))
 
 
 def test_same_episode_continuation_survives_a_generation_fence_advance():
@@ -113,26 +109,6 @@ def test_same_episode_continuation_survives_a_generation_fence_advance():
     resumed = replace(state, revision=WorkflowRevision(replace(state.revision.fence, generation=1), 2))
     assert resumed.episode.continuation == state.episode.continuation
     assert resumed.episode.continuation.session.session_id == "session:with:separator"
-
-
-@pytest.mark.parametrize("change", ["episode", "target", "epoch", "generation", "version"])
-def test_continuation_cannot_inherit_foreign_or_future_authority(change):
-    state = continuation_state()
-    with pytest.raises(ValueError):
-        if change == "episode":
-            replace(state.episode, episode_id="new-episode")
-        elif change == "target":
-            replace(state, revision=replace(state.revision, fence=replace(state.revision.fence, key=WorkflowKey("o/r", IssueRef(999)))))
-        elif change == "epoch":
-            replace(state, authority=replace(state.authority, epoch=2))
-        elif change == "generation":
-            source = state.episode.continuation.author_attempt
-            future = replace(source, binding=replace(source.binding, fence=replace(source.binding.fence, generation=1)))
-            admission = replace(state.episode.continuation.author_admission, attempt=future,
-                                revision=WorkflowRevision(future.binding.fence, 1))
-            replace(state, episode=replace(state.episode, continuation=AuthoredResolve(admission, 1)))
-        else:
-            replace(state, revision=replace(state.revision, version=0))
 
 
 @pytest.mark.parametrize("version", [True, -1, 2**63, "1", None])
@@ -171,16 +147,3 @@ def test_admission_revision_is_positive_and_matches_attempt_generation():
         ResolveAdmission(attempt, WorkflowRevision(replace(state.revision.fence, generation=1), 1), ResolveStage.RESOLVE)
 
 
-@pytest.mark.parametrize("ceiling", [None, True, -1, 2**63])
-def test_adjudication_receipt_requires_a_real_configured_ceiling(ceiling):
-    state = snapshot()
-    attempt = WorkflowAttemptIdentity(state.binding, RunId("run"), "leg")
-    with pytest.raises(ValueError):
-        ResolveAdmission(attempt, replace(state.revision, version=1), ResolveStage.ADJUDICATE, ceiling)
-
-
-def test_adjudication_boundary_counts_prior_admissions_and_zero_disables_it():
-    assert adjudication_allowed(0, 1)
-    assert not adjudication_allowed(1, 1)
-    assert not adjudication_allowed(2, 1)
-    assert not adjudication_allowed(0, 0)

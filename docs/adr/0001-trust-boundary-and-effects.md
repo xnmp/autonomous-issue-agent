@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/operator_effects.py src/issue_agent/domain/trust.py src/issue_agent/domain/gate.py plugin/hooks/
+Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/operator_effects.py src/issue_agent/domain/trust.py
 
 ## Decision
 
@@ -16,7 +16,7 @@ control store exposes pending work only to that scope. Publication commands
 also capture the prior remote revision; a remote value that is neither the
 captured prior nor the proposed revision is divergence and never executes.
 
-The shell governor and hooks are advisory defence-in-depth. Credential
+The shell governor and hooks were deleted in slice 6a (2026-10). Credential
 placement, expected-revision checks, and effect receipts
 are the authority. Until agents run without publication credentials, supported
 repositories remain trusted-inbound only.

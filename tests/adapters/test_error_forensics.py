@@ -82,7 +82,7 @@ def test_envelope_subtype_is_captured_on_success_too():
 
 # ── forensics ────────────────────────────────────────────────────────────────
 def test_forensics_surface_permission_denials():
-    """A governor-wedged agent is invisible in every other surface."""
+    """A permission-wedged agent is invisible in every other surface."""
     msg = _Result(permission_denials=[{"tool": "Bash", "cmd": "git push --no-verify"}],
                   num_turns=40, subtype="error_max_turns")
     line = error_forensics(msg)

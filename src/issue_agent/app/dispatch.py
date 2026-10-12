@@ -39,7 +39,6 @@ from ..domain.ports import (
     WorkflowState,
 )
 from ..domain.workflow_ports import WorkflowControl
-from ..domain.resolve_split import ContractRevision, ContractResetResult
 from .planners.tasks import FixTaskConfig, ReviewTaskConfig
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.review import ReviewAuthority, ReviewWorkflow, ReviewWorkflowConfig
@@ -57,8 +56,6 @@ class DispatchConfig:
     review: ReviewTaskConfig | None = None
     fork_threshold: int = 5
     max_review_rejections: int = 4
-    author_tests_split: bool = False
-    max_contract_rounds: int = 2
     # REVIEW_MODE: which reviewer strategy to run —
     #   SINGLE    — one session-resumed agent reads diff + files itself (default).
     #   MULTI     — the /code-review fan-out (skip-gate → dimension specialists →
@@ -117,8 +114,6 @@ class DispatchConfig:
             base_branch=self.base_branch,
             fix=self.fix,
             fork_threshold=self.fork_threshold,
-            author_tests_split=self.author_tests_split,
-            max_contract_rounds=self.max_contract_rounds,
             fix_mcp_config=self.fix_mcp_config,
             harness_root=self.harness_root,
             log=self.log,
@@ -166,10 +161,6 @@ class _NoFixWorktrees:
 
     def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str | None:
         del issue, fallback
-        raise self._unavailable()
-
-    def reset_contract(self, issue: int, revision: ContractRevision, intent_id: str) -> ContractResetResult:
-        del issue, revision, intent_id
         raise self._unavailable()
 
 
@@ -227,8 +218,7 @@ class AgentDispatcher:
 
     async def _run_logged(self, label: str, issue: int, task):
         """Run one agent leg, bracketing it with start/done breadcrumbs so a long
-        in-session TDD run isn't a silent gap in the log. The per-commit milestones
-        (red:/green:/docs:) are logged live by the governor hook as they happen."""
+        in-session run isn't a silent gap in the log."""
         return await run_leg(
             self.runner,
             self.cfg.log,

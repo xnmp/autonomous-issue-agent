@@ -2,8 +2,8 @@
 
 Current as of 2026-10-06. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
-document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
-remains because Codex uses it on the live Python path.
+document have been deleted. Slice 6a (2026-10) deleted the remaining
+`plugin/hooks/` gate stack, the governor and the fixer's publication gates.
 
 The [phase-4 simplification roadmap](../open/2026-09-30-phase-4-simplification-roadmap.md)
 and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern selected
@@ -49,9 +49,8 @@ worktrees live below the hidden `.claude/worktrees` scratch path and that path i
 also excluded by the primary checkout's shared `.git/info/exclude`, but their type
 gate must be identical to the primary checkout's.
 
-The shell governor is advisory defense-in-depth; durable
-commands, captured-revision guards, SQLite ownership, and trusted readback
-are the publication authority.
+Durable commands, captured-revision guards, SQLite ownership, and trusted
+readback are the publication authority.
 
 ## The five properties worth preserving
 
@@ -96,34 +95,13 @@ tests pass.
 The reviewer submits its model verdict for the exact PR head. Targets must have CI
 checks; a PR with no reported checks does not merge. A diff touching `.github/**` escalates
 through the existing human-review path. Reviewer legs do not execute target tests.
-See [ADR 0011](../adr/0011-trusted-execution-and-gate-evidence.md).
 
-## Enforcement: authority plus two advisory stacks
+## No fixer gates
 
-The fixer is governed at two levels:
-
-- **The advisory governor hook** (`adapters/governor.py` +
-  `plugin/hooks/bash_governor.py`)
-  inspects every Bash call the agent makes. Its parsing core
-  (`domain/governor_policy.py`) is *shared* between the Python and bash entry points,
-  which is why that half provably cannot drift.
-- **The gates** (`domain/gate.py` for the SDK path, `plugin/hooks/checks/*.sh`
-  for codex mode) enforce the PR/push/commit contract: base branch, acceptance
-  criteria, test runs, red-before-green, evidence images, ADR citations,
-  lint/typecheck. Red-fail preserves changed test files, including additions to
-  existing files, and executes the suite with implementation changes reverted.
-  Existing-test edits are listed as untrusted diff evidence for reviewers; in
-  multi-review they require specialist review even if the skip classifier
-  reports no behavioural change. No test-edit grants or exemption trailers
-  authorize publication or merge. Historical grant-only downgrades require a
-  fresh review rather than being copied onto rebased heads.
-
-Those two gate implementations shared a *spec*, not code, and had already
-drifted when the review checked. They are now pinned by
-`tests/test_gate_parity.py`: 35 golden cases run through **both** stacks in real
-scratch git repos, asserting identical verdicts. Three legitimate divergences
-are asserted explicitly rather than dropped. **If you add a gate rule, add a
-parity case** — a set-equality test over rule families will fail otherwise.
+The fixer has no publication gates and no command governor (slice 6a; ADR 0011
+superseded). TDD is prompt guidance in `plugin/AGENT.md`. What a fixer pushes
+is judged by CI and the independent reviewer; existing-test edits in the diff
+(`domain/diff_tests.py`) are listed for the reviewer as untrusted evidence.
 
 ## Operational state, telemetry, and money
 
@@ -505,16 +483,13 @@ ancestor and matched to the live SQLite run/lease instead of trusted from
 child-controlled assignments. The registered process-group leader remains as
 an authority-carrier ancestor while the provider runs in its child; accounting,
 event, and publication variables are removed before the provider or target test
-starts. Advisory leg-role and durable-publication markers remain visible to the
-hook. The Codex hook receives the operator base branch as a quoted, hook-local
-value, so PR validation does not require exporting deployment configuration to
-target commands. The authority is carried as a compact bundle so the same
+starts; no `ISSUE_AGENT_*` variable reaches the provider. The authority is carried as a compact bundle so the same
 ancestor check works through `/proc` on Linux and `ps` on macOS; its
 GitHub host is captured by the daemon, and both push remotes and `gh --repo`
 scope are pinned to that host rather than child-controlled `GH_HOST`.
 Publication credentials are nevertheless still
-recoverable in the child process/filesystem topology; the governor and broker
-do not constitute credential isolation. All runtimes therefore remain
+recoverable in the child process/filesystem topology; the broker does not
+constitute credential isolation. All runtimes therefore remain
 trusted-inbound-only until the trigger-gated separately privileged artifact
 publisher is deployed.
 
@@ -564,13 +539,13 @@ re-diagnosing one tick's failure blind),
 `domain/eligibility.py`
 (action-specific allowed/held/invalid results and immutable completion facts;
 shared by lifecycle policy and durable action payloads without an import cycle),
-`domain/effort.py`, `domain/environment.py`
+`domain/effort.py`, `domain/diff_tests.py`
 (the harness-attested capability manifest: what the boot probe saw, and the
 narrow conditions under which it may state a verdict rather than facts),
-`domain/events.py`, `domain/fix.py`, `domain/gate.py`,
+`domain/events.py`, `domain/fix.py`,
 `domain/measurement.py` (validated incident/intervention observations),
 `domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
-`domain/governor_policy.py`, `domain/git_remote.py`, `domain/identity.py`,
+`domain/git_remote.py`, `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
@@ -588,7 +563,7 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
 `domain/continuation_import.py` (closed stopped fix source fields and typed import decisions),
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
-`domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
+`domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/review_activation.py`, `domain/review_linkage.py`,
 `domain/review_execution.py` (pure current execution authority and bounded ordered unresolved-suffix fold),
@@ -629,15 +604,15 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/measurement.py` (atomic observation recording and read-only SQL export),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
-`adapters/codex_hook.py`, `adapters/codex_runner.py`,
+`adapters/codex_home.py`, `adapters/codex_runner.py`,
 `adapters/codex_child_usage.py` (bounded native lineage, own-response observation and frozen-card recovery),
 `adapters/control_path.py`, `adapters/control_store.py`,
 `adapters/deployment_authority.py`, `adapters/durable_effects.py`,
 `adapters/effects.py`,
-`adapters/env_file.py`, `adapters/environment.py`,
+`adapters/env_file.py`,
 `adapters/event_log.py`, `adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
-`adapters/governor.py`, `adapters/gate_transport.py` (trusted shell gate composition), `adapters/handover.py`,
+`adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
@@ -674,7 +649,7 @@ adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
 `app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
-`app/dispatch.py`, `app/gate_check.py` (absolute advisory gate entry),
+`app/dispatch.py`,
 `app/execute.py`, `app/identity_pools.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
