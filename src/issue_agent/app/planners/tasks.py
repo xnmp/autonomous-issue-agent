@@ -127,8 +127,8 @@ FIXER_DENY: tuple[str, ...] = (
 # text. See P4.5.
 _RESUME_REMINDER = (
     "Continuing the SAME session — the AGENT.md contract you were given at session "
-    "start still applies IN FULL and is unchanged: the TDD commit sequence "
-    "(plan:/red:/green:), the PR + adversarial gates, evidence for visual criteria, "
+    "start still applies IN FULL and is unchanged: failing tests first, then the "
+    "implementation, the adversarial review, evidence for visual criteria, "
     "and no scope creep beyond the issue.\n"
     "Re-read it from your own context rather than re-deriving it; if you cannot "
     "recall a rule, say so instead of guessing.\n"
@@ -161,7 +161,7 @@ _FIXER_REVIEW_AUTHORIZATION = (
     "findings. Clarifying follow-ups are allowed, but cannot replace fresh "
     "verification after a FAIL. All children share this leg's budget. This authorization "
     "does not extend to implementation delegation or separate paid CLI sessions. "
-    "All existing tests, evidence requirements and publication gates still apply.\n\n"
+    "All existing tests and evidence requirements still apply.\n\n"
 )
 
 _HUMAN_MESSAGES = (
@@ -202,10 +202,8 @@ _STANDING_POLICY_NOTICE = (
     "(2026-08-10); an unproven environment ask is a defect.\n"
     "2. CONTRADICTION — two acceptance criteria that cannot both hold, "
     "where any guess would build the wrong thing.\n"
-    "Routine technical questions are a defect. (A wrong acceptance "
-    "criterion is neither: it has its own machine-adjudicated path — see "
-    "the contract escape hatch in your task. A wrong existing TEST is not "
-    "a petition at all: correct it and say so in the PR.)"
+    "Routine technical questions are a defect. (A wrong existing TEST is not "
+    "a blocker: correct it and say so in the PR.)"
 )
 
 

@@ -119,7 +119,7 @@ def test_publishing_task_authorizes_bounded_native_review_in_user_prompt(builder
     assert "one evidence-capture child" in authorization
     assert "Obtain PASS from the initial reviewer or, after fixing a FAIL, a fresh verifier before publishing" in authorization
     assert "separate paid CLI sessions" in authorization
-    assert "publication gates still apply" in authorization
+    assert "existing tests and evidence requirements still apply" in authorization
     assert "<untrusted_" not in authorization
 
 

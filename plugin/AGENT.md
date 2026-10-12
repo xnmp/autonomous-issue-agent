@@ -21,11 +21,11 @@ typechecks and compiler suites sequentially; honor configured worker counts.
   decisions override your defaults. If an invariant seems wrong, STOP and explain
   in your blocked summary; never violate or work around it.
 - Cite `ADR <id>` or its filename in the PR body for every ADR whose `Governs:`
-  line names a changed path; the PR gate requires it on both runners.
+  line names a changed path.
 - Delegate codebase search to `explore-local`; keep your context for reasoning,
   design and code.
 
-## Workflow (DDD + TDD — hook-enforced order)
+## Workflow (DDD + TDD)
 1. Keep the prepared branch: never create, rename or switch branches. Confirm it
    identifies `$ISSUE_NUMBER` and retain prior work; conventional types such as
    `fix/`, `feat/` and `test/` are supported.
@@ -37,18 +37,13 @@ typechecks and compiler suites sequentially; honor configured worker counts.
    the step 2 observable at its producing layer and FAIL when implementation is
    reverted. For import difficulties, mock the dependency or move the unit;
    never neuter assertions.
-   Write the exact command for your added tests to `.harness/test-cmd` regardless
-   of operator configuration. Operator `TEST_CMD` takes precedence; the marker
-   applies only without it. The resolved command must pass normally and fail with
-   the implementation reverted, so include your added tests in it.
 4. Read directory `CLAUDE.md` files for touched paths and relevant ADRs (see Design
    priors for invariants and the ADR index).
-5. Commit `plan:` domain interfaces/types, then `red:` failing tests, then `green:`
-   implementation until tests pass. Confirm red tests fail for the right reason
-   before proceeding; green requires an earlier red commit on the branch.
-   Check for commitlint/commit-msg hooks before the first commit. If present,
-   use a conventional type with phase scope for every commit: `test(red):`,
-   `feat(green):` / `fix(green):`, `docs(plan):`, `chore(evidence):`.
+5. Test first: write the failing tests, run them and confirm they fail for the
+   right reason, then implement until they pass. Keep the whole suite green; no
+   harness hook checks this, but the repo's required CI does and the independent
+   reviewer judges whether your tests prove the change.
+   Check for commitlint/commit-msg hooks before the first commit and follow them.
 6. For UI-facing changes, commit screenshots from the running app in `evidence/`,
    each at most 700KB; the reviewer judges whether they show the changed behavior.
 7. `docs:` update folder `CLAUDE.md` with non-obvious learnings.
@@ -99,13 +94,13 @@ typechecks and compiler suites sequentially; honor configured worker counts.
    acceptance criteria and closing linkage on create/edit, and edits only your
    branch's PR. Pass a literal `--body` (for long Markdown, use a scratch file
    with `--body "$(cat body.md)"`); `--body-file` is rejected.
-   Always create with `--base "$BASE_BRANCH"`; the PR gate rejects other bases.
+   Always create with `--base "$BASE_BRANCH"`.
    The broker commits lifecycle commands before network effects and reconciles
    ambiguous outcomes before retry.
 
 ## Hard rules
-- Never bypass hooks: no `--no-verify`, commit `-n`, `HUSKY=0`, or
-  `core.hooksPath` override. Open a PR only when all hooks pass.
+- Never bypass the repo's git hooks: no `--no-verify`, commit `-n`, `HUSKY=0`,
+  or `core.hooksPath` override. Open a PR only when they pass.
 - Never skip/disable tests to go green. Correct wrong existing expectations and
   explain in the PR description. Do not refactor unrelated code.
 - Fix quality/security signals for changed code; never hide them with exclusions,
@@ -126,9 +121,9 @@ typechecks and compiler suites sequentially; honor configured worker counts.
   artifact uploads). After two inconclusive diagnostic runs, implement the best defensive
   fix from captured evidence and explain in the PR. If genuinely unable to proceed,
   return `status=blocked` with exactly what you need; do not guess.
-- Never call `gh issue create`. Work around legitimate hook blocks where possible;
-  if completion is prevented, return `status=blocked` with a focused harness-issue
-  title and reproduction in `needs` for the operator to file.
+- Never call `gh issue create`. If completion is prevented, return
+  `status=blocked` with a focused harness-issue title and reproduction in `needs`
+  for the operator to file.
 
 ## Structured output contract
 You are invoked with `--json-schema`. Your FINAL message must satisfy it:
@@ -136,14 +131,6 @@ You are invoked with `--json-schema`. Your FINAL message must satisfy it:
   summary : one-paragraph summary of what you did
   needs   : if blocked, EXACTLY what you need to proceed
 Return `status=pr_opened` only once `gh pr create` has actually succeeded.
-
-If you are running as the IMPLEMENTER in a split run (the tests + acceptance
-criteria were written by a separate author) and a test or criterion is GENUINELY
-wrong — it asserts the wrong observable, contradicts the issue, or is infeasible,
-NOT merely inconvenient — return `status=contract_change` with `needs` = which
-test/criterion is wrong, the correct observable, and why. An independent author
-adjudicates your objection; you are not the judge of it. Default to making the
-tests pass and petition only for a real defect.
 
 ## Debugging / Logging / Documentation / Tests
 $DIAGNOSE_RULES
