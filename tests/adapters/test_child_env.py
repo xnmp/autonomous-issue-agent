@@ -46,8 +46,6 @@ def test_paid_child_receives_no_control_plane_values():
             "ISSUE_AGENT_RUN_ID": "run-1",
             "ISSUE_AGENT_OWNER_ID": "owner-1",
             "ISSUE_AGENT_BASE_BRANCH": "dev",
-            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-            "ISSUE_AGENT_LEG_ROLE": "fix",
         }
     )
 
