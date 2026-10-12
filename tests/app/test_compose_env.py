@@ -777,7 +777,6 @@ def test_doctor_rejects_bot_suffix_mismatch_under_identity_mode_three(tmp_path):
         "IDENTITY_MODE": "three",
         "FIX_BOT": "acme-fixer",
         "REVIEW_BOT": "acme-fixer[bot]",
-        "STEWARD_BOT": "acme-steward",
         "REPO": "o/r",
     })
     assert result.returncode != 0
@@ -792,10 +791,9 @@ def test_doctor_accepts_distinct_identities_under_identity_mode_three(tmp_path):
         "IDENTITY_MODE": "three",
         "FIX_BOT": "acme-fixer",
         "REVIEW_BOT": "acme-reviewer",
-        "STEWARD_BOT": "acme-steward",
         "REPO": "o/r",
     })
-    assert "three distinct identities" in result.stdout
+    assert "two distinct identities" in result.stdout
 
 
 def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
@@ -807,7 +805,6 @@ def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
         "IDENTITY_MODE": "three",
         "FIX_BOT": "Acme-Fixer",
         "REVIEW_BOT": "acme-fixer[BOT]",
-        "STEWARD_BOT": "acme-steward",
         "REPO": "o/r",
     })
     assert result.returncode != 0
@@ -912,7 +909,6 @@ def _ci_doctor(tmp_path: Path, extra_env: dict, **fixture) -> subprocess.Complet
         "BASE_BRANCH": "trunk",
         "FIX_BOT": "acme-fixer",
         "REVIEW_BOT": "acme-review",
-        "STEWARD_BOT": "acme-review",
     }
     env.update(extra_env)
     return _run_doctor(env)

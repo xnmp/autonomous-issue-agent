@@ -108,7 +108,6 @@ def _doctor(tmp_path: Path, **fixture) -> tuple[str, str]:
             "BASE_BRANCH": "trunk",
             "FIX_BOT": "acme-fixer",
             "REVIEW_BOT": "acme-review",
-            "STEWARD_BOT": "acme-review",
             "REVIEW_BOT_TOKEN": "github_pat_fake",
         }
     )

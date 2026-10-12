@@ -6,15 +6,15 @@
 #
 # Composes the env → preflight (doctor) → ensures the BASE_BRANCH exists on the
 # target → ensures GitHub labels + local worktree-scratch ignores (NO repo file
-# mutation) → runs all three watchers (fix, review, steward) in the FOREGROUND
-# under one trap. Ctrl-C stops all three. Idempotent.
+# mutation) → runs both watchers (fix, review) in the FOREGROUND
+# under one trap. Ctrl-C stops both. Idempotent.
 #
 # Point-and-fire: nothing is installed into the target's tracked tree. The SDK
 # daemons inject the governor hook + AGENT.md in-process; the only target-side
 # effects are GitHub labels and a local .git/info/exclude.
 #
 # Env knobs:
-#   ROLES="fix review steward"    which watchers to start (default: all three)
+#   ROLES="fix review"            which watchers to start (default: both)
 #   ISSUE_AGENT_MAX_TICKS=N       bound each daemon's loop (dry run / CI); unset = forever
 #   LOG_DIR=<path>                 daemon log directory (default:
 #                                  ${XDG_STATE_HOME:-$HOME/.local/state}/issue-agent/logs)
@@ -44,7 +44,7 @@ HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NAME="${1:?usage: bin/point-at.sh <name>  (reads config/repos/<name>.env)}"
 SHARED="$HARNESS_ROOT/config/shared.env"
 REPO_ENV="$HARNESS_ROOT/config/repos/$NAME.env"
-ROLES="${ROLES:-fix review steward}"
+ROLES="${ROLES:-fix review}"
 # Private, persistent log dir — NOT world-readable /tmp (any local user could
 # read prior /tmp/issue-agent-*.log, which may carry issue/PR content) and NOT
 # lost on reboot (tmpfs / systemd-tmpfiles clears /tmp). XDG_STATE_HOME is the
@@ -244,8 +244,6 @@ fi
 #       scratch (.claude/worktrees/, .harness/, evidence non-images, .codex/,
 #       AGENTS.md) never lands in a PR. This is local + untracked: the tracked
 #       tree is left pristine.
-# INVARIANTS.md / docs/adr are read by the steward IF the repo has them; the
-# harness never creates them.
 
 info "ensuring GitHub lifecycle labels on $REPO"
 if ! run_harness_issue_agent prepare-remote --repo "$REPO" --name "$NAME"; then
@@ -410,8 +408,8 @@ trap 'echo; info "stopping watchers…"; kill 0 2>/dev/null; wait 2>/dev/null; e
 
 for role in $ROLES; do
   case "$role" in
-    fix|review|steward) run_role "$role"; pids+=("$!") ;;
-    *) red "unknown role '$role' (want: fix review steward)"; ;;
+    fix|review) run_role "$role"; pids+=("$!") ;;
+    *) red "unknown role '$role' (want: fix review)"; ;;
   esac
 done
 

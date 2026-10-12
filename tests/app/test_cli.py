@@ -741,28 +741,25 @@ def test_parse_test_cmd_monorepo_composite():
     assert cli._parse_test_cmd_reply(f"TEST_CMD: {cmd}") == cmd
 
 
-# ── review M11: status merges STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR ────
+# ── review M11: status merges STATE_DIR/REVIEW_STATE_DIR ────
 def test_journal_paths_overlay_values_win(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
     (tmp_path / "myapp.env").write_text(
         'STATE_DIR="/custom/fix"\n'
         'REVIEW_STATE_DIR="/custom/review"\n'
-        'STEWARD_STATE_DIR="/custom/steward"\n'
     )
     assert cli.journal_paths("myapp") == [
         "/custom/fix/journal.jsonl",
         "/custom/review/journal.jsonl",
-        "/custom/steward/journal.jsonl",
     ]
 
 
 def test_journal_paths_falls_back_to_synth_defaults(tmp_path, monkeypatch):
     """No overlay at all → the same per-role layout `synth_repo_env` writes."""
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    fix, review, steward = cli.journal_paths("other")
+    fix, review = cli.journal_paths("other")
     assert fix.endswith(os.path.join(".local", "state", "issue-agent-other", "journal.jsonl"))
     assert review.endswith(os.path.join(".local", "state", "review-agent-other", "journal.jsonl"))
-    assert steward.endswith(os.path.join(".local", "state", "steward-agent-other", "journal.jsonl"))
 
 
 def test_journal_paths_for_a_hand_written_overlay_match_where_daemons_write(
@@ -780,7 +777,6 @@ def test_journal_paths_for_a_hand_written_overlay_match_where_daemons_write(
     assert cli.journal_paths("myapp") == [
         os.path.join(daemon_cfg.state_dir, "journal.jsonl"),
         os.path.join(daemon_cfg.review_state_dir, "journal.jsonl"),
-        os.path.join(daemon_cfg.steward_state_dir, "journal.jsonl"),
     ]
 
 
@@ -811,7 +807,6 @@ def test_journal_paths_prefer_the_composed_launch_snapshot(tmp_path, monkeypatch
     assert cli.journal_paths("myapp") == [
         os.path.join(daemon_cfg.state_dir, "journal.jsonl"),
         os.path.join(daemon_cfg.review_state_dir, "journal.jsonl"),
-        os.path.join(daemon_cfg.steward_state_dir, "journal.jsonl"),
     ]
 
 
@@ -819,18 +814,18 @@ def test_a_snapshot_missing_one_key_still_falls_through_to_the_overlay(
     tmp_path, monkeypatch
 ):
     """Per FIELD, not per file: a snapshot that names REPO but not
-    STEWARD_STATE_DIR must not blank the overlay's explicit value."""
+    REVIEW_STATE_DIR must not blank the overlay's explicit value."""
     repos, config = _isolated_config(tmp_path, monkeypatch)
     (repos / "myapp.env").write_text(
-        'REPO="Acme/Old"\nSTEWARD_STATE_DIR="/custom/steward"\n'
+        'REPO="Acme/Old"\nREVIEW_STATE_DIR="/custom/review"\n'
     )
     (config / ".active.myapp.env").write_text(
         'REPO="Acme/New"\nSTATE_DIR="/composed/fix"\n'
     )
 
-    fix, _review, steward = cli.journal_paths("myapp")
+    fix, review = cli.journal_paths("myapp")
     assert fix == "/composed/fix/journal.jsonl", "snapshot wins where it speaks"
-    assert steward == "/custom/steward/journal.jsonl", "overlay fills the gap"
+    assert review == "/custom/review/journal.jsonl", "overlay fills the gap"
 
 
 def test_journal_path_backcompat_is_the_fix_journal(tmp_path, monkeypatch):
@@ -849,13 +844,12 @@ def _write_jsonl(path: str, *lines: str) -> None:
             f.write(line + "\n")
 
 
-def test_status_merges_all_three_journals_in_global_ts_order(tmp_path):
-    """review M11: a STATE_DIR-only read made review/steward runs, spend
+def test_status_merges_all_journals_in_global_ts_order(tmp_path):
+    """review M11: a STATE_DIR-only read made review runs, spend
     blocks, and escalations invisible to `issue-agent status`. Interleaved
-    events across all three files must render as ONE global timeline."""
+    events across both files must render as ONE global timeline."""
     fix_j = str(tmp_path / "fix" / "journal.jsonl")
     review_j = str(tmp_path / "review" / "journal.jsonl")
-    steward_j = str(tmp_path / "steward" / "journal.jsonl")
     _write_jsonl(
         fix_j,
         json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run",
@@ -867,19 +861,16 @@ def test_status_merges_all_three_journals_in_global_ts_order(tmp_path):
                     "kind": "REVIEW", "number": 9, "cost_usd": 2.0, "status": "ok"}),
         json.dumps({"ts": "2026-07-25T10:06:00+00:00", "event": "spend_block",
                     "scope": "issue", "issue": 9}),
-    )
-    _write_jsonl(
-        steward_j,
         json.dumps({"ts": "2026-07-25T10:07:00+00:00", "event": "escalation",
                     "target": "issue", "number": 3}),
     )
     now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
     out = "\n".join(cli.spend_status_lines(
-        [fix_j, review_j, steward_j],
+        [fix_j, review_j],
         10.0,
         lambda: now,
     ))
-    # review/steward events reach the render — the M11 blind spot.
+    # review events reach the render — the M11 blind spot.
     assert "REVIEW" in out and "#9" in out
     assert "1 spend block(s) today" in out
     assert "1 escalation(s) to needs-human-review in 24h" in out
@@ -890,8 +881,8 @@ def test_status_merges_all_three_journals_in_global_ts_order(tmp_path):
 
 
 def test_status_merge_anti_vacuity_single_populated_journal_unchanged(tmp_path):
-    """With only the fix journal populated (review/steward never ran — their
-    files don't exist), passing the full journal_paths triple must render
+    """With only the fix journal populated (review never ran — its
+    file doesn't exist), passing the full journal_paths pair must render
     IDENTICALLY to passing the fix journal alone (pre-M11 behaviour) — a role
     that never ran must not perturb the output."""
     fix_j = str(tmp_path / "fix" / "journal.jsonl")
@@ -901,11 +892,10 @@ def test_status_merge_anti_vacuity_single_populated_journal_unchanged(tmp_path):
                     "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
     )
     missing_review = str(tmp_path / "review" / "journal.jsonl")
-    missing_steward = str(tmp_path / "steward" / "journal.jsonl")
     now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
     out_single = cli.spend_status_lines(fix_j, 10.0, lambda: now)
     out_multi = cli.spend_status_lines(
-        [fix_j, missing_review, missing_steward],
+        [fix_j, missing_review],
         10.0,
         lambda: now,
     )
@@ -1515,15 +1505,12 @@ def test_role_pid_discovery_is_scoped_to_requested_deployment(
         "issue_agent.app.launchd_main fix": [],
         "issue_agent.app.main review": [201, 202],
         "issue_agent.app.launchd_main review": [],
-        "issue_agent.app.main steward": [301],
-        "issue_agent.app.launchd_main steward": [],
     }
     owners = {
         101: "deployment-a",
         102: "deployment-b",
         201: "deployment-a",
         202: "deployment-b",
-        301: "deployment-b",
     }
     monkeypatch.setattr(cli, "_pgrep", lambda pattern: by_pattern[pattern])
     monkeypatch.setattr(
@@ -1533,12 +1520,10 @@ def test_role_pid_discovery_is_scoped_to_requested_deployment(
     assert cli._role_pids("deployment-a") == {
         "fix": [101],
         "review": [201],
-        "steward": [],
     }
     assert cli._role_pids("deployment-b") == {
         "fix": [102],
         "review": [202],
-        "steward": [301],
     }
 
 
@@ -1564,12 +1549,6 @@ def test_fresh_role_heartbeats_are_bounded_and_ignore_terminal_state(
             "updated_at": (now - timedelta(seconds=31)).isoformat(),
         })
     )
-    (state_dirs[2] / "heartbeat.json").write_text(
-        json.dumps({
-            "state": "running",
-            "updated_at": (now + timedelta(seconds=1)).isoformat(),
-        })
-    )
     monkeypatch.setattr(
         cli,
         "journal_paths",
@@ -1580,10 +1559,20 @@ def test_fresh_role_heartbeats_are_bounded_and_ignore_terminal_state(
         "app", now_fn=lambda: now, stale_after_s=30
     ) == {"fix": now - timedelta(seconds=10)}
 
-    (state_dirs[2] / "heartbeat.json").write_text(
+    (state_dirs[1] / "heartbeat.json").write_text(
+        json.dumps({
+            "state": "running",
+            "updated_at": (now + timedelta(seconds=1)).isoformat(),
+        })
+    )
+    assert "review" not in cli._fresh_role_heartbeats(
+        "app", now_fn=lambda: now, stale_after_s=30
+    )
+
+    (state_dirs[1] / "heartbeat.json").write_text(
         json.dumps({"state": "stopped", "updated_at": now.isoformat()})
     )
-    assert "steward" not in cli._fresh_role_heartbeats(
+    assert "review" not in cli._fresh_role_heartbeats(
         "app", now_fn=lambda: now, stale_after_s=30
     )
 
@@ -1623,7 +1612,6 @@ def test_cmd_status_reports_heartbeat_when_pid_namespace_hides_daemon(
     output = capsys.readouterr().out
     assert "fix     : running (fresh heartbeat; PID not visible)" in output
     assert "review  : running (fresh heartbeat; PID not visible)" in output
-    assert "steward : stopped" in output
 
 
 def test_systemd_status_log_reads_the_installed_unit_journal(monkeypatch) -> None:
@@ -1707,7 +1695,7 @@ def test_cmd_status_prefers_service_journal_over_stale_foreground_log(
     monkeypatch.setattr(
         cli,
         "_role_pids",
-        lambda _name: {"fix": [101], "review": [], "steward": []},
+        lambda _name: {"fix": [101], "review": []},
     )
     monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
     monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
@@ -1753,7 +1741,7 @@ def test_cmd_status_prefers_live_foreground_log_over_inactive_installed_unit(
     monkeypatch.setattr(
         cli,
         "_role_pids",
-        lambda _name: {"fix": [101], "review": [], "steward": []},
+        lambda _name: {"fix": [101], "review": []},
     )
     monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
     monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
@@ -1779,7 +1767,7 @@ def test_cmd_status_prefers_live_foreground_log_over_inactive_installed_unit(
         )
     ) == 0
     assert "live foreground output" in capsys.readouterr().out
-    assert service_queries == ["fix", "review", "steward"]
+    assert service_queries == ["fix", "review"]
 
 
 def test_cmd_status_shows_foreground_log_alongside_unavailable_systemd(
@@ -1795,7 +1783,7 @@ def test_cmd_status_shows_foreground_log_alongside_unavailable_systemd(
     monkeypatch.setattr(
         cli,
         "_role_pids",
-        lambda _name: {"fix": [101], "review": [], "steward": []},
+        lambda _name: {"fix": [101], "review": []},
     )
     monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
     monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
@@ -2330,7 +2318,7 @@ def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None
 def _wizard_answers(**over) -> list[str]:
     base = {
         "mode": "three", "fix": "fix-bot", "review": "review-bot",
-        "steward": "review-bot", "app": "N", "jira": "N",
+        "app": "N",
         "fixer_runtime": "claude", "reviewer_runtime": "claude",
     }
     base.update(over)
@@ -2373,8 +2361,8 @@ def test_cmd_init_reprompts_when_reviewer_is_the_fixer(tmp_path, monkeypatch, ca
     differ only by case or a [bot] suffix."""
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "Fix-Bot[bot]", "review-bot", "review-bot",
-                 "N", "N", "claude", "claude"],
+        answers=["three", "fix-bot", "Fix-Bot[bot]", "review-bot",
+                 "N", "claude", "claude"],
         secrets=["", ""],
     )
 
@@ -2390,7 +2378,7 @@ def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(
     shared, asked, _s = _init_env(
         tmp_path, monkeypatch,
         answers=["three", "fix-bot", "fix-bot", "fix-bot", "fix-bot",
-                 "steward-bot", "N", "N", "claude", "claude"],
+                 "N", "claude", "claude"],
         secrets=["", ""],
     )
 
@@ -2399,18 +2387,6 @@ def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(
     assert "doctor" in capsys.readouterr().err
     reviewer_prompts = [p for p in asked.prompts if "Reviewer login" in p]
     assert len(reviewer_prompts) == 3  # bounded, then the answer stands
-
-
-def test_cmd_init_enforces_steward_distinct_from_fixer(tmp_path, monkeypatch):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "fix-bot", "steward-bot",
-                 "N", "N", "claude", "claude"],
-        secrets=["", ""],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["STEWARD_BOT"] == "steward-bot"
 
 
 def test_cmd_init_writes_a_token_that_authenticates_as_the_reviewer(
@@ -2619,15 +2595,15 @@ def test_cmd_init_does_not_ask_for_a_fixer_token_in_solo_mode(tmp_path, monkeypa
 def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configured(
     tmp_path, monkeypatch
 ):
-    """The App supplies the review+steward identity, so REVIEW_BOT_TOKEN is not
-    asked for. The FIXER's is: the App covers review and steward only, and
+    """The App supplies the review identity, so REVIEW_BOT_TOKEN is not
+    asked for. The FIXER's is: the App covers review only, and
     `main` builds the fix gateway from FIX_BOT_TOKEN or nothing (2026-08-02
     keifu — an App-configured deployment still ran its fixer on the operator's
     ambient credential)."""
     shared, _asked, secrets = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "review-bot", "y",
-                 "123", "456", "/keys/app.pem", "N", "claude", "claude"],
+        answers=["three", "fix-bot", "review-bot", "y",
+                 "123", "456", "/keys/app.pem", "claude", "claude"],
         secrets=["fixer-pat"],
         gh=_gh_stub(token_logins={"fixer-pat": "fix-bot"}),
     )
@@ -2653,7 +2629,7 @@ def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
     )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+        answers=["three", "fix-bot", "review-bot", "N",
                  "claude", "codex"],
         secrets=["", ""], codex=shadowed,
     )
@@ -2667,7 +2643,7 @@ def test_cmd_init_leaves_codex_bin_unpinned_when_resolution_is_clean(
 ):
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+        answers=["three", "fix-bot", "review-bot", "N",
                  "claude", "codex", "https://api.openai.com/v1"],
         secrets=["", ""],
         codex=_codex_report(path="/opt/codex", version="0.147.0"),
@@ -2707,7 +2683,7 @@ def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
     )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+        answers=["three", "fix-bot", "review-bot", "N",
                  "claude", "codex", "n", "https://api.openai.com/v1"],
         secrets=["", ""], codex=shadowed,
     )

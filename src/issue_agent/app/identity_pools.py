@@ -1,7 +1,7 @@
 """Which GitHub credential does each daemon actually use, and whose rate-limit
 pool does it spend?
 
-2026-08-02 (keifu), two config-class gaps doctor could not see, each of which
+2026-08-02 (keifu), config-class gaps doctor could not see, each of which
 cost an operator surgery:
 
   1. IDENTITY_MODE=three with FIX_BOT_TOKEN unset. `main._daemon` builds the fix
@@ -12,11 +12,9 @@ cost an operator surgery:
      personal 5,000-point/hour pool. The pool was exhausted twice and the
      harness was blind for roughly 50 minutes of each hour.
 
-  2. Review and steward on one credential. `_app_identity` resolves App token →
-     REVIEW_BOT_TOKEN → ambient for BOTH roles, so a single REVIEW_BOT_TOKEN
-     makes them one identity against one 5,000-point/hour pool. At
-     POLL_SECONDS=20 two daemons rebuilding the world every tick exceed that
-     pool outright (issue #163).
+  2. Two roles on one credential (the fixer and reviewer both falling through
+     to the ambient credential). At POLL_SECONDS=20 two daemons rebuilding the
+     world every tick exceed one 5,000-point/hour pool outright (issue #163).
 
 Both are decidable offline from the composed env, which is why they live here
 and not behind a probe: the resolution rules are the harness's own, and reading
@@ -61,7 +59,7 @@ DEFAULT_POLL_SECONDS = 20
 
 SECONDS_PER_HOUR = 3600
 
-ROLES = ("fix", "review", "steward")
+ROLES = ("fix", "review")
 
 AMBIENT_POOL = "ambient"
 
@@ -232,8 +230,6 @@ def resolve_role_identities(
         fix,
         RoleIdentity("review", shared.source, shared.pool, shared.ambient,
                      shared.blank_secret),
-        RoleIdentity("steward", shared.source, shared.pool, shared.ambient,
-                     shared.blank_secret),
     )
 
 
@@ -367,10 +363,8 @@ def _burn_finding(
         else f"resolve to the same credential ({pool.source})"
     )
     level = "warn" if pool.fraction > BURN_WARN_FRACTION else "info"
-    # POLL_SECONDS first, deliberately. review+steward on one credential is a
-    # SUPPORTED arrangement (STEWARD_BOT "may equal reviewer"), and a GitHub App
-    # does not fix it either — one installation is one pool. The cadence is the
-    # knob that always applies.
+    # POLL_SECONDS first, deliberately: the cadence is the knob that always
+    # applies.
     remedy = (
         " Raise POLL_SECONDS, or give each role its own credential."
         if level == "warn" else ""
@@ -384,8 +378,7 @@ def _burn_finding(
         f"~{pool.points_per_hour:,} points/hour, {_percent(pool.fraction)} of the "
         f"pool (warn above {BURN_WARN_FRACTION:.0%}). It is an upper bound twice "
         f"over: {WORLD_BUILD_GRAPHQL_POINTS} points is the FIXER's world build "
-        f"applied to every role (the steward never fetches PRs, so its build is "
-        f"smaller), and the ADR 0010 change probe answers an unchanged tick from "
+        f"applied to every role, and the ADR 0010 change probe answers an unchanged tick from "
         f"the REST quota — a separate bucket — instead of rebuilding. A busy repo "
         f"has no unchanged ticks.{remedy}",
     )

@@ -9,9 +9,28 @@ from issue_agent.adapters.control_store import (
     IncompatibleSchema,
     RetiredOwnerError,
 )
+from issue_agent.app import cli
 from issue_agent.app import main as main_module
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.supervision import ExitCode
+
+
+def test_only_the_fix_and_review_roles_can_be_started(capsys):
+    """The steward role is deleted: neither `issue-agent start --roles` nor the
+    daemon entry point may select it, and both still select fix and review."""
+    parser = cli.build_parser()
+    assert parser.parse_args(["start", "--roles", "fix", "review"]).roles == [
+        "fix", "review",
+    ]
+    assert [main_module._role([role]) for role in ("fix", "review")] == [
+        "fix", "review",
+    ]
+    with pytest.raises(SystemExit):
+        parser.parse_args(["start", "--roles", "steward"])
+    assert "invalid choice: 'steward'" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as rejected:
+        main_module._role(["steward"])
+    assert rejected.value.code == ExitCode.INVALID_CONFIG
 
 
 @pytest.mark.parametrize(

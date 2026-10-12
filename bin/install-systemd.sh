@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the three per-repo role services and host-wide dashboard service
+# Install the two per-repo role services and host-wide dashboard service
 # (Linux). Mirrors install-launchd.sh for the role services.
 #
 #   bin/install-systemd.sh                # install + enable + start all roles,
@@ -7,7 +7,7 @@
 #                                          # for the repo config AGENT_ENV points at
 #   bin/install-systemd.sh uninstall      # stop + disable + remove ALL issue-agent
 #                                          # units (every repo installed this way)
-#   bin/install-systemd.sh uninstall <name>  # remove just <name>'s three units
+#   bin/install-systemd.sh uninstall <name>  # remove just <name>'s role units
 #
 # Per-deployment naming: the CLI passes its resolved overlay identity as
 # ISSUE_AGENT_DEPLOYMENT_ID. Direct legacy invocations derive owner+repository
@@ -33,7 +33,7 @@ canonical_deployment_id() {
   printf '%s' "${normalized:-target}"
 }
 
-services=(issue-agent-fix-watcher issue-agent-review-watcher issue-agent-steward)
+services=(issue-agent-fix-watcher issue-agent-review-watcher)
 DASHBOARD_SERVICE=issue-agent-dashboard
 DRY_RUN=0
 [ "${1:-}" != "--dry-run" ] || DRY_RUN=1

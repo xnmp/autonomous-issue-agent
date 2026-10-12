@@ -12,7 +12,7 @@ and `config/mcp/*.json` — none of which ship in the wheel. `bin/install.sh`
 installs this editable so `HARNESS_ROOT` (below) still resolves those siblings.
 
 Subcommands: init | start | stop | status | dashboard | doctor | ready |
-triage | install-service | uninstall-service. The pure helpers (detect_repo,
+install-service | uninstall-service. The pure helpers (detect_repo,
 resolve_name, synth_repo_env) are unit-tested with no git/network.
 """
 
@@ -77,7 +77,7 @@ def _active_env_path(name: str) -> str:
     config/.active.env) so concurrent deployments never overwrite each other's
     snapshot or trip each other's mtime hot-reload watch."""
     return os.path.join(HARNESS_ROOT, "config", f".active.{name}.env")
-ROLES = ("fix", "review", "steward")
+ROLES = ("fix", "review")
 
 
 # ── ANSI helpers (match point-at.sh's palette) ────────────────────────────────
@@ -128,9 +128,9 @@ def parse_remote_url(url: str) -> str:
 # file actually assigns is ever returned. Add a name here before reading it
 # elsewhere in this module.
 _OVERLAY_FIELDS = (
-    "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
+    "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR",
     "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
-    "FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME", "REVIEW_MODE",
+    "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
     *FIX_MODEL_TIER_ENV_KEYS,
     # Read by the dashboard's operator re-arm: which login's change requests
     # count toward the rejection ceiling, how many of them it takes, and the
@@ -468,7 +468,6 @@ def synth_repo_env(
         "# Isolated daemon state (keeps this deployment's state separate).",
         f'STATE_DIR="$HOME/.local/state/issue-agent-{name}"',
         f'REVIEW_STATE_DIR="$HOME/.local/state/review-agent-{name}"',
-        f'STEWARD_STATE_DIR="$HOME/.local/state/steward-agent-{name}"',
     ]
     if repointed_from_deployments:
         lines += [
@@ -2033,7 +2032,7 @@ def cmd_start(args) -> int:
             err(f"REFUSING to reuse config/repos/{name}.env — wrong repo/checkout:")
             err(f"  {mismatch}")
             err(
-                "Reusing it would run fix/review/steward against a DIFFERENT repo "
+                "Reusing it would run fix/review against a DIFFERENT repo "
                 "and checkout: labeling issues, opening PRs, and merging there. Pass "
                 f"--name <other> to pick the overlay that matches {repo!r} at "
                 f"{target_dir!r}, or --write-config to (re)synthesize "
@@ -2211,14 +2210,13 @@ def cmd_stop(args) -> int:
     return _stop_deployment(name)
 
 
-# M11: STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR paired with the synth
+# M11: STATE_DIR/REVIEW_STATE_DIR paired with the synth
 # default dirname pattern `synth_repo_env` writes for each (issue-agent-<name>
-# / review-agent-<name> / steward-agent-<name>) — one place both journal_paths
+# / review-agent-<name>) — one place both journal_paths
 # and synth_repo_env's isolated-state block agree on the naming.
 _JOURNAL_ROLE_DEFAULTS = (
     ("STATE_DIR", "issue-agent"),
     ("REVIEW_STATE_DIR", "review-agent"),
-    ("STEWARD_STATE_DIR", "steward-agent"),
 )
 
 
@@ -2259,9 +2257,9 @@ def deployment_env_field(name: str, field: str) -> str:
 
 def journal_paths(name: str) -> list[str]:
     """Every per-role journal overlay `name`'s daemons may have written (M11):
-    fix, review, and steward each get their OWN STATE_DIR and therefore their
+    fix and review each get their OWN STATE_DIR and therefore their
     own journal.jsonl. Reading STATE_DIR alone (the pre-M11 `journal_path`)
-    made review/steward runs, their spend blocks, and their loops invisible to
+    made review runs, their spend blocks, and their loops invisible to
     `issue-agent status`. Each role's state dir comes from the composed launch
     snapshot, else the overlay (`_deployment_env_field`); an absent/empty one
     falls back to the daemon's own derivation (config.default_state_dir keyed
@@ -2295,7 +2293,7 @@ def journal_path(name: str) -> str:
     """The fix-role journal for overlay `name` (STATE_DIR only). Kept for
     back-compat (tests/adapters/test_journal.py, outside this leg's file
     ownership, calls this directly) — prefer `journal_paths` (M11), which also
-    covers review/steward and is what `cmd_status` now reads."""
+    covers review and is what `cmd_status` now reads."""
     return journal_paths(name)[0]
 
 
@@ -2343,8 +2341,8 @@ def spend_status_lines(
     M11: `journal_file` may be a single path (back-compat — pre-M11 callers,
     e.g. tests/adapters/test_journal.py outside this leg's file ownership,
     pass the fix journal alone) or a list of per-role journals. `cmd_status`
-    now passes `journal_paths(name)`, the STATE_DIR/REVIEW_STATE_DIR/
-    STEWARD_STATE_DIR triple — reading STATE_DIR alone made review/steward
+    now passes `journal_paths(name)`, the STATE_DIR/REVIEW_STATE_DIR
+    pair — reading STATE_DIR alone made review
     runs, their spend blocks, and their loops invisible here. Every file's
     events are read then merge-sorted into ONE global `ts` timeline before
     anything below is computed, so a review run interleaves correctly with a
@@ -2446,7 +2444,6 @@ def spend_status_lines(
 _SYSTEMD_ROLE_UNITS = {
     "fix": "issue-agent-fix-watcher-{name}.service",
     "review": "issue-agent-review-watcher-{name}.service",
-    "steward": "issue-agent-steward-{name}.service",
 }
 _STATUS_COMMAND_TIMEOUT_S = 2.0
 
@@ -2953,7 +2950,7 @@ def _doctor_installed_services(composed: dict, name: str) -> tuple[Finding, ...]
     return findings
 
 
-CODEX_RUNTIME_KEYS = ("FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME")
+CODEX_RUNTIME_KEYS = ("FIXER_RUNTIME", "REVIEWER_RUNTIME")
 
 
 def _composed_env(env: dict) -> dict:
@@ -3044,10 +3041,6 @@ def cmd_ready(args) -> int:
     return _label_issues(args, "ai-ready")
 
 
-def cmd_triage(args) -> int:
-    return _label_issues(args, "ai-triage")
-
-
 REMOTE_LABELS = (
     "ai-triage",
     "ai-ready",
@@ -3078,13 +3071,12 @@ def _operator_effects(repo: str, name: str, channel: str):
     fields = _source_env_file(overlay)
     state_dirs = tuple(
         fields.get(key, "")
-        for key in ("STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR")
+        for key in ("STATE_DIR", "REVIEW_STATE_DIR")
     )
     if not any(state_dirs):
         state_dirs = (
             os.path.expanduser(f"~/.local/state/issue-agent-{name}"),
             os.path.expanduser(f"~/.local/state/review-agent-{name}"),
-            os.path.expanduser(f"~/.local/state/steward-agent-{name}"),
         )
     return build_operator_effects(
         repo,
@@ -3272,14 +3264,8 @@ def cmd_init(args) -> int:
         "the fixer", fix_bot,
     )
     fields.append(("REVIEW_BOT", review_bot))
-    fields.append((
-        "STEWARD_BOT",
-        ask_distinct_login(
-            "Steward login (may equal reviewer)", review_bot, "the fixer", fix_bot
-        ),
-    ))
     print()
-    gh_app = ask("Configure GitHub App for review+steward identity? (y/N)", "N").lower().startswith("y")
+    gh_app = ask("Configure GitHub App for review identity? (y/N)", "N").lower().startswith("y")
     if gh_app:
         fields.append(("GH_APP_ID", ask("GH App ID", "")))
         fields.append(("GH_APP_INSTALL_ID", ask("GH App installation ID", "")))
@@ -3296,7 +3282,7 @@ def cmd_init(args) -> int:
             warn("no REVIEW_BOT_TOKEN set — the reviewer will act as the ambient gh "
                  "account and GitHub will 422 its approvals.")
     if identity_mode == "three":
-        # Asked regardless of the App answer: the App covers review+steward only,
+        # Asked regardless of the App answer: the App covers review only,
         # and the fixer's credential is FIX_BOT_TOKEN or nothing. Skipping this
         # is what put keifu's fixer on a human account and its personal quota.
         print()
@@ -3309,11 +3295,6 @@ def cmd_init(args) -> int:
         if fix_token:
             fields.append(("FIX_BOT_TOKEN", fix_token))
     _wizard_pool_summary(fields)
-    print()
-    if ask("Enable Jira sync? (y/N)", "N").lower().startswith("y"):
-        fields.append(("JIRA_SYNC", "1"))
-        fields.append(("JIRA_PROJECT_KEY", ask("Jira project key (e.g. ACME)", "")))
-        fields.append(("JIRA_CLOUD_ID", ask("Jira cloud id / host", "")))
     print()
     claude_ready = detect_claude_auth()
     codex_mode = detect_codex_auth()
@@ -3407,10 +3388,6 @@ def cmd_fix_activation(args) -> int:
     return _cmd_workflow_activation(args, family="fix")
 
 
-def cmd_steward_activation(args) -> int:
-    return _cmd_workflow_activation(args, family="steward")
-
-
 def _cmd_workflow_activation(args, *, family: str) -> int:
     import sqlite3
 
@@ -3421,9 +3398,9 @@ def _cmd_workflow_activation(args, *, family: str) -> int:
 
     name = args.name or _resolve_context(args)[2]
     try:
-        transport = continuation_activation if family in {"fix", "steward"} else review_execution_activation if family == "review-execution" else activation
+        transport = continuation_activation if family == "fix" else review_execution_activation if family == "review-execution" else activation
         scope = transport.activation_scope(name, harness_root=HARNESS_ROOT, extra_roots=tuple(args.legacy_state_dir),
-                                           **({"family": family} if family in {"fix", "steward"} else {}))
+                                           **({"family": family} if family == "fix" else {}))
         if args.action in ("inventory", "shadow"):
             result = transport.inspect(scope, shadow=args.action == "shadow")
         elif args.action == "rehearse":
@@ -3502,7 +3479,7 @@ def build_parser() -> argparse.ArgumentParser:
         "push being denied later.",
     )
     add_context_flags(sp)
-    sp.add_argument("--roles", nargs="+", choices=ROLES, help="subset to run (default: all three)")
+    sp.add_argument("--roles", nargs="+", choices=ROLES, help="subset to run (default: both)")
     # Default None, not "dev": only an ABSENT flag may be inferred from the repo.
     sp.add_argument(
         "--base-branch", default=None,
@@ -3584,11 +3561,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repo", default="", help="owner/name (default: auto-detect)")
     sp.set_defaults(func=cmd_ready)
 
-    sp = sub.add_parser("triage", help="label issue(s) ai-triage (queue for the steward)")
-    sp.add_argument("issues", nargs="+", help="issue number(s)")
-    sp.add_argument("--repo", default="", help="owner/name (default: auto-detect)")
-    sp.set_defaults(func=cmd_triage)
-
     sp = sub.add_parser("prepare-remote", help=argparse.SUPPRESS)
     sp.add_argument("--repo", required=True)
     sp.add_argument("--name", required=True, type=_deployment_name_arg)
@@ -3605,7 +3577,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for family, handler in (("resolve", cmd_resolve_activation), ("review", cmd_review_activation),
                             ("review-execution", cmd_review_execution_activation),
-                            ("fix", cmd_fix_activation), ("steward", cmd_steward_activation)):
+                            ("fix", cmd_fix_activation)):
         sp = sub.add_parser(
             f"{family}-activation",
             help=f"inventory, shadow-compare, rehearse or activate the {family} workflow family",
@@ -3621,7 +3593,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--legacy-state-dir", action="append", default=[], metavar="DIR",
                         help="additional older/custom state root to import from (repeatable)")
         sp.add_argument("--copy-to", default="", help="rehearse: new empty directory for the isolated copy")
-        if family in {"review-execution", "fix", "steward"}:
+        if family in {"review-execution", "fix"}:
             sp.add_argument("--plan-file", default="", help="activate: saved original complete shadow JSON report")
         sp.set_defaults(func=handler)
 

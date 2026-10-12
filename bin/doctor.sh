@@ -137,12 +137,12 @@ for _ACTIVE_ENV in "${_ACTIVE_FILES[@]}"; do
 done
 
 echo "== per-repo state-dir collisions (config/repos/*.env) =="
-# review M5/D7: default STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR are now
+# review M5/D7: default STATE_DIR/REVIEW_STATE_DIR are now
 # per-repo (app/config.py::_default_state_dir), but nothing stopped two
 # overlays from setting (or defaulting to) the SAME dir — a second repo's fix
 # daemon would then resume the first repo's issue-N.session/.phase transcript.
 # Scan every config/repos/*.env overlay, resolve each role's EFFECTIVE state
-# dir (explicit STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR if set, else the
+# dir (explicit STATE_DIR/REVIEW_STATE_DIR if set, else the
 # same per-repo default config.py computes), and fail on any (role, dir) pair
 # two different overlays resolve to.
 _REPOS_DIR="$HARNESS_ROOT/config/repos"
@@ -182,22 +182,20 @@ if [ -d "$_REPOS_DIR" ] && compgen -G "$_REPOS_DIR/*.env" >/dev/null 2>&1; then
       # point-at invokes doctor after exporting the active snapshot. Missing
       # keys in another overlay must resolve from shared/defaults, not inherit
       # that active deployment's state directories.
-      unset REPO STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR
+      unset REPO STATE_DIR REVIEW_STATE_DIR
       set -a
       [ -f "$HARNESS_ROOT/config/shared.env" ] && . "$HARNESS_ROOT/config/shared.env"
       . "$_ov"
       set +a
-      printf '%s\n%s\n%s\n%s\n' "${REPO:-}" "${STATE_DIR:-}" "${REVIEW_STATE_DIR:-}" "${STEWARD_STATE_DIR:-}"
+      printf '%s\n%s\n%s\n' "${REPO:-}" "${STATE_DIR:-}" "${REVIEW_STATE_DIR:-}"
     )"
     _repo="$(sed -n '1p' <<<"$_vals")"
     _sd="$(sed -n '2p' <<<"$_vals")"
     _rd="$(sed -n '3p' <<<"$_vals")"
-    _wd="$(sed -n '4p' <<<"$_vals")"
     [ -n "$_sd" ] || _sd="$(_default_state_dir "$_repo" issue-agent)"
     [ -n "$_rd" ] || _rd="$(_default_state_dir "$_repo" review-agent)"
-    [ -n "$_wd" ] || _wd="$(_default_state_dir "$_repo" steward-agent)"
 
-    for _pair in "fix:$_sd" "review:$_rd" "steward:$_wd"; do
+    for _pair in "fix:$_sd" "review:$_rd"; do
       _role="${_pair%%:*}"; _dir="${_pair#*:}"
       _key="$_role:$_dir"
       if [ -n "${_seen_dir[$_key]:-}" ] && [ "${_seen_dir[$_key]}" != "$_name" ]; then
@@ -234,7 +232,7 @@ _placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
 #   three, no token          → GitHub App path; the App fields are required
 # (app/main.py `_app_identity` resolves App token → static token → ambient.)
 if [ "${IDENTITY_MODE:-three}" = "three" ]; then
-  _placeholder_vars="$_placeholder_vars REVIEW_BOT STEWARD_BOT"
+  _placeholder_vars="$_placeholder_vars REVIEW_BOT"
   if [ -z "${REVIEW_BOT_TOKEN:-}" ]; then
     _placeholder_vars="$_placeholder_vars GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
   fi
@@ -249,11 +247,11 @@ for _var in $_placeholder_vars; do
   # The `<angle bracket>` form is not the only unedited value that ships: the
   # examples in config/agent.env.example are PLAUSIBLE-looking (owner/repo,
   # fix-bot, review-bot) and so sailed through the bracket check, letting
-  # doctor report "✓ three distinct identities (fix-bot / review-bot /
-  # steward-bot)" for three accounts that do not exist. A confident green on a
+  # doctor report "✓ two distinct identities (fix-bot / review-bot)" for
+  # accounts that do not exist. A confident green on a
   # config nobody edited is worse than no check at all.
   case "$_var=${!_var:-}" in
-    "REPO=owner/repo"|"REPO=owner/name"|"FIX_BOT=fix-bot"|"REVIEW_BOT=review-bot"|"STEWARD_BOT=steward-bot")
+    "REPO=owner/repo"|"REPO=owner/name"|"FIX_BOT=fix-bot"|"REVIEW_BOT=review-bot")
       bad "$_var is still the shipped example value (${!_var}) — this config was never edited"
       _reported_bad="$_reported_bad $_var" ;;
   esac
@@ -267,29 +265,21 @@ elif [ -n "$(_normalize_login "$FIX_BOT")" ]; then ok "FIX_BOT=$FIX_BOT"
 else bad "FIX_BOT unset"; fi
 
 if [ "$IDENTITY_MODE" = "three" ]; then
-  : "${REVIEW_BOT:=}"; : "${STEWARD_BOT:=}"
-  # FIX must differ from REVIEW (GitHub 422 self-approval) and from STEWARD.
-  # REVIEW and STEWARD MAY share an account: the steward never approves/merges
-  # PRs, so it triggers no self-approval conflict. Compared NORMALIZED (review
-  # C1) — a raw `!=` would let fix-bot vs fix-bot[bot] (the SAME identity)
-  # through.
+  : "${REVIEW_BOT:=}"
+  # FIX must differ from REVIEW (GitHub 422 self-approval). Compared NORMALIZED
+  # (review C1) — a raw `!=` would let fix-bot vs fix-bot[bot] (the SAME
+  # identity) through.
   _nfix="$(_normalize_login "$FIX_BOT")"
   _nreview="$(_normalize_login "$REVIEW_BOT")"
-  _nsteward="$(_normalize_login "$STEWARD_BOT")"
-  # Distinctness is meaningless if the logins are unedited examples — three
+  # Distinctness is meaningless if the logins are unedited examples — two
   # DIFFERENT fake names are still "distinct". Suppress the ✓ so the scan's ✗
   # is the only verdict on this line.
-  if _is_bad_var FIX_BOT || _is_bad_var REVIEW_BOT || _is_bad_var STEWARD_BOT; then
+  if _is_bad_var FIX_BOT || _is_bad_var REVIEW_BOT; then
     :
-  elif [ -n "$REVIEW_BOT" ] && [ -n "$STEWARD_BOT" ] \
-     && [ "$_nfix" != "$_nreview" ] && [ "$_nfix" != "$_nsteward" ]; then
-    if [ "$_nreview" = "$_nsteward" ]; then
-      ok "two distinct identities (fix=$FIX_BOT, review+steward=$REVIEW_BOT)"
-    else
-      ok "three distinct identities ($FIX_BOT / $REVIEW_BOT / $STEWARD_BOT)"
-    fi
+  elif [ -n "$REVIEW_BOT" ] && [ "$_nfix" != "$_nreview" ]; then
+    ok "two distinct identities (fix=$FIX_BOT, review=$REVIEW_BOT)"
   else
-    bad "IDENTITY_MODE=three needs REVIEW_BOT+STEWARD_BOT set and FIX_BOT distinct from both after normalizing ([bot]-suffix-insensitive, case-insensitive) — review+steward may coincide"
+    bad "IDENTITY_MODE=three needs REVIEW_BOT set and FIX_BOT distinct from it after normalizing ([bot]-suffix-insensitive, case-insensitive)"
   fi
 else
   ok "solo identity mode (human reviews; auto-merge stays human)"

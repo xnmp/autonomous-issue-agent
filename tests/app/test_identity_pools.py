@@ -4,7 +4,7 @@
 Two config-class gaps doctor could not see:
   1. IDENTITY_MODE=three with FIX_BOT_TOKEN unset — the fixer silently acted as
      the operator's personal account and burned its GraphQL pool;
-  2. review and steward on one REVIEW_BOT_TOKEN at POLL_SECONDS=20 — one
+  2. fix and review on one credential at POLL_SECONDS=20 — one
      5,000-point/hour pool, two daemons, exhausted (issue #163).
 """
 
@@ -48,6 +48,15 @@ DISTINCT = {
     "FIX_BOT": "human-operator",
     "FIX_BOT_TOKEN": "fix-secret",
     "REVIEW_BOT_TOKEN": "review-secret",
+    "POLL_SECONDS": "60",
+}
+
+# fix and review resolve to one credential, so they spend one pool.
+SHARED = {
+    "IDENTITY_MODE": "three",
+    "FIX_BOT": "human-operator",
+    "FIX_BOT_TOKEN": "one-pat",
+    "REVIEW_BOT_TOKEN": "one-pat",
     "POLL_SECONDS": "60",
 }
 
@@ -117,18 +126,9 @@ def test_only_an_exactly_spelled_solo_suppresses_the_attribution_finding(mode):
 
 
 # ── incident 2: shared pool and burn estimate ─────────────────────────────────
-def test_review_and_steward_on_one_token_at_20s_warns_over_the_pool():
-    report = identity_pool_report({**DISTINCT, "POLL_SECONDS": "20"})
-    assert [p.roles for p in report.shared_pools] == [("review", "steward")]
-    assert fires_about(
-        report, "review + steward", "REVIEW_BOT_TOKEN", "5,040 points/hour",
-        "101%", level="warn",
-    ), messages(report)
-
-
-def test_the_same_arrangement_at_60s_is_information_not_a_warning():
-    report = identity_pool_report(DISTINCT)
-    assert fires_about(report, "review + steward", "1,680 points/hour", level="info")
+def test_a_shared_pool_at_60s_is_information_not_a_warning():
+    report = identity_pool_report(SHARED)
+    assert fires_about(report, "fix + review", "1,680 points/hour", level="info")
     assert not messages(report, "warn")
     assert report.healthy
 
@@ -140,35 +140,14 @@ def test_a_credential_per_role_at_a_sane_cadence_is_completely_silent():
         "REVIEW_BOT_TOKEN": "review-secret",
         "POLL_SECONDS": "600",
     })
-    assert [p.roles for p in report.shared_pools] == [("review", "steward")]
+    assert not report.shared_pools
     assert not messages(report, "warn") and not messages(report, "error")
     assert report.healthy
 
 
-def test_a_github_app_installation_is_still_one_pool_for_review_and_steward():
-    """An App token is not an escape from the shared pool — one installation is
-    one budget — so the arrangement is still reported, under the App's name."""
-    report = identity_pool_report(
-        {
-            "IDENTITY_MODE": "three",
-            "FIX_BOT_TOKEN": "fix-secret",
-            "GH_APP_ID": "1",
-            "GH_APP_INSTALL_ID": "2",
-            "GH_APP_KEY_FILE": "/keys/app.pem",
-            "POLL_SECONDS": "20",
-        },
-        key_readable=lambda _: True,
-    )
-    assert [p.roles for p in report.shared_pools] == [("review", "steward")]
-    assert fires_about(
-        report, "GitHub App 1 (install 2)", "share ONE GitHub rate-limit pool",
-        level="warn",
-    ), messages(report)
-
-
 def test_the_burn_estimate_names_its_assumptions():
     """A number an operator cannot re-derive is a number they cannot act on."""
-    report = identity_pool_report({**DISTINCT, "POLL_SECONDS": "20"})
+    report = identity_pool_report({**SHARED, "POLL_SECONDS": "20"})
     assert fires_about(
         report, "2 roles", "180 ticks/hour",
         f"{WORLD_BUILD_GRAPHQL_POINTS} points per world build",
@@ -181,15 +160,14 @@ def test_the_estimate_declares_itself_an_upper_bound_and_says_why():
     way onto an operator's ignore list. Both sources of slack are named: the 14
     points is the FIXER's world build, and the ADR 0010 probe answers unchanged
     ticks out of the separate REST bucket."""
-    report = identity_pool_report({**DISTINCT, "POLL_SECONDS": "20"})
+    report = identity_pool_report({**SHARED, "POLL_SECONDS": "20"})
     assert fires_about(report, "Upper bound at POLL_SECONDS=20")
-    assert fires_about(report, "the steward never fetches PRs")
     assert fires_about(report, "REST quota — a separate bucket")
 
 
 def test_only_the_warning_level_prescribes_a_remedy():
-    hot = identity_pool_report({**DISTINCT, "POLL_SECONDS": "20"})
-    cool = identity_pool_report(DISTINCT)
+    hot = identity_pool_report({**SHARED, "POLL_SECONDS": "20"})
+    cool = identity_pool_report(SHARED)
     assert fires_about(hot, "Raise POLL_SECONDS")
     assert not fires_about(cool, "Raise POLL_SECONDS")
 
@@ -197,23 +175,23 @@ def test_only_the_warning_level_prescribes_a_remedy():
 # ── pool identity: unset, ambient, and duplicated secrets ─────────────────────
 def test_two_unset_tokens_share_a_pool_because_both_fall_through_to_ambient():
     """The grouping is on the RESOLVED credential, not on "both vars are empty".
-    Three ambient roles really are one pool and the finding must say so."""
+    Both ambient roles really are one pool and the finding must say so."""
     report = identity_pool_report({"IDENTITY_MODE": "solo", "POLL_SECONDS": "20"})
-    assert [p.roles for p in report.shared_pools] == [("fix", "review", "steward")]
+    assert [p.roles for p in report.shared_pools] == [("fix", "review")]
     assert fires_about(
-        report, "fix + review + steward", "all fall through to the ambient",
-        "7,560 points/hour", level="warn",
+        report, "fix + review", "all fall through to the ambient",
+        "5,040 points/hour", level="warn",
     ), messages(report)
 
 
 def test_an_unset_fixer_token_alongside_a_configured_reviewer_is_two_pools():
     """Ambient and REVIEW_BOT_TOKEN are different credentials; treating "unset"
-    as equal to a real token would invent a three-role pool that does not exist."""
+    as equal to a real token would invent a shared pool that does not exist."""
     report = identity_pool_report({
         "IDENTITY_MODE": "solo", "REVIEW_BOT_TOKEN": "review-secret",
         "POLL_SECONDS": "20",
     })
-    assert [p.roles for p in report.shared_pools] == [("review", "steward")]
+    assert not report.shared_pools
 
 
 def test_the_same_secret_in_two_vars_is_one_pool_and_is_named_as_such():
@@ -223,7 +201,7 @@ def test_the_same_secret_in_two_vars_is_one_pool_and_is_named_as_such():
         "REVIEW_BOT_TOKEN": "one-pat",
         "POLL_SECONDS": "20",
     })
-    assert [p.roles for p in report.shared_pools] == [("fix", "review", "steward")]
+    assert [p.roles for p in report.shared_pools] == [("fix", "review")]
     assert fires_about(
         report, "FIX_BOT_TOKEN = REVIEW_BOT_TOKEN", "one and the same secret",
     ), messages(report)
@@ -296,7 +274,7 @@ def test_the_app_key_is_resolved_against_the_daemon_home_not_doctors(tmp_path):
 
 def test_an_unreadable_app_key_with_no_bot_token_lands_on_ambient():
     """The exact fall-through main.py warns about: App configured, key absent,
-    no static token — review and steward end up on the ambient credential."""
+    no static token — fix and review end up on the ambient credential."""
     roles = resolve_role_identities(
         {"GH_APP_ID": "1", "GH_APP_INSTALL_ID": "2", "GH_APP_KEY_FILE": "/gone.pem"},
         key_readable=lambda _: False,
@@ -342,13 +320,13 @@ def test_poll_seconds_parsing_never_raises_on_operator_input(raw, expected, vali
 
 def test_a_malformed_poll_seconds_still_produces_an_estimate_and_says_so():
     """An unparseable cadence must not delete the check that depends on it."""
-    report = identity_pool_report({**DISTINCT, "POLL_SECONDS": "abc"})
+    report = identity_pool_report({**SHARED, "POLL_SECONDS": "abc"})
     assert report.poll_seconds == DEFAULT_POLL_SECONDS
     assert fires_about(report, "'abc' is not a positive integer", "5,040 points/hour")
 
 
 def test_an_absent_poll_seconds_says_it_assumed_the_default():
-    env = {k: v for k, v in DISTINCT.items() if k != "POLL_SECONDS"}
+    env = {k: v for k, v in SHARED.items() if k != "POLL_SECONDS"}
     assert fires_about(identity_pool_report(env), "POLL_SECONDS is not set")
 
 
@@ -363,7 +341,7 @@ def test_a_non_string_poll_seconds_does_not_traceback():
 
 def test_a_small_share_of_the_pool_is_not_rounded_away_to_zero_percent():
     """A '0%' printed beside a non-zero points/hour reads as a broken estimate."""
-    report = identity_pool_report({**DISTINCT, "POLL_SECONDS": "3600"})
+    report = identity_pool_report({**SHARED, "POLL_SECONDS": "3600"})
     assert fires_about(report, "0.6% of the pool"), messages(report)
 
 
@@ -376,7 +354,7 @@ def test_a_cadence_longer_than_an_hour_still_costs_one_build():
 def test_the_warn_threshold_is_a_fraction_of_the_documented_pool():
     below = estimated_points_per_hour(2, 65)
     assert below / GRAPHQL_HOURLY_POINTS <= BURN_WARN_FRACTION
-    report = identity_pool_report({**DISTINCT, "POLL_SECONDS": "65"})
+    report = identity_pool_report({**SHARED, "POLL_SECONDS": "65"})
     assert not messages(report, "warn")
 
 
@@ -392,12 +370,11 @@ def reported(capsys) -> str:
 def test_doctor_prints_a_line_per_role_and_every_finding(capsys):
     cli.report_identity_pools({
         "IDENTITY_MODE": "three", "FIX_BOT": "human-operator",
-        "REVIEW_BOT_TOKEN": "review-secret", "POLL_SECONDS": "20",
+        "POLL_SECONDS": "20",
     })
     out = reported(capsys)
     assert "identity: fix → ambient `gh auth` credential" in out
-    assert "identity: review → REVIEW_BOT_TOKEN" in out
-    assert "identity: steward → REVIEW_BOT_TOKEN" in out
+    assert "identity: review → ambient `gh auth` credential" in out
     assert "FIX_BOT_TOKEN is not set" in out
     assert "share ONE GitHub rate-limit pool" in out
 
@@ -457,11 +434,10 @@ def test_the_wizard_surfaces_the_same_two_facts_at_config_time(capsys):
     cli._wizard_pool_summary([
         ("IDENTITY_MODE", "three"),
         ("FIX_BOT", "human-operator"),
-        ("REVIEW_BOT_TOKEN", "review-secret"),
     ])
     out = reported(capsys)
     assert "FIX_BOT_TOKEN is not set" in out
-    assert "review + steward" in out
+    assert "fix + review" in out
     assert "POLL_SECONDS is not set" in out
 
 
@@ -473,7 +449,4 @@ def test_the_wizard_stops_flagging_attribution_once_a_fixer_token_is_collected(c
     ])
     out = reported(capsys)
     assert "FIX_BOT_TOKEN is not set" not in out
-    # The shared review+steward pool DOES still warn: the wizard's own defaults
-    # (one reviewer token, POLL_SECONDS=20) are exactly the keifu arrangement,
-    # and config time is when that is cheapest to learn.
-    assert "review + steward" in out and "Raise POLL_SECONDS" in out
+    assert "share ONE GitHub rate-limit pool" not in out
