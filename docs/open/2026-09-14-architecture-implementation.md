@@ -145,11 +145,8 @@ full gate (2026-10-03 07:08 UTC, exit 0). Phase 5's offline measurement and
 operator-absent replays are independently reviewed and pass the full gate
 (2026-10-04 12:22 UTC, exit 0; 10,341 Python cases, hook checks, parity,
 architecture and both type checks), committed as `eb5941f`. Phase 6's gate
-consolidation and independent test-evidence contracts are accepted locally after
-independent review and the combined full gate (2026-10-04 14:52 UTC, exit 0;
-10,442 Python cases, 123 hook checks, parity, four architecture contracts and both
-type checks). The [Phase 5/6 execution brief](2026-10-04-phase-5-6-execution.md)
-records the implementation and remaining limits. Whole Phase 5 acceptance still
+consolidation was accepted locally after independent review and the combined full
+gate (2026-10-04 14:52 UTC, exit 0). Whole Phase 5 acceptance still
 requires actual unattended measurement. Its
 [unattended-window proposal](2026-10-04-phase-5-unattended-windows.md)
 was approved by the user on 2026-10-04 at approximately 22:51 UTC. Actual start

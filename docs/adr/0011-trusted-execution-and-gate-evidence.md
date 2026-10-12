@@ -42,26 +42,15 @@ deployment, accounting, event, publication, and test-policy controls. A target
 command receives workload inputs, not authority to select its base, cap,
 credentials, state database, or evidence verdict.
 
-Screenshot reads and red/revert verification produce harness-owned typed
-receipts bound to the worktree and invocation. Ordinary gate tests return a harness-owned verdict. Durable review approvals
-require a separately persisted ordinary-test receipt for the exact rejection
-and execution binding, head, patch, and frozen operator configuration. Only
-operator `TEST_CMD` authorizes that execution; repository declarations cannot
-authorize approval. Compatible rounds reuse completed successes and genuine
-failures. Explicit `ALLOW_UNTESTED` records a separate operator waiver.
+Red/revert verification produces harness-owned typed receipts bound to the
+worktree and invocation. Ordinary fixer gate tests return a harness-owned verdict.
+Agent-created `.harness/` markers may request verification or describe visual
+acceptance criteria, but cannot assert that a test passed.
 
-The nonpaid executor persists intent before launch and records structured
-pre/post committed, index, and tracked-tree proofs plus typed execution
-outcome. It awaits bounded supervised teardown before checkout cleanup.
-Unavailable execution follows subject-specific evidence backoff and ceiling;
-ordinary-test holds never fall through to trailer reads. At the ceiling the
-existing execution-renewal action can retire the selected test hold and grant
-one new execution episode after the old round settles, preserving other
-holds and rejection allowance. Durable writers validate current stored
-evidence and configuration before absent approvals and never run tests;
-already-present effects reconcile first. Agent-created `.harness/` markers may request
-verification or describe visual acceptance criteria, but cannot assert that a
-read or test passed.
+Review approval comes from the model verdict on the exact PR head; the harness
+does not execute target tests during review. Repository-required CI checks still
+gate merge. Diffs touching `.github/workflows/**` escalate through the existing
+human-review path because CI configuration is repository governance.
 
 Environment scrubbing is capability reduction, not a security boundary against
 code running as the daemon's operating-system account. Supported inbound

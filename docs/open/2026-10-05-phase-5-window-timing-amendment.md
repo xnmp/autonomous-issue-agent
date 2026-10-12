@@ -48,18 +48,6 @@ operator disposition removed PR #997's budget labels and its current typed
 marker. Ledger values and retry/infra counts were preserved. The two automatic
 clears consumed their existing self-clear allowance once; no counter was reset.
 
-The new-profile ordinary qualification failed with exit 101 on October 6;
-its receipt is retained. The diagnosed ambient-plugin dependency led to a
-reviewed explicit clean-configuration `TEST_CMD` policy and a separate full
-bounded pass in 19.16 seconds. Its exact command, test-evidence identity and
-launch-file hashes must be frozen; the harness configuration version alone
-does not encode `TEST_CMD`. Target PR #998 advanced `dev` before the first canary
-freeze. Its ordinary suite and all four native scenarios then passed. The
-current-profile canary completed its stopped admission/accounting/cancellation
-readout, with no implementation outcome claimed. Ordinary supervision and
-the final full-window freeze remain required. Window 2 remains
-unarmed until the first full stopped readout and halt adjudication are complete.
-
 ## Reason and cancelled historical schedule
 
 The installed role units allow 90 seconds for control-group shutdown. Stopping
