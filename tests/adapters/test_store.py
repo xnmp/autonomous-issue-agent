@@ -123,26 +123,6 @@ def test_ci_pending_escalated_head_marker_roundtrip():
         assert not hasattr(s, name)
 
 
-
-
-
-
-
-# ── merged/closed-unmerged cleanup orchestration (review M4/D8) ────────────
-
-
-
-
-# ── P1R-16: an issueless PR's NEGATED-key counters were never cleaned ───────
-# `domain.fix.breaker_key` falls back to the NEGATED pr number for a PR with
-# no resolvable issue, so infra-deaths (at least) for such a PR accumulates at
-# issue_path(-pr, "infra-deaths") — e.g. the literal file "issue--112.infra-
-# deaths". Before the fix, cleanup_pr(112, None, …) cleared ONLY pr-112.* and
-# this namespace leaked forever — reachable in production any time an
-# issueless PR's fixer leg dies pre-result enough times to trip the infra
-# ceiling and then gets merged/closed.
-
-
 def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open():
     s, _ = _store()
     s.save_predicted_paths(5, ["src/action.rs", "./src/help.rs"])
