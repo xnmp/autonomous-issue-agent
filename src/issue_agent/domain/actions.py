@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Literal, Union
 
 from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
-from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding, WorkflowRevision
+from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding
 if TYPE_CHECKING:
     from .continuation_components import CIEpisodeReset, PRRepairCleanup, PublicationIdentityEscalationCapture
 
