@@ -217,7 +217,7 @@
 }
 /* Collapsed: the rail is gone entirely. The expand toggle keeps the exact
    spot (and height) the collapse toggle had — top-left, level with the tab
-   row — so it never jumps; the quota button floats alone at bottom-left. */
+   row — so it never jumps; the settings button floats alone at bottom-left. */
 .sidebar-float .rail-btn.icon-only {
   width: 40px;
   height: 40px;
@@ -227,11 +227,16 @@
   border: 1px solid var(--border-strong);
   box-shadow: var(--shadow-md);
 }
-.sidebar-float .usage-inline.collapsed {
+.sidebar-float .options-menu {
   position: fixed;
   z-index: 30;
   left: var(--s2);
   bottom: var(--s2);
+  width: 40px;
+}
+.sidebar-float .options-popover {
+  right: auto;
+  width: 260px;
 }
 /* Beats .sidebar-toggle's absolute positioning (same file, later block). */
 .sidebar-float .sidebar-toggle-float {
