@@ -2082,15 +2082,19 @@ def _merge_facts(
 
 
 def _head_approved(gh_pr: Mapping | None) -> bool:
-    """An approving review submitted on the PR's current head commit."""
+    """An approving review submitted on the PR's current head commit.
+
+    Reads `reviews`: gh returns `latestReviews[].commit.oid` empty, so only the
+    full review list says which commit an approval was made on."""
     pr = gh_pr or {}
     head = pr.get("headRefOid")
-    return isinstance(head, str) and bool(head) and any(
+    reviews = pr.get("reviews")
+    return isinstance(head, str) and bool(head) and isinstance(reviews, list) and any(
         isinstance(review, Mapping)
         and str(review.get("state") or "").upper() == "APPROVED"
         and isinstance(commit := review.get("commit"), Mapping)
         and commit.get("oid") == head
-        for review in pr.get("latestReviews") or []
+        for review in reviews
     )
 
 

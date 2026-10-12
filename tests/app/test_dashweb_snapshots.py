@@ -3525,7 +3525,7 @@ def test_an_approval_carried_across_a_mechanical_rebase_still_asks_the_operator_
     # The reviewer copies APPROVE onto an unchanged rebased patch without a
     # paid leg; GitHub's approval is bound to the new head.
     rebase = {**_REVIEW_APPROVE, "role": "fix", "kind": "REBASE", "status": "done", "ts": ts(minutes=40)}
-    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "latestReviews": [
+    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "reviews": [
         {"state": "APPROVED", "submittedAt": ts(minutes=30), "commit": {"oid": "rebased-head"}}]}
 
     card = snapshots.issue_card(_approved_row(rebase), NOW, gh_prs={12: pr})
@@ -3535,13 +3535,25 @@ def test_an_approval_carried_across_a_mechanical_rebase_still_asks_the_operator_
 
 def test_an_approval_on_an_older_head_does_not_survive_a_rebase():
     rebase = {**_REVIEW_APPROVE, "role": "fix", "kind": "REBASE", "status": "done", "ts": ts(minutes=40)}
-    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "latestReviews": [
+    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "reviews": [
         {"state": "APPROVED", "submittedAt": ts(minutes=50), "commit": {"oid": "old-head"}}]}
 
     card = snapshots.issue_card(_approved_row(rebase), NOW, gh_prs={12: pr})
 
     assert board_of(card)["status"] == "working"
 
+
+
+def test_latest_reviews_as_gh_returns_them_do_not_prove_a_head_bound_approval():
+    # Live gh shape (checked on tauri #1074, 2026-10-12): latestReviews carries
+    # an empty commit oid, so it alone must not carry an approval across a rebase.
+    rebase = {**_REVIEW_APPROVE, "role": "fix", "kind": "REBASE", "status": "done", "ts": ts(minutes=40)}
+    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "latestReviews": [
+        {"state": "APPROVED", "submittedAt": ts(minutes=30), "commit": {"oid": ""}}]}
+
+    card = snapshots.issue_card(_approved_row(rebase), NOW, gh_prs={12: pr})
+
+    assert board_of(card)["status"] == "working"
 
 def test_a_ci_visit_survives_a_later_review_when_checks_started_before_approval():
     approve = {**_REVIEW_APPROVE, "ts": ts(minutes=40)}
