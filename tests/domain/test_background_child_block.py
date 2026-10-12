@@ -8,7 +8,6 @@ from issue_agent.domain.outcome import (
     Outcome,
     classify_outcome,
     infra_class_failure,
-    infra_class_reason,
     reclassify_pending_background_block,
 )
 

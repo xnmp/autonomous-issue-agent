@@ -37,7 +37,6 @@ from issue_agent.adapters.codex_runner import (
 from issue_agent.domain.outcome import (
     Outcome,
     classify_outcome,
-    infra_class_reason,
 )
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
@@ -1488,7 +1487,7 @@ def test_run_returns_blocked_result_when_not_ready(monkeypatch):
     res = asyncio.run(r.run(RuntimePlan(prompt="x")))
     assert res.is_error and res.status == "blocked"
     assert classify_outcome(res) == Outcome.ERROR
-    assert infra_class_reason(res) == "runtime_unavailable"
+    assert res.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
     assert "not found on PATH" in res.summary
     assert any("NOT READY" in m for m in logged)
 

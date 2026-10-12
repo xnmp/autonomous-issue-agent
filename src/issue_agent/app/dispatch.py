@@ -335,10 +335,6 @@ class AgentDispatcher:
             return action.number, None
         return self._lookup_issue(action.number), None
 
-    def _issue_number(self, action: RunAgent) -> int | None:
-        """The issue this dispatch spends against (see `_spend_target`)."""
-        return self._spend_target(action)[0]
-
     async def dispatch(self, action: RunAgent) -> None:
         handler = {
             AgentKind.RESOLVE: self.fix_workflow.resolve,

@@ -268,8 +268,9 @@ def attach_workflow_authority(
     return store._workflow_authority
 
 
-def seed_infra_outcome(control, issue, outcome, *, owner_id="o/r:fix:fixture", reclaim=False):
-    """Seed a fixed issue episode through actual admission, classification and money."""
+def seed_infra_outcome(control, issue, normal=False, *, owner_id="o/r:fix:fixture", reclaim=False):
+    """Seed one ended fix leg through actual admission, classification and money:
+    a normal return, or (by default) a machine end that records no receipt."""
     import uuid
     from issue_agent.domain import continuation_components as cc
     from issue_agent.adapters.control_store import SettlementRequest
@@ -287,8 +288,8 @@ def seed_infra_outcome(control, issue, outcome, *, owner_id="o/r:fix:fixture", r
     if reclaim:
         control.register_process_lease(paid.run_id, expected_owner_id=owner_id, pid=123, pgid=123, process_start_ticks=99)
         assert control.reclaim_dead_leases(owner_id, lambda *_: False) == (paid.run_id,)
-    else:
-        control.record_fix_infra_return(paid.run_id, outcome, WorkflowWriter("o/r", "fix", owner_id))
+    elif normal:
+        control.record_fix_infra_return(paid.run_id, WorkflowWriter("o/r", "fix", owner_id))
     assert control.settle(SettlementRequest(paid.run_id, Money("USD", 0), PricingBasis.PROVIDER_REPORTED,
         "infra-fixture:" + str(paid.run_id), None, None, None)).disposition.value == "available"
     return paid.run_id

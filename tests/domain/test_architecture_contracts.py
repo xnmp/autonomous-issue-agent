@@ -601,6 +601,7 @@ def test_every_adr_is_referenced_by_a_governed_source_file() -> None:
             if token.startswith("src/") and token.endswith(".py")
         )
         assert source_files, f"{adr.name} governs no source file"
+        assert all(path.is_file() for path in source_files), f"{adr.name} governs a missing source file"
         assert any(
             path.is_file() and marker in path.read_text()
             for path in source_files

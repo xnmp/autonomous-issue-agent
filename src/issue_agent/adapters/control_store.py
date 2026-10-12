@@ -4015,11 +4015,6 @@ class SQLiteControlStore:
                 ).rowcount
                 if not updated:
                     continue
-                infra = self._fix_infra_admission(db, run_id)
-                if infra is not None:
-                    from ..domain.workflow_identity import WorkflowWriter
-                    self._record_fix_infra(db, run_id, cc.FixInfraOutcome.RECLAIMED,
-                        WorkflowWriter(infra[0].attempt.binding.fence.key.repository, "fix", identity[2]), captured=infra)
                 self._record_steward_recovery(db, run_id, cc.StewardFailureKind.RECLAIMED,
                                               recovery_owner=identity[2])
                 retained_reason = (
@@ -7268,33 +7263,20 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError("fix infrastructure admission differs from actual issue dispatch")
         return admission, provenance, row, purchase
 
-    def record_fix_infra_return(self, run_id: RunId, outcome: cc.FixInfraOutcome, writer) -> None:
+    def record_fix_infra_return(self, run_id: RunId, writer) -> None:
+        """Record that a fix run returned normally. Any ended fix run without
+        this receipt (died, reclaimed, refused, machine-class return) is a
+        machine end to the backoff (`fix_leg_ends`)."""
         with self.transaction() as db, self.mutation_savepoint(db):
-            self._record_fix_infra(db, run_id, outcome, writer)
-
-    def _record_fix_infra(self, db, run_id: RunId, outcome: cc.FixInfraOutcome, writer, *, captured=None) -> None:
-        if not isinstance(outcome, cc.FixInfraOutcome):
-            raise ValueError("fix infrastructure outcome requires a fixed classification")
-        captured = captured if captured is not None else self._fix_infra_admission(db, run_id)
-        if captured is None:
-            return
-        admission, provenance, run, _ = captured
-        self._require_repair_writer(db, writer, admission, provenance["owner_id"])
-        if run["outcome"] == "unlaunched_released":
-            return
-        repository = admission.attempt.binding.fence.key.repository
-        # Read by value, not decoded: receipts written before the infra ceiling
-        # was deleted carry retired fields and outcomes.
-        recorded = db.execute("SELECT json_extract(payload_json,'$.value.fields.outcome.value') FROM dedupe_keys "
-                              "WHERE namespace='fix-infra-outcome' AND scope=? AND key=?", (repository, str(run_id))).fetchone()
-        # The actual reply wins over a reclaim recorded while it was in flight;
-        # a returned classification is final, so a later reclaim never re-reads it.
-        if recorded is not None and (outcome is cc.FixInfraOutcome.RECLAIMED
-                                     or recorded[0] != cc.FixInfraOutcome.RECLAIMED.value):
-            return
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('fix-infra-outcome',?,?,?,?) "
-                   "ON CONFLICT(namespace,scope,key) DO UPDATE SET payload_json=excluded.payload_json",
-            (repository, str(run_id), _stamp(self._now()), encode_workflow(cc.FixInfraReceipt(admission, outcome))))
+            captured = self._fix_infra_admission(db, run_id)
+            if captured is None:
+                return
+            admission, provenance, _, _ = captured
+            self._require_repair_writer(db, writer, admission, provenance["owner_id"])
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('fix-infra-outcome',?,?,?,?) "
+                       "ON CONFLICT(namespace,scope,key) DO NOTHING",
+                (admission.attempt.binding.fence.key.repository, str(run_id), _stamp(self._now()),
+                 encode_workflow(cc.FixInfraReceipt(admission, cc.FixInfraOutcome.RETURNED_NORMAL))))
 
     def _linked_issue_reply_admission(self, db, attempt: WorkflowAttemptIdentity, run):
         purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueReplyPurchase)]

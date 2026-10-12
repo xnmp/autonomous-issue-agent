@@ -114,11 +114,9 @@ class ReviewRetryState:
 
 
 class FixInfraOutcome(str, Enum):
-    """How a fix run ended; anything but a normal return is a machine end."""
+    """The one recorded fix-run end. An ended run without it is a machine end."""
 
-    RETURNED_INFRA = "returned_infra"
     RETURNED_NORMAL = "returned_normal"
-    RECLAIMED = "reclaimed"
 
 
 @dataclass(frozen=True)

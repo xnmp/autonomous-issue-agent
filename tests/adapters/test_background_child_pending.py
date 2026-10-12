@@ -26,7 +26,6 @@ from issue_agent.domain.outcome import (
     Outcome,
     classify_outcome,
     infra_class_failure,
-    infra_class_reason,
     resolve_actions,
     resume_actions,
 )

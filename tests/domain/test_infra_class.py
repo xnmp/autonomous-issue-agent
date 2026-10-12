@@ -14,7 +14,6 @@ from issue_agent.domain.outcome import (
     ExitReason,
     address_review_actions,
     infra_class_failure,
-    infra_class_reason,
     no_session_evidence,
     PROVIDER_REFUSED_SUBTYPE,
     resumable_session,
@@ -93,18 +92,6 @@ def test_an_unknown_envelope_subtype_is_not_laundered_into_an_exemption():
     assert not infra_class_failure(
         result(envelope_subtype="", exit_reason=ExitReason.AGENT_ERROR)
     )
-
-
-# ── the reason string ────────────────────────────────────────────────────────
-def test_infra_class_reason_names_the_cause_and_is_blank_otherwise():
-    assert infra_class_reason(
-        result(exit_reason=ExitReason.RUNTIME_UNAVAILABLE)
-    ) == "runtime_unavailable"
-    assert infra_class_reason(
-        result(envelope_subtype="dispatch_claim_unavailable",
-               exit_reason=ExitReason.AGENT_ERROR)
-    ) == "dispatch_claim_unavailable"
-    assert infra_class_reason(result(exit_reason=ExitReason.AGENT_ERROR)) == ""
 
 
 # ── the evidence predicate ───────────────────────────────────────────────────

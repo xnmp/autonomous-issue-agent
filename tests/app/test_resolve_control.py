@@ -241,7 +241,7 @@ def test_composed_holds_are_labels_and_machine_deaths_never_hold(deployment):
     from issue_agent.domain import continuation_components as cc
     control = deployment[2]
     for _ in range(10):
-        seed_infra_outcome(control, 1, cc.FixInfraOutcome.RETURNED_INFRA, owner_id=workflow.control.writer.owner_id)
-    seed_infra_outcome(control, 1, cc.FixInfraOutcome.RECLAIMED, owner_id=workflow.control.writer.owner_id, reclaim=True)
+        seed_infra_outcome(control, 1, owner_id=workflow.control.writer.owner_id)
+    seed_infra_outcome(control, 1, owner_id=workflow.control.writer.owner_id, reclaim=True)
     assert workflow.external_holds(issue) == ()
     assert set(workflow.external_holds(observed)) == {label.value for label in labels}

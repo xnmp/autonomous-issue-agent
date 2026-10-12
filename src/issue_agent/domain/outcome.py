@@ -334,23 +334,6 @@ def resumable_session(result: AgentResult) -> str:
     return result.session_id or ""
 
 
-def infra_class_reason(result: AgentResult) -> str:
-    """Machine-readable why, for the journal event that records the exemption.
-
-    Blank when the leg is not infra-class, so a caller can use it as the
-    predicate and the payload at once.
-    """
-    if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
-        return result.envelope_subtype
-    if pre_admission_refusal(result):
-        # Harness-minted summary names the authority that was missing (#262).
-        return f"{result.envelope_subtype}: {result.summary}"[:300]
-    if (infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason)
-            or result.exit_reason in _INFRA_CLASS_EXTRA):
-        return result.exit_reason.value if result.exit_reason else ""
-    return ""
-
-
 # ── deterministic transport deaths (#13) ──────────────────────────────────────
 # The breakers assume a death is STOCHASTIC: retry the identical dispatch and it
 # may survive. Some deaths are caused by the INPUT instead, so every retry

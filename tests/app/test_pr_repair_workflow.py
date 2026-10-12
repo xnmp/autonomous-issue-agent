@@ -277,7 +277,7 @@ def test_fix_launched_death_and_reclaim_charge_once_keep_unknown_spend(monkeypat
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("normal", [False, True])
@@ -301,51 +301,8 @@ def test_fix_reclaimed_run_actual_reply_classifies_once(monkeypatch, normal):
     assert issue_ci_state(files).ci_failures == (1 if normal else 0)
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*), SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
-        receipt = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0], cc.FixInfraReceipt)
-    assert receipt.outcome is (cc.FixInfraOutcome.RETURNED_NORMAL if normal else cc.FixInfraOutcome.RETURNED_INFRA)
-    store.record_fix_infra_return(receipt.admission.attempt.run_id, cc.FixInfraOutcome.RECLAIMED, files._workflow_authority.writer)
-    assert machine_ends(files) == [not normal]
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == int(normal)
 
-
-def test_caught_fix_reclaim_receipt_failure_keeps_joint_mutation_retryable(monkeypatch):
-    import sqlite3
-    workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, cost_usd=.01))
-    store = files._workflow_db
-    original = store.reserve
-    captured = []
-    def interrupted(request):
-        assert original(request).admitted
-        captured.append(request)
-        raise RuntimeError("lost after admission before launch")
-    with monkeypatch.context() as patch:
-        patch.setattr(store, "reserve", interrupted)
-        with pytest.raises(RuntimeError, match="lost after admission"):
-            asyncio.run(workflow.fix_ci(100))
-    request = captured[0]
-    store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
-        pid=123, pgid=123, process_start_ticks=99)
-    before = issue_ci_state(files)
-    with store.transaction() as db:
-        db.execute("CREATE TRIGGER refuse_infra BEFORE INSERT ON dedupe_keys WHEN NEW.namespace='fix-infra-outcome' BEGIN SELECT RAISE(ABORT,'refused infra'); END")
-        @contextmanager
-        def borrowed():
-            yield db
-        with monkeypatch.context() as patch:
-            patch.setattr(store, "transaction", borrowed)
-            with pytest.raises(sqlite3.IntegrityError, match="refused infra"):
-                store.reclaim_dead_leases(request.owner_id, lambda *_: False)
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('scratch','o/r','outer','0','{}')")
-    assert issue_ci_state(files) == before
-    with store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 1
-        assert db.execute("SELECT state FROM runs").fetchone()[0] == "running"
-        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='scratch'").fetchone()[0] == 1
-        db.execute("DROP TRIGGER refuse_infra")
-    assert store.reclaim_dead_leases(request.owner_id, lambda *_: False) == (request.run_id,)
-    assert store.reclaim_dead_leases(request.owner_id, lambda *_: False) == ()
-    assert machine_ends(files) == [True]
 
 def pr_reply_workflow(*, establish_session=True, body="Use A."):
     from issue_agent.domain.world import Comment, IssueView
@@ -2091,31 +2048,9 @@ def test_fix_deterministic_launched_failure_is_one_machine_end_in_both_orders(mo
     assert machine_ends(files) == [True]
     assert issue_ci_state(files).ci_failures == 0
     with store.transaction() as db:
-        receipt = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0], cc.FixInfraReceipt)
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-    assert receipt.outcome is cc.FixInfraOutcome.RECLAIMED
-
-
-_O = cc.FixInfraOutcome
-
-
-@pytest.mark.parametrize("first,late,machine", [
-    (_O.RECLAIMED, _O.RETURNED_NORMAL, False),
-    (_O.RECLAIMED, _O.RETURNED_INFRA, True),
-    (_O.RETURNED_NORMAL, _O.RECLAIMED, False),
-    (_O.RETURNED_NORMAL, _O.RETURNED_INFRA, False),
-    (_O.RETURNED_INFRA, _O.RECLAIMED, True),
-    (_O.RETURNED_INFRA, _O.RETURNED_NORMAL, True),
-])
-def test_fix_leg_classification_actual_reply_wins_over_reclaim_and_a_return_is_final(first, late, machine):
-    from tests.fakes.accounted_workflow import seed_infra_outcome
-    _, files, _, _ = active_ci_workflow(AgentResult(is_error=False, cost_usd=.01))
-    store = files._workflow_db
-    run = seed_infra_outcome(store, 5, first)
-    store.record_fix_infra_return(run, late, files._workflow_authority.writer)
-    store.record_fix_infra_return(run, late, files._workflow_authority.writer)
-    assert machine_ends(files) == [machine]
 
 
 @pytest.mark.parametrize("payload", [None, "retired"])
@@ -2126,8 +2061,8 @@ def test_fix_leg_without_a_normal_return_receipt_is_a_machine_end(payload):
     from tests.fakes.accounted_workflow import seed_infra_outcome
     _, files, _, _ = active_ci_workflow(AgentResult(is_error=False, cost_usd=.01))
     store = files._workflow_db
-    seed_infra_outcome(store, 5, _O.RETURNED_NORMAL)
-    run = seed_infra_outcome(store, 5, _O.RETURNED_NORMAL)
+    seed_infra_outcome(store, 5, normal=True)
+    run = seed_infra_outcome(store, 5, normal=True)
     with store.transaction() as db:
         if payload is None:
             db.execute("DELETE FROM dedupe_keys WHERE namespace='fix-infra-outcome' AND key=?", (str(run),))
@@ -2138,7 +2073,7 @@ def test_fix_leg_without_a_normal_return_receipt_is_a_machine_end(payload):
                                             "failures": 5, "episode": None, "charge": 5})
             db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='fix-infra-outcome' AND key=?", (json.dumps(wire), str(run)))
     assert machine_ends(files) == [False, True]
-    store.record_fix_infra_return(run, _O.RETURNED_NORMAL, files._workflow_authority.writer)
+    store.record_fix_infra_return(run, files._workflow_authority.writer)
     assert machine_ends(files) == ([False, False] if payload is None else [False, True])
 
 
@@ -2146,7 +2081,7 @@ def test_actual_normal_return_ends_the_machine_streak_and_settles_unreadable_spe
     from tests.fakes.accounted_workflow import seed_infra_outcome
     workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed",
         usage={"input_tokens":"malformed"}))
-    seed_infra_outcome(files._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
+    seed_infra_outcome(files._workflow_db, 5)
     asyncio.run(workflow.fix_ci(100))
     assert len(inner.tasks) == 1
     assert machine_ends(files) == [False, True]

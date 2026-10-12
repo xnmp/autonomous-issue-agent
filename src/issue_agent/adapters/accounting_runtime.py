@@ -668,18 +668,11 @@ class AccountingRuntime(AgentRuntime):
                         WorkflowWriter(self.repository, "steward", self.owner_id or f"{self.repository}:steward"))
                 except Exception:
                     pass
-            if self.role == "fix" and not isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                try:
-                    self.store.record_fix_infra_return(run_id, cc.FixInfraOutcome.RECLAIMED,
-                        WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
-                except Exception:
-                    # Preserve the provider failure. A run without a receipt
-                    # still reads as a machine end to the backoff.
-                    pass
             raise
-        if self.role == "fix":
+        if self.role == "fix" and not infra_class_failure(result):
+            # Only a normal return is recorded: every other ended fix run, with
+            # no receipt, is a machine end to the backoff.
             self.store.record_fix_infra_return(run_id,
-                cc.FixInfraOutcome.RETURNED_INFRA if infra_class_failure(result) else cc.FixInfraOutcome.RETURNED_NORMAL,
                 WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
         result = replace(
             result,
