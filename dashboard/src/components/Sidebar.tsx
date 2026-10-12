@@ -148,12 +148,11 @@ export function Sidebar({
   };
 
   // Fully out of the way when collapsed: no rail, no border — just a floating
-  // quota button (the one thing worth glancing at while reading the board) and
-  // the affordance to bring the sidebar back.
+  // settings button and the affordance to bring the sidebar back.
   if (collapsed) {
     return (
       <div className="sidebar-float">
-        <UsageBlock usage={usage} collapsed />
+        <OptionsMenu options={options} onChange={onOptionsChange} collapsed />
         <button
           className="sidebar-toggle sidebar-toggle-float"
           onClick={toggleCollapsed}
