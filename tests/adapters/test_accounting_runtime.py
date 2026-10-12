@@ -335,31 +335,6 @@ def test_activated_resolve_rejects_missing_or_stale_authority_before_provider(tm
     assert store.active_reservation_runs() == ()
 
 
-@pytest.mark.parametrize("kind", ["ROUTE", "RESUME"])
-def test_workflow_binding_survives_nested_leg_context_and_exception(tmp_path, kind) -> None:
-    wrapper, _store = _wrapper(tmp_path, Runtime(AgentResult(False)))
-    journaled = JournalingRuntime(
-        wrapper, Journal(str(tmp_path / "events.jsonl")), repo="o/r", role="fix"
-    )
-    binding = WorkflowBinding(
-        WorkflowFence(WorkflowKey("o/r", IssueRef(1)), 2),
-        FamilyAuthority(WorkflowFamily.RESOLVE, 1),
-        "captured-episode",
-    )
-    journaled.set_context("fix", "RESOLVE", 1, 1, workflow=binding)
-
-    with pytest.raises(RuntimeError, match="leg failed"):
-        with journaled.leg_kind(kind):
-            assert wrapper.workflow_binding == binding
-            assert journaled.workflow_binding == binding
-            raise RuntimeError("leg failed")
-
-    assert journaled.workflow_binding == wrapper.workflow_binding == binding
-    journaled.set_context("fix", "RESOLVE", 2, 2)
-    assert journaled.workflow_binding is None
-    assert wrapper.workflow_binding is None
-
-
 def test_unpinned_codex_run_without_reported_model_uses_reserved_fallback(
     tmp_path,
 ) -> None:

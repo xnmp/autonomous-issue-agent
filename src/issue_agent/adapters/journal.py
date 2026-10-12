@@ -521,10 +521,6 @@ class JournalingRuntime:
     def context(self) -> RunContext:
         return self._context.get()
 
-    @property
-    def workflow_binding(self) -> WorkflowBinding | None:
-        return self.context.workflow
-
     @context.setter
     def context(self, value: RunContext) -> None:
         self._context.set(value)

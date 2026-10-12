@@ -10,6 +10,7 @@ from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.outcome import AgentResult
 from tests.adapters.test_accounting_runtime import Runtime, _wrapper, _publication_context_for_accounting_tests
+from tests.fakes.workflow_authority import resolve_snapshot
 
 
 @pytest.mark.parametrize("provider", [RuntimeName.CLAUDE, RuntimeName.CODEX])
@@ -20,7 +21,7 @@ def test_selected_provider_is_accounted_before_launch_and_shared_cap_refuses_pee
     other = RuntimeName.CODEX if provider is RuntimeName.CLAUDE else RuntimeName.CLAUDE
     peer = Runtime(AgentResult(False, status="ok"))
     runtime = SelectingRuntime({provider: wrapper, other: replace(wrapper, inner=peer, runtime_name=other.value)}, other)
-    runtime.set_context("fix", "RESOLVE", 1, 1, workflow=wrapper.workflow_binding)
+    runtime.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
     first = asyncio.run(runtime.run(RuntimePlan("work", runtime=provider, model="model", max_budget_usd=2)))
     assert first.status == "ok"
     assert raw.calls == 1
@@ -55,9 +56,6 @@ def test_concurrent_selection_keeps_context_and_run_identity_separate():
             self.name = name
             self.context = ContextVar(f"context-{name}")
             self.identity = ContextVar(f"identity-{name}")
-        @property
-        def workflow_binding(self):
-            return None
         def set_context(self, role, kind, number, issue, claim_target=None, *, workflow=None, review_child=None):
             self.context.set((number, issue))
         def set_run_identity(self, run_id, leg_id):

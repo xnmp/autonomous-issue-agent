@@ -175,9 +175,6 @@ class AgentRuntime(Protocol):
 
 @runtime_checkable
 class ContextualRuntime(AgentRuntime, Protocol):
-    @property
-    def workflow_binding(self) -> WorkflowBinding | None: ...
-
     def set_context(
         self,
         role: str,

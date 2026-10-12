@@ -183,10 +183,6 @@ class AccountingRuntime(AgentRuntime):
             RuntimeName(self.runtime_name)
         self._context.set((issue, kind, number, claim_target, workflow, review_child))
 
-    @property
-    def workflow_binding(self) -> WorkflowBinding | None:
-        return self._context.get()[4]
-
     def _reserve_reclaiming_dead_headroom(
         self,
         request: ReservationRequest,
