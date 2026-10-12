@@ -170,20 +170,6 @@ def create_app(
         except Exception as exc:  # noqa: BLE001
             return degraded("verification ledger", exc, rows=[])
 
-    @app.get("/api/repos/{name}/measurement")
-    async def api_measurement(name: str, specification: str = Query(max_length=65536)):
-        import json
-        await require_known(name)
-        try:
-            raw = json.loads(specification)
-            if not isinstance(raw, dict):
-                raise ValueError("measurement specification must be an object")
-            return await invoke(backend.measurement, name, raw)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001
-            return degraded("measurement", exc, comparability="unavailable")
-
     @app.get("/api/repos/{name}/overview", response_model=contracts.OverviewPayload)
     async def api_overview(
         name: str,

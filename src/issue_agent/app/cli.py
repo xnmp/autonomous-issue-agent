@@ -2773,8 +2773,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="Autonomous issue-resolving harness — run it from inside a target repo.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
-    from .measurement import add_parser
-    add_parser(sub)
 
     def add_context_flags(sp):
         sp.add_argument("--repo", default="", help="owner/name (default: auto-detect from cwd)")

@@ -296,13 +296,6 @@ class Backend:
             verification.default_path(self.harness_root)
         )
 
-    def measurement(self, name: str, specification: dict) -> dict:
-        from ..measurement import local_export
-        cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
-        state_dirs = (cfg.state_dir, cfg.review_state_dir)
-        path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
-        return local_export(path, cfg.repo, specification)
-
     def overview(self, name: str, timezone_name: str | None = None) -> dict:
         live, scan_ok = system.scan_proc_daemons()
         snapshot = self.snapshot(name)
