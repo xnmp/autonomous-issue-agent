@@ -16,6 +16,8 @@ from issue_agent.domain.outcome import (
     infra_class_failure,
     infra_class_reason,
     no_session_evidence,
+    PROVIDER_REFUSED_SUBTYPE,
+    resumable_session,
 )
 from issue_agent.domain.steward_stall import stall_charge
 
@@ -35,6 +37,20 @@ def result(**kwargs) -> AgentResult:
 )
 def test_harness_side_endings_are_infra_class(reason):
     assert infra_class_failure(result(exit_reason=reason))
+
+
+@pytest.mark.parametrize(("fields", "session"), [
+    (dict(exit_reason=ExitReason.AGENT_ERROR, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s"), "s"),
+    (dict(exit_reason=ExitReason.AGENT_ERROR, session_id="s"), "s"),
+    (dict(exit_reason=ExitReason.TRANSPORT_DEATH, session_id="s"), ""),
+    (dict(exit_reason=ExitReason.BUDGET_EXHAUSTED, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s"), ""),
+    (dict(exit_reason=ExitReason.AGENT_ERROR, envelope_subtype=PROVIDER_REFUSED_SUBTYPE), ""),
+])
+def test_a_provider_refused_end_is_a_machine_failure_whose_session_stays_resumable(fields, session):
+    ended = result(**fields)
+    assert resumable_session(ended) == session
+    if fields.get("envelope_subtype") == PROVIDER_REFUSED_SUBTYPE:
+        assert infra_class_failure(ended)
 
 
 @pytest.mark.parametrize("subtype", sorted(ADMISSION_REFUSAL_SUBTYPES))

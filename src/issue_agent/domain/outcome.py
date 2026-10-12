@@ -210,6 +210,13 @@ ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset(
 )
 
 
+# Set by the codex runtime from its own rollout (the token counters' trusted
+# channel) when the provider refused the final turn for capacity or quota. The
+# agent never got that turn, so it is a machine failure; the session it ended
+# is intact, so it stays resumable (`resumable_session`).
+PROVIDER_REFUSED_SUBTYPE = "provider_refused"
+
+
 # Minted by the accounting runtime when a paid leg is refused BEFORE any run
 # exists (#262); its summary names the missing authority.
 RETURN_REFUSED_STATUS = "return_authority_unavailable"
@@ -315,7 +322,16 @@ def infra_class_failure(result: AgentResult) -> bool:
         or runtime_unavailable(result.exit_reason)
         or result.exit_reason in _INFRA_CLASS_EXTRA
         or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
+        or result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE
     )
+
+
+def resumable_session(result: AgentResult) -> str:
+    """The session a later leg may resume, or "" when this end left none usable."""
+    if budget_exhausted(result.exit_reason) or (
+            infra_class_failure(result) and result.envelope_subtype != PROVIDER_REFUSED_SUBTYPE):
+        return ""
+    return result.session_id or ""
 
 
 def infra_class_reason(result: AgentResult) -> str:

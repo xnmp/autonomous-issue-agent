@@ -41,6 +41,7 @@ from ..domain.outcome import (
     budget_exhausted,
     infra_class_failure,
     address_review_actions,
+    resumable_session,
 )
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
@@ -697,7 +698,7 @@ class AccountingRuntime(AgentRuntime):
                 result = replace(result, structured={"verdict": verdict, "rationale": rationale})
             assert result.workflow_attempt is not None
             session = None
-            if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)):
+            if resumable_session(result):
                 session = ResolveSession(result.workflow_attempt, result.session_id, self.runtime_name, reserved_model)
             revision: ContractRevision | UnavailableContractRevision | None = None
             if task.split_input is not None and kind in ("AUTHOR", "ADJUDICATE"):
@@ -815,7 +816,7 @@ class AccountingRuntime(AgentRuntime):
             runtime = RuntimeName(self.runtime_name)
             actual_model = cc.RepairModel(admission, runtime, result.model or model or "<runtime-default>")
             session = (cc.RepairSession(admission, result.session_id, runtime, actual_model.model)
-                       if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)) else None)
+                       if resumable_session(result) else None)
             state = replace(repair_input.selection.component.state, branch=repair_input.branch,
                             session=session, actual_model=actual_model)
             writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")

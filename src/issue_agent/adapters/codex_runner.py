@@ -47,6 +47,7 @@ from ..domain.outcome import (
     ExitReason,
     MAX_BUDGET_STATUS,
     Outcome,
+    PROVIDER_REFUSED_SUBTYPE,
     classify_outcome,
     declared_status,
     no_session_evidence,
@@ -2417,7 +2418,7 @@ class CodexRunner(AgentRuntime):
             # The provider refused the turn (capacity or quota): the agent never
             # got to work, so this is a machine failure, not an agent attempt.
             self._log(f"codex: provider refused the turn ({provider_failure}) — machine failure, not an attempt")
-            result = _replace(result, exit_reason=ExitReason.TRANSPORT_DEATH,
+            result = _replace(result, envelope_subtype=PROVIDER_REFUSED_SUBTYPE,
                               summary=f"provider refused the turn: {provider_failure}")
         if (
             result.status in ("pr_opened", "pushed")
