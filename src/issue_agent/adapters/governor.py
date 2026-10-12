@@ -34,11 +34,6 @@ from typing import Any
 
 from ..domain import gate
 from ..domain.contracts import TestExecution, TestExecutionStatus
-from ..domain.exemptions import (
-    ExemptionDeclaration,
-    RULE_REQUIRED_TEST,
-    declared_subjects,
-)
 from ..domain.refs import is_governed_branch
 from ..domain import governor_policy
 
@@ -91,27 +86,6 @@ class GateContext:
     # Subjects already on the observed remote PR branch (base..origin/<branch>);
     # published history the commit-log gate must not re-police (keifu #182).
     published_subjects: tuple[str, ...] = ()
-    # #124 exemption declarations from Gate-Exemption commit trailers on the
-    # branch. A declaration only makes the violation visible (the merge rule
-    # withholds until REVIEW_BOT grants); () = none declared.
-    declared_exemptions: tuple[ExemptionDeclaration, ...] = ()
-    # Lines that LOOK like Gate-Exemption trailers but failed to parse
-    # (typo'd rule, out-of-charset subject like `@scope/pkg`). They are
-    # rightly inert, but silently so — the denial hint below keeps a typo
-    # from recreating the #126 comply-how loop.
-    malformed_exemption_lines: int = 0
-    # OLD-side paths of modified/deleted/renamed files. Kept apart from
-    # `changed_files` (new-side): a deleted test path there would read as an
-    # ADDED test and satisfy check_required_test. Only the tests-immutable
-    # check consults it, so a rename out of the test tree is still an
-    # exemption request (round-4 adversarial review + parity check).
-    touched_at_base: tuple[str, ...] = ()
-    # Modified files whose branch diff adds lines only (numstat deletions 0).
-    # Only check_tests_immutable consults it: a purely additive edit to an
-    # existing test is refused at commit time (the reviewer refuses those
-    # grants on policy — 2026-08-09 tauri batch, 4 paid rounds). () = the
-    # builder could not tell → pre-existing reviewer-caught behavior.
-    additive_only: tuple[str, ...] = ()
     base_resolvable: bool = True
     changed_files: tuple[str, ...] = ()      # diff vs base
     # Push-gate precondition, as a LAZY probe rather than a value (review
@@ -142,7 +116,6 @@ class GateContext:
     # repo overlay). Read from the DAEMON's env, never the agent's command line —
     # the agent must not be able to grant itself the exemption.
     allow_untested: bool = False
-    exists_at_base: Callable[[str], bool] = lambda f: False
     run_tests: Callable[[str], bool | None] = lambda c: True
     run_red_tests: Callable[[str], TestExecution] = _unbound_test_execution
     revert_and_run: Callable[[tuple[str, ...]], TestExecution] = lambda impl: TestExecution(
@@ -460,27 +433,12 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_no_web(argv),
         lambda: gate.check_pr_base(pr_base, ctx.base_branch),
         lambda: gate.ALLOW if ctx.history_available and ctx.branch_diff_available else gate.deny("required Git history/diff facts are unavailable"),
-        lambda: _hint_malformed_declarations(
-            gate.check_required_test(
-                ctx.branch,
-                ctx.changed_files,
-                declared_subjects(ctx.declared_exemptions, RULE_REQUIRED_TEST),
-            ),
-            ctx,
-        ),
         lambda: gate.check_commit_log(
             ctx.branch_subjects, ctx.published_subjects
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
         lambda: gate.check_generated_instructions(ctx.instruction_blobs(False)),
-        # tests-immutable subjects are AUTO-DECLARED from the diff — no
-        # trailer, so no malformed-trailer hint applies here.
-        lambda: gate.check_tests_immutable(
-            tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
-            ctx.exists_at_base,
-            ctx.additive_only,
-        ),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
         # it sits LAST among the cheap checks: a repo with no docs/adr/ pays one
@@ -498,11 +456,11 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     if not tests_result.ok:
         return [tests_result.reason]
 
-    new_tests, impl = gate.partition_changed(ctx.changed_files, ctx.exists_at_base)
+    tests, impl = gate.partition_changed(ctx.changed_files)
     red_fail_result = gate.check_red_fails(
         gate.RedFailInputs(
             test_cmd=test_cmd,
-            new_test_files=new_tests,
+            test_files=tests,
             impl_files=impl,
             red_must_fail=ctx.red_must_fail,
             base_resolvable=ctx.base_resolvable,
@@ -565,11 +523,6 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
         lambda: gate.check_generated_instructions(ctx.instruction_blobs(False)),
-        lambda: gate.check_tests_immutable(
-            tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
-            ctx.exists_at_base,
-            ctx.additive_only,
-        ),
     )
     for check in cheap_checks:
         result = check()
@@ -581,28 +534,6 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     if not tests.ok:
         return [_annotate(tests.reason, branch, mode)]
     return []
-
-
-def _hint_malformed_declarations(
-    result: gate.GateResult, ctx: GateContext
-) -> gate.GateResult:
-    """Append a hint to an exemptable rule's DENIAL when the branch carries
-    Gate-Exemption-looking lines that failed to parse. The parser's silence
-    is correct (malformed ⇒ not a declaration, fail closed) but unteachable:
-    without this, an agent that typo'd the rule name or used an
-    out-of-charset subject sees the same denial as one that never declared,
-    and loops on 'how do I comply' (#126 class)."""
-    if result.ok or not ctx.malformed_exemption_lines:
-        return result
-    n = ctx.malformed_exemption_lines
-    return gate.deny(
-        result.reason
-        + f" NOTE: {n} Gate-Exemption line(s) in your commit messages did "
-        "not parse and were ignored — the format is exactly "
-        "'Gate-Exemption: <rule> <subject>' where <rule> is an exemptable "
-        "rule (tests-immutable, required-test) and <subject> is a plain "
-        "path of [A-Za-z0-9._/+-] (or * for required-test)."
-    )
 
 
 def _annotate(reason: str, branch: str, mode: gate.PushGateMode) -> str:

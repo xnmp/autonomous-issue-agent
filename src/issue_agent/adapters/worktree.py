@@ -4,7 +4,7 @@
 `git worktree remove`. `build_gate_context` is the git/fs fact-gatherer the
 governor's `make_pretooluse_hook(build_ctx)` needs — it reads the worktree's
 branch, the commit subjects since base, the changed-file list, the `.harness/`
-markers, and wires the `run_tests` / `revert_and_run` / `exists_at_base` /
+markers, and wires the `run_tests` / `revert_and_run` /
 `open_pr` callables (§1 + §10 + the push gate) over real git and `gh`.
 
 git/subprocess is injected as `run` so the path/branch logic is testable with a
@@ -34,11 +34,6 @@ from ..domain.contracts import (
     TestExecutionStatus,
     classify_test_exit_code,
     parse_test_failure_exit_codes,
-)
-from ..domain.exemptions import (
-    ExemptionDeclaration,
-    count_malformed_declarations,
-    parse_exemption_declarations,
 )
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from ..domain.git_remote import require_repository_remote, require_safe_fetch_url
@@ -1697,85 +1692,14 @@ def build_gate_context(
     branch_diff_available = True
     subjects: tuple[str, ...] = ()
     published_subjects: tuple[str, ...] = ()
-    declared_exemptions: tuple[ExemptionDeclaration, ...] = ()
-    malformed_exemption_lines = 0
     changed: tuple[str, ...] = ()
-    touched_at_base: tuple[str, ...] = ()
-    additive_only: tuple[str, ...] = ()
     if baseref:
         log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
         history_available = log.code == 0
         subjects = tuple(s for s in log.out.splitlines() if s)
-        # #124 declarations are Gate-Exemption trailers anywhere on the
-        # branch's commits: tracked history the agent cannot edit without
-        # changing the branch, and nothing left in the repo after merge.
-        bodies = git(["log", f"{baseref}..HEAD", "--format=%B"], cwd)
-        history_available = history_available and bodies.code == 0
-        if bodies.code == 0:
-            seen_decl: dict[ExemptionDeclaration, None] = {}
-            for declaration in parse_exemption_declarations(bodies.out):
-                seen_decl.setdefault(declaration)
-            declared_exemptions = tuple(seen_decl)
-            malformed_exemption_lines = count_malformed_declarations(
-                bodies.out
-            )
         diff = git(["diff", "--name-only", f"{baseref}...HEAD"], cwd)
         changed = tuple(f for f in diff.out.splitlines() if f)
-        # OLD-side paths of modified/deleted/renamed files, tracked SEPARATELY
-        # from `changed`. `--name-only` reports a rename by its NEW path only,
-        # so three tests renamed out of the test tree left the suite with the
-        # tests-immutable gate seeing nothing test-shaped, while the
-        # merge-side and shell derivations (both old-side) saw three subjects
-        # — the gate admitted what merge would then withhold, and on the SDK
-        # path nothing stopped the removal pre-publish (round-4 adversarial
-        # review + parity check). It must NOT be folded into `changed`: a
-        # DELETED test path there would read as an ADDED test and satisfy
-        # check_required_test. `-M` off so a rename is delete+add.
-        old_side = git(
-            [
-                "diff",
-                "--no-renames",
-                "--diff-filter=MDRT",
-                "--name-only",
-                f"{baseref}...HEAD",
-            ],
-            cwd,
-        )
-        if old_side.code == 0:
-            touched_at_base = tuple(
-                f for f in old_side.out.splitlines() if f
-            )
-        # Modified files whose branch diff ADDS lines only (numstat deletions
-        # 0). Only check_tests_immutable consults it (pure additions to an
-        # existing test belong in a new file — the reviewer refuses those
-        # grants on policy, so the gate now says so at commit time). Binary
-        # files report "-" and are never counted; a failed numstat leaves the
-        # set empty, i.e. the pre-existing (reviewer-caught) behavior.
-        numstat = git(
-            [
-                "diff",
-                "--no-renames",
-                "--diff-filter=M",
-                "--numstat",
-                f"{baseref}...HEAD",
-            ],
-            cwd,
-        )
-        branch_diff_available = all(result.code == 0 for result in (diff, old_side, numstat))
-        if numstat.code == 0:
-            additive: list[str] = []
-            for row in numstat.out.splitlines():
-                parts = row.split("\t", 2)
-                if len(parts) != 3:
-                    branch_diff_available = False
-                    break
-                added, deleted, path = parts
-                if not path or len(path) > 4096 or not ((added.isdigit() and deleted.isdigit()) or (added == deleted == "-")):
-                    branch_diff_available = False
-                    break
-                if deleted == "0" and added.isdigit() and added != "0":
-                    additive.append(path)
-            additive_only = tuple(additive)
+        branch_diff_available = diff.code == 0
         # Commits already on the observed remote PR branch are published
         # history the agent cannot rewrite (the broker requires them as
         # ancestors), so the commit-log gate must not re-police their
@@ -1855,8 +1779,8 @@ def build_gate_context(
         if git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0:
             return True
         # cat-file uses the same failure code for absent objects and failed
-        # reads. A successful tree lookup must prove absence before granting
-        # new-test treatment or deleting an implementation in red verification.
+        # reads. A successful tree lookup must prove absence before deleting
+        # an implementation in red verification.
         tree = git(["ls-tree", "-z", "--name-only", baseref, "--", path], cwd)
         if tree.code != 0:
             raise ValueError("base-tree evidence is unavailable")
@@ -2025,10 +1949,6 @@ def build_gate_context(
         branch=branch,
         branch_subjects=subjects,
         published_subjects=published_subjects,
-        declared_exemptions=declared_exemptions,
-        malformed_exemption_lines=malformed_exemption_lines,
-        touched_at_base=touched_at_base,
-        additive_only=additive_only,
         base_resolvable=base_resolvable,
         changed_files=changed,
         open_pr=open_pr,
@@ -2036,7 +1956,6 @@ def build_gate_context(
         allow_untested=allow_untested,
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
-        exists_at_base=exists_at_base,
         run_tests=rt,
         run_red_tests=run_red_tests,
         revert_and_run=revert_and_run,

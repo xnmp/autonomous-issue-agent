@@ -597,25 +597,6 @@ def test_an_unavailable_read_during_a_pending_rearm_is_visible_and_never_complet
     assert rearmed(client) and TRIGGER in client.labels()
 
 
-def test_repeatedly_unreadable_exemption_evidence_backs_off_to_a_visible_gate_never_an_approval(deployment):
-    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
-    client.remote.soft_failures.add("pr_commit_messages")
-    client.boot()
-    reads = []
-    for _ in range(40):
-        client.tick(minutes=5)
-        reads.append(len([c for c in client.log if "exemption trailers unreadable" in c]))
-        if "EvidenceUnavailable" in client.gate_causes():
-            break
-    (gate,) = client.gates()
-    assert isinstance(gate.cause, EvidenceUnavailable) and gate.gate_id.startswith("exemption-evidence:")
-    # Bounded: backed-off reads, far fewer than ticks; nothing bought or posted.
-    assert reads[-1] < len(reads) and client.provider.tasks == [] and client.submissions() == []
-    client.tick(3, minutes=5)
-    assert client.provider.tasks == []
-    client.remote.soft_failures.clear()
-    progress_until(client, lambda c: len(c.provider.tasks) == 1, limit=6, minutes=31)
-    assert client.gate_causes() == [] and client.bot_reviews()[-1].state == "APPROVED"
 
 
 # -- held uncertainty and the operator's retry grant ------------------------------------------------
@@ -947,11 +928,9 @@ def test_a_bound_re_review_diffs_from_its_baseline_never_the_legacy_head_cache(d
 DECLARATION = "chore: config only\n\nGate-Exemption: required-test *"
 
 
-@pytest.mark.parametrize("declared, escalates", [(False, False), (True, True)],
-                         ids=["complete-approval-resets", "ungranted-approval-does-not-reset"])
-def test_a_current_head_approval_resets_the_bound_count_only_when_its_grants_are_complete(
-        bare, monkeypatch, declared, escalates):
-    """A legacy approval of the current head met at activation: counted past only if its grants fall short."""
+@pytest.mark.parametrize("declared", [False, True], ids=["no-trailer", "legacy-trailer"])
+def test_a_current_head_approval_resets_the_bound_count_without_grants(
+        bare, monkeypatch, declared):
     bare.activate()
     compose_review(bare).activate_execution(monkeypatch)
     heads = bare.heads
@@ -967,13 +946,8 @@ def test_a_current_head_approval_resets_the_bound_count_only_when_its_grants_are
     client.boot()
     client.tick(3)
     assert len(client.provider.tasks) == 1
-    if escalates:
-        assert client.gate_causes() == ["ReviewRejectionCeiling"] and NHR in client.labels()
-        (gate,) = client.gates()
-        assert [c.review_id for c in gate.cause.counted] == ["legacy-rejection"]
-    else:
-        assert client.gate_causes() == [] and TRIGGER in client.labels()
-        assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"
+    assert client.gate_causes() == [] and TRIGGER in client.labels()
+    assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"
 
 
 # -- operator request replay, human reviews and release ordering ----------------------------------
@@ -1799,3 +1773,33 @@ def test_ordinary_test_ceiling_renewal_restarts_one_new_execution_subject(deploy
     resumed.tick(3)
     assert len(resumed.provider.tasks) == 1 and resumed.bot_reviews()[-1].state == "APPROVED"
     assert resumed.state().execution.binding.execution_episode != before.execution.binding.execution_episode
+
+
+def test_persisted_grant_downgrade_is_not_republished_after_restart(tmp_path, monkeypatch):
+    deployment = create_review_deployment(tmp_path, ceiling=10)
+    isolate_authority(deployment, monkeypatch)
+    install_clock(deployment, monkeypatch)
+    deployment.activate()
+    compose_review(deployment).activate_execution(monkeypatch)
+    body = ('The reviewer returned APPROVE but did not grant every gate exemption required by the current patch. '
+            'This is therefore REQUEST_CHANGES, not a mergeable approval. Either revise the patch so these '
+            'exemptions are no longer required, or explicitly grant each pair on the next review.\n\n'
+            'Ungranted requests:\n- `tests-immutable` for `tests/test_old.py`\n\nReviewer rationale:\nlgtm')
+    prior = replace(verdicts('REQUEST_CHANGES')[0], structured={'decision': 'REQUEST_CHANGES', 'body': body})
+    first = compose_review(deployment, provider=ScriptedProvider([prior]))
+    first.boot()
+    first.tick()
+    assert first.bot_reviews()[-1].state == 'CHANGES_REQUESTED'
+    assert body in first.bot_reviews()[-1].body
+    assert len(first.provider.tasks) == 1
+    remote = deployment.github()
+    rebased = deployment.heads[2]
+    remote.set_diff(rebased, diff_text('change0', offset=9))
+    remote.external_pr_change(PR, head_ref_oid=rebased)
+    restarted = compose_review(deployment, provider=ScriptedProvider(verdicts('APPROVE')))
+    restarted.boot()
+    restarted.tick(2)
+    copied = [r for r in restarted.bot_reviews() if r.commit_id == rebased]
+    assert copied and copied[-1].state == "APPROVED"
+    assert body not in copied[-1].body
+    assert len(restarted.provider.tasks) == 1

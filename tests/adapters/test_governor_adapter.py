@@ -253,7 +253,6 @@ def _good_pr_ctx():
         branch_subjects=("red: t", "green: impl"),
         changed_files=("src/x.py", "tests/test_x.py"),
         harness_test_cmd="pytest",
-        exists_at_base=lambda f: False,
         run_tests=lambda c: True,
         revert_and_run=lambda impl: execution(False),  # genuine red
     )
@@ -855,106 +854,6 @@ def test_posttooluse_fails_open_on_runner_error():
     assert out == {}  # never wedge the agent over a broken check
 
 
-# ── malformed Gate-Exemption hint (ADR 0014) ─────────────────────────────────
-# The declaration parser is silent about lines it rejects, which is correct
-# (malformed ⇒ not a declaration, fail closed) but unteachable: an agent that
-# typo'd the rule or used an out-of-charset subject sees the same denial as one
-# that never declared, and loops on "how do I comply" (keifu #126). The gate
-# surfaces the count on the denial of the one rule a trailer still governs —
-# required-test. tests-immutable is auto-declared from the diff since
-# 2026-08-03, so it has no trailer to typo and carries no hint.
-def _notest_ctx(**overrides):
-    """A fix/ branch whose diff carries no test at all — the required-test
-    denial, the rule a `Gate-Exemption:` trailer still applies to."""
-    return GateContext(**{
-        **_good_pr_ctx().__dict__,
-        "changed_files": ("src/x.py",),
-        **overrides,
-    })
-
-
-def test_a_required_test_denial_names_unparsed_gate_exemption_lines():
-    v = evaluate_command(_good_pr_cmd(), _notest_ctx(malformed_exemption_lines=2))
-    assert not v.allowed
-    assert "regression test" in v.reason        # the rule still speaks first
-    assert "Gate-Exemption" in v.reason
-    assert "did not parse" in v.reason
-    assert "2" in v.reason
-
-
-def test_the_same_denial_without_malformed_lines_is_left_alone():
-    # Anti-vacuity twin: the hint is driven by the observed count, not bolted
-    # onto every denial.
-    v = evaluate_command(_good_pr_cmd(), _notest_ctx(malformed_exemption_lines=0))
-    assert not v.allowed
-    assert "did not parse" not in v.reason
-    assert v.reason == evaluate_command(_good_pr_cmd(), _notest_ctx()).reason
-
-
-def test_malformed_lines_never_turn_an_allow_into_a_denial():
-    # A hint is a hint. A compliant change with sloppy trailers still passes.
-    ctx_with_junk = GateContext(**{
-        **_good_pr_ctx().__dict__, "malformed_exemption_lines": 3
-    })
-    assert evaluate_command(_good_pr_cmd(), ctx_with_junk).allowed
-
-
-# ── tests-immutable is auto-declared from the diff (ADR 0014, 2026-08-03) ────
-def test_editing_an_existing_test_no_longer_denies_at_the_pr_gate():
-    # The edit is admitted so the reviewer can judge it; the MERGE rule
-    # withholds until REVIEW_BOT grants it. Denying here was the #126/#163
-    # comply-how loop.
-    edited = GateContext(**{
-        **_good_pr_ctx().__dict__,
-        "exists_at_base": lambda f: f.startswith("tests/"),
-    })
-    assert evaluate_command(_good_pr_cmd(), edited).allowed
-
-
-def test_tests_renamed_out_of_the_tree_count_toward_the_scope_bound():
-    # `--name-only` reports a rename by its NEW path only, so without the
-    # old-side list three tests renamed out of the test tree left the suite
-    # with the gate seeing nothing test-shaped (round-4 adversarial review).
-    renamed = GateContext(**{
-        **_good_pr_ctx().__dict__,
-        # A NEW test keeps required-test satisfied; the point here is the
-        # nine renamed-away OLD paths. (That the old paths alone do NOT
-        # satisfy required-test is the separation this field exists for.)
-        "changed_files": tuple(f"docs/old_{i}.txt" for i in range(9))
-        + ("tests/test_new.py",),
-        "touched_at_base": tuple(f"tests/test_{i}.py" for i in range(9)),
-        "exists_at_base": lambda f: f.startswith("tests/"),
-    })
-    v = evaluate_command(_good_pr_cmd(), renamed)
-    assert not v.allowed
-    assert "existing test files modified/deleted" in v.reason
-
-
-def test_a_few_renamed_tests_are_admitted_like_any_other_edit():
-    # Anti-vacuity twin: "counted" must not mean "everything denies".
-    renamed = GateContext(**{
-        **_good_pr_ctx().__dict__,
-        "changed_files": ("docs/old_0.txt", "docs/old_1.txt", "tests/test_new.py"),
-        "touched_at_base": ("tests/test_0.py", "tests/test_1.py"),
-        "exists_at_base": lambda f: f.startswith("tests/"),
-    })
-    assert evaluate_command(_good_pr_cmd(), renamed).allowed
-
-
-def test_a_mass_test_rewrite_still_denies_and_teaches_no_trailer():
-    # Beyond the scope bound the gate refuses — and since the rule has no
-    # trailer any more, the denial must not mention one even when the branch
-    # carries unparsed Gate-Exemption lines.
-    many = GateContext(**{
-        **_good_pr_ctx().__dict__,
-        "changed_files": tuple(f"tests/test_{i}.py" for i in range(9)) + ("src/x.py",),
-        "exists_at_base": lambda f: f.startswith("tests/"),
-        "malformed_exemption_lines": 2,
-    })
-    v = evaluate_command(_good_pr_cmd(), many)
-    assert not v.allowed
-    assert "existing test files modified/deleted" in v.reason
-    assert "Gate-Exemption" not in v.reason
 
 
 @pytest.mark.parametrize("value", ["malformed", "9" * 5000])

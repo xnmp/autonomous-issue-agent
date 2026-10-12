@@ -1373,55 +1373,7 @@ def test_fix_effort_reaches_the_fix_runtime_view():
     assert from_env({"REPO": "x", "FIX_EFFORT": "low"}).fix_runtime.effort is Effort.LOW
 
 
-# ── ADR 0014 grant-authentication key ────────────────────────────────────────
-# The key is what makes a grant line unforgeable (the patch id it also binds is
-# a public hash the fixer can compute). It is derived from credentials the
-# daemons already share, and must never reach a log, a dump, or an agent.
-def test_the_grant_key_is_derived_from_the_review_token_not_the_token_itself():
-    token = "ghp_averysecrettokenvalue"
-    cfg = from_env({"REPO": "o/r", "REVIEW_BOT_TOKEN": token})
-    assert len(cfg.exemption_mac_key) == 64
-    assert all(c in "0123456789abcdef" for c in cfg.exemption_mac_key)
-    assert token not in cfg.exemption_mac_key
-    assert cfg.exemption_mac_key != token
-    # Deterministic: both daemons derive the same key from the same token, and
-    # rotating the token rotates the key (voiding open grants).
-    assert from_env({"REPO": "o/r", "REVIEW_BOT_TOKEN": token}).exemption_mac_key == (
-        cfg.exemption_mac_key
-    )
-    assert from_env(
-        {"REPO": "o/r", "REVIEW_BOT_TOKEN": token + "2"}
-    ).exemption_mac_key != cfg.exemption_mac_key
-
-
-def test_an_explicit_key_wins_and_no_credentials_means_no_key():
-    explicit = from_env(
-        {
-            "REPO": "o/r",
-            "REVIEW_BOT_TOKEN": "ghp_token",
-            "EXEMPTION_MAC_KEY": "operator-provided-key",
-        }
-    )
-    assert explicit.exemption_mac_key == "operator-provided-key"
-    # Nothing to derive from → "" , which disables grants entirely (declared
-    # PRs then withhold with an accurate reason rather than self-authorizing).
-    assert from_env({"REPO": "o/r"}).exemption_mac_key == ""
-
-
-def test_neither_the_key_nor_the_token_can_leak_through_a_config_dump():
-    token = "ghp_averysecrettokenvalue"
-    cfg = from_env(
-        {
-            "REPO": "o/r",
-            "FIX_BOT": "fix-bot",
-            "REVIEW_BOT_TOKEN": token,
-            "EXEMPTION_MAC_KEY": "operator-provided-key",
-        }
-    )
-    described = cfg.describe()
-    assert cfg.exemption_mac_key not in described
-    assert token not in described
-    assert "EXEMPTION_MAC_KEY" not in described
-    # repr() is what an unguarded exception traceback or log line prints.
-    assert cfg.exemption_mac_key not in repr(cfg)
-    assert token not in repr(cfg)
+@pytest.mark.parametrize("retired", ["", "old-key", "x" * 100_000])
+def test_retired_exemption_key_is_ignored_by_config_loading(retired):
+    base = {"REPO": "o/r", "REVIEW_BOT_TOKEN": "review-token"}
+    assert from_env({**base, "EXEMPTION_MAC_KEY": retired}) == from_env(base)

@@ -1767,25 +1767,6 @@ class GitHubGateway:
                 return int(p["number"])
         return None
 
-    def pr_commit_messages(self, pr: int) -> tuple[str, ...]:
-        """Full message (headline + body) of every commit on the PR, in order.
-
-        Feeds the #124 declaration collector: Test-Exemption trailers live in
-        commit messages, which the world's PRView deliberately does not carry
-        (they are only needed for PRs whose diff touches existing tests)."""
-        data = self._gh_json(
-            ["pr", "view", str(pr), "--repo", self.repo, "--json", "commits"]
-        ) or {}
-        commits = data.get("commits") if isinstance(data, dict) else None
-        messages: list[str] = []
-        for c in commits or []:
-            if not isinstance(c, dict):
-                continue
-            headline = str(c.get("messageHeadline") or "")
-            body = str(c.get("messageBody") or "")
-            messages.append(f"{headline}\n{body}" if body else headline)
-        return tuple(messages)
-
     def issue_for_pr(self, pr: int) -> int | None:
         p = self.get_pr(pr)
         if p.closing_issue is not None:

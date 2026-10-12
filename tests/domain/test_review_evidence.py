@@ -1,13 +1,12 @@
-"""Bounded review-evidence reads: exemption trailers and review history (ADR 0012/0015 UNVERIFIABLE loops)."""
+"""Bounded review-history reads and historical hold recognition (ADR 0012/0015)."""
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from issue_agent.domain.review_evidence import (
-    ReviewEvidenceKind, evidence_gate_id, exemption_evidence_due, exemption_evidence_gate_id,
-    is_exemption_evidence_gate, is_review_evidence_gate, review_evidence_gate_kind, unavailable_evidence,
-    unavailable_exemption_evidence,
+    ReviewEvidenceKind, evidence_due, evidence_gate_id,
+    is_review_evidence_gate, review_evidence_gate_kind, unavailable_evidence,
 )
 from issue_agent.domain.review_workflow import ends_with_advance
 from issue_agent.domain.workflow import EvidenceUnavailable, OpenGate, ReconciliationPolicy
@@ -18,8 +17,8 @@ POLICY = ReconciliationPolicy()
 BINDING = held().binding
 
 
-def unavailable(prior, *, at=NOW, head=HEAD, error="commit messages unavailable", policy=POLICY):
-    return unavailable_exemption_evidence(BINDING, head, prior, now=at, error=error, policy=policy)
+def unavailable(prior, *, at=NOW, head=HEAD, error="review history unavailable", policy=POLICY):
+    return unavailable_evidence(ReviewEvidenceKind.REVIEW_HISTORY, BINDING, head, prior, now=at, error=error, policy=policy)
 
 
 def test_unavailable_reads_back_off_exponentially_then_gate_visibly_at_the_ceiling():
@@ -36,9 +35,10 @@ def test_unavailable_reads_back_off_exponentially_then_gate_visibly_at_the_ceili
     assert all(delay <= POLICY.maximum_delay_seconds for delay in delays)
     gate = progress.gate
     assert isinstance(gate, OpenGate) and isinstance(gate.cause, EvidenceUnavailable)
-    assert gate.gate_id == exemption_evidence_gate_id(9, HEAD) and is_exemption_evidence_gate(gate)
-    assert gate.cause.last_error == "commit messages unavailable"
-    assert "never approves" in gate.remediation.reason
+    assert gate.gate_id == evidence_gate_id(ReviewEvidenceKind.REVIEW_HISTORY, 9, HEAD)
+    assert is_review_evidence_gate(gate)
+    assert gate.cause.last_error == "review history unavailable"
+    assert "never counts" in gate.remediation.reason
 
 
 def test_a_new_head_restarts_the_history_instead_of_inheriting_its_gate():
@@ -66,10 +66,10 @@ def test_a_huge_error_is_bounded_and_reads_saturate_without_overflow():
 
 def test_due_is_per_head_and_waits_for_the_schedule():
     progress = unavailable(None)
-    assert not exemption_evidence_due(progress.schedule, HEAD, now=NOW)
-    assert exemption_evidence_due(progress.schedule, HEAD, now=progress.schedule.history.next_read_at)
-    assert exemption_evidence_due(progress.schedule, OTHER_HEAD, now=NOW)
-    assert exemption_evidence_due(None, HEAD, now=NOW)
+    assert not evidence_due(progress.schedule, HEAD, now=NOW)
+    assert evidence_due(progress.schedule, HEAD, now=progress.schedule.history.next_read_at)
+    assert evidence_due(progress.schedule, OTHER_HEAD, now=NOW)
+    assert evidence_due(None, HEAD, now=NOW)
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -86,27 +86,28 @@ def test_an_issue_binding_or_bad_pr_number_is_refused():
     from tests.fakes.workflow_authority import resolve_snapshot
 
     with pytest.raises(ValueError):
-        unavailable_exemption_evidence(resolve_snapshot().binding, HEAD, None, now=NOW, error="x")
+        unavailable_evidence(ReviewEvidenceKind.REVIEW_HISTORY, resolve_snapshot().binding, HEAD, None, now=NOW, error="x")
     with pytest.raises(ValueError):
-        exemption_evidence_gate_id(0, HEAD)
+        evidence_gate_id(ReviewEvidenceKind.REVIEW_HISTORY, 0, HEAD)
 
 
 def test_a_generation_advance_supersedes_an_evidence_hold_but_never_a_ceiling():
     gated = unavailable(None, policy=ReconciliationPolicy(maximum_reads=1)).gate
     assert gated is not None and ends_with_advance(gated)
-    assert not is_exemption_evidence_gate(ceiling_gate())
+    assert not is_review_evidence_gate(ceiling_gate())
 
 
 def test_each_evidence_kind_gates_on_its_own_subject_and_never_as_another_kind():
     policy = ReconciliationPolicy(maximum_reads=1)
     history = unavailable_evidence(ReviewEvidenceKind.REVIEW_HISTORY, BINDING, HEAD, None, now=NOW,
                                    error="review page 0 failed", policy=policy).gate
-    trailers = unavailable(None, policy=policy).gate
+    trailers = unavailable_evidence(ReviewEvidenceKind.EXEMPTION_TRAILERS, BINDING, HEAD, None, now=NOW,
+                                    error="legacy trailers unavailable", policy=policy).gate
     assert history is not None and trailers is not None and history.gate_id != trailers.gate_id
     assert history.gate_id == evidence_gate_id(ReviewEvidenceKind.REVIEW_HISTORY, 9, HEAD)
     assert review_evidence_gate_kind(history) is ReviewEvidenceKind.REVIEW_HISTORY
     assert review_evidence_gate_kind(trailers) is ReviewEvidenceKind.EXEMPTION_TRAILERS
-    assert is_review_evidence_gate(history) and not is_exemption_evidence_gate(history)
+    assert is_review_evidence_gate(history)
     assert "complete review history" in history.cause.required_fact and "never counts" in history.remediation.reason
     assert ends_with_advance(history)
     assert review_evidence_gate_kind(ceiling_gate()) is None

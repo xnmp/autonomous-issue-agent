@@ -584,6 +584,8 @@ def test_every_adr_is_referenced_by_a_governed_source_file() -> None:
         decision = adr.read_text()
         match = re.match(r"# ADR ([0-9]{4})\b", decision)
         assert match is not None, f"{adr.name} has no ADR id"
+        if re.search(r"^Status: Superseded\b", decision, re.MULTILINE):
+            continue  # retired authority has no live source obligation
         marker = f"ADR {match.group(1)}"
         governs = next(
             (
@@ -612,3 +614,17 @@ def test_prompt_budget_evidence_matches_current_instruction_file() -> None:
     ).read_text()
     assert f"{len(prompt.encode()):,}" in evidence
     assert f"{len(prompt.split()):,}" in evidence
+
+
+
+def test_current_documentation_has_no_retired_test_grant_authority():
+    architecture = (ROOT / "docs/reference/architecture.md").read_text()
+    manual = (ROOT / "HARNESS.md").read_text()
+    assert "`domain/exemptions.py`" not in architecture
+    assert "`domain/review_exemptions.py`" not in architecture
+    assert "exemption-trailer" not in architecture
+    assert "counting and exemption evidence" not in manual
+    residuals = (ROOT / "docs/open/residuals.md").read_text()
+    assert "UNVERIFIABLE exemption verdict" not in residuals
+    assert "missing MAC key map to WITHHELD" not in residuals
+    assert "Increment 8 retains this fix-side collector residual" not in residuals

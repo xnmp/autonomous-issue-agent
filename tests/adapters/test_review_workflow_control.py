@@ -932,6 +932,28 @@ def test_an_unavailable_read_backs_off_journals_and_gates_at_the_ceiling(rig):
     assert state.intent.request_id == finished.snapshot.intent.request_id
 
 
+def test_retired_exemption_hold_is_released_after_restart_without_trailer_reads(rig):
+    from issue_agent.domain.review_evidence import ReviewEvidenceKind
+
+    rig.activate()
+    control = rig.control(policy=ReconciliationPolicy(maximum_reads=1))
+    control.ensure_observed_workflow(PR_KEY)
+    control.record_evidence(PR_KEY, HEAD, ReviewEvidenceKind.EXEMPTION_TRAILERS,
+                            error="legacy trailers unavailable")
+    control.record_evidence(PR_KEY, HEAD, ReviewEvidenceKind.REVIEW_HISTORY,
+                            error="review history unavailable")
+    before = rig.workflow()
+    retired = {g.gate_id for g in before.gates if g.gate_id.startswith("exemption-evidence:")}
+    assert retired
+    rig.points.add("read")
+    restarted = rig.restart()
+    assert restarted.reconcile_holds() == 1
+    remaining = {g.gate_id for g in rig.workflow().gates}
+    assert not retired & remaining
+    assert any(g.startswith("review-history:") for g in remaining)
+    assert not rig.query("SELECT 1 FROM dedupe_keys WHERE namespace='review-exemption-evidence'")
+
+
 def test_a_rejection_during_a_pending_rearm_stops_it_visibly_and_regates(rig):
     """Re-rejection to the ceiling while the re-arm is pending is an explicit stop, then a new ceiling gate.
 

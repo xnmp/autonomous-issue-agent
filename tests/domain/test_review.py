@@ -7,30 +7,20 @@ import pytest
 from tests.domain.builders import pr, world
 
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
-from issue_agent.domain.exemptions import (
-    ExemptionGrant,
-    authenticated_grant_pairs,
-    grant_mac,
-)
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import (
     ApprovedSubmission,
     ChangesRequestedSubmission,
-    CompleteGrants,
     EscalatedSubmission,
     Finding,
-    RejectedExemptions,
     ReviewConfig,
     ReviewMode,
     BoundReviewState,
-    ReviewTarget,
-    UNGRANTED_DOWNGRADE_MARKER,
     count_prior_rejections,
     decide_bound_review,
     gate_submission,
     parse_findings,
     patch_signature,
-    resolve_authenticated_grants,
     review_submission,
     reviewer_verdict_on_head,
     synthesize_review,
@@ -434,141 +424,29 @@ def test_incomplete_current_head_approval_does_not_reset_rejections():
 
 # ── review_submission: verdict → effect, with the rejection ceiling ───────────
 # The verdict under test is the (prior_rejections + 1)-th rejection; cap here is 4.
-REVIEW_TARGET = ReviewTarget(42, "test-patch")
-AUTHENTICATED_EMPTY = authenticated_grant_pairs(
-    (), issue_number=42, patch_id="test-patch", mac_key="test-key"
-)
-COMPLETE_GRANTS = resolve_authenticated_grants(
-    (), AUTHENTICATED_EMPTY, target=REVIEW_TARGET
-)
-assert isinstance(COMPLETE_GRANTS, CompleteGrants)
-
-
 def test_submission_approve_wins_even_at_ceiling():
     # A rebase/housekeeping push that ends in APPROVE never escalates, whatever the
     # prior rejection count.
     sub = review_submission(
         "APPROVE", "lgtm", prior_rejections=3, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "APPROVE" and sub.escalate is False
 
 
-def test_submission_approval_without_required_grants_requests_changes():
-    sub = review_submission(
-        "APPROVE",
-        "No code findings; additive tests need no exemption.",
-        prior_rejections=0,
-        max_rejections=4,
-        grant_resolution=RejectedExemptions(
-            (("tests-immutable", "tests/existing.spec.ts"),)
-        ),
-        target=REVIEW_TARGET,
-    )
-
-    assert isinstance(sub, ChangesRequestedSubmission)
-    assert sub.event == "REQUEST_CHANGES"
-    assert sub.escalate is False
-    assert sub.rejected_exemptions is not None
-    assert "not a mergeable approval" in sub.body
-    # The re-review copy shortcut recognizes a downgrade by this marker; if the
-    # body ever stops carrying it, an unchanged patch re-copies the downgrade
-    # forever and livelocks to the rejection ceiling (tauri #634).
-    assert UNGRANTED_DOWNGRADE_MARKER in sub.body
-    assert "`tests-immutable` for `tests/existing.spec.ts`" in sub.body
-    assert "additive coverage belongs in a new test file" in sub.body
-    assert "Reviewer rationale:" in sub.body
 
 
-def test_submission_ungranted_approval_obeys_rejection_ceiling():
-    sub = review_submission(
-        "APPROVE",
-        "refused",
-        prior_rejections=3,
-        max_rejections=4,
-        grant_resolution=RejectedExemptions((("required-test", "*"),)),
-        target=REVIEW_TARGET,
-    )
-
-    assert isinstance(sub, EscalatedSubmission)
-    assert sub.event == "COMMENT"
-    assert sub.escalate is True
-    assert sub.escalate_cause == "ceiling"
 
 
-def test_approval_variant_requires_complete_grants_at_runtime():
-    with pytest.raises(TypeError, match="authenticated grant resolution"):
-        CompleteGrants(None, "", (), object())
-
-    approved = ApprovedSubmission("looks good", COMPLETE_GRANTS, REVIEW_TARGET)
-    assert approved.event == "APPROVE"
-    assert approved.escalate is False
 
 
-def test_complete_grant_proof_is_bound_to_issue_patch_and_requests():
-    request = ("tests-immutable", "tests/existing.spec.ts")
-    grant = ExemptionGrant(
-        request[0],
-        42,
-        request[1],
-        "patch-42",
-        grant_mac("test-key", request[0], 42, request[1], "patch-42"),
-    )
-    authenticated = authenticated_grant_pairs(
-        (grant,), issue_number=42, patch_id="patch-42", mac_key="test-key"
-    )
-    resolved = resolve_authenticated_grants(
-        (request,),
-        authenticated,
-        target=ReviewTarget(42, "patch-42"),
-    )
-
-    assert isinstance(resolved, CompleteGrants)
-    assert resolved.issue_number == 42
-    assert resolved.patch_id == "patch-42"
-    assert resolved.requests == (request,)
 
 
-def test_complete_grant_proof_fails_closed_without_patch_binding():
-    request = ("tests-immutable", "tests/existing.spec.ts")
-    authenticated = authenticated_grant_pairs(
-        (), issue_number=42, patch_id="", mac_key="test-key"
-    )
-    resolved = resolve_authenticated_grants(
-        (request,),
-        authenticated,
-        target=ReviewTarget(42, ""),
-    )
-
-    assert isinstance(resolved, RejectedExemptions)
-    assert resolved.requests == (request,)
 
 
-def test_approval_rejects_complete_grants_for_another_target():
-    with pytest.raises(ValueError, match="different review target"):
-        ApprovedSubmission(
-            "looks good", COMPLETE_GRANTS, ReviewTarget(43, "other-patch")
-        )
 
 
-def test_complete_grants_cannot_be_rebound_with_dataclass_replace():
-    with pytest.raises(TypeError):
-        replace(COMPLETE_GRANTS, issue_number=43, patch_id="other-patch")
 
 
-def test_submission_zero_disables_ceiling_for_ungranted_approval():
-    sub = review_submission(
-        "APPROVE",
-        "refused",
-        prior_rejections=10_000,
-        max_rejections=0,
-        grant_resolution=RejectedExemptions((("required-test", "*"),)),
-        target=REVIEW_TARGET,
-    )
-
-    assert sub.event == "REQUEST_CHANGES"
-    assert sub.escalate is False
 
 
 def test_submission_zero_disables_ceiling_for_ordinary_rejection():
@@ -577,36 +455,18 @@ def test_submission_zero_disables_ceiling_for_ordinary_rejection():
         "still wrong",
         prior_rejections=10_000,
         max_rejections=0,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
 
     assert sub.event == "REQUEST_CHANGES"
     assert sub.escalate is False
 
 
-def test_submission_deduplicates_ungranted_requests_and_allows_empty_body():
-    request = ("tests-immutable", "tests/existing.spec.ts")
-    sub = review_submission(
-        "APPROVE",
-        "",
-        prior_rejections=0,
-        max_rejections=4,
-        grant_resolution=RejectedExemptions((request, request)),
-        target=REVIEW_TARGET,
-    )
-
-    assert sub.event == "REQUEST_CHANGES"
-    assert sub.body.count("`tests-immutable` for `tests/existing.spec.ts`") == 1
-    assert "Reviewer rationale:" not in sub.body
 
 
 def test_submission_request_changes_below_ceiling_bounces_back():
     # 3rd rejection (2 prior) with a cap of 4 → still bounces back to the fixer.
     sub = review_submission(
         "REQUEST_CHANGES", "fix x", prior_rejections=2, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "REQUEST_CHANGES" and sub.escalate is False
 
@@ -616,8 +476,6 @@ def test_submission_request_changes_at_ceiling_escalates():
     # it escalates to a human regardless of the model verdict.
     sub = review_submission(
         "REQUEST_CHANGES", "still wrong", prior_rejections=3, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "COMMENT" and sub.escalate is True
     assert sub.escalate_cause == "ceiling"
@@ -626,8 +484,6 @@ def test_submission_request_changes_at_ceiling_escalates():
 def test_submission_explicit_escalate_always_escalates():
     sub = review_submission(
         "ESCALATE", "deadlocked", prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.escalate is True
     # The cause names the verdict, not the ceiling: keifu PR #177 escalated on
@@ -640,8 +496,6 @@ def test_submission_escalate_verdict_at_ceiling_reports_verdict_cause():
     # When both apply, the reviewer's explicit verdict is the truer cause.
     sub = review_submission(
         "ESCALATE", "deadlocked", prior_rejections=3, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.escalate is True and sub.escalate_cause == "verdict"
 
@@ -649,13 +503,9 @@ def test_submission_escalate_verdict_at_ceiling_reports_verdict_cause():
 def test_submission_non_escalating_paths_carry_no_cause():
     ok = review_submission(
         "APPROVE", "lgtm", prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     bounce = review_submission(
         "REQUEST_CHANGES", "fix", prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert ok.escalate_cause == "" and bounce.escalate_cause == ""
 
@@ -686,8 +536,6 @@ def test_synthesis_no_confirmed_findings_approves():
     fs = [Finding("correctness", "a.py:1", "maybe", "blocking", confirmed=False)]
     sub = synthesize_review(
         fs, prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "APPROVE" and sub.escalate is False
 
@@ -695,8 +543,6 @@ def test_synthesis_no_confirmed_findings_approves():
 def test_synthesis_empty_approves():
     sub = synthesize_review(
         [], prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "APPROVE"
     assert "LGTM" in sub.body
@@ -710,8 +556,6 @@ def test_synthesis_confirmed_blocking_requests_changes():
     ]
     sub = synthesize_review(
         fs, prior_rejections=1, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "REQUEST_CHANGES"
     assert "x.py:9" in sub.body and "Must fix" in sub.body
@@ -722,8 +566,6 @@ def test_synthesis_only_advisory_confirmed_approves_with_notes():
     fs = [Finding("architecture", "z.py:4", "consider extracting", "advisory", confirmed=True)]
     sub = synthesize_review(
         fs, prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "APPROVE"
     assert "z.py:4" in sub.body and "Non-blocking" in sub.body
@@ -735,8 +577,6 @@ def test_synthesis_blocking_at_ceiling_escalates():
     fs = [Finding("correctness", "a.py:1", "real bug", "blocking", confirmed=True)]
     sub = synthesize_review(
         fs, prior_rejections=3, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "COMMENT" and sub.escalate is True
 
@@ -750,8 +590,6 @@ def test_synthesis_unconfirmed_blocking_ignored():
     ]
     sub = synthesize_review(
         fs, prior_rejections=0, max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "APPROVE"
 
@@ -763,8 +601,6 @@ def test_synthesis_incomplete_and_no_finding_returns_none():
     # approving a PR whose defect-detecting lens may never have run.
     assert synthesize_review(
         [], prior_rejections=0, max_rejections=4, complete=False,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     ) is None
 
 
@@ -774,8 +610,6 @@ def test_synthesis_incomplete_but_blocking_still_reports():
     fs = [Finding("security", "a.py:1", "real", "blocking", confirmed=True)]
     sub = synthesize_review(
         fs, prior_rejections=0, max_rejections=4, complete=False,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub is not None and sub.event == "REQUEST_CHANGES"
 
@@ -784,8 +618,6 @@ def test_synthesis_complete_no_finding_approves():
     # The default (complete=True) still approves on a clean review.
     sub = synthesize_review(
         [], prior_rejections=0, max_rejections=4, complete=True,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub is not None and sub.event == "APPROVE"
 
@@ -794,26 +626,11 @@ def test_gate_submission_approves():
     sub = gate_submission(
         prior_rejections=0,
         max_rejections=4,
-        grant_resolution=COMPLETE_GRANTS,
-        target=REVIEW_TARGET,
     )
     assert sub.event == "APPROVE" and sub.escalate is False
     assert "docs/formatting/config" in sub.body
 
 
-def test_gate_submission_cannot_approve_rejected_exemptions():
-    sub = gate_submission(
-        prior_rejections=3,
-        max_rejections=4,
-        grant_resolution=RejectedExemptions(
-            (("tests-immutable", "tests/existing.spec.ts"),)
-        ),
-        target=REVIEW_TARGET,
-    )
-
-    assert isinstance(sub, EscalatedSubmission)
-    assert sub.event == "COMMENT"
-    assert sub.escalate_cause == "ceiling"
 
 
 # ── rebase-invariant patch identity (harness #2) ──────────────────────────────
@@ -1018,3 +835,11 @@ def test_a_hold_does_not_withhold_a_non_dispatch_action():
     plan = hold_review_dispatch(escalations, {9: _held(9, 1.0)})
     assert escalations and plan.actions == tuple(escalations)
     assert plan.deferred == ()
+
+
+@pytest.mark.parametrize("body", ["", "Looks good", "gate-exemption: granted rule=tests-immutable issue=42 subject=tests/test_x.py patch=old mac=old"])
+def test_approval_needs_no_test_grant_and_preserves_legacy_body_text(body):
+    submitted = review_submission("APPROVE", body, 1000, 4)
+    assert submitted.event == "APPROVE"
+    assert submitted.body == body
+    assert not submitted.escalate
