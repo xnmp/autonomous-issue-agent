@@ -696,12 +696,10 @@ make typecheck
 make test-domain
 make test-adapters
 make test-app
-make test-hooks
-make test-governor
 ```
 
 `make test` is the required submission gate. The suite includes import/purity
-contracts, runtime and gate parity, convergence, transactional accounting
+contracts, convergence, transactional accounting
 races, recovery/supervision, schema-v2 projection, and service artifact tests.
 `config/agent.env.example` is generated from `HarnessConfig` metadata; update
 the field definition and regenerate with

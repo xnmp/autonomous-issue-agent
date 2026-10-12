@@ -159,7 +159,7 @@ _HUMAN_MESSAGES = (
 
 # The autonomy contract (operator directive, 2026-08-03): technical decisions
 # belong to the fixer, in service of the acceptance criteria; an independent
-# reviewer and the gates bound the damage of a wrong call, while a question
+# reviewer and CI bound the damage of a wrong call, while a question
 # costs unbounded human latency. Blocking is legal on exactly two grounds.
 _DECISION_OWNERSHIP_POLICY = (
     "\n\nDECISION OWNERSHIP — within the requested scope, choose and document "
@@ -874,9 +874,9 @@ def _location_paths(location: str) -> tuple[str, ...]:
 
 _VISUAL_REVIEW_NOTE = (
     "If the PR commits screenshots under `evidence/` for a visual acceptance "
-    "criterion, you are the ONLY verifier of that evidence — the fixer gate "
-    "does not judge image content. READ each image and judge whether it "
-    "actually substantiates its criterion (right screen, right state, the "
+    "criterion, you are the ONLY verifier of that evidence. READ each image "
+    "and judge whether it actually substantiates its criterion (right screen, "
+    "right state, the "
     "criterion visibly met). REQUEST_CHANGES if a screenshot is missing, "
     "irrelevant, or does not show the behaviour the criterion claims — and "
     "also if an image shows a stale or pre-change state, or was reused from an "

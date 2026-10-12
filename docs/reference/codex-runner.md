@@ -8,6 +8,12 @@
 > ceiling (no native cap), register the model in model-catalog.json, and one live
 > demo-gate resolve comparing fix quality + cost vs Opus. The sections below were
 > the original scope; they match what shipped.
+>
+> **Slice 6a (2026-10):** the governor hook is deleted. `adapters/codex_hook.py`
+> became `adapters/codex_home.py`, which writes only developer instructions into
+> the state-owned CODEX_HOME (still under its historical `codex-hooks/` path), and
+> `--dangerously-bypass-hook-trust` is gone. Governor mentions in the original
+> scope below are historical.
 
 
 **Goal:** run agent legs on
@@ -36,12 +42,10 @@ model and rollout usage, enabling cost-mix analysis by runtime/model.
 Codex review supports `REVIEW_MODE=single` only. `multi` and `delegated` rely
 on Claude aliases and SDK subagents, so configuration rejects those combinations
 instead of silently dropping legs. The reviewer runs in the operator checkout
-under Codex's read-only sandbox and a dedicated governor allow-list (`git diff`,
-`gh pr diff/view`, `cat`, `ls`), so filesystem and ambient-GitHub mutation paths
-are both contained. Because Codex's resume grammar cannot carry a sandbox
+under Codex's read-only sandbox, which contains filesystem mutation. Because Codex's resume grammar cannot carry a sandbox
 setting, every Codex re-review and in-leg transport retry is intentionally a
 fresh session; it receives the prior verdict as context and cannot regain a
-writable resume mode. The governor hook is installed only immediately before a
+writable resume mode. The CODEX_HOME is prepared only immediately before a
 review leg in the explicit `TARGET_DIR`; daemon construction never mutates the
 process cwd, and an unset target fails closed instead of using an implicit cwd.
 
@@ -97,9 +101,8 @@ Map each `RuntimePlan` field to a `codex exec` flag:
 | `max_budget_usd` | no native budget FLAG; enforced in-harness (#29) — the stderr pump samples the session's streamed token counters each poll slice and kills the process group once THIS LEG's priced spend crosses it, returning `ExitReason.BUDGET_EXHAUSTED` |
 | `mcp_servers` | `codex mcp add` / config; SonarQube CI-fix only (not wired in Python yet anyway) |
 | `env` | process env when spawning codex |
-| sandbox | `--sandbox danger-full-access` (Codex hardcodes `.git` read-only under workspace-write — no knob; full-access + governor is the SAME posture as the Claude fixer's bypassPermissions+governor) |
+| sandbox | `--sandbox danger-full-access` (Codex hardcodes `.git` read-only under workspace-write — no knob; the SAME posture as the Claude fixer's bypassPermissions) |
 | provider cfg | `-c model_providers.<id>.{name,base_url,env_key,wire_api}` + `-c model_provider=<id>` (inline; do NOT rely on `[profiles.x]` — 0.142 rejects the legacy profile table with `-p`) |
-| hook trust | `--dangerously-bypass-hook-trust` (headless can't do interactive `/hooks` trust; this is what KEEPS the governor on, not extra danger) |
 
 **Result parsing** (mirror `result_to_agent_result`): pass `-o <file>` (last message)
 and/or `--json` (JSONL events). Read the JSON envelope from `-o`, map
