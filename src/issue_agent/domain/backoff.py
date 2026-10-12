@@ -80,5 +80,10 @@ def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime |
         latest = latest or end.ended_at
     if latest is None:
         return None
-    return latest + min(BACKOFF_BASE * 2 ** min(streak - 1, _MAX_DOUBLINGS), BACKOFF_CAP)
+    return latest + machine_backoff_wait(streak)
+
+
+def machine_backoff_wait(streak: int) -> timedelta:
+    """The wait after the ``streak``-th consecutive machine end (at least one)."""
+    return min(BACKOFF_BASE * 2 ** min(max(streak, 1) - 1, _MAX_DOUBLINGS), BACKOFF_CAP)
 

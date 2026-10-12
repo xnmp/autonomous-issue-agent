@@ -4,13 +4,14 @@ from dataclasses import dataclass, replace
 import hashlib
 import sqlite3
 
+from ..domain.backoff import machine_backoff_wait
 from ..domain.fix import breaker_key
 from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import (
     ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress, MAX_EXECUTION_SUFFIX,
     ReviewPreparationKind,
-    ReviewRoundOutcome, same_execution_episode,
+    ReviewPinDeferred, ReviewRoundOutcome, same_execution_episode,
     CurrentReviewExecution, finalize_current_review_round,
 )
 from ..domain.review_rounds import (
@@ -33,7 +34,7 @@ from ..domain.workflow_identity import (
 )
 from .control_store import (
     ControlStoreError, PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest,
-    _dispatch_claim_issue, _json, _stamp,
+    _dispatch_claim_issue, _json, _parse_stamp, _stamp,
 )
 from .deployment_authority import deployment_role
 from .review_effects import ReviewReads, bound_submission_op, read_pull_request
@@ -315,7 +316,32 @@ class SQLiteReviewExecutionControl:
             snapshot = load_review_workflow_row(db, key)
             if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
                 return None
-            return self._pending_recovery_hold_in_tx(db, snapshot.execution)
+            return (self._pending_recovery_hold_in_tx(db, snapshot.execution)
+                    or self._pin_backoff_hold_in_tx(db, snapshot.execution))
+
+    def _pin_backoff_hold_in_tx(self, db: sqlite3.Connection, execution: CurrentReviewExecution) -> str | None:
+        """An unavailable pinned checkout is a machine failure: the next round
+        waits the fixer's doubling backoff after the latest settled round, when
+        that round was a pin deferral. The streak is the stored `pin_deferrals`
+        (reset only by progress), so nothing new is recorded."""
+        if not execution.state.pin_deferrals:
+            return None
+        binding = execution.binding
+        key = binding.rejection.fence.key
+        row = db.execute(
+            "SELECT rr.outcome_json,d.claimed_at FROM review_execution_rounds rr "
+            "INDEXED BY review_execution_rounds_episode JOIN dedupe_keys d "
+            "ON d.namespace=? AND d.scope=rr.repository AND d.key=rr.round_id "
+            "WHERE rr.repository=? AND rr.target_number=? AND rr.execution_epoch=? AND rr.execution_episode=? "
+            "AND rr.outcome_json IS NOT NULL ORDER BY rr.sequence DESC LIMIT 1",
+            (REVIEW_OUTCOME_NAMESPACE, key.repository, key.target.number, binding.execution_epoch,
+             binding.execution_episode),
+        ).fetchone()
+        if row is None or not isinstance(
+                decode_workflow(row["outcome_json"], ReviewRoundOutcome).disposition, ReviewPinDeferred):
+            return None
+        until = _parse_stamp(row["claimed_at"]) + machine_backoff_wait(execution.state.pin_deferrals)
+        return f"pinned checkout backing off until {_stamp(until)}" if self._control.now() < until else None
 
     def _record_recovery_block(self, round_id: str, reason: str) -> None:
         with self._control.transaction() as db:

@@ -153,7 +153,10 @@ def test_composed_review_modes_have_one_productive_outer_round(tmp_path, monkeyp
     assert len(client.provider.tasks) == len(results) and len(client.submissions()) == 1
 
 
-def test_composed_pin_deferrals_are_counted_without_a_strike_or_paid_admission(tmp_path, monkeypatch):
+def test_composed_pin_deferrals_are_spaced_by_the_machine_backoff_without_a_strike(tmp_path, monkeypatch):
+    """An unavailable pinned checkout is a machine failure: never a strike or a
+    paid admission, and a minute-by-minute poll re-plans the round only on the
+    doubling backoff (deferrals at minutes 1, 2, 4, 8, 16), not every tick."""
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch, verdicts,
     )
@@ -175,15 +178,15 @@ def test_composed_pin_deferrals_are_counted_without_a_strike_or_paid_admission(t
 
     workflow.cfg = replace(workflow.cfg, review_checkout=refuse_pin)
     client.boot()
-    client.tick(6)
+    client.tick(20)
     state = client.state()
-    assert state.execution.state.pin_deferrals == 6 and state.execution.state.failures == 0, client.log
+    assert state.execution.state.pin_deferrals == 5 and state.execution.state.failures == 0, client.log
     assert client.provider.tasks == [] and client.charges() == [] and client.submissions() == []
     with client.review.control.transaction() as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
-        assert db.execute("SELECT count(*) FROM review_execution_rounds WHERE outcome_json IS NOT NULL").fetchone()[0] == 6
+        assert db.execute("SELECT count(*) FROM review_execution_rounds WHERE outcome_json IS NOT NULL").fetchone()[0] == 5
     workflow.cfg = replace(workflow.cfg, review_checkout=original_checkout)
-    client.tick()
+    client.tick(minutes=16)
     assert len(client.provider.tasks) == len(client.charges()) == len(client.submissions()) == 1, client.log
     assert client.state().execution.state.pin_deferrals == client.state().execution.state.failures == 0
 

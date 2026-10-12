@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.domain.actions import AgentKind
-from issue_agent.domain.backoff import LegEnd, dispatched_kind, machine_backoff_until
+from issue_agent.domain.backoff import LegEnd, dispatched_kind, machine_backoff_until, machine_backoff_wait
 
 T = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -28,6 +28,14 @@ def latest(history: tuple[LegEnd, ...]) -> datetime:
 def test_wait_doubles_per_consecutive_machine_end_up_to_an_hour(streak, wait):
     history = ends(*([True] * streak))
     assert machine_backoff_until(history, AgentKind.FIX_CI) == latest(history) + wait
+
+
+@pytest.mark.parametrize(("streak", "wait"), [
+    (-5, timedelta(seconds=60)), (0, timedelta(seconds=60)), (1, timedelta(seconds=60)),
+    (4, timedelta(seconds=480)), (2**62, timedelta(hours=1)),
+])
+def test_wait_for_a_stored_streak_count_is_clamped_to_base_and_cap(streak, wait):
+    assert machine_backoff_wait(streak) == wait
 
 
 def test_huge_streak_is_capped_without_overflow():
