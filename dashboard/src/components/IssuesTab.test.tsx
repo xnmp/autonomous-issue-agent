@@ -204,3 +204,56 @@ describe("IssuesTab", () => {
     expect(screen.queryByRole("heading", { name: "Context" })).not.toBeInTheDocument();
   });
 });
+
+describe("Untriaged tab", () => {
+  const backlog = (issue: number, steward_state: string, title: string) => ({
+    issue, title, url: null, body: null, labels: [], recurrence: false, recurrence_count: 0,
+    steward_state, age_days: 1, comments: 0,
+  });
+
+  it("lists only issues the steward has not seen, each promotable to ai-ready after a confirmation", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+      return new Response(JSON.stringify({ ok: true, detail: "ok" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const issues = polled({
+      in_flight: [], pending: [], done: [],
+      backlog: [
+        backlog(71, "raw", "Nobody has looked at this"),
+        backlog(72, "processed", "Already triaged"),
+        backlog(73, "blocked_on_human_reply", "Steward asked a question"),
+      ],
+      gh_ok: true, notifications: [], warnings: [],
+    } as unknown as IssuesPayload);
+    render(<IssuesTab repo="demo" sub="untriaged" issues={issues} onOpenIssue={vi.fn()} />);
+
+    expect(screen.getByText("Nobody has looked at this")).toBeVisible();
+    expect(screen.queryByText("Already triaged")).not.toBeInTheDocument();
+    expect(screen.queryByText("Steward asked a question")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Promote #71 to ai-ready" }));
+    expect(calls).toEqual([]);
+    await userEvent.click(screen.getByRole("button", { name: "Promote #71" }));
+
+    expect(calls).toEqual(["POST /api/repos/demo/issues/71/promote"]);
+    expect(issues.refresh).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("says so when every backlog issue has been seen", () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="untriaged"
+        issues={polled({
+          in_flight: [], pending: [], done: [], backlog: [backlog(72, "processed", "Already triaged")],
+          gh_ok: true, notifications: [], warnings: [],
+        } as unknown as IssuesPayload)}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/nothing untriaged/)).toBeVisible();
+  });
+});

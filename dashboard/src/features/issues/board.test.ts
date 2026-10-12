@@ -1,13 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { IssueCard, IssuesPayload, PendingCard } from "../../api/types";
+import type { BacklogCard, IssueCard, IssuesPayload, PendingCard } from "../../api/types";
 import {
   boardItems,
   countLabel,
   groupItems,
   historyView,
+  isUntriaged,
   overspendOf,
   primaryAction,
   railNodes,
+  railSummary,
   waitCell,
   waitCompact,
   type BoardStatus,
@@ -220,9 +222,27 @@ describe("primaryAction", () => {
       expect(primaryAction(needs(null, ask))?.label).toBe("Open issue");
     }
     expect(primaryAction({ ...queued, on: { kind: "triage", why: "parked" } })?.label).toBe("Unpark");
-    expect(primaryAction({ ...queued, on: { kind: "triage", why: "awaiting_reply" } })?.label).toBe("Set priority");
+    expect(primaryAction({ ...queued, on: { kind: "triage", why: "awaiting_reply" } })?.label).toBe("Promote to ai-ready");
     expect(primaryAction(queued)).toBeNull();
     expect(primaryAction({ ...queued, on: { kind: "issue", issue: 4 } })).toBeNull();
     expect(primaryAction(working)).toBeNull();
+  });
+});
+
+describe("the rail in words", () => {
+  it("names the current stage with its count, then every other count", () => {
+    expect(railSummary(railNodes(rail({ current: "review", furthest: "ci", review_rounds: 5, ci_runs: 3, resolve_attempts: 2 }))))
+      .toBe("Review, round 5; Resolve 2 attempts; CI 3 runs");
+    expect(railSummary(railNodes(rail({ current: "triage", furthest: "triage", review_rounds: 0, resolve_attempts: 0 }))))
+      .toBe("Triage");
+  });
+});
+
+describe("isUntriaged", () => {
+  it("is only a backlog issue the steward has not seen", () => {
+    const backlog = (steward_state: string) => ({ steward_state }) as BacklogCard;
+    expect(isUntriaged(backlog("raw"))).toBe(true);
+    expect(isUntriaged(backlog("processed"))).toBe(false);
+    expect(isUntriaged(backlog("blocked_on_human_reply"))).toBe(false);
   });
 });

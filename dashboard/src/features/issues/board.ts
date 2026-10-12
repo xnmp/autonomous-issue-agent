@@ -13,7 +13,7 @@ import type {
 } from "../../api/types";
 import type { components } from "../../api/generated";
 import { parseTs } from "../../lib/format";
-import { CANONICAL, type RailNode } from "../../components/ui/LifecycleStepper";
+import { CANONICAL, railSummary, type RailNode } from "../../components/ui/LifecycleStepper";
 
 type Schema = components["schemas"];
 
@@ -279,6 +279,7 @@ export function overspendOf(card: IssueCard | null): Overspend | null {
 /* ------------------------------------------------------------ the rail */
 
 export type { RailNode };
+export { railSummary };
 
 const UNIT: Partial<Record<StageId, string>> = { resolve: "attempt", review: "round", ci: "run" };
 const HOT: Partial<Record<StageId, { at: number; tip: string }>> = {
@@ -322,6 +323,13 @@ export function railNodes(rail: StageRail): RailNode[] {
       hotTip: isHot ? hot.tip : null,
     };
   });
+}
+
+/* ------------------------------------------------------------ untriaged */
+
+/** A backlog issue the steward has not looked at yet (no ai-triage label). */
+export function isUntriaged(card: BacklogCard): boolean {
+  return card.steward_state === "raw";
 }
 
 /* ------------------------------------------------------------ history */
@@ -392,7 +400,7 @@ export type PrimaryAction =
   | { kind: "open_issue"; label: "Open issue" }
   | { kind: "open_pr"; label: "Open PR" }
   | { kind: "unpark"; label: "Unpark" }
-  | { kind: "set_priority"; label: "Set priority" };
+  | { kind: "promote"; label: "Promote to ai-ready" };
 
 /**
  * At most one action per row, and only where the operator is what moves it:
@@ -414,7 +422,7 @@ export function primaryAction(board: BoardStatus): PrimaryAction | null {
   if (board.status === "blocked" && board.on.kind === "triage") {
     return board.on.why === "parked"
       ? { kind: "unpark", label: "Unpark" }
-      : { kind: "set_priority", label: "Set priority" };
+      : { kind: "promote", label: "Promote to ai-ready" };
   }
   return null;
 }

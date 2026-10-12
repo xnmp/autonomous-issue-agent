@@ -194,10 +194,10 @@ describe("LifecycleStepper", () => {
       { id: "merge", label: "Merge", state: "future", count: null, hot: false, hotTip: null },
     ].map((node) => overrides[node.id] ?? node) as RailNode[];
 
-    it("always draws the five stages and names the current one", () => {
+    it("always draws the five stages and names the current one with every count", () => {
       render(<LifecycleStepper rail={rail()} tone="ok" live={false} label="Issue #7 stage" />);
 
-      const list = screen.getByRole("list", { name: "Issue #7 stage: Review" });
+      const list = screen.getByRole("list", { name: "Issue #7 stage: Review, round 5; CI 2 runs" });
       expect(Array.from(list.querySelectorAll("li")).map((node) => node.textContent)).toEqual([
         "Triage", "Resolve", "Reviewround 5", "CI2 runs", "Merge",
       ]);

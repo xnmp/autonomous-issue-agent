@@ -38,7 +38,7 @@ import {
   usd,
 } from "../lib/format";
 import { shortModel } from "../lib/models";
-import { boardItems, matchesQuery } from "../features/issues/board";
+import { boardItems, isUntriaged, matchesQuery } from "../features/issues/board";
 import { Chip } from "./ui/Chip";
 import { StepBadge } from "./ui/StepBadge";
 import { TableFilter } from "./ui/TableFilter";
@@ -48,7 +48,7 @@ import {
   useSortedRows,
   type TableColumn,
 } from "./ui/ResizableTable";
-import { ConfirmModal } from "./ui/Modal";
+import { PromoteConfirm } from "./PromoteConfirm";
 import {
   EmptyState,
   ErrorBanner,
@@ -73,8 +73,11 @@ interface IssuesTabProps {
   showDurationSeconds?: boolean;
 }
 
-/** The two table sub-tabs; the in-flight board has no optional columns. */
-type TableSub = Exclude<IssuesSub, "inflight">;
+/**
+ * The two column sets; the in-flight board has none, and the untriaged list
+ * is the backlog table over the issues the steward has not looked at yet.
+ */
+type TableSub = "done" | "backlog";
 type Visibility = Record<TableSub, Record<string, boolean>>;
 
 const COLUMN_STORAGE = "issue-agent.dashboard.columns";
@@ -143,19 +146,21 @@ export function IssuesTab({
     inflight: "",
     done: "",
     backlog: "",
+    untriaged: "",
   });
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
+  const table: TableSub | null = sub === "inflight" ? null : sub === "untriaged" ? "backlog" : sub;
   const query = queries[sub];
   const normalizedQuery = query.trim().toLowerCase();
   const visible = useMemo(
     () => new Set(
-      sub === "inflight"
+      table === null
         ? []
-        : Object.entries(visibility[sub]).filter(([, shown]) => shown).map(([key]) => key),
+        : Object.entries(visibility[table]).filter(([, shown]) => shown).map(([key]) => key),
     ),
-    [sub, visibility],
+    [table, visibility],
   );
   // In-flight, queued and triage-blocked backlog rows are one board; the
   // server already decided each row's group.
@@ -172,19 +177,30 @@ export function IssuesTab({
     () => filterCards(data?.backlog ?? [], normalizedQuery),
     [data?.backlog, normalizedQuery],
   );
-  const sourceCount = sub === "inflight"
-    ? allBoard.length
-    : sub === "done" ? (data?.done.length ?? 0) : (data?.backlog.length ?? 0);
-  const filteredCount = sub === "inflight"
-    ? filteredBoard.length
-    : sub === "done" ? filteredDone.length : filteredBacklog.length;
+  const untriaged = useMemo(() => (data?.backlog ?? []).filter(isUntriaged), [data?.backlog]);
+  const filteredUntriaged = useMemo(
+    () => filterCards(untriaged, normalizedQuery),
+    [untriaged, normalizedQuery],
+  );
+  const sourceCount = {
+    inflight: allBoard.length,
+    done: data?.done.length ?? 0,
+    backlog: data?.backlog.length ?? 0,
+    untriaged: untriaged.length,
+  }[sub];
+  const filteredCount = {
+    inflight: filteredBoard.length,
+    done: filteredDone.length,
+    backlog: filteredBacklog.length,
+    untriaged: filteredUntriaged.length,
+  }[sub];
   const hasMatches = !normalizedQuery || filteredCount > 0;
   // Persisted by the handler, never by the state updater: React may invoke an
   // updater more than once for a single click, and a reducer that writes to
   // storage is not a pure function of its input.
   const setColumn = (key: string, shown: boolean) => {
-    if (sub === "inflight") return;
-    const next = { ...visibility, [sub]: { ...visibility[sub], [key]: shown } };
+    if (table === null) return;
+    const next = { ...visibility, [table]: { ...visibility[table], [key]: shown } };
     setVisibility(next);
     try {
       localStorage.setItem(COLUMN_STORAGE, JSON.stringify(next));
@@ -193,7 +209,7 @@ export function IssuesTab({
     }
   };
   const openColumnMenu = (event: MouseEvent<HTMLDivElement>) => {
-    if (sub === "inflight") return;
+    if (table === null) return;
     if (!(event.target instanceof Element) || !event.target.closest("th")) return;
     event.preventDefault();
     setColumnMenuAt({
@@ -211,12 +227,12 @@ export function IssuesTab({
       {/* The visible <h1> was removed by design; screen-reader heading
           navigation still needs the page identified. */}
       <h1 className="sr-only">
-        {sub === "inflight" ? "In-flight issues" : sub === "done" ? "Done issues" : "Backlog"}
+        {{ inflight: "In-flight issues", done: "Done issues", backlog: "Backlog", untriaged: "Untriaged issues" }[sub]}
       </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
-      {sub !== "inflight" ? (
+      {table !== null ? (
         <ColumnMenu
-          columns={COLUMN_CHOICES[sub]}
+          columns={COLUMN_CHOICES[table]}
           visible={visible}
           onChange={setColumn}
           position={columnMenuAt}
@@ -274,6 +290,23 @@ export function IssuesTab({
           visible={visible}
           onRefresh={issues.refresh}
           onPromotion={onBacklogPromotion}
+        />
+      ) : null}
+
+      {/* Untriaged issues are on neither the board (it holds in-flight and
+          queued work) nor hidden: promoting one is the triage decision. */}
+      {sub === "untriaged" && hasMatches ? (
+        <BacklogTable
+          repo={repo}
+          cards={filteredUntriaged}
+          loading={issues.loading}
+          ghOk={ghOk}
+          visible={visible}
+          onRefresh={issues.refresh}
+          onPromotion={onBacklogPromotion}
+          storageKey="issues-untriaged"
+          promoteLabel="Promote to ai-ready"
+          emptyText="nothing untriaged: the steward has seen every backlog issue"
         />
       ) : null}
     </div>
@@ -420,6 +453,9 @@ function BacklogTable({
   visible,
   onRefresh,
   onPromotion,
+  storageKey = "issues-backlog",
+  promoteLabel,
+  emptyText,
 }: {
   repo: string;
   cards: BacklogCard[];
@@ -428,6 +464,10 @@ function BacklogTable({
   visible: ReadonlySet<string>;
   onRefresh: () => void;
   onPromotion: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
+  storageKey?: string;
+  /** A labelled promote button where promoting is the row's one action. */
+  promoteLabel?: string;
+  emptyText?: string;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [promote, setPromote] = useState<BacklogCard | null>(null);
@@ -443,10 +483,10 @@ function BacklogTable({
     age: (card) => card.age_s ?? (card.age_days === null ? null : card.age_days * 86_400),
     comments: (card) => card.comments,
     labels: (card) => card.labels.join(" "),
-  }, { key: "issue", direction: "asc" }, "issues-backlog", sortableAndShown);
+  }, { key: "issue", direction: "asc" }, storageKey, sortableAndShown);
   if (loading) return <SkeletonRows what="backlog" rows={5} />;
   if (cards.length === 0) {
-    return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
+    return <EmptyState>{ghOk ? (emptyText ?? "no unlabelled open issues — the backlog is clear") : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
   }
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue", width: 350 },
@@ -483,7 +523,7 @@ function BacklogTable({
       {error ? <ErrorBanner message={error} /> : null}
       <div className="tbl-wrap panel">
         <ResizableTable
-          storageKey="issues-backlog"
+          storageKey={storageKey}
           columns={columns}
           className="issue-list-table"
           sort={sorted.sort}
@@ -510,7 +550,7 @@ function BacklogTable({
                           <div className="row-wrap">
                             <IssueNumber issue={card.issue} url={card.url} />
                             <button
-                              className="btn btn-xs promote-icon"
+                              className={promoteLabel ? "btn btn-xs btn-primary" : "btn btn-xs promote-icon"}
                               title={`Promote #${card.issue} to ai-ready`}
                               aria-label={`Promote #${card.issue} to ai-ready`}
                               onClick={(event) => {
@@ -519,7 +559,7 @@ function BacklogTable({
                                 setPromote(card);
                               }}
                             >
-                              ↑
+                              {promoteLabel ?? "↑"}
                             </button>
                           </div>
                           <span
@@ -590,18 +630,11 @@ function BacklogTable({
       </div>
 
       {promote ? (
-        <ConfirmModal
-          title="Promote to ai-ready"
-          confirmLabel={`Promote #${promote.issue}`}
-          busy={false}
+        <PromoteConfirm
+          issue={promote.issue}
+          title={promote.title}
           onConfirm={() => void doPromote()}
           onCancel={() => setPromote(null)}
-          body={
-            <>
-              <p>Add the <span className="mono">ai-ready</span> label to <strong className="mono">#{promote.issue}</strong>{promote.title ? ` — ${promote.title}` : ""}?</p>
-              <p className="muted">The fixer picks up ai-ready issues on its next tick and will start spending.</p>
-            </>
-          }
         />
       ) : null}
     </>

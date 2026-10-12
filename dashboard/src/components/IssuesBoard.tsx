@@ -1,7 +1,7 @@
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { useMemo, useState } from "react";
 import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
-import type { IssueCard, Priority } from "../api/types";
+import type { IssueCard } from "../api/types";
 import {
   COLUMN_HEADINGS,
   GROUP_META,
@@ -35,6 +35,7 @@ import { ResolveControls } from "./resolve/ResolveControls";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { tipProps } from "./ui/Tip";
 import { ErrorBanner, SkeletonRows } from "./ui/Feedback";
+import { PromoteConfirm } from "./PromoteConfirm";
 import "./issues-board.css";
 
 /** The reader's display options, from the options menu. */
@@ -170,23 +171,31 @@ function BoardRow({
   const wait = waitCell(board, nowMs);
   const overspend = overspendOf(item.card);
   const drawerId = `board-drawer-${item.issue}`;
+  // The title button is described by what a sighted reader scans across the
+  // row: the headline and reason, the rail (its label names every count) and
+  // the wait under its column heading.
+  const ids = ["say", "rail", "waithead", "wait"].map((part) => `board-row-${item.issue}-${part}`);
+  const [sayId, railId, waitHeadId, waitId] = ids;
   const live = board.status === "working" && board.activity === "agent";
   return (
     <div className={`board-item${open ? " open" : ""}`}>
-      <div
-        className="board-row board-grid"
-        role="button"
-        tabIndex={0}
-        aria-label={`Issue #${item.issue}${item.title ? `: ${item.title}` : ""}`}
-        aria-expanded={open}
-        aria-controls={open ? drawerId : undefined}
-        onClick={onToggle}
-        onKeyDown={(event) => toggleFromKeyboard(event, onToggle)}
-      >
+      {/* The whole row toggles for a pointer; the title is the disclosure
+          button for keyboards and assistive tech, so the issue and PR links
+          beside it are siblings rather than controls nested in a button. */}
+      <div className="board-row board-grid" onClick={onToggle}>
         <div className="board-issue">
-          <div className="board-title" title={item.title ?? undefined}>
-            {item.title ?? <span className="faint">title unavailable</span>}
-          </div>
+          <button
+            type="button"
+            className="board-title-btn"
+            aria-expanded={open}
+            aria-controls={open ? drawerId : undefined}
+            aria-describedby={ids.join(" ")}
+          >
+            <span className="board-title" title={item.title ?? undefined}>
+              {item.title ?? <span className="faint">title unavailable</span>}
+            </span>
+          </button>
+          <span id={waitHeadId} className="sr-only">{COLUMN_HEADINGS[board.status].wait}:</span>
           <div className="board-refs">
             <IssueLink issue={item.issue} url={item.url} />
             {item.pr !== null ? <PrNumber pr={item.pr} url={item.prUrl} /> : null}
@@ -200,7 +209,7 @@ function BoardRow({
             ) : null}
           </div>
         </div>
-        <div className={`board-say${operatorOwned(board) ? " board-say-owned" : ""}`}>
+        <div id={sayId} className={`board-say${operatorOwned(board) ? " board-say-owned" : ""}`}>
           <span className="board-headline">{board.headline}</span>
           <span className="board-reason">{board.reason}</span>
         </div>
@@ -211,10 +220,12 @@ function BoardRow({
               tone={GROUP_META[board.status].tone}
               live={item.rail.live || live}
               label={`Issue #${item.issue} stage`}
+              id={railId}
             />
           ) : <span className="faint">—</span>}
         </div>
         <span
+          id={waitId}
           className={`board-wait num${wait.stale ? " board-wait-stale" : ""}${wait.text === "queued" ? " faint" : ""}`}
           {...(wait.title ? tipProps(wait.title) : {})}
         >
@@ -461,14 +472,16 @@ function ActionControl({
   const [revealed, setRevealed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const run = async (write: () => Promise<unknown>) => {
+  const run = async (write: () => Promise<unknown>): Promise<boolean> => {
     setBusy(true);
     setError(null);
     try {
       await write();
       onChanged();
+      return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -497,29 +510,24 @@ function ActionControl({
           {error ? <ErrorBanner message={error} /> : null}
         </>
       );
-    case "set_priority":
+    case "promote":
+      // ai-ready is what moves a triage-blocked issue: the fixer admits it
+      // on its next tick, so the row leaves Blocked.
       return (
         <>
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => setRevealed(true)}>
+            {action.label}
+          </button>
           {revealed ? (
-            <div className="seg" role="group" aria-label="Set priority">
-              {(["P1", "P2", "P3"] as Priority[]).map((priority) => (
-                <button
-                  key={priority}
-                  type="button"
-                  className="seg-btn"
-                  disabled={busy}
-                  onClick={() => void run(() => api.setPriority(repo, item.issue, priority))}
-                >
-                  {priority}
-                </button>
-              ))}
-            </div>
-          ) : (
-            <button type="button" className="btn btn-primary" onClick={() => setRevealed(true)}>
-              {action.label}
-            </button>
-          )}
-          {error ? <ErrorBanner message={error} /> : null}
+            <PromoteConfirm
+              issue={item.issue}
+              title={item.title}
+              busy={busy}
+              error={error}
+              onConfirm={() => void run(() => api.promote(repo, item.issue)).then((ok) => ok && setRevealed(false))}
+              onCancel={() => setRevealed(false)}
+            />
+          ) : null}
         </>
       );
     case "rearm":
@@ -590,18 +598,4 @@ function PrNumber({ pr, url }: { pr: number; url: string | null }) {
       PR #{pr}
     </a>
   );
-}
-
-function toggleFromKeyboard(event: KeyboardEvent<HTMLElement>, toggle: () => void) {
-  if (
-    event.target instanceof Element
-    && event.target !== event.currentTarget
-    && event.target.closest("a, button, input, select, textarea, [role='button']")
-  ) {
-    return;
-  }
-  if (event.key === "Enter" || event.key === " ") {
-    event.preventDefault();
-    toggle();
-  }
 }

@@ -860,7 +860,7 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
   await expect(activeIssueRow.locator(".board-headline")).toHaveText("Answer the agent");
   await expect(activeIssueRow.getByText("round 4")).toHaveAttribute("data-tip", "4 or more review rounds: above typical");
   await activeIssueRow.click();
-  await expect(activeIssueRow).toHaveAttribute("aria-expanded", "true");
+  await expect(activeIssueRow.locator(".board-title-btn")).toHaveAttribute("aria-expanded", "true");
   await expect(page.locator("body")).not.toContainText("↗");
   const mainbodyDimensions = await page.locator(".mainbody").evaluate((element) => ({
     clientWidth: element.clientWidth,

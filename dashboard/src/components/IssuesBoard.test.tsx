@@ -205,6 +205,33 @@ describe("issues board groups", () => {
 });
 
 describe("issues board row", () => {
+  it("makes the title the disclosure button, described by the headline, reason, stage and wait", async () => {
+    stubFetch();
+    renderBoard({
+      in_flight: [card(145, needs("budget", "2026-10-12T11:00:00Z", "Approve spend or close"), {
+        pr: 61, pr_url: "https://github.com/o/r/pull/61",
+        rail: rail({ current: "review", furthest: "ci", review_rounds: 5, ci_runs: 3 }),
+      })],
+    });
+
+    const toggle = screen.getByRole("button", { name: "Issue 145 title" });
+    // Browsers read the rail by its label and jsdom by its text; either way
+    // the description carries the headline, reason, counts and wait.
+    expect(toggle).toHaveAccessibleDescription(
+      /^Approve spend or close reason for Approve spend or close .*Review,? round 5.*CI,? 3 runs.* Waiting: 1h$/,
+    );
+    // The issue and PR links sit beside the button, never inside it.
+    expect(toggle.querySelector("a, button")).toBeNull();
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    toggle.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-controls", "board-drawer-145");
+    await userEvent.keyboard(" ");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
   it("flags overspend from twice the projection, with the exact figures in its tooltip", () => {
     stubFetch();
     renderBoard({
@@ -229,7 +256,7 @@ describe("issues board row", () => {
     expect(screen.getByText(long)).toHaveAttribute("title", long);
     expect(screen.getByRole("link", { name: "#160" })).toHaveAttribute("href", "https://github.com/o/r/issues/160");
     await userEvent.click(screen.getByRole("link", { name: "PR #61" }));
-    expect(row(long)).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByRole("button", { name: long })).toHaveAttribute("aria-expanded", "false");
   });
 
   it("draws the rail counts, amber thresholds and a rewound stage", () => {
@@ -287,7 +314,7 @@ describe("issues board drawer", () => {
       />,
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Issue #185: Issue 185 title" }));
+    await userEvent.click(screen.getByRole("button", { name: "Issue 185 title" }));
     await userEvent.click(within(document.getElementById("board-drawer-185") as HTMLElement)
       .getByRole("button", { name: "Open full issue" }));
 
@@ -404,7 +431,7 @@ describe("issues board actions", () => {
     expect(refresh).toHaveBeenCalled();
   });
 
-  it("sets a priority on a triage question through the priority endpoint", async () => {
+  it("promotes a triage question to ai-ready through the promote endpoint, after a confirmation", async () => {
     const calls = stubFetch();
     renderBoard({
       backlog: [{
@@ -416,12 +443,13 @@ describe("issues board actions", () => {
     });
 
     await userEvent.click(row("Asked a question"));
-    await userEvent.click(screen.getByRole("button", { name: "Set priority" }));
-    await userEvent.click(screen.getByRole("button", { name: "P2" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready" }));
+    expect(calls.filter(({ method }) => method === "POST")).toEqual([]);
+    await userEvent.click(screen.getByRole("button", { name: "Promote #230" }));
 
     const writes = calls.filter(({ method }) => method === "POST");
-    expect(writes.map(({ url }) => url)).toEqual(["/api/repos/demo/issues/230/priority"]);
-    expect(writes[0]?.body).toContain("P2");
+    expect(writes.map(({ url }) => url)).toEqual(["/api/repos/demo/issues/230/promote"]);
+    await vi.waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
   it("re-arms through the issue's guarded resolve controls, never a direct write", async () => {

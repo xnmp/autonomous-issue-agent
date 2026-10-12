@@ -67,6 +67,14 @@ function card(issue: number, title: string, over: Record<string, unknown>) {
   };
 }
 
+function untriaged(issue: number, title: string, labels: string[], ageDays: number) {
+  return {
+    issue, title, url: `https://github.com/openai/autonomous-issue-agent/issues/${issue}`, body: null, labels,
+    recurrence: false, recurrence_count: 0, steward_state: "raw", age_days: ageDays, age_s: ageDays * 86_400,
+    comments: 0, issue_type: null, difficulty: null, impact: null, board: null, rail: null,
+  };
+}
+
 const pr = (n: number) => ({ pr: n, pr_url: `https://github.com/openai/autonomous-issue-agent/pull/${n}`, pr_state: "open" });
 
 const boardIssues = {
@@ -131,7 +139,14 @@ const boardIssues = {
     },
   ],
   done: [],
-  backlog: [],
+  backlog: [
+    untriaged(1101, "settings: remember the last opened folder per window", ["enhancement"], 3),
+    untriaged(1102, "crash when dragging a tab onto a closed window on macOS", ["bug"], 0),
+    {
+      ...untriaged(1103, "already triaged: acceptance criteria and a test plan written", ["ai-triage"], 6),
+      steward_state: "processed",
+    },
+  ],
   gh_ok: true,
   notifications: [],
   warnings: [],
@@ -324,4 +339,38 @@ test("captures the board at phone width with a drawer open", async ({ page }) =>
   await expect(page.locator("#board-drawer-1082")).toBeVisible();
   await noSidewaysScroll(page);
   await page.screenshot({ path: "../evidence/dashboard-issues-board-phone.png", fullPage: true, animations: "disabled" });
+});
+
+test("opens a row from the keyboard through its title button", async ({ page }) => {
+  await openBoard(page);
+  const toggle = boardRow(page, "window-transfer-lifetime").getByRole("button", { name: /window-transfer-lifetime/ });
+
+  await toggle.focus();
+  await page.keyboard.press("Enter");
+
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator("#board-drawer-710")).toBeVisible();
+  await expect(toggle).toHaveAccessibleDescription(
+    /^Re-arm or close Resolve failed 3× without opening a PR\. .*Resolve,? attempt 3.* Waiting: 30d$/,
+  );
+});
+
+test("lists untriaged backlog issues on their own tab, off the board, each promotable", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openBoard(page);
+  await expect(page.getByRole("tab", { name: /Untriaged/ })).toContainText("2");
+  await expect(page.locator(".board-row", { hasText: "remember the last opened folder" })).toHaveCount(0);
+
+  await page.getByRole("tab", { name: /Untriaged/ }).click();
+  await expect(page.getByText("remember the last opened folder per window")).toBeVisible();
+  await expect(page.getByText("crash when dragging a tab")).toBeVisible();
+  await expect(page.getByText("already triaged")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Promote #1101 to ai-ready" })).toHaveText("Promote to ai-ready");
+  await noSidewaysScroll(page);
+  await page.screenshot({ path: "../evidence/dashboard-issues-untriaged.png", fullPage: true, animations: "disabled" });
+
+  await page.getByRole("button", { name: "Promote #1101 to ai-ready" }).click();
+  const promoted = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/issues/1101/promote"));
+  await page.getByRole("button", { name: "Promote #1101", exact: true }).click();
+  await promoted;
 });

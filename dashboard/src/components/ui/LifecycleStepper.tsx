@@ -253,6 +253,16 @@ export interface RailNode {
 
 export type RailTone = "fail" | "ok" | "muted";
 
+/** The rail in words: the current stage with its count, then every other count. */
+export function railSummary(nodes: readonly RailNode[]): string {
+  const current = nodes.find((node) => node.state === "current");
+  const here = current ? [current.label, current.count].filter(Boolean).join(", ") : "unknown";
+  const elsewhere = nodes
+    .filter((node) => node.state !== "current" && node.count)
+    .map((node) => `${node.label} ${node.count}`);
+  return [here, ...elsewhere].join("; ");
+}
+
 interface StepsProps {
   steps: TimelineStep[];
   stage?: string | null;
@@ -272,6 +282,8 @@ interface RailProps {
   /** A leg is running: the current node pulses. */
   live: boolean;
   label?: string;
+  /** For a row control that names the rail in its description. */
+  id?: string;
 }
 
 /**
@@ -282,10 +294,10 @@ export function LifecycleStepper(props: StepsProps | RailProps) {
   return "rail" in props ? <RailStepper {...props} /> : <StepsStepper {...props} />;
 }
 
-function RailStepper({ rail, tone, live, label = "Stage" }: RailProps) {
+function RailStepper({ rail, tone, live, label = "Stage", id }: RailProps) {
   const current = rail.find((node) => node.state === "current");
   return (
-    <ol className={`lifecycle-rail rail-tone-${tone}`} aria-label={`${label}: ${current?.label ?? "unknown"}`}>
+    <ol id={id} className={`lifecycle-rail rail-tone-${tone}`} aria-label={`${label}: ${railSummary(rail)}`}>
       {rail.map((node) => (
         <li
           key={node.id}
