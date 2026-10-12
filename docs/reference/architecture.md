@@ -626,7 +626,7 @@ criteria and closing link when absent, instead of denying the publication),
 (level-triggered retirement of machine-checkable blocks — #180 publication/checks
 blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/steward.py`, `domain/steward_stall.py`,
-`domain/supervision.py`, `domain/terminal_output.py` (pure terminal escape cleanup),
+`domain/supervision.py`,
 `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),

@@ -18,7 +18,6 @@ from ..domain import review_workflow as rw
 from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain.review_evidence import EvidenceSchedule
-from ..domain.review import PostedReview
 from ..domain import review_execution as rx
 from ..domain import review_execution_migration as migration
 from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport
@@ -168,7 +167,6 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
-    PostedReview,
     MachineBlocker, Target, EffectStatus,
     UsageSource, PricingBasis, ChargeOrigin,
     LifecycleOperation,
