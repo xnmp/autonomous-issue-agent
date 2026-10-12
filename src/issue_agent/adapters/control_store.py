@@ -2393,8 +2393,8 @@ CREATE TEMP TABLE retired_review_gates AS
     WHERE g.target_kind='pr' AND (
         g.gate_id LIKE 'ordinary-test:%'
         OR COALESCE(
-            json_extract(g.payload_json,'$.fields.cause.fields.submission_command_id'),
-            json_extract(g.payload_json,'$.fields.gate.fields.cause.fields.submission_command_id')
+            json_extract(g.payload_json,'$.value.fields.cause.fields.submission_command_id'),
+            json_extract(g.payload_json,'$.value.fields.gate.fields.cause.fields.submission_command_id')
         ) IN (
             SELECT command_id FROM lifecycle_commands
             WHERE json_extract(payload_json,'$.event')='REQUEST_CHANGES'

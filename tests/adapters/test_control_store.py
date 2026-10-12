@@ -3730,3 +3730,49 @@ def test_v41_preserves_existing_money_and_only_marks_identifiable_legacy_recover
     assert result.disposition is (AccountingDisposition.AVAILABLE if origin is ChargeOrigin.RECOVERY_ESTIMATE
                                   else AccountingDisposition.CONFLICT)
     assert restarted.snapshot(_scope()).settled == Money("USD", 51 if origin is ChargeOrigin.RECOVERY_ESTIMATE else 50)
+
+
+@pytest.mark.parametrize("rearming", [False, True])
+def test_retiring_synthetic_execution_rejection_keeps_model_verdict_holds(tmp_path, rearming):
+    from issue_agent.adapters.control_store import _encoded_payload_digest
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+    from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
+    from issue_agent.domain.review_rejection import ReviewVerdictHold
+    from issue_agent.domain.workflow import NoAuthorizedRemediation, OpenGate, RearmingGate
+    from tests.domain.test_review_workflow_policy import fresh
+    from tests.fakes.workflow_authority import install_workflow
+
+    store = _store(tmp_path)
+    state = fresh()
+    retired = OpenGate("verdict:test-rejection", state.revision.fence.generation,
+                       ReviewVerdictHold("historical-test-rejection", "a" * 40),
+                       NoAuthorizedRemediation("retired execution evidence"))
+    retained = OpenGate("verdict:model-rejection", state.revision.fence.generation,
+                        ReviewVerdictHold("historical-model-rejection", "a" * 40),
+                        NoAuthorizedRemediation("human judgment"))
+    install_workflow(store, state)
+    with store.transaction() as db:
+        persist_workflow_snapshot(db, dataclasses.replace(state, gates=(retired, retained)))
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 41)
+        op = BoundReviewSubmissionOp(state.revision.fence.key.target.number, "REQUEST_CHANGES", "legacy",
+                                     "a" * 40, "review-bot", "b" * 64, None)
+        payload = json.dumps(dict(op.payload(), test_evidence_ref="legacy"))
+        binding = encode_workflow(state.binding)
+        db.execute(
+            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
+            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
+            "state,created_at,updated_at,workflow_binding_json) "
+            "VALUES ('historical-test-rejection','legacy-key','legacy-key',0,'submit_review',?,"
+            "?,'legacy','o/r','review-owner',?,?,'pending',?,?,?)",
+            (f"pr:{state.revision.fence.key.target.number}", "a" * 40, payload,
+             _encoded_payload_digest(payload, binding), NOW.isoformat(), NOW.isoformat(), binding),
+        )
+        if rearming:
+            db.execute("UPDATE workflow_gates SET state='rearming',payload_json=? WHERE gate_id=?",
+                       (encode_workflow(RearmingGate(retired, "retired-request")), retired.gate_id))
+    store.initialize()
+    with store.transaction() as db:
+        loaded = load_review_workflow_row(db, state.revision.fence.key)
+    assert loaded is not None and loaded.gates == (retained,)
