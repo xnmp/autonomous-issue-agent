@@ -55,6 +55,7 @@ if [ "${1:-}" = "uninstall" ]; then
     patterns=(
       "$LA/dev.issue-agent.fix-watcher.$deployment_id.plist"
       "$LA/dev.issue-agent.review-watcher.$deployment_id.plist"
+      "$LA/dev.issue-agent.steward.$deployment_id.plist"
     )
     if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
       for plist in "$LA"/dev.issue-agent.*.plist; do
@@ -68,6 +69,7 @@ if [ "${1:-}" = "uninstall" ]; then
     patterns=(
       "$LA"/dev.issue-agent.fix-watcher*.plist
       "$LA"/dev.issue-agent.review-watcher*.plist
+      "$LA"/dev.issue-agent.steward*.plist
     )
   fi
   targets=()

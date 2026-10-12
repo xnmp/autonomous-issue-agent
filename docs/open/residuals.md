@@ -85,6 +85,7 @@ self-authored issue.
 
 | Item | Why it's accepted | Where it bites |
 |---|---|---|
+| Migration 44 deletes steward continuation admission/return receipts | The steward role is deleted; settled runs and charges stay, so ledger spend and caps are unaffected | historical measurement/cohort readouts lose steward spend attribution (more `run lacks authoritative admission binding` gaps); measurement is deleted in slice 8a |
 | Push gate: bash denies on an unreadable PR state, Python runs the state checks and allows a clean push | P1R-12 was decided for the Python path only; changing the codex path's fail-closed stance needs its own call | codex mode only; asserted in `tests/test_gate_parity.py` |
 | Commit-arm rule *order* differs between stacks (lint before ordering vs interleaved) | Verdicts are identical, only the reported reason differs | cosmetic; asserted as a parity divergence |
 | `git -C /other/worktree push` is gated against *this* worktree's state | The destination branch is now correct (P1R-10); per-cwd context is a larger change | rare; documented in `_push_gate` |

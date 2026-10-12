@@ -263,31 +263,6 @@ def test_done_marker_after_a_torn_start_remains_terminal():
     assert row.running == ()
 
 
-def test_post_merge_jira_sync_does_not_reopen_a_done_issue():
-    dep = dashboard_domain.build_deployment(
-        "demo",
-        "o/r",
-        feeds(
-            fix=[action("relabel issue #7: +ai-done", ts_min=2)],
-            steward=[
-                run(
-                    ts=at(1),
-                    role="steward",
-                    kind="JIRA_SYNC",
-                    issue=7,
-                    number=7,
-                )
-            ],
-        ),
-        now_fn=_now,
-    )
-    row = next(row for row in dep.issues if row.issue == 7)
-    assert row.done is True
-    assert row.stage == "done"
-    assert dep.metrics.done_issues == 1
-    assert dep.metrics.in_flight_issues == 0
-
-
 def test_router_model_is_not_reported_as_an_issue_execution_model():
     events = [
         run(kind="ROUTE", model="luna"),

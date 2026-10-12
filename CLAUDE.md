@@ -1,8 +1,8 @@
 # autonomous-issue-agent
 
 Headless harness that resolves GitHub issues end-to-end: issue → branch → TDD
-implementation → PR → CI → independent review → merge to `dev`. Three Python
-daemons (`fix`, `review`, `steward`) reconcile GitHub and drive Claude, Codex,
+implementation → PR → CI → independent review → merge to `dev`. Two Python
+daemons (`fix`, `review`) reconcile GitHub and drive Claude, Codex,
 or GLM runtimes.
 
 Start with:
@@ -36,7 +36,8 @@ Guardrails:
 - first-pass approval rate and rounds per PR;
 - escalation and infra-death rate;
 - merges per deployment day for a comparable difficulty mix;
-- recurrence rate (reopened or refiled defects after a harness merge).
+- recurrence rate (reopened or refiled defects after a harness merge),
+  measured from GitHub reopen/refile events (no harness emitter).
 
 Every incident adds a behavioral regression test. Fix the generator/class, not
 only the observed instance. A temporary workaround names the issue or condition

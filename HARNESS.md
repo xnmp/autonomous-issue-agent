@@ -249,6 +249,9 @@ instead of resetting a cap.
 Use `issue-agent install-service` for this cutover: the installers stop every
 legacy role before starting any SQLite-authoritative role, preventing a late
 legacy-ledger append from racing the import.
+Upgrading past the steward removal: before reinstalling, stop/disable/remove any
+`issue-agent-steward-<name>` systemd unit, or unload/remove the steward launchd plist;
+the installers no longer manage it.
 Settlement is idempotent and records currency, integer micros, pricing basis,
 usage provenance, and rate-card identity.
 
@@ -584,8 +587,7 @@ remove an ESCALATE/human hold, renew review execution allowance or erase fix
 leg history. Each supported named release consumes its selected SQL
 cause/revision and existing durable receipt. Legacy label-only unblock does not
 grant unsupported fix retry allowance; requests needing such a grant refuse
-before remote labels/comments. Ordinary selected state comes from SQL, with
-Jira's explicitly retained counter path as the sole runtime exception.
+before remote labels/comments. Ordinary selected state comes from SQL.
 
 ### Resolve family activation (offline, operator-only)
 

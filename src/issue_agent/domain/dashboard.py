@@ -2342,7 +2342,7 @@ def board_status(facts: BoardFacts) -> BoardStatus:
       9. otherwise the harness owns the next move.
     """
     triage = facts.triage
-    if triage is not None and triage.why == "parked":
+    if triage is not None:
         return Blocked(
             OnTriage("parked"),
             "Waiting on triage",

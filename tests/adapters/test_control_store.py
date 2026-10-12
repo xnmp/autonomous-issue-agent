@@ -3941,3 +3941,78 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
         assert db.execute("SELECT run_id FROM leases").fetchall() == []
         assert sorted(row[0] for row in db.execute("SELECT event_id FROM event_outbox")) == [
             "fix-pending", "steward-emitted"]
+
+
+def test_migration_44_rewrites_steward_out_of_episode_json_on_both_branches(tmp_path):
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+
+    store = _store(tmp_path)
+    install_workflow(store, resolve_snapshot(7))
+    install_workflow(store, resolve_snapshot(8))
+    fake = {"type": "ActiveSteward", "fields": {"identity": {"type": "X", "fields": {}}}}
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 43)
+        rows = {n: json.loads(e) for n, e in db.execute("SELECT target_number,episode_json FROM workflows")}
+        pair = rows[7]["value"]
+        collapsing = {"format": 1, "value": {"type": "IssueFamilyEpisodes", "fields": {
+            "authority": pair[0], "episode": pair[1],
+            "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}}, "steward": fake}}}
+        shell = {"format": 1, "value": {"type": "IssueWorkflowShell", "fields": {
+            "authority": "a", "issue_recovery": {"type": "ActiveIssueRecovery", "fields": {}}, "steward": fake}}}
+        db.execute("UPDATE workflows SET episode_json=? WHERE target_number=7", (json.dumps(collapsing, separators=(",", ":")),))
+        db.execute("UPDATE workflows SET episode_json=? WHERE target_number=8", (json.dumps(shell, separators=(",", ":")),))
+        original_pair = json.dumps(rows[7], separators=(",", ":"))
+    store.initialize()
+    with sqlite3.connect(store.path) as db:
+        after = dict(db.execute("SELECT target_number,episode_json FROM workflows"))
+    assert json.loads(after[7]) == json.loads(original_pair)
+    kept = json.loads(after[8])["value"]
+    assert "steward" not in kept["fields"] and kept["fields"]["issue_recovery"]["type"] == "ActiveIssueRecovery"
+
+
+def test_migration_44_releases_unstarted_and_unreconciled_steward_runs(tmp_path):
+    store = _store(tmp_path)
+    steward = "o/r:steward:x"
+    for index, cap in ((1, 100), (2, 200)):
+        assert store.reserve(dataclasses.replace(_request(index, cap=cap), owner_id=steward)).admitted
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 43)
+        db.execute("UPDATE runs SET state='completed', outcome='spend_unreconciled', started_at=?, completed_at=? "
+                   "WHERE run_id='run-2'", (NOW.isoformat(), NOW.isoformat()))
+        db.execute("UPDATE reservation_recovery SET policy='reconcile_only' WHERE run_id='run-2'")
+    store.initialize()
+    with sqlite3.connect(store.path) as db:
+        assert sorted(db.execute("SELECT r.run_id,r.state,r.outcome,b.state FROM runs r "
+                                 "JOIN budget_reservations b USING(run_id)")) == [
+            ("run-1", "cancelled", "unlaunched_released", "released"),
+            ("run-2", "completed", "spend_unmeasured_released", "released")]
+    store.integrity_check()
+    SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+
+
+def test_cross_scope_adoption_refuses_without_mutation(tmp_path):
+    store = _store(tmp_path)
+    assert store.reserve(dataclasses.replace(_request(1), owner_id="o/r:fix:old")).admitted
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    for wrong_owner in ("elsewhere/repo:fix:old", "o/r:review:old"):
+        with pytest.raises(ValueError):
+            store.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=(wrong_owner,))
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before
+
+
+def test_adopted_existing_process_lease_retry_is_inert(tmp_path):
+    store = _store(tmp_path)
+    request = dataclasses.replace(_request(1), owner_id="o/r:fix:old")
+    assert store.reserve(request).admitted
+    store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
+                                 pid=123, pgid=123, process_start_ticks=456)
+    store.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=("o/r:fix:old",))
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    lease = store.register_process_lease(request.run_id, expected_owner_id="o/r:fix:new",
+                                         pid=123, pgid=123, process_start_ticks=456)
+    assert lease.owner_id == "o/r:fix:new"
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before

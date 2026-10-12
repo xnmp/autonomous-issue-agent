@@ -40,7 +40,7 @@ issue-agent ready <issue-number>   # label an issue ai-ready → the fixer picks
 `issue-agent start` runs in the foreground (Ctrl-C stops everything) and does the
 whole first-run flow: creates `config/shared.env` interactively if absent, detects
 `REPO`/`TARGET_DIR` from the cwd, discovers your `TEST_CMD`, and launches the fix +
-review + steward daemons. `issue-agent doctor` checks prerequisites; `issue-agent
+review daemons. `issue-agent doctor` checks prerequisites; `issue-agent
 status` shows what's running.
 
 **Foreground is the dev / first-run mode.** Once it's proven your config works,
@@ -51,7 +51,7 @@ for details.
 
 ### What you must supply — the reviewer runs as a GitHub App
 
-The fixer acts as **your** `gh auth` login. The **reviewer + steward act as a GitHub
+The fixer acts as **your** `gh auth` login. The **reviewer acts as a GitHub
 App**, not a PAT — GitHub returns *422 "can not approve your own pull request"* if the
 reviewer shares the author's identity, and an App gives a clean second bot with
 short-lived auto-minted tokens. One-time setup:
@@ -69,7 +69,7 @@ short-lived auto-minted tokens. One-time setup:
    FIX_BOT="<your-gh-login>"        # MUST differ from the App (the 422 rule)
    ```
 
-   `REVIEW_BOT`/`STEWARD_BOT` default to `my-reviewer-bot[bot]`, so if you name
+   `REVIEW_BOT` defaults to `my-reviewer-bot[bot]`, so if you name
    your App that you need only supply the key file. Otherwise set them to your App's
    login. See [`config/shared.example.env`](config/shared.example.env) for the full
    annotated template, and [HARNESS.md](HARNESS.md) for the operator's manual.
@@ -88,8 +88,8 @@ that environment (nothing is hardcoded). Two ways to provide it:
 
 Either way this bills **your** Anthropic account/quota — the reviewer is *not* a
 separately-metered LLM identity (unlike its distinct GitHub App). A long-running
-three-daemon deployment can consume meaningful token spend; the per-agent budget caps
-(`MAX_BUDGET_USD`, `REVIEW_BUDGET_USD`, `STEWARD_TRIAGE_BUDGET_USD`) bound each run.
+two-daemon deployment can consume meaningful token spend; the per-agent budget caps
+(`MAX_BUDGET_USD`, `REVIEW_BUDGET_USD`) bound each run.
 
 ## Document map
 

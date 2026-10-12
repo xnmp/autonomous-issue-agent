@@ -13,8 +13,6 @@ continuity writers. A2 whole-system acceptance and Phase 6's declared policy/
 independent-execution contracts are complete. Phase 5's offline contracts and
 live cutover are verified; actual unattended windows and readout remain pending.
 Current evidence is in the [execution record](../open/2026-10-05-phase-5-live-execution.md).
-Jira's explicitly retained legacy counter path is the sole
-runtime exception; its mirror context remains advisory.
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
 harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
@@ -75,7 +73,7 @@ tests pass.
    exclusively, so an old mutation either completes before retirement or fails
    its owner check after it. Peer effects remain concurrent and no SQLite
    transaction spans network I/O. This includes
-   CLI/dashboard labels, bootstrap settings, base-branch creation, Jira sync,
+   CLI/dashboard labels, bootstrap settings, base-branch creation,
    and webhook relay lifecycle. Paid agents publish branches and open PRs
    through `issue-agent-publish`; `AgentPublicationBroker` commits
    intent before the network call and reconciles remote state before retrying an
@@ -362,8 +360,7 @@ that matters is not "wrong answer" but "loop that bills forever":
   machine end. Nothing is stored for it, and only the money caps bound the
   retries. Pre-admission refusals mint no run, so they retry each poll at $0.
 - `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — the reviewer's ceiling on paid rounds that
-  advanced nothing. `MAX_INFRA_DEATHS` survives only as the steward lanes'
-  ceiling and dies with the steward.
+  advanced nothing.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices streamed rollout counters and kills the process group on
   crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
@@ -495,7 +492,7 @@ is the sole env/coercion/choice table, drives `from_env`, and generates
 `config/agent.env.example`. The immutable config snapshot hash is recorded on
 every reservation and lifecycle command.
 
-Untrusted repository, issue, review, CI, and Jira text crosses into planners as
+Untrusted repository, issue, review, and CI text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
 Target `AGENTS.md` and `CLAUDE.md` files share one byte ceiling and one encoded
 untrusted block appended only to the user task for both providers. Codex
@@ -575,7 +572,7 @@ narrow conditions under which it may state a verdict rather than facts),
 `domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
 `domain/governor_policy.py`, `domain/git_remote.py`, `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
-legs), `domain/jira.py`,
+legs),
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,

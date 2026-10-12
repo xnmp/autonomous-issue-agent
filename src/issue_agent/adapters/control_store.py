@@ -2472,10 +2472,12 @@ DELETE FROM dedupe_keys WHERE namespace='fix-budget-refusal';
     # The steward role is deleted. Its family authority, components, commands,
     # dispatch claims, run admissions/returns and one-shot keys are retired by
     # deletion, never parsed; issue aggregates drop their steward component.
-    # Settled steward runs and charges stay, so spend history is unchanged. No
-    # steward daemon remains to reconcile its own unfinished runs, so they are
-    # abandoned and their holds released unmeasured, as the stale-hold release
-    # does; their pending telemetry has no flusher left.
+    # Settled steward runs and charges stay. No steward daemon remains to
+    # reconcile its own unfinished runs: never-launched ones (spawn_pending)
+    # become cancelled/unlaunched_released, as every never-launched release
+    # does; completed-unreconciled ones get the stale-hold-release treatment
+    # (hold released, outcome spend_unmeasured_released). Other unfinished runs
+    # are abandoned. Pending telemetry has no flusher.
     SchemaMigration(44, """
 CREATE TEMP TABLE retired_steward_commands AS
     SELECT command_id FROM lifecycle_commands
@@ -2500,11 +2502,18 @@ DELETE FROM dispatch_claim_runs WHERE role='steward';
 DELETE FROM dispatch_claims WHERE role='steward';
 CREATE TEMP TABLE retired_steward_runs AS
     SELECT run_id FROM runs WHERE owner_id LIKE '%:steward' OR owner_id LIKE '%:steward:%';
+UPDATE runs SET state='cancelled', outcome='unlaunched_released',
+    completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+WHERE run_id IN (SELECT rr.run_id FROM reservation_recovery rr JOIN retired_steward_runs USING(run_id)
+                 JOIN runs r USING(run_id) JOIN budget_reservations b USING(run_id)
+                 WHERE rr.policy='spawn_pending' AND b.state='active' AND r.provider_receipt_id IS NULL AND r.started_at IS NULL
+                 AND r.state NOT IN ('completed','cancelled','abandoned'));
 UPDATE runs SET outcome='spend_unmeasured_released',
     state=CASE WHEN state IN ('completed','cancelled','abandoned') THEN state ELSE 'abandoned' END,
     completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 WHERE run_id IN (SELECT b.run_id FROM budget_reservations b JOIN retired_steward_runs USING(run_id)
-                 WHERE b.state='active');
+                 WHERE b.state='active')
+    AND NOT(state='cancelled' AND outcome IS 'unlaunched_released');
 UPDATE runs SET state='abandoned', outcome=COALESCE(outcome,'dead_lease'),
     completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 WHERE run_id IN (SELECT run_id FROM retired_steward_runs)

@@ -164,8 +164,7 @@ run family:
    "first_pass_rate": 0.6, "rounds_per_pr": 1.4, "escalations": 0,
    "recurrences": 0, "spend_blocks": 0, "today_usd": ...,
    "by_kind": [{ "kind": "RESOLVE", "usd": 13.2, "runs": 4 }] },
-  "cost_mix": { "resolve_usd": ..., "review_usd": ..., "repair_usd": ...,
-                "steward_usd": ... },
+  "cost_mix": { "resolve_usd": ..., "review_usd": ..., "repair_usd": ... },
   "caps": { "issue_cap_usd": ..., "daily_cap_usd": ..., "today_usd": ... },
   "health": [ ...same role objects as /api/repos... ],
   "health_trend": [{ "day": "2026-07-29", "opened": 3, "closed": 1,
@@ -175,8 +174,7 @@ run family:
   "warnings": [] }
 ```
 
-Repair family = FIX_CI + ADDRESS_REVIEW + REBASE; steward = TRIAGE +
-STEWARD_DRIVE + JIRA_SYNC; review = REVIEW + RE_REVIEW; resolve = the rest.
+Repair family = FIX_CI + ADDRESS_REVIEW + REBASE; review = REVIEW + RE_REVIEW; resolve = the rest.
 
 `health_trend` is advisory per browser-native local day: the SPA sends its IANA
 timezone on the overview request, then GitHub issue `createdAt`/`closedAt`

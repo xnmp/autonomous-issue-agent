@@ -98,7 +98,6 @@ def test_collect_prefers_v2_fold_and_ignores_legacy_lifecycle(tmp_path) -> None:
         (
             str(legacy),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -158,7 +157,6 @@ def test_completion_without_start_still_contributes_visible_cost(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -208,7 +206,6 @@ def test_collect_counts_reconciled_spend_without_a_completion_event(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -281,7 +278,6 @@ def test_production_dashboard_today_spend_comes_from_sqlite_not_telemetry(
     journal_paths = [
         str(state / "journal.jsonl"),
         str(tmp_path / "review" / "journal.jsonl"),
-        str(tmp_path / "steward" / "journal.jsonl"),
     ]
 
     deployment = collect(
@@ -395,7 +391,6 @@ def test_unavailable_sqlite_spend_preserves_dashboard_history(
     journal_paths = [
         str(state / "journal.jsonl"),
         str(tmp_path / "review" / "journal.jsonl"),
-        str(tmp_path / "steward" / "journal.jsonl"),
     ]
 
     deployment = collect(
@@ -497,7 +492,6 @@ def test_v2_unattributed_events_keep_cost_and_guardrail_metrics(tmp_path):
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -557,7 +551,6 @@ def test_v2_dashboard_hides_unfinished_issues_absent_from_current_world(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -620,7 +613,6 @@ def test_v2_dashboard_preserves_tombstoned_done_metrics_and_spend(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -668,7 +660,6 @@ def test_v2_dashboard_places_current_unowned_open_issue_in_backlog(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -750,7 +741,6 @@ def test_v2_health_uses_scheduler_heartbeat_when_events_are_quiet(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -796,7 +786,6 @@ def test_v2_health_rejects_future_heartbeat_timestamp(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -870,7 +859,6 @@ def test_v2_emit_fold_issue_detail_preserves_run_drilldown_fields(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -907,7 +895,6 @@ def test_bad_v2_lines_warn_without_crashing_any_dashboard_renderer(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -932,7 +919,6 @@ def test_bad_v2_lines_warn_without_crashing_any_dashboard_renderer(
         journal_paths=[
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ],
         log_dir=str(tmp_path / "logs"),
         ledger_path=str(tmp_path / "spend.jsonl"),
@@ -955,7 +941,7 @@ def test_fresh_deployment_without_event_file_is_defined_as_empty_v2(
         "owner/repo",
         tuple(
             str(tmp_path / role / "journal.jsonl")
-            for role in ("fix", "review", "steward")
+            for role in ("fix", "review")
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -987,7 +973,6 @@ def test_legacy_only_upgrade_history_remains_readable_on_both_surfaces(
     journal_paths = [
         str(legacy),
         str(tmp_path / "review" / "journal.jsonl"),
-        str(tmp_path / "steward" / "journal.jsonl"),
     ]
 
     deployment = collect(
@@ -1048,7 +1033,6 @@ def test_v2_health_rejects_stopped_heartbeat_and_terminal_state(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
@@ -1104,7 +1088,6 @@ def test_a_dashboard_operator_action_reads_as_a_step_not_as_daemon_liveness(
         (
             str(state / "journal.jsonl"),
             str(tmp_path / "review" / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
         ),
         str(tmp_path / "logs"),
         str(tmp_path / "spend.jsonl"),
