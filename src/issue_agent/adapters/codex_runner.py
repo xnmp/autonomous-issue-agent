@@ -512,6 +512,57 @@ def _rollout_event_time(event: dict) -> float:
     return stamp.timestamp()
 
 
+def _rollout_path(session_id: str, codex_home: str | None) -> str | None:
+    """The newest rollout file codex wrote for this session, or None."""
+    if not session_id:
+        return None
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    paths = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*-{session_id}.jsonl"), recursive=True)
+    return max(paths, key=os.path.getmtime) if paths else None
+
+
+# Provider refusals codex records on the rollout's terminal `task_complete`
+# event as `error.codex_error_info`. The codex client writes it from the
+# provider's response, the same trusted channel as the token counters; agent
+# output never reaches that field. Observed values also include "other", which
+# stays an agent error.
+_PROVIDER_MACHINE_FAILURES = frozenset({"server_overloaded", "usage_limit_exceeded"})
+
+
+def read_rollout_provider_failure(
+    session_id: str, codex_home: str | None = None, *, since: float | None = None
+) -> str | None:
+    """The provider refusal that ended this run's last turn, or None.
+
+    Only `task_complete` events at or after `since` count, so a resumed
+    session's earlier overloaded turn never classifies this run. Unreadable
+    evidence reads as None: the run keeps its ordinary classification.
+    """
+    try:
+        path = _rollout_path(session_id, codex_home)
+        if path is None:
+            return None
+        last: object = None
+        with open(path) as f:
+            for line in f:
+                if '"task_complete"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    payload = event.get("payload") or {}
+                    if payload.get("type") != "task_complete":
+                        continue
+                    if since is not None and _rollout_event_time(event) < since:
+                        continue
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                error = payload.get("error")
+                last = error.get("codex_error_info") if isinstance(error, dict) else None
+        return last if isinstance(last, str) and last in _PROVIDER_MACHINE_FAILURES else None
+    except Exception:  # noqa: BLE001 — classification evidence must never kill a run
+        return None
+
+
 def read_rollout_usage(
     session_id: str, codex_home: str | None = None, *, until: float | None = None
 ) -> dict | None:
@@ -534,18 +585,12 @@ def read_rollout_usage(
     `until` excludes counters after the recorded end without erasing earlier
     usage. Untimestamped counters cannot establish this run's invocation window.
     """
-    if not session_id:
-        return None
-    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
     try:
-        pattern = os.path.join(
-            home, "sessions", "**", f"rollout-*-{session_id}.jsonl"
-        )
-        paths = glob.glob(pattern, recursive=True)
-        if not paths:
+        path = _rollout_path(session_id, codex_home)
+        if path is None:
             return None
         found: dict | None = None
-        with open(max(paths, key=os.path.getmtime)) as f:
+        with open(path) as f:
             for line in f:
                 if '"token_count"' not in line:
                     continue
@@ -584,18 +629,12 @@ def read_rollout_turns(session_id: str, codex_home: str | None = None) -> int | 
     The count is kept separate from token parsing so a malformed usage payload
     cannot erase otherwise observable turn telemetry.
     """
-    if not session_id:
-        return None
-    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
     try:
-        pattern = os.path.join(
-            home, "sessions", "**", f"rollout-*-{session_id}.jsonl"
-        )
-        paths = glob.glob(pattern, recursive=True)
-        if not paths:
+        path = _rollout_path(session_id, codex_home)
+        if path is None:
             return None
         turns = 0
-        with open(max(paths, key=os.path.getmtime)) as f:
+        with open(path) as f:
             for line in f:
                 if '"token_count"' not in line:
                     continue
@@ -1007,8 +1046,8 @@ def codex_budget_not_enforced_warning(
 # failure the breakers exist to stop.
 #
 # Keep this list SHORT and specific, like DETERMINISTIC_DEATH_SIGNATURES: a
-# false positive here buys an unwinnable dispatch until the infra ceiling stops
-# it. Everything unrecognised stays AGENT_ERROR — today's behaviour.
+# false positive here buys an unwinnable dispatch, spaced by the machine
+# backoff, until the money caps stop it. Everything unrecognised stays AGENT_ERROR — today's behaviour.
 #
 # ONE entry, on purpose. The obvious additions — "exec format error", "no such
 # file or directory", "command not found" — are all UNREACHABLE from the
@@ -2370,6 +2409,16 @@ class CodexRunner(AgentRuntime):
         from dataclasses import replace as _replace
 
         result = _replace(result, num_turns=rollout_turns)
+        provider_failure = (
+            read_rollout_provider_failure(session_id, codex_home=codex_home, since=rollout_started_at)
+            if result.is_error else None
+        )
+        if provider_failure is not None:
+            # The provider refused the turn (capacity or quota): the agent never
+            # got to work, so this is a machine failure, not an agent attempt.
+            self._log(f"codex: provider refused the turn ({provider_failure}) — machine failure, not an attempt")
+            result = _replace(result, exit_reason=ExitReason.TRANSPORT_DEATH,
+                              summary=f"provider refused the turn: {provider_failure}")
         if (
             result.status in ("pr_opened", "pushed")
             and result.usage is None
