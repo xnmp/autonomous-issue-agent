@@ -341,7 +341,6 @@ class GitHubEffectExecutor:
         repository: str,
         identity: str,
         config_version: str = "",
-        test_configuration=None,
         fix_config: FixConfig = FixConfig(fix_bot=""),
         repository_cap: Money | None = None,
         global_cap: Money | None = None,
@@ -358,7 +357,6 @@ class GitHubEffectExecutor:
         self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
-        self.test_configuration = test_configuration
         self.fix_config = fix_config
         self.repository_cap = repository_cap
         self.global_cap = global_cap
@@ -961,7 +959,6 @@ class GitHubEffectExecutor:
         """Fresh decision facts shared by ordinary writes and authorized retries."""
         assert command.workflow is not None
         if op.event == "APPROVE":
-            from .review_test_execution import approval_test_error
             from .workflow_rows import load_review_workflow_row, read_review_submission_registration
             from ..domain.review_execution import CurrentReviewExecution
             with self.store.transaction() as db:
@@ -970,10 +967,6 @@ class GitHubEffectExecutor:
                 if (state is None or not isinstance(state.execution, CurrentReviewExecution) or registration is None
                         or registration.round.binding != state.execution.binding):
                     return ReviewCommandCheck(ReviewCheck.REFUSED, "approval lacks its current registered execution binding")
-                error = approval_test_error(db, self.repository, op.test_evidence_ref, self.test_configuration,
-                    command.workflow, state.execution.binding, op.head, op.patch_id)
-            if error:
-                return ReviewCommandCheck(ReviewCheck.REFUSED, error)
         observed, view = read_pull_request(
             self.gateway, command.workflow.fence.key, self.store.now(), reviews=False,
         )

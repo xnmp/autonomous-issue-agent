@@ -195,15 +195,6 @@ limit. The executor recorded `UNAVAILABLE` / `TIMED_OUT`, preserved equal
 pre/post tracked-tree proof and completed process teardown with no remaining
 orphans. This first run verifies bounded failure handling.
 
-The final reviewed executor then ran the same retained command with the warmed
-private cache at 2026-10-04 13:35–13:39 UTC. It passed in 258,591 ms, recorded
-equal pre/post committed/index/tracked-tree proof, and left no orphan processes.
-The tested configuration digest was
-`67a3122de6b766194cb5df5ce1208872dbbf40fc22615de1c1353e259ed87ab3`.
-This qualifies the ordinary test command in the isolated Linux checkout;
-it does not supply migration, paid-provider, canary or unattended-window
-acceptance. The original checkout and live authority were unchanged.
-
 No dates, accepted starting revisions, selected issue set, successful family
 activation/rollback, coverage declaration or live readout has been recorded.
 These remain required before Phase 5's unattended-measurement acceptance. The

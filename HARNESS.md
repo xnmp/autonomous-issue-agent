@@ -117,18 +117,11 @@ Important fields:
   the issue scope is omitted because no issue authority exists.
 - `ISSUE_AGENT_MAX_TICKS=N` is the safe one/few-tick live canary control.
 
-Durable review approval requires a nonpaid test receipt from the frozen operator
-`TEST_CMD` for the exact PR head, patch, execution episode and configuration.
-Repository `.harness/test-cmd` cannot authorize approval. Compatible rounds reuse
-completed results; genuine failures request changes through the normal rejection
-ceiling. `ALLOW_UNTESTED=1` records an explicit operator waiver.
-
-Unavailable tests back off without buying another reviewer before the next due
-observation. At the evidence ceiling, settle the old round and use the existing
-**Renew execution** action for the ordinary-test hold. It grants one new execution
-episode and preserves unrelated holds and rejection allowance. Changing test
-configuration alone does not release a hold. Writers never launch tests while
-draining commands.
+The reviewer approves on its model verdict for the exact PR head. Merge
+requires a passing CI report: targets must have CI checks, and a PR with no
+reported checks does not merge. Changes under `.github/**`
+escalate through the existing human-review path. Review legs do not execute
+operator test commands.
 
 Do not put shell watch commands in `TEST_CMD`; `pytest`, `vitest run`, and
 equivalent terminating commands are appropriate.

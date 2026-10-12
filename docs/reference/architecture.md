@@ -121,18 +121,11 @@ tests pass.
    with a PR number. They are the densest defence in the codebase. When you move
    code, move its comment verbatim.
 
-## Independent review execution
+## Review quality
 
-Reviewer children remain diff-only. After source review and before an ordinary
-approval, the harness independently executes the frozen operator `TEST_CMD`
-against the exact PR checkout. Its stored receipt binds rejection/execution
-authority, head, patch and configuration, with pre/post tracked-tree proof and
-bounded supervised teardown. Durable writers recheck that evidence before an
-absent approval write; changed revisions or configuration cannot reuse a pass.
-Compatible rounds reuse completed results. Failure requests changes; timeout,
-interruption and unavailable execution follow bounded evidence holds. An explicit
-operator waiver is recorded separately. Behavioral contracts cover normal and
-copied approvals, unavailable execution, mutation, cancellation and restart.
+The reviewer submits its model verdict for the exact PR head. Targets must have CI
+checks; a PR with no reported checks does not merge. A diff touching `.github/**` escalates
+through the existing human-review path. Reviewer legs do not execute target tests.
 See [ADR 0011](../adr/0011-trusted-execution-and-gate-evidence.md).
 
 ## Enforcement: authority plus two advisory stacks
@@ -633,7 +626,7 @@ criteria and closing link when absent, instead of denying the publication),
 (level-triggered retirement of machine-checkable blocks — #180 publication/checks
 blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/steward.py`, `domain/steward_stall.py`,
-`domain/supervision.py`, `domain/terminal_output.py` (pure terminal escape cleanup),
+`domain/supervision.py`,
 `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
@@ -656,7 +649,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_return.py` (bounded, unclassified review child result evidence),
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
 `domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
-`domain/review_evidence.py`, `domain/review_test_evidence.py` (revision/configuration-bound independent execution facts), `domain/deployment.py`
+`domain/review_evidence.py`, `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; the PR-owned review-rejection
 family has its own snapshot, continuation and handoff-free intents, sharing only
@@ -709,7 +702,6 @@ pull request retains its lever subject to fresh acceptance reads).
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
 `adapters/review_execution_claims.py` (exact parent claim and lifecycle receipt validation),
-`adapters/review_test_execution.py` (supervised nonpaid operator tests and frozen-input proofs),
 `adapters/review_execution_control.py` (review-round preflight, source-backed registration and abandoned-round recovery),
 `adapters/review_round_sources.py` (transaction-local reconstruction of child, planning and submission receipts),
 `adapters/review_workflow_control.py` (the review owner's generation-fenced

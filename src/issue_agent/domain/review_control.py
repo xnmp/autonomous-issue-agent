@@ -86,16 +86,6 @@ def execution_recovery_choices(view: ReviewControlView) -> tuple[tuple[OpenGate,
         "the captured pull request is not open" if basis is not None and basis.state is not PullRequestState.OPEN
         else None)
     result: list[tuple[OpenGate, GateAction]] = []
-    from .review_test_evidence import ordinary_test_hold
-    for gate in view.snapshot.gates:
-        if not ordinary_test_hold(gate, execution.binding, head):
-            continue
-        reason = refusal or ("every unfinished old-episode round must settle before renewal" if view.execution_episode_open else None)
-        action = ActionRefused(ReviewOperatorCommand.RENEW_EXECUTION, reason) if reason else ActionOffered(
-            ReviewOperatorCommand.RENEW_EXECUTION,
-            "Renew the settled execution episode once for operator tests; unrelated holds and rejection allowance remain.")
-        result.append((gate, action))
-
     if view.execution_ceiling > 0 and execution.state.failures >= view.execution_ceiling:
         gate = OpenGate(review_execution_ceiling_gate_id(view.snapshot, head, view.execution_ceiling),
             view.snapshot.revision.fence.generation,

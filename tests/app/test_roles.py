@@ -2717,8 +2717,6 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path, monkeyp
     )
     store = Store(str(tmp_path / "review-state"))
     control = _activate_review_fixture(cfg, gateway)
-    observed_test_head = tmp_path / "ordinary-test-head"
-    monkeypatch.setenv("TEST_CMD", f'git rev-parse HEAD > "{observed_test_head}"; test "$(cat "{observed_test_head}")" = {head_sha}')
     daemon = build_review_daemon(cfg, gateway, store, runner)
 
     actions = daemon.tick()
@@ -2735,7 +2733,6 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path, monkeyp
     )
     assert any(c[:3] == ("review", pr.number, "APPROVE") and c[3].startswith("lgtm")
                for c in gateway.calls)
-    assert observed_test_head.read_text().strip() == head_sha
     from issue_agent.app.review_runtime import current_review_failures
     assert current_review_failures(control, "o/r", pr.number) == 0
     assert not os.path.exists(store.pr_path(pr.number, "session"))

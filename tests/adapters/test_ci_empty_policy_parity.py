@@ -1,5 +1,9 @@
 """Empty-policy outcomes captured against origin/dev 807aa508, without ignores.
 
+Slice 1 (2026-10-12) deliberately diverges on "no checks reported": a head
+with no CI result never automerges, since required CI is the only test
+evidence once review-time operator tests are gone.
+
 ci_empty_policy_probe.py also runs unchanged with that checkout's src on
 PYTHONPATH, so the compatibility contract can be checked against real code.
 """
@@ -20,8 +24,8 @@ def observed_cases():
     {"case": "same-name-distinct-events", "ci": "ok", "checks": [["unit", "pass", 11]], "actions": ["EnableAutoMerge"]},
     {"case": "all-queued", "ci": "pending", "checks": [["unit", "pending", 10]], "actions": []},
     {"case": "latest-rerun", "ci": "ok", "checks": [["unit", "pass", 11]], "actions": ["EnableAutoMerge"]},
-    {"case": "empty-reports", "ci": "none", "checks": [], "actions": ["EnableAutoMerge"]},
-    {"case": "empty-reports-with-retry-debt", "ci": "none", "checks": [], "actions": ["EnableAutoMerge"]},
+    {"case": "empty-reports", "ci": "none", "checks": [], "actions": []},
+    {"case": "empty-reports-with-retry-debt", "ci": "none", "checks": [], "actions": []},
     {"case": "empty-reports-check-blocker", "ci": "none", "checks": [], "actions": []},
     {"case": "empty-policy-hooks", "ci": "none", "checks": [], "actions": []},
     {"case": "empty-policy-unstable", "ci": "ok", "checks": [["unit", "pass", 10]], "actions": []},

@@ -50,7 +50,6 @@ from ..domain.review_rounds import (
     FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed,
 )
 from ..domain.review_rejection import CountingRule, ReviewProjectionRefused, ReviewRejectionCeiling, ReviewVerdictHold
-from ..domain.review_test_evidence import test_only_rejection_release_eligible
 from ..domain.review_workflow import (
     CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, ObservedPullRequest, PendingReviewRearm,
     PullRequestState, PullRequestUnavailable, RecordedPullRequest, ReviewRearmIntent, ReviewRearmPreflight,
@@ -86,10 +85,9 @@ from .control_store import (
 )
 from .deployment_authority import deployment_effect_barrier, deployment_role
 from .review_effects import (
-    PullRequestProjectionOp, ReviewCheck, ReviewReads, bound_submission_op, check_review_op, observe_pull_request,
+    PullRequestProjectionOp, ReviewCheck, ReviewReads, check_review_op, observe_pull_request,
     read_pull_request, review_family_op,
 )
-from .review_test_execution import read_test_completion
 from .review_dispatch_holds import (
     RECORDED_REVIEW_NAMESPACE as _RECORDED_REVIEW_NAMESPACE,
     RELEASE_RESOLVED_NAMESPACE as _RELEASE_RESOLVED_NAMESPACE,
@@ -1128,7 +1126,7 @@ class SQLiteReviewWorkflowControl:
             receipt = load_bound_review_submission(db, CommandId(identity))
         except KeyError as exc:
             raise WorkflowAuthorityError("selected verdict command is absent") from exc
-        if not isinstance(receipt, ReviewSubmissionReceipt):
+        if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
             return None
         registration = read_review_submission_registration(db, self._writer.repository, identity)
         if registration is None:
@@ -1144,17 +1142,6 @@ class SQLiteReviewWorkflowControl:
             round.sequence)
         if outcome.round != round:
             raise WorkflowAuthorityError("selected verdict source changed its exact round identity")
-        if not receipt.escalated:
-            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (identity,)).fetchone()
-            op = bound_submission_op(_command_from_row(row))
-            if op is None or not test_only_rejection_release_eligible(
-                event=op.event, reference=op.test_evidence_ref,
-                completion=read_test_completion(db, key.repository, op.test_evidence_ref)
-                    if op.test_evidence_ref is not None else None,
-                rejection=receipt.submission.binding, execution=round.binding,
-                head=receipt.head_sha, patch=receipt.patch_id,
-            ):
-                return None
         return receipt
 
     def _old_execution_episode_open(self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot) -> bool:
@@ -2773,83 +2760,6 @@ class SQLiteReviewWorkflowControl:
 
     # -- unreadable evidence (the ADR 0012/0015 UNVERIFIABLE loops) ------------------------------
 
-    def ordinary_test_schedule(self, db, subject):
-        from .review_test_execution import TEST_SCHEDULE_NAMESPACE
-        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (TEST_SCHEDULE_NAMESPACE, self._writer.repository, subject.identity)).fetchone()
-        if row is None:
-            return None
-        captured, schedule = decode_workflow(row["payload_json"], tuple)
-        if captured != subject or not isinstance(schedule, EvidenceSchedule):
-            raise WorkflowAuthorityError("ordinary test schedule has conflicting subject facts")
-        return schedule
-
-    def _record_ordinary_test_in_tx(self, db, subject, expected_schedule, *, error):
-        from ..domain.review_test_evidence import ordinary_test_required_fact
-        from .review_test_execution import TEST_SCHEDULE_NAMESPACE
-        key = subject.rejection.fence.key
-        self._scope(key)
-        state = self._load(db, key)
-        if state.binding != subject.rejection or not isinstance(state.execution, CurrentReviewExecution) or state.execution.binding != subject.execution:
-            raise WorkflowAuthorityError("ordinary test subject is no longer current")
-        prior = self.ordinary_test_schedule(db, subject)
-        if prior != expected_schedule:
-            raise WorkflowAuthorityError("ordinary test schedule changed during execution")
-        if error is None:
-            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (TEST_SCHEDULE_NAMESPACE, self._writer.repository, subject.identity))
-            if any((g.gate if isinstance(g, RearmingGate) else g).gate_id == subject.gate_id for g in state.gates):
-                self._control._reconciliation_gate(db, state.binding, subject.gate_id, None)
-            return
-        progress = unavailable_evidence(ReviewEvidenceKind.ORDINARY_TEST, state.binding, subject.head_sha, prior,
-            now=self._now(), error=error, policy=self._policy)
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
-            "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,payload_json=excluded.payload_json",
-            (TEST_SCHEDULE_NAMESPACE, self._writer.repository, subject.identity,
-                self._now().isoformat(), encode_workflow((subject, progress.schedule))))
-        if progress.gate is not None:
-            from ..domain.workflow import EvidenceUnavailable
-            assert isinstance(progress.gate.cause, EvidenceUnavailable)
-            gate = replace(progress.gate, gate_id=subject.gate_id,
-                cause=replace(progress.gate.cause, required_fact=ordinary_test_required_fact(subject)))
-            self._control._reconciliation_gate(db, state.binding, gate.gate_id, gate)
-        self._control._transition(db, "workflow", encode_workflow(key), "ordinary_test_unavailable",
-            {"subject": subject.identity, "failed_reads": progress.schedule.history.failed_reads})
-
-    def _reread_ordinary_test(self, state):
-        from ..domain.review_test_evidence import ordinary_test_hold
-        from .review_test_execution import read_test_intent, read_test_completion
-        key = state.revision.fence.key
-        observed, _ = read_pull_request(self._gateway, key, self._now(), reviews=False)
-        if isinstance(observed, PullRequestUnavailable):
-            return False, observed.reason
-        changed = False
-        with self._control.transaction() as db:
-            current = self._load(db, key)
-            if current.revision != state.revision:
-                return False, "ordinary test authority changed during read"
-            for item in state.gates:
-                gate = item.gate if isinstance(item, RearmingGate) else item
-                if review_evidence_gate_kind(gate) is not ReviewEvidenceKind.ORDINARY_TEST:
-                    continue
-                intent = read_test_intent(db, self._writer.repository, gate.gate_id.removeprefix("ordinary-test:"))
-                if intent is None:
-                    raise WorkflowAuthorityError("ordinary test hold lacks its captured subject")
-                subject = intent.subject
-                if observed.state is not PullRequestState.OPEN or observed.head_sha != subject.head_sha:
-                    self._control._reconciliation_gate(db, current.binding, gate.gate_id, None)
-                    changed = True
-                    continue
-                # This synchronous recovery is never a test executor. A held
-                # subject without trusted passing evidence requires renewal.
-                completion = read_test_completion(db, self._writer.repository, intent.invocation_id)
-                if (completion is not None and completion.approves and current.binding == subject.rejection
-                        and isinstance(current.execution, CurrentReviewExecution)
-                        and ordinary_test_hold(gate, current.execution.binding, observed.head_sha)):
-                    self._record_ordinary_test_in_tx(db, subject, self.ordinary_test_schedule(db, subject), error=None)
-                    changed = True
-        return changed, ""
-
     def _evidence_schedule(
         self, db: sqlite3.Connection, key: WorkflowKey, kind: ReviewEvidenceKind,
     ) -> EvidenceSchedule | None:
@@ -2870,8 +2780,6 @@ class SQLiteReviewWorkflowControl:
     def evidence_due(self, key: WorkflowKey, head_sha: str, kind: ReviewEvidenceKind) -> bool:
         """Whether this head's evidence of this kind may be read now (its backoff has elapsed)."""
         self._scope(key)
-        if kind is ReviewEvidenceKind.ORDINARY_TEST:
-            raise ValueError("ordinary test schedules require the full subject")
         with closing(self._control._connect()) as db:
             db.execute("BEGIN")
             schedule = self._evidence_schedule(db, key, kind)
@@ -2889,8 +2797,6 @@ class SQLiteReviewWorkflowControl:
     ) -> None:
         """Share the existing evidence schedule with a round's outcome transaction."""
         self._scope(key)
-        if kind is ReviewEvidenceKind.ORDINARY_TEST:
-            raise ValueError("ordinary test recording requires the full subject")
         namespace, scope = _EVIDENCE_NAMESPACES[kind], f"pr:{key.target.number}"
         state = self._load(db, key)
         prior = self._evidence_schedule(db, key, kind)
@@ -2948,8 +2854,6 @@ class SQLiteReviewWorkflowControl:
 
     def _reread_evidence(self, state: ReviewWorkflowSnapshot, kind: ReviewEvidenceKind) -> tuple[bool, str]:
         """The scheduled read that alone may release an unreadable-evidence hold."""
-        if kind is ReviewEvidenceKind.ORDINARY_TEST:
-            return self._reread_ordinary_test(state)
         key = state.revision.fence.key
         if kind is ReviewEvidenceKind.EXEMPTION_TRAILERS:
             # Retired ADR 0014 holds can still be present in persisted workflows.

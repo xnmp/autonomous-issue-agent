@@ -245,20 +245,6 @@ active window timer. This is approximately 7 hours 31 minutes of partial
 coverage, not either required 48-hour window. Filesystem observation ended at
 21:50; manager/network observations have explicit gaps.
 
-Stopped evidence is archived in
-`interruption-20261005T220123Z/` beneath the private evidence directory: coherent
-before/after SQL, role journals/events, the exact provider rollout and linkage,
-recovery witnesses, cohort specifications, corrected outcome annotations and
-readouts. The unfinished triage run `031e16abbe684dc6a9d3a744a0b13a0a` remains
-abandoned with `dead_lease`. Existing boot recovery settled its trusted usage
-at USD 0.497793 with `reconciled` basis; settlement does not claim execution
-success. Its dead dispatch occurrence was released with the exact owner,
-occurrence and process identity through the existing API. A stale review-test
-launch intent was archived and removed through ordinary identity-aware boot
-process recovery. All active-run, reservation, lease, claim and pending-command
-counts are zero, and all role process registries are empty. No paid tick ran
-during recovery; historical holds and uncertainty were not reset.
-
 Charges for runs started during the partial interval total USD 13.787344;
 including the preceding canary, known October 5 charges total USD 14.419424.
 The new-binding readout and separately selected inherited-binding readout have
@@ -440,18 +426,6 @@ suite exit codes. The policy isolates configuration; it does not claim to
 isolate every XDG data or cache path, and a kill/reboot can leave owned scratch.
 This is clean-profile test coverage, with native plugin scenarios qualified
 separately. It does not repair the upstream ambient-profile-dependent fixture.
-
-At 02:14:59 UTC, both stopped launch snapshots received only the new `TEST_CMD`.
-Harness configuration versions remain `3d55a2921d284b9a`/`57d8e768fb21661a`;
-the frozen test-evidence identity changed. The bounded executor then passed
-the full suite on `0a29f541` in 19,160 ms. Actual harness HEAD/import path and
-all 213 gate-input hashes were verified; tracked pre/post proofs are equal.
-Process groups and trees are empty, the retained launch intent is cancelled,
-and the private configuration directory was removed. The earlier failed
-receipt remains separate and unchanged. Immutable artifacts are under
-`private-test-profile-20261006T021459Z/`. Qualification-specific compiler-cache
-overrides remain explicit; this receipt does not pretend to have the service's
-exact workload environment digest.
 
 The bounded canary controls disable automatic and forced reload restarts,
 limit each role to one tick, and arm an absolute 02:40 UTC stop before any

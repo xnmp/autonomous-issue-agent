@@ -17,8 +17,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import sqlite3
-import asyncio
-import uuid
 
 from ..adapters.control_store import ControlStoreError, SQLiteControlStore, _dispatch_claim_target
 from ..adapters.effects import GitHubEffectExecutor, UnknownEffectOutcome, bound_review_command_id
@@ -27,10 +25,7 @@ from ..adapters.review_effects import (
 )
 from ..adapters.review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl, read_review_guidance
-from ..adapters.review_test_execution import ReviewTestExecutor
-from ..domain.review_test_evidence import (ReviewTestConfiguration, ReviewTestSubject, ReviewTestInvocation,
-    ReviewTestCompletion, ReviewTestOutcome, PostedReview, posted_review, failed_test_review_body)
-from ..domain.review_rounds import ReviewPlanningRefused
+from ..domain.review import PostedReview, posted_review
 from ..domain.continuation_components import BlockedPRRepair
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
@@ -212,9 +207,6 @@ class ActiveReviewRuntime:
         self, control: SQLiteReviewWorkflowControl, effects: GitHubEffectExecutor, gateway: object, *,
         review_bot: str, log: Callable[[str], None], mode: ReviewMode = ReviewMode.SINGLE,
         runtime: RuntimeName = RuntimeName.CLAUDE, failure_ceiling: int = 5,
-        test_configuration: ReviewTestConfiguration | None = None,
-        test_executor: ReviewTestExecutor | None = None, test_checkout: Callable[[int, str], str] | None = None,
-        max_review_rejections: int = 3,
     ) -> None:
         self.control = control
         self._effects = effects
@@ -226,8 +218,6 @@ class ActiveReviewRuntime:
             control._control, control.writer, gateway,
             preparation_control=control if control._runtime_preflight is not None else None,
         )
-        self._test_configuration, self._test_executor, self._test_checkout = test_configuration, test_executor, test_checkout
-        self._max_review_rejections = max_review_rejections
         self._record_failures = 0
         self._record_failure_reported: datetime | None = None
 
@@ -649,21 +639,7 @@ class ActiveReviewRuntime:
     def evidence_due(self, binding: WorkflowBinding, head_sha: str) -> bool:
         """Whether every read a review of this head depends on may be attempted now."""
         key = binding.fence.key
-        return all(self.control.evidence_due(key, head_sha, kind) for kind in ReviewEvidenceKind if kind not in {ReviewEvidenceKind.ORDINARY_TEST, ReviewEvidenceKind.EXEMPTION_TRAILERS})
-
-    def test_due(self, bound: BoundReviewRound, patch_id: str) -> bool:
-        from ..domain.review_evidence import evidence_due
-        config = self._test_configuration
-        if config is None:
-            return False
-        subject = ReviewTestSubject(bound.binding, bound.plan.round.binding, bound.head_sha, patch_id, config.identity)
-        with self.control._control.transaction() as db:
-            state = self.control._load(db, bound.binding.fence.key)
-            if (state.binding != subject.rejection or not isinstance(state.execution, CurrentReviewExecution)
-                    or state.execution.binding != subject.execution or state.gates):
-                return False
-            schedule = self.control.ordinary_test_schedule(db, subject)
-        return evidence_due(schedule, subject.head_sha, now=self._now())
+        return all(self.control.evidence_due(key, head_sha, kind) for kind in ReviewEvidenceKind if kind is not ReviewEvidenceKind.EXEMPTION_TRAILERS)
 
     async def submit(
         self, bound: BoundReviewRound, event: str, body: str, *, patch_id: str, escalate_cause: str | None,
@@ -676,56 +652,10 @@ class ActiveReviewRuntime:
         gate is judged under the same rule.
         """
         pr = bound.binding.fence.key.target.number
-        evidence_ref = None
-        if event == "APPROVE":
-            config, executor = self._test_configuration, self._test_executor
-            if config is None or executor is None:
-                raise WorkflowAuthorityError("independent operator test execution is not configured")
-            subject = ReviewTestSubject(bound.binding, bound.plan.round.binding, bound.head_sha, patch_id, config.identity)
-            proposed = ReviewTestInvocation(subject, config, bound.plan.round, "review-test-" + uuid.uuid4().hex, self._now())
-            selected, schedule = self.execution.begin_test(proposed, self.control)
-            if selected is None:
-                self.stop(bound, ReviewPlanningRefused("ordinary-test-deferred:" + bound.plan.round.round_id))
-                return None
-            if isinstance(selected, ReviewTestInvocation):
-                try:
-                    if selected != proposed:
-                        await executor.recover(selected)
-                        completion = ReviewTestCompletion(selected, ReviewTestOutcome.UNAVAILABLE, None, None, None,
-                            "prior supervised test invocation was interrupted; scheduled retry required")
-                    elif self._test_checkout is None:
-                        completion = ReviewTestCompletion(selected, ReviewTestOutcome.UNAVAILABLE, None, None, None,
-                            "pinned test checkout is unavailable")
-                    else:
-                        cwd = self._test_checkout(pr, bound.head_sha)
-                        completion = await executor.execute(selected, cwd)
-                except asyncio.CancelledError:
-                    await executor.recover(selected)
-                    completion = ReviewTestCompletion(selected, ReviewTestOutcome.UNAVAILABLE, None, None, None, "test invocation cancelled")
-                    self.execution.finish_test(completion, schedule, self.control)
-                    self.stop(bound, ReviewPlanningRefused("ordinary-test-cancelled:" + bound.plan.round.round_id))
-                    raise
-                except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
-                    raise
-                except Exception as exc:
-                    completion = ReviewTestCompletion(selected, ReviewTestOutcome.UNAVAILABLE, None, None, None,
-                        f"test preparation unavailable: {type(exc).__name__}: {exc}"[:4096])
-                selected = self.execution.finish_test(completion, schedule, self.control)
-            if selected.outcome is ReviewTestOutcome.UNAVAILABLE:
-                self.stop(bound, ReviewPlanningRefused("ordinary-test-unavailable:" + bound.plan.round.round_id))
-                return None
-            evidence_ref = selected.invocation.invocation_id
-            if selected.outcome is ReviewTestOutcome.FAILED:
-                from ..domain.review import review_submission
-                decision = review_submission("REQUEST_CHANGES", failed_test_review_body(selected.summary,
-                    selected.execution.exit_code if selected.execution is not None else None),
-                    self.prior_rejections(bound, counted_past), self._max_review_rejections)
-                event, body = decision.event, decision.body
-                escalate_cause = decision.escalate_cause if decision.escalate else None
         counting = tuple(sorted(counted_past)) if escalate_cause == "ceiling" else ()
         command = bound_review_command_id(BoundReviewSubmissionOp(
-            pr, event, body, bound.head_sha, self._review_bot, patch_id, escalate_cause, counting, evidence_ref), bound.binding)
-        op = BoundReviewSubmissionOp(pr, event, body, bound.head_sha, self._review_bot, patch_id, escalate_cause, counting, evidence_ref)
+            pr, event, body, bound.head_sha, self._review_bot, patch_id, escalate_cause, counting), bound.binding)
+        op = BoundReviewSubmissionOp(pr, event, body, bound.head_sha, self._review_bot, patch_id, escalate_cause, counting)
         state = self.control.load_workflow(bound.binding.fence.key)
         if not isinstance(state, ReviewWorkflowSnapshot):
             raise WorkflowAuthorityError("review submission lacks its current aggregate")
@@ -739,7 +669,6 @@ class ActiveReviewRuntime:
                              bound.head_sha, op.payload(), self._effects.config_version,
                              self.repository, self.control.writer.owner_id, workflow=bound.binding),
             ReviewSubmissionKind.PAID if stored[2].stages else ReviewSubmissionKind.COPIED,
-            test_configuration=self._test_configuration,
         )
         try:
             landed = self._effects.execute_registered_review(pending)
