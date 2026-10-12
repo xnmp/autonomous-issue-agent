@@ -57,7 +57,6 @@ function card(issue: number, title: string, over: Record<string, unknown>) {
     idle_s: 4_680,
     idle_active: false,
     leg_running: false,
-    projected_eta_s: null,
     models: ["gpt-6.1-sol"],
     model_badges: [{ model: "gpt-6.1-sol", effort: "high" }],
     rounds: 1,
@@ -365,11 +364,11 @@ test("lists untriaged backlog issues on their own tab, off the board, each promo
   await expect(page.getByText("remember the last opened folder per window")).toBeVisible();
   await expect(page.getByText("crash when dragging a tab")).toBeVisible();
   await expect(page.getByText("already triaged")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Promote #1101 to ai-ready" })).toHaveText("Promote to ai-ready");
+  await expect(page.getByRole("button", { name: "Promote to ai-ready #1101" })).toHaveText("Promote to ai-ready");
   await noSidewaysScroll(page);
   await page.screenshot({ path: "../evidence/dashboard-issues-untriaged.png", fullPage: true, animations: "disabled" });
 
-  await page.getByRole("button", { name: "Promote #1101 to ai-ready" }).click();
+  await page.getByRole("button", { name: "Promote to ai-ready #1101" }).click();
   const promoted = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/issues/1101/promote"));
   await page.getByRole("button", { name: "Promote #1101", exact: true }).click();
   await promoted;

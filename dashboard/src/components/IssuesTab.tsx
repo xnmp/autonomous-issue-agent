@@ -306,7 +306,7 @@ export function IssuesTab({
           onPromotion={onBacklogPromotion}
           storageKey="issues-untriaged"
           promoteLabel="Promote to ai-ready"
-          emptyText="nothing untriaged: the steward has seen every backlog issue"
+          emptyText="no untriaged backlog issues"
         />
       ) : null}
     </div>
@@ -552,7 +552,9 @@ function BacklogTable({
                             <button
                               className={promoteLabel ? "btn btn-xs btn-primary" : "btn btn-xs promote-icon"}
                               title={`Promote #${card.issue} to ai-ready`}
-                              aria-label={`Promote #${card.issue} to ai-ready`}
+                              // A labelled button's accessible name starts with
+                              // its visible text (WCAG 2.5.3 label in name).
+                              aria-label={promoteLabel ? `${promoteLabel} #${card.issue}` : `Promote #${card.issue} to ai-ready`}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 setError(null);

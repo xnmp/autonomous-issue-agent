@@ -24,7 +24,7 @@ function card(issue: number, board: BoardStatus | null, over: Partial<IssueCard>
     issue, title: `Issue ${issue}`, url: null, labels: [], pr: null, pr_url: null, pr_state: null,
     stage: null, done: false, steps: [], cost_usd: null, estimated: false, projected_cost_usd: null,
     started_ts: null, last_ts: null, elapsed_s: null, working_s: null, idle_s: null, idle_active: false,
-    leg_running: false, projected_eta_s: null, models: [], model_badges: [], rounds: null,
+    leg_running: false, models: [], model_badges: [], rounds: null,
     board, rail: null, ...over,
   } as IssueCard;
 }

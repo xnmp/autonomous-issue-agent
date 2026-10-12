@@ -39,7 +39,6 @@ function card(issue: number, board: BoardStatus | null, over: Partial<IssueCard>
     idle_s: 500,
     idle_active: false,
     leg_running: false,
-    projected_eta_s: null,
     models: ["gpt-6.1-sol"],
     model_badges: [{ model: "gpt-6.1-sol", effort: null }],
     rounds: 1,
@@ -450,6 +449,31 @@ describe("issues board actions", () => {
     const writes = calls.filter(({ method }) => method === "POST");
     expect(writes.map(({ url }) => url)).toEqual(["/api/repos/demo/issues/230/promote"]);
     await vi.waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("forgets a failed promotion's error once the confirmation is cancelled", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ detail: "issue is closed" }),
+      { status: 409, headers: { "Content-Type": "application/json" } },
+    )));
+    renderBoard({
+      backlog: [{
+        issue: 231, title: "Asked another question", url: null, body: null, labels: [], recurrence: false, recurrence_count: 0,
+        steward_state: "blocked_on_human_reply", age_days: null, comments: null,
+        board: { status: "blocked", on: { kind: "triage", why: "awaiting_reply" }, headline: "Waiting on triage", reason: "", since_ts: null },
+        rail: rail({ steps: 0 }),
+      } as BacklogCard],
+    });
+
+    await userEvent.click(row("Asked another question"));
+    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote #231" }));
+    expect(await screen.findByText("issue is closed")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready" }));
+
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(screen.queryByText("issue is closed")).not.toBeInTheDocument();
   });
 
   it("re-arms through the issue's guarded resolve controls, never a direct write", async () => {

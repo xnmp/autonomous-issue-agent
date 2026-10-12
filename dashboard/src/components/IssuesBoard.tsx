@@ -525,7 +525,10 @@ function ActionControl({
               busy={busy}
               error={error}
               onConfirm={() => void run(() => api.promote(repo, item.issue)).then((ok) => ok && setRevealed(false))}
-              onCancel={() => setRevealed(false)}
+              onCancel={() => {
+                setRevealed(false);
+                setError(null);
+              }}
             />
           ) : null}
         </>

@@ -68,9 +68,9 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
     )
 
     assert ask(card) == "merge"
-    # The wait runs from the row's last activity: in a live journal the
-    # observation of the settled checks is that activity.
-    assert card["board"]["since_ts"] == ts(hours=1)
+    # The wait runs from the newest approval or settled check, the same
+    # moment the human-wait clock starts.
+    assert card["board"]["since_ts"] == ts(minutes=20)
 
 
 @pytest.mark.parametrize(

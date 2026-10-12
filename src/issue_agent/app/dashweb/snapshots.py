@@ -1529,21 +1529,22 @@ _ATTENTION_LABELS = frozenset({"needs-human-review", "needs-budget-review", "ai-
 
 
 def _attention_issue_view(row: dash.IssueRow, gh_issue: dict | None) -> dict | None:
-    """The issue as the attention arms read it, with its authoritative labels.
+    """The issue as the attention arms read it.
 
     A schema-v2 GitHub enrichment deliberately carries no labels: the world
     projection owns them (`card_labels`). Reading only the enrichment left an
     escalated v2 issue with no attention label at all, so it read "Up next".
-    A truncated observation proves the labels it lists but never an absence,
-    so without an attention label it falls back to the GitHub view.
+    Projected labels only ever add an attention label: a projection without
+    one proves no absence (it may be truncated or stale), so it must not
+    hand the arms a label list that contradicts the journal fallback.
     """
     projected = row.facts.get("labels")
     if not isinstance(projected, (tuple, list, set, frozenset)):
         return gh_issue
-    labels = card_labels(row, gh_issue)
-    if row.facts.get("observation_truncated") and not _ATTENTION_LABELS & set(labels):
+    attention = _ATTENTION_LABELS & {str(label) for label in projected}
+    if not attention:
         return gh_issue
-    return {**(gh_issue or {}), "labels": labels}
+    return {**(gh_issue or {}), "labels": sorted(_labels_set(gh_issue) | attention)}
 
 
 def _human_action(
@@ -1930,10 +1931,11 @@ def _attention(
     gh_issue: dict | None,
     gh_pr: dict | None,
     labels: set[str],
-) -> dash.Attention | None:
-    # A merge-ready PR is not a hold: the board classifies it from the
-    # current-patch approval and the merge owner (`_merge_facts`).
+) -> dash.Attention | dash.MergeReady | None:
+    """What the human-wait clock is waiting on: one rule for both."""
     kind, since = _human_action(row, gh_issue, gh_pr)
+    if kind == "merge-ready":
+        return dash.MergeReady(since)
     if kind == "awaiting-reply":
         return dash.AwaitingReply(since, _blocked_reason(row))
     if kind != "escalated":
@@ -2030,9 +2032,11 @@ def board_status(
     )
     ci = _pr_ci_state(gh_pr, row) if row is not None else None
     merge_owner, github_approved, merge_refused = _merge_facts(gh_pr, harness_merges)
+    attention = _attention(row, gh_issue, gh_pr, label_set) if row is not None else None
     return dash.board_status(dash.BoardFacts(
         track=track,
-        attention=_attention(row, gh_issue, gh_pr, label_set) if row is not None else None,
+        attention=None if isinstance(attention, dash.MergeReady) else attention,
+        merge_ready=attention if isinstance(attention, dash.MergeReady) else None,
         triage=triage,
         running_kind=row.running[-1].kind if row is not None and row.running and not row.done else None,
         hold=hold,

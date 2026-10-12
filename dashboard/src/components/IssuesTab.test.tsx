@@ -27,7 +27,6 @@ const doneCard: IssueCard = {
   idle_s: 15,
   idle_active: false,
   leg_running: false,
-  projected_eta_s: 60,
   models: ["gpt-5.6-terra", "claude-opus-4-1"],
   model_badges: [
     { model: "gpt-5.6-terra", effort: "medium" },
@@ -232,7 +231,7 @@ describe("Untriaged tab", () => {
     expect(screen.queryByText("Already triaged")).not.toBeInTheDocument();
     expect(screen.queryByText("Steward asked a question")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Promote #71 to ai-ready" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready #71" }));
     expect(calls).toEqual([]);
     await userEvent.click(screen.getByRole("button", { name: "Promote #71" }));
 
@@ -241,7 +240,7 @@ describe("Untriaged tab", () => {
     vi.unstubAllGlobals();
   });
 
-  it("says so when every backlog issue has been seen", () => {
+  it("says so when no backlog issue is untriaged", () => {
     render(
       <IssuesTab
         repo="demo"
@@ -254,6 +253,6 @@ describe("Untriaged tab", () => {
       />,
     );
 
-    expect(screen.getByText(/nothing untriaged/)).toBeVisible();
+    expect(screen.getByText(/no untriaged backlog issues/)).toBeVisible();
   });
 });

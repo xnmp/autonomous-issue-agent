@@ -59,7 +59,7 @@ describe("validated API client", () => {
       done: false, steps: [], cost_usd: 1, estimated: false,
       projected_cost_usd: null, started_ts: null, last_ts: null,
       elapsed_s: null, working_s: null, idle_s: null, idle_active: false,
-      projected_eta_s: null, models: [], rounds: null,
+      models: [], rounds: null,
     };
     vi.stubGlobal(
       "fetch",

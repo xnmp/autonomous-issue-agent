@@ -15,8 +15,9 @@ interface ConfirmModalProps {
  * In-app confirm dialog. `window.confirm`/`alert` are forbidden — they block
  * the poll loop, cannot be themed, and are unstyleable in a kiosk dashboard.
  *
- * Focus is moved to the confirm button on open, Escape cancels, and a click on
- * the backdrop cancels; the panel itself stops propagation.
+ * Focus is moved to the confirm button once, on open (a parent re-render must
+ * not pull focus back from Cancel), Escape cancels, and a click on the
+ * backdrop cancels; the panel itself stops propagation.
  */
 export function ConfirmModal({
   title,
@@ -29,15 +30,17 @@ export function ConfirmModal({
   onCancel,
 }: ConfirmModalProps) {
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef(onCancel);
+  cancelRef.current = onCancel;
 
   useEffect(() => {
     confirmRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape") cancelRef.current();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [onCancel]);
+  }, []);
 
   return (
     <div className="modal-backdrop" onClick={onCancel} role="presentation">

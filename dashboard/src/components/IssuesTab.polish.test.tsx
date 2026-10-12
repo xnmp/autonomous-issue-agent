@@ -32,7 +32,6 @@ const done: IssueCard = {
   idle_s: 0,
   idle_active: false,
   leg_running: false,
-  projected_eta_s: 3600,
   models: [],
   model_badges: [],
   rounds: 1,

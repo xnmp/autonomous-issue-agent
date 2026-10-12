@@ -73,7 +73,6 @@ const issueCard = {
   merged_ts: "2026-07-29T08:00:00Z",
   projected_cost_usd: 2,
   projected_model: "gpt-5.6-terra",
-  projected_eta_s: 60,
   rounds: 1,
   models: ["gpt-5.6-terra"],
   model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],

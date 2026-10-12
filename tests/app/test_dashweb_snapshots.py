@@ -3142,6 +3142,8 @@ def test_merge_ownership_follows_the_fixers_per_branch_rule(branch, status):
     assert board_of(card)["status"] == status
     if status == "needs_you":
         assert ask_of(card) == "merge"
+        # The human-wait clock's start: the newest approval or settled check.
+        assert board_of(card)["since_ts"] == ts(minutes=20)
     else:
         assert board_of(card)["headline"] == "Ready to merge"
         assert "The harness merges it next." in board_of(card)["reason"]
@@ -3166,16 +3168,28 @@ def test_a_v2_enriched_pr_keeps_the_merge_readiness_the_board_needs():
 
 
 def test_an_approval_does_not_survive_the_ci_fix_that_changed_the_head():
+    # GitHub keeps the approval across the push (stale approvals are not
+    # dismissed), so only the journal says the head changed under it.
     fixed = {**_REVIEW_APPROVE, "ts": ts(minutes=30), "role": "fix", "kind": "FIX_CI",
              "status": "done"}
-    pr = {**_MERGE_READY_PR, "headRefName": "fix/7-test", "headRefOid": "bbb",
-          "reviewDecision": "REVIEW_REQUIRED"}
+    pr = {**_MERGE_READY_PR, "headRefName": "fix/7-test", "headRefOid": "bbb"}
 
     card = snapshots.issue_card(
         _approved_row(fixed), NOW, gh_prs={12: pr}, harness_merges=_harness_merges_governed,
     )
 
-    assert board_of(card)["headline"] not in {"Ready to merge", "Merge the PR"}
+    assert board_of(card)["status"] == "working"
+    assert board_of(card)["headline"] not in {"Ready to merge", "Approved"}
+
+
+def test_github_requiring_a_review_on_the_current_head_awaits_review():
+    pr = {**_MERGE_READY_PR, "headRefName": "fix/7-test", "reviewDecision": "REVIEW_REQUIRED",
+          "mergeStateStatus": "BLOCKED"}
+
+    card = snapshots.issue_card(_approved_row(), NOW, gh_prs={12: pr})
+
+    assert board_of(card)["status"] == "working"
+    assert board_of(card)["headline"] == "Awaiting review"
 
 
 def test_github_auto_merge_armed_by_someone_else_is_not_the_operators_merge():
@@ -3184,7 +3198,55 @@ def test_github_auto_merge_armed_by_someone_else_is_not_the_operators_merge():
     card = snapshots.issue_card(_approved_row(), NOW, gh_prs={12: pr})
 
     assert board_of(card)["status"] == "working"
-    assert "GitHub merges it automatically." in board_of(card)["reason"]
+    assert "GitHub merges it automatically" in board_of(card)["reason"]
+
+
+@pytest.mark.parametrize(
+    "gh_prs",
+    [
+        {},  # the enrichment never fetched the PR
+        {12: {**_MERGE_READY_PR, "mergeable": "UNKNOWN"}},
+        {12: {"state": "OPEN", "reviewDecision": "APPROVED"}},
+    ],
+)
+def test_an_approved_pr_github_has_not_confirmed_never_asks_the_operator_to_merge(gh_prs):
+    row = replace(_approved_row(), facts={"pr_ci_gate": "ok"})
+
+    card = snapshots.issue_card(row, NOW, gh_prs=gh_prs, harness_merges=_harness_merges_governed)
+
+    assert board_of(card)["status"] == "working"
+
+
+@pytest.mark.parametrize(
+    "facts,rollup",
+    [({"pr_ci_gate": "none"}, None), ({}, [])],
+)
+def test_a_repo_without_ci_still_asks_the_operator_to_merge(facts, rollup):
+    pr = {**_MERGE_READY_PR, "statusCheckRollup": rollup}
+
+    card = snapshots.issue_card(replace(_approved_row(), facts=facts), NOW, gh_prs={12: pr})
+
+    assert ask_of(card) == "merge"
+
+
+def test_a_reviewer_running_after_the_approval_reads_as_reviewing():
+    start = {"ts": ts(minutes=2), "event": "agent_run_start", "role": "review",
+             "kind": "RE_REVIEW", "number": 12, "issue": 7, "dispatch": "review-2", "model": ""}
+
+    card = snapshots.issue_card(_approved_row(start), NOW, gh_prs={12: _MERGE_READY_PR})
+
+    assert board_of(card)["status"] == "working"
+    assert board_of(card)["headline"] == "Reviewing"
+
+
+def test_a_projection_without_an_attention_label_keeps_the_journal_escalation():
+    # A truncated or stale projection proves no absence: it must not erase
+    # the journal's record of an escalation the label view never showed.
+    row = replace(row_view([BREAKER_COMMENT, ESCALATION]), facts={"labels": ("ai-working",)})
+
+    card = snapshots.issue_card(row, NOW, gh_issue={"title": "x"})
+
+    assert ask_of(card) == "rearm"
 
 
 @pytest.mark.parametrize("label,ask", [("needs-human-review", "escalated"), ("needs-budget-review", "budget")])

@@ -2047,6 +2047,16 @@ class AwaitingReply:
 
 Attention = Escalated | AwaitingReply
 
+
+@dataclass(frozen=True)
+class MergeReady:
+    """GitHub would merge the open PR now: open, not a draft, mergeable,
+    clean, approved, CI green or absent, no auto-merge armed. The same rule
+    starts the human-wait clock, so the board and the clock agree."""
+
+    since: datetime | None
+
+
 # Who merges an approved, green PR: the fixer (`fix.harness_merges_branch`),
 # GitHub's own auto-merge armed by someone else, or the operator.
 MergeOwner = Literal["harness", "github", "operator"]
@@ -2084,6 +2094,7 @@ class BoardFacts:
     # An ai-ready issue with nothing in progress: it waits for the fixer.
     queued: bool = False
     priority: str | None = None
+    merge_ready: MergeReady | None = None
     merge_owner: MergeOwner = "operator"
     # GitHub's review decision on the current head: False when it requires a
     # review or asks for changes, None when unread.
@@ -2144,49 +2155,80 @@ def _short_reason(reason: str | None, *prefixes: str) -> str | None:
 _PATCH_KINDS = RESOLVE_KINDS | REPAIR_KINDS | {"PR_RESUME"}
 
 
-def _approved(facts: BoardFacts) -> bool:
-    """Whether the current patch is approved.
+ReviewState = Literal["approved", "changes", "patched", "none"]
 
-    The newest review decision must be an approval with no patch-changing
-    step after it, and GitHub must not say the current head still needs a
-    review: a lifetime approval survives neither a CI fix's new head nor a
-    rebase.
-    """
-    if facts.github_approved is False:
-        return False
-    for visit in reversed(facts.track.visits):
+
+def _review_state(track: StageTrack) -> ReviewState:
+    """The harness's newest review decision, or "patched" when a step that
+    can push a new head ran after it: that decision was about a different
+    patch."""
+    patched = False
+    for visit in reversed(track.visits):
         for chip in reversed(visit.chips):
             kind = chip.kind.strip().upper()
             if kind in _PATCH_KINDS:
-                return False
-            if kind in REVIEW_KINDS and chip.outcome in {
+                patched = True
+            elif kind in REVIEW_KINDS and chip.outcome in {
                 StepOutcome.PASSED,
                 StepOutcome.CHANGES_REQUESTED,
             }:
-                return chip.outcome is StepOutcome.PASSED
-    return False
+                if patched:
+                    return "patched"
+                return "approved" if chip.outcome is StepOutcome.PASSED else "changes"
+    return "none"
 
 
-def _merge(facts: BoardFacts) -> BoardStatus:
-    """An approved, green PR GitHub would merge: whoever owns the merge acts."""
-    rounds = max(facts.track.review_rounds, 1)
-    if facts.merge_owner == "operator":
+def _approved(facts: BoardFacts) -> bool:
+    """Whether the harness approved the current patch.
+
+    A lifetime approval survives neither a CI fix's new head nor a rebase,
+    and GitHub saying the current head still needs a review overrides it.
+    """
+    return facts.github_approved is not False and _review_state(facts.track) == "approved"
+
+
+def _approved_line(track: StageTrack) -> str:
+    rounds = track.review_rounds
+    return f"Approved on review round {rounds}" if rounds > 0 else "Approved"
+
+
+# Who merges, (when GitHub would merge now, when it has not confirmed yet).
+_MERGER: Mapping[str, tuple[str, str]] = {
+    "harness": ("The harness merges it next.", "The harness merges it once GitHub allows."),
+    "github": ("GitHub merges it automatically.", "GitHub merges it automatically once its rules pass."),
+}
+
+
+def _merge_ready(facts: BoardFacts, ready: MergeReady) -> BoardStatus:
+    """GitHub would merge it now: whoever owns the merge acts."""
+    merger = _MERGER.get(facts.merge_owner)
+    if merger is None:
         return NeedsYou(
             Ask.MERGE,
             "Merge the PR",
             "Approved and green. The harness does not merge this PR.",
-            facts.last_activity,
+            ready.since,
         )
-    then = (
-        "The harness merges it next." if facts.merge_owner == "harness"
-        else "GitHub merges it automatically."
-    )
     return Working(
         Activity.MERGE,
         "Ready to merge",
-        f"Approved on review round {rounds} and green. {then}",
-        facts.last_activity,
+        f"{_approved_line(facts.track)} and green. {merger[0]}",
+        ready.since,
     )
+
+
+def _approved_waiting(facts: BoardFacts) -> Working:
+    """Approved, but GitHub has not confirmed it would merge. Unread GitHub
+    state never claims the operator's attention."""
+    approved, since = _approved_line(facts.track), facts.last_activity
+    if facts.merge_refused:
+        return Working(Activity.HANDOFF, "Approved", f"{approved}. GitHub does not allow the merge yet.", since)
+    if facts.ci == "failing":
+        return Working(Activity.HANDOFF, "Approved", f"{approved}. CI failed on the current head.", since)
+    merger = _MERGER.get(facts.merge_owner)
+    if facts.ci == "passing" and merger is not None:
+        return Working(Activity.MERGE, "Ready to merge", f"{approved} and green. {merger[1]}", since)
+    return Working(Activity.HANDOFF, "Approved", f"{approved}. GitHub has not confirmed it can merge.", since)
 
 
 def _needs_you(attention: Attention) -> NeedsYou:
@@ -2246,10 +2288,10 @@ def _handoff(facts: BoardFacts) -> Working:
         return Working(Activity.HANDOFF, "Retrying", f"The last step ({name}) failed; the harness tries again.", since)
     if last is not None and last.outcome is StepOutcome.CHANGES_REQUESTED:
         return Working(Activity.HANDOFF, "Changes requested", f"Review round {track.review_rounds} asked for changes.", since)
+    if facts.github_approved is False:
+        return Working(Activity.HANDOFF, "Awaiting review", "GitHub requires a review on the current head.", since)
     if last is not None and _approved(facts):
-        # Green and approved reaches here only when GitHub refuses the merge.
-        wait = "GitHub does not allow the merge yet." if facts.ci == "passing" else "Waiting for CI."
-        return Working(Activity.HANDOFF, "Approved", f"Approved on review round {track.review_rounds}. {wait}", since)
+        return _approved_waiting(facts)
     if last is not None and (kind in RESOLVE_KINDS | REPAIR_KINDS or kind == CI_RUN_KIND):
         return Working(Activity.HANDOFF, "Awaiting review", "The reviewer picks it up next.", since)
     return Working(Activity.HANDOFF, "Up next", "The harness picks it up on its next tick.", since)
@@ -2280,10 +2322,11 @@ def board_status(facts: BoardFacts) -> BoardStatus:
       1. parked: the operator moved it out of the pipeline on purpose;
       2. escalated or awaiting a reply: nothing moves until a person acts,
          even while a leg is still running (that leg cannot clear the hold);
-      3. the current patch is approved and green and GitHub would merge it:
-         Working when the harness or GitHub's auto-merge merges it, Needs
-         you when the operator does;
-      4. a leg is running;
+      3. a leg is running: a reviewer re-reading a new head outranks the
+         approval it may withdraw;
+      4. GitHub would merge it now (`MergeReady`) and no patch step ran
+         since the harness's newest review: Needs you when the operator
+         merges, Working when the harness or GitHub's auto-merge does;
       5. a hold on another issue or PR, or a file overlap;
       6. the steward is waiting on the author's reply;
       7. CI is running on the current head;
@@ -2302,8 +2345,6 @@ def board_status(facts: BoardFacts) -> BoardStatus:
         )
     if facts.attention is not None:
         return _needs_you(facts.attention)
-    if facts.ci == "passing" and not facts.merge_refused and _approved(facts):
-        return _merge(facts)
     if facts.running_kind is not None:
         kind = facts.running_kind.strip().upper()
         return Working(
@@ -2312,18 +2353,20 @@ def board_status(facts: BoardFacts) -> BoardStatus:
             _working_reason(facts.track, kind),
             facts.last_activity,
         )
+    if facts.merge_ready is not None and _review_state(facts.track) != "patched":
+        return _merge_ready(facts, facts.merge_ready)
     if facts.hold is not None:
         return _blocked_on(facts.hold)
     if triage is not None:
         return Blocked(
             OnTriage("awaiting_reply"),
             "Waiting on triage",
-            "The steward asked the author a question. It waits for their reply.",
+            "The steward asked the author a question. Promote it to queue it anyway.",
             triage.since,
         )
     if facts.ci == "pending":
         reason = (
-            f"Approved on review round {facts.track.review_rounds}."
+            f"{_approved_line(facts.track)}."
             if _approved(facts)
             else f"Run {max(facts.track.ci_runs, 1)} on the current head."
         )

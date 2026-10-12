@@ -297,6 +297,9 @@ def test_escalated_while_a_leg_is_running_stays_needs_you():
     assert isinstance(status, dash.NeedsYou)
 
 
+READY = dash.MergeReady(at(5))
+
+
 @pytest.mark.parametrize(
     "owner,group,says",
     [
@@ -305,18 +308,40 @@ def test_escalated_while_a_leg_is_running_stays_needs_you():
         ("operator", dash.NeedsYou, "The harness does not merge this PR."),
     ],
 )
-def test_an_approved_green_pr_goes_to_whoever_owns_its_merge(owner, group, says):
+def test_a_pr_github_would_merge_goes_to_whoever_owns_its_merge(owner, group, says):
     status = dash.board_status(BoardFacts(
-        track=REVIEWED, ci="passing", merge_owner=owner, last_activity=at(3),
+        track=REVIEWED, ci="passing", merge_ready=READY, merge_owner=owner, last_activity=at(9),
     ))
 
     assert isinstance(status, group)
     assert says in status.reason
-    assert status.since == at(3)
+    # The wait runs from the merge-ready moment, the human-wait clock's start.
+    assert status.since == at(5)
     if isinstance(status, dash.NeedsYou):
         assert (status.ask, status.headline) == (Ask.MERGE, "Merge the PR")
     else:
         assert status.headline == "Ready to merge"
+
+
+def test_a_pr_github_would_merge_asks_for_it_even_without_ci_or_a_harness_review():
+    status = dash.board_status(BoardFacts(track=EMPTY, ci=None, merge_ready=READY))
+
+    assert isinstance(status, dash.NeedsYou) and status.ask is Ask.MERGE
+
+
+@pytest.mark.parametrize("owner", ["harness", "github", "operator"])
+def test_approved_and_green_without_githubs_merge_confirmation_never_asks_the_operator(owner):
+    """mergeable UNKNOWN, an unread enrichment or an unknown state: nothing
+    proves the operator can merge, so the row stays with the harness."""
+    status = dash.board_status(BoardFacts(track=REVIEWED, ci="passing", merge_owner=owner))
+
+    assert isinstance(status, dash.Working)
+    if owner == "operator":
+        assert (status.activity, status.headline) == (dash.Activity.HANDOFF, "Approved")
+        assert "GitHub has not confirmed it can merge" in status.reason
+    else:
+        assert (status.activity, status.headline) == (dash.Activity.MERGE, "Ready to merge")
+        assert "once" in status.reason
 
 
 @pytest.mark.parametrize("owner", ["harness", "operator"])
@@ -330,6 +355,12 @@ def test_a_merge_github_refuses_is_nobodys_merge_yet(owner):
     assert "GitHub does not allow the merge yet" in status.reason
 
 
+def test_an_approved_pr_without_ci_never_claims_to_wait_for_ci():
+    status = dash.board_status(BoardFacts(track=REVIEWED, ci=None))
+
+    assert isinstance(status, dash.Working) and "CI" not in status.reason
+
+
 @pytest.mark.parametrize(
     "after",
     [("FIX_CI", O.DONE), ("ADDRESS_REVIEW", O.DONE), ("REBASE", O.DONE), ("PR_RESUME", O.DONE), ("RESUME", O.DONE)],
@@ -337,25 +368,32 @@ def test_a_merge_github_refuses_is_nobodys_merge_yet(owner):
 def test_an_approval_does_not_survive_a_changed_patch(after):
     track = stage_track(steps(("RESOLVE", O.DONE), ("REVIEW", O.PASSED, True), after))
 
-    status = dash.board_status(BoardFacts(track=track, ci="passing", merge_owner="harness"))
+    for ready in (None, READY):
+        status = dash.board_status(BoardFacts(track=track, ci="passing", merge_ready=ready))
+
+        assert isinstance(status, dash.Working)
+        assert status.activity is dash.Activity.HANDOFF
+        assert status.headline not in {"Ready to merge", "Approved"}
+
+
+def test_a_reviewer_running_on_a_new_head_outranks_the_merge():
+    status = dash.board_status(BoardFacts(
+        track=REVIEWED, ci="passing", merge_ready=READY, running_kind="RE_REVIEW",
+    ))
 
     assert isinstance(status, dash.Working)
-    assert status.activity is dash.Activity.HANDOFF
-    assert status.headline not in {"Ready to merge", "Approved"}
+    assert (status.activity, status.headline) == (dash.Activity.AGENT, "Reviewing")
 
 
-def test_github_requiring_a_review_on_the_current_head_overrides_the_journal_approval():
+def test_github_requiring_a_review_on_the_current_head_reads_awaiting_review():
     status = dash.board_status(BoardFacts(
         track=REVIEWED, ci="passing", merge_owner="harness", github_approved=False,
     ))
 
-    assert isinstance(status, dash.Working) and status.headline != "Ready to merge"
-
-
-def test_an_unread_github_review_decision_trusts_the_current_journal_approval():
-    status = dash.board_status(BoardFacts(track=REVIEWED, ci="passing", github_approved=None))
-
-    assert isinstance(status, dash.NeedsYou) and status.ask is Ask.MERGE
+    assert isinstance(status, dash.Working)
+    assert (status.headline, status.reason) == (
+        "Awaiting review", "GitHub requires a review on the current head.",
+    )
 
 
 def test_parked_outranks_an_escalation_and_reads_as_a_red_triage_wait():
@@ -478,6 +516,7 @@ def test_every_combination_of_facts_yields_exactly_one_group():
                             status = dash.board_status(BoardFacts(
                                 track=REVIEWED, attention=attention, triage=triage, hold=hold,
                                 running_kind=running, stall=stall, queued=True, ci=ci,
+                                merge_ready=READY if ci == "passing" else None,
                                 github_approved=True,
                             ))
                             assert isinstance(status, (dash.NeedsYou, dash.Working, dash.Blocked))

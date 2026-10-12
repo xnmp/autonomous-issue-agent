@@ -76,7 +76,6 @@ const historicalDoneIssue = {
   working_s: null,
   idle_s: null,
   idle_active: false,
-  projected_eta_s: null,
   models: [],
   model_badges: [],
   rounds: null,
