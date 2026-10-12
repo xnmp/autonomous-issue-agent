@@ -28,7 +28,20 @@ def test_codex_home_lives_outside_worktree(tmp_path) -> None:
     assert not (worktree / "AGENTS.override.md").exists()
     text = open(config).read()
     assert 'developer_instructions = "contract' in text
-    assert "hooks" not in text
+
+
+def test_rewrite_replaces_a_stale_governor_hook_config(tmp_path) -> None:
+    # The home keeps its historical codex-hooks path, so a pre-6a config whose
+    # hook runs the deleted governor must not survive the next leg's write.
+    state = tmp_path / "state"
+    (tmp_path / "worktree").mkdir()
+    config = write_codex_home(str(tmp_path / "worktree"), state_dir=str(state))
+    with open(config, "w") as stale:
+        stale.write('[[hooks.PreToolUse]]\ncommand = "gov.sh"\n')
+
+    assert write_codex_home(str(tmp_path / "worktree"), state_dir=str(state)) == config
+    assert "hooks" not in tomllib.loads(open(config).read())
+    assert os.path.dirname(os.path.dirname(config)) == str(state / "codex-hooks")
 
 
 def test_repository_instructions_are_not_developer_instructions(tmp_path) -> None:

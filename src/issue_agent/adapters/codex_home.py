@@ -1,6 +1,6 @@
 """Prepare the external CODEX_HOME a Codex leg runs under.
 
-Each checkout gets a state-owned `<state>/codex-home/<key>/config.toml` that
+Each checkout gets a state-owned `<state>/codex-hooks/<key>/config.toml` that
 carries the trusted harness contract as `developer_instructions` and disables
 Codex's native project-document loading, so target-owned AGENTS.md files reach
 the model only as untrusted task data (see `repository_guidance`). Nothing is
@@ -86,7 +86,10 @@ def write_codex_home(
     """
     if not state_dir:
         raise OSError("STATE_DIR is required for Codex containment")
-    codex_dir = os.path.join(state_dir, "codex-home", _home_key(cwd))
+    # The directory name is historical (it once held the governor hooks). It
+    # stays so persisted Codex sessions remain resumable and the absolute
+    # CODEX_HOME in unsettled spend-recovery evidence stays valid.
+    codex_dir = os.path.join(state_dir, "codex-hooks", _home_key(cwd))
     os.makedirs(codex_dir, exist_ok=True)
     os.chmod(codex_dir, stat.S_IRWXU)
     _link_codex_auth(codex_dir, auth_file)
