@@ -103,6 +103,11 @@ def test_a_requeued_issue_does_not_inherit_the_dead_prs_attempt_history():
     s.cleanup_pr(100, 9, merged=False)
     assert s.get_ci_history(9) == ()
 
+def _seed_infra_deaths(s, key, count):
+    """Legacy infra-death evidence; no runtime path writes these any more."""
+    Path(s.issue_path(key, "infra-deaths")).write_text(str(count))
+
+
 def test_malformed_numeric_state_blocks_reads_and_increments():
     s, root = _store()
     for path in (
@@ -113,10 +118,8 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
         with open(path, "w") as f:
             f.write("not-an-int")
 
-    for read in (lambda: s.get_infra_deaths(5),
-                 lambda: s.bump_infra_deaths(5)):
-        with pytest.raises(ValueError, match="control unavailable"):
-            read()
+    with pytest.raises(ValueError, match="control unavailable"):
+        s.get_infra_deaths(5)
     with open(os.path.join(root, "issue-5.resumes")) as f:
         assert f.read() == "not-an-int"
 
@@ -128,10 +131,10 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
 # collision the pid-suffixed tmp name exists to avoid.
 def test_write_leaves_no_tmp_file_after_success():
     s, root = _store()
-    s.set_infra_deaths(5, 4)
+    s.set_jira_key(5, "K-4")
 
-    assert s.get_infra_deaths(5) == 4
-    assert os.path.exists(os.path.join(root, "issue-5.infra-deaths"))
+    assert s.get_jira_key(5) == "K-4"
+    assert os.path.exists(os.path.join(root, "issue-5.jira"))
     leftover = [f for f in os.listdir(root) if f.endswith(".tmp")]
     assert leftover == []
 
@@ -143,17 +146,17 @@ def test_write_survives_crash_before_replace(monkeypatch):
     # fail, so it would silently install the new (wrong-for-this-test) value
     # and this assertion would catch it.
     s, _ = _store()
-    s.set_infra_deaths(5, 4)
+    s.set_jira_key(5, "K-4")
 
     def _boom(_src, _dst):
         raise OSError("simulated crash before replace")
 
     monkeypatch.setattr(os, "replace", _boom)
     try:
-        s.set_infra_deaths(5, 9)
+        s.set_jira_key(5, "K-9")
     except OSError:
         pass
-    assert s.get_infra_deaths(5) == 4
+    assert s.get_jira_key(5) == "K-4"
 
 def test_write_syncs_tmp_file_before_replace(monkeypatch):
     # review M3: fsync narrows the crash window a bare os.replace(tmp, path)
@@ -169,9 +172,9 @@ def test_write_syncs_tmp_file_before_replace(monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _tracking_fsync)
-    s.set_infra_deaths(5, 4)
+    s.set_jira_key(5, "K-4")
     assert calls, "Store._write must fsync the tmp file before os.replace"
-    assert s.get_infra_deaths(5) == 4
+    assert s.get_jira_key(5) == "K-4"
 
 def test_tmp_name_is_pid_suffixed(monkeypatch):
     # review M3: two daemons (fix + review) sharing a STATE_DIR, or a
@@ -186,9 +189,9 @@ def test_tmp_name_is_pid_suffixed(monkeypatch):
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", _capture)
-    s.set_infra_deaths(5, 4)
+    s.set_jira_key(5, "K-4")
     assert str(os.getpid()) in seen["src"]
-    assert s.get_infra_deaths(5) == 4
+    assert s.get_jira_key(5) == "K-4"
 
 def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     """An operator unblock resets the retry ceilings a wedge consumed — and
@@ -197,7 +200,7 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     _seed_legacy_ci_counter(s, 5, 3)
     Path(s.issue_path(5, "review-retries")).write_text("2026-01-01T00:00:00Z 2")
     Path(s.issue_path(5, "rebase-retries")).write_text("1")
-    s.set_infra_deaths(5, 5)
+    _seed_infra_deaths(s, 5, 5)
 
     assert not hasattr(s, "clear_retries")
 
@@ -266,23 +269,13 @@ def test_clear_issue_removes_all():
     Path(s.issue_path(5, "rebase-retries")).write_text("1")
     seed_retained_issue_file(s, 5, "resumed-at", "t")
     seed_retained_issue_file(s, 5, "phase", "authored")
-    s.bump_infra_deaths(5)
+    _seed_infra_deaths(s, 5, 1)
     s._clear_issue_advisory(5)
     assert retained_issue_file(s, 5, "session") == "x"
     assert _legacy_ci_counter(s, 5) == 2
     assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
     assert retained_issue_file(s, 5, "phase") == "authored"           # retained stopped evidence
     assert s.get_infra_deaths(5) == 1     # retained Jira/import evidence
-
-def test_set_infra_deaths_writes_the_tally_the_reader_sees():
-    # The saturate a deterministic death needs (#13): one write, read back by
-    # the same accessor the ceiling uses.
-    s, _ = _store()
-    s.bump_infra_deaths(5)
-    s.set_infra_deaths(5, 5)
-    assert s.get_infra_deaths(5) == 5
-    s.set_infra_deaths(5, -3)  # a negative tally is meaningless, not an error
-    assert s.get_infra_deaths(5) == 0
 
 def test_clear_issue_does_not_touch_pr_automerge_marker():
     # review M4: `automerge` is a PR suffix now — clear_issue must not remove
@@ -325,7 +318,7 @@ def test_clear_pr_state():
 def test_cleanup_pr_merged_clears_full_issue_state_and_automerge_marker():
     s, _ = _store()
     seed_retained_issue_file(s, 9, "session", "sess-1")
-    s.bump_infra_deaths(9)
+    _seed_infra_deaths(s, 9, 1)
     Path(s.pr_path(100, "automerge")).write_text("")
     s.cleanup_pr(100, 9, merged=True)
     assert retained_issue_file(s, 9, "session") == "sess-1"
@@ -339,7 +332,7 @@ def test_cleanup_pr_closed_unmerged_keeps_infra_deaths():
     seed_retained_issue_file(s, 9, "session", "sess-1")
     seed_retained_issue_file(s, 9, "phase", "authoring")
     seed_retained_issue_file(s, 9, "resumed-at", "2026-09-01T00:00:00Z")
-    s.bump_infra_deaths(9)
+    _seed_infra_deaths(s, 9, 1)
     Path(s.pr_path(100, "automerge")).write_text("")
     s.cleanup_pr(100, 9, merged=False)
     assert retained_issue_file(s, 9, "session") == "sess-1"
@@ -375,7 +368,7 @@ def test_cleanup_pr_issueless_unmerged_is_a_noop():
 def test_cleanup_pr_issueless_merged_clears_the_negated_key_issue_state():
     s, _ = _store()
     Path(s.pr_path(100, "automerge")).write_text("")
-    s.bump_infra_deaths(-100)          # the negated-PR breaker key
+    _seed_infra_deaths(s, -100, 1)          # the negated-PR breaker key
     s.cleanup_pr(100, None, merged=True)
     assert not Path(s.pr_path(100, "automerge")).exists()       # PR-side still clears (regression guard)
     assert s.get_infra_deaths(-100) == 1           # retained legacy debt is evidence, not a runtime reset
@@ -387,7 +380,7 @@ def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
     # routes through clear_issue_resume_state, not a blanket clear_issue.
     s, _ = _store()
     Path(s.pr_path(100, "automerge")).write_text("")
-    s.bump_infra_deaths(-100)
+    _seed_infra_deaths(s, -100, 1)
     s.cleanup_pr(100, None, merged=False)
     assert Path(s.pr_path(100, "automerge")).exists()        # PR-side untouched, as before
     assert s.get_infra_deaths(-100) == 1           # kept — same conservatism as a real issue
@@ -449,7 +442,7 @@ def test_store_has_no_retired_continuity_authority_surface():
     names = ("get_branch", "save_branch", "get_session", "save_session",
              "has_session", "get_model", "save_model", "get_resumed_at",
              "set_resumed_at", "bump_resumes", "get_phase", "set_phase",
-             "clear_infra_deaths", "automerge_enabled", "mark_automerge",
+             "clear_infra_deaths", "bump_infra_deaths", "set_infra_deaths", "automerge_enabled", "mark_automerge",
              "get_triage_at", "get_groom_at", "get_groom_content",
              "triage_at_path", "groom_at_path", "groom_content_path",
              "clear_pr_state")

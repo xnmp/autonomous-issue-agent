@@ -605,21 +605,17 @@ def test_fixed_origin_and_default_rejection_grant_round_trip():
     assert decode_workflow(encode_workflow(ReviewRejectionGrant()), ReviewRejectionGrant) == ReviewRejectionGrant()
 
 
-def test_literal_accepted_pre_f7_capture_preserves_wire_and_absent_policy():
+def test_capture_wire_roundtrips_and_retired_infra_ceiling_is_dropped_on_read():
     from pathlib import Path
     from issue_agent.domain import continuation_components as cc
     literal = json.loads((Path(__file__).parents[1] / "fixtures/phase4-pre-f7-capture.json").read_text())
     old = decode_workflow(literal["capture_wire"], cc.ContinuationCapture)
-    assert old.fix_infra_ceiling is None
     assert encode_workflow(old) == literal["capture_wire"] and repr(old) == literal["capture_repr"]
-    disabled = replace(old, fix_infra_ceiling=0)
-    assert encode_workflow(disabled) != literal["capture_wire"]
-    assert decode_workflow(encode_workflow(disabled), cc.ContinuationCapture).fix_infra_ceiling == 0
-    assert repr(disabled) == literal["capture_repr"]
-    with pytest.raises(ValueError):
-        replace(old, fix_infra_ceiling=-1)
-    with pytest.raises(ValueError):
-        replace(old, fix_infra_ceiling=True)
+    for ceiling in (None, 0, 5):
+        wire = json.loads(literal["capture_wire"])
+        wire["value"]["fields"]["fix_infra_ceiling"] = ceiling
+        stamped = decode_workflow(json.dumps(wire), cc.ContinuationCapture)
+        assert stamped == old and encode_workflow(stamped) == literal["capture_wire"]
 
 
 def test_literal_accepted_steward_purchase_preserves_wire_and_captured_policy():

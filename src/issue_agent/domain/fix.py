@@ -50,6 +50,7 @@ from .ci import (
     pending_checks,
     pending_deadline_breached,
 )
+from .backoff import LegEnd, machine_backoff_until
 from .identity import login_eq
 from .checks import Observed, Unavailable
 from . import continuation_components as cc
@@ -107,12 +108,6 @@ class FixConfig:
     # itself 403s) that race is the accepted residual — requiring this flag
     # unconditionally silently disabled every merge on such repos (observed
     # 2026-08-01; see residuals.md).
-    # SEPARATE, HIGHER ceiling for sessions that die BEFORE returning a result
-    # (review C3/D2c). "Infra deaths are not attempts" stays true for every
-    # retry breaker above (FAILURE-MODES #58) — but a leg whose session keeps
-    # dying pre-result never records an attempt at all, so nothing bounded it:
-    # one full paid session every two polls, forever. 0 disables.
-    max_infra_deaths: int = 5
     # How long CI may sit PENDING before the PR is handed to a human (#30),
     # measured from the newest pending check's start. PENDING outranks FAILURE
     # (the #49 anti-loop rule) and nothing bounded that, so one job stuck
@@ -165,13 +160,13 @@ class FixState:
     # Missing/unavailable authority never means a fresh allowance. Resolve's
     # gates, failure count and continuation are one SQLite-owned episode.
     resolve_workflows: Mapping[int, WorkflowRead] = field(default_factory=dict)
-    # Pre-result session deaths (review C3), keyed the same way the retry
-    # counters are: issue number for the issue legs, `breaker_key(pr)` for the
-    # PR legs. Written by the dispatcher (on a raised handler) and by the fix
-    # workflow (on a RETURNED infra-death result) — the two are mutually
-    # exclusive, so a single death counts once.
-    infra_deaths: dict[int, int] = field(default_factory=dict)
-    infra_control_errors: Mapping[int, str] = field(default_factory=dict)
+    # Ended fix legs per issue (`breaker_key`), the only input to the machine
+    # failure backoff. A machine failure is never an attempt (domain.backoff).
+    leg_ends: Mapping[int, tuple[LegEnd, ...]] = field(default_factory=dict)
+    # Issue → why its leg history or issue recovery authority is unreadable.
+    # Holds every leg for that issue: unknown history cannot prove a backoff
+    # has elapsed, and admission refuses an issue without recovery authority.
+    leg_history_errors: Mapping[int, str] = field(default_factory=dict)
     # PR number → the head SHA whose ONE free CI re-run has been spent (#38).
     # Keyed on the SHA, not a boolean, so a push resets the allowance for free:
     # a new head is a genuinely new failure and deserves its own flake test,
@@ -609,7 +604,7 @@ def prs_needing_resume(
     for pr in fixer_prs(world, cfg):
         # `needs-human-review` is also lifecycle-blocked, but it is terminal:
         # an operator reply must never silently reopen an escalation that
-        # deliberately removed `ai-blocked` at the retry/infra ceiling.
+        # deliberately removed `ai-blocked` at a retry ceiling.
         if not pr.has(Label.AI_BLOCKED) or pr.number in state.pr_reply_control_errors:
             continue
         issue = _issue_for_pr(pr)
@@ -775,7 +770,7 @@ def reap_actions(
     failing (a renamed label, a 403, or a crash between the PR opening and the
     relabel — and since review S7 that failure is swallowed per-action), the
     reaper requeued every other poll and the harness paid for a full RESOLVE
-    session each time, with `resolve_retries` and `infra_deaths` both reading 0.
+    session each time, with `resolve_retries` reading 0.
     Repairing instead of requeueing removes the loop at its source: the label is
     re-derived from the world, so the same tick that observes the PR fixes the
     label, and the PR legs (address-review / fix-ci / rebase) take over.
@@ -1453,30 +1448,6 @@ def _escalate_pr(
     return pr_escalation(pr, reason, from_label).actions()
 
 
-def infra_ceiling_hit(state: FixState, cfg: FixConfig, key: int) -> bool:
-    """The infra-death breaker (review C3/D2c). A session that dies before
-    returning a result records NO attempt — deliberately, so a machine under
-    memory pressure can't walk a healthy issue to needs-human-review
-    (FAILURE-MODES #58). The cost of that exemption was that nothing bounded
-    dying itself: the reaper requeued and the next poll paid for another full
-    session. This is the separate, HIGHER ceiling that stops it. cap<=0
-    disables, like every other breaker here."""
-    return breaker_tripped(state.infra_deaths.get(key, 0), cfg.max_infra_deaths)
-
-
-def infra_escalation_reason(cap: int) -> str:
-    """Human-facing text for an infra-death escalation. Says what the harness
-    saw (deaths before any result) so the human looks at the runtime/daemon,
-    not at the code the agent never got to touch."""
-    return (
-        f"INFRA: the agent session died {cap}× before returning a result — a "
-        "transport drop, an external kill, a daemon restart mid-run, a refused "
-        "admission, or a runtime that could not start at all, so no attempt was "
-        "ever recorded. This measures the harness, not the issue: the "
-        "harness/runtime needs a human look, and the issue itself may be fine."
-    )
-
-
 # ── composition ────────────────────────────────────────────────────────────
 def _has_pending_rebase_return(state: FixState, issue: int) -> bool:
     workflow = state.resolve_workflows.get(issue)
@@ -1585,9 +1556,16 @@ def decide_fix(
     issues_by_number = {issue.number: issue for issue in world.issues}
 
     def target_available(issue: int) -> bool:
-        if issue in state.infra_control_errors:
-            return False
         return all(active.issue != issue for active in inflight)
+
+    now = parse_timestamp(world.now)
+
+    def backing_off(issue: int, kind: AgentKind) -> bool:
+        if issue in state.leg_history_errors:
+            return True
+        until = machine_backoff_until(state.leg_ends.get(issue, ()), kind)
+        # An unreadable clock cannot prove the wait is over.
+        return until is not None and (now is None or now < until)
 
     def dispatchable(issue: int, paths: frozenset[str]) -> bool:
         exclusive = not paths
@@ -1720,11 +1698,7 @@ def decide_fix(
                 paths = pr.changed_files | issue_paths(issue)
                 if not dispatchable(issue, paths):
                     continue
-                if infra_ceiling_hit(state, cfg, bkey):
-                    actions.extend(_escalate_pr(
-                        pr.number, infra_escalation_reason(cfg.max_infra_deaths),
-                        Label.AI_BLOCKED,
-                    ))
+                if backing_off(issue, AgentKind.PR_RESUME):
                     continue
                 actions.append(RunAgent(AgentKind.PR_RESUME, pr.number))
                 claim(issue, paths)
@@ -1768,10 +1742,6 @@ def decide_fix(
             paths = pr.changed_files | issue_paths(issue_n)
             if not remaining or not dispatchable(issue_n, paths):
                 continue
-            if infra_ceiling_hit(state, cfg, bkey):
-                actions.extend(_escalate_pr(
-                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                continue
             if breaker_tripped(state.rebase_retries.get(bkey, 0),
                                cfg.max_rebase_retries):
                 actions.extend(_escalate_pr(
@@ -1786,6 +1756,8 @@ def decide_fix(
                 actions.append(NoOp(
                     f"rebase #{pr.number} held: waiting for the current workflow's durable rebase return"
                 ))
+                continue
+            if backing_off(issue_n, AgentKind.REBASE):
                 continue
             actions.append(RunAgent(AgentKind.REBASE, pr.number))
             claim(issue_n, paths)
@@ -1806,10 +1778,6 @@ def decide_fix(
             # nothing else resets it (see FixState.review_retries).
             if bkey in state.review_control_errors:
                 continue
-            if infra_ceiling_hit(state, cfg, bkey):
-                actions.extend(_escalate_pr(
-                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                continue
             at, n = state.review_retries.get(bkey, ("", 0))
             count = n if at == review.submitted_at else 0
             if breaker_tripped(count, cfg.max_review_retries):
@@ -1817,6 +1785,8 @@ def decide_fix(
                     pr.number,
                     f"address-review failed {cfg.max_review_retries}× without resolution.",
                 ))
+                continue
+            if backing_off(issue_n, AgentKind.ADDRESS_REVIEW):
                 continue
             actions.append(RunAgent(AgentKind.ADDRESS_REVIEW, pr.number))
             claim(issue_n, paths)
@@ -1847,7 +1817,6 @@ def decide_fix(
             if not target_available(issue_n):
                 continue
             paths = pr.changed_files | issue_paths(issue_n)
-            infra_hit = infra_ceiling_hit(state, cfg, bkey)
             ci_hit = breaker_tripped(state.ci_retries.get(bkey, 0), cfg.max_ci_retries)
             # Flake first (#38): one free `gh run rerun --failed` per head
             # SHA before any paid repair. Two FIX_CI legs of one deployment
@@ -1872,22 +1841,20 @@ def decide_fix(
             # Only the free rerun ignores paid capacity (tauri #1074 waited
             # hours behind an unrelated RESOLVE slot, 2026-10-11); breaker
             # escalations and FIX_CI keep their capacity and path gates.
-            if not (infra_hit or ci_hit) and free_ci_rerun(pr, state, cfg):
+            if not ci_hit and free_ci_rerun(pr, state, cfg):
                 actions.append(
                     RerunFailedChecks(pr.number, pr.head_ref_oid, ci_rerun_run_ids(pr, cfg))
                 )
                 continue
             if not remaining or not dispatchable(issue_n, paths):
                 continue
-            if infra_hit:
-                actions.extend(_escalate_pr(
-                    pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
-                continue
             if ci_hit:
                 actions.extend(_escalate_pr(
                     pr.number,
                     f"CI fix failed {cfg.max_ci_retries}× without going green.",
                 ))
+                continue
+            if backing_off(issue_n, AgentKind.FIX_CI):
                 continue
             actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
             claim(issue_n, paths)
@@ -1905,57 +1872,45 @@ def decide_fix(
             if not remaining:
                 break
             paths = issue_paths(n)
-            if not dispatchable(n, paths):
+            if not dispatchable(n, paths) or backing_off(n, AgentKind.RESUME):
                 continue
-            if infra_ceiling_hit(state, cfg, n):
-                actions.extend(issue_escalation(
-                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_BLOCKED,
-                ).actions())
-            else:
-                issue = issues_by_number[n]
-                claim_action = Relabel(
-                    Target.ISSUE,
-                    n,
-                    Label.AI_BLOCKED,
-                    Label.AI_WORKING,
-                    issue.updated_at,
-                )
-                actions.append(claim_action)
-                actions.append(RunAgent(AgentKind.RESUME, n, claim_action))
-                claim(n, paths)
+            issue = issues_by_number[n]
+            claim_action = Relabel(
+                Target.ISSUE,
+                n,
+                Label.AI_BLOCKED,
+                Label.AI_WORKING,
+                issue.updated_at,
+            )
+            actions.append(claim_action)
+            actions.append(RunAgent(AgentKind.RESUME, n, claim_action))
+            claim(n, paths)
 
     # Filter before selecting so held high-priority work cannot starve an
     # unrelated available episode. Labels cannot grant or reset SQL authority.
     ready_world = replace(world, prs=observed_prs, issues=tuple(
         issue for issue in world.issues
         if issue.number not in guarded
-        and issue.number not in state.infra_control_errors
+        and not backing_off(issue.number, AgentKind.RESOLVE)
         and isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
         and not workflow.gates
     ))
     # 3) New ai-ready issues, only after repair work and only while slots remain.
     while remaining:
         n = pick_ready_issue(ready_world, tuple(inflight))
-        if n is not None:
-            if infra_ceiling_hit(state, cfg, n):
-                actions.extend(issue_escalation(
-                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_READY,
-                ).actions())
-                break
-            else:
-                issue = issues_by_number[n]
-                claim_action = Relabel(
-                    Target.ISSUE,
-                    n,
-                    Label.AI_READY,
-                    Label.AI_WORKING,
-                    issue.updated_at,
-                )
-                actions.append(claim_action)
-                actions.append(RunAgent(AgentKind.RESOLVE, n, claim_action))
-                claim(n, issue_paths(n))
-        else:
+        if n is None:
             break
+        issue = issues_by_number[n]
+        claim_action = Relabel(
+            Target.ISSUE,
+            n,
+            Label.AI_READY,
+            Label.AI_WORKING,
+            issue.updated_at,
+        )
+        actions.append(claim_action)
+        actions.append(RunAgent(AgentKind.RESOLVE, n, claim_action))
+        claim(n, issue_paths(n))
 
     # 3c) auto-merge + branch-update: lock-free and INDEPENDENT of the fixer, so
     # they get their OWN pass over the same PRs (review M14). They used to sit at

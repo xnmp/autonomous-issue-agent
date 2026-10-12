@@ -12,8 +12,6 @@ from ..adapters.github import GitHubGateway, Identity
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
 from ..adapters.workflow_control import SQLiteWorkflowControl
-from ..domain.fix import breaker_tripped
-from ..domain.continuation_components import SelectedIssueRecovery
 from ..domain.deployment import canonical_deployment_name
 from ..domain.labels import Label
 from ..domain.ports import FixWorktreePort, WorkflowGitHubReads
@@ -35,18 +33,8 @@ def compose_resolve_rearm(
     owner = owner_identity_for_target(cfg.repo, cfg.target_dir, "fix")
 
     def external_holds(observed: ObservedIssue) -> tuple[str, ...]:
-        issue = observed.key.target.number
-        holds = tuple(label.value for label in (Label.AI_BLOCKED, Label.AI_PARKED, Label.NEEDS_BUDGET_REVIEW)
-                      if label in observed.issue.labels)
-        selected = control.read_issue_recovery(observed.key)
-        if not isinstance(selected, SelectedIssueRecovery):
-            raise ValueError("fix infrastructure episode is inactive or migration blocked")
-        # Pre-admission refusals (#262) are deliberately NOT a re-arm hold: the
-        # operator's re-arm is their recovery, and the generation bump clears them.
-        deaths = selected.component.state.infra_failures
-        if breaker_tripped(deaths, cfg.max_infra_deaths):
-            holds += ("infrastructure failure ceiling",)
-        return holds
+        return tuple(label.value for label in (Label.AI_BLOCKED, Label.AI_PARKED, Label.NEEDS_BUDGET_REVIEW)
+                     if label in observed.issue.labels)
 
     workflow = SQLiteWorkflowControl(control, WorkflowWriter(cfg.repo, "fix", owner),
                                      resolve_ceiling=cfg.max_resolve_retries,

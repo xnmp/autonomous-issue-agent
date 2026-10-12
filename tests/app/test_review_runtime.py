@@ -3,6 +3,7 @@
 from tests.domain.builders import observed_pr
 
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -55,8 +56,8 @@ def test_stopped_import_reader_preserves_legacy_attribution(tmp_path, key):
     store = Store(str(tmp_path))
     pr = view(closing_issue=5, head_ref_name="fix/5-thing")
     deaths = {-PR: 3} if key == "recovered" else {}
-    for _ in range(3 if key != "recovered" else 0):
-        store.bump_infra_deaths(5 if key == "issue" else -PR)
+    if key != "recovered":
+        Path(store.issue_path(5 if key == "issue" else -PR, "infra-deaths")).write_text("3")
     read = unproductive_rounds_reader(store, lambda: deaths)(pr)
     assert read == 3
     holds = review_external_holds(unproductive_rounds_reader(store, lambda: deaths), 3)
@@ -69,8 +70,8 @@ from tests.adapters.test_review_execution_control import rig
 def test_rearm_and_dispatch_read_the_same_current_allowance(rig, tmp_path):
     control, _, _, _, _ = rig
     store = Store(str(tmp_path / "retired-files"))
-    for _ in range(20):
-        store.bump_infra_deaths(-9)
+    Path(store.issue_path(-9, "infra-deaths")).parent.mkdir(parents=True, exist_ok=True)
+    Path(store.issue_path(-9, "infra-deaths")).write_text("20")
     pr = observed_pr(9, head_ref_oid=HEAD)
     errors = {}
     counts = _review_unproductive_rounds(control, "o/r", SimpleNamespace(prs=[pr]), errors)

@@ -23,7 +23,6 @@ from ...domain import fix as fix_domain
 from ...domain.events import (
     BudgetPathEntered,
     Correlation,
-    InfraPathEntered,
     RoutingEscalated,
     TelemetryEvent,
     TelemetryWarning,
@@ -65,7 +64,6 @@ from ...domain.ports import (
     CiPromptReads,
     FixWorktreePort,
     EventSink,
-    InfraBreakerPort,
     ReviewPromptReads,
     WorkflowGitHubReads,
     WorkflowState,
@@ -138,11 +136,6 @@ class FixWorkflowConfig:
     # the routing guardrail is "split the metrics by tier", which is unanswerable
     # if the tier a leg actually ran at was never recorded.
     journal: EventSink | None = None
-    # Deployment-wide infra breaker (app.infra_breaker.InfraBreaker). Every
-    # infra-class death is reported to it beside the per-issue ceiling charge,
-    # and every returned result clears it. None = per-issue ceilings only,
-    # which is the pre-breaker behaviour every hand-built config keeps.
-    infra_breaker: InfraBreakerPort | None = None
     operator_guidance: Callable[[int], str] | None = None
 
 
@@ -474,12 +467,6 @@ class FixWorkflow:
         except Exception as exc:  # noqa: BLE001 — advisory prompt enrichment
             self.cfg.log(f"prompt input 'failed_run_log' unavailable: {exc}")
             return ""
-
-    def _report_return_health(self, result) -> None:
-        # Issue episode changes require the exact paid run receipt captured by
-        # accounting; this retains the independent deployment probe behavior.
-        if not outcome.infra_class_failure(result):
-            self._report_healthy_leg()
 
     def _leg_kind(self, kind: str | None):
         """Journal the next run under its own `kind` (#40), when the wrapped
@@ -864,10 +851,7 @@ class FixWorkflow:
         task = dataclasses.replace(task, resolve_inputs=ResolveInputs(iss.title, iss.body, iss.author))
         result = await self._run_logged("resolve", issue, task)
         returned = self._returned_result(result, binding)
-        self._report_return_health(result)
         if returned is not None:
-            if outcome.infra_class_failure(result):
-                self._charge_infra_death(issue, "resolve", result)
             if self._finish_return(returned):
                 self.executor.replay_pending()
             return
@@ -885,8 +869,6 @@ class FixWorkflow:
         followup = outcome.ResolveFollowup.RETRY if changed else outcome.resolve_followup(result, pr is not None)
         if not self._record_resolve_result(issue, result, stage, task, binding, followup):
             return False
-        if outcome.infra_class_failure(result):
-            self._charge_infra_death(issue, stage.value.casefold(), result)
         actions = self._resolve_actions(issue, result, pr)
         if changed:
             self.cfg.log(f"resolve #{issue}: requirements changed during work; requeueing for the new facts")
@@ -1123,10 +1105,6 @@ class FixWorkflow:
             )
         author = await self._run_logged("author", issue, task, kind="AUTHOR")
         returned = self._returned_result(author, binding)
-        if outcome.infra_class_failure(author):
-            self._charge_infra_death(issue, "author", author)
-        else:
-            self._report_return_health(author)
         if returned is not None:
             completed = self._finish_return(returned)
             if completed:
@@ -1351,10 +1329,6 @@ class FixWorkflow:
                     task = dataclasses.replace(task, issue_reply=cc.IssueReplyInput(selected, selected_reply.created_at, selected_reply.body, context.branch))
             result = await self._run_logged(leg, issue, task, kind=kind)
             returned = self._returned_result(result, binding)
-            if outcome.infra_class_failure(result):
-                self._charge_infra_death(issue, leg, result)
-            else:
-                self._report_return_health(result)
             if returned is None:
                 # Only legacy non-accounting infra/budget fakes can arrive
                 # without the captured return this split plan requested.
@@ -1372,57 +1346,6 @@ class FixWorkflow:
                 is not outcome.ImplementFollowup.CONTRACT_CHANGE
             ):
                 return
-
-    def _charge_infra_death(self, issue: int, leg: str, result) -> None:
-        """Report the deployment fault and the already captured SQL episode.
-
-        Reporting must survive unavailable authority without charging the run
-        a second time through the dispatcher exception path.
-        """
-        self._report_infra_death(issue, leg, outcome.infra_class_reason(result))
-        try:
-            selected = self.workflow_control.read_issue_recovery(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue))) if self.workflow_control is not None else None
-            if not isinstance(selected, cc.SelectedIssueRecovery):
-                raise WorkflowAuthorityError("fix infrastructure episode is unavailable")
-            deaths = selected.component.state.infra_failures + self.workflow_control.fix_admission_refusals(selected)
-        except Exception as exc:  # noqa: BLE001 — reporting preserves the original fault
-            self.cfg.log(f"agent #{issue}: infra episode unavailable ({exc})")
-            return
-        journal = self.cfg.journal
-        if journal is None:
-            return
-        try:
-            journal.emit(
-                TelemetryEvent(
-                    InfraPathEntered(
-                        leg, outcome.infra_class_reason(result), deaths
-                    ),
-                    Correlation(issue=issue),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 — telemetry never fails a leg
-            self.cfg.log(f"agent #{issue}: infra path not journalled ({exc})")
-
-    def _report_infra_death(self, issue: int, leg: str, reason: str) -> None:
-        """Feed the deployment-wide breaker. Never fails the leg: the breaker
-        is an efficiency control, and a broken one must not become a second
-        failure on top of the death it is being told about."""
-        breaker = self.cfg.infra_breaker
-        if breaker is None:
-            return
-        try:
-            breaker.record_death(issue, leg, reason)
-        except Exception as exc:  # noqa: BLE001 — see docstring
-            self.cfg.log(f"agent #{issue}: infra breaker not updated ({exc})")
-
-    def _report_healthy_leg(self) -> None:
-        breaker = self.cfg.infra_breaker
-        if breaker is None:
-            return
-        try:
-            breaker.record_success()
-        except Exception as exc:  # noqa: BLE001 — see `_report_infra_death`
-            self.cfg.log(f"infra breaker not cleared ({exc})")
 
     def _journal_budget_path(self, issue: int, leg: str, reason, pr: int | None) -> None:
         """Record the operator-cap path separately from capability escalation."""
@@ -1541,10 +1464,6 @@ class FixWorkflow:
             assert binding is not None
             returned = self._returned_result(result, binding)
             if returned is not None:
-                if outcome.infra_class_failure(result):
-                    self._charge_infra_death(issue, "resume", result)
-                else:
-                    self._report_return_health(result)
                 if self._finish_return(returned):
                     self.executor.replay_pending()
                 return
@@ -1568,10 +1487,6 @@ class FixWorkflow:
         else:
             changed = False
             current = None
-        if outcome.infra_class_failure(result):
-            self._charge_infra_death(issue, "resume", result)
-        else:
-            self._report_return_health(result)
         actions = ([Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)] if changed
                    else outcome.resume_actions(issue, result, pr))
         if state is not None:
@@ -1695,10 +1610,6 @@ class FixWorkflow:
             "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body,
             guidance=guidance,
         )
-        if outcome.infra_class_failure(result):
-            self._charge_infra_death(issue, "pr-resume", result)
-        else:
-            self._report_return_health(result)
         self.executor.execute_all(outcome.pr_resume_actions(pr, result))
 
     def _resolve_handoff_session(self, issue: int) -> ResolveSession | None:
@@ -1785,17 +1696,6 @@ class FixWorkflow:
         )
         out = outcome.address_review_actions(pr, result)
         self.executor.execute_all(out.actions)
-        if outcome.infra_class_failure(result):
-            # review C3/D2c, RETURNED-result half. address_review_actions
-            # exempts an external kill from the review-retry ceiling (no attempt
-            # was made) and leaves the PR untouched, so the next poll sees the same
-            # CHANGES_REQUESTED review and pays for the leg again — unbounded
-            # until this counter bounds it. Same key the review-retry counter
-            # uses, so the decide side reads one key per issue. A leg either
-            # raises or returns, so a death is counted exactly once.
-            self._charge_infra_death(issue, "address-review", result)
-        else:
-            self._report_return_health(result)
 
     def _pr_guidance(self, pr: int) -> str:
         """The operator's scope note for a PR repair, from its one owner.
@@ -1913,20 +1813,8 @@ class FixWorkflow:
         # zero-information rows, i.e. the blindness this exists to remove,
         # disguised as a populated history. An infra death and an agent error
         # DO get recorded: those legs ran, and their failure is the evidence.
-        capped = outcome.budget_exhausted(result.exit_reason)
-        if not capped:
+        if not outcome.budget_exhausted(result.exit_reason):
             self._try(lambda: self.store.append_ci_attempt(issue, attempt), None)
-        if capped:
-            pass
-        elif not outcome.infra_class_failure(result):
-            self._report_return_health(result)
-        else:
-            # Separate, higher ceiling for the deaths themselves (review C3/D2c)
-            # — same key the CI counter uses, so the decide side reads one key.
-            # `ci_retries` is ALSO router difficulty evidence
-            # (EscalationSignals), so a harness fault charged here would inflate
-            # effort and model tier as well as the breaker (keifu #130).
-            self._charge_infra_death(issue, "fix-ci", result)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     async def rebase(
@@ -1969,14 +1857,6 @@ class FixWorkflow:
         task = dataclasses.replace(task, pr_repair_input=repair)
         self.runner.set_context("fix", "REBASE", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged("rebase", issue, task, p, kind="REBASE", guidance=guidance)
-        # Same rule as fix_ci: neither an infra kill nor a budget-capped
-        # admission/leg is a failed rebase attempt (#155).
-        if outcome.budget_exhausted(result.exit_reason):
-            pass
-        elif not outcome.infra_class_failure(result):
-            self._report_return_health(result)
-        else:  # review C3/D2c, as in fix_ci
-            self._charge_infra_death(issue, "rebase", result)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     @staticmethod

@@ -7,6 +7,7 @@ from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
 from .continuation_components import CIEpisodeReset, SelectedIssueRecovery, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
 from .world import IssueView
 from .agent_task import RuntimeName
+from .backoff import LegEnd
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
@@ -50,9 +51,8 @@ class WorkflowControl(Protocol):
 
     def read_issue_recovery(self, key: WorkflowKey) -> IssueRecoverySelection: ...
 
-    def fix_admission_refusals(self, selected: SelectedIssueRecovery) -> int:
-        """Refusals minted before admission (no run, no receipt), scoped to the
-        selected recovery episode; they spend the infra-death ceiling (#262)."""
+    def fix_leg_ends(self, issue: int) -> tuple[LegEnd, ...]:
+        """Ended fix legs for one issue, the input to the machine backoff."""
         ...
 
     def reset_ci_episode(self, source: CIEpisodeReset) -> bool: ...

@@ -19,5 +19,4 @@ def with_resolve_authority(dispatcher, *, resolve_ceiling=3):
         pr_repair=True,
     )
     dispatcher.fix_workflow = AccountedFixtureWorkflow(**values)
-    object.__setattr__(dispatcher.fix_workflow, "_fixture_infra_ceiling", dispatcher.cfg.max_infra_deaths)
     return dispatcher

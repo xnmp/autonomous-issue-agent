@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import os
-import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -39,7 +38,6 @@ from ..domain.outcome import (
     DAILY_HEADROOM_STATUS,
     MAX_BUDGET_STATUS,
     RETURN_REFUSED_STATUS,
-    pre_admission_refusal,
     budget_exhausted,
     infra_class_failure,
     address_review_actions,
@@ -148,7 +146,6 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     max_contract_rounds: int | None = None
-    fix_infra_ceiling: int = 5
     admit: Callable[[ReservationRequest], ReservationResult] | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None]
@@ -268,40 +265,6 @@ class AccountingRuntime(AgentRuntime):
         self._identity.set((run_id, leg_id))
 
     async def run(self, task: RuntimePlan) -> AgentResult:
-        issue = self._context.get()[0]
-        track = self.role == "fix" and issue is not None
-        if track and self.store.fix_refusal_unrecorded(self.repository, issue):
-            # The ledger could not record an earlier refusal for this issue, so
-            # its ceiling position is unknown: no paid admission until a write
-            # succeeds again (ADR 0012: fail closed, never proceed blind).
-            result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
-        else:
-            result = await self._admit_and_run(task)
-        if track and pre_admission_refusal(result):
-            # Refused before any run exists, so the episode's receipt-driven
-            # infra charge can never see it (#262). Count it durably here;
-            # the fix role folds the ledger into the infra-death ceiling.
-            try:
-                selected = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
-                if not isinstance(selected, cc.SelectedIssueRecovery):
-                    raise ValueError("issue recovery episode is unavailable to scope the refusal")
-                self.store.record_fix_admission_refusal(
-                    self.repository, issue, selected.episode_scope, result.summary
-                )
-            except Exception as exc:  # noqa: BLE001 - the store now fails this issue closed
-                self._ledger_fault(issue, "record", exc)
-                result = replace(result, summary=f"{result.summary} [refusal not recorded: {exc}]")
-        return result
-
-    def _ledger_fault(self, issue: int, operation: str, exc: Exception) -> None:
-        """A ledger fault is never silent (ADR 0012): journal it, and fall back
-        to stderr when the store that failed cannot take the event either."""
-        try:
-            self.store.record_fix_refusal_ledger_fault(issue, operation, f"{type(exc).__name__}: {exc}")
-        except Exception:  # noqa: BLE001 - last resort, the daemon log captures stderr
-            print(f"fix admission refusal ledger {operation} failed for #{issue}: {exc}", file=sys.stderr)
-
-    async def _admit_and_run(self, task: RuntimePlan) -> AgentResult:
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return _return_refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
@@ -515,10 +478,6 @@ class AccountingRuntime(AgentRuntime):
             separators=(",", ":"),
         )
         reserved_model = task.model or "<runtime-default>"
-        if self.role == "fix":
-            continuations = tuple(replace(purchase, capture=replace(purchase.capture, fix_infra_ceiling=self.fix_infra_ceiling))
-                if purchase.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY else purchase
-                for purchase in continuations)
         request = ReservationRequest(
             ReservationId(uuid.uuid4().hex),
             run_id,
@@ -600,12 +559,6 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.AGENT_ERROR,
             )
-        if self.role == "fix" and issue is not None:
-            # Admission succeeded: whatever authority was missing is back.
-            try:
-                self.store.clear_fix_admission_refusals(self.repository, issue)
-            except Exception as exc:  # noqa: BLE001 - a stale count only brings the ceiling nearer
-                self._ledger_fault(issue, "clear", exc)
         publication_owner = (
             self.owner_id or f"{self.repository}:{self.role}"
         )
@@ -689,16 +642,12 @@ class AccountingRuntime(AgentRuntime):
                 except Exception:
                     pass
             if self.role == "fix" and not isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                from ..domain.outcome import deterministic_death
-                deterministic = deterministic_death(f"{type(exc).__name__}: {exc}",
-                    str(getattr(exc, "harness_last_trace", "") or ""))
                 try:
-                    self.store.record_fix_infra_return(run_id,
-                        cc.FixInfraOutcome.DETERMINISTIC_DEATH if deterministic is not None else cc.FixInfraOutcome.RECLAIMED,
+                    self.store.record_fix_infra_return(run_id, cc.FixInfraOutcome.RECLAIMED,
                         WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
                 except Exception:
-                    # Preserve the provider failure; existing dead-run recovery
-                    # still owns the retained reservation and exact episode.
+                    # Preserve the provider failure. A run without a receipt
+                    # still reads as a machine end to the backoff.
                     pass
             raise
         if self.role == "fix":
@@ -845,8 +794,7 @@ class AccountingRuntime(AgentRuntime):
                             session=session, actual_model=actual_model)
             writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")
             ci = (cc.CIRepairResult(self.store.ci_repair_admission(attempt),
-                cc.CICharge.BUDGET if budget_exhausted(result.exit_reason) else
-                cc.CICharge.INFRA if infra_class_failure(result) else cc.CICharge.ATTEMPT)
+                cc.CICharge.NOT_ATTEMPT if budget_exhausted(result.exit_reason) or infra_class_failure(result) else cc.CICharge.ATTEMPT)
                 if repair_input.ci is not None else None)
             review = (cc.ReviewRepairResult(self.store.review_repair_admission(attempt),
                 cc.ReviewCharge.ATTEMPT if address_review_actions(repair_input.review.pr.number, result).bump_retry else cc.ReviewCharge.NOT_ATTEMPT)
@@ -1039,10 +987,8 @@ def _issue_scope(
 
 def _return_refused(detail: str) -> AgentResult:
     # Receipt authority is a harness precondition, not evidence of exhausted
-    # money or a failed issue implementation. `AccountingRuntime.run` counts
-    # every such refusal toward its issue's infra ceiling (it mints no run, so
-    # no receipt would); being infra-class it also feeds the deployment-wide
-    # InfraBreaker through the fix workflow, which gates dispatch on an outage.
+    # money or a failed issue implementation: a machine failure, never an
+    # attempt. It mints no run, so it buys nothing and leaves no backoff.
     return AgentResult(
         is_error=True,
         status=RETURN_REFUSED_STATUS,

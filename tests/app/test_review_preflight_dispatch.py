@@ -67,7 +67,7 @@ def test_composed_single_review_settles_one_durable_execution_round(tmp_path, mo
     legacy = Store(client.cfg.review_state_dir)
     Path(legacy.pr_path(7, "session")).write_text("claude:obsolete-file-session")
     Path(legacy.pr_path(7, "round")).write_text("91")
-    legacy.bump_infra_deaths(-7)
+    Path(legacy.issue_path(-7, "infra-deaths")).write_text("1")
     legacy_paths = (Path(legacy.pr_path(7, "session")), Path(legacy.pr_path(7, "round")),
                     Path(legacy.issue_path(-7, "infra-deaths")))
     legacy_bytes = {path: path.read_bytes() for path in legacy_paths if path.is_file()}

@@ -3,6 +3,7 @@
 from tests.domain.builders import with_checks
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -54,6 +55,7 @@ from issue_agent.domain.fix import (
     should_automerge,
     should_update_branch,
 )
+from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.labels import Label
 from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow import (
@@ -857,17 +859,19 @@ def test_blank_pr_reply_dispatches_without_saved_session_for_unpaid_consumption(
     assert prs_needing_resume(world(prs=[blocked]), FixState(), CFG) == [(100, 7, "2026-10-01T00:00:01Z")]
 
 
-def test_pr_resume_infra_ceiling_replaces_the_blocked_label():
+def test_pr_resume_machine_death_waits_for_backoff_and_never_escalates():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
         comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
-    state = FixState(sessions=frozenset({7}), infra_deaths={7: 5})
+    state = FixState(sessions=frozenset({7}), leg_ends=_machine_deaths(7, AgentKind.PR_RESUME, 2))
 
-    assert Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW) in decide_fix(
-        world(prs=[blocked]), INFRA_CFG, state, fixer_busy=False
-    )
+    waiting = decide_fix(world(prs=[blocked], now=_stamp(timedelta(seconds=119))), CFG, state, fixer_busy=False)
+    resumed = decide_fix(world(prs=[blocked], now=_stamp(timedelta(seconds=120))), CFG, state, fixer_busy=False)
+
+    assert _run_agents(waiting) == [] and not _escalated(waiting)
+    assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(resumed)
 
 
 def test_needs_human_review_pr_reply_never_reopens_the_escalation():
@@ -925,13 +929,10 @@ def test_unresolved_current_rebase_does_not_starve_ready_issue(pending_generatio
 
 
 
-@pytest.mark.parametrize("counter", ["infra_deaths", "rebase_retries"])
-def test_pending_rebase_preserves_retry_ceiling_and_unrelated_ready_work(counter):
-    ceiling = CFG.max_infra_deaths if counter == "infra_deaths" else CFG.max_rebase_retries
+def test_pending_rebase_preserves_retry_ceiling_and_unrelated_ready_work():
     state = FixState(
         resolve_workflows={5: _workflow_with_pending_rebase(2)},
-        infra_deaths={5: ceiling} if counter == "infra_deaths" else {},
-        rebase_retries={5: ceiling} if counter == "rebase_retries" else {},
+        rebase_retries={5: CFG.max_rebase_retries},
     )
     observed = world(issues=[issue(995, "ai-ready")], prs=[
         pr(100, "ai-pr-open", head_ref_name="fix/5-x", mergeable="CONFLICTING"),
@@ -1630,105 +1631,99 @@ def test_pending_checks_are_neither_green_nor_red_at_the_cap():
     assert not any(isinstance(a, ResetCiRetries) for a in actions)
 
 
-# ── infra-death ceiling (review C3/D2c) ──────────────────────────────────────
-# A session that dies BEFORE returning a result records no attempt anywhere (that
-# exemption is FAILURE-MODES #58), so none of the retry breakers above can see it
-# — the death cycle was unbounded. These pin the SEPARATE, higher ceiling: same
-# escalation shape, its own counter, its own reason text.
-INFRA_CFG = FixConfig(fix_bot="fix-bot", max_infra_deaths=2)
+# ── machine-failure backoff ──────────────────────────────────────────────────
+# A machine failure is never an attempt and never escalates; the next dispatch
+# of the same kind for the same item waits out the backoff derived from the
+# ended legs (domain.backoff). Only the money caps bound the retries.
+_DIED = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
 
-def test_ready_issue_at_infra_ceiling_escalates_instead_of_dispatching():
-    st = FixState(infra_deaths={5: 2})
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), INFRA_CFG, st, fixer_busy=False)
-    assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW, workflow=_workflow(5).binding) in actions
-    assert any(isinstance(a, PostComment) and "died 2×" in a.body for a in actions)
+def _stamp(after: timedelta) -> str:
+    return (_DIED + after).isoformat()
 
 
-def test_ready_issue_below_infra_ceiling_still_dispatches():
-    # Anti-vacuity twin: the ceiling is HIGHER than the retry caps on purpose —
-    # a couple of transport deaths must not stop a healthy issue.
-    st = FixState(infra_deaths={5: 1})
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), INFRA_CFG, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
-
-
-def test_infra_deaths_are_counted_against_their_own_higher_cap():
-    # Defaults: max_resolve_retries=3, max_infra_deaths=5. Four infra deaths is
-    # past the RETRY cap and must still dispatch — the two counters are separate
-    # ceilings, and "resolve failed 4× without opening a PR" would be a lie
-    # about work that never ran.
-    st = FixState(infra_deaths={5: 4}, resolve_workflows={5: _workflow(5)})
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
-
-
-def test_infra_ceiling_of_zero_never_escalates():
-    st = FixState(infra_deaths={5: 99})
-    cfg = FixConfig(fix_bot="fix-bot", max_infra_deaths=0)  # 0 = off, like every cap
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), cfg, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
+def _machine_deaths(issue_number, kind, n):
+    return {issue_number: tuple(LegEnd(kind, _DIED - timedelta(minutes=5 * i), True) for i in range(n))}
 
 
 def _blocked_issue_with_reply():
     return issue(7, "ai-blocked", comments=(Comment("alice", "more context", "2026-10-01T00:00:01Z"),))
 
 
-def test_resume_at_infra_ceiling_escalates_from_blocked():
-    # This newer reply remains unconsumed; the existing infrastructure ceiling
-    # refuses it before admission and removes its observed ai-blocked label.
-    st = _with_session(infra_deaths={7: 2})
-    actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
-                         fixer_busy=False)
+_ARMS = {
+    AgentKind.RESOLVE: (lambda: world(issues=[issue(5, "ai-ready")]), 5, lambda ends: FixState(leg_ends=ends),
+                        RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding)),
+    AgentKind.RESUME: (lambda: world(issues=[_blocked_issue_with_reply()]), 7, lambda ends: _with_session(leg_ends=ends),
+                       RunAgent(AgentKind.RESUME, 7, workflow=_workflow(7).binding)),
+    AgentKind.ADDRESS_REVIEW: (lambda: world(prs=[_changes_requested_pr()]), 9, lambda ends: FixState(leg_ends=ends),
+                               RunAgent(AgentKind.ADDRESS_REVIEW, 100)),
+    AgentKind.REBASE: (lambda: world(prs=[pr(100, "ai-pr-open", closing_issue=9, mergeable="CONFLICTING")]), 9,
+                       lambda ends: FixState(leg_ends=ends), RunAgent(AgentKind.REBASE, 100)),
+    AgentKind.FIX_CI: (lambda: world(prs=[_ci_fail_pr()]), 9, lambda ends: FixState(leg_ends=ends),
+                       RunAgent(AgentKind.FIX_CI, 100)),
+}
+
+
+def _decide_at(kind, ends, after):
+    build_world, _, build_state, _ = _ARMS[kind]
+    return decide_fix(replace(build_world(), now=_stamp(after)), CFG, build_state(ends), fixer_busy=False)
+
+
+def _escalated(actions):
+    return any(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions)
+
+
+@pytest.mark.parametrize("kind", list(_ARMS))
+def test_machine_death_redispatches_only_after_the_backoff(kind):
+    _, number, _, expected = _ARMS[kind]
+    ends = _machine_deaths(number, kind, 1)
+
+    waiting = _decide_at(kind, ends, timedelta(seconds=59))
+    resumed = _decide_at(kind, ends, timedelta(seconds=60))
+
+    assert _run_agents(waiting) == [] and not _escalated(waiting)
+    assert expected in _run_agents(resumed)
+
+
+@pytest.mark.parametrize("kind", list(_ARMS))
+def test_machine_deaths_never_escalate_however_many(kind):
+    _, number, _, expected = _ARMS[kind]
+    ends = _machine_deaths(number, kind, 500)
+
+    held = _decide_at(kind, ends, timedelta(minutes=59))
+    after = _decide_at(kind, ends, timedelta(hours=1))
+
+    assert _run_agents(held) == [] and not _escalated(held)
+    assert expected in _run_agents(after) and not _escalated(after)
+
+
+def test_backoff_is_per_kind():
+    ends = _machine_deaths(9, AgentKind.FIX_CI, 3)
+    actions = _decide_at(AgentKind.ADDRESS_REVIEW, ends, timedelta(seconds=1))
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
+
+
+def test_unstamped_world_cannot_prove_a_backoff_elapsed():
+    ends = _machine_deaths(5, AgentKind.RESOLVE, 1)
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, FixState(leg_ends=ends), fixer_busy=False)
     assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 7, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW, workflow=_workflow(7).binding) in actions
 
 
-def test_resume_below_infra_ceiling_still_dispatches():
-    st = _with_session(infra_deaths={7: 1})
-    actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
-                         fixer_busy=False)
-    assert RunAgent(AgentKind.RESUME, 7, workflow=_workflow(7).binding) in _run_agents(actions)
+def test_agent_attempt_end_dispatches_without_backoff():
+    ends = {5: (LegEnd(AgentKind.RESOLVE, _DIED, False),)}
+    actions = _decide_at(AgentKind.RESOLVE, ends, timedelta(seconds=1))
+    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
 
 
-def test_ci_leg_at_infra_ceiling_escalates_the_pr():
-    st = FixState(infra_deaths={9: 2})  # keyed by breaker_key → closing_issue 9
-    actions = decide_fix(world(prs=[_ci_fail_pr()]), INFRA_CFG, st, fixer_busy=False)
-    assert _run_agents(actions) == []
-    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
-
-
-def test_address_review_leg_at_infra_ceiling_escalates_the_pr():
-    st = FixState(infra_deaths={9: 2})
-    actions = decide_fix(world(prs=[_changes_requested_pr()]), INFRA_CFG, st,
-                         fixer_busy=False)
-    assert _run_agents(actions) == []
-    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
-
-
-def test_rebase_leg_at_infra_ceiling_escalates_the_pr():
-    st = FixState(infra_deaths={9: 2})
-    p = pr(100, "ai-pr-open", closing_issue=9, mergeable="CONFLICTING")
-    actions = decide_fix(world(prs=[p]), INFRA_CFG, st, fixer_busy=False)
-    assert _run_agents(actions) == []
-    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
-
-
-def test_pr_leg_below_infra_ceiling_still_dispatches():
-    st = FixState(infra_deaths={9: 1})
-    actions = decide_fix(world(prs=[_ci_fail_pr()]), INFRA_CFG, st, fixer_busy=False)
-    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
-
-
-def test_infra_ceiling_does_not_escalate_a_pr_with_no_work_to_do():
-    # A clean, green PR carrying stale infra deaths from an earlier leg must be
-    # left alone: the ceiling gates DISPATCH, it is not a standing verdict on
-    # the PR. Escalating here would hand a healthy PR to a human for nothing.
-    st = FixState(infra_deaths={9: 5})
-    p = pr(100, "ai-pr-open", closing_issue=9, checks=(Check("unit", bucket="pass"),))
-    actions = decide_fix(world(prs=[p]), INFRA_CFG, st, fixer_busy=False)
-    assert actions == []
+@pytest.mark.parametrize("kind", list(_ARMS))
+def test_unreadable_leg_history_holds_every_leg_of_that_issue(kind):
+    build_world, number, build_state, expected = _ARMS[kind]
+    state = replace(build_state({}), leg_history_errors={number: "issue recovery authority is inactive"})
+    held = decide_fix(replace(build_world(), now=_stamp(timedelta(days=1))), CFG, state, fixer_busy=False)
+    other = replace(build_state({}), leg_history_errors={number + 1000: "unrelated"})
+    free = decide_fix(replace(build_world(), now=_stamp(timedelta(days=1))), CFG, other, fixer_busy=False)
+    assert _run_agents(held) == [] and not _escalated(held)
+    assert expected in _run_agents(free)
 
 
 # ── reap ────────────────────────────────────────────────────────────────────────
@@ -3108,7 +3103,6 @@ def test_spent_free_rerun_cannot_launch_paid_repair_without_capacity():
     ({"mergeable": "CONFLICTING", "merge_state": "DIRTY"}, FixState(), ()),
     ({"reviews": (Review("CHANGES_REQUESTED", "review-bot", "t1"),)}, FixState(), ()),
     ({}, FixState(ci_remediation_errors={100: "unreadable remediation"}), ()),
-    ({}, FixState(infra_control_errors={100: "unreadable recovery"}), ()),
     ({"head_ref_oid": ""}, FixState(), ()),
     ({"checks": (Check("unit", bucket="fail"),)}, FixState(), ()),
 ])
@@ -3179,9 +3173,9 @@ def test_a_re_run_head_that_is_still_red_is_not_yet_a_flake():
 
 
 
-def test_missing_infra_authority_holds_ready_target_without_starving_peer():
+def test_unreadable_leg_history_holds_ready_target_without_starving_peer():
     observed = world(issues=[issue(1, "ai-ready", "P1"), issue(2, "ai-ready", "P2")])
-    state = FixState(infra_control_errors={1: "issue recovery migration required"})
+    state = FixState(control_errors={1: "fix leg history is unavailable"})
     actions = decide_fix(observed, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
     paid = [action for action in actions if isinstance(action, RunAgent)]
     assert [action.number for action in paid] == [2]

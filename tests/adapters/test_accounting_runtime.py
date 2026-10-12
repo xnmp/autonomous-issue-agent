@@ -1241,8 +1241,7 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
 
     selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
     assert isinstance(selected, cc.SelectedIssueRecovery)
-    assert selected.component.state.infra_failures == 0
-    assert selected.component.state.infra_episode is None
+    assert selected.component.state == cc.IssueRecoveryState()  # a machine failure is no attempt
 
 
 def test_malformed_usage_settles_zero_estimate_without_changing_work_result(
@@ -1313,8 +1312,7 @@ def test_non_codex_runtime_exception_releases_after_completed_teardown(
 
     selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
     assert isinstance(selected, cc.SelectedIssueRecovery)
-    assert selected.component.state.infra_failures == 0
-    assert selected.component.state.infra_episode is None
+    assert selected.component.state == cc.IssueRecoveryState()  # a machine failure is no attempt
 
 
 def test_runtime_exception_after_child_registration_retains_reservation(

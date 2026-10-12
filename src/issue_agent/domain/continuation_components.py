@@ -114,50 +114,25 @@ class ReviewRetryState:
 
 
 class FixInfraOutcome(str, Enum):
+    """How a fix run ended; anything but a normal return is a machine end."""
+
     RETURNED_INFRA = "returned_infra"
     RETURNED_NORMAL = "returned_normal"
     RECLAIMED = "reclaimed"
-    DETERMINISTIC_DEATH = "deterministic_death"
-
-
-@dataclass(frozen=True)
-class FixInfraEpisode:
-    source: ContinuationAdmission
-    latest_version: int
-    reset_version: int
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.source, ContinuationAdmission)
-                or self.source.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
-            raise ValueError("fix infrastructure episode requires its exact issue admission")
-        validate_workflow_integer(self.latest_version, "latest fix infrastructure input", minimum=1)
-        validate_workflow_integer(self.reset_version, "fix infrastructure reset boundary")
-        if self.source.admission_version > self.latest_version or self.reset_version > self.latest_version:
-            raise ValueError("fix infrastructure episode has impossible ordering")
 
 
 @dataclass(frozen=True)
 class FixInfraReceipt:
+    """The per-run machine classification the backoff reads (domain.backoff)."""
+
     admission: ContinuationAdmission
     outcome: FixInfraOutcome
-    failures: int
-    episode: FixInfraEpisode | None
-    charge: int = 0
 
     def __post_init__(self) -> None:
         if (not isinstance(self.admission, ContinuationAdmission)
                 or self.admission.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
                 or not isinstance(self.outcome, FixInfraOutcome)):
             raise ValueError("fix infrastructure receipt requires its exact run classification")
-        validate_workflow_integer(self.failures, "recorded fix infrastructure failures")
-        validate_workflow_integer(self.charge, "attributed fix infrastructure charge")
-        if self.episode is not None and self.charge > self.failures:
-            raise ValueError("attributed infrastructure charge exceeds applied failures")
-        if self.outcome is FixInfraOutcome.RETURNED_NORMAL and self.charge:
-            raise ValueError("an actual non-infrastructure reply has no failure charge")
-        if self.episode is not None and (not isinstance(self.episode, FixInfraEpisode)
-                or self.episode.source != self.admission):
-            raise ValueError("applied fix infrastructure receipt requires its exact source")
 
 
 @dataclass(frozen=True)
@@ -168,15 +143,13 @@ class IssueRecoveryState:
     ci_failures: int = 0
     review_failures: ReviewRetryState = field(default_factory=ReviewRetryState)
     rebase_failures: int = 0
-    infra_failures: int = 0
     pending_ci: ContinuationAdmission | None = field(default=None, repr=False)
     pending_rebase: ContinuationAdmission | None = field(default=None, repr=False)
-    infra_episode: FixInfraEpisode | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
         validate_workflow_text(self.remembered_branch, "remembered issue branch", empty=True)
-        for name in ("resumes", "ci_failures", "rebase_failures", "infra_failures"):
+        for name in ("resumes", "ci_failures", "rebase_failures"):
             validate_workflow_integer(getattr(self, name), name)
         if not isinstance(self.review_failures, ReviewRetryState):
             raise ValueError("review retry allowance requires one typed timestamp/count state")
@@ -186,8 +159,6 @@ class IssueRecoveryState:
         if self.pending_rebase is not None and (not isinstance(self.pending_rebase, ContinuationAdmission)
                 or self.pending_rebase.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
             raise ValueError("pending rebase requires its exact issue recovery admission")
-        if self.infra_episode is not None and not isinstance(self.infra_episode, FixInfraEpisode):
-            raise ValueError("fix infrastructure state requires one typed episode")
 
 
 @dataclass(frozen=True)
@@ -612,11 +583,6 @@ class ActiveIssueRecovery:
                     or pending.attempt.binding.episode_id != self.identity.episode_id
                     or pending.admission_version > self.watermarks.last_admitted):
                 raise ValueError("pending repair differs from admitted issue component provenance")
-        if self.state.infra_episode is not None:
-            binding = self.state.infra_episode.source.attempt.binding
-            if (binding.fence.key != self.identity.key or binding.authority != self.identity.authority
-                    or binding.episode_id != self.identity.episode_id):
-                raise ValueError("fix infrastructure episode differs from its issue component")
 
 
 @dataclass(frozen=True)
@@ -734,11 +700,6 @@ def validate_component_revision(component: object, revision: WorkflowRevision, f
     if isinstance(component, ActiveIssueRecovery) and component.state.pending_rebase is not None:
         if component.state.pending_rebase.attempt.binding.fence.generation > revision.fence.generation:
             raise ValueError("pending rebase cannot originate in a future target generation")
-    if isinstance(component, ActiveIssueRecovery) and component.state.infra_episode is not None:
-        episode = component.state.infra_episode
-        fence = episode.source.attempt.binding.fence
-        if fence.generation > revision.fence.generation or fence == revision.fence and episode.latest_version > revision.version:
-            raise ValueError("fix infrastructure episode cannot originate in a future target revision")
 
 
 @dataclass(frozen=True)
@@ -755,12 +716,6 @@ class SelectedIssueRecovery:
     def binding(self) -> WorkflowBinding:
         return self.component.identity.bind(self.revision.fence)
 
-    @property
-    def episode_scope(self) -> str:
-        """Names this recovery episode and re-arm generation; a counter kept
-        outside the component (pre-admission refusals, #262) is valid only
-        while this value is unchanged."""
-        return f"{self.component.identity.episode_id}@{self.revision.fence.generation}"
 
 
 @dataclass(frozen=True)
@@ -837,17 +792,12 @@ class ContinuationCapture:
     binding: WorkflowBinding
     revision: WorkflowRevision
     leg_id: str
-    fix_infra_ceiling: int | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if self.fix_infra_ceiling is not None:
-            validate_workflow_integer(self.fix_infra_ceiling, "captured fix infrastructure ceiling")
         if not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family not in (
             WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD,
         ):
             raise ValueError("continuation capture requires a fixed secondary binding")
-        if self.fix_infra_ceiling is not None and self.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY:
-            raise ValueError("fix infrastructure policy belongs only to issue recovery")
         if not isinstance(self.revision, WorkflowRevision) or self.binding.fence != self.revision.fence:
             raise ValueError("continuation capture requires its exact aggregate revision")
         validate_workflow_identifier(self.leg_id, "continuation leg")
@@ -969,8 +919,7 @@ class CIRepairInput:
 
 class CICharge(str, Enum):
     ATTEMPT = "attempt"
-    BUDGET = "budget"
-    INFRA = "infra"
+    NOT_ATTEMPT = "not_attempt"
     NOT_LAUNCHED = "not_launched"
 
 
@@ -1542,53 +1491,6 @@ def groom_admissible(selection: StewardSelection, input_at: str, signature: str,
 
 
 ContinuationPurchase = IssueInfraPurchase | IssueRecoveryPurchase | IssueReplyPurchase | IssueCIPurchase | IssueReviewPurchase | IssueRebasePurchase | PRRepairPurchase | StewardPurchase
-
-
-def apply_fix_infra(selection: SelectedIssueRecovery, admission: ContinuationAdmission,
-                   outcome: FixInfraOutcome, previous: FixInfraReceipt | None = None,
-                   *, failure_charge: int = 1) -> tuple[ActiveIssueRecovery | None, FixInfraReceipt]:
-    if (not isinstance(selection, SelectedIssueRecovery) or not isinstance(admission, ContinuationAdmission)
-            or not isinstance(outcome, FixInfraOutcome)):
-        raise ValueError("fix infrastructure application requires selected typed evidence")
-    validate_workflow_integer(failure_charge, "fix infrastructure failure charge", minimum=1)
-    binding = admission.attempt.binding
-    if binding.fence.key != selection.binding.fence.key or binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY:
-        raise ValueError("fix infrastructure evidence belongs to another issue")
-    normal = outcome is FixInfraOutcome.RETURNED_NORMAL
-    charge = 0 if normal else failure_charge
-    if previous is not None:
-        if not isinstance(previous, FixInfraReceipt) or previous.admission != admission:
-            raise ValueError("fix infrastructure retry differs from its admitted run")
-        if previous.outcome in (FixInfraOutcome.RETURNED_INFRA, FixInfraOutcome.RETURNED_NORMAL):
-            if previous.outcome is outcome or outcome in (FixInfraOutcome.RECLAIMED, FixInfraOutcome.DETERMINISTIC_DEATH):
-                return None, previous
-            raise ValueError("fix infrastructure returned classification conflicts")
-        if outcome is FixInfraOutcome.RECLAIMED or previous.outcome is outcome:
-            return None, previous
-        if outcome is FixInfraOutcome.RETURNED_INFRA:
-            return None, replace(previous, outcome=outcome)
-        if outcome is FixInfraOutcome.DETERMINISTIC_DEATH:
-            charge = max(0, charge - previous.charge)
-    state = selection.component.state
-    refused = replace(previous, outcome=outcome, charge=0 if normal else previous.charge) if previous is not None else FixInfraReceipt(
-        admission, outcome, state.infra_failures, None, 0)
-    if (binding.fence.generation > selection.revision.fence.generation
-            or binding == selection.binding and admission.admission_version > selection.revision.version):
-        raise ValueError("fix infrastructure evidence has a future admission fence")
-    if binding != selection.binding:
-        return None, refused
-    episode = state.infra_episode
-    same_generation = episode is not None and episode.source.attempt.binding.fence == binding.fence
-    latest = episode.latest_version if same_generation and episode is not None else 0
-    reset = episode.reset_version if same_generation and episode is not None else 0
-    version = admission.admission_version
-    if (normal and version < latest or not normal and version <= reset):
-        return None, refused
-    failures = 0 if normal else state.infra_failures + charge
-    episode = FixInfraEpisode(admission, max(latest, version), version if normal else reset)
-    after = replace(selection.component, state=replace(state, infra_failures=failures, infra_episode=episode))
-    contribution = 0 if normal else charge + (previous.charge if previous is not None else 0)
-    return after, FixInfraReceipt(admission, outcome, failures, episode, contribution)
 
 
 def consume_issue_rebase(selection: SelectedIssueRecovery, purchase: IssueRebasePurchase, admission: ContinuationAdmission) -> ActiveIssueRecovery:

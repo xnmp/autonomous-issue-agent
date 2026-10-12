@@ -93,14 +93,13 @@ def test_terminal_launched_repair_without_return_is_acknowledged_after_money_dis
     with store.transaction() as db:
         run = db.execute("SELECT state,outcome FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         assert tuple(run) == ("cancelled", "released")
-    infra = stuck.infra_failures
 
     assert control.reconcile_pr_repair_returns() == 1
     after = issue_ci_state(files)
     assert _pending(after, lane) is None
-    # The launched attempt remains debt; no other history is rewritten.
-    assert _failures(after, lane) == _failures(before, lane) + 1
-    assert after.infra_failures == infra and after.infra_episode == stuck.infra_episode
+    # A launched repair that never returned is a machine failure, not an
+    # attempt; no other history is rewritten.
+    assert _failures(after, lane) == _failures(before, lane)
     repair = control.read_pr_repair(key)
     assert repair.component.state.session is None and repair.component.state.actual_model is None
     assert repair.component.watermarks.last_applied == repair.component.watermarks.last_admitted
@@ -123,7 +122,7 @@ def test_terminal_launched_repair_without_return_is_acknowledged_after_money_dis
     _repair(workflow, lane)
     assert len(inner.tasks) == 1
     final = issue_ci_state(files)
-    assert _pending(final, lane) is None and _failures(final, lane) == _failures(before, lane) + 2
+    assert _pending(final, lane) is None and _failures(final, lane) == _failures(before, lane) + 1
     assert control.read_pr_repair(key).component.state.session is not None
 
 
@@ -251,7 +250,9 @@ def test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack(mon
         result = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
     assert result.state.session.handle == "late"
     assert _pending(issue_ci_state(files), lane) is None
-    assert _failures(issue_ci_state(files), lane) == 1
+    # The acknowledgment already classified the run as no attempt; the late
+    # output corrects money only and never replays workflow effects.
+    assert _failures(issue_ci_state(files), lane) == 0
     contributions = [decode_event_line(line).payload.amount_micros for line in log.read_text().splitlines()
         if isinstance(decode_event_line(line).payload, SpendRecorded)]
     assert contributions == [estimate, -estimate, 1_250_000]

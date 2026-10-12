@@ -6,6 +6,7 @@ step's state — never on how the aggregation stores it.
 
 import time
 from dataclasses import replace
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -2919,15 +2920,15 @@ def test_issue_detail_reads_current_execution_allowance_and_ignores_retired_file
     review_dir = tmp_path / "review"
     review_dir.mkdir()
     files = Store(str(review_dir))
-    files.set_infra_deaths(7, 2)
-    files.set_infra_deaths(-9, 1)
+    Path(files.issue_path(7, "infra-deaths")).write_text("2")
+    Path(files.issue_path(-9, "infra-deaths")).write_text("1")
     before = dump(store)
 
     first = backend.issue("demo", 7)
     assert first is not None
     assert first["steps"][1]["review"]["unproductive_rounds"] == 3
-    files.set_infra_deaths(7, 99)
-    files.set_infra_deaths(-9, 99)
+    Path(files.issue_path(7, "infra-deaths")).write_text("99")
+    Path(files.issue_path(-9, "infra-deaths")).write_text("99")
     second = backend.issue("demo", 7)
     assert second is not None
     assert second["steps"][1]["review"]["unproductive_rounds"] == 3

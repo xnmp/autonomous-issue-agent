@@ -137,8 +137,9 @@ run corrections.
 PR-repair accounting disposition does not itself acknowledge paired workflow
 admissions. `reconcile_pr_repair_returns` also recovers launched terminal work
 without a captured return, after leases, dispatch bindings, publications and
-active money are gone. Its distinct `PRRepairUnreturned` acknowledgment keeps
-attempt debt and prior session provenance; it never invents output or spend.
+active money are gone. Its distinct `PRRepairUnreturned` acknowledgment charges
+no attempt (a machine failure) and keeps prior session provenance; it never
+invents output or spend.
 Selection is not acknowledgment authority: a real result captured before the
 mutation recheck wins. The architecture reference maps both race orderings and
 crash boundaries to behavioral tests.

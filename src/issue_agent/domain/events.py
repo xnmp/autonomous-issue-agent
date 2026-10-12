@@ -472,55 +472,6 @@ class BudgetPathEntered(EventPayload):
     exit_reason: str
 
 
-@event_type("infra.path.entered.v1")
-@dataclass(frozen=True)
-class InfraPathEntered(EventPayload):
-    """A failed leg was classed INFRA: it was billed to the infra ceiling
-    rather than to the issue (a quality counter it would otherwise have
-    advanced, or a decay it would otherwise have earned).
-
-    ADR 0012: the exemption is a skip, and a skip needs a journal event and a
-    ceiling. The ceiling is the infra-death counter this same leg bumps;
-    `infra_deaths` carries where it now stands so "why didn't the breaker
-    move?" is answerable from the event log alone (keifu #130).
-    """
-
-    leg: str
-    exit_reason: str
-    infra_deaths: int = 0
-
-
-@event_type("infra.breaker.tripped.v1")
-@dataclass(frozen=True)
-class InfraBreakerTripped(EventPayload):
-    """Infra-class deaths crossed issues: paid dispatch paused deployment-wide.
-
-    ONE event for a storm that used to produce one escalation per affected
-    issue (keifu 2026-08-02). `cause` and `remediation` are machine-checkable
-    strings in ADR 0013's shape — the predicate plus its evidence, and what the
-    harness already tried automatically — so the escalation can be re-evaluated
-    rather than re-read.
-    """
-
-    cause: str
-    remediation: str
-    deaths: int = 0
-    issues: tuple[int, ...] = ()
-    window_seconds: int = 0
-
-
-@event_type("infra.breaker.cleared.v1")
-@dataclass(frozen=True)
-class InfraBreakerCleared(EventPayload):
-    """The breaker re-armed. `reason` is `probe_succeeded` (a leg completed, so
-    the runtime is demonstrably alive) or `cooldown_elapsed` (the bound on the
-    hold expired; a still-broken runtime re-trips within one window)."""
-
-    reason: str
-    cause: str = ""
-    deaths: int = 0
-
-
 @event_type("issue.groomed.v1")
 @dataclass(frozen=True)
 class IssueGroomed(EventPayload):

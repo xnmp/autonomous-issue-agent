@@ -14,7 +14,6 @@ export function FixRecoveryView({ recovery }: { recovery?: Recovery | null }) {
         <dt>CI failures</dt><dd>{recovery.ci_failures}</dd>
         <dt>Review failures</dt><dd>{recovery.review_failures}</dd>
         <dt>Rebase failures</dt><dd>{recovery.rebase_failures}</dd>
-        <dt>Infrastructure failures</dt><dd>{recovery.infra_failures}</dd>
         </>}
       </dl>
       {recovery.family === "issue_recovery"

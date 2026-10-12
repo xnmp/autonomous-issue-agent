@@ -298,10 +298,9 @@ def infra_class_failure(result: AgentResult) -> bool:
     `needs-human-review` at $0 per strike and inflates effort routing on
     phantom evidence (keifu #130).
 
-    Callers still bump the separate, higher infra-death ceiling, so a
-    PERSISTENT harness fault still reaches a human — under an INFRA reason
-    string, pointed at the runtime rather than at the code the agent never got
-    to touch.
+    Nothing escalates a machine failure either: the next dispatch of the same
+    kind waits out a per-item backoff (`domain.backoff`) and the money caps
+    bound the retries.
 
     NOT included, deliberately:
 

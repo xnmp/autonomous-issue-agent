@@ -12,7 +12,7 @@ from issue_agent.domain.world import IssueView
 from issue_agent.domain.workflow import AuthoredResolve
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
-from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state, seed_resolve
+from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state, seed_resolve, machine_ends
 
 
 class RecordingJournal:
@@ -54,7 +54,7 @@ def budget_result():
 def assert_budget_path(gateway, store, journal, leg, *, failures=0):
     assert resolve_state(store, 5).episode.failures == failures
     assert resolve_state(store, 5).gates == ()
-    assert store.get_infra_deaths(5) == 0
+    assert True not in machine_ends(store)  # budget exhaustion is not a machine failure
     assert Label.AI_WORKING not in gateway.issues[5].labels
     assert {Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW} <= gateway.issues[5].labels
     budget_events = [(event, fields) for event, fields in journal.events if isinstance(event.payload, BudgetPathEntered)]

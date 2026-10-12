@@ -290,8 +290,7 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                 raise ValueError("remembered issue branch lacks matching target ownership")
             review_at, _, review_count = values.get("review-retries", " 0").rpartition(" ")
             return cc.IssueRecoveryState(values.get("resumed-at", ""), count("resumes"), values.get("branch", ""),
-                                         count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"),
-                                         count("infra-deaths"))
+                                         count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"))
         if record.family is WorkflowFamily.PR_REPAIR:
             def imported(name):
                 text = values.get(name)

@@ -64,7 +64,6 @@ class AccountedFixtureWorkflow(FixWorkflow):
             BudgetPolicy(limits), RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
                                             ModelRates(1, 1, 1, 1)),
             owner_id="o/r:fix:fixture", max_contract_rounds=self.cfg.max_contract_rounds,
-            fix_infra_ceiling=getattr(self, "_fixture_infra_ceiling", 5),
         )
         if self.cfg.available_fix_runtimes:
             from issue_agent.adapters.runtime_selection import SelectingRuntime
@@ -282,7 +281,7 @@ def seed_infra_outcome(control, issue, outcome, *, owner_id="o/r:fix:fixture", r
     from issue_agent.adapters.workflow_rows import load_issue_aggregate
     with control.transaction() as db:
         principal = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue))).binding
-    captured = cc.IssueInfraPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:" + name, 5))
+    captured = cc.IssueInfraPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:" + name))
     paid = dataclasses.replace(request(name, binding=principal), owner_id=owner_id, continuations=(captured,))
     assert control.reserve(paid).admitted
     if reclaim:
@@ -294,3 +293,9 @@ def seed_infra_outcome(control, issue, outcome, *, owner_id="o/r:fix:fixture", r
         "infra-fixture:" + str(paid.run_id), None, None, None)).disposition.value == "available"
     return paid.run_id
 
+
+
+def machine_ends(store, issue=5, repository="o/r"):
+    """Sorted machine flags of every ended fix leg for one issue."""
+    control = getattr(store, "_workflow_db", store)
+    return sorted(end.machine for end in control.fix_leg_ends(repository, issue))
