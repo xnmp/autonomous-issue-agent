@@ -2469,16 +2469,20 @@ DROP TABLE retired_self_clears;
 DROP INDEX lifecycle_self_clear_pending;
 DELETE FROM dedupe_keys WHERE namespace='fix-budget-refusal';
 """),
-    # The steward role is deleted. Its family authority, components, verdict
-    # commands, run admissions/returns and one-shot keys are retired by
+    # The steward role is deleted. Its family authority, components, commands,
+    # dispatch claims, run admissions/returns and one-shot keys are retired by
     # deletion, never parsed; issue aggregates drop their steward component.
-    # Settled steward runs and charges stay, so spend history is unchanged.
+    # Settled steward runs and charges stay, so spend history is unchanged. No
+    # steward daemon remains to reconcile its own unfinished runs, so they are
+    # abandoned and their holds released unmeasured, as the stale-hold release
+    # does; their pending telemetry has no flusher left.
     SchemaMigration(44, """
 CREATE TEMP TABLE retired_steward_commands AS
     SELECT command_id FROM lifecycle_commands
     WHERE kind IN ('add_dependency','create_jira_issue','transition_jira_issue')
         OR instr(payload_json,'"steward_guard"')>0
-        OR idempotency_key LIKE 'steward-verdict:%' OR logical_key LIKE 'steward-verdict:%';
+        OR idempotency_key LIKE 'steward-verdict:%' OR logical_key LIKE 'steward-verdict:%'
+        OR executor_identity LIKE '%:steward' OR executor_identity LIKE '%:steward:%';
 DELETE FROM workflow_retry_authorizations WHERE command_id IN (SELECT command_id FROM retired_steward_commands);
 DELETE FROM workflow_rearm_commands WHERE command_id IN (SELECT command_id FROM retired_steward_commands);
 DELETE FROM workflow_evidence WHERE command_id IN (SELECT command_id FROM retired_steward_commands);
@@ -2492,6 +2496,25 @@ DELETE FROM workflow_components WHERE family='steward';
 DELETE FROM workflow_activation_imports WHERE family='steward';
 DELETE FROM workflow_activation_evidence WHERE family='steward';
 DELETE FROM workflow_authority_epochs WHERE family='steward';
+DELETE FROM dispatch_claim_runs WHERE role='steward';
+DELETE FROM dispatch_claims WHERE role='steward';
+CREATE TEMP TABLE retired_steward_runs AS
+    SELECT run_id FROM runs WHERE owner_id LIKE '%:steward' OR owner_id LIKE '%:steward:%';
+UPDATE runs SET outcome='spend_unmeasured_released',
+    state=CASE WHEN state IN ('completed','cancelled','abandoned') THEN state ELSE 'abandoned' END,
+    completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+WHERE run_id IN (SELECT b.run_id FROM budget_reservations b JOIN retired_steward_runs USING(run_id)
+                 WHERE b.state='active');
+UPDATE runs SET state='abandoned', outcome=COALESCE(outcome,'dead_lease'),
+    completed_at=COALESCE(completed_at,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+WHERE run_id IN (SELECT run_id FROM retired_steward_runs)
+    AND state NOT IN ('completed','cancelled','abandoned');
+UPDATE budget_reservations SET state='released', release_reason='steward role retired before settlement',
+    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+WHERE state='active' AND run_id IN (SELECT run_id FROM retired_steward_runs);
+DELETE FROM leases WHERE run_id IN (SELECT run_id FROM retired_steward_runs);
+DROP TABLE retired_steward_runs;
+DELETE FROM event_outbox WHERE emitted_at IS NULL AND destination LIKE '%:steward';
 UPDATE workflows SET episode_json=CASE
     WHEN json_extract(episode_json,'$.value.type')='IssueFamilyEpisodes'
         AND json_extract(episode_json,'$.value.fields.issue_recovery.type')='InactiveIssueRecovery'
@@ -9882,10 +9905,9 @@ class SQLiteControlStore:
         without the evidence that produces it.
 
         Convergence is also NOT assumed when the two actors demonstrably
-        produced DIFFERENT remote objects. `reconcile_async`'s "reconciling
-        read" is not always read-only: the Jira workflow's is a paid
-        search-then-create MCP leg, so two overlapping workflows can create
-        PROJ-100 and PROJ-101 for one command. Silently answering False there
+        produced DIFFERENT remote objects. A reconciling read need not be
+        read-only: a search-then-create leg run by two overlapping actors can
+        create two remote objects for one command. Silently answering False there
         would let the caller persist the key the authoritative receipt does
         not name, orphaning a paid duplicate with no log line. Differing
         non-null `remote_object_id`s therefore raise: that is provable

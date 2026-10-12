@@ -129,10 +129,10 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
 # collision the pid-suffixed tmp name exists to avoid.
 def test_write_leaves_no_tmp_file_after_success():
     s, root = _store()
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
 
-    assert s.get_jira_key(5) == "K-4"
-    assert os.path.exists(os.path.join(root, "issue-5.jira"))
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
+    assert os.path.exists(os.path.join(root, "issue-5.predicted-paths"))
     leftover = [f for f in os.listdir(root) if f.endswith(".tmp")]
     assert leftover == []
 
@@ -144,17 +144,17 @@ def test_write_survives_crash_before_replace(monkeypatch):
     # fail, so it would silently install the new (wrong-for-this-test) value
     # and this assertion would catch it.
     s, _ = _store()
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
 
     def _boom(_src, _dst):
         raise OSError("simulated crash before replace")
 
     monkeypatch.setattr(os, "replace", _boom)
     try:
-        s.set_jira_key(5, "K-9")
+        s.save_predicted_paths(5, ["src/b.py"])
     except OSError:
         pass
-    assert s.get_jira_key(5) == "K-4"
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
 
 def test_write_syncs_tmp_file_before_replace(monkeypatch):
     # review M3: fsync narrows the crash window a bare os.replace(tmp, path)
@@ -170,9 +170,9 @@ def test_write_syncs_tmp_file_before_replace(monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _tracking_fsync)
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
     assert calls, "Store._write must fsync the tmp file before os.replace"
-    assert s.get_jira_key(5) == "K-4"
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
 
 def test_tmp_name_is_pid_suffixed(monkeypatch):
     # review M3: two daemons (fix + review) sharing a STATE_DIR, or a
@@ -187,9 +187,9 @@ def test_tmp_name_is_pid_suffixed(monkeypatch):
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", _capture)
-    s.set_jira_key(5, "K-4")
+    s.save_predicted_paths(5, ["src/a.py"])
     assert str(os.getpid()) in seen["src"]
-    assert s.get_jira_key(5) == "K-4"
+    assert s.get_predicted_paths(5) == frozenset({"src/a.py"})
 
 def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     """An operator unblock resets the retry ceilings a wedge consumed — and

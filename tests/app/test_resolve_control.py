@@ -35,7 +35,7 @@ def deployment(tmp_path, monkeypatch):
         "CONTROL_AUTHORITY_ROOT": str(tmp_path / "authority"),
         "ROLES": "fix review", "BASE_BRANCH": "release",
         "FIX_BOT_TOKEN": "isolated-fix-token", "FIX_BOT": "fix-bot", "GH_HOST": "git.example.test",
-        "FIXER_RUNTIME": "codex", "MAX_INFRA_DEATHS": "3",
+        "FIXER_RUNTIME": "codex",
     }
     for key in (*env, "AGENT_ENV", "REPOINTED_FROM_DEPLOYMENTS"):
         monkeypatch.delenv(key, raising=False)

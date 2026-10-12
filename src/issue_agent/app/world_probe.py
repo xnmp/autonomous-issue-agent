@@ -15,8 +15,8 @@ daemons' own actions invalidate the signature by construction.
 
 What the signature is blind to: CI check-run completion and mergeable/
 mergeStateStatus flips, which GitHub recomputes without touching `updated_at`.
-The reviewer and the steward read neither (the reviewer ignores checks; the
-steward never fetches PRs at all), so they are gated unconditionally. The FIX
+The reviewer reads neither (it ignores checks), so it is gated
+unconditionally. The FIX
 daemon consumes both (CI-fix dispatch, auto-rebase) — but only when there is
 something in flight to consume them FROM. `probe_when` expresses exactly that:
 an optional predicate over the LAST fully-built world which decides whether the
@@ -109,13 +109,12 @@ class WorldProbe:
 
     fetch_signature: Callable[[], str]
     # Reconciliation ceiling: a full build at least this often, whatever the
-    # signature says. Bounds the staleness of anything the signature cannot see
-    # (and, when Jira sync is on, of Jira-side edits the steward mirrors).
+    # signature says. Bounds the staleness of anything the signature cannot see.
     ttl_seconds: float = 300.0
     clock: Callable[[], float] = time.time
     # Predicate over the LAST fully-built world: "was that world a shape in which
     # the signature is a sound stand-in for a build?". None = always probe (the
-    # review/steward wiring). False for the last world = build unconditionally,
+    # review wiring). False for the last world = build unconditionally,
     # and don't even spend the REST point on a probe whose answer can't be used.
     probe_when: Callable[[WorldState, ProbeSignals], bool] | None = None
     # Re-reads what the signature cannot see (CI + mergeability of the last
@@ -130,7 +129,7 @@ class WorldProbe:
 
     def gate(self, build: Callable[[], WorldState]) -> Callable[[], WorldState]:
         def observe() -> WorldState:
-            # With no predicate the gate is unconditional (review/steward: their
+            # With no predicate the gate is unconditional (review: its
             # first tick probes, finds no committed signature, and builds). With
             # one, a world must exist to judge — and it must pass.
             current: tuple[HeadSignal, ...] | None = None

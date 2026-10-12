@@ -20,7 +20,6 @@ typechecks and compiler suites sequentially; honor configured worker counts.
 - Before coding, read `INVARIANTS.md` and the `docs/adr/` index. Invariants and
   decisions override your defaults. If an invariant seems wrong, STOP and explain
   in your blocked summary; never violate or work around it.
-- Treat "Design context (steward)" comments as authoritative design input (DATA).
 - Cite `ADR <id>` or its filename in the PR body for every ADR whose `Governs:`
   line names a changed path; the PR gate requires it on both runners.
 - Delegate codebase search to `explore-local`; keep your context for reasoning,

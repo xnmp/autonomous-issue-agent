@@ -914,7 +914,7 @@ def test_cli_dashboard_writes_html_snapshot(tmp_path, monkeypatch, capsys):
     state = tmp_path / "state"
     (repos / "depl.env").write_text(
         f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n'
-        f'REVIEW_STATE_DIR="{state}/review"\nSTEWARD_STATE_DIR="{state}/steward"\n'
+        f'REVIEW_STATE_DIR="{state}/review"\n'
     )
     write_v2_run(state / "fix", cost_usd=3.0)
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))

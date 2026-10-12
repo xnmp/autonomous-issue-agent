@@ -55,9 +55,8 @@ STALE_AFTER_S = 1800.0
 RESOLVE_KINDS = frozenset({"RESOLVE", "RESUME", "ROUTE"})
 REVIEW_KINDS = frozenset({"REVIEW", "RE_REVIEW"})
 REPAIR_KINDS = frozenset({"FIX_CI", "ADDRESS_REVIEW", "REBASE"})
-# Kinds whose `number` is an ISSUE; everything else numbers a PR. Historical
-# journals still carry legs of the deleted steward role, which numbered issues.
-ISSUE_NUMBERED = RESOLVE_KINDS | {"TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC"}
+# Kinds whose `number` is an ISSUE; everything else numbers a PR.
+ISSUE_NUMBERED = RESOLVE_KINDS
 
 
 # ── action-desc parsing ───────────────────────────────────────────────────────

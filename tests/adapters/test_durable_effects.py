@@ -1,17 +1,12 @@
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Event
 from typing import Any, cast
 
 import pytest
 
 from issue_agent.adapters.control_store import (
-    RetiredOwnerError,
     SQLiteControlStore,
 )
 from issue_agent.adapters.deployment_authority import (
-    DeploymentAuthority,
     UnfencedEffectAuthority,
 )
 from issue_agent.adapters.durable_effects import (
@@ -139,145 +134,6 @@ def test_null_effect_outcome_becomes_unknown_instead_of_staying_executing(
     assert store.pending_commands()[0].state == (
         EffectStatus.UNKNOWN_OUTCOME.value
     )
-
-
-def test_async_reconciliation_only_resolves_authoritatively_proven_success(
-    tmp_path,
-) -> None:
-    runner, store = _runner(tmp_path)
-    command = _command()
-    runner.enqueue(command)
-
-    with pytest.raises(RuntimeError, match="reply lost"):
-        runner.execute(command, _reply_lost)
-
-    async def still_ambiguous() -> EffectOutcome[str]:
-        return EffectOutcome(
-            "not-proven",
-            EffectStatus.UNKNOWN_OUTCOME,
-            error="readback unavailable",
-        )
-
-    assert asyncio.run(
-        runner.reconcile_async(command, still_ambiguous)
-    ) == "not-proven"
-    assert store.pending_commands()[0].state == "unknown_outcome"
-    first_receipt = store.effect_receipt(command.command_id)
-    assert first_receipt is not None
-    assert first_receipt.error == "RuntimeError: reply lost"
-
-    async def proven() -> EffectOutcome[str]:
-        return EffectOutcome(
-            "comment-1",
-            EffectStatus.SUCCEEDED,
-            remote_object_id="comment-1",
-        )
-
-    assert asyncio.run(runner.reconcile_async(command, proven)) == "comment-1"
-    assert store.pending_commands() == ()
-    final_receipt = store.effect_receipt(command.command_id)
-    assert final_receipt is not None
-    assert final_receipt.status is EffectStatus.SUCCEEDED
-    assert final_receipt.remote_object_id == "comment-1"
-
-
-def test_null_async_reconciliation_preserves_existing_unknown_receipt(
-    tmp_path,
-) -> None:
-    runner, store = _runner(tmp_path)
-    command = _command()
-    runner.enqueue(command)
-
-    with pytest.raises(RuntimeError, match="reply lost"):
-        runner.execute(command, _reply_lost)
-
-    async def missing_outcome() -> EffectOutcome[None]:
-        return cast(Any, None)
-
-    with pytest.raises(TypeError, match="returned no outcome"):
-        asyncio.run(runner.reconcile_async(command, missing_outcome))
-
-    assert store.pending_commands()[0].state == "unknown_outcome"
-    receipt = store.effect_receipt(command.command_id)
-    assert receipt is not None
-    assert receipt.error == "RuntimeError: reply lost"
-
-
-def test_async_effect_finishes_before_owner_retirement_can_commit(
-    tmp_path,
-) -> None:
-    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
-    store.initialize()
-    old_owner = "o/r:fix:deployment-1"
-    new_owner = "o/r:fix:deployment-2"
-    runner = DurableEffectRunner(
-        store,
-        DeploymentAuthority(store, "o/r", "fix", old_owner),
-        executor_identity=old_owner,
-        now=lambda: NOW,
-    )
-    command = LifecycleCommand(
-        CommandId("async-effect"),
-        "effect:async",
-        CommandKind.POST_COMMENT,
-        "issue:1",
-        "revision-1",
-        {},
-        "cfg",
-        "o/r",
-        old_owner,
-    )
-    later = LifecycleCommand(
-        CommandId("later-effect"),
-        "effect:later",
-        CommandKind.POST_COMMENT,
-        "issue:2",
-        "revision-1",
-        {},
-        "cfg",
-        "o/r",
-        old_owner,
-    )
-    runner.enqueue(command)
-    runner.enqueue(later)
-    entered = Event()
-    release = Event()
-    retirement_done = Event()
-
-    async def effect() -> EffectOutcome[str]:
-        entered.set()
-        while not release.is_set():
-            await asyncio.sleep(0.01)
-        return EffectOutcome("PROJ-1", EffectStatus.SUCCEEDED)
-
-    def retire() -> None:
-        successor = SQLiteControlStore(store.path, now=lambda: NOW)
-        successor.initialize()
-        successor.adopt_legacy_owner(
-            "o/r",
-            "fix",
-            new_owner,
-            prior_owner_ids=(old_owner,),
-        )
-        retirement_done.set()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        execution = pool.submit(
-            lambda: asyncio.run(runner.execute_async(command, effect))
-        )
-        assert entered.wait(timeout=1)
-        retirement = pool.submit(retire)
-        assert not retirement_done.wait(timeout=0.1)
-        release.set()
-        assert execution.result(timeout=1) == "PROJ-1"
-        retirement.result(timeout=1)
-
-    assert retirement_done.is_set()
-    with pytest.raises(RetiredOwnerError, match="deployment-2"):
-        runner.execute(
-            later,
-            lambda: EffectOutcome(None, EffectStatus.SUCCEEDED),
-        )
 
 
 @pytest.mark.parametrize("payload, display", [

@@ -428,7 +428,7 @@ def _run_correlation(
     # pr=None and the dashboard relabelled the run "PR #185". The kind decides.
     # `number == issue` is treated as issue-numbered regardless of kind: GitHub
     # numbers issues and PRs from one sequence, so they can never coincide, and
-    # kinds absent from `ISSUE_NUMBERED` (GROOM, an unset kind) would otherwise
+    # kinds absent from `ISSUE_NUMBERED` (an unset kind) would otherwise
     # claim their own issue as a PR.
     numbers_a_pr = (
         context.number > 0
@@ -984,7 +984,7 @@ def death_key(event: dict) -> int | None:
     """The `infra-deaths` counter key an event's dispatch would have been
     charged to, or None if the event names no usable target.
 
-    ADR 0008 makes review convergence stably PR-keyed; fix and steward failures
+    ADR 0008 makes review convergence stably PR-keyed; fix failures
     use their issue when known and the negated PR fallback otherwise. This
     mirrors the application policy because `unsettled_starts` must feed the
     same ceiling as a surviving-process bump. Kept local because adapters

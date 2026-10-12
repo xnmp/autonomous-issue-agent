@@ -410,7 +410,7 @@ def test_the_raise_path_death_settles_and_so_is_not_counted_here():
     """Anti-double-count. A pre-result transport death the PROCESS SURVIVED is
     already counted once, by the dispatcher's store bump; `JournalingRuntime`
     also writes it a settled `transport_death` line. Counting it here too would
-    halve `MAX_INFRA_DEATHS` for the failure mode it was tuned on."""
+    count one death twice."""
     events = [
         _start(NOW - timedelta(minutes=1)),
         _run(NOW, status="raised", is_error=True, exit_reason="transport_death",

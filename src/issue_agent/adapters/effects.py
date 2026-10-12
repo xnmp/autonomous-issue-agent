@@ -81,7 +81,7 @@ _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
 #
 # Deliberately an ALLOW-list, not a broker-kinds deny-list. The control store
 # is shared, so the drain also sees publish_branch/open_pull_request
-# (AgentPublicationBroker), the operator effect kinds, and the Jira kinds. A
+# (AgentPublicationBroker) and the operator effect kinds. A
 # deny-list would silently inherit every kind a future ADR adds and hand it to
 # `action_from_command`, which raises — that is exactly the per-tick
 # "command kind cannot be reconstructed as Action: CommandKind.PUBLISH_BRANCH"

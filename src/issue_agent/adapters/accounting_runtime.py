@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import uuid
 import contextvars
-import asyncio
 import hashlib
 import json
 from collections.abc import Callable

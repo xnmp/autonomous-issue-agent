@@ -57,7 +57,7 @@ class HandoverScope:
     def eligible(self) -> bool:
         """Only fixer issue worktrees are private to one logical task.
 
-        Review and steward tasks may share the target checkout across unrelated
+        Review tasks may share the target checkout across unrelated
         PRs/issues, where one canonical handover path would leak or overwrite
         context between dispatches.
         """

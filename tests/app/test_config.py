@@ -917,14 +917,6 @@ def test_absence_of_fix_bot_check_would_have_validated_silently():
     assert errors != ()  # …but the dedicated check does
 
 
-def test_max_infra_deaths_default_and_override():
-    assert from_env({"REPO": "x"}).max_infra_deaths == 5
-    c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "2"})
-    assert c.max_infra_deaths == 2
-    assert c.steward_runtime.max_infra_deaths == 2
-    assert not hasattr(c.fix_runtime, "max_infra_deaths")  # machine failures never escalate fix work
-
-
 def test_sdk_max_buffer_default_clears_a_five_megabyte_read():
     # #13: the SDK's own 1MB ceiling is below one base64'd hi-DPI screenshot,
     # and blowing it kills the whole session's transport.
@@ -943,12 +935,6 @@ def test_sdk_max_buffer_is_overridable_and_zero_means_the_sdk_default():
 def test_negative_sdk_max_buffer_is_a_config_error():
     c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "SDK_MAX_BUFFER_BYTES": "-1"})
     assert any("SDK_MAX_BUFFER_BYTES" in e for e in c.validation_errors())
-
-
-def test_max_infra_deaths_zero_is_a_valid_off_value():
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_INFRA_DEATHS": "0"})
-    assert c.max_infra_deaths == 0
-    assert c.validation_errors() == ()
 
 
 def test_fix_dispatch_concurrency_defaults_to_two_and_can_go_serial():

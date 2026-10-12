@@ -24,8 +24,7 @@ from .lifecycle import (
 from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 from .workflow_identity import WorkflowBinding
 
-# Ceiling on UNPRODUCTIVE review rounds per PR (see ReviewConfig). Deliberately
-# the same order of magnitude as the fixer's MAX_INFRA_DEATHS: high enough that
+# Ceiling on UNPRODUCTIVE review rounds per PR (see ReviewConfig): high enough that
 # ordinary transport flakiness never hands a PR to a human, low enough that a
 # permanently-broken PR costs single-digit sessions instead of one per poll
 # forever.

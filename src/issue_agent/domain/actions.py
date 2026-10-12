@@ -1,6 +1,6 @@
 """The Action ADT.
 
-Decision functions (`decide_fix`, `decide_bound_review`, `decide_steward`) are pure:
+Decision functions (`decide_fix`, `decide_bound_review`) are pure:
 they take a `WorldState` (plus config) and return an ordered list of `Action`s.
 The orchestration layer interprets each Action against adapters
 (GitHub, AgentRunner, worktree). Keeping the decision as data — not direct
@@ -254,9 +254,8 @@ class EscalatePRRecovery(EscalateCiPending):
 
 @dataclass(frozen=True)
 class RunAgent:
-    """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME/TRIAGE)
-    or PR (PR_RESUME/ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE
-    ignores it."""
+    """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME)
+    or PR (PR_RESUME/ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW)."""
 
     kind: AgentKind
     number: int = 0

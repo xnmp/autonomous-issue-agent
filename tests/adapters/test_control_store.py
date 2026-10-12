@@ -3869,17 +3869,27 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
     state = resolve_snapshot(7)
     install_workflow(store, state)
     binding = encode_workflow(state.binding)
+    steward, fix = "o/r:steward:x", "o/r:fix:y"
+    # A steward leg still in flight when the role was deleted, beside a live fix leg.
+    assert store.reserve(dataclasses.replace(_request(1), owner_id=steward)).disposition is AccountingDisposition.AVAILABLE
+    assert store.reserve(dataclasses.replace(_request(2, cap=200), owner_id=fix)).disposition is AccountingDisposition.AVAILABLE
 
-    def command(db, command_id, payload):
+    def command(db, command_id, payload, executor="owner"):
         db.execute(
             "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
             "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
             "state,created_at,updated_at,workflow_binding_json) "
-            "VALUES (?,?,?,0,'post_comment','issue:7','r','legacy','o/r','owner',?,?,'succeeded',?,?,?)",
-            (command_id, command_id, command_id, payload, _encoded_payload_digest(payload, binding),
+            "VALUES (?,?,?,0,'post_comment','issue:7','r','legacy','o/r',?,?,?,'succeeded',?,?,?)",
+            (command_id, command_id, command_id, executor, payload, _encoded_payload_digest(payload, binding),
              NOW.isoformat(), NOW.isoformat(), binding))
         db.execute("INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,status,"
-                   "receipt_digest) VALUES (?,'owner','s','c','succeeded',?)", (command_id, "b" * 64))
+                   "receipt_digest) VALUES (?,?,'s','c','succeeded',?)", (command_id, executor, "b" * 64))
+
+    def claim(db, role, owner, run_id):
+        db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,"
+                   "paths_json,claimed_at,occurrence_id) VALUES ('o/r',?,'issue:9','RESOLVE',?,1,1,'[]',?,?)",
+                   (role, owner, NOW.isoformat(), f"occurrence-{role}"))
+        db.execute("INSERT INTO dispatch_claim_runs VALUES ('o/r',?,'issue:9',?,?)", (role, run_id, NOW.isoformat()))
 
     def dedupe(db, namespace, key):
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at) VALUES (?,'o/r',?,?)",
@@ -3889,6 +3899,16 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
         _historical_fixture(db, 42)
         command(db, "steward-cmd", json.dumps({"steward_guard": {"lane": "triage"}}))
         command(db, "plain-cmd", json.dumps({"body": "hello"}))
+        command(db, "steward-plain-cmd", json.dumps({"body": "hello"}), executor=steward)
+        db.execute("UPDATE runs SET state='running', started_at=? WHERE run_id='run-1'", (NOW.isoformat(),))
+        db.execute("INSERT INTO leases VALUES ('run-1','dispatch-1',?,123,123,99,?)", (steward, NOW.isoformat()))
+        claim(db, "steward", steward, "run-1")
+        claim(db, "fix", fix, "run-2")
+        for event_id, destination, emitted in (("steward-pending", "deployment-a:o/r:steward", None),
+                                               ("steward-emitted", "deployment-a:o/r:steward", NOW.isoformat()),
+                                               ("fix-pending", "deployment-a:o/r:fix", None)):
+            db.execute("INSERT INTO event_outbox(event_id,destination,event_json,committed_at,emitted_at) "
+                       "VALUES (?,?,'{}',?,?)", (event_id, destination, NOW.isoformat(), emitted))
         for namespace, key in (("continuation-admission", "run-s:steward"), ("continuation-admission", "run-f:issue_recovery"),
                                ("continuation-return", "run-s:steward"), ("groomed", "issue-7"),
                                ("triage_close", "issue-7"), ("recurrence", "issue-7"), ("other", "issue-7")):
@@ -3912,3 +3932,12 @@ def test_migration_44_retires_steward_rows_and_keeps_steward_spend(tmp_path):
         assert db.execute("SELECT count(*) FROM workflows").fetchone()[0] == 1
         assert db.execute("SELECT r.run_id,c.amount_micros FROM runs r JOIN charges c USING(run_id)").fetchall() == [
             ("steward-run", 1234)]
+        assert db.execute("SELECT role FROM dispatch_claims").fetchall() == [("fix",)]
+        assert db.execute("SELECT role,run_id FROM dispatch_claim_runs").fetchall() == [("fix", "run-2")]
+        assert sorted(db.execute("SELECT r.run_id,r.state,r.outcome,b.state FROM runs r "
+                                 "JOIN budget_reservations b USING(run_id)")) == [
+            ("run-1", "abandoned", "spend_unmeasured_released", "released"),
+            ("run-2", "reserved", None, "active")]
+        assert db.execute("SELECT run_id FROM leases").fetchall() == []
+        assert sorted(row[0] for row in db.execute("SELECT event_id FROM event_outbox")) == [
+            "fix-pending", "steward-emitted"]

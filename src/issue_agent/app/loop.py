@@ -115,7 +115,7 @@ class Daemon:
     # ONE sleep(poll_seconds) call, unsliced.
     wake_check: Callable[[], bool] | None = None
     # Paid dispatches may run behind the observation loop. Zero preserves the
-    # synchronous behavior used by review/steward and by existing hand-built
+    # synchronous behavior used by review and by existing hand-built
     # daemons; a positive value bounds the background worker pool.
     dispatch_capacity: int = 0
     # Stable identity for duplicate suppression. Fix wiring maps every issue-

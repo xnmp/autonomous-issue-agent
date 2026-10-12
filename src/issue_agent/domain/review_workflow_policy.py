@@ -851,7 +851,7 @@ def review_dispatch_decision(
 # The labels that hold, release or terminate review work on a pull request:
 # the review triggers, the human opt-out, the attention and trusted holds, and
 # the lifecycle positions. Advisory markers (recurrence, maybe-resolved),
-# priority and steward triage labels are observations, not decision facts, so
+# priority and triage labels are observations, not decision facts, so
 # a projection is never refused because one of them changed (ADR 0015).
 PULL_REQUEST_HOLD_FACT_LABELS: frozenset[Label] = LIFECYCLE_LABELS | frozenset({
     Label.AI_REVIEW, Label.NO_AI_REVIEW, Label.NEEDS_BUDGET_REVIEW,

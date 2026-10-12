@@ -845,9 +845,9 @@ def cleanup_actions(
     the issue is OPEN because a HUMAN put it back (GitHub `stateReason` =
     reopened), which is the #10 recurrence signal — the truest "losing power"
     evidence the harness has, and the one thing review cannot see. Re-closing it
-    within one poll would erase it. The ai-done relabel still runs: the steward's
-    recurrence reporter selects exactly `open + ai-done + reopened`, so ai-done on
-    a reopened issue is what MAKES the signal readable."""
+    within one poll would erase it. The ai-done relabel still runs: the
+    recurrence shape is exactly `open + ai-done + reopened`, so ai-done on a
+    reopened issue is what MAKES the signal readable."""
     actions: list[Action] = []
 
     merged = pr.state == "MERGED"
@@ -917,7 +917,7 @@ def orphaned_cleanup_actions(
     * OPEN + `stateReason` "reopened" → repair to ai-done, and (via
       `cleanup_actions`' sibling guard) never re-close. GitHub itself testifies the
       issue was closed and deliberately put back; ai-done is precisely what makes
-      it legible to the steward's recurrence reporter.
+      it legible as a recurrence (`open + ai-done + reopened`).
     * OPEN + never closed → DELIBERATELY NOT TOUCHED. This shape is ambiguous
       between a closed-unmerged requeue whose relabel failed (wants ai-ready) and a
       merged PR on a non-default base whose close failed (wants ai-done), and there

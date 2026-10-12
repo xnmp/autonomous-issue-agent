@@ -189,7 +189,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     # review C5: end-to-end — shared.env + overlay -> compose-env.sh ->
     # .active.env -> _load_agent_env -> (simulated main.py) os.environ. Uses
     # CI_PENDING_MAX_SECONDS (documented, omitted from the old allow-list) and
-    # MAX_INFRA_DEATHS (a brand-new knob no allow-list edit ever added), plus
+    # MAX_RESOLVE_RETRIES (a brand-new knob no allow-list edit ever added), plus
     # a value with spaces/quotes to prove %q quoting survived the rewrite.
     compose_env_sh = _install_compose_env(tmp_path)
     (tmp_path / "config").mkdir(exist_ok=True)
@@ -201,7 +201,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     (repos_dir / "demo.env").write_text(
         'REPO="acme/widget"\n'
         'CI_PENDING_MAX_SECONDS="3600"\n'
-        'MAX_INFRA_DEATHS="7"\n'
+        'MAX_RESOLVE_RETRIES="7"\n'
         # Escaped \$ — a LITERAL dollar sign in the value, not a shell
         # parameter expansion (compose-env.sh sources this as real bash, so
         # an unescaped $var would be interpreted, per the documented
@@ -216,12 +216,12 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     active = tmp_path / "config" / ".active.demo.env"
     active_text = active.read_text()
     assert "CI_PENDING_MAX_SECONDS=" in active_text
-    assert "MAX_INFRA_DEATHS=7" in active_text
+    assert "MAX_RESOLVE_RETRIES=7" in active_text
     assert "REPO=acme/widget" in active_text
 
     env = _load_agent_env({"AGENT_ENV": str(active)})
     assert env["CI_PENDING_MAX_SECONDS"] == "3600"
-    assert env["MAX_INFRA_DEATHS"] == "7"
+    assert env["MAX_RESOLVE_RETRIES"] == "7"
     assert env["WEIRD_VALUE"] == 'has spaces and "quotes" and $dollar signs'
     assert env["REPO"] == "acme/widget"
 
@@ -231,7 +231,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert os.environ["CI_PENDING_MAX_SECONDS"] == "3600"
-    assert os.environ["MAX_INFRA_DEATHS"] == "7"
+    assert os.environ["MAX_RESOLVE_RETRIES"] == "7"
     assert os.environ["WEIRD_VALUE"] == 'has spaces and "quotes" and $dollar signs'
 
 
@@ -524,11 +524,11 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
     env_file = tmp_path / "agent.env"
     env_file.write_text(
         'REPO="o/r"\nFIX_BOT="fixer"\n'
-        'CI_PENDING_MAX_SECONDS="3600"\nMAX_INFRA_DEATHS="9"\n'
+        'CI_PENDING_MAX_SECONDS="3600"\nMAX_RESOLVE_RETRIES="9"\n'
     )
     monkeypatch.setenv("AGENT_ENV", str(env_file))
     monkeypatch.delenv("CI_PENDING_MAX_SECONDS", raising=False)
-    monkeypatch.delenv("MAX_INFRA_DEATHS", raising=False)
+    monkeypatch.delenv("MAX_RESOLVE_RETRIES", raising=False)
     # Avoid a real flock/tempfile side effect — the single-instance guard is
     # not what this test is about.
     monkeypatch.setattr(
@@ -551,7 +551,7 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
         main_module.main(["fix"])
 
     assert os.environ["CI_PENDING_MAX_SECONDS"] == "3600"
-    assert os.environ["MAX_INFRA_DEATHS"] == "9"
+    assert os.environ["MAX_RESOLVE_RETRIES"] == "9"
 
 
 def test_build_role_does_not_reload_env_when_already_provided(

@@ -372,10 +372,6 @@ class HarnessConfig:
     # resolve — the most expensive — had none, so an always-erroring resolve
     # requeued ai-ready and re-dispatched a full session every poll forever.
     max_resolve_retries: int = 3
-    # Steward-only triage/groom/Jira infrastructure ceiling. Fix and review
-    # machine failures are never attempts (domain.backoff); this dies with the
-    # steward. 0 disables.
-    max_infra_deaths: int = 5
     # Counts paid review
     # rounds that advanced NOTHING — a session that died pre-result, but also a
     # fan-out whose synthesis returned None, a failed submit POST, or an errored
@@ -775,7 +771,6 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_REVIEW_RETRIES", self.max_review_retries)
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
         _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
-        _require_non_negative(errors, "MAX_INFRA_DEATHS", self.max_infra_deaths)
         _require_non_negative(
             errors, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS", self.max_unproductive_review_rounds
         )
