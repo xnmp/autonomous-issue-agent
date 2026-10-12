@@ -8,7 +8,7 @@
  * cyan = links/models — holds everywhere by construction.
  */
 
-import type { CostMix, IssueCard, IssueFlag, RoleHealth, StepState } from "../api/types";
+import type { CostMix, RoleHealth, StepState } from "../api/types";
 import { isElevatedEffort } from "./models";
 
 export type Tone =
@@ -29,6 +29,9 @@ const KIND_LABEL: Record<string, string> = {
   TRIAGE: "Triage",
   STEWARD_DRIVE: "Steward",
   JIRA_SYNC: "Jira sync",
+  GROOM: "Groom",
+  CI: "CI",
+  MERGE: "Merge",
 };
 
 export function kindLabel(kind: string): string {
@@ -174,30 +177,6 @@ export function commitSubjectTone(subject: string): Tone {
   return "neutral";
 }
 
-/** Every flag is a problem; severity splits red from orange-ish yellow. */
-export function flagTone(flag: IssueFlag): Tone {
-  if (flag === "waiting") return "info";
-  if (flag === "blocked") return "fail";
-  // `escalated` / `spend-blocked` are lifetime counters, not live state: the
-  // row-alert treatment owns "human needed NOW", so history reads as meta —
-  // a done row that once escalated must not shout red forever.
-  if (flag === "escalated" || flag === "spend-blocked") return "meta";
-  return "running";
-}
-
-/**
- * Whether the harness has stopped and is waiting on a person.
- *
- * `human_action` is the backend's own attention bucket, so the board reads it
- * rather than re-deriving one from stages and flags. Needs-budget-review
- * arrives as `escalated` — only a cap decision resumes it — which is why there
- * is no third arm. Merge-ready is deliberately absent: nothing is stuck there,
- * the work is finished and waiting to be shipped.
- */
-export function blocksOnHuman(card: Pick<IssueCard, "human_action">): boolean {
-  return card.human_action === "escalated" || card.human_action === "awaiting-reply";
-}
-
 export function prStateTone(state: string | null | undefined): Tone {
   if (state === "merged") return "ok";
   if (state === "closed") return "fail";
@@ -314,6 +293,7 @@ const DIFFICULTY_TONES: Record<string, Tone> = {
   moderate: "running",
   medium: "running",
   complex: "fail",
+  exceptional: "fail",
   hard: "fail",
   high: "fail",
   large: "fail",
@@ -484,20 +464,4 @@ export function mixSlices(mix: CostMix | null): MixSlice[] {
     { family: "repair", label: "Repair", usd: at(mix?.repair_usd), varName: "--series-3" },
     { family: "steward", label: "Steward", usd: at(mix?.steward_usd), varName: "--series-4" },
   ];
-}
-
-/** A step badge's colour inside an issue-row progress bar. */
-export function familyVar(kind: string): string {
-  switch (familyOf(kind)) {
-    case "resolve":
-      return "--series-1";
-    case "review":
-      return "--series-2";
-    case "repair":
-      return "--series-3";
-    case "steward":
-      return "--series-4";
-    default:
-      return "--ink-faint";
-  }
 }

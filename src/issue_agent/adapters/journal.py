@@ -481,14 +481,20 @@ class _DeferredRouteReceipt:
     model: str = ""
     effort: str | None = None
     selected_runtime: str | None = None
+    # The router's difficulty tier, when it named one on the ladder.
+    tier: str | None = None
     context: RunContext | None = None
     run_id: str = ""
     leg_id: str = ""
 
-    def decide(self, model: str | None, effort: object | None, runtime: str | None = None) -> None:
+    def decide(
+        self, model: str | None, effort: object | None, runtime: str | None = None,
+        *, tier: str | None = None,
+    ) -> None:
         self.selected_runtime = runtime
         self.model = model or ""
         self.effort = getattr(effort, "value", effort) or None
+        self.tier = tier
 
 
 class JournalingRuntime:
@@ -814,6 +820,7 @@ class JournalingRuntime:
                     "probe_model": probe_model,
                     "probe_runtime": actual_runtime,
                     "selected_runtime": route_decision.selected_runtime,
+                    "tier": route_decision.tier,
                 }
                 if route_decision is not None else {"model": probe_model}
             )
@@ -826,6 +833,7 @@ class JournalingRuntime:
                 "probe_model": route_fields.get("probe_model"),
                 "probe_runtime": route_fields.get("probe_runtime"),
                 "selected_runtime": route_fields.get("selected_runtime"),
+                "tier": route_fields.get("tier"),
                 "envelope_subtype": (
                     getattr(result, "envelope_subtype", "") or None
                 ),

@@ -70,12 +70,6 @@ export type VerificationStatus =
   | "pending"
   | (string & {});
 export type StepState = "ok" | "failed" | "running" | "advisory" | (string & {});
-export type IssueFlag =
-  | "escalated"
-  | "recurred"
-  | "spend-blocked"
-  | "held"
-  | (string & {});
 
 /** Journal events deliberately remain open-shaped. */
 export interface JournalEvent {

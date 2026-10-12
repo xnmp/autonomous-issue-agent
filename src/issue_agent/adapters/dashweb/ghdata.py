@@ -36,7 +36,10 @@ ISSUE_HISTORY_LIMIT = 1000
 PR_FIELDS = (
     "number,title,url,state,mergedAt,updatedAt,reviewDecision,"
     "statusCheckRollup,autoMergeRequest,latestReviews,labels,comments,"
-    "isDraft,mergeable,mergeStateStatus,headRefName,closingIssuesReferences"
+    "isDraft,mergeable,mergeStateStatus,headRefName,closingIssuesReferences,"
+    # `reviews` (not `latestReviews`) is the field gh fills with each review's
+    # commit oid; the board needs it to tell a head-bound approval from a stale one.
+    "headRefOid,reviews"
 )
 PR_DETAIL_FIELDS = (
     "number,url,state,headRefName,headRefOid,closingIssuesReferences,"

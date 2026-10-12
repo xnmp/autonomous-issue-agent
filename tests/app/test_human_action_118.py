@@ -8,6 +8,15 @@ from test_dashweb_ghdata import reader
 from test_dashweb_snapshots import NOW, RESOLVE, row_for, ts
 
 
+def ask(card):
+    """What the board asks of the operator for this card, or None."""
+    board = card["board"]
+    return board["ask"] if board and board["status"] == "needs_you" else None
+
+
+ESCALATED_ASKS = {"escalated", "rearm", "budget"}
+
+
 def _pr_row():
     return row_for([
         RESOLVE,
@@ -58,9 +67,10 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
         }},
     )
 
-    assert card["human_action"] == "merge-ready"
-    assert card["human_wait_s"] == 1_200
-    assert "merge-ready" in card["flags"]
+    assert ask(card) == "merge"
+    # The wait runs from the newest approval or settled check, the same
+    # moment the human-wait clock starts.
+    assert card["board"]["since_ts"] == ts(minutes=20)
 
 
 @pytest.mark.parametrize(
@@ -72,8 +82,9 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
         {"isDraft": True},
         {"mergeable": "CONFLICTING"},
         {"mergeStateStatus": "DIRTY"},
-        {"mergeStateStatus": "HAS_HOOKS"},
-        {"mergeStateStatus": "UNSTABLE"},
+        {"mergeStateStatus": "BEHIND"},
+        {"mergeStateStatus": "BLOCKED"},
+        {"reviewDecision": "REVIEW_REQUIRED"},
     ],
 )
 def test_pr_that_still_has_harness_work_is_not_merge_ready(override):
@@ -88,9 +99,7 @@ def test_pr_that_still_has_harness_work_is_not_merge_ready(override):
         **override,
     }
 
-    assert snapshots.issue_card(
-        _pr_row(), NOW, gh_prs={90: pr}
-    )["human_action"] is None
+    assert ask(snapshots.issue_card(_pr_row(), NOW, gh_prs={90: pr})) is None
 
 
 def test_ai_blocked_question_is_awaiting_reply_until_a_later_comment():
@@ -104,26 +113,22 @@ def test_ai_blocked_question_is_awaiting_reply_until_a_later_comment():
     }
 
     card = snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)
-    assert card["human_action"] == "awaiting-reply"
-    assert card["human_wait_s"] == 2_400
+    assert ask(card) == "awaiting_reply"
+    assert card["board"]["since_ts"] == ts(seconds=2_400)
 
     issue["comments"].append({
         "createdAt": ts(minutes=20),
         "body": "Automated progress update.",
         "author": {"login": "other-app[bot]"},
     })
-    assert snapshots.issue_card(
-        row_for([RESOLVE], 7), NOW, gh_issue=issue
-    )["human_action"] == "awaiting-reply"
+    assert ask(snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)) == "awaiting_reply"
 
     issue["comments"].append({
         "createdAt": ts(minutes=10),
         "body": "Choose A.",
         "author": {"login": "operator"},
     })
-    assert snapshots.issue_card(
-        row_for([RESOLVE], 7), NOW, gh_issue=issue
-    )["human_action"] is None
+    assert ask(snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)) is None
 
 
 def test_pr_thread_ai_blocked_question_is_awaiting_reply():
@@ -144,8 +149,8 @@ def test_pr_thread_ai_blocked_question_is_awaiting_reply():
         }},
     )
 
-    assert card["human_action"] == "awaiting-reply"
-    assert card["human_wait_s"] == 1_500
+    assert ask(card) == "awaiting_reply"
+    assert card["board"]["since_ts"] == ts(seconds=1_500)
 
 
 def test_past_escalation_is_not_a_current_human_action_after_resume():
@@ -156,16 +161,17 @@ def test_past_escalation_is_not_a_current_human_action_after_resume():
          "desc": "relabel issue #7: -needs-human-review +ai-working"},
     ], 7)
 
-    assert snapshots.issue_card(
+    assert ask(snapshots.issue_card(
         row,
         NOW,
         gh_issue={"labels": [{"name": "ai-working"}]},
-    )["human_action"] is None
+    )) is None
+    # A done issue has left the board altogether.
     assert snapshots.issue_card(
         replace(row, done=True),
         NOW,
         gh_issue={"labels": [{"name": "needs-human-review"}]},
-    )["human_action"] is None
+    )["board"] is None
 
 
 def test_readded_external_escalation_does_not_reuse_cleared_wait_start():
@@ -185,8 +191,8 @@ def test_readded_external_escalation_does_not_reuse_cleared_wait_start():
         },
     )
 
-    assert card["human_action"] == "escalated"
-    assert card["human_wait_s"] == 600
+    assert ask(card) in ESCALATED_ASKS
+    assert card["board"]["since_ts"] == ts(seconds=600)
 
 
 def test_malformed_check_rollup_is_not_merge_ready():
@@ -197,9 +203,7 @@ def test_malformed_check_rollup_is_not_merge_ready():
         "statusCheckRollup": ["invalid"],
     }
 
-    assert snapshots.issue_card(
-        _pr_row(), NOW, gh_prs={90: pr}
-    )["human_action"] is None
+    assert ask(snapshots.issue_card(_pr_row(), NOW, gh_prs={90: pr})) is None
 
 
 def test_malformed_comment_author_does_not_break_human_action_projection():
@@ -212,13 +216,11 @@ def test_malformed_comment_author_does_not_break_human_action_projection():
         }],
     }
 
-    assert snapshots.issue_card(
-        row_for([RESOLVE], 7), NOW, gh_issue=issue
-    )["human_action"] == "awaiting-reply"
+    assert ask(snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)) == "awaiting_reply"
 
 
 @pytest.mark.parametrize("kind", ["ADDRESS_REVIEW", "REVIEW"])
-def test_cleanly_blocked_leg_flags_the_row_and_is_not_a_successful_step(kind):
+def test_cleanly_blocked_leg_asks_for_a_reply_and_is_not_a_successful_step(kind):
     blocked = {
         "ts": ts(minutes=20),
         "event": "agent_run",
@@ -230,7 +232,11 @@ def test_cleanly_blocked_leg_flags_the_row_and_is_not_a_successful_step(kind):
         "exit_reason": "ok",
     }
 
-    card = snapshots.issue_card(row_for([RESOLVE, blocked], 7), NOW)
+    relabel = {"ts": ts(minutes=19), "event": "action", "issue": 7,
+               "desc": "relabel issue #7: +ai-blocked"}
 
-    assert "blocked" in card["flags"]
+    card = snapshots.issue_card(row_for([RESOLVE, blocked, relabel], 7), NOW)
+
+    assert ask(card) == "awaiting_reply"
     assert card["steps"][-1]["state"] == "blocked"
+    assert card["rail"]["steps"] >= 2

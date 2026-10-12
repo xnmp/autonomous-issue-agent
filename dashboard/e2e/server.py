@@ -612,10 +612,8 @@ ISSUE_CARD = {
     "last_ts": "2026-07-29T08:00:00Z",
     "merged_ts": "2026-07-29T08:00:00Z",
     "projected_cost_usd": 2,
-    "projected_eta_s": 60,
     "rounds": 1,
     "models": ["claude-sonnet-5"],
-    "flags": [],
     "steps": [{"kind": "RESOLVE", "state": "ok", "status": "done", "cost_usd": 2}],
 }
 

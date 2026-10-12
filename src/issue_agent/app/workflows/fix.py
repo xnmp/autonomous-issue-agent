@@ -100,7 +100,8 @@ from .completion import execute_issue_completion
 
 
 def _discard_route_decision(
-    _model: str | None, _effort: object | None, _runtime: str | None = None
+    _model: str | None, _effort: object | None, _runtime: str | None = None,
+    *, tier: str | None = None,
 ) -> None:
     return None
 
@@ -818,7 +819,13 @@ class FixWorkflow:
             routed = self._escalated(
                 cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss
             )
-            record_decision(routed.model, routed.effort, routed.runtime.value if routed.runtime else self._resolve_runtime_name())
+            record_decision(
+                routed.model, routed.effort,
+                routed.runtime.value if routed.runtime else self._resolve_runtime_name(),
+                # Only a tier the router actually named on the ladder; a garbage
+                # answer was routed as the default and stays unclassified.
+                tier=tier if tier in TIER_LADDER else None,
+            )
             self.cfg.log(
                 f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
             )

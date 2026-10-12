@@ -107,8 +107,7 @@ class StubBackend:
                     "estimated": False, "projected_cost_usd": None,
                     "started_ts": None, "last_ts": None, "elapsed_s": None,
                     "working_s": None, "idle_s": None, "idle_active": False,
-                    "projected_eta_s": None, "models": [], "rounds": 0,
-                    "flags": [],
+                    "models": [], "rounds": 0,
                 }], "pending": [], "done": [],
                 "backlog": [], "gh_ok": True, "warnings": []}
 

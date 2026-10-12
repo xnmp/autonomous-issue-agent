@@ -53,6 +53,39 @@ def test_route_event_records_the_decision_not_the_probe_model(tmp_path):
     assert route["model"] == "opus"
     assert route["effort"] == "high"
     assert route["probe_model"] == "haiku"
+    # The dashboard's difficulty badge reads this; nothing reverse-maps models.
+    assert route["tier"] == "complex"
+
+
+def test_route_event_omits_a_tier_the_router_did_not_name_on_the_ladder(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    runtime = JournalingRuntime(SeqRunner([
+        AgentResult(is_error=False, session_id="rt", structured={"tier": "galaxy-brain"}),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
+    ]), journal, repo="o/r", role="fix")
+    runtime.set_context("fix", "RESOLVE", 5, 5)
+    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+    worktrees = FakeWorktrees()
+    workflow = AccountedFixtureWorkflow(
+        FixWorkflowConfig(
+            base_branch="dev",
+            fix=FixTaskConfig("o/r", agent_md="AM", effort=Effort.HIGH),
+            fork_threshold=5, author_tests_split=False, max_contract_rounds=2,
+            fix_mcp_config="", harness_root="", log=lambda _message: None,
+        ),
+        gateway, store, worktrees, runtime,
+        Executor(gateway, remove_worktree=worktrees.remove),
+        workflow_control=attach_workflow_authority(gateway, store),
+    )
+
+    asyncio.run(workflow.resolve(5))
+
+    route = next(
+        event for event in read_events(journal.path)
+        if event["event"] == "agent_run" and event["kind"] == "ROUTE"
+    )
+    assert "tier" not in route
 
 
 def test_concurrent_route_receipts_keep_task_local_decisions(tmp_path):

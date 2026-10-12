@@ -11,7 +11,7 @@ passes them here for projection into API payloads.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 import hashlib
 import json
@@ -20,6 +20,7 @@ from typing import assert_never
 
 from ...domain import dashboard as dash
 from ...domain.ci import ci_state
+from ...domain.effort import TIER_LADDER
 from ...domain.world import Check
 from ...domain.actions import AgentKind
 from ...domain.identity import is_bot_login, login_eq
@@ -1066,10 +1067,6 @@ def _suspension_partition(
     )
 
 
-def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
-    return _suspension_partition(row, max_seconds)[0]
-
-
 def _union_intervals(
     intervals: list[tuple[datetime, datetime]],
 ) -> list[tuple[datetime, datetime]]:
@@ -1193,28 +1190,6 @@ def _duration_breakdown(
     return elapsed, working, idle, idle_active
 
 
-def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
-    flags = []
-    if row.escalations:
-        flags.append("escalated")
-    if row.recurrences:
-        flags.append("recurred")
-    if row.spend_blocks:
-        flags.append("spend-blocked")
-    newest_leg_blocked = (
-        bool(row.legs)
-        and row.legs[-1].status.lower() == "blocked"
-        and row.stage in {"awaiting review", "reviewed", "awaiting human reply"}
-    )
-    if row.stage == "blocked" or newest_leg_blocked:
-        flags.append("blocked")
-    if _deferred_event(row):
-        flags.append("waiting")
-    if human_action:
-        flags.append(human_action)
-    return flags
-
-
 def _reason_line(raw: object) -> str | None:
     """First line of prose the harness did not author, bounded for a row.
 
@@ -1233,15 +1208,28 @@ def _reason_line(raw: object) -> str | None:
 def _escalation_reason(row: dash.IssueRow) -> str | None:
     """Why the harness handed this issue to a human, while it still is.
 
-    The `escalation` event carries no prose; the escalating pass states its
-    reason in a comment posted in the same executor pass, so the newest
-    escalation is paired with the nearest comment action on the same target.
-    Ties break toward the later event — a breaker comments, then escalates.
-
     Retirement follows `_active_escalation_at`: a relabel that took
     needs-human-review off, or a finished issue, ends the reason with it. The
     clients gate their unblock affordances on this field, so a reason that
     outlived its escalation would offer to unblock nothing.
+    """
+    return _reason_line(_escalation_comment(row))
+
+
+# The drawer shows the whole comment, but it is still prose the harness
+# relays from agents: bounded so one runaway body cannot bloat every poll.
+_MESSAGE_CHARS = 4000
+
+
+def _escalation_comment(row: dash.IssueRow) -> str | None:
+    """The full comment the escalating pass posted, while it is still active.
+
+    The `escalation` event carries no prose; the escalating pass states its
+    reason in a comment posted in the same executor pass, so the newest
+    escalation is paired with the nearest comment action on the same target.
+    Ties break toward the later event — a breaker comments, then escalates.
+    Provenance: comment actions are journalled by the harness executor for
+    its own writes, never read back from GitHub.
     """
     events = row.events
     if row.done or _active_escalation_at(row) is None:
@@ -1255,7 +1243,7 @@ def _escalation_reason(row: dash.IssueRow) -> str | None:
             if isinstance(number, int)
         }
         candidates = [
-            (abs(offset - index), -offset, reason)
+            (abs(offset - index), -offset, str(action.get("body")).strip())
             for offset in range(
                 max(0, index - _ESCALATION_COMMENT_WINDOW),
                 min(len(events), index + _ESCALATION_COMMENT_WINDOW + 1),
@@ -1273,9 +1261,9 @@ def _escalation_reason(row: dash.IssueRow) -> str | None:
             )
             # A body-less comment beside the escalation is not the reason, and
             # must not shadow the real one a little further out.
-            and (reason := _reason_line(action.get("body"))) is not None
+            and _reason_line(action.get("body")) is not None
         ]
-        return min(candidates)[2] if candidates else None
+        return min(candidates)[2][:_MESSAGE_CHARS] if candidates else None
     return None
 
 
@@ -1537,6 +1525,28 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
     return active_at
 
 
+_ATTENTION_LABELS = frozenset({"needs-human-review", "needs-budget-review", "ai-blocked"})
+
+
+def _attention_issue_view(row: dash.IssueRow, gh_issue: dict | None) -> dict | None:
+    """The issue as the attention arms read it.
+
+    A schema-v2 GitHub enrichment deliberately carries no labels: the world
+    projection owns them (`card_labels`). Reading only the enrichment left an
+    escalated v2 issue with no attention label at all, so it read "Up next".
+    Projected labels only ever add an attention label: a projection without
+    one proves no absence (it may be truncated or stale), so it must not
+    hand the arms a label list that contradicts the journal fallback.
+    """
+    projected = row.facts.get("labels")
+    if not isinstance(projected, (tuple, list, set, frozenset)):
+        return gh_issue
+    attention = _ATTENTION_LABELS & {str(label) for label in projected}
+    if not attention:
+        return gh_issue
+    return {**(gh_issue or {}), "labels": sorted(_labels_set(gh_issue) | attention)}
+
+
 def _human_action(
     row: dash.IssueRow,
     gh_issue: dict | None,
@@ -1544,6 +1554,7 @@ def _human_action(
 ) -> tuple[str | None, datetime | None]:
     if row.done:
         return None, None
+    gh_issue = _attention_issue_view(row, gh_issue)
     issue_labels = _labels_set(gh_issue)
     pr_labels = _labels_set(gh_pr)
     # needs-budget-review is an escalation too: only a cap decision resumes it,
@@ -1678,22 +1689,6 @@ def projected_cost_by_model(rows) -> dict[str, float]:
     }
 
 
-def mean_wall_clock_s(rows) -> float | None:
-    """Mean first-event→last-event seconds over DONE issues; None with none.
-    The ETA a card projects is only ever this repo's own history."""
-    spans = []
-    for row in rows:
-        if not row.done:
-            continue
-        start, last = _started(row), row.last_ts
-        if start and last:
-            wall_seconds = (last - start).total_seconds()
-            spans.append(
-                max(0.0, wall_seconds - _suspended_seconds(row, wall_seconds))
-            )
-    return round(sum(spans) / len(spans), 1) if spans else None
-
-
 def _clock_end(
     row: dash.IssueRow,
     started: datetime | None,
@@ -1705,8 +1700,8 @@ def _clock_end(
     In flight the clock runs to NOW; done, to the last thing that happened. An
     issue parked on a human is neither: the harness stopped working at the
     escalation/block point, and letting elapsed keep climbing charges the
-    harness for the operator's queue. `human_wait_s` still ticks live, so the
-    wait itself stays visible. A wait stamp at or before the issue's first
+    harness for the operator's queue; the board's wait column shows the wait
+    itself. A wait stamp at or before the issue's first
     event cannot bound anything, so it is ignored.
     """
     if row.done and row.last_ts:
@@ -1720,6 +1715,450 @@ def _clock_end(
     return now
 
 
+# ── issues board ──────────────────────────────────────────────────────────────
+_CI_OUTCOME = {
+    "pending": dash.StepOutcome.RUNNING,
+    "failure": dash.StepOutcome.FAILED,
+    "ok": dash.StepOutcome.PASSED,
+}
+
+
+def _leg_outcome(leg: dash.RunSummary) -> dash.StepOutcome:
+    state = leg_state(leg)
+    if state in {"failed", "blocked"}:
+        return dash.StepOutcome.FAILED
+    verdict = dash.review_verdict(leg)
+    if verdict is not None and verdict.decision is ReviewDecision.APPROVE:
+        return dash.StepOutcome.PASSED
+    if verdict is not None and verdict.decision is ReviewDecision.REQUEST_CHANGES:
+        return dash.StepOutcome.CHANGES_REQUESTED
+    return dash.StepOutcome.DONE
+
+
+def _ci_run_steps(row: dash.IssueRow, gh_pr: Mapping | None = None) -> list[dash.TrackStep]:
+    """One CI step per PR head on which CI was observed.
+
+    The world fold journals a PR observation only when its facts change, so
+    the newest observation says how a head's run ended, and the step sits
+    where it reached that state: a run that started before an approval and
+    settled after it is the CI the approval sent the patch to. A head
+    superseded before its checks settled ran no further: it reads as done
+    rather than as running forever. GitHub's current-head rollup counts
+    when no journalled observation covers that head.
+    """
+    first: dict[tuple[int, str], datetime | None] = {}
+    state: dict[tuple[int, str], str] = {}
+    newest_head: dict[int, str] = {}
+    for event in row.events:
+        if not str(event.get("event") or "").startswith("world.observed"):
+            continue
+        number = event.get("subject_number")
+        facts = event.get("facts")
+        if (
+            event.get("subject_kind") != "pr"
+            or isinstance(number, bool)
+            or not isinstance(number, int)
+            or not isinstance(facts, Mapping)
+        ):
+            continue
+        head = facts.get("head_sha")
+        summary = facts.get("ci_summary")
+        if isinstance(head, str) and head:
+            newest_head[number] = head
+        if not (isinstance(head, str) and head and isinstance(summary, Mapping)):
+            continue
+        ci = str(summary.get("state") or "")
+        # `none` (no checks reported) and `unknown` are not runs: a repo
+        # without CI must not read as a PR that keeps failing it.
+        if ci not in _CI_OUTCOME:
+            continue
+        key = (number, head)
+        if state.get(key) != ci:
+            first[key] = dash.parse_ts(event.get("ts"))
+        state[key] = ci
+    steps = _current_head_ci(gh_pr, {head for _number, head in first})
+    for key, stamp in first.items():
+        outcome = _CI_OUTCOME[state[key]]
+        if outcome is dash.StepOutcome.RUNNING and newest_head.get(key[0]) != key[1]:
+            outcome = dash.StepOutcome.DONE
+        steps.append(dash.TrackStep(dash.CI_RUN_KIND, outcome, stamp))
+    return steps
+
+
+_ROLLUP_OUTCOME = {
+    "pending": dash.StepOutcome.RUNNING,
+    "failing": dash.StepOutcome.FAILED,
+    "passing": dash.StepOutcome.PASSED,
+}
+
+
+def _current_head_ci(gh_pr: Mapping | None, journalled_heads: set[str]) -> list[dash.TrackStep]:
+    """The current head's CI run from GitHub's rollup, unless the journal
+    already observed that head (one run per head, whichever source saw it)."""
+    pr = dict(gh_pr or {})
+    head = pr.get("headRefOid")
+    if not isinstance(head, str) or not head or head in journalled_heads:
+        return []
+    outcome = _ROLLUP_OUTCOME.get(_pr_ci_state(pr) or "")
+    if outcome is None:
+        return []
+    stamps = [
+        stamp
+        for check in pr.get("statusCheckRollup") or []
+        if isinstance(check, Mapping)
+        for field in ("completedAt", "startedAt")
+        if (stamp := dash.parse_ts(check.get(field))) is not None
+    ]
+    return [dash.TrackStep(dash.CI_RUN_KIND, outcome, max(stamps, default=None))]
+
+
+def stage_track(row: dash.IssueRow, gh_pr: Mapping | None = None) -> dash.StageTrack:
+    """The issue's stage visits from its legs, operator steps and CI heads."""
+    steps = [
+        dash.TrackStep(
+            leg.kind,
+            _leg_outcome(leg),
+            leg.ts,
+            verdict=dash.review_verdict(leg) is not None,
+        )
+        for leg in row.legs
+    ]
+    steps.extend(
+        dash.TrackStep(kind, dash.StepOutcome.FAILED if state == "failed" else dash.StepOutcome.DONE,
+                       dash.parse_ts(event.get("ts")))
+        for event, kind, _note, state in _operator_steps(row)
+    )
+    steps.extend(_ci_run_steps(row, gh_pr))
+    if row.done and gh_pr and gh_pr.get("mergedAt"):
+        steps.append(dash.TrackStep(
+            dash.MERGE_KIND, dash.StepOutcome.DONE,
+            dash.parse_ts(gh_pr.get("mergedAt")) or row.last_ts,
+        ))
+    # Running legs close the sequence whatever their start stamp says: a leg
+    # dispatched before a later observation is still the newest activity.
+    running = [dash.TrackStep(leg.kind, dash.StepOutcome.RUNNING) for leg in row.running]
+    return dash.stage_track([*steps, *running])
+
+
+def rail_json(track: dash.StageTrack, live: bool) -> dict:
+    return {
+        "current": track.current.value,
+        "furthest": track.furthest.value,
+        "resolve_attempts": track.resolve_attempts,
+        "review_rounds": track.review_rounds,
+        "ci_runs": track.ci_runs,
+        "steps": track.steps,
+        "live": live,
+    }
+
+
+def history_json(track: dash.StageTrack) -> list[dict]:
+    return [
+        {
+            "stage": visit.stage.value,
+            "steps": [
+                {"kind": chip.kind, "outcome": chip.outcome.value, "count": chip.count}
+                for chip in visit.chips
+            ],
+        }
+        for visit in track.visits
+    ]
+
+
+def _positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _board_hold(row: dash.IssueRow | None) -> tuple[dash.Hold | None, str | None]:
+    """The active dependency/overlap hold, else the defer reason it gives.
+
+    `_deferred_event` is the one reading of the journalled defers. Only the
+    fixer's admission holds (blocker, overlap) wait on another target; any
+    other active defer is a reason the harness gave for not moving, which a
+    stall reports (#296).
+    """
+    event = _deferred_event(row) if row is not None else {}
+    if not event:
+        return None, None
+    since = dash.parse_ts(event.get("ts"))
+    blocker_issue = _positive_int(event.get("blocker_issue"))
+    blocker_pr = _positive_int(event.get("blocker_pr"))
+    reason = event.get("reason")
+    if event.get("event") == "hold":
+        # Pre-structured journals: the blocker survives only as "pr#N".
+        blocker = str(event.get("blocker") or "")
+        number = _positive_int(_event_number(blocker[3:])) if blocker.lower().startswith("pr#") else None
+        if number is not None:
+            return dash.Hold(dash.OnPr(number), since), None
+        if reason == "overlap":
+            return dash.Hold(dash.OnOverlap(), since), None
+        return dash.Hold(dash.OnIssue(None), since), None
+    if reason == "overlap":
+        return dash.Hold(dash.OnOverlap(blocker_issue, blocker_pr), since), None
+    if reason == "blocker":
+        return dash.Hold(dash.OnIssue(blocker_issue), since), None
+    if blocker_pr is not None:
+        return dash.Hold(dash.OnPr(blocker_pr), since), None
+    if blocker_issue is not None:
+        return dash.Hold(dash.OnIssue(blocker_issue), since), None
+    return None, str(reason).strip() if isinstance(reason, str) and reason.strip() else None
+
+
+_PROGRESS_EVENTS = frozenset({"agent_run_start", "agent_run", "action", "escalation"})
+
+
+def _observed_signature(event: Mapping) -> tuple[object, tuple] | None:
+    """An observation's subject and the facts the stall watchdog's signature
+    covers (`domain.liveness.pr_signature`/`issue_signature`), so a title or
+    body edit is not progress the watchdog itself would ignore."""
+    facts = event.get("facts")
+    if not isinstance(facts, Mapping):
+        return None
+
+    def text(key: str) -> str:
+        value = facts.get(key)
+        return value if isinstance(value, str) else ""
+
+    def rows(key: str, fields: tuple[str, ...]) -> tuple:
+        value = facts.get(key)
+        if not isinstance(value, list):
+            return ()
+        return tuple(
+            tuple(str(item.get(field) or "") for field in fields)
+            for item in value
+            if isinstance(item, Mapping)
+        )
+
+    labels = facts.get("labels")
+    label_set = tuple(sorted(str(label) for label in labels)) if isinstance(labels, list) else ()
+    subject = (event.get("subject_kind"), event.get("subject_number"))
+    if event.get("subject_kind") == "pr":
+        return subject, (
+            text("state"), text("head_sha"), label_set,
+            rows("reviews", ("state", "commit_id"))[-4:],
+            tuple(sorted(rows("checks", ("name", "bucket")))),
+            text("merge_state"),
+        )
+    return subject, (text("state"), label_set, text("updated_at"))
+_MAX_STALL_AGE_S = 10 * 365 * 86_400
+
+
+def _stall_start(stamp: datetime | None, seconds: float) -> datetime | None:
+    """When the stall began, or the event's own stamp when that predates the
+    calendar (a stamp near year 1 minus the age)."""
+    if stamp is None:
+        return None
+    floor = datetime.min.replace(tzinfo=stamp.tzinfo)
+    return stamp - timedelta(seconds=seconds) if (stamp - floor).total_seconds() > seconds else stamp
+
+
+def _active_stall(row: dash.IssueRow | None, deferral: str | None) -> dash.StallObserved | None:
+    """The newest stall nothing has answered yet.
+
+    The stall watchdog (ADR 0012) journals `target_stalled` with the age of
+    the unchanged signature, so the stall began that long before the event.
+    Any later leg, harness write or escalation answers it, and so does an
+    observation that changes what the watchdog watches; the watchdog
+    re-announces a stall that resumes at its next level.
+    """
+    active: dash.StallObserved | None = None
+    signatures: dict[object, tuple] = {}
+    for event in row.events if row is not None else ():
+        name = str(event.get("event") or "")
+        observed = _observed_signature(event) if name.startswith("world.observed") else None
+        if observed is not None:
+            subject, signature = observed
+            prior = signatures.get(subject)
+            signatures[subject] = signature
+            # The first sighting of a subject proves no change, nor its absence.
+            if prior is None or prior != signature:
+                active = None
+            continue
+        if event.get("code") == "target_stalled":
+            stamp = dash.parse_ts(event.get("ts"))
+            details = event.get("details")
+            age = details.get("age_seconds") if isinstance(details, Mapping) else None
+            # Compared before any conversion: an int beyond float range, NaN
+            # and infinity all fail the range test rather than raise.
+            seconds = (
+                float(age)
+                if isinstance(age, (int, float)) and not isinstance(age, bool)
+                and 0 <= age < _MAX_STALL_AGE_S
+                else 0.0
+            )
+            active = dash.StallObserved(_stall_start(stamp, seconds), deferral)
+        elif name in _PROGRESS_EVENTS or name.startswith("world.observed"):
+            active = None
+    return active
+
+
+def _triage_since(row: dash.IssueRow | None, event_name: str, action_type: str | None = None) -> datetime | None:
+    for event in reversed(row.events if row is not None else ()):
+        if event.get("event") != event_name:
+            continue
+        action = event.get("action")
+        if action_type is None or (isinstance(action, Mapping) and action.get("type") == action_type):
+            return dash.parse_ts(event.get("ts"))
+    return None
+
+
+def _attention(
+    row: dash.IssueRow,
+    gh_issue: dict | None,
+    gh_pr: dict | None,
+    labels: set[str],
+) -> dash.Attention | dash.MergeReady | None:
+    """What the human-wait clock is waiting on: one rule for both."""
+    kind, since = _human_action(row, gh_issue, gh_pr)
+    if kind == "merge-ready":
+        return dash.MergeReady(since)
+    if kind == "awaiting-reply":
+        return dash.AwaitingReply(since, _blocked_reason(row))
+    if kind != "escalated":
+        return None
+    comment = _escalation_comment(row) or ""
+    return dash.Escalated(
+        since,
+        reason=_reason_line(comment),
+        breaker=comment.startswith("**Circuit breaker:**"),
+        budget="needs-budget-review" in labels
+        or comment.startswith("**Budget review needed:**"),
+    )
+
+
+def board_json(status: dash.BoardStatus) -> dict:
+    common = {
+        "headline": status.headline,
+        "reason": status.reason,
+        "since_ts": iso(status.since),
+    }
+    if isinstance(status, dash.NeedsYou):
+        return {"status": "needs_you", "ask": status.ask.value, **common}
+    if isinstance(status, dash.Working):
+        return {"status": "working", "activity": status.activity.value, **common}
+    on = status.on
+    if isinstance(on, dash.OnIssue):
+        target: dict = {"kind": "issue", "issue": on.issue}
+    elif isinstance(on, dash.OnPr):
+        target = {"kind": "pr", "pr": on.pr}
+    elif isinstance(on, dash.OnOverlap):
+        target = {"kind": "overlap", "issue": on.issue, "pr": on.pr}
+    elif isinstance(on, dash.OnTriage):
+        target = {"kind": "triage", "why": on.why}
+    else:
+        target = {"kind": "queue", "priority": on.priority}
+    return {"status": "blocked", "on": target, **common}
+
+
+def _never_harness(_branch: str) -> bool:
+    return False
+
+
+# GitHub's mergeStateStatus values that refuse a merge outright.
+_MERGE_REFUSED_STATES = frozenset({"DIRTY", "BEHIND", "BLOCKED", "DRAFT"})
+_GITHUB_REVIEW = {"APPROVED": True, "REVIEW_REQUIRED": False, "CHANGES_REQUESTED": False}
+
+
+def _merge_facts(
+    gh_pr: Mapping | None,
+    harness_merges: Callable[[str], bool],
+) -> tuple[dash.MergeOwner, bool | None, bool]:
+    """Who merges the PR, GitHub's current-head review decision, and whether
+    GitHub refuses the merge now. Unread fields claim nothing."""
+    pr = gh_pr or {}
+    branch = pr.get("headRefName")
+    owner: dash.MergeOwner = (
+        "harness" if isinstance(branch, str) and harness_merges(branch)
+        else "github" if pr.get("autoMergeRequest")
+        else "operator"
+    )
+    approved = _GITHUB_REVIEW.get(str(pr.get("reviewDecision") or "").upper())
+    refused = (
+        bool(pr.get("isDraft"))
+        or str(pr.get("mergeable") or "").upper() == "CONFLICTING"
+        or str(pr.get("mergeStateStatus") or "").upper() in _MERGE_REFUSED_STATES
+    )
+    return owner, approved, refused
+
+
+def _head_approved(gh_pr: Mapping | None) -> bool:
+    """An approving review submitted on the PR's current head commit.
+
+    Reads `reviews`: gh returns `latestReviews[].commit.oid` empty, so only the
+    full review list says which commit an approval was made on."""
+    pr = gh_pr or {}
+    head = pr.get("headRefOid")
+    reviews = pr.get("reviews")
+    return isinstance(head, str) and bool(head) and isinstance(reviews, list) and any(
+        isinstance(review, Mapping)
+        and str(review.get("state") or "").upper() == "APPROVED"
+        and isinstance(commit := review.get("commit"), Mapping)
+        and commit.get("oid") == head
+        for review in reviews
+    )
+
+
+def board_status(
+    row: dash.IssueRow | None,
+    track: dash.StageTrack,
+    *,
+    labels,
+    gh_issue: dict | None = None,
+    gh_pr: dict | None = None,
+    harness_merges: Callable[[str], bool] = _never_harness,
+    queued: bool = False,
+    triage_reply: bool = False,
+) -> dash.BoardStatus:
+    """Gather one row's board facts and let the domain decide its group.
+
+    `harness_merges` is the fixer's per-branch merge rule
+    (`fix.harness_merges_branch` bound to this repository's configuration).
+    """
+    label_set = {str(label) for label in labels} | _labels_set(gh_pr)
+    hold, deferral = _board_hold(row)
+    triage = (
+        dash.TriageHold("parked", _triage_since(row, "action", "operator_park"))
+        if "ai-parked" in label_set
+        else dash.TriageHold("awaiting_reply", _triage_since(row, "triage_disposition"))
+        if triage_reply
+        else None
+    )
+    ci = _pr_ci_state(gh_pr, row) if row is not None else None
+    merge_owner, github_approved, merge_refused = _merge_facts(gh_pr, harness_merges)
+    attention = _attention(row, gh_issue, gh_pr, label_set) if row is not None else None
+    return dash.board_status(dash.BoardFacts(
+        track=track,
+        attention=None if isinstance(attention, dash.MergeReady) else attention,
+        merge_ready=attention if isinstance(attention, dash.MergeReady) else None,
+        triage=triage,
+        running_kind=row.running[-1].kind if row is not None and row.running and not row.done else None,
+        hold=hold,
+        ci=ci if ci in {"pending", "passing", "failing"} and _pr_state(gh_pr) not in {"merged", "closed"} else None,
+        stall=_active_stall(row, deferral),
+        queued=queued,
+        priority=priority_of(label_set),
+        merge_owner=merge_owner,
+        github_approved=github_approved,
+        head_approved=_head_approved(gh_pr),
+        merge_refused=merge_refused,
+        last_activity=row.last_ts if row is not None else None,
+    ))
+
+
+def route_tier(row: dash.IssueRow) -> str | None:
+    """The router's difficulty tier from its newest ROUTE completion.
+
+    Never reverse-mapped from the model id: one model can serve several
+    tiers. A value outside the ladder is an unclassified issue, not a tier.
+    """
+    for event in reversed(row.events):
+        if event.get("event") == "agent_run" and str(event.get("kind") or "") == "ROUTE":
+            tier = event.get("tier")
+            if isinstance(tier, str) and tier in TIER_LADDER:
+                return tier
+    return None
+
+
 def issue_card(
     row: dash.IssueRow,
     now: datetime,
@@ -1727,39 +2166,35 @@ def issue_card(
     gh_issue: dict | None = None,
     gh_prs: dict | None = None,
     projected_cost_usd: float | None = None,
-    projected_eta_s: float | None = None,
     projected_model: str | None = None,
     issue_verification: str | None = None,
     pr_verification: str | None = None,
     issue_verification_reason: str | None = None,
     pr_verification_reason: str | None = None,
+    harness_merges: Callable[[str], bool] = _never_harness,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
     gh_pr = (gh_prs or {}).get(pr) if pr is not None else None
-    human_action, human_wait_since = _human_action(row, gh_issue, gh_pr)
+    _human_action_kind, human_wait_since = _human_action(row, gh_issue, gh_pr)
+    labels = card_labels(row, gh_issue)
+    track = stage_track(row, gh_pr)
+    leg_running = bool(row.running) and not row.done
     elapsed, working, idle, idle_active = _duration_breakdown(
         row, started, _clock_end(row, started, now, human_wait_since)
     )
     displayed_models = fixer_card_models(row)
-    human_wait_s = (
-        max(0.0, (now - human_wait_since).total_seconds())
-        if human_wait_since is not None
-        else None
-    )
     card = {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
-        "labels": card_labels(row, gh_issue),
+        "labels": labels,
         "pr": pr,
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
         "pr_review_state": _pr_review_state(gh_pr),
         "pr_ci_state": _pr_ci_state(gh_pr, row),
         "stage": _display_stage(row),
-        "attention_reason": _blocked_reason(row),
-        "escalation_reason": _escalation_reason(row),
         "done": row.done,
         "steps": collapse_steps(row),
         "cost_usd": row.cost_usd,
@@ -1773,17 +2208,20 @@ def issue_card(
         "idle_s": round(idle) if idle is not None else None,
         "idle_active": idle_active,
         # A paid leg is executing RIGHT NOW. The client tick predicate needs
-        # this directly: human_action alone must not dead-stop both clocks
+        # this directly: a human-owned row must not dead-stop both clocks
         # while a leg is visibly spending (keifu #142/#181, 2026-08-03).
-        "leg_running": bool(row.running) and not row.done,
-        "human_action": human_action,
-        "human_wait_since_ts": iso(human_wait_since),
-        "human_wait_s": round(human_wait_s) if human_wait_s is not None else None,
-        "projected_eta_s": projected_eta_s,
+        "leg_running": leg_running,
+        # Done rows leave the board; every other row is in exactly one group.
+        "board": None if row.done else board_json(board_status(
+            row, track, labels=labels, gh_issue=gh_issue, gh_pr=gh_pr,
+            harness_merges=harness_merges,
+        )),
+        "rail": rail_json(track, leg_running),
+        "overspend_ratio": dash.overspend_ratio(row.cost_usd, projected_cost_usd),
+        "tier": route_tier(row),
         "models": displayed_models,
         "model_badges": model_badges(row, displayed_models),
         "rounds": row.rounds,
-        "flags": _flags(row, human_action),
         "issue_verification": issue_verification,
         "pr_verification": pr_verification,
         "issue_verification_reason": issue_verification_reason,
@@ -1880,12 +2318,20 @@ def pending_card(
     row: dash.IssueRow | None,
     *,
     gh_prs: Mapping[int, dict] | None = None,
+    harness_merges: Callable[[str], bool] = _never_harness,
 ) -> dict:
     labels = labels_of(issue)
     held, hold_reason = hold_state(row, labels)
     pr = row.prs[-1] if row and row.prs else None
     gh_pr = (gh_prs or {}).get(pr) if pr is not None else None
+    track = stage_track(row, gh_pr) if row is not None else dash.stage_track(())
+    leg_running = row is not None and bool(row.running) and not row.done
     return {
+        "board": board_json(board_status(
+            row, track, labels=labels, gh_issue=issue, gh_pr=gh_pr,
+            harness_merges=harness_merges, queued=True,
+        )),
+        "rail": rail_json(track, leg_running),
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
         "url": issue.get("url"),
@@ -1909,7 +2355,16 @@ def backlog_card(
 ) -> dict:
     labels = labels_of(issue)
     recurrence_count = max(row.recurrences if row else 0, int("recurrence" in labels))
+    steward_state = backlog_steward_state(labels, row)
+    # Only a steward question puts a backlog row on the board: the rest of the
+    # backlog waits on nobody in particular and would flood it.
+    triage_blocked = steward_state == "blocked_on_human_reply"
+    track = stage_track(row) if row is not None else dash.stage_track(())
     return {
+        "board": board_json(board_status(
+            row, track, labels=labels, gh_issue=issue, triage_reply=True,
+        )) if triage_blocked else None,
+        "rail": rail_json(track, False) if triage_blocked else None,
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
         "url": issue.get("url"),
@@ -1920,7 +2375,7 @@ def backlog_card(
         "age_days": age_days(issue.get("createdAt"), now),
         "age_s": age_seconds(issue.get("createdAt"), now),
         "comments": _comment_count(issue.get("comments")),
-        "steward_state": backlog_steward_state(labels, row),
+        "steward_state": steward_state,
         "issue_type": _label_value(labels, ("type:",), exact=("bug", "feature")),
         "difficulty": _label_value(labels, ("difficulty:", "effort:")),
         "impact": _label_value(labels, ("impact:",)),
@@ -2570,7 +3025,11 @@ def issue_detail(
     elapsed, working, idle, idle_active = _duration_breakdown(
         row, started, _clock_end(row, started, now, human_wait_since)
     )
+    track = stage_track(row, gh_pr)
     return {
+        "rail": rail_json(track, bool(row.running) and not row.done),
+        "history": history_json(track),
+        "harness_message": _escalation_comment(row),
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),

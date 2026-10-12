@@ -280,6 +280,35 @@
             ],
             "title": "Age S"
           },
+          "board": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "blocked": "#/components/schemas/BoardBlocked",
+                    "needs_you": "#/components/schemas/BoardNeedsYou",
+                    "working": "#/components/schemas/BoardWorking"
+                  },
+                  "propertyName": "status"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BoardNeedsYou"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardWorking"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardBlocked"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Board"
+          },
           "body": {
             "anyOf": [
               {
@@ -346,6 +375,16 @@
             "title": "Labels",
             "type": "array"
           },
+          "rail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StageRail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "recurrence": {
             "title": "Recurrence",
             "type": "boolean"
@@ -399,6 +438,338 @@
           "steward_state"
         ],
         "title": "BacklogCard",
+        "type": "object"
+      },
+      "BlockedOnIssue": {
+        "additionalProperties": true,
+        "properties": {
+          "issue": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue"
+          },
+          "kind": {
+            "const": "issue",
+            "enum": [
+              "issue"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "issue"
+        ],
+        "title": "BlockedOnIssue",
+        "type": "object"
+      },
+      "BlockedOnOverlap": {
+        "additionalProperties": true,
+        "properties": {
+          "issue": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue"
+          },
+          "kind": {
+            "const": "overlap",
+            "enum": [
+              "overlap"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr"
+          }
+        },
+        "required": [
+          "kind",
+          "issue",
+          "pr"
+        ],
+        "title": "BlockedOnOverlap",
+        "type": "object"
+      },
+      "BlockedOnPr": {
+        "additionalProperties": true,
+        "properties": {
+          "kind": {
+            "const": "pr",
+            "enum": [
+              "pr"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "pr": {
+            "title": "Pr",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "pr"
+        ],
+        "title": "BlockedOnPr",
+        "type": "object"
+      },
+      "BlockedOnQueue": {
+        "additionalProperties": true,
+        "properties": {
+          "kind": {
+            "const": "queue",
+            "enum": [
+              "queue"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "enum": [
+                  "P1",
+                  "P2",
+                  "P3"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          }
+        },
+        "required": [
+          "kind",
+          "priority"
+        ],
+        "title": "BlockedOnQueue",
+        "type": "object"
+      },
+      "BlockedOnTriage": {
+        "additionalProperties": true,
+        "properties": {
+          "kind": {
+            "const": "triage",
+            "enum": [
+              "triage"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "why": {
+            "enum": [
+              "parked",
+              "awaiting_reply"
+            ],
+            "title": "Why",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "why"
+        ],
+        "title": "BlockedOnTriage",
+        "type": "object"
+      },
+      "BoardBlocked": {
+        "additionalProperties": true,
+        "properties": {
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
+          "on": {
+            "discriminator": {
+              "mapping": {
+                "issue": "#/components/schemas/BlockedOnIssue",
+                "overlap": "#/components/schemas/BlockedOnOverlap",
+                "pr": "#/components/schemas/BlockedOnPr",
+                "queue": "#/components/schemas/BlockedOnQueue",
+                "triage": "#/components/schemas/BlockedOnTriage"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BlockedOnIssue"
+              },
+              {
+                "$ref": "#/components/schemas/BlockedOnPr"
+              },
+              {
+                "$ref": "#/components/schemas/BlockedOnOverlap"
+              },
+              {
+                "$ref": "#/components/schemas/BlockedOnTriage"
+              },
+              {
+                "$ref": "#/components/schemas/BlockedOnQueue"
+              }
+            ],
+            "title": "On"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "since_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Ts"
+          },
+          "status": {
+            "const": "blocked",
+            "enum": [
+              "blocked"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "on",
+          "headline",
+          "reason",
+          "since_ts"
+        ],
+        "title": "BoardBlocked",
+        "type": "object"
+      },
+      "BoardNeedsYou": {
+        "additionalProperties": true,
+        "properties": {
+          "ask": {
+            "enum": [
+              "rearm",
+              "escalated",
+              "budget",
+              "awaiting_reply",
+              "merge",
+              "stalled"
+            ],
+            "title": "Ask",
+            "type": "string"
+          },
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "since_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Ts"
+          },
+          "status": {
+            "const": "needs_you",
+            "enum": [
+              "needs_you"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "ask",
+          "headline",
+          "reason",
+          "since_ts"
+        ],
+        "title": "BoardNeedsYou",
+        "type": "object"
+      },
+      "BoardWorking": {
+        "additionalProperties": true,
+        "properties": {
+          "activity": {
+            "enum": [
+              "agent",
+              "ci",
+              "merge",
+              "handoff"
+            ],
+            "title": "Activity",
+            "type": "string"
+          },
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "since_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Ts"
+          },
+          "status": {
+            "const": "working",
+            "enum": [
+              "working"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "activity",
+          "headline",
+          "reason",
+          "since_ts"
+        ],
+        "title": "BoardWorking",
         "type": "object"
       },
       "CancelRearm": {
@@ -1326,16 +1697,34 @@
       "IssueCard": {
         "additionalProperties": true,
         "properties": {
-          "attention_reason": {
+          "board": {
             "anyOf": [
               {
-                "type": "string"
+                "discriminator": {
+                  "mapping": {
+                    "blocked": "#/components/schemas/BoardBlocked",
+                    "needs_you": "#/components/schemas/BoardNeedsYou",
+                    "working": "#/components/schemas/BoardWorking"
+                  },
+                  "propertyName": "status"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BoardNeedsYou"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardWorking"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardBlocked"
+                  }
+                ]
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Attention Reason"
+            "title": "Board"
           },
           "cost_usd": {
             "anyOf": [
@@ -1363,65 +1752,9 @@
             ],
             "title": "Elapsed S"
           },
-          "escalation_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Escalation Reason"
-          },
           "estimated": {
             "title": "Estimated",
             "type": "boolean"
-          },
-          "flags": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Flags",
-            "type": "array"
-          },
-          "human_action": {
-            "anyOf": [
-              {
-                "enum": [
-                  "merge-ready",
-                  "awaiting-reply",
-                  "escalated"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Human Action"
-          },
-          "human_wait_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Human Wait S"
-          },
-          "human_wait_since_ts": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Human Wait Since Ts"
           },
           "idle_active": {
             "title": "Idle Active",
@@ -1513,6 +1846,17 @@
             },
             "title": "Models",
             "type": "array"
+          },
+          "overspend_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overspend Ratio"
           },
           "pr": {
             "anyOf": [
@@ -1611,17 +1955,6 @@
             ],
             "title": "Projected Cost Usd"
           },
-          "projected_eta_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Projected Eta S"
-          },
           "projected_model": {
             "anyOf": [
               {
@@ -1632,6 +1965,16 @@
               }
             ],
             "title": "Projected Model"
+          },
+          "rail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StageRail"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "rounds": {
             "anyOf": [
@@ -1672,6 +2015,23 @@
             },
             "title": "Steps",
             "type": "array"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "trivial",
+                  "standard",
+                  "complex",
+                  "exceptional"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tier"
           },
           "title": {
             "anyOf": [
@@ -1726,10 +2086,8 @@
           "working_s",
           "idle_s",
           "idle_active",
-          "projected_eta_s",
           "models",
-          "rounds",
-          "flags"
+          "rounds"
         ],
         "title": "IssueCard",
         "type": "object"
@@ -1793,6 +2151,25 @@
             "title": "Events",
             "type": "array"
           },
+          "harness_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness Message"
+          },
+          "history": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/StageVisit"
+            },
+            "title": "History",
+            "type": "array"
+          },
           "idle_active": {
             "title": "Idle Active",
             "type": "boolean"
@@ -1846,6 +2223,16 @@
             },
             "title": "Pull Requests",
             "type": "array"
+          },
+          "rail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StageRail"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "stage": {
             "anyOf": [
@@ -2928,6 +3315,35 @@
       "PendingCard": {
         "additionalProperties": true,
         "properties": {
+          "board": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "blocked": "#/components/schemas/BoardBlocked",
+                    "needs_you": "#/components/schemas/BoardNeedsYou",
+                    "working": "#/components/schemas/BoardWorking"
+                  },
+                  "propertyName": "status"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BoardNeedsYou"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardWorking"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardBlocked"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Board"
+          },
           "body": {
             "anyOf": [
               {
@@ -3038,6 +3454,16 @@
               }
             ],
             "title": "Priority"
+          },
+          "rail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StageRail"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "title": {
             "anyOf": [
@@ -6335,6 +6761,94 @@
         "title": "SpendBucket",
         "type": "object"
       },
+      "StageRail": {
+        "additionalProperties": true,
+        "description": "Where the issue is on the five-stage track, from one stage-visit fold.",
+        "properties": {
+          "ci_runs": {
+            "title": "Ci Runs",
+            "type": "integer"
+          },
+          "current": {
+            "enum": [
+              "triage",
+              "resolve",
+              "review",
+              "ci",
+              "merge"
+            ],
+            "title": "Current",
+            "type": "string"
+          },
+          "furthest": {
+            "enum": [
+              "triage",
+              "resolve",
+              "review",
+              "ci",
+              "merge"
+            ],
+            "title": "Furthest",
+            "type": "string"
+          },
+          "live": {
+            "title": "Live",
+            "type": "boolean"
+          },
+          "resolve_attempts": {
+            "title": "Resolve Attempts",
+            "type": "integer"
+          },
+          "review_rounds": {
+            "title": "Review Rounds",
+            "type": "integer"
+          },
+          "steps": {
+            "title": "Steps",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "current",
+          "furthest",
+          "resolve_attempts",
+          "review_rounds",
+          "ci_runs",
+          "steps",
+          "live"
+        ],
+        "title": "StageRail",
+        "type": "object"
+      },
+      "StageVisit": {
+        "additionalProperties": true,
+        "properties": {
+          "stage": {
+            "enum": [
+              "triage",
+              "resolve",
+              "review",
+              "ci",
+              "merge"
+            ],
+            "title": "Stage",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/TrackChip"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stage",
+          "steps"
+        ],
+        "title": "StageVisit",
+        "type": "object"
+      },
       "StepEventsPayload": {
         "additionalProperties": true,
         "properties": {
@@ -6507,6 +7021,37 @@
           "cache_creation_input_tokens"
         ],
         "title": "TokenUsage",
+        "type": "object"
+      },
+      "TrackChip": {
+        "additionalProperties": true,
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "changes_requested",
+              "done",
+              "running"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "outcome",
+          "count"
+        ],
+        "title": "TrackChip",
         "type": "object"
       },
       "UnavailableControl": {

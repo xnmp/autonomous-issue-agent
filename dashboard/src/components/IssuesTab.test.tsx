@@ -27,14 +27,12 @@ const doneCard: IssueCard = {
   idle_s: 15,
   idle_active: false,
   leg_running: false,
-  projected_eta_s: 60,
   models: ["gpt-5.6-terra", "claude-opus-4-1"],
   model_badges: [
     { model: "gpt-5.6-terra", effort: "medium" },
     { model: "claude-opus-4-1", effort: null },
   ],
   rounds: 2,
-  flags: [],
   issue_verification: "VERIFIED",
   pr_verification: "pending",
   merged_ts: "2026-07-29T08:00:00Z",
@@ -51,18 +49,6 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 }
 
 describe("IssuesTab", () => {
-  it("shows CI activity on a pending issue with a PR", () => {
-    render(<IssuesTab repo="demo" sub="inflight" onOpenIssue={vi.fn()} issues={polled({
-      in_flight: [], done: [], backlog: [], gh_ok: true, notifications: [], warnings: [],
-      pending: [{
-        issue: 50, title: "Ready with pending CI", url: null, body: "", priority: null,
-        labels: ["ai-ready"], held: false, hold_reason: null, overlap: null,
-        pr: 75, pr_url: null, pr_state: "open", pr_ci_state: "pending",
-      }],
-    })} />);
-    expect(screen.getByText("CI running")).toHaveClass("chip-running", "pulse");
-  });
-
   it("expands done rows before opening the full issue and hides rounds by default", async () => {
     const onOpenIssue = vi.fn();
     const { container } = render(
@@ -180,141 +166,6 @@ describe("IssuesTab", () => {
     expect(screen.getByRole("button", { name: "Promote #63 to ai-ready" })).toBeVisible();
   });
 
-  it("expands a pending row to show the issue text, same as backlog", async () => {
-    render(
-      <IssuesTab
-        repo="demo"
-        sub="inflight"
-        issues={polled({
-          in_flight: [],
-          pending: [{
-            issue: 81,
-            title: "Waiting its turn",
-            url: "https://github.com/o/r/issues/81",
-            body: "## Context\n\nthe queue is long",
-            priority: "P2",
-            labels: ["ai-ready"],
-            held: true,
-            hold_reason: "waiting on PR #179",
-            overlap: null,
-          }],
-          done: [],
-          backlog: [],
-          gh_ok: true,
-          notifications: [],
-          warnings: [],
-        })}
-        onOpenIssue={vi.fn()}
-      />,
-    );
-
-    await userEvent.click(screen.getByRole("row", { name: /Waiting its turn/ }));
-    // MarkdownBody arrives via React.lazy — same load-tolerant timeout as the
-    // backlog expansion test.
-    expect(
-      await screen.findByRole("heading", { name: "Context" }, { timeout: 10_000 }),
-    ).toBeVisible();
-    expect(screen.getByText("the queue is long")).toBeVisible();
-  });
-
-  it("badges a parked pending row and offers Unpark in its expansion", async () => {
-    const calls: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        calls.push(String(input));
-        return new Response(JSON.stringify({ ok: true, detail: "ok" }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }),
-    );
-    render(
-      <IssuesTab
-        repo="demo"
-        sub="inflight"
-        issues={polled({
-          in_flight: [],
-          pending: [{
-            issue: 34,
-            title: "Parked work",
-            url: "https://github.com/o/r/issues/34",
-            body: "text",
-            priority: null,
-            labels: ["ai-parked"],
-            held: true,
-            hold_reason: "parked",
-            overlap: null,
-            pr: 179,
-            pr_url: "https://github.com/o/r/pull/179",
-            pr_state: "open",
-            pr_ci_state: "failing",
-          }],
-          done: [],
-          backlog: [],
-          gh_ok: true,
-          notifications: [],
-          warnings: [],
-        })}
-        onOpenIssue={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText("parked")).toBeVisible();
-    const pr = screen.getByText("PR #179").closest(".chip");
-    expect(pr).toHaveClass("chip-fail");
-    expect(pr?.closest("a")).toHaveAttribute(
-      "href",
-      "https://github.com/o/r/pull/179",
-    );
-    await userEvent.click(screen.getByRole("row", { name: /Parked work/ }));
-    await userEvent.click(await screen.findByRole("button", { name: "Unpark" }));
-    expect(calls.some((url) => url.endsWith("/issues/34/unpark"))).toBe(true);
-    vi.unstubAllGlobals();
-  });
-
-  it("does not toggle a pending row when a priority button is clicked", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(JSON.stringify({ ok: true, detail: "" }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
-      ),
-    );
-    render(
-      <IssuesTab
-        repo="demo"
-        sub="inflight"
-        issues={polled({
-          in_flight: [],
-          pending: [{
-            issue: 81,
-            title: "Waiting its turn",
-            url: null,
-            body: "text",
-            priority: null,
-            labels: ["ai-ready"],
-            held: false,
-            hold_reason: null,
-            overlap: null,
-          }],
-          done: [],
-          backlog: [],
-          gh_ok: true,
-          notifications: [],
-          warnings: [],
-        })}
-        onOpenIssue={vi.fn()}
-      />,
-    );
-
-    await userEvent.click(screen.getByRole("button", { name: "P3" }));
-    expect(screen.queryByText("Issue context")).not.toBeInTheDocument();
-    vi.unstubAllGlobals();
-  });
-
   it("does not toggle a backlog row when its promote button is keyboard-activated", async () => {
     render(
       <IssuesTab
@@ -350,5 +201,58 @@ describe("IssuesTab", () => {
 
     expect(screen.getByRole("dialog")).toBeVisible();
     expect(screen.queryByRole("heading", { name: "Context" })).not.toBeInTheDocument();
+  });
+});
+
+describe("Untriaged tab", () => {
+  const backlog = (issue: number, steward_state: string, title: string) => ({
+    issue, title, url: null, body: null, labels: [], recurrence: false, recurrence_count: 0,
+    steward_state, age_days: 1, comments: 0,
+  });
+
+  it("lists only issues the steward has not seen, each promotable to ai-ready after a confirmation", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(`${init?.method ?? "GET"} ${String(input)}`);
+      return new Response(JSON.stringify({ ok: true, detail: "ok" }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    const issues = polled({
+      in_flight: [], pending: [], done: [],
+      backlog: [
+        backlog(71, "raw", "Nobody has looked at this"),
+        backlog(72, "processed", "Already triaged"),
+        backlog(73, "blocked_on_human_reply", "Steward asked a question"),
+      ],
+      gh_ok: true, notifications: [], warnings: [],
+    } as unknown as IssuesPayload);
+    render(<IssuesTab repo="demo" sub="untriaged" issues={issues} onOpenIssue={vi.fn()} />);
+
+    expect(screen.getByText("Nobody has looked at this")).toBeVisible();
+    expect(screen.queryByText("Already triaged")).not.toBeInTheDocument();
+    expect(screen.queryByText("Steward asked a question")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Promote to ai-ready #71" }));
+    expect(calls).toEqual([]);
+    await userEvent.click(screen.getByRole("button", { name: "Promote #71" }));
+
+    expect(calls).toEqual(["POST /api/repos/demo/issues/71/promote"]);
+    expect(issues.refresh).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("says so when no backlog issue is untriaged", () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="untriaged"
+        issues={polled({
+          in_flight: [], pending: [], done: [], backlog: [backlog(72, "processed", "Already triaged")],
+          gh_ok: true, notifications: [], warnings: [],
+        } as unknown as IssuesPayload)}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/no untriaged backlog issues/)).toBeVisible();
   });
 });

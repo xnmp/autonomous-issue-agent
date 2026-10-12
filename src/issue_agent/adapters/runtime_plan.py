@@ -208,7 +208,10 @@ class RunIdentityRuntime(Protocol):
 
 
 class RouteDecisionRecorder(Protocol):
-    def __call__(self, model: str | None, effort: object | None, runtime: str | None = None) -> None: ...
+    def __call__(
+        self, model: str | None, effort: object | None, runtime: str | None = None,
+        *, tier: str | None = None,
+    ) -> None: ...
 
 
 @runtime_checkable

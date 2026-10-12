@@ -226,7 +226,6 @@ One call returns all four buckets (the UI splits sub-tabs client-side):
   "projected_cost_usd": 17.0,        // repo mean $/done issue; null if no dones
   "started_ts": "…", "last_ts": "…",
   "elapsed_s": 812,                   // server-computed; client ticks it live
-  "projected_eta_s": 5400,            // mean done-issue wall clock; null if none
   "models": ["claude-sonnet-5"], "rounds": 1,
   "flags": ["escalated", "recurred", "spend-blocked", "held"] }
 ```

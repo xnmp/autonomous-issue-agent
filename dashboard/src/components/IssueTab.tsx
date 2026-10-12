@@ -150,7 +150,7 @@ export function IssueTab({
     when: (step) => step.ts,
   }, { key: "when", direction: "asc" }, "issue-tasks");
 
-  // The detail payload carries no `human_action`; a live issue that escalated,
+  // The detail payload carries no board status; a live issue that escalated,
   // blocked, or asked a question is held by legacy choreography until its
   // resolve authority says otherwise.
   // Plan decision 9: each linked pull request carries its own review control.

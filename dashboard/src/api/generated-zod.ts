@@ -29,10 +29,96 @@ const RepoSummary = z
 const ReposPayload = z
   .object({ repos: z.array(RepoSummary), warnings: z.array(z.string()) })
   .passthrough();
+const BoardNeedsYou = z
+  .object({
+    ask: z.enum([
+      "rearm",
+      "escalated",
+      "budget",
+      "awaiting_reply",
+      "merge",
+      "stalled",
+    ]),
+    headline: z.string(),
+    reason: z.string(),
+    since_ts: z.union([z.string(), z.null()]),
+    status: z.literal("needs_you"),
+  })
+  .passthrough();
+const BoardWorking = z
+  .object({
+    activity: z.enum(["agent", "ci", "merge", "handoff"]),
+    headline: z.string(),
+    reason: z.string(),
+    since_ts: z.union([z.string(), z.null()]),
+    status: z.literal("working"),
+  })
+  .passthrough();
+const BlockedOnIssue = z
+  .object({ issue: z.union([z.number(), z.null()]), kind: z.literal("issue") })
+  .passthrough();
+const BlockedOnPr = z
+  .object({ kind: z.literal("pr"), pr: z.number().int() })
+  .passthrough();
+const BlockedOnOverlap = z
+  .object({
+    issue: z.union([z.number(), z.null()]),
+    kind: z.literal("overlap"),
+    pr: z.union([z.number(), z.null()]),
+  })
+  .passthrough();
+const BlockedOnTriage = z
+  .object({
+    kind: z.literal("triage"),
+    why: z.enum(["parked", "awaiting_reply"]),
+  })
+  .passthrough();
+const BlockedOnQueue = z
+  .object({
+    kind: z.literal("queue"),
+    priority: z.union([z.enum(["P1", "P2", "P3"]), z.null()]),
+  })
+  .passthrough();
+const BoardBlocked = z
+  .object({
+    headline: z.string(),
+    on: z.discriminatedUnion("kind", [
+      BlockedOnIssue,
+      BlockedOnPr,
+      BlockedOnOverlap,
+      BlockedOnTriage,
+      BlockedOnQueue,
+    ]),
+    reason: z.string(),
+    since_ts: z.union([z.string(), z.null()]),
+    status: z.literal("blocked"),
+  })
+  .passthrough();
+const StageRail = z
+  .object({
+    ci_runs: z.number().int(),
+    current: z.enum(["triage", "resolve", "review", "ci", "merge"]),
+    furthest: z.enum(["triage", "resolve", "review", "ci", "merge"]),
+    live: z.boolean(),
+    resolve_attempts: z.number().int(),
+    review_rounds: z.number().int(),
+    steps: z.number().int(),
+  })
+  .passthrough();
 const BacklogCard = z
   .object({
     age_days: z.union([z.number(), z.null()]),
     age_s: z.union([z.number(), z.null()]).optional(),
+    board: z
+      .union([
+        z.discriminatedUnion("status", [
+          BoardNeedsYou,
+          BoardWorking,
+          BoardBlocked,
+        ]),
+        z.null(),
+      ])
+      .optional(),
     body: z.union([z.string(), z.null()]),
     comments: z.union([z.number(), z.null()]),
     difficulty: z.union([z.string(), z.null()]).optional(),
@@ -40,6 +126,7 @@ const BacklogCard = z
     issue: z.number().int(),
     issue_type: z.union([z.string(), z.null()]).optional(),
     labels: z.array(z.string()),
+    rail: z.union([StageRail, z.null()]).optional(),
     recurrence: z.boolean(),
     recurrence_count: z.number().int(),
     steward_state: z.enum(["raw", "processed", "blocked_on_human_reply"]),
@@ -61,18 +148,20 @@ const CardStep = z
   .passthrough();
 const IssueCard = z
   .object({
-    attention_reason: z.union([z.string(), z.null()]).optional(),
+    board: z
+      .union([
+        z.discriminatedUnion("status", [
+          BoardNeedsYou,
+          BoardWorking,
+          BoardBlocked,
+        ]),
+        z.null(),
+      ])
+      .optional(),
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
-    escalation_reason: z.union([z.string(), z.null()]).optional(),
     estimated: z.boolean(),
-    flags: z.array(z.string()),
-    human_action: z
-      .union([z.enum(["merge-ready", "awaiting-reply", "escalated"]), z.null()])
-      .optional(),
-    human_wait_s: z.union([z.number(), z.null()]).optional(),
-    human_wait_since_ts: z.union([z.string(), z.null()]).optional(),
     idle_active: z.boolean(),
     idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
@@ -84,6 +173,7 @@ const IssueCard = z
     merged_ts: z.union([z.string(), z.null()]).optional(),
     model_badges: z.array(ModelBadge).optional().default([]),
     models: z.array(z.string()),
+    overspend_ratio: z.union([z.number(), z.null()]).optional(),
     pr: z.union([z.number(), z.null()]),
     pr_ci_state: z
       .union([z.enum(["passing", "failing", "pending"]), z.null()])
@@ -96,12 +186,18 @@ const IssueCard = z
     pr_verification: z.union([z.string(), z.null()]).optional(),
     pr_verification_reason: z.union([z.string(), z.null()]).optional(),
     projected_cost_usd: z.union([z.number(), z.null()]),
-    projected_eta_s: z.union([z.number(), z.null()]),
     projected_model: z.union([z.string(), z.null()]).optional(),
+    rail: z.union([StageRail, z.null()]).optional(),
     rounds: z.union([z.number(), z.null()]),
     stage: z.union([z.string(), z.null()]),
     started_ts: z.union([z.string(), z.null()]),
     steps: z.array(CardStep),
+    tier: z
+      .union([
+        z.enum(["trivial", "standard", "complex", "exceptional"]),
+        z.null(),
+      ])
+      .optional(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
     working_s: z.union([z.number(), z.null()]),
@@ -120,6 +216,16 @@ const ToastNotification = z
   .passthrough();
 const PendingCard = z
   .object({
+    board: z
+      .union([
+        z.discriminatedUnion("status", [
+          BoardNeedsYou,
+          BoardWorking,
+          BoardBlocked,
+        ]),
+        z.null(),
+      ])
+      .optional(),
     body: z.union([z.string(), z.null()]).optional(),
     held: z.boolean(),
     hold_reason: z.union([z.string(), z.null()]),
@@ -133,6 +239,7 @@ const PendingCard = z
     pr_state: z.union([z.string(), z.null()]).optional(),
     pr_url: z.union([z.string(), z.null()]).optional(),
     priority: z.union([z.enum(["P1", "P2", "P3"]), z.null()]),
+    rail: z.union([StageRail, z.null()]).optional(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
   })
@@ -160,6 +267,25 @@ const ValidationError = z
 const HTTPValidationError = z
   .object({ detail: z.array(ValidationError) })
   .partial()
+  .passthrough();
+const TrackChip = z
+  .object({
+    count: z.number().int(),
+    kind: z.string(),
+    outcome: z.enum([
+      "passed",
+      "failed",
+      "changes_requested",
+      "done",
+      "running",
+    ]),
+  })
+  .passthrough();
+const StageVisit = z
+  .object({
+    stage: z.enum(["triage", "resolve", "review", "ci", "merge"]),
+    steps: z.array(TrackChip),
+  })
   .passthrough();
 const PullRequestLink = z
   .object({
@@ -237,6 +363,8 @@ const IssueDetailPayload = z
     elapsed_s: z.union([z.number(), z.null()]),
     escalation_reason: z.union([z.string(), z.null()]).optional(),
     events: z.array(z.object({}).partial().passthrough()),
+    harness_message: z.union([z.string(), z.null()]).optional(),
+    history: z.array(StageVisit).optional().default([]),
     idle_active: z.boolean(),
     idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
@@ -246,6 +374,7 @@ const IssueDetailPayload = z
       .optional(),
     prs: z.array(z.number().int()),
     pull_requests: z.array(PullRequestLink),
+    rail: z.union([StageRail, z.null()]).optional(),
     stage: z.union([z.string(), z.null()]),
     steps: z.array(IssueStep),
     title: z.union([z.string(), z.null()]),
@@ -1205,6 +1334,15 @@ export const schemas = {
   RoleHealth,
   RepoSummary,
   ReposPayload,
+  BoardNeedsYou,
+  BoardWorking,
+  BlockedOnIssue,
+  BlockedOnPr,
+  BlockedOnOverlap,
+  BlockedOnTriage,
+  BlockedOnQueue,
+  BoardBlocked,
+  StageRail,
   BacklogCard,
   ModelBadge,
   CardStep,
@@ -1214,6 +1352,8 @@ export const schemas = {
   IssuesPayload,
   ValidationError,
   HTTPValidationError,
+  TrackChip,
+  StageVisit,
   PullRequestLink,
   IssueStepChange,
   IssueStepEscalation,
@@ -1428,6 +1568,8 @@ const endpoints = makeApi([
         elapsed_s: z.union([z.number(), z.null()]),
         escalation_reason: z.union([z.string(), z.null()]).optional(),
         events: z.array(z.object({}).partial().passthrough()),
+        harness_message: z.union([z.string(), z.null()]).optional(),
+        history: z.array(StageVisit).optional().default([]),
         idle_active: z.boolean(),
         idle_s: z.union([z.number(), z.null()]),
         issue: z.number().int(),
@@ -1437,6 +1579,7 @@ const endpoints = makeApi([
           .optional(),
         prs: z.array(z.number().int()),
         pull_requests: z.array(PullRequestLink),
+        rail: z.union([StageRail, z.null()]).optional(),
         stage: z.union([z.string(), z.null()]),
         steps: z.array(IssueStep),
         title: z.union([z.string(), z.null()]),
