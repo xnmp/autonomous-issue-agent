@@ -1735,13 +1735,16 @@ def _leg_outcome(leg: dash.RunSummary) -> dash.StepOutcome:
     return dash.StepOutcome.DONE
 
 
-def _ci_run_steps(row: dash.IssueRow) -> list[dash.TrackStep]:
+def _ci_run_steps(row: dash.IssueRow, gh_pr: Mapping | None = None) -> list[dash.TrackStep]:
     """One CI step per PR head on which CI was observed.
 
     The world fold journals a PR observation only when its facts change, so
-    a head's first observation places the run and its newest one says how it
-    ended. A head superseded before its checks settled ran no further: it
-    reads as done rather than as running forever.
+    the newest observation says how a head's run ended, and the step sits
+    where it reached that state: a run that started before an approval and
+    settled after it is the CI the approval sent the patch to. A head
+    superseded before its checks settled ran no further: it reads as done
+    rather than as running forever. GitHub's current-head rollup counts
+    when no journalled observation covers that head.
     """
     first: dict[tuple[int, str], datetime | None] = {}
     state: dict[tuple[int, str], str] = {}
@@ -1770,15 +1773,43 @@ def _ci_run_steps(row: dash.IssueRow) -> list[dash.TrackStep]:
         if ci not in _CI_OUTCOME:
             continue
         key = (number, head)
-        first.setdefault(key, dash.parse_ts(event.get("ts")))
+        if state.get(key) != ci:
+            first[key] = dash.parse_ts(event.get("ts"))
         state[key] = ci
-    steps = []
+    steps = _current_head_ci(gh_pr, {head for _number, head in first})
     for key, stamp in first.items():
         outcome = _CI_OUTCOME[state[key]]
         if outcome is dash.StepOutcome.RUNNING and newest_head.get(key[0]) != key[1]:
             outcome = dash.StepOutcome.DONE
         steps.append(dash.TrackStep(dash.CI_RUN_KIND, outcome, stamp))
     return steps
+
+
+_ROLLUP_OUTCOME = {
+    "pending": dash.StepOutcome.RUNNING,
+    "failing": dash.StepOutcome.FAILED,
+    "passing": dash.StepOutcome.PASSED,
+}
+
+
+def _current_head_ci(gh_pr: Mapping | None, journalled_heads: set[str]) -> list[dash.TrackStep]:
+    """The current head's CI run from GitHub's rollup, unless the journal
+    already observed that head (one run per head, whichever source saw it)."""
+    pr = dict(gh_pr or {})
+    head = pr.get("headRefOid")
+    if not isinstance(head, str) or not head or head in journalled_heads:
+        return []
+    outcome = _ROLLUP_OUTCOME.get(_pr_ci_state(pr) or "")
+    if outcome is None:
+        return []
+    stamps = [
+        stamp
+        for check in pr.get("statusCheckRollup") or []
+        if isinstance(check, Mapping)
+        for field in ("completedAt", "startedAt")
+        if (stamp := dash.parse_ts(check.get(field))) is not None
+    ]
+    return [dash.TrackStep(dash.CI_RUN_KIND, outcome, max(stamps, default=None))]
 
 
 def stage_track(row: dash.IssueRow, gh_pr: Mapping | None = None) -> dash.StageTrack:
@@ -1797,7 +1828,7 @@ def stage_track(row: dash.IssueRow, gh_pr: Mapping | None = None) -> dash.StageT
                        dash.parse_ts(event.get("ts")))
         for event, kind, _note, state in _operator_steps(row)
     )
-    steps.extend(_ci_run_steps(row))
+    steps.extend(_ci_run_steps(row, gh_pr))
     if row.done and gh_pr and gh_pr.get("mergedAt"):
         steps.append(dash.TrackStep(
             dash.MERGE_KIND, dash.StepOutcome.DONE,
@@ -1874,6 +1905,41 @@ def _board_hold(row: dash.IssueRow | None) -> tuple[dash.Hold | None, str | None
 
 
 _PROGRESS_EVENTS = frozenset({"agent_run_start", "agent_run", "action", "escalation"})
+
+
+def _observed_signature(event: Mapping) -> tuple[object, tuple] | None:
+    """An observation's subject and the facts the stall watchdog's signature
+    covers (`domain.liveness.pr_signature`/`issue_signature`), so a title or
+    body edit is not progress the watchdog itself would ignore."""
+    facts = event.get("facts")
+    if not isinstance(facts, Mapping):
+        return None
+
+    def text(key: str) -> str:
+        value = facts.get(key)
+        return value if isinstance(value, str) else ""
+
+    def rows(key: str, fields: tuple[str, ...]) -> tuple:
+        value = facts.get(key)
+        if not isinstance(value, list):
+            return ()
+        return tuple(
+            tuple(str(item.get(field) or "") for field in fields)
+            for item in value
+            if isinstance(item, Mapping)
+        )
+
+    labels = facts.get("labels")
+    label_set = tuple(sorted(str(label) for label in labels)) if isinstance(labels, list) else ()
+    subject = (event.get("subject_kind"), event.get("subject_number"))
+    if event.get("subject_kind") == "pr":
+        return subject, (
+            text("state"), text("head_sha"), label_set,
+            rows("reviews", ("state", "commit_id"))[-4:],
+            tuple(sorted(rows("checks", ("name", "bucket")))),
+            text("merge_state"),
+        )
+    return subject, (text("state"), label_set, text("updated_at"))
 _MAX_STALL_AGE_S = 10 * 365 * 86_400
 
 
@@ -1891,13 +1957,23 @@ def _active_stall(row: dash.IssueRow | None, deferral: str | None) -> dash.Stall
 
     The stall watchdog (ADR 0012) journals `target_stalled` with the age of
     the unchanged signature, so the stall began that long before the event.
-    Any later leg, harness write, escalation or observed change is progress
-    and answers it; the watchdog re-announces a stall that resumes at its
-    next level.
+    Any later leg, harness write or escalation answers it, and so does an
+    observation that changes what the watchdog watches; the watchdog
+    re-announces a stall that resumes at its next level.
     """
     active: dash.StallObserved | None = None
+    signatures: dict[object, tuple] = {}
     for event in row.events if row is not None else ():
         name = str(event.get("event") or "")
+        observed = _observed_signature(event) if name.startswith("world.observed") else None
+        if observed is not None:
+            subject, signature = observed
+            prior = signatures.get(subject)
+            signatures[subject] = signature
+            # The first sighting of a subject proves no change, nor its absence.
+            if prior is None or prior != signature:
+                active = None
+            continue
         if event.get("code") == "target_stalled":
             stamp = dash.parse_ts(event.get("ts"))
             details = event.get("details")
@@ -2005,6 +2081,19 @@ def _merge_facts(
     return owner, approved, refused
 
 
+def _head_approved(gh_pr: Mapping | None) -> bool:
+    """An approving review submitted on the PR's current head commit."""
+    pr = gh_pr or {}
+    head = pr.get("headRefOid")
+    return isinstance(head, str) and bool(head) and any(
+        isinstance(review, Mapping)
+        and str(review.get("state") or "").upper() == "APPROVED"
+        and isinstance(commit := review.get("commit"), Mapping)
+        and commit.get("oid") == head
+        for review in pr.get("latestReviews") or []
+    )
+
+
 def board_status(
     row: dash.IssueRow | None,
     track: dash.StageTrack,
@@ -2046,6 +2135,7 @@ def board_status(
         priority=priority_of(label_set),
         merge_owner=merge_owner,
         github_approved=github_approved,
+        head_approved=_head_approved(gh_pr),
         merge_refused=merge_refused,
         last_activity=row.last_ts if row is not None else None,
     ))

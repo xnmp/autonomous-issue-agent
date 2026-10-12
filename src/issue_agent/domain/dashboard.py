@@ -1915,6 +1915,7 @@ def stage_track(steps: Iterable[TrackStep]) -> StageTrack:
     )
     visits: list[tuple[Stage, list[TrackChip]]] = []
     in_progress = Stage.TRIAGE
+    reached = in_progress
     for step in ordered:
         kind = step.kind.strip().upper()
         in_progress = stage_of_kind(kind) or in_progress
@@ -1927,13 +1928,16 @@ def stage_track(steps: Iterable[TrackStep]) -> StageTrack:
             chips.append(TrackChip(step.kind, step.outcome, 1))
         if step.verdict and step.outcome is StepOutcome.PASSED and kind in REVIEW_KINDS:
             in_progress = Stage.CI
+        # An approval reaches CI even when a later re-review returns to
+        # Review before any CI step lands there.
+        reached = max(reached, in_progress, key=STAGE_ORDER.index)
     kinds = [step.kind.strip().upper() for step in ordered]
     folded = tuple(StageVisit(stage, tuple(chips)) for stage, chips in visits)
     return StageTrack(
         visits=folded,
         current=in_progress,
         furthest=max(
-            (in_progress, *(visit.stage for visit in folded)),
+            (reached, *(visit.stage for visit in folded)),
             key=STAGE_ORDER.index,
         ),
         resolve_attempts=sum(kind in _RESOLVE_ATTEMPT_KINDS for kind in kinds),
@@ -2099,6 +2103,10 @@ class BoardFacts:
     # GitHub's review decision on the current head: False when it requires a
     # review or asks for changes, None when unread.
     github_approved: bool | None = None
+    # An approving review is bound to the current head commit. A step that
+    # can push (a rebase) does not always change the patch: the reviewer
+    # carries its approval onto an unchanged patch without a paid leg.
+    head_approved: bool = False
     # GitHub refuses the merge right now: draft, conflicting, behind or
     # blocked by a branch rule.
     merge_refused: bool = False
@@ -2178,13 +2186,25 @@ def _review_state(track: StageTrack) -> ReviewState:
     return "none"
 
 
-def _approved(facts: BoardFacts) -> bool:
-    """Whether the harness approved the current patch.
+def _current_approval(facts: BoardFacts) -> bool:
+    """No step since the newest approval may have changed the patch, or an
+    approval is bound to the current head itself. The step kinds only say a
+    head may have moved; head-bound evidence says what it was approved on."""
+    state = _review_state(facts.track)
+    return state != "patched" or facts.head_approved
 
-    A lifetime approval survives neither a CI fix's new head nor a rebase,
-    and GitHub saying the current head still needs a review overrides it.
+
+def _approved(facts: BoardFacts) -> bool:
+    """Whether the current patch is approved.
+
+    A lifetime approval survives neither a CI fix's new head nor a rebase
+    unless an approval is bound to the new head, and GitHub saying the
+    current head still needs a review overrides it.
     """
-    return facts.github_approved is not False and _review_state(facts.track) == "approved"
+    state = _review_state(facts.track)
+    return facts.github_approved is not False and (
+        state == "approved" or (state == "patched" and facts.head_approved)
+    )
 
 
 def _approved_line(track: StageTrack) -> str:
@@ -2353,7 +2373,7 @@ def board_status(facts: BoardFacts) -> BoardStatus:
             _working_reason(facts.track, kind),
             facts.last_activity,
         )
-    if facts.merge_ready is not None and _review_state(facts.track) != "patched":
+    if facts.merge_ready is not None and _current_approval(facts):
         return _merge_ready(facts, facts.merge_ready)
     if facts.hold is not None:
         return _blocked_on(facts.hold)

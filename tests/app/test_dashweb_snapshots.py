@@ -3518,3 +3518,92 @@ def test_board_cards_validate_against_the_http_contract():
     IssueCard.model_validate(snapshots.issue_card(row_view([BREAKER_COMMENT, ESCALATION]), NOW))
     PendingCard.model_validate(snapshots.pending_card({"number": 9, "labels": ["ai-ready"]}, None))
     BacklogCard.model_validate(snapshots.backlog_card({"number": 3, "labels": []}, NOW))
+
+
+# ── issues board: third review (Codex, unseeded) ──────────────────────────────
+def test_an_approval_carried_across_a_mechanical_rebase_still_asks_the_operator_to_merge():
+    # The reviewer copies APPROVE onto an unchanged rebased patch without a
+    # paid leg; GitHub's approval is bound to the new head.
+    rebase = {**_REVIEW_APPROVE, "role": "fix", "kind": "REBASE", "status": "done", "ts": ts(minutes=40)}
+    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "latestReviews": [
+        {"state": "APPROVED", "submittedAt": ts(minutes=30), "commit": {"oid": "rebased-head"}}]}
+
+    card = snapshots.issue_card(_approved_row(rebase), NOW, gh_prs={12: pr})
+
+    assert ask_of(card) == "merge"
+
+
+def test_an_approval_on_an_older_head_does_not_survive_a_rebase():
+    rebase = {**_REVIEW_APPROVE, "role": "fix", "kind": "REBASE", "status": "done", "ts": ts(minutes=40)}
+    pr = {**_MERGE_READY_PR, "headRefOid": "rebased-head", "latestReviews": [
+        {"state": "APPROVED", "submittedAt": ts(minutes=50), "commit": {"oid": "old-head"}}]}
+
+    card = snapshots.issue_card(_approved_row(rebase), NOW, gh_prs={12: pr})
+
+    assert board_of(card)["status"] == "working"
+
+
+def test_a_ci_visit_survives_a_later_review_when_checks_started_before_approval():
+    approve = {**_REVIEW_APPROVE, "ts": ts(minutes=40)}
+    rereview = {**approve, "kind": "RE_REVIEW", "status": "REQUEST_CHANGES", "ts": ts(minutes=10)}
+    legs = [RESOLVE, approve, rereview]
+    events = [RESOLVE, _pr_observed("aaa", "pending", 50), approve,
+              _pr_observed("aaa", "ok", 30), rereview]
+    row = replace(row_view(events, legs=legs), prs=(12,))
+
+    detail = snapshots.issue_detail(row, NOW)
+
+    assert detail["rail"]["furthest"] == "ci"
+    assert [visit["stage"] for visit in detail["history"]] == ["resolve", "review", "ci", "review"]
+
+
+def test_an_approval_reaches_ci_even_when_a_re_review_follows_before_any_ci_step():
+    approve = {**_REVIEW_APPROVE, "ts": ts(minutes=40)}
+    rereview = {**approve, "kind": "RE_REVIEW", "status": "REQUEST_CHANGES", "ts": ts(minutes=10)}
+    row = replace(row_view([RESOLVE, approve, rereview], legs=[RESOLVE, approve, rereview]), prs=(12,))
+
+    assert snapshots.issue_detail(row, NOW)["rail"]["furthest"] == "ci"
+
+
+def test_current_head_ci_on_github_counts_when_the_journal_never_observed_it():
+    pr = {"state": "OPEN", "headRefOid": "aaa", "statusCheckRollup": [{"status": "IN_PROGRESS"}]}
+
+    card = snapshots.issue_card(_approved_row(), NOW, gh_prs={12: pr})
+
+    assert board_of(card)["headline"] == "CI running"
+    assert card["rail"]["ci_runs"] == 1
+
+
+def test_current_head_ci_already_journalled_is_one_run_not_two():
+    pr = {"state": "OPEN", "headRefOid": "aaa", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+    row = replace(row_view([RESOLVE, _REVIEW_APPROVE, _pr_observed("aaa", "ok", 30)]), prs=(12,))
+
+    assert snapshots.issue_card(row, NOW, gh_prs={12: pr})["rail"]["ci_runs"] == 1
+
+
+def test_a_pr_title_edit_is_not_progress_that_clears_a_stall():
+    observed = _pr_observed("aaa", "ok", 70)
+    stalled = {**_stalled(age_seconds=1800), "pr": 12, "details": {"kind": "pr", "level": 1, "age_seconds": 1800}}
+    edited = {**observed, "ts": ts(minutes=20), "facts": {**observed["facts"], "title": "Edited title"}}
+    row = replace(row_view([RESOLVE, observed, stalled, edited]), prs=(12,))
+
+    assert ask_of(snapshots.issue_card(row, NOW)) == "stalled"
+
+
+def test_a_new_head_observed_after_a_stall_answers_it():
+    observed = _pr_observed("aaa", "ok", 70)
+    stalled = {**_stalled(age_seconds=1800), "pr": 12, "details": {"kind": "pr", "level": 1, "age_seconds": 1800}}
+    pushed = _pr_observed("bbb", "pending", 20)
+    row = replace(row_view([RESOLVE, observed, stalled, pushed]), prs=(12,))
+
+    assert ask_of(snapshots.issue_card(row, NOW)) != "stalled"
+
+
+def test_a_v2_merge_wait_starts_at_the_approval_on_a_repo_without_ci():
+    pr = {**_MERGE_READY_PR, "statusCheckRollup": [], "updatedAt": ts(minutes=20)}
+
+    card = snapshots.issue_card(replace(_approved_row(), facts={"pr_ci_gate": "none"}), NOW,
+                                gh_prs={12: service._github_enrichment(pr)})
+
+    assert ask_of(card) == "merge"
+    assert board_of(card)["since_ts"] == ts(minutes=30)

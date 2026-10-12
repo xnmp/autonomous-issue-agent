@@ -1384,6 +1384,9 @@ _PR_ENRICHMENT_FIELDS = (
     # approved, green PR GitHub refuses (draft, behind, blocked) from one the
     # operator should merge now.
     "mergeStateStatus", "isDraft", "autoMergeRequest",
+    # When the merge wait began (`_merge_ready_since`): without them a repo
+    # with no CI had no stamp at all, so its merge ask sorted last.
+    "latestReviews", "updatedAt",
     # Fetched only by GhReader.pr for an open issue detail. Keeping them in the
     # v2 enrichment is necessary because `_github_enrichment` deliberately
     # strips list-query fields that cannot affect the projected lifecycle.

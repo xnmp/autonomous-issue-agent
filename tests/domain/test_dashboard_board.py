@@ -376,6 +376,24 @@ def test_an_approval_does_not_survive_a_changed_patch(after):
         assert status.headline not in {"Ready to merge", "Approved"}
 
 
+def test_an_approval_bound_to_the_current_head_survives_a_rebase():
+    track = stage_track(steps(("RESOLVE", O.DONE), ("REVIEW", O.PASSED, True), ("REBASE", O.DONE)))
+
+    ready = dash.board_status(BoardFacts(track=track, ci="passing", merge_ready=READY, head_approved=True))
+    waiting = dash.board_status(BoardFacts(track=track, ci="passing", merge_owner="harness", head_approved=True))
+
+    assert isinstance(ready, dash.NeedsYou) and ready.ask is Ask.MERGE
+    assert isinstance(waiting, dash.Working) and waiting.headline == "Ready to merge"
+
+
+def test_an_approval_reaches_ci_even_if_a_re_review_returns_before_any_ci_step():
+    track = stage_track(steps(
+        ("RESOLVE", O.DONE), ("REVIEW", O.PASSED, True), ("RE_REVIEW", O.CHANGES_REQUESTED, True),
+    ))
+
+    assert (track.current, track.furthest) == (Stage.REVIEW, Stage.CI)
+
+
 def test_a_reviewer_running_on_a_new_head_outranks_the_merge():
     status = dash.board_status(BoardFacts(
         track=REVIEWED, ci="passing", merge_ready=READY, running_kind="RE_REVIEW",
