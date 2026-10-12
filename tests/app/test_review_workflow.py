@@ -14,7 +14,7 @@ from tests.fakes.review_authority import BoundFixtureReviewWorkflow, FixtureRevi
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import (
     JournalingRuntime,
-    _legacy_event_record,
+    record_fields,
     read_events,
 )
 from issue_agent.domain.events import Correlation, TelemetryWarning
@@ -46,7 +46,7 @@ class FakeJournal:
 
     def emit(self, event, **fields):
         if not isinstance(event, str):
-            event, fields = _legacy_event_record(event)
+            event, fields = record_fields(event)
         self.events.append((event, fields))
 
 

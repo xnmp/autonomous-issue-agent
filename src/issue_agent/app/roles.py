@@ -19,7 +19,6 @@ import json
 import os
 import sqlite3
 import threading
-import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -39,12 +38,10 @@ from ..adapters.control_store import (
 from ..adapters.control_path import control_store_path
 from ..adapters.effects import GitHubEffectExecutor
 from ..adapters.accounting_runtime import AccountingRuntime
-from ..adapters.event_log import EventLog
-from ..adapters.typed_journal import TypedJournal
 from ..adapters.github import GitHubGateway, Identity
 from ..adapters.journal import (
     JournalingRuntime,
-    LegacyJournalLocator,
+    Journal,
     default_ledger_path,
 )
 from ..adapters.store import Store
@@ -110,7 +107,6 @@ from ..domain.pricing import (
 )
 from ..domain.recovery import RecoveryTrigger
 from ..domain.events import (
-    Producer,
     TelemetryEvent,
     TelemetryWarning,
 )
@@ -220,14 +216,12 @@ def _owner_identity(cfg: HarnessConfig, role: str) -> str:
 def _control_store(
     cfg: HarnessConfig,
     state_dir: str,
-    journal: TypedJournal,
+    role: str,
 ) -> SQLiteControlStore:
     """Open the one accounting/control authority shared by all role daemons."""
 
     control = SQLiteControlStore(_control_store_path(cfg, state_dir))
     control.initialize()
-    role = journal.events.producer.role
-    prior_deployments = prior_deployment_identities(cfg, role)
     prior_owners = configured_prior_owner_ids(cfg, role)
     control.adopt_legacy_owner(
         cfg.repo,
@@ -236,21 +230,6 @@ def _control_store(
         prior_owner_ids=prior_owners,
     )
     control.bind_active_owner(_owner_identity(cfg, role))
-    control.bind_event_outbox(
-        journal.events.prepare,
-        journal.events.append_committed,
-        line_limit=journal.events.line_limit,
-        destination=journal.events.producer.feed_identity,
-    )
-    for prior_repository, prior_deployment in prior_deployments:
-        control.adopt_projection_feed(
-            prior_deployment=prior_deployment,
-            current_deployment=journal.events.producer.deployment,
-            repository=cfg.repo,
-            role=role,
-            prior_destination=f"{prior_deployment}:{prior_repository}:{role}",
-            current_destination=journal.events.producer.feed_identity,
-        )
     return control
 
 
@@ -337,7 +316,6 @@ def _with_accounting(
     cfg: HarnessConfig,
     role: str,
     runtime_name: str,
-    journal: TypedJournal,
     reconciler: _LateReservationReconciler | None = None,
     *,
     admit: Callable[[ReservationRequest], ReservationResult] | None = None,
@@ -360,10 +338,6 @@ def _with_accounting(
         _budget_policy(cfg),
         _rate_table(cfg, runtime_name),
         spend_evidence_dir(_role_state_dir(cfg, role)),
-        journal.events.path,
-        journal.events.producer.deployment,
-        journal.events.producer.role,
-        journal.events.line_limit,
         owner_id=_owner_identity(cfg, role),
         github_host=os.environ.get("GH_HOST", "github.com"),
         approved_base_branch=cfg.base_branch,
@@ -475,7 +449,7 @@ def _effects(
     base_branch: str,
     fix_config: FixConfig = FixConfig(fix_bot=""),
     retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
-    journal: TypedJournal | None = None,
+    journal: Journal | None = None,
     alert_cmd: str = "",
     log: Callable[[str], None] | None = None,
 ) -> EffectRecovery:
@@ -513,7 +487,7 @@ def _recovery(
     cfg: HarnessConfig,
     control: SQLiteControlStore,
     effects: EffectRecovery,
-    journal: TypedJournal,
+    role: str,
     worktrees: Worktrees | None = None,
     *,
     owner_id: str,
@@ -522,7 +496,6 @@ def _recovery(
     from ..adapters.process_supervisor import ProcessSupervisor
 
     effective_state_dir = state_dir or os.path.dirname(control.path)
-    role = journal.events.producer.role
     coordinator = RecoveryCoordinator(
         ProcessSupervisor(
             process_supervision_state_dir(
@@ -535,21 +508,14 @@ def _recovery(
         worktrees or NoWorktreeRecovery(),
         effects,
         CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
-        journal,
         owner_id,
     )
-
-    def reconcile(trigger: RecoveryTrigger) -> RecoveryReport:
-        report = coordinator.reconcile(trigger)
-        control.flush_bound_outbox()
-        return report
-
     if reconciler is not None:
         reconciler.bind(
-            _SweepReservationReconciler(control, owner_id, reconcile)
+            _SweepReservationReconciler(control, owner_id, coordinator.reconcile)
         )
 
-    return _RecoveryHooks(reconcile)
+    return _RecoveryHooks(coordinator.reconcile)
 
 
 def _force_kill(
@@ -570,7 +536,6 @@ def _shutdown_finalize(
     effects: CommandRecovery,
     *,
     owner_id: str,
-    retire_projection_feed: Callable[[], object],
 ) -> Callable[[], object]:
     """Persist remaining ownership and flush effects before forced teardown."""
 
@@ -578,10 +543,7 @@ def _shutdown_finalize(
         control.record_owned_cancellation_intents(
             owner_id, "shutdown_deadline_spend_unknown"
         )
-        drained = effects.drain_pending_commands()
-        retire_projection_feed()
-        control.flush_bound_outbox()
-        return drained
+        return effects.drain_pending_commands()
 
     return finalize
 
@@ -631,7 +593,6 @@ def _shutdown_terminalize(
                 continue
             control.mark_cancellation_handover_written(intent.run_id)
             written += 1
-        control.flush_bound_outbox()
         return written
 
     return terminalize
@@ -864,32 +825,10 @@ def review_capability_line(*, can_approve: bool, adopt_unlabeled: bool) -> str:
     )
 
 
-def _journal(store: Store) -> LegacyJournalLocator:
-    """Locate historical JSONL while live telemetry writes only schema v2."""
+def _journal(store: Store) -> Journal:
+    """The role's plain JSONL journal, beside its other local state."""
 
-    return LegacyJournalLocator(os.path.join(store.state_dir, "journal.jsonl"))
-
-
-def _typed_journal(
-    legacy: LegacyJournalLocator,
-    cfg: HarnessConfig,
-    role: str,
-    state_dir: str,
-) -> TypedJournal:
-    """Attach the canonical v2 sink without changing the historical test seam."""
-
-    deployment = _deployment_identity(cfg, role)
-    events = EventLog(
-        os.path.join(state_dir, "events-v2.jsonl"),
-        Producer(
-            deployment,
-            cfg.repo,
-            role,
-            os.getpid(),
-            uuid.uuid4().hex,
-        ),
-    )
-    return TypedJournal(legacy.path, events)
+    return Journal(os.path.join(store.state_dir, "journal.jsonl"))
 
 
 def _wake_check(cfg: HarnessConfig, store: Store):
@@ -1424,13 +1363,13 @@ class FixDaemonComposition:
     """The fix role's composed authorities.
 
     Exposed so acceptance tests drive the exact production wiring (drain and
-    recovery bindings, spend gate, worktree removal, outbox flush) instead of a
+    recovery bindings, spend gate, worktree removal) instead of a
     hand-copied replica that can drift from it.
     """
 
     daemon: Daemon
     control: SQLiteControlStore
-    journal: TypedJournal
+    journal: Journal
     executor: Executor
     effects: EffectRecovery
     dispatcher: AgentDispatcher
@@ -1480,7 +1419,7 @@ def compose_fix_daemon(
         max_rebase_retries=fix_runtime.max_rebase_retries,
         max_resolve_retries=fix_runtime.max_resolve_retries,
     )
-    journal = _typed_journal(_journal(store), cfg, "fix", store.state_dir)
+    journal = _journal(store)
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
@@ -1509,7 +1448,7 @@ def compose_fix_daemon(
     }
     prepare_cwd = runtime_bindings[cfg.fixer_runtime].prepare_cwd if not cfg.fix_model_routes else None
 
-    control = _control_store(cfg, cfg.state_dir, journal)
+    control = _control_store(cfg, cfg.state_dir, "fix")
     dcfg = replace(dcfg, operator_guidance=review_guidance_reader(control, cfg.repo))
     owner_id = _owner_identity(cfg, "fix")
     effect_executor = _effects(
@@ -1576,7 +1515,7 @@ def compose_fix_daemon(
 
     governed_runtimes = {
         provider: _with_accounting(
-            binding.runner, control, cfg, "fix", provider.value, journal,
+            binding.runner, control, cfg, "fix", provider.value,
             fix_reconciler,
             admit=WorkspaceAdmission(control, worktrees, os.environ.get("GH_HOST", "github.com")),
         ) for provider, binding in runtime_bindings.items()
@@ -1769,11 +1708,12 @@ def compose_fix_daemon(
         cfg,
         control,
         effect_executor,
-        journal,
+        "fix",
         worktrees,
         owner_id=owner_id,
         reconciler=fix_reconciler,
     )
+
     def observe_with_prefetch_reservations():
         pre_fetch_inflight[:] = [reservations.snapshot()]
         return gateway.build_world()
@@ -1803,11 +1743,6 @@ def compose_fix_daemon(
             control,
             effect_executor,
             owner_id=owner_id,
-            retire_projection_feed=lambda: control.retire_projection_feed(
-                deployment=_deployment_identity(cfg, "fix"),
-                repository=cfg.repo,
-                role="fix",
-            ),
         ),
         terminalize=_shutdown_terminalize(
             control,
@@ -1878,7 +1813,7 @@ class ReviewDaemonComposition:
 
     daemon: Daemon
     control: SQLiteControlStore
-    journal: TypedJournal
+    journal: Journal
     executor: Executor
     effects: EffectRecovery
     dispatcher: AgentDispatcher
@@ -1900,7 +1835,7 @@ def compose_review_daemon(
     say: Callable[[str], None] = log or _log("review")
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
-    journal = _typed_journal(_journal(store), cfg, "review", store.state_dir)
+    journal = _journal(store)
     rcfg = ReviewConfig(
         review_bot=review_runtime.bot, identity_mode=repo_cfg.identity_mode,
         trigger_label=Label(review_runtime.trigger_label),
@@ -1965,7 +1900,7 @@ def compose_review_daemon(
     )
 
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
-    control = _control_store(cfg, cfg.review_state_dir, journal)
+    control = _control_store(cfg, cfg.review_state_dir, "review")
     owner_id = _owner_identity(cfg, "review")
     effect_executor = _effects(
         gateway,
@@ -2009,7 +1944,6 @@ def compose_review_daemon(
                 cfg,
                 "review",
                 review_runtime.runtime.value,
-                journal,
                 review_reconciler,
             ),
             journal,
@@ -2159,7 +2093,7 @@ def compose_review_daemon(
         cfg,
         control,
         effect_executor,
-        journal,
+        "review",
         owner_id=owner_id,
         reconciler=review_reconciler,
     )
@@ -2216,13 +2150,6 @@ def compose_review_daemon(
                       control,
                       effect_executor,
                       owner_id=owner_id,
-                      retire_projection_feed=lambda: (
-                          control.retire_projection_feed(
-                              deployment=_deployment_identity(cfg, "review"),
-                              repository=cfg.repo,
-                              role="review",
-                          )
-                      ),
                   ),
                   terminalize=_shutdown_terminalize(
                       control,

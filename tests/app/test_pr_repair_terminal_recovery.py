@@ -10,7 +10,6 @@ from dataclasses import replace
 import pytest
 
 from issue_agent.adapters.workflow_codec import decode_workflow
-from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain import continuation_components as cc
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.outcome import AgentResult
@@ -213,14 +212,9 @@ def test_acknowledged_run_captures_a_late_real_result_and_keeps_newer_work(monke
 @pytest.mark.parametrize("estimate", [0, 500_000])
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack(monkeypatch, tmp_path, lane, estimate, interrupted):
-    from issue_agent.adapters.event_log import EventLog
     from issue_agent.domain.contracts import ChargeOrigin, Money, PricingBasis, SettlementRequest
-    from issue_agent.domain.events import Producer, SpendRecorded, decode_event_line
     workflow, files, inner, key = _workflow(lane)
     store, control = files._workflow_db, files._workflow_authority
-    log = tmp_path / "events.jsonl"
-    events = EventLog(str(log), Producer("test", "o/r", "fix", 123, "boot"))
-    store.bind_event_outbox(events.prepare, events.append_committed)
     run_ids = []
 
     async def late(task):
@@ -253,7 +247,4 @@ def test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack(mon
     # The acknowledgment already classified the run as no attempt; the late
     # output corrects money only and never replays workflow effects.
     assert _failures(issue_ci_state(files), lane) == 0
-    contributions = [decode_event_line(line).payload.amount_micros for line in log.read_text().splitlines()
-        if isinstance(decode_event_line(line).payload, SpendRecorded)]
-    assert contributions == [estimate, -estimate, 1_250_000]
     assert control.reconcile_pr_repair_returns() == 0

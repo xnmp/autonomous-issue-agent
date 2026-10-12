@@ -15,7 +15,7 @@ This is the deployment truth, not a security claim inferred from hooks.
 | Run/process ownership | SQLite lease plus PID/PGID/start-identity receipts | boot recovery kills/reclaims before admission |
 | Deduplication | namespaced SQLite keys/command idempotency | conflicts are loud; journal tails are never authority |
 | Gate evidence | GitHub state, operator config | indeterminate is deny; worktree marker forgery has no authority |
-| Telemetry/dashboard | schema-v2 JSONL and deterministic projection | may be incomplete; never changes control decisions |
+| Logs/dashboard | plain per-role JSONL log, SQLite legs/money tables, GitHub | may be incomplete; never changes control decisions |
 
 All paid runtimes receive the durable `issue-agent-publish` command. Nothing
 forces raw `git push`, `gh pr create`, or `gh pr edit` through it (residual

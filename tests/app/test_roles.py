@@ -77,12 +77,10 @@ from issue_agent.app.roles import (
     _fix_holds,
     _fix_state as read_fix_state,
     _inject_predicted_paths,
-    _journal,
     _owner_identity,
     _shutdown_finalize,
     _shutdown_prepare,
     _shutdown_terminalize,
-    _typed_journal,
     process_supervision_state_dir,
 )
 from issue_agent.domain.agent_task import RuntimeName
@@ -341,13 +339,7 @@ def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
         )
     )
 
-    journal = _typed_journal(
-        _journal(Store(state_dir=state)),
-        current,
-        "fix",
-        state,
-    )
-    adopted = _control_store(current, state, journal)
+    adopted = _control_store(current, state, "fix")
     current_owner = _owner_identity(current, "fix")
     assert adopted.leases(current_owner)[0].run_id == request.run_id
     assert adopted.reclaim_dead_leases(
@@ -424,10 +416,9 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
         control,
         Effects(),
         owner_id="o/r:fix",
-        retire_projection_feed=lambda: order.append("retire-feed"),
     )()
 
-    assert order == ["effects", "retire-feed"]
+    assert order == ["effects"]
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
 
     class Spend:

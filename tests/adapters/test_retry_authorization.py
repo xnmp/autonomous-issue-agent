@@ -282,11 +282,10 @@ def test_present_on_recheck_settles_without_spending_the_grant(control, absent, 
     assert all(getattr(g, "gate_id", None) != "uncertain" for g in _current(control, command).gates)
 
 
-def test_transient_read_failure_keeps_the_grant_open_under_backoff_then_spends_it(control, absent, clock, tmp_path):
+def test_transient_read_failure_keeps_the_grant_open_under_backoff_then_spends_it(control, absent, clock):
     command, gateway = absent
     granted = _gate(control, command).cause.absence_evidence_id
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
-    grants = _journal(control, tmp_path)
     gateway.fail_reads = True
     clock[0] += timedelta(seconds=5)
     logs = []
@@ -298,7 +297,6 @@ def test_transient_read_failure_keeps_the_grant_open_under_backoff_then_spends_i
     assert _gate(control, command).cause == RetryAuthorizationRequired(command.command_id, granted)
     state = control.command_reconciliation(command.command_id)
     assert state.history.unresolved_since == UNRESOLVED_SINCE and state.history.next_read_at > clock[0]
-    assert [name for name, _ in grants()] == ["deferred"]
     assert executor(control, gateway, logs).drain_pending_commands() == 0  # not yet due
     assert _grant_row(control)["unavailable_reads"] == 1
     gateway.fail_reads = False
@@ -510,23 +508,6 @@ class CountingGateway(CompletionGateway):
         return super().has_label(kind, number, label)
 
 
-def _journal(control, tmp_path):
-    from pathlib import Path
-    from issue_agent.adapters.event_log import EventLog
-    from issue_agent.domain.events import ControlTransitionCommitted, Producer, decode_event_line
-
-    events = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 123, "boot"))
-    control.bind_event_outbox(events.prepare, events.append_committed, destination=events.producer.feed_identity)
-
-    def grants():
-        path = Path(events.path)
-        lines = path.read_text().splitlines() if path.exists() else []
-        return [(event.payload.state, dict(event.payload.attributes)) for event in map(decode_event_line, lines)
-                if isinstance(event.payload, ControlTransitionCommitted)
-                and event.payload.entity_kind == "workflow_retry_authorization"]
-    return grants
-
-
 def _ticks(control, gateway, clock, count, logs=None):
     """Drain `count` one-minute ticks; returns GitHub reads made after the first."""
     first = None
@@ -548,14 +529,13 @@ def test_another_hold_is_refused_at_acceptance_and_never_offered(control, absent
     assert _grant_row(control) is None
 
 
-def test_hold_after_grant_voids_once_with_bounded_reads_and_rotated_evidence(control, absent, clock, tmp_path):
+def test_hold_after_grant_voids_once_with_bounded_reads_and_rotated_evidence(control, absent, clock):
     from tests.adapters.test_return_command_recovery import add_hold
 
     command, _ = absent
     granted = _gate(control, command).cause.absence_evidence_id
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
     add_hold(control, _current(control, command))
-    grants = _journal(control, tmp_path)
     gateway, logs = CountingGateway(), []
     # One visit reads the postcondition and the guard, then the schedule holds.
     assert _ticks(control, gateway, clock, 10, logs) == 0 and gateway.reads > 0
@@ -563,7 +543,6 @@ def test_hold_after_grant_voids_once_with_bounded_reads_and_rotated_evidence(con
     row = _grant_row(control)
     assert row["disposition"] == "void" and "another gate" in row["disposition_reason"]
     assert row["consumed_attempt"] is None
-    assert [state for state, _ in grants()] == ["void"]
     rotated = _gate(control, command).cause
     assert isinstance(rotated, RetryAuthorizationRequired) and rotated.absence_evidence_id != granted
     state = control.command_reconciliation(command.command_id)
@@ -590,12 +569,11 @@ def test_generation_change_after_grant_ends_it_without_a_write(control, absent, 
     assert command_row(control, command.command_id)["attempts"] == 1
 
 
-def test_repeated_faults_before_consumption_back_off_then_void_at_the_ceiling(control, absent, clock, monkeypatch, tmp_path):
+def test_repeated_faults_before_consumption_back_off_then_void_at_the_ceiling(control, absent, clock, monkeypatch):
     from issue_agent.domain.workflow_retry import MAX_GRANT_UNAVAILABLE_READS
 
     command, _ = absent
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
-    grants = _journal(control, tmp_path)
 
     def broken(*_args, **_kwargs):
         raise ControlStoreError("injected spend fault")
@@ -614,7 +592,6 @@ def test_repeated_faults_before_consumption_back_off_then_void_at_the_ceiling(co
     assert visits == MAX_GRANT_UNAVAILABLE_READS and ticks > 4 * visits
     row = _grant_row(control)
     assert row["disposition"] == "void" and "ceiling" in row["disposition_reason"]
-    assert [name for name, _ in grants()] == ["deferred"] * (MAX_GRANT_UNAVAILABLE_READS - 1) + ["void"]
 
 
 def test_read_taken_before_an_attempt_cannot_back_absence_after_it(control, absent, clock):
@@ -1092,11 +1069,10 @@ def test_spend_and_read_evidence_are_stamped_at_read_start(control, absent, cloc
     assert decode_workflow(payload, CommandAbsenceEvidence).observed_at == started
 
 
-def test_authorized_attempts_per_command_are_capped(control, absent, clock, tmp_path):
+def test_authorized_attempts_per_command_are_capped(control, absent, clock):
     from issue_agent.domain.workflow_retry import MAX_AUTHORIZED_ATTEMPTS
 
     command, gateway = absent
-    grants = _journal(control, tmp_path)
     gateway.fail_relabel = True
     for index in range(MAX_AUTHORIZED_ATTEMPTS):
         assert isinstance(_authorize(control, _grant(control, command, f"grant-{index}")), WorkflowCommitted)
@@ -1109,7 +1085,6 @@ def test_authorized_attempts_per_command_are_capped(control, absent, clock, tmp_
     assert not _offered(control, command)
     rejected = _authorize(control, _grant(control, command, "one-too-many"))
     assert isinstance(rejected, WorkflowRejected) and "authorized attempts" in rejected.reason
-    assert [name for name, _ in grants()].count("ceiling_reached") == 1
 
 
 def test_execution_authority_refusal_is_never_offered_or_accepted(control, absent, monkeypatch):

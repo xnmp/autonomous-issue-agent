@@ -22,8 +22,6 @@ from issue_agent.adapters.codex_runner import CodexRunner, write_spend_evidence,
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.adapters.control_store import AccountingDisposition
-from issue_agent.adapters.event_log import EventLog
-from issue_agent.domain.events import ControlTransitionCommitted, Producer, decode_event_line
 from tests.adapters.test_spend_recovery import _end_run_at, _reserved_store
 
 ENDED = datetime(2100, 1, 1, tzinfo=timezone.utc)
@@ -101,9 +99,6 @@ def test_completed_request_without_evidence_journals_gap_in_actual_settlement(tm
     wrapper, control = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    log = tmp_path / "events.jsonl"
-    events = EventLog(str(log), Producer("deployment", "o/r", "fix", 123, "boot"))
-    control.bind_event_outbox(events.prepare, events.append_committed)
     if crash_after_commit:
         settle = control.settle
 
@@ -118,9 +113,6 @@ def test_completed_request_without_evidence_journals_gap_in_actual_settlement(tm
         asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
     with control.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (200, "estimate")
-    emitted = [decode_event_line(line).payload for line in log.read_text().splitlines()]
-    gaps = [e for e in emitted if isinstance(e, ControlTransitionCommitted) and e.entity_kind == "accounting" and e.state == "estimated"]
-    assert len(gaps) == 1 and gaps[0].attributes["gap"]
 
 
 def test_recovery_excludes_copied_history_without_ordinal_boundary_and_replays_once(tmp_path):
@@ -552,10 +544,8 @@ def test_v2_recovery_without_native_rates_keeps_frozen_scalar_request_pricing(tm
     ("estimated", "estimate"), ("measured", "configured_rate_card"),
     ("reported", "provider_reported"), ("streamed", "estimate"),
 ])
-def test_completion_telemetry_matches_the_committed_settlement_basis(tmp_path, usage_kind, expected_basis):
-    from issue_agent.adapters.journal import JournalingRuntime
-    from issue_agent.adapters.typed_journal import TypedJournal
-    from issue_agent.domain.events import AgentRunCompleted
+def test_journalled_run_cost_matches_the_committed_settlement(tmp_path, usage_kind, expected_basis):
+    from issue_agent.adapters.journal import Journal, JournalingRuntime
 
     sample = ModelUsage(ROOT, "sol", TokenUsage(100, 0, source=UsageSource.ROLLOUT),
                         reported_cost=Money("USD", 200) if usage_kind == "reported" else None)
@@ -566,17 +556,13 @@ def test_completion_telemetry_matches_the_committed_settlement_basis(tmp_path, u
                          usage={"input_tokens": 100, "output_tokens": 0, "source": "rollout"})
     wrapper, store = _wrapper(tmp_path, Runtime(result))
     wrapper = replace(wrapper, rate_table=RATES)
-    log = tmp_path / "events.jsonl"
-    events = EventLog(str(log), Producer("test", "o/r", "fix", 123, "boot"))
-    store.bind_event_outbox(events.prepare, events.append_committed)
-    journaled = JournalingRuntime(wrapper, TypedJournal(str(tmp_path / "journal.jsonl"), events),
+    journaled = JournalingRuntime(wrapper, Journal(str(tmp_path / "journal.jsonl")),
                                   repo="o/r", role="fix", runtime="codex")
     journaled.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     asyncio.run(journaled.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
-    completed = next(e.payload for e in map(decode_event_line, log.read_text().splitlines())
-                     if isinstance(e.payload, AgentRunCompleted))
+    completed = next(r for r in (json.loads(line) for line in (tmp_path / "journal.jsonl").read_text().splitlines())
+                     if r["event"] == "agent_run" and "cost_usd" in r)
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (200, expected_basis)
-    assert completed.cost_micros == 200
-    assert completed.pricing_basis == expected_basis
+    assert completed["cost_usd"] == 0.0002

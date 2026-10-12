@@ -1,5 +1,7 @@
 # Incident, intervention and cohort measurement
 
+**Superseded (slice 8a, 2026-10-13):** the `issue-agent measurement` commands, their recorder and the cohort export were deleted. Metrics now derive from the SQLite legs/money tables (runs, charges) plus GitHub. Kept for history only.
+
 These local observations measure human effort and outcomes. They cannot release a hold, authorize a paid attempt, change workflow authority or activate a deployment. Historical missing values remain unknown; the September baseline is not a comparable prospective cohort.
 
 Use an existing initialized control database. Recording does not initialize or migrate it:

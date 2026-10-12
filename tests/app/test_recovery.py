@@ -91,15 +91,6 @@ class _Spend:
         return run_id in self.settled
 
 
-class _Abandonments:
-    def __init__(self):
-        self.calls = []
-
-    def abandon_run(self, run_id, reason):
-        self.calls.append((run_id, reason))
-        return True
-
-
 class _Worktrees:
     def prune_validate(self):
         return 2
@@ -113,11 +104,10 @@ class _Commands:
 def test_recovery_reconciles_dead_reservation_before_unknown_release():
     control = _Control()
     spend = _Spend((RunId("recovered"),))
-    abandonments = _Abandonments()
 
     report = RecoveryCoordinator(
         _Supervisor(), control, _Worktrees(), _Commands(),
-        spend, abandonments, "o/r:fix"
+        spend, "o/r:fix"
     ).reconcile(RecoveryTrigger.BOOT)
 
     assert report.killed_orphans == ()
@@ -128,48 +118,20 @@ def test_recovery_reconciles_dead_reservation_before_unknown_release():
     assert report.pending_commands == 1
     assert spend.seen == [RunId("recovered")]
     assert control.released == []
-    assert abandonments.calls == [
-        (RunId("recovered"), "process ownership lost")
-    ]
 
 
 def test_recovery_never_releases_indeterminate_spend_after_execution():
     control = _Control()
     spend = _Spend()
-    abandonments = _Abandonments()
 
     report = RecoveryCoordinator(
         _Supervisor(), control, _Worktrees(), _Commands(),
-        spend, abandonments, "o/r:fix"
+        spend, "o/r:fix"
     ).reconcile(RecoveryTrigger.BOOT)
 
     assert report.spend_unknown == ()
     assert control.released == []
     assert RunId("live") not in spend.seen
-    assert abandonments.calls == [
-        (RunId("recovered"), "process ownership lost")
-    ]
-
-
-def test_recovery_completes_when_abandonment_telemetry_raises():
-    control = _Control()
-
-    class BrokenTelemetry:
-        def abandon_run(self, _run_id, _reason):
-            raise OSError("disk full")
-
-    report = RecoveryCoordinator(
-        _Supervisor(),
-        control,
-        _Worktrees(),
-        _Commands(),
-        _Spend(),
-        BrokenTelemetry(),
-        "o/r:fix",
-    ).reconcile(RecoveryTrigger.BOOT)
-
-    assert report.spend_unknown == ()
-    assert control.released == []
 
 
 def test_recovery_runs_the_fixed_crash_consistency_sequence():
@@ -211,18 +173,12 @@ def test_recovery_runs_the_fixed_crash_consistency_sequence():
             calls.append("drain_commands")
             return 0
 
-    class Abandonments:
-        def abandon_run(self, run_id, reason):
-            calls.append("correct_abandonment")
-            return True
-
     RecoveryCoordinator(
         Supervisor(),
         Control(),
         Worktrees(),
         Commands(),
         _Spend(),
-        Abandonments(),
         "o/r:fix",
     ).reconcile(RecoveryTrigger.BOOT)
 
@@ -280,7 +236,6 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
         Worktrees(),
         Commands(),
         _Spend(),
-        _Abandonments(),
         "o/r:fix",
     )
 
@@ -354,13 +309,12 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
             )
             return result.disposition is AccountingDisposition.AVAILABLE
 
-    abandonments = _Abandonments()
     monkeypatch.setattr(
         "issue_agent.app.recovery._pid_alive", lambda _pid, _start: False
     )
     report = RecoveryCoordinator(
         _Supervisor(), store, _Worktrees(), _Commands(),
-        Reconciler(), abandonments, "o/r:fix"
+        Reconciler(), "o/r:fix"
     ).reconcile(RecoveryTrigger.BOOT)
 
     with sqlite3.connect(store.path) as db:
@@ -374,9 +328,6 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
         "dead_lease",
         "provider-receipt",
     )
-    assert abandonments.calls == [
-        (run_id, "process ownership lost")
-    ]
 
 
 def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
@@ -430,14 +381,12 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
         def recover_abandoned_orphans(self):
             return ()
 
-    abandonments = _Abandonments()
     report = RecoveryCoordinator(
         SafeSupervisor(),
         store,
         _Worktrees(),
         _Commands(),
         _Spend(),
-        abandonments,
         "o/r:fix",
         now=lambda: now + timedelta(hours=1),
     ).reconcile(RecoveryTrigger.WAKE)
@@ -459,7 +408,6 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
         )
     )
     assert settled.disposition is AccountingDisposition.AVAILABLE
-    assert abandonments.calls == []
 
 
 def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
@@ -499,14 +447,12 @@ def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
     assert store.record_reservation_retained(
         run_id, "trusted usage and provider charge unavailable"
     )
-    abandonments = _Abandonments()
     coordinator = RecoveryCoordinator(
         _Supervisor(),
         store,
         _Worktrees(),
         _Commands(),
         _Spend(),
-        abandonments,
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
         now=lambda: current[0],
@@ -524,7 +470,6 @@ def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
     assert report.spend_unknown == ()
     assert store.active_reservation_runs("o/r:fix") == ()
     assert store.snapshot(scope).reserved == Money.zero("USD")
-    assert abandonments.calls == []
     with sqlite3.connect(store.path) as db:
         policy, reservation_state, reason, run_state, outcome = db.execute(
             "SELECT rr.policy, b.state, b.release_reason, r.state, r.outcome "
@@ -587,7 +532,6 @@ def test_periodic_sweep_releases_only_stale_unlaunched_reservation(
         _Worktrees(),
         _Commands(),
         _Spend(),
-        _Abandonments(),
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
         now=lambda: reserved_at + timedelta(minutes=3),
@@ -657,7 +601,6 @@ def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
         _Worktrees(),
         _Commands(),
         RegisteringReconciler(),
-        _Abandonments(),
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
         now=lambda: reserved_at + timedelta(minutes=3),
@@ -670,18 +613,13 @@ def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
     )
 
 
-def test_boot_settles_legacy_accounting_hold_once_and_preserves_money_and_journal(tmp_path):
+def test_boot_settles_legacy_accounting_hold_once_and_preserves_money(tmp_path):
     import json
     from issue_agent.adapters.spend_recovery import CodexSpendReconciler
-    from issue_agent.adapters.event_log import EventLog
-    from issue_agent.domain.events import Producer
 
     now = datetime.now(timezone.utc)
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: now)
     store.initialize()
-    log_path = tmp_path / "events.jsonl"
-    log = EventLog(str(log_path), Producer("deployment", "o/r", "fix", 100, "boot"))
-    store.bind_event_outbox(log.prepare, log.append_committed)
     scope = BudgetScope("o/r", "repository", "USD", now.date().isoformat(),
                         now.replace(hour=0), now.replace(hour=0) + timedelta(days=1), ZoneInfo("UTC"))
     run_id = RunId("9fdbdc47801a41849dc212b941ef6b8f")
@@ -695,15 +633,16 @@ def test_boot_settles_legacy_accounting_hold_once_and_preserves_money_and_journa
         db.execute("UPDATE reservation_recovery SET policy='reconcile_only',reason='unfinished turns' WHERE run_id=?",
                    (str(run_id),))
     coordinator = RecoveryCoordinator(_Supervisor(), store, _Worktrees(), _Commands(),
-        CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)), _Abandonments(), "o/r:fix",
+        CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)), "o/r:fix",
         now=lambda: now)
     assert coordinator.reconcile(RecoveryTrigger.BOOT).spend_unknown == ()
     assert store.active_reservation_runs() == ()
     assert store.snapshot(scope).reserved == Money.zero()
-    journal = log_path.read_text()
-    assert 'Codex recovery evidence is missing' in journal
+    with store.transaction() as db:
+        ledger = db.execute("SELECT run_id,amount_micros,basis FROM charges").fetchall()
     assert coordinator.reconcile(RecoveryTrigger.BOOT).spend_unknown == ()
-    assert log_path.read_text() == journal
+    with store.transaction() as db:
+        assert db.execute("SELECT run_id,amount_micros,basis FROM charges").fetchall() == ledger
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
         assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("completed", "settled")

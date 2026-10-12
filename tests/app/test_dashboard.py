@@ -20,17 +20,9 @@ import pytest
 
 from issue_agent.adapters import control_path
 from issue_agent.adapters.dashweb import system as dashweb_system
-from issue_agent.adapters.event_log import EventLog
 from issue_agent.app import cli, dashboard as dash
 from issue_agent.domain.contracts import Money
 from issue_agent.domain import dashboard as dashboard_domain
-from issue_agent.domain.events import (
-    AgentRunCompleted,
-    AgentRunStarted,
-    Correlation,
-    Producer,
-    WorldObserved,
-)
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 
@@ -79,7 +71,7 @@ def write_jsonl(path: str, *lines) -> str:
     return path
 
 
-def write_v2_run(
+def write_run(
     state_dir: Path,
     *,
     role: str = "fix",
@@ -93,56 +85,15 @@ def write_v2_run(
     is_error: bool = False,
 ) -> str:
     state_dir.mkdir(parents=True, exist_ok=True)
-    log = EventLog(
-        str(state_dir / "events-v2.jsonl"),
-        Producer("deployment", "o/r", role, 100, "boot"),
-    )
-    occurred_at = NOW - timedelta(minutes=minutes_ago)
-    log.emit(
-        WorldObserved(
-            "issue",
-            issue,
-            f"issue-{issue}",
-            {
-                "present": True,
-                "state": "open",
-                "labels": ["ai-working"],
-            },
+    return write_jsonl(
+        str(state_dir / "journal.jsonl"),
+        run(
+            ts=at(minutes_ago), role=role, kind=kind, cost_usd=cost_usd,
+            status=status, number=number, issue=issue,
+            exit_reason=exit_reason, is_error=is_error,
+            dispatch=f"{role}-{kind}-{number}",
         ),
-        correlation=Correlation(issue=issue),
-        causation_time=occurred_at - timedelta(seconds=2),
     )
-    correlation = Correlation(
-        issue=issue,
-        pr=number if kind in dash.REVIEW_KINDS else None,
-        dispatch_id=f"{role}-{kind}-{number}",
-        run_id=f"{role}-{kind}-{number}",
-        leg_id=f"{role}-{kind}-{number}",
-    )
-    log.emit(
-        AgentRunStarted("model", kind),
-        correlation=correlation,
-        causation_time=occurred_at - timedelta(seconds=1),
-    )
-    log.emit(
-        AgentRunCompleted(
-            status,
-            is_error,
-            exit_reason,
-            30_000,
-            "model",
-            "codex",
-            round(cost_usd * 1_000_000),
-            "USD",
-            "configured_rate_card",
-            None,
-            None,
-            kind,
-        ),
-        correlation=correlation,
-        causation_time=occurred_at,
-    )
-    return str(state_dir / "journal.jsonl")
 
 
 def feeds(fix=(), review=(), steward=()):
@@ -377,21 +328,6 @@ def test_stage_of_a_settled_leg_keys_on_the_error_signal(exit_reason, is_error, 
     assert dash.stage_for(events) == expected
 
 
-@pytest.mark.parametrize("exit_reason,is_error,failed", FAILURE_SIGNAL_CASES)
-def test_v2_stage_of_a_settled_leg_keys_on_the_error_signal(
-    tmp_path, exit_reason, is_error, failed
-):
-    path = write_v2_run(
-        tmp_path / "fix", exit_reason=exit_reason or None, is_error=is_error
-    )
-    dep = dash.collect(
-        "n", "o/r", [path], str(tmp_path / "logs"),
-        str(tmp_path / "ledger.jsonl"), now_fn=_now,
-    )
-    (row,) = dep.issues
-    assert row.stage == ("run failed" if failed else "awaiting review")
-
-
 def test_stage_uses_the_newest_decisive_event():
     events = [
         action("relabel issue #7: +ai-ready", ts_min=30),
@@ -533,8 +469,7 @@ def test_running_leg_is_reported_per_issue():
 
 
 def test_settled_dispatch_is_not_reported_as_running():
-    from issue_agent.adapters.journal import unsettled_start_events
-
+    unsettled_start_events = dashboard_domain.unsettled_start_events
     events = [
         start(dispatch="d1", ts=at(9)),
         run(dispatch="d1", ts=at(8)),
@@ -705,10 +640,10 @@ def test_health_keeps_the_journal_and_log_paths_for_drill_down():
 
 # ── merging + malformed input ─────────────────────────────────────────────────
 def test_fix_and_review_journals_merge_into_one_issue_timeline(tmp_path):
-    fix = write_v2_run(
+    fix = write_run(
         tmp_path / "fix", cost_usd=1.0, minutes_ago=30
     )
-    review = write_v2_run(
+    review = write_run(
         tmp_path / "review",
         role="review",
         kind="REVIEW",
@@ -724,14 +659,14 @@ def test_fix_and_review_journals_merge_into_one_issue_timeline(tmp_path):
 
 
 def test_malformed_and_empty_lines_are_skipped(tmp_path):
-    path = write_v2_run(
+    path = write_run(
         tmp_path / "fix", cost_usd=1.5
     )
-    event_path = tmp_path / "fix" / "events-v2.jsonl"
+    event_path = tmp_path / "fix" / "journal.jsonl"
     event_path.write_text(
         "\n{not json\n[1, 2, 3]\n"
         + event_path.read_text()
-        + '{"schema_version":2,"type":"torn"\n'
+        + '{"event":"agent_run","torn"\n'
     )
     dep = dash.collect("n", "o/r", [path, str(tmp_path / "nope.jsonl"),
                                     str(tmp_path / "nope2.jsonl")],
@@ -739,9 +674,6 @@ def test_malformed_and_empty_lines_are_skipped(tmp_path):
                        now_fn=_now)
     (row,) = dep.issues
     assert row.cost_usd == 1.5
-    assert dep.warnings == (
-        "skipped 3 malformed schema-v2 event line(s)",
-    )
 
 
 def test_missing_journals_and_ledger_render_an_empty_deployment(tmp_path):
@@ -861,7 +793,7 @@ def test_text_wins_over_the_default_serve(tmp_path, monkeypatch, capsys):
     repos.mkdir()
     state = tmp_path / "state"
     (repos / "depl.env").write_text(f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n')
-    write_v2_run(state / "fix", cost_usd=3.0)
+    write_run(state / "fix", cost_usd=3.0)
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     monkeypatch.setattr(cli, "_prepare_dashweb", lambda: pytest.fail("served despite --text"))
@@ -874,7 +806,7 @@ def test_html_wins_over_the_default_serve(tmp_path, monkeypatch):
     repos.mkdir()
     state = tmp_path / "state"
     (repos / "depl.env").write_text(f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n')
-    write_v2_run(state / "fix", cost_usd=3.0)
+    write_run(state / "fix", cost_usd=3.0)
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     monkeypatch.setattr(cli, "_prepare_dashweb", lambda: pytest.fail("served despite --html"))
@@ -891,7 +823,7 @@ def test_cli_dashboard_writes_html_snapshot(tmp_path, monkeypatch, capsys):
         f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n'
         f'REVIEW_STATE_DIR="{state}/review"\n'
     )
-    write_v2_run(state / "fix", cost_usd=3.0)
+    write_run(state / "fix", cost_usd=3.0)
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     out = tmp_path / "out" / "dash.html"
@@ -905,7 +837,7 @@ def test_cli_dashboard_text_mode_prints(tmp_path, monkeypatch, capsys):
     repos.mkdir()
     state = tmp_path / "state"
     (repos / "depl.env").write_text(f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n')
-    write_v2_run(state / "fix", cost_usd=3.0)
+    write_run(state / "fix", cost_usd=3.0)
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     assert cli.cmd_dashboard(_args()) == 0
@@ -923,8 +855,8 @@ def test_cli_dashboard_writes_nothing_but_the_html(tmp_path, monkeypatch):
     repos.mkdir()
     state = tmp_path / "state"
     (repos / "depl.env").write_text(f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n')
-    write_v2_run(state / "fix")
-    journal = str(state / "fix" / "events-v2.jsonl")
+    write_run(state / "fix")
+    journal = str(state / "fix" / "journal.jsonl")
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     before = {p: os.stat(p).st_mtime_ns for p in (journal,)}

@@ -22,7 +22,6 @@ from issue_agent.domain.contracts import (
     BudgetScope, EffectReceipt, EffectStatus, Money, PriceQuote,
     PricingBasis, ReservationId, RunId, WorkflowAttemptIdentity,
 )
-from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from issue_agent.domain.labels import Label
 from issue_agent.domain.workflow import (
     FreshResolve, ResolveAdmission, ResolveSession, ResolveStage,
@@ -912,21 +911,6 @@ def test_sql_failure_rolls_back_generation_allowance_gates_intent_and_outbox(con
     with closing(control._connect()) as db:
         assert db.execute("SELECT count(*) FROM lifecycle_commands").fetchone()[0] == 0
 
-
-def test_accepted_state_and_events_survive_a_down_telemetry_sink(control):
-    before = held()
-    install_workflow(control, before)
-    producer = Producer("deployment", "o/r", "fix", 123, "boot")
-    def factory(payload, correlation):
-        return EventEnvelope(payload, new_event_id(NOW), 0, NOW, NOW, 0, producer, correlation)
-    def offline(_event):
-        raise RuntimeError("sink offline")
-    control.bind_event_outbox(factory, offline)
-    commit(control, request(before))
-    published = []
-    control.bind_event_outbox(factory, published.append)
-    assert {e.payload.entity_kind for e in published} == {"workflow", "lifecycle_command"}
-    assert isinstance(adapter(control).lookup_rearm(before.revision.fence.key, "request:1"), PendingRearm)
 
 
 def test_retired_owner_epoch_change_and_wrong_executor_cannot_commit(control):

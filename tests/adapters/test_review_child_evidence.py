@@ -187,11 +187,7 @@ def test_late_accounting_reconciliation_completes_non_striking_review_evidence(a
         store.reclaim_dead_leases(lambda _pid, _ticks: False)
     raw = returned(store, proposed, result=AgentResult(True, status="blocked", exit_reason=ExitReason.ACCOUNTING_UNAVAILABLE))
     assert store.record_reservation_retained(proposed.run_id, "native usage missing", returned_review=raw)
-    with store.transaction() as db:
-        event_count = db.execute("SELECT count(*) FROM event_outbox").fetchone()[0]
     assert store.record_reservation_retained(proposed.run_id, "native usage missing", returned_review=raw)
-    with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM event_outbox").fetchone()[0] == event_count
     assert observed(store, child) == (ReviewChildPending(child),)
     recovered = replace(settlement(proposed, basis=basis), provider_receipt_id=f"codex-recovered:session:{proposed.run_id}", origin=ChargeOrigin.RECOVERY_ESTIMATE)
     assert store.settle_review_return(recovered, raw).disposition is AccountingDisposition.AVAILABLE

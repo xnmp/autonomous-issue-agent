@@ -4,14 +4,6 @@ from datetime import datetime, timedelta, timezone
 
 from issue_agent.app.dashweb import snapshots
 from issue_agent.domain import dashboard as dash
-from issue_agent.domain.events import (
-    AgentRunCompleted,
-    Correlation,
-    EventEnvelope,
-    Producer,
-    WorldObserved,
-)
-from issue_agent.domain.projection import fold
 
 NOW = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
 
@@ -199,52 +191,10 @@ def test_notification_identity_does_not_change_when_older_events_arrive_late():
 def test_a_review_verdict_names_the_pr_reviewed_not_the_issue_it_closes():
     """2026-08-03 (keifu): review of PR #186 for issue #185 toasted "PR #185
     approved" — the leg's own number lost to its issue correlation."""
-    correlation = Correlation(
-        issue=185,
-        run_id="run-1",
-        leg_id="leg-1",
-        dispatch_id="dispatch-1",
-    )
-    events = tuple(
-        EventEnvelope(
-            payload,
-            f"event-{seq}",
-            seq,
-            NOW + timedelta(minutes=seq),
-            NOW + timedelta(minutes=seq),
-            seq,
-            Producer("deployment", "owner/repo", "review", 100, "boot"),
-            correlation,
-        )
-        for seq, payload in enumerate(
-            (
-                WorldObserved(
-                    "issue",
-                    185,
-                    "hash",
-                    {"state": "open", "labels": ["ai-working"]},
-                ),
-                AgentRunCompleted(
-                    "APPROVE",
-                    False,
-                    None,
-                    1_000,
-                    "model",
-                    "codex",
-                    kind="REVIEW",
-                    attributes={"number": 186, "role": "review"},
-                ),
-            ),
-            start=1,
-        )
-    )
-    rows = dash.build_deployment_v2(
-        "demo",
-        "owner/repo",
-        (("review", "/j", "/l", events),),
-        fold(events),
-        lambda: NOW + timedelta(hours=1),
-    ).issues
+    rows = rows_for([
+        {"ts": ts(2), "event": "agent_run", "role": "review", "kind": "REVIEW",
+         "issue": 185, "number": 186, "status": "APPROVE"},
+    ])
 
     notifications = snapshots.journal_notifications(rows)
 

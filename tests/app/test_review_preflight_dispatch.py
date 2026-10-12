@@ -65,6 +65,7 @@ def test_composed_single_review_settles_one_durable_execution_round(tmp_path, mo
     client = compose_review(deployment, provider=ScriptedProvider(results, during=register_review_launch))
     client.activate_execution(monkeypatch)
     legacy = Store(client.cfg.review_state_dir)
+    Path(client.cfg.review_state_dir).mkdir(parents=True, exist_ok=True)
     Path(legacy.pr_path(7, "session")).write_text("claude:obsolete-file-session")
     Path(legacy.pr_path(7, "round")).write_text("91")
     Path(legacy.issue_path(-7, "infra-deaths")).write_text("1")

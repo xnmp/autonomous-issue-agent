@@ -12,11 +12,9 @@ from issue_agent.adapters.control_store import (
     SQLiteControlStore,
     AccountingDisposition,
 )
-from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.adapters.codex_child_usage import CodexChildUsageMeter
 from issue_agent.domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage
-from issue_agent.domain.events import ControlTransitionCommitted, NativeUsageRemetered, Producer, decode_event_line
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -274,8 +272,6 @@ def test_recovery_with_2000_unrelated_rollouts_settles_owned_usage(tmp_path):
 def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settles(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
-    log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
-    store.bind_event_outbox(log.prepare, log.append_committed)
     with store.transaction() as db:
         db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
@@ -287,9 +283,6 @@ def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settl
     # root 500 uncached in/10 out/500 cached + child 600/20/400 counted once.
     assert store.snapshot(scope).settled == Money("USD", 12_500)
     assert not any(evidence_dir.iterdir())
-    payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
-    assert not any(isinstance(p, NativeUsageRemetered) for p in payloads)
-    assert any(isinstance(p, ControlTransitionCommitted) and p.entity_kind == "accounting" and p.state == "estimated" for p in payloads)
 
 
 @pytest.mark.parametrize("failure", ["native child has no corroborating rollout", "something unclassified"])
@@ -384,23 +377,6 @@ def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
     assert store.active_reservation_runs() == (run_id,)
-
-
-def test_estimate_gap_journal_is_emitted_once_across_sweeps(tmp_path):
-    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
-    log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
-    store.bind_event_outbox(log.prepare, log.append_committed)
-    _end_run_at(store, run_id, END)
-    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
-    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
-    reconciler = CodexSpendReconciler(store, (str(evidence_dir),))
-
-    assert reconciler.reconcile(run_id)
-    reconciler.reconcile(run_id)
-
-    payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
-    assert sum(isinstance(p, ControlTransitionCommitted) and p.entity_kind == "accounting" and p.state == "estimated" for p in payloads) == 1
-    assert not any(isinstance(p, NativeUsageRemetered) for p in payloads)
 
 
 def test_untimestamped_root_usage_does_not_prevent_estimated_settlement(tmp_path):

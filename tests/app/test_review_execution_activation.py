@@ -34,7 +34,6 @@ from issue_agent.app.config import HarnessConfig, configured_prior_owner_ids, ow
 from issue_agent.app.review_execution_activation import (
     ConfiguredReviewExecutionActivation, ReviewExecutionActivationRefused,
 )
-from issue_agent.domain.events import ControlTransitionCommitted, EventEnvelope, Producer, new_event_id
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_execution import CurrentReviewExecution
 from issue_agent.domain.review_execution_activation import LegacyReviewOwnerLineage
@@ -132,12 +131,6 @@ def test_offline_activation_is_atomic_hot_readable_and_exact_retry_is_inert(rig)
     before = _dump(control)
     plan = activation.plan(files, links, sql)
     assert _dump(control) == before
-    published = []
-    now = datetime.now(timezone.utc)
-    producer = Producer("offline-rehearsal", cfg.repo, "review", 123, "boot")
-    control.bind_event_outbox(lambda payload, correlation: EventEnvelope(
-        payload, new_event_id(now), 0, now, now, 0, producer, correlation,
-    ), published.append)
     result = activation.activate(plan, files, links, sql)
     assert result.plan == plan and not result.idempotent
     with control.transaction() as db:
@@ -146,17 +139,13 @@ def test_offline_activation_is_atomic_hot_readable_and_exact_retry_is_inert(rig)
             assert snapshot is not None and isinstance(snapshot.execution, CurrentReviewExecution)
             assert snapshot.execution.baseline.through_sequence == 0
         assert db.execute("SELECT count(*) FROM workflow_activation_imports WHERE family='review_execution'").fetchone()[0] == 2
-    assert len(published) == 1
-    payload = published[0].payload
-    assert isinstance(payload, ControlTransitionCommitted)
-    assert payload.entity_kind == "workflow_activation" and payload.attributes["imported"] == 2
     gateway.unavailable = True
     liveness.append("watcher is now running")
     Path(cfg.review_state_dir, "pr-9.round").write_text("99")
     after = _dump(control)
     retry = activation.activate(plan, files, links, sql)
     assert retry.idempotent and retry.plan == plan
-    assert _dump(control) == after and len(published) == 1
+    assert _dump(control) == after
 
 
 @pytest.mark.parametrize("change", ("file", "head", "listing", "hold", "review", "partial", "workflow", "active_run", "foreign_authority", "liveness"))
@@ -402,27 +391,4 @@ def test_selected_blocker_corruption_refuses_reader_and_retry(rig, corruption):
             load_review_workflow_row(db, WorkflowKey(cfg.repo, PullRequestRef(9)))
     with pytest.raises(WorkflowAuthorityError):
         activation.activate(plan, None, None, None)
-    assert _dump(control) == before
-
-
-@pytest.mark.parametrize("failure", ("factory", "outbox"))
-def test_activation_event_failure_rolls_back_terminal_and_eligible_publication(rig, failure):
-    cfg, control, _, _, _, links, sql, _, activation = rig
-    Path(cfg.review_state_dir, "pr-11.round").write_text("4")
-    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir)))
-    plan = activation.plan(files, links, sql)
-    now = datetime.now(timezone.utc)
-    producer = Producer("offline-review", cfg.repo, "review", 123, "boot")
-    def factory(payload, correlation):
-        if failure == "factory":
-            raise ValueError("activation event factory failed")
-        return EventEnvelope(payload, new_event_id(now), 0, now, now, 0, producer, correlation)
-    control.bind_event_outbox(factory, lambda _event: None)
-    if failure == "outbox":
-        with control.transaction() as db:
-            db.execute("CREATE TRIGGER fail_activation_event BEFORE INSERT ON event_outbox "
-                       "BEGIN SELECT RAISE(ABORT,'activation outbox failed'); END")
-    before = _dump(control)
-    with pytest.raises((ValueError, sqlite3.IntegrityError), match="activation.*failed"):
-        activation.activate(plan, files, links, sql)
     assert _dump(control) == before

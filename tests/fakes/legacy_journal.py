@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from issue_agent.adapters.journal import _legacy_event_record
+from issue_agent.adapters.journal import record_fields
 from issue_agent.domain.events import TelemetryEvent
 
 
@@ -27,7 +27,7 @@ class Journal:
     def emit(self, event: str | TelemetryEvent, **fields: object) -> None:
         try:
             if isinstance(event, TelemetryEvent):
-                event, fields = _legacy_event_record(event)
+                event, fields = record_fields(event)
             line = json.dumps(
                 {"ts": _stamp(), "event": event, **fields},
                 default=str,

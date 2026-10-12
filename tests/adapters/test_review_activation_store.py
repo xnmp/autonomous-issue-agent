@@ -91,7 +91,7 @@ def test_distinct_roots_keep_duplicate_targets_and_deduplicate_root_aliases(stat
     assert len(records) == 2 and {record.root for record in records} == {"review", "old"}
 
 
-@pytest.mark.parametrize("failure", ["snapshot", "gate", "journal"])
+@pytest.mark.parametrize("failure", ["snapshot", "gate"])
 def test_failure_after_epoch_insertion_rolls_back_every_activation_row(control, state, monkeypatch, failure):
     activation = SQLiteReviewActivation(control)
     plan = evaluate(control, state)
@@ -103,10 +103,8 @@ def test_failure_after_epoch_insertion_rolls_back_every_activation_row(control, 
 
     if failure == "snapshot":
         monkeypatch.setattr(module, "imported_snapshot", crash)
-    elif failure == "gate":
-        monkeypatch.setattr(module, "persist_workflow_snapshot", crash)
     else:
-        monkeypatch.setattr(control, "_transition", crash)
+        monkeypatch.setattr(module, "persist_workflow_snapshot", crash)
     with pytest.raises(RuntimeError, match="injected"):
         activation.activate(plan, revalidate=lambda: evaluate(control, state))
     assert dump(control) == before

@@ -14,7 +14,6 @@ from issue_agent.adapters.control_store import AccountingDisposition, SQLiteCont
 from issue_agent.adapters.codex_runner import spend_evidence_path, write_spend_evidence
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import ChargeOrigin, Money, PricingBasis, SettlementRequest
-from issue_agent.domain.events import ControlTransitionCommitted, Producer, decode_event_line
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.run_usage import price_run_usage
@@ -54,15 +53,9 @@ def test_usable_provider_dollars_survive_an_unusaged_completed_request_and_journ
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    log = tmp_path / "events.jsonl"
-    events = native.EventLog(str(log), Producer("test", "o/r", "fix", 123, "boot"))
-    store.bind_event_outbox(events.prepare, events.append_committed)
     asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (900, "estimate")
-    gaps = [decode_event_line(line).payload for line in log.read_text().splitlines()]
-    assert any(isinstance(e, ControlTransitionCommitted) and e.entity_kind == "accounting"
-               and e.state == "estimated" and e.attributes["gap"] for e in gaps)
 
 
 def test_mixed_request_evidence_stops_live_execution_at_the_same_settled_amount(tmp_path, monkeypatch):

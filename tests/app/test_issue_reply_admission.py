@@ -240,18 +240,6 @@ def test_blank_caught_enqueue_error_rolls_back_only_inner(monkeypatch):
         assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='test'").fetchone()[0] == 1
 
 
-def test_blank_outbox_failure_rolls_back_consumption():
-    workflow, _, store, _ = setup_reply('  ')
-    control = store._workflow_db
-    prior = resolve_state(store)
-    def failed(*args):
-        raise ValueError('event failed')
-    control.bind_event_outbox(failed, lambda event: None)
-    with pytest.raises(ValueError, match='event failed'):
-        workflow.workflow_control.consume_blank_issue_reply(prior.binding, REPLY_AT, '  ')
-    assert resolve_state(store) == prior
-
-
 @pytest.mark.parametrize("budget_refused", [False, True])
 def test_no_pr_fork_count_and_remembered_branch_advance_only_on_admission(monkeypatch, budget_refused):
     from issue_agent.adapters.workflow_rows import persist_workflow_snapshot

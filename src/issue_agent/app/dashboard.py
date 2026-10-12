@@ -10,10 +10,7 @@ from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 from ..adapters.control_store import read_settled_spend
-from ..adapters.event_log import read_event_log
-from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.journal import read_events
-from ..domain.projection import fold
 from ..domain.dashboard import (
     ActionFact,
     BlockedRun,
@@ -32,7 +29,6 @@ from ..domain.dashboard import (
     SettledRun,
     STALE_AFTER_S,
     build_deployment,
-    build_deployment_v2,
     build_issue_rows,
     build_metrics,
     event_issue,
@@ -102,80 +98,23 @@ def collect(
             control_db_path, repo, now, to_local_date, local_midnight
         )
     )
-    legacy_paths = tuple(journal_paths)
-    typed_paths = tuple(
-        os.path.join(os.path.dirname(path), "events-v2.jsonl")
-        for path in legacy_paths
-    )
-    results = tuple(read_event_log(path) for path in typed_paths)
-    if not any(result.source_files for result in results) and any(
-        os.path.isfile(path) for path in (*legacy_paths, ledger_path)
-    ):
-        legacy_feeds = tuple(
-            (
-                role,
-                path,
-                os.path.join(log_dir, f"{role}-{name}.log"),
-                tuple(read_events(path)),
-            )
-            for role, path in zip(ROLE_NAMES, legacy_paths)
-        )
-        return build_deployment(
-            name,
-            repo,
-            legacy_feeds,
-            tuple(read_events(ledger_path)),
-            now_fn,
-            stale_after_s,
-            (
-                "showing read-only schema-v1 dashboard history",
-                *spend_warnings,
-            ),
-            settled_today_usd,
-            settled_today_unavailable,
-            to_local_date,
-        )
-    typed_feeds = tuple(
+    feeds = tuple(
         (
             role,
             path,
             os.path.join(log_dir, f"{role}-{name}.log"),
-            result.events,
+            tuple(read_events(path)),
         )
-        for role, path, result in zip(
-            ROLE_NAMES, typed_paths, results
-        )
+        for role, path in zip(ROLE_NAMES, tuple(journal_paths))
     )
-    model = fold(
-        event
-        for _role, _path, _log, events in typed_feeds
-        for event in events
-    )
-    heartbeat_times = {
-        role: stamp
-        for role, legacy_path in zip(ROLE_NAMES, legacy_paths)
-        if (
-            stamp := read_heartbeat_time(
-                os.path.join(os.path.dirname(legacy_path), "heartbeat.json")
-            )
-        )
-        is not None
-    }
-    malformed = sum(result.malformed_lines for result in results)
-    warnings = spend_warnings + (
-        (f"skipped {malformed} malformed schema-v2 event line(s)",)
-        if malformed
-        else ()
-    )
-    return build_deployment_v2(
+    return build_deployment(
         name,
         repo,
-        typed_feeds,
-        model,
+        feeds,
+        tuple(read_events(ledger_path)),
         now_fn,
         stale_after_s,
-        heartbeat_times,
-        warnings,
+        spend_warnings,
         settled_today_usd,
         settled_today_unavailable,
         to_local_date,

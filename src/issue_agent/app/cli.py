@@ -1670,121 +1670,32 @@ def global_daily_cap(name: str) -> float:
 
 
 def spend_status_lines(
-    journal_file: str | list[str],
     cap: float = 0.0,
-    now_fn=None,
     repo: str | None = None,
     global_cap: float = 0.0,
     *,
     repository_spent: float = 0.0,
     all_repositories_spent: float = 0.0,
 ) -> list[str]:
-    """The spend/health section of `issue-agent status`, as plain lines.
+    """Today's settled spend for `issue-agent status`, from SQLite totals the
+    caller reads. Zero spend yields `[]`.
 
-    Reads only the event files; authoritative SQLite spend totals are injected
-    by the caller so rendering stays deterministic and testable without a
-    daemon. An absent history and zero spend yield `[]`.
-
-    M11: `journal_file` may be a single path (back-compat — pre-M11 callers,
-    e.g. tests/adapters/test_journal.py outside this leg's file ownership,
-    pass the fix journal alone) or a list of per-role journals. `cmd_status`
-    now passes `journal_paths(name)`, the STATE_DIR/REVIEW_STATE_DIR
-    pair — reading STATE_DIR alone made review
-    runs, their spend blocks, and their loops invisible here. Every file's
-    events are read then merge-sorted into ONE global `ts` timeline before
-    anything below is computed, so a review run interleaves correctly with a
-    fix run instead of rendering as three disjoint, file-ordered lists. A role
-    that never ran contributes no events (`read_events` tolerates a missing
-    file), so it is silently absent, not an error.
-
-    The three warnings are the failure shapes that cost real money and are
-    otherwise invisible until the bill: a leg that re-dispatches without
-    converging, a cap that actually fired, and work that quietly stopped because
-    it escalated to a human who has not looked yet.
+    DAILY_SPEND_CAP_USD bounds THIS repo (#32), so the repo line pairs it with
+    the repo's own spend; the global cap pairs with the all-repos total.
     """
-    from datetime import datetime, timezone
-
-    from ..adapters.event_log import read_event_log
-    from ..adapters.journal import (
-        events_within,
-        legacy_event_view,
-        parse_ts,
-        read_events,
-        repeated_dispatch_warning,
-    )
-
-    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
-    paths = [journal_file] if isinstance(journal_file, str) else list(journal_file)
-    events: list[dict] = []
-    malformed_typed_lines = 0
-    for path in paths:
-        typed_path = os.path.join(os.path.dirname(path), "events-v2.jsonl")
-        typed = read_event_log(typed_path)
-        if typed.source_files:
-            malformed_typed_lines += typed.malformed_lines
-            events.extend(legacy_event_view(event) for event in typed.events)
-        else:
-            events.extend(read_events(path))
-    # Global order across files. A missing/garbled `ts` sorts first (never
-    # corrupts the ordering of the events after it) rather than raising —
-    # readers tolerating garbage is the module's own contract (journal.py).
-    events.sort(key=lambda e: parse_ts(e.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
-    spent = all_repositories_spent
-    if not events and not spent and not malformed_typed_lines:
+    if not all_repositories_spent:
         return []
-
-    lines = ["", _c("36", "── spend & health ──")]
-    # DAILY_SPEND_CAP_USD bounds THIS repo (#32), so pairing it with the
-    # all-repos total read as "you have $640 of headroom" on a box where the
-    # other deployment had spent it all. Cap and number must share a scope.
+    lines = ["", _c("36", "── spend ──")]
     if repo:
         budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
         lines.append(f"  today, {repo}: ${repository_spent:.2f}{budget}")
         global_budget = (
             f" / ${global_cap:.2f} cap" if global_cap > 0 else " (no global cap)"
         )
-        lines.append(f"  today, all repos: ${spent:.2f}{global_budget}")
+        lines.append(f"  today, all repos: ${all_repositories_spent:.2f}{global_budget}")
     else:
         budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
-        lines.append(f"  today, all repos: ${spent:.2f}{budget}")
-
-    # `agent_run` only, not `agent_run_start` — the latter (wave-A
-    # JournalingRuntime pre-await receipt) is the other half of the same
-    # dispatch and would double-list a run still in flight, or one that never
-    # settled, as if it were a completed one.
-    runs = [e for e in events if e.get("event") == "agent_run"][-5:]
-    if runs:
-        lines.append("  last runs:")
-        for r in runs:
-            why = r.get("exit_reason") or ("error" if r.get("is_error") else r.get("status") or "ok")
-            lines.append(
-                f"    {str(r.get('ts', ''))[:19]}  {r.get('kind', '?'):<14} "
-                f"#{r.get('number', '?'):<6} ${float(r.get('cost_usd', 0) or 0):>6.2f}  {why}"
-            )
-
-    warnings: list[str] = []
-    if malformed_typed_lines:
-        warnings.append(
-            f"skipped {malformed_typed_lines} malformed schema-v2 event line(s)"
-        )
-    hour = events_within(events, 3600, now_fn)
-    loop = repeated_dispatch_warning(hour, 3600, 4)
-    if loop:
-        warnings.append(loop)
-    today = now_fn().strftime("%Y-%m-%d")
-    blocks = [e for e in events
-              if e.get("event") == "spend_block" and str(e.get("ts", ""))[:10] == today]
-    if blocks:
-        scopes = ", ".join(sorted({str(b.get("scope", "?")) for b in blocks}))
-        warnings.append(f"{len(blocks)} spend block(s) today (scope: {scopes}) — dispatch was skipped")
-    escalations = [e for e in events_within(events, 86400, now_fn)
-                   if e.get("event") == "escalation"]
-    if escalations:
-        where = ", ".join(f"{e.get('target', '?')} #{e.get('number', '?')}" for e in escalations[:5])
-        warnings.append(f"{len(escalations)} escalation(s) to needs-human-review in 24h: {where}")
-    if warnings:
-        lines.append(_c("33", "  WARNINGS:"))
-        lines.extend(f"    ! {w}" for w in warnings)
+        lines.append(f"  today, all repos: ${all_repositories_spent:.2f}{budget}")
     return lines
 
 
@@ -1928,8 +1839,8 @@ def cmd_status(args) -> int:
         if os.path.isfile(log):
             print(_c("36", f"\n── tail {log} ──"))
             print(_run(["tail", "-n", str(args.lines), log]) or "  (empty)")
-    # Journal-backed summary. Wrapped: status must still report daemon liveness
-    # even if the journal is unreadable — the diagnostic must not be the thing
+    # SQLite spend summary. Wrapped: status must still report daemon liveness
+    # even if the store is unreadable — the diagnostic must not be the thing
     # that fails when things are going wrong.
     try:
         from datetime import datetime, timezone
@@ -1964,9 +1875,7 @@ def cmd_status(args) -> int:
                 spend.detail or "settled spend is unavailable"
             )
         for line in spend_status_lines(
-            journal_paths(name),
             daily_cap(name),
-            now_fn=lambda: now,
             repo=configured_repo,
             global_cap=global_daily_cap(name),
             repository_spent=(
@@ -1978,12 +1887,9 @@ def cmd_status(args) -> int:
         ):
             print(line)
     except Exception as exc:  # noqa: BLE001
-        err(f"(could not read the event journal: {exc})")
-    # Interventions come from the schema-v2 fold, not from `spend_status_lines`:
-    # operator actions are only ever written as typed `lifecycle.action.applied`
-    # events, and the legacy journal.jsonl those lines read no longer exists on
-    # a v2 deployment. Its own try/except for the same reason as the block
-    # above — a diagnostic must not be what fails.
+        err(f"(could not read settled spend: {exc})")
+    # Its own try/except for the same reason as the block above — a
+    # diagnostic must not be what fails.
     try:
         print(interventions_status_line(name, repo))
     except Exception as exc:  # noqa: BLE001

@@ -213,16 +213,11 @@ def record_commit(
     db: sqlite3.Connection, control: SQLiteControlStore, repository: str,
     transition: WorkflowChanged, encoded: str,
 ) -> WorkflowCommitted:
-    """Persist the dedupe receipt and outbox transition for an applied commit."""
+    """Persist the dedupe receipt for an applied commit."""
     namespace, dedupe = transition_dedupe_key(transition)
     db.execute(
         "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
         (namespace, repository, dedupe, control._now().isoformat(), encoded),
-    )
-    control._transition(
-        db, "workflow", encode_workflow(transition.expected.fence.key), transition.mutation.value,
-        {"generation": transition.snapshot.revision.fence.generation,
-         "version": transition.snapshot.revision.version},
     )
     return WorkflowCommitted(transition.snapshot)
 
@@ -305,6 +300,3 @@ def persist_retry_authorization(
          hashlib.sha256(encode_workflow((audit.actor.subject, audit.command)).encode()).hexdigest(),
          encode_workflow(audit), grant.binding.fence.generation, _stamp(control._now())),
     )
-    control._transition(db, "workflow_retry_authorization", grant.authorization_id, "authorized", {
-        "command_id": str(grant.command_id), "gate_id": grant.gate_id, "evidence_id": grant.evidence_id,
-    })

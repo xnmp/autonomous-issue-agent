@@ -36,12 +36,6 @@ from issue_agent.domain.contracts import (
     ReservationId,
     RunId,
 )
-from issue_agent.domain.events import (
-    AdmissionReconciled,
-    EventEnvelope,
-    Producer,
-    new_event_id,
-)
 from issue_agent.domain.outcome import (
     MAX_BUDGET_STATUS,
     AgentResult,
@@ -127,15 +121,6 @@ class _NoTrustedUsage:
         return False
 
 
-class _Abandonments:
-    def __init__(self):
-        self.calls = []
-
-    def abandon_run(self, run_id, reason) -> bool:
-        self.calls.append((run_id, reason))
-        return True
-
-
 class _CountingReconciler:
     """Observes the ADR 0012 ceiling on reconcile-then-retry."""
 
@@ -176,35 +161,7 @@ def _store(tmp_path, stamped_at: datetime):
     )
     store.initialize()
     install_workflow(store, with_issue_recovery(resolve_snapshot(ISSUE)))
-    published: list[EventEnvelope] = []
-    producer = Producer("deployment", REPOSITORY, "fix", 123, "boot")
-    sequence = [0]
-
-    def factory(payload, correlation):
-        index = sequence[0]
-        sequence[0] += 1
-        stamp = stamped_at + timedelta(milliseconds=index)
-        return EventEnvelope(
-            payload,
-            new_event_id(stamp),
-            index,
-            stamp,
-            stamp,
-            index,
-            producer,
-            correlation,
-        )
-
-    store.bind_event_outbox(factory, published.append)
-    return store, published
-
-
-def _reconciled(published) -> list[AdmissionReconciled]:
-    return [
-        event.payload
-        for event in published
-        if isinstance(event.payload, AdmissionReconciled)
-    ]
+    return store
 
 
 def _scope(now: datetime):
@@ -271,7 +228,6 @@ def _sweeper(store, now: datetime):
         _Worktrees(),
         _Commands(),
         _NoTrustedUsage(),
-        _Abandonments(),
         OWNER,
         reservation_grace=GRACE,
         now=lambda: now,
@@ -319,7 +275,7 @@ def test_phantom_reservations_are_reclaimed_instead_of_escalated(tmp_path):
     # tick after the deaths onward, and the state in which the pre-change
     # harness still refused to dispatch because the label is human-terminal.
     died_at = now - timedelta(minutes=10)
-    store, published = _store(tmp_path, died_at)
+    store = _store(tmp_path, died_at)
     scope = _scope(now)
     # MAX_BUDGET_USD leaves room for exactly three concurrent legs.
     cap = Money("USD", 6_000_000)
@@ -340,16 +296,12 @@ def test_phantom_reservations_are_reclaimed_instead_of_escalated(tmp_path):
     active = store.active_reservation_runs(OWNER)
     assert all(run_id not in active for run_id in dead)
 
-    (event,) = _reconciled(published)
-    assert event.admitted is True
-    assert event.released_runs == 3
-    assert event.scope == f"issue:{ISSUE}"
 
 
 def test_reconciliation_never_releases_a_still_running_leg(tmp_path):
     now = datetime.now(timezone.utc)
     started_at = now - timedelta(minutes=10)
-    store, _published = _store(tmp_path, started_at)
+    store = _store(tmp_path, started_at)
     scope = _scope(now)
     cap = Money("USD", 4_000_000)
     dead = _dead_leg(store, scope, "broken-binary", cap, started_at)
@@ -370,7 +322,7 @@ def test_a_genuine_cap_exhaustion_still_escalates_to_a_human(tmp_path):
     """Nothing releasable means the pre-incident escalation is unchanged."""
 
     now = datetime.now(timezone.utc)
-    store, published = _store(tmp_path, now)
+    store = _store(tmp_path, now)
     scope = _scope(now)
     cap = Money("USD", 4_000_000)
     _live_leg(store, scope, "running-a", cap, now)
@@ -386,16 +338,13 @@ def test_a_genuine_cap_exhaustion_still_escalates_to_a_human(tmp_path):
     assert runtime.calls == 0
     assert len(store.active_reservation_runs(OWNER)) == 2
 
-    (event,) = _reconciled(published)
-    assert event.admitted is False
-    assert event.released_runs == 0
 
 
 def test_admission_reconciles_at_most_once_per_dispatch(tmp_path):
     """ADR 0012 ceiling: one reconcile, one retry, no loop."""
 
     now = datetime.now(timezone.utc)
-    store, _published = _store(tmp_path, now)
+    store = _store(tmp_path, now)
     scope = _scope(now)
     cap = Money("USD", 2_000_000)
     _live_leg(store, scope, "running", cap, now)
@@ -416,7 +365,7 @@ def test_admission_reconciles_at_most_once_per_dispatch(tmp_path):
 
 def test_unreadable_reconciliation_escalates_without_admitting(tmp_path):
     now = datetime.now(timezone.utc)
-    store, published = _store(tmp_path, now)
+    store = _store(tmp_path, now)
     cap = Money("USD", 2_000_000)
     _dead_leg(store, _scope(now), "just-died", cap, now)
 
@@ -425,9 +374,6 @@ def test_unreadable_reconciliation_escalates_without_admitting(tmp_path):
 
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 0
-    (event,) = _reconciled(published)
-    assert event.admitted is False
-    assert "reconciliation unavailable" in event.reason
 
 
 def test_admission_without_a_reconciler_escalates_exactly_as_before(tmp_path):
@@ -436,7 +382,7 @@ def test_admission_without_a_reconciler_escalates_exactly_as_before(tmp_path):
     assert _LateReservationReconciler().reconcile_stale_reservations() == 0
 
     now = datetime.now(timezone.utc)
-    store, published = _store(tmp_path, now)
+    store = _store(tmp_path, now)
     cap = Money("USD", 2_000_000)
     _dead_leg(store, _scope(now), "just-died", cap, now)
 
@@ -445,12 +391,11 @@ def test_admission_without_a_reconciler_escalates_exactly_as_before(tmp_path):
 
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 0
-    assert _reconciled(published) == []
 
 
 def test_an_admitted_reservation_never_calls_reconciliation(tmp_path):
     now = datetime.now(timezone.utc)
-    store, published = _store(tmp_path, now)
+    store = _store(tmp_path, now)
 
     runtime = _Runtime()
     reconciler = _CountingReconciler(_sweeper(store, now))
@@ -460,7 +405,6 @@ def test_an_admitted_reservation_never_calls_reconciliation(tmp_path):
 
     assert result.status == "ok"
     assert reconciler.calls == 0
-    assert _reconciled(published) == []
 
 
 class _SettlesExactly:
@@ -490,7 +434,7 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
 
     now = datetime.now(timezone.utc)
     died_at = now - timedelta(minutes=10)
-    store, published = _store(tmp_path, died_at)
+    store = _store(tmp_path, died_at)
     scope = _scope(now)
     # Room for one leg plus the small recovered charge, so admission turns on
     # the reservation being converted to its real, much smaller cost.
@@ -503,7 +447,6 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
         _Worktrees(),
         _Commands(),
         _SettlesExactly(store, Money("USD", 10_000)),
-        _Abandonments(),
         OWNER,
         reservation_grace=GRACE,
         now=lambda: now,
@@ -517,53 +460,12 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
 
     assert result.status == "ok"
     assert runtime.calls == 1
-    (event,) = _reconciled(published)
-    assert event.admitted is True
-    # The sweep reported no unknown spend, yet a reservation did go away.
-    assert event.released_runs == 1
 
-
-def test_the_journalled_scope_names_the_cap_that_actually_tripped(tmp_path):
-    """An operator reads this to know which cap to move."""
-
-    now = datetime.now(timezone.utc)
-    store, published = _store(tmp_path, now)
-    issue_cap = Money("USD", 2_000_000)
-    _live_leg(store, _scope(now), "running", issue_cap, now)
-
-    runtime = _Runtime()
-    late = _LateReservationReconciler()
-    late.bind(_sweeper(store, now))
-    wrapper = AccountingRuntime(
-        runtime,
-        store,
-        REPOSITORY,
-        "fix",
-        # A generous daily repository cap is the primary scope; the tight
-        # per-issue MAX_BUDGET_USD is the limit that actually denies the leg.
-        Money("USD", 500_000_000),
-        None,
-        issue_cap,
-        "cfg",
-        "codex",
-        BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}),
-        _rates(),
-        owner_id=OWNER,
-        reservation_reconciler=late,
-    )
-    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE, workflow=resolve_snapshot(ISSUE).binding)
-
-    result = _resolve(wrapper)
-
-    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-    (event,) = _reconciled(published)
-    assert event.scope == f"issue:{ISSUE}", "not the primary repository scope"
-    assert event.admitted is False
 
 
 def test_recent_completed_accounting_gap_settles_before_admission_without_grace(tmp_path):
     now = datetime.now(timezone.utc)
-    store, published = _store(tmp_path, now)
+    store = _store(tmp_path, now)
     cap = Money("USD", 2_000_000)
     dead = _dead_leg(store, _scope(now), "just-completed", cap, now)
     runtime = _Runtime()
@@ -576,6 +478,3 @@ def test_recent_completed_accounting_gap_settles_before_admission_without_grace(
     with store.transaction() as db:
         assert tuple(db.execute("SELECT amount_micros,basis FROM charges WHERE run_id=?",
                                 (str(dead),)).fetchone()) == (0, "estimate")
-    (event,) = _reconciled(published)
-    assert event.admitted is True
-    assert event.released_runs == 1

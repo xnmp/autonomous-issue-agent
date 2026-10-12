@@ -10,7 +10,6 @@ import re
 import sqlite3
 
 from ..domain import continuation_components as cc
-from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.continuation_import import (
     ISSUE_FIELDS, PR_FIELDS, MAX_IMPORT_TARGETS,
     ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, digest,
@@ -290,11 +289,3 @@ def publish_continuation_import(db: sqlite3.Connection, plan: ContinuationImport
                 continue
             after = replace(value, revision=replace(value.revision, version=value.revision.version + 1))
             persist_workflow_snapshot(db, after)
-        if control._event_factory is not None:
-            payload = ControlTransitionCommitted(
-                "workflow_activation", f"{plan.repository}:" + ",".join(f.value for f in plan.families), "activated", {
-                    "epoch": plan.epoch, "plan_digest": plan.plan_digest,
-                    "source_digest": plan.source_digest, "targets": len(plan.targets),
-                },
-            )
-            control.enqueue_event(control._event_factory(payload, Correlation()), db)

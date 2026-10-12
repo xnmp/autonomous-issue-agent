@@ -10,16 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import os
-import uuid
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .continuation_activation import ContinuationActivationScope
 
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import SQLiteControlStore
-from ..adapters.event_log import EventLog
 from ..adapters.resolve_activation import (
     ActivationSourcesChanged, LegacyRoots, ResolveActivationRefused, SQLiteResolveActivation, copy_for_rehearsal, distinct_roots,
     file_digests, read_legacy_resolve_roots,
@@ -31,7 +25,6 @@ from ..domain.resolve_activation import (
     LegacyEntry, LegacyFile, LegacyPresent, LegacyResolveRecord, ResolveActivationPlan,
     UnmappedLegacyEntry, plan_resolve_activation, shadow_compare,
 )
-from ..domain.events import Producer
 from ..domain.workflow import WorkflowSnapshot
 from ..domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter, canonical_workflow_repository
 from .config import owner_identity_for_target
@@ -158,24 +151,10 @@ def report(scope: ActivationScope, evaluation: Evaluation, *, shadow: bool) -> J
     return result
 
 
-def _bind_operator_feed(control: SQLiteControlStore, scope: ActivationScope | ContinuationActivationScope) -> None:
-    """Record activation through the committed outbox into the fix role's
-    feed under an operator producer, as dashboard interventions do."""
-    events = EventLog(
-        os.path.join(scope.event_dir, "events-v2.jsonl"),
-        Producer(f"operator:{scope.name}", scope.repository, "operator", os.getpid(), uuid.uuid4().hex),
-    )
-    control.bind_event_outbox(
-        events.prepare, events.append_committed,
-        line_limit=events.line_limit, destination=events.producer.feed_identity,
-    )
 
-
-def _operator_activation(scope: ActivationScope, *, journal: bool = False) -> SQLiteResolveActivation:
+def _operator_activation(scope: ActivationScope) -> SQLiteResolveActivation:
     control = SQLiteControlStore(scope.control_path)
     control.require_initialized()
-    if journal:
-        _bind_operator_feed(control, scope)
     return SQLiteResolveActivation(control)
 
 
@@ -188,7 +167,7 @@ class ActivationNotConfirmed(ValueError):
 
 
 def activate(scope: ActivationScope, *, confirm_plan_digest: str) -> JsonReport:
-    activation = _operator_activation(scope, journal=True)
+    activation = _operator_activation(scope)
     evaluation = evaluate(scope, activation)
     decision = evaluation.decision
     if isinstance(decision, ActiveWithDifferences):
@@ -243,7 +222,6 @@ def rehearse(scope: ActivationScope, *, copy_to: str) -> JsonReport:
     events = os.path.join(copy_to, "events")
     os.makedirs(events, mode=0o700, exist_ok=True)
     copy_scope = replace(scope, control_path=copied.control_path, legacy_roots=copied.roots, event_dir=events)
-    _bind_operator_feed(copy_control, copy_scope)
     activation = SQLiteResolveActivation(copy_control)
     evaluation = evaluate(copy_scope, activation)
     result = report(copy_scope, evaluation, shadow=True)

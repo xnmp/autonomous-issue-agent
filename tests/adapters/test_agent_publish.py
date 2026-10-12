@@ -22,18 +22,12 @@ from issue_agent.adapters.control_store import (
     RetiredOwnerError,
     SQLiteControlStore,
 )
-from issue_agent.adapters.event_log import EventLog
 from issue_agent.domain.contracts import (
     BudgetScope, CommandKind, Money, PriceQuote, ReservationId, RunId,
 )
 from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.domain.workflow_identity import WorkflowBinding
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
-from issue_agent.domain.events import (
-    ControlTransitionCommitted,
-    Producer,
-    decode_event_line,
-)
 
 
 class Remote:
@@ -365,15 +359,6 @@ def test_unbound_repair_run_cannot_authorize_another_issues_publication(tmp_path
 def test_push_is_committed_then_receipted(tmp_path):
     remote = Remote()
     control = store(tmp_path)
-    events = EventLog(
-        str(tmp_path / "events-v2.jsonl"),
-        Producer("deployment", "o/r", "fix", 123, "boot"),
-    )
-    control.bind_event_outbox(
-        events.prepare,
-        events.append_committed,
-        destination=events.producer.feed_identity,
-    )
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
@@ -410,16 +395,6 @@ def test_push_is_committed_then_receipted(tmp_path):
         1,
     )
     assert tuple(receipt) == ("succeeded", remote.head)
-    emitted = tuple(
-        decode_event_line(line)
-        for line in Path(events.path).read_text().splitlines()
-    )
-    assert [
-        event.payload.state
-        for event in emitted
-        if isinstance(event.payload, ControlTransitionCommitted)
-        and event.payload.entity_kind == "lifecycle_command"
-    ] == ["pending", "executing", "succeeded"]
 
 
 def test_owner_retirement_after_enqueue_fences_publication(tmp_path):
@@ -1417,15 +1392,6 @@ def _open_pr(remote: Remote) -> Remote:
 def test_body_update_on_own_pr_is_committed_then_receipted(tmp_path):
     remote = _open_pr(Remote())
     control = store(tmp_path)
-    events = EventLog(
-        str(tmp_path / "events-v2.jsonl"),
-        Producer("deployment", "o/r", "fix", 123, "boot"),
-    )
-    control.bind_event_outbox(
-        events.prepare,
-        events.append_committed,
-        destination=events.producer.feed_identity,
-    )
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
@@ -1456,73 +1422,6 @@ def test_body_update_on_own_pr_is_committed_then_receipted(tmp_path):
     assert state == "succeeded"
     assert target == "pull-request-body:o/r:42"
     assert (status, remote_object) == ("succeeded", "42")
-
-    emitted = tuple(
-        decode_event_line(line)
-        for line in Path(events.path).read_text().splitlines()
-    )
-    transitions = [
-        event
-        for event in emitted
-        if isinstance(event.payload, ControlTransitionCommitted)
-        and event.payload.entity_kind == "lifecycle_command"
-    ]
-    assert [event.payload.state for event in transitions] == [
-        "pending",
-        "executing",
-        "succeeded",
-    ]
-    # Journalled with BOTH correlation identifiers, on the fold the dashboard
-    # actually reads — not merely inside the command payload. The `executing`
-    # transition is exempt: `begin_command_execution` is keyed by command id
-    # alone and emits an empty correlation for EVERY kind, which is a
-    # pre-existing gap this change does not widen.
-    correlations = {
-        (event.correlation.issue, event.correlation.pr)
-        for event in transitions
-    }
-    assert (42, 42) in correlations
-    assert correlations <= {(42, 42), (None, None)}
-
-
-def test_body_update_correlates_the_issue_its_branch_names(tmp_path):
-    """Issue and PR correlation are distinct fields, so a fixture where both
-    happen to be 42 cannot show the issue is really derived from the branch."""
-    remote = _open_pr(Remote())
-    remote.branch = "fix/7-issue"
-    control = store(tmp_path)
-    events = EventLog(
-        str(tmp_path / "events-v2.jsonl"),
-        Producer("deployment", "o/r", "fix", 123, "boot"),
-    )
-    control.bind_event_outbox(
-        events.prepare,
-        events.append_committed,
-        destination=events.producer.feed_identity,
-    )
-    publisher = AgentPublicationBroker(
-        control,
-        repository="o/r",
-        base_branch="dev",
-        owner="o/r:fix",
-        run=remote.run,
-    )
-
-    assert publisher.publish(
-        ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
-    ).code == 0
-
-    correlations = {
-        (event.correlation.issue, event.correlation.pr)
-        for event in (
-            decode_event_line(line)
-            for line in Path(events.path).read_text().splitlines()
-        )
-        if isinstance(event.payload, ControlTransitionCommitted)
-        and event.payload.entity_kind == "lifecycle_command"
-    }
-    assert (7, 42) in correlations          # branch names the issue, not the PR
-    assert correlations <= {(7, 42), (None, None)}
 
 
 @pytest.mark.parametrize("number", ("41", "43", "1", "999999"))

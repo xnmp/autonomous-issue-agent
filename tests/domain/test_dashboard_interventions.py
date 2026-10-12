@@ -1,8 +1,8 @@
 """Operator interventions per merged PR — the unattended-operation metric.
 
-The fold is the only place that turns journalled operator actions into a
+The dashboard is the only place that turns journalled operator actions into a
 number, so these tests drive it the way the deployment does: synthetic
-schema-v2 journals in, `Metrics` out. Nothing asserts on how the counts are
+journal events in, `Metrics` out. Nothing asserts on how the counts are
 stored, only on what the metric reports.
 """
 
@@ -15,168 +15,132 @@ import pytest
 from issue_agent.domain.dashboard import (
     INTERVENTION_CLASSES,
     Metrics,
-    build_deployment_v2,
+    build_deployment,
     classify_intervention,
     intervention_counts,
     intervention_items,
     interventions_line,
     operator_action,
 )
-from issue_agent.domain.events import (
-    ActionApplied,
-    AgentRunCompleted,
-    AgentRunStarted,
-    Correlation,
-    EventEnvelope,
-    Producer,
-    WorldObserved,
-)
-from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
 OPERATOR = "owner/repo:dashboard"
 
 
-def _event(payload, seq: int, correlation: Correlation | None = None):
+def _event(
+    action_type: str,
+    seq: int,
+    desc: str,
+    attributes: dict,
+    *,
+    command_id: str = "",
+    issue: int | None = None,
+    pr: int | None = None,
+):
     stamp = NOW - timedelta(minutes=100 - seq)
-    return EventEnvelope(
-        payload,
-        f"event-{seq}",
-        seq,
-        stamp,
-        stamp,
-        seq,
-        Producer("deployment", "owner/repo", "fix", 100, "boot"),
-        correlation or Correlation(),
-    )
+    event = {
+        "ts": stamp.isoformat(),
+        "event": "action",
+        "event_id": f"event-{seq}",
+        "desc": desc,
+        "command_id": command_id,
+        "action": {"type": action_type, **attributes},
+    }
+    if issue is not None:
+        event["issue"] = issue
+    if pr is not None:
+        event["pr"] = pr
+    return event
 
 
 def _unblock(seq: int, issue: int, removed=("ai-blocked",)):
     return _event(
-        ActionApplied(
-            f"operator-unblock:{seq:x}",
-            "operator_unblock",
-            "issue",
-            f"operator unblock issue #{issue}: "
-            + " ".join(f"-{label}" for label in removed),
-            issue,
-            {
-                "add": [],
-                "remove": list(removed),
-                "operator": OPERATOR,
-                "labels_applied": True,
-            },
-        ),
+        "operator_unblock",
         seq,
-        Correlation(issue=issue),
+        f"operator unblock issue #{issue}: "
+        + " ".join(f"-{label}" for label in removed),
+        {
+            "add": [],
+            "remove": list(removed),
+            "operator": OPERATOR,
+            "labels_applied": True,
+        },
+        command_id=f"operator-unblock:{seq:x}",
+        issue=issue,
     )
 
 
 def _dismiss(seq: int, issue: int, pr: int):
     return _event(
-        ActionApplied(
-            f"operator-dismiss-review:{seq:x}",
-            "operator_dismiss_review",
-            "pr",
-            f"operator re-arm pr #{pr}: dismissed review PRR_1",
-            pr,
-            {
-                "add": [],
-                "remove": [],
-                "operator": OPERATOR,
-                "review_id": "PRR_1",
-                "dismissed": True,
-            },
-        ),
+        "operator_dismiss_review",
         seq,
-        Correlation(issue=issue, pr=pr),
+        f"operator re-arm pr #{pr}: dismissed review PRR_1",
+        {
+            "add": [],
+            "remove": [],
+            "operator": OPERATOR,
+            "review_id": "PRR_1",
+            "dismissed": True,
+        },
+        command_id=f"operator-dismiss-review:{seq:x}",
+        issue=issue,
+        pr=pr,
     )
 
 
 def _promote(seq: int, issue: int):
     return _event(
-        ActionApplied(
-            "9f55fd81a2ef20b879ddb88ff35ac43fcffb648922eccca41d3c2abd3a660869",
-            "operator_relabel",
-            "issue",
-            f"operator relabel issue #{issue}: +ai-ready",
-            issue,
-            {"add": ["ai-ready"], "remove": [], "operator": OPERATOR},
-        ),
+        "operator_relabel",
         seq,
-        Correlation(issue=issue),
+        f"operator relabel issue #{issue}: +ai-ready",
+        {"add": ["ai-ready"], "remove": [], "operator": OPERATOR},
+        issue=issue,
     )
 
 
 def _priority(seq: int, issue: int, priority: str = "P1"):
     others = [label for label in ("P1", "P2", "P3") if label != priority]
     return _event(
-        ActionApplied(
-            "c3cb5ff1060ddffdb9b267f85443967c4fd950018975cb72d6944dde2ff4dd97",
-            "operator_relabel",
-            "issue",
-            f"operator relabel issue #{issue}: +{priority} "
-            + " ".join(f"-{label}" for label in others),
-            issue,
-            {"add": [priority], "remove": others, "operator": OPERATOR},
-        ),
+        "operator_relabel",
         seq,
-        Correlation(issue=issue),
+        f"operator relabel issue #{issue}: +{priority} "
+        + " ".join(f"-{label}" for label in others),
+        {"add": [priority], "remove": others, "operator": OPERATOR},
+        issue=issue,
     )
 
 
 def _harness_relabel(seq: int, issue: int):
     """A relabel the FIX daemon applied — not an intervention."""
     return _event(
-        ActionApplied(
-            f"harness:{seq:x}",
-            "relabel",
-            "issue",
-            f"relabel issue #{issue}: -ai-ready +ai-working",
-            issue,
-            {"add": ["ai-working"], "remove": ["ai-ready"]},
-        ),
+        "relabel",
         seq,
-        Correlation(issue=issue),
+        f"relabel issue #{issue}: -ai-ready +ai-working",
+        {"add": ["ai-working"], "remove": ["ai-ready"]},
+        command_id=f"harness:{seq:x}",
+        issue=issue,
     )
 
 
 def _merged_issue(seq: int, issue: int, pr: int):
     """The minimum journal that makes `issue` count as a done (merged) issue."""
+    stamp = NOW - timedelta(minutes=100 - seq)
     return [
-        _event(
-            WorldObserved(
-                "issue",
-                issue,
-                f"hash-{issue}",
-                {"state": "closed", "labels": ["ai-done"]},
-            ),
-            seq,
-            Correlation(issue=issue),
-        ),
-        _event(
-            AgentRunStarted("model", "RESOLVE"),
-            seq + 1,
-            Correlation(issue=issue, run_id=f"run-{issue}", leg_id=f"leg-{issue}"),
-        ),
-        _event(
-            AgentRunCompleted("ok", False, 1_000, 1000, "model", "codex"),
-            seq + 2,
-            Correlation(issue=issue, run_id=f"run-{issue}", leg_id=f"leg-{issue}"),
-        ),
+        {
+            "ts": stamp.isoformat(),
+            "event": "action",
+            "desc": f"clear state for pr #{pr}, issue #{issue} (merged)",
+        }
     ]
 
 
 def _metrics(events) -> Metrics:
-    ordered = tuple(sorted(events, key=lambda e: e.seq))
-    model = fold(ordered)
-    return build_deployment_v2(
+    return build_deployment(
         "demo",
         "owner/repo",
-        (("fix", "/j", "/l", ordered),),
-        model,
-        lambda: NOW,
+        (("fix", "/j", "/l", list(events)),),
+        now_fn=lambda: NOW,
     ).metrics
 
 
@@ -212,16 +176,12 @@ def test_a_daemons_own_relabel_is_not_an_operator_intervention() -> None:
 
 def test_an_unknown_operator_verb_is_counted_as_other_not_dropped() -> None:
     invented = _event(
-        ActionApplied(
-            "operator-quarantine:1",
-            "operator_quarantine",
-            "issue",
-            "operator quarantine issue #7",
-            7,
-            {"operator": OPERATOR},
-        ),
+        "operator_quarantine",
         20,
-        Correlation(issue=7),
+        "operator quarantine issue #7",
+        {"operator": OPERATOR},
+        command_id="operator-quarantine:1",
+        issue=7,
     )
 
     metrics = _metrics([*_merged_issue(1, 7, 70), invented])
@@ -304,16 +264,12 @@ def test_a_malformed_operator_display_string_still_counts_and_never_crashes(
     display: str,
 ) -> None:
     event = _event(
-        ActionApplied(
-            "operator-unblock:deadbeef",
-            "operator_unblock",
-            "issue",
-            display,
-            7,
-            {"add": [], "remove": ["ai-blocked"], "operator": OPERATOR},
-        ),
+        "operator_unblock",
         20,
-        Correlation(issue=7),
+        display,
+        {"add": [], "remove": ["ai-blocked"], "operator": OPERATOR},
+        command_id="operator-unblock:deadbeef",
+        issue=7,
     )
 
     metrics = _metrics([*_merged_issue(1, 7, 70), event])
@@ -482,22 +438,18 @@ def test_the_timeline_and_the_tile_never_disagree_about_the_split() -> None:
 
 def test_a_rearm_that_moved_the_scope_note_reads_as_guidance() -> None:
     guided = _event(
-        ActionApplied(
-            "operator-unblock:beef",
-            "operator_unblock",
-            "issue",
-            "operator unblock issue #7: -ai-blocked",
-            7,
-            {
-                "add": [],
-                "remove": ["ai-blocked"],
-                "operator": OPERATOR,
-                "labels_applied": True,
-                "guidance": "set",
-            },
-        ),
+        "operator_unblock",
         20,
-        Correlation(issue=7),
+        "operator unblock issue #7: -ai-blocked",
+        {
+            "add": [],
+            "remove": ["ai-blocked"],
+            "operator": OPERATOR,
+            "labels_applied": True,
+            "guidance": "set",
+        },
+        command_id="operator-unblock:beef",
+        issue=7,
     )
 
     metrics = _metrics([*_merged_issue(1, 7, 70), guided])
@@ -511,16 +463,12 @@ def test_a_rearm_that_moved_the_scope_note_reads_as_guidance() -> None:
 
 def test_an_operator_label_move_outside_the_grammar_reads_as_relabel() -> None:
     moved = _event(
-        ActionApplied(
-            "operator-relabel:cafe",
-            "operator_relabel",
-            "issue",
-            "operator relabel issue #7: +needs-design",
-            7,
-            {"add": ["needs-design"], "remove": [], "operator": OPERATOR},
-        ),
+        "operator_relabel",
         20,
-        Correlation(issue=7),
+        "operator relabel issue #7: +needs-design",
+        {"add": ["needs-design"], "remove": [], "operator": OPERATOR},
+        command_id="operator-relabel:cafe",
+        issue=7,
     )
 
     metrics = _metrics([*_merged_issue(1, 7, 70), moved])

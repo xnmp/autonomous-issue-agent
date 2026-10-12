@@ -175,22 +175,3 @@ def test_unlaunched_unknown_or_malformed_recovery_fails_closed(monkeypatch, muta
     assert control.reconcile_pr_repair_returns() == 0
     assert _dump(store) == held
     assert _pending(issue_ci_state(files), "review") is not None
-
-
-@pytest.mark.parametrize("retained", [True, False])
-def test_acknowledgment_journals_whether_money_is_still_retained(monkeypatch, retained):
-    workflow, files, inner, key, run_id = _lose_with_unknown_cost(monkeypatch)
-    store, control = files._workflow_db, files._workflow_authority
-    if not retained:
-        assert store.settle_terminal_estimate(run_id, "repeat recovery")
-    journal = []
-    original = store._transition
-
-    def record(db, entity, entity_id, state, *args, **kwargs):
-        journal.append((entity, entity_id, state))
-        return original(db, entity, entity_id, state, *args, **kwargs)
-
-    monkeypatch.setattr(store, "_transition", record)
-    assert control.reconcile_pr_repair_returns() == 1
-    expected = "unreturned_acknowledged"
-    assert journal == [("pr_repair", str(run_id), expected)]

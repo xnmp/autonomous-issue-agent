@@ -232,8 +232,7 @@ The per-account SQLite database at
 - paid reservations and charges;
 - run/lease ownership;
 - deduplication keys;
-- lifecycle commands and effect receipts;
-- the transactional event outbox.
+- lifecycle commands and effect receipts.
 
 Every paid leg reserves its maximum charge before the runtime starts, including
 when operator caps are disabled. Concurrent final-cap races are serialized.
@@ -262,13 +261,12 @@ records `spend_unmeasured_released`. This keeps repeated usage-blind results
 from permanently exhausting admission capacity while preserving an explicit
 operator-visible accounting gap.
 An explicit same-repository repoint first reaps the recorded prior checkout
-registries and atomically adopts their run, lease, claim, command, outbox, and
-world-feed authority; unrelated sibling checkouts remain isolated.
+registries and atomically adopts their run, lease, claim, and command
+authority; unrelated sibling checkouts remain isolated.
 Historical JSONL is never queried for these decisions.
 
-Schema-v2 JSONL is rotated projection input and telemetry only. The dashboard
-folds typed events; schema-v1 readers exist solely as a read-only historical
-converter.
+Each role's `journal.jsonl` is a plain JSON-lines log only. Metrics derive
+from the SQLite legs/money tables (runs, charges) plus GitHub.
 
 ## Dashboard
 
@@ -284,9 +282,8 @@ checkout's committed HEAD and exits 87 after active requests drain so systemd
 can restart it on the new code. A manually started server exits the same way
 and prints the command to re-run when no supervisor is present.
 
-For deployments with `events-v2.jsonl`, all dashboard surfaces use the one pure
-`domain/projection.py::fold`. GitHub calls may enrich links/titles but do not
-infer lifecycle state.
+The board reads each role's `journal.jsonl` plus GitHub. GitHub calls may
+enrich links/titles but do not infer lifecycle state.
 CLI and dashboard quota totals are read-only projections of settled SQLite
 charges for the current budget period; the legacy spend ledger is migration
 input only.
@@ -700,16 +697,10 @@ make test-app
 
 `make test` is the required submission gate. The suite includes import/purity
 contracts, convergence, transactional accounting
-races, recovery/supervision, schema-v2 projection, and service artifact tests.
+races, recovery/supervision, and service artifact tests.
 `config/agent.env.example` is generated from `HarnessConfig` metadata; update
 the field definition and regenerate with
 `uv run python scripts/generate_config_example.py > config/agent.env.example`.
-
-Run the local control-plane capacity probe with:
-
-```bash
-uv run python scripts/benchmark_control_plane.py --iterations 500
-```
 
 ## Safe live canary
 
@@ -722,11 +713,11 @@ ISSUE_AGENT_MAX_TICKS=1 issue-agent start
 Confirm:
 
 - all roles reach readiness and write heartbeats;
-- `events-v2.jsonl` and the control database are created with restrictive
+- the control database is created with restrictive
   permissions;
 - the issue produces one reservation before a runtime starts;
 - Ctrl-C/SIGTERM leaves no registered process groups;
-- the dashboard renders the observed issue from the v2 fold.
+- the dashboard renders the observed issue.
 
 Only then install the unattended services.
 

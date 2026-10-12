@@ -23,7 +23,6 @@ from ..domain.ports import (
     ProcessSupervisor,
     CommandRecovery,
     RecoveryControl,
-    RunAbandonmentSink,
     SpendReconciler,
     WorktreeRecovery,
 )
@@ -47,7 +46,6 @@ class RecoveryCoordinator:
     worktrees: WorktreeRecovery
     commands: CommandRecovery
     spend: SpendReconciler
-    abandonments: RunAbandonmentSink
     owner_id: str
     reservation_grace: timedelta = timedelta(minutes=2)
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
@@ -117,7 +115,6 @@ class RecoveryCoordinator:
             self.owner_id, cutoff
         )
         unknown: list[RunId] = []
-        abandoned = set(reclaimed)
         for run_id in candidates:
             state = ReservationRecoveryState.observed(
                 live_lease=run_id in live_runs,
@@ -158,16 +155,7 @@ class RecoveryCoordinator:
                     )
                 if decision.report_spend_unknown:
                     unknown.append(run_id)
-                if decision.record_abandonment:
-                    abandoned.add(run_id)
                 break
-        for run_id in sorted(abandoned):
-            try:
-                self.abandonments.abandon_run(
-                    run_id, "process ownership lost"
-                )
-            except Exception:
-                pass
         return reclaimed, tuple(unknown)
 
 

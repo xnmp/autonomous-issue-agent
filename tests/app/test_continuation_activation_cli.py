@@ -548,7 +548,7 @@ def test_alias_discarded_source_changes_are_observed(stopped):
     assert first_changed != before and second_changed != before
 
 
-def test_public_activation_publishes_outbox(stopped, capsys, tmp_path):
+def test_public_activation_retry_is_idempotent(stopped, capsys, tmp_path):
     state, control, _ = stopped
     (state / 'issue-7.resumes').write_text('1')
     code, report, _ = command(capsys, 'fix', 'shadow')
@@ -556,9 +556,6 @@ def test_public_activation_publishes_outbox(stopped, capsys, tmp_path):
     saved.write_text(json.dumps(report))
     code, result, err = command(capsys, 'fix', 'activate', '--plan-file', str(saved), '--confirm-plan-digest', report['plan_digest'])
     assert code == 0, err
-    with control._connect() as db:
-        outbox = db.execute('SELECT count(*) FROM event_outbox').fetchone()[0]
-    assert outbox == 1
     before = dump(control)
     code, retry, err = command(capsys, 'fix', 'activate', '--plan-file', str(saved), '--confirm-plan-digest', report['plan_digest'])
     assert code == 0 and retry['status'] == 'already_active_with_this_plan', err
@@ -625,28 +622,6 @@ def test_retry_wrong_target_payload_is_typed_refusal(stopped):
             verify_original_plan(db, plan)
 
 
-@pytest.mark.parametrize('failure', ['factory', 'outbox'])
-def test_event_failure_rolls_back_publication(stopped, capsys, tmp_path, monkeypatch, failure):
-    from issue_agent.adapters.event_log import EventLog
-    state, control, _ = stopped
-    (state / 'issue-7.resumes').write_text('1')
-    _, report, _ = command(capsys, 'fix', 'shadow')
-    saved = tmp_path / 'original.json'
-    saved.write_text(json.dumps(report))
-    if failure == 'factory':
-        def refused(*args, **kwargs):
-            raise ValueError('factory unavailable')
-        monkeypatch.setattr(EventLog, 'prepare', refused)
-    else:
-        with control.transaction() as db:
-            db.execute("CREATE TRIGGER refuse_event BEFORE INSERT ON event_outbox BEGIN SELECT RAISE(ABORT,'event rejected'); END")
-    before = dump(control)
-    code, result, err = command(capsys, 'fix', 'activate', '--plan-file', str(saved), '--confirm-plan-digest', report['plan_digest'])
-    assert code == 2, (result, err)
-    assert dump(control) == before
-
-
-
 def test_issue_reply_shadow_preserves_timestamp_count_and_owned_branch(stopped, capsys):
     state, control, _ = stopped
     (state / "issue-7.resumed-at").write_text("2026-10-01T00:00:00Z\n")
@@ -681,7 +656,6 @@ def test_pre_f6_literal_rebase_plan_keeps_sql_retry_after_source_cleanup(stopped
                                 "--confirm-plan-digest", report["plan_digest"])
     assert code == 0 and retry["status"] == "already_active_with_this_plan", error
     assert dump(control) == before
-
 
 
 def test_pre_f2_literal_pr_plan_keeps_wire_and_sql_retry_after_raw_cleanup(stopped, capsys, monkeypatch):

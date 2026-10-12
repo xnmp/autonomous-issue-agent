@@ -269,12 +269,6 @@ class SQLiteReviewActivation:
                 "INSERT INTO workflow_activation_imports VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (plan.repository, _FAMILY, plan.epoch, *scope[1:], plan.source_digest, target.canonical()),
             )
-        self._control._transition(db, "workflow_activation", f"{plan.repository}:{_FAMILY}", "activated", {
-            "epoch": plan.epoch, "source_digest": plan.source_digest,
-            "inventory_digest": plan.inventory_digest, "plan_digest": plan.plan_digest,
-            "ceiling": plan.ceiling, "imported": len(plan.imports), "held": held,
-            "baselines": baselines, "guided": guided,
-        })
 
 
 __all__ = [

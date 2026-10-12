@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 from datetime import timedelta
-from itertools import count
 import sqlite3
 
 import pytest
@@ -11,7 +10,6 @@ from issue_agent.adapters import review_execution_control, review_workflow_contr
 from issue_agent.adapters.control_store import load_bound_review_submission
 from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row, persist_workflow_snapshot
-from issue_agent.domain.events import ControlTransitionCommitted, EventEnvelope, Producer, new_event_id
 from issue_agent.domain.review_execution import (
     CurrentReviewExecution, CopiedReviewProgress, PaidReviewProgress, ReviewExecutionGenerationBoundary,
     ReviewRoundFailure, ReviewInfrastructureDeath, ReviewUnlaunchedRound, ReviewExecutionOriginKind,
@@ -41,20 +39,9 @@ from tests.adapters.test_review_preparation_finalization import stopped_round
 from tests.adapters.test_review_productive_settlement import confirmed_copy, confirmed_escalation, workflow_for
 
 
-def bind_current_events(store, key, monkeypatch):
+def current_workflow(store, key):
     with store.transaction() as db:
-        current = workflow_rows.load_review_workflow_row(db, key)
-    published = []
-    sequence = count()
-    producer = Producer("construction", "o/r", "review", 123, "boot")
-
-    def factory(payload, correlation):
-        index = next(sequence)
-        return EventEnvelope(payload, new_event_id(store.now()), index, store.now(), store.now(),
-                             index, producer, correlation)
-
-    store.bind_event_outbox(factory, published.append)
-    return current, published
+        return workflow_rows.load_review_workflow_row(db, key)
 
 
 @pytest.fixture(params=("copied", "paid"))
@@ -79,12 +66,12 @@ def current_verdict(rig, monkeypatch, request):
                                           EffectStatus.SUCCEEDED, remote_object_id="review:current-paid"))
         plan = control.read_round_facts(plan.round.round_id).plan
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
-    return store, key, control, workflow_for(store, gateway), plan, command, before, published
+    before = current_workflow(store, key)
+    return store, key, control, workflow_for(store, gateway), plan, command, before
 
 
 def test_current_verdict_records_baseline_resets_allowance_and_retries_once(current_verdict):
-    store, key, control, workflow, plan, command, before, published = current_verdict
+    store, key, control, workflow, plan, command, before = current_verdict
     assert before.execution.state.failures == 3 and before.execution.state.pin_deferrals == 2
     result = workflow.record_review(command.command_id)
     assert isinstance(result, WorkflowCommitted)
@@ -97,13 +84,12 @@ def test_current_verdict_records_baseline_resets_allowance_and_retries_once(curr
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == int(bool(plan.children))
         if plan.children:
             assert db.execute("SELECT SUM(amount_micros) FROM charges").fetchone()[0] == 12
-    events = tuple(published)
     assert isinstance(control.finalize_completed_round(plan.round.round_id).outcome.disposition,
                       PaidReviewProgress if plan.children else CopiedReviewProgress)
     assert workflow.record_review(command.command_id).idempotent
-    assert tuple(published) == events
-    assert sum(isinstance(event.payload, ControlTransitionCommitted)
-               and event.payload.entity_id == plan.round.round_id for event in events) == 1
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-round-outcome' AND key=?",
+                          (plan.round.round_id,)).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("source", ["refused", "infrastructure", "no-progress"])
@@ -124,7 +110,7 @@ def test_current_completed_sources_preserve_distinct_allowance_and_real_spend(ri
         ))
     control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
+    before = current_workflow(store, key)
     result = control.finalize_completed_round(plan.round.round_id)
     expected = {"refused": ReviewUnlaunchedRound, "infrastructure": ReviewInfrastructureDeath,
                 "no-progress": ReviewRoundFailure}[source]
@@ -136,15 +122,13 @@ def test_current_completed_sources_preserve_distinct_allowance_and_real_spend(ri
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == int(source != "refused")
         if source != "refused":
             assert db.execute("SELECT SUM(amount_micros) FROM charges").fetchone()[0] == 12
-    events = tuple(published)
     assert control.finalize_completed_round(plan.round.round_id) == result
-    assert tuple(published) == events
 
 
 def test_current_runtime_preparation_closure_and_visible_hold_commit_together(stopped_round, monkeypatch):
     store, selection, control, _, child, _, _ = stopped_round
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
+    before = current_workflow(store, key)
     result = control.finalize_completed_round(child.round.round_id)
     assert isinstance(result, DeferredReviewPreparation)
     with store.transaction() as db:
@@ -153,13 +137,11 @@ def test_current_runtime_preparation_closure_and_visible_hold_commit_together(st
         assert any(review_evidence_gate_kind(gate) is ReviewEvidenceKind.RUNTIME_PREPARATION
                    for gate in after.gates)
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-round-preparation'").fetchone()[0] == 1
-    events = tuple(published)
     assert control.finalize_completed_round(child.round.round_id) == result
-    assert tuple(published) == events
 
 
 def test_current_unsupported_renewed_origin_remains_held_with_its_records_intact(current_verdict):
-    store, key, _, _, _, _, before, _ = current_verdict
+    store, key, _, _, _, _, before = current_verdict
     with store.transaction() as db:
         unsupported = replace(before, execution=replace(before.execution, origin=replace(
             before.execution.origin, kind=ReviewExecutionOriginKind.RENEWED,
@@ -174,7 +156,7 @@ def test_current_unsupported_renewed_origin_remains_held_with_its_records_intact
 
 @pytest.mark.parametrize("source", ["submission_marker", "effect", "outcome"])
 def test_current_progress_requires_its_selected_exact_settlement_sources(current_verdict, source):
-    store, key, _, workflow, plan, command, _, _ = current_verdict
+    store, key, _, workflow, plan, command, _ = current_verdict
     assert isinstance(workflow.record_review(command.command_id), WorkflowCommitted)
     with store.transaction() as db:
         if source == "effect":
@@ -196,7 +178,7 @@ def test_current_escalation_paths_settle_exact_marker_timestamps_and_effects(rig
         rig, cause="ceiling" if kind == "ceiling" else "verdict",
     )
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
+    before = current_workflow(store, key)
     now = store.now() + timedelta(microseconds=999)
     store._now = lambda: now
     if kind == "superseded":
@@ -217,10 +199,8 @@ def test_current_escalation_paths_settle_exact_marker_timestamps_and_effects(rig
             assert after.episode.continuation.source.command_id == command.command_id
         if kind == "ceiling":
             assert after.gates
-    events = tuple(published)
     assert control.finalize_completed_round(plan.round.round_id).outcome.round == plan.round
     assert workflow.settle_submission(command.command_id) is None
-    assert tuple(published) == events
 
 
 @pytest.mark.parametrize("planned_child", [False, True])
@@ -232,7 +212,7 @@ def test_current_unpaid_abandonment_closes_without_spend_or_allowance_changes(ri
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     control.seal_abandoned_planning(plan.round.round_id)
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
+    before = current_workflow(store, key)
     result = control.finalize_abandoned_round(plan.round.round_id)
     assert result.outcome.disposition == ReviewRoundCancelled(
         ReviewCancellationReason.UNPAID_ABANDONMENT, control.read_round_facts(plan.round.round_id).closure_receipt,
@@ -242,27 +222,23 @@ def test_current_unpaid_abandonment_closes_without_spend_or_allowance_changes(ri
         assert after.execution.state == before.execution.state
         assert after.execution.baseline.through_sequence == plan.round.sequence
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
-    events = tuple(published)
     assert control.finalize_abandoned_round(plan.round.round_id) == result
-    assert tuple(published) == events
 
 
-@pytest.mark.parametrize("stage", ["receipt", "state", "event"])
+@pytest.mark.parametrize("stage", ["receipt", "state"])
 def test_caught_inner_productive_failure_cannot_commit_the_rejection_half(current_verdict, stage):
-    store, key, _, workflow, plan, command, before, published = current_verdict
+    store, key, _, workflow, plan, command, before = current_verdict
     with store.transaction() as db:
-        prior_events = db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0]
         proposed = record_review(before, load_bound_review_submission(db, command.command_id))
         assert isinstance(proposed, WorkflowChanged)
         table, operation, condition = {
             "receipt": ("dedupe_keys", "INSERT", "WHEN NEW.namespace='review-round-outcome'"),
             "state": ("workflows", "UPDATE", f"WHEN NEW.version={before.revision.version + 2}"),
-            "event": ("event_outbox", "INSERT", "WHEN NEW.event_json LIKE '%outcome_finalized%'"),
         }[stage]
         db.execute(f"CREATE TEMP TRIGGER fail_current_productivity BEFORE {operation} ON {table} "
                    f"{condition} BEGIN SELECT RAISE(ABORT,'productive inner failure'); END")
-        db.execute("INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
-                   ("test-outer", "o/r", "before", "{}", store.now().isoformat()))
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   ("test-outer", "o/r", "before", store.now().isoformat(), "{}"))
         with pytest.raises(sqlite3.IntegrityError, match="productive inner failure"):
             workflow._commit(db, before.revision, (before.authority,), proposed)
         assert load_review_workflow_row(db, key) == before
@@ -270,13 +246,11 @@ def test_caught_inner_productive_failure_cannot_commit_the_rejection_half(curren
                           (plan.round.round_id,)).fetchone()[:] == (None, None)
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace IN "
                           "('review-recorded-submission','review-round-outcome','workflow-transition')").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0] == prior_events
-        db.execute("INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
-                   ("test-outer", "o/r", "after", "{}", store.now().isoformat()))
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   ("test-outer", "o/r", "after", store.now().isoformat(), "{}"))
     with store.transaction() as db:
         assert load_review_workflow_row(db, key) == before
-        assert db.execute("SELECT COUNT(*) FROM level_state WHERE namespace='test-outer'").fetchone()[0] == 2
-    assert published == []
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='test-outer'").fetchone()[0] == 2
     assert isinstance(workflow.record_review(command.command_id), WorkflowCommitted)
     with store.transaction() as db:
         recovered = load_review_workflow_row(db, key)
@@ -329,7 +303,7 @@ def test_current_stale_productivity_after_four_generations_uses_exact_witness_wi
     )
     assert isinstance(workflow.settle_submission(escalation.command_id), WorkflowCommitted)
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
+    before = current_workflow(store, key)
     advance_four_generations(store, key, workflow, before)
     with store.transaction() as db:
         advanced = load_review_workflow_row(db, key)
@@ -352,10 +326,8 @@ def test_current_stale_productivity_after_four_generations_uses_exact_witness_wi
         assert witness.receipt.outcome.round == old.round
         assert witness.command_id == str(command.command_id)
         assert witness.settled_binding == advanced.execution.binding
-    events = tuple(published)
     assert control.finalize_completed_round(old.round.round_id).outcome.round == old.round
     assert workflow.settle_submission(command.command_id) is None
-    assert tuple(published) == events
 
 
 def test_current_late_paid_return_after_four_generations_preserves_one_charge_and_current_allowance(rig, monkeypatch):
@@ -382,7 +354,7 @@ def test_current_late_paid_return_after_four_generations_preserves_one_charge_an
     )
     assert isinstance(workflow.settle_submission(escalation.command_id), WorkflowCommitted)
     key = selection.expected.fence.key
-    before, published = bind_current_events(store, key, monkeypatch)
+    before = current_workflow(store, key)
     advance_four_generations(store, key, workflow, before)
     with store.transaction() as db:
         advanced = load_review_workflow_row(db, key)
@@ -399,10 +371,8 @@ def test_current_late_paid_return_after_four_generations_preserves_one_charge_an
         after = load_review_workflow_row(db, key)
         assert after.execution == advanced.execution and after.episode == advanced.episode
         assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (1, 12)
-    events = tuple(published)
     assert store.settle_review_return(payment, delayed).idempotent
     assert control.finalize_completed_round(old.round.round_id) == result
-    assert tuple(published) == events
     assert store.snapshot(proposed.scope).committed.micros == 12
 
 
@@ -414,7 +384,7 @@ def test_stopped_conversion_requires_legacy_live_productivity_joint_marker(curre
     from issue_agent.domain.review_execution import ActivatedReviewExecution
     from issue_agent.domain.review_rounds import CurrentReviewOutcomeReceipt
 
-    store, key, _, workflow, plan, command, before, _ = current_verdict
+    store, key, _, workflow, plan, command, before = current_verdict
     assert isinstance(workflow.record_review(command.command_id), WorkflowCommitted)
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     with store.transaction() as db:

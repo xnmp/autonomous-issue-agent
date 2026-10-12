@@ -219,9 +219,9 @@ a concurrent bind or lease transition is conservatively retained and retried.
 The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
 accounting run, cleanup receipt, and post-canary invariants are captured in
 `live-release-canary-evidence.json`.
-JSONL is bounded
-schema-v2 telemetry and a projection feed; losing it cannot authorize a write,
-deduplicate work, or admit spend.
+JSONL is the per-role daemon log only; losing it cannot authorize a write,
+deduplicate work, or admit spend. Metrics derive from the SQLite legs/money
+tables plus GitHub.
 Every lifecycle command and paid run is scoped to repository, role, and stable
 checkout deployment identity in the shared store. Cross-process dispatch/path
 claims remain repository/role-global, so two intentionally allowed checkouts
@@ -273,7 +273,7 @@ binary before it can mutate the current database.
 The supported exception is an explicit same-repository checkout repoint:
 `issue-agent start --write-config` records a bounded lineage of exact prior
 checkout identities. The first boot reaps only those process registries and
-adopts their run/lease/claim/command and projection-feed ownership. The marker
+adopts their run/lease/claim/command ownership. The marker
 persists across repeated repoints so an interrupted intermediate boot cannot
 strand an older reservation. Before the overlay changes, the CLI stops and
 verifies all foreground and service-owned processes carrying its stable name;
@@ -301,28 +301,11 @@ CLI status and dashboard usage endpoints project current-period settled charges
 directly from this SQLite authority. The historical JSONL spend ledger is read
 only during idempotent migration and cannot make current spend appear as zero.
 
-The dashboard is a read-only projection consumer. Its canonical operational
-model is rebuilt by the pure `domain/projection.py::fold` over schema-v2
-events; GitHub reads may enrich titles and URLs but never infer lifecycle
-success or turn an unavailable observation into an empty world.
-The fold retains the first start for a run, never lets a duplicate start erase
-its terminal state, and preserves a completion even when its start aged out of
-the bounded event window, keeping visible cost and completion metrics intact.
-Per-role scheduler heartbeats supply scheduler-health freshness when an
-unchanged world correctly emits no new observation event; they do not infer
-process liveness.
-If process discovery is unavailable, dashboard liveness is `unknown`; recent
-activity is never promoted into proof that a role is alive or dead.
-Event streams retain eight rotated files plus the current file. Rotation writes
-the active level envelopes, permanent feed-retirement fences, and the latest
-observation for every `(feed, world subject)` into the new current file, so
-bounded retention and restart do not resurrect a cleared level, discard an
-active one, or make an unchanged issue disappear. A stable per-path
-interprocess lock covers append, replacement, authoritative on-disk reseeding,
-and pruning; multiple daemon/publisher writers cannot rotate stale in-memory
-state over one another. `EventLogSegments` is the sole segment locator and
-accepts only the writer's timestamp-plus-UUID suffix, so backup or unrelated
-siblings are never projected or deleted.
+The dashboard is a read-only consumer. Its board is built from each role's
+plain `journal.jsonl` log, SQLite settled spend, and GitHub reads; GitHub reads
+never infer lifecycle success or turn an unavailable observation into an empty
+world. If process discovery is unavailable, dashboard liveness is `unknown`;
+recent activity is never promoted into proof that a role is alive or dead.
 
 Every paid run is bounded by layered breakers, because the failure mode
 that matters is not "wrong answer" but "loop that bills forever":
@@ -451,12 +434,12 @@ startup. Network fail-soft behavior and operation-local reconcile-first effects
 are not recovery triggers.
 `SIGTERM` moves the daemon through `RUNNING → DRAINING → STOPPED`: paid
 admission stops first, active work receives a bounded cancellation window,
-handover and receipts are persisted, the outbox is flushed, and remaining
+handover and receipts are persisted, and remaining
 groups are killed. Before cancellation, owned active runs receive a durable
 cancellation intent. Forced teardown then reconciles measured rollout usage; a
 still-indeterminate paid run retains its reservation and evidence for boot
 recovery instead of manufacturing a zero charge or releasing unknown capacity.
-State-owned handovers and the resulting outbox transitions are then flushed.
+State-owned handovers are then written.
 Missing the shutdown deadline changes a clean request to a transient exit. Exit codes
 distinguish clean/operator stops, transient
 failures, invalid configuration, duplicate instances, incompatible schemas,
@@ -543,18 +526,15 @@ shared by lifecycle policy and durable action payloads without an import cycle),
 (the harness-attested capability manifest: what the boot probe saw, and the
 narrow conditions under which it may state a verdict rather than facts),
 `domain/events.py`, `domain/fix.py`,
-`domain/measurement.py` (validated incident/intervention observations),
-`domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
 `domain/git_remote.py`, `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
-`domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/pr_body.py` (completes a fixer's PR body with the issue's acceptance
 criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
-`domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
+`domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`,
 `domain/supervision.py`,
@@ -601,7 +581,6 @@ pull request retains its lever subject to fresh acceptance reads).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
-`adapters/measurement.py` (atomic observation recording and read-only SQL export),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_home.py`, `adapters/codex_runner.py`,
@@ -610,7 +589,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/deployment_authority.py`, `adapters/durable_effects.py`,
 `adapters/effects.py`,
 `adapters/env_file.py`,
-`adapters/event_log.py`, `adapters/github.py`,
+`adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
 `adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
@@ -639,7 +618,6 @@ re-arm reconciliation and the ceiling-release projection fact),
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
-`adapters/typed_journal.py`,
 `adapters/wake.py`, `adapters/worktree.py`, `adapters/workflow_codec.py`,
 `adapters/workflow_rows.py` (family-scoped authority reads),
 `adapters/workflow_commit.py` (family-neutral CAS receipt helpers),
@@ -653,7 +631,6 @@ adapters live under `adapters/dashweb/`.
 `app/execute.py`, `app/identity_pools.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
-`app/measurement.py` (local observation/export transport and cohort specification),
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
 `app/continuation_activation.py` (configured fixed fix offline import, original-plan retry and copied rehearsal),
@@ -666,7 +643,7 @@ one review-control composition the daemon and the operator transport share),
 `app/review_control.py` (the review owner's operator composition from the
 launch snapshot for the PR-scoped dashboard API),
 `app/service_doctor.py`, `app/webhook.py`,
-`app/world_probe.py`, and `app/world_reporter.py`.
+and `app/world_probe.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid
 workflow sequencing and the single `run_leg` path are in `app/workflows/`;
 its shared completion helper revalidates current facts between confirmed

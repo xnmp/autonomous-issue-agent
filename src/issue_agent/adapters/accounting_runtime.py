@@ -128,10 +128,6 @@ class AccountingRuntime(AgentRuntime):
     budget_policy: BudgetPolicy
     rate_table: RateTable | None = None
     spend_evidence_dir: str = ""
-    event_log_path: str = ""
-    event_deployment: str = ""
-    event_role: str = ""
-    event_line_limit: int = 0
     owner_id: str = ""
     github_host: str = "github.com"
     approved_base_branch: str = "dev"
@@ -202,49 +198,11 @@ class AccountingRuntime(AgentRuntime):
         ):
             return reservation
         try:
-            released = (
-                self.reservation_reconciler.reconcile_stale_reservations()
-            )
-        except Exception as exc:  # noqa: BLE001 - escalate exactly as before
-            self._journal_reconciled(
-                request,
-                reservation,
-                0,
-                False,
-                f"reconciliation unavailable: {exc}",
-            )
+            self.reservation_reconciler.reconcile_stale_reservations()
+        except Exception:  # noqa: BLE001 - escalate exactly as before
             return reservation
-        retried = admit(request)
-        self._journal_reconciled(
-            request,
-            reservation,
-            released,
-            retried.disposition is AccountingDisposition.AVAILABLE,
-            reservation.detail,
-        )
-        return retried
+        return admit(request)
 
-    def _journal_reconciled(
-        self,
-        request: ReservationRequest,
-        exhausted: ReservationResult,
-        released: int,
-        admitted: bool,
-        reason: str,
-    ) -> None:
-        # The journalled scope names the limit that tripped, not the primary
-        # one: a leg carrying repository, global, and issue caps can be denied
-        # by any of them, and an operator reads this to decide which cap moves.
-        try:
-            self.store.record_admission_reconciled(
-                request.run_id,
-                exhausted.tripped_dimension or request.scope.dimension,
-                released,
-                admitted,
-                reason,
-            )
-        except Exception:  # noqa: BLE001 - telemetry never fails a dispatch
-            pass
 
     def set_run_identity(self, run_id: str, leg_id: str) -> None:
         if not run_id or not leg_id:
@@ -549,18 +507,6 @@ class AccountingRuntime(AgentRuntime):
             "ISSUE_AGENT_REPOSITORY": self.repository,
             "ISSUE_AGENT_OWNER_ID": request.owner_id,
             **({"ISSUE_AGENT_REVIEW_CHILD": "1"} if review_child is not None else {}),
-            **(
-                {
-                    "ISSUE_AGENT_EVENT_LOG": self.event_log_path,
-                    "ISSUE_AGENT_EVENT_DEPLOYMENT": self.event_deployment,
-                    "ISSUE_AGENT_EVENT_ROLE": self.event_role,
-                    "ISSUE_AGENT_EVENT_LINE_LIMIT": str(
-                        self.event_line_limit
-                    ),
-                }
-                if self.event_log_path
-                else {}
-            ),
         }
         publication_authority: dict[str, str] = {}
         if publication is not None:

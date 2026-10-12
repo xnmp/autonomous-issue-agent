@@ -112,12 +112,12 @@ def test_caught_stopped_conversion_failure_preserves_held_authority_and_outer_wo
                    "BEGIN SELECT RAISE(ABORT,'caught conversion failure'); END")
         with pytest.raises(sqlite3.IntegrityError, match="caught conversion failure"):
             convert_legacy_review_execution(db, selection.expected.fence.key)
-        db.execute("INSERT INTO level_state VALUES (?,?,?,?,?)", (
-            "test-outer", "o/r", "committed", "{}", store.now().isoformat(),
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)", (
+            "test-outer", "o/r", "committed", store.now().isoformat(), "{}",
         ))
     with store.transaction() as db:
         assert db.execute("SELECT episode_json FROM workflows WHERE target_kind='pr'").fetchone()[0] == retained
-        assert db.execute("SELECT key FROM level_state WHERE namespace='test-outer'").fetchone()[0] == "committed"
+        assert db.execute("SELECT key FROM dedupe_keys WHERE namespace='test-outer'").fetchone()[0] == "committed"
         with pytest.raises(ReviewExecutionHeld):
             load_review_workflow_row(db, selection.expected.fence.key)
 
@@ -135,12 +135,9 @@ def test_finalization_exact_retry_survives_malformed_current_authority(rig):
     assert dump(store) == before
 
 
-def test_old_certificate_and_unrelated_retained_history_do_not_gate_admission(rig):
+def test_unrelated_retained_history_does_not_gate_admission(rig):
     store, _, _, selection, control = rig
     with store.transaction() as db:
-        db.execute("INSERT INTO level_state VALUES (?,?,?,?,?)", (
-            "review-execution-archive-gate-v1", "o/r", "invalid-expired-certificate", "malformed", store.now().isoformat(),
-        ))
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)", (
             "review-execution-generation", "unrelated/repository", "retained:malformed", store.now().isoformat(), "malformed",
         ))

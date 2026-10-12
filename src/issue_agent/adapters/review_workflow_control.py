@@ -27,9 +27,16 @@ from ..domain.resolve_rearm import (
     PendingRetry, RearmObservation, UnavailableResolveRearm, defer_rearm_observation, schedule_rearm_observation,
 )
 from ..domain.review_dispatch_record import (
-    DecisionBasis, DecisionEntry, DecisionRead, DecisionUpdate, DepartedReadFailed, RecordedDispatch,
-    RecordedReviewDecision, departed_backoff_at_ceiling, departed_backoff_seconds, departed_read_after,
-    departed_read_due, next_decision_record,
+    DecisionBasis,
+    DecisionEntry,
+    DecisionRead,
+    DecisionUpdate,
+    DepartedReadFailed,
+    RecordedDispatch,
+    RecordedReviewDecision,
+    departed_read_after,
+    departed_read_due,
+    next_decision_record,
 )
 from ..domain.review_rearm import (
     AbsentReviewControl, GateFactsUnavailable, HoldRestoration, MigrationRequiredReviewControl,
@@ -673,26 +680,8 @@ class SQLiteReviewWorkflowControl:
                      encode_workflow(record)),
                 )
                 written += 1
-                failure = record.read_failure
-                if isinstance(entry, DepartedReadFailed) and failure is not None and (
-                    failure.failed_reads == 1 or departed_backoff_at_ceiling(failure.failed_reads)
-                ):
-                    self._control._transition(
-                        db, "review_departed_read", f"pr:{key.target.number}",
-                        "read_failed" if failure.failed_reads == 1 else "read_backoff_ceiling", {
-                            "failed_reads": failure.failed_reads, "since": failure.first_failed_at.isoformat(),
-                            "next_read_seconds": departed_backoff_seconds(failure.failed_reads),
-                            "reason": failure.reason[:512],
-                        })
         return DecisionsRecorded(written, tuple(skipped))
 
-    def journal_decision_record_failure(self, detail: str, suppressed: int) -> None:
-        """Journal that the plan's decisions could not be recorded; the caller bounds how often (ADR 0012)."""
-        if type(suppressed) is not int or suppressed < 0:
-            raise ValueError("suppressed failures are a non-negative count")
-        with self._control.transaction() as db:
-            self._control._transition(db, "review_dispatch_record", self._writer.repository, "record_failed",
-                                      {"detail": str(detail)[:512], "suppressed": suppressed})
 
     def _decision_change(
         self, db: sqlite3.Connection, entry: DecisionEntry, now: datetime,
@@ -784,8 +773,6 @@ class SQLiteReviewWorkflowControl:
                 if after != prior:
                     after = replace(after, revision=replace(prior.revision, version=prior.revision.version + 1))
                     persist_workflow_snapshot(db, after)
-                    self._control._transition(db, "workflow", encode_workflow(key), "migration_hold_installed",
-                                              {"family": "pr_repair", "version": after.revision.version})
                     return WorkflowCommitted(after)
                 return WorkflowCommitted(prior, idempotent=True)
             execution_authority = load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository)
@@ -863,8 +850,6 @@ class SQLiteReviewWorkflowControl:
                 )
             if execution_authority is not None and load_review_workflow_row(db, key) != snapshot:
                 raise WorkflowAuthorityError("discovered execution failed canonical readback")
-            self._control._transition(db, "workflow", encode_workflow(key), "discovered",
-                                      {"generation": 0, "version": 0, "epoch": authority.epoch})
             return WorkflowCommitted(snapshot)
 
     def _first_observation(
@@ -908,12 +893,6 @@ class SQLiteReviewWorkflowControl:
                                                       "reads": history.failed_reads,
                                                       "surfaced": surfaced or progress.surface})),
             )
-            if prior is None or progress.surface:
-                self._control._transition(db, "workflow", encode_workflow(key),
-                                          "first_observation_ceiling" if progress.surface
-                                          else "first_observation_unavailable",
-                                          {"failed_reads": history.failed_reads, "error": error[:512],
-                                           "next_read_at": history.next_read_at.isoformat()})
 
     # -- the one commit boundary ------------------------------------------------------------------
 
@@ -1482,8 +1461,6 @@ class SQLiteReviewWorkflowControl:
             if row["prewrite_read_json"] is not None:
                 db.execute("UPDATE lifecycle_commands SET prewrite_read_json=NULL WHERE command_id=?",
                            (row["command_id"],))
-                self._control._transition(db, "lifecycle_command", row["command_id"], "prewrite_evidence_ended",
-                                          {"reason": "generation advanced"})
             if row["state"] in ("succeeded", "permanent_failure") or isinstance(
                 self._control._command_reconciliation(row), (RetiredSettledCommand, RetiredUncertainCommand)
             ):
@@ -1495,10 +1472,6 @@ class SQLiteReviewWorkflowControl:
                            (retirement_id, *scope, payload))
                 recorded = True
             self._control._retire_workflow_command(db, row, command, after, retirement_id, create_uncertainty=True)
-            self._control._transition(db, "lifecycle_command", row["command_id"], "stale_generation_retired", {
-                "evidence_id": retirement_id, "generation": binding.fence.generation,
-                "current_generation": after.revision.fence.generation,
-            })
 
     def _retire_obligation(
         self, db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, after: ReviewWorkflowSnapshot,
@@ -1532,7 +1505,6 @@ class SQLiteReviewWorkflowControl:
                 self._control._dispose_grant(db, grant, RetryDisposition.VOID.value,
                                              "the command was retired before the grant was spent",
                                              details={"evidence_id": retirement_id})
-            self._control._transition(db, "lifecycle_command", command_id, "superseded", {"evidence_id": retirement_id})
         else:
             self._control._retire_workflow_command(db, row, command, after, retirement_id)
         db.execute("UPDATE lifecycle_commands SET prewrite_read_json=NULL WHERE command_id=?", (command_id,))
@@ -1655,22 +1627,12 @@ class SQLiteReviewWorkflowControl:
             if not restores.get(decision.gate_id, (0, False))[1]:
                 self._owe_signal(db, key, decision.gate_id, "hold_contested")
                 self._write_restores(db, key, decision.gate_id, decision.restores, contested=True)
-                self._control._transition(db, "workflow_hold", f"pr:{key.target.number}", "hold_contested", {
-                    "gate_id": decision.gate_id, "restores": decision.restores,
-                    "generation": state.revision.fence.generation,
-                    "labels": sorted(label.value for label in recorded.observation.labels),
-                })
             return False
         assert isinstance(decision, RestoreHold)
         count = restores.get(decision.gate_id, (0, False))[0] + 1
         self._insert_evidence(db, key, recorded)
         self._control._enqueue_command(db, decision.command)
         self._write_restores(db, key, decision.gate_id, count, contested=False)
-        self._control._transition(db, "workflow_hold", f"pr:{key.target.number}", "hold_reprojected", {
-            "command_id": str(decision.command.command_id), "generation": state.revision.fence.generation,
-            "gate_id": decision.gate_id, "restores": count,
-            "labels": sorted(label.value for label in recorded.observation.labels), "evidence_id": evidence_id,
-        })
         return True
 
     def _restore_records(self, db: sqlite3.Connection, key: WorkflowKey) -> list[sqlite3.Row]:
@@ -1704,9 +1666,6 @@ class SQLiteReviewWorkflowControl:
             db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
                        (_HOLD_RESTORES_NAMESPACE, self._writer.repository, f"pr:{key.target.number}:{gate_id}"))
             del rows[gate_id]
-            if contested:
-                self._control._transition(db, "workflow_hold", f"pr:{key.target.number}", "hold_contest_cleared",
-                                          {"gate_id": gate_id, "generation": state.revision.fence.generation})
         return rows
 
     def _write_restores(self, db: sqlite3.Connection, key: WorkflowKey, gate_id: str, restores: int, *,
@@ -1759,7 +1718,6 @@ class SQLiteReviewWorkflowControl:
         if identity is None or not owns_command(db, self._writer, command.executor_identity):
             raise WorkflowAuthorityError("a refused escalation projection belongs to another executor")
         state = self._load(db, key)
-        subject = f"pr:{key.target.number}"
         # A ceiling's projection names its gate, not a submission.
         submitted = db.execute("SELECT 1 FROM lifecycle_commands WHERE command_id=?", (identity,)).fetchone()
         receipt = load_bound_review_submission(db, CommandId(identity)) if submitted is not None else None
@@ -1770,8 +1728,6 @@ class SQLiteReviewWorkflowControl:
             db.execute("INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                        (_ESCALATION_RESOLVED_NAMESPACE, self._writer.repository, str(command.command_id),
                         self._now().isoformat(), json.dumps({"outcome": outcome, **detail})))
-            self._control._transition(db, "workflow_escalation", subject, f"escalation_{outcome}", {
-                "command_id": str(command.command_id), "escalation": identity, "refusal": refusal, **detail})
 
         if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
             resolve("owned_by_ceiling", {})  # restored by the open ceiling's hold restoration
@@ -2174,8 +2130,6 @@ class SQLiteReviewWorkflowControl:
         if not changed:
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,NULL)",
                        (_OBSERVATION_NAMESPACE, self._writer.repository, request_id, next_read.isoformat()))
-        self._control._transition(db, "workflow_rearm", record_key, "authority_unavailable",
-                                  {"reason": reason, "next_read_at": next_read.isoformat()})
         return UnavailableResolveRearm(record_key, reason, next_read)
 
     def reconcile_rearm(self, expected: WorkflowRevision) -> WorkflowCommitted | WorkflowConflict:
@@ -2268,13 +2222,6 @@ class SQLiteReviewWorkflowControl:
         if after != state:
             persist_workflow_snapshot(db, after)
         assert isinstance(state.intent, PendingReviewRearm)
-        self._control._transition(db, "workflow_rearm", state.intent.request_id, "observation_deferred", {
-            "failed_reads": deferred.history.failed_reads,
-            "next_read_at": deferred.history.next_read_at.isoformat(),
-            "gated": any((g.gate if isinstance(g, RearmingGate) else g).cause.__class__.__name__ == "EvidenceUnavailable"
-                         for g in after.gates),
-            "error": error[:512],
-        })
         return WorkflowCommitted(after)
 
     # -- ceiling-release projection ------------------------------------------------------------
@@ -2342,10 +2289,6 @@ class SQLiteReviewWorkflowControl:
                                                   self._now().isoformat(), evidence_id))
                 if gate is not None:
                     self._control._reconciliation_gate(db, binding, gate_id, None)
-                self._control._transition(db, "workflow_release", command_id, "verified_by_observation", {
-                    "evidence_id": evidence_id, "terminal": pr.state is not PullRequestState.OPEN,
-                    "superseded": superseded, "generation": binding.fence.generation,
-                })
                 return
         if gate is None:
             error = db.execute("SELECT error FROM effect_receipts WHERE command_id=?", (command_id,)).fetchone()
@@ -2355,8 +2298,6 @@ class SQLiteReviewWorkflowControl:
             self._open_refused_gate(db, state, command, reason, (
                 f"correct the pull request labels by hand ({planned}); the next harness read verifies "
                 "them and releases this hold"))
-            self._control._transition(db, "workflow_release", command_id, "refusal_gated",
-                                      {"gate_id": gate_id, "generation": binding.fence.generation})
 
     # -- runtime: activation, settled submissions, holds and evidence --------------------------
 
@@ -2554,11 +2495,6 @@ class SQLiteReviewWorkflowControl:
             db.execute("INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                        (_SETTLED_SUBMISSION_NAMESPACE, self._writer.repository, str(submission),
                         self._now().isoformat(), json.dumps({"outcome": outcome})))
-            self._control._transition(db, "review_submission", str(submission), "settled", {
-                "outcome": outcome, "reason": result.reason[:512] if isinstance(result, WorkflowRejected) else "",
-                "escalation": ("ceiling" if isinstance(bound, CeilingEscalation)
-                               else "verdict" if bound.escalated else ""),
-            })
         return result
 
     @staticmethod
@@ -2612,10 +2548,7 @@ class SQLiteReviewWorkflowControl:
                     ):
                         continue
                 result = self.settle_submission(CommandId(row["command_id"]))
-            except (WorkflowAuthorityError, ControlStoreError, KeyError) as exc:
-                with self._control.transaction() as db:
-                    self._control._transition(db, "review_submission", row["command_id"], "settle_unavailable",
-                                              {"reason": _reason(exc)[:512]})
+            except (WorkflowAuthorityError, ControlStoreError, KeyError):
                 continue
             applied += isinstance(result, WorkflowCommitted) and not result.idempotent
         return applied
@@ -2674,10 +2607,6 @@ class SQLiteReviewWorkflowControl:
                  (now + timedelta(seconds=delay)).isoformat(),
                  json.dumps({"failed_reads": failed_reads, "error": error[:512]})),
             )
-            if error:
-                self._control._transition(db, "workflow_hold", f"pr:{number}", "observation_deferred", {
-                    "failed_reads": failed_reads, "error": error[:512], "delay_seconds": delay,
-                })
 
     def reconcile_holds(self, *, limit: int = 16) -> int:
         """Drive every due review hold from one fresh read: ceilings, refused releases, evidence.
@@ -2810,8 +2739,6 @@ class SQLiteReviewWorkflowControl:
                        (namespace, self._writer.repository, scope))
             for stale_id in held:
                 self._control._reconciliation_gate(db, state.binding, stale_id, None)
-            self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_available",
-                                      {"head": head_sha, "closed_gates": len(held)})
             return
         progress = unavailable_evidence(kind, state.binding, head_sha, prior, now=now, error=error,
                                         policy=(replace(self._policy, maximum_reads=1)
@@ -2833,11 +2760,6 @@ class SQLiteReviewWorkflowControl:
                 self._control._reconciliation_gate(db, state.binding, stale_id, None)
         if progress.gate is not None:
             self._control._reconciliation_gate(db, state.binding, gate_id, progress.gate)
-        self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_unavailable", {
-            "head": head_sha, "failed_reads": schedule.history.failed_reads,
-            "next_read_at": schedule.history.next_read_at.isoformat(), "gated": progress.gate is not None,
-            "error": schedule.last_error[:512],
-        })
 
     def _record_runtime_evidence_if_current(
         self, state: ReviewWorkflowSnapshot, schedule: EvidenceSchedule | None,

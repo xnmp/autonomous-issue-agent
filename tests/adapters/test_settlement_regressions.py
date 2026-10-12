@@ -36,14 +36,10 @@ def test_delayed_linked_receipt_keeps_other_cumulative_spend_and_gap(tmp_path):
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status='pushed', run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context('fix', 'RESOLVE', 1, 1, workflow=resolve_snapshot().binding)
-    events = native.EventLog(str(tmp_path / 'events.jsonl'), native.Producer('review', 'o/r', 'fix', 123, 'review'))
-    store.bind_event_outbox(events.prepare, events.append_committed)
     asyncio.run(wrapper.run(RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=2)))
     with store.transaction() as db:
         charge = tuple(db.execute('SELECT amount_micros,basis FROM charges').fetchone())
-    emitted = [native.decode_event_line(line).payload for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
     assert charge == (400, 'estimate')
-    assert sum(isinstance(payload, native.ControlTransitionCommitted) and payload.entity_kind == 'accounting' and payload.state == 'estimated' for payload in emitted) == 1
 
 @pytest.mark.parametrize('receipt_first', [False, True])
 def test_cumulative_only_and_two_legacy_receipts_settle_once(tmp_path, receipt_first):
