@@ -45,9 +45,9 @@ from ...domain.workflow_identity import PullRequestRef, WorkflowBinding, Workflo
 from ...adapters.workflow_rows import WorkflowAuthorityError
 from .base import run_leg
 
-# A round that could not PIN its checkout never ran a paid leg — it must defer
-# (retry next poll) without feeding the unproductive-round counter, or five
-# free deferrals walk a healthy PR into needs-human-review (0d2e295 H3).
+# A round that could not PIN its checkout never ran a paid leg — it defers
+# (retried on the machine backoff) without feeding the unproductive-round
+# counter (0d2e295 H3).
 _PIN_DEFERRED_STATUS = "review_checkout_deferred"
 
 @dataclass(frozen=True)
