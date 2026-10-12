@@ -278,3 +278,15 @@ def test_async_effect_finishes_before_owner_retirement_can_commit(
             later,
             lambda: EffectOutcome(None, EffectStatus.SUCCEEDED),
         )
+
+
+@pytest.mark.parametrize("payload, display", [
+    ({"remove": "needs-human-review", "add": "ai-pr-open"}, "relabel pr #9: -needs-human-review +ai-pr-open"),
+    ({"reason": "escalate pending CI"}, "relabel"),
+])
+def test_a_relabel_success_event_names_its_moves_only_when_the_payload_carries_labels(payload, display):
+    from issue_agent.adapters.control_store import _command_applied_event
+    from issue_agent.domain.contracts import CommandId
+    command = LifecycleCommand(CommandId("c" * 64), "github:c", CommandKind.RELABEL, "pr:9", None, payload,
+                               repository="o/r", executor_identity="o/r:review:test")
+    assert _command_applied_event(command).display == display

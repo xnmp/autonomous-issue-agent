@@ -11618,9 +11618,12 @@ def _command_applied_event(command: LifecycleCommand) -> ActionApplied:
                 labels = list(dict.fromkeys(value for value in values if isinstance(value, str)))
                 moves[field] = labels
                 display_moves.extend(f"{sign}{label}" for label in labels)
-            return ActionApplied(str(command.command_id), "relabel", target,
-                                 f"relabel {target} #{number}: {' '.join(display_moves) or '(no-op)'}",
-                                 number, moves)
+            # Escalation payloads carry no label fields; keep their generic event
+            # rather than misreporting a labelled write as a no-op.
+            if display_moves:
+                return ActionApplied(str(command.command_id), "relabel", target,
+                                     f"relabel {target} #{number}: {' '.join(display_moves)}",
+                                     number, moves)
     return ActionApplied(str(command.command_id), command.kind.value, command.target, command.kind.value)
 
 
