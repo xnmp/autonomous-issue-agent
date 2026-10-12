@@ -3,7 +3,7 @@ Actions against GitHub.
 
 There is no command queue. Every write is either naturally idempotent (a
 label set, a merge bound to its head, an update-branch bound to its head, a
-PR opened only when none exists for the branch) or carries an idempotency key
+PR opened only when the branch has no open one) or carries an idempotency key
 claimed in SQLite before the write and confirmed after a read-back (design
 rule 2: SQLite owns idempotency keys). A write whose read-back fails raises;
 the daemon logs it and the next tick re-derives from GitHub.

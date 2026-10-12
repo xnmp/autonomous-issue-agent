@@ -29,9 +29,11 @@ from ..domain.outcome import (
     DAILY_HEADROOM_STATUS,
     MAX_BUDGET_STATUS,
     RETURN_REFUSED_STATUS,
+    LegClass,
     classify_leg,
     resumable_session,
 )
+from ..domain.policy import question_text
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
@@ -72,11 +74,11 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     _context: contextvars.ContextVar[
-        tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None, str]
+        tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None, str, bool]
     ] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}",
-            default=(None, "", 0, None, None, None, ""),
+            default=(None, "", 0, None, None, None, "", False),
         ),
         init=False,
         repr=False,
@@ -102,9 +104,10 @@ class AccountingRuntime(AgentRuntime):
         workflow: WorkflowBinding | None = None,
         review_child: ReviewChildIdentity | None = None,
         head: str = "",
+        resumed: bool = False,
     ) -> None:
-        if not isinstance(head, str):
-            raise ValueError("accounting context head must be text")
+        if not isinstance(head, str) or type(resumed) is not bool:
+            raise ValueError("accounting context head must be text and resumed an exact bool")
         if workflow is not None and not isinstance(workflow, WorkflowBinding):
             raise ValueError("accounting context requires a validated workflow binding")
         if review_child is not None and (
@@ -117,7 +120,7 @@ class AccountingRuntime(AgentRuntime):
             raise ValueError("accounting review child requires its bound review context")
         if review_child is not None:
             RuntimeName(self.runtime_name)
-        self._context.set((issue, kind, number, claim_target, workflow, review_child, head))
+        self._context.set((issue, kind, number, claim_target, workflow, review_child, head, resumed))
 
     def _reserve_reclaiming_dead_headroom(
         self,
@@ -160,7 +163,7 @@ class AccountingRuntime(AgentRuntime):
         claim relabel each time (#262, tauri PR #1019). Cancelled, released and
         receipt-less, the row reads as a machine end and nothing else counts it.
         """
-        issue, kind, number, *_, head = self._context.get()
+        issue, kind, number, *_, head, _resumed = self._context.get()
         if self.role != "fix" or issue is None or not kind:
             return
         run_id = RunId(uuid.uuid4().hex)
@@ -178,7 +181,7 @@ class AccountingRuntime(AgentRuntime):
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return self._refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
-        issue, kind, number, claim_target, workflow, review_child, head = self._context.get()
+        issue, kind, number, claim_target, workflow, review_child, head, resumed = self._context.get()
         if self.role == "fix" and (workflow is not None or review_child is not None):
             return self._refused("a fix leg is a plain leg: no workflow binding")
         # ADR 0008: paid admission binds the decision-side target unchanged;
@@ -347,12 +350,16 @@ class AccountingRuntime(AgentRuntime):
         if self.role == "fix":
             # The leg's class, recorded before settlement: a fix run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
+            leg = classify_leg(result, resumed=resumed)
             self.store.receipt(FIX_LEG_NAMESPACE, self.repository, str(run_id), {
-                "leg": classify_leg(result, resumed=bool(task.resume)).value,
+                "leg": leg.value,
                 "session": resumable_session(result),
                 "runtime": self.runtime_name,
                 # The PR body the harness opens a RESOLVE's branch with (Q11).
                 "summary": (result.summary or "")[:_SUMMARY_LIMIT],
+                # The question the QUESTION stop comment embeds: recorded with
+                # the leg so no separate post can lose it.
+                **({"question": question_text(result.needs)} if leg is LegClass.ASKED else {}),
             })
         result = replace(
             result,

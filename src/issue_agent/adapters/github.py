@@ -30,6 +30,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from ..domain.ci import parse_timestamp
 from ..domain.labels import Label
 from ..domain.review_rejection import MAX_OBSERVED_REVIEWS, is_commit_sha
 from ..domain.review_workflow import (
@@ -741,15 +742,20 @@ def build_time() -> str:
 
 
 _FIX_MAX_PAGES = {"issues": 10, "pullRequests": 10, "refs": 10}
-_FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "labels": 100}
+_FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500}
 _HARNESS_BRANCH_PREFIX = "fix/"
 _COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt}}}}"
 _LABELS = "labels(first:100){totalCount nodes{name}}"
+# Cross-references, paged in full like any nested connection: a merged harness
+# PR past one page must read as "unknown" (the issue is skipped), never as
+# "not merged" (which would re-RESOLVE a done issue). No totalCount: whether
+# it honours `itemTypes` is undocumented, so completeness rests on paging.
+_TIMELINE = ("timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:100{before}){{pageInfo{{hasPreviousPage startCursor}} "
+             "nodes{{... on CrossReferencedEvent{{source{{... on PullRequest{{number state headRefName "
+             "repository{{nameWithOwner}}}}}}}}}}}}")
 _FIX_ISSUE = (
     "id number title state author{login} " + _LABELS + " "
-    + _COMMENTS.format(before="")
-    + " timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:25){nodes{... on CrossReferencedEvent{"
-    "source{... on PullRequest{number state headRefName repository{nameWithOwner}}}}}}"
+    + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="")
 )
 _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
             "nodes{{author{{login}} state submittedAt body commit{{oid}}}}}}")
@@ -760,8 +766,13 @@ _FIX_PR = (
     + _REVIEWS.format(before="") + " " + _FILES.format(after="")
     + " commits(last:1){nodes{commit{oid committedDate author{user{login}}}}}"
 )
+# Per branch: its newest PR (any state), its head commit's date, and how many
+# commits it has that the base lacks (`compare` reads the ref as the base, so
+# that count is `behindBy`).
 _FIX_REFS = ("refs(refPrefix:\"refs/heads/" + _HARNESS_BRANCH_PREFIX + "\",first:100{after}){{pageInfo{{hasNextPage endCursor}} "
-             "nodes{{name associatedPullRequests(first:1){{totalCount}} target{{... on Commit{{committedDate}}}}}}}}")
+             "nodes{{name associatedPullRequests(last:1,orderBy:{{field:CREATED_AT,direction:ASC}})"
+             "{{totalCount nodes{{state closedAt}}}} target{{... on Commit{{committedDate}}}} "
+             "compare(headRef:$base){{behindBy}}}}}}")
 def _escaped(fields: str) -> str:
     return fields.replace("{", "{{").replace("}", "}}")
 
@@ -814,12 +825,11 @@ def parse_fix_issue(node: object, comments: list) -> IssueView:
     )
 
 
-def parse_merged_harness_prs(node: object, repository: str) -> tuple[PRView, ...]:
-    """Merged same-repo harness PRs that cross-reference this issue. A merged
-    harness PR means the issue is done even while it stays open (base ≠ default
-    branch never auto-closes it)."""
+def parse_merged_harness_prs(items: list, repository: str) -> tuple[PRView, ...]:
+    """Merged same-repo harness PRs among an issue's (fully paged)
+    cross-references. A merged harness PR means the issue is done even while
+    it stays open (base ≠ default branch never auto-closes it)."""
     out = []
-    items, _ = _connection(node, "timelineItems") if isinstance(node, dict) else ([], {})
     for item in items:
         source = item.get("source") if isinstance(item, dict) else None
         if not isinstance(source, dict) or source.get("state") != "MERGED":
@@ -862,18 +872,34 @@ def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PR
 
 
 def parse_fix_refs(nodes: list) -> tuple[Branch, ...]:
-    """Harness branches that never had a PR (in any state)."""
+    """Harness branches owed a PR: ahead of base, and either never had a PR or
+    were pushed after their newest PR was closed unmerged (a human closed it
+    and the issue went back to RESOLVE). A branch with nothing ahead of base
+    is owed nothing: opening its PR could only fail, every tick."""
     out = []
     for node in nodes:
         if not isinstance(node, dict) or not isinstance(node.get("name"), str):
             raise FixObservationIncomplete("branch ref is malformed")
         prs = node.get("associatedPullRequests")
-        if not isinstance(prs, dict) or type(prs.get("totalCount")) is not int:
+        if not isinstance(prs, dict) or type(prs.get("totalCount")) is not int or not isinstance(prs.get("nodes"), list):
             raise FixObservationIncomplete("branch PR association is unreadable")
-        if prs["totalCount"]:
-            continue
+        compare = node.get("compare")
+        if compare is not None and (not isinstance(compare, dict) or type(compare.get("behindBy")) is not int):
+            raise FixObservationIncomplete("branch comparison is unreadable")
         target = node.get("target") if isinstance(node.get("target"), dict) else {}
-        out.append(Branch(_HARNESS_BRANCH_PREFIX + node["name"], target.get("committedDate") or ""))
+        committed = target.get("committedDate") if isinstance(target.get("committedDate"), str) else ""
+        # GitHub answers null when the comparison cannot be made: unproven, so not owed.
+        if compare is None or compare["behindBy"] <= 0:
+            continue
+        if prs["totalCount"]:
+            newest = prs["nodes"][-1] if prs["nodes"] else None
+            if not isinstance(newest, dict) or newest.get("state") not in ("OPEN", "CLOSED", "MERGED"):
+                raise FixObservationIncomplete("branch PR state is unreadable")
+            closed_at = parse_timestamp(newest.get("closedAt") or "")
+            pushed_at = parse_timestamp(committed)
+            if newest["state"] != "CLOSED" or closed_at is None or pushed_at is None or pushed_at <= closed_at:
+                continue
+        out.append(Branch(_HARNESS_BRANCH_PREFIX + node["name"], committed))
     return tuple(out)
 
 
@@ -1511,8 +1537,9 @@ class GitHubGateway:
         return parse_closing_refs(data)
 
     def _graphql(self, query: str, **variables: str) -> dict:
-        owner, name = self.repo.split("/", 1)
-        args = ["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"repo={name}"]
+        """One query; `variables` must be exactly the ones it declares (GitHub
+        rejects a declared-but-unused variable)."""
+        args = ["api", "graphql", "-f", f"query={query}"]
         for key, value in variables.items():
             args += ["-f", f"{key}={value}"]
         raw = self._gh_json(args)
@@ -1521,17 +1548,18 @@ class GitHubGateway:
         return raw["data"]
 
     def _repository_page(self, fields: str, **variables: str) -> dict:
+        owner, name = self.repo.split("/", 1)
         declared = "".join(f",${key}:String!" for key in variables)
         data = self._graphql(
             f"query($owner:String!,$repo:String!{declared}){{repository(owner:$owner,name:$repo){{{fields}}}}}",
-            **variables,
+            owner=owner, repo=name, **variables,
         )
         if not isinstance(data.get("repository"), dict):
             raise FixObservationIncomplete("repository is unreadable")
         return data["repository"]
 
-    def _nested(self, node: dict, name: str, template: str, *, backward: bool) -> list | None:
-        """A nested connection read in full, or None past its bound."""
+    def _nested(self, node: dict, name: str, template: str, *, on: str, backward: bool) -> list | None:
+        """A nested connection of an `on`-typed node read in full, or None past its bound."""
         nodes, info = _connection(node, name)
         nodes = list(nodes)
         total = node[name].get("totalCount")
@@ -1542,8 +1570,7 @@ class GitHubGateway:
                 return None
             field = template.format(**{"before" if backward else "after": f",{'before' if backward else 'after'}:$cursor"})
             data = self._graphql(
-                f"query($owner:String!,$repo:String!,$id:ID!,$cursor:String!){{node(id:$id){{"
-                f"... on Issue{{{field}}} ... on PullRequest{{{field}}}}}}}",
+                f"query($id:ID!,$cursor:String!){{node(id:$id){{... on {on}{{{field}}}}}}}",
                 id=str(node.get("id") or ""), cursor=cursor,
             )
             page, info = _connection(data.get("node"), name)
@@ -1552,14 +1579,14 @@ class GitHubGateway:
             return None
         return nodes
 
-    def build_fix_world(self) -> WorldState:
+    def build_fix_world(self, base: str) -> WorldState:
         """The fix role's observation: open `ai-ready`/`needs-human` issues,
         open harness PRs (`fix/<issue>-`) with head, mergeability, required
         checks, reviews, comments, every changed file and the head push, and
-        harness branches that never had a PR. `GhUnavailable` and incomplete
-        top-level reads propagate: the daemon skips the tick."""
+        harness branches owed a PR against `base`. `GhUnavailable` and
+        incomplete top-level reads propagate: the daemon skips the tick."""
         now = build_time()
-        first = self._repository_page(" ".join(t.format(after="") for t in _FIX_CONNECTIONS.values()))
+        first = self._repository_page(" ".join(t.format(after="") for t in _FIX_CONNECTIONS.values()), base=base)
         collected: dict[str, list] = {}
         for name, template in _FIX_CONNECTIONS.items():
             nodes, info = _connection(first, name)
@@ -1568,7 +1595,8 @@ class GitHubGateway:
                 cursor = info.get("endCursor")
                 if pages >= _FIX_MAX_PAGES[name] or not isinstance(cursor, str) or not cursor:
                     raise FixObservationIncomplete(f"{name} exceed {_FIX_MAX_PAGES[name]} pages")
-                page = self._repository_page(template.format(after=",after:$after"), after=cursor)
+                page = self._repository_page(template.format(after=",after:$after"), after=cursor,
+                                             **({"base": base} if name == "refs" else {}))
                 more, info = _connection(page, name)
                 nodes.extend(more)
                 pages += 1
@@ -1578,11 +1606,12 @@ class GitHubGateway:
         for node in collected["issues"]:
             number = node.get("number") if isinstance(node, dict) else None
             try:
-                comments = self._nested(node, "comments", _COMMENTS, backward=True)
-                if comments is None:
-                    raise FixObservationIncomplete("comments exceed their bound")
+                comments = self._nested(node, "comments", _COMMENTS, on="Issue", backward=True)
+                xrefs = self._nested(node, "timelineItems", _TIMELINE, on="Issue", backward=True)
+                if comments is None or xrefs is None:
+                    raise FixObservationIncomplete("comments or cross-references exceed their bound")
                 issues.append(parse_fix_issue(node, comments))
-                merged.update((p.number, p) for p in parse_merged_harness_prs(node, self.repo))
+                merged.update((p.number, p) for p in parse_merged_harness_prs(xrefs, self.repo))
             except FixObservationIncomplete as exc:
                 self._skip_item("issue", number if type(number) is int else 0, exc)
         prs: list[PRView] = []
@@ -1592,9 +1621,9 @@ class GitHubGateway:
             if not node["headRefName"].startswith(_HARNESS_BRANCH_PREFIX):
                 continue
             try:
-                comments = self._nested(node, "comments", _COMMENTS, backward=True)
-                reviews = self._nested(node, "reviews", _REVIEWS, backward=True)
-                files = self._nested(node, "files", _FILES, backward=False)
+                comments = self._nested(node, "comments", _COMMENTS, on="PullRequest", backward=True)
+                reviews = self._nested(node, "reviews", _REVIEWS, on="PullRequest", backward=True)
+                files = self._nested(node, "files", _FILES, on="PullRequest", backward=False)
                 if comments is None or reviews is None or files is None:
                     raise FixObservationIncomplete("a nested connection exceeds its bound")
                 pr = parse_fix_pr(node, comments, reviews, files)
@@ -1609,8 +1638,10 @@ class GitHubGateway:
                           branches=parse_fix_refs(collected["refs"]))
 
     def pull_request_for_branch(self, branch: str) -> int | None:
-        """Any PR (any state) whose head is `branch` in this repository."""
-        data = self._gh_json(["pr", "list", "--repo", self.repo, "--head", branch, "--state", "all",
+        """The open PR whose head is `branch` in this repository. A closed one
+        does not count: a branch pushed after its PR was closed is reopened
+        with a new PR."""
+        data = self._gh_json(["pr", "list", "--repo", self.repo, "--head", branch, "--state", "open",
                               "--json", "number,headRefName", "--limit", "10"])
         if not isinstance(data, list):
             raise FixObservationIncomplete("PR lookup by branch is unreadable")

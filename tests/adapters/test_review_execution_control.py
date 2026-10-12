@@ -66,7 +66,7 @@ def rig(tmp_path, request):
     snapshot = _activate_execution_fixture(store, gateway, baseline=getattr(request, "param", True))
     install_workflow(store, resolve_snapshot(7))
     gateway.calls.clear()
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
     selection = ReviewPreflightSelection("preflight:1", snapshot.revision, snapshot.execution.binding, occurrence, -9,
                                         ObservedPullRequest(snapshot.revision.fence.key, gateway.view.head_ref_oid,
@@ -111,7 +111,7 @@ def test_unresolved_submission_holds_next_preflight(rig, status):
         assert store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
                                                  EffectStatus(status), error="lost response"))
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
     later = replace(selection, request_id="preflight:2", expected=current(store, selection).revision,
                     claim_occurrence_id=occurrence)
@@ -166,7 +166,7 @@ def test_preflight_refuses_absent_changed_or_unproven_parent_claim_without_write
     if corruption in {"released", "replacement"}:
         assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
         if corruption == "replacement":
-            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     else:
         with store.transaction() as db:
             if corruption == "missing_created":
@@ -335,7 +335,7 @@ def test_fresh_remote_evidence_must_match_selection_and_claim_linkage(rig, chang
 def linked_selection(rig):
     store, _, gateway, selection, _ = rig
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    assert store.claim_dispatch("o/r", "review", 7, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", 7, AgentKind.REVIEW.name, OWNER)
     gateway.view = replace(gateway.view, closing_issue=7)
     return replace(selection, claim_target=7, claim_occurrence_id=store.active_dispatch_claims("o/r", "review")[0].claim_key)
 
@@ -448,7 +448,7 @@ def test_claim_replaced_during_gateway_read_cannot_allocate_using_old_occurrence
     def replace_claim():
         gateway.on_pr = None
         assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
         after_replacement.append(dump(store))
 
     gateway.on_pr = replace_claim
@@ -485,7 +485,7 @@ def test_policy_or_retired_authority_refusal_never_allocates_a_round(rig, refusa
 def test_preflight_accepts_the_rereview_claim_leg(rig):
     store, _, _, selection, control = rig
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.RE_REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.RE_REVIEW.name, OWNER)
     occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
     plan = control.preflight(replace(selection, claim_occurrence_id=occurrence))
     assert plan.round.sequence == 1 and plan.round.binding == selection.binding
@@ -559,7 +559,7 @@ import sys
 from issue_agent.adapters.control_store import SQLiteControlStore
 store = SQLiteControlStore(sys.argv[1])
 store.initialize()
-assert store.claim_dispatch('o/r', 'review', -9, 'REVIEW', sys.argv[2], frozenset())
+assert store.claim_dispatch('o/r', 'review', -9, 'REVIEW', sys.argv[2])
 print(store.active_dispatch_claims('o/r', 'review')[0].claim_key)
 """, store.path, OWNER],
         capture_output=True, text=True, check=True,

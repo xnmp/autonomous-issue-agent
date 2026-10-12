@@ -207,7 +207,7 @@ def test_paid_reservation_does_not_authorize_a_stale_or_unproven_launch(admitted
     store, _, proposed = admitted
     if change == "replaced_claim":
         assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     else:
         with store.transaction() as db:
             if change == "stale_binding":

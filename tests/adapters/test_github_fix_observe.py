@@ -4,6 +4,7 @@ world build, against GitHub GraphQL answer shapes."""
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -27,7 +28,7 @@ def issue_node(number=5, **kw) -> dict:
     node = {"id": f"I{number}", "number": number, "title": "Null token", "state": "OPEN",
             "author": {"login": "alice"}, "labels": labels("ai-ready"),
             "comments": {"totalCount": 0, "pageInfo": {"hasPreviousPage": False}, "nodes": []},
-            "timelineItems": {"nodes": []}}
+            "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": []}}
     node.update(kw)
     return node
 
@@ -43,8 +44,18 @@ def pr_node(number=100, head="h1", **kw) -> dict:
     return node
 
 
-def ref(name: str, prs: int = 0, committed: str = "2026-10-01T00:00:00Z") -> dict:
-    return {"name": name, "associatedPullRequests": {"totalCount": prs}, "target": {"committedDate": committed}}
+def ref(name: str, *prs: dict, committed: str = "2026-10-01T00:00:00Z", ahead: int | None = 1) -> dict:
+    """A `fix/` ref node: its newest PR (if any), head commit date, and commits ahead of base."""
+    return {"name": name, "associatedPullRequests": {"totalCount": len(prs), "nodes": list(prs[-1:])},
+            "target": {"committedDate": committed}, "compare": None if ahead is None else {"behindBy": ahead}}
+
+
+def assoc(state: str, closed: str | None = None) -> dict:
+    return {"state": state, "closedAt": closed}
+
+
+def xref(number, state="MERGED", repo="o/r", head="fix/5-x") -> dict:
+    return {"source": {"number": number, "state": state, "headRefName": head, "repository": {"nameWithOwner": repo}}}
 
 
 # ── parsers ──────────────────────────────────────────────────────────────────
@@ -90,13 +101,28 @@ def test_a_malformed_pr_node_is_incomplete(node):
         parse_fix_pr(node, [], [], [])
 
 
-def test_only_harness_branches_that_never_had_a_pr_are_owed_publication():
-    refs = [ref("5-null-token"), ref("6-merged", prs=1), ref("7-new", committed="")]
-    assert parse_fix_refs(refs) == (Branch("fix/5-null-token", "2026-10-01T00:00:00Z"), Branch("fix/7-new", ""))
+@pytest.mark.parametrize(("node", "owed"), [
+    (ref("5-x"), True),                                                           # never had a PR
+    (ref("5-x", ahead=0), False),                                                 # nothing ahead of base (P1-9)
+    (ref("5-x", ahead=None), False),                                              # comparison impossible: unproven
+    (ref("5-x", assoc("OPEN")), False),
+    (ref("5-x", assoc("MERGED", "2026-09-01T00:00:00Z")), False),
+    (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z")), True),                  # pushed after a human closed it (P1-8)
+    (ref("5-x", assoc("CLOSED", "2026-10-02T00:00:00Z")), False),                 # closed after its last push
+    (ref("5-x", assoc("CLOSED", None)), False),
+    (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z"), committed=""), False),   # untimed push proves nothing
+])
+def test_a_branch_is_owed_a_pr_only_when_ahead_of_base_and_without_a_live_or_newer_pr(node, owed):
+    assert parse_fix_refs([node]) == ((Branch("fix/5-x", node["target"]["committedDate"]),) if owed else ())
 
 
 @pytest.mark.parametrize("bad", [
-    [None], [{"name": 5}], [{"name": "5-x"}], [{"name": "5-x", "associatedPullRequests": {"totalCount": "0"}}],
+    [None], [{"name": 5}], [{"name": "5-x"}],
+    [{**ref("5-x"), "associatedPullRequests": {"totalCount": "0", "nodes": []}}],
+    [{**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": []}}],
+    [{**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": [{"state": "DRAFT"}]}}],
+    [{**ref("5-x"), "compare": {"behindBy": "2"}}],
+    [{**ref("5-x"), "compare": []}],
 ])
 def test_an_unreadable_branch_association_is_incomplete_not_unpublished(bad):
     with pytest.raises(FixObservationIncomplete):
@@ -104,14 +130,9 @@ def test_an_unreadable_branch_association_is_incomplete_not_unpublished(bad):
 
 
 def test_merged_harness_prs_come_only_from_this_repository_and_fix_branches():
-    def xref(number, state="MERGED", repo="O/R", head="fix/5-x"):
-        return {"source": {"number": number, "state": state, "headRefName": head,
-                           "repository": {"nameWithOwner": repo}}}
-    node = issue_node(timelineItems={"nodes": [
-        xref(10), xref(11, state="CLOSED"), xref(12, repo="fork/r"), xref(13, head="feat/5-x"), {"source": None},
-    ]})
-    assert [p.number for p in parse_merged_harness_prs(node, "o/r")] == [10]
-    assert parse_merged_harness_prs(node, "o/r")[0].state == "MERGED"
+    items = [xref(10, repo="O/R"), xref(11, state="CLOSED"), xref(12, repo="fork/r"), xref(13, head="feat/5-x"),
+             {"source": None}, None]
+    assert [(p.number, p.state) for p in parse_merged_harness_prs(items, "o/r")] == [(10, "MERGED")]
 
 
 # ── the bounded world build ──────────────────────────────────────────────────
@@ -134,14 +155,13 @@ class GraphQL:
 
 
 def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
-    merged = {"source": {"number": 9, "state": "MERGED", "headRefName": "fix/4-old",
-                         "repository": {"nameWithOwner": "o/r"}}}
+    merged = xref(9, head="fix/4-old")
     runner = GraphQL({
-        "issues": page([issue_node(5), issue_node(4, timelineItems={"nodes": [merged]})]),
+        "issues": page([issue_node(5), issue_node(4, timelineItems={"pageInfo": {}, "nodes": [merged]})]),
         "pullRequests": page([pr_node(headRefName="feature/x")]),  # not a harness PR: never fetched further
         "refs": page([ref("5-null-token")]),
     })
-    world = GitHubGateway("o/r", runner=runner).build_fix_world()
+    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
     assert [i.number for i in world.issues] == [5, 4]
     assert [(p.number, p.state) for p in world.prs] == [(9, "MERGED")]
     assert world.branches == (Branch("fix/5-null-token", "2026-10-01T00:00:00Z"),)
@@ -151,14 +171,14 @@ def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
 def test_an_issue_with_unreadable_comments_is_skipped_not_misread():
     broken = issue_node(6, comments={"totalCount": 3, "pageInfo": {"hasPreviousPage": False}, "nodes": []})
     runner = GraphQL({"issues": page([issue_node(5), broken]), "pullRequests": page([]), "refs": page([])})
-    assert [i.number for i in GitHubGateway("o/r", runner=runner).build_fix_world().issues] == [5]
+    assert [i.number for i in GitHubGateway("o/r", runner=runner).build_fix_world("dev").issues] == [5]
 
 
 def test_a_top_level_connection_past_its_page_bound_skips_the_tick():
     first = {"issues": page([], more=True, cursor="c0"), "pullRequests": page([]), "refs": page([])}
     more = [{"issues": page([], more=True, cursor=f"c{i}")} for i in range(1, 12)]
     with pytest.raises(FixObservationIncomplete, match="issues exceed"):
-        GitHubGateway("o/r", runner=GraphQL(first, *more)).build_fix_world()
+        GitHubGateway("o/r", runner=GraphQL(first, *more)).build_fix_world("dev")
 
 
 @pytest.mark.parametrize("answer", [
@@ -168,12 +188,115 @@ def test_a_top_level_connection_past_its_page_bound_skips_the_tick():
 def test_an_errored_or_partial_answer_skips_the_tick(answer):
     gateway = GitHubGateway("o/r", runner=lambda argv, token: json.dumps(answer))
     with pytest.raises(FixObservationIncomplete):
-        gateway.build_fix_world()
+        gateway.build_fix_world("dev")
 
 
 def test_an_unreadable_open_pr_still_shadows_its_issue_with_no_head():
     runner = GraphQL({"issues": page([issue_node(5)]),
                       "pullRequests": page([pr_node(labels={"totalCount": 2, "nodes": []})]),
                       "refs": page([])})
-    world = GitHubGateway("o/r", runner=runner).build_fix_world()
+    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
     assert [(p.number, p.head_ref_oid, p.content_known) for p in world.prs] == [(100, "", False)]
+
+
+# ── paged reads: the query text GitHub validates (P1-5) ──────────────────────
+
+def _back(nodes, cursor=None) -> dict:
+    return {"totalCount": None, "pageInfo": {"hasPreviousPage": cursor is not None, "startCursor": cursor},
+            "nodes": nodes}
+
+
+def _fwd(nodes, cursor=None) -> dict:
+    return {"pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor}, "nodes": nodes}
+
+
+class PagedGitHub:
+    """Answers the first repository read with one more page behind every
+    connection, then each follow-up read from the query it is sent. Records
+    every GraphQL query with the variables passed to it."""
+
+    def __init__(self, timeline_pages: int = 1):
+        self.calls: list[tuple[str, dict]] = []
+        self.timeline_pages = timeline_pages
+
+    def first(self) -> dict:
+        issue = issue_node(5, comments=_back([], "ic"), timelineItems=_back([], "it0"))
+        harness = pr_node(comments=_back([], "pc"), reviews=_back([], "pr"), files={"totalCount": None, **_fwd([], "pf")})
+        return {"issues": page([issue]), "pullRequests": page([harness]), "refs": _fwd([], "r1")}
+
+    def node(self, query: str, variables: dict) -> dict:
+        name = re.search(r"on \w+\{(\w+)\(", query).group(1)
+        if name == "timelineItems":
+            step = int(variables["cursor"].removeprefix("it")) + 1
+            more = f"it{step}" if step < self.timeline_pages else None
+            nodes = [xref(9, head="fix/5-old")] if more is None else [xref(n, state="CLOSED") for n in range(100)]
+            return {name: _back(nodes, more)}
+        if name == "files":
+            return {name: _fwd([{"path": "src/a.py"}])}
+        if name == "reviews":
+            return {name: _back([{"author": {"login": "review-bot"}, "state": "APPROVED",
+                                   "submittedAt": "2026-10-01T00:00:00Z", "body": "", "commit": {"oid": "h1"}}])}
+        return {name: _back([{"author": {"login": "alice"}, "body": "older", "createdAt": "2026-09-01T00:00:00Z"}])}
+
+    def __call__(self, argv, _token):
+        if argv[:3] != ["gh", "api", "graphql"]:
+            return "[]"  # REST reads (required checks): nothing configured
+        pairs = [argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "-f"]
+        variables = {k: v for k, v in pairs}
+        query = variables.pop("query")
+        self.calls.append((query, variables))
+        if query.startswith("query($id"):
+            return json.dumps({"data": {"node": self.node(query, variables)}})
+        if "refs(" in query and "after:$after" in query:
+            return json.dumps({"data": {"repository": {"refs": _fwd([ref("5-x")])}}})
+        return json.dumps({"data": {"repository": self.first()}})
+
+
+def _declared(query: str) -> set[str]:
+    header = query[query.index("(") + 1:query.index(")")]
+    return set(re.findall(r"\$(\w+):", header))
+
+
+def _used(query: str) -> set[str]:
+    return set(re.findall(r"\$(\w+)", query[query.index(")") + 1:]))
+
+
+def test_every_paged_query_declares_exactly_the_variables_it_uses_and_is_sent_them():
+    runner = PagedGitHub()
+    world = GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    assert len(runner.calls) == 7  # first read, refs page 2, 5 nested pages
+    for query, variables in runner.calls:
+        assert _declared(query) == _used(query) == set(variables), query
+
+
+@pytest.mark.parametrize(("connection", "owners"), [
+    ("timelineItems", ["Issue"]), ("files", ["PullRequest"]), ("reviews", ["PullRequest"]),
+    ("comments", ["Issue", "PullRequest"]),
+])
+def test_a_nested_page_selects_its_connection_only_on_the_owners_type(connection, owners):
+    runner = PagedGitHub()
+    GitHubGateway("o/r", runner=runner).build_fix_world("dev")
+    pages = [q for q, _ in runner.calls if q.startswith("query($id") and f"{{{connection}(" in q]
+    head = re.compile(r"query\(\$id:ID!,\$cursor:String!\)\{node\(id:\$id\)\{\.\.\. on (\w+)\{" + connection + r"\(")
+    assert sorted(m.group(1) for q in pages if (m := head.match(q))) == owners
+    assert len(pages) == len(owners)
+
+
+def test_paged_connections_are_read_in_full():
+    world = GitHubGateway("o/r", runner=PagedGitHub()).build_fix_world("dev")
+    (issue,) = world.issues
+    harness = next(p for p in world.prs if p.state == "OPEN")
+    assert [c.body for c in issue.comments] == ["older"]
+    assert harness.content_known and harness.changed_files == frozenset({"src/a.py"})
+    assert [r.state for r in harness.reviews] == ["APPROVED"] and len(harness.comments) == 1
+    assert world.branches == (Branch("fix/5-x", "2026-10-01T00:00:00Z"),)
+
+
+def test_a_merged_pr_on_a_later_cross_reference_page_still_retires_its_issue():
+    world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=3)).build_fix_world("dev")
+    assert [(p.number, p.state) for p in world.prs if p.state == "MERGED"] == [(9, "MERGED")]
+
+
+def test_cross_references_past_their_bound_skip_the_issue_rather_than_read_as_unmerged():
+    world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=50)).build_fix_world("dev")
+    assert world.issues == () and not any(p.state == "MERGED" for p in world.prs)

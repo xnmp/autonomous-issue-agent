@@ -353,6 +353,8 @@ class RunContext:
     review_child: ReviewChildIdentity | None = None
     # The PR head a fix leg was decided on (accounting records it per run).
     head: str = ""
+    # A fix leg continuing a wall-capped leg (the resume-once rule's input).
+    resumed: bool = False
 
 
 def _run_correlation(
@@ -475,6 +477,7 @@ class JournalingRuntime:
         workflow: WorkflowBinding | None = None,
         review_child: ReviewChildIdentity | None = None,
         head: str = "",
+        resumed: bool = False,
     ) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
         Mutable state on purpose: journaling and paid admission consume the
@@ -494,6 +497,7 @@ class JournalingRuntime:
             workflow=workflow,
             review_child=review_child,
             head=head,
+            resumed=resumed,
         ))
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
@@ -505,6 +509,7 @@ class JournalingRuntime:
                 workflow=workflow,
                 **({"review_child": review_child} if review_child is not None else {}),
                 head=head,
+                resumed=resumed,
             )
 
     @contextlib.contextmanager
@@ -533,6 +538,7 @@ class JournalingRuntime:
                 workflow=previous.workflow,
                 **({"review_child": previous.review_child} if previous.review_child is not None else {}),
                 head=previous.head,
+                resumed=previous.resumed,
             )
         try:
             yield
@@ -547,6 +553,7 @@ class JournalingRuntime:
                     workflow=previous.workflow,
                     **({"review_child": previous.review_child} if previous.review_child is not None else {}),
                     head=previous.head,
+                    resumed=previous.resumed,
                 )
             self._context.reset(token)
 

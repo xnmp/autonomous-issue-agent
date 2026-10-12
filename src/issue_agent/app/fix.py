@@ -13,19 +13,18 @@ the review role.
 from __future__ import annotations
 
 import json
-import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from ..adapters.control_store import FixRun
-from ..domain.actions import Action, AgentKind, MergePullRequest, PostComment, RunAgent, Target
+from ..domain.actions import Action, AgentKind, MergePullRequest, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.ci import failed_checks, parse_timestamp
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
-from ..domain.outcome import LegClass, classify_leg
-from ..domain.policy import actions as policy_actions
+from ..domain.outcome import LegClass
+from ..domain.policy import actions as policy_actions, question_text
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.state import Harness, ItemKey, Local, derive, issue_key, pr_key
 from ..domain.trust import as_untrusted
@@ -36,7 +35,6 @@ from .workflows.base import run_leg
 # Pre-5b run kinds (RESUME, PR_RESUME, ROUTE) belong to no act: under the
 # cutover rule those legs simply stop counting.
 _FIX_ACTS = frozenset({AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.ADDRESS_REVIEW})
-_QUESTION_LIMIT = 4000
 
 
 def run_item(run: FixRun) -> ItemKey | None:
@@ -56,14 +54,18 @@ def leg_end(run: FixRun) -> LegEnd | None:
     kind = dispatched_kind(run.kind)
     if kind not in _FIX_ACTS or run.completed_at.utcoffset() is None:
         return None
-    leg = run.receipt.get("leg") if run.receipt is not None else None
+    leg = _leg(run)
     started = run.started_at
     if started is not None and (started.utcoffset() is None or started > run.completed_at):
         started = None
-    return LegEnd(
-        kind, run.completed_at, leg not in (LegClass.AGENT.value, LegClass.ASKED.value), run.head,
-        asked=leg == LegClass.ASKED.value, started_at=started,
-    )
+    question = question_text((run.receipt or {}).get("question")) if leg is LegClass.ASKED else None
+    return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started)
+
+
+def _leg(run: FixRun) -> LegClass:
+    """A run's recorded class; no readable receipt is a machine end."""
+    raw = run.receipt.get("leg") if run.receipt is not None else None
+    return next((c for c in (LegClass.AGENT, LegClass.ASKED) if raw == c.value), LegClass.MACHINE)
 
 
 def local_legs(runs: Iterable[FixRun]) -> dict[ItemKey, tuple[LegEnd, ...]]:
@@ -121,14 +123,6 @@ def human_reply(comments: Iterable[Comment], after: datetime, harness: Harness) 
     return "\n\n".join(f"@{c.author}: {c.body}" for _, c in sorted(picked, key=lambda p: p[0]))
 
 
-def question_body(harness: Harness, needs: str) -> str:
-    """The agent's question as a marked harness comment. The text is the
-    agent's: hidden-comment openers are neutralised so it can never carry a
-    stop tag or the harness marker."""
-    text = (needs or "").replace("<!--", "<​!--").strip()[:_QUESTION_LIMIT] or "(no question text)"
-    return f"{harness.marker}\n**The agent needs a human's judgment:**\n\n{text}"
-
-
 @dataclass(frozen=True)
 class FixSettings:
     repository: str
@@ -140,8 +134,10 @@ class FixSettings:
 
 
 class FixFacts:
-    """The local facts derive needs, read from SQLite each tick. Any read
-    failure raises: the daemon skips the tick rather than deciding blind."""
+    """The local facts derive needs, read from SQLite each tick. A failed run
+    or lease read raises: the daemon skips the tick rather than deciding
+    blind. A failed lifetime-spend read is no headroom instead: paid legs wait
+    silently and free work (merge, open, refresh, stops) goes on."""
 
     def __init__(
         self,
@@ -173,17 +169,23 @@ class FixFacts:
         return held
 
     def __call__(self, world: WorldState) -> Local:
-        # Sampled before the SQLite reads: a leg ending mid-read then reads
-        # busy for one more tick instead of free with its end not yet seen.
+        # `active` is sampled before the run read, so a leg ending between the
+        # two reads is busy (still active) rather than free with its end
+        # unseen. A leg that ended after GitHub was read is seen here but its
+        # push may not be in `world`: derive holds it busy (end > world.now).
         active = tuple(self.active())
         issues = item_issues(world)
         runs = self.control.fix_runs(self.settings.repository, issues)
+        try:
+            capped: frozenset[int] | None = frozenset(n for n in issues if self.lifetime_capped(n))
+        except Exception:  # noqa: BLE001 - see the class docstring
+            capped = None
         return Local(
             now=self.now(),
             legs=local_legs(runs),
             leases=leased_items(active, self.held_issues()),
-            headroom=self.headroom(),
-            lifetime_capped=frozenset(n for n in issues if self.lifetime_capped(n)),
+            headroom=capped is not None and self.headroom(),
+            lifetime_capped=capped or frozenset(),
         )
 
 
@@ -191,7 +193,9 @@ class FixLegs:
     """Runs one fix leg: re-checks the item against GitHub, prepares the
     worktree, picks the session to resume, builds the task, and runs it
     through the accounting runtime. A preparation failure is recorded as a
-    refused (machine) leg so the item backs off instead of retrying hot."""
+    refused (machine) leg so the item backs off instead of retrying hot. A
+    question the leg asks is recorded in its receipt; derive's QUESTION stop
+    comment carries it (one writer, one comment)."""
 
     def __init__(
         self,
@@ -203,7 +207,6 @@ class FixLegs:
         accounting,
         worktrees,
         task_config: tasks.FixTaskConfig,
-        post: Callable[[PostComment], None],
         prepare_cwd: Callable[[str], None] | None,
         log: Callable[[str], None],
     ) -> None:
@@ -214,7 +217,6 @@ class FixLegs:
         self.accounting = accounting
         self.worktrees = worktrees
         self.task_config = task_config
-        self.post = post
         self.prepare_cwd = prepare_cwd
         self.log = log
 
@@ -236,9 +238,8 @@ class FixLegs:
                 return
         owner = self.settings.owner_id
         repo = self.settings.repository
-        self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue, head=action.head)
-        if not self.control.claim_dispatch(repo, "fix", issue, action.kind.name, owner, frozenset()):
-            self.log(f"{action.kind.name} #{action.number}: skipped — issue #{issue} is held by another leg")
+        if not self.control.claim_dispatch(repo, "fix", issue, action.kind.name, owner):
+            self.log(f"{action.kind.name} #{action.number}: skipped — issue #{issue} already has a fix leg in flight")
             return
         try:
             await self._run_claimed(action, item, issue, subject)
@@ -247,7 +248,16 @@ class FixLegs:
 
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
         runs = sorted(self.control.fix_runs(self.settings.repository, (issue,)), key=lambda r: r.completed_at)
-        latest = next((r for r in reversed(runs) if run_item(r) == item), None)
+        mine = [r for r in runs if run_item(r) == item]
+        latest = mine[-1] if mine else None
+        # The question is the newest agent leg's, the same rule derive stops on:
+        # a machine death after the answer must not drop the answer.
+        answered = next((r for r in reversed(mine) if _leg(r) is not LegClass.MACHINE), None)
+        asked = answered if answered is not None and _leg(answered) is LegClass.ASKED else None
+        # Resume once (classify_leg): a leg continuing a machine end's session.
+        continues = latest is not None and _leg(latest) is LegClass.MACHINE and bool(self._session([latest]))
+        self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue,
+                                 head=action.head, resumed=continues)
         try:
             if action.kind is AgentKind.RESOLVE:
                 branch = self._resolve_branch(issue, subject.title)
@@ -256,23 +266,17 @@ class FixLegs:
                 cwd = self.worktrees.sync(issue, subject.head_ref_name, action.head)
             if self.prepare_cwd is not None:
                 self.prepare_cwd(cwd)
-            task = self._task(action, subject, cwd, runs, latest)
+            task = self._task(action, subject, cwd, runs, latest if continues else None, asked)
             task = replace(task, env={**task.env, **self._git_identity()})
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")
             self.accounting.record_refused_leg()
             return
         target = LegTarget.ISSUE if action.kind is AgentKind.RESOLVE else LegTarget.PR
-        result = await run_leg(
+        await run_leg(
             self.runtime, self.log, Leg(action.kind.name, target, action.number, True, ("global", "repository", "issue")),
             task,
         )
-        if classify_leg(result, resumed=bool(task.resume)) is LegClass.ASKED:
-            self.post(PostComment(
-                Target.ISSUE if action.kind is AgentKind.RESOLVE else Target.PR, action.number,
-                question_body(self.settings.harness, result.needs),
-                key=f"question:{item.target.name.lower()}:{item.number}:{uuid.uuid4().hex}",
-            ))
 
     def _git_identity(self) -> dict[str, str]:
         """Commits attribute to the fix bot (or to no login at all), never to
@@ -296,22 +300,22 @@ class FixLegs:
                 return session
         return ""
 
-    def _task(self, action: RunAgent, subject, cwd: str, runs: list[FixRun], latest: FixRun | None):
+    def _task(
+        self, action: RunAgent, subject, cwd: str, runs: list[FixRun], cut_off: FixRun | None, asked: FixRun | None,
+    ):
+        """`cut_off` is the machine end this leg continues; `asked` the agent
+        leg whose question a human has since answered."""
         cfg = self.task_config
-        receipt = (latest.receipt or {}) if latest is not None else {}
-        asked = receipt.get("leg") == LegClass.ASKED.value
-        latest_session = self._session([latest]) if latest is not None else ""
-        reply = human_reply(subject.comments, latest.completed_at, self.settings.harness) if asked and latest else ""
+        reply = human_reply(subject.comments, asked.completed_at, self.settings.harness) if asked else ""
         if action.kind is AgentKind.RESOLVE:
-            if asked:
-                if latest_session:
-                    return tasks.build_resume_task(as_untrusted(reply), cwd, latest_session, cfg)
+            if cut_off is not None:
+                return tasks.build_continue_task(cwd, self._session([cut_off]), cfg)
+            if asked is not None:
+                if session := self._session([asked]):
+                    return tasks.build_resume_task(as_untrusted(reply), cwd, session, cfg)
                 return tasks.build_fresh_reply_task(
                     action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(reply), cwd, cfg,
                 )
-            if latest is not None and receipt.get("leg") == LegClass.MACHINE.value and latest_session:
-                # A wall-cap machine end resumes its session once (classify_leg).
-                return tasks.build_continue_task(cwd, latest_session, cfg)
             return tasks.build_resolve_task(
                 action.number, as_untrusted(subject.title), as_untrusted(subject.body), cwd, cfg,
                 self._resolve_branch(action.number, subject.title),
@@ -375,5 +379,5 @@ def lease_slots(daemon_ref: Mapping[str, object]) -> Callable[[], int]:
 
 __all__ = [
     "FixFacts", "FixLegs", "FixSettings", "decide_with", "dispatch_item", "fix_actions", "human_reply",
-    "item_issues", "leased_items", "leg_end", "local_legs", "question_body", "run_item",
+    "item_issues", "leased_items", "leg_end", "local_legs", "run_item",
 ]

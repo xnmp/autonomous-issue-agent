@@ -2,8 +2,9 @@
 
 `needs-human` has one writer: this module. A stop adds the label first and
 then one marked comment keyed for dedupe. That order matters: a crash between
-the two leaves the item labelled (stopped, visible) rather than leaving a stop
-comment on an unlabelled item, which derive would read as already released.
+the two leaves the item labelled with no stop comment, which derive re-stops
+(both writes again; the label is idempotent and the comment keyed), rather than
+a stop comment on an unlabelled item, which derive would read as released.
 """
 
 from __future__ import annotations
@@ -24,13 +25,22 @@ _WHY = {
     StopReason.LIFETIME_CAP: "this issue has spent its lifetime budget; raising the cap is a grant.",
     StopReason.ATTEMPTS: f"{{act}} ran {ATTEMPT_CAP} times without progress since the last human activity.",
     StopReason.REVIEW_ROUNDS: f"the reviewer requested changes {REVIEW_ROUND_CAP} times; the dispute needs a human.",
-    StopReason.QUESTION: "the agent asked a question that needs a human's judgment (see its comment above).",
+    StopReason.QUESTION: "the agent asked a question that needs a human's judgment:",
 }
 _HOW = {
     StopReason.LIFETIME_CAP: "Raise the per-issue budget, then reply here or remove the `needs-human` label.",
     StopReason.QUESTION: "Reply here with the answer (the agent resumes with it), or remove the `needs-human` label.",
 }
 _DEFAULT_HOW = "Reply here or remove the `needs-human` label to release it."
+QUESTION_LIMIT = 4000
+
+
+def question_text(needs: object) -> str:
+    """The agent's question as text a stop comment may embed: bounded, and with
+    hidden-comment openers neutralised so it can never carry a stop tag or the
+    harness marker. Idempotent, so the writer and the embedder can both apply it."""
+    text = needs if isinstance(needs, str) else ""
+    return text.replace("<!--", "<\u200b!--").strip()[:QUESTION_LIMIT].strip() or "(no question text)"
 
 
 def actions(states: Mapping[ItemKey, DerivedState], harness: Harness) -> tuple[Action, ...]:
@@ -63,8 +73,9 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
         return (Relabel(key.target, key.number, remove=Label.NEEDS_HUMAN, add=None, harness_signal=True),)
     if isinstance(state, NeedsHuman):
         why = _WHY[state.reason].format(act=state.act.name if state.act else "")
+        asked = f"\n\n{question_text(state.question)}" if state.reason is StopReason.QUESTION else ""
         body = (f"{harness.marker}\n{stop_tag(state.reason)}\n"
-                f"**needs-human**: {why}\n\n{_HOW.get(state.reason, _DEFAULT_HOW)}")
+                f"**needs-human**: {why}{asked}\n\n{_HOW.get(state.reason, _DEFAULT_HOW)}")
         return (
             Relabel(key.target, key.number, remove=None, add=Label.NEEDS_HUMAN, harness_signal=True),
             PostComment(key.target, key.number, body, harness_signal=True, key=needs_human_key(key, state)),
@@ -74,4 +85,4 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     raise TypeError(f"unknown derived state {state!r}")
 
 
-__all__ = ["actions", "needs_human_key"]
+__all__ = ["QUESTION_LIMIT", "actions", "needs_human_key", "question_text"]

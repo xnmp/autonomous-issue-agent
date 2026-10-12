@@ -24,7 +24,7 @@ repositories remain trusted-inbound only.
 Slice 5b (2026-10-13) amends this for the fix role. It queues no
 `LifecycleCommand`s: `adapters/act.py` executes its derived Actions directly.
 Each write is naturally idempotent (a label set, a merge or update-branch
-bound to the decided head, a PR opened only when none exists for the branch)
+bound to the decided head, a PR opened only when the branch has no open one)
 or claims an idempotency key in SQLite before writing and confirms it only
 after a GitHub read-back. A failed read-back raises and the next tick
 re-derives from GitHub. The agent pushes its own branch with git; the publish

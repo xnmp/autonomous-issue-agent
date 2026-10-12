@@ -626,8 +626,9 @@ class CancellableAsyncDispatch:
                 continue
 
 
-class DispatchPathReservations:
-    """Atomic issue/path leases shared across threads and deployments."""
+class DispatchReservations:
+    """Atomic issue leases shared across threads and deployments: one paid
+    dispatch per target (Q13 deleted the path-overlap holds)."""
 
     def __init__(
         self,
@@ -638,7 +639,6 @@ class DispatchPathReservations:
         owner_id: str = "",
     ) -> None:
         self._lock = threading.Lock()
-        self._paths: dict[int, frozenset[str]] = {}
         self._actions: dict[RunAgent, int] = {}
         self._control = control
         self._repository = repository
@@ -651,22 +651,9 @@ class DispatchPathReservations:
                 "durable dispatch claims require repository, role, and owner"
             )
 
-    def _conflicts(self, issue: int, paths: frozenset[str]) -> bool:
-        return any(
-            other_issue != issue
-            and (
-                not paths
-                or not other_paths
-                or bool(paths & other_paths)
-            )
-            for other_issue, other_paths in self._paths.items()
-        )
-
-    def reserve(
-        self, action: RunAgent, issue: int, paths: frozenset[str]
-    ) -> bool:
+    def reserve(self, action: RunAgent, issue: int) -> bool:
         with self._lock:
-            if issue in self._paths or self._conflicts(issue, paths):
+            if issue in self._actions.values():
                 return False
             if self._control is not None and not self._control.claim_dispatch(
                 self._repository,
@@ -674,10 +661,8 @@ class DispatchPathReservations:
                 issue,
                 action.kind.name,
                 self._owner_id,
-                paths,
             ):
                 return False
-            self._paths[issue] = paths
             self._actions[action] = issue
             return True
 
@@ -685,7 +670,6 @@ class DispatchPathReservations:
         with self._lock:
             issue = self._actions.pop(action, None)
             if issue is not None:
-                self._paths.pop(issue, None)
                 if self._control is not None:
                     self._control.release_dispatch_claim(
                         self._repository,
@@ -1064,6 +1048,7 @@ def _lifetime_capped(cfg: HarnessConfig, control: SQLiteControlStore) -> Callabl
     def capped(issue: int) -> bool:
         snapshot = control.snapshot(issue_budget_scope(cfg.repo, issue, "USD"))
         if snapshot.disposition.value != "available":
+            # FixFacts reads a failed read as no headroom: paid legs wait, free work goes on.
             raise ControlStoreError(f"issue #{issue} spend is unreadable: {snapshot.detail}")
         return snapshot.committed.micros + leg.micros > cap.micros
 
@@ -1152,7 +1137,6 @@ def compose_fix_daemon(
         runtime=cfg.fixer_runtime.value, state_dir=cfg.state_dir,
     )
     daemon_ref: dict[str, Daemon] = {}
-    act_ref: dict[str, GitHubAct] = {}
     legs = FixLegs(
         gateway, control, settings,
         runtime=runtime,
@@ -1162,7 +1146,6 @@ def compose_fix_daemon(
             cfg.repo, cfg.base_branch, cfg.agent_md, fix_runtime.budget_usd,
             fix_runtime.model, fix_runtime.effort, runtime=cfg.fixer_runtime,
         ),
-        post=lambda comment: act_ref["act"].post(comment),
         prepare_cwd=binding.prepare_cwd,
         log=log,
     )
@@ -1176,7 +1159,6 @@ def compose_fix_daemon(
         marker=settings.harness.marker,
         dispatch=dispatch, remove_worktree=worktrees.remove, log=log,
     )
-    act_ref["act"] = act
     facts = FixFacts(
         control, settings,
         active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
@@ -1189,7 +1171,7 @@ def compose_fix_daemon(
     )
     daemon = Daemon(
         "fix",
-        gateway.build_fix_world,
+        lambda: gateway.build_fix_world(cfg.base_branch),
         decide_with(facts, settings, lease_slots(daemon_ref), log),
         act,
         cfg.tick_interval_seconds,
@@ -1379,7 +1361,7 @@ def compose_review_daemon(
         alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )
-    reservations = DispatchPathReservations(
+    reservations = DispatchReservations(
         control,
         repository=cfg.repo,
         role="review",
@@ -1505,11 +1487,7 @@ def compose_review_daemon(
             # one target identity. Branch linkage is authoritative when GitHub
             # omits a closing issue on a non-default-base PR.
             issue = breaker_key(pr) if pr is not None else -action.number
-            if reservations.reserve(
-                action,
-                issue,
-                frozenset({f"pr:{action.number}"}),
-            ):
+            if reservations.reserve(action, issue):
                 acquired.append(action)
                 continue
             rejected_prs.add(action.number)

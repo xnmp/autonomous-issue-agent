@@ -602,7 +602,6 @@ class _DispatchClaimObservation:
     owner_start_ticks: int
     occurrence_id: str
     claimed_at: str
-    paths_json: str
     bound_runs: tuple[tuple[str, str, int, int], ...]
 
 
@@ -4074,9 +4073,10 @@ class SQLiteControlStore:
         issue: int,
         leg: str,
         owner_id: str,
-        paths: frozenset[str],
     ) -> bool:
-        """Atomically reserve one paid target/path set across deployments."""
+        """Atomically reserve one paid target across deployments. Targets are
+        the only conflict: the path-overlap holds were deleted (Q13), and the
+        `paths_json` column is written empty until the schema drops it."""
 
         if (
             not repository
@@ -4092,7 +4092,6 @@ class SQLiteControlStore:
         if identity is None:
             raise ProcessLookupError("dispatch owner identity is unavailable")
         target = _dispatch_claim_target(issue)
-        encoded_paths = _json(sorted(paths))
         with closing(self._connect()) as db, db:
             observed = self._dispatch_claim_observations(
                 db, repository, role
@@ -4148,20 +4147,8 @@ class SQLiteControlStore:
                         "owner_start_ticks": claim.owner_start_ticks,
                         "claimed_at": claim.claimed_at,
                     })
-                for claim in live:
-                    try:
-                        other_paths = frozenset(json.loads(claim.paths_json))
-                    except (TypeError, json.JSONDecodeError) as exc:
-                        raise CorruptControlStore(
-                            "dispatch claim contains invalid paths"
-                        ) from exc
-                    if (
-                        claim.target == target
-                        or not paths
-                        or not other_paths
-                        or bool(paths & other_paths)
-                    ):
-                        return False
+                if any(claim.target == target for claim in live):
+                    return False
                 occurrence_id = uuid.uuid4().hex
                 claimed_at = _stamp(self._now())
                 db.execute(
@@ -4177,7 +4164,7 @@ class SQLiteControlStore:
                         owner_id,
                         identity.pid,
                         identity.start_ticks,
-                        encoded_paths,
+                        "[]",
                         claimed_at,
                         occurrence_id,
                     ),
@@ -4199,7 +4186,7 @@ class SQLiteControlStore:
     ) -> tuple[_DispatchClaimObservation, ...]:
         rows = db.execute(
             "SELECT dc.target, dc.leg, dc.owner_id, dc.owner_pid, "
-            "dc.owner_start_ticks, dc.occurrence_id, dc.claimed_at, dc.paths_json, dcr.run_id, r.state, "
+            "dc.owner_start_ticks, dc.occurrence_id, dc.claimed_at, dcr.run_id, r.state, "
             "l.pid AS lease_pid, l.process_start_ticks AS lease_start_ticks "
             "FROM dispatch_claims dc "
             "LEFT JOIN dispatch_claim_runs dcr "
@@ -4236,7 +4223,6 @@ class SQLiteControlStore:
                 int(base["owner_start_ticks"]),
                 str(base["occurrence_id"]),
                 str(base["claimed_at"]),
-                str(base["paths_json"]),
                 tuple(bindings),
             )
             for target, (base, bindings) in grouped.items()

@@ -194,13 +194,13 @@ def test_background_dispatch_is_bounded_and_admits_independent_targets():
 
 
 def test_rejected_dispatch_releases_exclusive_lease_and_can_retry():
-    from issue_agent.app.roles import DispatchPathReservations
+    from issue_agent.app.roles import DispatchReservations
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     started = threading.Event()
     release = threading.Event()
     retried = threading.Event()
-    reservations = DispatchPathReservations()
+    reservations = DispatchReservations()
     occupying = RunAgent(AgentKind.RESOLVE, 1)
     rejected = RunAgent(AgentKind.RESOLVE, 50)
     ticks = 0
@@ -210,7 +210,7 @@ def test_rejected_dispatch_releases_exclusive_lease_and_can_retry():
         ticks += 1
         if ticks == 1:
             return [occupying]
-        assert reservations.reserve(rejected, 50, frozenset())
+        assert reservations.reserve(rejected, 50)
         return [rejected]
 
     def run_agent(action):
@@ -236,7 +236,7 @@ def test_rejected_dispatch_releases_exclusive_lease_and_can_retry():
     assert reservations.issue_for(rejected) is None
 
     unrelated = RunAgent(AgentKind.RESOLVE, 99)
-    assert reservations.reserve(unrelated, 99, frozenset({"src/z.py"}))
+    assert reservations.reserve(unrelated, 99)
     reservations.finish(unrelated)
 
     release.set()
@@ -247,12 +247,12 @@ def test_rejected_dispatch_releases_exclusive_lease_and_can_retry():
 
 
 def test_submit_exception_releases_decision_lease():
-    from issue_agent.app.roles import DispatchPathReservations
+    from issue_agent.app.roles import DispatchReservations
     from issue_agent.domain.actions import AgentKind, RunAgent
 
-    reservations = DispatchPathReservations()
+    reservations = DispatchReservations()
     action = RunAgent(AgentKind.RESOLVE, 50)
-    assert reservations.reserve(action, 50, frozenset())
+    assert reservations.reserve(action, 50)
     daemon = Daemon(
         "fix",
         lambda: WorldState(),
@@ -269,7 +269,6 @@ def test_submit_exception_releases_decision_lease():
     assert reservations.reserve(
         RunAgent(AgentKind.RESOLVE, 99),
         99,
-        frozenset({"src/z.py"}),
     )
 
 

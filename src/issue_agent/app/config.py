@@ -281,9 +281,8 @@ class HarnessConfig:
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
     # there is exactly one source and 20 (the value that actually shipped) wins.
     poll_seconds: int = 20
-    # Paid fix legs run independently of observation; values >1 admit disjoint
-    # work up to this bound (the path-overlap serializer still keeps same-path
-    # and path-unknown legs exclusive). Default 2 since 2026-08-02: with one
+    # Paid fix legs run independently of observation; values >1 admit legs on
+    # different issues up to this bound (one leg per issue). Default 2 since 2026-08-02: with one
     # slot a single ADDRESS_REVIEW leg held the whole deployment while other
     # PRs' repairs queued behind it. Review dispatch remains
     # synchronous. Set FIX_DISPATCH_CONCURRENCY=1 to restore serial dispatch.

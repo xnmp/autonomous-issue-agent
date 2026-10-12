@@ -30,7 +30,7 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
         snapshot = load_review_workflow_row(db, KEY)
         assert snapshot is not None and isinstance(snapshot.execution, CurrentReviewExecution)
     assert review.control.claim_dispatch(REPO, "review", 1, AgentKind.REVIEW.name,
-                                         review.owner_id, frozenset())
+                                         review.owner_id)
     claim = review.control.active_dispatch_claims(REPO, "review")[0]
     observed, view = read_pull_request(composed.remote, KEY, deployment.clock.now(), reviews=True)
     assert isinstance(observed, ObservedPullRequest) and view is not None

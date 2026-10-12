@@ -202,7 +202,6 @@ def test_production_runtime_binds_paid_run_to_dispatch_claim(tmp_path) -> None:
         1,
         "RESOLVE",
         "o/r:fix:deployment",
-        frozenset({"src/a.py"}),
     )
 
     result = asyncio.run(
@@ -312,7 +311,6 @@ def test_issue_less_review_binds_pr_claim_without_issue_budget_scope(
         -42,
         "REVIEW",
         owner,
-        frozenset({"pr:42"}),
     )
     wrapper.set_context(
         "review",
@@ -370,7 +368,6 @@ def test_issue_less_multi_review_preserves_pr_claim_across_leg_context(
         -42,
         "REVIEW",
         owner,
-        frozenset({"pr:42"}),
     )
     journaled = JournalingRuntime(
         accounting,
@@ -430,7 +427,6 @@ def test_linked_review_separates_issue_claim_from_pr_retry_key(tmp_path) -> None
         9,
         "REVIEW",
         owner,
-        frozenset({"pr:42"}),
     )
     wrapper.set_context(
         "review",

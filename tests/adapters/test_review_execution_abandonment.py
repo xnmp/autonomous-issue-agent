@@ -214,7 +214,7 @@ def test_replaced_claim_does_not_reopen_old_occurrence(rig):
     plan = control.preflight(selection)
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     from issue_agent.domain.actions import AgentKind
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     abandoned = control.seal_abandoned_planning(plan.round.round_id)
     assert abandoned.abandonment_receipt.endswith(":released")
     assert current(store, selection).execution.last_sequence == 1
@@ -225,7 +225,7 @@ def test_reclaimed_parent_occurrence_can_seal_its_open_round(rig, monkeypatch):
     plan = control.preflight(selection)
     monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(lambda *_: False))
     from issue_agent.domain.actions import AgentKind
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     abandoned = control.seal_abandoned_planning(plan.round.round_id)
     assert abandoned.abandonment_receipt == f"dispatch-claim-lifecycle:{selection.claim_occurrence_id}:reclaimed"
     assert current(store, selection).execution.last_sequence == 1
@@ -256,7 +256,7 @@ def test_abandoned_planning_blocks_late_paid_admission_even_with_replacement_cla
     child = registered.children[0]
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     from issue_agent.domain.actions import AgentKind
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     control.seal_abandoned_planning(plan.round.round_id)
     before = dump(store)
     outcome = store.reserve(request(child))
@@ -370,7 +370,7 @@ def test_recovery_cannot_release_a_replacement_claim_from_an_old_liveness_sample
 
     def replace_dead_claim(*_):
         assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
         return False
 
     with monkeypatch.context() as patch:
@@ -471,7 +471,7 @@ def test_recovery_limit_holds_new_allocation_but_retry_and_valid_settlement_clea
         control.reconcile_review_rounds()
     key = selection.expected.fence.key
     assert control.pending_recovery_hold(key) is not None
-    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER)
     fresh = replace(selection, request_id="recovery-held:new",
                     claim_occurrence_id=store.active_dispatch_claims("o/r", "review")[0].claim_key,
                     expected=current(store, selection).revision)

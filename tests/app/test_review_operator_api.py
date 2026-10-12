@@ -815,7 +815,7 @@ def test_a_terminal_departed_pr_is_recorded_when_its_linked_issue_is_unavailable
 def hold_fix_claim(deployment) -> None:
     """A live fix-role dispatch claim on the pull request's issue, as the fix daemon takes one (#176)."""
     store = SQLiteControlStore(deployment.control_path, now=deployment.clock.now)
-    assert store.claim_dispatch(REPO, "fix", 1, "ADDRESS_REVIEW", "fix-owner", frozenset({"thing.py"}))
+    assert store.claim_dispatch(REPO, "fix", 1, "ADDRESS_REVIEW", "fix-owner")
 
 
 def ceiling_held_outside_the_review_read(deployment, *, fault=lambda _: None) -> ReviewComposition:
@@ -1047,7 +1047,7 @@ def test_a_review_owed_behind_another_deployments_claim_is_recorded_withheld_res
     daemon = reviewed_once(deployment)
     daemon.remote.external_pr_change(PR, head_ref_oid=deployment.heads[1])
     store = SQLiteControlStore(deployment.control_path, now=deployment.clock.now)
-    assert store.claim_dispatch(REPO, "review", 1, "RE_REVIEW", "other-deployment", frozenset({"pr:7"}))
+    assert store.claim_dispatch(REPO, "review", 1, "RE_REVIEW", "other-deployment")
     daemon.tick()
     dispatch = http(deployment).read()["daemon"]["dispatch"]
     assert dispatch["kind"] == "withheld" and dispatch["review"] == "re_review" and dispatch["reason"] == "reserved"

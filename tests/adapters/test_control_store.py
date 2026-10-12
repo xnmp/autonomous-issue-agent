@@ -612,43 +612,16 @@ def test_concurrent_role_boot_serializes_schema_migrations(
             assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 0
 
 
-def test_dispatch_claims_serialize_targets_and_overlapping_paths(
+def test_dispatch_claims_serialize_one_target_and_admit_others_concurrently(
     tmp_path,
 ) -> None:
     store = _store(tmp_path)
 
-    assert store.claim_dispatch(
-        "o/r",
-        "fix",
-        7,
-        "RESOLVE",
-        "deployment-a",
-        frozenset({"src/shared.py"}),
-    )
-    assert not store.claim_dispatch(
-        "o/r",
-        "fix",
-        7,
-        "RESUME",
-        "deployment-b",
-        frozenset({"src/other.py"}),
-    )
-    assert not store.claim_dispatch(
-        "o/r",
-        "fix",
-        8,
-        "RESOLVE",
-        "deployment-b",
-        frozenset({"src/shared.py"}),
-    )
-    assert store.claim_dispatch(
-        "o/r",
-        "fix",
-        8,
-        "RESOLVE",
-        "deployment-b",
-        frozenset({"src/independent.py"}),
-    )
+    assert store.claim_dispatch("o/r", "fix", 7, "RESOLVE", "deployment-a")
+    assert not store.claim_dispatch("o/r", "fix", 7, "RESUME", "deployment-b")
+    # Another target runs alongside: only the target conflicts (Q13).
+    assert store.claim_dispatch("o/r", "fix", 8, "RESOLVE", "deployment-b")
+    assert not store.claim_dispatch("o/r", "fix", 8, "RESOLVE", "deployment-a")
 
     assert not store.release_dispatch_claim(
         "o/r", "fix", 7, "deployment-b"
@@ -662,7 +635,6 @@ def test_dispatch_claims_serialize_targets_and_overlapping_paths(
         7,
         "RESUME",
         "deployment-b",
-        frozenset({"src/other.py"}),
     )
 
 
@@ -672,7 +644,7 @@ def test_dispatch_claim_process_probe_runs_outside_write_transaction(
 ) -> None:
     store = _store(tmp_path)
     assert store.claim_dispatch(
-        "o/r", "fix", 1, "RESOLVE", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 1, "RESOLVE", "owner-a"
     )
     transaction_open = False
     original_transaction = store.transaction
@@ -700,7 +672,7 @@ def test_dispatch_claim_process_probe_runs_outside_write_transaction(
     )
 
     assert store.claim_dispatch(
-        "o/r", "fix", 2, "RESOLVE", "owner-b", frozenset({"b.py"})
+        "o/r", "fix", 2, "RESOLVE", "owner-b"
     )
 
 
@@ -718,7 +690,7 @@ def test_dispatch_claim_survives_dead_daemon_while_bound_child_is_live(
         kind="RESOLVE",
     )
     assert store.claim_dispatch(
-        "o/r", "fix", 42, "RESOLVE", owner, frozenset({"src/shared.py"})
+        "o/r", "fix", 42, "RESOLVE", owner
     )
     assert store.reserve(request).admitted
     assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
@@ -755,7 +727,6 @@ def test_dispatch_claim_survives_dead_daemon_while_bound_child_is_live(
             42,
             "RESOLVE",
             "o/r:fix:checkout-b",
-            frozenset({"src/shared.py"}),
         )
     finally:
         process.terminate()
@@ -773,7 +744,6 @@ def test_dispatch_claim_survives_dead_daemon_while_bound_child_is_live(
         42,
         "RESOLVE",
         "o/r:fix:checkout-b",
-        frozenset({"src/shared.py"}),
     )
 
 
@@ -889,7 +859,6 @@ def test_repoint_permanently_fences_the_prior_owner_from_authority(
         91,
         "RESOLVE",
         old_owner,
-        frozenset({"src/shared.py"}),
     )
     refused = old_store.reserve(
         dataclasses.replace(
@@ -909,7 +878,6 @@ def test_repoint_permanently_fences_the_prior_owner_from_authority(
         91,
         "RESOLVE",
         current_owner,
-        frozenset({"src/shared.py"}),
     )
 
 
@@ -1247,7 +1215,7 @@ def test_semantically_corrupt_dispatch_binding_is_rejected(tmp_path):
     owner = "o/r:fix:deployment"
     request = dataclasses.replace(_request(1), owner_id=owner)
     assert store.claim_dispatch(
-        "o/r", "fix", 1, "RESOLVE", owner, frozenset({"src/a.py"})
+        "o/r", "fix", 1, "RESOLVE", owner
     )
     assert store.reserve(request).admitted
     assert store.bind_dispatch_claim(
@@ -2370,13 +2338,13 @@ def test_legacy_spend_import_rejects_invalid_authority_rows_atomically(
 def test_active_dispatch_claims_report_live_fix_targets(tmp_path) -> None:
     store = _store(tmp_path)
     assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a"
     )
     assert store.claim_dispatch(
-        "o/r", "fix", -7, "FIX_CI", "owner-a", frozenset({"b.py"})
+        "o/r", "fix", -7, "FIX_CI", "owner-a"
     )
     assert store.claim_dispatch(
-        "o/r", "review", 99, "REVIEW", "owner-a", frozenset({"c.py"})
+        "o/r", "review", 99, "REVIEW", "owner-a"
     )
 
     claims = store.active_dispatch_claims("o/r", "fix")
@@ -2391,10 +2359,10 @@ def test_active_dispatch_claims_report_live_fix_targets(tmp_path) -> None:
 def test_released_and_dead_claims_are_not_reported_as_active(tmp_path) -> None:
     store = _store(tmp_path)
     assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a"
     )
     assert store.claim_dispatch(
-        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a", frozenset({"b.py"})
+        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a"
     )
     assert store.release_dispatch_claim("o/r", "fix", 42, "owner-a")
     # A leaked row whose owner process is gone and which never bound a run: the
@@ -2414,10 +2382,10 @@ def test_a_claim_with_an_unreadable_row_is_skipped(tmp_path) -> None:
     not be able to starve review."""
     store = _store(tmp_path)
     assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a"
     )
     assert store.claim_dispatch(
-        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a", frozenset({"b.py"})
+        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a"
     )
     with store._connect() as db:
         db.execute(
@@ -2477,7 +2445,7 @@ def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> N
     )
     request = _selected_review_claim_request(store, request)
     assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", owner, frozenset({"a.py"})
+        "o/r", "fix", 42, "ADDRESS_REVIEW", owner
     )
     before = store.active_dispatch_claims("o/r", "fix")
 
@@ -2507,7 +2475,7 @@ def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
     )
     request = _selected_review_claim_request(store, request)
     assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", owner, frozenset({"a.py"})
+        "o/r", "fix", 42, "ADDRESS_REVIEW", owner
     )
     assert store.reserve(request).admitted
     assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
@@ -2770,7 +2738,7 @@ def _claim_receipts(store):
 
 def test_dispatch_claim_occurrence_retains_create_and_normal_release_provenance_once(tmp_path):
     store = _store(tmp_path)
-    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
     claim, = _claim_rows(store)
     occurrence = claim["occurrence_id"]
     created = _claim_receipts(store)[f"{occurrence}:created"]
@@ -2778,7 +2746,7 @@ def test_dispatch_claim_occurrence_retains_create_and_normal_release_provenance_
         assert created[field] == claim[field]
     assert created["source"] == "admission"
     assert store.active_dispatch_claims("o/r", "fix")[0].claim_key == occurrence
-    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
     assert _claim_rows(store) == (claim,)
     assert len(_claim_receipts(store)) == 1
     assert store.release_dispatch_claim("o/r", "fix", 42, "owner")
@@ -2792,10 +2760,10 @@ def test_dispatch_claim_occurrence_retains_create_and_normal_release_provenance_
 
 def test_stale_dispatch_reclaim_retains_exact_old_occurrence_and_mints_new_one(tmp_path, monkeypatch):
     store = _store(tmp_path)
-    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
     old, = _claim_rows(store)
     monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(lambda _pid, _ticks: False))
-    assert store.claim_dispatch("o/r", "fix", 42, "RESUME", "successor", frozenset({"file.py"}))
+    assert store.claim_dispatch("o/r", "fix", 42, "RESUME", "successor")
     new, = _claim_rows(store)
     assert old["occurrence_id"] != new["occurrence_id"]
     receipts = _claim_receipts(store)
@@ -2808,7 +2776,7 @@ def test_stale_dispatch_reclaim_retains_exact_old_occurrence_and_mints_new_one(t
 
 def test_same_owner_pid_and_timestamp_replacement_is_not_reclaimed_from_an_old_probe(tmp_path, monkeypatch):
     store = _store(tmp_path)
-    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
     old, = _claim_rows(store)
     replacements = []
 
@@ -2816,12 +2784,12 @@ def test_same_owner_pid_and_timestamp_replacement_is_not_reclaimed_from_an_old_p
         assert not replacements
         assert (pid, start_ticks) == (old["owner_pid"], old["owner_start_ticks"])
         assert store.release_dispatch_claim("o/r", "fix", 42, "owner")
-        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
         replacements.extend(_claim_rows(store))
         return False
 
     monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(replace_during_probe))
-    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "competitor", frozenset({"file.py"}))
+    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "competitor")
     replacement, = replacements
     assert replacement["occurrence_id"] != old["occurrence_id"]
     assert {key: value for key, value in replacement.items() if key != "occurrence_id"} == {
@@ -2843,7 +2811,7 @@ def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change
         monkeypatch.setattr(control_module.uuid, "uuid4", lambda: identity)
         occurrence = identity.hex
     else:
-        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
         occurrence = _claim_rows(store)[0]["occurrence_id"]
     assert store.receipt("dispatch-claim-lifecycle", "o/r", f"{occurrence}:{event}", {"conflicting": "accepted fact"})
     with sqlite3.connect(store.path) as db:
@@ -2854,7 +2822,7 @@ def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change
         if event == "released":
             store.release_dispatch_claim("o/r", "fix", 42, "owner")
         else:
-            store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "successor", frozenset({"file.py"}))
+            store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "successor")
     with sqlite3.connect(store.path) as db:
         assert tuple(db.iterdump()) == before
 
@@ -3001,7 +2969,7 @@ def test_v34_unrelated_writes_need_no_retired_projection_witness(tmp_path):
                              'runs_require_workflow_episode_insert', 'runs_require_workflow_episode_update',
                              'runs_review_attachment_insert', 'runs_review_attachment_update',
                              'workflow_retry_grant_insert', 'workflow_retry_grant_update')
-    assert store.claim_dispatch('o/r', 'review', -9, 'REVIEW', 's6-owner', frozenset())
+    assert store.claim_dispatch('o/r', 'review', -9, 'REVIEW', 's6-owner')
     with pytest.raises(sqlite3.IntegrityError, match='occurrence is immutable'):
         with store.transaction() as db:
             db.execute("UPDATE dispatch_claims SET occurrence_id='changed' WHERE repository='o/r'")

@@ -207,7 +207,7 @@ boundary and serialize fresh/v8/v9 boot. Machine-readable
 evidence is in `control-store-migration-evidence.json`.
 V12 removes the run-level active-dispatch uniqueness constraint: one review
 workflow may legitimately run several validator sublegs concurrently. The
-coarser paid-dispatch authority is instead the durable target/path claim made
+coarser paid-dispatch authority is instead the durable target claim made
 before the workflow starts and released on every completion, rejection, or
 cancellation path. Process liveness is snapshotted before the claim
 transaction, so OS inspection never holds SQLite's cross-process write lock.
@@ -220,9 +220,10 @@ JSONL is the per-role daemon log only; losing it cannot authorize a write,
 deduplicate work, or admit spend. Metrics derive from the SQLite legs/money
 tables plus GitHub.
 Every lifecycle command and paid run is scoped to repository, role, and stable
-checkout deployment identity in the shared store. Cross-process dispatch/path
+checkout deployment identity in the shared store. Cross-process dispatch
 claims remain repository/role-global, so two intentionally allowed checkouts
-cannot both admit the same target or overlapping path set. A daemon queries
+cannot both admit the same target (targets are the only conflict; Q13 deleted
+the path-overlap holds). A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
 The observed-world target used to acquire a dispatch claim is carried through

@@ -19,7 +19,7 @@ This is the deployment truth, not a security claim inferred from hooks.
 
 Fix agents push their own branch with plain `git push` (refactor decision
 Q11); the publish broker and `issue-agent-publish` were deleted in slice 5b.
-The harness opens the PR from a pushed `fix/<issue>-` branch that has none,
+The harness opens the PR from a pushed `fix/<issue>-` branch owed one (ahead of base, no open PR),
 once, through `adapters/act.py`. Nothing stops an agent from running
 `gh pr create` or `gh pr edit` itself (it holds the daemon account's
 credentials); a PR the agent opened is simply observed and the harness opens

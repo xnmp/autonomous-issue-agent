@@ -190,10 +190,14 @@ The daemon observes GitHub, derives each item's state with a pure function,
 and maps it to `Action` values. The fix role executes them directly
 (`adapters/act.py`): every write is naturally idempotent (a label set, a merge
 or update-branch bound to the decided head, a PR opened only when the branch
-has none) or claims an idempotency key in SQLite and confirms it with a GitHub
-read-back. The fix agent pushes its own `fix/<issue>-` branch with `git push`
-and returns; the harness opens the PR from that branch, using the agent's
-summary as the description. The review role still submits durable
+has no open one) or claims an idempotency key in SQLite and confirms it with a
+GitHub read-back. The fix agent pushes its own `fix/<issue>-` branch with `git
+push` and returns; the harness opens the PR from that branch (when it is ahead
+of base, and has no PR or was pushed after a human closed its PR), using the
+agent's summary as the description. An agent's question is recorded with its
+leg and carried by the `needs-human` stop comment; reply on that thread to
+answer it. Harness comments are recognised by the marker and a harness login
+together. The review role still submits durable
 `LifecycleCommand`s through `GitHubEffectExecutor`, bound to the exact
 repository and role identity, until slice 5c.
 

@@ -7,31 +7,42 @@ GitHub cannot hold (`Local`: ended legs, leases, money headroom, `now`).
 
 Precedence, the single place it is defined (first match wins, per item):
 
-1. Busy        a lease is held on the item or its issue. A running leg's
-               outcome is unknown, so nothing else is decided about the item.
-2. Lifetime    the issue spent its per-issue lifetime cap -> NeedsHuman (Wait
-               once labelled). Money is a grant, so a reply cannot release it.
-3. needs-human labelled: a qualifying reply (Q8) -> Release, else Wait.
+1. Busy        a lease is held on the item or its issue, or one of its legs
+               ended after the observation was taken (the world may predate
+               that leg's push). A running leg's outcome is unknown, so
+               nothing else is decided about the item.
+2. Unread      the PR's content could not be read -> Wait (no stop or label
+               logic runs on a placeholder).
+3. needs-human labelled with a stop comment: a lifetime stop on a still-capped
+               issue -> Wait (money is a grant, so a reply cannot release
+               it); a qualifying reply (Q8) -> Release; else Wait. Labelled
+               with no stop comment (the comment failed, or a human labelled
+               it): the steps below run, a NeedsHuman is emitted (the label
+               add is idempotent, the comment keyed) and anything else waits.
 4. Question    the item's latest agent leg asked a human for judgment and no
-               stop comment follows it -> NeedsHuman (the leg already posted
-               its question; the stop is the single needs-human writer).
+               stop comment follows it -> NeedsHuman, whose comment carries
+               the question (the stop is the single needs-human writer).
 5. Workflow    the PR touches `.github/` and no released workflow stop exists
                on it -> NeedsHuman.
-6. Publication an issue with a pushed `fix/<issue>-` branch that never had a
-               PR -> OpenPR (free; the agent pushes, the harness opens, Q11).
+6. Publication an issue with a pushed `fix/<issue>-` branch ahead of base and
+               owed a PR -> OpenPR (free; the agent pushes, the harness
+               opens, Q11).
 7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
                for another head -> Wait; red -> FIX_CI; pending -> Wait; green
                and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
                head -> ADDRESS_REVIEW; no bot verdict on head -> REVIEW; bot
                CHANGES_REQUESTED on head -> ADDRESS_REVIEW; bot APPROVED head ->
                Merge, unless a human's standing CHANGES_REQUESTED is on an
-               older head (Wait) or mergeability is unknown (Wait).
+               older head (Wait) or GitHub does not report it mergeable and
+               unblocked (Wait: branch protection waits on a human).
                Issue: `ai-ready`, open, no open or merged harness PR ->
                RESOLVE.
-8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh are free):
-               bot review rounds >= cap (ADDRESS_REVIEW on a bot verdict) ->
-               NeedsHuman; attempts >= cap -> NeedsHuman; machine backoff ->
-               Backoff; daily or global headroom short -> Wait (silent, Q7).
+8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh/open are
+               free): bot review rounds >= cap (ADDRESS_REVIEW on a bot
+               verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
+               issue's lifetime cap cannot afford a leg -> NeedsHuman; machine
+               backoff -> Backoff; daily or global headroom short -> Wait
+               (silent, Q7).
 
 Attempts for act A (Q21) are the tail run of A's agent legs after the reset
 floor: machine legs are skipped, any other act's agent leg ends the run, and
@@ -99,9 +110,10 @@ def pr_key(number: int) -> ItemKey:
 
 @dataclass(frozen=True)
 class Harness:
-    """Who the harness is on GitHub. Comments are attributed by the hidden
-    marker, not the author, because FIX_BOT can be the operator's own login (Q1);
-    reviews and pushes by login, since only the harness bots make those."""
+    """Who the harness is on GitHub. A harness comment carries the hidden
+    marker AND a harness login: the marker alone is forgeable by any commenter,
+    and the login alone is not enough because FIX_BOT can be the operator's own
+    login (Q1). Reviews and pushes are attributed by login."""
 
     fix_bot: str
     review_bot: str
@@ -119,7 +131,7 @@ class Harness:
         return login_eq(login, self.fix_bot) or login_eq(login, self.review_bot)
 
     def wrote(self, comment: Comment) -> bool:
-        return self.marker in comment.body
+        return self.marker in comment.body and self.owns_login(comment.author)
 
 
 @dataclass(frozen=True)
@@ -158,7 +170,7 @@ class WaitReason(str, Enum):
     HEAD_UNKNOWN = "head-unknown"
     CI_UNKNOWN = "ci-unknown"
     CI_PENDING = "ci-pending"
-    MERGEABILITY_UNKNOWN = "mergeability-unknown"
+    MERGEABILITY_UNKNOWN = "mergeability-unknown"  # or reported BLOCKED
     HUMAN_CHANGES_REQUESTED = "human-changes-requested"
     HEADROOM = "headroom"
 
@@ -239,11 +251,13 @@ class Wait:
 @dataclass(frozen=True)
 class NeedsHuman:
     """A judgment stop. `anchor` (the item's last leg end, or "-") makes the
-    comment's idempotency key unique per episode and stable within one."""
+    comment's idempotency key unique per episode and stable within one.
+    `question` is the agent's question, carried exactly by a QUESTION stop."""
 
     reason: StopReason
     anchor: str
     act: AgentKind | None = None
+    question: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.reason, StopReason) or not isinstance(self.anchor, str) or not self.anchor:
@@ -252,6 +266,8 @@ class NeedsHuman:
             self.act is not None and self.act not in DISPATCHABLE
         ):
             raise ValueError("an act is named exactly for an attempts stop")
+        if not isinstance(self.question, str) or bool(self.question) != (self.reason is StopReason.QUESTION):
+            raise ValueError("a question is carried exactly by a question stop")
 
 
 @dataclass(frozen=True)
@@ -304,7 +320,8 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p) for p, n in prs if p.number > 0]
-    return {item.key: _decide(item, local, harness) for item in items}
+    observed = parse_timestamp(world.now)
+    return {item.key: _decide(item, local, harness, observed) for item in items}
 
 
 def touches_github(paths: Iterable[str]) -> bool:
@@ -312,31 +329,45 @@ def touches_github(paths: Iterable[str]) -> bool:
     return any(isinstance(p, str) and p.removeprefix("./").startswith(".github/") for p in paths)
 
 
-def _decide(item: _Item, local: Local, harness: Harness) -> DerivedState:
+def _decide(item: _Item, local: Local, harness: Harness, observed: datetime | None) -> DerivedState:
     if item.key in local.leases or issue_key(item.issue) in local.leases:
         return Busy()
     legs = local.legs.get(item.key, ())
     last_end = max((leg.ended_at for leg in legs), default=None)
+    # The world is read before the local facts: a leg that ended after the read
+    # began may have pushed what this world does not show yet.
+    if observed is not None and last_end is not None and last_end > observed:
+        return Busy()
+    if item.pr is not None and not item.pr.content_known:
+        return Wait(WaitReason.HEAD_UNKNOWN)
     anchor = last_end.isoformat() if last_end else "-"
-    labelled = Label.NEEDS_HUMAN in item.labels
-    if item.issue in local.lifetime_capped:
-        return Wait(WaitReason.NEEDS_HUMAN) if labelled else NeedsHuman(StopReason.LIFETIME_CAP, anchor)
-
     comments = [(at, c) for c in item.comments if (at := parse_timestamp(c.created_at))]
     stops = [(at, m.group(1)) for at, c in comments if harness.wrote(c) and (m := _STOP_TAG_RE.search(c.body))]
-    last_stop = max((at for at, _ in stops), default=None)
-    if labelled:
-        if last_stop and any(
-            at > last_stop and (last_end is None or at > last_end) and _human_comment(c, harness)
-            for at, c in comments
-        ):
+    last_stop = max(stops, default=None)
+    labelled = Label.NEEDS_HUMAN in item.labels
+    if labelled and last_stop is not None:
+        if item.issue in local.lifetime_capped and last_stop[1] == StopReason.LIFETIME_CAP.value:
+            return Wait(WaitReason.NEEDS_HUMAN)
+        if any(at > last_stop[0] and (last_end is None or at > last_end) and _human_comment(c, harness)
+               for at, c in comments):
             return Release()
         return Wait(WaitReason.NEEDS_HUMAN)
+    state = _proceed(item, local, harness, legs, comments, stops, anchor)
+    if labelled and not isinstance(state, NeedsHuman):
+        return Wait(WaitReason.NEEDS_HUMAN)
+    return state
 
+
+def _proceed(
+    item: _Item, local: Local, harness: Harness, legs: tuple[LegEnd, ...],
+    comments: list[tuple[datetime, Comment]], stops: list[tuple[datetime, str]], anchor: str,
+) -> DerivedState:
+    last_stop = max((at for at, _ in stops), default=None)
     agent_legs = [leg for leg in legs if not leg.machine]
     last_agent = max(agent_legs, key=lambda leg: leg.ended_at, default=None)
-    if last_agent is not None and last_agent.asked and not any(at > last_agent.ended_at for at, _ in stops):
-        return NeedsHuman(StopReason.QUESTION, anchor)
+    if (last_agent is not None and last_agent.question is not None
+            and not any(at > last_agent.ended_at for at, _ in stops)):
+        return NeedsHuman(StopReason.QUESTION, anchor, question=last_agent.question)
 
     pr = item.pr
     released_workflow = any(code == StopReason.WORKFLOW_PATH.value for _, code in stops)
@@ -356,6 +387,8 @@ def _decide(item: _Item, local: Local, harness: Harness) -> DerivedState:
         return NeedsHuman(StopReason.REVIEW_ROUNDS, anchor)
     if _attempts(legs, step, floor) >= ATTEMPT_CAP:
         return NeedsHuman(StopReason.ATTEMPTS, anchor, step.act)
+    if item.issue in local.lifetime_capped:
+        return NeedsHuman(StopReason.LIFETIME_CAP, anchor)
     until = machine_backoff_until(legs, step.act)
     if until is not None and until > local.now:
         return Backoff(step.act, until)
@@ -393,7 +426,9 @@ def _pr_step(pr: PRView, harness: Harness) -> DerivedState:
         return Dispatch(AgentKind.ADDRESS_REVIEW, head)
     if human_heads:
         return Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
-    if pr.mergeable.upper() != "MERGEABLE":
+    # BLOCKED with green CI and the bot's approval: branch protection waits on
+    # a human (approval, CODEOWNERS). GitHub clears it; nothing to write.
+    if pr.mergeable.upper() != "MERGEABLE" or pr.merge_state.upper() == "BLOCKED":
         return Wait(WaitReason.MERGEABILITY_UNKNOWN)
     return Merge(head)
 

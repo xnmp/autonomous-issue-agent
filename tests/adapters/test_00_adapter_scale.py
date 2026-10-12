@@ -105,7 +105,7 @@ def test_real_sequential_round_history_keeps_current_reads_bounded(rig):
     started = time.perf_counter()
     for sequence in range(1, checkpoints[-1] + 1):
         if sequence > 1:
-            assert store.claim_dispatch('o/r', 'review', -9, AgentKind.REVIEW.name, OWNER, frozenset())
+            assert store.claim_dispatch('o/r', 'review', -9, AgentKind.REVIEW.name, OWNER)
         occurrence = store.active_dispatch_claims('o/r', 'review')[0].claim_key
         snapshot = current(store, selection)
         plan = control.preflight(replace(

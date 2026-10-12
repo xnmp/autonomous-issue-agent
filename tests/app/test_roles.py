@@ -56,7 +56,7 @@ from issue_agent.app.dispatch import AgentDispatcher
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.main import _recover_pre_adapter_processes
 from issue_agent.app.roles import (
-    DispatchPathReservations,
+    DispatchReservations,
     EffectRecovery,
     _FIX_RUNTIME_REGISTRY,
     _REVIEW_RUNTIME_REGISTRY,
@@ -457,13 +457,13 @@ def test_distinct_checkouts_share_durable_fix_dispatch_claims(
     second_store = SQLiteControlStore(path)
     first_store.initialize()
     second_store.initialize()
-    first = DispatchPathReservations(
+    first = DispatchReservations(
         first_store,
         repository="o/r",
         role="fix",
         owner_id="o/r:fix:checkout-a",
     )
-    second = DispatchPathReservations(
+    second = DispatchReservations(
         second_store,
         repository="o/r",
         role="fix",
@@ -471,16 +471,13 @@ def test_distinct_checkouts_share_durable_fix_dispatch_claims(
     )
     action = RunAgent(AgentKind.RESOLVE, 7)
 
-    assert first.reserve(action, 7, frozenset({"src/a.py"}))
-    assert not second.reserve(action, 7, frozenset({"src/b.py"}))
-    assert not second.reserve(
-        RunAgent(AgentKind.RESOLVE, 8),
-        8,
-        frozenset({"src/a.py"}),
-    )
+    assert first.reserve(action, 7)
+    assert not second.reserve(action, 7)
+    # Another issue runs alongside: only the target conflicts (Q13).
+    assert second.reserve(RunAgent(AgentKind.RESOLVE, 8), 8)
 
     first.finish(action)
-    assert second.reserve(action, 7, frozenset({"src/b.py"}))
+    assert second.reserve(action, 7)
 
 
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
@@ -955,7 +952,7 @@ def test_an_active_fix_leg_defers_the_review_of_the_same_pr(tmp_path):
     now = datetime.now(timezone.utc)
     world_state = WorldState(prs=(_held_pr(),))
     assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
     )
 
     plan = _decide(tmp_path, control, world_state, now)
@@ -974,7 +971,7 @@ def test_a_fix_hold_past_the_ceiling_stops_starving_the_review(tmp_path):
     control = _control(tmp_path)
     world_state = WorldState(prs=(_held_pr(),))
     assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
     )
     wedged = datetime.now(timezone.utc) + timedelta(
         seconds=fix_hold_ceiling_seconds(2700.0) + 1
@@ -990,7 +987,7 @@ def test_a_fix_hold_leaves_every_other_prs_review_alone(tmp_path):
     control = _control(tmp_path)
     world_state = WorldState(prs=(_held_pr(), _held_pr(614, 610)))
     assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
     )
 
     plan = _decide(tmp_path, control, world_state, datetime.now(timezone.utc))
@@ -1001,7 +998,7 @@ def test_a_fix_hold_leaves_every_other_prs_review_alone(tmp_path):
 def test_a_dead_fix_claim_does_not_defer_the_review(tmp_path):
     control = _control(tmp_path)
     assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
     )
     with control._connect() as db:
         db.execute(
@@ -1037,7 +1034,7 @@ def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):
         labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT, state="OPEN",
     )
     assert control.claim_dispatch(
-        "o/r", "fix", -617, "FIX_CI", "owner-a", frozenset({"a.py"})
+        "o/r", "fix", -617, "FIX_CI", "owner-a"
     )
 
     plan = _decide(

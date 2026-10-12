@@ -168,6 +168,7 @@ class ContextualRuntime(AgentRuntime, Protocol):
         workflow: WorkflowBinding | None = None,
         review_child: ReviewChildIdentity | None = None,
         head: str = "",
+        resumed: bool = False,
     ) -> None: ...
 
 

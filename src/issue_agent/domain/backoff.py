@@ -24,10 +24,8 @@ BACKOFF_CAP = timedelta(hours=1)
 _MAX_DOUBLINGS = 6
 
 
-# Only the leg that ended a dispatch may reset its streak: the advisory ROUTE
-# leg runs before every unpinned RESOLVE and returns normally, so treating it
-# as RESOLVE pinned the wait at 60s however many RESOLVE legs died (slice 3
-# review). ROUTE stays its own kind, which nothing dispatches.
+# A recorded kind that is no AgentKind (the deleted ROUTE leg's rows) belongs
+# to no dispatch, so it can neither extend nor reset a streak.
 def dispatched_kind(run_kind: str) -> AgentKind | None:
     """The dispatch a recorded run kind belongs to, or None if it is no agent kind."""
     try:
@@ -47,9 +45,10 @@ class LegEnd:
     # The PR head the leg was dispatched on ("" for issue-stage legs). Lets
     # attempt counting key REVIEW legs to the head they reviewed.
     head: str = ""
-    # The agent returned asking a human for judgment (the outcome layer's
-    # ASKED class). Always False for a machine end.
-    asked: bool = False
+    # The question the agent returned asking a human for judgment (the outcome
+    # layer's ASKED class), bounded and neutralised; None when it did not ask.
+    # Always None for a machine end.
+    question: str | None = None
     # When the leg started, if known. Comments inside a leg's window are the
     # agent's own (it posts acceptance criteria and test plans under the bot's
     # login, without the harness marker), so they never reset attempts.
@@ -64,8 +63,8 @@ class LegEnd:
             raise ValueError("leg end requires an exact machine classification")
         if not isinstance(self.head, str):
             raise ValueError("leg end head must be a string")
-        if type(self.asked) is not bool or (self.asked and self.machine):
-            raise ValueError("only an agent end can have asked")
+        if self.question is not None and (not isinstance(self.question, str) or not self.question or self.machine):
+            raise ValueError("only an agent end can carry a question, and it is non-empty text")
         if self.started_at is not None and (
             not isinstance(self.started_at, datetime) or self.started_at.utcoffset() is None
             or self.started_at > self.ended_at

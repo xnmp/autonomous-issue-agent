@@ -176,9 +176,9 @@ class MergePullRequest:
 
 @dataclass(frozen=True)
 class OpenPullRequest:
-    """Open the harness PR for a pushed `fix/<issue>-` branch that has none
+    """Open the harness PR for a pushed `fix/<issue>-` branch owed one
     (refactor decision Q11: the agent pushes, the harness opens). Idempotent
-    under `key`; GitHub itself refuses a second open PR for one head."""
+    by lookup: act opens only when no open PR has this head."""
 
     issue: int
     branch: str
@@ -186,10 +186,6 @@ class OpenPullRequest:
     def __post_init__(self) -> None:
         if type(self.issue) is not int or self.issue <= 0 or not isinstance(self.branch, str) or not self.branch:
             raise ValueError("opening a PR requires the issue and its pushed branch")
-
-    @property
-    def key(self) -> str:
-        return f"open-pr:{self.branch}"
 
 
 @dataclass(frozen=True)
