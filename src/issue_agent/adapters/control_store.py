@@ -108,7 +108,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 42
+SCHEMA_VERSION = 43
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2448,6 +2448,25 @@ DELETE FROM dedupe_keys WHERE namespace IN (
     'review-round-test-intent', 'review-round-test-invocation',
     'review-round-test-completion', 'review-round-test-evidence'
 );
+"""),
+    # Self-clear is retired by deletion. Its relabels, persisted with a
+    # `self_clear` key, would otherwise drain as plain relabels and release
+    # ai-blocked without a human reply; GitHub stays authority, so the labels
+    # they left are what the next tick reads.
+    SchemaMigration(43, """
+CREATE TEMP TABLE retired_self_clears AS
+    SELECT command_id FROM lifecycle_commands
+    WHERE CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text';
+DELETE FROM workflow_retry_authorizations WHERE command_id IN (SELECT command_id FROM retired_self_clears)
+    OR evidence_id IN (SELECT evidence_id FROM workflow_evidence
+        WHERE command_id IN (SELECT command_id FROM retired_self_clears));
+DELETE FROM workflow_rearm_commands WHERE command_id IN (SELECT command_id FROM retired_self_clears);
+DELETE FROM workflow_evidence WHERE command_id IN (SELECT command_id FROM retired_self_clears);
+DELETE FROM effect_receipts WHERE command_id IN (SELECT command_id FROM retired_self_clears);
+DELETE FROM lifecycle_commands WHERE command_id IN (SELECT command_id FROM retired_self_clears);
+DROP TABLE retired_self_clears;
+DROP INDEX lifecycle_self_clear_pending;
+DELETE FROM dedupe_keys WHERE namespace='fix-budget-refusal';
 """),
 )
 

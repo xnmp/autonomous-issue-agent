@@ -211,7 +211,7 @@ def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
 
 
 def _stopped_copy_index_rollback(path: Path) -> None:
-    """Explicit fixture-only schema42→38 rollback; every authority row survives."""
+    """Explicit fixture-only schema43→38 rollback; every authority row survives."""
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
     index_migrations = {
         40: ("event_outbox_pending", "event_outbox_pending_destination", "lifecycle_review_generation_candidates"),
@@ -220,6 +220,9 @@ def _stopped_copy_index_rollback(path: Path) -> None:
     charge_origin = next(item for item in _SCHEMA_MIGRATIONS if item.version == 41)
     with sqlite3.connect(path) as db:
         db.execute("BEGIN IMMEDIATE")
+        assert db.execute("DELETE FROM schema_migrations WHERE version=43").rowcount == 1
+        self_clear_index = next(item for item in _SCHEMA_MIGRATIONS if item.version == 38)
+        db.execute(self_clear_index.source)
         assert db.execute("DELETE FROM schema_migrations WHERE version=42").rowcount == 1
         assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (41, charge_origin.digest)
         # The schema-38 build has no charge origin; every copied charge carries the default, so nothing is lost.
