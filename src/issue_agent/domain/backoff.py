@@ -23,10 +23,14 @@ BACKOFF_CAP = timedelta(hours=1)
 # 60s * 2^6 already exceeds the cap; a longer streak cannot lengthen the wait.
 _MAX_DOUBLINGS = 6
 
-# Split and routing legs run inside a RESOLVE dispatch, so they back off the
-# dispatch that bought them rather than a kind nothing dispatches.
+# Split legs run inside a RESOLVE dispatch, so they back off the dispatch that
+# bought them rather than a kind nothing dispatches. Only the leg that ended a
+# dispatch may reset its streak: the advisory ROUTE leg runs before every
+# unpinned RESOLVE and returns normally, so mapping it here pinned the wait at
+# 60s however many RESOLVE legs died (slice 3 review). ROUTE stays its own kind,
+# which nothing dispatches. A normal split AUTHOR followed by a dying IMPLEMENT
+# still resets; split mode is off by default and slice 6 deletes it.
 _DISPATCHED_AS: dict[str, AgentKind] = {
-    "ROUTE": AgentKind.RESOLVE,
     "AUTHOR": AgentKind.RESOLVE,
     "IMPLEMENT": AgentKind.RESOLVE,
     "ADJUDICATE": AgentKind.RESOLVE,

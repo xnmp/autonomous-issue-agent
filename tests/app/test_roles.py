@@ -110,6 +110,8 @@ from issue_agent.domain.fix import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.backoff import machine_backoff_until
+from issue_agent.app.planners.schemas import ROUTER_SCHEMA
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -881,6 +883,41 @@ def test_machine_death_leaves_attempts_unchanged_and_redispatches_only_after_bac
         assert not _has_run(early, AgentKind.RESOLVE)
         assert not any(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in early)
         assert _has_run(decide_fix(world(due), cfg, _fix_state(store, world(due)), fixer_busy=False), AgentKind.RESOLVE)
+
+
+def test_routed_resolve_deaths_double_the_backoff_despite_normal_router_legs(tmp_path):
+    """Slice 3 review finding 1. With FIX_MODEL unpinned every RESOLVE dispatch
+    first runs the difficulty router, which returns normally, then the RESOLVE
+    leg dies pre-result. Only the leg that ended the dispatch counts, so the
+    wait still doubles per death instead of staying at the 60s base."""
+    issue = 8
+    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
+    store = Store(state_dir=str(tmp_path))
+
+    class RouteOkResolveDies:
+        def __init__(self):
+            self.routed = 0
+
+        async def run(self, task):
+            if task.schema is ROUTER_SCHEMA:
+                self.routed += 1
+                return AgentResult(is_error=False, session_id="rt", structured={"tier": "standard"})
+            store._workflow_db.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
+                expected_owner_id="o/r:fix:fixture", pid=123, pgid=123, process_start_ticks=99)
+            raise RuntimeError("stream closed before any result")
+
+    runner = RouteOkResolveDies()
+    d = _dispatcher(gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"))
+    waits = []
+    for _ in range(5):
+        with pytest.raises(RuntimeError):
+            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
+        ends = store._workflow_db.fix_leg_ends("o/r", issue)
+        until = machine_backoff_until(ends, AgentKind.RESOLVE)
+        assert until is not None
+        waits.append((until - max(end.ended_at for end in ends)).total_seconds())
+    assert runner.routed == 5
+    assert waits == [60.0, 120.0, 240.0, 480.0, 960.0]
 
 
 # ── C4 key-agreement: breaker_key(pr) vs gateway.issue_for_pr(pr) ──────────────
