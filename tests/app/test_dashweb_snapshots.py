@@ -815,6 +815,25 @@ def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     assert card["merged_ts"] == "2026-07-29T10:00:00Z"
 
 
+@pytest.mark.parametrize("enriched", [False, True])
+@pytest.mark.parametrize("done", [False, True])
+def test_merged_pr_without_rollup_or_journal_ci_stays_unknown(enriched, done):
+    row = replace(row_for([RESOLVE, REVIEW_LEG], 7), done=done)
+    pr = {"state": "MERGED", "mergedAt": ts(minutes=20), "headRefOid": "merged-head",
+          "reviewDecision": "APPROVED", "mergeable": "MERGEABLE"}
+    if enriched:
+        pr = service._github_enrichment(pr)
+    card = snapshots.issue_card(row, NOW, gh_prs={12: pr})
+    detail = snapshots.issue_detail(row, NOW, gh_prs={12: pr})
+
+    assert card["pr_state"] == "merged"
+    assert card["pr_review_state"] == "mergeable"
+    assert card["pr_ci_state"] is None and detail["pr_ci_state"] is None
+    assert card["rail"]["ci_runs"] == 0 and detail["rail"]["ci_runs"] == 0
+    if not done:
+        assert card["board"]["headline"] != "CI running"
+
+
 def test_issue_card_without_gh_shows_numbers_only_never_a_stale_title():
     card = snapshots.issue_card(row_for([RESOLVE], 7), NOW)
     assert card["title"] is None and card["url"] is None and card["pr_state"] is None

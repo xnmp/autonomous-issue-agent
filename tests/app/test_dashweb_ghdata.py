@@ -7,6 +7,8 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from issue_agent.adapters.dashweb import ghdata
 
 
@@ -144,9 +146,83 @@ def test_pr_detail_uses_the_longer_change_history_ttl():
 
 
 def test_a_gh_failure_degrades_to_an_error_string():
-    gh, _calls = reader([("", "gh: not authenticated")])
+    gh = ghdata.GhReader(run=lambda _argv: ("", "gh: not authenticated"))
     payload, error = gh.prs("o/r")
     assert payload is None and error == "gh: not authenticated"
+
+
+def test_pr_reads_run_in_parallel_and_keep_full_open_facts_over_light_history():
+    rendezvous = threading.Barrier(2)
+    calls = []
+    light = {"number": 12, "state": "OPEN", "title": "light title"}
+    full = {**light, "title": "full title", "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+            "comments": [{"body": "reply"}], "reviews": [{"state": "APPROVED"}]}
+    merged = {"number": 13, "state": "MERGED", "mergedAt": "2026-10-12T00:00:00Z",
+              "reviewDecision": "APPROVED", "mergeable": "MERGEABLE"}
+    closed = {"number": 14, "state": "CLOSED", "labels": [{"name": "needs-human-review"}]}
+
+    def run(argv):
+        calls.append(argv)
+        rendezvous.wait(timeout=2)
+        return json.dumps([full] if argv[argv.index("--state") + 1] == "open"
+                          else [light, merged, closed]), ""
+
+    gh = ghdata.GhReader(run=run)
+    for _ in range(2):
+        payload, error = gh.prs("o/r")
+        assert error == ""
+        assert ghdata.index_by_number(payload) == {12: full, 13: merged, 14: closed}
+    assert len(calls) == 2
+    by_state = {argv[argv.index("--state") + 1]: argv for argv in calls}
+    assert set(by_state) == {"open", "all"}
+    for state, argv in by_state.items():
+        assert argv[argv.index("--limit") + 1] == "200"
+        assert argv[-2:] == ["-R", "o/r"]
+        fields = set(argv[argv.index("--json") + 1].split(","))
+        if state == "all":
+            assert fields == {"number", "title", "url", "state", "mergedAt", "updatedAt",
+                              "labels", "headRefName", "headRefOid", "closingIssuesReferences",
+                              "reviewDecision", "mergeable"}
+        else:
+            assert {"comments", "statusCheckRollup", "latestReviews", "reviews"} <= fields
+
+
+@pytest.mark.parametrize("open_newer", [False, True])
+def test_the_pr_read_github_updated_last_wins_when_the_two_reads_disagree(open_newer):
+    stale, fresh = "2026-10-12T07:00:00Z", "2026-10-12T07:05:00Z"
+    full = {"number": 12, "state": "OPEN", "headRefOid": "old", "updatedAt": fresh if open_newer else stale,
+            "reviews": [{"state": "APPROVED", "commit": {"oid": "old"}}]}
+    light = {"number": 12, "state": "MERGED", "mergedAt": fresh, "headRefOid": "new",
+             "updatedAt": stale if open_newer else fresh}
+
+    def run(argv):
+        return json.dumps([full] if argv[argv.index("--state") + 1] == "open" else [light]), ""
+
+    payload, error = ghdata.GhReader(run=run).prs("o/r")
+    assert error == "" and ghdata.index_by_number(payload) == {12: full if open_newer else light}
+
+
+@pytest.mark.parametrize("failed_state", ["open", "all"])
+@pytest.mark.parametrize("failure", [("", "HTTP 504"), ("not json", "")])
+def test_either_pr_read_failure_discards_the_pr_payload(failed_state, failure):
+    def run(argv):
+        return failure if argv[argv.index("--state") + 1] == failed_state else ('[{"number": 12}]', "")
+
+    payload, error = ghdata.GhReader(run=run).prs("o/r")
+    assert payload is None
+    assert error == (failure[1] or "gh returned unparseable JSON")
+
+
+def test_pr_history_at_the_limit_keeps_the_existing_no_warning_contract():
+    def run(argv):
+        rows = [] if argv[argv.index("--state") + 1] == "open" else [
+            {"number": number, "state": "MERGED"} for number in range(1, 201)
+        ]
+        return json.dumps(rows), ""
+
+    payload, error = ghdata.GhReader(run=run).prs("o/r")
+    assert isinstance(payload, list) and len(payload) == 200
+    assert error == ""
 
 
 def test_a_failure_is_cached_too_so_a_down_gh_is_not_hammered():

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import threading
 import time
+import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+from issue_agent.adapters.dashweb import ghdata
 from issue_agent.app.dashweb import service
 from issue_agent.domain import dashboard as dash
 
@@ -202,3 +206,25 @@ def test_issue_detail_does_not_append_poll_warnings_into_the_enrichment_cache() 
     assert first is not None and second is not None
     assert first["warnings"] == ["review breaker state unavailable"]
     assert second["warnings"] == ["review breaker state unavailable"]
+
+
+@pytest.mark.parametrize("failed_state", ["open", "all"])
+def test_pr_read_failure_warns_the_board_and_keeps_successful_issue_facts(failed_state):
+    def run(argv):
+        if argv[0] == "issue":
+            return json.dumps([{"number": 7, "title": "Live issue title", "state": "OPEN"}]), ""
+        if argv[argv.index("--state") + 1] == failed_state:
+            return "", "HTTP 504"
+        return json.dumps([{"number": 12, "state": "OPEN", "url": "u/12"}]), ""
+
+    backend = _backend(
+        _snapshot(_run("RESOLVE", 7, hours=2), _run("REVIEW", 12, hours=1)),
+        ghdata.GhReader(run=run),
+    )
+    payload = _eventually(lambda: backend.issues("demo"), lambda value: bool(value["warnings"]))
+
+    assert payload["gh_ok"] is False
+    assert payload["warnings"] == ["HTTP 504"]
+    card = payload["in_flight"][0]
+    assert card["title"] == "Live issue title"
+    assert card["pr_state"] is None and card["pr_url"] is None

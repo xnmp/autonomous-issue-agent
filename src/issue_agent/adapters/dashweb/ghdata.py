@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 DEFAULT_TTL_S = 45.0
@@ -40,6 +41,11 @@ PR_FIELDS = (
     # `reviews` (not `latestReviews`) is the field gh fills with each review's
     # commit oid; the board needs it to tell a head-bound approval from a stale one.
     "headRefOid,reviews"
+)
+# Closed-PR CI/comments fall back to journal/unknown: tauri's 200-PR GraphQL timeout (2026-10-12).
+PR_HISTORY_FIELDS = (
+    "number,title,url,state,mergedAt,updatedAt,labels,headRefName,headRefOid,"
+    "closingIssuesReferences,reviewDecision,mergeable"
 )
 PR_DETAIL_FIELDS = (
     "number,url,state,headRefName,headRefOid,closingIssuesReferences,"
@@ -185,11 +191,20 @@ class GhReader:
         )
 
     def prs(self, repo: str, limit: int = 200) -> tuple[object | None, str]:
-        return self.json(
-            repo,
-            ["pr", "list", "--state", "all", "--limit", str(limit),
-             "--json", PR_FIELDS],
-        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reads = [
+                executor.submit(
+                    self.json, repo,
+                    ["pr", "list", "--state", state, "--limit", str(limit),
+                     "--json", fields],
+                )
+                for state, fields in (("all", PR_HISTORY_FIELDS), ("open", PR_FIELDS))
+            ]
+            history, opened = [read.result() for read in reads]
+        error = history[1] or opened[1]
+        if error:
+            return None, error
+        return merge_pr_reads(history[0], opened[0]), ""
 
     def pr(self, repo: str, number: int) -> tuple[object | None, str]:
         """One PR's change history, fetched only for the issue detail view."""
@@ -198,6 +213,18 @@ class GhReader:
             repo,
             ["pr", "view", str(number), "--json", PR_DETAIL_FIELDS],
         )
+
+
+def merge_pr_reads(history, opened) -> list[dict]:
+    """The two reads are cached and fetched independently, so a PR can be OPEN
+    in one and already MERGED, or on a newer head, in the other. The row GitHub
+    updated last wins; the full open row is kept only when it is not the stale one."""
+    merged = index_by_number(history)
+    for number, row in index_by_number(opened).items():
+        light = merged.get(number)
+        if light is None or str(row.get("updatedAt") or "") >= str(light.get("updatedAt") or ""):
+            merged[number] = row
+    return list(merged.values())
 
 
 def index_by_number(payload) -> dict[int, dict]:
