@@ -2295,6 +2295,48 @@ def test_daily_headroom_refused_at_admission_waits_without_a_label(tmp_path, mon
     assert gateway.prs[100].labels == pr.labels
 
 
+def test_pr_resume_refused_for_daily_headroom_keeps_the_pr_blocked_with_its_reply_unanswered(monkeypatch):
+    """Decision 7: the daily window is a wait; un-blocking would drop the reply."""
+    from issue_agent.domain.contracts import ReservationId
+    from tests.fakes import accounted_workflow
+    original = accounted_workflow.AccountingRuntime
+    admissions = []
+
+    def limited(*args, **kwargs):
+        runtime = dataclasses.replace(original(*args, **kwargs), repository_cap=Money("USD", 30_000_000))
+
+        def admit(request):
+            admissions.append(request)
+            if len(admissions) > 1:
+                n = len(admissions)
+                overhang = dataclasses.replace(request, run_id=RunId(f"overhang{n}"), reservation_id=ReservationId(f"overhang{n}"),
+                    kind="overhang", owner_id="o/r:fix:overhang", dispatch_id=f"overhang{n}", workflow=None, continuations=(),
+                    quote=dataclasses.replace(request.quote, maximum_charge=Money("USD", 29_000_000)))
+                assert runtime.store.reserve(overhang).admitted
+            return runtime.store.reserve(request)
+        return dataclasses.replace(runtime, admit=admit)
+    monkeypatch.setattr(accounted_workflow, "AccountingRuntime", limited)
+
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    pr = observed_pr(100, head_ref_name="fix/5-token", closing_issue=5, comments=(
+        Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")))
+    gateway = FakeGateway(issues={5: IssueView(5, title="Token", body="b")}, prs={100: pr}, pr_for_issue={5: 100})
+    store = FakeStore()
+    runner = SeqRunner([AgentResult(is_error=False, status="pushed", session_id="prior-session"),
+                        AgentResult(is_error=False, status="pushed", session_id="s5")])
+    workflow = _workflow(gateway, store, runner, fix_bot="fix-bot")
+    asyncio.run(workflow.resolve(5))
+    gateway.prs[100] = with_checks(gateway.prs[100], labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
+    before = len(gateway.calls)
+
+    asyncio.run(workflow.resume_pr(100))
+
+    assert len(runner.tasks) == 1, "the refused resume bought nothing"
+    assert [call for call in gateway.calls[before:] if call[0] in {"relabel", "comment"}] == []
+    assert Label.AI_BLOCKED in gateway.prs[100].labels
+    assert pr_repair_state(store).consumed_reply_at == ""
+
+
 @pytest.mark.parametrize("missing", ["binding", "control", "row", "activation", "stale"])
 def test_selected_resolve_refuses_missing_or_stale_authority_before_paid_work(missing):
     gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")})

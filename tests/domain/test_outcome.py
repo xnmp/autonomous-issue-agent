@@ -3,12 +3,14 @@
 from issue_agent.domain.outcome import (
     AgentResult,
     ExitReason,
+    MAX_BUDGET_STATUS,
     Outcome,
     ResolveFollowup,
     classify_outcome,
     deterministic_death,
     infra_death,
     offending_path,
+    pr_budget_actions,
     pr_resume_actions,
     resolve_followup,
 )
@@ -103,6 +105,15 @@ def test_pr_resume_infra_death_keeps_the_blocked_pr_unchanged():
     assert actions == []
     assert AgentResult(is_error=True).exit_reason is None
     assert AgentResult(is_error=True).usage is None
+
+def test_pr_resume_lifetime_cap_refusal_asks_for_a_cap_decision():
+    # The daily-window arm waits (test_fix_workflow); a lifetime refusal is
+    # deterministic, so the PR stays blocked under needs-budget-review.
+    actions = pr_resume_actions(100, AgentResult(
+        is_error=True, exit_reason=ExitReason.BUDGET_EXHAUSTED, envelope_subtype=MAX_BUDGET_STATUS))
+    assert actions == pr_budget_actions(100)
+    assert Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.AI_PR_OPEN) not in actions
+
 
 
 # ── deterministic deaths: the retry cannot win, so it must not be bought (#13) ─

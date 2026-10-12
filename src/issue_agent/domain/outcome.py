@@ -749,9 +749,12 @@ def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
     changing the issue here would manufacture a second lifecycle state to keep
     coherent. The PR stays blocked while the one-at-a-time dispatcher runs, so
     a raised runner exception cannot strand an invented `ai-working` marker.
+    A daily-headroom refusal leaves the PR blocked with its reply unanswered.
     """
-    if infra_death(result.exit_reason):
+    if infra_death(result.exit_reason) or daily_headroom_wait(result):
         return []
+    if budget_exhausted(result.exit_reason):
+        return pr_budget_actions(pr)
     if classify_outcome(result) is Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
