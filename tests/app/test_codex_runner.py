@@ -2039,14 +2039,15 @@ def _run_refused(codex_error_info, **kwargs):
 def test_provider_overload_terminal_is_a_machine_failure_that_keeps_its_session(codex_error_info):
     from issue_agent.domain.outcome import resumable_session
     result, machine = _run_refused(codex_error_info)
-    assert result.is_error and machine
+    # RESUME and review classify on exit_reason, so it must say transport death.
+    assert result.is_error and machine and result.exit_reason is ExitReason.TRANSPORT_DEATH
     assert result.session_id and resumable_session(result) == result.session_id
 
 
 @pytest.mark.parametrize("codex_error_info", ["other", "", "x" * 10_000])
 def test_unrecognised_provider_error_stays_an_agent_error(codex_error_info):
     result, machine = _run_refused(codex_error_info)
-    assert result.is_error and not machine
+    assert result.is_error and not machine and result.exit_reason is not ExitReason.TRANSPORT_DEATH
 
 
 def test_an_earlier_turns_overload_does_not_classify_this_run():

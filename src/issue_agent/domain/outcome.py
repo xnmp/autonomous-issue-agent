@@ -322,7 +322,6 @@ def infra_class_failure(result: AgentResult) -> bool:
         or runtime_unavailable(result.exit_reason)
         or result.exit_reason in _INFRA_CLASS_EXTRA
         or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
-        or result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE
     )
 
 
