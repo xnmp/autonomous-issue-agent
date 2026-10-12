@@ -31,20 +31,15 @@ from ..domain.resolve_rearm import (
 from ..domain.resolve_return import (
     FinalizedResolveReturn, PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve, RetiredResolveReturn, UnavailableResolveReturn,
 )
-from ..domain.resolve_split import (
-    AdjudicationInput, ContractBaseline, ContractResetCompleted, ContractResetIntent,
-    ContractRevision, NeedsAdjudication, ReauthorInput, ReauthorResetIntent, ResetIntent,
-    SplitContext, SplitImplement, split_context, validate_contract_rounds,
-)
 from ..domain.resolve_workspace import (
     EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared, NoPriorResolveAdmission,
     ObservedResolveBase, PriorResolveAdmission, ResolveWorkspaceObserved,
 )
 from ..domain.workflow import (
-    ActiveReconciliation, ReconciliationOnly, RetiredSettledCommand, RetiredUncertainCommand, AuthoredResolve, AuthorizeAbsentRetry, RearmObligation, RetryAuthorizationRequired, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    ActiveReconciliation, ReconciliationOnly, RetiredSettledCommand, RetiredUncertainCommand, AuthorizeAbsentRetry, RearmObligation, RetryAuthorizationRequired, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate, OperatorActor,
     PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
-    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage,
+    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
     WorkflowConflict, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
     WorkflowUnchanged, WorkflowRejected, WorkflowRejection,
@@ -54,15 +49,14 @@ from ..domain.workflow_identity import (
     WorkflowWriter, validate_workflow_identifier, validate_workflow_integer,
 )
 from ..domain.workflow_policy import (
-    apply_return_cleanup, clear_return_split, decide_return, defer_return_observation, initial_resolve_workflow,
-    cancel_resolve_rearm, reauthor_baseline, record_resolve_attempt, resolve_return_actions, return_gate_id,
-    update_return_observation, validate_resolve_transition, split_return_continuation,
+    apply_return_cleanup, decide_return, defer_return_observation, initial_resolve_workflow,
+    cancel_resolve_rearm, record_resolve_attempt, resolve_return_actions, return_gate_id,
+    update_return_observation, validate_resolve_transition,
 )
 from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, minted_authorization, retry_authorization_available
 from .control_store import (
     load_retry_authorization_facts, AccountingDisposition, ControlStoreError, SettlementRequest, SettlementResult, SQLiteControlStore,
-    _command_from_row, _stamp, admitted_adjudications, latest_work_admission,
-    proven_unlaunched_run, require_workspace_predecessor, reset_predecessor_admission,
+    _command_from_row, _stamp, latest_work_admission,
     target_has_work_admissions, workflow_run_scope_bounds,
 )
 from .effects import command_for_action
@@ -83,18 +77,16 @@ from .workflow_rows import (
 
 class SQLiteWorkflowControl:
     def __init__(
-        self, control: SQLiteControlStore, writer: WorkflowWriter, *, resolve_ceiling: int, max_contract_rounds: int = 2,
+        self, control: SQLiteControlStore, writer: WorkflowWriter, *, resolve_ceiling: int,
     ) -> None:
         if not isinstance(control, SQLiteControlStore) or not isinstance(writer, WorkflowWriter):
             raise ValueError("workflow control requires the existing store and a typed writer")
         if writer.role != "fix" or deployment_role(writer.repository, writer.owner_id) != writer.role:
             raise ValueError("resolve workflow authority requires the repository's fix owner")
         validate_workflow_integer(resolve_ceiling, "resolve ceiling")
-        validate_contract_rounds(max_contract_rounds)
         self._control = control
         self._writer = writer
         self._resolve_ceiling = resolve_ceiling
-        self._max_contract_rounds = max_contract_rounds
 
     @property
     def writer(self) -> WorkflowWriter:
@@ -832,42 +824,6 @@ class SQLiteWorkflowControl:
         if prior is None:
             raise WorkflowAuthorityError("paid return requires existing workflow authority")
         admission = self._validate_attempt_run(db, self._return_proof(returned))
-        if returned.split_input is not None:
-            encoded = encode_workflow(returned.split_input)
-            fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
-            row = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(returned.attempt.run_id),)).fetchone()
-            metadata = json.loads(row["dispatch_id"])
-            selection = split_context(returned.split_input).selection
-            reservation = db.execute("SELECT model FROM budget_reservations WHERE run_id=?", (str(returned.attempt.run_id),)).fetchone()
-            if admission.split_fingerprint != fingerprint or metadata.get("split_fingerprint") != fingerprint or metadata.get("split_input") != encoded:
-                raise WorkflowAuthorityError("returned split context disagrees with its admitted input")
-            if metadata.get("resolve_inputs") != encode_workflow(returned.inputs):
-                raise WorkflowAuthorityError("returned split issue facts disagree with the admitted task")
-            if metadata.get("runtime") != selection.runtime or metadata.get("effort") != (selection.effort.value if selection.effort is not None else None) or reservation is None or reservation["model"] != selection.model:
-                raise WorkflowAuthorityError("returned split selection disagrees with actual admitted runtime/model/effort")
-            if isinstance(returned.split_input, (SplitImplement, AdjudicationInput)):
-                source = returned.split_input if isinstance(returned.split_input, SplitImplement) else returned.split_input.petition
-                predecessor = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-disposition' AND scope=? AND key=?", (self.writer.repository, str(source.source.run_id))).fetchone()
-                if predecessor is None:
-                    raise WorkflowAuthorityError("split input lacks its finalized predecessor")
-                finalized = decode_workflow(predecessor["payload_json"], FinalizedResolveReturn)
-                if finalized.result.attempt != source.source or finalized.result.split != source or source.admission_version >= admission.revision.version:
-                    raise WorkflowAuthorityError("split input does not match its earlier finalized predecessor")
-            if isinstance(returned.split_input, ReauthorInput):
-                intent = returned.split_input.reset.intent
-                assert isinstance(intent, ReauthorResetIntent)
-                source, source_admission, _ = self._finalized_source(db, intent.source)
-                if source_admission.revision.version >= admission.revision.version or intent.binding != returned.attempt.binding or intent.input_fingerprint != admission.input_fingerprint:
-                    raise WorkflowAuthorityError("replacement author disagrees with its earlier reset predecessor")
-                if self._source_baseline(db, source) != intent.baseline:
-                    raise WorkflowAuthorityError("replacement author reset used a different safe baseline")
-            if isinstance(returned.split_input, (AdjudicationInput, ReauthorInput)):
-                ack = returned.split_input.reset
-                stored = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset-completed' AND scope=? AND key=?", (self.writer.repository, ack.intent.intent_id)).fetchone()
-                if stored is None or stored["payload_json"] != encode_workflow(ack):
-                    raise WorkflowAuthorityError("split input lacks its durable verified reset")
-        elif admission.split_fingerprint is not None:
-            raise WorkflowAuthorityError("returned result omitted its admitted split input")
         if admission.revision.version > prior.revision.version or returned.returned_at > self._control._now():
             raise WorkflowAuthorityError("paid return or admission is newer than current authority")
         return prior, admission
@@ -896,7 +852,7 @@ class SQLiteWorkflowControl:
                                         (self.writer.repository, str(command_id))).fetchone()
                 if provenance is None or decode_workflow(provenance["payload_json"], WorkflowAttemptIdentity) != returned.attempt:
                     raise WorkflowAuthorityError("paid return command lacks its admitted occurrence provenance")
-            if not returned.is_error and (returned.status in ("pushed", "done") or returned.split_input is not None) and disposition.issue.issue.state == "closed" and isinstance(disposition.linkage, NoLinkedPr):
+            if not returned.is_error and returned.status in ("pushed", "done") and disposition.issue.issue.state == "closed" and isinstance(disposition.linkage, NoLinkedPr):
                 cleanup_row = self._return_row(db, "workflow-return-cleanup", returned)
                 if cleanup_row is None:
                     raise WorkflowAuthorityError("terminal returned result lacks its cleanup acknowledgement")
@@ -1081,7 +1037,7 @@ class SQLiteWorkflowControl:
             yield
 
     def finalize_return(self, returned: ReturnedResolve, issue: ObservedIssue, linkage: NoLinkedPr | LinkedPrPresent,
-                        *, cleanup: ResolveCleanupCompleted | None = None, contract_revision: ContractRevision | None = None) -> WorkflowCommitted | WorkflowConflict:
+                        *, cleanup: ResolveCleanupCompleted | None = None) -> WorkflowCommitted | WorkflowConflict:
         with self._control.transaction() as db:
             prior, admission = self._return_prior(db, returned)
             self._require_return(db, returned)
@@ -1089,10 +1045,7 @@ class SQLiteWorkflowControl:
                 return WorkflowCommitted(prior, idempotent=True)
             if prior.binding != returned.attempt.binding:
                 return WorkflowCommitted(self._retire_return(db, prior, returned))
-            adjudications = admitted_adjudications(db, prior.binding)
-            classified, actions = decide_return(returned, issue, linkage, now=self._control._now(),
-                                               adjudications=adjudications,
-                                               adjudication_ceiling=self._max_contract_rounds)
+            classified, actions = decide_return(returned, issue, linkage, now=self._control._now())
             remaining = replace(prior, gates=tuple(g for g in prior.gates if opened_gate(g).gate_id != return_gate_id(returned)))
             if any(not isinstance(action, Relabel) for action in actions):
                 if remaining.gates:
@@ -1103,14 +1056,6 @@ class SQLiteWorkflowControl:
                 actions = ()
             elif cleanup is not None:
                 return WorkflowConflict(prior.revision, "unexpected cleanup acknowledgement for remote completion")
-            if contract_revision is not None:
-                if not isinstance(contract_revision, ContractRevision) or returned.stage not in (ResolveStage.AUTHOR, ResolveStage.ADJUDICATE) or returned.split_input is None or contract_revision.branch != split_context(returned.split_input).branch:
-                    return WorkflowConflict(prior.revision, "recovered contract revision does not match the returned branch")
-            try:
-                cursor = None if cleanup is not None or issue.issue.state == "closed" or isinstance(linkage, LinkedPrPresent) else split_return_continuation(returned, admission, classified, issue=issue, contract_revision=contract_revision, adjudications=adjudications, adjudication_ceiling=self._max_contract_rounds)
-            except ValueError as exc:
-                return WorkflowConflict(prior.revision, str(exc))
-            classified = replace(classified, split=cursor)
             if self._return_row(db, "workflow-result", returned) is not None:
                 return WorkflowConflict(prior.revision, "paid return already has an independently recorded classification")
             self._validate_attempt_run(db, classified)
@@ -1122,10 +1067,6 @@ class SQLiteWorkflowControl:
             # blocked RESUME can still clear this exact run's returned session.
             after = replace(after, gates=tuple(g for g in after.gates if opened_gate(g).gate_id != return_gate_id(returned)),
                             revision=replace(prior.revision, version=prior.revision.version + 1))
-            if issue.issue.state == "closed" or isinstance(linkage, LinkedPrPresent) or (
-                returned.stage is ResolveStage.ADJUDICATE and classified.kind is ResolveResultKind.INFRA_FAILURE and cursor is None
-            ):
-                after = clear_return_split(after, admission)
             if cleanup is not None:
                 after = apply_return_cleanup(after, cleanup)
             self._persist_snapshot(db, after)
@@ -1143,123 +1084,9 @@ class SQLiteWorkflowControl:
                                        encode_workflow(FinalizedResolveReturn(classified, issue, linkage, tuple(commands))))
             if cleanup is not None:
                 self._insert_return_record(db, "workflow-return-cleanup", returned, encode_workflow(cleanup))
-            if contract_revision is not None:
-                self._insert_return_record(db, "workflow-return-contract", returned, encode_workflow(ContractBaseline(returned.attempt, contract_revision)))
             self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "finalized",
                                       {"classification": classified.kind.value, "commands": commands})
             return WorkflowCommitted(after)
-
-    def _finalized_source(self, db: sqlite3.Connection, attempt: WorkflowAttemptIdentity) -> tuple[ReturnedResolve, ResolveAdmission, FinalizedResolveReturn]:
-        self._scope(attempt.binding.fence.key)
-        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?", (self.writer.repository, str(attempt.run_id))).fetchone()
-        if row is None:
-            raise WorkflowAuthorityError("reset predecessor lacks its immutable paid return")
-        returned = decode_workflow(row["payload_json"], ReturnedResolve)
-        if returned.attempt != attempt:
-            raise WorkflowAuthorityError("reset predecessor belongs to another attempt")
-        admission = self._validate_attempt_run(db, self._return_proof(returned))
-        run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(attempt.run_id),)).fetchone()
-        metadata = json.loads(run["dispatch_id"])
-        encoded = encode_workflow(returned.split_input)
-        if returned.split_input is None or admission.split_fingerprint != hashlib.sha256(encoded.encode()).hexdigest() or metadata.get("split_input") != encoded or metadata.get("split_fingerprint") != admission.split_fingerprint or metadata.get("resolve_inputs") != encode_workflow(returned.inputs):
-            raise WorkflowAuthorityError("reset predecessor disagrees with its immutable admitted input")
-        disposition = self._return_disposition(db, returned)
-        if not isinstance(disposition, FinalizedResolveReturn):
-            raise WorkflowAuthorityError("reset predecessor requires a finalized paid return")
-        return returned, admission, disposition
-
-    def _source_baseline(self, db: sqlite3.Connection, returned: ReturnedResolve) -> ContractBaseline | None:
-        disposition = self._return_disposition(db, returned)
-        if not isinstance(disposition, FinalizedResolveReturn):
-            raise WorkflowAuthorityError("reset baseline requires finalized predecessor evidence")
-        row = self._return_row(db, "workflow-return-contract", returned)
-        recovered = decode_workflow(row["payload_json"], ContractBaseline) if row is not None else None
-        try:
-            return reauthor_baseline(returned, disposition, recovered=recovered)
-        except ValueError as exc:
-            raise WorkflowAuthorityError(str(exc)) from exc
-
-    def _reauthor_reset_intent(self, db: sqlite3.Connection, binding: WorkflowBinding, input_fingerprint: str) -> ReauthorResetIntent | None:
-        if not isinstance(input_fingerprint, str) or len(input_fingerprint) != 64 or any(char not in "0123456789abcdef" for char in input_fingerprint):
-            raise ValueError("re-author reset requires the replacement input SHA-256 digest")
-        self._scope(binding.fence.key)
-        self._control._assert_owner_active(db, self.writer.owner_id)
-        state = load_resolve_workflow_row(db, binding.fence.key)
-        if state is None or state.binding != binding or state.gates:
-            raise WorkflowAuthorityError("re-author reset requires current unheld authority")
-        continuation = state.episode.continuation
-        if isinstance(continuation, AuthoredResolve) and continuation.author_admission.input_fingerprint == input_fingerprint:
-            raise WorkflowAuthorityError("applicable author inputs do not require replacement")
-        workspace_predecessor = require_workspace_predecessor(db, state)
-        if (workspace_predecessor is not None
-                and workspace_predecessor.attempt.binding.episode_id != binding.episode_id):
-            return None
-        latest = reset_predecessor_admission(db, binding)
-        if latest is None:
-            if isinstance(continuation, AuthoredResolve):
-                raise WorkflowAuthorityError("authored checkpoint has no admitted predecessor")
-            return None
-        if (latest.attempt.binding.fence.key, latest.attempt.binding.authority, latest.attempt.binding.episode_id) != (binding.fence.key, binding.authority, binding.episode_id):
-            raise WorkflowAuthorityError("re-author predecessor belongs to another episode")
-        if proven_unlaunched_run(db, latest.attempt.run_id):
-            run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(latest.attempt.run_id),)).fetchone()
-            metadata = json.loads(run["dispatch_id"])
-            raw = metadata.get("split_input")
-            if latest.stage is ResolveStage.AUTHOR and not isinstance(continuation, AuthoredResolve) and isinstance(raw, str) and latest.split_fingerprint == hashlib.sha256(raw.encode()).hexdigest() and metadata.get("split_fingerprint") == latest.split_fingerprint and isinstance(decode_workflow(raw, SplitContext), SplitContext):
-                return None
-            raise WorkflowAuthorityError("unlaunched reset source lacks a safe admitted predecessor")
-        returned, admission, _ = self._finalized_source(db, latest.attempt)
-        if admission != latest:
-            raise WorkflowAuthorityError("re-author reset source disagrees with latest admitted authority")
-        if db.execute("SELECT 1 FROM leases WHERE run_id=?", (str(latest.attempt.run_id),)).fetchone() is not None:
-            raise WorkflowAuthorityError("re-author reset is blocked by an active process lease")
-        baseline = self._source_baseline(db, returned)
-        if baseline is None:
-            if isinstance(continuation, AuthoredResolve):
-                raise WorkflowAuthorityError("existing author checkpoint cannot discard baseline provenance")
-            return None
-        return ReauthorResetIntent(binding, latest.attempt, baseline, input_fingerprint)
-
-    def reauthor_reset_intent(self, binding: WorkflowBinding, input_fingerprint: str) -> ReauthorResetIntent | None:
-        with self._control.transaction() as db:
-            return self._reauthor_reset_intent(db, binding, input_fingerprint)
-
-    def _reset_state(self, db: sqlite3.Connection, intent: ResetIntent) -> WorkflowSnapshot:
-        if not isinstance(intent, (ContractResetIntent, ReauthorResetIntent)):
-            raise ValueError("contract reset requires a typed intent")
-        self._scope(intent.binding.fence.key)
-        self._control._assert_owner_active(db, self.writer.owner_id)
-        state = load_resolve_workflow_row(db, intent.binding.fence.key)
-        if state is None or state.binding != intent.binding or state.gates:
-            raise WorkflowAuthorityError("contract reset requires current unheld authority")
-        if isinstance(intent, ReauthorResetIntent):
-            if self._reauthor_reset_intent(db, intent.binding, intent.input_fingerprint) != intent:
-                raise WorkflowAuthorityError("re-author reset disagrees with current predecessor or baseline")
-            return state
-        continuation = state.episode.continuation
-        if not isinstance(continuation, AuthoredResolve) or continuation.split != intent.petition:
-            raise WorkflowAuthorityError("contract reset no longer owns the current petition")
-        if admitted_adjudications(db, intent.binding) >= self._max_contract_rounds:
-            raise WorkflowAuthorityError("contract adjudication allowance is exhausted")
-        latest = latest_work_admission(db, intent.binding)
-        if latest is not None and latest.stage is ResolveStage.ADJUDICATE and proven_unlaunched_run(db, latest.attempt.run_id):
-            run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(latest.attempt.run_id),)).fetchone()
-            supplied = decode_workflow(json.loads(run["dispatch_id"])["split_input"], AdjudicationInput)
-            ack = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset-completed' AND scope=? AND key=?", (self.writer.repository, intent.intent_id)).fetchone()
-            if supplied.reset.intent == intent and ack is not None and decode_workflow(ack["payload_json"], ContractResetCompleted) == supplied.reset:
-                return state
-        if latest is None or latest.attempt != intent.petition.source:
-            raise WorkflowAuthorityError("contract reset is blocked by a later active or returned admission")
-        row = db.execute("SELECT runs.state, leases.run_id AS leased FROM runs LEFT JOIN leases USING(run_id) WHERE runs.run_id=?", (str(latest.attempt.run_id),)).fetchone()
-        if row is None or row["state"] not in ("completed", "cancelled", "abandoned") or row["leased"] is not None:
-            raise WorkflowAuthorityError("contract reset is blocked by an active run or process lease")
-        done = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-disposition' AND scope=? AND key=?", (self.writer.repository, str(latest.attempt.run_id))).fetchone()
-        if done is None:
-            raise WorkflowAuthorityError("contract reset requires its finalized paid predecessor")
-        disposition = decode_workflow(done["payload_json"], FinalizedResolveReturn)
-        if disposition.result.attempt != latest.attempt or disposition.result.split != intent.petition:
-            raise WorkflowAuthorityError("contract reset predecessor does not own this petition")
-        return state
 
     @contextmanager
     def _rearm_barriers(self):
@@ -1489,46 +1316,6 @@ class SQLiteWorkflowControl:
             self._assert_workspace_predecessor(db, state, state.intent.handoff)
             return load_workspace_ack(db, state.intent.handoff)
 
-    @contextmanager
-    def contract_reset_authority(self, intent: ResetIntent):
-        with deployment_effect_barrier(self._control.path, self.writer.repository, self.writer.role):
-            with self._control.transaction() as db:
-                self._reset_state(db, intent)
-                encoded = encode_workflow(intent)
-                row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset' AND scope=? AND key=?", (self.writer.repository, intent.intent_id)).fetchone()
-                if row is not None and row["payload_json"] != encoded:
-                    raise WorkflowAuthorityError("contract reset identity already contains different intent")
-                if row is None:
-                    db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-contract-reset',?,?,?,?)", (self.writer.repository, intent.intent_id, self._control._now().isoformat(), encoded))
-                done = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset-completed' AND scope=? AND key=?", (self.writer.repository, intent.intent_id)).fetchone()
-                acknowledgement = decode_workflow(done["payload_json"], ContractResetCompleted) if done is not None else None
-                if acknowledgement is not None and acknowledgement.intent != intent:
-                    raise WorkflowAuthorityError("contract reset acknowledgement belongs to different intent")
-            # The exclusive barrier serializes reset callers; a replay with
-            # retained acknowledgement must not mutate the worktree again.
-            yield acknowledgement
-
-    def complete_contract_reset(self, acknowledgement: ContractResetCompleted) -> ContractResetCompleted:
-        if not isinstance(acknowledgement, ContractResetCompleted):
-            raise ValueError("contract reset completion requires verified evidence")
-        intent = acknowledgement.intent
-        with self._control.transaction() as db:
-            self._reset_state(db, intent)
-            if not 0 <= (self._control._now() - acknowledgement.observed_at).total_seconds() <= 300:
-                raise WorkflowAuthorityError("contract reset completion must be fresh")
-            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset' AND scope=? AND key=?", (self.writer.repository, intent.intent_id)).fetchone()
-            if row is None or row["payload_json"] != encode_workflow(intent):
-                raise WorkflowAuthorityError("contract reset completion lacks its durable intent")
-            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset-completed' AND scope=? AND key=?", (self.writer.repository, intent.intent_id)).fetchone()
-            if prior is not None:
-                stored = decode_workflow(prior["payload_json"], ContractResetCompleted)
-                if stored.intent != intent or stored.result != acknowledgement.result:
-                    raise WorkflowAuthorityError("contract reset completion disagrees with retained evidence")
-                return stored
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-contract-reset-completed',?,?,?,?)", (self.writer.repository, intent.intent_id, acknowledgement.observed_at.isoformat(), encode_workflow(acknowledgement)))
-            self._control._transition(db, "workflow_contract_reset", intent.intent_id, "verified", {"archive_ref": acknowledgement.result.archive_ref})
-            return acknowledgement
-
     def record_attempt(self, result: ResolveAttemptResult) -> WorkflowCommitted | WorkflowConflict:
         """Every paid classification has one immutable audit, even without a strike."""
         if not isinstance(result, ResolveAttemptResult):
@@ -1542,8 +1329,6 @@ class SQLiteWorkflowControl:
             if prior is None:
                 raise WorkflowAuthorityError("workflow must be explicitly imported before recording results")
             admission = self._validate_attempt_run(db, result)
-            if admission.split_fingerprint is not None:
-                return WorkflowConflict(prior.revision, "split admission must use atomic return capture and observation finalization")
             if db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
                           (self.writer.repository, str(result.attempt.run_id))).fetchone() is not None:
                 return WorkflowConflict(prior.revision, "captured paid return must use observation finalization")

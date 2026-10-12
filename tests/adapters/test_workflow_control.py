@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from itertools import permutations
 import json
 import sqlite3
 from zoneinfo import ZoneInfo
@@ -20,13 +19,13 @@ from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, workflow_scope, load_workflow_row
 from issue_agent.domain.contracts import (
-    BudgetScope, CommandKind, EffectReceipt, EffectStatus, Money, PriceQuote,
+    BudgetScope, EffectReceipt, EffectStatus, Money, PriceQuote,
     PricingBasis, ReservationId, RunId, WorkflowAttemptIdentity,
 )
 from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from issue_agent.domain.labels import Label
 from issue_agent.domain.workflow import (
-    AuthoredResolve, FreshResolve, ResolveAdmission, ResolveSession, ResolveStage,
+    FreshResolve, ResolveAdmission, ResolveSession, ResolveStage,
     CancelRearm, CancelledRearm, ContinueGrantedRearm, EvidenceUnavailable,
     KeepGuidance, NoAuthorizedRemediation, NoLinkedPr, ObservedIssue, OpenGate,
     OperatorActor, PendingRearm, RemoteOutcomeUncertain, RequestRearm,
@@ -42,7 +41,7 @@ from issue_agent.domain.workflow_policy import (
     resolve_rearm_projection, supersede_resolve_rearm,
 )
 from issue_agent.domain.world import IssueView
-from issue_agent.domain.resolve_return import PendingResolveReturn, ResolveCleanupCompleted, ResolveInputs, ReturnedResolve, UnavailableResolveReturn
+from issue_agent.domain.resolve_return import PendingResolveReturn, ResolveInputs, ReturnedResolve, UnavailableResolveReturn
 from issue_agent.domain.resolve_workspace import PriorResolveAdmission
 from issue_agent.domain.workflow_policy import return_gate_id
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot as initial_snapshot
@@ -150,7 +149,7 @@ def run(control, state, *, name="run:1", status="completed", leg="leg:1", stage=
 def admission(state, attempt_result):
     """Captured post-admission fixture; production reads the immutable SQL receipt."""
     return ResolveAdmission(attempt_result.attempt, WorkflowRevision(attempt_result.attempt.binding.fence, state.revision.version), attempt_result.stage,
-                            3 if attempt_result.stage is ResolveStage.ADJUDICATE else None, input_fingerprint="a" * 64)
+                            input_fingerprint="a" * 64)
 
 
 def command_row(control, command_id):
@@ -159,12 +158,10 @@ def command_row(control, command_id):
 
 
 def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runtime-default>", session_id=None, launch=True, settle=True, historical=False):
-    """Real accounting with historical split rows for pre-cutover recovery.
+    """Real accounting; ``historical`` installs a concurrent pre-cutover admission.
 
-    These tests deliberately deliver concurrent/reversed legacy split stages.
-    New split admission serializes stages; its full pipeline is exercised in
-    test_split_workflow_control and test_split_runtime. Only this fixture may
-    install the historical shape, never the production admission path.
+    Only this fixture may install the historical shape, never the production
+    admission path.
     """
     attempt = WorkflowAttemptIdentity(state.binding, RunId(name), f"leg:{name}")
     session_id = f"session:{name}" if session_id is None else session_id
@@ -177,10 +174,9 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
         BudgetScope(money_scope, "daily", "USD", "2026-09-14", NOW, NOW + timedelta(days=1), ZoneInfo("UTC")),
         PriceQuote(model, "card", "1", NOW, Money("USD", 1)), Money("USD", 100), "config", "o/r",
         kind=stage.value, owner_id=WRITER.owner_id, workflow=state.binding,
-        adjudication_ceiling=3 if stage is ResolveStage.ADJUDICATE else None,
     )
-    if historical or stage in (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE):
-        assert control.reserve(replace(request, kind="historical-fixture", workflow=None, adjudication_ceiling=None)).admitted
+    if historical:
+        assert control.reserve(replace(request, kind="historical-fixture", workflow=None)).admitted
         with control.transaction() as db:
             current = load_workflow_row(db, state.revision.fence.key)
             assert current is not None
@@ -190,7 +186,7 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
                        (stage.value, encode_workflow(state.binding), workflow_episode_key(state.binding), name))
             db.execute("UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
                        (revision.version, *workflow_scope(state.revision.fence.key)))
-            legacy = ResolveAdmission(attempt, revision, stage, request.adjudication_ceiling, "a" * 64)
+            legacy = ResolveAdmission(attempt, revision, stage, "a" * 64)
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission',?,?,?,?)",
                        (WRITER.repository, name, NOW.isoformat(), encode_workflow(legacy)))
             db.execute(
@@ -465,35 +461,6 @@ def test_closed_return_keeps_local_cleanup_explicitly_pending(control):
     assert adapter(control).pending_returns()[0].returned == returned
 
 
-def test_closed_return_finishes_only_after_matching_idempotent_cleanup_acknowledgement(control):
-    before = initial_snapshot()
-    install_workflow(control, before)
-    authored = paid_result(control, before, "earned-author", ResolveStage.AUTHOR)
-    before = adapter(control).record_attempt(authored).snapshot
-    assert isinstance(before.episode.continuation, AuthoredResolve)
-    returned = paid_return(control, before, status="done", historical=True)
-    workflow = adapter(control)
-    workflow.capture_return(returned)
-    issue, linkage = return_observations(returned, state="closed")
-    with workflow.return_effect_authority(returned):
-        # A second transaction is possible during local I/O; the shared effect
-        # barrier, not a held SQLite write transaction, fences re-arm acceptance.
-        with control.transaction() as db:
-            assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
-        wrong = ResolveCleanupCompleted(returned.attempt, replace(issue, issue=replace(issue.issue, title="changed")), linkage)
-        assert isinstance(workflow.finalize_return(returned, issue, linkage, cleanup=wrong), WorkflowConflict)
-        acknowledged = ResolveCleanupCompleted(returned.attempt, issue, linkage)
-        finalized = workflow.finalize_return(returned, issue, linkage, cleanup=acknowledged)
-    assert finalized.snapshot.episode.failures == 0 and finalized.snapshot.gates == ()
-    assert isinstance(finalized.snapshot.episode.continuation, FreshResolve)
-    assert finalized.snapshot.episode.continuation.session is None
-    assert finalized.snapshot.episode.continuation.last_applied_admission_version > before.episode.continuation.last_applied_admission_version
-    reopened = workflow.ensure_observed_workflow(replace(issue, issue=replace(issue.issue, state="open", state_reason="reopened")))
-    assert reopened.snapshot.episode.continuation == finalized.snapshot.episode.continuation
-    assert workflow.pending_returns() == ()
-    assert not control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id)
-
-
 def test_stale_generation_cannot_enter_return_local_effect_authority(control):
     before = initial_snapshot()
     install_workflow(control, before)
@@ -615,51 +582,6 @@ def test_unlaunched_reservation_cannot_mint_returned_progress(control):
     assert adapter(control).pending_returns() == ()
 
 
-@pytest.mark.parametrize("money_scope", ["o/r", "*"])
-@pytest.mark.parametrize("model", ["<runtime-default>", "selected-model"])
-def test_real_paid_author_session_survives_restart_with_repository_or_global_budget(control, money_scope, model):
-    before = initial_snapshot()
-    install_workflow(control, before)
-    result = paid_result(control, before, "author", ResolveStage.AUTHOR, money_scope=money_scope, model=model)
-    recorded = adapter(control).record_attempt(result)
-    continuation = recorded.snapshot.episode.continuation
-    assert isinstance(continuation, AuthoredResolve)
-    assert continuation.author_attempt == result.attempt and continuation.session == result.session
-    assert continuation.last_applied_admission_version == 1
-    assert recorded.snapshot.episode.failures == 0
-    restarted = SQLiteControlStore(control.path, now=lambda: NOW)
-    assert adapter(restarted).record_attempt(result).idempotent
-    assert adapter(restarted).load_workflow(before.revision.fence.key) == recorded.snapshot
-
-
-def test_real_admissions_reverse_delivery_counts_old_strike_without_regressing_checkpoint(control):
-    before = replace(initial_snapshot(), episode=ResolveEpisode("initial", 2))
-    install_workflow(control, before)
-    old = replace(paid_result(control, before, "old", ResolveStage.RESOLVE), kind=ResolveResultKind.COUNTED_REQUEUE)
-    newer = paid_result(control, adapter(control).load_workflow(before.revision.fence.key), "author", ResolveStage.AUTHOR)
-    latest = adapter(control).record_attempt(newer).snapshot
-    restarted = SQLiteControlStore(control.path, now=lambda: NOW)
-    final = adapter(restarted).record_attempt(old).snapshot
-    assert final.episode.continuation == latest.episode.continuation
-    assert final.episode.failures == 3
-    assert adapter(restarted).held_projection(before.revision.fence.key).held
-    assert adapter(restarted).record_attempt(old).idempotent
-
-
-def test_actual_resume_blocked_clears_session_without_losing_authored_checkpoint(control):
-    before = initial_snapshot()
-    install_workflow(control, before)
-    author = paid_result(control, before, "author", ResolveStage.AUTHOR)
-    authored = adapter(control).record_attempt(author).snapshot
-    blocked = replace(paid_result(control, authored, "resume", ResolveStage.RESUME, historical=True), kind=ResolveResultKind.BLOCKED)
-    assert blocked.session is not None
-    cleared = adapter(control).record_attempt(blocked).snapshot
-    assert isinstance(cleared.episode.continuation, AuthoredResolve)
-    assert cleared.episode.continuation.author_attempt == author.attempt
-    assert cleared.episode.continuation.session is None
-    assert cleared.episode.failures == 0
-
-
 @pytest.mark.parametrize("corruption", [
     "missing_admission", "wrong_admission_scope", "malformed_admission", "admission_run", "admission_stage",
     "future_admission", "run_stage", "dispatch_stage", "dispatch_runtime", "unknown_receipt", "recovered_receipt",
@@ -668,7 +590,7 @@ def test_actual_resume_blocked_clears_session_without_losing_authored_checkpoint
 def test_unproven_continuation_is_rejected_without_audit_or_episode_mutation(control, corruption):
     before = initial_snapshot()
     install_workflow(control, before)
-    result = paid_result(control, before, "author", ResolveStage.AUTHOR)
+    result = paid_result(control, before, "author", ResolveStage.RESOLVE)
     admitted = adapter(control).load_workflow(before.revision.fence.key)
     with control.transaction() as db:
         if corruption == "missing_admission":
@@ -683,12 +605,12 @@ def test_unproven_continuation_is_rejected_without_audit_or_episode_mutation(con
             if corruption == "admission_run":
                 proof = replace(proof, attempt=replace(proof.attempt, run_id=RunId("wrong-run")))
             elif corruption == "admission_stage":
-                proof = replace(proof, stage=ResolveStage.RESOLVE)
+                proof = replace(proof, stage=ResolveStage.RESUME)
             else:
                 proof = replace(proof, revision=replace(proof.revision, version=admitted.revision.version + 1))
             db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='workflow-admission'", (encode_workflow(proof),))
         elif corruption == "run_stage":
-            db.execute("UPDATE runs SET kind='RESOLVE'")
+            db.execute("UPDATE runs SET kind='RESUME'")
         elif corruption in ("dispatch_stage", "dispatch_runtime"):
             metadata = json.loads(db.execute("SELECT dispatch_id FROM runs").fetchone()[0])
             metadata["kind" if corruption == "dispatch_stage" else "runtime"] = "wrong"
@@ -716,7 +638,7 @@ def test_unproven_continuation_is_rejected_without_audit_or_episode_mutation(con
 def test_result_proposal_uses_durable_admission_not_a_forged_newer_order(control):
     before = initial_snapshot()
     install_workflow(control, before)
-    result = paid_result(control, before, "old", ResolveStage.AUTHOR)
+    result = paid_result(control, before, "old", ResolveStage.RESOLVE, historical=True)
     latest_result = paid_result(control, adapter(control).load_workflow(before.revision.fence.key), "new", ResolveStage.RESOLVE, historical=True)
     latest = adapter(control).record_attempt(latest_result).snapshot
     forged_proof = ResolveAdmission(result.attempt, latest.revision, result.stage, input_fingerprint="a" * 64)
@@ -727,23 +649,10 @@ def test_result_proposal_uses_durable_admission_not_a_forged_newer_order(control
     assert adapter(control).load_workflow(before.revision.fence.key) == latest
 
 
-def test_accounted_empty_session_sentinel_cannot_be_laundered_into_a_resume_handle(control):
-    before = initial_snapshot()
-    install_workflow(control, before)
-    result = paid_result(control, before, "author", ResolveStage.AUTHOR, session_id="")
-    assert result.session is None
-    fabricated = replace(result, session=ResolveSession(result.attempt, "no-session", "codex", "<runtime-default>"))
-    with pytest.raises(WorkflowAuthorityError, match="provenance"):
-        adapter(control).record_attempt(fabricated)
-    legitimate = adapter(control).record_attempt(result)
-    assert isinstance(legitimate.snapshot.episode.continuation, AuthoredResolve)
-    assert legitimate.snapshot.episode.continuation.session is None
-
-
 def test_continuation_and_result_audit_roll_back_together(control):
     before = initial_snapshot()
     install_workflow(control, before)
-    result = paid_result(control, before, "author", ResolveStage.AUTHOR)
+    result = paid_result(control, before, "author", ResolveStage.RESOLVE)
     admitted = adapter(control).load_workflow(before.revision.fence.key)
     with control.transaction() as db:
         db.execute("CREATE TRIGGER fail_classification BEFORE INSERT ON dedupe_keys WHEN NEW.namespace='workflow-result' BEGIN SELECT RAISE(ABORT, 'classification crash'); END")
@@ -752,53 +661,12 @@ def test_continuation_and_result_audit_roll_back_together(control):
     assert adapter(control).load_workflow(before.revision.fence.key) == admitted
 
 
-@pytest.mark.parametrize("order", [(1, 0), (0, 1)])
-def test_real_author_then_implement_converge_when_results_arrive_in_reverse_order(control, order):
-    before = initial_snapshot()
-    install_workflow(control, before)
-    author = paid_result(control, before, "author", ResolveStage.AUTHOR)
-    implement = paid_result(control, adapter(control).load_workflow(before.revision.fence.key), "implement", ResolveStage.IMPLEMENT)
-    results = (author, implement)
-    for index in order:
-        adapter(control).record_attempt(results[index])
-    restarted = SQLiteControlStore(control.path, now=lambda: NOW)
-    continuation = adapter(restarted).load_workflow(before.revision.fence.key).episode.continuation
-    assert isinstance(continuation, AuthoredResolve)
-    assert continuation.author_attempt == author.attempt
-    assert continuation.author_admission.revision.version == 1
-    assert continuation.session == implement.session
-    assert continuation.last_applied_admission_version == 2
-    assert all(adapter(restarted).record_attempt(result).idempotent for result in results)
-
-
-@pytest.mark.parametrize("order", tuple(permutations(range(4))))
-def test_real_multiple_author_successes_and_blocked_resume_converge_independently(control, order):
-    current = initial_snapshot()
-    install_workflow(control, current)
-    results = []
-    for name, stage in (("author-one", ResolveStage.AUTHOR), ("author-two", ResolveStage.AUTHOR),
-                        ("implement", ResolveStage.IMPLEMENT), ("resume", ResolveStage.RESUME)):
-        result = paid_result(control, current, name, stage, historical=stage is ResolveStage.RESUME)
-        results.append(replace(result, kind=ResolveResultKind.BLOCKED) if stage is ResolveStage.RESUME else result)
-        current = adapter(control).load_workflow(current.revision.fence.key)
-    for index in order:
-        adapter(control).record_attempt(results[index])
-    final = adapter(control).load_workflow(current.revision.fence.key)
-    continuation = final.episode.continuation
-    assert isinstance(continuation, AuthoredResolve)
-    assert continuation.author_attempt == results[1].attempt
-    assert continuation.author_admission.revision.version == 2
-    assert continuation.last_applied_admission_version == 4
-    assert continuation.session is None and final.episode.failures == 0
-    assert all(adapter(control).record_attempt(result).idempotent for result in results)
-
-
 @pytest.mark.parametrize("kind", [ResolveResultKind.STAGE_PROGRESSED, ResolveResultKind.COUNTED_REQUEUE,
                                   ResolveResultKind.BLOCKED, ResolveResultKind.PR_OPENED])
-def test_actual_unlaunched_author_cannot_claim_progress_or_a_strike(control, kind):
+def test_actual_unlaunched_resolve_cannot_claim_progress_or_a_strike(control, kind):
     before = initial_snapshot()
     install_workflow(control, before)
-    unlaunched = paid_result(control, before, "unlaunched", ResolveStage.AUTHOR, launch=False)
+    unlaunched = paid_result(control, before, "unlaunched", ResolveStage.RESOLVE, launch=False)
     admitted = adapter(control).load_workflow(before.revision.fence.key)
     with pytest.raises(WorkflowAuthorityError, match="settlement provenance"):
         adapter(control).record_attempt(replace(unlaunched, kind=kind))
@@ -811,7 +679,7 @@ def test_actual_unlaunched_author_cannot_claim_progress_or_a_strike(control, kin
 def test_unlaunched_infrastructure_or_budget_result_remains_auditable_without_settlement(control, kind):
     before = initial_snapshot()
     install_workflow(control, before)
-    result = replace(paid_result(control, before, "unlaunched", ResolveStage.AUTHOR, launch=False), kind=kind)
+    result = replace(paid_result(control, before, "unlaunched", ResolveStage.RESOLVE, launch=False), kind=kind)
     admitted = adapter(control).load_workflow(before.revision.fence.key)
     recorded = adapter(control).record_attempt(result)
     assert recorded.snapshot == admitted
@@ -819,10 +687,10 @@ def test_unlaunched_infrastructure_or_budget_result_remains_auditable_without_se
 
 
 @pytest.mark.parametrize("corruption", ["cancelled", "abandoned", "released", "reconciled", "missing_charge", "foreign_charge"])
-def test_sessionless_author_needs_normal_completed_settlement(control, corruption):
+def test_sessionless_resolve_needs_normal_completed_settlement(control, corruption):
     before = initial_snapshot()
     install_workflow(control, before)
-    result = paid_result(control, before, "author", ResolveStage.AUTHOR, session_id="")
+    result = paid_result(control, before, "author", ResolveStage.RESOLVE, session_id="")
     with control.transaction() as db:
         if corruption in ("cancelled", "abandoned"):
             db.execute("UPDATE runs SET state=?", (corruption,))
@@ -1470,3 +1338,81 @@ def test_unknown_receipt_retains_original_executor_after_active_command_adoption
     assert isinstance(new_control.commit_workflow(stopped.expected, (pending.authority,), stopped), WorkflowCommitted)
     assert control.effect_receipt(command_id) == receipt
     assert isinstance(decode_workflow(command_row(control, command_id)["workflow_reconciliation_json"], RetiredUncertainCommand), RetiredUncertainCommand)
+
+
+@pytest.mark.parametrize("shape", ["plain", "family"])
+def test_v45_turns_an_authored_checkpoint_into_a_fresh_continuation(control, shape):
+    """An authored split checkpoint survives schema 45 as a fresh continuation at
+    the same applied watermark, in both stored workflow shapes: the plain
+    (authority, episode) tuple and the IssueFamilyEpisodes envelope."""
+    from issue_agent.domain.workflow import FreshResolve
+    from tests.adapters.test_control_store import _historical_fixture
+
+    before = initial_snapshot()
+    install_workflow(control, before)
+    watermark = before.revision.version + 1  # an authored checkpoint follows its admission
+    authored = ("json_object('type','AuthoredResolve','fields',json_object("
+                "'author_admission',json_object('retired',1),"
+                f"'last_applied_admission_version',{watermark},"
+                "'session',json('null'),'split',json('null'),'split_applied_admission_version',0))")
+    with sqlite3.connect(control.path) as db:
+        db.execute(f"UPDATE workflows SET version=?,episode_json=json_set(episode_json,"
+                   f"'$.value[1].fields.continuation',{authored})", (watermark,))
+        if shape == "family":
+            db.execute("UPDATE workflows SET episode_json=json_object('format',1,'value',json_object("
+                       "'fields',json_object('authority',json_extract(episode_json,'$.value[0]'),"
+                       "'episode',json_extract(episode_json,'$.value[1]'),"
+                       "'issue_recovery',json_object('fields',json_object(),'type','InactiveIssueRecovery')),"
+                       "'type','IssueFamilyEpisodes'))")
+        _historical_fixture(db, 44)
+
+    SQLiteControlStore(control.path, now=lambda: NOW).initialize()
+
+    loaded = adapter(SQLiteControlStore(control.path, now=lambda: NOW)).load_workflow(before.revision.fence.key)
+    assert loaded == replace(before, revision=replace(before.revision, version=watermark),
+                             episode=replace(before.episode, continuation=FreshResolve(None, watermark)))
+    with closing(sqlite3.connect(control.path)) as db:
+        assert "AuthoredResolve" not in db.execute("SELECT episode_json FROM workflows").fetchone()[0]
+
+
+def test_v45_retires_split_records_and_keeps_resolve_records_byte_canonical(control):
+    """Schema 45 forgets the deleted author/implement/adjudicate split by
+    migration: split-only rows go, the always-encoded split fields leave every
+    surviving resolve record, and what remains still re-encodes byte-for-byte
+    (the codec compares stored payloads against a fresh encoding)."""
+    from tests.adapters.test_control_store import _historical_fixture
+
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    assert adapter(control).settle_return(request, returned).disposition is AccountingDisposition.AVAILABLE
+    settled_state = adapter(control).load_workflow(before.revision.fence.key)
+    with sqlite3.connect(control.path) as db:
+        db.execute("UPDATE dedupe_keys SET payload_json=json_set(payload_json,"
+                   "'$.value.fields.adjudication_ceiling',json('null'),'$.value.fields.split_fingerprint',json('null')) "
+                   "WHERE namespace IN ('workflow-admission','workflow-work-latest')")
+        for prefix, namespace in (("$.value.fields.", "workflow-return"),
+                                  ("$.value.fields.returned.fields.", "workflow-return-observation")):
+            db.execute(f"UPDATE dedupe_keys SET payload_json=json_set(payload_json,"
+                       f"'{prefix}split_input',json('null'),'{prefix}verdict','','{prefix}rationale','',"
+                       f"'{prefix}contract_revision',json('null')) WHERE namespace=?", (namespace,))
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                   "SELECT namespace,scope,'authored',claimed_at,"
+                   "json_set(payload_json,'$.value.fields.stage.value','AUTHOR') "
+                   "FROM dedupe_keys WHERE namespace='workflow-admission'")
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                   "VALUES ('workflow-split-consumed','o/r','spent',?,'{}')", (NOW.isoformat(),))
+        _historical_fixture(db, 44)
+
+    SQLiteControlStore(control.path, now=lambda: NOW).initialize()
+
+    restarted = adapter(SQLiteControlStore(control.path, now=lambda: NOW))
+    assert restarted.load_workflow(before.revision.fence.key) == settled_state
+    assert restarted.returned_result(returned.attempt) == returned
+    assert [pending.returned for pending in restarted.pending_returns()] == [returned]
+    with closing(sqlite3.connect(control.path)) as db:
+        assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='workflow-split-consumed' "
+                          "OR key='authored'").fetchone()[0] == 0
+        assert "split" not in "".join(row[0] for row in db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace LIKE 'workflow-%'"))
+        assert db.execute("SELECT count(*) FROM sqlite_master WHERE name='runs_adjudication_episode'").fetchone()[0] == 0

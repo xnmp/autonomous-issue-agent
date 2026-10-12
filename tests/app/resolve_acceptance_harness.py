@@ -55,7 +55,6 @@ from issue_agent.app.workflows.resolve_rearm import ResolveRearmWorkflow
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.recovery import RecoveryTrigger
-from issue_agent.domain.resolve_split import ContractRevision
 from issue_agent.domain.workflow import ResolveEpisode, WorkflowSnapshot
 from issue_agent.domain.workflow_policy import reconcile_resolve_ceiling
 from issue_agent.domain.world import IssueView
@@ -337,21 +336,9 @@ def _publication_context(role: str, cwd: str | None):
     )
 
 
-def _capture_contract_revision(cwd, issue, capture_id, branch):
-    return ContractRevision(branch, "a" * 40)
-
-
-def _verify_contract_revision(*args) -> None:
-    return None
-
-
 def patch_publication_environment(monkeypatch=None) -> None:
-    """External binary/contract-capture capabilities only; authority stays real."""
-    from issue_agent.app.workflows import fix as fix_workflow_module
-
-    patches = ((fix_workflow_module, "verify_contract_revision", _verify_contract_revision),
-               (accounting_runtime, "capture_contract_revision", _capture_contract_revision),
-               (accounting_runtime, "_fix_publication_context", _publication_context))
+    """External binary capabilities only; authority stays real."""
+    patches = ((accounting_runtime, "_fix_publication_context", _publication_context),)
     for module, name, value in patches:
         if monkeypatch is None:
             setattr(module, name, value)

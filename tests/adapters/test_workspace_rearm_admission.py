@@ -9,7 +9,6 @@ from issue_agent.adapters.control_store import ControlStoreError
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.contracts import EffectReceipt, EffectStatus
 from issue_agent.domain.labels import Label
-from issue_agent.domain.resolve_split import SplitContext, SplitSelection
 from issue_agent.domain.workflow import (
     CancelRearm, ContinueGrantedRearm, NoLinkedPr, ResolveEpisode,
     ResolveResultKind, ResolveStage,
@@ -27,10 +26,10 @@ from tests.fakes.workflow_authority import install_workflow
 from tests.fakes.workflow_workspace import workspace_ack
 
 
-def pending_rearm(store, *, prior_stage=ResolveStage.RESOLVE):
+def pending_rearm(store):
     before = replace(resolve_snapshot(), episode=ResolveEpisode("old-episode", 2))
     install_workflow(store, before)
-    returned = paid_result(store, before, "prior-work", prior_stage)
+    returned = paid_result(store, before, "prior-work", ResolveStage.RESOLVE)
     exhausted = adapter(store).record_attempt(
         replace(returned, kind=ResolveResultKind.COUNTED_REQUEUE)
     ).snapshot
@@ -71,18 +70,15 @@ def test_acknowledged_workspace_does_not_admit_paid_work_before_remote_completio
     assert not control.reserve(paid_request("too-early", binding=pending.binding)).admitted
 
 
-@pytest.mark.parametrize("prior_stage", [ResolveStage.RESOLVE, ResolveStage.AUTHOR])
-@pytest.mark.parametrize("next_stage", ["RESOLVE", "AUTHOR"])
-def test_completed_handoff_bridges_retained_predecessor_then_advances_normally(control, prior_stage, next_stage):
-    pending = pending_rearm(control, prior_stage=prior_stage)
+def test_completed_handoff_bridges_retained_predecessor_then_advances_normally(control):
+    pending = pending_rearm(control)
     with control.transaction() as db:
         old_pointer = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest'").fetchone()[0]
     acknowledgement = prepare_workspace(control, pending)
     completed = complete(control, pending, acknowledgement)
     with control.transaction() as db:
         assert db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest'").fetchone()[0] == old_pointer
-    split = SplitContext(completed.intent.handoff.branch, SplitSelection("codex", "model")) if next_stage == "AUTHOR" else None
-    first = paid_request("new-work", binding=completed.binding, stage=next_stage, split_input=split)
+    first = paid_request("new-work", binding=completed.binding)
     assert not control.reserve(first).admitted
     assert control._reserve(first, workspace_verified=acknowledgement).admitted
     assert adapter(control).load_workflow(completed.revision.fence.key).revision.version == completed.revision.version + 1

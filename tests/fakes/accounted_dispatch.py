@@ -15,7 +15,6 @@ def with_resolve_authority(dispatcher, *, resolve_ceiling=3):
         workflow.gateway,
         workflow.store,
         resolve_ceiling=resolve_ceiling,
-        max_contract_rounds=workflow.cfg.max_contract_rounds,
         pr_repair=True,
     )
     dispatcher.fix_workflow = AccountedFixtureWorkflow(**values)

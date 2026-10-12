@@ -20,54 +20,6 @@ FIX_SCHEMA: dict = {
     "required": ["status", "ticket_key", "summary"],
 }
 
-# Author leg (test/interface writer, when AUTHOR_TESTS_SPLIT is on). The author
-# writes interfaces + failing tests and STOPS before the implementation — so its
-# terminal status is tests_authored, never pr_opened.
-AUTHOR_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "status": {"type": "string", "enum": ["tests_authored", "blocked", "failed"]},
-        "summary": {"type": "string"},
-        "needs": {"type": "string", "description": "if blocked, exactly what is needed"},
-    },
-    "required": ["status", "summary"],
-}
-
-# Implementer leg (AUTHOR_TESTS_SPLIT). FIX_SCHEMA + a contract_change terminal:
-# the implementer may petition that the author's contract (a test / acceptance
-# criterion) is genuinely wrong — `needs` carries the structured objection. This
-# is adjudicated by a fresh author, NOT honoured blindly (the implementer is not
-# judge of its own case).
-IMPLEMENT_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "status": {
-            "type": "string",
-            "enum": ["pr_opened", "blocked", "failed", "contract_change"],
-        },
-        "summary": {"type": "string"},
-        "needs": {
-            "type": "string",
-            "description": (
-                "if blocked, what is needed; if contract_change, WHICH test/criterion "
-                "is wrong, the correct observable, and why"
-            ),
-        },
-    },
-    "required": ["status", "summary"],
-}
-
-# Adjudicator leg — a fresh author rules on the implementer's contract objection.
-ADJUDICATE_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "verdict": {"type": "string", "enum": ["revised", "upheld"]},
-        "summary": {"type": "string"},
-        "rationale": {"type": "string", "description": "why revised, or why the contract stands"},
-    },
-    "required": ["verdict", "summary"],
-}
-
 # agent/lib.sh ROUTER_SCHEMA — difficulty classifier.
 ROUTER_SCHEMA: dict = {
     "type": "object",

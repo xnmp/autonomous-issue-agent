@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
-from issue_agent.domain.resolve_split import ContractResetResult
 from issue_agent.domain.resolve_workspace import (
+    ContractResetResult,
     EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared, NoPriorResolveAdmission,
     ObservedResolveBase, PrepareResolveWorkspace, PriorResolveAdmission,
 )

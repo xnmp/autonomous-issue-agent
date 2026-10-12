@@ -32,7 +32,7 @@ def test_route_event_records_the_decision_not_the_probe_model(tmp_path):
         FixWorkflowConfig(
             base_branch="dev",
             fix=FixTaskConfig("o/r", agent_md="AM", effort=Effort.HIGH),
-            fork_threshold=5, author_tests_split=False, max_contract_rounds=2,
+            fork_threshold=5,
             fix_mcp_config="", harness_root="", log=lambda _message: None,
         ),
         gateway, store, worktrees, runtime,
@@ -71,7 +71,7 @@ def test_route_event_omits_a_tier_the_router_did_not_name_on_the_ladder(tmp_path
         FixWorkflowConfig(
             base_branch="dev",
             fix=FixTaskConfig("o/r", agent_md="AM", effort=Effort.HIGH),
-            fork_threshold=5, author_tests_split=False, max_contract_rounds=2,
+            fork_threshold=5,
             fix_mcp_config="", harness_root="", log=lambda _message: None,
         ),
         gateway, store, worktrees, runtime,

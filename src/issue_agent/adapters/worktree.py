@@ -38,8 +38,9 @@ from ..domain.contracts import (
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from ..domain.git_remote import require_repository_remote, require_safe_fetch_url
 from ..domain.refs import issue_from_branch
-from ..domain.resolve_split import ContractResetResult, ContractRevision
 from ..domain.resolve_workspace import (
+    ContractResetResult,
+    ContractRevision,
     EpisodeWorkspaceHandoff,
     EpisodeWorkspacePrepared,
     NoPriorResolveAdmission,
@@ -318,79 +319,6 @@ def _create_or_verify_ref(
     observed = _read_ref(run, cwd, ref)
     if observed != target:
         raise WorktreeUnavailable(f"cannot create retained Git reference {ref!r}")
-
-
-def capture_contract_revision(
-    cwd: str,
-    issue: int,
-    capture_id: str,
-    expected_branch: str,
-    run: GitRunner = _subprocess_git,
-) -> ContractRevision:
-    """Capture a clean issue checkout's exact HEAD under an immutable pin."""
-
-    revision = _validate_contract_checkout(
-        cwd, issue, expected_branch, run, require_clean=True
-    )
-    ref = _contract_ref("contracts", capture_id)
-    _create_or_verify_ref(run, cwd, ref, revision.head_sha)
-    pinned = _read_ref(run, cwd, ref)
-    verified = _validate_contract_checkout(
-        cwd, issue, expected_branch, run, require_clean=True
-    )
-    if pinned != revision.head_sha or verified != revision:
-        raise WorktreeUnavailable(f"contract pin {ref!r} could not be verified")
-    return revision
-
-
-def read_captured_contract_revision(
-    cwd: str,
-    issue: int,
-    capture_id: str,
-    expected_branch: str,
-    run: GitRunner = _subprocess_git,
-) -> ContractRevision:
-    """Read an existing contract pin without changing refs or checkout state."""
-
-    _validate_contract_checkout(
-        cwd, issue, expected_branch, run, require_clean=False
-    )
-    ref = _contract_ref("contracts", capture_id)
-    pinned = _read_ref(run, cwd, ref)
-    if pinned is None:
-        raise WorktreeUnavailable(f"contract pin {ref!r} does not exist")
-    commit = _contract_git(
-        run,
-        ["rev-parse", "--verify", f"{ref}^{{commit}}"],
-        cwd,
-        f"contract pin {ref!r} does not name a commit",
-    )
-    if commit.code != 0 or commit.out.strip() != pinned:
-        raise WorktreeUnavailable(f"contract pin {ref!r} does not name a commit")
-    try:
-        return ContractRevision(expected_branch, pinned)
-    except (TypeError, ValueError) as exc:
-        raise WorktreeUnavailable(f"contract pin {ref!r} is invalid") from exc
-
-
-def verify_contract_revision(
-    cwd: str,
-    issue: int,
-    revision: ContractRevision,
-    run: GitRunner = _subprocess_git,
-) -> ContractRevision:
-    """Prove a clean owned checkout is still at an exact captured revision."""
-
-    if not isinstance(revision, ContractRevision):
-        raise WorktreeUnavailable("contract verification requires an exact revision")
-    observed = _validate_contract_checkout(
-        cwd, issue, revision.branch, run, require_clean=True
-    )
-    if observed != revision:
-        raise WorktreeUnavailable(
-            f"contract checkout for issue #{issue} changed after capture"
-        )
-    return observed
 
 
 def _checkout_status(
@@ -1119,21 +1047,6 @@ class Worktrees:
                 raise WorktreeUnavailable(
                     f"branch deletion for {branch!r} could not be verified"
                 )
-
-    def reset_contract(
-        self,
-        issue: int,
-        revision: ContractRevision,
-        intent_id: str,
-    ) -> ContractResetResult:
-        """Restore one managed issue checkout to an exact retained contract.
-
-        The displaced branch state remains reachable through the returned ref.
-        Existing refs are replay evidence, never permission to overwrite them.
-        """
-
-        with self._mutation_lock:
-            return self._reset_contract(issue, revision, intent_id)
 
     def _reset_contract(
         self,

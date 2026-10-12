@@ -384,7 +384,6 @@ def _with_accounting(
         approved_base_branch=cfg.base_branch,
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
-        max_contract_rounds=cfg.max_contract_rounds,
         admit=admit,
     )
 
@@ -401,9 +400,6 @@ def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
         "ADDRESS_REVIEW",
         "FIX_CI",
         "REBASE",
-        "AUTHOR",
-        "IMPLEMENT",
-        "ADJUDICATE",
     ):
         limits[("fix", kind)] = money(cfg.fix_budget_usd)
     limits[("fix", "ROUTE")] = money(cfg.router_budget_usd)
@@ -2052,8 +2048,6 @@ def compose_fix_daemon(
             runtime=cfg.fixer_runtime,
         ),
         max_review_rejections=cfg.max_review_rejections,
-        author_tests_split=fix_runtime.author_tests_split,
-        max_contract_rounds=fix_runtime.max_contract_rounds,
         fix_mcp_config=fix_runtime.mcp_config,
         harness_root=cfg.runtime_paths.harness_root,
         log=log,
@@ -2092,7 +2086,6 @@ def compose_fix_daemon(
     workflow_control = SQLiteWorkflowControl(
         control, WorkflowWriter(cfg.repo, "fix", owner_id),
         resolve_ceiling=cfg.max_resolve_retries,
-        max_contract_rounds=fix_runtime.max_contract_rounds,
     )
     def validate_cleanup_fix_state(action):
         if action.pr is not None:

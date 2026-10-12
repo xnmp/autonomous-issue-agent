@@ -25,7 +25,6 @@ from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.model_routing import ModelRoute, parse_model_route
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
-from ..domain.resolve_split import MAX_SPLIT_TRAIL
 from ..domain.review_rejection import MAX_COUNTED_REVIEWS
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.environment import EVIDENCE_STACKS
@@ -199,8 +198,6 @@ class FixRuntimeConfig:
     auto_rebase_conflicts: bool
     max_rebase_retries: int
     max_resolve_retries: int
-    author_tests_split: bool
-    max_contract_rounds: int
     mcp_config: str
 
 
@@ -453,15 +450,6 @@ class HarnessConfig:
     # Fast deterministic check run after every file edit (PostToolUse hook), e.g.
     # "npx tsc --noEmit" / "pyrefly check". Blank → no edit-time check.
     edit_check_cmd: str = ""
-    # AUTHOR_TESTS_SPLIT: resolve an issue in two BLIND passes sharing one worktree
-    # — a test/interface author (interfaces + failing tests, no implementation) then
-    # a fresh-session implementer (makes the tests green, opens the PR). The author
-    # can't anticipate the impl; the implementer can't weaken the tests (gate).
-    author_tests_split: bool = False
-    # Max contract-renegotiation rounds (implementer petition → fresh-author
-    # adjudication) before escalating the dispute to a human. Supported range 0–4
-    # reserves bounded durable reply/verdict context before the initial paid leg.
-    max_contract_rounds: int = 2
     # FIX_MCP_CONFIG: JSON map {check-name-regex: {config: <mcp.json path>, tools:
     # <glob>}}. On the CI-fix leg, servers whose regex matches a PR check are attached
     # to the fixer. Relative config paths resolve against harness_root.
@@ -689,8 +677,6 @@ class HarnessConfig:
             auto_rebase_conflicts=self.auto_rebase_conflicts,
             max_rebase_retries=self.max_rebase_retries,
             max_resolve_retries=self.max_resolve_retries,
-            author_tests_split=self.author_tests_split,
-            max_contract_rounds=self.max_contract_rounds,
             mcp_config=self.fix_mcp_config,
         )
 
@@ -819,14 +805,11 @@ class HarnessConfig:
                 "IDENTITY_MODE=three (GitHub rejects self-approval with a 422)"
             )
         _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
-        _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
         if self.max_review_rejections > MAX_COUNTED_REVIEWS:
             errors.append(
                 f"REVIEW_MAX_REJECTIONS must be <= {MAX_COUNTED_REVIEWS} "
                 "(one review re-arm can dismiss at most that many counted reviews)"
             )
-        if self.max_contract_rounds > MAX_SPLIT_TRAIL:
-            errors.append(f"MAX_CONTRACT_ROUNDS must be <= {MAX_SPLIT_TRAIL} (durable contract context capacity)")
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
             ("ROUTER_BUDGET_USD", self.router_budget_usd),

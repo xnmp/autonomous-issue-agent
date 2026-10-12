@@ -2,20 +2,18 @@
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from itertools import permutations
 
 import pytest
 
-from issue_agent.domain.contracts import CommandId, RunId, WorkflowAttemptIdentity
+from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason, ResolveFollowup
 from issue_agent.domain.workflow import (
-    AuthoredResolve, FreshResolve, ResolveAdmission, ResolveAttemptResult, ResolveSession, ResolveStage,
+    FreshResolve, ResolveAdmission, ResolveAttemptResult, ResolveSession, ResolveStage,
     CancelRearm, CancelledRearm, ClearGuidance, CompletedRearm, ContinueGrantedRearm,
     EvidenceUnavailable, HeldProjection, IssueAbsent, IssueUnavailable, KeepGuidance,
     LinkedPrPresent, LinkedPrUnavailable, NoAuthorizedRemediation, NoLinkedPr,
-    ObservedIssue, OpenGate, OperatorActor, PendingRearm, RearmingGate,
-    AuthorizedOperatorCommand, RenewResolveAllowance, ResolveRearmAcceptance, ResolveRearmPreflight,
+    ObservedIssue, OpenGate, OperatorActor, PendingRearm, AuthorizedOperatorCommand, RenewResolveAllowance, ResolveRearmAcceptance, ResolveRearmPreflight,
     RemoteOutcomeUncertain, RequestRearm, ResolveCeiling, ResolveEpisode,
     ResolveResultKind, SetGuidance, StopReason, SupersededRearm, WorkflowChanged,
     WorkflowRejected, WorkflowRejection, WorkflowSnapshot, WorkflowUnchanged,
@@ -166,7 +164,7 @@ def snapshot(*, number=7, failures=0, guidance=""):
 def admission(state, attempt_result):
     """Captured post-admission fixture; production reads the immutable SQL receipt."""
     return ResolveAdmission(attempt_result.attempt, WorkflowRevision(attempt_result.attempt.binding.fence, state.revision.version), attempt_result.stage,
-                            3 if attempt_result.stage is ResolveStage.ADJUDICATE else None, input_fingerprint="a" * 64)
+                            input_fingerprint="a" * 64)
 
 
 def observed(state, *, labels=frozenset({Label.NEEDS_HUMAN_REVIEW}), remote_state="open"):
@@ -656,114 +654,39 @@ def staged_result(state, stage, *, kind=ResolveResultKind.STAGE_PROGRESSED, name
     return ResolveAttemptResult(attempt, kind, stage=stage, session=session)
 
 
-def authored_state():
+def session_state():
     before = snapshot()
-    author = staged_result(before, ResolveStage.AUTHOR)
-    changed = record_resolve_attempt(before, author, ceiling=3, admission=admission(before, author))
+    resolved = staged_result(before, ResolveStage.RESOLVE)
+    changed = record_resolve_attempt(before, resolved, ceiling=3, admission=admission(before, resolved))
     assert isinstance(changed, WorkflowChanged) and isinstance(changed.snapshot, WorkflowSnapshot)
     return changed.snapshot
 
 
-def test_successful_author_owns_checkpoint_without_consuming_allowance():
-    state = authored_state()
-    continuation = state.episode.continuation
-    assert isinstance(continuation, AuthoredResolve)
-    assert continuation.author_attempt.run_id == "stage"
-    assert continuation.session is not None and continuation.session.session_id == "session"
-    assert state.episode.failures == 0
-    assert continuation.last_applied_admission_version == 1
-
-
-def test_blocked_author_cannot_claim_an_authored_checkpoint():
-    state = snapshot()
-    blocked = staged_result(state, ResolveStage.AUTHOR, kind=ResolveResultKind.BLOCKED)
-    changed = record_resolve_attempt(state, blocked, ceiling=3, admission=admission(state, blocked))
-    assert isinstance(changed.snapshot.episode.continuation, FreshResolve)
-    assert changed.snapshot.episode.failures == 0
-
-
-@pytest.mark.parametrize("stage", [ResolveStage.RESOLVE, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE, ResolveStage.RESUME])
-@pytest.mark.parametrize("session_id", [None, "new-session"])
-def test_newer_leg_updates_or_clears_session_without_losing_authored_checkpoint(stage, session_id):
-    before = authored_state()
-    old = before.episode.continuation
-    outcome = staged_result(before, stage, name="next", session_id=session_id)
-    after = record_resolve_attempt(before, outcome, ceiling=3, admission=admission(before, outcome)).snapshot
-    continuation = after.episode.continuation
-    assert isinstance(continuation, AuthoredResolve) and isinstance(old, AuthoredResolve)
-    assert continuation.author_attempt == old.author_attempt
-    assert continuation.session == outcome.session
-    assert continuation.last_applied_admission_version == before.revision.version
-
-
 @pytest.mark.parametrize("kind", [ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL])
-def test_infrastructure_or_budget_failure_cannot_replace_authored_session(kind):
-    before = authored_state()
-    failed = staged_result(before, ResolveStage.IMPLEMENT, kind=kind, name="failed", session_id="unusable")
+def test_infrastructure_or_budget_failure_cannot_replace_a_recorded_session(kind):
+    before = session_state()
+    failed = staged_result(before, ResolveStage.RESUME, kind=kind, name="failed", session_id="unusable")
     unchanged = record_resolve_attempt(before, failed, ceiling=3, admission=admission(before, failed))
     assert isinstance(unchanged, WorkflowUnchanged) and unchanged.snapshot == before
 
 
 @pytest.mark.parametrize("kind", list(ResolveResultKind))
 def test_router_result_is_audit_only_even_when_followup_is_requeue(kind):
-    before = authored_state()
+    before = session_state()
     routed = staged_result(before, ResolveStage.ROUTE, kind=kind, name="route", session_id=None)
     unchanged = record_resolve_attempt(before, routed, ceiling=3, admission=admission(before, routed))
     assert isinstance(unchanged, WorkflowUnchanged) and unchanged.snapshot == before
 
 
-def test_reversed_result_order_counts_old_strike_but_preserves_newer_checkpoint():
-    admitted = snapshot(failures=2)
-    old = staged_result(admitted, ResolveStage.RESOLVE, kind=ResolveResultKind.COUNTED_REQUEUE, name="old", session_id="old-session")
-    old_admission = admission(admitted, old)
-    newer = replace(admitted, revision=replace(admitted.revision, version=2))
-    author = staged_result(newer, ResolveStage.AUTHOR, name="author", session_id="new-session")
-    after_author = record_resolve_attempt(newer, author, ceiling=3, admission=admission(newer, author)).snapshot
-    after_old = record_resolve_attempt(after_author, old, ceiling=3, admission=old_admission).snapshot
-    assert after_old.episode.continuation == after_author.episode.continuation
-    assert after_old.episode.failures == 3
-    assert HeldProjection(after_old).held
-
-
-def test_blocked_resume_clears_even_returned_handle_and_fences_late_session_restore():
-    before = authored_state()
-    late = staged_result(before, ResolveStage.IMPLEMENT, name="late", session_id="old-handle")
-    late_admission = admission(before, late)
-    resumed = replace(before, revision=replace(before.revision, version=3))
-    blocked = staged_result(resumed, ResolveStage.RESUME, kind=ResolveResultKind.BLOCKED, name="resume", session_id="blocked-handle")
-    cleared = record_resolve_attempt(resumed, blocked, ceiling=3, admission=admission(resumed, blocked)).snapshot
-    assert cleared.episode.continuation.session is None
-    assert cleared.episode.continuation.last_applied_admission_version == 3
-    replay = record_resolve_attempt(cleared, late, ceiling=3, admission=late_admission)
-    assert isinstance(replay, WorkflowUnchanged)
-    assert isinstance(cleared.episode.continuation, AuthoredResolve)
-
-
-def test_new_episode_rearm_clears_checkpoint_but_continue_preserves_granted_episode():
-    before = authored_state()
-    before = replace(before, episode=replace(before.episode, failures=3))
-    held = reconcile_resolve_ceiling(before, ceiling=3, evidence_ids=("import",)).snapshot
-    pending = start(held).snapshot
-    assert pending.episode.continuation == FreshResolve()
-    # Continue retains an episode-owned checkpoint, including its earlier
-    # generation provenance, rather than rewriting that provenance on re-arm.
-    outcome = staged_result(pending, ResolveStage.AUTHOR)
-    checkpoint = AuthoredResolve(admission(pending, outcome), pending.revision.version, outcome.session)
-    pending = replace(pending, episode=replace(pending.episode, continuation=checkpoint))
-    stopped = cancel_resolve_rearm(pending, CancelRearm("cancel", pending.revision, pending.intent.request_id, "stop"), ACTOR).snapshot
-    continued = continue_resolve_rearm(stopped, ContinueGrantedRearm("continue", stopped.revision, stopped.intent.request_id), ACTOR, observed(stopped), no_pr(stopped), now=NOW, active_attempts=()).snapshot
-    assert continued.episode == stopped.episode
-
-
 @pytest.mark.parametrize("changed", ["run", "stage", "future_version"])
 def test_result_requires_matching_captured_admission(changed):
     before = snapshot()
-    outcome = staged_result(before, ResolveStage.AUTHOR)
+    outcome = staged_result(before, ResolveStage.RESOLVE)
     proof = admission(before, outcome)
     if changed == "run":
         proof = replace(proof, attempt=replace(proof.attempt, run_id=RunId("different")))
     elif changed == "stage":
-        proof = replace(proof, stage=ResolveStage.RESOLVE)
+        proof = replace(proof, stage=ResolveStage.RESUME)
     else:
         proof = replace(proof, revision=replace(proof.revision, version=2))
     assert isinstance(record_resolve_attempt(before, outcome, ceiling=3, admission=proof), WorkflowRejected)
@@ -771,7 +694,7 @@ def test_result_requires_matching_captured_admission(changed):
 
 def test_replacement_checkpoint_cannot_be_committed_without_exact_admission_derivation():
     before = snapshot()
-    outcome = staged_result(before, ResolveStage.AUTHOR)
+    outcome = staged_result(before, ResolveStage.RESOLVE)
     proof = admission(before, outcome)
     changed = record_resolve_attempt(before, outcome, ceiling=3, admission=proof)
     assert isinstance(changed, WorkflowChanged)
@@ -780,34 +703,6 @@ def test_replacement_checkpoint_cannot_be_committed_without_exact_admission_deri
         validate_resolve_transition(before, forged, ceiling=3, now=NOW, admission=proof)
     with pytest.raises(ValueError, match="captured admission"):
         validate_resolve_transition(before, changed, ceiling=3, now=NOW)
-
-
-@pytest.mark.parametrize("order", [(1, 0), (0, 1)])
-def test_late_author_checkpoint_converges_independently_of_newer_implementation_session(order):
-    state = replace(snapshot(), revision=replace(snapshot().revision, version=2))
-    author = staged_result(state, ResolveStage.AUTHOR, name="author")
-    implement = staged_result(state, ResolveStage.IMPLEMENT, name="implement", session_id="implementation-session")
-    results = (author, implement)
-    proofs = tuple(ResolveAdmission(item.attempt, replace(state.revision, version=index + 1), item.stage, input_fingerprint="a" * 64) for index, item in enumerate(results))
-    for index in order:
-        state = record_resolve_attempt(state, results[index], ceiling=3, admission=proofs[index]).snapshot
-    assert state.episode.continuation == AuthoredResolve(proofs[0], 2, implement.session)
-
-
-@pytest.mark.parametrize("order", tuple(permutations(range(4))))
-def test_multiple_authors_and_blocked_resume_converge_for_every_delivery_order(order):
-    state = replace(snapshot(), revision=replace(snapshot().revision, version=4))
-    results = (
-        staged_result(state, ResolveStage.AUTHOR, name="first-author"),
-        staged_result(state, ResolveStage.AUTHOR, name="second-author"),
-        staged_result(state, ResolveStage.IMPLEMENT, name="implement"),
-        staged_result(state, ResolveStage.RESUME, kind=ResolveResultKind.BLOCKED, name="resume"),
-    )
-    proofs = tuple(ResolveAdmission(item.attempt, replace(state.revision, version=index + 1), item.stage, input_fingerprint="a" * 64) for index, item in enumerate(results))
-    for index in order:
-        state = record_resolve_attempt(state, results[index], ceiling=3, admission=proofs[index]).snapshot
-    assert state.episode.continuation == AuthoredResolve(proofs[1], 4, None)
-    assert state.episode.failures == 0
 
 
 def test_resolve_rearm_preserves_legacy_attention_on_the_same_issue():

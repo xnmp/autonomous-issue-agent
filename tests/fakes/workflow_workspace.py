@@ -2,8 +2,8 @@
 
 from datetime import datetime
 
-from issue_agent.domain.resolve_split import ContractResetResult
 from issue_agent.domain.resolve_workspace import (
+    ContractResetResult,
     EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared, NoPriorResolveAdmission,
     ObservedResolveBase, ResolveWorkspaceObserved, ResolveWorkspacePredecessor,
 )

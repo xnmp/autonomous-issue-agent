@@ -11,7 +11,6 @@ from tests.fakes.workflow_authority import retained_issue_file, seed_retained_is
 from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
 
 import asyncio
-import hashlib
 from dataclasses import replace
 
 import pytest
@@ -21,7 +20,6 @@ from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.domain.actions import AgentKind, RunAgent
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.resolve_split import ContractResetResult
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
     ReviewTaskConfig,
@@ -121,21 +119,11 @@ class FakeStore:
 
 
 class FakeWorktrees:
-    def __init__(self):
-        self.resets = []
-
     def ensure(self, issue, branch):
         return f"/wt/issue-{issue}"
 
     def remove(self, issue):
         pass
-
-    def reset_contract(self, issue, revision, intent_id):
-        self.resets.append(issue)
-        digest = hashlib.sha256(intent_id.encode()).hexdigest()
-        return ContractResetResult(
-            revision, f"refs/issue-agent/contract-reset/{digest}"
-        )
 
     def branch_for_issue(self, issue, fallback, *, preferred=""):
         del issue
@@ -279,43 +267,6 @@ def test_resolve_authority_hold_never_calls_provider(authority):
     assert not runner.tasks
     assert not any(call[0] == "relabel" for call in gw.calls)
     assert any("held" in message for message in logged)
-
-
-def _split_dispatcher(gw, store, runner, wt=None, max_contract_rounds=2):
-    cfg = DispatchConfig(
-        # Pinned model: split tests script exact run sequences; an unpinned
-        # config would prepend the difficulty-router leg (see test_fix_workflow).
-        fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
-        author_tests_split=True, max_contract_rounds=max_contract_rounds,
-    )
-    wt = wt or FakeWorktrees()
-    executor = Executor(gw, remove_worktree=wt.remove)
-    return with_resolve_authority(AgentDispatcher(cfg, gw, store, wt, runner, executor))
-
-
-def test_split_resolve_routes_to_fix_workflow():
-    gw = FakeGateway(
-        issues={5: IssueView(5, title="Null token", body="x")},
-        prs={100: observed_pr(100)},
-        pr_for_issue={},
-    )
-    store, wt = FakeStore(), FakeWorktrees()
-
-    class PrOpeningRunner(SeqRunner):
-        async def run(self, task):
-            result = await super().run(task)
-            if result.status == "pr_opened":
-                gw._pr_for_issue[5] = 100
-            return result
-
-    runner = PrOpeningRunner([
-        AgentResult(is_error=False, status="tests_authored", session_id="a5"),
-        AgentResult(is_error=False, status="pr_opened", session_id="i5"),
-    ])
-    d = _split_dispatcher(gw, store, runner, wt=wt)
-    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-    assert len(runner.tasks) == 2
-    assert ("relabel", "issue", 5, "ai-working", "ai-pr-open") in gw.calls
 
 
 def test_review_submits_decision_from_structured():

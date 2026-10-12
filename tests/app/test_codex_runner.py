@@ -42,11 +42,7 @@ from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.app.config import from_env
-from issue_agent.app.planners.schemas import (
-    AUTHOR_SCHEMA,
-    FIX_SCHEMA,
-    IMPLEMENT_SCHEMA,
-)
+from issue_agent.app.planners.schemas import FIX_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.effort import Effort
@@ -2302,7 +2298,7 @@ def test_an_aborted_run_still_reports_its_model():
 # status of a COMPLETED FORCE-PUSH — was missing, so that leg could be re-run on
 # resume. Pin the vocabulary here so a schema change breaks loudly.
 _FIXER_TERMINAL_STATUSES = frozenset(
-    {"pr_opened", "pushed", "blocked", "failed", "tests_authored", "contract_change"}
+    {"pr_opened", "pushed", "blocked", "failed"}
 )
 # `done` is in no schema; agent/lib.sh and classify_outcome still accept it, so a
 # codex run that emits it must still count as real output.
@@ -2312,9 +2308,7 @@ _LEGACY_OK_ALIASES = frozenset({"done"})
 def test_fixer_status_vocabulary_is_exactly_the_schemas_union():
     """Drift alarm: if a leg's schema gains or loses a terminal status, this
     fails and whoever changed it must re-check the retry guard below."""
-    union = set()
-    for schema in (FIX_SCHEMA, AUTHOR_SCHEMA, IMPLEMENT_SCHEMA):
-        union |= set(schema["properties"]["status"]["enum"])
+    union = set(FIX_SCHEMA["properties"]["status"]["enum"])
     assert union == set(_FIXER_TERMINAL_STATUSES)
 
 

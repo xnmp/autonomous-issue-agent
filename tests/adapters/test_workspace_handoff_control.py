@@ -105,7 +105,7 @@ def test_observation_records_exact_latest_admission_and_branch(control):
 def test_missing_latest_pointer_is_not_treated_as_admission_absence(control):
     before = resolve_snapshot()
     install_workflow(control, before)
-    paid_result(control, before, "retained-work", ResolveStage.AUTHOR)
+    paid_result(control, before, "retained-work", ResolveStage.RESOLVE)
     with control.transaction() as db:
         db.execute(
             "DELETE FROM dedupe_keys WHERE namespace='workflow-work-latest'"

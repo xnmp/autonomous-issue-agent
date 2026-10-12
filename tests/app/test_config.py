@@ -419,19 +419,12 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
         "MAX_REVIEW_RETRIES": "-2",
         "MAX_REBASE_RETRIES": "-3",
         "REVIEW_MAX_REJECTIONS": "-4",
-        "MAX_CONTRACT_ROUNDS": "-5",
     })
 
     _assert_each_knob_flagged_once(c.validation_errors(), {
         "POLL_SECONDS", "MAX_CI_RETRIES", "MAX_REVIEW_RETRIES",
-        "MAX_REBASE_RETRIES", "REVIEW_MAX_REJECTIONS", "MAX_CONTRACT_ROUNDS",
+        "MAX_REBASE_RETRIES", "REVIEW_MAX_REJECTIONS",
     })
-
-
-def test_contract_round_limit_matches_durable_context_capacity():
-    for value, rejected in (("4", False), ("5", True), ("1000000", True)):
-        config = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_CONTRACT_ROUNDS": value})
-        assert any("MAX_CONTRACT_ROUNDS" in error for error in config.validation_errors()) is rejected
 
 
 def test_review_rejection_ceiling_fits_one_rearm_dismissal_fan_out():

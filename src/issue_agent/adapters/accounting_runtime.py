@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import uuid
 import contextvars
-import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -49,11 +48,6 @@ from ..domain.refs import is_governed_branch
 from ..domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowWriter
 from ..domain.workflow import ResolveSession, ResolveStage
 from ..domain.resolve_return import ReturnedResolve
-from ..domain.resolve_split import (
-    AdjudicationInput, ReauthorInput, ContractRevision, SplitContext, SplitImplement,
-    UnavailableContractRevision, split_context, validate_contract_rounds,
-)
-from .worktree import WorktreeUnavailable, capture_contract_revision
 from .workflow_control import SQLiteWorkflowControl
 from .workflow_codec import WorkflowEncodingError, encode_workflow
 from ..domain.agent_task import RuntimeName, run_input_fingerprint
@@ -116,8 +110,6 @@ _FIX_PUBLICATION_KINDS = frozenset(
         "ADDRESS_REVIEW",
         "FIX_CI",
         "REBASE",
-        "AUTHOR",
-        "IMPLEMENT",
     }
 )
 
@@ -145,7 +137,6 @@ class AccountingRuntime(AgentRuntime):
     approved_base_branch: str = "dev"
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
-    max_contract_rounds: int | None = None
     admit: Callable[[ReservationRequest], ReservationResult] | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None]
@@ -296,40 +287,16 @@ class AccountingRuntime(AgentRuntime):
         issue, kind, number, claim_target, workflow, review_child = self._context.get()
         if review_child is not None and task.resolve_inputs is not None:
             return self._refused("review child cannot carry resolve inputs")
-        if workflow is not None and kind in ("AUTHOR", "IMPLEMENT", "ADJUDICATE") and task.resolve_inputs is None:
-            return self._refused("split completion requires durable stage inputs")
         if task.resolve_inputs is not None:
-            split_types = {"AUTHOR": (SplitContext, ReauthorInput), "IMPLEMENT": SplitImplement, "ADJUDICATE": AdjudicationInput}
-            expected = split_types.get(kind or "")
-            if workflow is None or self.role != "fix" or kind not in ("RESOLVE", "RESUME", *split_types) or (
-                (expected is None and task.split_input is not None)
-                or (expected is not None and not isinstance(task.split_input, expected))
-            ):
+            if workflow is None or self.role != "fix" or kind not in ("RESOLVE", "RESUME"):
                 return self._refused("returned-result context does not match the admitted workflow")
             # Bound persisted input before paying. Provider prose is normalized
             # separately below, leaving room for its receipt and provenance.
             try:
-                encoded_inputs = encode_workflow((task.resolve_inputs, task.split_input))
+                encoded_inputs = encode_workflow(task.resolve_inputs)
             except WorkflowEncodingError:
                 return self._refused("resolve completion inputs exceed durable receipt capacity")
-            # Context persists across legs; reset acknowledgements are transient
-            # input envelopes. Charging both against the context allowance makes
-            # an accepted contract impossible to re-author near the size limit.
-            if len(encoded_inputs.encode()) > 200000:
-                return self._refused("resolve completion inputs exceed durable receipt capacity")
-            if kind == "AUTHOR":
-                rounds = self.max_contract_rounds if self.max_contract_rounds is not None else 2
-                try:
-                    validate_contract_rounds(rounds)
-                except ValueError as exc:
-                    return self._refused(str(exc))
-                # Reserve space for all permitted verdicts/provenance before
-                # buying the initial contract. Later stages retain that space.
-                assert task.split_input is not None
-                retained = encode_workflow((task.resolve_inputs, split_context(task.split_input)))
-                if len(retained.encode()) > 100000 - rounds * 20000:
-                    return self._refused("resolve completion inputs exceed durable receipt capacity")
-            elif task.split_input is None and len(encoded_inputs.encode()) > 100000:
+            if len(encoded_inputs.encode()) > 100000:
                 return self._refused("resolve completion inputs exceed durable receipt capacity")
         # ADR 0008: paid admission binds the decision-side target unchanged;
         # review convergence remains PR-owned even when spend is issue-scoped.
@@ -378,7 +345,7 @@ class AccountingRuntime(AgentRuntime):
                         or task.pr_repair_input is None or workflow != task.pr_repair_input.selection.binding
                         or workflow.fence.key.target != selected.pr):
                     return self._refused("linked PR issue reply requires its exact issue/PR context")
-            elif self.role != "fix" or kind not in {"RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"} or workflow is None or workflow.fence != selected.selection.revision.fence:
+            elif self.role != "fix" or kind != "RESUME" or workflow is None or workflow.fence != selected.selection.revision.fence:
                 return self._refused("selected issue reply requires its captured resolve context")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = ((cc.IssueReplyPurchase(capture, selected.reply_at) if isinstance(selected, cc.LinkedPRIssueReplyInput)
@@ -424,7 +391,7 @@ class AccountingRuntime(AgentRuntime):
                 capture = cc.ContinuationCapture(rebase.selection.binding, rebase.selection.revision, _leg_id or str(run_id))
                 continuations += (cc.IssueRebasePurchase(capture, rebase.pr, rebase.head, rebase.branch, rebase.ceiling),)
         if (self.role == "fix" and issue is not None
-                and kind in {"ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"}
+                and kind in {"ROUTE", "RESOLVE", "RESUME", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"}
                 and not any(p.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY for p in continuations)):
             selected_infra = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
             if not isinstance(selected_infra, cc.SelectedIssueRecovery):
@@ -464,12 +431,10 @@ class AccountingRuntime(AgentRuntime):
                 "runtime": self.runtime_name,
                 "effort": task.effort.value if task.effort is not None else None,
                 "input_fingerprint": run_input_fingerprint(task.intent),
-                "split_input": encode_workflow(task.split_input) if task.split_input is not None else None,
                 "resolve_inputs": encode_workflow(task.resolve_inputs) if task.resolve_inputs is not None else None,
                 **({"issue_reply": encode_workflow((task.issue_reply.reply_at, task.issue_reply.body,
                     task.issue_reply.branch if isinstance(task.issue_reply, cc.IssueReplyInput) else task.issue_reply.pr.number))}
                    if task.issue_reply is not None else {}),
-                "split_fingerprint": hashlib.sha256(encode_workflow(task.split_input).encode()).hexdigest() if task.split_input is not None else None,
                 "number": number,
                 "issue": issue,
                 **({"ci_head": task.pr_repair_input.ci.head} if task.pr_repair_input is not None and task.pr_repair_input.ci is not None else {}),
@@ -513,7 +478,6 @@ class AccountingRuntime(AgentRuntime):
             kind or "paid",
             self.owner_id or f"{self.repository}:{self.role}",
             workflow=workflow,
-            adjudication_ceiling=self.max_contract_rounds if workflow is not None and kind == "ADJUDICATE" else None,
             review_child=review_child,
             continuations=continuations,
         )
@@ -663,30 +627,15 @@ class AccountingRuntime(AgentRuntime):
         returned = None
         if task.resolve_inputs is not None:
             result = _normalize_resolve_result(result)
-            verdict = rationale = ""
-            if kind == "ADJUDICATE":
-                verdict = _return_text(result.field("verdict"))
-                rationale = _return_text(result.field("rationale"))
-                result = replace(result, structured={"verdict": verdict, "rationale": rationale})
             assert result.workflow_attempt is not None
             session = None
             if resumable_session(result):
                 session = ResolveSession(result.workflow_attempt, result.session_id, self.runtime_name, reserved_model)
-            revision: ContractRevision | UnavailableContractRevision | None = None
-            if task.split_input is not None and kind in ("AUTHOR", "ADJUDICATE"):
-                try:
-                    if task.cwd is None or issue is None:
-                        raise WorktreeUnavailable("contract capture requires an owned worktree")
-                    revision = capture_contract_revision(task.cwd, issue, str(run_id), split_context(task.split_input).branch)
-                except (WorktreeUnavailable, OSError, ValueError) as exc:
-                    revision = UnavailableContractRevision(_return_text(str(exc)) or "contract revision capture failed")
             returned = ReturnedResolve(
                 result.workflow_attempt, ResolveStage(kind), task.resolve_inputs,
                 result.is_error,
                 result.status, result.summary, result.needs, result.envelope_subtype,
                 result.exit_reason, session, datetime.now(timezone.utc),
-                split_input=task.split_input, verdict=verdict, rationale=rationale,
-                contract_revision=revision,
             )
         review_return = None
         if review_child is not None:

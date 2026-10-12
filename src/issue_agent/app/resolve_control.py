@@ -44,8 +44,7 @@ def compose_resolve_rearm(
                      if label in observed.issue.labels)
 
     workflow = SQLiteWorkflowControl(control, WorkflowWriter(cfg.repo, "fix", owner),
-                                     resolve_ceiling=cfg.max_resolve_retries,
-                                     max_contract_rounds=cfg.max_contract_rounds)
+                                     resolve_ceiling=cfg.max_resolve_retries)
     return ResolveRearmWorkflow(workflow, gateway, worktrees, now, log,
                                 approved_host=approved_host, external_holds=external_holds)
 

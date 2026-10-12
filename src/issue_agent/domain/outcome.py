@@ -24,10 +24,6 @@ Read it as: given this classification, what does the leg's `*_actions` emit?
     infra death    (no move — stay        (no move — stay        no move, NO retry     no move, NO retry
                    ai-working)            ai-working)            bump                  bump
 
-The author/implement legs (AUTHOR_TESTS_SPLIT) read as extra rows of the resolve
-column: AUTHORED keeps ai-working for the implementer, blocked asks, error
-requeues, and an infra death moves nothing (review M15).
-
 The two PR columns move NO label except on blocked, because the PR-side
 `ai-working` remove they used to open with was deleted (review M22/D9): nothing
 ever added that label, so it was a `gh` call per leg removing nothing.
@@ -611,104 +607,6 @@ def resolve_actions(
         return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
                                  unblock_prompt("**Agent needs input:**", needs))
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
-
-
-class AuthorFollowup(Enum):
-    AUTHORED = "authored"   # tests written → keep ai-working; implementer runs next
-    BLOCKED = "blocked"     # → comment 'needs', issue ai-working→ai-blocked
-    RETRY = "retry"         # error → issue ai-working→ai-ready (never strand)
-
-
-def author_followup(result: AgentResult) -> AuthorFollowup:
-    """Classify the author (test-writer) leg's terminal envelope. tests_authored
-    is the success terminal here (the author never opens a PR). Ground truth (a PR)
-    is irrelevant — the author doesn't create one."""
-    if result.is_error:
-        return AuthorFollowup.RETRY
-    if result.status == "tests_authored":
-        return AuthorFollowup.AUTHORED
-    if result.status == "blocked":
-        return AuthorFollowup.BLOCKED
-    return AuthorFollowup.RETRY
-
-
-def author_actions(issue: int, result: AgentResult) -> list[Action]:
-    """author leg tail. AUTHORED → keep ai-working (the implementer leg picks it up
-    on the next dispatch; the phase marker is persisted by the dispatcher). BLOCKED
-    → ask the human + ai-blocked. ERROR → back to ai-ready (never strand);
-    infra death → NOTHING (stay ai-working for the reaper, like every other leg)."""
-    fu = author_followup(result)
-    if fu is AuthorFollowup.AUTHORED:
-        return []  # stay ai-working; dispatcher persists phase=authored
-    if daily_headroom_wait(result):
-        return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
-    if budget_exhausted(result.exit_reason):
-        return budget_actions(issue)
-    # The same guard the other three tails carry (review M15) — this leg was the
-    # one that missed it. `author_followup` maps a killed session to RETRY, so an
-    # OOM'd author leg relabelled ai-working→ai-ready, the fixer re-picked the
-    # issue next poll, and the author leg was dispatched into the same OOM: a
-    # relabel→dispatch→kill loop at full session cost with no breaker in it (the
-    # infra-death ceiling only counts, it doesn't stop the requeue). Emitting
-    # nothing leaves the issue ai-working, which is the designed settle path —
-    # see the module docstring's "infra deaths are not attempts".
-    if infra_death(result.exit_reason):
-        return []
-    if fu is AuthorFollowup.BLOCKED:
-        needs = result.needs or result.summary or "see logs"
-        return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED,
-                                 unblock_prompt("**Author needs input:**", needs))
-    return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
-
-
-# ── implementer leg + contract renegotiation (AUTHOR_TESTS_SPLIT) ──────────────
-class ImplementFollowup(Enum):
-    PR_OPENED = "pr_opened"            # success (ground truth or status)
-    CONTRACT_CHANGE = "contract_change"  # petition: the contract is wrong → adjudicate
-    BLOCKED = "blocked"               # ordinary block → human resume
-    RETRY = "retry"                   # error → requeue
-
-
-def implement_followup(result: AgentResult, pr_opened: bool) -> ImplementFollowup:
-    """Classify the implementer leg. Ground truth wins (a PR that opened is success
-    even if the model said otherwise). The contract_change petition is distinct from
-    an ordinary block: it routes to adjudication, not to a human."""
-    if pr_opened:
-        return ImplementFollowup.PR_OPENED
-    if result.is_error:
-        return ImplementFollowup.RETRY
-    if result.status == "contract_change":
-        return ImplementFollowup.CONTRACT_CHANGE
-    if result.status == "blocked":
-        return ImplementFollowup.BLOCKED
-    return ImplementFollowup.RETRY
-
-
-class Adjudication(Enum):
-    REVISED = "revised"   # the contract was amended → re-implement
-    UPHELD = "upheld"     # the objection was rejected → re-implement, contract stands
-
-
-def adjudication(result: AgentResult) -> Adjudication:
-    """Read the adjudicator's verdict. Anything that isn't an explicit 'revised'
-    (including an errored adjudication) is treated as UPHELD — fail toward keeping
-    the contract the author already committed, never silently weaken it."""
-    if not result.is_error and result.field("verdict") == "revised":
-        return Adjudication.REVISED
-    return Adjudication.UPHELD
-
-
-def contract_escalation_actions(issue: int, objection: str, trail: str) -> list[Action]:
-    """Round budget for contract renegotiation exhausted → escalate to a human with
-    the implementer's objection and the adjudication trail. Issue ai-working →
-    needs-human-review (stops the fixer re-dispatching it)."""
-    body = (
-        "**Contract dispute unresolved after the round budget.** A human needs to "
-        "decide whether the acceptance criteria / tests should change.\n\n"
-        f"**Implementer's objection:**\n{objection or 'see logs'}\n\n"
-        f"**Adjudication trail:**\n{trail or '(none)'}"
-    )
-    return attention_actions(Target.ISSUE, issue, Label.AI_WORKING, Label.NEEDS_HUMAN_REVIEW, body)
 
 
 def resume_actions(

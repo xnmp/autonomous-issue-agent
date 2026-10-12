@@ -148,37 +148,6 @@ def test_blank_committed_projection_recovers_after_process_loss(monkeypatch):
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
-def test_split_reply_admission_consumes_once():
-    workflow, gateway, store, runner = setup_reply()
-    workflow.cfg = replace(workflow.cfg, author_tests_split=True)
-    gateway.issues[5] = replace(gateway.issues[5], labels=frozenset({Label.AI_BLOCKED}))
-    asyncio.run(workflow.resume(5))
-    first = resolve_state(store)
-    asyncio.run(workflow.resume(5))
-    assert first.issue_recovery.state.consumed_reply_at == REPLY_AT
-    assert len(runner.tasks) == 1
-
-
-def test_split_same_body_new_timestamp_consumed():
-    from test_dispatch import SeqRunner
-    from issue_agent.domain.outcome import AgentResult
-    from issue_agent.domain.world import Comment
-    workflow, gateway, store, _ = setup_reply()
-    workflow.cfg = replace(workflow.cfg, author_tests_split=True)
-    gateway.issues[5] = replace(gateway.issues[5], labels=frozenset({Label.AI_BLOCKED}))
-    runner = SeqRunner([
-        AgentResult(is_error=False, status='tests_authored', session_id='a'),
-        AgentResult(is_error=False, status='blocked'),
-        AgentResult(is_error=False, status='blocked'),
-        AgentResult(is_error=False, status='blocked'),
-    ])
-    workflow.runner = runner
-    asyncio.run(workflow.resume(5))
-    gateway.issues[5] = replace(gateway.issues[5], comments=(*gateway.issues[5].comments, Comment('alice', 'answer', '2026-10-02T00:00:00Z')))
-    asyncio.run(workflow.resume(5))
-    assert resolve_state(store).issue_recovery.state.consumed_reply_at == '2026-10-02T00:00:00Z'
-
-
 def test_blank_retry_requires_selected_projection_command(monkeypatch):
     workflow, gateway, store, _ = setup_reply('  ')
     gateway.issues[5] = replace(gateway.issues[5], labels=frozenset({Label.AI_WORKING}))

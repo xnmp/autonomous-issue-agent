@@ -4,17 +4,9 @@ from issue_agent.domain.actions import PostComment, Relabel, Target
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import (
     AgentResult,
-    Adjudication,
-    AuthorFollowup,
     ExitReason,
-    ImplementFollowup,
     address_review_actions,
-    adjudication,
-    author_actions,
-    author_followup,
-    contract_escalation_actions,
     fix_ci_actions,
-    implement_followup,
     resolve_actions,
     resume_actions,
 )
@@ -50,56 +42,6 @@ def test_resolve_blocked_comments_and_blocks():
 def test_resolve_error_requeues_ready():
     acts = resolve_actions(5, AgentResult(is_error=True), pr=None)
     assert acts == [Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_READY)]
-
-
-# ── author tail (AUTHOR_TESTS_SPLIT) ──
-def test_author_authored_stays_working_no_actions():
-    # tests_authored → no label move (stay ai-working); the implementer runs next.
-    assert author_followup(_ok("tests_authored")) is AuthorFollowup.AUTHORED
-    assert author_actions(5, _ok("tests_authored")) == []
-
-
-def test_author_blocked_asks_and_blocks():
-    acts = author_actions(5, _ok("blocked", needs="which schema?"))
-    comment = next(a for a in acts if isinstance(a, PostComment))
-    assert "which schema?" in comment.body
-    assert Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_BLOCKED) in acts
-
-
-def test_author_error_requeues_ready():
-    acts = author_actions(5, AgentResult(is_error=True))
-    assert acts == [Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_READY)]
-
-
-# ── implementer leg + contract renegotiation ──
-def test_implement_pr_opened_ground_truth_wins():
-    # even a contract_change status is overridden when a PR actually opened.
-    assert implement_followup(_ok("contract_change"), pr_opened=True) is ImplementFollowup.PR_OPENED
-
-
-def test_implement_contract_change_is_its_own_outcome():
-    fu = implement_followup(_ok("contract_change", needs="test X asserts the wrong layer"), pr_opened=False)
-    assert fu is ImplementFollowup.CONTRACT_CHANGE
-
-
-def test_implement_blocked_vs_error():
-    assert implement_followup(_ok("blocked"), False) is ImplementFollowup.BLOCKED
-    assert implement_followup(AgentResult(is_error=True), False) is ImplementFollowup.RETRY
-
-
-def test_adjudication_revised_only_on_explicit_verdict():
-    assert adjudication(AgentResult(is_error=False, structured={"verdict": "revised"})) is Adjudication.REVISED
-    assert adjudication(AgentResult(is_error=False, structured={"verdict": "upheld"})) is Adjudication.UPHELD
-    # errored / missing verdict → UPHELD (never silently weaken the contract)
-    assert adjudication(AgentResult(is_error=True, structured={"verdict": "revised"})) is Adjudication.UPHELD
-    assert adjudication(AgentResult(is_error=False, structured=None)) is Adjudication.UPHELD
-
-
-def test_contract_escalation_goes_to_human():
-    acts = contract_escalation_actions(5, "test X is wrong", "round1: upheld; round2: upheld")
-    comment = next(a for a in acts if isinstance(a, PostComment))
-    assert "test X is wrong" in comment.body and "upheld" in comment.body
-    assert Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.NEEDS_HUMAN_REVIEW) in acts
 
 
 # ── resume tail (differs: error stays blocked, not ready) ──
@@ -231,36 +173,6 @@ def test_resolve_infra_death_still_labels_a_pr_that_actually_opened():
     acts = resolve_actions(5, _killed(), pr=100)
     assert Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_PR_OPEN) in acts
     assert Relabel(Target.PR, 100, None, Label.AI_PR_OPEN) in acts
-
-
-def test_author_infra_death_leaves_issue_working_for_the_reaper():
-    # review M15 — the fifth outcome tail, and the one that was missing this
-    # guard. author_followup maps a killed session to RETRY, so the leg used to
-    # relabel ai-working→ai-ready; the fixer then re-picked the issue on the next
-    # poll and dispatched the author leg straight back into whatever killed it
-    # (with split mode + Codex, an OOM). relabel→dispatch→kill, forever, at full
-    # session cost: the infra-death ceiling COUNTS deaths, it does not stop the
-    # requeue that feeds them. Emitting nothing leaves the issue ai-working, the
-    # designed settle path.
-    assert author_actions(5, _killed()) == []
-    # Anti-vacuity twin: the SAME shape of result WITHOUT the exit_reason still
-    # requeues, so [] above is the guard firing, not author_actions gone quiet.
-    assert author_actions(5, AgentResult(is_error=True)) == [
-        Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_READY)
-    ]
-
-
-def test_author_infra_death_outranks_a_blocked_envelope():
-    # Guard ORDER, not just presence. `exit_reason` is classified by the runtime
-    # independently of what the agent said (see AgentResult), so a leg can carry a
-    # 'blocked' envelope AND a kill. The kill wins: posting the question and moving
-    # to ai-blocked would park the issue on a human for a machine failure.
-    # Contrast test_author_blocked_asks_and_blocks — same status, no exit_reason.
-    killed_after_blocking = AgentResult(
-        is_error=False, status="blocked", needs="which schema?",
-        exit_reason=ExitReason.KILLED_EXTERNALLY,
-    )
-    assert author_actions(5, killed_after_blocking) == []
 
 
 def test_resume_infra_death_does_not_consume_the_human_reply():

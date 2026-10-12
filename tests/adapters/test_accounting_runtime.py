@@ -277,23 +277,21 @@ def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, b
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
 
 
-def test_author_runtime_persists_fingerprint_of_supplied_inputs_before_provider_runs(tmp_path) -> None:
+def test_resolve_runtime_persists_fingerprint_of_supplied_inputs_before_provider_runs(tmp_path) -> None:
     from issue_agent.adapters.workflow_codec import decode_workflow
     from issue_agent.domain.workflow import ResolveAdmission
-    from issue_agent.domain.resolve_split import SplitContext, SplitSelection
 
     state = resolve_snapshot()
-    task = RuntimePlan("Author the issue contract", schema={"type": "object"},
+    task = RuntimePlan("Resolve the issue", schema={"type": "object"},
                        append_system_prompt="Keep public behavior stable", max_budget_usd=2,
-                       resolve_inputs=ResolveInputs("title", "body", "alice"),
-                       split_input=SplitContext("fix/1-test", SplitSelection("codex", "<runtime-default>")))
+                       resolve_inputs=ResolveInputs("title", "body", "alice"))
     seen = []
 
     class InspectingRuntime:
         async def run(self, supplied):
             with store._connect() as db:
                 row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope='o/r' AND key='author-run'",
+                    "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope='o/r' AND key='resolve-run'",
                 ).fetchone()
             receipt = decode_workflow(row[0], ResolveAdmission)
             seen.append(receipt)
@@ -301,9 +299,9 @@ def test_author_runtime_persists_fingerprint_of_supplied_inputs_before_provider_
             return AgentResult(False, status="ok", cost_usd=1)
 
     wrapper, store = _wrapper(tmp_path, InspectingRuntime())
-    wrapper = dataclasses.replace(wrapper, budget_policy=BudgetPolicy({("fix", "AUTHOR"): Money("USD", 2_000_000)}))
-    wrapper.set_context("fix", "AUTHOR", 1, 1, workflow=state.binding)
-    wrapper.set_run_identity("author-run", "author-leg")
+    wrapper = dataclasses.replace(wrapper, budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 2_000_000)}))
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
+    wrapper.set_run_identity("resolve-run", "resolve-leg")
     result = asyncio.run(wrapper.run(task))
 
     assert result.status == "ok"
@@ -337,7 +335,7 @@ def test_activated_resolve_rejects_missing_or_stale_authority_before_provider(tm
     assert store.active_reservation_runs() == ()
 
 
-@pytest.mark.parametrize("kind", ["ROUTE", "AUTHOR", "IMPLEMENT", "ADJUDICATE"])
+@pytest.mark.parametrize("kind", ["ROUTE", "RESUME"])
 def test_workflow_binding_survives_nested_leg_context_and_exception(tmp_path, kind) -> None:
     wrapper, _store = _wrapper(tmp_path, Runtime(AgentResult(False)))
     journaled = JournalingRuntime(

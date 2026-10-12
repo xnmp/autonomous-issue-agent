@@ -35,7 +35,7 @@ def test_no_pending_children_leaves_a_genuine_block_alone():
 
 
 def test_only_a_blocked_claim_is_rewritten():
-    for status in ("pr_opened", "pushed", "", "contract_change"):
+    for status in ("pr_opened", "pushed", "", "failed"):
         result = AgentResult(is_error=False, status=status, exit_reason=ExitReason.OK)
         assert reclassify_pending_background_block(result, 1) == result
 

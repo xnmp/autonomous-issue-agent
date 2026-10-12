@@ -10,10 +10,7 @@ import pytest
 from issue_agent.adapters.runtime_plan import McpServer
 from issue_agent.domain.trust import as_untrusted
 from issue_agent.app.planners.schemas import (
-    ADJUDICATE_SCHEMA,
-    AUTHOR_SCHEMA,
     FIX_SCHEMA,
-    IMPLEMENT_SCHEMA,
     REVIEW_FINDINGS_SCHEMA,
     REVIEW_GATE_SCHEMA,
     REVIEW_SCHEMA,
@@ -26,13 +23,10 @@ from issue_agent.app.planners.tasks import (
     FixTaskConfig,
     ReviewTaskConfig,
     build_address_review_task,
-    build_adjudicate_task,
-    build_author_task,
     build_delegated_re_review_task,
     build_delegated_review_task,
     build_fix_ci_task,
     build_fresh_re_review_task,
-    build_implement_task,
     build_fresh_reply_task,
     build_re_review_task,
     build_resolve_task,
@@ -99,7 +93,6 @@ def test_resolve_task():
 
 @pytest.mark.parametrize("builder,args", [
     (build_resolve_task, (5, U("title"), U("body"), "/wt")),
-    (build_implement_task, (5, U("title"), U("body"), "/wt")),
     (build_resume_task, (U("reply"), "/wt", "session")),
     (build_fresh_reply_task, (5, U("title"), U("body"), U("reply"), "/wt")),
     (build_address_review_task, (7, U("review"), U("inline"), "/wt", "session")),
@@ -123,11 +116,6 @@ def test_publishing_task_authorizes_bounded_native_review_in_user_prompt(builder
     assert "<untrusted_" not in authorization
 
 
-def test_nonpublishing_author_does_not_gain_native_review_authorization():
-    task = build_author_task(5, U("title"), U("body"), "/wt", replace(FIX_CFG, runtime="codex"))
-    assert "user explicitly authorizes" not in task.prompt
-
-
 def test_review_prompt_makes_the_reviewer_the_sole_evidence_verifier():
     t = build_review_task(
         7, U("t"), U("b"), U("diff"),
@@ -142,68 +130,6 @@ def test_raw_text_cannot_cross_the_prompt_boundary():
         build_resolve_task(
             5, cast(Any, "raw"), U("body"), "/wt/issue-5", FIX_CFG
         )
-
-
-def test_author_task_writes_tests_not_impl():
-    t = build_author_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
-    assert t.schema is AUTHOR_SCHEMA          # terminal is tests_authored, not pr_opened
-    assert t.append_system_prompt.startswith("AGENTMD")
-    assert t.cwd == "/wt/issue-5"
-    assert t.resume is None                   # fresh session
-    # T5 (review): "AUTHOR" / "Do NOT write the implementation" were prose-only —
-    # no code parses them, and AUTHOR_SCHEMA already proves this is the author
-    # builder. "tests_authored" is the one REQUIRED marker: `author_followup`
-    # (domain/outcome.py) branches on this literal status string.
-    assert "tests_authored" in t.prompt
-
-
-def test_implement_task_is_fresh_and_test_immutable():
-    t = build_implement_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
-    assert t.schema is IMPLEMENT_SCHEMA       # opens PR OR petitions → implement schema
-    assert t.resume is None                   # FRESH session, NOT a resume of the author
-    # T5 (review): "IMPLEMENTER" / "do NOT modify … test files" were prose-only —
-    # IMPLEMENT_SCHEMA already proves builder identity, and test-immutability is
-    # actually ENFORCED by the PR gate's test-immutability check, not by this
-    # prompt's wording (the prompt only informs the agent of a rule the gate
-    # already guarantees).
-    assert "Fixes #5" in t.prompt             # interpolated issue number
-    assert "contract_change" in t.prompt      # required marker: ImplementFollowup parses it
-
-
-def test_implement_task_carries_uphold_note():
-    t = build_implement_task(
-        5,
-        U("t"),
-        U("b"),
-        "/wt",
-        FIX_CFG,
-        uphold_note=U("the AC is correct because X"),
-    )
-    # T5 (review): "UPHELD" alone was prose (a heading word); the interpolated
-    # note content below is the real contract this test is named for.
-    assert "the AC is correct because X" in t.prompt
-
-
-def test_adjudicate_task_is_blind_to_impl():
-    t = build_adjudicate_task(
-        5,
-        U("Null token"),
-        U("crashes"),
-        U("test asserts the wrong layer"),
-        "/wt/issue-5",
-        FIX_CFG,
-    )
-    assert t.schema is ADJUDICATE_SCHEMA
-    assert t.resume is None                   # fresh session
-    assert "test asserts the wrong layer" in t.prompt  # the objection is DATA in the prompt
-    # T5 (review): "adjudicating" (role label, redundant with ADJUDICATE_SCHEMA)
-    # and "Default to UPHELD" (a bias-polarity instruction unrelated to this
-    # test's namesake claim) were prose-only, pruned. "do NOT see the
-    # implementer's code" is kept: it is this test's whole point, and the
-    # real blindness MECHANISM (worktree reset before this leg runs) lives in
-    # app/workflows/fix.py, not in this module, so this is the only place that
-    # documents the agent is TOLD it is blind.
-    assert "do NOT see the implementer's code" in t.prompt
 
 
 def test_resume_task_carries_session_and_reply():
@@ -358,11 +284,6 @@ def _every_fixer_task():
     from issue_agent.app.planners.tasks import build_rebase_task
     return {
         "resolve": build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG),
-        "author": build_author_task(5, U("t"), U("b"), "/wt", FIX_CFG),
-        "implement": build_implement_task(5, U("t"), U("b"), "/wt", FIX_CFG),
-        "adjudicate": build_adjudicate_task(
-            5, U("t"), U("b"), U("obj"), "/wt", FIX_CFG
-        ),
         "resume": build_resume_task(U("reply"), "/wt", "s1", FIX_CFG),
         "address_review": build_address_review_task(
             9, U("rb"), U("il"), "/wt", "s1", FIX_CFG
@@ -444,10 +365,9 @@ def test_fresh_legs_still_get_the_full_agent_md():
             f"{name} dropped AGENT.md"
         )
         assert "still applies" not in task.append_system_prompt.lower(), name
-    for name in ("resolve", "author", "implement", "adjudicate"):
-        prompt = _every_fixer_task()[name].append_system_prompt
-        assert prompt.startswith("AGENTMD"), name
-        assert "AUTONOMY CONTRACT" in prompt, name
+    prompt = _every_fixer_task()["resolve"].append_system_prompt
+    assert prompt.startswith("AGENTMD")
+    assert "AUTONOMY CONTRACT" in prompt
 
 
 # ── diff scoping (P4.2) ──

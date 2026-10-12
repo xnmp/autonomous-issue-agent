@@ -53,8 +53,6 @@ def workflow(gateway, store, runner, **overrides):
         base_branch="dev",
         fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
         fork_threshold=5,
-        author_tests_split=False,
-        max_contract_rounds=2,
         fix_mcp_config="",
         harness_root="",
         log=lambda _message: None,

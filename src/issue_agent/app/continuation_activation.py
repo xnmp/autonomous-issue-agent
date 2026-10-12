@@ -149,7 +149,7 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
             keys = {key for key in keys if isinstance(key.target, IssueRef) or WorkflowFamily.PR_REPAIR in scope.families}
             if len(keys) > MAX_IMPORT_TARGETS:
                 raise ResolveActivationRefused("continuation target inventory exceeds its bound")
-            kinds = ("ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
+            kinds = ("ROUTE", "RESOLVE", "RESUME", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
             targets = []
             authority_sources = []
             for key in sorted(keys, key=lambda k: (type(k.target).__name__, k.target.number)):

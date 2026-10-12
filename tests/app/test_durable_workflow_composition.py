@@ -35,7 +35,6 @@ from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.app.workflows import fix as fix_workflow_module
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.contracts import EffectStatus, Money, daily_budget_scope
 from issue_agent.domain.fix import FixConfig, decide_fix
@@ -45,7 +44,6 @@ from issue_agent.domain.lifecycle import LifecycleOperation, completion_guard
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.workflow import ResolveAdmission
-from issue_agent.domain.resolve_split import ContractRevision, ContractResetResult
 from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from tests.domain.builders import issue, pr
 from tests.fakes.persistent_github import PersistentGitHub
@@ -72,10 +70,6 @@ class Worktrees:
     def reset(self, number: int) -> None:
         self.resets.append(number)
 
-    def reset_contract(self, issue: int, revision: ContractRevision, intent_id: str) -> ContractResetResult:
-        import hashlib
-        self.resets.append(issue)
-        return ContractResetResult(revision, "refs/issue-agent/contract-reset/" + hashlib.sha256(intent_id.encode()).hexdigest())
 
 
 class Provider:
@@ -104,9 +98,6 @@ class Composition:
 
 @pytest.fixture(autouse=True)
 def controlled_publication_context(monkeypatch):
-    monkeypatch.setattr(fix_workflow_module, "verify_contract_revision", lambda *args: None)
-    monkeypatch.setattr(accounting_runtime, "capture_contract_revision",
-                        lambda cwd, issue, capture_id, branch: ContractRevision(branch, "a" * 40))
     monkeypatch.setattr(
         accounting_runtime, "_fix_publication_context",
         lambda _role, cwd: accounting_runtime._FixPublicationContext(
@@ -115,22 +106,11 @@ def controlled_publication_context(monkeypatch):
     )
 
 
-class SplitProvider(Provider):
-    async def run(self, task):
-        self.tasks.append(task)
-        if "TEST/INTERFACE AUTHOR" in task.prompt:
-            return AgentResult(False, status="tests_authored", session_id="author", cost_usd=.25)
-        if "independent AUTHOR adjudicating" in task.prompt:
-            return AgentResult(False, status="done", session_id="adjudicator", cost_usd=.25,
-                               structured={"verdict": "upheld", "rationale": "The public API must remain stable."})
-        return AgentResult(False, status="contract_change", needs="The contract requires the wrong API.", session_id="implementer", cost_usd=.25)
-
-
 # ADR 0015 initial reconciliation delay: an unknown outcome's first read is due then.
 UNKNOWN_READ_DELAY = timedelta(seconds=31)
 
 
-def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix", split=False,
+def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix",
             later: timedelta = timedelta(0), control_path: Path | None = None,
             state_dir: Path | None = None) -> Composition:
     """``later`` restarts the process that much after the prior one (store clock)."""
@@ -152,13 +132,12 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     runtime = AccountingRuntime(
         provider, control, "o/r", "fix", Money("USD", 5_000_000), None, None,
         "test", "claude", BudgetPolicy({("fix", kind): Money("USD", 3_000_000)
-                                         for kind in ("RESOLVE", "RESUME", "FIX_CI", "AUTHOR", "IMPLEMENT", "ADJUDICATE")}),
-        max_contract_rounds=2,
+                                         for kind in ("RESOLVE", "RESUME", "FIX_CI")}),
     )
     executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=lambda action: state.cleanup_pr(action.pr, action.issue, action.merged))
     dispatcher = AgentDispatcher(
         DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append,
-                       author_tests_split=split, operator_guidance=roles.review_guidance_reader(control, "o/r")),
+                       operator_guidance=roles.review_guidance_reader(control, "o/r")),
         remote, state, Worktrees(root), JournalingRuntime(runtime, journal, repo="o/r", role="fix", runtime="claude"), executor, workflow_control=workflow,
     )
     executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
@@ -412,32 +391,6 @@ def test_corrupt_paid_return_holds_only_its_issue_while_restart_advances_a_healt
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 2
 
 
-@pytest.mark.parametrize("stage", ["AUTHOR", "IMPLEMENT", "ADJUDICATE"])
-def test_split_settlement_captures_the_return_before_application_receives_it(tmp_path, monkeypatch, stage):
-    seed(tmp_path, "ai-ready")
-
-    first = compose(tmp_path, provider=SplitProvider(), split=True)
-    settle = AccountingRuntime._settle_result
-
-    def crash_after_settlement(runtime, run_id, model, result, **kwargs):
-        settled = settle(runtime, run_id, model, result, **kwargs)
-        with runtime.store._connect() as db:
-            kind = db.execute("SELECT kind FROM runs WHERE run_id=?", (str(run_id),)).fetchone()[0]
-        if kind == stage:
-            raise Crash(f"after {stage} settlement")
-        return settled
-
-    monkeypatch.setattr(AccountingRuntime, "_settle_result", crash_after_settlement)
-    with pytest.raises(Crash, match=stage):
-        first.daemon.tick()
-    pending = first.workflow.pending_returns()
-    assert len(pending) == 1
-    assert pending[0].returned.stage.value == stage
-    assert first.workflow.load_workflow(resolve_snapshot(7).binding.fence.key).gates
-    with first.control._connect() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == ("AUTHOR", "IMPLEMENT", "ADJUDICATE").index(stage) + 1
-
-
 def test_process_loss_after_capture_retains_session_and_durable_followup(tmp_path):
     seed(tmp_path, "ai-ready")
     paid = False
@@ -496,57 +449,6 @@ def _terminated_after_paid_settlement(root: Path) -> None:
         accounting_runtime, "_fix_publication_context", return_value=context,
     ):
         client.daemon.tick()
-
-
-def _terminated_after_split_settlement(root: Path, stage: str) -> None:
-    client = compose(root, provider=SplitProvider(), split=True)
-    settle = AccountingRuntime._settle_result
-
-    def after_settlement(runtime, run_id, model, result, **kwargs):
-        settled = settle(runtime, run_id, model, result, **kwargs)
-        with runtime.store._connect() as db:
-            kind = db.execute("SELECT kind FROM runs WHERE run_id=?", (str(run_id),)).fetchone()[0]
-        if kind == stage:
-            os._exit(73)
-        return settled
-
-    context = accounting_runtime._FixPublicationContext(
-        str(root.resolve()), "fix/7-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
-    )
-    with patch.object(AccountingRuntime, "_settle_result", after_settlement), patch.object(
-        accounting_runtime, "_fix_publication_context", return_value=context,
-    ), patch.object(accounting_runtime, "capture_contract_revision", side_effect=lambda cwd, number, capture_id, branch: ContractRevision(branch, "a" * 40)), patch.object(
-        fix_workflow_module, "verify_contract_revision", return_value=None,
-    ):
-        client.daemon.tick()
-
-
-@pytest.mark.parametrize("stage,next_stage", [("AUTHOR", "IMPLEMENT"), ("IMPLEMENT", "ADJUDICATE"), ("ADJUDICATE", "IMPLEMENT")])
-def test_process_exit_preserves_split_stage_without_repeating_completed_paid_work(tmp_path, stage, next_stage):
-    seed(tmp_path, "ai-ready")
-    process = multiprocessing.get_context("spawn").Process(target=_terminated_after_split_settlement, args=(tmp_path, stage))
-    process.start()
-    try:
-        process.join(timeout=10)
-        assert process.exitcode == 73
-    finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-    restarted = compose(tmp_path, split=True)
-    receipt = restarted.workflow.pending_returns()[0].returned
-    assert receipt.stage.value == stage
-    restarted.daemon.tick()
-    assert restarted.workflow.pending_returns() == ()
-    assert restarted.provider.tasks == []
-    state = restarted.workflow.load_workflow(resolve_snapshot(7).binding.fence.key)
-    from issue_agent.domain.resolve_split import NeedsAdjudication
-    cursor = state.episode.continuation.split
-    assert ("ADJUDICATE" if isinstance(cursor, NeedsAdjudication) else "IMPLEMENT") == next_stage
-    if stage == "ADJUDICATE":
-        assert cursor.context.uphold_note == "The public API must remain stable."
-    with restarted.control._connect() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == ("AUTHOR", "IMPLEMENT", "ADJUDICATE").index(stage) + 1
 
 
 def test_process_exit_after_settlement_cannot_leave_a_charge_without_return_evidence(tmp_path):
