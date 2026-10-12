@@ -326,8 +326,6 @@ class IssueCard(Contract):
     # must show no CI signal rather than a guessed green.
     pr_ci_state: Literal["passing", "failing", "pending"] | None = None
     stage: str | None
-    attention_reason: str | None = None
-    escalation_reason: str | None = None
     done: bool
     steps: list[CardStep]
     cost_usd: float | None
@@ -344,8 +342,6 @@ class IssueCard(Contract):
     # directly: a human-owned row must not dead-stop both clocks while a leg
     # is visibly spending (keifu #142/#181, 2026-08-03).
     leg_running: bool = False
-    human_wait_since_ts: str | None = None
-    human_wait_s: float | None = None
     # The issues board group; None once the issue is done.
     board: BoardStatus | None = None
     rail: StageRail | None = None
@@ -353,7 +349,6 @@ class IssueCard(Contract):
     overspend_ratio: float | None = None
     # The router's difficulty tier; None means untriaged.
     tier: Literal["trivial", "standard", "complex", "exceptional"] | None = None
-    projected_eta_s: float | None
     models: list[str]
     model_badges: list[ModelBadge] = []
     rounds: int | None

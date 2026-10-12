@@ -297,15 +297,65 @@ def test_escalated_while_a_leg_is_running_stays_needs_you():
     assert isinstance(status, dash.NeedsYou)
 
 
-@pytest.mark.parametrize("automerge,group", [(True, dash.Working), (False, dash.NeedsYou)])
-def test_merge_ready_is_working_only_where_the_harness_merges(automerge, group):
-    status = dash.board_status(BoardFacts(track=REVIEWED, attention=dash.MergeReady(at(2)), automerge=automerge))
+@pytest.mark.parametrize(
+    "owner,group,says",
+    [
+        ("harness", dash.Working, "The harness merges it next."),
+        ("github", dash.Working, "GitHub merges it automatically."),
+        ("operator", dash.NeedsYou, "The harness does not merge this PR."),
+    ],
+)
+def test_an_approved_green_pr_goes_to_whoever_owns_its_merge(owner, group, says):
+    status = dash.board_status(BoardFacts(
+        track=REVIEWED, ci="passing", merge_owner=owner, last_activity=at(3),
+    ))
 
     assert isinstance(status, group)
+    assert says in status.reason
+    assert status.since == at(3)
     if isinstance(status, dash.NeedsYou):
-        assert status.ask is Ask.MERGE
+        assert (status.ask, status.headline) == (Ask.MERGE, "Merge the PR")
     else:
         assert status.headline == "Ready to merge"
+
+
+@pytest.mark.parametrize("owner", ["harness", "operator"])
+def test_a_merge_github_refuses_is_nobodys_merge_yet(owner):
+    status = dash.board_status(BoardFacts(
+        track=REVIEWED, ci="passing", merge_owner=owner, merge_refused=True,
+    ))
+
+    assert isinstance(status, dash.Working)
+    assert (status.headline, status.activity) == ("Approved", dash.Activity.HANDOFF)
+    assert "GitHub does not allow the merge yet" in status.reason
+
+
+@pytest.mark.parametrize(
+    "after",
+    [("FIX_CI", O.DONE), ("ADDRESS_REVIEW", O.DONE), ("REBASE", O.DONE), ("PR_RESUME", O.DONE), ("RESUME", O.DONE)],
+)
+def test_an_approval_does_not_survive_a_changed_patch(after):
+    track = stage_track(steps(("RESOLVE", O.DONE), ("REVIEW", O.PASSED, True), after))
+
+    status = dash.board_status(BoardFacts(track=track, ci="passing", merge_owner="harness"))
+
+    assert isinstance(status, dash.Working)
+    assert status.activity is dash.Activity.HANDOFF
+    assert status.headline not in {"Ready to merge", "Approved"}
+
+
+def test_github_requiring_a_review_on_the_current_head_overrides_the_journal_approval():
+    status = dash.board_status(BoardFacts(
+        track=REVIEWED, ci="passing", merge_owner="harness", github_approved=False,
+    ))
+
+    assert isinstance(status, dash.Working) and status.headline != "Ready to merge"
+
+
+def test_an_unread_github_review_decision_trusts_the_current_journal_approval():
+    status = dash.board_status(BoardFacts(track=REVIEWED, ci="passing", github_approved=None))
+
+    assert isinstance(status, dash.NeedsYou) and status.ask is Ask.MERGE
 
 
 def test_parked_outranks_an_escalation_and_reads_as_a_red_triage_wait():
@@ -412,16 +462,11 @@ def test_with_nothing_running_or_held_the_harness_owns_the_next_move():
     assert status.headline == "Changes requested"
 
 
-def test_an_approved_green_patch_reads_ready_to_merge_without_operator_merge_readiness():
-    status = dash.board_status(BoardFacts(track=REVIEWED, ci="passing", automerge=True))
-
-    assert isinstance(status, dash.Working) and status.headline == "Ready to merge"
-
-
 def test_every_combination_of_facts_yields_exactly_one_group():
     """Contradictory inputs (escalated and parked and held and stalled and
-    queued) must still produce one coherent state, never an error."""
-    attentions = [None, dash.Escalated(None, breaker=True, budget=True), dash.AwaitingReply(None), dash.MergeReady(None)]
+    queued and merge-ready) must still produce one coherent state, never an
+    error."""
+    attentions = [None, dash.Escalated(None, breaker=True, budget=True), dash.AwaitingReply(None)]
     triages = [None, dash.TriageHold("parked", None), dash.TriageHold("awaiting_reply", None)]
     holds = [None, dash.Hold(OnPr(1), None)]
     for attention in attentions:
@@ -429,12 +474,14 @@ def test_every_combination_of_facts_yields_exactly_one_group():
             for hold in holds:
                 for running in (None, "REVIEW"):
                     for stall in (None, dash.StallObserved(None)):
-                        status = dash.board_status(BoardFacts(
-                            track=REVIEWED, attention=attention, triage=triage, hold=hold,
-                            running_kind=running, stall=stall, queued=True, ci="pending",
-                        ))
-                        assert isinstance(status, (dash.NeedsYou, dash.Working, dash.Blocked))
-                        assert status.headline and status.reason
+                        for ci in ("pending", "passing"):
+                            status = dash.board_status(BoardFacts(
+                                track=REVIEWED, attention=attention, triage=triage, hold=hold,
+                                running_kind=running, stall=stall, queued=True, ci=ci,
+                                github_approved=True,
+                            ))
+                            assert isinstance(status, (dash.NeedsYou, dash.Working, dash.Blocked))
+                            assert status.headline and status.reason
 
 
 # ── overspend ─────────────────────────────────────────────────────────────────

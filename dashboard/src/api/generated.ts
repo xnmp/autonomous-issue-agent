@@ -865,8 +865,6 @@ export interface components {
         };
         /** IssueCard */
         IssueCard: {
-            /** Attention Reason */
-            attention_reason?: string | null;
             /** Board */
             board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
             /** Cost Usd */
@@ -875,14 +873,8 @@ export interface components {
             done: boolean;
             /** Elapsed S */
             elapsed_s: number | null;
-            /** Escalation Reason */
-            escalation_reason?: string | null;
             /** Estimated */
             estimated: boolean;
-            /** Human Wait S */
-            human_wait_s?: number | null;
-            /** Human Wait Since Ts */
-            human_wait_since_ts?: string | null;
             /** Idle Active */
             idle_active: boolean;
             /** Idle S */
@@ -932,8 +924,6 @@ export interface components {
             pr_verification_reason?: string | null;
             /** Projected Cost Usd */
             projected_cost_usd: number | null;
-            /** Projected Eta S */
-            projected_eta_s: number | null;
             /** Projected Model */
             projected_model?: string | null;
             rail?: components["schemas"]["StageRail"] | null;

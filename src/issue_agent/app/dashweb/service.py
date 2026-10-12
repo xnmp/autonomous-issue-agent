@@ -6,10 +6,11 @@ import os
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import TYPE_CHECKING
 
@@ -27,7 +28,7 @@ from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
 from ...domain.labels import Label
-from ...domain.review import IdentityMode
+from ...domain.fix import harness_merges_branch
 
 # (target, number, labels added, labels removed) — one applied park/unpark move.
 _ParkMove = tuple[str, int, tuple[str, ...], tuple[str, ...]]
@@ -159,12 +160,14 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
 _AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE", "IDENTITY_MODE")
 
 
-def _harness_merges(name: str, repo: str) -> bool:
-    """Whether the fixer merges approved, green PRs itself on this repo.
+def _harness_merges(name: str, repo: str) -> Callable[[str], bool]:
+    """Which PR branches the fixer merges itself on this repo.
 
-    The same two knobs `automerge_in_scope` reads first. An unreadable
-    configuration answers False, which surfaces a merge-ready PR to the
-    operator rather than letting it sit in Working on a guess.
+    The fixer's own per-branch rule (`harness_merges_branch`, which
+    `automerge_in_scope` applies) bound to this deployment's knobs, so a
+    stranger's branch on an auto-merging repo still reads as the operator's.
+    An unreadable configuration merges nothing, which surfaces a merge-ready
+    PR to the operator rather than letting it sit in Working on a guess.
     """
     try:
         configured = {
@@ -174,8 +177,16 @@ def _harness_merges(name: str, repo: str) -> bool:
         }
         cfg = config.from_env({"REPO": repo, **configured})
     except Exception:  # noqa: BLE001 - a display hint never fails the board
-        return False
-    return cfg.auto_merge and cfg.identity_mode == IdentityMode.THREE
+        return _merges_nothing
+    return partial(
+        harness_merges_branch,
+        auto_merge=cfg.auto_merge,
+        identity_mode=cfg.identity_mode,
+    )
+
+
+def _merges_nothing(_branch: str) -> bool:
+    return False
 
 
 def _detail(exc: BaseException) -> str:
@@ -395,10 +406,10 @@ class Backend:
             key, lambda: _detail_limits(name, repo)
         )
 
-    def _cached_harness_merges(self, name: str, repo: str) -> bool:
-        return bool(self._detail_configs.get_or_load(
+    def _cached_harness_merges(self, name: str, repo: str) -> Callable[[str], bool]:
+        return self._detail_configs.get_or_load(
             ("automerge", name, repo), lambda: _harness_merges(name, repo)
-        ))
+        )
 
     def _review_unproductive_rounds(
         self, snapshot: dash.Snapshot, row: dash.IssueRow,
@@ -444,12 +455,11 @@ class Backend:
             }
         rows = snap.deployment.issues
         projected_by_model = snapshots.projected_cost_by_model(rows)
-        projected_eta = snapshots.mean_wall_clock_s(rows)
         verification_payload = self.verification()
         ledger_rows = verification_payload.get("rows", [])
         issue_status, pr_status = verification.status_indexes(ledger_rows)
         issue_reason, pr_reason = verification.reason_indexes(ledger_rows)
-        automerge = self._cached_harness_merges(name, snap.repo)
+        harness_merges = self._cached_harness_merges(name, snap.repo)
 
         def card(row):
             model = snapshots.projection_model(row)
@@ -460,7 +470,6 @@ class Backend:
                 gh_issue=gh_issues.get(row.issue),
                 gh_prs=gh_prs,
                 projected_cost_usd=projected_by_model.get(model) if model else None,
-                projected_eta_s=projected_eta,
                 projected_model=model,
                 issue_verification=issue_status.get(row.issue),
                 pr_verification=pr_status.get(pr) if pr is not None else None,
@@ -468,7 +477,7 @@ class Backend:
                 pr_verification_reason=(
                     pr_reason.get(pr) if pr is not None else None
                 ),
-                automerge=automerge,
+                harness_merges=harness_merges,
             )
 
         row_by_issue = {row.issue: row for row in rows}
@@ -516,7 +525,7 @@ class Backend:
                         issue,
                         row_by_issue.get(number),
                         gh_prs=gh_prs,
-                        automerge=automerge,
+                        harness_merges=harness_merges,
                     )
                 )
             for number in sorted(backlog_numbers):
@@ -542,7 +551,7 @@ class Backend:
                             issue,
                             row_by_issue.get(number),
                             gh_prs=gh_prs,
-                            automerge=automerge,
+                            harness_merges=harness_merges,
                         )
                     )
                 elif snapshots.is_backlog(issue):
@@ -1371,6 +1380,10 @@ _PR_ENRICHMENT_FIELDS = (
     # journalled) left the fold believing a human owned the row forever,
     # freezing both clocks while paid legs ran (keifu #142/#181, 2026-08-03).
     "labels",
+    # The merge-readiness inputs. Without them a v2 board could not tell an
+    # approved, green PR GitHub refuses (draft, behind, blocked) from one the
+    # operator should merge now.
+    "mergeStateStatus", "isDraft", "autoMergeRequest",
     # Fetched only by GhReader.pr for an open issue detail. Keeping them in the
     # v2 enrichment is necessary because `_github_enrichment` deliberately
     # strips list-query fields that cannot affect the projected lifecycle.

@@ -148,7 +148,6 @@ const CardStep = z
   .passthrough();
 const IssueCard = z
   .object({
-    attention_reason: z.union([z.string(), z.null()]).optional(),
     board: z
       .union([
         z.discriminatedUnion("status", [
@@ -162,10 +161,7 @@ const IssueCard = z
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
-    escalation_reason: z.union([z.string(), z.null()]).optional(),
     estimated: z.boolean(),
-    human_wait_s: z.union([z.number(), z.null()]).optional(),
-    human_wait_since_ts: z.union([z.string(), z.null()]).optional(),
     idle_active: z.boolean(),
     idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
@@ -190,7 +186,6 @@ const IssueCard = z
     pr_verification: z.union([z.string(), z.null()]).optional(),
     pr_verification_reason: z.union([z.string(), z.null()]).optional(),
     projected_cost_usd: z.union([z.number(), z.null()]),
-    projected_eta_s: z.union([z.number(), z.null()]),
     projected_model: z.union([z.string(), z.null()]).optional(),
     rail: z.union([StageRail, z.null()]).optional(),
     rounds: z.union([z.number(), z.null()]),

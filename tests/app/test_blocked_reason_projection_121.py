@@ -5,7 +5,7 @@ from issue_agent.app.dashweb import snapshots
 from test_dashweb_snapshots import NOW, RESOLVE, row_for, ts
 
 
-def test_blocked_reason_round_trips_to_card_and_detail_as_one_bounded_line():
+def test_blocked_reason_reaches_the_board_and_detail_as_one_bounded_line():
     events = [
         RESOLVE,
         {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
@@ -16,10 +16,9 @@ def test_blocked_reason_round_trips_to_card_and_detail_as_one_bounded_line():
     ]
     row = row_for(events, 7)
 
-    card = snapshots.issue_card(row, NOW)
     detail = snapshots.issue_detail(row, NOW)
-    assert card["attention_reason"] == "Choose endpoint A or B."
     assert detail["attention_reason"] == "Choose endpoint A or B."
+    assert snapshots.issue_card(row, NOW)["board"]["reason"] == "Choose endpoint A or B."
 
 
 def test_historical_blocked_run_without_reason_stays_renderable():
@@ -30,4 +29,4 @@ def test_historical_blocked_run_without_reason_stays_renderable():
 
     card = snapshots.issue_card(row, NOW)
     assert card["stage"] == "awaiting human reply"
-    assert card["attention_reason"] is None
+    assert snapshots.issue_detail(row, NOW)["attention_reason"] is None

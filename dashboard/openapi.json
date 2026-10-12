@@ -1697,17 +1697,6 @@
       "IssueCard": {
         "additionalProperties": true,
         "properties": {
-          "attention_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Attention Reason"
-          },
           "board": {
             "anyOf": [
               {
@@ -1763,42 +1752,9 @@
             ],
             "title": "Elapsed S"
           },
-          "escalation_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Escalation Reason"
-          },
           "estimated": {
             "title": "Estimated",
             "type": "boolean"
-          },
-          "human_wait_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Human Wait S"
-          },
-          "human_wait_since_ts": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Human Wait Since Ts"
           },
           "idle_active": {
             "title": "Idle Active",
@@ -1999,17 +1955,6 @@
             ],
             "title": "Projected Cost Usd"
           },
-          "projected_eta_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Projected Eta S"
-          },
           "projected_model": {
             "anyOf": [
               {
@@ -2141,7 +2086,6 @@
           "working_s",
           "idle_s",
           "idle_active",
-          "projected_eta_s",
           "models",
           "rounds"
         ],

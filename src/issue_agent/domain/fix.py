@@ -641,27 +641,36 @@ def prs_needing_resume(
     return out
 
 
+def harness_merges_branch(
+    head_ref_name: str, *, auto_merge: bool, identity_mode: IdentityMode,
+) -> bool:
+    """Whether the fixer, not an operator, merges a PR on this branch.
+
+    Merge ONLY our own work. The reviewer deliberately adopts unlabelled PRs
+    (REVIEW_ADOPT_UNLABELED, on by default) so one that bypassed the pipeline
+    is still seen — reviewing a stranger's PR is useful, MERGING it is not what
+    anybody asked for. Composed with AUTO_MERGE those two safe-sounding
+    defaults meant "approve and merge any open PR into the base branch", and on
+    the first real deployment the reviewer promptly adopted a dependabot PR
+    (#486) on a repo with five of them queued. Adoption widens what we REVIEW;
+    this keeps it from widening what we MERGE.
+
+    Keyed on the BRANCH, not the linked issue: `_issue_for_pr` prefers GitHub's
+    closing-reference graph, which a stranger's PR can populate just by writing
+    "Fixes #N" in its body. The branch name is the thing only the fixer creates.
+    """
+    return (
+        auto_merge
+        and identity_mode == IdentityMode.THREE
+        and is_governed_branch(head_ref_name)
+    )
+
+
 def automerge_in_scope(pr: PRView, cfg: FixConfig) -> bool:
     """Whether this PR is in the configured auto-merge scope."""
-    if not cfg.auto_merge:
-        return False
-    if not pr.head_ref_oid:
-        return False
-    # Merge ONLY our own work. The reviewer deliberately adopts unlabelled PRs
-    # (REVIEW_ADOPT_UNLABELED, on by default) so one that bypassed the pipeline is
-    # still seen — reviewing a stranger's PR is useful, MERGING it is not what
-    # anybody asked for. Composed with AUTO_MERGE those two safe-sounding defaults
-    # meant "approve and merge any open PR into the base branch", and on the first
-    # real deployment the reviewer promptly adopted a dependabot PR (#486) on a
-    # repo with five of them queued. Adoption widens what we REVIEW; this keeps it
-    # from widening what we MERGE.
-    #
-    # Keyed on the BRANCH, not the linked issue: `_issue_for_pr` prefers GitHub's
-    # closing-reference graph, which a stranger's PR can populate just by writing
-    # "Fixes #N" in its body. The branch name is the thing only the fixer creates.
-    if not is_governed_branch(pr.head_ref_name):
-        return False
-    if cfg.identity_mode != IdentityMode.THREE:
+    if not pr.head_ref_oid or not harness_merges_branch(
+        pr.head_ref_name, auto_merge=cfg.auto_merge, identity_mode=cfg.identity_mode,
+    ):
         return False
     # A CONFLICTING PR cannot merge no matter what gh is told — arming it just
     # burns a gh call + verification probe per poll and logs a refusal every
@@ -705,8 +714,10 @@ def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
 
 def should_update_branch(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     """GitHub's BEHIND verdict owns freshness; ordinary branch updates remain."""
-    return (cfg.auto_merge and cfg.identity_mode == IdentityMode.THREE
-        and bool(pr.head_ref_oid) and is_governed_branch(pr.head_ref_name)
+    return (harness_merges_branch(
+            pr.head_ref_name, auto_merge=cfg.auto_merge, identity_mode=cfg.identity_mode,
+        )
+        and bool(pr.head_ref_oid)
         and pr.number not in state.ci_remediation_errors and pr.is_behind()
         and merge_preconditions_met(pr, cfg))
 

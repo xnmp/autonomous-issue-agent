@@ -11,7 +11,7 @@ passes them here for projection into API payloads.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 import hashlib
 import json
@@ -1067,10 +1067,6 @@ def _suspension_partition(
     )
 
 
-def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
-    return _suspension_partition(row, max_seconds)[0]
-
-
 def _union_intervals(
     intervals: list[tuple[datetime, datetime]],
 ) -> list[tuple[datetime, datetime]]:
@@ -1529,6 +1525,27 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
     return active_at
 
 
+_ATTENTION_LABELS = frozenset({"needs-human-review", "needs-budget-review", "ai-blocked"})
+
+
+def _attention_issue_view(row: dash.IssueRow, gh_issue: dict | None) -> dict | None:
+    """The issue as the attention arms read it, with its authoritative labels.
+
+    A schema-v2 GitHub enrichment deliberately carries no labels: the world
+    projection owns them (`card_labels`). Reading only the enrichment left an
+    escalated v2 issue with no attention label at all, so it read "Up next".
+    A truncated observation proves the labels it lists but never an absence,
+    so without an attention label it falls back to the GitHub view.
+    """
+    projected = row.facts.get("labels")
+    if not isinstance(projected, (tuple, list, set, frozenset)):
+        return gh_issue
+    labels = card_labels(row, gh_issue)
+    if row.facts.get("observation_truncated") and not _ATTENTION_LABELS & set(labels):
+        return gh_issue
+    return {**(gh_issue or {}), "labels": labels}
+
+
 def _human_action(
     row: dash.IssueRow,
     gh_issue: dict | None,
@@ -1536,6 +1553,7 @@ def _human_action(
 ) -> tuple[str | None, datetime | None]:
     if row.done:
         return None, None
+    gh_issue = _attention_issue_view(row, gh_issue)
     issue_labels = _labels_set(gh_issue)
     pr_labels = _labels_set(gh_pr)
     # needs-budget-review is an escalation too: only a cap decision resumes it,
@@ -1670,22 +1688,6 @@ def projected_cost_by_model(rows) -> dict[str, float]:
     }
 
 
-def mean_wall_clock_s(rows) -> float | None:
-    """Mean first-event→last-event seconds over DONE issues; None with none.
-    The ETA a card projects is only ever this repo's own history."""
-    spans = []
-    for row in rows:
-        if not row.done:
-            continue
-        start, last = _started(row), row.last_ts
-        if start and last:
-            wall_seconds = (last - start).total_seconds()
-            spans.append(
-                max(0.0, wall_seconds - _suspended_seconds(row, wall_seconds))
-            )
-    return round(sum(spans) / len(spans), 1) if spans else None
-
-
 def _clock_end(
     row: dash.IssueRow,
     started: datetime | None,
@@ -1697,8 +1699,8 @@ def _clock_end(
     In flight the clock runs to NOW; done, to the last thing that happened. An
     issue parked on a human is neither: the harness stopped working at the
     escalation/block point, and letting elapsed keep climbing charges the
-    harness for the operator's queue. `human_wait_s` still ticks live, so the
-    wait itself stays visible. A wait stamp at or before the issue's first
+    harness for the operator's queue; the board's wait column shows the wait
+    itself. A wait stamp at or before the issue's first
     event cannot bound anything, so it is ignored.
     """
     if row.done and row.last_ts:
@@ -1871,6 +1873,16 @@ def _board_hold(row: dash.IssueRow | None) -> tuple[dash.Hold | None, str | None
 
 
 _PROGRESS_EVENTS = frozenset({"agent_run_start", "agent_run", "action", "escalation"})
+_MAX_STALL_AGE_S = 10 * 365 * 86_400
+
+
+def _stall_start(stamp: datetime | None, seconds: float) -> datetime | None:
+    """When the stall began, or the event's own stamp when that predates the
+    calendar (a stamp near year 1 minus the age)."""
+    if stamp is None:
+        return None
+    floor = datetime.min.replace(tzinfo=stamp.tzinfo)
+    return stamp - timedelta(seconds=seconds) if (stamp - floor).total_seconds() > seconds else stamp
 
 
 def _active_stall(row: dash.IssueRow | None, deferral: str | None) -> dash.StallObserved | None:
@@ -1889,16 +1901,15 @@ def _active_stall(row: dash.IssueRow | None, deferral: str | None) -> dash.Stall
             stamp = dash.parse_ts(event.get("ts"))
             details = event.get("details")
             age = details.get("age_seconds") if isinstance(details, Mapping) else None
+            # Compared before any conversion: an int beyond float range, NaN
+            # and infinity all fail the range test rather than raise.
             seconds = (
                 float(age)
                 if isinstance(age, (int, float)) and not isinstance(age, bool)
-                and math.isfinite(age) and 0 <= age < 10 * 365 * 86_400
+                and 0 <= age < _MAX_STALL_AGE_S
                 else 0.0
             )
-            active = dash.StallObserved(
-                stamp - timedelta(seconds=seconds) if stamp is not None else None,
-                deferral,
-            )
+            active = dash.StallObserved(_stall_start(stamp, seconds), deferral)
         elif name in _PROGRESS_EVENTS or name.startswith("world.observed"):
             active = None
     return active
@@ -1920,9 +1931,9 @@ def _attention(
     gh_pr: dict | None,
     labels: set[str],
 ) -> dash.Attention | None:
+    # A merge-ready PR is not a hold: the board classifies it from the
+    # current-patch approval and the merge owner (`_merge_facts`).
     kind, since = _human_action(row, gh_issue, gh_pr)
-    if kind == "merge-ready":
-        return dash.MergeReady(since)
     if kind == "awaiting-reply":
         return dash.AwaitingReply(since, _blocked_reason(row))
     if kind != "escalated":
@@ -1961,6 +1972,37 @@ def board_json(status: dash.BoardStatus) -> dict:
     return {"status": "blocked", "on": target, **common}
 
 
+def _never_harness(_branch: str) -> bool:
+    return False
+
+
+# GitHub's mergeStateStatus values that refuse a merge outright.
+_MERGE_REFUSED_STATES = frozenset({"DIRTY", "BEHIND", "BLOCKED", "DRAFT"})
+_GITHUB_REVIEW = {"APPROVED": True, "REVIEW_REQUIRED": False, "CHANGES_REQUESTED": False}
+
+
+def _merge_facts(
+    gh_pr: Mapping | None,
+    harness_merges: Callable[[str], bool],
+) -> tuple[dash.MergeOwner, bool | None, bool]:
+    """Who merges the PR, GitHub's current-head review decision, and whether
+    GitHub refuses the merge now. Unread fields claim nothing."""
+    pr = gh_pr or {}
+    branch = pr.get("headRefName")
+    owner: dash.MergeOwner = (
+        "harness" if isinstance(branch, str) and harness_merges(branch)
+        else "github" if pr.get("autoMergeRequest")
+        else "operator"
+    )
+    approved = _GITHUB_REVIEW.get(str(pr.get("reviewDecision") or "").upper())
+    refused = (
+        bool(pr.get("isDraft"))
+        or str(pr.get("mergeable") or "").upper() == "CONFLICTING"
+        or str(pr.get("mergeStateStatus") or "").upper() in _MERGE_REFUSED_STATES
+    )
+    return owner, approved, refused
+
+
 def board_status(
     row: dash.IssueRow | None,
     track: dash.StageTrack,
@@ -1968,11 +2010,15 @@ def board_status(
     labels,
     gh_issue: dict | None = None,
     gh_pr: dict | None = None,
-    automerge: bool = False,
+    harness_merges: Callable[[str], bool] = _never_harness,
     queued: bool = False,
     triage_reply: bool = False,
 ) -> dash.BoardStatus:
-    """Gather one row's board facts and let the domain decide its group."""
+    """Gather one row's board facts and let the domain decide its group.
+
+    `harness_merges` is the fixer's per-branch merge rule
+    (`fix.harness_merges_branch` bound to this repository's configuration).
+    """
     label_set = {str(label) for label in labels} | _labels_set(gh_pr)
     hold, deferral = _board_hold(row)
     triage = (
@@ -1983,6 +2029,7 @@ def board_status(
         else None
     )
     ci = _pr_ci_state(gh_pr, row) if row is not None else None
+    merge_owner, github_approved, merge_refused = _merge_facts(gh_pr, harness_merges)
     return dash.board_status(dash.BoardFacts(
         track=track,
         attention=_attention(row, gh_issue, gh_pr, label_set) if row is not None else None,
@@ -1993,7 +2040,9 @@ def board_status(
         stall=_active_stall(row, deferral),
         queued=queued,
         priority=priority_of(label_set),
-        automerge=automerge,
+        merge_owner=merge_owner,
+        github_approved=github_approved,
+        merge_refused=merge_refused,
         last_activity=row.last_ts if row is not None else None,
     ))
 
@@ -2019,13 +2068,12 @@ def issue_card(
     gh_issue: dict | None = None,
     gh_prs: dict | None = None,
     projected_cost_usd: float | None = None,
-    projected_eta_s: float | None = None,
     projected_model: str | None = None,
     issue_verification: str | None = None,
     pr_verification: str | None = None,
     issue_verification_reason: str | None = None,
     pr_verification_reason: str | None = None,
-    automerge: bool = False,
+    harness_merges: Callable[[str], bool] = _never_harness,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
@@ -2038,11 +2086,6 @@ def issue_card(
         row, started, _clock_end(row, started, now, human_wait_since)
     )
     displayed_models = fixer_card_models(row)
-    human_wait_s = (
-        max(0.0, (now - human_wait_since).total_seconds())
-        if human_wait_since is not None
-        else None
-    )
     card = {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
@@ -2054,8 +2097,6 @@ def issue_card(
         "pr_review_state": _pr_review_state(gh_pr),
         "pr_ci_state": _pr_ci_state(gh_pr, row),
         "stage": _display_stage(row),
-        "attention_reason": _blocked_reason(row),
-        "escalation_reason": _escalation_reason(row),
         "done": row.done,
         "steps": collapse_steps(row),
         "cost_usd": row.cost_usd,
@@ -2072,17 +2113,14 @@ def issue_card(
         # this directly: a human-owned row must not dead-stop both clocks
         # while a leg is visibly spending (keifu #142/#181, 2026-08-03).
         "leg_running": leg_running,
-        "human_wait_since_ts": iso(human_wait_since),
-        "human_wait_s": round(human_wait_s) if human_wait_s is not None else None,
         # Done rows leave the board; every other row is in exactly one group.
         "board": None if row.done else board_json(board_status(
             row, track, labels=labels, gh_issue=gh_issue, gh_pr=gh_pr,
-            automerge=automerge,
+            harness_merges=harness_merges,
         )),
         "rail": rail_json(track, leg_running),
         "overspend_ratio": dash.overspend_ratio(row.cost_usd, projected_cost_usd),
         "tier": route_tier(row),
-        "projected_eta_s": projected_eta_s,
         "models": displayed_models,
         "model_badges": model_badges(row, displayed_models),
         "rounds": row.rounds,
@@ -2182,7 +2220,7 @@ def pending_card(
     row: dash.IssueRow | None,
     *,
     gh_prs: Mapping[int, dict] | None = None,
-    automerge: bool = False,
+    harness_merges: Callable[[str], bool] = _never_harness,
 ) -> dict:
     labels = labels_of(issue)
     held, hold_reason = hold_state(row, labels)
@@ -2193,7 +2231,7 @@ def pending_card(
     return {
         "board": board_json(board_status(
             row, track, labels=labels, gh_issue=issue, gh_pr=gh_pr,
-            automerge=automerge, queued=True,
+            harness_merges=harness_merges, queued=True,
         )),
         "rail": rail_json(track, leg_running),
         "issue": int(issue.get("number") or 0),

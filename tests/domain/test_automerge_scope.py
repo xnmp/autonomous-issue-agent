@@ -13,7 +13,13 @@ from tests.domain.builders import observed_pr
 
 import pytest
 
-from issue_agent.domain.fix import FixConfig, FixState, should_automerge, should_update_branch
+from issue_agent.domain.fix import (
+    FixConfig,
+    FixState,
+    harness_merges_branch,
+    should_automerge,
+    should_update_branch,
+)
 from issue_agent.domain.world import Check, PRView, Review
 from issue_agent.domain.review import IdentityMode
 
@@ -68,6 +74,25 @@ def test_a_harness_authored_pr_still_automerges(branch):
 def test_an_adopted_foreign_pr_is_never_automerged(branch):
     """The regression: approved + green + three-identity was enough to merge."""
     assert should_automerge(_pr(branch), FixState(), _cfg()) is False
+
+
+@pytest.mark.parametrize(
+    "branch,auto_merge,mode,owned",
+    [
+        ("fix/504-tab-titles", True, IdentityMode.THREE, True),
+        ("dependabot/npm_and_yarn/typescript-6.0.3", True, IdentityMode.THREE, False),
+        ("fix/504-tab-titles", False, IdentityMode.THREE, False),
+        ("fix/504-tab-titles", True, IdentityMode.SOLO, False),
+        ("", True, IdentityMode.THREE, False),
+    ],
+)
+def test_merge_ownership_is_the_rule_automerge_applies(branch, auto_merge, mode, owned):
+    """The dashboard reads who merges a PR from this same rule, so a board
+    that promises "the harness merges it next" can never disagree with the
+    fixer about a stranger's branch."""
+    assert harness_merges_branch(branch, auto_merge=auto_merge, identity_mode=mode) is owned
+    cfg = _cfg(auto_merge=auto_merge, identity_mode=mode)
+    assert should_automerge(_pr(branch or "x"), FixState(), cfg) is (owned and bool(branch))
 
 
 def test_a_conflicting_pr_is_not_armed():

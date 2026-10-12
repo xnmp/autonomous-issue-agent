@@ -68,8 +68,9 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
     )
 
     assert ask(card) == "merge"
-    assert card["human_wait_s"] == 1_200
-    assert card["board"]["since_ts"] == card["human_wait_since_ts"]
+    # The wait runs from the row's last activity: in a live journal the
+    # observation of the settled checks is that activity.
+    assert card["board"]["since_ts"] == ts(hours=1)
 
 
 @pytest.mark.parametrize(
@@ -81,8 +82,9 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
         {"isDraft": True},
         {"mergeable": "CONFLICTING"},
         {"mergeStateStatus": "DIRTY"},
-        {"mergeStateStatus": "HAS_HOOKS"},
-        {"mergeStateStatus": "UNSTABLE"},
+        {"mergeStateStatus": "BEHIND"},
+        {"mergeStateStatus": "BLOCKED"},
+        {"reviewDecision": "REVIEW_REQUIRED"},
     ],
 )
 def test_pr_that_still_has_harness_work_is_not_merge_ready(override):
@@ -112,7 +114,7 @@ def test_ai_blocked_question_is_awaiting_reply_until_a_later_comment():
 
     card = snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)
     assert ask(card) == "awaiting_reply"
-    assert card["human_wait_s"] == 2_400
+    assert card["board"]["since_ts"] == ts(seconds=2_400)
 
     issue["comments"].append({
         "createdAt": ts(minutes=20),
@@ -148,7 +150,7 @@ def test_pr_thread_ai_blocked_question_is_awaiting_reply():
     )
 
     assert ask(card) == "awaiting_reply"
-    assert card["human_wait_s"] == 1_500
+    assert card["board"]["since_ts"] == ts(seconds=1_500)
 
 
 def test_past_escalation_is_not_a_current_human_action_after_resume():
@@ -190,7 +192,7 @@ def test_readded_external_escalation_does_not_reuse_cleared_wait_start():
     )
 
     assert ask(card) in ESCALATED_ASKS
-    assert card["human_wait_s"] == 600
+    assert card["board"]["since_ts"] == ts(seconds=600)
 
 
 def test_malformed_check_rollup_is_not_merge_ready():
