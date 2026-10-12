@@ -27,7 +27,8 @@ import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
 import { Chip, Dot } from "./components/ui/Chip";
-import { HEALTH_LABEL, HEALTH_TONE, roleHealth, stageTone } from "./lib/semantics";
+import { HEALTH_LABEL, HEALTH_TONE, roleHealth, type Tone } from "./lib/semantics";
+import { boardItems, GROUP_META, type BoardGroup } from "./features/issues/board";
 import {
   DASHBOARD_THEMES,
   type DashboardOptions,
@@ -57,6 +58,9 @@ function priorityFromLabels(labels: string[]): Priority {
     ));
   return priority ?? null;
 }
+
+/** An open issue tab names the board group its issue is in. */
+const BOARD_TONE: Record<BoardGroup, Tone> = { needs_you: "fail", working: "ok", blocked: "neutral" };
 
 function pendingCardFromBacklog(card: BacklogCard): PendingCard {
   return {
@@ -282,7 +286,7 @@ export default function App() {
     for (const sub of ISSUES_SUBS) {
       const count = displayedIssues.data
         ? sub === "inflight"
-          ? displayedIssues.data.in_flight.length + displayedIssues.data.pending.length
+          ? boardItems(displayedIssues.data).length
           : displayedIssues.data[sub].length
         : null;
       tabs.push({
@@ -310,14 +314,14 @@ export default function App() {
         label: (
           <>
             <span className="mono">#{n}</span>
-            {card?.stage ? (
+            {card?.board ? (
               <Chip
-                tone={stageTone(card.stage)}
-                pulse={!card.done && stageTone(card.stage) === "running"}
+                tone={BOARD_TONE[card.board.status]}
+                pulse={card.board.status === "working"}
               >
-                {card.stage}
+                {GROUP_META[card.board.status].label}
               </Chip>
-            ) : null}
+            ) : card?.done ? <Chip tone="ok">done</Chip> : null}
           </>
         ),
         active: route.view === "issue" && route.issue === n,

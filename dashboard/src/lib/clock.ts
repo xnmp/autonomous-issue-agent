@@ -123,8 +123,6 @@ export interface ClockAnchors {
   idle_active?: boolean;
   /** A paid leg is executing right now. */
   leg_running?: boolean;
-  /** Non-null when the next move belongs to a person. */
-  human_action?: string | null;
   done?: boolean;
 }
 
@@ -137,12 +135,12 @@ export interface LiveClocks {
 /**
  * Which of the two clocks is still moving.
  *
- * A running leg owns the work clock EVEN WHEN a human action is posted: the
+ * A running leg owns the work clock EVEN WHEN the row waits on a person: the
  * fold can believe a row is human-owned (a journalled hold nobody journalled
  * clearing) while the harness is demonstrably still spending on it, and
  * freezing both clocks there hid live work behind a dead row (keifu
- * #142/#181, 2026-08-03). `human_action` alone — with no leg running and no
- * idle accrual — is genuine quiescence, and freezing is then correct.
+ * #142/#181, 2026-08-03). A human-owned row with no leg running and no idle
+ * accrual is genuine quiescence, and freezing is then correct.
  */
 export function tickingClock(anchors: ClockAnchors): "work" | "idle" | null {
   if (anchors.done) return null;

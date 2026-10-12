@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
 import type { IssueCard, IssuesPayload } from "../api/types";
@@ -12,11 +12,10 @@ const card: IssueCard = {
   pr: 179,
   pr_url: "https://github.com/o/r/pull/179",
   pr_state: "open",
-  stage: "fixing CI",
-  human_action: null,
+  stage: "done",
   human_wait_since_ts: null,
   human_wait_s: null,
-  done: false,
+  done: true,
   steps: [],
   cost_usd: 2,
   estimated: false,
@@ -33,7 +32,6 @@ const card: IssueCard = {
   models: [],
   model_badges: [],
   rounds: 1,
-  flags: [],
   issue_verification: null,
   pr_verification: null,
 };
@@ -41,9 +39,9 @@ const card: IssueCard = {
 function board(over: Partial<IssueCard>) {
   const issues: Polled<IssuesPayload> = {
     data: {
-      in_flight: [{ ...card, ...over }],
+      in_flight: [],
       pending: [],
-      done: [],
+      done: [{ ...card, ...over }],
       backlog: [],
       gh_ok: true,
       notifications: [],
@@ -55,7 +53,7 @@ function board(over: Partial<IssueCard>) {
     refresh: vi.fn(),
   };
   return render(
-    <IssuesTab repo="demo" sub="inflight" issues={issues} onOpenIssue={vi.fn()} />,
+    <IssuesTab repo="demo" sub="done" issues={issues} onOpenIssue={vi.fn()} />,
   );
 }
 
@@ -65,6 +63,7 @@ function prChip(container: HTMLElement): Element | null {
   ) ?? null;
 }
 
+// The done table's PR control; the in-flight board shows CI on its rail.
 describe("the PR control wears CI's verdict", () => {
   it("reads ok when every check passed", () => {
     const { container } = board({ pr_ci_state: "passing" });
@@ -81,17 +80,6 @@ describe("the PR control wears CI's verdict", () => {
   it("reads running while checks are still going", () => {
     const { container } = board({ pr_ci_state: "pending" });
     expect(prChip(container)).toHaveClass("chip-running");
-    expect(screen.getByText("CI running")).toHaveClass("chip-running", "pulse");
-  });
-
-  it.each(["passing", "failing", null] as const)("has no CI activity badge for %s", (pr_ci_state) => {
-    board({ pr_ci_state });
-    expect(screen.queryByText("CI running")).not.toBeInTheDocument();
-  });
-
-  it("has no CI activity badge without a PR", () => {
-    board({ pr: null, pr_ci_state: "pending" });
-    expect(screen.queryByText("CI running")).not.toBeInTheDocument();
   });
 
   it("claims nothing when CI state is unknown", () => {

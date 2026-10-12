@@ -110,8 +110,8 @@ test("promotion updates both tabs and a new dispatch raises a toast", async ({ p
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
   await expect(page.getByRole("tab", { name: /In flight/ })).toContainText("1");
   await page.getByRole("tab", { name: /In flight/ }).click();
-  await expect(page.getByRole("row", { name: /#120.*pending.*feature.*ai-ready/ }))
-    .toBeVisible();
+  const queued = page.getByRole("region", { name: "Blocked" }).locator(".board-row", { hasText: "#120" });
+  await expect(queued.locator(".board-headline")).toHaveText("Queued");
 
   await expect(page.getByRole("status").filter({ hasText: "Issue #120 dispatched" }))
     .toBeVisible({ timeout: 7_000 });

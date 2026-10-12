@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { liveClocks, offsetSince, tickingClock } from "./clock";
 
 describe("tickingClock", () => {
-  it("gives the work clock to a running leg even when a human action is posted", () => {
-    expect(tickingClock({ leg_running: true, human_action: "awaiting-reply" }))
+  it("gives the work clock to a running leg even while the row also accrues idleness", () => {
+    expect(tickingClock({ leg_running: true, idle_active: true }))
       .toBe("work");
   });
 
@@ -12,7 +12,7 @@ describe("tickingClock", () => {
   });
 
   it("freezes a quiescent human-owned row", () => {
-    expect(tickingClock({ human_action: "escalated" })).toBeNull();
+    expect(tickingClock({ leg_running: false, idle_active: false })).toBeNull();
   });
 
   it("freezes a finished row whatever else the payload claims", () => {
@@ -36,7 +36,7 @@ describe("liveClocks", () => {
   });
 
   it("holds every clock still when neither side is moving", () => {
-    expect(liveClocks({ ...anchors, human_action: "escalated" }, 30))
+    expect(liveClocks({ ...anchors, leg_running: false, idle_active: false }, 30))
       .toEqual({ elapsed: 600, working: 100, idle: 500 });
   });
 

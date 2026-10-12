@@ -10,23 +10,17 @@ import {
 } from "react";
 import { api } from "../api/client";
 import { usePolled, type Polled } from "../api/hooks";
-import { liveClocks, SnapshotAnchor, useNow, useSnapshotOffset } from "../lib/clock";
-import { tipProps } from "./ui/Tip";
+import { SnapshotAnchor, useNow } from "../lib/clock";
 import type {
   BacklogCard,
   CardStep,
   IssueCard,
   IssueStep,
   IssuesPayload,
-  PendingCard,
-  Priority,
 } from "../api/types";
 import type { IssuesSub } from "../routing/hash";
 import {
-  blocksOnHuman,
   difficultyTone,
-  familyVar,
-  flagTone,
   impactTone,
   issueTypeTone,
   labelTone,
@@ -36,21 +30,17 @@ import {
   type Tone,
 } from "../lib/semantics";
 import {
-  DASH,
   ageCompact,
   duration,
   localDate,
-  localTime,
   num,
   parseTs,
   usd,
 } from "../lib/format";
 import { shortModel } from "../lib/models";
-import { readRecord } from "../lib/prefs";
+import { boardItems, matchesQuery } from "../features/issues/board";
 import { Chip } from "./ui/Chip";
-import { EtaProgress } from "./ui/Charts";
-import { CiRunningBadge, StepBadge } from "./ui/StepBadge";
-import { LifecycleStepper } from "./ui/LifecycleStepper";
+import { StepBadge } from "./ui/StepBadge";
 import { TableFilter } from "./ui/TableFilter";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import {
@@ -67,6 +57,7 @@ import {
   SectionTitle,
   WarningList,
 } from "./ui/Feedback";
+import { IssuesBoard } from "./IssuesBoard";
 
 const MarkdownBody = lazy(() => import("./ui/MarkdownBody"));
 
@@ -82,29 +73,12 @@ interface IssuesTabProps {
   showDurationSeconds?: boolean;
 }
 
-type Visibility = Record<IssuesSub, Record<string, boolean>>;
+/** The two table sub-tabs; the in-flight board has no optional columns. */
+type TableSub = Exclude<IssuesSub, "inflight">;
+type Visibility = Record<TableSub, Record<string, boolean>>;
 
 const COLUMN_STORAGE = "issue-agent.dashboard.columns";
-const TASK_HISTORY_COLUMN_STORAGE = "issue-agent.dashboard.task-history-columns";
-// Task is the row identity and remains visible, like Issue in the parent
-// tables. The menu controls the three optional measurements beside it.
-const TASK_HISTORY_COLUMN_CHOICES: ColumnChoice[] = [
-  { key: "time", label: "Time" },
-  { key: "cost", label: "Cost" },
-  { key: "since", label: "Time since" },
-];
-const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
-  inflight: [
-    { key: "lifecycle", label: "Lifecycle" },
-    { key: "cost", label: "Cost" },
-    { key: "elapsed", label: "Duration" },
-    { key: "progress", label: "Progress" },
-    { key: "model", label: "Model" },
-    { key: "pending-priority", label: "Pending priority" },
-    { key: "pending-overlap", label: "Pending overlap" },
-    { key: "pending-hold", label: "Pending state" },
-    { key: "pending-labels", label: "Pending labels" },
-  ],
+const COLUMN_CHOICES: Record<TableSub, ColumnChoice[]> = {
   done: [
     { key: "cost", label: "Cost" },
     { key: "duration", label: "Duration" },
@@ -127,7 +101,6 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
 };
 
 const DEFAULT_VISIBILITY: Visibility = {
-  inflight: Object.fromEntries(COLUMN_CHOICES.inflight.map(({ key }) => [key, true])),
   // "how long ago" is what an operator scanning the done list actually asks;
   // the absolute date is available beside it, off by default.
   done: Object.fromEntries(
@@ -148,39 +121,11 @@ function storedVisibility(): Visibility {
   try {
     const parsed = JSON.parse(localStorage.getItem(COLUMN_STORAGE) ?? "{}") as Partial<Visibility>;
     return {
-      inflight: { ...DEFAULT_VISIBILITY.inflight, ...parsed.inflight },
       done: { ...DEFAULT_VISIBILITY.done, ...parsed.done },
       backlog: { ...DEFAULT_VISIBILITY.backlog, ...parsed.backlog },
     };
   } catch {
     return DEFAULT_VISIBILITY;
-  }
-}
-
-function storedTaskHistoryVisibility(storageKey: string): Record<string, boolean> {
-  const defaults = Object.fromEntries(
-    TASK_HISTORY_COLUMN_CHOICES.map(({ key }) => [key, true]),
-  );
-  try {
-    const all = readRecord<Record<string, boolean>>(TASK_HISTORY_COLUMN_STORAGE);
-    return { ...defaults, ...all[storageKey] };
-  } catch {
-    return defaults;
-  }
-}
-
-function persistTaskHistoryVisibility(
-  storageKey: string,
-  visibility: Record<string, boolean>,
-) {
-  try {
-    const all = readRecord<Record<string, boolean>>(TASK_HISTORY_COLUMN_STORAGE);
-    localStorage.setItem(
-      TASK_HISTORY_COLUMN_STORAGE,
-      JSON.stringify({ ...all, [storageKey]: visibility }),
-    );
-  } catch {
-    // This table remains configurable for the mounted session without storage.
   }
 }
 
@@ -205,18 +150,19 @@ export function IssuesTab({
   const query = queries[sub];
   const normalizedQuery = query.trim().toLowerCase();
   const visible = useMemo(
-    () => new Set(Object.entries(visibility[sub]).filter(([, shown]) => shown).map(([key]) => key)),
+    () => new Set(
+      sub === "inflight"
+        ? []
+        : Object.entries(visibility[sub]).filter(([, shown]) => shown).map(([key]) => key),
+    ),
     [sub, visibility],
   );
-  // One in-flight payload, split by who owns the next move. The backend already
-  // decided that per card; the board only groups by it.
-  const filteredInFlight = useMemo(
-    () => filterCards(data?.in_flight ?? [], normalizedQuery),
-    [data?.in_flight, normalizedQuery],
-  );
-  const filteredPending = useMemo(
-    () => filterCards(data?.pending ?? [], normalizedQuery),
-    [data?.pending, normalizedQuery],
+  // In-flight, queued and triage-blocked backlog rows are one board; the
+  // server already decided each row's group.
+  const allBoard = useMemo(() => boardItems(data), [data]);
+  const filteredBoard = useMemo(
+    () => allBoard.filter((item) => matchesQuery(item, normalizedQuery)),
+    [allBoard, normalizedQuery],
   );
   const filteredDone = useMemo(
     () => filterCards(data?.done ?? [], normalizedQuery),
@@ -226,21 +172,18 @@ export function IssuesTab({
     () => filterCards(data?.backlog ?? [], normalizedQuery),
     [data?.backlog, normalizedQuery],
   );
-  const [blocked, running] = useMemo(() => {
-    const cards = filteredInFlight;
-    return [cards.filter(isOperatorHold), cards.filter((card) => !isOperatorHold(card))];
-  }, [filteredInFlight]);
   const sourceCount = sub === "inflight"
-    ? (data?.in_flight.length ?? 0) + (data?.pending.length ?? 0)
+    ? allBoard.length
     : sub === "done" ? (data?.done.length ?? 0) : (data?.backlog.length ?? 0);
   const filteredCount = sub === "inflight"
-    ? filteredInFlight.length + filteredPending.length
+    ? filteredBoard.length
     : sub === "done" ? filteredDone.length : filteredBacklog.length;
   const hasMatches = !normalizedQuery || filteredCount > 0;
   // Persisted by the handler, never by the state updater: React may invoke an
   // updater more than once for a single click, and a reducer that writes to
   // storage is not a pure function of its input.
   const setColumn = (key: string, shown: boolean) => {
+    if (sub === "inflight") return;
     const next = { ...visibility, [sub]: { ...visibility[sub], [key]: shown } };
     setVisibility(next);
     try {
@@ -250,6 +193,7 @@ export function IssuesTab({
     }
   };
   const openColumnMenu = (event: MouseEvent<HTMLDivElement>) => {
+    if (sub === "inflight") return;
     if (!(event.target instanceof Element) || !event.target.closest("th")) return;
     event.preventDefault();
     setColumnMenuAt({
@@ -270,13 +214,15 @@ export function IssuesTab({
         {sub === "inflight" ? "In-flight issues" : sub === "done" ? "Done issues" : "Backlog"}
       </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
-      <ColumnMenu
-        columns={COLUMN_CHOICES[sub]}
-        visible={visible}
-        onChange={setColumn}
-        position={columnMenuAt}
-        onClose={() => setColumnMenuAt(null)}
-      />
+      {sub !== "inflight" ? (
+        <ColumnMenu
+          columns={COLUMN_CHOICES[sub]}
+          visible={visible}
+          onChange={setColumn}
+          position={columnMenuAt}
+          onClose={() => setColumnMenuAt(null)}
+        />
+      ) : null}
 
       {issues.error ? (
         <ErrorBanner message={issues.error} onRetry={issues.refresh} stale={!!data} />
@@ -294,48 +240,14 @@ export function IssuesTab({
       {!hasMatches ? <EmptyState>no issues match “{query.trim()}”</EmptyState> : null}
 
       {sub === "inflight" && hasMatches ? (
-        <>
-          {/* Blocked leads the board: it is the only section whose rows cannot
-              move until a person acts, so it must not be scrolled past. It
-              disappears entirely when nothing is waiting, rather than standing
-              as a permanent empty heading. */}
-          {blocked.length > 0 ? (
-            <>
-              <SectionTitle>Blocked</SectionTitle>
-              <InFlightTable
-                storageKey="issues-blocked"
-                repo={repo}
-                cards={blocked}
-                onRefresh={issues.refresh}
-                loading={issues.loading}
-                visible={visible}
-                onOpen={onOpenIssue}
-                showProjectedCost={showProjectedCost}
-                showDurationSeconds={showDurationSeconds}
-              />
-            </>
-          ) : null}
-          <SectionTitle>In flight</SectionTitle>
-          <InFlightTable
-            repo={repo}
-            cards={running}
-            onRefresh={issues.refresh}
-            loading={issues.loading}
-            visible={visible}
-            onOpen={onOpenIssue}
-            showProjectedCost={showProjectedCost}
-            showDurationSeconds={showDurationSeconds}
-          />
-          <SectionTitle>Pending</SectionTitle>
-          <PendingTable
-            repo={repo}
-            cards={filteredPending}
-            loading={issues.loading}
-            ghOk={ghOk}
-            visible={visible}
-            onRefresh={issues.refresh}
-          />
-        </>
+        <IssuesBoard
+          repo={repo}
+          items={filteredBoard}
+          loading={issues.loading}
+          onRefresh={issues.refresh}
+          showProjectedCost={showProjectedCost}
+          showDurationSeconds={showDurationSeconds}
+        />
       ) : null}
 
       {sub === "done" && hasMatches ? (
@@ -347,7 +259,6 @@ export function IssuesTab({
             loading={issues.loading}
             visible={visible}
             onOpen={onOpenIssue}
-            onRefresh={issues.refresh}
             showDurationSeconds={showDurationSeconds}
           />
         </>
@@ -369,7 +280,7 @@ export function IssuesTab({
   );
 }
 
-type FilterableCard = IssueCard | PendingCard | BacklogCard;
+type FilterableCard = IssueCard | BacklogCard;
 
 /** Search only operator-facing fields, not arbitrary payload internals. */
 function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
@@ -378,10 +289,8 @@ function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
     const issue = `#${card.issue}`;
     const common = [issue, card.issue, card.title, ...card.labels];
     const details = isIssueCard(card)
-      ? [card.stage, card.pr, ...card.models, ...card.flags]
-      : isPendingCard(card)
-        ? [card.priority, card.hold_reason, card.pr]
-        : [card.issue_type, card.difficulty, card.impact, card.body];
+      ? [card.stage, card.pr, ...card.models]
+      : [card.issue_type, card.difficulty, card.impact, card.body];
     return [...common, ...details]
       .some((value) => String(value ?? "").toLowerCase().includes(query));
   });
@@ -391,387 +300,12 @@ function isIssueCard(card: FilterableCard): card is IssueCard {
   return typeof (card as IssueCard).done === "boolean";
 }
 
-function isPendingCard(card: FilterableCard): card is PendingCard {
-  return typeof (card as PendingCard).held === "boolean";
-}
-
-const OPERATOR_HOLD_LABELS = new Set([
-  "ai-blocked",
-  "ai-parked",
-  "needs-budget-review",
-  "needs-human-review",
-]);
-
-function isOperatorHold(card: IssueCard): boolean {
-  return blocksOnHuman(card)
-    || card.stage === "blocked"
-    || card.stage === "escalated"
-    || card.stage === "awaiting human reply"
-    || card.flags.includes("blocked")
-    || card.labels.some((label) => OPERATOR_HOLD_LABELS.has(label.toLowerCase()));
-}
-
-function InFlightTable({
-  repo,
-  cards,
-  loading,
-  visible,
-  onOpen,
-  onRefresh,
-  showProjectedCost,
-  showDurationSeconds,
-  // Two of these are on screen at once. Sharing one storage key would give a
-  // single stored width/order/sort two live owners, and a drag in one table
-  // would leave the other showing the old layout until the next reload.
-  storageKey = "issues-inflight",
-}: {
-  repo: string;
-  cards: IssueCard[];
-  loading: boolean;
-  visible: ReadonlySet<string>;
-  onOpen: (issue: number) => void;
-  onRefresh: () => void;
-  storageKey?: string;
-  showProjectedCost: boolean;
-  showDurationSeconds: boolean;
-}) {
-  const [expanded, setExpanded] = useState<number | null>(null);
-  const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
-  const sorted = useSortedRows(cards, {
-    issue: (card) => card.issue,
-    lifecycle: (card) => card.steps.length,
-    cost: (card) => card.cost_usd,
-    elapsed: (card) => card.elapsed_s,
-    progress: (card) => (
-      card.elapsed_s !== null && card.projected_eta_s
-        ? card.elapsed_s / card.projected_eta_s
-        : null
-    ),
-    model: (card) => card.models.join(" "),
-  }, { key: "issue", direction: "asc" }, storageKey, sortableAndShown);
-  const offset = useSnapshotOffset();
-  if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
-  if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
-  const columns: TableColumn[] = [
-    { key: "issue", label: "Issue / PR", width: 360 },
-    ...(visible.has("lifecycle")
-      ? [{ key: "lifecycle", label: "Lifecycle", width: 280, minWidth: 240 }]
-      : []),
-    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 105, minWidth: 88 }] : []),
-    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 135 }] : []),
-    ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 135 }] : []),
-    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 135 }] : []),
-  ];
-
-  return (
-    <div className="tbl-wrap panel">
-      <ResizableTable
-        storageKey={storageKey}
-        columns={columns}
-        className="issue-list-table"
-        sort={sorted.sort}
-        onSort={sorted.onSort}
-      >
-        <tbody>
-          {sorted.rows.map((card) => {
-            // Which clock moves is one rule, stated once, in lib/clock.ts:
-            // a running leg ticks work, an idle row ticks idle, and only a
-            // genuinely quiescent row freezes both.
-            const { elapsed, working, idle } = liveClocks(card, offset);
-            const humanOwned = !!card.human_action;
-            const open = expanded === card.issue;
-            // Current operator ownership is redundant across the reconciled
-            // action, stage and live labels because GitHub enrichment can lag
-            // one poll. Lifetime escalation counters alone are not an alarm.
-            const alert = humanOwned || isOperatorHold(card);
-            // Merge-ready is attention, not alarm: same treatment, green.
-            const alertClass = !alert
-              ? ""
-              : card.human_action === "merge-ready" ? " row-alert row-alert-ready" : " row-alert";
-            return (
-              <Fragment key={card.issue}>
-                <tr
-                  className={`clickable${open ? " expanded" : ""}${alertClass}`}
-                  tabIndex={0}
-                  aria-expanded={open}
-                  onClick={() => setExpanded(open ? null : card.issue)}
-                  onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
-                >
-                  <td><IssueSummary card={card} open={open} /></td>
-                  {visible.has("lifecycle") ? (
-                    <td className="lifecycle-column"><IssueLifecycle card={card} /></td>
-                  ) : null}
-                  {visible.has("cost") ? (
-                    <td
-                      className={`r mono nowrap cost-cell${overBudget(card) ? " cost-over" : ""}`}
-                      title={overBudget(card) ? "over the projected cost for this model" : undefined}
-                    >
-                      {usd(card.cost_usd)}
-                      {card.estimated ? <span className="faint" title="synthetic dollars (subscription runtime)"> ~</span> : null}
-                      {showProjectedCost && card.projected_cost_usd !== null ? (
-                        <span
-                          className="faint"
-                          title={`mean completed issue cost for ${card.projected_model ?? "this model"}`}
-                        >
-                          {" "}/ {usd(card.projected_cost_usd)}
-                        </span>
-                      ) : null}
-                    </td>
-                  ) : null}
-                  {visible.has("elapsed") ? (
-                    <td className="r mono" title={card.started_ts ? `started ${localTime(card.started_ts)}` : ""}>
-                      <DurationBreakdown
-                        working={working}
-                        idle={idle}
-                        showSeconds={showDurationSeconds}
-                      />
-                    </td>
-                  ) : null}
-                  {visible.has("progress") ? (
-                    <td>
-                      {elapsed !== null && card.projected_eta_s !== null ? (
-                        <EtaProgress
-                          elapsedS={elapsed}
-                          etaS={card.projected_eta_s}
-                          segments={card.steps.map((step, index) => ({
-                            key: `${step.kind}-${index}`,
-                            varName: familyVar(step.kind),
-                            weight: Math.max(step.cost_usd ?? 0, 0.01),
-                          }))}
-                        />
-                      ) : <span className="faint">no projection</span>}
-                    </td>
-                  ) : null}
-                  {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
-                </tr>
-                {open ? (
-                  <TaskDetailRow
-                    repo={repo}
-                    card={card}
-                    colSpan={columns.length}
-                    onOpen={() => onOpen(card.issue)}
-                    onRefresh={onRefresh}
-                    taskTableStorageKey={`${storageKey}-task-history`}
-                  />
-                ) : null}
-              </Fragment>
-            );
-          })}
-        </tbody>
-      </ResizableTable>
-    </div>
-  );
-}
-
-function PendingTable({
-  repo,
-  cards,
-  loading,
-  ghOk,
-  visible,
-  onRefresh,
-}: {
-  repo: string;
-  cards: PendingCard[];
-  loading: boolean;
-  ghOk: boolean;
-  visible: ReadonlySet<string>;
-  onRefresh: () => void;
-}) {
-  const [busyIssue, setBusyIssue] = useState<number | null>(null);
-  const [expanded, setExpanded] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  // This table's column choices are namespaced (`pending-*`) because it shares
-  // the in-flight sub-tab's menu, so the visible set has to be translated into
-  // this table's own sort keys.
-  const sortableAndShown = useMemo(() => new Set([
-    "issue",
-    ...(visible.has("pending-priority") ? ["priority"] : []),
-    ...(visible.has("pending-overlap") ? ["overlap"] : []),
-    ...(visible.has("pending-hold") ? ["state"] : []),
-    ...(visible.has("pending-labels") ? ["labels"] : []),
-  ]), [visible]);
-  const sorted = useSortedRows(cards, {
-    issue: (card) => card.issue,
-    priority: (card) => card.priority,
-    overlap: (card) => card.overlap === null ? null : String(card.overlap),
-    state: (card) => card.hold_reason ?? "pending",
-    labels: (card) => card.labels.join(" "),
-  }, { key: "issue", direction: "asc" }, "issues-pending", sortableAndShown);
-  if (loading) return <SkeletonRows what="pending issues" rows={3} />;
-  if (cards.length === 0) {
-    return <EmptyState>{ghOk ? "nothing is pending" : "pending needs GitHub data"}</EmptyState>;
-  }
-
-  const setPriority = async (issue: number, priority: Priority) => {
-    setBusyIssue(issue);
-    setError(null);
-    try {
-      await api.setPriority(repo, issue, priority);
-      onRefresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyIssue(null);
-    }
-  };
-  const unpark = async (issue: number) => {
-    setBusyIssue(issue);
-    setError(null);
-    try {
-      await api.unpark(repo, issue);
-      onRefresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyIssue(null);
-    }
-  };
-  const columns: TableColumn[] = [
-    { key: "issue", label: "Issue", width: 360 },
-    ...(visible.has("pending-priority") ? [{ key: "priority", label: "Priority", width: 220 }] : []),
-    ...(visible.has("pending-overlap") ? [{ key: "overlap", label: "Overlap", width: 110 }] : []),
-    ...(visible.has("pending-hold") ? [{ key: "state", label: "State", width: 220 }] : []),
-    ...(visible.has("pending-labels") ? [{ key: "labels", label: "Labels", width: 260 }] : []),
-  ];
-
-  return (
-    <>
-      {error ? <ErrorBanner message={error} /> : null}
-      <div className="tbl-wrap panel">
-        <ResizableTable
-          storageKey="issues-pending"
-          columns={columns}
-          sort={sorted.sort}
-          onSort={sorted.onSort}
-        >
-          <tbody>
-            {sorted.rows.map((card) => {
-              const open = expanded === card.issue;
-              return (
-                <Fragment key={card.issue}>
-                  <tr
-                    className={`clickable${open ? " expanded" : ""}`}
-                    tabIndex={0}
-                    aria-expanded={open}
-                    onClick={() => setExpanded(open ? null : card.issue)}
-                    onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
-                  >
-                    <td>
-                      <div className="issue-summary">
-                        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
-                        <div className="issue-summary-main">
-                          <CompactIssue issue={card.issue} title={card.title} url={card.url} />
-                          <div className="row-wrap">
-                            <PrLink card={card} />
-                            <CiRunningBadge state={card.pr_ci_state} hasPullRequest={card.pr != null} />
-                          </div>
-                        </div>
-                      </div>
-                    </td>
-                    {visible.has("pending-priority") ? <td onClick={(event) => event.stopPropagation()}>
-                      <PrioritySelector
-                        value={card.priority}
-                        busy={busyIssue === card.issue}
-                        onChange={(priority) => void setPriority(card.issue, priority)}
-                      />
-                    </td> : null}
-                    {visible.has("pending-overlap") ? (
-                      <td><span className="faint" title="steward overlap prediction not built yet">n/a</span></td>
-                    ) : null}
-                    {visible.has("pending-hold") ? <td>
-                      {card.hold_reason === "parked" ? (
-                        <Chip tone="meta" title="operator parked: a human owns its PR; the queue no longer waits on it">
-                          parked
-                        </Chip>
-                      ) : card.held ? (
-                        <Chip tone="info" title={card.hold_reason ?? "pending"}>
-                          {card.hold_reason ?? "pending"}
-                        </Chip>
-                      ) : <Chip tone="info">pending</Chip>}
-                    </td> : null}
-                    {visible.has("pending-labels") ? <td><LabelList labels={card.labels} /></td> : null}
-                  </tr>
-                  {open ? (
-                    <tr className="detail-row">
-                      <td colSpan={columns.length}>
-                        <div className="row-detail">
-                          <div className="row-detail-hd">
-                            <strong>Issue context</strong>
-                            <span className="row-wrap">
-                              {card.hold_reason === "parked" ? (
-                                <button
-                                  className="btn btn-xs"
-                                  disabled={busyIssue === card.issue}
-                                  {...tipProps("Restore the PR to the harness: review, merge and overlap serialization resume")}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    void unpark(card.issue);
-                                  }}
-                                >
-                                  Unpark
-                                </button>
-                              ) : null}
-                              {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub</a> : null}
-                            </span>
-                          </div>
-                          <FormattedIssueBody body={card.body ?? null} />
-                        </div>
-                      </td>
-                    </tr>
-                  ) : null}
-                </Fragment>
-              );
-            })}
-          </tbody>
-        </ResizableTable>
-      </div>
-    </>
-  );
-}
-
-const PRIORITIES: { value: Priority; label: string }[] = [
-  { value: "P1", label: "P1" },
-  { value: "P2", label: "P2" },
-  { value: "P3", label: "P3" },
-  { value: null, label: "none" },
-];
-
-function PrioritySelector({
-  value,
-  busy,
-  onChange,
-}: {
-  value: Priority;
-  busy: boolean;
-  onChange: (priority: Priority) => void;
-}) {
-  return (
-    <div className={`seg${busy ? " busy" : ""}`} role="group" aria-label="priority">
-      {PRIORITIES.map((priority) => (
-        <button
-          key={priority.label}
-          className={`seg-btn${priority.value === value ? " active" : ""}`}
-          disabled={busy}
-          aria-pressed={priority.value === value}
-          onClick={() => {
-            if (priority.value !== value) onChange(priority.value);
-          }}
-        >
-          {priority.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function DoneTable({
   repo,
   cards,
   loading,
   visible,
   onOpen,
-  onRefresh,
   showDurationSeconds,
 }: {
   repo: string;
@@ -779,7 +313,6 @@ function DoneTable({
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
-  onRefresh: () => void;
   showDurationSeconds: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -867,7 +400,6 @@ function DoneTable({
                     card={card}
                     colSpan={columns.length}
                     onOpen={() => onOpen(card.issue)}
-                    onRefresh={onRefresh}
                   />
                 ) : null}
               </Fragment>
@@ -1076,10 +608,9 @@ function BacklogTable({
 }
 
 /**
- * What actually happened to this issue, in order: one line per task, carrying
- * the note the backend wrote for it (a review verdict, the question that
- * blocked it, the failure reason, an operator intervention). Money is the
- * quietest thing on the line — it only matters when it runs over.
+ * What actually happened to this merged issue, in order: one line per task,
+ * carrying the note the backend wrote for it (a review verdict, the failure
+ * reason, an operator intervention). Money is the quietest thing on the line.
  *
  * The card's own `steps` collapse retries and carry no prose, so the story
  * comes from the issue-detail endpoint; the collapsed strip is the fallback
@@ -1090,217 +621,36 @@ function TaskDetailRow({
   card,
   colSpan,
   onOpen,
-  onRefresh,
-  taskTableStorageKey,
 }: {
   repo: string;
   card: IssueCard;
   colSpan: number;
   onOpen: () => void;
-  onRefresh: () => void;
-  taskTableStorageKey?: string;
 }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const detail = usePolled(
     `issue:${repo}:${card.issue}`,
     (signal) => api.issue(repo, card.issue, signal),
-    card.done ? 0 : 5_000,
+    0,
   );
-  const steps = detail.data?.steps ?? null;
-  const unblockable = blocksOnHuman(card);
-  // Park only makes sense for the blocked-with-an-open-PR shape: a human is
-  // taking the PR over, and the queue must stop waiting for it.
-  const parkable = unblockable && card.pr !== null && card.pr_state === "open";
-
-  const doPark = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.park(repo, card.issue);
-      detail.refresh();
-      onRefresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusy(false);
-    }
-  };
-
+  const steps: (CardStep | IssueStep)[] = detail.data?.steps ?? card.steps;
   return (
     <tr className="detail-row">
       <td colSpan={colSpan}>
         <div className="row-detail">
           <div className="row-detail-hd">
             <strong>What happened</strong>
-            <span className="row-wrap">
-              {unblockable ? (
-                // Holds are released only from the issue page, where the
-                // current resolve authority decides which command applies.
-                <button
-                  className="btn btn-xs"
-                  {...tipProps("Open the issue's resolve controls to review and release its holds")}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onOpen();
-                  }}
-                >
-                  Review holds
-                </button>
-              ) : null}
-              {parkable ? (
-                <button
-                  className="btn btn-xs"
-                  disabled={busy}
-                  {...tipProps("Hand the PR to a human and free the queue: other issues stop waiting on its files")}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void doPark();
-                  }}
-                >
-                  Park
-                </button>
-              ) : null}
-              <button className="btn btn-xs" onClick={onOpen}>Open full issue</button>
-            </span>
+            <button className="btn btn-xs" onClick={onOpen}>Open full issue</button>
           </div>
-          {error ? <ErrorBanner message={error} /> : null}
-          {card.escalation_reason ? (
-            <div className="task-escalation">{card.escalation_reason}</div>
-          ) : null}
-          {taskTableStorageKey && (steps ?? card.steps).length > 0 ? (
-            <TaskStoryTable
-              issue={card.issue}
-              steps={steps ?? card.steps}
-              storageKey={taskTableStorageKey}
-            />
-          ) : null}
-          {!taskTableStorageKey && steps !== null && steps.length > 0 ? (
+          {steps.length > 0 ? (
             <ol className="task-story">
-              {steps.map((step) => <TaskStoryLine key={step.idx} step={step} />)}
-            </ol>
-          ) : null}
-          {!taskTableStorageKey && steps === null && card.steps.length > 0 ? (
-            <ol className="task-story">
-              {card.steps.map((step, index) => (
-                <TaskStoryLine key={`${step.kind}-${index}`} step={step} />
+              {steps.map((step, index) => (
+                <TaskStoryLine key={(step as { idx?: number }).idx ?? `${step.kind}-${index}`} step={step} />
               ))}
             </ol>
-          ) : null}
-          {(steps ?? card.steps).length === 0 ? (
-            <EmptyState>no tasks recorded yet</EmptyState>
-          ) : null}
+          ) : <EmptyState>no tasks recorded yet</EmptyState>}
         </div>
       </td>
     </tr>
-    );
-}
-
-/**
- * Blocked and live rows are operational queues, so their expansion optimises
- * for scanning what happened, when, what it cost, and how old it is.
- */
-function TaskStoryTable({
-  issue,
-  steps,
-  storageKey,
-}: {
-  issue: number;
-  steps: (CardStep | IssueStep)[];
-  storageKey: string;
-}) {
-  const nowMs = useNow(60_000);
-  const [columnVisibility, setColumnVisibility] = useState(
-    () => storedTaskHistoryVisibility(storageKey),
-  );
-  const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
-  const visible = useMemo(
-    () => new Set(
-      Object.entries(columnVisibility)
-        .filter(([, shown]) => shown)
-        .map(([key]) => key),
-    ),
-    [columnVisibility],
-  );
-  const columns: TableColumn[] = [
-    { key: "task", label: "Task", width: 260, minWidth: 140 },
-    ...(visible.has("time")
-      ? [{ key: "time", label: "Time", width: 120, minWidth: 84 }]
-      : []),
-    ...(visible.has("cost")
-      ? [{ key: "cost", label: "Cost", className: "r", width: 90, minWidth: 76 }]
-      : []),
-    ...(visible.has("since")
-      ? [{ key: "since", label: "Time since", className: "r", width: 110, minWidth: 92 }]
-      : []),
-  ];
-  const setColumn = (key: string, shown: boolean) => {
-    const next = { ...columnVisibility, [key]: shown };
-    setColumnVisibility(next);
-    persistTaskHistoryVisibility(storageKey, next);
-  };
-  const openColumnMenu = (event: MouseEvent<HTMLDivElement>) => {
-    if (!(event.target instanceof Element) || !event.target.closest("th")) return;
-    event.preventDefault();
-    // The board owns a separate parent-table menu on the same bubbling path.
-    event.stopPropagation();
-    setColumnMenuAt({
-      x: Math.min(event.clientX, window.innerWidth - 220),
-      y: Math.min(event.clientY, window.innerHeight - 220),
-    });
-  };
-
-  return (
-    <div className="task-story-table-shell" onContextMenu={openColumnMenu}>
-      <ColumnMenu
-        columns={TASK_HISTORY_COLUMN_CHOICES}
-        visible={visible}
-        onChange={setColumn}
-        position={columnMenuAt}
-        onClose={() => setColumnMenuAt(null)}
-      />
-      <div className="task-story-table-wrap">
-        <ResizableTable
-          storageKey={storageKey}
-          columns={columns}
-          className="task-story-table"
-          ariaLabel={`Issue #${issue} task history`}
-        >
-          <tbody>
-          {steps.map((step, index) => {
-            const ts = stepTimestamp(step);
-            const tone = stepOutcomeTone(step.kind, step.state, step.status);
-            const note = stepNote(step);
-            const took = stepDuration(step);
-            const rawIndex = (step as { idx?: unknown }).idx;
-            const key = typeof rawIndex === "number" ? rawIndex : `${step.kind}-${index}`;
-            return (
-              <tr key={key}>
-                <td className={`task-story-context tone-border-${tone}`}>
-                  <div className="task-story-event">
-                    <StepBadge step={step} label={taskName(step)} title={step.kind} />
-                    {step.state === "ok" || step.state === "done" ? null : (
-                      <span className={`task-state tone-${tone}`}>{step.state}</span>
-                    )}
-                    {note ? <span className="task-note" title={note}>{note}</span> : null}
-                  </div>
-                </td>
-                {visible.has("time") ? (
-                  <td className="mono nowrap" title="task wall time">{duration(took)}</td>
-                ) : null}
-                {visible.has("cost") ? (
-                  <td className="r mono nowrap">{taskCost(step.cost_usd)}</td>
-                ) : null}
-                {visible.has("since") ? (
-                  <td className="r mono nowrap">{timeSince(ts, nowMs)}</td>
-                ) : null}
-              </tr>
-            );
-          })}
-          </tbody>
-        </ResizableTable>
-      </div>
-    </div>
   );
 }
 
@@ -1340,21 +690,6 @@ function stepDuration(step: CardStep | IssueStep): number | null {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
-/** Card summaries have no timestamp; detailed rows do. */
-function stepTimestamp(step: CardStep | IssueStep): string | null {
-  const value = (step as { ts?: unknown }).ts;
-  return typeof value === "string" && parseTs(value) !== null ? value : null;
-}
-
-function timeSince(ts: string | null, nowMs: number): string {
-  const at = parseTs(ts);
-  return at === null ? ageCompact(null) : ageCompact(Math.max(0, (nowMs - at) / 1000));
-}
-
-function taskCost(cost: number | null | undefined): string {
-  return cost === 0 ? DASH : usd(cost);
-}
-
 function taskName(step: CardStep | IssueStep): string {
   return step.kind.replaceAll("_", " ").toLowerCase();
 }
@@ -1371,8 +706,6 @@ function overBudget(card: IssueCard): boolean {
 }
 
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
-  const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
-  const status = humanStatus(card);
   return (
     <div className="issue-cell">
       <div className="issue-summary">
@@ -1381,99 +714,12 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
           <span className="issue-summary-title" title={card.title ?? undefined}>
             {card.title ?? <span className="faint">title unavailable</span>}
           </span>
-          {status ? (
-            <span
-              className={`issue-attention${card.human_action === "merge-ready" ? " issue-attention-ready" : ""}`}
-              title={status}
-            >
-              <span className="issue-attention-label">Harness</span>
-              <span className="issue-attention-text">{status}</span>
-            </span>
-          ) : null}
           <div className="row-wrap">
             <IssueNumber issue={card.issue} url={card.url} />
             <PrLink card={card} />
-            {card.stage === "blocked" || card.stage === "escalated" ? (
-              <span className="attention-stage">{card.stage}</span>
-            ) : null}
-            {card.human_action ? (
-              <span className={`human-action human-action-${card.human_action}`}>
-                {card.human_action.replace("-", " ")}
-              </span>
-            ) : null}
-            {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}
           </div>
         </div>
       </div>
-    </div>
-  );
-}
-
-function IssueLifecycle({ card }: { card: IssueCard }) {
-  const attention = card.human_action === "awaiting-reply"
-    ? "blocked"
-    : card.human_action === "escalated"
-        || card.stage === "blocked"
-        || card.stage === "escalated"
-      ? "escalated"
-      : null;
-  return (
-    <div className="step-flow">
-      <LifecycleStepper
-        compact
-        steps={card.steps}
-        stage={card.stage}
-        hasPullRequest={card.pr !== null}
-        attention={attention}
-        label={`Issue #${card.issue} lifecycle`}
-      />
-      <CiRunningBadge state={card.pr_ci_state} hasPullRequest={card.pr != null} />
-    </div>
-  );
-}
-
-/**
- * The row's second line: what a human would have to read the issue to learn.
- *
- * The chip beside it already names the *kind* of attention, so this line
- * carries the reason and never repeats the kind. Needs-budget-review arrives as
- * `escalated` with the cap decision stated in `escalation_reason`.
- */
-function humanStatus(card: IssueCard): string | null {
-  const prose = (text: string | null | undefined) => text?.trim() || null;
-  switch (card.human_action) {
-    case "escalated":
-      return prose(card.escalation_reason)
-        ?? prose(card.attention_reason)
-        ?? "escalated — see the issue comments";
-    case "awaiting-reply":
-      return prose(card.attention_reason)
-        ?? "the agent asked a question — reply on GitHub to unblock it";
-    case "merge-ready":
-      return "reviewed and green — merge when you are ready";
-    default:
-      break;
-  }
-  if (card.stage === "awaiting human reply") {
-    const why = prose(card.attention_reason);
-    return why ? `awaiting human reply · ${why}` : "awaiting human reply";
-  }
-  return prose(card.escalation_reason);
-}
-
-function CompactIssue({
-  issue,
-  title,
-  url,
-}: {
-  issue: number;
-  title: string | null;
-  url: string | null;
-}) {
-  return (
-    <div className="compact-issue">
-      <IssueNumber issue={issue} url={url} />
-      <span className="trunc" title={title ?? undefined}>{title ?? <span className="faint">title unavailable</span>}</span>
     </div>
   );
 }
@@ -1594,15 +840,6 @@ function DurationBreakdown({
       <span title="time waiting on a dependency, hold, or human input">
         <span className="faint">idle</span> {duration(idle, showSeconds)}
       </span>
-    </span>
-  );
-}
-
-function FlagList({ flags }: { flags: string[] }) {
-  if (flags.length === 0) return <span className="faint">—</span>;
-  return (
-    <span className="row-wrap">
-      {flags.map((flag) => <Chip key={flag} tone={flagTone(flag)}>{flag}</Chip>)}
     </span>
   );
 }

@@ -1,6 +1,6 @@
 import type { CardStep, IssueStep } from "../../api/types";
 import { duration, usd } from "../../lib/format";
-import { kindLabel, stepOutcomeMark, type Tone } from "../../lib/semantics";
+import { stepOutcomeMark, type Tone } from "../../lib/semantics";
 import { tipProps } from "./Tip";
 
 export type LifecycleStageId = "triage" | "resolve" | "review" | "ci" | "merge";
@@ -20,7 +20,7 @@ interface LifecycleStage {
   glyph: string | null;
 }
 
-const CANONICAL: { id: LifecycleStageId; label: string }[] = [
+export const CANONICAL: readonly { id: LifecycleStageId; label: string }[] = [
   { id: "triage", label: "Triage" },
   { id: "resolve", label: "Resolve" },
   { id: "review", label: "Review" },
@@ -239,102 +239,88 @@ function RetryArc({ count }: { count: number }) {
   );
 }
 
-const COMPACT_TASK_TAIL = 5;
-
-function taskDetailFor(step: TimelineStep): string {
-  const attempts = countFor(step);
-  const model = (step as { model?: unknown }).model;
-  const durationS = (step as { duration_s?: unknown }).duration_s;
-  return [
-    step.kind,
-    step.state,
-    step.status && step.status !== step.state ? step.status : null,
-    attempts > 1 ? `${attempts} attempts` : null,
-    typeof model === "string" && model ? `model ${model}` : null,
-    typeof durationS === "number" && Number.isFinite(durationS)
-      ? `duration ${duration(durationS)}`
-      : null,
-    step.cost_usd ? `cost ${usd(step.cost_usd)}` : null,
-  ].filter(Boolean).join(" · ");
-}
-
-function taskLifecycleState(step: TimelineStep, tone: Tone): LifecycleStageState {
-  if (step.state === "running") return "active";
-  if (tone === "fail") return step.state === "blocked" ? "blocked" : "failed";
-  return "completed";
-}
-
-function CompactTaskLifecycle({
-  steps,
-  label,
-}: {
-  steps: TimelineStep[];
+/** One stage of the board's rail, from the server's stage-visit fold. */
+export interface RailNode {
+  id: LifecycleStageId;
   label: string;
-}) {
-  if (steps.length === 0) return <span className="faint">no tasks yet</span>;
-  const hidden = steps.length > COMPACT_TASK_TAIL
-    ? steps.slice(0, -COMPACT_TASK_TAIL)
-    : [];
-  const shown = hidden.length > 0 ? steps.slice(-COMPACT_TASK_TAIL) : steps;
-  return (
-    <ol className="lifecycle lifecycle-compact lifecycle-task-compact" aria-label={label}>
-      {hidden.length > 0 ? (
-        <li className="life-stage life-future life-tone-neutral life-elided">
-          <span
-            className="life-node"
-            tabIndex={0}
-            {...tipProps(hidden.map(taskDetailFor).join("\n"), { labelled: true })}
-          >
-            <span className="life-node-ring life-elided-count">+{hidden.length}</span>
-            <span className="life-compact-label">earlier</span>
-          </span>
-        </li>
-      ) : null}
-      {shown.map((step, index) => {
-        const mark = stepOutcomeMark(step.kind, step.state, step.status);
-        const state = taskLifecycleState(step, mark.tone);
-        const attempts = countFor(step);
-        return (
-          <li
-            className={`life-stage life-${state} life-tone-${mark.tone}${index > 0 || hidden.length > 0 ? " life-connected" : ""}`}
-            key={`${step.kind}-${indexFor(step) ?? index}`}
-          >
-            <span className="life-node" {...tipProps(taskDetailFor(step), { labelled: true })}>
-              <span className="life-node-ring">
-                <StateGlyph state={state} glyph={mark.glyph} />
-              </span>
-              <span className="life-compact-label">{kindLabel(step.kind)}</span>
-            </span>
-            {attempts > 1 ? <RetryArc count={attempts} /> : null}
-          </li>
-        );
-      })}
-    </ol>
-  );
+  /** Rewound: reached earlier, then sent back (e.g. a CI fix re-reviewed). */
+  state: "done" | "current" | "rewound" | "future";
+  count: string | null;
+  /** Above typical: amber, with `hotTip` saying why. */
+  hot: boolean;
+  hotTip: string | null;
 }
 
-export function LifecycleStepper({
-  steps,
-  stage,
-  done = false,
-  hasPullRequest = false,
-  attention = null,
-  ciState = null,
-  compact = false,
-  label = "Issue lifecycle",
-  onSelectStep,
-}: {
+export type RailTone = "fail" | "ok" | "muted";
+
+interface StepsProps {
   steps: TimelineStep[];
   stage?: string | null;
   done?: boolean;
   hasPullRequest?: boolean;
   attention?: "blocked" | "escalated" | null;
   ciState?: LifecycleCiState;
-  compact?: boolean;
   label?: string;
   onSelectStep?: (index: number) => void;
-}) {
-  if (compact) return <CompactTaskLifecycle steps={steps} label={label} />;
+}
+
+interface RailProps {
+  /** The projected rail; the five stages are always all drawn. */
+  rail: RailNode[];
+  /** The current node takes its row's group colour. */
+  tone: RailTone;
+  /** A leg is running: the current node pulses. */
+  live: boolean;
+  label?: string;
+}
+
+/**
+ * The five-stage track. The issue page derives it from the steps it shows;
+ * the issues board passes the server's projected rail, with round counts.
+ */
+export function LifecycleStepper(props: StepsProps | RailProps) {
+  return "rail" in props ? <RailStepper {...props} /> : <StepsStepper {...props} />;
+}
+
+function RailStepper({ rail, tone, live, label = "Stage" }: RailProps) {
+  const current = rail.find((node) => node.state === "current");
+  return (
+    <ol className={`lifecycle-rail rail-tone-${tone}`} aria-label={`${label}: ${current?.label ?? "unknown"}`}>
+      {rail.map((node) => (
+        <li
+          key={node.id}
+          className={`rail-stage rail-${node.state}${node.state === "current" && live ? " rail-live" : ""}`}
+          aria-current={node.state === "current" ? "step" : undefined}
+          {...(node.state === "rewound" && current
+            ? tipProps(`Reached earlier; now back at ${current.label}`)
+            : {})}
+        >
+          <span className="rail-node" aria-hidden="true" />
+          <span className="rail-label">{node.label}</span>
+          {node.count ? (
+            <span
+              className={`rail-count num${node.hot ? " rail-hot" : ""}`}
+              {...(node.hotTip ? tipProps(node.hotTip) : {})}
+            >
+              {node.count}
+            </span>
+          ) : null}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function StepsStepper({
+  steps,
+  stage,
+  done = false,
+  hasPullRequest = false,
+  attention = null,
+  ciState = null,
+  label = "Issue lifecycle",
+  onSelectStep,
+}: StepsProps) {
   const stages = deriveLifecycleStages({
     steps,
     stage,
@@ -344,23 +330,12 @@ export function LifecycleStepper({
     ciState,
   });
   return (
-    <ol className={`lifecycle${compact ? " lifecycle-compact" : ""}`} aria-label={label}>
+    <ol className="lifecycle" aria-label={label}>
       {stages.map((item, index) => {
         const previous = stages[index - 1];
         const connected = previous?.state === "completed" && item.state !== "future";
         const retries = item.attempts > 1;
         const detail = detailFor(item);
-        const content = (
-          <>
-            <span className="life-node-ring"><StateGlyph state={item.state} glyph={item.glyph} /></span>
-            {!compact ? (
-              <span className={`life-label${item.state === "active" ? " life-label-active" : ""}`}>
-                {item.label}
-              </span>
-            ) : null}
-            {!compact ? <span className="life-state-label">{item.state}</span> : null}
-          </>
-        );
         return (
           <li
             className={`life-stage life-${item.state} life-tone-${item.tone}${connected ? " life-connected" : ""}`}
@@ -377,7 +352,11 @@ export function LifecycleStepper({
                   }
                 : undefined}
             >
-              {content}
+              <span className="life-node-ring"><StateGlyph state={item.state} glyph={item.glyph} /></span>
+              <span className={`life-label${item.state === "active" ? " life-label-active" : ""}`}>
+                {item.label}
+              </span>
+              <span className="life-state-label">{item.state}</span>
             </button>
             {retries ? <RetryArc count={item.attempts} /> : null}
           </li>

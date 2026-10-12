@@ -77,7 +77,6 @@ const issueCard = {
   rounds: 1,
   models: ["gpt-5.6-terra"],
   model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],
-  flags: [],
   issue_verification: "VERIFIED",
   pr_verification: "pending",
   steps: [{ kind: "RESOLVE", state: "ok", status: "done", cost_usd: 2 }],
@@ -95,6 +94,15 @@ const issues = {
     stage: "reviewing",
     done: false,
     merged_ts: null,
+    leg_running: true,
+    board: {
+      status: "working", activity: "agent", headline: "Reviewing",
+      reason: "The reviewer is reading the patch.", since_ts: "2026-07-29T08:00:00Z",
+    },
+    rail: {
+      current: "review", furthest: "review", resolve_attempts: 1, review_rounds: 1,
+      ci_runs: 0, steps: 2, live: true,
+    },
     models: ["gpt-5.6-terra", "gpt-5.6-fable", "gpt-5.6-luna"],
     model_badges: [
       { model: "gpt-5.6-terra", effort: "medium" },
@@ -166,9 +174,17 @@ const round3Issues = {
     pr: 482,
     pr_url: "https://github.com/openai/autonomous-issue-agent/pull/482",
     stage: "reviewing",
-    human_action: "escalated",
     escalation_reason: "Harness issue: required-test gate rejects diagnostic output after the full acceptance plan was supplied; operator decision is required before another review round",
-    flags: ["escalated"],
+    leg_running: true,
+    board: {
+      status: "needs_you", ask: "escalated", headline: "Answer the agent",
+      reason: "Harness issue: required-test gate rejects diagnostic output after the full acceptance plan was supplied; operator decision is required before another review round",
+      since_ts: "2026-07-29T07:30:00Z",
+    },
+    rail: {
+      current: "review", furthest: "ci", resolve_attempts: 1, review_rounds: 4,
+      ci_runs: 1, steps: 10, live: true,
+    },
     rounds: 3,
     steps: [
       { kind: "RESOLVE", state: "ok", status: "done", cost_usd: 1.22, count: 1 },
@@ -478,6 +494,8 @@ async function mockApi(
           state: "open",
         }],
       });
+    const detail = /^\/api\/repos\/self\/issues\/(\d+)$/.exec(path);
+    if (detail) return json(route, { ...issue, issue: Number(detail[1]), done: false, prs: [], pull_requests: [] });
     if (path.startsWith("/api/repos/self/issues/50/steps/") && path.endsWith("/events"))
       return json(route, {
         events: [{
@@ -717,12 +735,11 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
 
   await page.getByRole("tab", { name: /In flight/ }).click();
-  const modelList = page.locator(".model-list").first();
-  await expect(modelList.locator(".chip")).toHaveCount(3);
-  await expect(modelList).toHaveCSS("flex-wrap", "wrap");
-  const modelListBounds = await modelList.boundingBox();
-  const modelChipBounds = await modelList.locator(".chip").first().boundingBox();
-  expect(modelListBounds!.height).toBeGreaterThan(modelChipBounds!.height);
+  await expect(page.getByRole("region", { name: "Blocked" }).locator(".board-row", { hasText: "#120" }))
+    .toContainText("Queued");
+  await page.locator(".board-row", { hasText: "Exercise model wrapping" }).click();
+  await expect(page.locator("#board-drawer-49").getByText("gpt-5.6-terra, gpt-5.6-fable, gpt-5.6-luna"))
+    .toBeVisible();
   await page.screenshot({
     path: "../evidence/dashboard-inflight-models.png",
     fullPage: true,
@@ -837,58 +854,19 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
     element.scrollTop = 0;
   });
 
-  await page.evaluate(() => {
-    const minimums = {
-      issue: 360,
-      lifecycle: 240,
-      cost: 88,
-      elapsed: 112,
-      progress: 112,
-      model: 112,
-    };
-    localStorage.setItem(
-      "issue-agent.dashboard.column-widths",
-      JSON.stringify({ "issues-blocked": minimums, "issues-inflight": minimums }),
-    );
-  });
   await page.getByRole("tab", { name: /In flight/ }).click();
-  await expect(page.getByRole("columnheader", { name: /Lifecycle/ })).toBeVisible();
-  await expect(page.getByText(/Harness issue: required-test gate rejects/)).toBeVisible();
-  const activeIssueRow = page.getByRole("row", {
-    name: /Required-test gate rejects diagnostic output/,
-  });
-  const issueCell = activeIssueRow.locator("td").first();
-  const lifecycleCell = activeIssueRow.locator("td.lifecycle-column");
-  const backgroundBeforeSelection = await issueCell.evaluate(
-    (element) => getComputedStyle(element).backgroundColor,
-  );
-  await expect(lifecycleCell).toHaveCSS("background-color", backgroundBeforeSelection);
+  const needsYou = page.getByRole("region", { name: "Needs you" });
+  const activeIssueRow = needsYou.locator(".board-row", { hasText: "Required-test gate rejects diagnostic output" });
+  await expect(activeIssueRow.locator(".board-headline")).toHaveText("Answer the agent");
+  await expect(activeIssueRow.getByText("round 4")).toHaveAttribute("data-tip", "4 or more review rounds: above typical");
   await activeIssueRow.click();
   await expect(activeIssueRow).toHaveAttribute("aria-expanded", "true");
-  const backgroundAfterSelection = await issueCell.evaluate(
-    (element) => getComputedStyle(element).backgroundColor,
-  );
-  await expect(lifecycleCell).toHaveCSS("background-color", backgroundAfterSelection);
-  expect(backgroundAfterSelection).not.toBe(backgroundBeforeSelection);
   await expect(page.locator("body")).not.toContainText("↗");
-  const issueScroller = page.locator(".tbl-wrap.panel").filter({
-    has: page.locator("table.issue-list-table"),
-  }).first();
-  const issueDimensions = await issueScroller.evaluate((element) => ({
+  const mainbodyDimensions = await page.locator(".mainbody").evaluate((element) => ({
     clientWidth: element.clientWidth,
     scrollWidth: element.scrollWidth,
   }));
-  expect(issueDimensions.scrollWidth).toBe(issueDimensions.clientWidth);
-
-  const earlier = page.locator(".life-elided .life-node");
-  await expect(earlier).toContainText("+5");
-  await earlier.hover();
-  const tip = page.locator(".tip.tip-on");
-  await expect(tip).toContainText("RESOLVE · ok · done");
-  const tipBounds = await tip.boundingBox();
-  expect(tipBounds).not.toBeNull();
-  expect(tipBounds!.x).toBeGreaterThanOrEqual(8);
-  expect(tipBounds!.x + tipBounds!.width).toBeLessThanOrEqual(1432);
+  expect(mainbodyDimensions.scrollWidth).toBe(mainbodyDimensions.clientWidth);
   await page.screenshot({
     path: "../evidence-facelift/after-issues-inflight.png",
     fullPage: true,
@@ -927,38 +905,6 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
     fullPage: true,
     animations: "disabled",
   });
-});
-
-test("reserves strong task emphasis for the task that is actually running", async ({ page }) => {
-  await mockApi(page, 0, {
-    issuesPayload: {
-      ...issues,
-      in_flight: [{
-        ...issues.in_flight[0],
-        steps: [
-          { kind: "REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.2 },
-          { kind: "ADDRESS_REVIEW", state: "running", status: null, cost_usd: 0.1 },
-        ],
-      }],
-    },
-  });
-  await page.goto("/#/repo/self/issues/inflight");
-
-  const completedYellowTask = page.getByLabel(/REVIEW · ok · REQUEST_CHANGES/).locator("..");
-  const runningTask = page.getByLabel(/^ADDRESS_REVIEW · running/).locator("..");
-  await expect(completedYellowTask).toHaveClass(/life-tone-running/);
-  await expect(completedYellowTask).not.toHaveClass(/life-active/);
-  await expect(runningTask).toHaveClass(/life-tone-running/);
-  await expect(runningTask).toHaveClass(/life-active/);
-  await expect(runningTask.locator(".life-compact-label")).toHaveCSS("font-weight", "720");
-  await expect(runningTask.locator(".life-node-ring")).toHaveCSS(
-    "animation-name",
-    "task-lifecycle-active",
-  );
-
-  await page.emulateMedia({ reducedMotion: "reduce" });
-  await expect(runningTask.locator(".life-node-ring")).toHaveCSS("animation-name", "none");
-  await expect(runningTask.locator(".life-node-ring")).not.toHaveCSS("box-shadow", "none");
 });
 
 test("shows a skeleton before the deployment request resolves", async ({ page }) => {
@@ -1032,61 +978,4 @@ test("the rail never covers the board at the viewport widths browser zoom produc
       `the page scrolls sideways at a ${width}px viewport`,
     ).toBeLessThanOrEqual(0);
   }
-});
-
-test("the in-flight history remains usable at a phone-width viewport", async ({ page }) => {
-  await mockApi(page);
-  await page.setViewportSize({ width: 320, height: 700 });
-  await page.goto("/#/repo/self/issues/inflight");
-  await page.getByRole("button", { name: "Collapse sidebar" }).click();
-  await page.getByRole("row", { name: /Exercise model wrapping/ }).click();
-
-  const history = page.getByRole("table", { name: "Issue #49 task history" });
-  await expect(history).toBeVisible();
-  const headers = history.getByRole("columnheader");
-  const cells = history.locator("tbody tr").first().getByRole("cell");
-  await expect(headers).toHaveCount(4);
-  await expect(cells).toHaveCount(4);
-  await expect(cells.nth(1)).toHaveText("1:17:18");
-  await expect(history).not.toContainText("Jul 29");
-  await headers.first().click({ button: "right" });
-  const historyMenu = page.getByRole("menu", { name: "Visible columns" });
-  await expect(historyMenu.getByRole("checkbox", { name: "Time", exact: true })).toBeChecked();
-  await expect(historyMenu.getByRole("checkbox", { name: "Cost", exact: true })).toBeChecked();
-  await expect(historyMenu.getByRole("checkbox", { name: "Time since", exact: true })).toBeChecked();
-  await expect(historyMenu.getByRole("checkbox", { name: "Tasks", exact: true })).toHaveCount(0);
-  await page.keyboard.press("Escape");
-  const timeResizer = history.getByRole("separator", { name: "Resize Time column" });
-  await expect(timeResizer).toHaveAttribute("aria-valuenow", "120");
-  await timeResizer.focus();
-  await page.keyboard.press("ArrowRight");
-  await expect(timeResizer).toHaveAttribute("aria-valuenow", "132");
-  for (let index = 0; index < 4; index += 1) {
-    const header = headers.nth(index);
-    const cell = cells.nth(index);
-    const bounds = await header.boundingBox();
-    const cellBounds = await cell.boundingBox();
-    expect(bounds).not.toBeNull();
-    expect(cellBounds).not.toBeNull();
-    expect(
-      await header.locator(".column-heading")
-        .evaluate((element) => element.scrollWidth <= element.clientWidth),
-    ).toBe(true);
-    expect(Math.abs(cellBounds!.x - bounds!.x)).toBeLessThanOrEqual(1);
-    expect(Math.abs(cellBounds!.width - bounds!.width)).toBeLessThanOrEqual(1);
-  }
-  const scroller = page.locator(".task-story-table-wrap");
-  const dimensions = await scroller.evaluate((element) => ({
-    clientWidth: element.clientWidth,
-    scrollWidth: element.scrollWidth,
-  }));
-  expect(dimensions.clientWidth).toBeGreaterThanOrEqual(240);
-  expect(dimensions.scrollWidth).toBeGreaterThan(dimensions.clientWidth);
-  await scroller.evaluate((element) => {
-    element.scrollLeft = element.scrollWidth;
-  });
-  const lastHeader = await headers.last().boundingBox();
-  expect(lastHeader).not.toBeNull();
-  expect(lastHeader!.x).toBeGreaterThanOrEqual(0);
-  expect(lastHeader!.x + lastHeader!.width).toBeLessThanOrEqual(320);
 });

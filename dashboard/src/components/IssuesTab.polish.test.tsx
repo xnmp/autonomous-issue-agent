@@ -36,7 +36,6 @@ const done: IssueCard = {
   models: [],
   model_badges: [],
   rounds: 1,
-  flags: [],
   issue_verification: "VERIFIED",
   pr_verification: "VERIFIED",
 };
@@ -234,95 +233,9 @@ describe("long-table filtering", () => {
   });
 });
 
-describe("blocked section", () => {
-  const working: IssueCard = {
-    ...done,
-    issue: 60,
-    title: "Still being worked",
-    done: false,
-    merged_ts: null,
-    stage: "resolving",
-    issue_verification: null,
-    pr_verification: null,
-  };
-  const escalated: IssueCard = {
-    ...working,
-    issue: 61,
-    title: "Needs a human decision",
-    stage: "escalated",
-    human_action: "escalated",
-    escalation_reason: "the cap was reached",
-  };
-  const asking: IssueCard = {
-    ...working,
-    issue: 62,
-    title: "Asked a question",
-    stage: "awaiting human reply",
-    human_action: "awaiting-reply",
-  };
-
-  /** The rows rendered by the panel that follows a given section heading. */
-  function rowsUnder(container: HTMLElement, heading: string): string {
-    const blocks = Array.from(container.querySelector(".tabbody")?.children ?? []);
-    const index = blocks.findIndex(
-      (block) => block.classList.contains("section-title")
-        && block.textContent?.trim().startsWith(heading),
-    );
-    return blocks[index + 1]?.textContent ?? "";
-  }
-
-  it("pulls issues waiting on a person out of the in-flight list", () => {
-    const { container } = board("inflight", { in_flight: [working, escalated, asking] });
-
-    expect(rowsUnder(container, "Blocked")).toContain("Needs a human decision");
-    expect(rowsUnder(container, "Blocked")).toContain("Asked a question");
-    expect(rowsUnder(container, "In flight")).toContain("Still being worked");
-    expect(rowsUnder(container, "In flight")).not.toContain("Needs a human decision");
-  });
-
-  it.each(["needs-human-review", "ai-blocked"])(
-    "highlights a live %s label even before human-action enrichment catches up",
-    (label) => {
-      const held = {
-        ...working,
-        issue: 63,
-        title: `Held by ${label}`,
-        labels: [label],
-      };
-      const { container } = board("inflight", { in_flight: [held] });
-
-      expect(rowsUnder(container, "Blocked")).toContain(`Held by ${label}`);
-      expect(screen.getByRole("row", { name: new RegExp(`Held by ${label}`) }))
-        .toHaveClass("row-alert");
-    },
-  );
-
-  it("leads the board with what a person has to act on", () => {
-    const { container } = board("inflight", { in_flight: [working, escalated] });
-
-    const headings = Array.from(container.querySelectorAll(".section-title"))
-      .map((node) => node.textContent?.trim());
-    expect(headings).toEqual(["Blocked", "In flight", "Pending"]);
-  });
-
-  it("collapses entirely when nothing is waiting on a person", () => {
-    const { container } = board("inflight", { in_flight: [working] });
-
-    expect(screen.queryByText("Blocked")).not.toBeInTheDocument();
-    expect(rowsUnder(container, "In flight")).toContain("Still being worked");
-  });
-
-  it("leaves a merge-ready issue in flight — nothing about it is stuck", () => {
-    const { container } = board("inflight", {
-      in_flight: [{ ...working, human_action: "merge-ready" }],
-    });
-
-    expect(screen.queryByText("Blocked")).not.toBeInTheDocument();
-    expect(rowsUnder(container, "In flight")).toContain("Still being worked");
-  });
-
+describe("page chrome", () => {
   it("omits the redundant Issues page heading and shown-count line", () => {
-    board("inflight", { in_flight: [working] });
+    board("inflight", { in_flight: [{ ...done, done: false, merged_ts: null }] });
 
     expect(screen.queryByRole("heading", { name: "Issues" })).not.toBeInTheDocument();
     expect(screen.queryByText(/shown$/)).not.toBeInTheDocument();
@@ -375,23 +288,5 @@ describe("backlog triage taxonomy", () => {
 
     expect(document.querySelector('[data-tip^="type:"]')).toBeNull();
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
-  });
-
-  it("gives a taxonomy label chip the same tone as its column", () => {
-    board("inflight", {
-      pending: [{
-        issue: 9,
-        title: "Waiting to start",
-        url: null,
-        priority: null,
-        labels: ["type:bug", "ai-ready"],
-        held: false,
-        hold_reason: null,
-        overlap: null,
-      }],
-    });
-
-    expect(screen.getByText("type:bug")).toHaveClass("chip-fail");
-    expect(screen.getByText("ai-ready")).toHaveClass("chip-neutral");
   });
 });

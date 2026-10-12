@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { CardStep, IssueStep } from "../../api/types";
-import { deriveLifecycleStages, LifecycleStepper } from "./LifecycleStepper";
+import { deriveLifecycleStages, LifecycleStepper, type RailNode } from "./LifecycleStepper";
 
 const cardStep = (overrides: Partial<CardStep>): CardStep => ({
   kind: "RESOLVE",
@@ -153,66 +153,18 @@ describe("LifecycleStepper", () => {
     expect(review).toHaveAttribute("data-tip", expect.stringContaining("cost $0.73"));
   });
 
-  it("uses the same outcome tones and glyphs as task chips", () => {
-    render(
-      <LifecycleStepper
-        compact
-        steps={[
-          cardStep({ kind: "REVIEW", status: "REQUEST_CHANGES" }),
-          cardStep({ kind: "FIX_CI", state: "running", status: null }),
-          cardStep({ kind: "unblock", state: "done", status: null }),
-        ]}
-      />,
-    );
-
-    const review = screen.getByLabelText(/REVIEW · ok · REQUEST_CHANGES/).closest("li");
-    const running = screen.getByLabelText(/^FIX_CI · running/).closest("li");
-    const operator = screen.getByLabelText(/^unblock · done/).closest("li");
-    expect(review).toHaveClass("life-tone-running");
-    expect(review).not.toHaveClass("life-active");
-    expect(review?.querySelector(".status-mark")).toHaveAttribute("data-status-glyph", "±");
-    expect(running).toHaveClass("life-tone-running", "life-active");
-    expect(operator).toHaveClass("life-tone-meta");
-  });
-
-  it("bounds long compact histories without dropping their earlier details", () => {
-    render(
-      <LifecycleStepper
-        compact
-        steps={Array.from({ length: 8 }, (_, index) => cardStep({
-          kind: index % 2 === 0 ? "RESOLVE" : "REVIEW",
-          status: index % 2 === 0 ? "done" : "APPROVE",
-        }))}
-      />,
-    );
-
-    expect(screen.getByText("+3")).toBeVisible();
-    const earlier = document.querySelector(".life-elided .life-node");
-    expect(earlier).toHaveAttribute("data-tip", expect.stringContaining("RESOLVE · ok · done"));
-    expect(earlier).toHaveAttribute("data-tip", expect.stringContaining("REVIEW · ok · APPROVE"));
-    expect(earlier).not.toHaveAttribute("title");
-    expect(earlier).toHaveAttribute("tabindex", "0");
-    expect(document.querySelectorAll(".lifecycle-task-compact .life-stage")).toHaveLength(6);
-  });
-
   it("distinguishes waiting-on-human from failure without relying on color", () => {
-    render(
-      <LifecycleStepper
-        compact
-        steps={[
-          cardStep({ kind: "RESOLVE" }),
-          cardStep({ kind: "REVIEW", state: "blocked", status: "blocked" }),
-        ]}
-        stage="awaiting human reply"
-        attention="blocked"
-        hasPullRequest
-      />,
-    );
+    const stages = deriveLifecycleStages({
+      steps: [
+        cardStep({ kind: "RESOLVE" }),
+        cardStep({ kind: "REVIEW", state: "blocked", status: "blocked" }),
+      ],
+      stage: "awaiting human reply",
+      attention: "blocked",
+      hasPullRequest: true,
+    });
 
-    expect(screen.getByLabelText(/REVIEW · blocked/).closest("li")).toHaveClass(
-      "life-blocked",
-      "life-tone-fail",
-    );
+    expect(stages.find(({ id }) => id === "review")).toMatchObject({ state: "blocked", tone: "fail" });
   });
 
   it("selects the latest detailed task when a full node is clicked", async () => {
@@ -231,5 +183,43 @@ describe("LifecycleStepper", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /^Review/ }));
     expect(onSelectStep).toHaveBeenCalledWith(5);
+  });
+
+  describe("with a projected rail", () => {
+    const rail = (overrides: Partial<Record<string, RailNode>> = {}): RailNode[] => [
+      { id: "triage", label: "Triage", state: "done", count: null, hot: false, hotTip: null },
+      { id: "resolve", label: "Resolve", state: "done", count: null, hot: false, hotTip: null },
+      { id: "review", label: "Review", state: "current", count: "round 5", hot: true, hotTip: "4 or more review rounds: above typical" },
+      { id: "ci", label: "CI", state: "rewound", count: "2 runs", hot: false, hotTip: null },
+      { id: "merge", label: "Merge", state: "future", count: null, hot: false, hotTip: null },
+    ].map((node) => overrides[node.id] ?? node) as RailNode[];
+
+    it("always draws the five stages and names the current one", () => {
+      render(<LifecycleStepper rail={rail()} tone="ok" live={false} label="Issue #7 stage" />);
+
+      const list = screen.getByRole("list", { name: "Issue #7 stage: Review" });
+      expect(Array.from(list.querySelectorAll("li")).map((node) => node.textContent)).toEqual([
+        "Triage", "Resolve", "Reviewround 5", "CI2 runs", "Merge",
+      ]);
+      expect(screen.getByText("Review").closest("li")).toHaveAttribute("aria-current", "step");
+    });
+
+    it("explains an amber count and a rewound stage", () => {
+      render(<LifecycleStepper rail={rail()} tone="fail" live={false} />);
+
+      expect(screen.getByText("round 5")).toHaveClass("rail-hot");
+      expect(screen.getByText("round 5")).toHaveAttribute("data-tip", "4 or more review rounds: above typical");
+      expect(screen.getByText("2 runs")).not.toHaveClass("rail-hot");
+      expect(screen.getByText("CI").closest("li")).toHaveClass("rail-rewound");
+      expect(screen.getByText("CI").closest("li")).toHaveAttribute("data-tip", "Reached earlier; now back at Review");
+    });
+
+    it("pulses the current node only while a leg is running", () => {
+      const { rerender } = render(<LifecycleStepper rail={rail()} tone="ok" live />);
+      expect(screen.getByText("Review").closest("li")).toHaveClass("rail-live");
+
+      rerender(<LifecycleStepper rail={rail()} tone="ok" live={false} />);
+      expect(screen.getByText("Review").closest("li")).not.toHaveClass("rail-live");
+    });
   });
 });

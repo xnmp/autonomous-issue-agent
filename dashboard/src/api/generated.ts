@@ -879,10 +879,6 @@ export interface components {
             escalation_reason?: string | null;
             /** Estimated */
             estimated: boolean;
-            /** Flags */
-            flags: string[];
-            /** Human Action */
-            human_action?: ("merge-ready" | "awaiting-reply" | "escalated") | null;
             /** Human Wait S */
             human_wait_s?: number | null;
             /** Human Wait Since Ts */

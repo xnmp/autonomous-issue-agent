@@ -341,10 +341,9 @@ class IssueCard(Contract):
     idle_s: float | None
     idle_active: bool
     # A paid leg is executing right now. The client tick predicate reads this
-    # directly: human_action alone must not dead-stop both clocks while a leg
+    # directly: a human-owned row must not dead-stop both clocks while a leg
     # is visibly spending (keifu #142/#181, 2026-08-03).
     leg_running: bool = False
-    human_action: Literal["merge-ready", "awaiting-reply", "escalated"] | None = None
     human_wait_since_ts: str | None = None
     human_wait_s: float | None = None
     # The issues board group; None once the issue is done.
@@ -358,7 +357,6 @@ class IssueCard(Contract):
     models: list[str]
     model_badges: list[ModelBadge] = []
     rounds: int | None
-    flags: list[str]
     issue_verification: str | None = None
     pr_verification: str | None = None
     issue_verification_reason: str | None = None

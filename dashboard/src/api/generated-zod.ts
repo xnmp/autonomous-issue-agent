@@ -164,10 +164,6 @@ const IssueCard = z
     elapsed_s: z.union([z.number(), z.null()]),
     escalation_reason: z.union([z.string(), z.null()]).optional(),
     estimated: z.boolean(),
-    flags: z.array(z.string()),
-    human_action: z
-      .union([z.enum(["merge-ready", "awaiting-reply", "escalated"]), z.null()])
-      .optional(),
     human_wait_s: z.union([z.number(), z.null()]).optional(),
     human_wait_since_ts: z.union([z.string(), z.null()]).optional(),
     idle_active: z.boolean(),

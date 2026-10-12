@@ -1194,28 +1194,6 @@ def _duration_breakdown(
     return elapsed, working, idle, idle_active
 
 
-def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
-    flags = []
-    if row.escalations:
-        flags.append("escalated")
-    if row.recurrences:
-        flags.append("recurred")
-    if row.spend_blocks:
-        flags.append("spend-blocked")
-    newest_leg_blocked = (
-        bool(row.legs)
-        and row.legs[-1].status.lower() == "blocked"
-        and row.stage in {"awaiting review", "reviewed", "awaiting human reply"}
-    )
-    if row.stage == "blocked" or newest_leg_blocked:
-        flags.append("blocked")
-    if _deferred_event(row):
-        flags.append("waiting")
-    if human_action:
-        flags.append(human_action)
-    return flags
-
-
 def _reason_line(raw: object) -> str | None:
     """First line of prose the harness did not author, bounded for a row.
 
@@ -2047,7 +2025,7 @@ def issue_card(
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
     gh_pr = (gh_prs or {}).get(pr) if pr is not None else None
-    human_action, human_wait_since = _human_action(row, gh_issue, gh_pr)
+    _human_action_kind, human_wait_since = _human_action(row, gh_issue, gh_pr)
     labels = card_labels(row, gh_issue)
     track = stage_track(row, gh_pr)
     leg_running = bool(row.running) and not row.done
@@ -2086,10 +2064,9 @@ def issue_card(
         "idle_s": round(idle) if idle is not None else None,
         "idle_active": idle_active,
         # A paid leg is executing RIGHT NOW. The client tick predicate needs
-        # this directly: human_action alone must not dead-stop both clocks
+        # this directly: a human-owned row must not dead-stop both clocks
         # while a leg is visibly spending (keifu #142/#181, 2026-08-03).
         "leg_running": leg_running,
-        "human_action": human_action,
         "human_wait_since_ts": iso(human_wait_since),
         "human_wait_s": round(human_wait_s) if human_wait_s is not None else None,
         # Done rows leave the board; every other row is in exactly one group.
@@ -2104,7 +2081,6 @@ def issue_card(
         "models": displayed_models,
         "model_badges": model_badges(row, displayed_models),
         "rounds": row.rounds,
-        "flags": _flags(row, human_action),
         "issue_verification": issue_verification,
         "pr_verification": pr_verification,
         "issue_verification_reason": issue_verification_reason,

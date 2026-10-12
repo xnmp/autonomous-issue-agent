@@ -615,7 +615,6 @@ ISSUE_CARD = {
     "projected_eta_s": 60,
     "rounds": 1,
     "models": ["claude-sonnet-5"],
-    "flags": [],
     "steps": [{"kind": "RESOLVE", "state": "ok", "status": "done", "cost_usd": 2}],
 }
 

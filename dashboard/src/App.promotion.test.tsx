@@ -80,7 +80,6 @@ const historicalDoneIssue = {
   models: [],
   model_badges: [],
   rounds: null,
-  flags: [],
   issue_verification: null,
   pr_verification: null,
   merged_ts: null,
@@ -149,11 +148,11 @@ describe("backlog promotion", () => {
 
     await userEvent.click(screen.getByRole("tab", { name: /In flight/ }));
     expect(await screen.findByText("Toast notifications")).toBeVisible();
-    expect(screen.getByText("pending")).toBeVisible();
+    expect(screen.getByText("Queued")).toBeVisible();
 
     serverPromoted = true;
     finishPromotion(json({ ok: true, detail: "promoted" }));
-    expect(await screen.findByText("P1")).toBeVisible();
+    expect(await screen.findByText(/picks it up \(P1\)/)).toBeVisible();
     expect(screen.getAllByText("Toast notifications")).toHaveLength(1);
   });
 

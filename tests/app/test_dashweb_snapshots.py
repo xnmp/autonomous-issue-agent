@@ -823,7 +823,7 @@ def test_issue_card_without_gh_shows_numbers_only_never_a_stale_title():
     assert card["title"] is None and card["url"] is None and card["pr_state"] is None
 
 
-def test_issue_card_flags_escalation_recurrence_spend_block_and_hold():
+def test_a_journalled_escalation_outranks_a_later_hold_on_the_board():
     events = [
         RESOLVE,
         {"ts": ts(hours=2), "event": "escalation", "target": "issue", "number": 7},
@@ -832,7 +832,10 @@ def test_issue_card_flags_escalation_recurrence_spend_block_and_hold():
         {"ts": ts(hours=1), "event": "hold", "issue": 7, "reason": "overlaps PR #12"},
     ]
     card = snapshots.issue_card(row_for(events, 7), NOW)
-    assert set(card["flags"]) == {"escalated", "recurred", "spend-blocked", "waiting"}
+    assert ask_of(card) in ESCALATED_ASKS
+    # Without the escalation the hold is what the row waits on.
+    held = snapshots.issue_card(row_for([events[0], events[-1]], 7), NOW)
+    assert board_of(held)["status"] == "blocked"
 
 
 def test_historical_hold_is_cleared_by_a_later_resolve_dispatch():
@@ -841,7 +844,7 @@ def test_historical_hold_is_cleared_by_a_later_resolve_dispatch():
         {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
          "kind": "RESOLVE", "issue": 7, "number": 7},
     ]
-    assert "waiting" not in snapshots.issue_card(row_for(events, 7), NOW)["flags"]
+    assert board_of(snapshots.issue_card(row_for(events, 7), NOW))["status"] != "blocked"
 
 
 def test_structured_defer_stays_active_until_its_clear_transition():
@@ -1851,12 +1854,12 @@ def test_operator_unpark_retires_the_escalation_and_its_reason():
         row_view([stall, ESCALATION, _UNPARK(hours=1)]), NOW
     )
     assert card["escalation_reason"] is None
-    assert card["human_action"] is None
+    assert ask_of(card) is None
 
 
 def test_the_escalation_stands_until_the_unpark_actually_happens():
     card = snapshots.issue_card(row_view([ESCALATION]), NOW)
-    assert card["human_action"] == "escalated"
+    assert ask_of(card) in ESCALATED_ASKS
 
 
 def test_a_daemon_relabel_does_not_strip_the_reason_off_a_live_escalation():
@@ -1900,7 +1903,7 @@ def test_issue_only_unpark_keeps_a_live_awaiting_reply_stamp():
         },
     }
     card = snapshots.issue_card(row_view([blocked, unpark]), NOW)
-    assert card["human_action"] == "awaiting-reply"
+    assert ask_of(card) == "awaiting_reply"
 
 
 def test_escalation_reason_ignores_a_comment_about_another_target():
@@ -1982,7 +1985,7 @@ def test_working_time_stops_accruing_once_the_issue_is_on_a_human():
     ]
     card = snapshots.issue_card(row_for(events, 7), NOW, gh_issue=ESCALATED_ISSUE)
 
-    assert card["human_action"] == "escalated"
+    assert ask_of(card) in ESCALATED_ASKS
     assert card["elapsed_s"] == 3_600  # 3h ago → escalated 2h ago
     assert card["human_wait_s"] == 7_200  # and still waiting, live
 
@@ -2005,7 +2008,7 @@ def test_the_clock_freezes_without_any_github_label_view():
         gh_prs={12: {"title": "t", "url": "u"}},
     )
 
-    assert card["human_action"] == "escalated"
+    assert ask_of(card) in ESCALATED_ASKS
     assert card["elapsed_s"] == 3_600
     assert card["human_wait_s"] == 7_200
 
@@ -2021,7 +2024,7 @@ def test_a_lifecycle_add_resumes_the_clock_after_an_escalation():
          "desc": "relabel issue #7: -ai-ready +ai-working"},
     ]
     card = snapshots.issue_card(row_view(events), NOW)
-    assert card["human_action"] is None
+    assert ask_of(card) is None
     assert card["human_wait_s"] is None
 
 
@@ -2036,7 +2039,7 @@ def test_an_operator_unblock_event_resumes_the_clock():
          "desc": "operator unblock issue #7: -needs-human-review"},
     ]
     card = snapshots.issue_card(row_view(events), NOW)
-    assert card["human_action"] is None
+    assert ask_of(card) is None
 
 
 def test_a_journal_block_freezes_the_clock_and_a_cleared_one_does_not():
@@ -2045,7 +2048,7 @@ def test_a_journal_block_freezes_the_clock_and_a_cleared_one_does_not():
     blocked = {"ts": ts(hours=2), "event": "action", "role": "fix", "issue": 7,
                "desc": "relabel issue #7: -ai-working +ai-blocked"}
     card = snapshots.issue_card(row_view([start, RESOLVE, blocked]), NOW)
-    assert card["human_action"] == "awaiting-reply"
+    assert ask_of(card) == "awaiting_reply"
     assert card["elapsed_s"] == 3_600
 
     cleared = {"ts": ts(hours=1), "event": "action", "role": "fix", "issue": 7,
@@ -2053,7 +2056,7 @@ def test_a_journal_block_freezes_the_clock_and_a_cleared_one_does_not():
     card = snapshots.issue_card(
         row_view([start, RESOLVE, blocked, cleared]), NOW
     )
-    assert card["human_action"] is None
+    assert ask_of(card) is None
     assert card["human_wait_s"] is None
 
 
@@ -2081,7 +2084,7 @@ def test_a_live_label_view_without_the_hold_releases_the_journals_stale_block():
         gh_prs={12: {"title": "t", "url": "u", "labels": [{"name": "ai-pr-open"}]}},
     )
 
-    assert not card["human_action"]
+    assert ask_of(card) is None
     assert card["human_wait_s"] is None
     # The clock is no longer pinned to the 2h-ago block: it runs to now.
     assert card["elapsed_s"] == 10_800
@@ -2097,7 +2100,7 @@ def test_a_legacy_enrichment_without_labels_keeps_the_journal_fallback():
         gh_prs={12: {"title": "t", "url": "u"}},
     )
 
-    assert card["human_action"] == "awaiting-reply"
+    assert ask_of(card) == "awaiting_reply"
     assert card["human_wait_s"] == 7_200
     assert card["elapsed_s"] == 3_600
 
@@ -2109,7 +2112,7 @@ def test_a_live_label_view_that_still_carries_the_hold_keeps_the_row_held():
         gh_prs={12: {"title": "t", "url": "u", "labels": [{"name": "ai-blocked"}]}},
     )
 
-    assert card["human_action"] == "awaiting-reply"
+    assert ask_of(card) == "awaiting_reply"
     assert card["human_wait_s"] == 7_200
     assert card["elapsed_s"] == 3_600
 
@@ -2122,7 +2125,7 @@ def test_a_partial_live_view_cannot_release_the_hold_the_journal_recorded():
         gh_issue={"title": "t", "url": "u", "labels": [{"name": "ai-working"}]},
         gh_prs={12: {"title": "t", "url": "u"}},
     )
-    assert card["human_action"] == "awaiting-reply"
+    assert ask_of(card) == "awaiting_reply"
     assert card["elapsed_s"] == 3_600
 
 
@@ -2150,7 +2153,7 @@ def test_a_held_row_still_reports_the_leg_that_is_spending_on_it():
     # both, so the client can tick work rather than dead-stop on the hold.
     row = replace(row_for([_BLOCK_START], 7), events=tuple(_BLOCKED_EVENTS))
     card = snapshots.issue_card(row, NOW)
-    assert card["human_action"] == "awaiting-reply"
+    assert ask_of(card) == "awaiting_reply"
     assert card["leg_running"] is True
 
 
@@ -2184,7 +2187,7 @@ def test_an_unescalated_issue_still_measures_its_clock_to_now():
          "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
     ]
     card = snapshots.issue_card(row_for(events, 7), NOW)
-    assert card["human_action"] is None and card["elapsed_s"] == 7_200
+    assert ask_of(card) is None and card["elapsed_s"] == 7_200
 
 
 def test_a_budget_review_label_also_reads_as_needing_a_human():
@@ -2193,7 +2196,7 @@ def test_a_budget_review_label_also_reads_as_needing_a_human():
         row, NOW,
         gh_issue={"labels": [{"name": "needs-budget-review"}], "updatedAt": ts(hours=1)},
     )
-    assert card["human_action"] == "escalated"
+    assert ask_of(card) in ESCALATED_ASKS
     assert card["human_wait_s"] == 3_600
 
 
@@ -3049,6 +3052,9 @@ def test_a_card_reports_every_label_of_a_heavily_tagged_issue():
 # ── issues board: status union, rail, overspend, tier ─────────────────────────
 def board_of(card) -> dict:
     return card["board"]
+
+
+ESCALATED_ASKS = {"escalated", "rearm", "budget"}
 
 
 def ask_of(card) -> str | None:

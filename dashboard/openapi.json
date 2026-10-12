@@ -1778,29 +1778,6 @@
             "title": "Estimated",
             "type": "boolean"
           },
-          "flags": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Flags",
-            "type": "array"
-          },
-          "human_action": {
-            "anyOf": [
-              {
-                "enum": [
-                  "merge-ready",
-                  "awaiting-reply",
-                  "escalated"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Human Action"
-          },
           "human_wait_s": {
             "anyOf": [
               {
@@ -2166,8 +2143,7 @@
           "idle_active",
           "projected_eta_s",
           "models",
-          "rounds",
-          "flags"
+          "rounds"
         ],
         "title": "IssueCard",
         "type": "object"
