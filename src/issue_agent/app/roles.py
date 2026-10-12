@@ -169,8 +169,6 @@ from .config import (
     configured_prior_owner_ids,
 )
 from .dispatch import AgentDispatcher, DispatchConfig
-from .infra_breaker import InfraBreaker
-from ..domain.infra_breaker import BreakerPolicy
 from .execute import Executor
 from .review_runtime import (
     ActiveReviewRuntime, ReviewDispatchPlan, configured_review_control,
@@ -417,7 +415,6 @@ def _with_accounting(
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
         max_contract_rounds=cfg.max_contract_rounds,
-        fix_infra_ceiling=cfg.max_infra_deaths,
         admit=admit,
     )
 
@@ -1068,57 +1065,6 @@ def _control_spend_gate(
         return None
 
     return gate
-
-
-def _first_gate(
-    *gates: Callable[[], str | None] | None,
-) -> Callable[[], str | None] | None:
-    """Compose tick gates: the first one with a reason wins, in order.
-
-    Order is precedence, and accounting comes first deliberately — an
-    ACCOUNTING UNAVAILABLE is the reason an operator must act on before any
-    other, and `Daemon._gate_blocks_this_tick` only ever reports one.
-    """
-    active = tuple(gate for gate in gates if gate is not None)
-    if not active:
-        return None
-    if len(active) == 1:
-        return active[0]
-
-    def gate() -> str | None:
-        for candidate in active:
-            reason = candidate()
-            if reason is not None:
-                return reason
-        return None
-
-    return gate
-
-
-def _infra_breaker(
-    cfg: HarnessConfig, journal, log: Callable[[str], None]
-) -> InfraBreaker | None:
-    """The deployment-wide infra breaker, or None when disabled.
-
-    One instance per role process, shared by the dispatch threads that report
-    deaths and the tick thread that reads the gate. "Deployment-wide" means the
-    whole repo's fix backlog — the granularity the incident needed, where four
-    issues each escalated separately for one broken binary. Roles are separate
-    daemons, so a cross-ROLE breaker would need the control store; the fix role
-    is where the paid resolve family lives and is deliberately the only role
-    wired here.
-    """
-    if not cfg.infra_breaker:
-        return None
-    return InfraBreaker(
-        BreakerPolicy.sane(
-            cfg.infra_breaker_deaths,
-            cfg.infra_breaker_window_seconds,
-            cfg.infra_breaker_cooldown_seconds,
-        ),
-        journal=journal,
-        log=log,
-    )
 
 
 def _build_codex_runner(
@@ -1772,28 +1718,20 @@ def _fix_state(
                     ci_resets[pr.number] = cc.CIEpisodeReset(selected.binding, selected.revision, repair.revision.fence, pr.head_ref_oid)
         except (ValueError, sqlite3.Error) as exc:
             errors[number] = str(exc)
-    infra_deaths = {}
-    infra_errors = {}
-    # No ledger pruning here: a partial observation (timed-out fetch, stale
-    # label search) would wrongly reset a live issue's ceiling. Episode scoping
-    # already keeps a reopened or re-armed issue from inheriting old refusals.
+    leg_ends: dict[int, tuple] = {}
+    leg_history_errors: dict[int, str] = {}
     for number in {issue.number for issue in world.issues} | pr_issues:
         try:
             if workflow_control is None:
-                raise ValueError("fix infrastructure episode authority is unavailable")
-            selected_infra = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
-            if not isinstance(selected_infra, cc.SelectedIssueRecovery):
-                raise ValueError("fix infrastructure episode is inactive or migration blocked")
-            # Refusals before admission mint no run, hence no episode receipt;
-            # they spend the same ceiling (#262).
-            infra_deaths[number] = (
-                selected_infra.component.state.infra_failures
-                + workflow_control.fix_admission_refusals(selected_infra)
-            )
+                raise ValueError("fix leg history is unavailable")
+            selected_issue = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
+            if not isinstance(selected_issue, cc.SelectedIssueRecovery):
+                raise ValueError("issue recovery authority is inactive or migration blocked")
+            leg_ends[number] = workflow_control.fix_leg_ends(number)
         except (ValueError, sqlite3.Error, ControlStoreError) as exc:
-            # A corrupt ledger row holds THIS issue only (fail closed); the
-            # tick logs it as "fix infrastructure <n> held".
-            infra_errors[number] = str(exc)
+            # Holds THIS issue only (fail closed); the tick logs it as
+            # "fix leg history <n> held".
+            leg_history_errors[number] = str(exc)
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
@@ -1831,7 +1769,7 @@ def _fix_state(
         ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
         review_control_errors=review_errors,
         rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
-        infra_deaths=infra_deaths, infra_control_errors=infra_errors, ci_rerun_head=ci_rerun_head,
+        leg_ends=leg_ends, leg_history_errors=leg_history_errors, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
         ci_remediations=ci_remediations, ci_remediation_errors=ci_remediation_errors,
         ci_pending_escalated=ci_pending_escalated,
@@ -2389,10 +2327,8 @@ def compose_fix_daemon(
         auto_rebase_conflicts=fix_runtime.auto_rebase_conflicts,
         max_rebase_retries=fix_runtime.max_rebase_retries,
         max_resolve_retries=fix_runtime.max_resolve_retries,
-        max_infra_deaths=fix_runtime.max_infra_deaths,
     )
     journal = _typed_journal(_journal(store), cfg, "fix", store.state_dir)
-    infra_breaker = _infra_breaker(cfg, journal, log)
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
@@ -2417,11 +2353,7 @@ def compose_fix_daemon(
         fix_model_routes=cfg.fix_model_routes,
         available_fix_runtimes=cfg.fix_runtimes,
         escalate_on_evidence=cfg.escalate_on_evidence,
-        # The same ceiling `fix_cfg` escalates on, so a deterministic death can
-        # saturate the counter rather than pay for cap-1 identical retries (#13).
-        max_infra_deaths=fix_runtime.max_infra_deaths,
         max_ci_retries=fix_runtime.max_ci_retries,
-        infra_breaker=infra_breaker,
         max_review_retries=fix_runtime.max_review_retries,
         max_rebase_retries=fix_runtime.max_rebase_retries,
         **_spend_cfg(cfg, "fix"),
@@ -2646,7 +2578,7 @@ def compose_fix_daemon(
         for prefix, errors in (
             ("workflow", state.control_errors),
             ("address-review", state.review_control_errors),
-            ("fix infrastructure", state.infra_control_errors),
+            ("fix leg history", state.leg_history_errors),
         ):
             for target, reason in errors.items():
                 if target in open_targets:
@@ -2743,10 +2675,7 @@ def compose_fix_daemon(
         cfg.tick_interval_seconds,
         log,
         journal=journal,
-        tick_gate=_first_gate(
-            _control_spend_gate(cfg, control, cfg.fix_budget_usd),
-            None if infra_breaker is None else infra_breaker.gate_reason,
-        ),
+        tick_gate=_control_spend_gate(cfg, control, cfg.fix_budget_usd),
         wake_check=_wake_check(cfg, store),
         dispatch_capacity=cfg.fix_dispatch_concurrency,
         dispatch_key=dispatch_key,
@@ -2998,10 +2927,6 @@ def compose_review_daemon(
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
         log=say,
-        # `rcfg.max_unproductive_rounds` is the ceiling the review decide side
-        # reads off this counter — same value, same getattr fallback, so a
-        # deterministic death saturates to exactly what escalates (#13).
-        max_infra_deaths=rcfg.max_unproductive_rounds,
         **_spend_cfg(cfg, "review"),
     )
     runtime_binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](

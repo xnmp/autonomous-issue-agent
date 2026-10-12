@@ -1016,8 +1016,6 @@ export interface components {
             generation: number;
             /** Holds */
             holds: "workflow"[];
-            /** Infra Failures */
-            infra_failures: number;
             /** Rebase Failures */
             rebase_failures: number;
             /** Resumes */

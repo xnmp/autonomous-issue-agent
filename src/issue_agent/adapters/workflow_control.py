@@ -20,6 +20,7 @@ from ..domain.labels import Label
 from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
+from ..domain.backoff import LegEnd
 from ..domain.outcome import budget_exhausted, infra_class_failure
 from ..domain.resolve_rearm import (
     AbsentResolveControl, InactiveResolveControl, PendingRetry, ResolveControlRead, ResolveControlView,
@@ -103,12 +104,8 @@ class SQLiteWorkflowControl:
         if not isinstance(key, WorkflowKey) or key.repository != self.writer.repository or not isinstance(key.target, IssueRef):
             raise WorkflowAuthorityError("workflow is outside the bound resolve writer scope")
 
-    def fix_admission_refusals(self, selected: cc.SelectedIssueRecovery) -> int:
-        """Pre-admission refusals in this recovery episode since the issue's last
-        admitted run (#262)."""
-        key = selected.binding.fence.key
-        self._scope(key)
-        return self._control.fix_admission_refusals(self.writer.repository, key.target.number, selected.episode_scope)
+    def fix_leg_ends(self, issue: int) -> tuple[LegEnd, ...]:
+        return self._control.fix_leg_ends(self.writer.repository, issue)
 
     def reconcile_pr_repair_returns(self) -> int:
         return self._control.reconcile_pr_repair_returns(self.writer)
@@ -1632,14 +1629,6 @@ class SQLiteWorkflowControl:
             accepted_preflight = decode_workflow(row["actor_json"], AuthorizedOperatorCommand).preflight
         retry_facts = self._retry_facts(db, transition.audit.command) if isinstance(transition.audit, AuthorizedOperatorCommand) and isinstance(transition.audit.command, AuthorizeAbsentRetry) else None
         validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission, retry_facts=retry_facts)
-        if transition.snapshot.binding != prior.binding:
-            # A new generation/episode starts the pre-admission refusal count
-            # over (#262). Deleted whatever the row holds, so a corrupt one
-            # (which holds the issue) is recoverable by the operator's re-arm.
-            db.execute(
-                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
-                (self._control._REFUSAL_NAMESPACE, self.writer.repository, str(expected.fence.key.target.number)),
-            )
         self._persist(db, prior, transition, encoded)
         if retry_facts is not None:
             self._persist_retry_authorization(db, transition, retry_facts)

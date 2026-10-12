@@ -27,7 +27,6 @@ from issue_agent.adapters.event_log import EventLog, read_event_log
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.typed_journal import TypedJournal
-from issue_agent.app.infra_breaker import InfraBreaker
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
@@ -135,7 +134,7 @@ UNKNOWN_READ_DELAY = timedelta(seconds=31)
 
 def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix", split=False,
             later: timedelta = timedelta(0), control_path: Path | None = None,
-            state_dir: Path | None = None, supported_infra: bool = False) -> Composition:
+            state_dir: Path | None = None) -> Composition:
     """``later`` restarts the process that much after the prior one (store clock)."""
     remote = PersistentGitHub(root / "github.db", fault=fault)
     control = SQLiteControlStore(str(control_path or root / "control.db"), now=lambda: datetime.now(timezone.utc) + later)
@@ -149,7 +148,6 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     state = Store(state_dir=str(state_dir or root / role))
     messages = []
     journal = TypedJournal(str(root / "legacy-events.jsonl"), events)
-    breaker = InfraBreaker(journal=journal, log=messages.append) if supported_infra else None
     effects = GitHubEffectExecutor(remote, control, repository="o/r", identity=f"o/r:{role}", log=messages.append,
         fix_config=FixConfig(fix_bot="fix-bot"))
     provider = provider or Provider()
@@ -162,7 +160,7 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=lambda action: state.cleanup_pr(action.pr, action.issue, action.merged))
     dispatcher = AgentDispatcher(
         DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append,
-                       author_tests_split=split, max_infra_deaths=FixConfig(fix_bot="fix-bot").max_infra_deaths if supported_infra else 0, infra_breaker=breaker, operator_guidance=roles.review_guidance_reader(control, "o/r")),
+                       author_tests_split=split, operator_guidance=roles.review_guidance_reader(control, "o/r")),
         remote, state, Worktrees(root), JournalingRuntime(runtime, journal, repo="o/r", role="fix", runtime="claude"), executor, workflow_control=workflow,
     )
     executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
@@ -177,7 +175,7 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
         world, FixConfig(fix_bot="fix-bot"),
         roles._fix_state(state, world, workflow_control=workflow), fixer_busy=False,
     ))
-    return Composition(Daemon("fix", remote.build_world, policy, executor, log=messages.append, journal=journal, tick_gate=breaker.gate_reason if breaker else None), remote, control, workflow, effects, provider, dispatched, messages)
+    return Composition(Daemon("fix", remote.build_world, policy, executor, log=messages.append, journal=journal), remote, control, workflow, effects, provider, dispatched, messages)
 
 
 def seed(root: Path, *labels: str) -> None:
@@ -1184,9 +1182,9 @@ def test_recorded_publication_identity_replay_is_bounded_without_operator(tmp_pa
     def published():
         remote.external_pr_change(70, checks=[asdict(Check("current-unit", bucket="pass", run_id=702))])
     provider = Provider(published, AgentResult(False, status="pushed", cost_usd=.25, session_id="publication-replay"))
-    first = compose(tmp_path, provider=provider, supported_infra=True)
+    first = compose(tmp_path, provider=provider)
     first.daemon.tick()
-    restarted = compose(tmp_path, provider=provider, supported_infra=True)
+    restarted = compose(tmp_path, provider=provider)
     for _ in range(8):
         restarted.daemon.tick()
     if matching:
@@ -1196,7 +1194,7 @@ def test_recorded_publication_identity_replay_is_bounded_without_operator(tmp_pa
     else:
         assert provider.tasks == []
         assert restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
-        assert any("publication" in message or "infra" in message for message in first.log + restarted.log)
+        assert any("publication" in message for message in first.log + restarted.log)
     with sqlite3.connect(restarted.control.path) as db:
         assert db.execute("SELECT COUNT(*),COALESCE(SUM(amount_micros),0) FROM charges").fetchone() == ((1, 250_000) if matching else (0, 0))
     assert restarted.control.active_reservation_runs() == ()

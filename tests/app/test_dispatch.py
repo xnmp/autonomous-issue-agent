@@ -16,7 +16,6 @@ from dataclasses import replace
 
 import pytest
 
-from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
@@ -62,7 +61,6 @@ class FakeStore:
         self.resumes = {}
         self.pr_resumed_at = {}
         self.phases = {}
-        self.infra_deaths = {}
         self.models = {}
         self.branches = {}
         self.predicted_paths = {}
@@ -144,15 +142,6 @@ class FakeStore:
     def set_jira_phase(self, i, p):
         self.__dict__.setdefault("_jira_phases", {})[i] = p
 
-    def get_infra_deaths(self, key):
-        return self.infra_deaths.get(key, 0)
-
-    def bump_infra_deaths(self, key):
-        self.infra_deaths[key] = self.infra_deaths.get(key, 0) + 1
-        return self.infra_deaths[key]
-
-    def clear_infra_deaths(self, key):
-        self.infra_deaths.pop(key, None)
 
 
 class FakeWorktrees:
@@ -298,7 +287,7 @@ def test_resolve_routes_to_fix_workflow():
 
 
 @pytest.mark.parametrize("authority", ["missing", "uncaptured", "stale"])
-def test_resolve_authority_hold_never_calls_provider_or_charges_infra(authority):
+def test_resolve_authority_hold_never_calls_provider(authority):
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False))
@@ -314,7 +303,6 @@ def test_resolve_authority_hold_never_calls_provider_or_charges_infra(authority)
     )
     asyncio.run(dispatcher.dispatch(action))
     assert not runner.tasks
-    assert store.get_infra_deaths(5) == 0
     assert not any(call[0] == "relabel" for call in gw.calls)
     assert any("held" in message for message in logged)
 
@@ -570,33 +558,16 @@ def test_resolve_logs_worktree_and_agent_lifecycle():
     assert "agent #5: resolve — done (status=pr_opened, $1.23)" in joined
 
 
-# ── review C3: a pre-result session death is COUNTED, and still propagates ─────
+# ── review C3: a pre-result session death still propagates ─────────────────
 def _resolve_gateway():
     return FakeGateway(issues={5: IssueView(5, title="Null token", body="x")},
                        pr_for_issue={})
 
 
-def test_pre_result_death_bumps_the_infra_counter(tmp_path):
-    """review C3. The handler dies before `runner.run` returns, so every
-    attempt-recording write in the workflow tail is skipped and the reaper
-    requeues the issue — one full paid session every two polls, forever, with
-    nothing on the ledger and no breaker moving. The infra-death counter is the
-    only durable trace of that attempt, so it must be written on the raise path.
-    Driven against a REAL Store: the key the dispatcher writes is the key the
-    decide side later reads."""
-    store = Store(state_dir=str(tmp_path))
-    d = _dispatcher(_resolve_gateway(), store, RaisingRunner())
-
-    with pytest.raises(RuntimeError, match="stream closed"):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-
-    assert store.get_infra_deaths(5) == 1
-
-
 def test_pre_result_death_re_raises_so_the_daemon_still_isolates_the_crash(tmp_path):
-    """Bump then re-raise UNCHANGED: `Daemon.tick`'s catch (issue keeps
-    ai-working, reaper requeues) is the crash-isolation contract. Swallowing
-    here would silently change it."""
+    """Re-raise UNCHANGED: `Daemon.tick`'s catch (issue keeps ai-working,
+    reaper requeues) is the crash-isolation contract. Swallowing here would
+    silently change it."""
     store = Store(state_dir=str(tmp_path))
     boom = ValueError("transport gone")
     d = _dispatcher(_resolve_gateway(), store, RaisingRunner(boom))
@@ -605,304 +576,6 @@ def test_pre_result_death_re_raises_so_the_daemon_still_isolates_the_crash(tmp_p
         asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
 
     assert excinfo.value is boom
-
-
-def test_a_returned_result_does_not_bump_the_infra_counter(tmp_path):
-    """Anti-vacuity twin: a leg that RETURNS (even an errored one) took the
-    workflow tail, so the retry breakers see it — it must not also consume the
-    infra ceiling, or a normally-failing issue escalates for the wrong reason."""
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=True))
-    d = _dispatcher(_resolve_gateway(), store, runner)
-
-    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-
-    assert store.get_infra_deaths(5) == 0
-
-
-def test_pre_result_death_on_a_pr_leg_is_keyed_by_the_linked_issue(tmp_path):
-    """PR-keyed kinds count against the ISSUE behind the PR — the same key
-    `domain.fix.breaker_key` reads for that PR's legs."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: _ci_pr()})
-    d = _ci_dispatcher(gw, store, RaisingRunner())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
-
-    assert store.get_infra_deaths(5) == 1       # closing_issue of PR #100
-    assert store.get_infra_deaths(100) == 0     # not the PR number
-
-
-def test_pre_result_death_on_an_issueless_pr_uses_the_negated_pr_key(tmp_path):
-    """A PR with no resolvable issue (Jira-keyed branch, no closing-ref) still
-    accumulates: `-pr` is exactly `breaker_key`'s fallback, so the decide side
-    reads what this wrote. The old `or -1` sentinel collapsed every such PR onto
-    one dead key and the breaker never tripped (PR #112)."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/ACME-2468-x")})
-    d = _dispatcher(gw, store, RaisingRunner())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 1
-
-
-# ── deterministic deaths must not buy the same unwinnable dispatch again (#13) ─
-_BUFFER_DEATH = RuntimeError(
-    "Fatal error in message reader: Failed to decode JSON: JSON message "
-    "exceeded maximum buffer size of 1048576 bytes"
-)
-
-
-def _capped_dispatcher(gw, store, runner, cap):
-    cfg = DispatchConfig(
-        review=ReviewTaskConfig("o/r", review_prompt="r"),
-        max_infra_deaths=cap,
-    )
-    return with_review_authority(AgentDispatcher(
-        cfg, gw, store, None, runner, Executor(gw, remove_worktree=FakeWorktrees().remove)
-    ))
-
-
-def test_a_deterministic_death_spends_the_whole_retry_budget_at_once(tmp_path):
-    """The input, not the infrastructure, killed this session — the next
-    dispatch reads the same file and dies identically. Charging it 1 buys
-    cap-1 more unwinnable sessions at full cost, which is what happened on
-    xnmp/tauri-explorer PR #552."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
-    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 5, "one death, the whole budget"
-
-
-def test_a_deterministic_death_reaches_the_reviewers_existing_ceiling(tmp_path):
-    """The admission policy holds the PR after a deterministic paid failure."""
-    from issue_agent.domain.review import ReviewConfig, ReviewExcluded, review_eligibility
-
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
-    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    cfg = ReviewConfig(review_bot="rb", max_unproductive_rounds=5)
-    decision = review_eligibility(gw.get_pr(100), cfg, store.get_infra_deaths(-100))
-    assert isinstance(decision, ReviewExcluded) and decision.breaker
-
-
-def test_an_ordinary_transport_death_still_costs_exactly_one_life(tmp_path):
-    """Anti-vacuity. A stochastic death is what the breakers were built for; if
-    the classifier widened to cover it, every flaky network blip would escalate
-    a PR a retry would have rescued."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
-    d = _capped_dispatcher(gw, store, RaisingRunner(RuntimeError("Stream closed")), cap=5)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 1
-
-
-def test_a_deterministic_death_never_lowers_an_existing_tally(tmp_path):
-    store = Store(state_dir=str(tmp_path))
-    for _ in range(7):
-        store.bump_infra_deaths(-100)
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
-    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 7
-
-
-def test_without_a_configured_ceiling_a_deterministic_death_bumps_as_before(tmp_path):
-    """cap 0 means the role's breaker is off; saturating to 0 would ERASE the
-    tally, so the ordinary bump must stand."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
-    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=0)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 1
-
-
-def test_a_deterministic_death_still_re_raises_unchanged(tmp_path):
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/x")})
-    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert excinfo.value is _BUFFER_DEATH
-
-
-# ── review P1R-1: a flaky issue lookup must not relocate the counter ──────────
-# The trap is the COUPLING: the flakiness that kills sessions is the flakiness
-# that fails `gateway.issue_for_pr`, so the old catch-everything→None→`-pr`
-# fallback moved the infra-death counter into a key space the fix role's decide
-# side never reads — the ceiling failed exactly when it was needed.
-class FlakyIssueLookup(FakeGateway):
-    """`issue_for_pr` raises on the listed call numbers (1-based); `always`
-    raises on every call. Counts its calls so a test can pin the retry."""
-
-    def __init__(self, prs, issue, fail_calls=(), always=False):
-        super().__init__(prs=prs)
-        self._issue = issue
-        self._fail_calls = set(fail_calls)
-        self._always = always
-        self.lookups = 0
-
-    def issue_for_pr(self, pr):
-        self.lookups += 1
-        if self._always or self.lookups in self._fail_calls:
-            raise GhUnavailable("network", "issue_for_pr timed out (test-injected)")
-        return self._issue
-
-
-def _review_pr():
-    return observed_pr(100, head_ref_name="fix/5-x", closing_issue=5)
-
-
-def test_review_death_stays_pr_keyed_when_issue_lookup_fails(tmp_path):
-    """Review convergence belongs to the PR, independently of linkage reads."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, fail_calls={1})
-    d = _dispatcher(gw, store, RaisingRunner())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert gw.lookups == 1
-    assert store.get_infra_deaths(5) == 0
-    assert store.get_infra_deaths(-100) == 1
-
-
-def test_repeated_review_deaths_share_one_pr_key_across_lookup_outcomes(tmp_path):
-    store = Store(state_dir=str(tmp_path))
-    gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, fail_calls=set(range(2, 99)))
-    d = _dispatcher(gw, store, RaisingRunner())
-
-    for _ in range(6):
-        with pytest.raises(RuntimeError):
-            asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(5) == 0
-    assert store.get_infra_deaths(-100) == 6, "one stable key, six deaths"
-
-
-def test_review_death_needs_no_retry_lookup_to_choose_its_pr_key(tmp_path):
-    store = Store(state_dir=str(tmp_path))
-    logged: list[str] = []
-    gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, always=True)
-    cfg = DispatchConfig(review=ReviewTaskConfig("o/r"), log=logged.append)
-    d = with_review_authority(AgentDispatcher(cfg, gw, store, None, RaisingRunner(), Executor(gw)))
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 1
-    assert any("could not resolve issue for PR #100" in m for m in logged)
-
-
-def test_a_clean_none_is_still_a_genuinely_issueless_pr(tmp_path):
-    """Anti-vacuity twin: a lookup that ANSWERS None is a fact, not an outage.
-    `-pr` is exactly `breaker_key`'s convention for it, and treating that as
-    unknown would strand every Jira-keyed PR's counter."""
-    store = Store(state_dir=str(tmp_path))
-    gw = FakeGateway(prs={100: observed_pr(100, head_ref_name="feat/ACME-2468-x")})
-    d = _dispatcher(gw, store, RaisingRunner())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
-
-    assert store.get_infra_deaths(-100) == 1
-
-
-# ── review P1R-3: an operator stopping the daemon is not an infra death ───────
-class InterruptingRunner:
-    def __init__(self, exc):
-        self.exc = exc
-        self.tasks = []
-
-    async def run(self, task):
-        self.tasks.append(task)
-        raise self.exc
-
-
-@pytest.mark.parametrize(
-    "exc", [KeyboardInterrupt(), SystemExit(0), asyncio.CancelledError()],
-    ids=["ctrl-c", "sys.exit", "cancelled"],
-)
-def test_stopping_the_daemon_burns_no_infra_death_life(tmp_path, exc):
-    """review P1R-3. `issue-agent start` runs in the FOREGROUND and Ctrl-C is
-    the documented way to stop it, so counting these meant five ordinary stops
-    escalated a healthy issue to needs-human-review — while a SIGTERM (systemd's
-    stop signal, which raises nothing) counted zero. CancelledError is in the
-    list because `asyncio.run` turns a Ctrl-C at an await point into exactly
-    that before it re-raises KeyboardInterrupt to the caller."""
-    store = Store(state_dir=str(tmp_path))
-    d = _dispatcher(_resolve_gateway(), store, InterruptingRunner(exc))
-
-    with pytest.raises(type(exc)):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-
-    assert store.get_infra_deaths(5) == 0
-
-
-def test_five_operator_stops_do_not_escalate_a_healthy_issue(tmp_path):
-    """The repro, at the ceiling: five Ctrl-Cs used to be five 'deaths'."""
-    store = Store(state_dir=str(tmp_path))
-    d = _dispatcher(_resolve_gateway(), store, InterruptingRunner(KeyboardInterrupt()))
-
-    for _ in range(5):
-        with pytest.raises(KeyboardInterrupt):
-            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-
-    assert store.get_infra_deaths(5) == 0
-
-
-def test_an_ordinary_exception_is_still_counted(tmp_path):
-    """Anti-vacuity twin: exempting the interrupt family must not exempt the
-    transport death the counter exists for."""
-    store = Store(state_dir=str(tmp_path))
-    d = _dispatcher(_resolve_gateway(), store, InterruptingRunner(RuntimeError("stream gone")))
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-
-    assert store.get_infra_deaths(5) == 1
-
-
-def test_a_counter_write_failure_does_not_replace_the_original_death():
-    """The bump is a receipt, not a gate: if the state dir is unwritable the
-    ORIGINAL exception must still be what the daemon sees, or the traceback that
-    explains the death is lost behind an OSError about a counter file."""
-    class BrokenStore(FakeStore):
-        def bump_infra_deaths(self, key):
-            raise OSError("read-only state dir")
-
-    logged: list[str] = []
-    cfg = DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM"), log=logged.append)
-    gw = _resolve_gateway()
-    d = with_resolve_authority(AgentDispatcher(cfg, gw, BrokenStore(), FakeWorktrees(),
-                        RaisingRunner(), Executor(gw)))
-
-    with pytest.raises(RuntimeError, match="stream closed"):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-
-    assert any("infra-death counter not persisted" in m for m in logged)
 
 
 # ── T3: a GhUnavailable arriving BETWEEN the paid run and the follow-up ────────
@@ -914,13 +587,7 @@ def test_a_counter_write_failure_does_not_replace_the_original_death():
 # untouched because the follow-up decision never ran, or bumped exactly once,
 # never both/double-counted, (3) nothing was half-applied: the failing gh call
 # raises BEFORE its write is recorded, so no partial label state is left
-# looking like a real, silent success. `AgentDispatcher.dispatch`'s own
-# crash-isolation net (see its except BaseException block) still bumps
-# infra-deaths for the SAME key breaker_key/the write side agree on — it can't
-# distinguish "the session died" from "a follow-up read/write died", so any
-# uncaught exception anywhere in the handler counts as one, which is the
-# documented "bump then re-raise unchanged" contract, not a bug introduced by
-# T3's fail_on injection.
+# looking like a real, silent success.
 
 def test_resolve_mid_dispatch_failure_persists_the_session_before_the_gh_read_fails(tmp_path):
     """The paid handle survives uncertainty without granting another dispatch.
@@ -945,7 +612,6 @@ def test_resolve_mid_dispatch_failure_persists_the_session_before_the_gh_read_fa
     assert resolve_state(store).episode.continuation.session is None
     assert resolve_state(store).episode.failures == 0  # unknown PR outcome is not absence
     assert not any(c[0] == "relabel" for c in gw.calls)  # nothing half-applied
-    assert store.get_infra_deaths(5) == 0  # observation failed, not the paid provider
 
 
 ## NOTE (B5→B4 coordination): `Executor.execute_all`'s exact failure-propagation
@@ -956,8 +622,7 @@ def test_resolve_mid_dispatch_failure_persists_the_session_before_the_gh_read_fa
 ## the invariants T3 actually cares about true (session persisted, the
 ## already-run counter bump survives, the failed write never landed, the
 ## label is recoverable via reap next tick); they differ ONLY in whether
-## `dispatch()` raises and, as a consequence, whether the dispatcher's OWN
-## crash-isolation net additionally bumps infra-deaths, and — for
+## `dispatch()` raises and — for
 ## address_review specifically — whether the retry bump coded after
 ## `execute_all` is reached at all. The assertions below match the
 ## `execute_all` behavior on disk as of THIS commit (full swallow, no
@@ -974,8 +639,7 @@ def test_fix_ci_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
     though the write then fails. `Executor.execute_all` isolates the failing
     action (logs it, does not re-raise), so `dispatch()` completes normally
     instead of the follow-up write being conflated with a pre-result session
-    death (infra-deaths — the dispatcher's OTHER, separate crash-isolation net —
-    stays untouched). The dropped ai-blocked write is self-correcting: the next
+    death. The dropped ai-blocked write is self-correcting: the next
     poll sees the same red CI and re-dispatches, bounded by the very counter
     this test proves advanced."""
     store = Store(state_dir=str(tmp_path))
@@ -988,7 +652,6 @@ def test_fix_ci_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
     assert pr_repair_state(store).session.handle == "c-live"
     assert issue_recovery_state(store).ci_failures == 1                   # the attempt DID count
     assert not any(c[0] == "relabel" for c in gw.calls)    # the ai-blocked write never landed
-    assert store.get_infra_deaths(5) == 0                  # isolated at the action level, not the session level
 
 
 def test_rebase_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
@@ -1005,7 +668,6 @@ def test_rebase_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
     assert pr_repair_state(store).session.handle == "reb-live"
     assert issue_recovery_state(store).rebase_failures == 1
     assert not any(c[0] == "relabel" for c in gw.calls)
-    assert store.get_infra_deaths(5) == 0
 
 
 def test_address_review_mid_dispatch_failure_still_applies_the_rest_of_the_tail(tmp_path):
@@ -1025,7 +687,6 @@ def test_address_review_mid_dispatch_failure_still_applies_the_rest_of_the_tail(
     assert pr_repair_state(store).session.handle == "ar-live"
     assert ("relabel", "pr", 100, None, "ai-blocked") in gw.calls
     assert review_retry_pair(store)[1] == 0
-    assert store.get_infra_deaths(5) == 0
 
 
 def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
@@ -1044,7 +705,6 @@ def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
     assert pr_repair_state(store).session.handle == "ar-live"
     assert review_retry_pair(store) == ("2026-01-01T00:00:01Z", 1)
     assert not any(c[0] == "relabel" for c in gw.calls)  # no gh write at all, not a failed one
-    assert store.get_infra_deaths(5) == 0
 
 
 @pytest.mark.parametrize(
@@ -1070,5 +730,4 @@ def test_fix_pr_kind_defers_without_dispatch_when_claim_target_carries_no_issue(
 
     assert runner.tasks == []
     assert retained_issue_file(store, 5, "session") == ""
-    assert store.get_infra_deaths(5) == 0
     assert gw.calls == []

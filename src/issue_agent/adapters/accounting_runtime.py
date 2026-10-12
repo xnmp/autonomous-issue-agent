@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import os
-import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -39,10 +38,10 @@ from ..domain.outcome import (
     DAILY_HEADROOM_STATUS,
     MAX_BUDGET_STATUS,
     RETURN_REFUSED_STATUS,
-    pre_admission_refusal,
     budget_exhausted,
     infra_class_failure,
     address_review_actions,
+    resumable_session,
 )
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
@@ -148,7 +147,6 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     max_contract_rounds: int | None = None
-    fix_infra_ceiling: int = 5
     admit: Callable[[ReservationRequest], ReservationResult] | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None]
@@ -267,49 +265,40 @@ class AccountingRuntime(AgentRuntime):
             raise ValueError("accounting run and leg identities are required")
         self._identity.set((run_id, leg_id))
 
-    async def run(self, task: RuntimePlan) -> AgentResult:
-        issue = self._context.get()[0]
-        track = self.role == "fix" and issue is not None
-        if track and self.store.fix_refusal_unrecorded(self.repository, issue):
-            # The ledger could not record an earlier refusal for this issue, so
-            # its ceiling position is unknown: no paid admission until a write
-            # succeeds again (ADR 0012: fail closed, never proceed blind).
-            result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
-        else:
-            result = await self._admit_and_run(task)
-        if track and pre_admission_refusal(result):
-            # Refused before any run exists, so the episode's receipt-driven
-            # infra charge can never see it (#262). Count it durably here;
-            # the fix role folds the ledger into the infra-death ceiling.
-            try:
-                selected = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
-                if not isinstance(selected, cc.SelectedIssueRecovery):
-                    raise ValueError("issue recovery episode is unavailable to scope the refusal")
-                self.store.record_fix_admission_refusal(
-                    self.repository, issue, selected.episode_scope, result.summary
-                )
-            except Exception as exc:  # noqa: BLE001 - the store now fails this issue closed
-                self._ledger_fault(issue, "record", exc)
-                result = replace(result, summary=f"{result.summary} [refusal not recorded: {exc}]")
-        return result
+    def _refused(self, detail: str) -> AgentResult:
+        self._record_refused_leg()
+        return _return_refused(detail)
 
-    def _ledger_fault(self, issue: int, operation: str, exc: Exception) -> None:
-        """A ledger fault is never silent (ADR 0012): journal it, and fall back
-        to stderr when the store that failed cannot take the event either."""
+    def _record_refused_leg(self) -> None:
+        """Record a fix refusal before admission as an ordinary zero-cost run.
+
+        A refusal buys nothing and mints no paid run, so without this row the
+        fix backoff never saw it and the item re-dispatched every poll with a
+        claim relabel each time (#262, tauri PR #1019). Cancelled, released and
+        receipt-less, the row reads as a machine end and nothing else counts it.
+        """
+        issue, kind, *_ = self._context.get()
+        if self.role != "fix" or issue is None or not kind:
+            return
+        run_id = RunId(uuid.uuid4().hex)
+        dispatch_id = json.dumps({"repository": self.repository, "role": self.role, "kind": kind, "issue": issue},
+                                 sort_keys=True, separators=(",", ":"))
         try:
-            self.store.record_fix_refusal_ledger_fault(issue, operation, f"{type(exc).__name__}: {exc}")
-        except Exception:  # noqa: BLE001 - last resort, the daemon log captures stderr
-            print(f"fix admission refusal ledger {operation} failed for #{issue}: {exc}", file=sys.stderr)
+            self.store.start_run(run_id, dispatch_id, kind, self.owner_id or f"{self.repository}:{self.role}",
+                                 self.config_version)
+            self.store.complete_run(run_id, state="cancelled", outcome="admission_refused")
+        except Exception:  # noqa: BLE001 - the refusal itself must still return
+            pass
 
-    async def _admit_and_run(self, task: RuntimePlan) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         if task.runtime is not None and task.runtime.value != self.runtime_name:
-            return _return_refused("selected provider differs from accounting runtime")
+            return self._refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
         issue, kind, number, claim_target, workflow, review_child = self._context.get()
         if review_child is not None and task.resolve_inputs is not None:
-            return _return_refused("review child cannot carry resolve inputs")
+            return self._refused("review child cannot carry resolve inputs")
         if workflow is not None and kind in ("AUTHOR", "IMPLEMENT", "ADJUDICATE") and task.resolve_inputs is None:
-            return _return_refused("split completion requires durable stage inputs")
+            return self._refused("split completion requires durable stage inputs")
         if task.resolve_inputs is not None:
             split_types = {"AUTHOR": (SplitContext, ReauthorInput), "IMPLEMENT": SplitImplement, "ADJUDICATE": AdjudicationInput}
             expected = split_types.get(kind or "")
@@ -317,32 +306,32 @@ class AccountingRuntime(AgentRuntime):
                 (expected is None and task.split_input is not None)
                 or (expected is not None and not isinstance(task.split_input, expected))
             ):
-                return _return_refused("returned-result context does not match the admitted workflow")
+                return self._refused("returned-result context does not match the admitted workflow")
             # Bound persisted input before paying. Provider prose is normalized
             # separately below, leaving room for its receipt and provenance.
             try:
                 encoded_inputs = encode_workflow((task.resolve_inputs, task.split_input))
             except WorkflowEncodingError:
-                return _return_refused("resolve completion inputs exceed durable receipt capacity")
+                return self._refused("resolve completion inputs exceed durable receipt capacity")
             # Context persists across legs; reset acknowledgements are transient
             # input envelopes. Charging both against the context allowance makes
             # an accepted contract impossible to re-author near the size limit.
             if len(encoded_inputs.encode()) > 200000:
-                return _return_refused("resolve completion inputs exceed durable receipt capacity")
+                return self._refused("resolve completion inputs exceed durable receipt capacity")
             if kind == "AUTHOR":
                 rounds = self.max_contract_rounds if self.max_contract_rounds is not None else 2
                 try:
                     validate_contract_rounds(rounds)
                 except ValueError as exc:
-                    return _return_refused(str(exc))
+                    return self._refused(str(exc))
                 # Reserve space for all permitted verdicts/provenance before
                 # buying the initial contract. Later stages retain that space.
                 assert task.split_input is not None
                 retained = encode_workflow((task.resolve_inputs, split_context(task.split_input)))
                 if len(retained.encode()) > 100000 - rounds * 20000:
-                    return _return_refused("resolve completion inputs exceed durable receipt capacity")
+                    return self._refused("resolve completion inputs exceed durable receipt capacity")
             elif task.split_input is None and len(encoded_inputs.encode()) > 100000:
-                return _return_refused("resolve completion inputs exceed durable receipt capacity")
+                return self._refused("resolve completion inputs exceed durable receipt capacity")
         # ADR 0008: paid admission binds the decision-side target unchanged;
         # review convergence remains PR-owned even when spend is issue-scoped.
         target = (
@@ -387,7 +376,7 @@ class AccountingRuntime(AgentRuntime):
             if (self.role != "steward" or kind != selected.lane.value.upper()
                     or number != selected.selection.binding.fence.key.target.number
                     or issue != number or workflow != selected.selection.binding):
-                return _return_refused("selected steward input requires its exact lane and issue context")
+                return self._refused("selected steward input requires its exact lane and issue context")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = (cc.StewardPurchase(capture, selected.lane, selected.input_at, selected.stall_ceiling,
                                                selected.content_signature, selected.infra_ceiling),)
@@ -398,9 +387,9 @@ class AccountingRuntime(AgentRuntime):
                         or issue != selected.selection.binding.fence.key.target.number
                         or task.pr_repair_input is None or workflow != task.pr_repair_input.selection.binding
                         or workflow.fence.key.target != selected.pr):
-                    return _return_refused("linked PR issue reply requires its exact issue/PR context")
+                    return self._refused("linked PR issue reply requires its exact issue/PR context")
             elif self.role != "fix" or kind not in {"RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"} or workflow is None or workflow.fence != selected.selection.revision.fence:
-                return _return_refused("selected issue reply requires its captured resolve context")
+                return self._refused("selected issue reply requires its captured resolve context")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = ((cc.IssueReplyPurchase(capture, selected.reply_at) if isinstance(selected, cc.LinkedPRIssueReplyInput)
                               else cc.IssueRecoveryPurchase(capture, selected.reply_at, selected.branch, 2**63 - 1)),)
@@ -418,10 +407,10 @@ class AccountingRuntime(AgentRuntime):
                                                 or selected.reply is not None and linked_reply)
                     or kind != "PR_RESUME" and selected.reply is not None
                     or kind != "FIX_CI" and selected.ci is not None):
-                return _return_refused("selected repair input requires its exact PR, runtime and family context")
+                return self._refused("selected repair input requires its exact PR, runtime and family context")
             session = selected.session
             if (task.resume or "") != (session.handle if session is not None else ""):
-                return _return_refused("repair launch handle differs from selected continuity")
+                return self._refused("repair launch handle differs from selected continuity")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = (cc.PRRepairPurchase(capture, reply_at=selected.reply.reply_at if selected.reply is not None else "",
                                                  allowance=(cc.RepairAllowance.INFRA if kind == "PR_RESUME" else cc.RepairAllowance.REVIEW if selected.review is not None else cc.RepairAllowance.REBASE if selected.rebase is not None else cc.RepairAllowance.CI), ceiling=2**63-1,
@@ -429,19 +418,19 @@ class AccountingRuntime(AgentRuntime):
             if selected.ci is not None:
                 ci = selected.ci
                 if issue != ci.selection.binding.fence.key.target.number:
-                    return _return_refused("CI allowance belongs to another linked issue")
+                    return self._refused("CI allowance belongs to another linked issue")
                 capture = cc.ContinuationCapture(ci.selection.binding, ci.selection.revision, _leg_id or str(run_id))
                 continuations += (cc.IssueCIPurchase(capture, ci.pr, ci.head, ci.ceiling),)
             if selected.review is not None:
                 review = selected.review
                 if issue != review.selection.binding.fence.key.target.number:
-                    return _return_refused("review allowance belongs to another linked issue")
+                    return self._refused("review allowance belongs to another linked issue")
                 capture = cc.ContinuationCapture(review.selection.binding, review.selection.revision, _leg_id or str(run_id))
                 continuations += (cc.IssueReviewPurchase(capture, review.pr, review.head, review.review_at, review.ceiling),)
             if selected.rebase is not None:
                 rebase = selected.rebase
                 if issue != rebase.selection.binding.fence.key.target.number:
-                    return _return_refused("rebase allowance belongs to another linked issue")
+                    return self._refused("rebase allowance belongs to another linked issue")
                 capture = cc.ContinuationCapture(rebase.selection.binding, rebase.selection.revision, _leg_id or str(run_id))
                 continuations += (cc.IssueRebasePurchase(capture, rebase.pr, rebase.head, rebase.branch, rebase.ceiling),)
         if (self.role == "fix" and issue is not None
@@ -449,7 +438,7 @@ class AccountingRuntime(AgentRuntime):
                 and not any(p.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY for p in continuations)):
             selected_infra = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
             if not isinstance(selected_infra, cc.SelectedIssueRecovery):
-                return _return_refused("fix infrastructure episode requires migrated issue recovery authority")
+                return self._refused("fix infrastructure episode requires migrated issue recovery authority")
             continuations += (cc.IssueInfraPurchase(cc.ContinuationCapture(
                 selected_infra.binding, selected_infra.revision, _leg_id or str(run_id))),)
         publication = _fix_publication_context(self.role, task.cwd)
@@ -458,6 +447,7 @@ class AccountingRuntime(AgentRuntime):
             and kind in _FIX_PUBLICATION_KINDS
             and publication is None
         ):
+            self._record_refused_leg()
             return AgentResult(
                 is_error=True,
                 status="publication_authority_unavailable",
@@ -515,10 +505,6 @@ class AccountingRuntime(AgentRuntime):
             separators=(",", ":"),
         )
         reserved_model = task.model or "<runtime-default>"
-        if self.role == "fix":
-            continuations = tuple(replace(purchase, capture=replace(purchase.capture, fix_infra_ceiling=self.fix_infra_ceiling))
-                if purchase.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY else purchase
-                for purchase in continuations)
         request = ReservationRequest(
             ReservationId(uuid.uuid4().hex),
             run_id,
@@ -550,9 +536,9 @@ class AccountingRuntime(AgentRuntime):
             try:
                 refusal = self.store.record_review_admission_refusal(request)
             except Exception as exc:  # noqa: BLE001 - uncertain authority cannot become a budget verdict
-                return _return_refused(f"review child refusal authority unavailable: {exc}")
+                return self._refused(f"review child refusal authority unavailable: {exc}")
             if refusal is None:
-                return _return_refused("review child budget or authority changed before final refusal")
+                return self._refused("review child budget or authority changed before final refusal")
             reservation = ReservationResult(
                 AccountingDisposition.EXHAUSTED, None,
                 Money(refusal.currency, refusal.committed_micros),
@@ -563,7 +549,7 @@ class AccountingRuntime(AgentRuntime):
             )
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
-                return _return_refused(reservation.detail or reservation.disposition.value)
+                return self._refused(reservation.detail or reservation.disposition.value)
             # Time restores daily headroom, so that refusal waits label-free
             # (DAILY_HEADROOM_STATUS); a lifetime issue cap needs a decision.
             daily = (reservation.disposition is AccountingDisposition.EXHAUSTED
@@ -600,12 +586,6 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.AGENT_ERROR,
             )
-        if self.role == "fix" and issue is not None:
-            # Admission succeeded: whatever authority was missing is back.
-            try:
-                self.store.clear_fix_admission_refusals(self.repository, issue)
-            except Exception as exc:  # noqa: BLE001 - a stale count only brings the ceiling nearer
-                self._ledger_fault(issue, "clear", exc)
         publication_owner = (
             self.owner_id or f"{self.repository}:{self.role}"
         )
@@ -688,22 +668,11 @@ class AccountingRuntime(AgentRuntime):
                         WorkflowWriter(self.repository, "steward", self.owner_id or f"{self.repository}:steward"))
                 except Exception:
                     pass
-            if self.role == "fix" and not isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
-                from ..domain.outcome import deterministic_death
-                deterministic = deterministic_death(f"{type(exc).__name__}: {exc}",
-                    str(getattr(exc, "harness_last_trace", "") or ""))
-                try:
-                    self.store.record_fix_infra_return(run_id,
-                        cc.FixInfraOutcome.DETERMINISTIC_DEATH if deterministic is not None else cc.FixInfraOutcome.RECLAIMED,
-                        WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
-                except Exception:
-                    # Preserve the provider failure; existing dead-run recovery
-                    # still owns the retained reservation and exact episode.
-                    pass
             raise
-        if self.role == "fix":
+        if self.role == "fix" and not infra_class_failure(result):
+            # Only a normal return is recorded: every other ended fix run, with
+            # no receipt, is a machine end to the backoff.
             self.store.record_fix_infra_return(run_id,
-                cc.FixInfraOutcome.RETURNED_INFRA if infra_class_failure(result) else cc.FixInfraOutcome.RETURNED_NORMAL,
                 WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
         result = replace(
             result,
@@ -722,7 +691,7 @@ class AccountingRuntime(AgentRuntime):
                 result = replace(result, structured={"verdict": verdict, "rationale": rationale})
             assert result.workflow_attempt is not None
             session = None
-            if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)):
+            if resumable_session(result):
                 session = ResolveSession(result.workflow_attempt, result.session_id, self.runtime_name, reserved_model)
             revision: ContractRevision | UnavailableContractRevision | None = None
             if task.split_input is not None and kind in ("AUTHOR", "ADJUDICATE"):
@@ -840,13 +809,12 @@ class AccountingRuntime(AgentRuntime):
             runtime = RuntimeName(self.runtime_name)
             actual_model = cc.RepairModel(admission, runtime, result.model or model or "<runtime-default>")
             session = (cc.RepairSession(admission, result.session_id, runtime, actual_model.model)
-                       if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)) else None)
+                       if resumable_session(result) else None)
             state = replace(repair_input.selection.component.state, branch=repair_input.branch,
                             session=session, actual_model=actual_model)
             writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")
             ci = (cc.CIRepairResult(self.store.ci_repair_admission(attempt),
-                cc.CICharge.BUDGET if budget_exhausted(result.exit_reason) else
-                cc.CICharge.INFRA if infra_class_failure(result) else cc.CICharge.ATTEMPT)
+                cc.CICharge.NOT_ATTEMPT if budget_exhausted(result.exit_reason) or infra_class_failure(result) else cc.CICharge.ATTEMPT)
                 if repair_input.ci is not None else None)
             review = (cc.ReviewRepairResult(self.store.review_repair_admission(attempt),
                 cc.ReviewCharge.ATTEMPT if address_review_actions(repair_input.review.pr.number, result).bump_retry else cc.ReviewCharge.NOT_ATTEMPT)
@@ -1039,10 +1007,8 @@ def _issue_scope(
 
 def _return_refused(detail: str) -> AgentResult:
     # Receipt authority is a harness precondition, not evidence of exhausted
-    # money or a failed issue implementation. `AccountingRuntime.run` counts
-    # every such refusal toward its issue's infra ceiling (it mints no run, so
-    # no receipt would); being infra-class it also feeds the deployment-wide
-    # InfraBreaker through the fix workflow, which gates dispatch on an outage.
+    # money or a failed issue implementation: a machine failure, never an
+    # attempt. It buys nothing; `_record_refused_leg` spaces its retry.
     return AgentResult(
         is_error=True,
         status=RETURN_REFUSED_STATUS,

@@ -31,12 +31,13 @@ from __future__ import annotations
 from tests.domain.builders import observed_pr, with_checks
 
 
-from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry, seed_infra_outcome
+from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
 from issue_agent.domain import continuation_components as cc
 
 import asyncio
 import json
 import os
+from pathlib import Path
 import subprocess
 import threading
 import time
@@ -109,6 +110,8 @@ from issue_agent.domain.fix import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.backoff import machine_backoff_until
+from issue_agent.app.planners.schemas import ROUTER_SCHEMA
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -846,14 +849,13 @@ def test_review_retry_round_trip_trips_the_breaker(tmp_path):
     assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
 
 
-# ── infra-deaths (issue-keyed) ─────────────────────────────────────────────────
-def test_infra_deaths_round_trip_trips_the_ceiling_for_an_issue_leg(tmp_path):
-    """review C4 / C3. Write: a RESOLVE session that dies pre-result (raises,
-    never returns) bumps infra-deaths via AgentDispatcher.dispatch's except
-    block. Read/decide: _fix_state surfaces it under the issue number (the
-    same key an issue leg's OTHER counters use); decide_fix's infra ceiling —
-    separate from, and checked independently of, the resolve-retry breaker —
-    trips once the SEPARATE cap is hit."""
+# ── machine deaths (issue-keyed) ───────────────────────────────────────────────
+def test_machine_death_leaves_attempts_unchanged_and_redispatches_only_after_backoff(tmp_path):
+    """review C4 / C3, and the rule that machine failures are never issue debt.
+    Write: a RESOLVE session that dies pre-result (raises, never returns) is a
+    reclaimed run, a machine end. Read/decide: the issue's attempts do not
+    move; the next RESOLVE waits out the doubling backoff from the last death,
+    then dispatches again. Five deaths in a row never escalate."""
     issue = 8
     gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
     store = Store(state_dir=str(tmp_path))
@@ -863,28 +865,59 @@ def test_infra_deaths_round_trip_trips_the_ceiling_for_an_issue_leg(tmp_path):
                 expected_owner_id="o/r:fix:fixture", pid=123, pgid=123, process_start_ticks=99)
             return await super().run(task)
     d = _dispatcher(gw, store, LaunchedDeath())
-    cfg = _cfg(max_infra_deaths=2)
+    cfg = _cfg()
 
-    def world():
+    def world(at):
         return WorldState(issues=(
             IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
-        ))
+        ), now=at.isoformat().replace("+00:00", "Z"))
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert issue_recovery_state(store, issue).infra_failures == 1
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert _has_run(actions, AgentKind.RESOLVE)           # 1 death < cap of 2
+    for deaths in range(1, 6):
+        with pytest.raises(RuntimeError):
+            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
+        ends = store._workflow_db.fix_leg_ends("o/r", issue)
+        assert [end.machine for end in ends] == [True] * deaths
+        assert resolve_state(store, issue).episode.failures == 0
+        due = max(end.ended_at for end in ends) + min(timedelta(seconds=60 * 2 ** (deaths - 1)), timedelta(hours=1))
+        early = decide_fix(world(due - timedelta(seconds=1)), cfg, _fix_state(store, world(due)), fixer_busy=False)
+        assert not _has_run(early, AgentKind.RESOLVE)
+        assert not any(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in early)
+        assert _has_run(decide_fix(world(due), cfg, _fix_state(store, world(due)), fixer_busy=False), AgentKind.RESOLVE)
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert issue_recovery_state(store, issue).infra_failures == 2
-    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.RESOLVE)
-    assert any(
-        isinstance(a, Relabel) and a.number == issue and a.add is Label.NEEDS_HUMAN_REVIEW
-        for a in actions
-    )
+
+def test_routed_resolve_deaths_double_the_backoff_despite_normal_router_legs(tmp_path):
+    """Slice 3 review finding 1. With FIX_MODEL unpinned every RESOLVE dispatch
+    first runs the difficulty router, which returns normally, then the RESOLVE
+    leg dies pre-result. Only the leg that ended the dispatch counts, so the
+    wait still doubles per death instead of staying at the 60s base."""
+    issue = 8
+    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
+    store = Store(state_dir=str(tmp_path))
+
+    class RouteOkResolveDies:
+        def __init__(self):
+            self.routed = 0
+
+        async def run(self, task):
+            if task.schema is ROUTER_SCHEMA:
+                self.routed += 1
+                return AgentResult(is_error=False, session_id="rt", structured={"tier": "standard"})
+            store._workflow_db.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
+                expected_owner_id="o/r:fix:fixture", pid=123, pgid=123, process_start_ticks=99)
+            raise RuntimeError("stream closed before any result")
+
+    runner = RouteOkResolveDies()
+    d = _dispatcher(gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"))
+    waits = []
+    for _ in range(5):
+        with pytest.raises(RuntimeError):
+            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
+        ends = store._workflow_db.fix_leg_ends("o/r", issue)
+        until = machine_backoff_until(ends, AgentKind.RESOLVE)
+        assert until is not None
+        waits.append((until - max(end.ended_at for end in ends)).total_seconds())
+    assert runner.routed == 5
+    assert waits == [60.0, 120.0, 240.0, 480.0, 960.0]
 
 
 # ── C4 key-agreement: breaker_key(pr) vs gateway.issue_for_pr(pr) ──────────────
@@ -915,8 +948,7 @@ def test_breaker_key_agrees_with_gateway_issue_for_pr_when_issueless(tmp_path):
         asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, pr.number)))
 
     state = _fix_state(store, WorldState(prs=(pr,)))
-    assert breaker_key(pr) not in state.infra_deaths
-    assert store.get_infra_deaths(-400) == 1
+    assert breaker_key(pr) not in state.leg_ends
     assert not _has_run(decide_fix(WorldState(prs=(pr,)), _cfg(), state, False), AgentKind.FIX_CI)
 
 
@@ -998,35 +1030,7 @@ def _open_pr(number=500, issue=9, sha="abc"):
 
 
 
-def test_control_store_process_deaths_escalate_the_fix_role(tmp_path):
-    issue = 8
-    store = Store(state_dir=str(tmp_path))
-    cfg = _cfg(max_infra_deaths=2)
-    world = WorldState(issues=(IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),))
-    control = attach_workflow_authority(FakeGateway(issues={issue: world.issues[0]}), store, resolve_ceiling=3)
-    seed_infra_outcome(store._workflow_db, issue, cc.FixInfraOutcome.RECLAIMED, reclaim=True)
-    first = _fix_state(store, world)
-    assert first.infra_deaths[issue] == 1
-    assert _has_run(decide_fix(world, cfg, first, False), AgentKind.RESOLVE)
-    seed_infra_outcome(store._workflow_db, issue, cc.FixInfraOutcome.RECLAIMED, reclaim=True)
-    actions = decide_fix(world, cfg, _fix_state(store, world), fixer_busy=False)
-    assert not _has_run(actions, AgentKind.RESOLVE)
-    assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW,
-                   workflow=resolve_state(store, issue).binding) in actions
-
-
-def test_healthy_runs_do_not_enter_control_store_process_deaths(tmp_path):
-    issue = 8
-    store = Store(state_dir=str(tmp_path))
-    world = WorldState(issues=(
-        IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
-    ))
-    assert _fix_state(store, world).infra_deaths[issue] == 0
-    assert _has_run(decide_fix(world, _cfg(max_infra_deaths=2), _fix_state(store, world),
-                               False), AgentKind.RESOLVE)
-
-
-def test_a_currently_running_dispatch_is_not_counted_as_a_process_death(tmp_path):
+def test_a_currently_running_dispatch_is_not_a_machine_end(tmp_path):
     issue = 8
     store = Store(state_dir=str(tmp_path))
     world = WorldState(issues=(
@@ -1038,17 +1042,15 @@ def test_a_currently_running_dispatch_is_not_counted_as_a_process_death(tmp_path
         (InFlightFix(issue, frozenset({"src/x.py"})),),
     )
 
-    assert state.infra_deaths[issue] == 0
+    assert state.leg_ends.get(issue, ()) == ()
     assert state.inflight == (InFlightFix(issue, frozenset({"src/x.py"})),)
 
 
-def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
+def test_a_raise_path_death_is_one_machine_end_not_two(tmp_path):
     """Anti-double-count, driven through the REAL write side. A pre-result
-    transport death the process SURVIVED bumps the store counter AND emits a
-    settled `transport_death` line, so the journal reconstruction must net it to
-    zero. Counting it twice would halve MAX_INFRA_DEATHS for the exact failure
-    mode it was tuned on — and would make the fix role escalate a healthy issue
-    after two flaky sessions."""
+    transport death the process SURVIVED is reclaimed AND emits a settled
+    `transport_death` journal line; the backoff reads the run table only, so
+    it sees exactly one machine end."""
     issue = 8
     gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
     store = Store(state_dir=str(tmp_path))
@@ -1060,11 +1062,7 @@ def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
             return await super().run(task)
     runner = JournalingRuntime(LaunchedDeath(), journal, repo="o/r", role="fix")
     d = _dispatcher(gw, store, runner)
-
-    def world():
-        return WorldState(issues=(
-            IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
-        ))
+    world = WorldState(issues=(IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),))
 
     with pytest.raises(RuntimeError):
         asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
@@ -1072,18 +1070,7 @@ def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
     events = read_events(journal.path)
     assert [e["event"] for e in events] == ["agent_run_start", "agent_run"]
     assert events[1]["exit_reason"] == "transport_death"
-    assert issue_recovery_state(store, issue).infra_failures == 1
-    assert _fix_state(store, world()).infra_deaths[issue] == 1, "counted once"
-    # …and one more of the same still leaves the cap-of-3 breaker untripped.
-    with pytest.raises(RuntimeError):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert _fix_state(store, world()).infra_deaths[issue] == 2
-    assert _has_run(decide_fix(world(), _cfg(max_infra_deaths=3),
-                               _fix_state(store, world()), False), AgentKind.RESOLVE)
-
-
-
-
+    assert [end.machine for end in _fix_state(store, world).leg_ends[issue]] == [True]
 
 
 # ── steward: the third role P0R-3 names, bounded on the SAME two mechanisms ────
@@ -1217,30 +1204,13 @@ def test_jira_legacy_death_gate_preserves_its_own_history(tmp_path, monkeypatch)
         jira_sync=True, jira_project_key="ABC", max_infra_deaths=2)
     world = replace(_triaged(), issues=(replace(_triaged().issues[0], labels=frozenset({Label.AI_READY})),))
     assert decide(world) == [RunAgent(AgentKind.JIRA_SYNC, 30)]
-    store.bump_infra_deaths(30)
+    Path(store.issue_path(30, "infra-deaths")).write_text("1")
     assert decide(world) == [RunAgent(AgentKind.JIRA_SYNC, 30)]
     control = store._steward_control
     control.start_run(RunId("legacy-jira-death"), json.dumps({"breaker_key": 30}),
         "JIRA_SYNC", store._steward_owner, "fixture", state="abandoned")
     assert decide(world) == []
     assert control.abandoned_dispatch_counts(store._steward_owner) == {30: 1}
-
-
-def test_real_steward_policy_does_not_change_jira_deterministic_charge(tmp_path, monkeypatch):
-    from issue_agent.app import roles
-    from issue_agent.adapters.runtime_plan import McpServer
-    from tests.app.test_dispatch import RaisingRunner
-    monkeypatch.setattr(roles, "mcp_servers_from_file", lambda *args, **kwargs:
-        (McpServer(name="atlassian", config={"type": "http"}, tools="mcp__atlassian__*"),))
-    daemon = _steward_daemon(tmp_path, MAX_INFRA_DEATHS="3", JIRA_SYNC="1", JIRA_PROJECT_KEY="ABC")
-    dispatcher = _steward_dispatcher(daemon)
-    assert dispatcher.steward_workflow.cfg.infra_ceiling == 3
-    dispatcher.jira_workflow.gateway = FakeGateway(issues={30:
-        IssueView(30, title="t", body="b", labels=frozenset({Label.AI_READY}))})
-    dispatcher.jira_workflow.runner = RaisingRunner(RuntimeError("exceeded maximum buffer size"))
-    with pytest.raises(RuntimeError):
-        asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.JIRA_SYNC, 30)))
-    assert dispatcher.store.get_infra_deaths(30) == 1
 
 
 def test_modern_steward_reclaim_does_not_feed_jira_legacy_gate(tmp_path, monkeypatch):
@@ -1290,28 +1260,14 @@ def test_the_steward_suppression_is_per_issue(tmp_path, monkeypatch):
 
 
 # ── infra-death key split (review P1R-1) ───────────────────────────────────────
-def test_issue_sql_episode_reaches_ceiling_without_unioning_historical_orphan_file(tmp_path):
-    store = Store(str(tmp_path))
-    pr = _ci_pr(5)
-    w = WorldState(prs=(pr,))
-    _fix_state(store, w)
-    for _ in range(5):
-        seed_infra_outcome(store._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
-    store.bump_infra_deaths(-100)
-    state = _fix_state(store, w)
-    assert state.infra_deaths[5] == 5
-    assert not _has_run(decide_fix(w, _cfg(max_infra_deaths=5), state, False), AgentKind.FIX_CI)
-    assert store.get_infra_deaths(-100) == 1
-
-
-def test_issueless_pr_has_no_invented_issue_failure_episode(tmp_path):
+def test_issueless_pr_has_no_invented_issue_machine_history(tmp_path):
     store = Store(str(tmp_path))
     pr = observed_pr(100, head_ref_name="chore/no-issue-here", closing_issue=None,
         checks=(Check("unit", bucket="fail"),), labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT)
     w = WorldState(prs=(pr,))
-    store.bump_infra_deaths(-100)
+    Path(store.issue_path(-100, "infra-deaths")).write_text("1")
     state = _fix_state(store, w)
-    assert -100 not in state.infra_deaths
+    assert -100 not in state.leg_ends
     assert not _has_run(decide_fix(w, _cfg(), state, False), AgentKind.FIX_CI)
 
 

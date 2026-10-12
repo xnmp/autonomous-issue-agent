@@ -228,11 +228,12 @@ accounting holds before this check. There is no retained-money exception or
 `unreturned_acknowledged_money_retained` event; acknowledgments use
 `unreturned_acknowledged` and follow the ordinary settled-money rule.
 The acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
-or settlement), charges the paired issue allowance one attempt so existing
-breakers still bound retries, and changes only the exact current admissions.
+or settlement), charges no attempt (a launched repair that never returned is a
+machine failure, spaced by the per-issue backoff), and changes only the exact
+current admissions.
 The acknowledgment preserves existing session/model provenance. A late real
 result is captured and corrects any estimated charge through the shared settlement
-path, while the acknowledgment continues to prevent duplicate attempt debt and
+path, while the acknowledgment continues to prevent replayed workflow effects and
 changes to newer workflow state. Recovery shares the
 existing ceiling of 32 completions per reconciliation pass.
 
@@ -379,30 +380,18 @@ Every paid run is bounded by layered breakers, because the failure mode
 that matters is not "wrong answer" but "loop that bills forever":
 
 - per-leg retry counters (`ci`, `review`, `rebase`, `resolve`) → escalate at cap
-- `MAX_INFRA_DEATHS` / `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — a *separate, higher*
-  ceiling for sessions that die before returning a result, which deliberately do
-  not count as attempts. Refusals minted before admission
-  (`return_authority_unavailable`: no run, so no episode receipt) spend the same
-  ceiling through a per-issue `level_state` row scoped to the issue-recovery
-  episode and re-arm generation; the next admitted run or a generation/episode
-  change (the operator's re-arm) clears it, a corrupt row holds only that issue
-  until that re-arm deletes it, and nothing prunes it on observation (a partial
-  fetch must not reset a live ceiling). Every refusal counts, whatever its
-  cause, so each issue is bounded. Refusals are also infra-class, so they reach
-  `INFRA_BREAKER` like any infra death: in a deployment outage the breaker trips
-  once two or more issues fail and gates dispatch, and issues escalate
-  individually only after repeated re-probes. If the
-  ledger write itself fails, the issue fails closed from an in-memory marker.
-  Bounded residual: the marker is lost on every restart and every hot reload
-  (re-exec), costing at most one uncounted refusal per lost write.
-- `INFRA_BREAKER` — the deployment-wide twin of the per-issue infra ceiling.
-  `INFRA_BREAKER_DEATHS` infra-class deaths over ≥2 distinct issues inside
-  `INFRA_BREAKER_WINDOW_SECONDS` cannot be about any one issue, so paid
-  admission pauses for the whole fix role, once, with a cause and the
-  remediation already attempted (`infra.breaker.tripped.v1`). It re-arms on the
-  next leg that returns a result, or after `INFRA_BREAKER_COOLDOWN_SECONDS`
-  (`infra.breaker.cleared.v1`). One issue dying repeatedly stays
-  `MAX_INFRA_DEATHS`'s business. State is in-memory: a restart re-arms.
+- machine failures (provider overload or quota, OOM, a killed, cancelled or
+  unreturned process, a runtime that never started, a refusal before
+  admission) are never attempts and never escalate. The next fix dispatch of
+  the same kind for the same issue waits `min(60s * 2^(n-1), 1h)` after the
+  last machine end, `n` consecutive machine ends since the last normal return
+  (`domain/backoff.py`). The input is the run table plus each run's
+  `fix-infra-outcome` receipt; a run ended without a normal-return receipt is a
+  machine end. Nothing is stored for it, and only the money caps bound the
+  retries. Pre-admission refusals mint no run, so they retry each poll at $0.
+- `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — the reviewer's ceiling on paid rounds that
+  advanced nothing. `MAX_INFRA_DEATHS` survives only as the steward lanes'
+  ceiling and dies with the steward.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices streamed rollout counters and kills the process group on
   crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
@@ -455,10 +444,10 @@ non-terminal (tracked from SDK `task_started` / `task_notification` /
 `task_updated`) cannot ever receive that task's notification. The runner
 reclassifies it as an infra-class `BACKGROUND_CHILD_PENDING` error instead of a
 human-input block; resume parks the issue back to `ai-ready`, and the ordinary
-consecutive-infra ceiling bounds repeats. Only `blocked` is rewritten.
+machine-failure backoff spaces repeats. Only `blocked` is rewritten.
 
-Counters decay on any leg that returns a result, so the ceilings bound
-*consecutive* failure rather than accumulating over a healthy issue's lifetime.
+The machine backoff restarts on any leg that returns normally, so it spaces
+*consecutive* machine failures rather than accumulating over an issue's lifetime.
 
 `tests/app/test_convergence.py` is the regression guard for this whole class:
 each scenario drives a real `Daemon` tick loop over the real workflow, dispatcher,
@@ -613,7 +602,8 @@ narrow conditions under which it may state a verdict rather than facts),
 `domain/measurement.py` (validated incident/intervention observations),
 `domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
 `domain/governor_policy.py`, `domain/git_remote.py`, `domain/identity.py`,
-`domain/infra_breaker.py`, `domain/jira.py`,
+`domain/backoff.py` (per-item machine-failure backoff derived from ended
+legs), `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
@@ -717,7 +707,7 @@ adapters live under `adapters/dashweb/`.
 `app/` — composition and use-case orchestration:
 `app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
 `app/dispatch.py`, `app/gate_check.py` (absolute advisory gate entry),
-`app/execute.py`, `app/identity_pools.py`, `app/infra_breaker.py`,
+`app/execute.py`, `app/identity_pools.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
 `app/measurement.py` (local observation/export transport and cohort specification),

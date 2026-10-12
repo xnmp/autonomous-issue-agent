@@ -50,11 +50,11 @@ def test_settled_recovery_preserves_prior_session_and_money_and_accepts_late_cap
     assert control.reconcile_pr_repair_returns() == 1
     assert control.read_pr_repair(key).component.state == prior
     assert issue_ci_state(files).pending_rebase is None
-    assert issue_ci_state(files).rebase_failures == 2
+    assert issue_ci_state(files).rebase_failures == 1  # the unreturned run is not an attempt
     assert _money(store) == money
     assert store.settle_pr_repair_result(result, control.writer).idempotent
     assert control.read_pr_repair(key).component.state == prior
-    assert issue_ci_state(files).rebase_failures == 2
+    assert issue_ci_state(files).rebase_failures == 1
     assert _money(store) == money
     assert control.reconcile_pr_repair_returns() == 0
 

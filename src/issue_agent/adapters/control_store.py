@@ -74,6 +74,7 @@ from ..domain.workflow_reconciliation import (
     prewrite_evidence_gate_id, unavailable_prewrite_read, unavailable_reconciliation, unknown_outcome_history,
 )
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
+from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.outcome import AuthorFollowup, ExitReason, author_followup
 from ..domain.resolve_split import MAX_SPLIT_TRAIL, AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
 from ..domain.events import (
@@ -2484,10 +2485,6 @@ _KNOWN_SCHEMA_DIGESTS = {
 }
 
 
-class UnclassifiedFixInfraHistory(WorkflowAuthorityError):
-    """Selected pre-F7 work lacks an authoritative consecutive-failure boundary."""
-
-
 class SQLiteControlStore:
     """One SQLite database, safe for threads and cooperating daemon processes."""
 
@@ -2516,7 +2513,6 @@ class SQLiteControlStore:
         self._flushing_outbox = False
         self._bound_owner_id: str | None = None
         self._telemetry_enqueue_failures = 0
-        self._unrecorded_refusals: set[tuple[str, int]] = set()
 
     @property
     def telemetry_enqueue_failures(self) -> int:
@@ -4019,11 +4015,6 @@ class SQLiteControlStore:
                 ).rowcount
                 if not updated:
                     continue
-                infra = self._fix_infra_admission(db, run_id)
-                if infra is not None:
-                    from ..domain.workflow_identity import WorkflowWriter
-                    self._record_fix_infra(db, run_id, cc.FixInfraOutcome.RECLAIMED,
-                        WorkflowWriter(infra[0].attempt.binding.fence.key.repository, "fix", identity[2]), captured=infra)
                 self._record_steward_recovery(db, run_id, cc.StewardFailureKind.RECLAIMED,
                                               recovery_owner=identity[2])
                 retained_reason = (
@@ -4917,82 +4908,27 @@ class SQLiteControlStore:
                 ),
             )
 
-    # Pre-admission refusals (accounting_runtime._return_refused) mint no run,
-    # so the infra episode's receipt-driven charge never sees them (#262). This
-    # level ledger is their ceiling input: the fix role adds it to the episode's
-    # infra_failures, and any admitted run on the issue clears it.
-    _REFUSAL_NAMESPACE = "fix-admission-refusals"
+    def fix_leg_ends(self, repository: str, issue: int) -> tuple[LegEnd, ...]:
+        """Every ended fix leg for one issue, classified machine or not.
 
-    # One row per issue, each mutated in its own BEGIN IMMEDIATE transaction:
-    # fix legs dispatch from a thread pool, so a whole-scope read-modify-write
-    # would lose a concurrent refusal or clear. `episode` scopes a count to one
-    # issue-recovery episode/generation; a count from another episode reads 0.
-    def fix_admission_refusals(self, repository: str, issue: int, episode: str) -> int:
+        The per-run `fix-infra-outcome` receipt carries the runtime's own
+        classification. A run ended without one never returned normally
+        (cancelled, reclaimed or released before any return): a machine end.
+        """
         with closing(self._connect()) as db, db:
-            row = db.execute(
-                "SELECT payload_json FROM level_state WHERE namespace=? AND scope=? AND key=?",
-                (self._REFUSAL_NAMESPACE, repository, str(issue)),
-            ).fetchone()
-        return self._refusal_count(row, episode)
-
-    @staticmethod
-    def _refusal_count(row, episode: str) -> int:
-        if row is None:
-            return 0
-        try:
-            payload = json.loads(row["payload_json"])
-            count, stored = payload["count"], payload["episode"]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise CorruptControlStore("invalid fix admission refusal row") from exc
-        if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(stored, str):
-            raise CorruptControlStore("invalid fix admission refusal row")
-        return count if stored == episode else 0
-
-    # In memory by necessity: it records that the DURABLE write failed, so it
-    # cannot itself be durable. Bounded residual: a restart forgets it, costing
-    # at most one uncounted refusal per lost write (architecture.md).
-    def fix_refusal_unrecorded(self, repository: str, issue: int) -> bool:
-        """True while a refusal for this issue could not be written: its ceiling
-        position is unknown, so callers must not admit paid work (ADR 0012)."""
-        return (repository, issue) in self._unrecorded_refusals
-
-    def record_fix_admission_refusal(self, repository: str, issue: int, episode: str, detail: str) -> int:
-        try:
-            with self.transaction() as db:
-                row = db.execute(
-                    "SELECT payload_json FROM level_state WHERE namespace=? AND scope=? AND key=?",
-                    (self._REFUSAL_NAMESPACE, repository, str(issue)),
-                ).fetchone()
-                count = self._refusal_count(row, episode) + 1
-                db.execute(
-                    "INSERT INTO level_state(namespace, scope, key, payload_json, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(namespace, scope, key) DO UPDATE SET "
-                    "payload_json=excluded.payload_json, updated_at=excluded.updated_at",
-                    (self._REFUSAL_NAMESPACE, repository, str(issue),
-                     _json({"count": count, "episode": episode, "detail": detail[:500]}),
-                     _stamp(self._now())),
-                )
-        except Exception:
-            self._unrecorded_refusals.add((repository, issue))
-            raise
-        self._unrecorded_refusals.discard((repository, issue))
-        return count
-
-    def clear_fix_admission_refusals(self, repository: str, issue: int) -> None:
-        with self.transaction() as db:
-            db.execute(
-                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
-                (self._REFUSAL_NAMESPACE, repository, str(issue)),
-            )
-
-    def record_fix_refusal_ledger_fault(self, issue: int, operation: str, detail: str) -> None:
-        """Journal a ledger read/write/clear that failed (ADR 0012: no silent swallow)."""
-        with self.transaction() as db:
-            self._event(
-                db,
-                TelemetryWarning("fix_admission_refusal_ledger_fault", detail[:500], {"operation": operation}),
-                correlation=Correlation(issue=issue),
-            )
+            rows = db.execute(
+                "SELECT r.kind, r.completed_at, "
+                "json_extract(k.payload_json,'$.value.fields.outcome.value') IS NOT 'returned_normal' AS machine "
+                "FROM runs r INDEXED BY runs_fix_issue_dispatch "
+                "LEFT JOIN dedupe_keys k ON k.namespace='fix-infra-outcome' AND k.scope=? AND k.key=r.run_id "
+                f"WHERE {_FIX_ISSUE_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? AND {_FIX_DISPATCH_ISSUE}=? "
+                "AND r.completed_at IS NOT NULL",
+                (repository, repository, issue),
+            ).fetchall()
+        return tuple(
+            LegEnd(kind, _parse_stamp(row["completed_at"]), bool(row["machine"]))
+            for row in rows if (kind := dispatched_kind(row["kind"])) is not None
+        )
 
     def record_world_observation(
         self,
@@ -5734,8 +5670,6 @@ class SQLiteControlStore:
                          cc.select_issue_recovery(aggregate) if family is WorkflowFamily.ISSUE_RECOVERY else cc.select_steward(aggregate)) if aggregate is not None else None
             if isinstance(selection, cc.SelectedPRRepair) and isinstance(purchase, cc.PRRepairPurchase) and purchase.branch:
                 self._validate_pr_repair_sources(db, selection)
-            if isinstance(selection, cc.SelectedIssueRecovery):
-                self._require_fix_infra_projection(db, selection)
             if (not isinstance(selection, (cc.SelectedIssueRecovery, cc.SelectedPRRepair, cc.SelectedSteward))
                     or getattr(aggregate, "gates", ()) or selection.component.gates
                     or not (selection.binding == admission.attempt.binding and admission.admission_version <= selection.revision.version
@@ -5888,7 +5822,6 @@ class SQLiteControlStore:
                     if not isinstance(selection, cc.SelectedIssueRecovery):
                         raise ValueError("issue recovery is inactive or migration blocked")
                     self._require_issue_reply_projection(db, key, selection.component.state.consumed_reply_at)
-                    self._require_fix_infra_projection(db, selection)
                     if isinstance(purchase, cc.IssueInfraPurchase):
                         if selection.binding != capture.binding or selection.component.gates:
                             raise ValueError("fix infrastructure capture is stale or held")
@@ -6820,8 +6753,6 @@ class SQLiteControlStore:
         with self.transaction() as db:
             aggregate = load_issue_aggregate(db, key)
             selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
-            if isinstance(selected, cc.SelectedIssueRecovery):
-                self._require_fix_infra_projection(db, selected)
             if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.pending_ci is not None:
                 pending = selected.component.state.pending_ci
                 purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
@@ -7299,41 +7230,6 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("continuation return conflicts with its actual run binding")
         return captured[0], row
 
-    def _require_fix_infra_projection(self, db, selected: cc.SelectedIssueRecovery) -> None:
-        episode = selected.component.state.infra_episode
-        if episode is None:
-            # A stopped schema upgrade fences older writers. One earliest admitted
-            # F7 capture can preserve a pristine baseline; prior uncaptured work
-            # requires a real returned reset, never a reconstructed lifetime total.
-            key = selected.binding.fence.key
-            prefix = json.dumps((*workflow_scope(key), WorkflowFamily.RESOLVE.value), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
-            primary = db.execute("SELECT run_id FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? LIMIT 1",
-                (prefix, prefix + "\uffff")).fetchone()
-            first = db.execute(f"SELECT run_id FROM runs INDEXED BY runs_fix_issue_dispatch "
-                f"WHERE {_FIX_ISSUE_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? AND {_FIX_DISPATCH_ISSUE}=? "
-                "ORDER BY rowid LIMIT 1", (key.repository, key.target.number)).fetchone()
-            for row in (primary, first):
-                if row is None:
-                    continue
-                captured = self._fix_infra_admission(db, RunId(row["run_id"]))
-                if captured is None or captured[3].capture.fix_infra_ceiling is None:
-                    raise UnclassifiedFixInfraHistory("selected pre-F7 fix run lacks its infrastructure episode")
-            if primary is None and first is None and selected.component.watermarks.last_admitted:
-                raise UnclassifiedFixInfraHistory("selected pre-F7 issue work lacks its infrastructure episode")
-            return
-        source = episode.source
-        purchase, _ = self._continuation_return_admission(db, source, WorkflowFamily.ISSUE_RECOVERY)
-        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome' AND scope=? AND key=?",
-            (selected.binding.fence.key.repository, str(source.attempt.run_id))).fetchone()
-        if row is None:
-            raise WorkflowAuthorityError("fix infrastructure episode lacks its selected outcome receipt")
-        receipt = decode_workflow(row[0], cc.FixInfraReceipt)
-        policy = max(1, purchase.capture.fix_infra_ceiling or 0)
-        charges = {0} if receipt.outcome is cc.FixInfraOutcome.RETURNED_NORMAL else {1} if receipt.outcome is cc.FixInfraOutcome.RECLAIMED else {policy} if receipt.outcome is cc.FixInfraOutcome.DETERMINISTIC_DEATH else {1, policy}
-        if (receipt.admission != source or receipt.episode != episode or receipt.failures != selected.component.state.infra_failures
-                or receipt.charge not in charges):
-            raise WorkflowAuthorityError("fix infrastructure episode disagrees with its exact selected receipt")
-
     def _fix_infra_admission(self, db, run_id: RunId):
         row = db.execute("SELECT continuations_json,dispatch_id,state,outcome FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         if row is None:
@@ -7367,51 +7263,20 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError("fix infrastructure admission differs from actual issue dispatch")
         return admission, provenance, row, purchase
 
-    def record_fix_infra_return(self, run_id: RunId, outcome: cc.FixInfraOutcome, writer) -> None:
+    def record_fix_infra_return(self, run_id: RunId, writer) -> None:
+        """Record that a fix run returned normally. Any ended fix run without
+        this receipt (died, reclaimed, refused, machine-class return) is a
+        machine end to the backoff (`fix_leg_ends`)."""
         with self.transaction() as db, self.mutation_savepoint(db):
-            self._record_fix_infra(db, run_id, outcome, writer)
-
-    def _record_fix_infra(self, db, run_id: RunId, outcome: cc.FixInfraOutcome, writer, *, captured=None) -> None:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        if not isinstance(outcome, cc.FixInfraOutcome):
-            raise ValueError("fix infrastructure outcome requires a fixed classification")
-        captured = captured if captured is not None else self._fix_infra_admission(db, run_id)
-        if captured is None:
-            return
-        admission, provenance, run, purchase = captured
-        failure_charge = 1
-        if outcome is cc.FixInfraOutcome.DETERMINISTIC_DEATH:
-            failure_charge = max(1, purchase.capture.fix_infra_ceiling or 0)
-        self._require_repair_writer(db, writer, admission, provenance["owner_id"])
-        if run["outcome"] == "unlaunched_released":
-            return
-        key = admission.attempt.binding.fence.key
-        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome' AND scope=? AND key=?",
-            (key.repository, str(run_id))).fetchone()
-        previous = decode_workflow(raw[0], cc.FixInfraReceipt) if raw is not None else None
-        aggregate = load_issue_aggregate(db, key)
-        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
-        if isinstance(selected, cc.SelectedIssueRecovery):
-            try:
-                self._require_fix_infra_projection(db, selected)
-            except UnclassifiedFixInfraHistory:
-                if outcome is not cc.FixInfraOutcome.RETURNED_NORMAL:
-                    after, receipt = None, previous or cc.FixInfraReceipt(admission, outcome, selected.component.state.infra_failures, None)
-                else:
-                    after, receipt = cc.apply_fix_infra(selected, admission, outcome, previous, failure_charge=failure_charge)
-            else:
-                after, receipt = cc.apply_fix_infra(selected, admission, outcome, previous, failure_charge=failure_charge)
-        else:
-            after, receipt = None, previous or cc.FixInfraReceipt(admission, outcome, 0, None)
-        if raw is not None and encode_workflow(receipt) == raw[0]:
-            return
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('fix-infra-outcome',?,?,?,?) "
-                   "ON CONFLICT(namespace,scope,key) DO UPDATE SET payload_json=excluded.payload_json",
-            (key.repository, str(run_id), _stamp(self._now()), encode_workflow(receipt)))
-        if after is not None:
-            assert aggregate is not None
-            persist_workflow_snapshot(db, replace(aggregate,
-                revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version + 1), issue_recovery=after))
+            captured = self._fix_infra_admission(db, run_id)
+            if captured is None:
+                return
+            admission, provenance, _, _ = captured
+            self._require_repair_writer(db, writer, admission, provenance["owner_id"])
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('fix-infra-outcome',?,?,?,?) "
+                       "ON CONFLICT(namespace,scope,key) DO NOTHING",
+                (admission.attempt.binding.fence.key.repository, str(run_id), _stamp(self._now()),
+                 encode_workflow(cc.FixInfraReceipt(admission, cc.FixInfraOutcome.RETURNED_NORMAL))))
 
     def _linked_issue_reply_admission(self, db, attempt: WorkflowAttemptIdentity, run):
         purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueReplyPurchase)]
@@ -7484,8 +7349,9 @@ class SQLiteControlStore:
             if prior is not None and family is WorkflowFamily.PR_REPAIR:
                 acknowledged = decode_workflow(prior["payload_json"], tuple)
                 if acknowledged == (admission, cc.PRRepairUnreturned(admission)):
-                    # Attempt debt was already applied. Capture the real output
-                    # and correct money without replaying paired workflow effects.
+                    # Recovery already classified the run (no attempt) and cleared
+                    # its pending source. Capture the real output and correct
+                    # money without replaying paired workflow effects.
                     return self._settle(db, request)
             if prior is not None and prior["payload_json"] != encoded:
                 raise WorkflowAuthorityError("continuation return conflicts with its immutable result")
@@ -7543,7 +7409,6 @@ class SQLiteControlStore:
                         raise WorkflowAuthorityError("issue return lost its issue aggregate")
                     applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
                                       ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci,
-                                      infra_failures=component.state.infra_failures, infra_episode=component.state.infra_episode,
                                       review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
                                       pending_rebase=component.state.pending_rebase)
                     after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
@@ -8479,26 +8344,27 @@ class SQLiteControlStore:
         self._finish_pr_repair_without_return(db, run_id, launched=False)
 
     def _finish_pr_repair_without_return(self, db, run_id: RunId, *, launched: bool) -> None:
-        # A launched run without a captured return still consumed its paired
-        # allowance: it is charged as an attempt so existing breakers bound it,
-        # while the repair side records no output, session or settlement.
+        # A launched run without a captured return is a machine end, never an
+        # attempt (#994: cancelled rebases walked a PR to its ceiling). The
+        # paired allowance is released uncharged; the repair side records no
+        # output, session or settlement.
         from .workflow_rows import persist_workflow_snapshot
         run = db.execute("SELECT continuations_json,dispatch_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         for purchase in decode_workflow(run[0], tuple):
             if isinstance(purchase, cc.IssueRebasePurchase):
                 admission = self._rebase_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
                 self._apply_rebase_result(db, cc.RebaseRepairResult(admission,
-                    cc.RebaseCharge.ATTEMPT if launched else cc.RebaseCharge.NOT_LAUNCHED))
+                    cc.RebaseCharge.NOT_ATTEMPT if launched else cc.RebaseCharge.NOT_LAUNCHED))
                 continue
             if isinstance(purchase, cc.IssueReviewPurchase):
                 admission = self._review_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
                 self._apply_review_result(db, cc.ReviewRepairResult(admission,
-                    cc.ReviewCharge.ATTEMPT if launched else cc.ReviewCharge.NOT_LAUNCHED))
+                    cc.ReviewCharge.NOT_ATTEMPT if launched else cc.ReviewCharge.NOT_LAUNCHED))
                 continue
             if isinstance(purchase, cc.IssueCIPurchase):
                 admission = self._ci_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
                 self._apply_ci_result(db, cc.CIRepairResult(admission,
-                    cc.CICharge.ATTEMPT if launched else cc.CICharge.NOT_LAUNCHED))
+                    cc.CICharge.NOT_ATTEMPT if launched else cc.CICharge.NOT_LAUNCHED))
                 continue
             if not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch:
                 continue

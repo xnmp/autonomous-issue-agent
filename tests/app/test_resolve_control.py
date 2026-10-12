@@ -232,7 +232,7 @@ def _compose(deployment):
     return workflow, cfg, store, issue
 
 
-def test_composed_holds_preserve_labels_and_sql_infra_episode(deployment):
+def test_composed_holds_are_labels_and_machine_deaths_never_hold(deployment):
     workflow, cfg, store, issue = _compose(deployment)
     labels = frozenset({Label.AI_BLOCKED, Label.AI_PARKED, Label.NEEDS_BUDGET_REVIEW})
     observed = replace(issue, issue=replace(issue.issue, labels=labels))
@@ -240,20 +240,16 @@ def test_composed_holds_preserve_labels_and_sql_infra_episode(deployment):
     from tests.fakes.accounted_workflow import seed_infra_outcome
     from issue_agent.domain import continuation_components as cc
     control = deployment[2]
-    for _ in range(cfg.max_infra_deaths - 1):
-        seed_infra_outcome(control, 1, cc.FixInfraOutcome.RETURNED_INFRA, owner_id=workflow.control.writer.owner_id)
-    assert "infrastructure failure ceiling" not in workflow.external_holds(issue)
-    control = deployment[2]
-    seed_infra_outcome(control, 1, cc.FixInfraOutcome.RECLAIMED, owner_id=workflow.control.writer.owner_id, reclaim=True)
-    assert set(workflow.external_holds(observed)) == {label.value for label in labels} | {
-        "infrastructure failure ceiling",
-    }
-    unrelated = replace(issue, key=resolve_snapshot(2).binding.fence.key, issue=replace(issue.issue, number=2))
-    assert workflow.external_holds(unrelated) == ()
+    for _ in range(10):
+        seed_infra_outcome(control, 1, owner_id=workflow.control.writer.owner_id)
+    seed_infra_outcome(control, 1, owner_id=workflow.control.writer.owner_id, reclaim=True)
+    assert workflow.external_holds(issue) == ()
+    assert set(workflow.external_holds(observed)) == {label.value for label in labels}
 
 
-@pytest.mark.parametrize("reader", ["read_issue_recovery"])
+@pytest.mark.parametrize("reader", ["read_issue_recovery", "fix_leg_ends"])
 def test_unavailable_hold_reader_is_not_treated_as_clear(deployment, monkeypatch, reader):
+    """The re-arm refuses on the same unreadable authority the fixer holds on."""
     workflow, cfg, store, issue = _compose(deployment)
     def unavailable(*args, **kwargs):
         raise ValueError("hold authority unavailable")

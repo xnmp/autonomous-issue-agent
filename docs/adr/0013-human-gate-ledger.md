@@ -1,6 +1,6 @@
 # ADR 0013 — Human gates are a ledger, not labels plus events
 
-Governs: src/issue_agent/domain/infra_breaker.py src/issue_agent/domain/dashboard.py
+Governs: src/issue_agent/domain/dashboard.py
 
 Status: proposed (2026-08-02). Motivating incidents: the 2026-08-02 keifu
 supervised session, especially issue #25 / PR #173.
@@ -85,10 +85,9 @@ escalation sites open gates; the review-ceiling and budget paths (the two that
 bit) migrate first; label-implied blocked states remain readable until their
 sites are touched. No big-bang rewrite.
 
-`domain/infra_breaker.py` is the first site written to this shape inside
-today's representation: it has no gate row to open yet, so its cause predicate
-and attempted remediation ride the journal event and the operator line instead.
-`BreakerTrip` is what opens the row when the table lands.
+The deployment-wide infra breaker that first used this shape was deleted in
+the 2026-10 subtractive refactor (slice 3): a machine failure never opens a
+gate; it backs off and only the money caps bound it.
 
 ## Alternatives considered
 

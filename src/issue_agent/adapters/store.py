@@ -156,26 +156,10 @@ class Store:
         )
         return history
 
-    # Jira retains its existing counter and ceiling policy. The stopped review
-    # activation reader also observes it once; selected fix/steward episodes
-    # neither consume nor update this counter.
+    # Legacy infra-death files, read only by the stopped review activation
+    # import and the steward's Jira gate; nothing writes them any more.
     def get_infra_deaths(self, key: int) -> int:
         return self._read_int(self.issue_path(key, "infra-deaths"))
-
-    def bump_infra_deaths(self, key: int) -> int:
-        path = self.issue_path(key, "infra-deaths")
-        n = self._read_int(path) + 1
-        self._write(path, str(n))
-        return n
-
-    def set_infra_deaths(self, key: int, count: int) -> None:
-        """Write the counter directly, for a death that is worth more than one
-        life. A DETERMINISTIC death (#13) reproduces on every retry, so charging
-        it 1 buys the identical unwinnable dispatch cap-1 more times; the
-        dispatcher saturates the counter instead and the role's existing ceiling
-        escalates on the next poll. Monotonic at the call site (max of current
-        and the cap) — a saturate must never lower a tally."""
-        self._write(self.issue_path(key, "infra-deaths"), str(max(0, int(count))))
 
     # ── stall watchdog markers (no-silent-forever) ──
     # (signature, since_iso) per watched target: the observable state last

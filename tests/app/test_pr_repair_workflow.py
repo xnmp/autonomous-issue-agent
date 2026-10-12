@@ -22,6 +22,7 @@ from tests.app.test_dispatch import FakeGateway, FakeRunner, FakeStore
 from tests.app.test_fix_workflow import _workflow
 from tests.fakes.review_workflow import held
 from tests.fakes.workflow_authority import install_workflow
+from tests.fakes.accounted_workflow import machine_ends
 
 
 def test_fix_ci_without_active_pr_component_refuses_without_purchase():
@@ -205,7 +206,7 @@ def test_rows_persisted_with_retired_self_clear_state_load_and_the_issue_proceed
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
 
 
-def test_fix_infra_return_and_exact_recovery_count_one_issue_death():
+def test_fix_infra_return_and_exact_recovery_record_one_machine_end_and_no_ci_debt():
     from issue_agent.domain.outcome import ExitReason
     workflow, files, inner, key = active_ci_workflow(AgentResult(
         is_error=True, status="timeout", exit_reason=ExitReason.TRANSPORT_DEATH, cost_usd=.01))
@@ -217,20 +218,20 @@ def test_fix_infra_return_and_exact_recovery_count_one_issue_death():
     files._workflow_db.settle_pr_repair_result(recorded, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"))
 
     state = issue_ci_state(files)
-    assert state.infra_failures == 1
+    assert machine_ends(files) == [True]
     assert state.ci_failures == 0 and state.pending_ci is None
     assert len(inner.tasks) == 1
     with files._workflow_db.transaction() as db:
         assert db.execute("SELECT COUNT(*), SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
 
 
-def test_fix_noninfra_error_return_resets_sql_episode_after_reopen_without_erasing_ci_debt():
+def test_fix_infra_then_error_return_is_one_machine_end_and_one_ci_attempt_after_reopen():
     from issue_agent.domain.outcome import ExitReason
     from issue_agent.adapters.control_store import SQLiteControlStore
     workflow, files, inner, key = active_ci_workflow(AgentResult(
         is_error=True, status="timeout", exit_reason=ExitReason.TRANSPORT_DEATH, cost_usd=.01))
     asyncio.run(workflow.fix_ci(100))
-    assert issue_ci_state(files).infra_failures == 1
+    assert machine_ends(files) == [True]
     with files._workflow_db.transaction() as db:
         original = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
     inner.result = AgentResult(is_error=True, status="error", exit_reason=ExitReason.AGENT_ERROR, cost_usd=.01)
@@ -238,7 +239,7 @@ def test_fix_noninfra_error_return_resets_sql_episode_after_reopen_without_erasi
 
     reopened = SQLiteControlStore(files._workflow_db.path)
     selected = reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    assert selected.component.state.infra_failures == 0 and selected.component.state.ci_failures == 1
+    assert machine_ends(reopened) == [False, True] and selected.component.state.ci_failures == 1
     before = selected.component
     reopened.settle_pr_repair_result(original, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"))
     assert reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component == before
@@ -264,18 +265,19 @@ def test_fix_launched_death_and_reclaim_charge_once_keep_unknown_spend(monkeypat
     monkeypatch.setattr(inner, "run", lost_reply)
     with pytest.raises(RuntimeError, match="stream closed after paid launch"):
         asyncio.run(workflow.fix_ci(100))
-    assert issue_ci_state(files).infra_failures == 1
+    assert machine_ends(files) == [True]
     if not recovery_first:
         assert store.reclaim_dead_leases("o/r:fix:fixture", lambda *_: False) == ()
         # Exception retention already completed this run and removed its lease.
     assert store.reclaim_dead_leases("o/r:fix:fixture", lambda *_: False) == ()
     from issue_agent.adapters.control_store import SQLiteControlStore
     reopened = SQLiteControlStore(store.path)
-    assert reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state.infra_failures == 1
+    assert machine_ends(reopened) == [True]
+    assert reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state.ci_failures == 0
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("normal", [False, True])
@@ -291,79 +293,16 @@ def test_fix_reclaimed_run_actual_reply_classifies_once(monkeypatch, normal):
         store.register_process_lease(run_id, expected_owner_id="o/r:fix:fixture",
             pid=123, pgid=123, process_start_ticks=99)
         assert store.reclaim_dead_leases("o/r:fix:fixture", lambda *_: False) == (run_id,)
-        assert issue_ci_state(files).infra_failures == 1
+        assert machine_ends(files) == [True]
         return await original(task)
     monkeypatch.setattr(inner, "run", reclaimed_reply)
     asyncio.run(workflow.fix_ci(100))
-    assert issue_ci_state(files).infra_failures == (0 if normal else 1)
+    assert machine_ends(files) == [not normal]  # the actual reply wins over the in-flight reclaim
     assert issue_ci_state(files).ci_failures == (1 if normal else 0)
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*), SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
-        receipt = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0], cc.FixInfraReceipt)
-    assert receipt.outcome is (cc.FixInfraOutcome.RETURNED_NORMAL if normal else cc.FixInfraOutcome.RETURNED_INFRA)
-    store.record_fix_infra_return(receipt.admission.attempt.run_id, receipt.outcome, files._workflow_authority.writer)
-    assert issue_ci_state(files).infra_failures == (0 if normal else 1)
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == int(normal)
 
-
-@pytest.mark.parametrize("namespace", ["fix-infra-outcome", "continuation-admission"])
-def test_fix_missing_selected_infra_source_refuses_read_and_new_purchase(namespace):
-    from issue_agent.domain.outcome import ExitReason
-    workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=True, cost_usd=.01,
-        exit_reason=ExitReason.TRANSPORT_DEATH))
-    asyncio.run(workflow.fix_ci(100))
-    with files._workflow_db.transaction() as db:
-        if namespace == "continuation-admission":
-            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND key LIKE '%issue_recovery%'", (namespace,))
-        else:
-            db.execute("DELETE FROM dedupe_keys WHERE namespace=?", (namespace,))
-    with pytest.raises(WorkflowAuthorityError, match="episode|admission|continuation"):
-        files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    with pytest.raises(WorkflowAuthorityError, match="episode|admission|continuation"):
-        asyncio.run(workflow.fix_ci(100))
-    assert len(inner.tasks) == 1
-    with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
-
-
-def test_caught_fix_reclaim_receipt_failure_keeps_joint_mutation_retryable(monkeypatch):
-    import sqlite3
-    workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, cost_usd=.01))
-    store = files._workflow_db
-    original = store.reserve
-    captured = []
-    def interrupted(request):
-        assert original(request).admitted
-        captured.append(request)
-        raise RuntimeError("lost after admission before launch")
-    with monkeypatch.context() as patch:
-        patch.setattr(store, "reserve", interrupted)
-        with pytest.raises(RuntimeError, match="lost after admission"):
-            asyncio.run(workflow.fix_ci(100))
-    request = captured[0]
-    store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
-        pid=123, pgid=123, process_start_ticks=99)
-    before = issue_ci_state(files)
-    with store.transaction() as db:
-        db.execute("CREATE TRIGGER refuse_infra BEFORE INSERT ON dedupe_keys WHEN NEW.namespace='fix-infra-outcome' BEGIN SELECT RAISE(ABORT,'refused infra'); END")
-        @contextmanager
-        def borrowed():
-            yield db
-        with monkeypatch.context() as patch:
-            patch.setattr(store, "transaction", borrowed)
-            with pytest.raises(sqlite3.IntegrityError, match="refused infra"):
-                store.reclaim_dead_leases(request.owner_id, lambda *_: False)
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('scratch','o/r','outer','0','{}')")
-    assert issue_ci_state(files) == before
-    with store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 1
-        assert db.execute("SELECT state FROM runs").fetchone()[0] == "running"
-        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='scratch'").fetchone()[0] == 1
-        db.execute("DROP TRIGGER refuse_infra")
-    assert store.reclaim_dead_leases(request.owner_id, lambda *_: False) == (request.run_id,)
-    assert store.reclaim_dead_leases(request.owner_id, lambda *_: False) == ()
-    assert issue_ci_state(files).infra_failures == 1
 
 def pr_reply_workflow(*, establish_session=True, body="Use A."):
     from issue_agent.domain.world import Comment, IssueView
@@ -428,8 +367,7 @@ def test_duplicate_pr_reply_purchases_one_resume_and_keeps_issue_marker_independ
     asyncio.run(workflow.resume_pr(100))
     asyncio.run(workflow.resume_pr(100))
     assert len(inner.tasks) == 2  # One initial CI leg and one reply-driven resume.
-    assert replace(issue_ci_state(files), infra_episode=before_issue.infra_episode) == before_issue
-    assert issue_ci_state(files).infra_failures == 0
+    assert issue_ci_state(files) == before_issue
     state = files._workflow_authority.read_pr_repair(key).component.state
     assert state.consumed_reply_at == "2026-10-02T00:00:01Z" and state.resumes == 1
     assert files.pr_resumed_at == {}
@@ -556,8 +494,7 @@ def test_same_head_relink_keeps_pr_consumption_and_does_not_grant_issue_allowanc
         Comment("alice", "new", "2026-10-02T00:00:02Z"),))
     asyncio.run(workflow.resume_pr(100))
     assert len(inner.tasks) == 3
-    assert replace(issue_ci_state(files, 6), infra_episode=before_issue.infra_episode) == before_issue
-    assert issue_ci_state(files, 6).infra_failures == 0
+    assert issue_ci_state(files, 6) == before_issue
     assert files._workflow_authority.read_pr_repair(key).component.state.resumes == 2
 
 
@@ -830,12 +767,12 @@ def test_rebase_charges_sql_allowance_and_exact_retry_preserves_sibling_debt():
     with files._workflow_db.transaction() as db:
         aggregate = load_issue_aggregate(db, issue_key)
         siblings = replace(aggregate.issue_recovery.state, ci_failures=2,
-            review_failures=cc.ReviewRetryState(count=3), resumes=4, infra_failures=5)
+            review_failures=cc.ReviewRetryState(count=3), resumes=4)
         persist_workflow_snapshot(db, replace(aggregate, issue_recovery=replace(aggregate.issue_recovery, state=siblings)))
     asyncio.run(workflow.rebase(100))
     assert len(inner.tasks) == 1
     after = issue_ci_state(files)
-    assert replace(after, infra_episode=siblings.infra_episode) == replace(siblings, rebase_failures=1, infra_failures=0)
+    assert after == replace(siblings, rebase_failures=1)
     assert files.sessions == {} and files.branches == {} and files.models == {}
     with files._workflow_db.transaction() as db:
         returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
@@ -845,7 +782,7 @@ def test_rebase_charges_sql_allowance_and_exact_retry_preserves_sibling_debt():
     assert len(inner.tasks) == 1
     with files._workflow_db.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 1
 
 
 def test_rebase_reopened_process_recovers_captured_result_once(monkeypatch):
@@ -935,7 +872,6 @@ def test_concurrent_rebase_admissions_purchase_only_one_current_attempt(monkeypa
     assert inner.tasks == [] and issue_ci_state(files).rebase_failures == 0
     assert issue_ci_state(files).pending_rebase is not None
     with store.transaction() as db:
-        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
 
@@ -990,8 +926,8 @@ def test_rebase_classifies_returned_charge_without_erasing_siblings(reason, coun
     before = issue_ci_state(files)
     asyncio.run(workflow.rebase(100))
     after = issue_ci_state(files)
-    assert replace(after, infra_episode=before.infra_episode) == replace(before, rebase_failures=count,
-        infra_failures=1 if reason == "transport_death" else 0)
+    assert after == replace(before, rebase_failures=count)
+    assert machine_ends(files) == [reason == "transport_death"]
 
 
 def test_rebase_proven_unlaunched_release_preserves_debt_and_allows_retry(monkeypatch):
@@ -1080,9 +1016,43 @@ def test_review_repair_preserves_primary_review_and_sibling_issue_allowances():
         after = load_review_workflow_row(db, key)
     assert (after.episode, after.execution, after.intent, after.gates) == (before.episode, before.execution, before.intent, before.gates)
     issue_after = issue_ci_state(files)
-    assert replace(issue_after, review_failures=issue_before.review_failures,
-                   infra_episode=issue_before.infra_episode) == issue_before
-    assert issue_after.infra_failures == 0
+    assert replace(issue_after, review_failures=issue_before.review_failures) == issue_before
+
+
+def test_held_repair_purchase_refusals_are_spaced_by_the_machine_backoff(monkeypatch):
+    """#262 / tauri PR #1019: ADDRESS_REVIEW refused before admission because
+    the PR repair purchase is held. Ticking every 30s, the refusal re-dispatches
+    only on the doubling machine backoff, buys nothing and never escalates."""
+    from datetime import datetime, timedelta, timezone
+    from issue_agent.app.roles import _fix_state
+    from issue_agent.domain.actions import AgentKind, Relabel, RunAgent
+    from issue_agent.domain.fix import FixConfig, decide_fix
+    from issue_agent.domain.labels import Label
+    from tests.domain.builders import issue as build_issue, labels, world
+
+    workflow, files, inner, _key = review_workflow(AgentResult(is_error=True, summary="x", session_id="s", num_turns=3))
+
+    def held_purchase(*_a, **_k):
+        raise ValueError("PR repair purchase is held, consumed or exhausted")
+
+    monkeypatch.setattr(cc, "consume_pr_repair", held_purchase)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], author="fix-bot", state="OPEN", labels=labels("ai-pr-open"))
+    start = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    clock = [start]
+    monkeypatch.setattr(files._workflow_db, "_now", lambda: clock[0])
+    dispatched, escalations = [], 0
+    for tick in range(32):
+        clock[0] = start + timedelta(seconds=30 * tick)
+        view = world(issues=[build_issue(5, "ai-pr-open")], prs=[workflow.gateway.prs[100]],
+                     now=clock[0].isoformat().replace("+00:00", "Z"))
+        state = _fix_state(files, view, workflow_control=workflow.workflow_control, available_runtimes=frozenset({"claude"}))
+        actions = decide_fix(view, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+        escalations += sum(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions)
+        if any(isinstance(a, RunAgent) and a.kind is AgentKind.ADDRESS_REVIEW for a in actions):
+            dispatched.append(30 * tick)
+            asyncio.run(workflow.address_review(100))
+    assert inner.tasks == [] and escalations == 0
+    assert dispatched == [0, 60, 180, 420, 900]
 
 
 def test_unknown_legacy_review_episode_refuses_without_purchasing_or_resetting():
@@ -1093,7 +1063,7 @@ def test_unknown_legacy_review_episode_refuses_without_purchasing_or_resetting()
     asyncio.run(workflow.address_review(100))
     assert inner.tasks == [] and issue_ci_state(files) == before
     with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
 def test_disabled_review_ceiling_preserves_existing_unbounded_policy():
@@ -1238,7 +1208,7 @@ def test_review_relinking_and_ambiguous_current_prs_refuse_without_purchase():
     assert len(inner.tasks) == 1
     assert issue_ci_state(files).review_failures.count == 1
     with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
 
 
 def test_review_distinct_reviewer_filter_does_not_rekey_to_own_or_nonqualifying_review():
@@ -1284,7 +1254,6 @@ def test_repair_common_admission_refuses_missing_purchase_or_changed_actual_cont
     assert not original(request).admitted
     assert inner.tasks == []
     with files._workflow_db.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
@@ -1327,8 +1296,7 @@ def test_ci_green_reset_is_exact_and_preserves_sibling_allowances():
     issue_key = WorkflowKey("o/r", IssueRef(5))
     with files._workflow_db.transaction() as db:
         current = load_issue_aggregate(db, issue_key)
-        siblings = replace(current.issue_recovery.state, resumes=2, review_failures=cc.ReviewRetryState(count=3), rebase_failures=4,
-                           infra_failures=5)
+        siblings = replace(current.issue_recovery.state, resumes=2, review_failures=cc.ReviewRetryState(count=3), rebase_failures=4)
         persist_workflow_snapshot(db, replace(current, issue_recovery=replace(current.issue_recovery, state=siblings)))
     asyncio.run(workflow.fix_ci(100))
     control = files._workflow_authority
@@ -1337,7 +1305,7 @@ def test_ci_green_reset_is_exact_and_preserves_sibling_allowances():
     source = cc.CIEpisodeReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence, "a" * 40)
     assert control.reset_ci_episode(source)
     after_reset = issue_ci_state(files)
-    assert replace(after_reset, infra_episode=siblings.infra_episode) == replace(siblings, infra_failures=0)
+    assert after_reset == siblings
     assert control.load_workflow(issue_key).episode == before_primary
     asyncio.run(workflow.fix_ci(100))
     after = issue_ci_state(files)
@@ -2063,10 +2031,9 @@ def test_unlaunched_branch_change_does_not_reclassify_old_session(monkeypatch):
 
 
 @pytest.mark.parametrize("recovery_first", [False, True])
-def test_fix_deterministic_launched_failure_uses_captured_ceiling_in_both_orders(monkeypatch, recovery_first):
+def test_fix_deterministic_launched_failure_is_one_machine_end_in_both_orders(monkeypatch, recovery_first):
     from issue_agent.domain.contracts import RunId
     workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, cost_usd=.01))
-    object.__setattr__(workflow, "_fixture_infra_ceiling", 5)
     store = files._workflow_db
     async def deterministic_failure(task):
         run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
@@ -2074,72 +2041,50 @@ def test_fix_deterministic_launched_failure_uses_captured_ceiling_in_both_orders
             pid=123, pgid=123, process_start_ticks=99)
         if recovery_first:
             assert store.reclaim_dead_leases("o/r:fix:fixture", lambda *_: False) == (run_id,)
-            assert issue_ci_state(files).infra_failures == 1
-        object.__setattr__(workflow, "_fixture_infra_ceiling", 99)
         raise RuntimeError("exceeded maximum buffer size")
     monkeypatch.setattr(inner, "run", deterministic_failure)
     with pytest.raises(RuntimeError, match="exceeded maximum buffer size"):
         asyncio.run(workflow.fix_ci(100))
-    assert issue_ci_state(files).infra_failures == 5
+    assert machine_ends(files) == [True]
+    assert issue_ci_state(files).ci_failures == 0
     with store.transaction() as db:
-        receipt = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0], cc.FixInfraReceipt)
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-    assert receipt.charge == 5 and receipt.outcome is cc.FixInfraOutcome.DETERMINISTIC_DEATH
-    store.record_fix_infra_return(receipt.admission.attempt.run_id, cc.FixInfraOutcome.DETERMINISTIC_DEATH, files._workflow_authority.writer)
-    assert issue_ci_state(files).infra_failures == 5
 
 
-@pytest.mark.parametrize("late", [cc.FixInfraOutcome.RETURNED_INFRA, cc.FixInfraOutcome.RETURNED_NORMAL, cc.FixInfraOutcome.DETERMINISTIC_DEATH])
-@pytest.mark.parametrize("generation_change", [False, True])
-def test_fix_late_old_death_or_reply_cannot_erase_or_revive_newer_episode(late, generation_change):
+@pytest.mark.parametrize("payload", [None, "retired"])
+def test_fix_leg_without_a_normal_return_receipt_is_a_machine_end(payload):
+    """A run ended with no receipt never returned normally; a receipt written
+    before the infra ceiling was deleted is read by its outcome value only."""
+    import json
     from tests.fakes.accounted_workflow import seed_infra_outcome
-    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-    from issue_agent.domain.workflow_identity import WorkflowRevision
     _, files, _, _ = active_ci_workflow(AgentResult(is_error=False, cost_usd=.01))
     store = files._workflow_db
-    old_run = seed_infra_outcome(store, 5, cc.FixInfraOutcome.RECLAIMED)
-    seed_infra_outcome(store, 5, cc.FixInfraOutcome.RETURNED_NORMAL)
-    assert issue_ci_state(files).infra_failures == 0
-    if generation_change:
-        with store.transaction() as db:
-            current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
-            persist_workflow_snapshot(db, replace(current, revision=WorkflowRevision(
-                replace(current.revision.fence, generation=current.revision.fence.generation + 1), current.revision.version + 1)))
-    seed_infra_outcome(store, 5, cc.FixInfraOutcome.RETURNED_INFRA)
-    before = files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    store.record_fix_infra_return(old_run, late, files._workflow_authority.writer)
-    store.record_fix_infra_return(old_run, late, files._workflow_authority.writer)
-    assert files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))) == before
-    assert before.component.state.infra_failures == 1
+    seed_infra_outcome(store, 5, normal=True)
+    run = seed_infra_outcome(store, 5, normal=True)
+    with store.transaction() as db:
+        if payload is None:
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='fix-infra-outcome' AND key=?", (str(run),))
+        else:
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome' AND key=?", (str(run),)).fetchone()
+            wire = json.loads(row[0])
+            wire["value"]["fields"].update({"outcome": {"type": "FixInfraOutcome", "value": "deterministic_death"},
+                                            "failures": 5, "episode": None, "charge": 5})
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='fix-infra-outcome' AND key=?", (json.dumps(wire), str(run)))
+    assert machine_ends(files) == [False, True]
+    store.record_fix_infra_return(run, files._workflow_authority.writer)
+    assert machine_ends(files) == ([False, False] if payload is None else [False, True])
 
 
-def test_selected_fix_infra_impossible_contribution_is_refused_before_purchase():
-    import json
-    from issue_agent.domain.outcome import ExitReason
-    workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=True, cost_usd=.01, exit_reason=ExitReason.TRANSPORT_DEATH))
-    asyncio.run(workflow.fix_ci(100))
-    with files._workflow_db.transaction() as db:
-        row = db.execute("SELECT key,payload_json FROM dedupe_keys WHERE namespace='fix-infra-outcome'").fetchone()
-        wire = json.loads(row[1])
-        wire["value"]["fields"]["charge"] = 999
-        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='fix-infra-outcome' AND key=?", (json.dumps(wire), row[0]))
-    with pytest.raises((ValueError, WorkflowAuthorityError), match="charge|receipt|failures"):
-        files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
-    with pytest.raises((ValueError, WorkflowAuthorityError)):
-        asyncio.run(workflow.fix_ci(100))
-    assert len(inner.tasks) == 1
-
-
-def test_actual_normal_return_resets_episode_and_settles_unreadable_spend_as_estimate():
+def test_actual_normal_return_ends_the_machine_streak_and_settles_unreadable_spend_as_estimate():
     from tests.fakes.accounted_workflow import seed_infra_outcome
     workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed",
         usage={"input_tokens":"malformed"}))
-    seed_infra_outcome(files._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
-    assert issue_ci_state(files).infra_failures == 1
+    seed_infra_outcome(files._workflow_db, 5)
     asyncio.run(workflow.fix_ci(100))
     assert len(inner.tasks) == 1
-    assert issue_ci_state(files).infra_failures == 0
+    assert machine_ends(files) == [False, True]
     with files._workflow_db.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM charges WHERE amount_micros>0").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM budget_reservations WHERE state='active'").fetchone()[0] == 0
@@ -2177,7 +2122,6 @@ def test_actual_ci_purchase_cannot_bypass_owed_remediation_with_paired_head(monk
     assert original(requested).disposition is AccountingDisposition.UNAVAILABLE
     assert inner.tasks == []
     with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 

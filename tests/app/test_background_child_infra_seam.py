@@ -1,24 +1,15 @@
 """#255 at the workflow seam: a leg that declared `blocked` over its own pending
-background child is journalled infra-class, advances the bounded infra counter,
-and is never parked `ai-blocked` for a human (#253's gap)."""
+background child is the agent's own behaviour, so it counts as an attempt, but
+it is never parked `ai-blocked` for a human (#253's gap)."""
 
 import asyncio
 
-from issue_agent.domain.events import InfraPathEntered
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.world import Comment, IssueView
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore
 from test_fix_workflow import _resolve_snapshot, _workflow
-from test_infra_class_counters import (
-    ISSUE,
-    RecordingJournal,
-    comments,
-    decide_from,
-    resolve_dispatches,
-    run_resolves,
-)
-from tests.fakes.accounted_workflow import issue_recovery_state
+from test_infra_class_counters import ISSUE, run_resolves
 
 
 def pending_child_leg():
@@ -33,36 +24,19 @@ def pending_child_leg():
     )
 
 
-def test_resolve_leg_over_pending_child_is_journalled_and_never_parks_a_human():
+def test_resolve_leg_over_pending_child_is_an_attempt_and_never_parks_a_human():
     store = FakeStore()
-    journal = RecordingJournal()
     gateway = FakeGateway(
         issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={}
     )
 
-    run_resolves(store, pending_child_leg(), 2, gateway=gateway, journal=journal)
+    run_resolves(store, pending_child_leg(), 2, gateway=gateway)
 
-    payloads = [e.payload for e in journal.events if isinstance(e.payload, InfraPathEntered)]
-    assert payloads == [
-        InfraPathEntered("resolve", "background_child_pending", 1),
-        InfraPathEntered("resolve", "background_child_pending", 2),
-    ]
-    assert issue_recovery_state(store, ISSUE).infra_failures == 2
-    assert _resolve_snapshot(store, ISSUE).episode.failures == 0
+    assert _resolve_snapshot(store, ISSUE).episode.failures == 2
     assert not any(
         call[:2] == ("relabel", "issue") and call[-1] == "ai-blocked"
         for call in gateway.calls
     )
-
-
-def test_the_infra_ceiling_bounds_repeated_pending_child_legs():
-    store = FakeStore()
-    run_resolves(store, pending_child_leg(), 5)
-
-    actions = decide_from(store)
-
-    assert resolve_dispatches(actions) == []
-    assert "INFRA" in comments(actions)
 
 
 def test_resume_over_pending_child_returns_issue_to_ready_not_blocked():

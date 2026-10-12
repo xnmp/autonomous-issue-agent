@@ -2347,12 +2347,6 @@
             "title": "Holds",
             "type": "array"
           },
-          "infra_failures": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Infra Failures",
-            "type": "integer"
-          },
           "rebase_failures": {
             "maximum": 9007199254740991.0,
             "minimum": 0.0,
@@ -2395,7 +2389,6 @@
           "ci_failures",
           "review_failures",
           "rebase_failures",
-          "infra_failures",
           "holds"
         ],
         "title": "IssueRecoveryAvailable",

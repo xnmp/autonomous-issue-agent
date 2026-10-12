@@ -63,7 +63,7 @@ _VALUES = (
     cc.CIRemediationCapture, cc.OwedCIRemediation, cc.SettledCIRemediation, cc.ImportedCIRemediation,
     cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.PublicationIdentityEscalationCapture, cc.OwedPRRecoveryEffect,
     cc.SettledPRRecoveryEffect, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation,
-    cc.FixInfraEpisode, cc.FixInfraReceipt, cc.IssueInfraPurchase,
+    cc.FixInfraReceipt, cc.IssueInfraPurchase,
     cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,
     cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.GroomContent, cc.GroomNoFinding, cc.ContinuationImportBlocker,
     cc.InactiveIssueRecovery, cc.InactivePRRepair, cc.InactiveSteward,
@@ -211,8 +211,7 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None, "ci_rerun": None, "ci_cancel": None, "branch_refresh": None, "pending_ci_escalation": None},
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
     "PRRepairResult": {"ci": None, "review": None, "rebase": None},
-    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None},
-    "ContinuationCapture": {"fix_infra_ceiling": None},
+    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
@@ -229,11 +228,14 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "CancelledReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
 }
 
-# Self-clear state (machine/budget holds and their allowance) was deleted
-# without a migration; rows persisted before then still carry it. Dropped
-# before decoding, so their retired nested variants are never constructed.
+# Self-clear state (machine/budget holds and their allowance) and the fix
+# infrastructure ceiling were deleted without a migration; rows persisted
+# before then still carry them. Dropped before decoding, so their retired
+# nested variants are never constructed.
 _RETIRED_FIELDS: dict[str, frozenset[str]] = {
-    "IssueRecoveryState": frozenset({"self_clears", "machine_block", "budget_block", "self_clear_ceiling_reported"}),
+    "IssueRecoveryState": frozenset({"self_clears", "machine_block", "budget_block", "self_clear_ceiling_reported",
+                                     "infra_failures", "infra_episode"}),
+    "ContinuationCapture": frozenset({"fix_infra_ceiling"}),
     "PRRepairState": frozenset({"self_clears"}),
     "PRRepairResult": frozenset({"machine_block"}),
 }
@@ -269,8 +271,7 @@ def _encode(value: object, depth: int = 0) -> object:
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None or field.name in {"ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation"} and getattr(value, field.name) is None))
-                    and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
-                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode"} and getattr(value, field.name) is None)
+                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase"} and getattr(value, field.name) is None)
                     and not (type(value) is SettlementRequest and field.name == "accounting_gap" and not value.accounting_gap)
                     and not (type(value) is SettlementRequest and field.name == "origin" and value.origin is ChargeOrigin.NORMAL_RETURN)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None

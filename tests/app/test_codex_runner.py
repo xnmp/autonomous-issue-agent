@@ -37,7 +37,6 @@ from issue_agent.adapters.codex_runner import (
 from issue_agent.domain.outcome import (
     Outcome,
     classify_outcome,
-    infra_class_reason,
 )
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
@@ -1488,7 +1487,7 @@ def test_run_returns_blocked_result_when_not_ready(monkeypatch):
     res = asyncio.run(r.run(RuntimePlan(prompt="x")))
     assert res.is_error and res.status == "blocked"
     assert classify_outcome(res) == Outcome.ERROR
-    assert infra_class_reason(res) == "runtime_unavailable"
+    assert res.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
     assert "not found on PATH" in res.summary
     assert any("NOT READY" in m for m in logged)
 
@@ -2004,6 +2003,68 @@ def test_run_reports_zero_cost_without_rates():
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
     assert r.status == "pr_opened"
     assert r.cost_usd == 0.0
+
+
+def _refused_codex(tmp, codex_error_info: str, *, at: datetime | None = None) -> str:
+    """A stub whose only turn the provider refused: codex records the refusal
+    on the rollout's terminal `task_complete`, writes no envelope, exits 1."""
+    event = json.dumps({
+        # Written before the run starts, so stamped just after it would begin.
+        "timestamp": (at or datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        "type": "event_msg",
+        "payload": {"type": "task_complete", "last_agent_message": None,
+                    "error": {"message": "provider refused", "codex_error_info": codex_error_info}},
+    }, separators=(",", ":"))
+    body = (
+        'mkdir -p "$CODEX_HOME/sessions/2026/10/01"\n'
+        f"printf '%s\\n' '{event}' > "
+        '"$CODEX_HOME/sessions/2026/10/01/rollout-now-sess-refused.jsonl"\n'
+        'echo "session id: sess-refused" >&2\n'
+        'echo "turn failed" >&2\n'
+        'exit 1\n'
+    )
+    return _fake_codex(tmp, body)
+
+
+def _run_refused(codex_error_info, **kwargs):
+    from issue_agent.domain.outcome import infra_class_failure
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(codex_bin=_refused_codex(tmp, codex_error_info, **kwargs),
+                         env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp})
+    result = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+    return result, infra_class_failure(result)
+
+
+@pytest.mark.parametrize("codex_error_info", ["server_overloaded", "usage_limit_exceeded"])
+def test_provider_overload_terminal_is_a_machine_failure_that_keeps_its_session(codex_error_info):
+    from issue_agent.domain.outcome import resumable_session
+    result, machine = _run_refused(codex_error_info)
+    # RESUME and review classify on exit_reason, so it must say transport death.
+    assert result.is_error and machine and result.exit_reason is ExitReason.TRANSPORT_DEATH
+    assert result.session_id and resumable_session(result) == result.session_id
+
+
+@pytest.mark.parametrize("codex_error_info", ["other", "", "x" * 10_000])
+def test_unrecognised_provider_error_stays_an_agent_error(codex_error_info):
+    result, machine = _run_refused(codex_error_info)
+    assert result.is_error and not machine and result.exit_reason is not ExitReason.TRANSPORT_DEATH
+
+
+def test_an_earlier_turns_overload_does_not_classify_this_run():
+    result, machine = _run_refused("server_overloaded", at=datetime.now(timezone.utc) - timedelta(hours=1))
+    assert result.is_error and not machine
+
+
+@pytest.mark.parametrize("content", ["", "not json\n", '{"payload":{"type":"task_complete","error":"overloaded"}}\n',
+                                     '{"timestamp":"bad","payload":{"type":"task_complete","error":{"codex_error_info":"server_overloaded"}}}\n'])
+def test_malformed_rollout_evidence_never_claims_a_provider_failure(tmp_path, content):
+    from issue_agent.adapters.codex_runner import read_rollout_provider_failure
+    day = tmp_path / "sessions" / "2026" / "10" / "01"
+    day.mkdir(parents=True)
+    (day / "rollout-now-sess-bad.jsonl").write_text(content)
+    assert read_rollout_provider_failure("sess-bad", str(tmp_path), since=0.0) is None
+    assert read_rollout_provider_failure("", str(tmp_path)) is None
+    assert read_rollout_provider_failure("missing", str(tmp_path)) is None
 
 
 # ── harness #4: the SHIPPED config must price codex, not just be able to ──────

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from ..domain.model_routing import ModelRoute
 
-import asyncio
 from dataclasses import dataclass, replace
 from collections.abc import Callable
 from functools import partial
@@ -31,7 +30,6 @@ from ..adapters.workflow_rows import WorkflowAuthorityError
 from ..domain.agent_task import (
     RuntimeName,
 )
-from ..domain.outcome import deterministic_death
 from ..domain.steward_stall import DEFAULT_STEWARD_ERROR_CEILING
 from ..domain.leg import Leg, LegTarget
 from ..domain.ports import (
@@ -39,7 +37,6 @@ from ..domain.ports import (
     ControlStore,
     FixWorktreePort,
     EventSink,
-    InfraBreakerPort,
     WorkflowGitHubReads,
     WorkflowState,
 )
@@ -112,13 +109,6 @@ class DispatchConfig:
     command_identity: str = ""
     deployment_owner_id: str = ""
     config_version: str = ""
-    # The ceiling this role's decide side reads off the infra-death counter
-    # (fix: max_infra_deaths; review: max_unproductive_rounds). Used ONLY to
-    # saturate the counter on a deterministic death (#13) so the role's existing
-    # escalation fires on the next poll instead of after N identical retries.
-    # 0 = unknown/disabled → the ordinary +1 bump, i.e. exactly today's behavior
-    # for every hand-built DispatchConfig.
-    max_infra_deaths: int = 0
     max_ci_retries: int = 3
     max_review_retries: int = 3
     max_rebase_retries: int = 3
@@ -126,9 +116,6 @@ class DispatchConfig:
     # version before the steward stops re-buying and escalates.
     steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
     steward_infra_ceiling: int = 0
-    # Deployment-wide infra breaker (app.infra_breaker.InfraBreaker). None keeps
-    # per-issue ceilings as the only bound, which is every hand-built config.
-    infra_breaker: InfraBreakerPort | None = None
     operator_guidance: Callable[[int], str] | None = None
 
     def __post_init__(self) -> None:
@@ -152,7 +139,6 @@ class DispatchConfig:
             fix_model_routes=self.fix_model_routes,
             available_fix_runtimes=self.available_fix_runtimes,
             escalate_on_evidence=self.escalate_on_evidence,
-            infra_breaker=self.infra_breaker,
             operator_guidance=self.operator_guidance,
             max_ci_retries=self.max_ci_retries,
             max_review_retries=self.max_review_retries,
@@ -255,9 +241,8 @@ class AgentDispatcher:
         self.executor = executor
         self.journal = journal
         self.dispatch_claim_target = dispatch_claim_target
-        # PR → issue answers this process has actually received. A dying
-        # gateway must not silently move a counter into a key space nobody
-        # reads (review P1R-1); see `_spend_target`.
+        # PR → issue answers this process has actually received, so a dying
+        # gateway does not silently drop the per-issue spend scope.
         self._issue_memo: dict[int, int] = {}
         fix_worktrees = worktrees if worktrees is not None else _NoFixWorktrees()
         self.fix_workflow = FixWorkflow(
@@ -322,30 +307,20 @@ class AgentDispatcher:
         AgentKind.REVIEW, AgentKind.RE_REVIEW,
     })
 
-    def _lookup_issue(self, pr: int) -> tuple[int | None, bool]:
-        """`(issue, resolved)` from the gateway. `resolved` is False iff the
-        lookup RAISED — which is a different fact from a clean `None`.
-
-        Review P1R-1: those two used to collapse into `None`. A clean None means
-        "this PR genuinely has no issue", whose breaker key IS `-pr`
-        (`domain.fix.breaker_key`). A raised lookup means "unknown", and
-        answering it with `-pr` moves the infra-death counter into a key space
-        the fix role's decide side never reads. The coupling is the trap: the
-        flakiness that kills sessions is the flakiness that fails this lookup,
-        so the ceiling would fail exactly when it is needed."""
+    def _lookup_issue(self, pr: int) -> int | None:
+        """The PR's issue from the gateway; on a failed lookup, the last answer
+        this process got for the same PR rather than a silent issueless spend."""
         try:
             issue = self.gw.issue_for_pr(pr)
         except Exception as exc:  # noqa: BLE001 — a lookup failure ≠ a blocked run
             self.cfg.log(f"spend: could not resolve issue for PR #{pr}: {exc}")
-            return None, False
+            return self._issue_memo.get(pr)
         if issue is not None:
             self._issue_memo[pr] = issue
-        return issue, True
+        return issue
 
-    def _spend_target(
-        self, action: RunAgent
-    ) -> tuple[int | None, bool, int | None]:
-        """Issue scope, resolution status, and the reserved claim target.
+    def _spend_target(self, action: RunAgent) -> tuple[int | None, int | None]:
+        """Issue scope and the reserved claim target.
 
         ADR 0008 makes the decision-side reservation authoritative for a
         production dispatch. Re-reading linkage here can disagree with the
@@ -355,58 +330,10 @@ class AgentDispatcher:
         if self.dispatch_claim_target is not None:
             target = self.dispatch_claim_target(action)
             if target is not None:
-                return (target if target > 0 else None), True, target
+                return (target if target > 0 else None), target
         if action.kind not in self._PR_KEYED:
-            return action.number, True, None
-        issue, resolved = self._lookup_issue(action.number)
-        if resolved:
-            return issue, True, None
-        # The lookup failed. The last answer this process got for the SAME PR is
-        # a far better key than a silent switch to the negated-PR space.
-        return self._issue_memo.get(action.number), False, None
-
-    def _issue_number(self, action: RunAgent) -> int | None:
-        """The issue this dispatch spends against (see `_spend_target`)."""
-        return self._spend_target(action)[0]
-
-    def _death_key(self, action: RunAgent, issue: int | None, resolved: bool) -> int:
-        """The `infra-deaths` key this dead dispatch is charged to.
-
-        It MUST be a key the decide side reads: the issue number for issue legs
-        and for any PR whose issue is resolvable, and `-pr` ONLY for a PR that
-        genuinely has none (`domain.fix.breaker_key`'s convention). When the
-        pre-handler lookup raised, `-pr` is a guess and not a fact, so:
-
-          1. retry the lookup once — the transient that killed the session is
-             frequently over by the time the exception unwinds, and one extra gh
-             call on a path that just burned a whole session is free;
-          2. fall back to whatever this process last resolved for that PR;
-          3. only then use `-pr`, and say so loudly, because at that point the
-             counter genuinely may not be read by the fix role's `_fix_state`
-             (the review role already reads the union — see `roles._review_unproductive_rounds`).
-        """
-        # Review retry policy is PR-keyed even when claim/spend attribution is
-        # issue-keyed. A later relink must not erase a paid failed round.
-        if action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}:
-            return -action.number
-        if issue is not None:
-            return issue
-        if action.kind not in self._PR_KEYED:
-            return action.number
-        if not resolved:
-            retried, ok = self._lookup_issue(action.number)
-            if retried is not None:
-                return retried
-            memo = self._issue_memo.get(action.number)
-            if memo is not None:
-                return memo
-            if not ok:
-                self.cfg.log(
-                    f"infra-death for PR #{action.number} charged to the negated "
-                    f"key -{action.number}: its issue could not be resolved on "
-                    "either attempt, so the per-issue ceiling may not see it"
-                )
-        return -action.number
+            return action.number, None
+        return self._lookup_issue(action.number), None
 
     async def dispatch(self, action: RunAgent) -> None:
         handler = {
@@ -426,7 +353,7 @@ class AgentDispatcher:
             return
         if action.kind in {AgentKind.RESOLVE, AgentKind.RESUME, AgentKind.REVIEW, AgentKind.RE_REVIEW}:
             handler = partial(handler, binding=action.workflow)
-        issue, resolved, claim_target = self._spend_target(action)
+        issue, claim_target = self._spend_target(action)
         if action.kind in {
             AgentKind.PR_RESUME,
             AgentKind.ADDRESS_REVIEW,
@@ -481,101 +408,12 @@ class AgentDispatcher:
             )
         try:
             await handler(action.number)
-        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-            # Review P1R-3. These three are the OPERATOR stopping the daemon, not
-            # infrastructure failing: `issue-agent start` runs in the foreground
-            # and Ctrl-C is the documented way to stop it. Counting them meant
-            # five ordinary Ctrl-Cs escalated a healthy issue to
-            # needs-human-review, while a SIGTERM (systemd's stop signal, which
-            # raises no Python exception at all) counted nothing — the asymmetry
-            # was exactly backwards.
-            #
-            # CancelledError is excluded WITH them, deliberately: under
-            # `asyncio.run` — how `roles.py` drives every dispatch — a Ctrl-C
-            # delivered while the loop is awaiting arrives here as a
-            # CancelledError, because `asyncio.run` cancels the task in its
-            # cleanup and only then re-raises KeyboardInterrupt to the caller.
-            # Excluding only KeyboardInterrupt would leave the repro open on its
-            # MORE likely path. Nothing inside the harness cancels a dispatch:
-            # both runners convert their own wall/idle timeouts into returned
-            # results, and the review fan-out gathers with
-            # `return_exceptions=True`, so a CancelledError here means shutdown.
-            # Re-raised untouched — a swallowed KeyboardInterrupt is a daemon
-            # that ignores Ctrl-C, and a swallowed CancelledError is a task that
-            # refuses to die.
-            raise
         except WorkflowAuthorityError as exc:
-            # Authority holds are not provider deaths and cannot spend the
-            # independent infrastructure allowance while migration is pending.
+            # Authority holds are not provider deaths; they are logged and the
+            # next tick re-derives the work.
             self.cfg.log(f"{action.kind.name} #{action.number} held: {exc}")
             if self.journal is not None:
                 self.journal.emit(TelemetryEvent(
                     TelemetryWarning("workflow_authority_held", str(exc)),
                     Correlation(issue=issue),
                 ))
-        except BaseException as exc:
-            # Review C3. A session that dies BEFORE `runner.run` returns RAISES
-            # (agent_runner.py, deliberately), so the whole workflow tail —
-            # save_session, the retry-counter bump, the follow-up actions — is
-            # skipped. The death was therefore unbounded, unbilled and invisible:
-            # `Daemon.tick` swallowed, the reaper put the issue back to ai-ready,
-            # and the next poll paid for a full session again, forever. Wave A
-            # made it VISIBLE (agent_run_start + a settled transport_death
-            # journal line); this counter BOUNDS it (decide_fix escalates at
-            # cfg.max_infra_deaths). Bump then re-raise UNCHANGED — the crash
-            # isolation the raise buys is the contract, not a bug to fix here.
-            #
-            # `_death_key` (not a bare `-action.number` fallback) picks the key:
-            # a failed pre-handler lookup must not silently relocate the counter
-            # into a key space the decide side does not read — review P1R-1.
-            key = self._death_key(action, issue, resolved)
-            # Deterministic deaths (#13) are charged the WHOLE budget at once.
-            # The breakers assume a retry might survive; when the cause is the
-            # input the retry reproduces it exactly, so a +1 bump buys the same
-            # unwinnable dispatch cap-1 more times at full session cost. Charging
-            # the cap routes the PR/issue to whatever terminal path the role
-            # already has (review: unproductive ceiling → pr_escalation →
-            # needs-human-review) on the very next poll — no new label, no new
-            # branch on the decide side.
-            det = deterministic_death(
-                f"{type(exc).__name__}: {exc}",
-                str(getattr(exc, "harness_last_trace", "") or ""),
-            )
-            bound_review = (self.cfg.role == "review" and action.workflow is not None
-                            and action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW})
-            if not bound_review and self.cfg.role != "fix" and (
-                    self.cfg.role != "steward" or action.kind is AgentKind.JIRA_SYNC):
-                try:
-                    if det is not None and self.cfg.max_infra_deaths > 0:
-                        charged = max(
-                            self.store.get_infra_deaths(key), self.cfg.max_infra_deaths
-                        )
-                        self.store.set_infra_deaths(key, charged)
-                        self.cfg.log(
-                            f"#{key}: deterministic session death "
-                            f"({det.signature}"
-                            + (f" on {det.path}" if det.path else "")
-                            + ") — retrying reproduces it, so the retry budget is "
-                            f"spent now ({charged}/{self.cfg.max_infra_deaths}); "
-                            "escalating to a human on the next poll"
-                        )
-                    else:
-                        self.store.bump_infra_deaths(key)
-                except Exception as err:  # noqa: BLE001
-                    # A counter we could not persist must not replace the death we
-                    # are trying to report (the traceback is the diagnosis).
-                    self.cfg.log(f"infra-death counter not persisted for #{key}: {err}")
-            # The deployment-wide breaker counts DISTINCT targets, so it is told
-            # only about keys that are a real issue number. A `-pr` key is
-            # `_death_key`'s last-resort guess for a PR whose issue could not be
-            # resolved; feeding it in would let one target present as two
-            # distinct "issues" and trip a repo-wide pause on a single-target
-            # fault — the exact confusion this breaker exists to avoid.
-            if key > 0 and self.cfg.infra_breaker is not None:
-                try:
-                    self.cfg.infra_breaker.record_death(
-                        key, action.kind.name.lower(), "raised"
-                    )
-                except Exception as err:  # noqa: BLE001 — see above
-                    self.cfg.log(f"infra breaker not updated for #{key}: {err}")
-            raise

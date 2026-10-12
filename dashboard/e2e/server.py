@@ -813,7 +813,7 @@ class FixtureBackend:
         if number in REVIEW_ISSUES:
             return rc.InactiveControl(status="inactive", repository=RESOLVE_REPO, issue=number,
                 fix_recovery=(rc.IssueRecoveryAvailable(status="available", family="issue_recovery", generation=2,
-                    version=8, resumes=4, ci_failures=3, review_failures=2, rebase_failures=5, infra_failures=6,
+                    version=8, resumes=4, ci_failures=3, review_failures=2, rebase_failures=5,
                     holds=["workflow"]) if number == 99 else None))
         return self._resolve.control(number, request_id)
 

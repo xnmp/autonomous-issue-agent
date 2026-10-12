@@ -113,7 +113,7 @@ def admitted_components(tmp_path):
     install_workflow(store, aggregate)
     selected = cc.select_issue_recovery(aggregate)
     purchase = cc.IssueInfraPurchase(cc.ContinuationCapture(
-        selected.binding, selected.revision, "leg:resolve", 5))
+        selected.binding, selected.revision, "leg:resolve"))
     paid = replace(request("resolve", binding=resolve.binding), continuations=(purchase,))
     assert store.reserve(paid).admitted
     assert store.settle(replace(money(paid.run_id), provider_receipt_id="codex:fixture:resolve")).disposition.value == "available"

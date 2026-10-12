@@ -417,7 +417,6 @@ const IssueRecoveryAvailable = z.object({
   family: z.literal("issue_recovery"),
   generation: z.number().int().gte(0).lte(9007199254740991),
   holds: z.array(z.literal("workflow")),
-  infra_failures: z.number().int().gte(0).lte(9007199254740991),
   rebase_failures: z.number().int().gte(0).lte(9007199254740991),
   resumes: z.number().int().gte(0).lte(9007199254740991),
   review_failures: z.number().int().gte(0).lte(9007199254740991),

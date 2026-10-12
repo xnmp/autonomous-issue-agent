@@ -74,8 +74,8 @@ def stall_charge(
 
     Deliberately NOT exempting `RUNTIME_UNAVAILABLE`, even though it is
     infra-class everywhere in the fix role. The two roles bound their loops
-    differently: a fix-role exemption pairs with a `bump_infra_deaths` that
-    still escalates, while a zero charge here returns without recording the
+    differently: a fix-role exemption pairs with the per-issue machine backoff
+    (`domain.backoff`), while a zero charge here returns without recording the
     issue's baseline, so the issue stays selected and the identical paid leg is
     bought again every sweep — with no counter of its own to stop it (the
     steward's `exhausted()` reads an infra counter that only the RAISE path

@@ -1085,9 +1085,11 @@ def _apply(
         failures = (min(failures + 1, _MAX_INTEGER) if isinstance(result.debit, AddReviewStrike)
                     else max(failures, result.debit.ceiling))
     elif isinstance(result, ReviewPinDeferred):
+        # An unavailable pinned checkout is a machine failure, never a strike;
+        # the count is the streak the review plan's backoff reads.
+        # `policy.free_pin_deferrals` is inert until the persisted checkpoints
+        # that carry it are cut over.
         pins = min(pins + 1, _MAX_INTEGER)
-        if pins > policy.free_pin_deferrals:
-            failures = min(failures + 1, _MAX_INTEGER)
     session, session_sequence = state.session, state.session_sequence
     if isinstance(outcome.session, ReplaceReviewSession):
         session, session_sequence = outcome.session.session, sequence

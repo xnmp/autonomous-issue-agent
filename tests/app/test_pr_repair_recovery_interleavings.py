@@ -58,7 +58,7 @@ def test_capture_between_selection_and_acknowledgment_wins(monkeypatch):
 
 
 @pytest.mark.parametrize('after_commit', [False, True], ids=['after-selection', 'after-commit'])
-def test_interrupted_acknowledgment_retries_without_duplicate_debt(monkeypatch, after_commit):
+def test_interrupted_acknowledgment_retries_without_inventing_debt(monkeypatch, after_commit):
     workflow, files, inner, key = _workflow('rebase')
     store, control = files._workflow_db, files._workflow_authority
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, 'rebase')
@@ -84,7 +84,7 @@ def test_interrupted_acknowledgment_retries_without_duplicate_debt(monkeypatch, 
     assert control.reconcile_pr_repair_returns() == (0 if after_commit else 1)
     after_issue, after_repair = issue_ci_state(files), control.read_pr_repair(key)
     assert after_issue.pending_rebase is None
-    assert after_issue.rebase_failures == before_issue.rebase_failures + 1
+    assert after_issue.rebase_failures == before_issue.rebase_failures
     assert after_repair.component.state == before_repair.component.state
     assert after_repair.component.watermarks.last_applied == after_repair.component.watermarks.last_admitted
     assert _money(store) == money

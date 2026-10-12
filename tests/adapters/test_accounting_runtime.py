@@ -273,7 +273,7 @@ def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, b
     assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
     assert result.workflow_attempt is None
     with store._connect() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
 
 
@@ -1241,8 +1241,7 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
 
     selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
     assert isinstance(selected, cc.SelectedIssueRecovery)
-    assert selected.component.state.infra_failures == 0
-    assert selected.component.state.infra_episode is None
+    assert selected.component.state == cc.IssueRecoveryState()  # a machine failure is no attempt
 
 
 def test_malformed_usage_settles_zero_estimate_without_changing_work_result(
@@ -1313,8 +1312,7 @@ def test_non_codex_runtime_exception_releases_after_completed_teardown(
 
     selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
     assert isinstance(selected, cc.SelectedIssueRecovery)
-    assert selected.component.state.infra_failures == 0
-    assert selected.component.state.infra_episode is None
+    assert selected.component.state == cc.IssueRecoveryState()  # a machine failure is no attempt
 
 
 def test_runtime_exception_after_child_registration_retains_reservation(

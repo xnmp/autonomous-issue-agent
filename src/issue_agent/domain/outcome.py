@@ -210,6 +210,13 @@ ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset(
 )
 
 
+# Set by the codex runtime from its own rollout (the token counters' trusted
+# channel) when the provider refused the final turn for capacity or quota. The
+# agent never got that turn, so it is a machine failure; the session it ended
+# is intact, so it stays resumable (`resumable_session`).
+PROVIDER_REFUSED_SUBTYPE = "provider_refused"
+
+
 # Minted by the accounting runtime when a paid leg is refused BEFORE any run
 # exists (#262); its summary names the missing authority.
 RETURN_REFUSED_STATUS = "return_authority_unavailable"
@@ -253,11 +260,9 @@ def no_session_evidence(
 
 
 # Infra-class reasons beyond the death/unavailability predicates. A pending
-# background child is the runtime contract failing, not evidence about the
-# issue, so it rides the infra ceiling rather than a per-issue quality breaker.
-_INFRA_CLASS_EXTRA: frozenset[ExitReason] = frozenset(
-    {ExitReason.ACCOUNTING_UNAVAILABLE, ExitReason.BACKGROUND_CHILD_PENDING}
-)
+# background child is NOT one: the agent started it and ended its turn (#255),
+# a full paid session of its own behaviour, so it counts as an attempt.
+_INFRA_CLASS_EXTRA: frozenset[ExitReason] = frozenset({ExitReason.ACCOUNTING_UNAVAILABLE})
 
 
 def background_child_pending(reason: ExitReason | None) -> bool:
@@ -298,10 +303,9 @@ def infra_class_failure(result: AgentResult) -> bool:
     `needs-human-review` at $0 per strike and inflates effort routing on
     phantom evidence (keifu #130).
 
-    Callers still bump the separate, higher infra-death ceiling, so a
-    PERSISTENT harness fault still reaches a human — under an INFRA reason
-    string, pointed at the runtime rather than at the code the agent never got
-    to touch.
+    Nothing escalates a machine failure either: the next dispatch of the same
+    kind waits out a per-item backoff (`domain.backoff`) and the money caps
+    bound the retries.
 
     NOT included, deliberately:
 
@@ -321,21 +325,12 @@ def infra_class_failure(result: AgentResult) -> bool:
     )
 
 
-def infra_class_reason(result: AgentResult) -> str:
-    """Machine-readable why, for the journal event that records the exemption.
-
-    Blank when the leg is not infra-class, so a caller can use it as the
-    predicate and the payload at once.
-    """
-    if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
-        return result.envelope_subtype
-    if pre_admission_refusal(result):
-        # Harness-minted summary names the authority that was missing (#262).
-        return f"{result.envelope_subtype}: {result.summary}"[:300]
-    if (infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason)
-            or result.exit_reason in _INFRA_CLASS_EXTRA):
-        return result.exit_reason.value if result.exit_reason else ""
-    return ""
+def resumable_session(result: AgentResult) -> str:
+    """The session a later leg may resume, or "" when this end left none usable."""
+    if budget_exhausted(result.exit_reason) or (
+            infra_class_failure(result) and result.envelope_subtype != PROVIDER_REFUSED_SUBTYPE):
+        return ""
+    return result.session_id or ""
 
 
 # ── deterministic transport deaths (#13) ──────────────────────────────────────

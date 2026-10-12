@@ -153,7 +153,8 @@ def test_schema34_legacy_file_mutations_do_not_regain_current_review_authority(r
     store, _, _, selection, control = rig
     before = current(store, selection)
     legacy = Store(str(tmp_path / 'legacy-review'))
-    legacy.set_infra_deaths(-9, 0)
+    Path(legacy.issue_path(-9, "infra-deaths")).parent.mkdir(parents=True, exist_ok=True)
+    Path(legacy.issue_path(-9, "infra-deaths")).write_text("0")
     Path(legacy.pr_path(9, "round")).write_text(str(10**12))
     Path(legacy.pr_path(9, "session")).write_text("claude:foreign-session")
     assert legacy.get_infra_deaths(-9) == 0

@@ -26,7 +26,6 @@ from issue_agent.domain.outcome import (
     Outcome,
     classify_outcome,
     infra_class_failure,
-    infra_class_reason,
     resolve_actions,
     resume_actions,
 )
@@ -92,7 +91,7 @@ def _asks_human(actions) -> bool:
     )
 
 
-def test_blocked_over_pending_background_child_is_a_typed_infra_outcome(monkeypatch):
+def test_blocked_over_pending_background_child_is_a_typed_attempt_outcome(monkeypatch):
     logged: list[str] = []
     result = _run(
         monkeypatch,
@@ -101,8 +100,7 @@ def test_blocked_over_pending_background_child_is_a_typed_infra_outcome(monkeypa
     )
     assert classify_outcome(result) is Outcome.ERROR
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
-    assert infra_class_failure(result)
-    assert infra_class_reason(result) == "background_child_pending"
+    assert not infra_class_failure(result)
     # The agent's own claim survives as a claim for the operator's log line.
     assert result.status == "blocked"
     assert any("t1" in line and "BACKGROUND CHILD PENDING" in line for line in logged)

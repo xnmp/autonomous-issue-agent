@@ -12,7 +12,7 @@ import pytest
 
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money, TokenUsage, UsageSource
-from issue_agent.domain.outcome import AgentResult, ExitReason, infra_class_failure, infra_class_reason
+from issue_agent.domain.outcome import AgentResult, ExitReason, infra_class_failure
 from issue_agent.domain.pricing import BudgetPolicy, RateTable, ModelRates
 from issue_agent.domain.run_usage import ModelUsage, MeasuredRunUsage, EstimatedRunUsage
 from tests.adapters.test_accounting_runtime import Runtime, _wrapper, _publication_context_for_accounting_tests

@@ -59,7 +59,7 @@ def test_unknown_cost_run_is_acknowledged_and_next_repair_proceeds_after_settlem
     assert _money(store, run_id) == before_money  # not released, settled or reclassified
     assert _active_reserved(store) == reserved
     assert _pending(issue_ci_state(files), lane) is None
-    assert _failures(issue_ci_state(files), lane) == failures + 1
+    assert _failures(issue_ci_state(files), lane) == failures  # unreturned is not an attempt
     assert isinstance(decode_workflow(_receipt(store, control, key, run_id)[0], tuple)[1], cc.PRRepairUnreturned)
 
     held = _dump(store)
@@ -70,7 +70,7 @@ def test_unknown_cost_run_is_acknowledged_and_next_repair_proceeds_after_settlem
     assert len(inner.tasks) == 1
     # The retained unknown spend still counts alongside the new repair's money.
     assert _money(store, run_id) == before_money
-    assert _failures(issue_ci_state(files), lane) == failures + 2
+    assert _failures(issue_ci_state(files), lane) == failures + 1
 
 
 def test_later_release_of_retained_run_keeps_pr_consistent(monkeypatch):

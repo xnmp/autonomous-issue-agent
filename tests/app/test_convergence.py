@@ -609,22 +609,17 @@ def _resolve_retry_loop() -> Scenario:
 def _pre_result_death_loop() -> Scenario:
     """Review C3, as a convergence row. The session dies before returning a
     result, so `AgentRunner` raises: the workflow tail never runs, the issue is
-    left ai-working, the reaper requeues it to ai-ready, and the poll after that
-    pays for another full session — the observed "one paid session every two
-    polls, forever", with $0.00 on the ledger and every retry breaker reading 0.
-
-    The infra-death counter (bumped by `AgentDispatcher.dispatch` on the raise
-    path) is the ONLY thing that can bound this, because no attempt is ever
-    recorded. Cap 2 here rather than the production default 5 purely to fit the
-    tick budget; the shape is what matters.
+    left ai-working, the reaper requeues it to ai-ready. A machine death is not
+    an attempt, so no retry counter moves; only the per-issue machine backoff
+    (`domain/backoff.py`) holds the next session. On a frozen world whose clock
+    never reaches the backoff deadline, that is one session, then quiet.
     """
     return Scenario(
         name="pre-result-death-loop",
         world=world(issues=[issue(5, "ai-ready")]),
-        cfg=replace(CFG, max_infra_deaths=2),
-        expect_dispatches=2,
+        expect_dispatches=1,
         expect_kinds=frozenset({AgentKind.RESOLVE}),
-        cap=2,
+        cap=1,
         runner_raises=True,
     )
 
@@ -694,15 +689,17 @@ def test_cleanup_stops_once_its_labels_are_applied(tmp_path):
     assert cleanup_ticks == [0]
 
 
-def test_pre_result_death_is_unbounded_without_the_infra_ceiling(tmp_path):
-    """Anti-vacuity twin for the pre-result-death row: with the ceiling disabled
-    (MAX_INFRA_DEATHS=0) the SAME frozen world pays for a full session every
-    other tick, forever — dispatch, die, reaper requeues, dispatch. That is the
-    C3 signature, and no other breaker in the file can see it, because a raised
-    run records no attempt anywhere."""
-    scenario = replace(_pre_result_death_loop(), cfg=replace(CFG, max_infra_deaths=0))
+def test_pre_result_death_retries_once_backoff_elapses_and_never_escalates(tmp_path):
+    """Anti-vacuity twin for the pre-result-death row: with a clock past every
+    backoff deadline the SAME frozen world pays for a session every other tick
+    (dispatch, die, reaper requeues, dispatch). Machine deaths are bounded by
+    the backoff and the money caps only; they never become issue debt, so
+    nothing escalates the issue to a human."""
+    scenario = replace(_pre_result_death_loop(), world=world(issues=[issue(5, "ai-ready")], now="2100-01-01T00:00:00Z"))
     trace = simulate(scenario, tmp_path)
     assert sum(len(tick.dispatches) for tick in trace) == TICKS // 2
+    added = {action.add for tick in trace for action in tick.decided if isinstance(action, Relabel)}
+    assert added <= {Label.AI_WORKING, Label.AI_READY, None}
 
 
 def test_simulator_can_detect_an_unbounded_loop():

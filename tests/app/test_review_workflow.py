@@ -912,10 +912,6 @@ def test_multi_re_review_at_ceiling_escalates():
 # these prompt-level cases ensure retired file counters stay inert.
 
 
-def _bumps(store) -> int:
-    return sum(store.infra_deaths.values())
-
-
 def test_a_healthy_review_counts_no_unproductive_round():
     """Anti-vacuity, and the one that matters most: a counter that ticks on the
     happy path escalates every PR the reviewer ever succeeds on."""
@@ -926,7 +922,7 @@ def test_a_healthy_review_counts_no_unproductive_round():
 
     asyncio.run(_workflow(gw, store, runner).review(100))
 
-    assert _bumps(store) == 0
+    assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
 
 
 def test_a_healthy_multi_review_counts_no_unproductive_round():
@@ -938,7 +934,6 @@ def test_a_healthy_multi_review_counts_no_unproductive_round():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
     assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
-    assert _bumps(store) == 0
 
 
 # ── unproductive-round decay (reviewer twin of review P1R-3) ───────────────────
@@ -1390,8 +1385,7 @@ def test_review_defers_when_the_pinned_checkout_is_unavailable():
     assert not review_state(store).head(100)
     assert not store.pr_sessions.get(100, "")
     # 0d2e295 H3: a deferral paid for nothing — it must NOT feed the
-    # unproductive-round counter, or five free deferrals escalate the PR.
-    assert store.infra_deaths == {}
+    # unproductive-round counter.
 
 
 def test_re_review_pin_deferral_is_not_an_unproductive_round():
@@ -1416,14 +1410,13 @@ def test_re_review_pin_deferral_is_not_an_unproductive_round():
         asyncio.run(wf.re_review(100))
 
     assert runner.tasks == []
-    assert store.infra_deaths == {}
 
 
 def test_pin_deferrals_are_journalled_without_a_second_file_counter():
-    """Adversarial F1: 'free' must not mean 'unbounded and invisible'. Every
-    deferral emits a review_pin_deferred TelemetryWarning (ADR 0008 — the
-    dashboard's per-issue view, not just the log), and past the free streak the
-    unproductive-round counter resumes so an unpinnable PR still escalates."""
+    """Adversarial F1: a deferral that never strikes must not be invisible.
+    Every deferral emits a review_pin_deferred TelemetryWarning (ADR 0008 — the
+    dashboard's per-issue view, not just the log); the machine backoff spaces
+    the re-plans."""
     review = Review(
         "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
     )
@@ -1453,14 +1446,12 @@ def test_pin_deferrals_are_journalled_without_a_second_file_counter():
     ]
     assert len(warnings) == 8                     # every deferral is visible
     assert warnings[-1].details["head"] == "new"
-    # 5 free, then the escalation bound resumes: deferrals 6-8 count.
-    assert store.infra_deaths == {}
 
 
 def test_a_progressed_round_resets_the_deferral_streak():
     """A transient flap (a few deferrals, then a round that actually lands a
-    verdict) must never accumulate toward the resumed counting. The reset is
-    on confirmed PROGRESS, not on a successful pin — multi-mode's gate pins
+    verdict) must not keep lengthening the pin backoff. The reset is on
+    confirmed PROGRESS, not on a successful pin — multi-mode's gate pins
     successfully even in rounds a dimension later defers."""
     review = Review(
         "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
@@ -1483,12 +1474,11 @@ def test_a_progressed_round_resets_the_deferral_streak():
         return "/pinned"
 
     wf = _workflow(gw, store, runner, review_checkout=checkout)
-    for _ in range(4):                     # 4 deferrals — under the free cap
+    for _ in range(4):                     # 4 deferrals
         asyncio.run(wf.re_review(100))
     flaky["fail"] = False
     asyncio.run(wf.re_review(100))         # pin succeeds → streak resets
     assert len(runner.tasks) == 1
-    assert store.infra_deaths == {}
 
 
 def test_an_empty_head_sha_defers_rather_than_reviewing_the_live_checkout():

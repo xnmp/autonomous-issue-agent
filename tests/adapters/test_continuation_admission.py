@@ -56,7 +56,7 @@ def recovery(tmp_path):
 
 def purchase(aggregate, *, reply=None, ceiling=2, leg="leg:first"):
     selected = cc.select_issue_recovery(aggregate)
-    return cc.IssueRecoveryPurchase(cc.ContinuationCapture(selected.binding, selected.revision, leg, 5),
+    return cc.IssueRecoveryPurchase(cc.ContinuationCapture(selected.binding, selected.revision, leg),
                                     reply or NOW.isoformat(), "fix/1-reply", ceiling)
 
 
@@ -154,7 +154,7 @@ def test_old_generation_money_settles_without_erasing_newer_components_and_retry
     admission = receipt(store, request.run_id)
     current = read(store, aggregate)
     changed = replace(current, revision=WorkflowRevision(replace(current.revision.fence, generation=3), 2),
-                      issue_recovery=replace(current.issue_recovery, state=replace(current.issue_recovery.state, infra_failures=3)))
+                      issue_recovery=replace(current.issue_recovery, state=replace(current.issue_recovery.state, rebase_failures=3)))
     with store.transaction() as db:
         persist_workflow_snapshot(db, changed)
     restarted = SQLiteControlStore(store.path, now=lambda: NOW)
@@ -297,7 +297,7 @@ def test_caught_return_failure_rolls_back_money_and_component_in_outer_transacti
         monkeypatch.setattr(store, "transaction", existing_transaction)
         monkeypatch.setattr(rows, "persist_workflow_snapshot", failure)
         with pytest.raises(RuntimeError, match="caught return failure"):
-            store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(infra_failures=1))
+            store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(resumes=1))
         assert load_issue_aggregate(db, aggregate.revision.fence.key) == current
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='continuation-return'").fetchone()[0] == 0
@@ -559,97 +559,11 @@ def test_empty_review_value_roundtrips_as_typed_root_but_old_issue_field_keeps_s
     old = '{"format":1,"value":{"type":"IssueRecoveryState","fields":{"consumed_reply_at":"","resumes":0,"remembered_branch":"","ci_failures":0,"review_failures":3,"rebase_failures":0,"infra_failures":0,"self_clears":0}}}'
     decoded = decode_workflow(old, cc.IssueRecoveryState)
     assert decoded.review_failures == cc.ReviewRetryState(count=3)
-    # The retired self-clear count is dropped on read; the scalar field stays.
+    # Retired self-clear and infra counts are dropped on read; the scalar field stays.
     expected = json.loads(old)
     del expected["value"]["fields"]["self_clears"]
+    del expected["value"]["fields"]["infra_failures"]
     assert encode_workflow(decoded) == json.dumps(expected, sort_keys=True, separators=(",", ":"))
-
-
-def test_generic_issue_settlement_preserves_classified_infrastructure_episode(recovery):
-    from issue_agent.domain.workflow_identity import WorkflowWriter
-    store, aggregate = recovery
-    selected = purchase(aggregate)
-    request = paid("infra-return", selected)
-    assert store.reserve_issue_recovery(request, selected).admitted
-    store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
-        pid=123, pgid=123, process_start_ticks=99)
-    admitted = receipt(store, request.run_id)
-    store.record_fix_infra_return(request.run_id, cc.FixInfraOutcome.RECLAIMED,
-        WorkflowWriter("o/r", "fix", request.owner_id))
-    before = read(store, aggregate).issue_recovery.state
-    assert before.infra_failures == 1 and before.infra_episode is not None
-    assert store.settle_issue_recovery(money(request.run_id), admitted, cc.IssueRecoveryState()).disposition is AccountingDisposition.AVAILABLE
-    after = read(store, aggregate).issue_recovery.state
-    assert after.infra_failures == before.infra_failures and after.infra_episode == before.infra_episode
-    store.read_issue_recovery(aggregate.revision.fence.key)
-
-
-@pytest.mark.parametrize("kind,paired", [("RESOLVE", False), ("PR_RESUME", False), ("RESUME", True)])
-def test_pre_f7_attributed_work_refuses_new_authority_but_settles_exactly(recovery, kind, paired):
-    from issue_agent.adapters.control_store import UnclassifiedFixInfraHistory
-    store, aggregate = recovery
-    selected = replace(purchase(aggregate), capture=replace(purchase(aggregate).capture, fix_infra_ceiling=None))
-    admitted = None
-    if paired:
-        requested = paid("legacy-selected", selected)
-        assert store.reserve_issue_recovery(requested, selected).admitted
-        admitted = receipt(store, requested.run_id)
-    elif kind == "RESOLVE":
-        requested = request("legacy-primary", binding=aggregate.binding)
-        assert store.reserve(requested).admitted
-    else:
-        requested = replace(request("legacy-pr-reply", binding=aggregate.binding), workflow=None, kind=kind,
-            dispatch_id=json.dumps({"repository":"o/r", "role":"fix", "kind":kind, "issue":1, "number":100, "leg_id":"legacy-pr-reply"}))
-        store.start_run(requested.run_id, requested.dispatch_id, kind, requested.owner_id, "config", state="abandoned")
-    with pytest.raises(UnclassifiedFixInfraHistory, match="pre-F7"):
-        store.read_issue_recovery(aggregate.revision.fence.key)
-    newer = purchase(read(store, aggregate), reply=(NOW + timedelta(seconds=1)).isoformat(), leg="later")
-    assert not store.reserve_issue_recovery(paid("later", newer), newer).admitted
-    if paired:
-        assert admitted is not None
-        assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState()).disposition is AccountingDisposition.AVAILABLE
-        assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState()).idempotent
-    elif kind == "RESOLVE":
-        assert store.settle(money(requested.run_id)).disposition is AccountingDisposition.AVAILABLE
-        assert store.settle(money(requested.run_id)).idempotent
-    with pytest.raises(UnclassifiedFixInfraHistory):
-        store.read_issue_recovery(aggregate.revision.fence.key)
-
-
-def test_pristine_scalar_infra_baseline_remains_supported_and_lookup_is_indexed(recovery):
-    from issue_agent.adapters.control_store import _FIX_ISSUE_DISPATCH, _FIX_DISPATCH_REPOSITORY, _FIX_DISPATCH_ISSUE
-    store, aggregate = recovery
-    baseline = replace(aggregate, issue_recovery=replace(aggregate.issue_recovery,
-        state=replace(aggregate.issue_recovery.state, infra_failures=2)))
-    with store.transaction() as db:
-        persist_workflow_snapshot(db, baseline)
-        plan = db.execute(f"EXPLAIN QUERY PLAN SELECT run_id FROM runs INDEXED BY runs_fix_issue_dispatch WHERE {_FIX_ISSUE_DISPATCH} AND {_FIX_DISPATCH_REPOSITORY}=? AND {_FIX_DISPATCH_ISSUE}=? ORDER BY rowid LIMIT 1", ("o/r", 1)).fetchall()
-    assert any("SEARCH runs USING INDEX runs_fix_issue_dispatch" in row[3] for row in plan)
-    assert store.read_issue_recovery(aggregate.revision.fence.key).component.state.infra_failures == 2
-    selected = purchase(baseline)
-    requested = paid("modern", selected)
-    assert store.reserve_issue_recovery(requested, selected).admitted
-    assert store.read_issue_recovery(aggregate.revision.fence.key).component.state.infra_failures == 2
-
-
-@pytest.mark.parametrize("damage", ["missing_repository", "malformed_json", "string_issue"])
-def test_pre_f7_bound_source_cannot_be_hidden_by_malformed_dispatch(recovery, damage):
-    from issue_agent.adapters.control_store import UnclassifiedFixInfraHistory
-    store, aggregate = recovery
-    old = request("legacy-damaged", binding=aggregate.binding)
-    assert store.reserve(old).admitted
-    store.complete_run(old.run_id, state="abandoned", outcome="dead_lease")
-    dispatch = json.loads(old.dispatch_id)
-    if damage == "missing_repository":
-        dispatch.pop("repository")
-    elif damage == "string_issue":
-        dispatch["issue"] = "1"
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET dispatch_id=? WHERE run_id=?", ("{" if damage == "malformed_json" else json.dumps(dispatch), str(old.run_id)))
-    with pytest.raises(UnclassifiedFixInfraHistory, match="pre-F7"):
-        store.read_issue_recovery(aggregate.revision.fence.key)
-    selected = purchase(read(store, aggregate))
-    assert not store.reserve_issue_recovery(paid("new", selected), selected).admitted
 
 
 def test_fix_presence_index_migrates_malformed_sources_atomically_and_fences_old_binary(tmp_path, monkeypatch):

@@ -336,7 +336,6 @@ def test_blank_projection_orders_newer_paid_reply_and_terminal_failure_stays_ter
         return
     assert runner.tasks == [] and resolve_state(store).issue_recovery.state == before
     with control._connect() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
     if state == "unknown_outcome":
         now = control._now()

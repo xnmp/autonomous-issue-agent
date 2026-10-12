@@ -41,9 +41,6 @@ from ..domain.events import (
     EventEnvelope,
     GithubUnavailable,
     HandoverWritten,
-    InfraBreakerCleared,
-    InfraBreakerTripped,
-    InfraPathEntered,
     IssueGroomed,
     LevelChanged,
     PathPrediction,
@@ -304,29 +301,6 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
             "cap_micros": payload.cap_micros,
             "currency": payload.currency,
             "reason": payload.reason,
-        }
-    if isinstance(payload, InfraPathEntered):
-        return "infra_path", {
-            **common,
-            "leg": payload.leg,
-            "exit_reason": payload.exit_reason,
-            "infra_deaths": payload.infra_deaths,
-        }
-    if isinstance(payload, InfraBreakerTripped):
-        return "infra_breaker", {
-            **common,
-            "cause": payload.cause,
-            "remediation": payload.remediation,
-            "deaths": payload.deaths,
-            "issues": list(payload.issues),
-            "window_seconds": payload.window_seconds,
-        }
-    if isinstance(payload, InfraBreakerCleared):
-        return "infra_breaker_cleared", {
-            **common,
-            "reason": payload.reason,
-            "cause": payload.cause,
-            "deaths": payload.deaths,
         }
     if isinstance(payload, IssueGroomed):
         return "groomed", {

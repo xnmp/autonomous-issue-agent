@@ -42,7 +42,7 @@ def test_accounting_refuses_conflicting_provider_without_admission(tmp_path):
     assert result.is_error
     assert raw.calls == 0
     with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
     assert store.active_reservation_runs() == ()
 
 

@@ -1020,7 +1020,8 @@ def test_max_infra_deaths_default_and_override():
     assert from_env({"REPO": "x"}).max_infra_deaths == 5
     c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "2"})
     assert c.max_infra_deaths == 2
-    assert c.fix_runtime.max_infra_deaths == 2
+    assert c.steward_runtime.max_infra_deaths == 2
+    assert not hasattr(c.fix_runtime, "max_infra_deaths")  # machine failures never escalate fix work
 
 
 def test_sdk_max_buffer_default_clears_a_five_megabyte_read():

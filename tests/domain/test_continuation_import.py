@@ -27,7 +27,9 @@ def record(family=WorkflowFamily.ISSUE_RECOVERY, **fields):
 def test_direct_issue_debt_and_consumed_reply_are_preserved():
     value = classify_record(record(**{"resumed-at": "2026-10-01T00:00:00Z", "resumes": "2", "ci-retries": "3", "infra-deaths": "4"}))
     assert isinstance(value, cc.IssueRecoveryState)
-    assert (value.consumed_reply_at, value.resumes, value.ci_failures, value.infra_failures) == ("2026-10-01T00:00:00Z", 2, 3, 4)
+    # Legacy infra deaths are machine history, never issue debt: not imported.
+    assert (value.consumed_reply_at, value.resumes, value.ci_failures) == ("2026-10-01T00:00:00Z", 2, 3)
+    assert value == cc.IssueRecoveryState(consumed_reply_at="2026-10-01T00:00:00Z", resumes=2, ci_failures=3)
 
 
 @pytest.mark.parametrize("family", [WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR])
@@ -104,13 +106,13 @@ def test_malformed_legacy_ci_debt_is_source_specifically_blocked(value):
 
 def test_pre_f4_issue_plan_digest_survives_pending_ci_evolution():
     from issue_agent.domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
-    # Re-pinned when slice 2 deleted the self-clear fields from the state repr;
-    # pending_ci (repr=False) must still leave it unchanged.
+    # Re-pinned when slices 2 and 3 deleted the self-clear and infra fields
+    # from the state repr; pending_ci (repr=False) must still leave it unchanged.
     target = ContinuationImportTarget(WorkflowKey("o/r", IssueRef(7)), WorkflowFamily.ISSUE_RECOVERY,
         None, "a" * 64, cc.IssueRecoveryState(ci_failures=3, resumes=2))
     plan = ContinuationImportPlan("o/r", (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR),
         1, "a" * 64, "c" * 64, "d" * 64, (target,))
-    assert plan.plan_digest == "b3e49be872df1d86711f46ed9238ed7a191368e7bffbd0bf8de8e7de72e72e9f"
+    assert plan.plan_digest == "efc33a994fc5ac21e0c2f1a6e08d3d7c0f6353772b3a2396847f4e6f24dd3140"
 
 
 @pytest.mark.parametrize("field,value", [("resumes", ""), ("resumes", "-1"), ("resumes", "1.5"), ("resumes", "1" * 1000),

@@ -327,7 +327,6 @@ class IssueRecoveryAvailable(ClosedContract):
     ci_failures: Counter
     review_failures: Counter
     rebase_failures: Counter
-    infra_failures: Counter
     holds: list[Literal["workflow"]]
 
 
