@@ -387,6 +387,23 @@ dashboard_port_owner() {
   printf '%s\t%s\n' "$owner_pid" "$owner_command"
 }
 
+# True when $1 is $2 or one of its descendants. The unit's MainPID is `uv`;
+# the listener is its `issue-agent` child, so PID equality refused the unit's
+# own socket (incident 2026-10-12). Orphans reparented away fail closed.
+pid_descends_from() {
+  pid="$1"
+  ancestor="$2"
+  case "$ancestor" in ''|0|*[!0-9]*) return 1 ;; esac
+  hops=0
+  while [ "$hops" -lt 64 ]; do
+    case "$pid" in ''|0|1|*[!0-9]*) return 1 ;; esac
+    [ "$pid" != "$ancestor" ] || return 0
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
 dashboard_owner=""
 if dashboard_owner="$(dashboard_port_owner 8321)"; then
   dashboard_owner_pid="${dashboard_owner%%$'\t'*}"
@@ -398,9 +415,7 @@ if dashboard_owner="$(dashboard_port_owner 8321)"; then
         --property=MainPID --value
     )"
   fi
-  if [ -z "$dashboard_unit_pid" ] \
-     || [ "$dashboard_unit_pid" = "0" ] \
-     || [ "$dashboard_owner_pid" != "$dashboard_unit_pid" ]; then
+  if ! pid_descends_from "$dashboard_owner_pid" "$dashboard_unit_pid"; then
     echo "dashboard install failed: TCP 8321 is already bound by PID $dashboard_owner_pid ($dashboard_owner_command), not $DASHBOARD_SERVICE.service. Stop the manual \`issue-agent dashboard\` process and rerun this installer; role units remain installed." >&2
     exit 1
   fi

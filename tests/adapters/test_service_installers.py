@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import plistlib
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -59,6 +62,7 @@ if [ "${1:-}" = "show" ]; then
   case "$*" in
     *"property=ActiveState"*) printf '%s\n' "${ACTIVE_STATE:-active}" ;;
     *"property=SubState"*) printf '%s\n' "${SUB_STATE:-running}" ;;
+    *"property=MainPID"*) printf '%s\n' "${MAIN_PID:-0}" ;;
   esac
   exit 0
 fi
@@ -1190,3 +1194,85 @@ def test_launchd_success_uses_stable_private_config_snapshot(tmp_path):
             rendered["EnvironmentVariables"]["AGENT_ENV"]
             == str(snapshots[0])
         )
+
+
+
+@contextlib.contextmanager
+def _process_tree():
+    """A real `bash → bash → sleep` tree; yields (root pid, grandchild pid)."""
+    root = subprocess.Popen(
+        ["bash", "-c", "bash -c 'sleep 60 & wait' & wait"], start_new_session=True
+    )
+    try:
+        leaf = None
+        for _ in range(100):
+            middle = subprocess.run(
+                ["pgrep", "-P", str(root.pid)], capture_output=True, text=True
+            ).stdout.split()
+            if middle:
+                found = subprocess.run(
+                    ["pgrep", "-P", middle[0]], capture_output=True, text=True
+                ).stdout.split()
+                if found:
+                    leaf = int(found[0])
+                    break
+            time.sleep(0.05)
+        assert leaf is not None
+        yield root.pid, leaf
+    finally:
+        os.killpg(root.pid, signal.SIGKILL)
+        root.wait()
+
+
+def _install_with_port_owner(tmp_path, owner_pid, main_pid):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    unit = home / ".config/systemd/user/issue-agent-dashboard.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("[Service]\nExecStart=/old\n")
+    port_check = tmp_path / "bin" / "dashboard-port-check"
+    _executable(port_check, f"printf '{owner_pid}\\tissue-agent\\tdashboard\\n'")
+    env["ISSUE_AGENT_DASHBOARD_PORT_CHECK"] = str(port_check)
+    env["MAIN_PID"] = str(main_pid)
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return result, unit
+
+
+def test_systemd_dashboard_port_held_by_its_own_unit_descendant_reinstalls(tmp_path):
+    # Incident 2026-10-12: the unit's MainPID is `uv`; the listener is its
+    # `issue-agent` child, so a PID comparison refused the unit's own socket.
+    with _process_tree() as (main_pid, listener):
+        result, unit = _install_with_port_owner(tmp_path, listener, main_pid)
+
+    assert result.returncode == 0, result.stderr
+    assert "ExecStart=/old" not in unit.read_text()
+
+
+def test_systemd_dashboard_port_held_by_its_main_pid_reinstalls(tmp_path):
+    with _process_tree() as (main_pid, _listener):
+        result, _unit = _install_with_port_owner(tmp_path, main_pid, main_pid)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("main_pid", ("unrelated", "0", "", "not-a-pid"))
+def test_systemd_dashboard_port_held_outside_the_unit_is_refused(tmp_path, main_pid):
+    with _process_tree() as (_root, listener), _process_tree() as (other, _leaf):
+        unit_pid = other if main_pid == "unrelated" else main_pid
+        result, unit = _install_with_port_owner(tmp_path, listener, unit_pid)
+
+    assert result.returncode != 0
+    assert "TCP 8321 is already bound" in result.stderr
+    assert "ExecStart=/old" in unit.read_text()
+
+
+def test_systemd_dashboard_port_owner_unknown_is_refused(tmp_path):
+    with _process_tree() as (main_pid, _listener):
+        result, unit = _install_with_port_owner(tmp_path, "unknown", main_pid)
+
+    assert result.returncode != 0
+    assert "PID unknown" in result.stderr
