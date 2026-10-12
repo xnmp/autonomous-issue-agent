@@ -2358,24 +2358,46 @@ UPDATE workflows SET episode_json=CASE
 WHERE json_extract(episode_json,'$.value.type') IN ('IssueFamilyEpisodes','IssueWorkflowShell')
     AND json_type(episode_json,'$.value.fields.steward') IS NOT NULL;
 """),
-    # The author/implement/adjudicate split is retired by deletion, never
-    # parsed. Its stage rows and reset evidence are forgotten, an authored
-    # checkpoint becomes a fresh continuation on the same branch, and the
-    # always-encoded split fields leave every surviving resolve record.
+    # The author/implement/adjudicate split is retired, never parsed. Its
+    # reset evidence is forgotten, and an authored checkpoint becomes a fresh
+    # continuation on the same branch. Split legs were resolve attempts (the
+    # old backoff counted them as RESOLVE), so their runs and receipts are
+    # relabelled RESOLVE in every place that records the stage: deleting them
+    # would break the latest-admission chain, since the paid runs (and their
+    # immutable episode key and spend) must stay. The continuation identity
+    # trigger is lifted only around that relabel. The always-encoded split
+    # fields leave every surviving resolve record.
     SchemaMigration(45, """
 DELETE FROM dedupe_keys WHERE namespace IN (
     'workflow-split-consumed', 'workflow-contract-reset',
     'workflow-contract-reset-completed', 'workflow-return-contract'
 );
-DELETE FROM dedupe_keys
+UPDATE dedupe_keys SET payload_json=json_set(payload_json,'$.value.fields.stage.value','RESOLVE')
 WHERE namespace IN ('workflow-admission','workflow-work-latest','workflow-result','workflow-return')
     AND json_extract(payload_json,'$.value.fields.stage.value') IN ('AUTHOR','IMPLEMENT','ADJUDICATE');
-DELETE FROM dedupe_keys
+UPDATE dedupe_keys SET payload_json=json_set(payload_json,'$.value.fields.result.fields.stage.value','RESOLVE')
 WHERE namespace='workflow-return-disposition'
     AND json_extract(payload_json,'$.value.fields.result.fields.stage.value') IN ('AUTHOR','IMPLEMENT','ADJUDICATE');
-DELETE FROM dedupe_keys
+UPDATE dedupe_keys SET payload_json=json_set(payload_json,'$.value.fields.returned.fields.stage.value','RESOLVE')
 WHERE namespace='workflow-return-observation'
     AND json_extract(payload_json,'$.value.fields.returned.fields.stage.value') IN ('AUTHOR','IMPLEMENT','ADJUDICATE');
+UPDATE leases SET dispatch_id=json_set(dispatch_id,'$.kind','RESOLVE')
+WHERE json_valid(dispatch_id)
+    AND run_id IN (SELECT run_id FROM runs WHERE kind IN ('AUTHOR','IMPLEMENT','ADJUDICATE'));
+UPDATE run_cancellation_intents SET kind='RESOLVE',
+    dispatch_id=CASE WHEN json_valid(dispatch_id) THEN json_set(dispatch_id,'$.kind','RESOLVE') ELSE dispatch_id END
+WHERE kind IN ('AUTHOR','IMPLEMENT','ADJUDICATE');
+DROP TRIGGER runs_continuation_identity_update;
+UPDATE runs SET kind='RESOLVE',
+    dispatch_id=CASE WHEN json_valid(dispatch_id) THEN json_set(dispatch_id,'$.kind','RESOLVE') ELSE dispatch_id END
+WHERE kind IN ('AUTHOR','IMPLEMENT','ADJUDICATE');
+CREATE TRIGGER runs_continuation_identity_update BEFORE UPDATE ON runs
+WHEN OLD.continuations_json <> '{"format":1,"value":[]}' AND (
+    NEW.workflow_binding_json IS NOT OLD.workflow_binding_json OR
+    NEW.workflow_episode_key IS NOT OLD.workflow_episode_key OR
+    NEW.dispatch_id IS NOT OLD.dispatch_id OR NEW.owner_id IS NOT OLD.owner_id OR
+    NEW.kind IS NOT OLD.kind OR NEW.config_version IS NOT OLD.config_version)
+BEGIN SELECT RAISE(ABORT,'continuation run identity is immutable'); END;
 UPDATE dedupe_keys SET payload_json=json_remove(payload_json,
     '$.value.fields.adjudication_ceiling','$.value.fields.split_fingerprint')
 WHERE namespace IN ('workflow-admission','workflow-work-latest')
