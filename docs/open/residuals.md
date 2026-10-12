@@ -29,7 +29,10 @@ OS account and inherits its home-directory surface. Environment scrubbing does
 not prevent recovery through filesystem or local-socket access
 (`CRED-HOME`). Slice 6a (2026-10) deleted the command governor and the
 agent-local hook stack outright, so there is no in-process command filter at
-all: the agent can run any command its OS account can.
+all: the agent can run any command its OS account can. Until slice 6b, the PR
+base, the branch and `Fixes #N` therefore depend on the agent following
+`AGENT.md`: nothing forces it through `issue-agent-publish`, and merge does not
+check the PR base. Slices 6a and 6b deploy together.
 
 **Consequence:** do not point this at a repository whose inbound issue, PR,
 review, or CI text is supplied by people you do not trust. The trigger-gated
