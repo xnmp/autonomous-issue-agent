@@ -268,27 +268,6 @@ def test_missing_pr_primary_refuses_before_any_publication(stopped, capsys):
     assert dump(control) == before
 
 
-def test_steward_rehearsal_leaves_source_and_primary_authority_unchanged(stopped, capsys, tmp_path):
-    _, control, env = stopped
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True)
-    (state / "triage-7.at").write_text("2026-10-01T00:00:00Z")
-    (state / "groom-7.at").write_text("2026-10-01T00:00:00Z")
-    (state / "groom-7.content").write_text("a" * 64)
-    (state / "issue-8.steward-stalls-groom").write_text("malformed")
-    (state / "events-v2.jsonl").write_text("retained source feed\n")
-    before = dump(control)
-    originals = {p.name: p.read_bytes() for p in state.iterdir()}
-    code, result, error = command(capsys, "steward", "rehearse", "--copy-to", str(tmp_path / "copy"))
-    assert code == 0, error
-    assert result["status"] == "rehearsed" and all(result["checks"].values())
-    assert {(t["number"], t["eligible"]) for t in result["targets"]} == {(7, True), (8, False)}
-    assert dump(control) == before
-    assert {p.name: p.read_bytes() for p in state.iterdir()} == originals
-    with closing(sqlite3.connect(tmp_path / "copy" / "issue-agent-control" / Path(control.path).name)) as db:
-        assert db.execute("SELECT count(*) FROM workflow_components WHERE family='resolve'").fetchone()[0] == 0
-
-
 @pytest.mark.parametrize("value", ["", "-1", "1" * 1000, "1" * 70000])
 def test_malformed_or_huge_field_blocks_only_its_selected_target(stopped, capsys, value):
     state, control, _ = stopped
@@ -418,24 +397,6 @@ def test_ambiguous_mapping_or_unsupported_handoff_blocks_affected_pr(stopped, ca
     prs = [target for target in result["targets"] if target["family"] == "pr_repair"]
     assert len(prs) == len(numbers) and all(not target["eligible"] and target["blockers"] for target in prs)
     assert dump(control) == before
-
-
-def test_rehearsal_includes_committed_wal_without_changing_source(stopped, capsys, tmp_path):
-    _, control, env = stopped
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True)
-    with closing(sqlite3.connect(control.path)) as retained:
-        retained.execute("PRAGMA wal_autocheckpoint=0")
-        retained.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at) VALUES ('test','o/r','in-wal','now')")
-        retained.commit()
-        main = Path(control.path).read_bytes()
-        wal = Path(control.path + "-wal").read_bytes()
-        code, result, error = command(capsys, "steward", "rehearse", "--copy-to", str(tmp_path / "wal-copy"))
-        assert code == 0 and result["status"] == "rehearsed", error
-        assert Path(control.path).read_bytes() == main
-        assert Path(control.path + "-wal").read_bytes() == wal
-        with closing(sqlite3.connect(tmp_path / "wal-copy" / "issue-agent-control" / Path(control.path).name)) as copy:
-            assert copy.execute("SELECT key FROM dedupe_keys WHERE namespace='test'").fetchone()[0] == "in-wal"
 
 
 def test_same_revision_authority_change_refuses_selected_publication(stopped):
@@ -700,76 +661,6 @@ def test_issue_reply_shadow_preserves_timestamp_count_and_owned_branch(stopped, 
     assert dump(control) == before
 
 
-def test_triage_shadow_preserves_baseline_and_stalls_and_blocks_unknown_history(stopped, capsys):
-    _, control, env = stopped
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "triage-7.at").write_text("2026-10-01T00:00:00Z\n")
-    (state / "issue-7.steward-stalls-triage").write_text("2")
-    (state / "triage-8.at").write_text("unknown")
-    before = dump(control)
-    code, result, error = command(capsys, "steward", "shadow")
-    assert code == 0, error
-    assert result["triage_shadow"] == [{"issue":7, "legacy":["2026-10-01T00:00:00Z",2],
-                                       "imported":["2026-10-01T00:00:00Z",2], "agrees":True}]
-    assert next(target for target in result["targets"] if target["number"] == 8)["eligible"] is False
-    assert dump(control) == before
-
-
-def test_groom_shadow_matches_supported_content_and_blocks_ambiguous_source(stopped, capsys):
-    _, control, env = stopped
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "groom-7.at").write_text("2026-10-01T00:00:00Z\n")
-    (state / "groom-7.content").write_text("a" * 64 + "\n")
-    (state / "issue-7.steward-stalls-groom").write_text("2")
-    (state / "groom-8.content").write_text("a" * 64)
-    before = dump(control)
-    code, result, error = command(capsys, "steward", "shadow")
-    assert code == 0, error
-    expected = ["2026-10-01T00:00:00Z", "a" * 64, 2]
-    assert result["groom_shadow"] == [{"issue":7, "legacy":expected, "imported":expected, "agrees":True}]
-    assert next(target for target in result["targets"] if target["number"] == 8)["eligible"] is False
-    assert dump(control) == before
-
-
-def test_oversized_groom_file_stays_visibly_blocked(stopped, capsys):
-    _, control, env = stopped
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "groom-7.at").write_text("2026-10-01T00:00:00Z")
-    (state / "groom-7.content").write_text("a" * 65537)
-    before = dump(control)
-    code, result, error = command(capsys, "steward", "shadow")
-    assert code == 0, error
-    target = next(target for target in result["targets"] if target["number"] == 7)
-    assert target["eligible"] is False
-    assert any("groom-content" in blocker for blocker in target["blockers"])
-    assert result["groom_shadow"] == [] and dump(control) == before
-
-
-def test_pre_t2_literal_plan_retains_digest_and_sql_only_retry_after_cleanup(stopped, capsys, monkeypatch):
-    from issue_agent.adapters.continuation_activation import read_import_plan
-    _, control, env = stopped
-    saved = Path(__file__).parents[1] / "fixtures" / "workflow_steward_import_pre_t2.json"
-    report = json.loads(saved.read_text())
-    original = read_import_plan(str(saved))
-    assert original.plan_digest == report["plan_digest"]
-    with control.transaction() as db:
-        publish_continuation_import(db, original, now=datetime(2026,10,1,tzinfo=timezone.utc), control=control)
-    state = Path(env["STEWARD_STATE_DIR"])
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "triage-7.at").write_text("2026-10-01T00:00:00Z")
-    (state / "triage-7.at").unlink()
-    before = dump(control)
-    monkeypatch.setattr(continuation_activation, "evaluate", lambda *args: pytest.fail("retry inspected raw source"))
-    monkeypatch.setattr(cli, "_activation_liveness", lambda *args: pytest.fail("retry inspected current work"))
-    code, retry, error = command(capsys, "steward", "activate", "--plan-file", str(saved),
-                                 "--confirm-plan-digest", report["plan_digest"])
-    assert code == 0 and retry["status"] == "already_active_with_this_plan", error
-    assert dump(control) == before
-
-
 def test_pre_f6_literal_rebase_plan_keeps_sql_retry_after_source_cleanup(stopped, capsys, monkeypatch):
     from issue_agent.adapters.continuation_activation import read_import_plan
     state, control, _ = stopped
@@ -886,7 +777,6 @@ def retained_execution(control, *, index=101, kind='RESOLVE', number=7, issue=7,
 
 
 def accepted_import(stopped,capsys,tmp_path,family='fix'):
-    if family=='steward':Path(stopped[2]['STEWARD_STATE_DIR']).mkdir(parents=True,exist_ok=True)
     code,report,error=command(capsys,family,'shadow')
     assert code==0,error
     saved=tmp_path/(family+'-retained-plan.json');saved.write_text(json.dumps(report))
@@ -938,14 +828,13 @@ def test_missing_legacy_repository_can_rehearse_and_activate_without_clearing_hi
     assert control.reserve_issue_recovery(paid('fresh-after-legacy-import', selected), selected).admitted
 
 
-@pytest.mark.parametrize('family,role,kind,component',[('fix','fix','RESOLVE','issue_recovery'),
-                                                     ('steward','steward','TRIAGE','steward')])
-def test_identified_retained_history_holds_only_its_target_and_imported_unspent_sibling_can_run(stopped,capsys,tmp_path,family,role,kind,component):
+def test_identified_retained_history_holds_only_its_target_and_imported_unspent_sibling_can_run(stopped,capsys,tmp_path):
+    family,role,kind,component='fix','fix','RESOLVE','issue_recovery'
     state,control,_=stopped
     retained_execution(control,kind=kind,role=role)
-    root=state if family=='fix' else Path(stopped[2]['STEWARD_STATE_DIR'])
+    root=state
     root.mkdir(parents=True,exist_ok=True)
-    (root/('issue-8.resumes' if family=='fix' else 'triage-8.at')).write_text('0' if family=='fix' else '2026-10-01T00:00:00Z')
+    (root/'issue-8.resumes').write_text('0')
     report,_=accepted_import(stopped,capsys,tmp_path,family)
     targets={t['number']:t for t in report['targets']}
     assert not targets[7]['eligible'] and targets[8]['eligible']
@@ -953,13 +842,12 @@ def test_identified_retained_history_holds_only_its_target_and_imported_unspent_
     with control.transaction() as db:
         old=load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(7)))
         fresh=load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(8)))
-    assert isinstance(getattr(old,component),cc.BlockedIssueRecovery if family=='fix' else cc.BlockedSteward)
-    if family=='fix':
-        from tests.adapters.test_continuation_admission import paid,purchase
-        # The continuation is allowed without inventing a primary resolve episode.
-        assert isinstance(fresh,IssueWorkflowShell)
-        selected=purchase(fresh,reply='2026-10-02T00:00:00Z',ceiling=5)
-        assert control.reserve_issue_recovery(paid('fresh-retained-sibling',selected),selected).admitted
+    assert isinstance(getattr(old,component),cc.BlockedIssueRecovery)
+    from tests.adapters.test_continuation_admission import paid,purchase
+    # The continuation is allowed without inventing a primary resolve episode.
+    assert isinstance(fresh,IssueWorkflowShell)
+    selected=purchase(fresh,reply='2026-10-02T00:00:00Z',ceiling=5)
+    assert control.reserve_issue_recovery(paid('fresh-retained-sibling',selected),selected).admitted
 
 
 @pytest.mark.parametrize('change',['alter','add','remove'])
@@ -1039,38 +927,6 @@ def test_missing_primary_retained_pr_cannot_defer_without_proven_closed_state(st
     assert dump(control)==before
 
 
-def test_genuinely_new_issue_after_activation_gets_active_secondary_and_paid_steward(stopped,capsys,tmp_path):
-    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-    from issue_agent.domain.workflow import ObservedIssue
-    from issue_agent.domain.workflow_identity import WorkflowWriter
-    from issue_agent.domain.world import IssueView
-    from tests.fakes.workflow_authority import resolve_snapshot
-    from tests.adapters.test_workflow_admission import request
-    state,control,_=stopped
-    retained_execution(control)
-    retained_execution(control,index=102,kind='TRIAGE',role='steward')
-    install_workflow(control,resolve_snapshot(1))
-    accepted_import(stopped,capsys,tmp_path,'fix')
-    accepted_import(stopped,capsys,tmp_path,'steward')
-    key=WorkflowKey('o/r',IssueRef(99))
-    with control.transaction() as db:
-        assert db.execute("SELECT count(*) FROM workflows WHERE target_kind='issue' AND target_number=99").fetchone()[0]==0
-    assert not list(state.glob('issue-99.*'))
-    workflow_control=SQLiteWorkflowControl(control,WorkflowWriter('o/r','fix','o/r:fix:test'),resolve_ceiling=3)
-    discovered=workflow_control.ensure_observed_workflow(ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())).snapshot
-    assert isinstance(discovered.issue_recovery,cc.ActiveIssueRecovery)
-    assert isinstance(discovered.steward,cc.ActiveSteward)
-    selected=cc.select_steward(discovered)
-    purchase=cc.StewardPurchase(cc.ContinuationCapture(selected.binding,selected.revision,'leg:new-steward'),
-                               cc.StewardLane.TRIAGE,control.now().isoformat(),2)
-    requested=replace(request('new-steward'),workflow=selected.binding,owner_id='o/r:steward:test',kind='TRIAGE',
-        dispatch_id=json.dumps(dict(repository='o/r',role='steward',kind='TRIAGE',issue=99,number=99,leg_id='leg:new-steward')))
-    assert control.reserve_steward(requested,purchase).admitted
-    with control.transaction() as db:
-        old=load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(7)))
-        assert isinstance(old.issue_recovery,cc.BlockedIssueRecovery) and isinstance(old.steward,cc.BlockedSteward)
-
-
 def test_genuinely_new_pr_after_activation_gets_paid_repair_without_clearing_old_hold(stopped,capsys,tmp_path):
     from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
     from issue_agent.domain.workflow_identity import WorkflowWriter
@@ -1128,93 +984,6 @@ def test_changed_publisher_deferred_decision_refuses_primary_discovery(stopped,c
         review.ensure_observed_workflow(WorkflowKey('o/r',PullRequestRef(9)))
     with control.transaction() as db:
         assert db.execute("SELECT count(*) FROM workflows WHERE target_kind='pr' AND target_number=9").fetchone()[0]==0
-
-
-def test_steward_first_discovery_paid_state_survives_fix_promotion_and_repeat_observation(stopped,capsys,tmp_path,monkeypatch):
-    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
-    from issue_agent.domain.workflow import ObservedIssue,WorkflowAbsent
-    from issue_agent.domain.workflow_identity import WorkflowWriter
-    from issue_agent.domain.world import IssueView
-    from tests.fakes.workflow_authority import resolve_snapshot
-    from tests.adapters.test_workflow_admission import request
-    from tests.adapters.test_continuation_admission import money,receipt
-    _,control,_=stopped
-    retained_execution(control,kind='TRIAGE',role='steward')
-    accepted_import(stopped,capsys,tmp_path,'steward')
-    key=WorkflowKey('o/r',IssueRef(99));observation=ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())
-    writer=WorkflowWriter('o/r','steward','o/r:steward:test')
-    selected=control.ensure_steward_observed_issue(observation,writer=writer)
-    assert isinstance(selected,cc.SelectedSteward)
-    with control.transaction() as db:assert isinstance(load_issue_aggregate(db,key),IssueWorkflowShell)
-    purchase=cc.StewardPurchase(cc.ContinuationCapture(selected.binding,selected.revision,'leg:standalone-steward'),
-                               cc.StewardLane.TRIAGE,control.now().isoformat(),2)
-    requested=replace(request('standalone-steward'),workflow=selected.binding,owner_id=writer.owner_id,kind='TRIAGE',
-        dispatch_id=json.dumps(dict(repository='o/r',role='steward',kind='TRIAGE',issue=99,number=99,leg_id='leg:standalone-steward')))
-    assert control.reserve_steward(requested,purchase).admitted
-    returned=cc.StewardState(triage=cc.StewardLaneState(stalls=1))
-    assert control.settle_steward(money(requested.run_id),receipt(control,requested.run_id,WorkflowFamily.STEWARD),returned).disposition.value=='available'
-    measured=control.read_steward(key)
-    assert measured.component.state.triage.stalls==1
-    assert control.ensure_steward_observed_issue(observation,writer=writer)==measured
-    install_workflow(control,resolve_snapshot(1))
-    fix=SQLiteWorkflowControl(control,WorkflowWriter('o/r','fix','o/r:fix:test'),resolve_ceiling=3)
-    assert isinstance(fix.load_workflow(key),WorkflowAbsent)
-    discovery=[];original_transition=control._transition
-    def capture_transition(db,entity_kind,entity_id,state,detail=None,**kwargs):
-        if state=='discovered':discovery.append(detail)
-        return original_transition(db,entity_kind,entity_id,state,detail,**kwargs)
-    monkeypatch.setattr(control,'_transition',capture_transition)
-    promoted=fix.ensure_observed_workflow(ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())).snapshot
-    assert promoted.steward==measured.component
-    assert any(detail['generation']==promoted.revision.fence.generation and detail['version']==promoted.revision.version for detail in discovery)
-    assert fix.ensure_observed_workflow(ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())).snapshot==promoted
-    oldkey=WorkflowKey('o/r',IssueRef(7));before=dump(control)
-    with pytest.raises(WorkflowAuthorityError,match='historical issue migration hold'):
-        fix.ensure_observed_workflow(ObservedIssue(oldkey,IssueView(7,updated_at='2026-10-01T00:00:00Z'),control.now()))
-    assert dump(control)==before
-
-
-@pytest.mark.parametrize('bad',['stale','future','foreign_writer','wrong_role','missing_evidence','malformed_evidence'])
-def test_steward_first_discovery_requires_fresh_scope_and_uncorrupted_activation(stopped,capsys,tmp_path,bad):
-    from datetime import timedelta
-    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
-    from issue_agent.domain.workflow import ObservedIssue
-    from issue_agent.domain.workflow_identity import WorkflowWriter
-    from issue_agent.domain.world import IssueView
-    _,control,_=stopped
-    accepted_import(stopped,capsys,tmp_path,'steward')
-    writer=WorkflowWriter('o/r','steward','o/r:steward:test')
-    now=control.now()
-    if bad=='stale':now-=timedelta(seconds=301)
-    if bad=='future':now+=timedelta(seconds=1)
-    if bad=='foreign_writer':writer=WorkflowWriter('x/y','steward','x/y:steward:test')
-    if bad=='wrong_role':writer=WorkflowWriter('o/r','fix','o/r:fix:test')
-    if bad in {'missing_evidence','malformed_evidence'}:
-        with control.transaction() as db:
-            if bad=='missing_evidence':db.execute("DELETE FROM workflow_activation_evidence WHERE family='steward'")
-            else:db.execute("UPDATE workflow_activation_evidence SET plan_digest=? WHERE family='steward'",('z'*64,))
-    before=dump(control)
-    with pytest.raises((ValueError,WorkflowAuthorityError)):
-        control.ensure_steward_observed_issue(ObservedIssue(WorkflowKey('o/r',IssueRef(99)),IssueView(99,updated_at='2026-10-01T00:00:00Z'),now),writer=writer)
-    assert dump(control)==before
-
-
-def test_steward_observation_expiring_under_owner_lock_cannot_create_target(stopped,capsys,tmp_path,monkeypatch):
-    from datetime import timedelta
-    from issue_agent.domain.workflow import ObservedIssue
-    from issue_agent.domain.workflow_identity import WorkflowWriter
-    from issue_agent.domain.world import IssueView
-    _,control,_=stopped
-    accepted_import(stopped,capsys,tmp_path,'steward')
-    now=control.now();before=dump(control);original=control._assert_owner_active
-    def delayed(db,owner):
-        original(db,owner)
-        monkeypatch.setattr(control,'_now',lambda:now+timedelta(seconds=301))
-    monkeypatch.setattr(control,'_assert_owner_active',delayed)
-    with pytest.raises(ValueError,match='became stale'):
-        control.ensure_steward_observed_issue(ObservedIssue(WorkflowKey('o/r',IssueRef(99)),IssueView(99,updated_at='2026-10-01T00:00:00Z'),now),writer=WorkflowWriter('o/r','steward','o/r:steward:test'))
-    assert dump(control)==before
 
 
 @pytest.mark.parametrize("previous_inactive",[False,True])

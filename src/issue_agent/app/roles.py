@@ -1,15 +1,14 @@
-"""Assemble the three role daemons from config + adapters.
+"""Assemble the two role daemons from config + adapters.
 
 Each `build_*_daemon` binds:
   * observe  → gateway.build_world (the GitHub slice the role needs),
-  * decide   → the bound pure decision function (decide_fix / decide_bound_review /
-               decide_steward-triage),
+  * decide   → the bound pure decision function (decide_fix / decide_bound_review),
   * executor → applies the leaf Actions; its `run_agent` drives the (async)
                AgentDispatcher for RunAgent actions.
 
 The dispatcher is async (SDK query is a coroutine). Each paid fix leg owns a
 bounded background worker and event loop; observation and lifecycle writes
-remain on the daemon thread. Review and steward keep synchronous dispatch.
+remain on the daemon thread. Review keeps synchronous dispatch.
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ from ..adapters.environment import boot_manifest
 from ..adapters.event_log import EventLog
 from ..adapters.typed_journal import TypedJournal
 from ..adapters.github import GitHubGateway, Identity
-from ..adapters.governor import read_adrs
 from ..adapters.journal import (
     JournalingRuntime,
     LegacyJournalLocator,
@@ -87,7 +85,7 @@ from ..domain.workflow import (
 )
 from ..domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey, WorkflowWriter
 from ..domain.workflow_ports import WorkflowControl
-from ..domain.lifecycle import pr_lifecycle, retry_breaker
+from ..domain.lifecycle import pr_lifecycle
 from ..domain import review as review_dom
 from ..domain.identity import login_eq
 from ..domain.review import (
@@ -100,28 +98,10 @@ from ..domain.review import (
     fix_hold_ceiling_seconds,
     hold_review_dispatch,
 )
-from .planners.tasks import (
-    REVIEW_DIMENSIONS,
-    FixTaskConfig,
-    GroomTaskConfig,
-    JiraTaskConfig,
-    ReviewTaskConfig,
-    TriageTaskConfig,
-)
-from ..domain.triage import (
-    TriageConfig,
-    TriageState,
-    adr_steward_actions,
-    parse_codeowners_default,
-    grooming_candidates,
-    grooming_content,
-    triage_candidates,
-)
-from ..domain.jira import jira_phase, jira_sync_needed
+from .planners.tasks import REVIEW_DIMENSIONS, FixTaskConfig, ReviewTaskConfig
 from ..domain.actions import AgentKind, NoOp, Relabel, ResetCiRetries, RunAgent, Target
-from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
+from ..adapters.runtime_plan import AgentRuntime
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
-from ..domain.outcome import AgentResult
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money, EffectStatus
 from ..domain.pricing import (
@@ -162,7 +142,6 @@ from .config import (
     CodexRuntimeConfig,
     HarnessConfig,
     ReviewRuntimeConfig,
-    StewardRuntimeConfig,
     deployment_identity_for_target,
     owner_identity_for_target,
     prior_deployment_identities,
@@ -176,7 +155,6 @@ from .review_runtime import (
 )
 from .workflows.resolve_rearm import ResolveRearmWorkflow
 from .loop import Daemon
-from .mcp import mcp_servers_from_file
 from .world_reporter import WorldReporter
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
 
@@ -448,9 +426,6 @@ def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
         limits[("review", f"VALIDATE_{normalized}")] = money(
             cfg.review_validation_budget_usd
         )
-    limits[("steward", "TRIAGE")] = money(cfg.triage_budget_usd)
-    limits[("steward", "GROOM")] = money(cfg.triage_budget_usd)
-    limits[("steward", "JIRA_SYNC")] = money(cfg.jira_budget_usd)
     return BudgetPolicy(limits)
 
 
@@ -927,38 +902,6 @@ def review_capability_line(*, can_approve: bool, adopt_unlabeled: bool) -> str:
     )
 
 
-def steward_capability_line(*, triage: bool, promote: bool, jira_sync: bool,
-                            recurrence: bool, groom: bool = False) -> str:
-    """One boot line for the steward — the role that can be configured into
-    doing literally nothing (#46).
-
-    An operator watching three healthy daemons reasonably concludes three things
-    are happening. With STEWARD_TRIAGE=0, STEWARD_PROMOTE=0 and JIRA_SYNC=0 the
-    steward polls forever with no work it can act on, and in `ps`, in the log
-    directory and in `issue-agent status` it is indistinguishable from the two
-    daemons that are working. So say it, in the log, at boot.
-
-    Recurrence reporting is reported separately from the verdict because it is
-    passive: it journals reopened `ai-done` issues, it never dispatches an agent,
-    and it is structurally inert without a FIX_BOT to attribute merges to. It is
-    therefore not "work the daemon can do" in the sense the NONE verdict means.
-    """
-    recurrence_note = (
-        "recurrence=watch" if recurrence else "recurrence=inert (FIX_BOT unset)"
-    )
-    if triage or groom or promote or jira_sync:
-        return (
-            "steward: capabilities: "
-            f"triage={_onoff(triage)} groom={_onoff(groom)} promote={_onoff(promote)} "
-            f"jira_sync={_onoff(jira_sync)} {recurrence_note}"
-        )
-    return (
-        "steward: capabilities: NONE — this daemon will poll but has no work it "
-        "can do (STEWARD_TRIAGE=0 STEWARD_GROOM=0 STEWARD_PROMOTE=0 JIRA_SYNC=0)"
-        f" — {recurrence_note}"
-    )
-
-
 def _journal(store: Store) -> LegacyJournalLocator:
     """Locate historical JSONL while live telemetry writes only schema v2."""
 
@@ -996,7 +939,7 @@ def _wake_check(cfg: HarnessConfig, store: Store):
     Interaction with the world probe: a webhook-shortened tick lands inside the
     probe's TTL, and check_suite/status deliveries move NO issue/PR updated_at —
     change_signature reads unchanged and the tick observes nothing. That is fine
-    for review/steward (neither reads checks). For the FIXER the load-bearing
+    for review (it does not read checks). For the FIXER the load-bearing
     invariant is now `WorldProbe.read_signals`: since #163 the fixer DOES gate
     with an ai-pr-open PR open, and a CI-completion wake turns into a build only
     because that hook re-reads the head's CI directly and `fix_probe_safe`
@@ -1388,148 +1331,6 @@ _SUPPORTED_REVIEW_RUNTIMES = frozenset(
 )
 if frozenset(_REVIEW_RUNTIME_REGISTRY) != _SUPPORTED_REVIEW_RUNTIMES:
     raise RuntimeError("review runtime registry is not exhaustive")
-
-
-@dataclass(frozen=True)
-class _UnavailableRuntime(AgentRuntime):
-    """A runtime that cannot be reached, and refuses instead of improvising.
-
-    A misconfigured Codex binding used to hand back the BARE runner: the leg
-    then ran with no CODEX_HOME, no generated PreToolUse hook, and whatever
-    `~/.codex/config.toml` the operator happens to have — a paid, UNGOVERNED
-    leg. Refusing is the only safe terminal state, and it is loud: the same
-    shape `HookPreparingRuntime` already uses for a plan with no cwd.
-    """
-
-    reason: str
-
-    async def run(self, task: RuntimePlan) -> AgentResult:
-        raise RuntimeError(self.reason)
-
-
-@dataclass(frozen=True)
-class _StewardRuntimeBinding:
-    runner: AgentRuntime
-    # Checkout the TRIAGE/GROOM legs execute in. "" means "leave the plan's cwd
-    # unset", which is what the Claude path has always done (main.py has already
-    # chdir'd the daemon into TARGET_DIR).
-    execution_cwd: str = ""
-    # Whether this binding can actually reach a GOVERNED runtime. False disarms
-    # every steward capability at build time, so the daemon neither decides nor
-    # dispatches paid work it cannot contain.
-    ready: bool = True
-
-
-def _bind_claude_steward_runtime(
-    _cfg: HarnessConfig,
-    _runtime_config: StewardRuntimeConfig,
-    runner: AgentRuntime,
-) -> _StewardRuntimeBinding:
-    return _StewardRuntimeBinding(runner)
-
-
-def _bind_codex_steward_runtime(
-    cfg: HarnessConfig,
-    runtime_config: StewardRuntimeConfig,
-    _runner: AgentRuntime,
-) -> _StewardRuntimeBinding:
-    """Triage/groom on Codex: read-only, same containment as a Codex review.
-
-    Triage and grooming are classification legs that read the checkout and
-    return JSON; they never edit. So the capability boundary is the reviewer's,
-    not the fixer's — read-only sandbox, no resume, hook-declared containment.
-    """
-    from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
-    from ..adapters.codex_runner import (
-        codex_budget_not_enforced_warning,
-        codex_cost_blindspot_warning,
-    )
-
-    log = _log("steward")
-    runner = _build_codex_runner(
-        cfg,
-        default_model=runtime_config.triage_model,
-        sandbox="read-only",
-        inject_system_prompt=True,
-        resume_on_retry=False,
-        leg_role="steward",
-        log=log,
-        state_dir=cfg.steward_state_dir,
-    )
-    reason = runner.preflight()
-    log(
-        f"codex: NOT READY at startup — {reason}"
-        if reason is not None
-        else "codex: runtime ready (bin + key present)"
-    )
-    blindspot = codex_cost_blindspot_warning(
-        cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
-        cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
-        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-        max_runtime=cfg.codex_runtime.max_runtime,
-        runtime_name="STEWARD_RUNTIME",
-        unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
-    )
-    if blindspot is not None:
-        log(blindspot)
-    budget_notice = codex_budget_not_enforced_warning(
-        fix_budget_usd=runtime_config.triage_budget_usd,
-        max_runtime=cfg.codex_runtime.max_runtime,
-        enforced=cfg.codex_runtime.enforce_budget,
-        priced=cfg.codex_runtime.budget_priceable,
-        pricing_gap=cfg.codex_runtime.budget_pricing_gap,
-        budget_name="STEWARD_TRIAGE_BUDGET_USD",
-        runtime_name="STEWARD_RUNTIME",
-    )
-    if budget_notice is not None:
-        log(budget_notice)
-    # An absent OR mis-typed TARGET_DIR both mean "no checkout to contain the
-    # leg in". Checking existence here makes a typo fail once at boot instead of
-    # once per paid dispatch.
-    execution_cwd = cfg.target_dir
-    if not execution_cwd or not os.path.isdir(execution_cwd):
-        detail = (
-            "TARGET_DIR is unset" if not execution_cwd
-            else f"TARGET_DIR {execution_cwd!r} is not a directory"
-        )
-        reason = (
-            "STEWARD_RUNTIME=codex requires TARGET_DIR so its read-only "
-            f"governor has an explicit checkout — {detail}"
-        )
-        log(f"codex: NOT READY at startup — {reason}")
-        return _StewardRuntimeBinding(_UnavailableRuntime(reason), ready=False)
-    prepare_cwd = partial(
-        write_hook_config,
-        review_only=True,
-        base_branch=cfg.base_branch,
-        repository=cfg.repo,
-        log=log,
-        state_dir=cfg.steward_state_dir,
-        auth_file=runner.oauth_auth_file(),
-    )
-    return _StewardRuntimeBinding(
-        HookPreparingRuntime(runner, prepare_cwd),
-        execution_cwd,
-    )
-
-
-_STEWARD_RUNTIME_REGISTRY: Mapping[
-    RuntimeName,
-    Callable[
-        [HarnessConfig, StewardRuntimeConfig, AgentRuntime],
-        _StewardRuntimeBinding,
-    ],
-] = {
-    RuntimeName.CLAUDE: _bind_claude_steward_runtime,
-    RuntimeName.CODEX: _bind_codex_steward_runtime,
-}
-
-_SUPPORTED_STEWARD_RUNTIMES = frozenset(
-    {RuntimeName.CLAUDE, RuntimeName.CODEX}
-)
-if frozenset(_STEWARD_RUNTIME_REGISTRY) != _SUPPORTED_STEWARD_RUNTIMES:
-    raise RuntimeError("steward runtime registry is not exhaustive")
 
 
 def _inject_predicted_paths(store: Store, world):
@@ -2457,7 +2258,6 @@ def compose_fix_daemon(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
         reserve_fix_paths=reservations.expand,
-        dedupe=control,
         dispatch_claim_target=reservations.issue_for,
         workflow_control=workflow_control,
     )
@@ -3013,7 +2813,6 @@ def compose_review_daemon(
         ),
         executor,
         journal=journal,
-        dedupe=control,
         dispatch_claim_target=reservations.issue_for,
         review_authority=runtime,
     )
@@ -3258,377 +3057,3 @@ def _active_review_runtime(
         mode=cfg.review_runtime.mode, runtime=cfg.review_runtime.runtime,
         failure_ceiling=cfg.review_runtime.max_unproductive_rounds,
     )
-
-
-_CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
-
-
-def _resolve_owner_handle(cfg: HarnessConfig, log) -> str:
-    """Owner @-mention for triage's technical/architectural questions. Order:
-    the target repo's CODEOWNERS `*` default owners → STEWARD_OWNER env → none.
-    Never fails silently: logs which source won (or that none was found)."""
-    base = cfg.target_dir or os.getcwd()
-    for rel in _CODEOWNERS_PATHS:
-        path = os.path.join(base, rel)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                owners = parse_codeowners_default(fh.read())
-        except OSError:
-            continue
-        if owners:
-            log(f"triage owner: {owners} (from {rel})")
-            return owners
-    if cfg.steward_owner:
-        log(f"triage owner: {cfg.steward_owner} (from STEWARD_OWNER)")
-        return cfg.steward_owner
-    log(
-        "triage owner: NONE — no CODEOWNERS default rule and STEWARD_OWNER unset; "
-        "owner-level questions will be tagged generically ('a maintainer'). Set "
-        "STEWARD_OWNER or add a CODEOWNERS '*' rule to route them."
-    )
-    return ""
-
-
-def build_steward_daemon(
-    cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRunner
-) -> Daemon:
-    steward_log = _log("steward")
-    repo_cfg = cfg.repository
-    journal = _typed_journal(
-        _journal(store), cfg, "steward", store.state_dir
-    )
-    steward_runtime = cfg.steward_runtime
-    binding = _STEWARD_RUNTIME_REGISTRY[steward_runtime.runtime](
-        cfg, steward_runtime, runner
-    )
-    steward_runner = binding.runner
-    leg_cwd = binding.execution_cwd or None
-    # A binding that cannot reach a governed runtime disarms every capability
-    # here, at build time. `ready` used to inform only the capability LOG line
-    # while `decide` kept emitting TRIAGE/GROOM — so the daemon announced
-    # triage=off and then dispatched paid, ungoverned legs anyway.
-    groom_enabled = cfg.steward_groom and binding.ready
-    jira_runtime = cfg.jira_runtime
-    tcfg_dom = TriageConfig(
-        steward_bot=steward_runtime.bot,
-        enabled=steward_runtime.triage_enabled and binding.ready,
-        promote=steward_runtime.promote, triage_label=Label.AI_TRIAGE,
-        owner_handle=_resolve_owner_handle(cfg, steward_log),
-    )
-    # Jira mirror: enabled by default, but INERT without a project key (so it's safe
-    # out of the box). The Atlassian MCP spec is loaded from cfg.jira_mcp_config and
-    # attached only to the steward's jira-sync task.
-    jira_on = jira_runtime.sync and bool(jira_runtime.project_key) and binding.ready
-    if jira_runtime.sync and not jira_runtime.project_key:
-        steward_log("JIRA_SYNC is on but JIRA_PROJECT_KEY is unset — Jira sync inert")
-    if jira_on and steward_runtime.runtime is not RuntimeName.CLAUDE:
-        # The Codex adapter has no MCP transport at all, so a jira-sync leg
-        # dispatched there would run WITHOUT the Atlassian server and either
-        # hallucinate a ticket key or burn a paid leg returning nothing. Inert
-        # and loud beats silently unattached (the #12 silent-knob class).
-        steward_log(
-            f"JIRA_SYNC is on but STEWARD_RUNTIME="
-            f"{steward_runtime.runtime.value} has no MCP transport — Jira sync "
-            "inert. Set STEWARD_RUNTIME=claude to mirror issues into Jira."
-        )
-        jira_on = False
-    jira_cfg = None
-    if jira_on:
-        mcp = mcp_servers_from_file(
-            jira_runtime.mcp_config, jira_runtime.mcp_tools,
-            cfg.runtime_paths.harness_root, log=steward_log,
-        )
-        if not mcp:
-            steward_log(
-                f"JIRA_SYNC on but no MCP server loaded from {jira_runtime.mcp_config} — "
-                "Jira sync inert (is the Atlassian MCP spec present?)"
-            )
-            jira_on = False
-        else:
-            jira_cfg = JiraTaskConfig(
-                project_key=jira_runtime.project_key, cloud_id=jira_runtime.cloud_id,
-                repo=repo_cfg.repo, mcp_servers=mcp, max_budget_usd=jira_runtime.budget_usd,
-                model=steward_runtime.triage_model,
-    )
-    owner_id = _owner_identity(cfg, "steward")
-    dcfg = DispatchConfig(
-        base_branch=repo_cfg.base_branch,
-        triage=TriageTaskConfig(
-            steward_runtime.bot, steward_runtime.triage_prompt,
-            steward_runtime.triage_budget_usd, steward_runtime.triage_model,
-            cwd=leg_cwd,
-        ),
-        groom=GroomTaskConfig(
-            steward_runtime.bot, steward_runtime.triage_budget_usd,
-            steward_runtime.triage_model, cwd=leg_cwd,
-        ) if groom_enabled else None,
-        triage_cfg=tcfg_dom,
-        jira=jira_cfg,
-        log=steward_log,
-        # Not for dispatching anything — the steward's recurrence check needs to
-        # know whose merged PRs count as "shipped by this harness".
-        fix_bot=cfg.fix_runtime.bot,
-        command_identity=f"{owner_id}:jira",
-        deployment_owner_id=owner_id,
-        config_version=cfg.config_version,
-        steward_error_ceiling=cfg.steward_error_ceiling,
-        steward_infra_ceiling=steward_runtime.max_infra_deaths,
-        **_spend_cfg(cfg, "steward"),
-    )
-    control = _control_store(cfg, cfg.steward_state_dir, journal)
-    effect_executor = _effects(
-        gateway,
-        control,
-        repository=cfg.repo,
-        identity=owner_id,
-        config_version=cfg.config_version,
-        base_branch=cfg.base_branch,
-        retry_ceiling=cfg.effect_retry_ceiling,
-        journal=journal,
-        alert_cmd=cfg.alert_cmd,
-        log=steward_log,
-    )
-    executor = Executor(
-        gateway,
-        log=steward_log,
-        journal=journal,
-        alert_cmd=cfg.alert_cmd,
-        effect_executor=effect_executor.actions,
-    )
-    reservations = DispatchPathReservations(
-        control,
-        repository=cfg.repo,
-        role="steward",
-        owner_id=owner_id,
-    )
-    steward_reconciler = _LateReservationReconciler()
-    dispatcher = AgentDispatcher(
-        dcfg, gateway, store, None,
-        JournalingRuntime(
-            _with_accounting(
-                steward_runner,
-                control,
-                cfg,
-                "steward",
-                steward_runtime.runtime.value,
-                journal,
-                steward_reconciler,
-            ),
-            journal,
-            repo=cfg.repo,
-            role="steward",
-            runtime=steward_runtime.runtime.value,
-            state_dir=cfg.steward_state_dir,
-        ),
-        executor,
-        journal=journal,
-        dedupe=control,
-        dispatch_claim_target=reservations.issue_for,
-    )
-    dispatch_runtime = CancellableAsyncDispatch(
-        dispatcher.dispatch,
-        finished=reservations.finish,
-    )
-    executor.bind_dispatch(dispatch_runtime)
-
-    # Lane infrastructure ceilings stop spending without inventing lifecycle
-    # state for an issue the steward never triaged. Suppression is logged only
-    # when the selected set changes. Jira retains its original legacy gate as
-    # an explicit exclusion from the triage/groom authority cutover.
-    max_deaths = steward_runtime.max_infra_deaths
-    suppressed_last: set[int] = set()
-    report_recurrences = _recurrence_reporter(
-        journal, gateway, cfg.repo, cfg.fix_runtime.bot, steward_log, control
-    )
-    adrs = read_adrs(os.path.join(cfg.target_dir, "docs", "adr"))
-    # What this daemon can actually DO here — not what it is configured with
-    # (#46). The two differ: JIRA_SYNC=1 with no project key is `jira_sync=off`,
-    # and recurrence watching needs a FIX_BOT to attribute merged PRs to.
-    steward_log(steward_capability_line(
-        triage=tcfg_dom.enabled,
-        groom=groom_enabled,
-        promote=tcfg_dom.promote,
-        jira_sync=jira_on,
-        recurrence=bool(cfg.fix_runtime.bot)
-        and isinstance(gateway, IssueStateReasonReads),
-    ))
-    if cfg.steward_groom_edit:
-        steward_log(
-            "STEWARD_GROOM_EDIT=1 is inert: grooming never edits issue bodies"
-        )
-
-    def decide(world):
-        # Before the pure decide, as in the fixer: if the decision raises, the
-        # tick has still recorded what came back. The steward is probe-gated, so
-        # this only runs on a genuinely fresh world.
-        report_recurrences(world)
-        errors: dict[int, str] = {}
-        from ..domain import continuation_components as cc
-        observed_at = parse_timestamp(world.now)
-        def observed_steward(issue):
-            selected = control.read_steward(WorkflowKey(cfg.repo, IssueRef(issue.number)))
-            if not isinstance(selected, cc.InactiveSteward):
-                return selected
-            if observed_at is None:
-                errors[issue.number] = "steward discovery requires a timestamped issue observation"
-                return selected
-            try:
-                return control.ensure_steward_observed_issue(
-                    ObservedIssue(WorkflowKey(cfg.repo, IssueRef(issue.number)), issue, observed_at),
-                    writer=WorkflowWriter(cfg.repo, "steward", owner_id))
-            except ValueError as exc:
-                raise WorkflowAuthorityError(str(exc)) from exc
-        triage_state = {
-            i.number: _control_value(errors, i.number,
-                lambda n: observed_steward(i), cc.InactiveSteward())
-            for i in world.issues
-        }
-        for i in world.issues:
-            selected = triage_state[i.number]
-            if isinstance(selected, cc.SelectedSteward):
-                for lane in (selected.component.state.triage, selected.component.state.groom):
-                    if lane.delivery_source is not None and _control_value(errors, i.number,
-                            lambda n: control.complete_steward_delivery(lane.delivery_source, gateway.get_issue(n)), False):
-                        triage_state[i.number] = control.read_steward(WorkflowKey(cfg.repo, IssueRef(i.number)))
-        seen = {number: selected.component.state.triage.baseline_at if isinstance(selected, cc.SelectedSteward) else ""
-                for number, selected in triage_state.items()}
-        groom_seen = {number: selected.component.state.groom.baseline_at if isinstance(selected, cc.SelectedSteward) else ""
-                      for number, selected in triage_state.items()}
-        groom_content = {number: selected.component.state.groom_content.successful if isinstance(selected, cc.SelectedSteward) else ""
-                         for number, selected in triage_state.items()}
-        for target, reason in errors.items():
-            steward_log(f"issue #{target} held: {reason}")
-        world = replace(world, issues=tuple(i for i in world.issues if i.number not in errors))
-        state = TriageState(seen_at=seen)
-        updated_at = {i.number: i.updated_at for i in world.issues}
-        signatures = {i.number: grooming_content(i) for i in world.issues}
-        actions = [
-            RunAgent(AgentKind.TRIAGE, n)
-            for n in triage_candidates(world, tcfg_dom, state)
-            if cc.triage_admissible(triage_state[n],
-                updated_at[n], cfg.steward_error_ceiling, infra_ceiling=max_deaths)
-        ]
-        actions.extend(
-            adr_steward_actions(world.prs, adrs, steward_runtime.bot)
-        )
-        groom_world = replace(world, issues=tuple(i for i in world.issues
-            if cc.groom_admissible(triage_state[i.number], updated_at[i.number],
-                signatures[i.number], cfg.steward_error_ceiling, infra_ceiling=max_deaths)))
-        actions.extend(
-            RunAgent(AgentKind.GROOM, n)
-            for n in grooming_candidates(
-                groom_world,
-                groom_seen,
-                groom_enabled,
-                groom_content,
-            )
-        )
-        if jira_on:
-            jira_errors: dict[int, str] = {}
-            jira_deaths = control.abandoned_dispatch_counts(owner_id)
-            for i in world.issues:
-                target = jira_phase(i.labels)
-                jira_infra = _control_value(jira_errors, i.number, store.get_infra_deaths, 0)
-                jira_held = i.number in jira_errors or retry_breaker(
-                    jira_infra + jira_deaths.get(i.number, 0), max_deaths).tripped
-                if target is not None and not jira_held and jira_sync_needed(
-                    target, store.get_jira_key(i.number), store.get_jira_phase(i.number)
-                ):
-                    actions.append(RunAgent(AgentKind.JIRA_SYNC, i.number))
-        suppressed = {i.number for i in world.issues
-            if isinstance(triage_state[i.number], cc.SelectedSteward) and max_deaths > 0
-            and (triage_state[i.number].component.state.triage.infra_failures >= max_deaths
-                 and not cc.triage_admissible(triage_state[i.number], updated_at[i.number],
-                     cfg.steward_error_ceiling, infra_ceiling=max_deaths)
-                 or triage_state[i.number].component.state.groom.infra_failures >= max_deaths
-                 and not cc.groom_admissible(triage_state[i.number], updated_at[i.number], signatures[i.number],
-                     cfg.steward_error_ceiling, infra_ceiling=max_deaths))}
-        if suppressed != suppressed_last:
-            if suppressed:
-                steward_log(
-                    f"steward: no longer dispatching for issue(s) "
-                    f"{sorted(suppressed)}: a selected triage/groom infrastructure "
-                    f"allowance reached {max_deaths}. Check the runtime/daemon; "
-                    "new human input starts a fresh lane episode."
-                )
-            suppressed_last.clear()
-            suppressed_last.update(suppressed)
-        rejected: set[RunAgent] = set()
-        for action in actions:
-            if not isinstance(action, RunAgent):
-                continue
-            if reservations.reserve(
-                action,
-                action.number,
-                frozenset({f"issue:{action.number}"}),
-            ):
-                continue
-            rejected.add(action)
-            steward_log(
-                f"dispatch {action.kind.name} #{action.number}: deferred — "
-                f"issue {action.number} is already reserved (another steward "
-                "action on the same issue this tick, or another deployment's "
-                "claim)"
-            )
-        return [
-            action
-            for action in actions
-            if action not in rejected
-        ]
-
-    # Jira needs closed ai-done issues too (for the final Done transition); triage
-    # alone needs just open issues.
-    observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
-    recovery = _recovery(
-        cfg.steward_state_dir,
-        cfg,
-        control,
-        effect_executor,
-        journal,
-        owner_id=owner_id,
-        reconciler=steward_reconciler,
-    )
-    return Daemon("steward", _reported_world(
-                      observe, control, cfg, "steward", steward_log
-                  ), decide, executor, cfg.tick_interval_seconds,
-                  steward_log, journal=journal,
-                  tick_gate=_control_spend_gate(cfg, control, cfg.triage_budget_usd),
-                  wake_check=_wake_check(cfg, store),
-                  dispatch_capacity=1,
-                  dispatch_key=lambda action: ("issue", action.number),
-                  cancel_active_dispatches=dispatch_runtime.cancel_all,
-                  dispatch_rejected=reservations.finish,
-                  force_kill_dispatches=_force_kill(
-                      cfg,
-                      "steward",
-                      cfg.steward_state_dir or store.state_dir
-                  ),
-                  heartbeat_path=os.path.join(
-                      cfg.steward_state_dir, "heartbeat.json"
-                  ),
-                  reconcile=recovery.reconcile,
-                  prepare_shutdown=_shutdown_prepare(
-                      control,
-                      owner_id=owner_id,
-                  ),
-                  finalize=_shutdown_finalize(
-                      control,
-                      effect_executor,
-                      owner_id=owner_id,
-                      retire_projection_feed=lambda: (
-                          control.retire_projection_feed(
-                              deployment=_deployment_identity(cfg, "steward"),
-                              repository=cfg.repo,
-                              role="steward",
-                          )
-                      ),
-                  ),
-                  terminalize=_shutdown_terminalize(
-                      control,
-                      CodexSpendReconciler(
-                          control, _spend_evidence_dirs(cfg)
-                      ),
-                      owner_id=owner_id,
-                      state_dir=cfg.steward_state_dir,
-                      role="steward",
-                  ))

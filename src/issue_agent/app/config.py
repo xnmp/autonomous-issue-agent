@@ -32,7 +32,6 @@ from ..domain.environment import EVIDENCE_STACKS
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
 from ..domain.review import IdentityMode, ReviewMode
-from ..domain.steward_stall import DEFAULT_STEWARD_ERROR_CEILING
 from ..domain.repository import (
     canonical_repository,
     repository_validation_error,
@@ -419,14 +418,6 @@ class HarnessConfig:
     # attempts, not time, and only verified refusals — infra failures receipt
     # unknown_outcome and are reconciled instead. See domain/effect_retry.py.
     effect_retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING
-    # ADR 0012 ceiling for PAID steward legs on one version of one issue. A
-    # triage/groom leg that returns no usable verdict (budget cap, agent error,
-    # malformed output) leaves the issue's baseline unrecorded, so the next sweep
-    # re-selects it and buys the leg again — unbounded spend on an issue nothing
-    # can classify. After this many consecutive failures the issue's baseline is
-    # recorded anyway and an operator decision is surfaced; any later edit to the
-    # issue starts a fresh series. See domain/steward_stall.py.
-    steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
     # Explicit runtime:model overrides; empty retains the runtime-specific ladder.
@@ -880,9 +871,6 @@ class HarnessConfig:
         # Positive, not non-negative: 0 here does not mean "disabled", it means
         # "restore the unbounded retry loop ADR 0012 forbids".
         _require_positive(errors, "EFFECT_RETRY_CEILING", self.effect_retry_ceiling)
-        _require_positive(
-            errors, "STEWARD_ERROR_CEILING", self.steward_error_ceiling
-        )
         if not (self.repo or "").strip():
             # Fail LOUD at startup, not with an opaque gh error on the first
             # poll: an empty REPO means a missing/mis-composed overlay (the

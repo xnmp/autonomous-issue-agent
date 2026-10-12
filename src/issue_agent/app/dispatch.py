@@ -5,7 +5,7 @@ This is the impure glue the executor's `run_agent` calls. It owns the GitHub
 reads the follow-up needs (notably the ground-truth "did a PR actually open?"
 check) and the worktree/session plumbing, but every DECISION is delegated to a
 pure domain function (resolve_actions / resume_actions / address_review_actions /
-fix_ci_actions / review_submission / triage.actions_for_verdict). So the
+fix_ci_actions / review_submission). So the
 dispatcher stays thin and the logic stays tested in tests/domain.
 
 Async because AgentRunner.run is async (the SDK query is a coroutine).
@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from collections.abc import Callable
 from functools import partial
 
-from ..domain import review as review_dom, triage as triage_dom
+from ..domain import review as review_dom
 from ..domain.actions import AgentKind, RunAgent
 from ..domain.events import Correlation, TelemetryEvent, TelemetryWarning
 from ..adapters.runtime_plan import (
@@ -30,11 +30,9 @@ from ..adapters.workflow_rows import WorkflowAuthorityError
 from ..domain.agent_task import (
     RuntimeName,
 )
-from ..domain.steward_stall import DEFAULT_STEWARD_ERROR_CEILING
 from ..domain.leg import Leg, LegTarget
 from ..domain.ports import (
     ActionExecutor,
-    ControlStore,
     FixWorktreePort,
     EventSink,
     WorkflowGitHubReads,
@@ -42,11 +40,9 @@ from ..domain.ports import (
 )
 from ..domain.workflow_ports import WorkflowControl
 from ..domain.resolve_split import ContractRevision, ContractResetResult
-from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
+from .planners.tasks import FixTaskConfig, ReviewTaskConfig
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
-from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
 from .workflows.review import ReviewAuthority, ReviewWorkflow, ReviewWorkflowConfig
-from .workflows.steward import StewardWorkflow, StewardWorkflowConfig
 from .workflows.base import run_leg
 
 
@@ -59,10 +55,6 @@ class DispatchConfig:
     base_branch: str = "dev"
     fix: FixTaskConfig | None = None
     review: ReviewTaskConfig | None = None
-    triage: TriageTaskConfig | None = None
-    groom: GroomTaskConfig | None = None
-    triage_cfg: triage_dom.TriageConfig | None = None
-    jira: JiraTaskConfig | None = None
     fork_threshold: int = 5
     max_review_rejections: int = 4
     author_tests_split: bool = False
@@ -88,7 +80,7 @@ class DispatchConfig:
     # PR label removed when a review escalates to needs-human-review. Matches the
     # reviewer's trigger label (default ai-pr-open; ai-review for an external repo).
     review_trigger_label: str = "ai-pr-open"
-    # Diagnostic logger (stderr in production; the steward passes its tagged logger).
+    # Diagnostic logger (stderr in production).
     log: Callable[[str], None] = _ignore_log
     # Fixer login, threaded to FixWorkflow so its resume path filters comments
     # with the same rule the decide side uses (see FixWorkflowConfig.fix_bot).
@@ -112,10 +104,6 @@ class DispatchConfig:
     max_ci_retries: int = 3
     max_review_retries: int = 3
     max_rebase_retries: int = 3
-    # ADR 0012: consecutive verdict-less paid steward legs allowed per issue
-    # version before the steward stops re-buying and escalates.
-    steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
-    steward_infra_ceiling: int = 0
     operator_guidance: Callable[[int], str] | None = None
 
     def __post_init__(self) -> None:
@@ -160,33 +148,6 @@ class DispatchConfig:
             log=self.log,
         )
 
-    def steward_workflow_config(self) -> StewardWorkflowConfig:
-        return StewardWorkflowConfig(
-            triage=self.triage,
-            triage_cfg=self.triage_cfg,
-            log=self.log,
-            groom=self.groom,
-            # The steward reads the FIXER's merged PRs (harness #10): "already
-            # shipped by this harness" means shipped by the fix bot, not by the
-            # steward's own identity.
-            fix_bot=self.fix_bot,
-            repo=self.repo,
-            error_ceiling=self.steward_error_ceiling,
-            infra_ceiling=self.steward_infra_ceiling,
-            owner_id=self.deployment_owner_id,
-            config_version=self.config_version,
-        )
-
-    def jira_workflow_config(self) -> JiraSyncWorkflowConfig:
-        return JiraSyncWorkflowConfig(
-            jira=self.jira,
-            log=self.log,
-            repository=self.repo,
-            command_identity=self.command_identity,
-            deployment_owner_id=self.deployment_owner_id,
-            config_version=self.config_version,
-        )
-
 
 class _NoFixWorktrees:
     """Typed null object for roles that cannot dispatch fix work."""
@@ -229,7 +190,6 @@ class AgentDispatcher:
         prepare_cwd: Callable[[str], None] | None = None,
         journal: EventSink | None = None,
         reserve_fix_paths: Callable[[int, frozenset[str]], bool] | None = None,
-        dedupe: ControlStore | None = None,
         dispatch_claim_target: Callable[[RunAgent], int | None] | None = None,
         workflow_control: WorkflowControl | None = None,
         review_authority: ReviewAuthority | None = None,
@@ -246,8 +206,8 @@ class AgentDispatcher:
         self._issue_memo: dict[int, int] = {}
         fix_worktrees = worktrees if worktrees is not None else _NoFixWorktrees()
         self.fix_workflow = FixWorkflow(
-            # Journal folded in here for the same reason as the steward's below:
-            # it arrives as a constructor argument, not through DispatchConfig.
+            # The journal arrives as a constructor argument, not through
+            # DispatchConfig, so it is folded in here.
             replace(cfg.fix_workflow_config(), journal=journal),
             gateway,
             store,
@@ -263,24 +223,6 @@ class AgentDispatcher:
             gateway, store, runner,
             self._run_logged,
             authority=review_authority,
-        )
-        self.steward_workflow = StewardWorkflow(
-            # The journal reaches the dispatcher as a constructor argument, not
-            # through DispatchConfig, so it is folded in here rather than being
-            # duplicated as a second config field that could disagree with it.
-            replace(
-                cfg.steward_workflow_config(),
-                journal=journal,
-                dedupe=dedupe,
-            ),
-            gateway, store, runner, executor,
-        )
-        self.jira_workflow = JiraSyncWorkflow(
-            cfg.jira_workflow_config(),
-            gateway,
-            store,
-            runner,
-            dedupe if hasattr(dedupe, "enqueue_command") else None,
         )
 
     async def _run_logged(self, label: str, issue: int, task):
@@ -345,9 +287,6 @@ class AgentDispatcher:
             AgentKind.REBASE: self.fix_workflow.rebase,
             AgentKind.REVIEW: self.review_workflow.review,
             AgentKind.RE_REVIEW: self.review_workflow.re_review,
-            AgentKind.TRIAGE: self.steward_workflow.triage,
-            AgentKind.GROOM: self.steward_workflow.groom,
-            AgentKind.JIRA_SYNC: self.jira_workflow.sync,
         }.get(action.kind)
         if handler is None:
             return

@@ -24,22 +24,16 @@ from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.resolve_split import ContractResetResult
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
-    JiraTaskConfig,
     ReviewTaskConfig,
-    TriageTaskConfig,
 )
-from issue_agent.adapters.runtime_plan import McpServer
 from issue_agent.domain.review import ReviewMode
-from issue_agent.domain.triage import TriageConfig
 from issue_agent.domain.world import (
     Check,
-    Comment,
     IssueView,
     PRView,
     Review,
     REVIEW_CHANGES_REQUESTED,
 )
-from issue_agent.domain.labels import Label
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.review_authority import with_review_authority, review_state
 from tests.fakes.accounted_dispatch import with_resolve_authority
@@ -52,9 +46,6 @@ class FakeStore:
     def __init__(self):
         self.sessions = {}
         self.pr_sessions = {}
-        self.triage_at = {}
-        self.groom_at = {}
-        self.groom_content = {}
         self.last_sha = {}
         self.last_patch_id = {}
         self.rounds = {}
@@ -121,26 +112,11 @@ class FakeStore:
 
 
 
-    def set_triage_at(self, i, at):
-        self.triage_at[i] = at
-
     def get_phase(self, i):
         return self.phases.get(i, "")
 
     def set_phase(self, i, p):
         self.phases[i] = p
-
-    def get_jira_key(self, i):
-        return getattr(self, "_jira_keys", {}).get(i, "")
-
-    def set_jira_key(self, i, k):
-        self.__dict__.setdefault("_jira_keys", {})[i] = k
-
-    def get_jira_phase(self, i):
-        return getattr(self, "_jira_phases", {}).get(i, "")
-
-    def set_jira_phase(self, i, p):
-        self.__dict__.setdefault("_jira_phases", {})[i] = p
 
 
 
@@ -247,8 +223,6 @@ def _dispatcher(gw, store, runner):
     cfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"),
         review=ReviewTaskConfig("o/r", review_prompt="round=$ROUND_NUMBER"),
-        triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
-        triage_cfg=TriageConfig("steward-bot", enabled=True),
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
     return with_review_authority(with_resolve_authority(AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor)))
@@ -387,27 +361,6 @@ def test_multi_review_routes_to_workflow():
     assert store.pr_sessions == {}
 
 
-def test_triage_routes_to_steward_workflow():
-    iss = IssueView(7, title="Add export", body="want it", author="alice",
-                    comments=(Comment("alice", "please add export"),), updated_at="2026-09-14T10:00:00+00:00")
-    gw = FakeGateway(issues={7: iss})
-    store = FakeStore()
-    runner = FakeRunner(AgentResult(
-        is_error=False,
-        structured={"verdict": "blocked", "plain_summary": "Need detail",
-                    "creator_questions": ["Which format?"], "owner_questions": [],
-                    "acceptance_criteria": []},
-    ))
-    d = _dispatcher(gw, store, runner)
-    from dataclasses import fields
-    from tests.fakes.accounted_steward import AccountedStewardWorkflow, triage_lane
-    original = d.steward_workflow
-    d.steward_workflow = AccountedStewardWorkflow(**{field.name: getattr(original, field.name) for field in fields(original)})
-    asyncio.run(d.dispatch(RunAgent(AgentKind.TRIAGE, 7)))
-    assert ("relabel", "issue", 7, None, "ai-triage") in gw.calls
-    assert triage_lane(store, 7).baseline_at == iss.updated_at
-
-
 def _ci_dispatcher(
     gw, store, runner, fix_mcp_config="", dispatch_claim_target=None,
     operator_guidance=None,
@@ -492,50 +445,6 @@ def test_fix_ci_defers_when_fresh_pr_linkage_disagrees_with_claim():
 
     assert runner.tasks == []
     assert store.sessions == {}
-
-
-# ── Jira lifecycle sync ─────────────────────────────────────────────────────────
-def _jira_dispatcher(gw, store, runner):
-    jira = JiraTaskConfig(
-        project_key="ABC", repo="o/r",
-        mcp_servers=(McpServer(name="atlassian", config={"type": "http"}, tools="mcp__atlassian__*"),),
-    )
-    cfg = DispatchConfig(jira=jira)
-    executor = Executor(gw)
-    return with_review_authority(AgentDispatcher(cfg, gw, store, None, runner, executor))
-
-
-def test_jira_dispatch_keeps_command_attribution_separate_from_authority():
-    owner = "o/r:steward:deployment-1"
-    cfg = DispatchConfig(
-        repo="o/r",
-        command_identity=f"{owner}:jira",
-        deployment_owner_id=owner,
-    ).jira_workflow_config()
-
-    assert cfg.command_identity == f"{owner}:jira"
-    assert cfg.deployment_owner_id == owner
-
-
-def _issue(n, *labels):
-    return IssueView(n, title="t", body="b", labels=frozenset(labels))
-
-
-def test_jira_create_persists_key_and_phase():
-    """Dispatcher-level smoke: JIRA_SYNC routes to the Jira workflow.
-
-    Detailed create/transition/skip/retry behavior is covered directly in
-    test_steward_workflows.py and domain/test_jira.py.
-    """
-    gw = FakeGateway(issues={5: _issue(5, Label.AI_READY)})
-    store = FakeStore()
-    runner = FakeRunner(AgentResult(is_error=False, status="created",
-                                    structured={"status": "created", "ticket_key": "ABC-9"}))
-    d = _jira_dispatcher(gw, store, runner)
-    asyncio.run(d.dispatch(RunAgent(AgentKind.JIRA_SYNC, 5)))
-    assert "Reconcile or create the Jira ticket" in runner.tasks[0].prompt
-    assert store.get_jira_key(5) == "ABC-9"
-    assert store.get_jira_phase(5) == "todo"
 
 
 # ── logging breadcrumbs: no more silent gap between dispatch and PR ────────────

@@ -1,7 +1,6 @@
-"""Operator input for the two ADR 0012 ceilings (EFFECT_RETRY_CEILING,
-STEWARD_ERROR_CEILING).
+"""Operator input for the ADR 0012 ceiling (EFFECT_RETRY_CEILING).
 
-Both are bounds on a loop that costs money or blocks a lifecycle write, so an
+It bounds a loop that blocks a lifecycle write, so an
 unusable value must be REPORTED, never silently accepted: 0 does not mean
 "disabled" here, it means "restore the unbounded loop the ceiling exists to
 stop". Malformed input must not traceback out of config construction either —
@@ -14,7 +13,6 @@ import pytest
 
 from issue_agent.app.config import from_env
 from issue_agent.domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
-from issue_agent.domain.steward_stall import DEFAULT_STEWARD_ERROR_CEILING
 
 
 def _errors(env: dict) -> str:
@@ -24,15 +22,12 @@ def _errors(env: dict) -> str:
 def test_defaults_are_bounded_and_valid():
     cfg = from_env({"REPO": "o/r"})
     assert cfg.effect_retry_ceiling == DEFAULT_EFFECT_RETRY_CEILING
-    assert cfg.steward_error_ceiling == DEFAULT_STEWARD_ERROR_CEILING
     assert "CEILING" not in "\n".join(cfg.validation_errors())
 
 
 def test_operator_value_is_honoured():
-    cfg = from_env(
-        {"REPO": "o/r", "EFFECT_RETRY_CEILING": "4", "STEWARD_ERROR_CEILING": "2"}
-    )
-    assert (cfg.effect_retry_ceiling, cfg.steward_error_ceiling) == (4, 2)
+    cfg = from_env({"REPO": "o/r", "EFFECT_RETRY_CEILING": "4"})
+    assert cfg.effect_retry_ceiling == 4
     assert "CEILING" not in "\n".join(cfg.validation_errors())
 
 
@@ -40,9 +35,6 @@ def test_operator_value_is_honoured():
 def test_non_positive_ceilings_are_rejected(value):
     assert "EFFECT_RETRY_CEILING must be > 0" in _errors(
         {"EFFECT_RETRY_CEILING": value}
-    )
-    assert "STEWARD_ERROR_CEILING must be > 0" in _errors(
-        {"STEWARD_ERROR_CEILING": value}
     )
 
 
@@ -52,16 +44,13 @@ def test_malformed_ceilings_fall_back_to_the_default_without_raising(value):
         {
             "REPO": "o/r",
             "EFFECT_RETRY_CEILING": value,
-            "STEWARD_ERROR_CEILING": value,
         }
     )
     assert cfg.effect_retry_ceiling == DEFAULT_EFFECT_RETRY_CEILING
-    assert cfg.steward_error_ceiling == DEFAULT_STEWARD_ERROR_CEILING
     errors = "\n".join(cfg.validation_errors())
     if value.strip():
         # Empty/whitespace is "unset"; anything else is a typo worth naming.
         assert "EFFECT_RETRY_CEILING must be an integer" in errors
-        assert "STEWARD_ERROR_CEILING must be an integer" in errors
     else:
         assert "CEILING" not in errors
 

@@ -8,8 +8,6 @@ import pytest
 
 from issue_agent.adapters.store import HarnessMarkers, Store
 from issue_agent.domain.ci_history import CiAttempt
-from issue_agent.domain.triage import grooming_candidates, grooming_content
-from issue_agent.domain.world import IssueView, WorldState
 
 def _seed_legacy_ci_counter(store, issue, count):
     Path(store.issue_path(issue, "ci-retries")).write_text(str(count))
@@ -406,17 +404,6 @@ def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open()
 
     s.save_predicted_paths(5, ["src/action.rs", "../outside.rs"])
     assert s.get_predicted_paths(5) == frozenset()
-
-def test_groom_content_digest_round_trips_and_damps_comment_only_updates():
-    s, _ = _store()
-    for body in ("Steps:\n1. click\n", "Steps:\r\n1. click\r\n"):
-        issue = IssueView(9, title="Login crashes", body=body, updated_at="after-comment")
-        Path(os.path.join(s.state_dir, "groom-9.content")).write_text(grooming_content(issue))
-        assert Path(os.path.join(s.state_dir, "groom-9.content")).read_text() == grooming_content(issue)
-        assert grooming_candidates(
-            WorldState(issues=(issue,)), {9: "before-comment"}, True,
-            {9: Path(os.path.join(s.state_dir, "groom-9.content")).read_text()},
-        ) == []
 
 def test_retired_review_files_survive_cleanup_as_import_evidence():
     s, _ = _store()

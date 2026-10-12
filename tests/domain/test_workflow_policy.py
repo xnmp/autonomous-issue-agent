@@ -810,18 +810,15 @@ def test_multiple_authors_and_blocked_resume_converge_for_every_delivery_order(o
     assert state.episode.failures == 0
 
 
-@pytest.mark.parametrize("producer", ["fix", "steward"])
-def test_resolve_rearm_preserves_legacy_attention_on_the_same_issue(producer):
+def test_resolve_rearm_preserves_legacy_attention_on_the_same_issue():
     from issue_agent.domain.lifecycle import issue_escalation
-    from issue_agent.domain.steward_stall import steward_stall_actions
     from issue_agent.domain.workflow_policy import resolve_rearm_projection
 
     state = exhausted()
     number = state.revision.fence.key.target.number
-    legacy = (issue_escalation(number, "infra ceiling", Label.AI_READY).actions() if producer == "fix"
-              else steward_stall_actions(number, "groom", 3, budget=False))
+    legacy = issue_escalation(number, "infra ceiling", Label.AI_READY).actions()
     labels = frozenset(action.add for action in legacy if isinstance(action, Relabel))
-    external = (f"legacy {producer} attention",)
+    external = ("legacy fix attention",)
     pending = start(state, external_holds=external).snapshot
     projection = resolve_rearm_projection(pending, observed(state, labels=labels).issue,
                                           external_holds=external)
