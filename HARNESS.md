@@ -69,30 +69,10 @@ Important fields:
 - `FIXER_RUNTIME=claude|codex|glm`;
   `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
-- Configure implementer tiers with `FIX_MODEL_LOW`, `FIX_MODEL_MED`,
-  `FIX_MODEL_HIGH`, and `FIX_MODEL_XHIGH`, each as `runtime:model`. They map
-  to trivial, standard, complex, and exceptional difficulty. For example:
-
-  ```sh
-  FIX_MODEL=""
-  FIX_MODEL_LOW="codex:gpt-6-luna"
-  FIX_MODEL_MED="codex:gpt-6.1-sol"
-  FIX_MODEL_HIGH="claude:claude-opus-5-5"
-  FIX_MODEL_XHIGH="codex:gpt-6-astra"
-  ```
-
-  Blank tier settings retain the built-in ladder. Partial overrides are
-  supported. Malformed selections and known model/provider mismatches fail
-  configuration validation. A configured ladder uses Low for classification
-  and Med if classification fails. Each purchase uses its selected provider's
-  accounting; Claude and Codex remain available while overrides are
-  enabled so changing a tier preserves existing sessions and PR
-  repairs. Clearing every tier override restores single-provider operation;
-  finish existing cross-provider work first or retain an explicit override
-  until its transcripts are no longer needed. Returning to a single provider
-  can require a fresh PR repair session or leave an issue resume held.
-  `FIX_MODEL` still pins fresh work to `FIXER_RUNTIME` and bypasses
-  classification. Review model settings are independent.
+- The fixer runs one configured model and effort: `FIX_MODEL` and
+  `FIX_EFFORT` (blank keeps the runtime default). There is no difficulty
+  router or per-tier model ladder (refactor decision Q12). Review model
+  settings are independent.
 - Unpinned implementers route by difficulty: `complex` uses Sol/Opus;
   `exceptional` uses Astra/Fable under Codex/Claude. Recurrence or two
   completed resolve/CI failures also select that exceptional ceiling. A pinned
@@ -206,14 +186,16 @@ GitHub-hosted minutes. See [native CI setup](docs/reference/self-hosted-ci.md)
 for the dedicated account, standard runner service, limits and installation.
 The runner retains all existing checks and reports genuine GitHub CI results.
 
-The daemon observes GitHub, computes pure `Action` values, and submits remote
-mutations as durable `LifecycleCommand`s. `GitHubEffectExecutor` handles daemon
-actions; paid agents must use `issue-agent-publish git push …` and
-`issue-agent-publish gh pr create …`. That broker commits intent before the
-network call and reconciles an unknown outcome before retry. Commands are bound
-to the exact repository and role identity; a different repo/role daemon cannot
-claim them from the shared control store. A branch publication also refuses to
-run if the remote moved after its expected revision was captured.
+The daemon observes GitHub, derives each item's state with a pure function,
+and maps it to `Action` values. The fix role executes them directly
+(`adapters/act.py`): every write is naturally idempotent (a label set, a merge
+or update-branch bound to the decided head, a PR opened only when the branch
+has none) or claims an idempotency key in SQLite and confirms it with a GitHub
+read-back. The fix agent pushes its own `fix/<issue>-` branch with `git push`
+and returns; the harness opens the PR from that branch, using the agent's
+summary as the description. The review role still submits durable
+`LifecycleCommand`s through `GitHubEffectExecutor`, bound to the exact
+repository and role identity, until slice 5c.
 
 There is no command governor and no fixer publication gate (slice 6a). Current
 runtime children still inherit publication capability, so use only trusted inbound

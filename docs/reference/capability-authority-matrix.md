@@ -17,22 +17,15 @@ This is the deployment truth, not a security claim inferred from hooks.
 | Gate evidence | GitHub state, operator config | indeterminate is deny; worktree marker forgery has no authority |
 | Logs/dashboard | plain per-role JSONL log, SQLite legs/money tables, GitHub | may be incomplete; never changes control decisions |
 
-All paid runtimes receive the durable `issue-agent-publish` command. Nothing
-forces raw `git push`, `gh pr create`, or `gh pr edit` through it (residual
-1.1); the broker records
-`PUBLISH_BRANCH`/`OPEN_PULL_REQUEST`/`UPDATE_PULL_REQUEST_BODY` commands and
-trusted receipts and reconciles executing/unknown commands on boot.
-`UPDATE_PULL_REQUEST_BODY` replaces the body of the ONE pull request the
-supervised run owns: the number is adjudicated against GitHub's open PRs for the
-authorized branch onto the approved base, the body is a bounded literal argv
-element completed with missing issue linkage and acceptance criteria before
-command capture (#327), and a body that changed between capture and
-execution refuses rather than overwrites. It carries no other PR mutation —
-title, labels, reviewers, base, and review dismissal are outside broker
-authority.
-A registered supervisor ancestor
-retains the compact authority bundle while provider and target-command
-environments omit accounting, event, and publication authority.
+Fix agents push their own branch with plain `git push` (refactor decision
+Q11); the publish broker and `issue-agent-publish` were deleted in slice 5b.
+The harness opens the PR from a pushed `fix/<issue>-` branch that has none,
+once, through `adapters/act.py`. Nothing stops an agent from running
+`gh pr create` or `gh pr edit` itself (it holds the daemon account's
+credentials); a PR the agent opened is simply observed and the harness opens
+no second one.
+A registered supervisor ancestor keeps the run's accounting identity while
+provider and target-command environments omit it.
 Because the model still runs as
 the daemon's OS account, filesystem or local-socket access may recover
 publication authority despite environment scrubbing. With no command filter,
