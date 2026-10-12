@@ -410,6 +410,10 @@ cannot mint an allowance renewal or authorize review dismissal.
 
 ## Migration and rollback
 
+> Superseded in part (slice 5a, 2026-10-13): offline family activation and legacy
+> import were deleted; family state is initialized only by a target's live first
+> observation.
+
 Schema changes are additive and versioned by the parent in the next available
 control-store migrations (v19 installs workflow foundations; v20 indexes admitted
 episode work and backfills only validated immutable historical bindings; v21

@@ -241,13 +241,9 @@ actual spend without resetting current allowance or reviving a session.
 An unresolved round whose existing recovery observations reach their limit
 holds new rounds and paid work; settlement and exact retries remain available.
 
-Stopped execution activation publishes one complete immutable plan, including
-eligible empty targets and explicit source-specific blocked targets. Terminal
-targets do not gain work; ambiguous historical counters, sessions or ownership
-are retained under migration holds. Shadow equivalence applies to supported
-empty inputs; blocked history is reported separately. Copied rehearsal preserves
-source databases, WAL and files. Exact original-plan retry reads only selected
-SQL receipts, even after later legitimate activity.
+Offline family activation and legacy import were deleted (slice 5a). A family
+epoch's plan evidence remains authority; a target's family state is initialized
+only by its live first observation.
 
 Execution renewal and selected confirmed verdict release use the existing
 pending operator intent and durable effect rail. Renewal requires complete
@@ -264,9 +260,9 @@ continuity have already committed. Schema39's fixed indexes select these owed
 sources independently of settled history. The copied rollback requires an
 explicit stopped index-only39→38 schema step before the archived F14 reader;
 later money/holds/replies survive, and forward migration restores39.
-Their raw files remain available to stopped import and cannot regain runtime
-authority after restart or rollback; the existing schema fence refuses an older
-binary before it can mutate the current database.
+Their raw files cannot regain runtime authority after restart or rollback; the
+existing schema fence refuses an older binary before it can mutate the current
+database.
 
 The supported exception is an explicit same-repository checkout repoint:
 `issue-agent start --write-config` records a bounded lineage of exact prior
@@ -538,19 +534,11 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
-`domain/continuation_import.py` (closed stopped fix source fields and typed import decisions),
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`,
-`domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
-`domain/review_activation.py`, `domain/review_linkage.py`,
+`domain/resolve_workspace.py`, `domain/resolve_rearm.py`,
+`domain/review_linkage.py`,
 `domain/review_execution.py` (pure current execution authority and bounded ordered unresolved-suffix fold),
-`domain/review_execution_activation.py` (typed stopped import identity, ownership and selected raw source observations),
-`domain/review_execution_counter_mapping.py` (offline attribution of legacy issue and negated-PR counter files from complete open-PR linkage observations; shared issue keys block),
-`domain/review_execution_death_import.py` (observational whole-set attribution of abandoned owner runs and current counter files; ambiguous or cross-PR deaths block),
-`domain/review_execution_history_import.py` (pure per-PR classification of inherited review evidence; empty observations remain nonauthoritative and historical sources retain specific blockers),
-`domain/review_execution_import_plan.py` (pure source-bound zero-history screening and fixed mixed whole-repository import proposals; no authority writer),
-`domain/review_execution_migration.py` (immutable sourced blockers and canonical blocked migration decisions; no execution grant),
-`domain/review_execution_session_import.py` (fail-closed classification of legacy session files; real handles retain source evidence but cannot yet grant reuse),
 `domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
 `domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
 `domain/review_return.py` (bounded, unclassified review child result evidence),
@@ -564,7 +552,6 @@ the gate values and transition envelopes with resolve, and its pure policy count
 rejections with one selector and authorizes dismissal of exactly the gate's
 observed set; workspace handoffs are explicit
 preparation obligations, not AUTHOR evidence or independent execution authority;
-family activation plans legacy imports offline and refuses rather than defaulting;
 an operator retry authorization buys exactly one execution of an existing
 reconciliation-only command after harness-proven absence; an unreadable
 review-history or linked-issue read backs off to a visible,
@@ -592,17 +579,8 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
-`adapters/repository_guidance.py`, `adapters/resolve_activation.py`, `adapters/review_activation.py`, `adapters/review_linkage.py`,
-`adapters/continuation_activation.py` (bounded raw continuation roots and atomic existing aggregate publication),
-`adapters/continuation_run_import.py` (bounded stopped SQL attribution; historical executions supply migration holds only),
-`adapters/review_execution_activation.py` (bounded read-only stopped file and SQL identity/ownership sources; ambiguous history retains source-specific blockers),
-`adapters/review_execution_import_observation.py` (read-only complete configured SQL import source collection with a cumulative source budget; no cursor advancement or activation authority),
+`adapters/repository_guidance.py`, `adapters/review_linkage.py`,
 `adapters/sql_read_budget.py` (opt-in transaction result-byte/row meter and temporary SQLite value bound; page and point queries bound engine work separately),
-`adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
-`adapters/review_execution_import_sources.py` (barrier-held legacy file/PR-link and SQL source revalidation, including current registration/lifecycle command membership before counter attribution),
-`adapters/review_execution_import_commit.py` (atomic mixed eligible/blocked whole-scope publication; blocked workflow identity grants no execution),
-`adapters/review_execution_import_replay.py` (bounded SQL-only original-plan retry against selected epoch, decision, origin and blocker receipts; later activity cannot change that accepted request),
-`adapters/review_execution_workflow_census.py` (stopped activation's bounded retained target inventory against its complete open listing; terminal identities remain visible),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
@@ -629,11 +607,7 @@ adapters live under `adapters/dashweb/`.
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
-`app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
-`app/continuation_activation.py` (configured fixed fix offline import, original-plan retry and copied rehearsal),
-`app/review_execution_import.py` (configuration-bound legacy source checks and observational whole-repository zero-history import planning),
-`app/review_execution_import_remote.py` (configured complete PR, review and trusted-hold rereads under the import coordinator's barriers),
-`app/review_execution_activation.py` (configuration-bound offline planning and activation under fix/review barriers, source and quiescence rechecks, atomic publication and SQL-only exact retry; operator transport and historical import remain pending),
+`app/resolve_control.py`,
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),

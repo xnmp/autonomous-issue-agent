@@ -296,9 +296,7 @@ its resolve controls; the board's "Review holds" opens that page rather than
 mutating from the row. The browser saves the exact in-flight command in the
 tab's session storage before sending it, so a lost reply or reload offers only
 a byte-identical retry, never a new request ID. The legacy label unblock is
-offered only when this API reports the family `inactive`. Live activation
-remains paused under the
-[architecture plan](docs/open/2026-09-14-architecture-implementation.md).
+offered only when this API reports the family `inactive`.
 
 GET reads existing SQLite authority only. It distinguishes inactive family,
 active-but-absent target (404), available workflow, and unavailable/corrupt
@@ -382,8 +380,8 @@ The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Orig
 and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
 account; it is not a multi-user authentication service. Legacy `/unblock` refuses
 activated resolve authority, including missing targets. It also refuses absent,
-unwitnessed, corrupt or outdated databases; operators must use the explicit
-offline migration/activation procedure when that slice is accepted.
+unwitnessed, corrupt or outdated databases; there is no activation procedure
+(deleted in slice 5a).
 
 ### Review rejection operator API
 
@@ -405,8 +403,8 @@ merged. Its statuses are:
   A label on GitHub is not such a hold. The panel says so.
 
 - `migration_required`: the review family is not activated. Review dispatch
-  and fix-side repairs needing its guidance defer until activation, regardless
-  of other families. Activate resolve and review together operationally.
+  and fix-side repairs needing its guidance defer, regardless of other
+  families. Offline activation was deleted in slice 5a.
 - `unavailable` (503): the authority is unreadable or corrupt.
 - `available`: gates with typed causes, the continuation (fresh review owed,
   or the reviewed baseline and its provenance), the pending intent with
@@ -579,109 +577,11 @@ cause/revision and existing durable receipt. Legacy label-only unblock does not
 grant unsupported fix retry allowance; requests needing such a grant refuse
 before remote labels/comments. Ordinary selected state comes from SQL.
 
-### Resolve family activation (offline, operator-only)
+### Family activation (deleted)
 
-A deployment's resolve family stays **inactive** until an operator activates it;
-inactive resolve work is held as `resolve_migration_required` and is never read
-from the legacy `issue-N.resolve-retries`/`last-error` files, which remain on
-disk only as import evidence. Activation is explicit and offline:
-
-```bash
-issue-agent resolve-activation inventory            # read-only: in-flight work, legacy records, blockers
-issue-agent resolve-activation shadow               # read-only: per-issue legacy vs new-authority comparison + plan digest
-issue-agent resolve-activation rehearse --copy-to /tmp/empty-dir   # full activation on an isolated copy
-issue-agent resolve-activation activate --confirm-plan-digest <digest from shadow>
-```
-
-Stop all roles first: `activate` refuses while any watcher process or fresh or
-unreadable heartbeat exists for any deployment of the same repository, while
-the control store records in-flight runs, leases, claims, non-terminal
-commands or active reservations for it, and when any legacy record is
-unreadable, malformed or duplicated across state roots. Add
-`--legacy-state-dir` (repeatable, absolute) for older or custom state roots.
-The confirmed digest covers the epoch, ceiling, sources, inventory and every
-import decision; any change since the reviewed `shadow` refuses. Activation
-commits the epoch, imported episodes, ceiling holds for exhausted issues,
-per-issue decisions and a `workflow_activation` event in one transaction.
-Re-running with the same digest reports `already_active_with_this_plan`;
-activation is never repeated or reversed. Rollback after activation means
-running compatible code against the retained SQLite authority (or keeping work
-paused) — never re-enabling the legacy files. Older binaries fail closed on the
-schema. Live activation remains paused under the architecture plan.
-
-### Review family activation (offline, operator-only)
-
-The review family uses the same four commands and liveness/quiescence checks:
-
-```bash
-issue-agent review-activation inventory
-issue-agent review-activation shadow
-issue-agent review-activation rehearse --copy-to /tmp/empty-review-rehearsal
-issue-agent review-activation activate --confirm-plan-digest <digest from shadow>
-```
-
-Inventory covers every open PR and every legacy review record across the
-configured role roots and repeatable `--legacy-state-dir` roots. A complete
-fresh bot-review history must corroborate both valid `last-sha` and `patch-id`
-before they import as a reviewed baseline. Otherwise the open PR owes a fresh
-review. Guidance imports verbatim; closed PR records remain evidence only.
-Fresh counting evidence may import a rejection ceiling only
-where legacy review holds it, including the abandoned-at-head escalation case.
-The latest bot escalation must prove the rejection-ceiling preamble; an
-independent ESCALATE verdict remains a separate hold. Unknown hold provenance
-or incomplete history on a potentially held PR blocks import.
-Unreadable or malformed sources and ambiguous duplicate roots block activation.
-
-The shadow report compares legacy and new dispatch, including configured
-adoption and external holds, and names paid reviews activation would cause.
-Linked issue lifecycle/dependency holds and SQLite gates are included in the
-new dispatch prediction. A known linked issue whose read fails is unavailable,
-never treated as an unlinked PR. Normal review operation preserves that same
-distinction and bounds repeated failures with an evidence gate and backoff.
-The confirmation digest covers sources, inventory, epoch and every decision.
-Activation revalidates under all three deployment barriers and commits once;
-same-digest replay reports `already_active_with_this_plan`. Import creates no
-daemon dispatch record: the daemon records its first decision from its own read.
-
-Rehearse both families on separate isolated copies first. With all roles still
-stopped, shadow and activate resolve, then obtain a fresh review shadow and
-activate review before restarting either role. Activating only resolve retires
-legacy unblock without supplying the review lever. Review baseline, patch and
-guidance files are retained as evidence; their runtime readers, writers and
-legacy dismissal/reset controls have been removed. Rollback retains SQLite
-authority and requires compatible code. Real activation and restart remain
-subject to the architecture plan's deployment pause.
-
-### Review execution activation (offline, operator-only)
-
-Execution activation follows rejection activation. Keep all writers stopped.
-Inventory and shadow show every open or retained target; verified empty targets
-receive a current execution origin, while historical targets retain a sourced
-migration hold. A hold grants no allowance or reusable session. Shadow reports
-compare legacy observations with eligibility, allowance, session and holds,
-and name the deliberate differences where history cannot safely import.
-
-```bash
-issue-agent review-execution-activation inventory
-issue-agent review-execution-activation shadow > /tmp/execution-plan.json
-issue-agent review-execution-activation rehearse --copy-to /tmp/empty-execution-rehearsal
-issue-agent review-execution-activation activate --plan-file /tmp/execution-plan.json --confirm-plan-digest <digest from shadow>
-```
-
-The saved shadow report contains the complete immutable original plan. Keep it
-for retry after an ambiguous command response; supply the same file and digest.
-An exact committed retry checks SQL receipts without GitHub, source-file or
-writer-liveness observations. A different digest refuses. First publication
-revalidates the configured sources, remote observations and stopped writers.
-Inactive execution reports `migration_required`. Activation creates no paid work.
-
-Rehearsal always activates an isolated copy using the canonical control layout.
-It refuses destinations overlapping source roots, the target checkout or control
-authority, checks exact retry and digest conflict, and verifies original file and
-database bytes remain unchanged. Repeatable `--legacy-state-dir` includes older
-roots. Rehearsal plans identify their copied sources; obtain a fresh original
-shadow report before a separately authorized deployment. Live activation and
-restart remain paused under the architecture plan.
+Offline resolve, review and review-execution activation, their
+`*-activation` CLI subcommands and legacy import were deleted in slice 5a. An
+inactive family stays inactive; there is no activation procedure.
 
 ## Testing
 
