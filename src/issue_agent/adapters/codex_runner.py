@@ -691,8 +691,7 @@ def codex_cost_usd(
     """Pure: token counters × the configured USD-per-MILLION-token rates.
 
     Both rates 0 → 0.0: an operator who zeroes the price table opts out of
-    codex spend tracking entirely, and gets a loud "the caps cannot see this
-    runtime" warning instead (see `codex_cost_blindspot_warning`). HarnessConfig
+    codex spend tracking entirely, and the caps cannot see this runtime. HarnessConfig
     ships non-zero list-price defaults, so this is an explicit choice, not the
     common path.
 
@@ -764,11 +763,10 @@ def budget_overrun_usd(
     - `max_budget_usd <= 0` — no bound was configured, so there is nothing to
       cross.
     - the priced spend is 0 — either no usage has been reported yet, or the
-      price table is zeroed. The latter is exactly the blind spot
-      `codex_cost_blindspot_warning` announces: a cap measured in dollars
-      cannot bound a runtime whose every run reads as free. Staying silent
-      keeps that failure mode "unbounded, and loudly warned about at boot"
-      rather than "silently bounded by a number nobody can measure".
+      price table is zeroed. A cap measured in dollars cannot bound a
+      runtime whose every run reads as free; staying silent keeps that
+      opt-out "unbounded" rather than "bounded by a number nobody can
+      measure".
 
     Returns the spend rather than a bool so the caller can report what the run
     had actually burned when it was stopped — a kill that cannot say how much
@@ -1114,8 +1112,8 @@ class CodexRunner(AgentRuntime):
     max_rate_limit_retries: int = 5
     # Price table for codex spend (review M1 / D12), USD per MILLION tokens. Both
     # 0 (the default) → cost_usd stays 0.0 and codex runs never reach the ledger,
-    # which is exactly the blind spot `codex_cost_blindspot_warning` announces at
-    # startup. Set them and every codex run becomes visible to both spend caps.
+    # so the caps cannot see codex. Set them and every codex run becomes visible
+    # to both spend caps.
     cost_per_mtok_in: float = 0.0
     cost_per_mtok_out: float = 0.0
     # PER-MODEL overrides of the scalar rates above (#43): (model, in, out, cached-in), USD
@@ -1133,9 +1131,8 @@ class CodexRunner(AgentRuntime):
     # process group and returns ExitReason.BUDGET_EXHAUSTED — the same exit the
     # Claude SDK's `error_max_budget_usd` maps to, so retry/escalation needs no
     # codex special case. False (CODEX_ENFORCE_BUDGET=0) keeps the old
-    # behaviour where the wall cap is the only per-run bound; the boot line and
-    # `codex_budget_not_enforced_warning` then say so instead of claiming a
-    # guarantee. Also inert when the price table is zeroed — see
+    # behaviour where the wall cap is the only per-run bound. Also inert when
+    # the price table is zeroed — see
     # `budget_overrun_usd` for why a $0.00-per-run runtime must not be killed
     # on a dollar threshold.
     enforce_budget: bool = True
