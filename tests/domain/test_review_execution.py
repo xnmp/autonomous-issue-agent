@@ -189,7 +189,7 @@ def test_out_of_order_delivery_and_incremental_compaction_preserve_the_same_outc
     outcomes = (failed(1), productive(2, handle="session:2", display=2),
                 pin(3), failed(4, children=6), pin(5))
     expected = project_review_execution(initial, outcomes).state
-    assert (expected.failures, expected.pin_deferrals, expected.displayed_round) == (2, 2, 2)
+    assert (expected.failures, expected.pin_deferrals, expected.displayed_round) == (1, 2, 2)
     assert expected.session.handle == "session:2"
 
     for delivery in permutations(outcomes):
@@ -220,13 +220,13 @@ def test_a_gap_is_not_compacted_and_filling_it_does_not_charge_later_rounds_twic
     assert project_review_execution(complete.checkpoint, ()).state == complete.state
 
 
-def test_compacted_pin_history_keeps_its_captured_policy_for_later_outcomes():
+def test_compacted_pin_history_replays_identically_and_never_strikes():
     start = checkpoint(policy=ReviewExecutionPolicy(free_pin_deferrals=1))
     prefix = project_review_execution(start, (pin(1),)).checkpoint
     resumed = project_review_execution(prefix, (pin(2), pin(3)))
     replayed = project_review_execution(start, (pin(1), pin(2), pin(3)))
     assert resumed == replayed
-    assert resumed.state.failures == 2
+    assert (resumed.state.failures, resumed.state.pin_deferrals) == (0, 3)
 
 
 def test_exact_suffix_replay_is_idempotent_but_compacted_replay_requires_receipt_verification():
@@ -256,13 +256,16 @@ def test_conflicting_round_replay_cannot_buy_or_erase_an_allowance(conflict):
 def test_progress_only_clears_failures_and_pin_deferrals_from_earlier_rounds():
     projection = project_review_execution(checkpoint(failures=7, pin_deferrals=8, policy=ReviewExecutionPolicy(0)),
                                          (pin(4), failed(3), copied(2), pin(1)))
-    assert (projection.state.failures, projection.state.pin_deferrals) == (2, 1)
+    assert (projection.state.failures, projection.state.pin_deferrals) == (1, 1)
     assert projection.state.productive_sequence == 2
 
 
-def test_persistent_pin_failures_use_the_free_bound_and_reset_after_verified_progress():
+def test_persistent_pin_deferrals_are_machine_failures_that_never_strike():
+    """An unavailable pinned checkout is the harness, not the review."""
+    first = project_review_execution(checkpoint(), tuple(pin(n) for n in range(1, 1001)))
+    assert (first.state.failures, first.state.pin_deferrals) == (0, 1000)
     first = project_review_execution(checkpoint(), tuple(pin(n) for n in range(1, 8)))
-    assert (first.state.failures, first.state.pin_deferrals) == (2, 7)
+    assert (first.state.failures, first.state.pin_deferrals) == (0, 7)
     reset = project_review_execution(first.checkpoint, (copied(8), pin(9), pin(10)))
     assert (reset.state.failures, reset.state.pin_deferrals) == (0, 2)
     assert reset.state.productive_sequence == 8

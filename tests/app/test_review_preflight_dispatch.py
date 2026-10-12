@@ -153,7 +153,7 @@ def test_composed_review_modes_have_one_productive_outer_round(tmp_path, monkeyp
     assert len(client.provider.tasks) == len(results) and len(client.submissions()) == 1
 
 
-def test_composed_pin_deferrals_keep_durable_bound_without_paid_admission(tmp_path, monkeypatch):
+def test_composed_pin_deferrals_are_counted_without_a_strike_or_paid_admission(tmp_path, monkeypatch):
     from tests.app.review_acceptance_harness import (
         compose_review, create_review_deployment, install_clock, isolate_authority, register_review_launch, verdicts,
     )
@@ -177,7 +177,7 @@ def test_composed_pin_deferrals_keep_durable_bound_without_paid_admission(tmp_pa
     client.boot()
     client.tick(6)
     state = client.state()
-    assert state.execution.state.pin_deferrals == 6 and state.execution.state.failures == 1, client.log
+    assert state.execution.state.pin_deferrals == 6 and state.execution.state.failures == 0, client.log
     assert client.provider.tasks == [] and client.charges() == [] and client.submissions() == []
     with client.review.control.transaction() as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0

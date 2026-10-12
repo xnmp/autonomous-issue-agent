@@ -271,14 +271,14 @@ def test_shutdown_cancellation_is_selected_consistently_when_children_have_both_
 
 
 @pytest.mark.parametrize("at", [0, 1, 3])
-def test_pin_precedes_sibling_death_and_counts_only_the_outer_pin_at_sixth_deferral(at):
+def test_pin_precedes_sibling_death_and_counts_only_the_outer_pin_never_a_strike(at):
     planned = plan(mode=ReviewMode.MULTI)
     children = tuple(rounds.ReviewChildPinDeferred(child, f"pin:{index}") if index == at
                      else failure(child, deterministic=True) for index, child in enumerate(planned.children))
     outcome = finalized(facts(planned, children=children))
     assert outcome.disposition == execution.ReviewPinDeferred("complete-closure")
     state = project(outcome, failures=2, pins=5)
-    assert state.failures == 3 and state.pin_deferrals == 6
+    assert state.failures == 2 and state.pin_deferrals == 6
 
 
 @pytest.mark.parametrize("ceiling,expected", [(0, 3), (1, 2), (5, 5), (2**63 - 1, 2**63 - 1)])
@@ -435,7 +435,7 @@ def test_paid_work_and_preparation_failure_keep_the_bounded_schedule_without_an_
     assert isinstance(result.outcome.disposition, expected)
     assert result.failures == (preparation,)
     state = project(result.outcome, failures=2, pins=5)
-    assert state.failures == (2 if override == "cancel" else 3)
+    assert state.failures == (3 if override == "none" else 2)  # only the agent failure strikes
     assert state.pin_deferrals == (6 if override == "pin" else 5)
 
 
