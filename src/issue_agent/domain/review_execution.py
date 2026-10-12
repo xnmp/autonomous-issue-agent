@@ -2,7 +2,7 @@
 
 Adapters must verify the named admission, launch and effect receipts before
 constructing these facts. Model output cannot mint them. This module supplies
-no runtime authority until the execution family is explicitly activated.
+no runtime authority by itself.
 """
 
 from __future__ import annotations

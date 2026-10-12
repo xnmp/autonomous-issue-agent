@@ -36,7 +36,6 @@ from ..domain.review_execution import (
     CompletedReviewExecutionRound,
     PendingReviewExecutionRound,
     review_generation_receipt_id,
-    reduce_current_review_execution,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
@@ -923,12 +922,12 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
 
 
 def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
-    """Canonical current authority; legacy components remain explicitly held."""
+    """Canonical current authority."""
     from .sql_read_budget import SqlReadBudgetExceeded, bounded_sql_source_reads
 
     try:
         with bounded_sql_source_reads(db, MAX_EXECUTION_HOT_ROUND_SOURCE_BYTES):
-            return _load_review_workflow_row(db, key, current_state=True)
+            return _load_review_workflow_row(db, key)
     except SqlReadBudgetExceeded as exc:
         raise WorkflowAuthorityError(str(exc)) from exc
 
@@ -1293,7 +1292,7 @@ def _check_current_execution(
         if state.session_sequence <= execution.generation_start_sequence:
             if generation == origin_generation:
                 if state.session != origin.checkpoint.state.session or state.session_sequence != 0:
-                    raise WorkflowAuthorityError("current imported session disagrees with its verified origin")
+                    raise WorkflowAuthorityError("carried session must equal its origin checkpoint's session")
             elif (not isinstance(state.session, NoReviewSession)
                   or state.session_sequence != execution.generation_start_sequence):
                 raise WorkflowAuthorityError("current carried session disagrees with its generation transition")
@@ -1315,7 +1314,7 @@ def _check_current_execution(
 
 
 def _load_review_workflow_row(
-    db: sqlite3.Connection, key: WorkflowKey, *, current_state: bool = False,
+    db: sqlite3.Connection, key: WorkflowKey,
 ) -> ReviewWorkflowSnapshot | None:
     """Review-rejection authority for a PR; an issue key is never read as review."""
     activation, row = _row_or_absence(db, key, WorkflowFamily.REVIEW_REJECTIONS)
@@ -1366,23 +1365,10 @@ def _load_review_workflow_row(
             WorkflowRevision(WorkflowFence(key, row["generation"]), row["version"]),
             authority, episode, gates, intent, execution, repair,
         )
-        if current_state:
-            if isinstance(execution, ActivatedReviewExecution):
-                raise ReviewExecutionHeld(snapshot)
-            if isinstance(execution, CurrentReviewExecution):
-                _check_current_execution(db, scope, execution, snapshot.revision)
-        elif isinstance(execution, CurrentReviewExecution):
-            raise WorkflowAuthorityError("current execution is unavailable to the retired legacy reader")
-        elif isinstance(execution, ActivatedReviewExecution):
-            if (execution.boundaries or execution.checkpoint.through_sequence != 0
-                    or execution.checkpoint_receipt is not None or execution.last_sequence > MAX_EXECUTION_SUFFIX):
-                raise WorkflowAuthorityError("prior execution ancestry is unsupported; its data remains held")
-            candidate = CurrentReviewExecution(execution.origin, execution.checkpoint,
-                                               execution.state, 0, execution.last_sequence)
-            _check_current_execution(db, scope, candidate, snapshot.revision)
-            initial = replace(candidate, state=candidate.baseline.state)
-            if reduce_current_review_execution(initial, read_current_review_pending(db, initial)).execution.state != execution.state:
-                raise WorkflowAuthorityError("prior execution disagrees with its bounded selected outcomes")
+        if isinstance(execution, ActivatedReviewExecution):
+            raise ReviewExecutionHeld(snapshot)
+        if isinstance(execution, CurrentReviewExecution):
+            _check_current_execution(db, scope, execution, snapshot.revision)
         return snapshot
     except ReviewExecutionHeld:
         raise

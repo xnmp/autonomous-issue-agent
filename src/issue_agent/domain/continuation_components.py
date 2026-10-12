@@ -11,7 +11,7 @@ from .agent_task import RuntimeName
 from .refs import issue_from_branch
 from .contracts import CommandId, EffectReceipt, EffectStatus, ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
 from .workflow_identity import (
-    MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
+    MAX_WORKFLOW_GATES, ContinuationComponentIdentity, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowRevision, WorkflowFence,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
 

@@ -23,7 +23,7 @@ from ...domain.review_rearm import (
 from ...domain.review_rejection import MAX_COUNTED_REVIEWS, ReviewProjectionRefused, ReviewRejectionCeiling
 from ...domain.review_execution import CurrentReviewExecution
 from ...domain.review_workflow import (
-    BoundReviewSubmission, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm,
+    CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm,
     ReviewRearmIntent, SupersededReviewRearm,
 )
 from ...domain.review_workflow_policy import (

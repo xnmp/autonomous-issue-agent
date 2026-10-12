@@ -94,6 +94,33 @@ def assert_unpaid(store):
 
 
 
+@pytest.mark.parametrize("status", ["executing", "unknown_outcome"])
+def test_unresolved_submission_holds_next_preflight(rig, status):
+    from issue_agent.domain.contracts import EffectReceipt, EffectStatus
+    from issue_agent.domain.review_rounds import ReviewSubmissionKind
+    from tests.adapters.test_review_execution_submission import command_for  # submission tests import this module
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    command = command_for(current(store, selection))
+    control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.COPIED)
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+    store.begin_command(command.command_id)
+    if status != "executing":
+        assert store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
+                                                 EffectStatus(status), error="lost response"))
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
+    later = replace(selection, request_id="preflight:2", expected=current(store, selection).revision,
+                    claim_occurrence_id=occurrence)
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="unresolved submission"):
+        control.preflight(later)
+    assert dump(store) == before
+
+
 def test_exact_preflight_replay_is_inert_after_claim_release_and_without_gateway_reads(rig):
     store, _, gateway, selection, control = rig
     first = control.preflight(selection)

@@ -463,8 +463,7 @@ that slice's accepted commit. There is never a dual reader choosing whichever
 gives a permissive result. During the protected window this runtime may remain
 unstartable for live selected scopes; acceptance of implementation does not
 authorize their activation.
-Retained import evidence and epochs are permanent audit/fencing data, not
-feature flags. Mark this ADR accepted only for implemented, reviewed slices,
+Epochs are permanent audit/fencing data, not feature flags. Mark this ADR accepted only for implemented, reviewed slices,
 and annotate ADR 0009 with the exact partial supersession then.
 
 ## Acceptance

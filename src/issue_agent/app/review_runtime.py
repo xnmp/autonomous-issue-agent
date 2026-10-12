@@ -153,7 +153,7 @@ def current_review_failures(control: SQLiteControlStore, repository: str, pr: in
     if snapshot is None:
         return 0
     if not isinstance(snapshot.execution, CurrentReviewExecution):
-        raise WorkflowAuthorityError("review execution is blocked or requires activation")
+        raise WorkflowAuthorityError("review execution is held")
     return snapshot.execution.state.failures
 
 
@@ -542,7 +542,7 @@ class ActiveReviewRuntime:
         if not isinstance(state, ReviewWorkflowSnapshot) or state.binding != binding:
             raise WorkflowAuthorityError("the review dispatch binding is no longer current")
         if not isinstance(state.execution, CurrentReviewExecution):
-            raise WorkflowAuthorityError("review execution is blocked or requires activation")
+            raise WorkflowAuthorityError("review execution is held")
         try:
             holds = self._scheduled_external_holds(observed, view)
         except _LinkedIssueDeferred as exc:
