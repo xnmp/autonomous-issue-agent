@@ -196,10 +196,6 @@ class FixState:
     # operator deliberately restoring ai-pr-open while the same check runs.
     ci_pending_escalated: frozenset[tuple[int, str]] = frozenset()
     cleanup_sources: Mapping[int, cc.PRRepairCleanup] = field(default_factory=dict)
-    # Observed this poll: settled daily repository/global spend leaves no room
-    # for one fix leg's reservation. Time clears it, so paid dispatch waits
-    # without a label (refactor decision 7); admission stays authoritative.
-    daily_headroom_short: bool = False
     # A bad per-target record must not mint a default allowance or hide peers.
     control_errors: Mapping[int, str] = field(default_factory=dict)
 
@@ -1581,8 +1577,8 @@ def decide_fix(
     )
 
     remaining = (
-        0 if state.daily_headroom_short
-        else (0 if fixer_busy else 1) if dispatch_slots is None
+        (0 if fixer_busy else 1)
+        if dispatch_slots is None
         else max(0, dispatch_slots)
     )
     inflight = list(state.inflight)

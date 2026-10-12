@@ -1018,15 +1018,31 @@ def _spend_cfg(cfg: HarnessConfig, role: str) -> dict:
     }
 
 
-def _daily_spend(cfg: HarnessConfig, control: SQLiteControlStore):
-    """Today's committed spend per configured daily cap, read lazily."""
-    now = datetime.now(timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    for repository, dimension, cap_usd in (
-        (cfg.repo, "repository", cfg.daily_spend_cap_usd),
-        ("*", "global", cfg.global_daily_spend_cap_usd),
-    ):
-        if cap_usd > 0:
+def _control_spend_gate(
+    cfg: HarnessConfig, control: SQLiteControlStore, leg_usd: float
+) -> Callable[[], str | None] | None:
+    """Fast-path daily admission over the same authority as reservation.
+
+    Paid dispatch waits while one leg's reservation no longer fits a cap, so a
+    cap below a single leg is reported here rather than refused at admission.
+    """
+
+    caps = tuple(
+        (repository, dimension, cap)
+        for repository, dimension, cap in (
+            (cfg.repo, "repository", cfg.daily_spend_cap_usd),
+            ("*", "global", cfg.global_daily_spend_cap_usd),
+        )
+        if cap > 0
+    )
+    if not caps:
+        return None
+    reservation = Money.from_major("USD", leg_usd)
+
+    def gate() -> str | None:
+        now = datetime.now(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        for repository, dimension, cap_usd in caps:
             scope = BudgetScope(
                 repository,
                 dimension,
@@ -1036,47 +1052,22 @@ def _daily_spend(cfg: HarnessConfig, control: SQLiteControlStore):
                 start + timedelta(days=1),
                 ZoneInfo("UTC"),
             )
-            yield dimension, cap_usd, control.snapshot(scope)
-
-
-def _control_spend_gate(
-    cfg: HarnessConfig, control: SQLiteControlStore
-) -> Callable[[], str | None] | None:
-    """Fast-path daily admission over the same authority as reservation."""
-
-    if cfg.daily_spend_cap_usd <= 0 and cfg.global_daily_spend_cap_usd <= 0:
-        return None
-
-    def gate() -> str | None:
-        for dimension, cap_usd, snapshot in _daily_spend(cfg, control):
+            snapshot = control.snapshot(scope)
             if snapshot.disposition.value != "available":
                 return (
                     "ACCOUNTING "
                     f"{snapshot.disposition.value.upper()} — {snapshot.detail}"
                 )
             cap = Money.from_major("USD", cap_usd)
-            if snapshot.committed.micros >= cap.micros:
+            if snapshot.committed.micros + reservation.micros > cap.micros:
                 return (
                     f"{dimension} daily spend cap reached: "
-                    f"${snapshot.committed.micros / 1_000_000:.2f} / "
-                    f"${cap_usd:.2f}"
+                    f"${snapshot.committed.micros / 1_000_000:.2f} spent, "
+                    f"${leg_usd:.2f} leg / ${cap_usd:.2f}"
                 )
         return None
 
     return gate
-
-
-def _daily_headroom_short(cfg: HarnessConfig, control: SQLiteControlStore) -> bool:
-    """Whether one fix leg's reservation no longer fits a daily cap.
-
-    Unavailable accounting is the tick gate's to report, not a headroom wait.
-    """
-    reservation = Money.from_major("USD", cfg.fix_budget_usd).micros
-    return any(
-        snapshot.disposition.value == "available"
-        and snapshot.committed.micros + reservation > Money.from_major("USD", cap_usd).micros
-        for _dimension, cap_usd, snapshot in _daily_spend(cfg, control)
-    )
 
 
 def _first_gate(
@@ -2672,7 +2663,6 @@ def compose_fix_daemon(
         for target, workflow in state.resolve_workflows.items():
             if target in open_targets and isinstance(workflow, WorkflowUnavailable):
                 log(f"resolve workflow {target} held: {workflow.reason}")
-        state = replace(state, daily_headroom_short=_daily_headroom_short(cfg, control))
         holds = report_holds(world, inflight)
         report_prediction_outcomes(world)
         report_ci_stalls(world, state)
@@ -2754,7 +2744,7 @@ def compose_fix_daemon(
         log,
         journal=journal,
         tick_gate=_first_gate(
-            _control_spend_gate(cfg, control),
+            _control_spend_gate(cfg, control, cfg.fix_budget_usd),
             None if infra_breaker is None else infra_breaker.gate_reason,
         ),
         wake_check=_wake_check(cfg, store),
@@ -3279,7 +3269,7 @@ def compose_review_daemon(
                       say
                   ), decide, executor,
                   cfg.tick_interval_seconds, say, journal=journal,
-                  tick_gate=_control_spend_gate(cfg, control),
+                  tick_gate=_control_spend_gate(cfg, control, cfg.review_budget_usd),
                   wake_check=_wake_check(cfg, store),
                   dispatch_capacity=1,
                   dispatch_key=lambda action: ("pr", action.number),
@@ -3677,7 +3667,7 @@ def build_steward_daemon(
                       observe, control, cfg, "steward", steward_log
                   ), decide, executor, cfg.tick_interval_seconds,
                   steward_log, journal=journal,
-                  tick_gate=_control_spend_gate(cfg, control),
+                  tick_gate=_control_spend_gate(cfg, control, cfg.triage_budget_usd),
                   wake_check=_wake_check(cfg, store),
                   dispatch_capacity=1,
                   dispatch_key=lambda action: ("issue", action.number),
