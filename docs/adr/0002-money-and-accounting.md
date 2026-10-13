@@ -49,8 +49,7 @@ and locked rates bound their financial interpretation (ADR 0012).
 
 Codex persists rollout coordinates, pre-run baselines and locked rates before
 launch. Boot/wake recovery reads only the harness-owned invocation window and
-settles terminal, lease-free legacy `accounting_unavailable` rows through the
-normal transaction. Missing/unusable recovery evidence settles zero as an
+settles ended, lease-free unsettled legs through the normal transaction. Missing/unusable recovery evidence settles zero as an
 estimate, with a journaled gap. Version-1 evidence prices usable parent usage at
 its frozen scalar rates even without native-child metadata or a model name.
 Repeated recovery neither adds another charge nor
