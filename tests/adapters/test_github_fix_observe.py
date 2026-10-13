@@ -8,6 +8,7 @@ import re
 
 import pytest
 
+from issue_agent.adapters import github as gh
 from issue_agent.adapters.github import (
     FixObservationIncomplete,
     GitHubGateway,
@@ -209,6 +210,12 @@ def test_an_unjudgeable_branch_makes_only_its_issue_unknown(bad):
 def test_a_name_that_only_contains_the_prefix_is_not_a_harness_branch():
     # `query:"fix/"` matches anywhere in the name.
     assert parse_fix_refs([{**ref("5-x"), "name": "hotfix/5-x"}, {**ref("6-y"), "name": "feat/fix/6-y"}]) == ((), {})
+
+
+def test_harness_refs_are_listed_under_refs_heads():
+    # 2026-10-13: under a `refs/heads/fix/` prefix GitHub fails `compare`, so
+    # every fix-role read failed. Live-verified shape; GitHub cannot be faked here.
+    assert 'refPrefix:"refs/heads/",query:"fix/"' in gh._FIX_REFS
 
 
 @pytest.mark.parametrize("bad", [[None], [{"name": 5}]])

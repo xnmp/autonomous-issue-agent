@@ -286,11 +286,11 @@ _FIX_PR = (
 )
 # Per branch: its newest PR (any state), its head commit's date, and how many
 # commits it has that the base lacks (`compare` reads the ref as the base, so
-# that count is `behindBy`). The prefix stays `refs/heads/`: GitHub resolves
-# `compare(headRef:)` relative to the connection's refPrefix, so a
-# `refs/heads/fix/` prefix looked up `fix/<base>` and failed every read
-# (2026-10-13, all three deployments). `query` narrows server-side; the parser
-# keeps only names that start with the harness prefix.
+# that count is `behindBy`). The prefix stays `refs/heads/`: under a
+# `refs/heads/fix/` prefix GitHub fails `compare` (500 or NOT_FOUND for every
+# base spelling), which failed every fix-role read (2026-10-13, all three
+# deployments). `query` (case-insensitive, matches anywhere) narrows
+# server-side; the parser keeps only names that start with the harness prefix.
 _FIX_REFS = ("refs(refPrefix:\"refs/heads/\",query:\"" + _HARNESS_BRANCH_PREFIX + "\",first:100{after})"
              "{{pageInfo{{hasNextPage endCursor}} "
              "nodes{{name associatedPullRequests(last:1,orderBy:{{field:CREATED_AT,direction:ASC}})"
