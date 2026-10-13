@@ -5,12 +5,14 @@ import {
   Suspense,
   useMemo,
   useState,
+  type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
 } from "react";
 import { api } from "../api/client";
 import { usePolled, type Polled } from "../api/hooks";
 import { useNow } from "../lib/clock";
+import { recencyIntensity } from "../lib/recency";
 import type {
   BacklogCard,
   DoneCard,
@@ -332,6 +334,9 @@ function DoneTable({
   onOpen: (issue: number) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  // Minute cadence: the tint moves ~0.07%/min, and a table-wide 1 s clock would
+  // re-render every row (see TimeSinceDone).
+  const nowMs = useNow(60_000);
   // The issue column is always rendered, so it is always a legal remembered
   // sort; everything else is the reader's current column choice.
   const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
@@ -373,10 +378,12 @@ function DoneTable({
           {page.rows.map((card) => {
             const open = expanded === card.issue;
             const isNew = unread.has(card.issue);
+            const recency = recencyIntensity(doneAtMs(card), nowMs);
             return (
               <Fragment key={card.issue}>
                 <tr
-                  className={`clickable${open ? " expanded" : ""}${isNew ? " unread" : ""}`}
+                  className={`clickable${open ? " expanded" : ""}${recency > 0 ? " recent" : ""}${isNew ? " unread" : ""}`}
+                  style={recency > 0 ? ({ "--recency": recency.toFixed(3) } as CSSProperties) : undefined}
                   tabIndex={0}
                   aria-expanded={open}
                   onClick={() => setExpanded(open ? null : card.issue)}
