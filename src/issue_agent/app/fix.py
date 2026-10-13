@@ -18,20 +18,20 @@ from datetime import datetime
 
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, MergePullRequest, RunAgent
-from ..domain.backoff import dispatched_kind
-from ..domain.ci import failed_checks, parse_timestamp
+from ..domain.backoff import LegEnd, dispatched_kind
+from ..domain.ci import failed_checks
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue, slugify
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Wait, WaitReason
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Wait, WaitReason, human_comments
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from ..adapters.act import GitHubAct
 from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, Role, compose_role, dispatch_item, leg_class, run_item, run_leg, stderr_log
+from .tick import Choose, Role, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, stderr_log
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 
@@ -54,14 +54,10 @@ def fix_actions(
     return tuple(out)
 
 
-def human_reply(comments: Iterable[Comment], after: datetime, harness: Harness) -> str:
-    """Non-harness, non-bot comments posted after `after`, oldest first."""
-    picked = [
-        (at, c) for c in comments
-        if (at := parse_timestamp(c.created_at)) is not None and at > after
-        and not harness.wrote(c) and not c.is_bot
-    ]
-    return "\n\n".join(f"@{c.author}: {c.body}" for _, c in sorted(picked, key=lambda p: p[0]))
+def human_reply(comments: Iterable[Comment], after: datetime, harness: Harness, legs: Iterable[LegEnd]) -> str:
+    """The human comments (derive's definition, so none inside one of the
+    item's leg windows) posted after `after`, oldest first."""
+    return "\n\n".join(f"@{c.author}: {c.body}" for at, c in human_comments(comments, harness, legs) if at > after)
 
 
 @dataclass(frozen=True)
@@ -133,8 +129,8 @@ class FixLegs:
 
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
         # The review role's legs are not this role's sessions to continue.
-        runs = sorted((r for r in self.control.leg_runs(self.settings.repository, (issue,))
-                       if dispatched_kind(r.kind) in _FIX_ACTS), key=lambda r: r.completed_at)
+        recorded = self.control.leg_runs(self.settings.repository, (issue,))
+        runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS), key=lambda r: r.completed_at)
         mine = [r for r in runs if run_item(r) == item]
         # The newest agent leg, the rule derive uses: machine and transport
         # deaths after it neither drop its question nor reset resume-once.
@@ -153,7 +149,10 @@ class FixLegs:
                 cwd = self.worktrees.sync(issue, subject.head_ref_name, action.head)
             if self.prepare_cwd is not None:
                 self.prepare_cwd(cwd)
-            task = self._task(action, subject, cwd, runs, cut_off, asked)
+            # Every leg of the item, either role's, as derive sees them (#342).
+            reply = human_reply(subject.comments, asked.completed_at, self.settings.harness,
+                                local_legs(recorded).get(item, ())) if asked else ""
+            task = self._task(action, subject, cwd, runs, cut_off, asked, reply)
             task = replace(task, env={**task.env, **self._git_identity()})
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")
@@ -189,11 +188,11 @@ class FixLegs:
 
     def _task(
         self, action: RunAgent, subject, cwd: str, runs: list[LegRun], cut_off: LegRun | None, asked: LegRun | None,
+        reply: str,
     ):
         """`cut_off` is the machine end this leg continues; `asked` the agent
-        leg whose question a human has since answered."""
+        leg whose question a human has since answered with `reply`."""
         cfg = self.task_config
-        reply = human_reply(subject.comments, asked.completed_at, self.settings.harness) if asked else ""
         if action.kind is AgentKind.RESOLVE:
             if cut_off is not None:
                 return tasks.build_continue_task(cwd, self._session([cut_off]), cfg)

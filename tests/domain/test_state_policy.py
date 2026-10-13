@@ -40,6 +40,7 @@ from issue_agent.domain.state import (
     Wait,
     WaitReason,
     derive,
+    human_comments,
     issue_key,
     pr_key,
     stop_tag,
@@ -830,6 +831,62 @@ def test_the_same_comment_outside_every_leg_window_resets():
     between = Comment("alice", "try the other approach", iso(3.5))
     loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
     assert pr_state(pr(ci=RED, comments=(between,)), loc) == Dispatch(FIX, HEAD)
+
+
+# ── One definition of a human comment (#342) ────────────────────────────────
+
+
+def _bodies(comments, legs_=()) -> list[str]:
+    return [c.body for _, c in human_comments(comments, H, legs_)]
+
+
+def test_342_the_agents_unmarked_fix_bot_comment_inside_a_machine_ended_leg_is_not_human():
+    # tauri #1102: the leg posted progress as FIX_BOT (the operator's login),
+    # then hit the wall cap. Its comment is not the human's answer.
+    capped = LegEnd(FIX, at(10), True, started_at=at(5))
+    own = Comment("fix-bot", "Progress: tried mocking the clock", iso(7))
+    assert human_comments([own], H, [capped]) == ()
+
+
+def test_342_the_operator_as_fix_bot_replying_outside_every_leg_is_human_oldest_first():
+    legs_ = [windowed(FIX, 1, 2), LegEnd(FIX, at(6), True, started_at=at(4))]
+    comments = [human(8, author="fix-bot", body="after"), human(3, author="FIX-BOT ", body="between"),
+                human(5, author="fix-bot", body="inside")]
+    assert _bodies(comments, legs_) == ["between", "after"]
+
+
+@pytest.mark.parametrize("stamp", ["", "yesterday", "2026-13-40T00:00:00Z", "x" * 100_000])
+def test_a_comment_whose_time_is_absent_or_malformed_is_never_human(stamp):
+    assert human_comments([Comment("alice", "ok", stamp)], H, ()) == ()
+
+
+def test_a_leg_that_never_launched_has_no_window():
+    refused = LegEnd(FIX, at(10), True)  # started_at None: refused before launch
+    assert _bodies([human(9, body="reply")], [refused]) == ["reply"]
+
+
+def test_harness_and_bot_comments_are_never_human():
+    marked = Comment("fix-bot", f"{H.marker} stop", iso(1))
+    assert human_comments([marked, human(2, author="ci[bot]")], H, ()) == ()
+
+
+def test_window_end_is_inclusive():
+    assert human_comments([human(5)], H, [windowed(FIX, 4, 5)]) == ()
+
+
+def test_ten_thousand_comments_against_many_legs():
+    legs_ = [windowed(FIX, 2 * k, 2 * k + 1) for k in range(50)]
+    comments = [human(m + 0.5) for m in range(10_000)]
+    # Inside: 2k+0.5 for k < 50; every other minute is outside.
+    assert len(human_comments(comments, H, legs_)) == 10_000 - 50
+
+
+def test_342_the_operator_as_fix_bot_releases_a_stop_after_a_machine_ended_leg():
+    # Release is safe by construction (the reply postdates the stop, which
+    # postdates every leg), so the shared window filter must not starve it.
+    capped = LegEnd(FIX, at(10), True, started_at=at(5))
+    reply = Comment("fix-bot", "Mock the clock.", iso(12))
+    assert pr_state(labelled([stop(StopReason.ATTEMPTS, 11), reply]), local(pr_legs(capped))) == Release()
 
 
 def test_a_comment_at_the_leg_start_instant_is_outside_the_window():

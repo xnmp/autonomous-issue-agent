@@ -349,6 +349,7 @@ def _decide(item: _Item, local: Local, harness: Harness, observed: datetime | No
     anchor = last_end.isoformat() if last_end else "-"
     comments = [(at, c) for c in item.comments if (at := parse_timestamp(c.created_at))]
     stops = [(at, m.group(1)) for at, c in comments if harness.wrote(c) and (m := _STOP_TAG_RE.search(c.body))]
+    human = human_comments(item.comments, harness, legs)
     # Older stops were released; they still matter below (reset floor, workflow).
     last_stop = max((s for s in stops if last_end is None or s[0] > last_end), default=None)
     labelled = Label.NEEDS_HUMAN in item.labels
@@ -360,10 +361,10 @@ def _decide(item: _Item, local: Local, harness: Harness, observed: datetime | No
         parked = parse_timestamp(item.labeled_at) if item.labeled_at else last_stop[0]
         if parked is None:
             return Wait(WaitReason.NEEDS_HUMAN)
-        if any(at > max(last_stop[0], parked) and _human_comment(c, harness) for at, c in comments):
+        if any(at > max(last_stop[0], parked) for at, _ in human):
             return Release()
         return Wait(WaitReason.NEEDS_HUMAN)
-    state = _proceed(item, local, harness, legs, comments, stops, anchor)
+    state = _proceed(item, local, harness, legs, human, stops, anchor)
     if labelled and not isinstance(state, NeedsHuman):
         return Wait(WaitReason.NEEDS_HUMAN)
     return state
@@ -371,7 +372,7 @@ def _decide(item: _Item, local: Local, harness: Harness, observed: datetime | No
 
 def _proceed(
     item: _Item, local: Local, harness: Harness, legs: tuple[LegEnd, ...],
-    comments: list[tuple[datetime, Comment]], stops: list[tuple[datetime, str]], anchor: str,
+    human: tuple[tuple[datetime, Comment], ...], stops: list[tuple[datetime, str]], anchor: str,
 ) -> DerivedState:
     last_stop = max((at for at, _ in stops), default=None)
     # Newest agent end; a tie goes to the later-recorded leg, as in _attempts.
@@ -391,7 +392,7 @@ def _proceed(
     step = _pr_step(pr, harness) if pr is not None else Dispatch(AgentKind.RESOLVE)
     if not isinstance(step, Dispatch):
         return step
-    floor = _reset_floor(item, comments, last_stop, harness, legs)
+    floor = _reset_floor(item, [at for at, _ in human], last_stop, harness)
     if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
             and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
             and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
@@ -482,21 +483,33 @@ def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) 
     return run
 
 
-def _human_comment(comment: Comment, harness: Harness) -> bool:
-    return not harness.wrote(comment) and not comment.is_bot
+def human_comments(
+    comments: Iterable[Comment], harness: Harness, legs: Iterable[LegEnd],
+) -> tuple[tuple[datetime, Comment], ...]:
+    """The comments a human wrote, with their times, oldest first: the one
+    definition release, the reset floor and the fixer's reply text share.
+
+    Not human: the harness's own (marker and login), a bot's, one whose
+    timestamp does not parse (it fails toward not a reply), and one inside one
+    of the item's leg windows (start, end]. The agent inherits the
+    ambient GitHub credentials and comments without the marker, under FIX_BOT
+    or the operator's login, which can be the same login (Q1), so its run
+    window is the only signal (#342). A leg without a start never launched
+    (the legs table stamps `started_at` at launch), so it posted nothing."""
+    windows = [(leg.started_at, leg.ended_at) for leg in legs if leg.started_at is not None]
+    picked = [(at, c) for c in comments
+              if (at := parse_timestamp(c.created_at)) is not None and not harness.wrote(c) and not c.is_bot
+              and not any(start < at <= end for start, end in windows)]
+    return tuple(sorted(picked, key=lambda p: p[0]))
 
 
 def _reset_floor(
-    item: _Item, comments: list[tuple[datetime, Comment]], last_stop: datetime | None, harness: Harness,
-    legs: tuple[LegEnd, ...],
+    item: _Item, human: list[datetime], last_stop: datetime | None, harness: Harness,
 ) -> datetime | None:
-    """The latest reset event (Q3): a non-harness comment, review or push. A
-    stop comment on an unlabelled item was released (reply or label removal),
-    so it is a reset too. A comment inside one of the item's leg windows is the
-    agent's own (it comments under the bot's login without the marker)."""
-    windows = [(leg.started_at, leg.ended_at) for leg in legs if leg.started_at is not None]
-    events = [at for at, c in comments if _human_comment(c, harness)
-              and not any(start < at <= end for start, end in windows)]
+    """The latest reset event (Q3): a human comment, or a non-harness review
+    or push. A stop comment on an unlabelled item was released (reply or label
+    removal), so it is a reset too."""
+    events = list(human)
     if last_stop is not None:
         events.append(last_stop)
     if item.pr is not None:
@@ -519,5 +532,5 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
 __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
     "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "Release", "Wait", "NeedsHuman",
-    "Busy", "Backoff", "DerivedState", "derive", "touches_github",
+    "Busy", "Backoff", "DerivedState", "derive", "human_comments", "touches_github",
 ]
