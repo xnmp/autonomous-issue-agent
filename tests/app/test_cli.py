@@ -1780,7 +1780,7 @@ def test_uninstall_service_all_is_explicit_and_unscoped(monkeypatch) -> None:
     ]
 
 
-def test_ready_routes_operator_label_through_durable_effects(
+def test_ready_routes_operator_label_through_operator_effects(
     monkeypatch, capsys
 ):
     calls = []

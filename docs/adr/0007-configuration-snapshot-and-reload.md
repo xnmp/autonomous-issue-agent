@@ -20,7 +20,7 @@ definitions are the single mapping: each field's default plus its metadata for
 env name, coercion, choices, and generated examples.
 `HarnessConfig.validation_errors()` owns range and cross-field validation.
 Configuration is validated before adapter construction and the resulting
-snapshot hash is recorded on reservations, commands, and events that need
+snapshot hash is recorded on reservations and runs that need
 historical identity.
 
 After validation, application code passes snapshot values explicitly. Ambient

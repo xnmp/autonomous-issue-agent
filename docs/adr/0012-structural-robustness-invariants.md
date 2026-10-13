@@ -1,6 +1,6 @@
 # ADR 0012 — Structural robustness invariants (post-voyage)
 
-Status: Accepted
+Status: Superseded by the minimal-harness refactor (slice 5d-1, 2026-10-13): the gate and verdict inputs it governed were deleted; bounded loops remain a CLAUDE.md rule.
 Governs: src/issue_agent/app/cli.py
 
 Decided 2026-08-01.

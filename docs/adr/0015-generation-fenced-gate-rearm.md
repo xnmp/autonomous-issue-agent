@@ -1,6 +1,7 @@
 # ADR 0015 — Generation-fenced gate re-arm authority
 
-Status: Accepted for resolve and review rejections. Proposed 2026-09-14;
+Status: Superseded by the minimal-harness refactor (slices 5b-5d-1, 2026-10-13): the resolve and review gates, re-arm commands and continuation authority were deleted.
+Previously: Accepted for resolve and review rejections. Proposed 2026-09-14;
 phases 1–2 accepted at `1703195`. The resolve
 slice is accepted (2026-09-25) at `6905184` (operator UI `6a6d769`, offline
 activation `f559282`, absence-authorized retry `bba05c8`, composed fault-matrix

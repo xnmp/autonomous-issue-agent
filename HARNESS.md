@@ -47,8 +47,8 @@ Configuration is layered:
 
 The repo overlay wins. The active snapshot is the daemon authority: removing a
 knob from it restores the dataclass default instead of accidentally inheriting a
-stale value from a relaunch shell. Each admitted run and lifecycle command
-records the snapshot version that created it.
+stale value from a relaunch shell. Each admitted run records the snapshot
+version that created it.
 
 Important fields:
 
@@ -214,9 +214,8 @@ The per-account SQLite database at
 `~/.local/state/issue-agent-control/control.db` is authoritative for:
 
 - paid reservations and charges;
-- run/lease ownership;
-- deduplication keys;
-- lifecycle commands and effect receipts.
+- run/lease ownership and legs/attempts;
+- idempotency keys for GitHub writes.
 
 Every paid leg reserves its maximum charge before the runtime starts, including
 when operator caps are disabled. Concurrent final-cap races are serialized.
@@ -235,8 +234,7 @@ usage provenance, and rate-card identity.
 
 At boot and after a suspension gap, recovery runs in a fixed order: kill known
 orphan groups, reclaim dead leases, reconcile unsettled spend, release only
-reservations durably proven never launched, drain commands through receipt
-verification. A run that may have reached
+reservations durably proven never launched. A run that may have reached
 a paid provider remains fail-closed until positive settlement evidence exists.
 Completed runs that returned without trusted usage or a provider charge are a
 separate liveness case: recovery retries provider reconciliation through the
@@ -245,8 +243,8 @@ records `spend_unmeasured_released`. This keeps repeated usage-blind results
 from permanently exhausting admission capacity while preserving an explicit
 operator-visible accounting gap.
 An explicit same-repository repoint first reaps the recorded prior checkout
-registries and atomically adopts their run, lease, claim, and command
-authority; unrelated sibling checkouts remain isolated.
+registries and atomically adopts their run and lease ownership; unrelated
+sibling checkouts remain isolated.
 Historical JSONL is never queried for these decisions.
 
 Each role's `journal.jsonl` is a plain JSON-lines log only. Metrics derive
@@ -272,100 +270,22 @@ CLI and dashboard quota totals are read-only projections of settled SQLite
 charges for the current budget period; the legacy spend ledger is migration
 input only.
 
-### Resolve operator API
+### Operator writes
 
-The loopback dashboard exposes `GET /api/repos/{name}/issues/{number}/resolve-control`
-and `POST` to the same path plus `/commands`. The issue page renders these as
-its resolve controls; the board's "Review holds" opens that page rather than
-mutating from the row. The browser saves the exact in-flight command in the
-tab's session storage before sending it, so a lost reply or reload offers only
-a byte-identical retry, never a new request ID. The legacy label unblock is
-offered only when this API reports the family `inactive`.
-
-GET reads existing SQLite authority only. It distinguishes inactive family,
-active-but-absent target (404), available workflow, and unavailable/corrupt
-authority (503). Optional `request_id` selects historical intent separately from
-the current intent and holds. `workflow_held` describes SQLite holds, not remote
-readiness; submission checks external facts again. Inspection never creates or
-migrates a database, performs Git recovery, or drains commands.
-
-`release` is the single recovery command; `cancel_rearm` remains cancellation.
-Copy the exact `expected` identity from GET (repository, issue or pull request,
-family, epoch, generation, version, episode) and use a stable `request_id`.
-Release selects one gate, registered eligible verdict, or stopped grant.
-For a resolve ceiling, send:
-
-```json
-{"operation":"release","request_id":"operator-stable-id","expected":{"...":"copy GET expected"},"selection":{"kind":"gate","gate_id":"copy GET gate_id","intent":{"kind":"resume","guidance":{"kind":"keep"}}}}
-```
-
-Guidance is `keep`, `clear`, or `set` with text. A stopped grant selection is
-`{"kind":"stopped_grant","stopped_request_id":"original request"}`; it continues
-existing authority. Cancellation names the pending request, cancellation ID,
-and reason. Actor identity is minted by the server for its local OS account.
-Release maps to the existing domain commands, with the same ID namespaces,
-guidance normalization, receipts, and audit bytes. Browser journals and response
-operation names keep their original shapes so tabs opened before deployment
-continue to work. Original HTTP operation payloads remain accepted for those tabs.
-
-`release` with gate intent `retry_absent` is offered only for a
-`retry_authorization_required` gate: a
-command whose remote outcome expired into reconciliation-only mode and whose
-current postcondition the harness's own read later proved absent. The body
-names `request_id`, selection `gate_id`, and intent `command_id`/`evidence_id` exactly as
-GET reports them; the API never accepts proof. It permits **one** execution of
-the existing command under its current generation and episode. It does not
-renew allowance, create a re-arm, advance generation, reset expiry, or erase
-unresolved history. It is offered and accepted only when the executor could
-begin it now — the same validator decides both: a re-arm obligation needs its
-original request still pending and its workspace handoff verified; a
-returned-result completion needs no other gate holding the workflow; the
-store's own execution-authority check must pass; retired commands are never
-authorizable. The absence must postdate the command's uncertainty and its last
-authorized attempt. Authorized attempts are bounded: one per grant and three
-per command over its life (the last one reaches the ceiling and no further grant is possible). A
-second grant while one is open, or a reused ID with different content,
-conflicts (409); an evidence ID that already backed a grant, a command whose
-original decision was judged inapplicable, or a command at its ceiling is
-rejected (422). While a grant is open the gate reports it under
-`pending_retry` ("one retry authorized, waiting for the executor").
-
-Every grant ends in one journaled terminal disposition (`consumed`,
-`not_needed`, `inapplicable` or `void`, entity `workflow_retry_authorization`).
-The fix daemon visits a new grant once immediately; later visits follow the
-read schedule. It re-reads the postcondition (stamped at read start): present
-settles success (`not_needed`); unavailable keeps the grant open under the
-normal backoff (`deferred`) and voids it after five unavailable reads or one
-day; a restart before consumption keeps it open for the next scheduled read.
-Absent re-checks the original decision's guards: a changed guard is
-`inapplicable` (a standalone command retires; a re-arm obligation becomes a
-verified refusal that supersedes its request at the next re-arm reconciliation,
-after which `release` can select the stopped grant, and it can never be granted again). A
-scope change since acceptance (other hold, generation, cancelled or retired
-obligation, stale read) is `void` and records the fresh absence. Otherwise the
-grant is consumed with the attempt in one transaction and the gate reports the
-attempt as `remote_uncertain`; while the attempt's process is alive no other
-drain reads that command. Success closes the gate; a crash or unverified write
-keeps reconciliation-only with the original history, and a later verified
-absence needs a new grant. Cancelling or superseding a re-arm voids any open
-grant on its retired obligations.
-
-Accepted (202) means durable intent, not completed recovery. Canonical replay
-returns 200, stale identity/content conflicts 409, invalid requests 422, and
-unavailable observations/authority 503. After a lost response, retry the exact
-same command and ID; do not invent a new grant. Later GET reports progress while
-the existing daemon recovery and durable executor establish completion.
-
-Both typed and legacy commands use one validated active launch snapshot, without
-per-field overlay fallback. Missing snapshots refuse; edits during a request do
-not redirect its repository, credentials or local state writes.
+The dashboard changes labels on GitHub and nothing else (refactor decision
+Q19). `POST /api/repos/{name}/issues/{number}/park` adds `needs-human` to the
+issue and to each open harness PR for it (head `fix/<issue>-…`); the fix
+policy then waits until the label is removed or a human replies to the stop.
+`POST …/unblock` removes `needs-human` from the issue and those PRs and puts
+the issue back on `ai-ready`. `POST …/promote` adds `ai-ready`, and
+`POST …/priority` sets one of P1–P3. Each write reads the label first, writes
+only what is missing, and reads it back; repeating a request moves nothing,
+and a write whose reply was lost is observed rather than repeated. There is no
+command queue, typed resolve command or retry grant (deleted in slice 5d-1).
 
 The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Origin,
 and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
-account; it is not a multi-user authentication service. Legacy `/unblock` refuses
-activated resolve authority, including missing targets. It also refuses absent,
-unwitnessed, corrupt or outdated databases; there is no activation procedure
-(deleted in slice 5a).
+account; it is not a multi-user authentication service.
 
 ### Review role
 

@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/domain/recovery.py src/issue_agent/app/recovery.py src/issue_agent/app/loop.py src/issue_agent/app/main.py src/issue_agent/app/roles.py
+Governs: src/issue_agent/domain/recovery.py src/issue_agent/app/recovery.py src/issue_agent/app/tick.py src/issue_agent/app/main.py src/issue_agent/app/roles.py
 
 ## Context
 
@@ -14,7 +14,7 @@ the daemon loop. A missing periodic edge stranded retained reservations, while
 a wake edge wired to unconditional process reaping killed live paid work.
 
 The defect class is therefore trigger-to-operation composition, not ownership
-of process, lease, reservation, command, or spend state.
+of process, lease, reservation, or spend state.
 
 ## Decision
 
@@ -24,13 +24,13 @@ executes its phased plan; the coordinator executes the post-composition arms:
 
 | Trigger | Process arm | Other arms | Reservation grace |
 |---|---|---|---|
-| Boot | reap all owned legacy, repointed, and current processes | reclaim leases, validate worktrees, drain commands, sweep reservations | immediate |
-| Wake | reap abandoned processes only | reclaim leases, validate worktrees, drain commands, sweep reservations | configured stale grace |
+| Boot | reap all owned legacy, repointed, and current processes | reclaim leases, validate worktrees, sweep reservations | immediate |
+| Wake | reap abandoned processes only | reclaim leases, validate worktrees, sweep reservations | configured stale grace |
 | Periodic | none | reclaim leases and sweep reservations | configured stale grace |
 
 Boot has two ordered phases under the same trigger. Its process arm reaps the
 legacy, explicitly repointed, and current-deployment registries before adapter
-construction. Lease, worktree, command, spend, and reservation reconciliation
+construction. Lease, worktree, spend, and reservation reconciliation
 runs explicitly after the application graph and legacy-spend migration
 complete, and before readiness is reported. Recovery does not run as a
 constructor side effect, and a production role without its trigger hook fails
