@@ -138,7 +138,7 @@ def test_systemd_dashboard_is_a_hot_reloading_host_singleton():
     exec_start = service["ExecStart"][0].split()
 
     assert exec_start[0] == "@UV_BIN@"
-    assert exec_start[-2:] == ["issue-agent", "dashboard"]
+    assert exec_start[-3:] == ["python", "-m", "issue_agent.app.dashweb.main"]
     assert service["WorkingDirectory"] == ["@HARNESS_ROOT@"]
     assert service["Environment"] == ["PATH=@INSTALL_PATH@"]
     assert service["Restart"] == ["on-failure"]

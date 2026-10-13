@@ -8,9 +8,6 @@ a guaranteed merge conflict (the #59-vs-#60 collision).
 from tests.domain.builders import observed_pr
 
 
-from tests.domain.builders import pr, world
-
-
 from issue_agent.domain.world import (
     Comment,
 )
@@ -21,7 +18,6 @@ def _pr(number, state, files):
     return observed_pr(number=number, state=state, changed_files=frozenset(files))
 
 
-IN_FLIGHT = world(prs=[pr(7, "ai-pr-open", head_ref_oid="sha1")])
 
 
 # ── Comment.is_bot (review R2-11: routed through identity.is_bot_login) ──────

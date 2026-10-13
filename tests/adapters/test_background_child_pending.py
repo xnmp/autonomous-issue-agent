@@ -84,7 +84,7 @@ def _run(monkeypatch, messages, log=None):
 
 def _asks_human(actions) -> bool:
     return any(isinstance(a, PostComment) for a in actions) or any(
-        isinstance(a, Relabel) and Label.AI_BLOCKED in a.added_labels for a in actions
+        isinstance(a, Relabel) and Label.NEEDS_HUMAN in a.added_labels for a in actions
     )
 
 

@@ -37,9 +37,6 @@ from .world import Comment, PRView
 ROLE_NAMES = ("fix", "review")
 # A role heartbeat older than this reads as stale (the CLI's status uses it too).
 STALE_AFTER_S = 1800.0
-# Kept for adapters/journal.py, which imports it to tell issue-numbered leg
-# kinds from PR-numbered ones; that import is the core's to drop.
-ISSUE_NUMBERED = frozenset({AgentKind.RESOLVE.name})
 
 MESSAGE_CHARS = 4000
 EXCERPT_CHARS = 500

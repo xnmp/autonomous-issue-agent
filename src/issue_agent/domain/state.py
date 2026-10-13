@@ -17,7 +17,8 @@ Precedence, the single place it is defined (first match wins, per item):
                item's last leg end; a stop is always posted after the legs it
                judges): a lifetime stop on a still-capped issue -> Wait (money
                is a grant, so a reply cannot release it); a qualifying reply
-               (Q8) -> Release; else Wait. Labelled without one (the comment
+               (Q8) newer than both the stop and the label's latest
+               application -> Release; else Wait. Labelled without one (the comment
                failed, or a human labelled it): the steps below run, a
                NeedsHuman is emitted (the label add is idempotent, the comment
                keyed) and anything else waits.
@@ -298,6 +299,7 @@ class _Item:
     comments: tuple[Comment, ...]
     pr: PRView | None = None
     branches: tuple[Branch, ...] = ()
+    labeled_at: str = ""
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
@@ -318,10 +320,12 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
         if (n := harness_branch_issue(b.name)) is not None:
             pushed.setdefault(n, []).append(b)
     items = [
-        _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())))
+        _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
+              labeled_at=i.needs_human_labeled_at)
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
-    ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p) for p, n in prs if p.number > 0]
+    ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at)
+         for p, n in prs if p.number > 0]
     observed = parse_timestamp(world.now)
     return {item.key: _decide(item, local, harness, observed) for item in items}
 
@@ -351,7 +355,12 @@ def _decide(item: _Item, local: Local, harness: Harness, observed: datetime | No
     if labelled and last_stop is not None:
         if item.issue in local.lifetime_capped and last_stop[1] == StopReason.LIFETIME_CAP.value:
             return Wait(WaitReason.NEEDS_HUMAN)
-        if any(at > last_stop[0] and _human_comment(c, harness) for at, c in comments):
+        # A reply releases only if it is newer than the label too: an operator
+        # re-park after a reply must not be undone (5d-1 review).
+        parked = parse_timestamp(item.labeled_at) if item.labeled_at else last_stop[0]
+        if parked is None:
+            return Wait(WaitReason.NEEDS_HUMAN)
+        if any(at > max(last_stop[0], parked) and _human_comment(c, harness) for at, c in comments):
             return Release()
         return Wait(WaitReason.NEEDS_HUMAN)
     state = _proceed(item, local, harness, legs, comments, stops, anchor)

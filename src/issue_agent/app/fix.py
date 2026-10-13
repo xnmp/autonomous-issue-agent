@@ -29,9 +29,10 @@ from ..domain.refs import harness_branch_issue, slugify
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Wait, WaitReason
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
+from ..adapters.act import GitHubAct
+from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, dispatch_item, leg_class, run_item
-from .tick import run_leg
+from .tick import Choose, Role, compose_role, dispatch_item, leg_class, run_item, run_leg, stderr_log
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 
@@ -255,4 +256,32 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
     return choose
 
 
-__all__ = ["FixLegs", "FixSettings", "fix_actions", "fix_choose", "human_reply"]
+def compose_fix_daemon(
+    cfg: HarnessConfig, gateway, worktrees, runner, *, log: Callable[[str], None] | None = None,
+) -> Role:
+    """The fix role: every Action but REVIEW, paid legs up to
+    FIX_DISPATCH_CONCURRENCY."""
+    log = log or stderr_log("fix")
+    settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, cfg.fixer_runtime.value,
+                           "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot))
+    task_config = tasks.FixTaskConfig(cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,
+                                      cfg.fix_model, cfg.fix_effort, runtime=cfg.fixer_runtime)
+
+    def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> FixLegs:
+        return FixLegs(gateway, control, replace(settings, owner_id=owner_id), runtime=runtime,
+                       accounting=accounting, worktrees=worktrees, task_config=task_config,
+                       prepare_cwd=prepare_cwd, log=log)
+
+    def make_act(dispatch, control) -> GitHubAct:
+        return GitHubAct(gateway, control, repository=cfg.repo, base_branch=cfg.base_branch,
+                         merge_method=cfg.merge_method, marker=settings.harness.marker, dispatch=dispatch,
+                         remove_worktree=worktrees.remove, log=log)
+
+    role = compose_role(cfg, "fix", gateway, runner, make_legs=make_legs, make_act=make_act,
+                        choose=fix_choose(settings, log), worktrees=worktrees,
+                        capacity=cfg.fix_dispatch_concurrency, log=log)
+    log(f"fix: capabilities: resolve=on merge={'on' if cfg.auto_merge else 'off'}")
+    return role
+
+
+__all__ = ["FixLegs", "FixSettings", "compose_fix_daemon", "fix_actions", "fix_choose", "human_reply"]

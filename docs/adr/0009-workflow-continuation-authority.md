@@ -8,7 +8,7 @@ selected runtime continuity was superseded by
 [ADR 0015](0015-generation-fenced-gate-rearm.md) and
 [ADR 0016](0016-phase-4-current-state-authority.md).
 Date: 2026-08-01
-Governs: src/issue_agent/adapters/store.py src/issue_agent/adapters/worktree.py
+Governs: src/issue_agent/adapters/worktree.py
 
 ## Context
 

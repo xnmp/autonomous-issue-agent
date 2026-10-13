@@ -87,7 +87,6 @@ class GitHubAct:
         repository: str,
         base_branch: str,
         merge_method: str,
-        close_issue_on_merge: bool,
         marker: str,
         dispatch: Callable[[RunAgent], None],
         remove_worktree: Callable[[int], None],
@@ -98,7 +97,6 @@ class GitHubAct:
         self.repository = repository
         self.base_branch = base_branch
         self.merge_method = merge_method
-        self.close_issue_on_merge = close_issue_on_merge
         self.marker = marker
         self.dispatch = dispatch
         self.remove_worktree = remove_worktree
@@ -130,7 +128,7 @@ class GitHubAct:
         issue = harness_branch_issue(pr.head_ref_name)
         if issue is None:
             return
-        if self.close_issue_on_merge and not self.gateway.is_issue_closed(issue):
+        if not self.gateway.is_issue_closed(issue):
             # A non-default base does not close the issue through `Fixes #N`.
             self.gateway.close_issue(issue, "completed", f"{self.marker}\nResolved by #{action.pr}.")
         try:

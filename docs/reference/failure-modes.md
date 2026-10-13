@@ -192,7 +192,7 @@ Status legend: **FIXED** · **OPEN / KNOWN** · **BY-DESIGN / OPERATIONAL**
 **34. dev-merge doesn't auto-close the issue (`closingIssuesReferences` empty)**
 - Symptom: #48 stayed OPEN after merge to `dev` + `ai-done`.
 - Root cause: GitHub auto-closes linked issues only on merges to the *default* branch (`main`); harness targets `dev`, so the field is always empty.
-- Fix: `CLOSE_ISSUE_ON_MERGE` in cleanup; cleanup uses `issue_from_branch` fallback to close explicitly.
+- Fix: the merge closes the issue in cleanup (the `CLOSE_ISSUE_ON_MERGE` knob was removed in slice 9; closing is unconditional); cleanup uses `issue_from_branch` fallback to close explicitly.
 
 **35. `issue_for_pr` via closing-ref graph fails for dev-targeted PRs**
 - Symptom: `fix-ci.sh` bailed "no linked issue for PR #..." on dev PRs, looping.
@@ -645,6 +645,13 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   adopts only those exact prior deployments. The lineage survives repeated
   interrupted repoints, unrelated siblings remain isolated, and
   cross-repository overlay reuse is refused.
+  REVISED 2026-10-13 (slice 9): the lineage is deleted. Boot reaps every
+  registry beneath the overlay's name-derived state roots, killing groups whose
+  recorded launcher is dead (a launch intent is authoritative over a live
+  subreaper parent), so no repoint strands a process. Same-repository leases
+  and legs are recovered by repository/role scope; a cross-repository repoint
+  leaves the old repository's unsettled legs reserved in its own scopes until
+  it runs again. Regression: `test_boot_reaps_an_orphan_another_repository_left_on_the_shared_state_root`.
 
 **117. A dead daemon released a dispatch claim while its paid child was alive**
 - Global target/path claims were keyed to the daemon PID. After an abrupt daemon

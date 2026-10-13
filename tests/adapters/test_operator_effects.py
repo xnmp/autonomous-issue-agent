@@ -39,8 +39,8 @@ class Journal:
     def __init__(self):
         self.events = []
 
-    def emit(self, event):
-        self.events.append(event)
+    def emit(self, event, fields):
+        self.events.append((event, dict(fields)))
 
 
 def _effects(gateway, *, run=None, journal=None):
@@ -130,14 +130,14 @@ def test_an_applied_label_change_is_journalled_as_an_operator_action():
         action_kind="operator_unblock", action_attributes={"channel": "ui"},
     )
 
-    (event,) = journal.events
-    payload = event.payload
-    assert payload.kind == "operator_unblock"
-    assert payload.number == 9 and event.correlation.issue == 9
-    assert payload.attributes["add"] == ["ai-ready"]
-    assert payload.attributes["remove"] == ["needs-human"]
-    assert payload.attributes["operator"] == "o/r:dashboard"
-    assert payload.attributes["channel"] == "ui"
+    ((name, fields),) = journal.events
+    action = fields["action"]
+    assert name == "action" and action["type"] == "operator_unblock"
+    assert action["number"] == 9 and fields["issue"] == 9
+    assert action["add"] == ["ai-ready"]
+    assert action["remove"] == ["needs-human"]
+    assert action["operator"] == "o/r:dashboard"
+    assert action["channel"] == "ui"
 
 
 def test_a_label_change_that_changed_nothing_is_not_journalled():
@@ -165,8 +165,6 @@ class Remote:
     def __init__(self):
         self.calls = []
         self.catalog: set[str] = set()
-        self.auto_merge = False
-        self.reject_auto_merge = False
         self.remote_branches: dict[str, str] = {}
         self.local_head = "a" * 40
 
@@ -179,12 +177,6 @@ class Remote:
             return self.result(json.dumps([{"name": label} for label in sorted(self.catalog)]))
         if argv[:3] == ["gh", "label", "create"]:
             self.catalog.add(argv[3])
-            return self.result()
-        if argv[:3] == ["gh", "api", "repos/o/r"]:
-            return self.result(json.dumps({"allow_auto_merge": self.auto_merge}))
-        if argv[:4] == ["gh", "api", "-X", "PATCH"]:
-            if not self.reject_auto_merge:
-                self.auto_merge = True
             return self.result()
         if argv[:3] == ["git", "-C", "/repo"] and argv[3] == "rev-parse":
             return self.result(self.local_head + "\n")
@@ -204,23 +196,12 @@ def test_bootstrap_steps_land_and_are_idempotent():
 
     for _ in range(2):
         assert effects.ensure_label("P1", color="b60205") == (True, "ok")
-        assert effects.set_repository_auto_merge(True) == (True, "ok")
         assert effects.publish_base_branch("/repo", "dev") == (True, "ok")
 
     assert remote.catalog == {"P1"}
-    assert remote.auto_merge is True
     assert remote.remote_branches == {"dev": remote.local_head}
-    mutations = [c for c in remote.calls if c[:3] == ("gh", "label", "create") or c[:4] == ("gh", "api", "-X", "PATCH") or "push" in c]
-    assert len(mutations) == 3
-
-
-def test_a_setting_that_does_not_read_back_is_reported_failed():
-    remote = Remote()
-    remote.reject_auto_merge = True
-
-    applied, detail = _effects(Labels(), run=remote.run).set_repository_auto_merge(True)
-
-    assert applied is False and "did not change" in detail
+    mutations = [c for c in remote.calls if c[:3] == ("gh", "label", "create") or "push" in c]
+    assert len(mutations) == 2
 
 
 def test_a_remote_base_branch_at_another_revision_is_never_overwritten():

@@ -40,7 +40,7 @@ from ...domain.state import DerivedState, Harness, ItemKey, derive
 from ...domain.world import WorldState
 from .. import config
 from ..config import HarnessConfig
-from ..tick import Facts
+from ..tick import Facts, headroom, lifetime_capped
 from . import views
 from .ports import GitHubQueries
 
@@ -58,22 +58,17 @@ def _detail(exc: BaseException) -> str:
 
 
 def daemon_control_path(cfg: HarnessConfig) -> str:
-    """The control store the deployment's daemons share (as `roles` opens it)."""
+    """The control store the deployment's daemons share (as `tick` opens it)."""
     return control_store_path((cfg.state_dir, cfg.review_state_dir), fallback_state_dir=cfg.state_dir,
                               authority_root=cfg.control_authority_root)
 
 
 def _role_facts(cfg: HarnessConfig, store: ReadOnlyControlStore, leg_usd: float,
                 now: Callable[[], datetime]) -> Facts:
-    """The local facts one role builds, priced at its leg (`roles` wiring).
+    """The local facts one role builds, priced at its leg (`tick` wiring).
     Nothing is in flight in this process; leases come from the store."""
-    # The roles' headroom and lifetime-cap helpers are private to roles.py on
-    # this base; slice 9 makes them public as `tick.headroom(cfg, control,
-    # leg_usd)` and `tick.lifetime_capped(cfg, control)`, which replace this.
-    from ..roles import _control_spend_gate, _headroom, _lifetime_capped
-
-    return Facts(store, cfg.repo, active=tuple, headroom=_headroom(_control_spend_gate(cfg, store, leg_usd)),
-                 lifetime_capped=_lifetime_capped(cfg, store), log=_unlogged, now=now)
+    return Facts(store, cfg.repo, active=tuple, headroom=headroom(cfg, store, leg_usd),
+                 lifetime_capped=lifetime_capped(cfg, store), log=_unlogged, now=now)
 
 
 def _unlogged(_message: str) -> None:
@@ -223,7 +218,7 @@ class Backend:
         cfg = config.from_env(system.deployment_env(self.harness_root, name, self.environ))
         problem = "" if cfg.repo else f"no REPO configured for deployment '{name}'"
         try:
-            harness: Harness | None = Harness(fix_bot=cfg.fix_runtime.bot, review_bot=cfg.review_runtime.bot)
+            harness: Harness | None = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
         except ValueError as exc:
             harness, problem = None, problem or f"harness identity incomplete: {exc}"
         try:
@@ -243,8 +238,8 @@ class Backend:
                 legs = read_legs(store, dep.cfg.repo)
                 if world is None or dep.harness is None:
                     return StoreRead(legs)
-                fix = _role_facts(dep.cfg, store, dep.cfg.fix_runtime.budget_usd, self.now_fn)(world)
-                review = _role_facts(dep.cfg, store, dep.cfg.review_runtime.budget_usd, self.now_fn)(world)
+                fix = _role_facts(dep.cfg, store, dep.cfg.fix_budget_usd, self.now_fn)(world)
+                review = _role_facts(dep.cfg, store, dep.cfg.review_budget_usd, self.now_fn)(world)
                 states = dash.role_states(derive(world, fix, dep.harness), derive(world, review, dep.harness))
                 return StoreRead(legs, states, fix.legs)
         except (ControlStoreError, sqlite3.Error, OSError) as exc:

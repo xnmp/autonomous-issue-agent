@@ -30,6 +30,15 @@ def test_codex_home_lives_outside_worktree(tmp_path) -> None:
     assert 'developer_instructions = "contract' in text
 
 
+def test_every_native_sub_agent_feature_is_pinned_off(tmp_path) -> None:
+    """The leg is priced from its root session alone (Q12): a default flip of
+    either multi-agent generation must not silently re-enable child sessions."""
+    (tmp_path / "worktree").mkdir()
+    config = write_codex_home(str(tmp_path / "worktree"), state_dir=str(tmp_path / "state"))
+    features = tomllib.loads(open(config).read())["features"]
+    assert features["multi_agent"] is False and features["multi_agent_v2"] is False
+
+
 def test_rewrite_replaces_a_stale_governor_hook_config(tmp_path) -> None:
     # The home keeps its historical codex-hooks path, so a pre-6a config whose
     # hook runs the deleted governor must not survive the next leg's write.
@@ -92,7 +101,7 @@ def test_target_agents_and_claude_files_are_low_authority_task_data(
     asyncio.run(runtime.run(RuntimePlan("authoritative task", cwd=str(worktree))))
 
     assert inner.task is not None
-    prompt = inner.task.prompt
+    prompt = inner.task.rendered_prompt
     assert prompt.startswith("authoritative task")
     assert prompt.count("<untrusted_repository_guidance_json>") == 1
     assert attack not in prompt
@@ -121,7 +130,7 @@ def test_target_agents_shares_the_repository_instruction_byte_limit(
     runtime = CodexHomeRuntime(inner, lambda _cwd: config)
     asyncio.run(runtime.run(RuntimePlan("task", cwd=str(worktree))))
     assert inner.task is not None
-    prompt = inner.task.prompt
+    prompt = inner.task.rendered_prompt
     assert "Additional target-repository guidance was omitted" in prompt
     assert "MUST-NOT-FIT" not in prompt
     encoded = prompt.split(

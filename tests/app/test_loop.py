@@ -9,7 +9,7 @@ import threading
 import pytest
 
 from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import read_events
+from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.github import GhUnavailable
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.tick import Daemon
@@ -44,10 +44,10 @@ def _daemon(decide, observe=None, logs=None):
 
 
 def test_tick_observes_decides_executes():
-    d, gw = _daemon(lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)])
+    d, gw = _daemon(lambda w: [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)])
     actions = d.tick()
     assert len(actions) == 1
-    assert gw.calls == [("relabel", "issue", 5, "ai-ready", "ai-working")]
+    assert gw.calls == [("relabel", "issue", 5, "needs-human", "ai-ready")]
 
 
 def test_tick_isolated_from_decide_crash():
@@ -85,7 +85,7 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
     d = Daemon(
         "fix", lambda: WorldState(),
         lambda w: [
-            Relabel(Target.ISSUE, 500, Label.AI_READY, Label.AI_WORKING),
+            Relabel(Target.ISSUE, 500, Label.NEEDS_HUMAN, Label.AI_READY),
             RunAgent(AgentKind.RESOLVE, 500),
             PostComment(Target.PR, 537, "done"),
             RunAgent(AgentKind.REBASE, 534),
@@ -243,7 +243,7 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
 
 
 def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
-    from issue_agent.app.roles import CancellableAsyncDispatch
+    from issue_agent.app.tick import CancellableAsyncDispatch
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     started = threading.Event()
@@ -538,7 +538,7 @@ def test_application_shutdown_deadline_fits_inside_every_systemd_hard_stop():
 
 
 def test_interrupt_before_worker_registration_is_sticky():
-    from issue_agent.app.roles import CancellableAsyncDispatch
+    from issue_agent.app.tick import CancellableAsyncDispatch
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     registering = threading.Event()
@@ -600,7 +600,7 @@ def test_tick_skips_the_pass_when_github_is_unavailable():
     decided = []
     def decide(world):
         decided.append(world)
-        return [Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)]
+        return [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)]
 
     d, gw = _daemon(decide, observe=rate_limited, logs=logs)
     assert d.tick() == []
@@ -850,7 +850,6 @@ def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
             retry_delays=(),
         ),
         poll_seconds=60,
-        journal=journal,
         reconcile=recoveries.append,
     )
 
@@ -864,17 +863,6 @@ def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
     )
 
     events = read_events(journal.path)
-    stall = [event for event in events if event["event"] == "stall"]
-    assert stall == [
-        {
-            **stall[0],
-            "event": "stall",
-            "started_at": "1970-01-01T00:01:00+00:00",
-            "woke_at": "1970-01-01T00:04:00+00:00",
-            "elapsed_seconds": 240,
-            "suspended_seconds": 180,
-        }
-    ]
     assert gateway.calls == []
     assert recoveries == [RecoveryTrigger.WAKE]
     assert not any(event.get("replayed") is True for event in events)
@@ -924,7 +912,6 @@ def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path)
         lambda _world: [],
         Executor(gateway, journal=journal),
         poll_seconds=60,
-        journal=journal,
     )
 
     times = iter([0, 239])
@@ -962,7 +949,6 @@ def test_long_active_late_heartbeat_does_not_stall_or_reconcile(tmp_path):
         lambda _world: [],
         Executor(gateway, journal=journal),
         poll_seconds=60,
-        journal=journal,
     )
     wall_times = iter([0, 240])
     active_times = iter([0, 240])
@@ -1002,7 +988,6 @@ def test_stall_diagnostic_does_not_turn_legacy_receipts_into_commands(tmp_path):
         lambda _world: [],
         Executor(gateway, journal=journal),
         poll_seconds=60,
-        journal=journal,
     )
     wall_times = iter([50, 300])
     active_times = iter([0, 10])
@@ -1014,105 +999,8 @@ def test_stall_diagnostic_does_not_turn_legacy_receipts_into_commands(tmp_path):
         max_ticks=1,
     )
 
-    events = read_events(journal.path)
     assert gateway.calls == []
-    assert any(
-        event["event"] == "stall"
-        and event["started_at"] == "1970-01-01T00:01:00+00:00"
-        and event["stall_clock_offset_seconds"] == 290
-        for event in events
-    )
-
-
-def test_legacy_run_rows_do_not_synthesize_control_corrections(
-    tmp_path,
-):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    rows = [
-        {
-            "ts": "1970-01-01T00:00:10+00:00",
-            "event": "agent_run_start",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 5,
-            "issue": 5,
-            "dispatch": "crossed-gap",
-        },
-        {
-            "ts": "1970-01-01T00:01:40+00:00",
-            "event": "agent_run",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 5,
-            "issue": 5,
-            "dispatch": "crossed-gap",
-            "duration_s": 30,
-        },
-        {
-            "ts": "1970-01-01T00:02:40+00:00",
-            "event": "agent_run_start",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 7,
-            "issue": 7,
-            "dispatch": "malformed-duration",
-        },
-        {
-            "ts": "1970-01-01T00:02:50+00:00",
-            "event": "agent_run",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 7,
-            "issue": 7,
-            "dispatch": "malformed-duration",
-            "duration_s": -1,
-        },
-        {
-            "ts": "1970-01-01T00:03:10+00:00",
-            "event": "agent_run_start",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 6,
-            "issue": 6,
-            "dispatch": "after-resume",
-        },
-        {
-            "ts": "1970-01-01T00:03:40+00:00",
-            "event": "agent_run",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 6,
-            "issue": 6,
-            "dispatch": "after-resume",
-            "duration_s": 30,
-        },
-    ]
-    tmp_path.joinpath("journal.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows)
-    )
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [],
-        Executor(FakeGateway(), journal=journal),
-        poll_seconds=60,
-        journal=journal,
-    )
-    wall_times = iter([0, 240])
-    active_times = iter([0, 180])
-
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: next(wall_times),
-        active_now=lambda: next(active_times),
-        max_ticks=1,
-    )
-
-    annotations = [
-        event for event in read_events(journal.path)
-        if event["event"] == "agent_run_stall"
-    ]
-    assert annotations == []
+    assert read_events(journal.path) == [receipt]
 
 
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):

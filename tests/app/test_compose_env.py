@@ -584,37 +584,6 @@ def test_build_role_does_not_reload_env_when_already_provided(
     assert daemon is not None
 
 
-def test_world_probe_preserves_fix_daemon_dispatch_identity(monkeypatch, tmp_path):
-    from issue_agent.app.tick import Daemon
-    from issue_agent.domain.world import WorldState
-
-    built = {}
-
-    def build_fix(_cfg, gateway, _store, _worktrees, _runner):
-        daemon = Daemon(
-            "fix",
-            lambda: WorldState(),
-            lambda _world: [],
-            Executor(gateway),
-            dispatch_capacity=2,
-        )
-        built["daemon"] = daemon
-        return daemon
-
-    monkeypatch.setattr(main_module, "build_fix_daemon", build_fix)
-
-    daemon = main_module.build_role("fix", {
-        "REPO": "o/r",
-        "FIX_BOT": "fix-bot",
-
-        "WORLD_PROBE": "1",
-        "STATE_DIR": str(tmp_path),
-    })
-
-    assert daemon is built["daemon"]
-    assert daemon.available_dispatch_slots == 2
-
-
 def test_build_role_self_loads_env_when_called_standalone_without_one(
     tmp_path, monkeypatch
 ):
@@ -806,7 +775,7 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
 #
 #   * CI triggered on `main` while every PR targeted `chong-dev`, so no PR had
 #     ever received a check. `ci_state` returns CIState.NONE for a PR with no
-#     checks and domain/fix.py:315/:340 treat NONE identically to OK — approved
+#     checks and domain/ci.py (reduce_ci) treats NONE identically to OK — approved
 #     PRs would have auto-merged with zero CI verification, silently.
 #   * The repo's `Security Audit` job is `continue-on-error: true`. GitHub still
 #     reports its conclusion as FAILURE, and domain/ci.py:45 makes any fail

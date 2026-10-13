@@ -31,12 +31,6 @@ class CIState(str, Enum):
     UNKNOWN = "unknown"  # the checks read FAILED this tick — not an answer (#48)
 
 
-class ReviewDecision(str, Enum):
-    APPROVE = "APPROVE"
-    REQUEST_CHANGES = "REQUEST_CHANGES"
-    ESCALATE = "ESCALATE"
-
-
 # GitHub review states (as returned by the reviews API / pr view).
 REVIEW_APPROVED = "APPROVED"
 REVIEW_CHANGES_REQUESTED = "CHANGES_REQUESTED"
@@ -109,6 +103,9 @@ class IssueView:
     updated_at: str = ""
     author: str = ""
     state: str = "open"  # open | closed
+    # When `needs-human` was last applied ("" = not observed). A reply older
+    # than that never releases: the operator parked the item after it.
+    needs_human_labeled_at: str = ""
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -155,6 +152,7 @@ class PRView:
     content_known: bool = True
     # Head-branch pushes, any order. Empty = none observed.
     pushes: tuple[Push, ...] = ()
+    needs_human_labeled_at: str = ""  # as on IssueView
 
     @property
     def checks(self) -> tuple[Check, ...]:
@@ -201,7 +199,6 @@ class WorldState:
 # Convenience re-export so callers can `from .world import replace`.
 __all__ = [
     "CIState",
-    "ReviewDecision",
     "REVIEW_APPROVED",
     "REVIEW_CHANGES_REQUESTED",
     "Check",

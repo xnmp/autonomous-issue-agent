@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo
 from .repository import canonical_repository
 
 RunId = NewType("RunId", str)
-ReservationId = NewType("ReservationId", str)
 
 
 _CURRENCY = re.compile(r"^[A-Z]{3}$")

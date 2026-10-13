@@ -134,7 +134,6 @@ name = "Daemon modules do not depend on the optional web stack"
 type = "forbidden"
 source_modules = [
     "issue_agent.app.main",
-    "issue_agent.app.roles",
     "issue_agent.app.tick",
     "issue_agent.app.fix",
     "issue_agent.app.review",
@@ -169,12 +168,6 @@ ignore_imports = [
     "issue_agent.app.dashweb -> issue_agent.**",
     "issue_agent.app.dashweb.** -> issue_agent.**",
     "issue_agent.adapters.dashweb.** -> issue_agent.**",
-    # The core's, until it drops them.
-    "issue_agent.app.cli -> issue_agent.domain.dashboard",
-    "issue_agent.app.cli -> issue_agent.app.dashboard",
-    "issue_agent.app.cli -> issue_agent.app.dashweb.server",
-    "issue_agent.app.cli -> issue_agent.adapters.dashweb.bundle",
-    "issue_agent.adapters.journal -> issue_agent.domain.dashboard",
 ]
 
 [dependency-groups]

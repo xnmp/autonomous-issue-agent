@@ -400,7 +400,6 @@ def test_orchestration_cannot_read_telemetry_for_control_state() -> None:
         }
     )
     control_paths = (
-        APP / "roles.py",
         APP / "tick.py",
         APP / "fix.py",
         APP / "review.py",
@@ -519,7 +518,7 @@ def test_architecture_docs_name_authoritative_subsystems() -> None:
         "dashboard",
     ):
         assert required in architecture
-    for runtime in ("claude", "codex", "glm"):
+    for runtime in ("claude", "codex"):
         assert runtime in matrix
     for authority in (
         "paid admission",

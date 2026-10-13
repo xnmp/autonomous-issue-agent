@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/domain/recovery.py src/issue_agent/app/recovery.py src/issue_agent/app/tick.py src/issue_agent/app/main.py src/issue_agent/app/roles.py
+Governs: src/issue_agent/domain/recovery.py src/issue_agent/app/recovery.py src/issue_agent/app/tick.py src/issue_agent/app/main.py
 
 ## Context
 
@@ -18,18 +18,18 @@ of process, lease, reservation, or spend state.
 
 ## Decision
 
-Recovery triggers and their operations are an immutable, exhaustive domain
-policy. Application recovery orchestration emits one of three triggers and
-executes its phased plan; the coordinator executes the post-composition arms:
+Recovery has three triggers (`domain/recovery.py`); the coordinator
+(`app/recovery.py`) maps each to its arms in one fixed order (slice 9 folded
+the former arm/plan tables into that mapping):
 
 | Trigger | Process arm | Other arms | Reservation grace |
 |---|---|---|---|
-| Boot | reap all owned legacy, repointed, and current processes | reclaim leases, validate worktrees, sweep reservations | immediate |
+| Boot | reap all owned legacy and current processes | reclaim leases, validate worktrees, sweep reservations | immediate |
 | Wake | reap abandoned processes only | reclaim leases, validate worktrees, sweep reservations | configured stale grace |
 | Periodic | none | reclaim leases and sweep reservations | configured stale grace |
 
 Boot has two ordered phases under the same trigger. Its process arm reaps the
-legacy, explicitly repointed, and current-deployment registries before adapter
+legacy and current-deployment registries before adapter
 construction. Lease, worktree, spend, and reservation reconciliation
 runs explicitly after the application graph and legacy-spend migration
 complete, and before readiness is reported. Recovery does not run as a
@@ -56,8 +56,8 @@ admission are steady-state loop policy, not recovery triggers.
 
 ## Consequences
 
-- Adding a trigger requires an explicit domain plan and composition coverage.
-- Trigger mapping can be tested without adapters, while boot, wake, and
-  periodic behavior remain covered through observable orchestration outcomes.
+- Adding a trigger requires an explicit coordinator mapping and composition coverage.
+- Boot, wake, and periodic behavior are covered through observable
+  orchestration outcomes.
 - The coordinator remains stateless orchestration over existing durable state;
   no new recovery authority or state machine is introduced.

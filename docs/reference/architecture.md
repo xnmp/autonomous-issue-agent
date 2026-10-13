@@ -18,7 +18,9 @@ harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
 ## The shape
 
 Two role daemons — **fix** and **review** — reconcile GitHub and
-drive Claude, Codex, or GLM sessions. Each is assembled in `app/roles.py` from:
+drive Claude or Codex sessions. Both assemble through one path,
+`tick.compose_role` (called by `fix.compose_fix_daemon` and
+`review.compose_review_daemon`), from:
 
 ```
 observe   gateway.build_world()      one bounded GitHub observation
@@ -156,17 +158,16 @@ binaries do not recognise the new schema.
 Completed legs settle from the sum of usable request receipts, otherwise streamed
 usage at the captured rate card, otherwise zero for interrupted/unusable requests.
 Partial evidence produces `basis=estimate`;
-the reserved maximum is never charged as an estimate. Terminal, lease-free legacy
-`accounting_unavailable` rows follow the same idempotent boot recovery transaction.
+the reserved maximum is never charged as an estimate.
 Live work retains its reservation and stops its process group on a metering
 fault that prevents cap enforcement. See [ADR 0002](../adr/0002-money-and-accounting.md)
 for runtime provenance, Claude's remaining cumulative-cost gap, and deferred late
 corrections.
-The coordinator feeds lease, reconciliation, and compare-and-set results into
-the pure `domain/reservation_recovery.py` state machine. That model owns action
-ordering and terminal reporting; SQLite remains responsible for atomically
-proving that a requested release is still eligible. New runtimes or evidence
-sources therefore extend one decision table rather than adding recovery loops.
+The coordinator (`app/recovery.py`) walks each stale reservation in one fixed
+order: a live lease preserves it; otherwise surviving request evidence settles
+it, else an ended leg settles at a zero estimate, else a never-launched hold is
+released. SQLite remains responsible for atomically proving that a requested
+release is still eligible.
 Lease liveness is probed (OS process inspection) outside SQLite write
 transactions; the write transaction revalidates the complete lease row, so a
 lease replaced meanwhile survives. The pre-cutover migration and canary
@@ -202,19 +203,20 @@ Offline family activation and legacy import were deleted (slice 5a). A family
 epoch's plan evidence remains authority; a target's family state is initialized
 only by its live first observation.
 
-The supported exception is an explicit same-repository checkout repoint:
-`issue-agent start --write-config` records a bounded lineage of exact prior
-checkout identities. The first boot reaps only those process registries; the
-predecessor's unsettled legs are recovered by repository/role-scoped recovery.
-Before the overlay changes, the CLI stops and verifies all foreground and
-service-owned processes carrying its stable name; failure preserves the old
-snapshot. Cross-repository overlay reuse is refused.
-Process-group, process-tree, and launch-intent receipts use the same stable
-checkout deployment identity beneath each role state root. Boot and shutdown
-therefore reap only that deployment's children even when sibling checkouts
-intentionally share the repo-level default state root. Upgrade recovery inspects
-the former unscoped registry conservatively: a live recorded launcher or live
-external parent remains authoritative and is never signalled.
+An overlay can be repointed (`issue-agent start --write-config`). Before the
+overlay changes, the CLI stops and verifies all foreground and service-owned
+processes carrying its stable name; failure preserves the old snapshot. For a
+new checkout of the same repository, repository/role-scoped recovery settles the
+predecessor's unsettled legs. After a repoint to another repository, the old
+repository's unsettled legs stay reserved in its own scopes, never blocking the
+new one, until a deployment of that repository recovers them.
+Process-group and launch-intent receipts use the stable checkout deployment
+identity beneath each role state root. Shutdown reaps only that deployment's
+children. Boot reaps its own registry, then every other registry beneath the
+deployment's state roots (a repointed predecessor, the sibling role, the former
+unscoped registry), signalling only groups whose recorded launcher is dead; a
+receipt without a launch intent falls back to its leader's parent, and a live
+one keeps it.
 
 The control database is rooted at the operating-system service account's
 `~/.local/state/issue-agent-control/control.db`, independently of every
@@ -248,9 +250,8 @@ that matters is not "wrong answer" but "loop that bills forever":
   without progress, REVIEW counted per head, and bot change-request rounds,
   each stopping at `needs-human`; nothing is stored for them.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
-  harness prices streamed rollout counters and kills the process group on
-  crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
-  legacy token prices are available
+  harness prices the root rollout counters with the captured rate card and
+  kills the process group on crossing
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
@@ -261,33 +262,21 @@ attribution error.
 
 Provider-billed runtimes settle their reported cost. Subscription runtimes
 whose provider reports zero use the configured versioned rate card as an
-explicit synthetic token meter, so sequential Claude/GLM work cannot release
+explicit synthetic token meter, so sequential Claude work cannot release
 its reservation back to a nominally armed cap at zero. If the final usage
 envelope is missing, an armed cap conservatively prices the observed stream
 accumulator; if neither trustworthy usage nor pricing authority exists, the
 full reservation remains active instead of becoming new headroom.
 
-Codex 0.160 native review children share their parent's run and reservation.
-The run-scoped observer joins durable spawn call/output receipts to canonical
-child metadata and excludes copied fork prefixes and referenced ancestor history.
-Each root/child session contributes the per-token-category maximum of cumulative
-usage and deduplicated receipt totals, after subtracting pre-launch usage. Frozen
-Each receipt uses its usable provider dollars, otherwise its frozen token price;
-frozen rates price only the cumulative remainder after subtracting receipt tokens. The same
-observation drives the live cap watchdog and terminal settlement, so delayed
-receipts cannot discard another request's spend. Missing/unusable evidence contributes zero; live metering faults stop the process group when
-cap enforcement cannot be established. Complete terminal records are parsed even
-without their final newline; an unparseable tail contributes zero.
-
-Recovery bounds all root and child evidence by the harness-owned invocation start
-and `runs.completed_at`. A later leg's resumed usage cannot enter the ended run.
-Legacy version-1 evidence prices usable parent usage at its frozen scalar rates;
-missing native-child metadata contributes no child spend and never erases parent spend.
-Version-2 evidence uses the captured native card. Repeated recovery keeps one
-charge. A late real return supersedes a recovery estimate using signed correction
-events and durable output capture, including after repair unreturned acknowledgment.
-The persisted typed charge origin makes a normal return final even at estimated
-prices. No older or recovery receipt can overwrite it.
+Codex runs with native sub-agents disabled in the isolated profile
+(`[features] multi_agent = false`), so a leg's spend is its root rollout's
+cumulative `token_count`, minus a resumed session's pre-launch baseline, priced
+at the rate card captured before launch. The same reading drives the live
+budget kill and terminal settlement; missing rollout usage settles an
+estimate of zero for the interrupted request, never the reserved maximum.
+Recovery prices the root counter up to `runs.completed_at`, so a later leg's
+resumed usage cannot enter the ended run; unusable evidence settles a terminal
+estimate. Repeated recovery keeps one charge.
 JSONL remains evidence for authoritative SQLite settlement.
 The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
 scoped verifiers and required evidence capture within this same leg's budget.
@@ -314,10 +303,9 @@ command executes, its child wrapper verifies the launcher's PID/start identity,
 persists PID/PGID/start-ticks in the SQLite `leases` table, and verifies the
 launcher again. A launcher death before registration refuses `exec`; a death
 after registration is recoverable through the same authoritative run record.
-A transport retry can replace that run's process lease only under the same
-active owner and dispatch, after the kernel proves the prior process group is
-absent and the new identity is live. It revalidates continuation admission and
-journals the replacement.
+A leg is one launch: a running leg's process lease is never replaced, and a
+gateway failure ends the leg (the item's backoff retries in a new leg with its
+own reservation).
 
 Each deployment has a role/repository/checkout-scoped lock and a stable
 deployment identity. Locks live in a private per-user host runtime directory,
@@ -347,8 +335,8 @@ application coordinator. Boot performs an unconditional current-deployment
 reap plus lease, worktree, command, and immediate reservation reconciliation;
 suspend-wake uses only the ownership-checked abandoned-process reaper and the
 configured reservation grace; periodic resync reclaims dead leases and sweeps
-stale reservations without touching processes, worktrees, or commands. Legacy,
-explicitly repointed, and current-deployment process registries are reaped in
+stale reservations without touching processes, worktrees, or commands. Legacy and
+current-deployment process registries are reaped in
 the boot trigger's pre-adapter phase. The remaining current-state
 reconciliation runs explicitly after graph construction and legacy-spend
 migration but before readiness; a missing production trigger hook fails
@@ -438,7 +426,6 @@ after same-head cancellation until the free rerun is spent. Unavailable reads
 leave durable escalations owed; settled Clear obsoletes other CI escalations),
 `domain/contracts.py`, `domain/dashboard.py`,
 `domain/effort.py`,
-`domain/events.py`, `domain/fix.py`,
 `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),
@@ -448,7 +435,7 @@ legs),
 criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,
-`domain/recovery.py`, `domain/reservation_recovery.py`,
+`domain/recovery.py`,
 `domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
 minimal-harness design; the fix role runs on it since slice 5b and the review
 role since slice 5c),
@@ -463,9 +450,9 @@ exact APPROVE or REQUEST_CHANGES with a bounded body, or nothing),
 idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
-`adapters/child_env.py`, `adapters/claude_profile.py`,
-`adapters/codex_home.py`, `adapters/codex_runner.py`,
-`adapters/codex_child_usage.py` (bounded native lineage, own-response observation and frozen-card recovery),
+`adapters/child_env.py`,
+`adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
+once per leg; native sub-agents disabled in the isolated profile),
 `adapters/control_path.py`, `adapters/control_store.py`,
 `adapters/env_file.py`,
 `adapters/github.py`,
@@ -476,26 +463,29 @@ one review per head, no command queue),
 `adapters/reload.py`,
 `adapters/repository_guidance.py`,
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
-`adapters/spend_recovery.py`, `adapters/store.py`,
+`adapters/spend_recovery.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 and `adapters/worktree.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
-`app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
+`app/cli.py`, `app/config.py`, `app/dashboard.py`,
+`app/doctor.py` (offline doctor checks: one credential per role, the codex
+binary the daemons exec, the installed services' PATH and snapshot),
 `app/fix.py` (the fix role: one paid leg per dispatch, resuming the right
-session), `app/identity_pools.py`,
+session),
 `app/launchd_main.py`,
 `app/main.py`,
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict
 once, resubmitting a stored verdict free when its submission never landed),
-`app/review_identity.py`, `app/roles.py`,
+`app/review_identity.py`,
 `app/tick.py` (the daemon both roles run: local facts from SQLite,
 derive → policy → choose, the action executor, bounded paid dispatch, the
-single `run_leg` path, and the SIGTERM drain),
-and `app/service_doctor.py`.
-Provider-neutral task construction is isolated in `app/planners/`; the web
+single `run_leg` path, the SIGTERM drain, and `compose_role`: the one
+composition both roles share — control store, recovery coordinator,
+accounting and journal runtimes, runtime binding, shutdown hooks).
+Prompt assembly for the five acts is isolated in `app/planners/`; the web
 composition/read-model boundary is in `app/dashweb/`.
 
 ## Where the detail lives

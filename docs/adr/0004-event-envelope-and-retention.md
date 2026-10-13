@@ -2,7 +2,7 @@
 
 Status: Superseded (slice 8a, 2026-10-13: schema-v2 events, outbox and projection deleted; metrics come from SQLite legs/money tables plus GitHub, logs from one plain JSONL journal)
 Date: 2026-07-30
-Governs: src/issue_agent/domain/events.py
+Governs: nothing (superseded; its module was deleted in slice 9)
 
 ## Decision
 

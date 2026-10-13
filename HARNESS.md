@@ -7,7 +7,7 @@ operator reference.
 ## First run
 
 Prerequisites: `git`, `gh`, `jq`, `uv`, and at least one configured runtime
-(`claude`, `codex`, or a GLM Claude profile).
+(`claude` or `codex`).
 
 ```bash
 make install
@@ -53,19 +53,22 @@ version that created it.
 Important fields:
 
 - `REPO=owner/name` and `TARGET_DIR=/absolute/path` are required.
-- `issue-agent start --write-config` may repoint an existing overlay only to a
-  new checkout of the same repository. It preserves a bounded
-  `REPOINTED_FROM_DEPLOYMENTS` lineage so the first boot can reap those exact
-  old deployments' process registries. Before replacing the overlay, the CLI
-  stops and verifies every foreground or installed process carrying that
-  deployment name; a stop failure leaves the old overlay unchanged. The new
-  deployment's recovery (scoped by repository and role) settles any leg the
-  old one left unsettled. Use a different `--name` for another repository; do
-  not hand-author the lineage.
+- `issue-agent start --write-config` regenerates an existing overlay for the
+  checkout given. Before replacing the overlay, the CLI stops and verifies every
+  foreground or installed process carrying that deployment name; a stop failure
+  leaves the old overlay unchanged. The overlay keeps its name-derived state
+  roots, so the new deployment's boot kills any process group the old one left
+  behind whose launching daemon is dead, whatever its repository. Lease and
+  spend recovery is scoped by repository and role: for a new checkout of the
+  same repository it settles the old deployment's unsettled legs; after a
+  repoint to another repository, the old repository's unsettled legs stay
+  reserved in its own scopes (they never block the new one) until a deployment
+  of that repository runs again. Prefer a different `--name` for another
+  repository.
 - `FIX_BOT` must differ from `REVIEW_BOT`.
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
-- `FIXER_RUNTIME=claude|codex|glm`;
+- `FIXER_RUNTIME=claude|codex`;
   `REVIEWER_RUNTIME=claude|codex`.
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
 - The fixer runs one configured model and effort: `FIX_MODEL` and
@@ -231,9 +234,7 @@ reservations whose process never registered. A leg that may have reached a
 paid provider keeps its reservation while its lease is live. Once its process
 is gone, recovery settles it from surviving request evidence (Codex rollouts),
 or else at a zero `estimate` charge, so usage-blind ends cannot exhaust
-admission capacity. An explicit same-repository repoint first reaps the
-recorded prior checkout registries; unrelated sibling checkouts remain
-isolated. Historical JSONL is never queried for these decisions.
+admission capacity. Historical JSONL is never queried for these decisions.
 
 A missing `control.db` is recreated only on a machine that never had one. If
 its companions remain (`control.db.initialize.lock`, `-wal`, `-shm`,
@@ -283,9 +284,7 @@ from the SQLite `legs` table plus GitHub.
 ## Dashboard
 
 ```bash
-issue-agent dashboard                 # interactive server
-issue-agent dashboard --text
-issue-agent dashboard --html
+issue-agent dashboard [--port PORT]   # = python -m issue_agent.app.dashweb.main
 ```
 
 The Linux service installer keeps the interactive server running as the

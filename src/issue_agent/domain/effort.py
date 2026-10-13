@@ -25,11 +25,6 @@ class Effort(Enum):
 # Weakest → strongest; the configurable choices.
 EFFORT_LADDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH)
 
-# Difficulty tiers the deleted router wrote into ROUTE journal events; the
-# dashboard still reads them from historical journals.
-TIER_LADDER: tuple[str, ...] = ("trivial", "standard", "complex", "exceptional")
-
-
 def parse_effort(raw: object, default: Effort | None = None) -> Effort | None:
     """Total: any junk (typo, None, wrong type) → `default`. Operator knobs are
     free text and a misspelled `FIX_EFFORT` must not take a daemon down."""

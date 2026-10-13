@@ -12,13 +12,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from types import MappingProxyType
-from collections.abc import Callable
 from typing import Mapping
 
 from .contracts import Money, PriceQuote, TokenUsage
 
 TOKENS_PER_MILLION = 1_000_000
-DEFAULT_CACHE_READ_DISCOUNT = Decimal("0.1")
 
 # Configured accounting estimates for newly routed models must also work with
 # existing deployments' older rate tables. Explicit operator rates take priority.
@@ -117,9 +115,6 @@ class RateTable:
             return False
         return True
 
-    def gaps(self, models: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(model for model in models if not self.priceable(model))
-
     def quote(
         self, model: str, maximum_usage: TokenUsage, effective_at: datetime
     ) -> PriceQuote:
@@ -147,28 +142,6 @@ def price(usage: TokenUsage, rates: ModelRates, currency: str = "USD") -> Money:
         if tokens
     )
     return Money(currency, micros)
-
-
-def overrun(spent: Money, maximum: Money) -> Money | None:
-    if spent.currency != maximum.currency:
-        raise ValueError("cannot compare different currencies")
-    return spent if spent.micros >= maximum.micros else None
-
-
-@dataclass(frozen=True)
-class BudgetSentinel:
-    """Runtime-neutral sampling and overrun decision; adapters own killing."""
-
-    sample_usage: Callable[[], TokenUsage | None]
-    rates: ModelRates
-    maximum: Money
-
-    def sample(self) -> tuple[TokenUsage, Money] | None:
-        usage = self.sample_usage()
-        if usage is None or not usage.trusted_for_accounting:
-            return None
-        spent = price(usage, self.rates, self.maximum.currency)
-        return (usage, spent) if overrun(spent, self.maximum) is not None else None
 
 
 @dataclass(frozen=True)

@@ -863,14 +863,9 @@ class SQLiteControlStore:
             ).fetchone()
             if lease is None:
                 raise ControlStoreError(f"leg {run_id} holds no lease")
-            replacing = (int(lease["pid"]), int(lease["start_ticks"])) != (pid, process_start_ticks)
-            # A transport retry shares its paid leg; it replaces the prior
-            # process group only once that group is gone.
-            if leg["state"] == "running" and replacing and (
-                ProcessSupervisor.matches_identity(int(lease["pid"]), int(lease["start_ticks"]))
-                or not ProcessSupervisor.group_is_absent(int(lease["pgid"]))
-            ):
-                raise ControlStoreError(f"conflicting live process lease for leg: {run_id}")
+            # A leg is one launch: a running leg takes no second process.
+            if leg["state"] == "running" and (int(lease["pid"]), int(lease["start_ticks"])) != (pid, process_start_ticks):
+                raise ControlStoreError(f"conflicting process lease for running leg: {run_id}")
             now = self._stamp_now()
             db.execute(
                 "UPDATE leases SET pid=?, pgid=?, start_ticks=? WHERE leg_id=?",

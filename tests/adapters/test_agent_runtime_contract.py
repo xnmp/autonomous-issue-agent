@@ -13,12 +13,7 @@ from types import SimpleNamespace
 
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
-from issue_agent.adapters.runtime_plan import (
-    AgentRuntime,
-    McpServer,
-    RuntimePlan,
-    SubagentDef,
-)
+from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
 from issue_agent.domain.outcome import AgentResult, Outcome, classify_outcome
 
 
@@ -54,17 +49,6 @@ def test_runtime_contract_accepts_task_and_returns_agent_result_shape():
             )
 
     assert isinstance(FakeRuntime(), AgentRuntime)
-
-
-def test_task_interface_collects_tool_policy_for_runner_adapters():
-    task = RuntimePlan(
-        prompt="review",
-        allowed_tools=("Read",),
-        mcp_servers=(McpServer("sonar", {"command": "sonar"}, "mcp__sonar__*"),),
-        subagents=(SubagentDef("scout", "find code", "search", tools=("Read",)),),
-    )
-
-    assert task.all_allowed_tools() == ["Read", "mcp__sonar__*", "Task"]
 
 
 def test_successful_structured_envelope_contract_is_shared():

@@ -2,8 +2,8 @@
 
 Headless harness that resolves GitHub issues end-to-end: issue → branch → TDD
 implementation → PR → CI → independent review → merge to `dev`. Two Python
-daemons (`fix`, `review`) reconcile GitHub and drive Claude, Codex,
-or GLM runtimes.
+daemons (`fix`, `review`) reconcile GitHub and drive Claude or Codex
+runtimes.
 
 Start with:
 

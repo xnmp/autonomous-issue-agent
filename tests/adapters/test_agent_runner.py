@@ -15,7 +15,7 @@ from issue_agent.adapters.agent_runner import (
     resolve_claude_cli,
     result_to_agent_result,
 )
-from issue_agent.adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import ExitReason
 
 
@@ -44,33 +44,7 @@ def test_no_append_still_uses_preset():
     assert kw["system_prompt"] == {"type": "preset", "preset": "claude_code"}
 
 
-def test_subagents_map_to_agents_dict_and_add_task_tool():
-    task = RuntimePlan(
-        prompt="x",
-        allowed_tools=("Read",),
-        subagents=(
-            SubagentDef(
-                name="code-scout",
-                description="cheap scout",
-                prompt="search the code",
-                tools=("Read", "Grep"),
-                model="sonnet",
-            ),
-        ),
-    )
-    kw = build_option_kwargs(task)
-    # Task tool auto-added so the parent can spawn the subagent.
-    assert "Task" in kw["allowed_tools"]
-    # agents emitted as a plain dict spec (SDK-free; run() materialises it).
-    assert kw["agents"]["code-scout"] == {
-        "description": "cheap scout",
-        "prompt": "search the code",
-        "tools": ["Read", "Grep"],
-        "model": "sonnet",
-    }
-
-
-def test_no_subagents_means_no_agents_key_and_no_task_tool():
+def test_no_agents_key_and_no_task_tool():
     kw = build_option_kwargs(RuntimePlan(prompt="x", allowed_tools=("Read",)))
     assert "agents" not in kw
     assert "Task" not in kw.get("allowed_tools", [])
@@ -85,7 +59,6 @@ def test_tools_model_budget_cwd_resume_map():
         max_budget_usd=1.5,
         cwd="/wt/issue-5",
         resume="sess-123",
-        fork_session=True,
     )
     kw = build_option_kwargs(task)
     assert kw["allowed_tools"] == ["Read", "Bash(git *)"]
@@ -94,24 +67,13 @@ def test_tools_model_budget_cwd_resume_map():
     assert kw["max_budget_usd"] == 1.5
     assert kw["cwd"] == "/wt/issue-5"
     assert kw["resume"] == "sess-123"
-    assert kw["fork_session"] is True
+    assert "fork_session" not in kw
     assert kw["setting_sources"] == []
 
 
 def test_target_project_settings_are_never_loaded_as_provider_authority():
     kw = build_option_kwargs(RuntimePlan(prompt="x", cwd="/target"))
     assert kw["setting_sources"] == []
-
-
-def test_mcp_servers_and_tool_globs():
-    task = RuntimePlan(
-        prompt="x",
-        allowed_tools=("Read",),
-        mcp_servers=(McpServer("sonarqube", {"command": "npx"}, "mcp__sonarqube__*"),),
-    )
-    kw = build_option_kwargs(task)
-    assert kw["mcp_servers"] == {"sonarqube": {"command": "npx"}}
-    assert kw["allowed_tools"] == ["Read", "mcp__sonarqube__*"]
 
 
 def test_permission_mode_override():
@@ -140,21 +102,8 @@ def test_no_buffer_knob_leaves_the_sdk_default_alone():
 def test_a_runner_applies_the_default_buffer_to_every_session(monkeypatch):
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"max_buffer_size"}))
     asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     assert seen["options"]["max_buffer_size"] == DEFAULT_MAX_BUFFER_BYTES
-
-
-def test_buffer_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
-    # An older SDK rejects an unknown field at construction — a harness that
-    # cannot raise the ceiling must still run, loudly.
-    seen = {}
-    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
-    logged: list[str] = []
-    asyncio.run(AgentRunner(log=logged.append).run(RuntimePlan(prompt="x")))
-    assert "max_buffer_size" not in seen["options"]
-    assert any("no max_buffer_size" in m for m in logged)
 
 
 def test_the_installed_sdk_accepts_max_buffer_size():
@@ -203,26 +152,11 @@ def test_a_task_with_no_effort_says_nothing():
     assert "effort" not in build_option_kwargs(RuntimePlan(prompt="x"))
 
 
-def test_effort_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
-    # Losing the cheap lever beats failing the dispatch: the tier half of the
-    # ladder still applies.
-    from issue_agent.domain.effort import Effort
-
-    seen = {}
-    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
-    logged: list[str] = []
-    asyncio.run(AgentRunner(log=logged.append).run(RuntimePlan(prompt="x", effort=Effort.HIGH)))
-    assert "effort" not in seen["options"]
-    assert any("no effort option" in m for m in logged)
-
-
 def test_effort_survives_to_the_session_on_a_build_that_has_the_field(monkeypatch):
     from issue_agent.domain.effort import Effort
 
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"effort"}))
     asyncio.run(AgentRunner().run(RuntimePlan(prompt="x", effort=Effort.LOW)))
     assert seen["options"]["effort"] == "low"
 
@@ -457,7 +391,8 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
 def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, tmp_path):
     """Default-model review receipts name the concrete SDK model."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     for role, kind in (("review", "REVIEW"),):
         init = type("InitMessage", (), {
@@ -482,7 +417,8 @@ def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, t
 def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_path):
     """Configured aliases remain the journal's model across the SDK session."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},
@@ -505,7 +441,8 @@ def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_p
 def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
     """A dropped terminal envelope retains the SDK model in its settled receipt."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},
@@ -526,7 +463,8 @@ def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypa
 def test_unpinned_sdk_timeout_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
     """An idle SDK leg keeps its init model when its timeout settles it."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},

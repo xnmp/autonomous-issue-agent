@@ -12,14 +12,12 @@ from __future__ import annotations
 
 import json
 import subprocess
-import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .act import relabel
 from .github import GitHubGateway
-from ..domain.events import ActionApplied, Correlation, TelemetryEvent
 from ..domain.labels import Label
 from ..domain.ports import EventSink
 from ..domain.refs import harness_branch_issue
@@ -162,19 +160,6 @@ class GitHubOperatorEffects:
         except Exception as exc:  # noqa: BLE001 - operator-facing result
             return False, _detail(exc)
 
-    def set_repository_auto_merge(self, enabled: bool) -> tuple[bool, str]:
-        try:
-            if self._repository_auto_merge() is not enabled:
-                self._mutate([
-                    "gh", "api", "-X", "PATCH", f"repos/{self.repository}",
-                    "-F", f"allow_auto_merge={'true' if enabled else 'false'}",
-                ])
-                if self._repository_auto_merge() is not enabled:
-                    raise OperatorEffectError("repository auto-merge setting did not change")
-            return True, "ok"
-        except Exception as exc:  # noqa: BLE001 - operator-facing result
-            return False, _detail(exc)
-
     def publish_base_branch(self, cwd: str, branch: str) -> tuple[bool, str]:
         """Create one missing remote base branch from a verified local head."""
         try:
@@ -209,30 +194,22 @@ class GitHubOperatorEffects:
             return
         try:
             changes = " ".join([*(f"+{label}" for label in added), *(f"-{label}" for label in removed)])
-            self.journal.emit(TelemetryEvent(
-                ActionApplied(
-                    uuid.uuid4().hex,
-                    action_kind,
-                    kind,
-                    f"{action_kind.replace('_', ' ')} {kind} #{number}: {changes}",
-                    number,
-                    {"add": list(added), "remove": list(removed), "operator": self.identity,
-                     **dict(attributes or {})},
-                ),
-                Correlation(issue=number) if kind == "issue" else Correlation(pr=number),
-            ))
+            action = {"add": list(added), "remove": list(removed), "operator": self.identity,
+                      **dict(attributes or {})}
+            action.setdefault("type", action_kind)
+            action.setdefault("target", kind.upper())
+            action.setdefault("number", number)
+            self.journal.emit("action", {
+                ("issue" if kind == "issue" else "pr"): number,
+                "desc": f"{action_kind.replace('_', ' ')} {kind} #{number}: {changes}",
+                "action": action,
+            })
         except Exception:  # noqa: BLE001 - telemetry never fails the write
             pass
 
     def _label_exists(self, label: str) -> bool:
         rows = self._json(["gh", "label", "list", "-R", self.repository, "--json", "name", "--limit", "1000"])
         return isinstance(rows, list) and any(isinstance(row, dict) and row.get("name") == label for row in rows)
-
-    def _repository_auto_merge(self) -> bool:
-        row = self._json(["gh", "api", f"repos/{self.repository}", "--jq", "{allow_auto_merge}"])
-        if not isinstance(row, dict):
-            raise OperatorEffectError("repository settings could not be read")
-        return bool(row.get("allow_auto_merge"))
 
     def _remote_branch(self, cwd: str, branch: str) -> str:
         output = self._text(["git", "-C", cwd, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"]).strip()

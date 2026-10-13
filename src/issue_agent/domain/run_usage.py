@@ -91,14 +91,3 @@ def price_run_usage(observed: RunUsage, table: RateTable | None) -> Money:
         for s in observed.samples if s.reported_cost is None and table.priceable(s.model)
     )
     return Money(currency, sum(m.micros for m in (*reported, *priced)))
-
-
-def usage_lower_bound(first: TokenUsage, second: TokenUsage) -> TokenUsage:
-    """Cumulative counters and deduplicated receipts overlap; neither erases the other."""
-    return TokenUsage(
-        max(first.input_tokens, second.input_tokens),
-        max(first.output_tokens, second.output_tokens),
-        max(first.cache_read_tokens, second.cache_read_tokens),
-        max(first.cache_write_tokens, second.cache_write_tokens),
-        UsageSource.ROLLOUT,
-    )

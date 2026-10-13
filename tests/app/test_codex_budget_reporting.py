@@ -23,12 +23,6 @@ def test_default_priced_config_reports_harness_enforcement():
     assert "harness-enforced on codex" in description
 
 
-def test_disabled_enforcement_reports_wall_only_bound():
-    description = _describe(CODEX_ENFORCE_BUDGET="0")
-    assert "CODEX_ENFORCE_BUDGET=0" in description
-    assert "wall cap 3600s is the only per-run bound" in description
-
-
 @pytest.mark.parametrize(
     "env",
     [
@@ -39,8 +33,6 @@ def test_disabled_enforcement_reports_wall_only_bound():
 )
 def test_incomplete_pricing_reports_unmeasurable_budget(env):
     description = _describe(**env)
-    assert "dollar threshold is not measurable" in description
-    assert "wall cap 3600s is the only per-run bound" in description
-
+    assert "NOT ENFORCED on codex" in description
 
 

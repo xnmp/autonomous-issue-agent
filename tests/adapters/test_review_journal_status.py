@@ -11,7 +11,8 @@ import pytest
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
 from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import JournalingRuntime, read_events
+from issue_agent.adapters.journal import JournalingRuntime
+from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
 
 

@@ -76,9 +76,3 @@ def test_retained_branch_recovery_uses_the_shared_issue_policy(repo, prefix):
     assert issue_from_branch(branch) == 703
 
 
-def test_persisted_branch_is_preferred_over_an_unrelated_retained_attempt(repo):
-    git(repo, "branch", "test/703-real")
-    git(repo, "branch", "fix/703-old")
-    assert Worktrees(str(repo)).branch_for_issue(
-        703, "fix/703-new-title", preferred="test/703-real"
-    ) == "test/703-real"

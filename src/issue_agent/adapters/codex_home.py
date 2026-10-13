@@ -41,6 +41,12 @@ def _config_toml(developer_instructions: str = "") -> str:
 # untrusted user-task data. Zero disables Codex's native developer-authority
 # project document loading for this checkout.
 project_doc_max_bytes = 0
+
+# Native sub-agents are disabled: the leg is priced from its root session's
+# counters alone, and independent review is its own leg (refactor decision Q12).
+[features]
+multi_agent = false
+multi_agent_v2 = false
 """
 
 

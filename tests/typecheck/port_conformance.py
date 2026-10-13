@@ -18,11 +18,8 @@ from issue_agent.adapters.process_supervisor import (
 )
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.app.dashweb.ports import GitHubQueries
-from issue_agent.app.recovery import NoWorktreeRecovery
-from issue_agent.app.roles import (
-    _LateReservationReconciler,
-    _SweepReservationReconciler,
-)
+from issue_agent.adapters.worktree import Worktrees
+from issue_agent.app.recovery import RecoveryCoordinator
 from issue_agent.domain.ports import (
     EventSink,
     ProcessSupervisor,
@@ -71,14 +68,8 @@ def spend_reconciler(
     return reconciler
 
 
-def sweep_reservation_reconciler(
-    reconciler: _SweepReservationReconciler,
-) -> StaleReservationReconciler:
-    return reconciler
-
-
-def late_reservation_reconciler(
-    reconciler: _LateReservationReconciler,
+def stale_reservation_reconciler(
+    reconciler: RecoveryCoordinator,
 ) -> StaleReservationReconciler:
     return reconciler
 
@@ -88,7 +79,7 @@ def event_sink(journal: Journal) -> EventSink:
 
 
 def worktree_recovery(
-    recovery: NoWorktreeRecovery,
+    recovery: Worktrees,
 ) -> WorktreeRecovery:
     return recovery
 

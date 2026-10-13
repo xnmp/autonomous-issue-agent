@@ -16,9 +16,9 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.github import GhUnavailable
-from issue_agent.adapters.store import Store
 from issue_agent.app.config import from_env
-from issue_agent.app.roles import compose_fix_daemon, compose_review_daemon
+from issue_agent.app.fix import compose_fix_daemon
+from issue_agent.app.review import compose_review_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
@@ -110,13 +110,13 @@ def roles(tmp_path):
 
         def review(self, gh, agent, checkouts=..., **env):
             c = cfg(**env)
-            return compose_review_daemon(c, gh, Store(c.review_state_dir), agent,
+            return compose_review_daemon(c, gh, agent,
                                          checkouts=self.checkouts if checkouts is ... else checkouts,
                                          log=lambda _line: None)
 
         def fix(self, gh, agent, **env):
             c = cfg(**env)
-            return compose_fix_daemon(c, gh, Store(c.state_dir), FakeWorktrees(tmp_path / "worktrees"), agent,
+            return compose_fix_daemon(c, gh, FakeWorktrees(tmp_path / "worktrees"), agent,
                                       log=lambda _line: None)
     return Roles()
 

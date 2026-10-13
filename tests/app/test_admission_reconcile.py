@@ -25,10 +25,6 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.app.recovery import RecoveryCoordinator
-from issue_agent.app.roles import (
-    _LateReservationReconciler,
-    _SweepReservationReconciler,
-)
 from issue_agent.domain.contracts import (
     Money,
     PricingBasis,
@@ -191,14 +187,10 @@ def _sweeper(store, now: datetime):
         reservation_grace=GRACE,
         now=lambda: now,
     )
-    return _SweepReservationReconciler(store, OWNER, coordinator.reconcile)
+    return coordinator
 
 
 def _admission(store, runtime, cap: Money, reconciler):
-    late = None
-    if reconciler is not None:
-        late = _LateReservationReconciler()
-        late.bind(reconciler)
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -212,7 +204,7 @@ def _admission(store, runtime, cap: Money, reconciler):
         BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}),
         _rates(),
         owner_id=OWNER,
-        reservation_reconciler=late,
+        reservation_reconciler=reconciler,
     )
     wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE)
     return wrapper
@@ -337,10 +329,6 @@ def test_unreadable_reconciliation_escalates_without_admitting(tmp_path):
 
 
 def test_admission_without_a_reconciler_escalates_exactly_as_before(tmp_path):
-    # An unbound shim is inert, so a role composed before recovery exists
-    # degrades to the pre-incident behaviour rather than inventing headroom.
-    assert _LateReservationReconciler().reconcile_stale_reservations() == 0
-
     now = datetime.now(timezone.utc)
     store = _store(tmp_path, now)
     cap = Money("USD", 2_000_000)
@@ -411,9 +399,7 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
         reservation_grace=GRACE,
         now=lambda: now,
     )
-    reconciler = _SweepReservationReconciler(
-        store, OWNER, coordinator.reconcile
-    )
+    reconciler = coordinator
 
     runtime = _Runtime()
     result = _resolve(_admission(store, runtime, cap, reconciler))

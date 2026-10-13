@@ -42,8 +42,9 @@ model and rollout usage, enabling cost-mix analysis by runtime/model.
 The reviewer runs in a detached checkout of `TARGET_DIR` pinned to the
 reviewed head, under Codex's read-only sandbox, which contains filesystem
 mutation. Because Codex's resume grammar cannot carry a sandbox setting, every
-Codex review and in-leg transport retry is intentionally a fresh session and
-cannot regain a writable resume mode. The CODEX_HOME is prepared only
+Codex review is intentionally a fresh session and cannot regain a writable
+resume mode. A leg is one `codex exec`: a gateway drop or a 429 ends it as a
+machine failure charged what its rollout measured. The CODEX_HOME is prepared only
 immediately before a review leg, in that pinned checkout; daemon construction
 never mutates the process cwd, and an unset target fails closed instead of
 using an implicit cwd.
@@ -146,39 +147,29 @@ exit together).
   upgrades; the gate's value depends on it firing.
 - **No native budget cap — RESOLVED in-harness (#29).** `max_budget_usd` still has no
   Codex flag, so `run()` enforces it: the stderr pump samples the session's rollout
-  token counters once per poll slice, prices them with the same `rates_for_model`
-  lookup the ledger uses, and kills the process group on crossing —
+  token counters once per poll slice, prices them with the rate card the ledger
+  settles with, and kills the process group on crossing —
   `status="error_max_budget_usd"`, `exit_reason=BUDGET_EXHAUSTED`, with the spend it
   had burned carried on the result so the ledger and both spend caps still see it.
-  Three things this depends on, in order of how badly they bite:
+  What this depends on:
   1. **Machine-readable root identity.** Codex 0.146.0 removed the human-oriented
      `session id:` header. Fresh runs discover the newest post-start
      `session_meta` matching `originator=codex_exec`, exact resolved cwd, and
-     `source=exec`; the last constraint excludes newer same-cwd subagent
-     rollouts. Resumed runs use the persisted ID directly because their
+     `source=exec`. Resumed runs use the persisted ID directly because their
      `session_meta` predates the current leg.
   2. **Per-leg, not cumulative.** A resumed session's counter includes the previous
      leg's already-ledgered tokens; the check runs on the `usage_delta`, or every
      follow-up leg dies instantly on its resolve's spend.
-  3. **Rollout counters, not arbitrary stderr.** Codex stderr includes
-     agent-controlled tool and test output. Usage-shaped text echoed there must
-     never price or kill an in-flight leg. The legacy stderr parser is used only
-     after exit and accepts a terminal footer.
-  4. **Priced or inert.** Both rates 0 → every run reads as $0.00 and the check is
-     deliberately silent (`budget_overrun_usd`), because a dollar threshold cannot
-     bound a runtime nobody is pricing. `describe()` and
-     `codex_budget_not_enforced_warning` both report that regime as NOT ENFORCED.
-  5. **`CODEX_ENFORCE_BUDGET=0`** returns to wall-cap-only bounding, and is likewise
-     reported. On a subscription the dollars are synthetic — they are a token meter —
-     so an operator whose rates over-state reality can opt out rather than have real
-     work cut short.
+  3. **Rollout counters, not stderr.** Codex stderr includes agent-controlled tool
+     and test output, so it never prices a leg. No rollout usage settles zero for
+     the interrupted request (an estimate), never the reserved maximum.
+  4. **No native sub-agents.** The isolated profile sets
+     `[features] multi_agent = false`, so the root rollout is the whole leg.
   History: before this, `AGENT_MAX_RUNTIME_SECONDS` was the only per-run bound and a
   keifu resolve completed at $28.74 against a configured `MAX_BUDGET_USD=20` with
   `exit_reason=ok`, while every boot logged `fix_budget=$20.00` as if it applied.
 - **Journal telemetry.** The journaling decorator measures wall duration for
-  every runtime. Codex additionally counts rollout `token_count` events as paid
-  model turns, subtracting a resumed session's baseline, so settled `agent_run`
-  entries carry `duration_s` and `turns` alongside cost and token usage.
+  every runtime; settled `agent_run` entries carry `duration_s`, cost and token usage.
 - **AGENT.md parity is the quality lever.** GPT-5.5 followed an inline TDD prompt well
   in the smoke test, but the full fixer contract (markers, adversarial verdict, PR body
   shape) lives in AGENT.md — port it faithfully or fix quality regresses.
