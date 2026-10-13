@@ -9,7 +9,7 @@ acceptance `6905184`). The review-rejection slice is accepted (2026-09-27) at
 `a7214bf`, including offline activation/import, retired legacy authority,
 transactional operator fences and linked-issue holds. Independent adversarial
 review and full-suite evidence are in the
-[verification record](../open/2026-09-27-review-slice-verification.md). No live
+[verification record](../../open/2026-09-27-review-slice-verification.md). No live
 workflow family has been activated: acceptance of implementation does not
 authorize activation on real deployment data.
 
@@ -22,8 +22,8 @@ scope. ADRs 0001–0003, 0008, 0010 and 0012 remain applicable.
 
 ## Context and scope
 
-The [architecture review](../open/2026-09-14-architecture-review.md) and
-[critique](../open/2026-09-14-architecture-overhaul-critique.md) identify a
+The [architecture review](../../open/2026-09-14-architecture-review.md) and
+[critique](../../open/2026-09-14-architecture-overhaul-critique.md) identify a
 re-arm distributed across counter files, review dismissal, guidance, labels
 and telemetry. An individually durable remote effect does not preserve the
 operator's entire intent. A restart can leave renewed allowance without the
@@ -469,7 +469,7 @@ and annotate ADR 0009 with the exact partial supersession then.
 
 ## Acceptance
 
-The [phase 3 seam and fault specification](../open/2026-09-14-phase-3-gate-design.md)
+The [phase 3 seam and fault specification](../../open/2026-09-14-phase-3-gate-design.md)
 defines the proposed API and bounded failure matrix. Each slice needs real
 daemon + SQLite + durable executor restart tests, pure malformed-input tests,
 independent adversarial review, and green `make test` before a parent commit.

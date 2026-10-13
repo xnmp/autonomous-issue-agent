@@ -9,7 +9,7 @@ finite roadmap implementable by Sol subagents. Complete **step 0.5, S1–S7**,
 before remaining phase-4 migration work.
 
 The [roadmap and deletion inventory](../2026-09-30-phase-4-simplification-roadmap.md)
-and [ADR 0016](../../adr/0016-phase-4-current-state-authority.md) define the fixed
+and [ADR 0016](../../archive/adr/0016-phase-4-current-state-authority.md) define the fixed
 design. Replace lifetime archive proof with SQLite current state, atomic exact
 receipts and bounded unresolved work. Keep money, ordered outcomes, generation
 fences, remote effect readback and unrelated holds. Ambiguous historical targets

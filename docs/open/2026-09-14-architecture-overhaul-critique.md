@@ -72,7 +72,7 @@ against `4c365a8` with the working tree applied:
   or zero sentinel. The comment on `_read_int` (`:162-176`) acknowledges a
   torn write resets a tripped breaker to a full budget. Eligibility-bearing
   counters therefore fail *open*.
-- ADR 0013 (`docs/adr/0013-human-gate-ledger.md`) remains `proposed`. No
+- ADR 0013 (`docs/archive/adr/0013-human-gate-ledger.md`) remains `proposed`. No
   `gates` table exists in `control_store.py` (full `CREATE TABLE` inventory at
   `:416-687`). The only re-arm implementation is
   `app/dashweb/service.py:683-862` plus `_clear_retry_counters` (`:1642`),

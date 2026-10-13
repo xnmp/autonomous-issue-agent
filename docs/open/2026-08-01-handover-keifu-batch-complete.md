@@ -59,7 +59,7 @@ receipts, which unblocks visual-AC issues on Codex.
   with a real-git repro, do not resurrect it), tracked-marker distrust
   (`HarnessMarkers._tracked`, memoized), `mints_visual_receipts`
   capability + honest dead-end messages, CLAUDE.md provenance/liveness
-  ratchet rule, `docs/adr/0012-structural-robustness-invariants.md`.
+  ratchet rule, `docs/archive/adr/0012-structural-robustness-invariants.md`.
   Three adversarial rounds total.
 - `aee0871` — findings report.
 

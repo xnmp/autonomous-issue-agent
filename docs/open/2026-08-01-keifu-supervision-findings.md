@@ -87,7 +87,7 @@ them.
    escalating `target_stalled` telemetry for any watched target whose
    observable state stops changing, plus the provenance ratchet rule in
    CLAUDE.md. Dosage and rollback triggers recorded in
-   `docs/adr/0012-structural-robustness-invariants.md`.
+   `docs/archive/adr/0012-structural-robustness-invariants.md`.
 
 ## Operator interventions (the babysitting the harness still needs)
 

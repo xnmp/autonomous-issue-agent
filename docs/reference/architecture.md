@@ -8,7 +8,7 @@ document have been deleted. Slice 6a (2026-10) deleted the remaining
 The [minimal-harness design](../open/2026-10-12-minimal-harness-design.md)
 governs the current shape. Each tick, both roles derive every item's state from
 GitHub plus local leg facts; nothing persists a selected continuation. The
-phase-4 roadmap and [ADR 0016](../adr/0016-phase-4-current-state-authority.md)
+phase-4 roadmap and [ADR 0016](../archive/adr/0016-phase-4-current-state-authority.md)
 continuation authority are superseded (slices 5c and 5d-1 deleted the workflow
 model, the durable-command path and the continuation writers).
 

@@ -394,8 +394,9 @@ def test_every_adr_is_referenced_by_a_governed_source_file() -> None:
         decision = adr.read_text()
         match = re.match(r"# ADR ([0-9]{4})\b", decision)
         assert match is not None, f"{adr.name} has no ADR id"
-        if re.search(r"^Status: Superseded\b", decision, re.MULTILINE):
-            continue  # retired authority has no live source obligation
+        assert not re.search(r"^Status: Superseded\b", decision, re.MULTILINE), (
+            f"{adr.name} is superseded: move it to docs/archive/adr/"
+        )
         marker = f"ADR {match.group(1)}"
         governs = next(
             (

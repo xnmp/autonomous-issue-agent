@@ -32,7 +32,7 @@ Source abbreviations used as file-and-line citations:
 | **F** | [Field-verification ledger](../field-verification.md), especially working-tree lines 22–53 and `git diff HEAD -- docs/field-verification.md`. Rows can say **pending** even when a fix is merged. |
 | **S** | [Stop-state consolidation audit](2026-10-11-stop-state-consolidation.md), written against `7c04d49`; its source pointers are historical. |
 | **M** | [Manager reference](../reference/manager.md), especially lines 22–67 and 130–179. |
-| **ADR11** | [Trusted execution and gate evidence](../adr/0011-trusted-execution-and-gate-evidence.md), lines 38–64. |
+| **ADR11** | [Trusted execution and gate evidence](../archive/adr/0011-trusted-execution-and-gate-evidence.md), lines 38–64. |
 | **T:L…** | Physical JSONL line in `/home/chong/.claude/projects/-home-chong-Repos-autonomous-issue-agent/712a8fde-092a-46b8-847b-6c8712ab57ea.jsonl`. This distinguishes actual user messages from tool results, cron prompts, compaction summaries and delegated reports. |
 | **P/name:line** | File in `/tmp/claude-1000/-home-chong-Repos-autonomous-issue-agent/712a8fde-092a-46b8-847b-6c8712ab57ea/scratchpad/`. The `codex-*.md` files are task briefs; reproduced findings quoted inside them are review evidence, while requests to inspect a risk are not proof that it occurred. |
 | **U** | [/tmp/pr-unblock-livelock-report.md](/tmp/pr-unblock-livelock-report.md). |

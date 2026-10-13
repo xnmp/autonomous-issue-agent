@@ -1,6 +1,6 @@
 # Phase 3 — Proposed shared seams and bounded acceptance
 
-Design companion to [proposed ADR 0015](../adr/0015-generation-fenced-gate-rearm.md).
+Design companion to [proposed ADR 0015](../archive/adr/0015-generation-fenced-gate-rearm.md).
 The ADR number is reserved here during design: repository contracts require
 documents in `docs/adr/` to name governed source with corresponding source
 references. Move it there with those implementation seams after release.

@@ -20,7 +20,7 @@ the overall outcome. Phases 1–4 are accepted; phases 5/6 remain pending.
 
 The user requested a substantial reduction of supporting machinery and a
 finite GitHub issue roadmap implementable by Sol subagents. The architecture
-decision is [ADR 0016](../adr/0016-phase-4-current-state-authority.md).
+decision is [ADR 0016](../archive/adr/0016-phase-4-current-state-authority.md).
 Accepted implementation commits and current verification are recorded in the
 [execution record](phase-4-roadmap/execution.json). All phase-4
 outcomes and A2 acceptance are recorded there.

@@ -37,7 +37,7 @@ Read in this order:
    and conventions brief.
 3. [Review slice plan](2026-09-25-phase-3-review-slice-plan.md). Decisions 1–12
    are binding.
-4. [ADR 0015](../adr/0015-generation-fenced-gate-rearm.md): review slice,
+4. [ADR 0015](../archive/adr/0015-generation-fenced-gate-rearm.md): review slice,
    transaction/effect boundary, uncertainty, migration and rollback.
 5. `HARNESS.md` sections "Review rejection operator API" and "Resolve family
    activation". Review activation mirrors resolve activation.
