@@ -138,3 +138,18 @@ def test_run_gh_reports_a_missing_binary_rather_than_raising(monkeypatch):
     monkeypatch.setattr(subprocess, "run", boom)
     out, error = ghdata.run_gh(["issue", "list"])
     assert out == "" and "not installed" in error
+
+
+def test_a_read_after_one_observation_ttl_sees_a_new_merge():
+    """The gh cache used to hold the Done list 45s past the observation's TTL."""
+    from issue_agent.app.dashweb.service import OBSERVE_TTL_S
+
+    clock = Clock()
+    merged = [[{"number": 1}]]
+    gh = ghdata.GhReader(run=lambda _argv: (json.dumps(merged[0]), ""), clock=clock)
+    assert gh.merged_prs("o/r")[0] == [{"number": 1}]
+
+    merged[0] = [{"number": 2}, {"number": 1}]
+    clock.t += OBSERVE_TTL_S
+
+    assert gh.merged_prs("o/r")[0] == [{"number": 2}, {"number": 1}]

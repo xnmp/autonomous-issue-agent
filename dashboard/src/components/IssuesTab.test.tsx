@@ -36,7 +36,7 @@ const detail: IssueDetailPayload = {
 
 function polled(data: Partial<IssuesPayload>): Polled<IssuesPayload> {
   return {
-    data: { in_flight: [], done: [], backlog: [], gh_ok: true, observed_at: "2026-07-29T09:00:00Z", notifications: [], warnings: [], ...data },
+    data: { in_flight: [], done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: "2026-07-29T09:00:00Z", notifications: [], warnings: [], ...data },
     error: null,
     loading: false,
     updatedAt: 0,
@@ -56,6 +56,17 @@ describe("IssuesTab", () => {
 
     expect(screen.getByText(/Board unavailable — control store unavailable/)).toBeVisible();
     expect(screen.queryByText("GitHub data unavailable")).not.toBeInTheDocument();
+  });
+
+  it("notes in the Done section, only when the merged list was truncated, that older merges are not counted", () => {
+    const note = /newest merged PRs; older merges are not counted/;
+    const { unmount } = render(
+      <IssuesTab repo="demo" sub="done" issues={polled({ done: [doneCard], merged_partial: true })} onOpenIssue={vi.fn()} />,
+    );
+    expect(screen.getByText(note)).toBeVisible();
+    unmount();
+    render(<IssuesTab repo="demo" sub="done" issues={polled({ done: [doneCard], merged_partial: false })} onOpenIssue={vi.fn()} />);
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
   });
 
   it("shows pre-cutover legs as one money-history total, not legacy leg rows or failures", async () => {

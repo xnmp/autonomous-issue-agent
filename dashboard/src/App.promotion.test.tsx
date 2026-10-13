@@ -34,7 +34,7 @@ const issues = {
   in_flight: [],
   done: [],
   backlog: [],
-  gh_ok: true,
+  gh_ok: true, merged_partial: false,
   observed_at: "2026-10-12T12:00:00Z",
   notifications: [],
   warnings: [],

@@ -608,6 +608,11 @@ export interface components {
             /** In Flight */
             in_flight: components["schemas"]["IssueCard"][];
             /**
+             * Merged Partial
+             * @default false
+             */
+            merged_partial: boolean;
+            /**
              * Notifications
              * @default []
              */
