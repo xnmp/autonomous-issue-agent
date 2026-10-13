@@ -8,7 +8,7 @@ import threading
 from issue_agent.app import cli
 
 
-def test_operator_stop_logs_each_sigterm_target(monkeypatch, capsys) -> None:
+def test_operator_stop_logs_each_sigterm_target(monkeypatch, capfd) -> None:
     victim = subprocess.Popen(["sleep", "30"])
     threading.Thread(target=victim.wait, daemon=True).start()  # reap so the stop sees it exit
     monkeypatch.setattr(cli, "_launcher_pids", lambda _n: [victim.pid])
@@ -17,7 +17,7 @@ def test_operator_stop_logs_each_sigterm_target(monkeypatch, capsys) -> None:
         assert cli._stop_deployment("dep") == 0
     finally:
         victim.kill()
-    (line,) = _lines(capsys.readouterr().err)
+    (line,) = _lines(capfd.readouterr().err)
     assert f"SIGTERM pid={victim.pid} reason=operator_stop:dep" in line
 
 

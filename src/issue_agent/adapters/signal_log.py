@@ -2,7 +2,7 @@
 
 Incident #270: a Codex leg took an unattributed SIGTERM and the harness could
 not rule its own sends in or out. Each send logs exactly one line (signal,
-target, reason, run_id) before it is attempted; a failed send still shows
+target, reason, run_id) before it is attempted (best-effort: a broken sink never blocks the send); a failed send still shows
 what was tried.
 """
 
@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import os
 import signal
-import sys
 from collections.abc import Callable
 
 
 def _stderr(line: str) -> None:
-    print(line, file=sys.stderr, flush=True)
+    # A raw write: safe inside a signal handler (no buffered-writer reentrancy).
+    os.write(2, (line + "\n").encode(errors="replace"))
 
 
 def send_signal(
@@ -33,10 +33,16 @@ def send_signal(
     """
     if (pid is None) == (pgid is None):
         raise ValueError("send_signal needs exactly one of pid or pgid")
-    name = signal.Signals(signum).name
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        name = f"SIG{signum}"
     target = f"pid={pid}" if pid is not None else f"pgid={pgid}"
     run = f" run_id={run_id}" if run_id else ""
-    (log or _stderr)(f"signal-send: {name} {target} reason={reason}{run} sender_pid={os.getpid()}")
+    try:
+        (log or _stderr)(f"signal-send: {name} {target} reason={reason}{run} sender_pid={os.getpid()}")
+    except Exception:  # noqa: BLE001 - a dead log sink must never stop the kill
+        pass
     if pid is not None:
         os.kill(pid, signum)
     else:
