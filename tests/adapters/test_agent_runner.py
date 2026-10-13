@@ -524,3 +524,91 @@ def test_claude_cli_resolution_prefers_the_pin_then_the_bundled_cli_then_path(tm
     gone = tmp_path / "deleted-venv" / "claude"
     assert resolve_claude_cli("", gone, which=lambda _: "/local/claude") == "/local/claude"
     assert resolve_claude_cli("", tmp_path / "missing", which=lambda _: None) is None
+
+
+# ── session id from the init message (#340): every end can be resumed ───────
+def _init(data):
+    """The SDK's generic init SystemMessage: the session id lives in `data`."""
+    return type("SystemMessage", (), {"subtype": "init", "data": data})()
+
+
+_WALL_TRIP = {"idle_timeout": None, "max_runtime": 900.0, "poll_slice": 0.05}
+
+
+def test_a_wall_capped_stream_carries_the_session_its_init_named(monkeypatch):
+    _install_hanging_sdk(monkeypatch, [_init({"session_id": "s-init", "model": "claude-opus-5-5"})])
+
+    r = _run(**_WALL_TRIP, wall_clock=_jumping_wall([1000.0, 1000.0, 1000.0, 1000.0, 4600.0]))
+
+    assert r.exit_reason is ExitReason.WALL_TIMEOUT
+    assert (r.session_id, r.model) == ("s-init", "claude-opus-5-5")
+
+
+def test_an_idle_or_resultless_end_carries_the_init_session(monkeypatch):
+    _install_hanging_sdk(monkeypatch, [_init({"session_id": "s-idle"})])
+    assert _run(idle_timeout=0.2, poll_slice=0.05).session_id == "s-idle"
+
+    _install_fake_sdk(monkeypatch, [_init({"session_id": "s-drop"})])
+    r = _run()
+    assert (r.exit_reason, r.session_id) == (ExitReason.NO_RESULT, "s-drop")
+
+
+@pytest.mark.parametrize("data", [
+    None, "s-not-a-dict", {}, {"session_id": None}, {"session_id": 123}, {"session_id": "   "},
+    {"session_id": "s" * 257}, {"session_id": ["s1"]},
+])
+def test_a_malformed_or_absent_init_leaves_a_timeout_with_no_session(monkeypatch, data):
+    _install_hanging_sdk(monkeypatch, [_init(data)])
+
+    r = _run(idle_timeout=0.2, poll_slice=0.05)
+
+    assert r.exit_reason is ExitReason.IDLE_TIMEOUT
+    assert r.session_id == ""
+
+
+def test_a_stream_without_init_uses_the_first_message_that_names_a_session(monkeypatch):
+    first = type("AssistantMessage", (), {"session_id": "s-main", "content": []})()
+    later = type("AssistantMessage", (), {"session_id": "s-later", "content": []})()
+    _install_hanging_sdk(monkeypatch, [_init({"model": "m"}), first, later])
+
+    assert _run(idle_timeout=0.2, poll_slice=0.05).session_id == "s-main"
+
+
+def test_the_result_envelope_session_wins_and_a_bare_one_falls_back_to_init(monkeypatch):
+    _install_fake_sdk(monkeypatch, [_init({"session_id": "s-init"}), _ResultMessage(is_error=False, session_id="s-end")])
+    assert _run().session_id == "s-end"
+
+    _install_fake_sdk(monkeypatch, [_init({"session_id": "s-init"}), _ResultMessage(is_error=False, session_id=None)])
+    assert _run().session_id == "s-init"
+
+
+def test_a_resumed_leg_that_hangs_before_any_message_keeps_the_resumed_session(monkeypatch):
+    _install_hanging_sdk(monkeypatch, [])
+
+    r = asyncio.run(AgentRunner(idle_timeout=0.2, poll_slice=0.05).run(RuntimePlan(prompt="x", resume="s-prior")))
+
+    assert (r.exit_reason, r.session_id) == (ExitReason.IDLE_TIMEOUT, "s-prior")
+
+
+def test_a_transport_death_after_init_journals_the_session(monkeypatch):
+    from issue_agent.adapters.journal import JournalingRuntime
+
+    class Sink:
+        canonical, path = True, ""
+
+        def __init__(self):
+            self.events = []
+
+        def emit(self, event, fields):
+            self.events.append((event, dict(fields)))
+
+    _install_fake_sdk(monkeypatch, [_init({"session_id": "s-died"})], raise_after=True)
+    sink = Sink()
+    runtime = JournalingRuntime(AgentRunner(), sink, repo="o/r", role="fix")
+    runtime.set_context("fix", "RESOLVE", 5, 5)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(runtime.run(RuntimePlan(prompt="x")))
+
+    settled = [f for e, f in sink.events if e == "agent_run"]
+    assert [(f["exit_reason"], f["session_id"]) for f in settled] == [("transport_death", "s-died")]
