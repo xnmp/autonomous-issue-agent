@@ -46,5 +46,6 @@ Stop all role daemons and the dashboard before copying `control.db` and its
 Restore the complete set to the same path with mode `0600`, then start one role
 and require its integrity check/recovery to finish before starting the others.
 Never roll an old copy over charges created after the backup. A retired
-pre-cutover file is never read again; keep it as evidence or delete it once the
-new store has run.
+pre-cutover file is never read again, but keep it: if `control.db` is lost with
+no backup, renaming the retired file back (any `-wal`/`-shm` moved aside) cuts
+it over again with its pre-cutover spend, which the refusal message says.

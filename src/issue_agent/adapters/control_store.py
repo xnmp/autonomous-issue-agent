@@ -625,12 +625,16 @@ class SQLiteControlStore:
             if row["state"] != "reserved":
                 return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
                                      detail=f"a {row['state']} leg is not eligible for this release")
-            db.execute(
-                "UPDATE legs SET state='released', end_reason=?, ended_at=COALESCE(ended_at, ?) WHERE leg_id=?",
-                (reason, self._stamp_now(), str(run_id)),
-            )
-            db.execute("DELETE FROM leases WHERE leg_id=?", (str(run_id),))
+            self._release_reserved(db, str(run_id), reason)
             return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
+
+    def _release_reserved(self, db: sqlite3.Connection, leg_id: str, reason: str) -> None:
+        db.execute(
+            "UPDATE legs SET state='released', end_reason=?, ended_at=COALESCE(ended_at, ?) "
+            "WHERE leg_id=? AND state='reserved'",
+            (reason, self._stamp_now(), leg_id),
+        )
+        db.execute("DELETE FROM leases WHERE leg_id=?", (leg_id,))
 
     def record_reservation_retained(self, run_id: RunId, reason: str) -> bool:
         """End a leg whose spend is uncertain, keeping its reservation for recovery."""
@@ -810,20 +814,29 @@ class SQLiteControlStore:
             return True
 
     def unlease(self, repository: str, role: str, target: int, owner_id: str) -> bool:
-        """Release a claim whose leg settled, was released, or never reserved.
+        """Release a claim. A bound leg that never launched (still `reserved`)
+        is released with it: it charges nothing and holds no usage to wait
+        for, so a failed release on the runtime's error path cannot leave the
+        daemon-pid lease and its reservation stuck until restart.
 
-        A bound leg still unsettled keeps the lease: its process (killed at
+        A bound `running` leg keeps the lease: its process (killed at
         shutdown, or crashed) may have left usage that only becomes readable
         once it is reaped, and settling it at a zero estimate now could not be
         corrected later. Liveness and dead-lease recovery govern it instead.
         """
         key = (canonical_repository(repository), role, target)
         with self._transaction() as db:
-            return bool(db.execute(
-                "DELETE FROM leases WHERE repository=? AND role=? AND target=? AND owner=? "
-                f"AND (leg_id IS NULL OR leg_id NOT IN (SELECT leg_id FROM legs WHERE {_UNSETTLED}))",
+            row = db.execute(
+                "SELECT l.leg_id, g.state FROM leases l LEFT JOIN legs g ON g.leg_id=l.leg_id "
+                "WHERE l.repository=? AND l.role=? AND l.target=? AND l.owner=?",
                 (*key, owner_id),
-            ).rowcount)
+            ).fetchone()
+            if row is None or row["state"] == "running":
+                return False
+            if row["state"] == "reserved":
+                self._release_reserved(db, row["leg_id"], "unlaunched_reservation")
+            db.execute("DELETE FROM leases WHERE repository=? AND role=? AND target=?", key)
+            return True
 
     def register_process_lease(
         self, run_id: RunId, *, expected_owner_id: str, pid: int, pgid: int, process_start_ticks: int,
@@ -972,13 +985,27 @@ def _refuse_prior_use(path: str, opened_before: bool) -> None:
     )
     if opened_before:
         evidence.insert(0, f"{path}.initialize.lock")
-    if evidence:
+    if not evidence:
+        return
+    refusal = (
+        f"control store {path} is missing but was used before ({', '.join(evidence)}); "
+        "refusing to recreate it empty, which would reset spend and caps to zero. Stop every role daemon and "
+    )
+    retired = sorted(item for item in evidence if ".retired-v" in item)
+    if retired:
+        # The retired pre-cutover file is the only record of that spend:
+        # renamed back, it is cut over again on the next start. It left WAL
+        # mode before it was retired, so any -wal/-shm here belong to the lost
+        # store and would be replayed into it.
         raise CorruptControlStore(
-            f"control store {path} is missing but was used before ({', '.join(evidence)}); "
-            "refusing to recreate it empty, which would reset spend and caps to zero. "
-            "Stop every role daemon and restore control.db (with its -wal, if any) from a backup, "
-            "or, to deliberately start with no spend history, delete the listed files and start again."
+            refusal + f"restore a backup of {path}, or move any -wal/-shm listed aside and rename "
+            f"{' or '.join(retired)} back to {path}: it is cut over again on start and keeps the "
+            "pre-cutover spend. Do not delete it."
         )
+    raise CorruptControlStore(
+        refusal + "restore control.db (with its -wal, if any) from a backup, or, to deliberately "
+        "start with no spend history, delete the listed files and start again."
+    )
 
 
 def _create(path: str) -> None:

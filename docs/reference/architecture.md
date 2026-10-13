@@ -117,9 +117,11 @@ no migration history and no digest pins):
   process (pid, pgid, start ticks). The claiming daemon holds it until the
   leg's child registers its own process group. A lease is live while its
   bound leg is unsettled and not ended, or while its process is alive. A
-  role releasing its claim leaves a still-unsettled leg's lease in place, so
-  a leg killed at shutdown is settled by boot recovery after the reap, from
-  usage that may only then be readable, never at a premature zero.
+  role releasing its claim leaves a running leg's lease in place, so a leg
+  killed at shutdown is settled by boot recovery after the reap, from usage
+  that may only then be readable, never at a premature zero. A bound leg that
+  never launched is released with the claim, so a failed release on the
+  runtime's error path cannot hold its reservation until restart.
 - `idempotency` — keyed writes (`fix-comment:{repository}:{key}`), claimed
   before the effect and confirmed after its read-back.
 

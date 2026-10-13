@@ -238,9 +238,13 @@ isolated. Historical JSONL is never queried for these decisions.
 A missing `control.db` is recreated only on a machine that never had one. If
 its companions remain (`control.db.initialize.lock`, `-wal`, `-shm`,
 `.retired-v*`, `.authority`), startup refuses and names them rather than
-silently resetting every cap to zero: restore the database from a backup with
-every daemon stopped, or delete the listed files to start deliberately with no
-spend history.
+silently resetting every cap to zero. With every daemon stopped, restore the
+database from a backup. If a `control.db.retired-v*` file is listed and there
+is no backup, move any listed `-wal`/`-shm` aside (they belong to the lost
+store) and rename the retired file back to `control.db`: the next start cuts it
+over again and keeps the pre-cutover spend; only legs recorded since the
+cutover are lost. Do not delete a retired file. Only when none is listed may
+you delete the listed files to start deliberately with no spend history.
 
 ### Upgrading to the 3-table store (slice 5d-2)
 
@@ -263,8 +267,9 @@ workflow rows, receipts, holds and attempt history (attempt counts restart).
      check is point-in-time, so step 1 is what actually guarantees nothing of
      the previous release is left running.
 4. On success the old file remains as
-   `control.db.retired-v<N>-<UTC stamp>` beside the new one. Nothing reads it;
-   keep it as evidence or delete it once the new store has run. The old
+   `control.db.retired-v<N>-<UTC stamp>` beside the new one. Nothing reads it,
+   but keep it: it is the only copy of the pre-cutover spend if `control.db`
+   is ever lost (see above). The old
    `control.db.authority` witness file beside it is no longer used and may be
    deleted too.
 

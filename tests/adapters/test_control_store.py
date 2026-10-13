@@ -146,7 +146,13 @@ def test_a_missing_store_with_evidence_of_prior_use_is_refused_not_recreated(tmp
         SQLiteControlStore(str(path)).initialize()
 
     assert str(refused.value).count(".initialize.lock" if evidence == "opened" else evidence) >= 1
-    assert "restore control.db" in str(refused.value)
+    if evidence.startswith(".retired-v"):
+        # The retired file is the only record of pre-cutover spend.
+        assert f"rename {path}{evidence} back to {path}" in str(refused.value)
+        assert "Do not delete it" in str(refused.value)
+        assert "delete the listed files" not in str(refused.value)
+    else:
+        assert "restore control.db" in str(refused.value)
     assert not path.exists()
 
 
@@ -547,6 +553,24 @@ def test_an_unsettled_leg_keeps_its_lease_until_its_process_is_gone(tmp_path):
     assert store.unlease(REPO, "fix", 1, OWNER) is False  # reclaim already dropped it
 
 
+def test_unleasing_a_never_launched_leg_releases_its_reservation_with_the_lease(tmp_path):
+    # The runtime's own release can fail on a transient SQLite error; the
+    # claim's release must not then keep the reservation and the daemon-pid
+    # lease until the daemon restarts.
+    store = _store(tmp_path)
+    assert _reserve(store, 1, issue=7, lease_target=7).admitted
+
+    assert store.unlease(REPO, "fix", 7, OWNER)
+
+    leg = _leg(store, "run-1")
+    assert (leg["state"], leg["end_reason"], leg["charged_micros"]) == ("released", "unlaunched_reservation", None)
+    assert leg["ended_at"] is not None
+    assert store.leases() == ()
+    assert store.held_targets(REPO) == frozenset()
+    assert store.snapshot(_daily()).committed == Money("USD", 0)
+    assert store.lease(REPO, "fix", 7, "o/r:fix:other")
+
+
 # -- idempotency -------------------------------------------------------------------
 
 
@@ -714,6 +738,25 @@ def test_a_v41_store_cuts_over_with_its_spend_in_the_caps(tmp_path):
     assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
     with closing(sqlite3.connect(path)) as db:
         assert set(db.execute("SELECT repository, origin FROM legs")) == {(REPO, "normal_return")}
+
+
+def test_a_lost_store_restored_from_its_retired_file_keeps_the_pre_cutover_spend(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED)
+    SQLiteControlStore(str(path), now=lambda: NOW).initialize()
+    path.unlink()
+
+    with pytest.raises(CorruptControlStore, match="Do not delete it"):
+        SQLiteControlStore(str(path), now=lambda: NOW).initialize()
+    for stale in (Path(f"{path}-wal"), Path(f"{path}-shm")):
+        if stale.exists():
+            stale.rename(tmp_path / f"aside{stale.name[-4:]}")
+    (retired,) = tmp_path.glob("control.db.retired-v46-*")
+    retired.rename(path)
+
+    store = SQLiteControlStore(str(path), now=lambda: NOW)
+    store.initialize()
+    assert store.snapshot(_daily()).settled == Money("USD", 350)
+    assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
 
 
 def test_a_cutover_that_would_move_a_charge_out_of_a_cap_scope_is_refused(tmp_path):
