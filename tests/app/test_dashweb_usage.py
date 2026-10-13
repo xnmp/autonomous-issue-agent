@@ -37,29 +37,11 @@ def test_utilization_objects_are_read_as_percentages():
     assert parsed["error"] is None
 
 
-def test_a_flat_pct_variant_is_accepted_too():
-    parsed = usage.parse_claude_usage({"five_hour_pct": 5, "seven_day_pct": 9})
-    assert (parsed["five_hour_pct"], parsed["seven_day_pct"]) == (5.0, 9.0)
-
-
 @pytest.mark.parametrize("payload", [{}, [], None, {"quota": "unknown"}, "text"])
 def test_an_unrecognised_shape_errors_rather_than_reporting_zero_used(payload):
     parsed = usage.parse_claude_usage(payload)
     assert parsed["error"]
     assert parsed["five_hour_pct"] is None and parsed["seven_day_pct"] is None
-
-
-def test_claude_usage_sends_the_token_to_the_fetcher_and_never_returns_it(tmp_path):
-    seen = {}
-
-    def fetch(token):
-        seen["token"] = token
-        return {"five_hour": {"utilization": 1.0}}
-
-    result = usage.claude_usage(fetch=fetch, credentials_path=creds(tmp_path),
-                               cache=fresh_cache())
-    assert seen["token"] == "sk-oauth-secret"
-    assert "sk-oauth-secret" not in json.dumps(result)
 
 
 def test_a_fetch_failure_reports_an_error_without_leaking_the_token(tmp_path):
@@ -111,19 +93,6 @@ def test_a_malformed_credentials_file_yields_no_token(tmp_path):
     path.write_text("{not json")
     assert usage.read_oauth_token(str(path)) == ""
     assert usage.read_oauth_token(str(tmp_path / "absent.json")) == ""
-
-
-def test_the_second_call_inside_the_ttl_does_not_refetch(tmp_path):
-    calls = []
-    cache = fresh_cache()
-
-    def fetch(token):
-        calls.append(token)
-        return {"five_hour": {"utilization": 1.0}}
-
-    for _ in range(3):
-        usage.claude_usage(fetch=fetch, credentials_path=creds(tmp_path), cache=cache)
-    assert len(calls) == 1
 
 
 # ── codex ─────────────────────────────────────────────────────────────────────

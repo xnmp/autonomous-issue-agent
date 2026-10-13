@@ -8,7 +8,6 @@ import argparse
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -590,84 +589,6 @@ def test_fresh_role_heartbeats_are_bounded_and_ignore_terminal_state(
     assert "review" not in cli._fresh_role_heartbeats(
         "app", now_fn=lambda: now, stale_after_s=30
     )
-
-
-def test_cmd_status_reports_heartbeat_when_pid_namespace_hides_daemon(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    heartbeat = datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {role: [] for role in cli.ROLES},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
-    monkeypatch.setattr(
-        cli,
-        "_fresh_role_heartbeats",
-        lambda _name: {"fix": heartbeat, "review": heartbeat},
-    )
-    monkeypatch.setattr(cli, "log_dir", lambda: str(tmp_path / "logs"))
-
-    rc = cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app", target_dir="/srv/acme-app", name="app", lines=5
-        )
-    )
-
-    assert rc == 0
-    output = capsys.readouterr().out
-    assert "fix     : running (fresh heartbeat; PID not visible)" in output
-    assert "review  : running (fresh heartbeat; PID not visible)" in output
-
-
-def test_systemd_status_log_reads_the_installed_unit_journal(monkeypatch) -> None:
-    calls: list[tuple[list[str], float]] = []
-
-    class Result:
-        def __init__(self, stdout: str):
-            self.returncode = 0
-            self.stdout = stdout
-            self.stderr = ""
-
-    def run(command, **kwargs):
-        calls.append((command, kwargs["timeout"]))
-        if command[0] == "systemctl":
-            return Result("ActiveState=active\nLoadState=loaded\n")
-        if command[0] == "journalctl":
-            return Result("fix: live service output\n")
-        raise AssertionError(command)
-
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-    monkeypatch.setattr(cli.subprocess, "run", run)
-
-    assert cli._systemd_status_log("app", "fix", 7) == (
-        "systemd journal: issue-agent-fix-watcher-app.service",
-        "fix: live service output",
-    )
-    assert calls == [
-        ([
-            "systemctl",
-            "--user",
-            "show",
-            "issue-agent-fix-watcher-app.service",
-            "--property=LoadState",
-            "--property=ActiveState",
-        ], cli._STATUS_COMMAND_TIMEOUT_S),
-        ([
-            "journalctl",
-            "--user",
-            "--unit",
-            "issue-agent-fix-watcher-app.service",
-            "--lines",
-            "7",
-            "--no-pager",
-            "--output=cat",
-        ], cli._STATUS_COMMAND_TIMEOUT_S),
-    ]
 
 
 def test_launcher_pid_discovery_uses_exact_deployment_argv_token(

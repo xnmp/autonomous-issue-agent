@@ -1,43 +1,18 @@
 """Env-compose pipeline + doctor preflight — review C5 / D3 / D7.
 
-C5(a): bin/compose-env.sh used to emit a hand-maintained allow-list that
-omitted ~18 documented knobs, so a systemd deployment silently dropped
-operator config. It now snapshots the environment before/after sourcing
-shared.env + the per-repo overlay and emits the diff — every var either file
-defined, with no allow-list to fall out of sync.
+C5(a): compose-env.sh once emitted a hand-maintained allow-list that dropped ~18
+documented knobs; it now emits every var shared.env + the overlay define.
+P0R-1: a PRE/POST diff alone dropped a var assigned to the value the launching
+shell already exported (`FOO="${FOO:-default}"`), so it emits the UNION of the
+diff and the assignment names scanned from the files — hence the set-equality
+test. C5(b): main() exports the composed config into os.environ, since systemd
+units set only AGENT_ENV + TARGET_DIR and subprocesses (git, gh, codex) inherit
+it. D7: doctor fails when two overlays resolve to one state dir, and compares
+normalized logins (`fix-bot` vs `fix-bot[bot]`).
 
-P0R-1: that C5(a) fix regressed in the opposite direction — a PRE/POST diff
-emits a var only when it is NEW or CHANGED, so a var the files DO assign to
-the value the launching shell already exported was byte-identical in both
-snapshots and silently dropped (`FOO="${FOO:-default}"`, or a TEST_CMD
-matching the operator's exported value). compose-env.sh now emits the UNION of
-the diff and the assignment names scanned out of the two files. The suite was
-green with that bug present because every test asserted MEMBERSHIP of a
-happy-path example or ABSENCE of ambient leakage; none asserted that an
-assigned var is still emitted. Hence the set-equality test below.
-
-C5(b): nothing exported the composed config into os.environ, so under systemd
-(unit files set only AGENT_ENV + TARGET_DIR) every subprocess spawned
-downstream (git, gh, codex — none of which pass `env=`
-explicitly) inherited an empty environment: operator knobs like CI_PENDING_MAX_SECONDS were silently
-ignored. `app/main.py::main()` now calls `os.environ.update(env)` before
-building anything.
-
-D7 (doctor half): bin/doctor.sh gains a check that fails when two
-config/repos/*.env overlays resolve to the same effective state dir (the
-exact M5 shape — a second repo's fix daemon would resume the first repo's
-issue-N.session), and its identity-distinctness check (C1) now normalizes
-logins before comparing so `fix-bot` vs `fix-bot[bot]` is caught instead of
-silently passing.
-
-These tests exercise the REAL scripts via subprocess (not a description of
-them) — bin/compose-env.sh is copied into a scratch tree so its
-self-locating `dirname "${BASH_SOURCE[0]}"/..` root resolves to the scratch
-config, never touching the real repo's (gitignored) config/. bin/doctor.sh is
-run in place with HARNESS_ROOT overridden for the same reason, and PATH
-prepended with fake gh/claude/jq/uv stubs so the run is hermetic (no network,
-no real gh auth needed) — per the wave brief's suggestion to
-"test via a stub PATH with a fake gh".
+These run the REAL scripts: compose-env.sh is copied into a scratch tree so its
+self-locating root resolves to scratch config, and doctor.sh runs with
+HARNESS_ROOT overridden and fake gh/claude/jq/uv stubs prepended to PATH.
 """
 
 from __future__ import annotations
@@ -177,48 +152,17 @@ _ASSIGN_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=", re
 _UNSET_RE = re.compile(r"^[ \t]*unset[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*$", re.MULTILINE)
 
 
-def test_compose_env_repo_overlay_wins_over_shared(tmp_path):
-    # Anti-vacuity twin: precedence still holds under the new diff-based
-    # emission (shared sets a default, the per-repo overlay wins).
-    compose_env_sh = _install_compose_env(tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "shared.env").write_text('MERGE_METHOD="merge"\n')
-    repos_dir = tmp_path / "config" / "repos"
-    repos_dir.mkdir()
-    (repos_dir / "demo.env").write_text('REPO="acme/widget"\nMERGE_METHOD="squash"\n')
-
-    subprocess.run(
-        ["bash", str(compose_env_sh), "demo"], check=True, capture_output=True, text=True
-    )
-    active_text = (tmp_path / "config" / ".active.demo.env").read_text()
-    assert "MERGE_METHOD=squash" in active_text
-    assert "MERGE_METHOD=merge" not in active_text
-
-
-def test_compose_env_does_not_leak_ambient_or_shell_owned_vars(tmp_path):
-    # Anti-vacuity twin of the pipeline test: the diff mechanism must emit
-    # ONLY what the two files defined/changed — not a raw env dump. An
-    # ambient var the files never touch (however it got into the composing
-    # shell's environment) must not appear, and neither should PATH/PWD/HOME/
-    # SHLVL/_ (the "vars the shell itself owns" the review explicitly calls
-    # out).
-    compose_env_sh = _install_compose_env(tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "shared.env").write_text('FIX_BOT="fix-bot"\n')
-    repos_dir = tmp_path / "config" / "repos"
-    repos_dir.mkdir()
-    (repos_dir / "demo.env").write_text('REPO="acme/widget"\n')
-
-    env = dict(os.environ)
-    env["SOME_UNRELATED_AMBIENT_VAR"] = "should-not-leak"
-    subprocess.run(
-        ["bash", str(compose_env_sh), "demo"],
-        check=True, capture_output=True, text=True, env=env,
-    )
-    active_text = (tmp_path / "config" / ".active.demo.env").read_text()
-    assert "SOME_UNRELATED_AMBIENT_VAR" not in active_text
+def test_compose_env_emits_the_files_with_overlay_precedence_and_nothing_ambient(tmp_path):
+    """The overlay wins over shared.env, and only what the two files define is
+    emitted: no unrelated ambient var and none of the shell's own (PATH/PWD/...)."""
+    active = _compose(tmp_path, shared='MERGE_METHOD="merge"\nFIX_BOT="fix-bot"\n',
+                      overlay='REPO="acme/widget"\nMERGE_METHOD="squash"\n',
+                      ambient={"SOME_UNRELATED_AMBIENT_VAR": "should-not-leak"})
+    text = active.read_text()
+    assert "MERGE_METHOD=squash" in text and "MERGE_METHOD=merge" not in text
+    assert "SOME_UNRELATED_AMBIENT_VAR" not in text
     for shell_owned in ("PATH=", "PWD=", "SHLVL=", "\n_=", "OLDPWD="):
-        assert shell_owned not in active_text
+        assert shell_owned not in text
 
 
 def test_compose_env_missing_overlay_fails_loud(tmp_path):

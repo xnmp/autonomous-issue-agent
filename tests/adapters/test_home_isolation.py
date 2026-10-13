@@ -21,9 +21,8 @@ def test_runner_suite_ignores_populated_operator_home(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q",
-         "tests/app/test_codex_runner.py::test_run_is_an_agent_error_when_only_the_agent_trace_mentions_a_rate_limit",
+         "tests/app/test_codex_runner.py::test_run_reports_zero_cost_without_rates",
          "tests/adapters/test_service_installers.py::test_service_installers_reject_noncanonical_deployment_identity[True]",
-         "tests/adapters/test_dashboard_bundle.py::test_parent_termination_is_forwarded_to_the_nested_process_group",
          "--basetemp", str(tmp_path / "nested-pytest")],
         cwd=repo,
         env={**os.environ, "HOME": str(operator_home), "CODEX_HOME": str(codex_home)},

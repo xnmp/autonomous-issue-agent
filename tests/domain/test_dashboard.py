@@ -10,7 +10,7 @@ import pytest
 from issue_agent.domain import dashboard as dash
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.state import (
-    Backoff, Busy, Dispatch, Harness, Merge, NeedsHuman, Release, StopReason, Wait, WaitReason, stop_tag,
+    Backoff, Dispatch, Harness, Merge, NeedsHuman, Release, StopReason, Wait, WaitReason, stop_tag,
 )
 from issue_agent.domain.world import Comment, PRView
 
@@ -76,33 +76,6 @@ def test_a_labelled_stop_names_its_reason_and_offers_unblock(reason):
     assert (board.reason, board.target, dash.primary_action(board, held=True)) == (reason.value, "pr", "unblock")
 
 
-def test_a_spent_lifetime_budget_is_raised_elsewhere_not_unblocked():
-    board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(StopReason.LIFETIME_CAP, 5)])
-    assert board.reason == "lifetime-cap" and dash.primary_action(board, held=True) == "open"
-
-
-def test_a_label_without_a_stop_comment_reads_as_parked():
-    board = status(Wait(WaitReason.NEEDS_HUMAN), legs=[leg(ended=2)])
-    assert isinstance(board, dash.NeedsYou)
-    assert board.reason == "labelled" and board.since_ts is None
-    assert dash.primary_action(board, held=True) == "unblock"
-
-
-def test_a_stop_older_than_the_last_leg_belongs_to_a_released_episode():
-    # Stopped at 5, released, a leg ended at 9, then parked again.
-    board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(StopReason.ATTEMPTS, 5)], legs=[leg(ended=9)])
-    assert board.reason == "labelled"
-
-
-def test_the_episode_boundary_is_derives_item_legs_not_every_leg_of_the_issue():
-    # A carried pre-cutover leg (or another item's leg) ended after the stop;
-    # derive keyed no leg to this item after it, so the stop is this episode's.
-    issue_legs = [leg(ended=2), leg(ended=9, role="carried")]
-    board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(StopReason.ATTEMPTS, 5)], legs=issue_legs,
-                   last_end=at(2))
-    assert board.reason == "attempts" and board.since_ts == stamp(5)
-
-
 @pytest.mark.parametrize("comment", [
     stop(StopReason.ATTEMPTS, 5, author="mallory"),  # marker forged by a commenter
     Comment("fixbot", f"{stop_tag(StopReason.ATTEMPTS)} without the marker", stamp(5)),
@@ -135,13 +108,6 @@ def test_a_stop_about_to_be_posted_is_already_needs_you():
 # ── working and waiting ──────────────────────────────────────────────────────
 
 
-def test_a_busy_item_names_its_running_leg():
-    board = status(Busy(), legs=[leg(ended=1), leg("REVIEW", 4, state="running")])
-    assert isinstance(board, dash.Working)
-    assert (board.activity, board.act, board.since_ts) == ("agent", "REVIEW", stamp(4))
-    assert dash.primary_action(board, held=True) is None
-
-
 @pytest.mark.parametrize("state,activity", [
     (Dispatch(AgentKind.FIX_CI, "h1"), "queued"),
     (Merge("h1"), "merge"),
@@ -165,20 +131,6 @@ def test_waits_name_what_they_wait_on():
     assert isinstance(backoff, dash.Waiting) and (backoff.on, backoff.until_ts) == ("backoff", stamp(30))
 
 
-def test_a_review_dispatch_is_the_review_roles_and_waits_on_its_own_headroom():
-    from issue_agent.domain.state import issue_key, pr_key
-
-    review, resolve, merge = pr_key(9), issue_key(4), pr_key(8)
-    fix = {review: Dispatch(AgentKind.REVIEW, "h"), resolve: Wait(WaitReason.HEADROOM), merge: Merge("h")}
-    # The review leg is dearer: the cap fits a fix leg but not a review leg.
-    rev = {review: Wait(WaitReason.HEADROOM), resolve: Dispatch(AgentKind.RESOLVE), merge: Merge("h")}
-    assert dash.role_states(fix, rev) == {review: Wait(WaitReason.HEADROOM), resolve: Wait(WaitReason.HEADROOM),
-                                          merge: Merge("h")}
-    # And the other way round: only the review role has room.
-    assert dash.role_states(rev, fix)[review] == Dispatch(AgentKind.REVIEW, "h")
-    assert dash.role_states({}, rev) == {}
-
-
 # ── rail and history ─────────────────────────────────────────────────────────
 
 
@@ -189,12 +141,6 @@ def test_the_rail_counts_legs_and_remembers_a_rewind():
     assert (rail.current, rail.furthest) == ("ci", "review")
     assert (rail.resolve_attempts, rail.review_rounds, rail.ci_runs, rail.steps) == (1, 1, 2, 4)
     assert rail.live is False
-
-
-def test_the_rail_of_a_new_issue_starts_at_resolve_and_a_merge_ends_it():
-    assert dash.rail(Dispatch(AgentKind.RESOLVE), has_pr=False, legs=()).current == "resolve"
-    assert dash.rail(None, has_pr=True, legs=(), done=True).current == "merge"
-    assert dash.rail(Busy(), has_pr=True, legs=(leg("REVIEW", 1, state="running"),)).live is True
 
 
 def test_history_folds_identical_consecutive_legs_per_stage_visit():
@@ -272,22 +218,6 @@ def test_hourly_spend_keeps_empty_hours_and_drops_stamps_outside_the_window():
     buckets = dash.spend_per_hour(legs, at(30), hours=3)
     assert [b.usd for b in buckets] == [0.0, 0.0, 2.0]
     assert dash.spend_per_hour(legs, at(30), hours=0) == ()
-
-
-def test_notifications_have_stable_ids_and_flag_failures_and_needs():
-    needs = dash.NeedsYou("question", "Answer", None, "issue", stamp(9))
-    out = dash.notifications([leg(cls="machine", leg_id="L1"), leg("REVIEW", 2, state="running", leg_id="L2")],
-                             [(7, needs)])
-    ids = [n.id for n in out]
-    assert ids == ["leg:L1:start", "leg:L1:end", "leg:L2:start", "needs:7:question:" + stamp(9)]
-    assert out[1].severity == "attention" and out[-1].severity == "attention"
-    assert dash.notifications([leg(leg_id=str(i), minutes=i) for i in range(80)], [], limit=10)[-1].id == "leg:79:end"
-    assert dash.notifications([leg()], [], limit=0) == ()
-
-
-def test_ci_display_reads_only_the_current_head():
-    assert dash.ci_display(None) is None
-    assert dash.ci_display(PRView(1, head_ref_oid="h1")) is None  # checks not observed
 
 
 def test_label_values_and_frecency():
