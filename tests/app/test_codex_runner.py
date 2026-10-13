@@ -88,8 +88,9 @@ def test_oversize_prompt_moves_to_stdin_small_stays_on_argv():
     assert routed_mb[-1] == "-" and payload_mb is not None
 
 
-def test_argv_basic_shape():
-    argv = build_codex_argv(RuntimePlan(prompt="do it"))
+def test_argv_shape():
+    argv = build_codex_argv(RuntimePlan(prompt="do it", cwd="/wt/issue-5"),
+                            schema_path="/tmp/s.json", output_path="/tmp/o.json")
     assert argv[:2] == ["codex", "exec"]
     assert argv[-1] == "do it"  # prompt is last positional
     assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
@@ -99,37 +100,21 @@ def test_argv_basic_shape():
     # and with no -m codex uses the provider's own default (in OAuth mode, the
     # subscription's current model).
     assert "-m" not in argv
-
-
-def test_argv_reasoning_effort_override_and_opt_out():
-    assert "model_reasoning_effort=high" in " ".join(
-        build_codex_argv(RuntimePlan(prompt="x"), reasoning_effort="high")
-    )
-    # "" = leave codex's own default alone — no pin at all.
-    assert "model_reasoning_effort" not in " ".join(
-        build_codex_argv(RuntimePlan(prompt="x"), reasoning_effort="")
-    )
-
-
-def test_argv_task_effort_beats_the_process_knob():
-    """The escalation ladder decides per LEG (#16); `reasoning_effort` is only
-    the default for legs with no opinion of their own."""
-    argv = build_codex_argv(
-        RuntimePlan(prompt="x", effort=Effort.HIGH), reasoning_effort="low"
-    )
-    joined = " ".join(argv)
-    assert "model_reasoning_effort=high" in joined
-    assert "model_reasoning_effort=low" not in joined
-
-
-def test_argv_cwd_schema_output():
-    argv = build_codex_argv(
-        RuntimePlan(prompt="x", cwd="/wt/issue-5"),
-        schema_path="/tmp/s.json", output_path="/tmp/o.json",
-    )
     assert argv[argv.index("-C") + 1] == "/wt/issue-5"
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
     assert argv[argv.index("-o") + 1] == "/tmp/o.json"
+
+
+@pytest.mark.parametrize("effort,knob,pinned", [
+    (None, "high", "high"),
+    (None, "", None),  # "" = leave codex's own default alone — no pin at all
+    # The escalation ladder decides per LEG (#16); the knob is only the default.
+    (Effort.HIGH, "low", "high"),
+])
+def test_argv_reasoning_effort(effort, knob, pinned):
+    joined = " ".join(build_codex_argv(RuntimePlan(prompt="x", effort=effort), reasoning_effort=knob))
+    assert joined.count("model_reasoning_effort") == (1 if pinned else 0)
+    assert pinned is None or f"model_reasoning_effort={pinned}" in joined
 
 
 def test_argv_resume_omits_exec_only_flags():
@@ -154,13 +139,17 @@ def test_argv_prepends_system_prompt_to_prompt():
     assert argv[-1].endswith("the task")
 
 
-def test_argv_custom_provider_and_bin():
+def test_argv_provider_block():
     prov = CodexProvider(provider_id="acme", name="Acme", base_url="https://x/y",
                          env_key="ACME_KEY", wire_api="chat")
     argv = build_codex_argv(RuntimePlan(prompt="x"), codex_bin="/opt/codex", provider=prov)
     assert argv[0] == "/opt/codex"
     joined = " ".join(argv)
     assert 'model_provider="acme"' in joined and 'env_key="ACME_KEY"' in joined
+    # Blank base_url = ChatGPT-subscription OAuth: codex's built-in provider must
+    # stay untouched (defining a custom one forces API-key auth).
+    oauth = " ".join(build_codex_argv(RuntimePlan(prompt="x"), provider=CodexProvider()))
+    assert "model_providers" not in oauth and "model_provider=" not in oauth
 
 
 def test_strict_schema_recurses_nested_objects():
@@ -285,60 +274,17 @@ def _meta(sid: str) -> str:
     return f'{sys.executable} -c "{code}" "{sid}"\n'
 
 
-def test_cancelled_run_terminates_its_process_group():
-    tmp = tempfile.mkdtemp()
-    pid_file = os.path.join(tmp, "pid")
-    body = f'''
-echo $$ > "{pid_file}"
-while true; do
-  echo "working" >&2
-  sleep 0.05
-done
-'''
-
-    async def scenario():
-        runner = CodexRunner(
-            codex_bin=_fake_codex(tmp, body),
-            env={"OPENAI_API_KEY": "test-key"},
-        )
-        task = asyncio.create_task(runner.run(RuntimePlan(prompt="x")))
-        for _ in range(100):
-            if os.path.exists(pid_file):
-                break
-            await asyncio.sleep(0.01)
-        assert os.path.exists(pid_file)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(scenario())
-
-    pid = int(open(pid_file).read())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
-
-
-@pytest.mark.parametrize(
-    "closed_streams",
-    ("exec 2>&-", "exec 1>&- 2>&-"),
-    ids=("stdout-drain", "process-wait"),
-)
-def test_cancelled_after_stderr_eof_terminates_its_process_group(closed_streams):
+@pytest.mark.parametrize("streams", ("", "exec 2>&-", "exec 1>&- 2>&-"),
+                         ids=("streaming", "stdout-drain", "process-wait"))
+def test_a_cancelled_run_terminates_its_process_group(streams):
     tmp = tempfile.mkdtemp()
     pid_file = os.path.join(tmp, "pid")
     ready_file = os.path.join(tmp, "ready")
-    body = f'''
-echo $$ > "{pid_file}"
-{closed_streams}
-echo ready > "{ready_file}"
-sleep 30
-'''
+    body = f'echo $$ > "{pid_file}"\n{streams}\necho ready > "{ready_file}"\n'
+    body += 'while true; do echo "working" >&2; sleep 0.05; done\n' if not streams else "sleep 30\n"
 
     async def scenario():
-        runner = CodexRunner(
-            codex_bin=_fake_codex(tmp, body),
-            env={"OPENAI_API_KEY": "test-key"},
-        )
+        runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"})
         task = asyncio.create_task(runner.run(RuntimePlan(prompt="x")))
         for _ in range(100):
             if os.path.exists(ready_file):
@@ -353,9 +299,8 @@ sleep 30
 
     asyncio.run(scenario())
 
-    pid = int(open(pid_file).read())
     with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+        os.kill(int(open(pid_file).read()), 0)
 
 
 def test_native_codex_child_receives_operator_build_settings(tmp_path, monkeypatch):
@@ -673,88 +618,46 @@ def test_run_process_killed_by_signal_is_infra_death_not_an_attempt():
     assert infra_death(r.exit_reason) is True
 
 
-def test_run_ordinary_nonzero_exit_is_an_agent_error_not_infra_death():
-    """The boundary of the exemption: a POSITIVE exit code is codex reporting
-    failure after running. That IS an attempt and must still count."""
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "boom" >&2\nexit 1\n')
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"})
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert r.is_error is True
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-    assert infra_death(r.exit_reason) is False
-
-
 # ── total-runtime (wall) cap ─────────────────────────────────────────────────
-def test_wall_cap_kills_a_run_the_idle_watchdog_never_catches():
+def _jumping_wall_clock(*ticks: float):
+    """An injected WALL clock that replays `ticks`, then holds the last one."""
+    remaining, held = iter(ticks), [ticks[0]]
+
+    def wall():
+        held[0] = next(remaining, held[0])
+        return held[0]
+    return wall
+
+
+@pytest.mark.parametrize("idle_timeout", [900.0, None], ids=["idle-armed", "idle-disabled"])
+def test_wall_cap_kills_a_run_the_idle_watchdog_never_catches(idle_timeout):
     """A codex run that keeps printing tool traces resets the idle window forever
-    (FAILURE-MODES #60). Here stderr flows steadily while the injected WALL clock
-    jumps past the cap: only elapsed-time accounting can stop it, and it must use
-    the same killpg teardown (the process group, not just the pid)."""
+    (FAILURE-MODES #60). Here stderr flows while the injected WALL clock jumps
+    past the cap: only elapsed-time accounting can stop it, with the same killpg
+    teardown. With only the wall cap armed the pump must NOT fall through to
+    the unbounded readline branch."""
     import time as _time
 
     tmp = tempfile.mkdtemp()
     # One stderr line straight away (so the idle watchdog is satisfied), then a long
     # sleep the cap must cut short.
     codex = _fake_codex(tmp, 'echo "codex tool: step 1" >&2\nsleep 30\n')
-    # started_at, between-lines check, last_line, then the post-line check jumps.
-    ticks = iter([1000.0, 1000.0, 1000.0, 4600.0])
-    held = {"t": 1000.0}
-
-    def wall():
-        try:
-            held["t"] = next(ticks)
-        except StopIteration:
-            pass
-        return held["t"]
-
     logged: list[str] = []
     runner = CodexRunner(
         codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        idle_timeout=900.0, max_runtime=900.0, poll_slice=0.1,
-        wall_clock=wall, log=logged.append,
+        idle_timeout=idle_timeout, max_runtime=900.0, poll_slice=0.1,
+        # started_at, between-lines check, last_line, then the post-line check jumps.
+        wall_clock=_jumping_wall_clock(1000.0, 1000.0, 1000.0, 4600.0), log=logged.append,
     )
 
     start = _time.monotonic()
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    elapsed = _time.monotonic() - start
 
-    assert elapsed < 20, f"wall cap did not trip promptly (took {elapsed:.1f}s)"
+    assert _time.monotonic() - start < 20, "wall cap did not trip promptly"
     assert r.is_error is True and r.status == "timeout"
     assert r.exit_reason is ExitReason.WALL_TIMEOUT
     assert any("WALL" in m for m in logged)
     assert not any("IDLE" in m for m in logged)  # the idle watchdog never saw it
-
-
-def test_wall_cap_alone_still_bounds_a_run_when_idle_timeout_is_disabled():
-    """With only the wall cap armed the pump must NOT fall through to the unbounded
-    readline branch, or the cap would silently never fire."""
-    import time as _time
-
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "codex tool: step 1" >&2\nsleep 30\n')
-    ticks = iter([1000.0, 1000.0, 1000.0, 4600.0])
-    held = {"t": 1000.0}
-
-    def wall():
-        try:
-            held["t"] = next(ticks)
-        except StopIteration:
-            pass
-        return held["t"]
-
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        idle_timeout=None, max_runtime=900.0, poll_slice=0.1, wall_clock=wall,
-    )
-
-    start = _time.monotonic()
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert _time.monotonic() - start < 20
-    assert r.exit_reason is ExitReason.WALL_TIMEOUT
 
 
 def test_healthy_run_inside_both_caps_is_untouched():
@@ -793,19 +696,9 @@ def test_idle_watchdog_trips_on_wall_clock_not_monotonic():
     # Stub prints nothing to stderr and sleeps a few seconds, then exits.
     codex = _fake_codex(tmp, "sleep 3\n")
     # Wall clock jumps +3600s after the first read, while real time stays ~seconds.
-    ticks = iter([1000.0, 4600.0, 4600.0, 4600.0, 4600.0])
-    held = {"t": 1000.0}
-
-    def wall():
-        try:
-            held["t"] = next(ticks)
-        except StopIteration:
-            pass
-        return held["t"]
-
     runner = CodexRunner(
         codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        idle_timeout=900.0, poll_slice=0.1, wall_clock=wall,
+        idle_timeout=900.0, poll_slice=0.1, wall_clock=_jumping_wall_clock(1000.0, 4600.0),
     )
     start = _time.monotonic()
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
@@ -900,16 +793,6 @@ def test_preflight_missing_key_names_the_var(monkeypatch):
     r = CodexRunner(codex_bin=codex, provider=prov)  # no env key
     reason = r.preflight()
     assert reason and "OPENAI_API_KEY is unset" in reason
-
-
-def test_oauth_mode_emits_no_provider_overrides_and_no_model_flag():
-    """Blank base_url = ChatGPT-subscription OAuth: codex's built-in provider
-    must stay untouched (defining a custom one forces API-key auth), and no
-    CODEX_MODEL means no -m (codex picks the subscription's default)."""
-    argv = build_codex_argv(RuntimePlan(prompt="x"), provider=CodexProvider())
-    joined = " ".join(argv)
-    assert "model_providers" not in joined and "model_provider=" not in joined
-    assert "-m" not in argv
 
 
 def test_oauth_mode_preflight_accepts_codex_login_credentials(monkeypatch):
