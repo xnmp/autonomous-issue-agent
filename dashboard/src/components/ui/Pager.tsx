@@ -1,4 +1,4 @@
-export const PAGE_SIZE = 50;
+export const PAGE_SIZE = 25;
 
 export type Page<T> = {
   rows: T[];
