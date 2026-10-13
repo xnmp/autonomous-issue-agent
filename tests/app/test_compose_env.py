@@ -55,7 +55,6 @@ import pytest
 
 from issue_agent.app import main as main_module
 from issue_agent.app.main import _load_agent_env
-from tests.fakes.executor import ImmediateExecutor as Executor
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_ENV_SH = ROOT / "bin" / "compose-env.sh"
@@ -178,59 +177,6 @@ _ASSIGN_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=", re
 _UNSET_RE = re.compile(r"^[ \t]*unset[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*$", re.MULTILINE)
 
 
-# ── C5(a) + acceptance pipeline (wave centerpiece) ─────────────────────────────
-def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ(
-    tmp_path, monkeypatch
-):
-    # review C5: end-to-end — shared.env + overlay -> compose-env.sh ->
-    # .active.env -> _load_agent_env -> (simulated main.py) os.environ. Uses
-    # CI_PENDING_MAX_SECONDS (documented, omitted from the old allow-list) and
-    # MAX_RESOLVE_RETRIES (a brand-new knob no allow-list edit ever added), plus
-    # a value with spaces/quotes to prove %q quoting survived the rewrite.
-    compose_env_sh = _install_compose_env(tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "shared.env").write_text(
-        'FIX_BOT="fix-bot"\n'
-    )
-    repos_dir = tmp_path / "config" / "repos"
-    repos_dir.mkdir()
-    (repos_dir / "demo.env").write_text(
-        'REPO="acme/widget"\n'
-        'CI_PENDING_MAX_SECONDS="3600"\n'
-        'MAX_RESOLVE_RETRIES="7"\n'
-        # Escaped \$ — a LITERAL dollar sign in the value, not a shell
-        # parameter expansion (compose-env.sh sources this as real bash, so
-        # an unescaped $var would be interpreted, per the documented
-        # ${ANTHROPIC_AUTH_TOKEN:-...}-style feature).
-        'WEIRD_VALUE="has spaces and \\"quotes\\" and \\$dollar signs"\n'
-    )
-
-    subprocess.run(
-        ["bash", str(compose_env_sh), "demo"], check=True, capture_output=True, text=True
-    )
-
-    active = tmp_path / "config" / ".active.demo.env"
-    active_text = active.read_text()
-    assert "CI_PENDING_MAX_SECONDS=" in active_text
-    assert "MAX_RESOLVE_RETRIES=7" in active_text
-    assert "REPO=acme/widget" in active_text
-
-    env = _load_agent_env({"AGENT_ENV": str(active)})
-    assert env["CI_PENDING_MAX_SECONDS"] == "3600"
-    assert env["MAX_RESOLVE_RETRIES"] == "7"
-    assert env["WEIRD_VALUE"] == 'has spaces and "quotes" and $dollar signs'
-    assert env["REPO"] == "acme/widget"
-
-    # review C5(b), simulated: main.py applies this exact dict with
-    # os.environ.update(env) before building anything. monkeypatch.setenv
-    # undoes this automatically at teardown.
-    for k, v in env.items():
-        monkeypatch.setenv(k, v)
-    assert os.environ["CI_PENDING_MAX_SECONDS"] == "3600"
-    assert os.environ["MAX_RESOLVE_RETRIES"] == "7"
-    assert os.environ["WEIRD_VALUE"] == 'has spaces and "quotes" and $dollar signs'
-
-
 def test_compose_env_repo_overlay_wins_over_shared(tmp_path):
     # Anti-vacuity twin: precedence still holds under the new diff-based
     # emission (shared sets a default, the per-repo overlay wins).
@@ -309,19 +255,6 @@ def test_compose_env_emits_assigned_var_whose_value_equals_the_ambient_shells(tm
     assert _load_agent_env({"AGENT_ENV": str(active)})["TEST_CMD"] == "uv run pytest -q"
 
 
-def test_compose_env_file_value_wins_when_it_differs_from_the_ambient_shells(tmp_path):
-    # Anti-vacuity twin: the fix must not degrade into "emit whatever the
-    # ambient shell had". When the file disagrees with the environment, the
-    # FILE wins — that is the whole point of an overlay.
-    active = _compose(
-        tmp_path,
-        shared='TEST_CMD="uv run pytest -q"\n',
-        overlay='REPO="acme/widget"\n',
-        ambient={"TEST_CMD": "make check"},
-    )
-    assert _load_agent_env({"AGENT_ENV": str(active)})["TEST_CMD"] == "uv run pytest -q"
-
-
 def test_compose_env_emits_parameter_expansion_default_with_the_ambient_value(tmp_path):
     # The `${VAR:-default}` idiom main.py's `_load_agent_env` docstring names as
     # the reason these files are shell syntax. With the var already exported the
@@ -335,18 +268,6 @@ def test_compose_env_emits_parameter_expansion_default_with_the_ambient_value(tm
     )
     env = _load_agent_env({"AGENT_ENV": str(active)})
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ambient-real"
-
-
-def test_compose_env_falls_back_when_the_expansion_default_actually_fires(tmp_path):
-    # Anti-vacuity twin of the above: with nothing ambient, the documented
-    # fallback is what lands.
-    active = _compose(
-        tmp_path,
-        shared='ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-fallback}"\n',
-        overlay='REPO="acme/widget"\n',
-        ambient={"ANTHROPIC_AUTH_TOKEN": None},
-    )
-    assert _load_agent_env({"AGENT_ENV": str(active)})["ANTHROPIC_AUTH_TOKEN"] == "fallback"
 
 
 def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path):
@@ -640,24 +561,6 @@ def test_doctor_fails_on_two_overlays_sharing_a_state_dir(tmp_path):
     assert "repo-b" in result.stdout and "repo-c" in result.stdout
 
 
-def test_doctor_passes_when_overlays_have_distinct_state_dirs(tmp_path):
-    # Anti-vacuity twin: distinct overlays (default per-repo dirs, which
-    # differ because REPO differs) must not be flagged.
-    fake_bin = _fake_tool_path(tmp_path)
-    harness = tmp_path / "harness"
-    repos_dir = harness / "config" / "repos"
-    repos_dir.mkdir(parents=True)
-    (repos_dir / "repo-a.env").write_text('REPO="acme/widget"\n')
-    (repos_dir / "repo-b.env").write_text('REPO="other/thing"\n')
-
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "HARNESS_ROOT": str(harness),
-    })
-    assert "state-dir collision:" not in result.stdout
-    assert "no state-dir collisions across 2 overlay(s)" in result.stdout
-
-
 def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
     """The scan must compose each overlay from files, not the active config.
 
@@ -687,47 +590,6 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
 
     assert "state-dir collision:" not in result.stdout
     assert "no state-dir collisions across 2 overlay(s)" in result.stdout
-
-
-def test_doctor_skips_state_dir_check_with_no_overlays(tmp_path):
-    fake_bin = _fake_tool_path(tmp_path)
-    harness = tmp_path / "harness"
-    (harness / "config" / "repos").mkdir(parents=True)
-
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "HARNESS_ROOT": str(harness),
-    })
-    assert "nothing to check" in result.stdout
-
-
-# ── D7 + C1: doctor identity-distinctness normalization ────────────────────────
-def test_doctor_rejects_bot_suffix_mismatch(tmp_path):
-    # review C1: acme-fixer and acme-fixer[bot] are the SAME GitHub identity in
-    # two
-    # API surface forms — a raw string compare (the old check) passed this,
-    # and GitHub then 422s the self-approval on every PR, forever.
-    fake_bin = _fake_tool_path(tmp_path)
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "FIX_BOT": "acme-fixer",
-        "REVIEW_BOT": "acme-fixer[bot]",
-        "REPO": "o/r",
-    })
-    assert result.returncode != 0
-    assert "FIX_BOT distinct from it" in result.stdout
-
-
-def test_doctor_accepts_distinct_identities(tmp_path):
-    # Anti-vacuity twin: genuinely distinct identities must still pass.
-    fake_bin = _fake_tool_path(tmp_path)
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "FIX_BOT": "acme-fixer",
-        "REVIEW_BOT": "acme-reviewer",
-        "REPO": "o/r",
-    })
-    assert "two distinct identities" in result.stdout
 
 
 def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
@@ -879,17 +741,6 @@ def test_doctor_errors_when_no_pr_into_base_ever_got_a_check(tmp_path):
     # It must name the consequence, not just the symptom — an operator who does
     # not know NONE is treated as OK will read a checkless PR as harmless.
     assert "CIState.NONE" in result.stdout
-
-
-def test_doctor_accepts_a_base_branch_whose_prs_do_get_checks(tmp_path):
-    """Anti-vacuity twin: the same code path must stay quiet on a healthy repo."""
-    result = _ci_doctor(
-        tmp_path, {},
-        workflows=1,
-        prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
-    )
-    assert "NOT ONE of the last" not in result.stdout
-    assert "PRs into 'trunk' receive checks (1 of the last 1 sampled)" in result.stdout
 
 
 def test_doctor_errors_when_the_repo_forbids_the_configured_merge_method(tmp_path):

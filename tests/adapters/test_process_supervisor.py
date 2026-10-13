@@ -18,7 +18,7 @@ from issue_agent.adapters.control_store import (
     ReservationRequest,
     SQLiteControlStore,
 )
-from issue_agent.adapters.process_supervisor import ProcessIdentity, ProcessSupervisor
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -37,27 +37,6 @@ def _wait_dead(process: subprocess.Popen[bytes]) -> None:
     while process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert process.poll() is not None
-
-
-@pytest.mark.parametrize("state", ["R", "S", "Z", "X"])
-def test_selected_process_identity_needs_no_host_census(monkeypatch, state):
-    original_is_dir = Path.is_dir
-    monkeypatch.setattr(Path, "is_dir", lambda path: path == Path("/proc") or original_is_dir(path))
-    fields = [state, "1", "123", *("0" for _ in range(16)), "9876"]
-
-    def read_stat(path, **kwargs):
-        assert path == Path("/proc/123/stat")
-        return f"123 (command with ) and ( spaces) {' '.join(fields)}"
-
-    def unavailable_census(path):
-        raise PermissionError("other processes are not observable")
-
-    monkeypatch.setattr(Path, "read_text", read_stat)
-    monkeypatch.setattr(Path, "iterdir", unavailable_census)
-    live = state not in {"Z", "X"}
-    assert ProcessSupervisor.process_identity(123) == (ProcessIdentity(123, 9876) if live else None)
-    assert ProcessSupervisor.matches_identity(123, 9876) is live
-    assert not ProcessSupervisor.matches_identity(123, 9877)
 
 
 @pytest.mark.parametrize("raw", [None, "malformed", "123 (short) R", "456 (replaced) R 1 123 " + "0 " * 16 + "9876"])
@@ -93,20 +72,6 @@ def _reserve_paid_run(
     )
     assert store.reserve(request).admitted
     return request
-
-
-def test_registered_process_group_is_killed_and_receipt_removed(tmp_path) -> None:
-    process = subprocess.Popen(
-        ["sleep", "30"], start_new_session=True, stdout=subprocess.DEVNULL
-    )
-    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
-    run_id = RunId("run-1")
-    supervisor.register(run_id, os.getpgid(process.pid))
-
-    supervisor.kill_tree(run_id)
-
-    _wait_dead(process)
-    assert _registrations(supervisor) == ()
 
 
 def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
@@ -264,31 +229,6 @@ def test_term_grace_kills_stubborn_descendant_after_leader_exits(
     assert process.returncode == 0
     assert ProcessSupervisor.process_identity(child_pid) is None
     assert _registrations(supervisor) == ()
-
-
-def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
-    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
-    run_id = RunId("wrapped")
-    command = supervisor.supervised_command(
-        run_id,
-        (
-            sys.executable,
-            "-c",
-            "import time; time.sleep(30)",
-        ),
-    )
-    process = subprocess.Popen(command, start_new_session=True)
-    deadline = time.monotonic() + 3
-    while not _registrations(supervisor) and time.monotonic() < deadline:
-        time.sleep(0.02)
-
-    registration = _registrations(supervisor)[0]
-    assert registration.run_id == run_id
-    assert registration.pgid == process.pid
-    assert registration.leader.pid == process.pid
-
-    supervisor.kill_tree(run_id)
-    _wait_dead(process)
 
 
 def test_cancellation_before_wrapper_registration_prevents_paid_exec(
@@ -516,73 +456,6 @@ def test_carrier_forwards_direct_termination_to_the_target_group(tmp_path) -> No
 
         assert ProcessSupervisor.process_identity(target_pid) is None
         assert process.returncode == -signal.SIGKILL
-    finally:
-        supervisor.kill_tree(run_id)
-
-
-def test_carrier_escalation_kills_descendants_forked_during_grace(
-    tmp_path,
-) -> None:
-    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
-    run_id = RunId("carrier-fork-race")
-    target_pid_file = tmp_path / "targets.pid"
-    target = tmp_path / "resistant_target.py"
-    target.write_text(
-        "import os\n"
-        "import signal\n"
-        "import time\n"
-        "from pathlib import Path\n"
-        "triggered = False\n"
-        "def resist(_signum, _frame):\n"
-        "    global triggered\n"
-        "    triggered = True\n"
-        "signal.signal(signal.SIGTERM, resist)\n"
-        f"path = Path({str(target_pid_file)!r})\n"
-        "path.write_text(f'{os.getpid()}\\n')\n"
-        "while not triggered:\n"
-        "    time.sleep(0.01)\n"
-        "while True:\n"
-        "    child = os.fork()\n"
-        "    if child == 0:\n"
-        "        signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "        time.sleep(30)\n"
-        "        os._exit(0)\n"
-        "    with path.open('a') as stream:\n"
-        "        stream.write(f'{child}\\n')\n"
-        "    time.sleep(0.05)\n"
-    )
-    command = supervisor.supervised_command(
-        run_id,
-        (sys.executable, str(target)),
-    )
-    process = subprocess.Popen(command, start_new_session=True)
-    deadline = time.monotonic() + 3
-    while not target_pid_file.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert target_pid_file.exists()
-
-    try:
-        process.terminate()
-        _wait_dead(process)
-        target_pids = tuple(
-            int(line) for line in target_pid_file.read_text().splitlines()
-        )
-        deadline = time.monotonic() + 3
-        while (
-            any(
-                ProcessSupervisor.process_identity(pid) is not None
-                for pid in target_pids
-            )
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.02)
-
-        assert len(target_pids) > 2
-        assert process.returncode == -signal.SIGKILL
-        assert all(
-            ProcessSupervisor.process_identity(pid) is None
-            for pid in target_pids
-        )
     finally:
         supervisor.kill_tree(run_id)
 

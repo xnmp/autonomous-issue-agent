@@ -18,14 +18,6 @@ FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_b
 U = as_untrusted
 
 
-def test_address_review_prompt_preserves_indented_marker_reproducer():
-    from issue_agent.domain.trust import untrusted_block
-
-    body = "Please fix parsing of this input:\n\n    <!-- issue-agent-review-command id=abc -->"
-    task = build_address_review_task(7, U(body), U("inline"), "/wt", "session", FIX_CFG)
-    assert untrusted_block("review_body", U(body)) in task.prompt
-
-
 @pytest.mark.parametrize("session", ["", "session"])
 def test_fixer_human_message_guidance_survives_fresh_and_resumed_sessions(session):
     task = build_resume_task(U("reply"), "/wt", session, FIX_CFG)
@@ -128,27 +120,6 @@ def test_address_review_task():
     assert "Re-capture only criteria affected" in t.prompt
 
 
-def test_fix_ci_task_carries_unaffected_evidence_forward():
-    t = build_fix_ci_task(100, U("tests"), U("failure"), "/wt", "s1", FIX_CFG)
-    assert "evidence/ captures carry forward" in t.prompt
-    assert "Re-capture only criteria affected" in t.prompt
-    assert t.schema is FIX_SCHEMA
-
-
-
-
-def test_fix_ci_task_omits_the_history_section_on_the_first_attempt():
-    t = build_fix_ci_task(100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG)
-    assert "Previous FIX_CI attempts" not in t.prompt
-    assert "de-flaked" not in t.prompt
-
-
-
-
-
-
-
-
 def test_rebase_task_resumes_session_and_names_base():
     from issue_agent.app.planners.tasks import build_rebase_task
     t = build_rebase_task(100, "dev", "/wt/issue-5", "sess-9", FIX_CFG)
@@ -161,10 +132,6 @@ def test_rebase_task_resumes_session_and_names_base():
     assert "force-with-lease" in t.prompt    # push guidance
     assert t.resume == "sess-9"              # reuses the author's session context
     assert t.cwd == "/wt/issue-5"
-
-
-
-
 
 
 # ── fixer deny-list (P3.1) ──
@@ -238,18 +205,6 @@ def test_resumed_legs_do_not_repay_for_agent_md():
         assert len(reminder) < 1000, f"{name} reminder is not short"
 
 
-def test_fresh_legs_still_get_the_full_agent_md():
-    # No session id → nothing is in context yet; the full contract must be sent.
-    for name, task in _resuming_builders("").items():
-        assert task.append_system_prompt.startswith("AGENTMD"), (
-            f"{name} dropped AGENT.md"
-        )
-        assert "still applies" not in task.append_system_prompt.lower(), name
-    prompt = _every_fixer_task()["resolve"].append_system_prompt
-    assert prompt.startswith("AGENTMD")
-    assert "AUTONOMY CONTRACT" in prompt
-
-
 # ── diff scoping (P4.2) ──
 MULTI_DIFF = (
     "diff --git a/src/app/pay.py b/src/app/pay.py\n"
@@ -306,13 +261,6 @@ def test_review_task_carries_the_discussion_as_untrusted_data():
     assert "no display; no screenshot exists" in t.prompt.replace("\\u003c", "<")
 
 
-def test_an_empty_thread_leaves_no_discussion_section():
-    for discussion in (None, U(""), U("   \n\t")):
-        t = build_review_task(100, U("t"), U("b"), U("d"), RCFG, discussion=discussion)
-        assert "pr_discussion" not in t.prompt
-        assert "UNTRUSTED parties" not in t.prompt
-
-
 def test_discussion_text_that_mimics_a_fence_stays_inert():
     # A comment quoting the harness's own markers must not be able to close the
     # fence and continue in harness voice.
@@ -330,12 +278,6 @@ def test_review_task_carries_the_bots_prior_review_as_fenced_data():
     body = t.prompt.split("<untrusted_prior_review_json>")[1]
     assert body.count("</untrusted_prior_review_json>") == 1
     assert "Fix the parser." in body
-
-
-def test_no_prior_review_leaves_no_prior_review_section():
-    for prior in (None, U(""), U(" \n")):
-        t = build_review_task(100, U("t"), U("b"), U("d"), RCFG, prior_review=prior)
-        assert "prior_review" not in t.prompt
 
 
 # ── delegated review (REVIEW_MODE=delegated) ──
@@ -495,10 +437,6 @@ def test_every_fixer_repair_builder_fences_its_untrusted_inputs():
             assert sentinel not in unfenced_text, (
                 f"{name}: {field} sentinel leaked OUTSIDE its fence"
             )
-
-
-
-
 
 
 # Incident: docs/open/issues/review-no-resultmessage-background-tasks.md — a

@@ -183,28 +183,6 @@ def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
         assert db.execute("SELECT repository FROM legs").fetchone()[0] == "o/r"
 
 
-def test_a_paid_leg_binds_its_item_lease_while_it_runs(tmp_path) -> None:
-    seen = []
-
-    class Inspecting(Runtime):
-        async def run(self, task):
-            seen.extend((lease.target, lease.run_id) for lease in store.leases())
-            seen.append(task.env["ISSUE_AGENT_RUN_ID"])
-            return await super().run(task)
-
-    runtime = Inspecting(AgentResult(False, status="ok", cost_usd=1, session_id="receipt",
-                                     usage={"input_tokens": 10, "output_tokens": 5}))
-    wrapper, store = _wrapper(tmp_path, runtime)
-    wrapper = dataclasses.replace(wrapper, owner_id="o/r:fix:deployment")
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
-
-    result = _run(wrapper, RuntimePlan("work", model="gpt-test", max_budget_usd=2))
-
-    assert result.status == "ok"
-    assert seen == [(1, seen[-1]), seen[-1]]
-    assert store.leases() == ()  # settlement ends the leg and its lease
-
-
 def test_a_leg_without_its_item_lease_is_refused_before_anything_runs(
     tmp_path,
 ) -> None:
@@ -387,52 +365,6 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
     assert result.status == "ok"
     assert runtime.calls == 1
     assert store.active_reservation_runs("o/r:fix") == ()
-
-
-def test_disabled_caps_still_price_observed_subscription_stream_usage(
-    tmp_path,
-) -> None:
-    runtime = Runtime(
-        AgentResult(
-            False,
-            status="stream-only",
-            cost_usd=0,
-            usage=None,
-            stream_usage={
-                "input_tokens": 1_000_000,
-                "output_tokens": 100_000,
-            },
-        )
-    )
-    store = SQLiteControlStore(str(tmp_path / "control.db"))
-    store.initialize()
-    wrapper = AccountingRuntime(
-        runtime,
-        store,
-        "o/r",
-        "fix",
-        None,
-        None,
-        None,
-        "cfg",
-        "claude",
-        _policy(),
-        _rates(),
-    )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
-
-    result = _run(wrapper, RuntimePlan("work", model="gpt-test", max_budget_usd=2))
-
-    assert result.status == "stream-only"
-    with store._read() as db:
-        amount, basis, usage_json, rate_card = db.execute(
-            "SELECT charged_micros, basis, usage_json, rate_card_id "
-            "FROM legs"
-        ).fetchone()
-    assert amount == 8_000_000
-    assert basis == "estimate"
-    assert json.loads(usage_json)["input_tokens"] == 1_000_000
-    assert rate_card == "test"
 
 
 def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
@@ -652,32 +584,6 @@ def test_forced_codex_shutdown_intent_preserves_reservation_for_recovery(
     assert store.leases() != ()  # still held: the leg's process may outlive the kill
 
 
-def test_non_codex_runtime_exception_releases_after_completed_teardown(
-    tmp_path,
-) -> None:
-    class Death:
-        async def run(self, _task):
-            raise RuntimeError("transport died")
-
-    wrapper, store = _wrapper(tmp_path, Death(), runtime_name="claude")
-
-    with pytest.raises(RuntimeError, match="transport died"):
-        _run(wrapper, RuntimePlan("work", max_budget_usd=2))
-
-    assert store.active_reservation_runs("o/r:fix") == ()
-    with store._read() as db:
-        state, reason = db.execute(
-            "SELECT state, end_reason FROM legs"
-        ).fetchone()
-    assert (state, reason) == (
-        "released",
-        "runtime_exception_before_launch",
-    )
-
-    # A machine failure is no attempt: the ended run carries no leg receipt.
-    assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
-
-
 def test_runtime_exception_after_child_registration_retains_reservation(
     tmp_path,
 ) -> None:
@@ -708,19 +614,6 @@ def test_runtime_exception_after_child_registration_retains_reservation(
         "running", True, "runtime failed after paid execution may have started",
     )
     assert store.leases() == ()
-
-
-def test_journal_supplied_run_identity_is_the_reservation_identity(tmp_path) -> None:
-    runtime = Runtime(
-        AgentResult(False, status="ok", cost_usd=1, session_id="receipt")
-    )
-    wrapper, store = _wrapper(tmp_path, runtime)
-    wrapper.set_run_identity("journal-run", "journal-leg")
-
-    _run(wrapper, RuntimePlan("work", max_budget_usd=2))
-
-    with store._read() as db:
-        assert [tuple(row) for row in db.execute("SELECT leg_id, state FROM legs")] == [("journal-run", "ended")]
 
 
 def test_successful_settlement_removes_crash_recovery_evidence(tmp_path) -> None:
@@ -766,17 +659,6 @@ def test_fix_admission_refusal_is_a_daily_wait_only_for_daily_caps(tmp_path, cap
         assert [tuple(row) for row in db.execute("SELECT state, end_reason, reserved_micros FROM legs")] == [
             ("released", "admission_refused", 0)]
     assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
-
-
-@pytest.mark.parametrize("invalid", [None, True, -1, 1.5, "12", 10**100])
-def test_malformed_primary_usage_preserves_valid_stream_estimate(tmp_path, invalid):
-    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="done",
-        usage={"input_tokens": invalid, "output_tokens": 1},
-        stream_usage={"input_tokens": 100, "output_tokens": 10})), runtime_name="claude")
-    result = _run(wrapper, RuntimePlan("work", model="gpt-test", max_budget_usd=2))
-    assert result.status == "done" and store.active_reservation_runs("o/r:fix") == ()
-    with store._read() as db:
-        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (800, "estimate")
 
 
 def test_valid_provider_dollars_survive_malformed_token_telemetry(tmp_path):

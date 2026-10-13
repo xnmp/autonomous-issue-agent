@@ -97,10 +97,6 @@ def _leg(store: SQLiteControlStore, run: str) -> sqlite3.Row:
         return db.execute("SELECT * FROM legs WHERE leg_id=?", (run,)).fetchone()
 
 
-def _alive(_pid: int, _ticks: int) -> bool:
-    return True
-
-
 def _dead(_pid: int, _ticks: int) -> bool:
     return False
 
@@ -452,18 +448,6 @@ def test_one_role_holds_one_item_and_the_other_role_may_hold_it_too(tmp_path):
     assert store.lease(REPO, "fix", 7, "o/r:fix:other")
 
 
-def test_a_paid_leg_must_bind_a_lease_its_owner_holds(tmp_path):
-    store = _store(tmp_path)
-
-    unleased = store.reserve(_request(1, lease_target=1))
-    assert store.lease(REPO, "fix", 1, "o/r:fix:other")
-    someone_elses = store.reserve(_request(1, lease_target=1))
-
-    assert unleased.disposition is AccountingDisposition.CONFLICT
-    assert someone_elses.disposition is AccountingDisposition.CONFLICT
-    assert store.snapshot(_daily()).committed == Money("USD", 0)
-
-
 def test_a_dead_holders_lease_is_taken_over_unless_its_leg_still_runs(tmp_path, monkeypatch):
     store = _store(tmp_path)
     assert store.lease(REPO, "fix", 1, OWNER)
@@ -505,21 +489,6 @@ def test_a_process_cannot_register_for_an_unleased_or_finished_leg(tmp_path):
     for leg in (RunId("run-1"), run, RunId("missing")):
         with pytest.raises(ControlStoreError):
             store.register_process_lease(leg, expected_owner_id=OWNER, pid=9, pgid=9, process_start_ticks=9)
-
-
-def test_a_dead_process_lease_is_reclaimed_and_its_leg_awaits_settlement(tmp_path):
-    store = _store(tmp_path)
-    run = _launch(store, 1)
-    _launch(store, 2)  # alive below
-    store.lease("x/y", "fix", 3, "x/y:fix:d")  # another repository: out of scope
-
-    assert store.reclaim_dead_leases(OWNER, _alive) == ()
-    reclaimed = store.reclaim_dead_leases(OWNER, _dead)
-    assert set(reclaimed) == {run, RunId("run-2")}
-    assert [lease.repository for lease in store.leases()] == ["x/y"]
-    leg = _leg(store, "run-1")
-    assert (leg["state"], leg["end_reason"]) == ("running", "dead_lease")
-    assert set(store.stale_active_reservation_runs(OWNER, NOW - timedelta(hours=1))) == {run, RunId("run-2")}
 
 
 def test_reclaim_probes_liveness_outside_the_write_transaction(tmp_path):

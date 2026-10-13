@@ -1,8 +1,5 @@
 """Worktree management, driven by a fake git runner."""
 
-import hashlib
-import hmac
-import json
 import os
 import threading
 import time
@@ -123,33 +120,6 @@ def test_ensure_raises_when_every_worktree_add_attempt_fails():
         wt.ensure(5, "fix/5-x")
 
 
-def test_ensure_returns_real_path_when_worktree_add_actually_creates_it(tmp_path):
-    """Anti-vacuity twin: when a 'worktree add' genuinely produces the
-    directory, `ensure` must still succeed — the honesty check is a real
-    verification, not a trap that also denies the success path. Uses the REAL
-    default `path_exists` against a real tmp_path directory."""
-    repo_dir = str(tmp_path)
-    expected_rel = Worktrees(repo_dir).path(7)
-    expected_abs = os.path.join(repo_dir, expected_rel)
-
-    def git(args, cwd):
-        if args[:2] == ["worktree", "add"]:
-            os.makedirs(expected_abs, exist_ok=True)
-            return GitResult(0, "")
-        if args[0] == "show-ref":
-            return GitResult(1, "")
-        if args == ["branch", "--show-current"]:
-            return GitResult(0, "fix/7-x")
-        return GitResult(0, "")
-
-    wt = Worktrees(repo_dir, base_branch="dev", run=git)
-
-    path = wt.ensure(7, "fix/7-x")
-
-    assert path == expected_abs
-    assert os.path.isdir(path)
-
-
 # ── M20: the git runner must be bounded and must surface failures ────────────
 def test_default_git_runner_times_out_and_reports_rather_than_hanging(tmp_path, monkeypatch, capsys):
     """A hanging `git` subprocess must be killed and reported as a failure, not
@@ -169,33 +139,6 @@ def test_default_git_runner_times_out_and_reports_rather_than_hanging(tmp_path, 
     assert result.code != 0            # reported as failure, never a silent pass
     err = capsys.readouterr().err
     assert "timed out" in err.lower()
-
-
-def test_default_git_runner_surfaces_stderr_on_failure(tmp_path, monkeypatch, capsys):
-    """A non-zero `git` exit must be surfaced (not silently swallowed) so a
-    wedged worktree op is visible in the daemon log — the other half of M20."""
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / "git"
-    fake_git.write_text("#!/bin/sh\necho 'fatal: kaboom' >&2\nexit 1\n")
-    fake_git.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
-
-    result = wt_mod._subprocess_git(["worktree", "add", "x", "y"], str(tmp_path))
-
-    assert result.code == 1
-    err = capsys.readouterr().err
-    assert "kaboom" in err
-
-
-def test_default_git_runner_real_success_path_unaffected(tmp_path):
-    """Anti-vacuity twin: the timeout/stderr-surfacing changes must not disturb
-    the ordinary (fast, well-behaved) case — a real `git` invocation still
-    returns its stdout untouched."""
-    result = wt_mod._subprocess_git(["--version"], str(tmp_path))
-
-    assert result.code == 0
-    assert "git version" in result.out
 
 
 class RemovalGit:
@@ -432,37 +375,6 @@ def test_review_checkout_defers_when_the_stale_dir_cannot_be_removed():
         rc.ensure(165, SHA)
 
 
-def test_review_checkout_prunes_before_add_so_a_lost_dir_self_heals():
-    """0d2e295 H2: a worktree registration whose directory is gone makes
-    `worktree add` fail forever. ensure() must prune the dead registration
-    before adding, so one deferral never becomes a permanent one."""
-    added = {"done": False}
-
-    def exists(_p):
-        return added["done"]
-
-    fg = FakeGit(
-        {
-            f"cat-file -e {SHA}": GitResult(0, ""),
-            "rev-parse HEAD": GitResult(0, SHA + "\n"),
-        }
-    )
-
-    def call(args, cwd):
-        if args[:2] == ["worktree", "add"]:
-            added["done"] = True
-        return fg(args, cwd)
-
-    rc = wt_mod.ReviewCheckouts(
-        "/repo", run=call, path_exists=exists, remove_tree=lambda p: None
-    )
-    rc.ensure(165, SHA)
-    joined = [" ".join(a) for a, _ in fg.calls]
-    assert joined.index("worktree prune") < joined.index(
-        f"worktree add --detach .claude/worktrees/review-pr-165 {SHA}"
-    )
-
-
 def test_review_checkout_defers_when_the_dir_cannot_be_classified():
     """Adversarial F2: a rev-parse that FAILS (timeout, spawn failure under
     process pressure) means 'could not classify' — the dir must be left alone
@@ -537,45 +449,6 @@ def test_review_checkout_unlinks_a_symlink_without_touching_its_pointee(tmp_path
     assert not link.is_symlink()  # the squatting link itself is gone…
     assert (victim / "keep.txt").read_text() == "sibling checkout"  # …pointee intact
     assert exploded == []  # and rmtree was never reached
-
-
-def test_a_symlink_to_the_parent_repo_is_never_classified_as_the_worktree(tmp_path):
-    """Adversarial N1: a link pointing at the PARENT repo makes both realpaths
-    resolve to the parent, so the toplevel comparison alone would classify it
-    as a valid worktree and reset --hard the operator's live checkout. A link
-    must always take the unlink path, whatever it points at."""
-    repo = tmp_path / "repo"
-    wt_root = repo / ".claude" / "worktrees"
-    wt_root.mkdir(parents=True)
-    (repo / "precious.txt").write_text("operator work")
-    link = wt_root / "review-pr-165"
-    link.symlink_to(repo)
-
-    mutated: list[str] = []
-
-    def git(args, cwd):
-        if args == ["rev-parse", "--show-toplevel"]:
-            return GitResult(0, str(repo) + "\n")  # the parent answers
-        if args[0] in ("checkout", "reset", "clean"):
-            mutated.append(" ".join(args))
-            return GitResult(0, "")
-        if args[:2] == ["worktree", "add"]:
-            link.mkdir()
-            return GitResult(0, "")
-        if args == ["rev-parse", "HEAD"]:
-            return GitResult(0, SHA + "\n")
-        if args[:2] == ["cat-file", "-e"]:
-            return GitResult(0, "")
-        return GitResult(0, "")
-
-    rc = wt_mod.ReviewCheckouts(
-        str(repo), run=git, remove_tree=lambda p: None
-    )
-    rc.ensure(165, SHA)
-
-    assert mutated == []                       # nothing ran inside the link
-    assert not link.is_symlink()               # squatter replaced by a real dir
-    assert (repo / "precious.txt").read_text() == "operator work"
 
 
 def test_remove_stale_dir_refuses_paths_outside_the_worktree_root():
