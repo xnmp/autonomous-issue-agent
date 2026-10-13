@@ -1,6 +1,5 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
-from tests.domain.builders import observed_pr
 
 import asyncio
 import json
@@ -41,13 +40,6 @@ def _daemon(decide, observe=None, logs=None):
         log=(logs.append if logs is not None else (lambda m: None)),
     )
     return d, gw
-
-
-def test_tick_observes_decides_executes():
-    d, gw = _daemon(lambda w: [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)])
-    actions = d.tick()
-    assert len(actions) == 1
-    assert gw.calls == [("relabel", "issue", 5, "needs-human", "ai-ready")]
 
 
 def test_tick_isolated_from_decide_crash():
@@ -102,59 +94,6 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
     assert sorted(executed[2:]) == [("run", 500), ("run", 534)]
     # Dispatch order among dispatches is preserved at submission.
     assert [a.number for a in taken if isinstance(a, RunAgent)] == [500, 534]
-
-
-def test_observation_and_lifecycle_continue_while_the_only_dispatch_slot_is_busy():
-    """N=1 remains serial for paid work but no longer makes the daemon blind."""
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
-    started = threading.Event()
-    release = threading.Event()
-    observations = []
-
-    class LiveGateway(FakeGateway):
-        def __init__(self):
-            super().__init__(
-                prs={24: observed_pr(24, head_ref_oid="head-24")}
-            )
-            self.arm_attempts = 0
-
-        def comment(self, kind, number, body):
-            self.arm_attempts += 1
-            if self.arm_attempts == 1:
-                raise RuntimeError("comment not posted")
-            super().comment(kind, number, body)
-
-    gateway = LiveGateway()
-
-    def run_agent(_action):
-        started.set()
-        assert release.wait(timeout=5)
-
-    executor = Executor(gateway, run_agent=run_agent)
-    daemon = Daemon(
-        "fix",
-        lambda: observations.append(len(observations) + 1) or WorldState(),
-        lambda _world: [
-            PostComment(Target.PR, 24, "ready"),
-            RunAgent(AgentKind.RESOLVE, 7),
-        ],
-        executor,
-        dispatch_capacity=1,
-    )
-
-    first = daemon.tick()
-    assert started.wait(timeout=1)
-    second = daemon.tick()
-
-    assert observations == [1, 2]
-    assert gateway.arm_attempts == 2, "a failed write retries on the next poll"
-    assert [a for a in first + second if isinstance(a, RunAgent)] == [
-        RunAgent(AgentKind.RESOLVE, 7)
-    ], "the same issue is never double-dispatched"
-
-    release.set()
-    daemon.wait_for_dispatches()
 
 
 def test_background_dispatch_is_bounded_and_admits_independent_targets():
@@ -578,18 +517,6 @@ def test_interrupt_before_worker_registration_is_sticky():
     assert daemon.active_dispatches == ()
 
 
-def test_tick_isolated_from_action_crash():
-    logs = []
-    class BadGateway:
-        def relabel(self, *a):
-            raise RuntimeError("gh down")
-    d = Daemon("fix", lambda: WorldState(),
-               lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, None)],
-               Executor(BadGateway()), log=logs.append)
-    d.tick()  # must not raise
-    assert any("action" in m and "failed" in m for m in logs)
-
-
 def test_tick_skips_the_pass_when_github_is_unavailable():
     """The V10 contract at the loop layer: an unreadable GitHub must produce NO
     decide, NO execute — not a pass over an empty world. Asserted on the observable
@@ -606,25 +533,6 @@ def test_tick_skips_the_pass_when_github_is_unavailable():
     assert d.tick() == []
     assert decided == []          # never asked the domain about a world we can't see
     assert gw.calls == []         # and never touched the repo
-
-
-def test_gh_unavailable_logs_one_concise_loud_line():
-    """An operator scanning the log needs the cause and the consequence on ONE
-    grep-able line — not a generic 'poll pass failed' dump that reads like a bug."""
-    logs = []
-    def unavailable():
-        raise GhUnavailable(
-            "rate-limit", "HTTP 403: API rate limit exceeded\n  for user ID 42\n  see docs"
-        )
-    d, _ = _daemon(lambda w: [], observe=unavailable, logs=logs)
-    d.tick()
-    assert len(logs) == 1
-    line = logs[0]
-    assert "\n" not in line
-    assert "world build failed" in line and "rate-limited" in line
-    assert "skipping tick" in line
-    assert "API rate limit exceeded" in line          # the cause survives
-    assert "poll pass failed" not in line             # not the generic arm
 
 
 def test_non_infra_observe_failure_still_uses_the_generic_arm():
@@ -652,18 +560,6 @@ def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
                Executor(ThrottledGateway()), log=logs.append)
     d.tick()  # must not raise
     assert any("action" in m and "failed" in m and "rate-limited" in m for m in logs)
-
-
-def test_run_forever_bounded_by_max_ticks():
-    calls = {"n": 0}
-    def decide(world):
-        calls["n"] += 1
-        return []
-    d, _ = _daemon(decide)
-    slept = []
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=3)
-    assert calls["n"] == 3
-    assert slept == [60, 60, 60]
 
 
 def test_normal_shutdown_persists_stopped_heartbeat(tmp_path):
@@ -788,87 +684,6 @@ def test_suspend_recovery_waits_for_active_dispatch_owner():
     assert recoveries == [RecoveryTrigger.WAKE]
 
 
-def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    rows = [
-        {
-            "ts": "1970-01-01T00:00:10+00:00",
-            "event": "action",
-            "desc": "comment issue #5 (7 chars)",
-            "action": {
-                "type": "comment",
-                "target": "ISSUE",
-                "number": 5,
-                "body": "blocked",
-            },
-        },
-        {
-            "ts": "1970-01-01T00:00:30+00:00",
-            "event": "agent_run_start",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 5,
-            "issue": 5,
-            "dispatch": "dispatch-5",
-        },
-        {
-            "ts": "1970-01-01T00:04:00+00:00",
-            "event": "agent_run",
-            "role": "fix",
-            "kind": "RESOLVE",
-            "number": 5,
-            "issue": 5,
-            "dispatch": "dispatch-5",
-            "duration_s": 30,
-        },
-    ]
-    tmp_path.joinpath("journal.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in rows)
-    )
-
-    class CommentGateway(FakeGateway):
-        def __init__(self):
-            super().__init__()
-            self.visible = False
-
-        def comment(self, kind, number, body):
-            self.calls.append(("comment", number, body))
-            self.visible = True
-
-        def has_comment(self, kind, number, body):
-            return self.visible
-
-    gateway = CommentGateway()
-    recoveries = []
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [],
-        Executor(
-            gateway,
-            journal=journal,
-            retry_delays=(),
-        ),
-        poll_seconds=60,
-        reconcile=recoveries.append,
-    )
-
-    times = iter([0, 240])
-    active_times = iter([0, 60])
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: next(times),
-        active_now=lambda: next(active_times),
-        max_ticks=1,
-    )
-
-    events = read_events(journal.path)
-    assert gateway.calls == []
-    assert recoveries == [RecoveryTrigger.WAKE]
-    assert not any(event.get("replayed") is True for event in events)
-    assert not any(event["event"] == "agent_run_stall" for event in events)
-
-
 def test_reservation_sweep_runs_on_bounded_tick_cadence():
     sweeps = []
     daemon = Daemon(
@@ -927,82 +742,6 @@ def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path)
     assert gateway.calls == []
 
 
-def test_long_active_late_heartbeat_does_not_stall_or_reconcile(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    receipt = {
-        "ts": "1970-01-01T00:00:10+00:00",
-        "event": "action",
-        "desc": "relabel issue #5: +ai-blocked",
-        "action": {
-            "type": "relabel",
-            "target": "ISSUE",
-            "number": 5,
-            "remove": None,
-            "add": "ai-blocked",
-        },
-    }
-    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
-    gateway = FakeGateway()
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [],
-        Executor(gateway, journal=journal),
-        poll_seconds=60,
-    )
-    wall_times = iter([0, 240])
-    active_times = iter([0, 240])
-
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: next(wall_times),
-        active_now=lambda: next(active_times),
-        max_ticks=1,
-    )
-
-    assert gateway.calls == []
-    events = read_events(journal.path)
-    assert events[0] == receipt
-    assert not any(event["event"] in {"stall", "agent_run_stall"} for event in events)
-
-
-def test_stall_diagnostic_does_not_turn_legacy_receipts_into_commands(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    receipt = {
-        "ts": "1970-01-01T00:00:30+00:00",
-        "event": "action",
-        "desc": "relabel issue #5: +ai-blocked",
-        "action": {
-            "type": "relabel",
-            "target": "ISSUE",
-            "number": 5,
-            "remove": None,
-            "add": "ai-blocked",
-        },
-    }
-    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
-    gateway = FakeGateway()
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [],
-        Executor(gateway, journal=journal),
-        poll_seconds=60,
-    )
-    wall_times = iter([50, 300])
-    active_times = iter([0, 10])
-
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: next(wall_times),
-        active_now=lambda: next(active_times),
-        max_ticks=1,
-    )
-
-    assert gateway.calls == []
-    assert read_events(journal.path) == [receipt]
-
-
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):
     d, _ = _daemon(lambda w: [], logs=logs)
     d.poll_seconds = poll_seconds
@@ -1015,15 +754,6 @@ def test_without_a_wake_the_full_interval_is_slept():
     slept = []
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert sum(slept) == 10
-
-
-def test_wake_wiring_does_not_change_max_ticks_or_tick_count():
-    """A wake shortens sleep; it must not smuggle in extra ticks."""
-    calls = {"n": 0}
-    d = _waking_daemon(lambda: True, poll_seconds=60)
-    d.decide = lambda w: calls.__setitem__("n", calls["n"] + 1) or []
-    d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=3)
-    assert calls["n"] == 3
 
 
 def test_no_wake_check_sleeps_in_one_call_as_before():

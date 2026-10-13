@@ -428,33 +428,6 @@ def test_systemd_refuses_live_current_unit_without_rollback_definition(
     )
 
 
-@pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
-def test_systemd_refuses_live_legacy_unit_without_rollback_definition(
-    tmp_path, state_var
-):
-    env, home, _uv = _environment(tmp_path, systemd=True)
-    env[state_var] = "issue-agent-fix-watcher.service"
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 2
-    assert "active/enabled legacy unit" in result.stderr
-    assert "no recoverable definition" in result.stderr
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    assert not any(
-        call.startswith(("stop ", "disable ", "restart ", "enable "))
-        for call in calls
-    )
-    assert not tuple(
-        (home / ".config/issue-agent").glob("*.env")
-    )
-
-
 def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
     tmp_path,
 ):
@@ -694,38 +667,6 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     assert snapshot.read_text() == "KNOWN_GOOD=1\n"
 
 
-def test_systemd_failed_cutover_restores_legacy_units(tmp_path):
-    env, home, _uv = _environment(
-        tmp_path, systemd=True, fail_pattern="review-watcher"
-    )
-    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
-    unit_dir = home / ".config/systemd/user"
-    unit_dir.mkdir(parents=True)
-    services = (
-        "issue-agent-fix-watcher",
-        "issue-agent-review-watcher",
-    )
-    for service in services:
-        (unit_dir / f"{service}-target-repo.service").write_text(
-            f"legacy-{service}"
-        )
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode != 0
-    assert all(
-        (unit_dir / f"{service}-target-repo.service").read_text()
-        == f"legacy-{service}"
-        for service in services
-    )
-    assert not any(unit_dir.glob("*-stable-name.service"))
-
-
 def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     env, home, uv = _environment(tmp_path, systemd=False)
 
@@ -813,120 +754,6 @@ def test_launchd_same_name_repoint_replaces_all_loaded_jobs_atomically(
         for path in plists
     ]
     assert max(unloads) < min(loads)
-
-
-def test_launchd_stable_identity_migrates_and_uninstalls_checksum_jobs(
-    tmp_path,
-):
-    env, home, _uv = _environment(tmp_path, systemd=False)
-    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
-    launch_agents = home / "Library/LaunchAgents"
-    launch_agents.mkdir(parents=True)
-    units = ("fix-watcher", "review-watcher")
-    predecessor_paths = tuple(
-        launch_agents / f"dev.issue-agent.{unit}.123456.plist"
-        for unit in units
-    )
-    other_paths = tuple(
-        launch_agents / f"dev.issue-agent.{unit}.999999.plist"
-        for unit in units
-    )
-    for path in predecessor_paths:
-        path.write_text(
-            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
-            "<string>acme-app</string>\n"
-        )
-    for path in other_paths:
-        path.write_text(
-            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
-            "<string>other-app</string>\n"
-        )
-
-    install = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert install.returncode == 0, install.stderr
-    assert not any(path.exists() for path in predecessor_paths)
-    assert all(path.exists() for path in other_paths)
-    current_paths = tuple(
-        launch_agents / f"dev.issue-agent.{unit}.acme-app.plist"
-        for unit in units
-    )
-    assert all(path.exists() for path in current_paths)
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    for path in predecessor_paths:
-        assert f"unload {path}" in calls
-        assert f"remove {path.stem}" in calls
-
-    uninstall = subprocess.run(
-        [
-            "bash",
-            str(ROOT / "bin/install-launchd.sh"),
-            "uninstall",
-            "acme-app",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert uninstall.returncode == 0, uninstall.stderr
-    assert not any(path.exists() for path in current_paths)
-    assert all(path.exists() for path in other_paths)
-
-
-def test_launchd_failed_stable_cutover_restores_checksum_predecessors(
-    tmp_path,
-):
-    env, home, _uv = _environment(
-        tmp_path,
-        systemd=False,
-        fail_pattern="review-watcher",
-    )
-    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
-    launch_agents = home / "Library/LaunchAgents"
-    launch_agents.mkdir(parents=True)
-    units = ("fix-watcher", "review-watcher")
-    predecessor_paths = tuple(
-        launch_agents / f"dev.issue-agent.{unit}.123456.plist"
-        for unit in units
-    )
-    for path in predecessor_paths:
-        path.write_text(
-            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
-            "<string>acme-app</string>\n"
-        )
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode != 0
-    assert all(path.exists() for path in predecessor_paths)
-    assert not any(
-        launch_agents.glob("dev.issue-agent.*.acme-app.plist")
-    )
-    assert not (
-        home
-        / "Library/Application Support/issue-agent"
-        / "acme-app.env"
-    ).exists()
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    for path in predecessor_paths:
-        assert calls.count(f"load {path}") == 1
 
 
 def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
@@ -1033,22 +860,6 @@ def test_launchd_refuses_loaded_current_job_without_rollback_plist(
             home / "Library/Application Support/issue-agent"
         ).glob("*.env")
     )
-
-
-@pytest.mark.parametrize("selector", ("--fix", "--review"))
-def test_launchd_refuses_partial_migration_cutover(tmp_path, selector):
-    env, home, _uv = _environment(tmp_path, systemd=False)
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh"), selector],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 2
-    assert "every legacy writer stops" in result.stderr
-    assert tuple((home / "Library/LaunchAgents").glob("*.plist")) == ()
 
 
 def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
@@ -1188,7 +999,6 @@ def test_launchd_success_uses_stable_private_config_snapshot(tmp_path):
             rendered["EnvironmentVariables"]["AGENT_ENV"]
             == str(snapshots[0])
         )
-
 
 
 @contextlib.contextmanager

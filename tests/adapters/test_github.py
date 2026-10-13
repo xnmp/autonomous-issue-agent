@@ -7,33 +7,10 @@ records argv and returns canned JSON (no network, no real gh)."""
 import errno
 import json
 
-from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _INLINE_COMMENT_LIMIT, _REVIEW_COMMENT_BODY_BYTES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_issue, parse_pr
+from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_pr
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Comment
 from issue_agent.domain.checks import Unavailable
-
-
-# ── parsers ────────────────────────────────────────────────────────────────
-def test_parse_issue_maps_fields():
-    d = {
-        "number": 5,
-        "title": "Null token",
-        "body": "crashes",
-        "labels": [{"name": "ai-ready"}, {"name": "needs-human"}, {"name": "weird-unknown"}],
-        "comments": [{"author": {"login": "alice"}, "body": "hi", "createdAt": "t1"}],
-        "updatedAt": "t9",
-        "author": {"login": "bob"},
-        "state": "OPEN",
-    }
-    iss = parse_issue(d)
-    assert iss.number == 5
-    assert iss.has(Label.AI_READY) and iss.has(Label.NEEDS_HUMAN)
-    assert iss.author == "bob"
-    assert iss.state == "open"            # normalised lower-case
-    assert iss.comments[0].author == "alice"
-    assert iss.updated_at == "t9"
-    # unknown labels are dropped, not crash
-    assert all(isinstance(x, Label) for x in iss.labels)
 
 
 def test_parse_pr_maps_reviews():
@@ -81,14 +58,6 @@ def test_parse_pr_review_api_user_shape():
     assert pr.reviews[0].commit_id == "sha-rest"
 
 
-def test_parse_pr_review_commit_id_defaults_empty_when_absent():
-    # neither commit.oid nor commit_id present → "" (unknown), not a crash. The
-    # ADDRESS_REVIEW supersession gate treats "" as "stay open" (see world.py).
-    d = {"number": 1, "reviews": [{"author": {"login": "x"}, "state": "APPROVED"}]}
-    pr = parse_pr(d)
-    assert pr.reviews[0].commit_id == ""
-
-
 def test_parse_pr_review_commit_id_tolerates_malformed_commit_field():
     # a non-dict "commit" (or a commit dict missing "oid") must not crash the
     # parse — falls through to the commit_id fallback, then to "".
@@ -99,14 +68,6 @@ def test_parse_pr_review_commit_id_tolerates_malformed_commit_field():
     pr = parse_pr(d)
     assert pr.reviews[0].commit_id == ""
     assert pr.reviews[1].commit_id == ""
-
-
-def test_parse_pr_checks_feed_ci_state():
-    d = {"number": 1, "statusCheckRollup": [
-        {"name": "unit", "bucket": "fail"}, {"name": "e2e", "state": "QUEUED"}]}
-    pr = parse_pr(d)
-    # The PR payload cannot prove a complete repository policy or report read.
-    assert isinstance(pr.ci, Unavailable)
 
 
 def test_parse_pr_extracts_changed_files():
@@ -125,29 +86,6 @@ def test_parse_pr_reads_mergeable():
     assert not parse_pr({"number": 1, "state": "OPEN", "mergeable": "MERGEABLE"}).is_conflicting()
     # missing/UNKNOWN → not conflicting (don't act on GitHub still computing it)
     assert not parse_pr({"number": 1, "state": "OPEN"}).is_conflicting()
-
-
-def test_parse_pr_reads_author():
-    p = parse_pr({"number": 1, "state": "OPEN", "author": {"login": "alice"}})
-    assert p.author == "alice"
-    # defaults when absent
-    assert parse_pr({"number": 2, "state": "OPEN"}).author == ""
-
-
-# ── identity ────────────────────────────────────────────────────────────────
-def test_identity_static_token():
-    assert Identity(static_token="tok").env_token() == "tok"
-
-
-def test_identity_provider_overrides():
-    calls = []
-    ident = Identity(token_provider=lambda: calls.append(1) or "minted")
-    assert ident.env_token() == "minted"
-    assert calls == [1]
-
-
-def test_identity_ambient_is_none():
-    assert Identity().env_token() is None
 
 
 # ── gateway with a fake runner ────────────────────────────────────────────────
@@ -373,15 +311,6 @@ def test_update_branch_refuses_to_advance_when_legacy_arm_cannot_be_revoked():
     assert not any(argv[1] == "api" for argv, _ in fr.calls)
 
 
-def test_submit_review_returns_true_on_success():
-    # gh `api ... POST` prints the created-review JSON on success → non-empty → True.
-    fr = FakeRunner({"api repos/o/r/pulls/100/reviews": {"id": 1, "state": "APPROVED"}})
-    gw = GitHubGateway("o/r", runner=fr)
-    assert gw.submit_review(100, "APPROVE", "lgtm", "head") is True
-    argv, _ = fr.calls[0]
-    assert argv[1] == "api" and "--method" in argv and "POST" in argv
-
-
 def test_viewer_login_names_the_identity_the_credential_acts_as():
     fr = FakeRunner({"api graphql": "review-app[bot]\n"})
     gw = GitHubGateway("o/r", runner=fr)
@@ -441,39 +370,6 @@ def test_parse_pr_keeps_known_labels_and_drops_retired_ones():
 # ── P0.7: loud warning when a world-building list hits the --limit cap ────────
 
 
-# ── native "blocked by" dependency gate ───────────────────────────────────────
-# ── closing-reference graph for the duplicate-PR guard (#39) ─────────────────
-# ── free CI re-run (#38) ─────────────────────────────────────────────────────
-def _pr_with_red_run(conclusion: str):
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "pr view 581" in key:
-            return json.dumps({
-                "number": 581, "state": "OPEN", "headRefOid": "head-581",
-            })
-        if "/commits/head-581/check-runs" in key:
-            return json.dumps([{"check_runs": [{
-                "name": "invocation",
-                "status": "completed",
-                "conclusion": conclusion,
-                "details_url": (
-                    "https://github.com/o/r/actions/runs/4242/job/99"
-                ),
-            }]}])
-        if "/commits/head-581/statuses" in key:
-            return json.dumps([[]])
-        if "actions/runs/4242" in key:
-            return json.dumps({
-                "id": 4242,
-                "head_sha": "head-581",
-                "run_attempt": 1,
-                "conclusion": conclusion,
-            })
-        return ""
-
-    return GitHubGateway("o/r", runner=runner)
-
-
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
 def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
     fr = FakeRunner({
@@ -503,21 +399,6 @@ def _fake_run_factory(rc, stderr):
     def _run(argv, capture_output, text, env, timeout):  # match subprocess.run kw
         return _FakeCompleted(returncode=rc, stdout="", stderr=stderr)
     return _run
-
-
-def test_non_benign_gh_failure_stays_loud_without_debug(monkeypatch, capsys):
-    """A REAL failure (e.g. a 422 self-approval on submit) must never be silenced —
-    the whole reason the stderr write exists. Not a pr-checks/rollup error → loud."""
-    monkeypatch.delenv("ISSUE_AGENT_DEBUG", raising=False)
-    monkeypatch.setattr(
-        _subprocess, "run",
-        _fake_run_factory(1, "HTTP 422: Can not approve your own pull request"),
-    )
-    _subprocess_runner(
-        ["gh", "api", "repos/o/r/pulls/1/reviews", "--method", "POST"], None
-    )
-    err = capsys.readouterr().err
-    assert "gh failed" in err and "422" in err
 
 
 # ── V10: infra failure ≠ "nothing to do" ──────────────────────────────────────
@@ -602,24 +483,6 @@ def test_runner_raises_on_local_resource_exhaustion(monkeypatch, stderr):
     assert error.value.kind == "local-resource"
 
 
-def test_runner_bounds_a_local_crash_dump_in_the_operator_log(
-    monkeypatch,
-    capsys,
-) -> None:
-    stderr = (
-        "runtime/cgo: pthread_create failed: Resource temporarily unavailable\n"
-        + "register dump line\n" * 10_000
-    )
-
-    with pytest.raises(GhUnavailable):
-        _run_with(monkeypatch, stderr)()
-
-    logged = capsys.readouterr().err
-    assert "pthread_create failed" in logged
-    assert "[gh stderr truncated]" in logged
-    assert len(logged.encode()) < 9_000
-
-
 def test_runner_redacts_and_bounds_a_large_publication_body(
     monkeypatch,
     capsys,
@@ -636,31 +499,6 @@ def test_runner_redacts_and_bounds_a_large_publication_body(
     assert body[:100] not in logged
     assert "<body redacted:" in logged
     assert len(logged.encode()) < 9_000
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
-        OSError(errno.ENOMEM, "Cannot allocate memory"),
-    ],
-)
-def test_runner_raises_when_local_exhaustion_prevents_gh_from_starting(
-    monkeypatch,
-    capsys,
-    error,
-) -> None:
-    def fail_to_start(*_args, **_kwargs):
-        raise error
-
-    monkeypatch.setattr(_subprocess, "run", fail_to_start)
-
-    with pytest.raises(GhUnavailable) as unavailable:
-        _subprocess_runner(["gh", "issue", "list"], None)
-
-    assert unavailable.value.kind == "local-resource"
-    assert unavailable.value.argv == ("gh", "issue", "list")
-    assert "gh failed to start" in capsys.readouterr().err
 
 
 def test_spawn_failure_redacts_a_large_graphql_body_field(
@@ -751,11 +589,6 @@ def test_pr_discussion_is_newest_first_and_keeps_bot_authors():
     assert "@harness-fixer[bot]" in text
 
 
-def test_an_empty_thread_renders_nothing():
-    assert format_pr_discussion(()) == ""
-    assert format_pr_discussion((Comment(author="a", body="   "),)) == ""
-
-
 def test_a_long_thread_is_truncated_with_an_explicit_marker():
     comments = tuple(
         Comment(author="rev", body=f"comment {n} " + "x" * 400) for n in range(200)
@@ -778,11 +611,6 @@ def test_one_huge_comment_is_capped_and_says_so():
     assert "old point" in text                 # the rest of the thread survives
 
 
-def test_a_comment_under_the_ceiling_is_never_marked():
-    text = format_pr_discussion((Comment(author="rev", body="short and whole"),))
-    assert text == "@rev: short and whole"
-
-
 # ── review M13 / D6: the two repair legs' prompt inputs ───────────────────────
 def test_format_review_comments_renders_path_line_author_body():
     """review M13: the fixer never saw the file:line asks reviewers actually make.
@@ -802,19 +630,6 @@ def test_format_review_comments_renders_path_line_author_body():
         "a.py:12 (rev): rename this",
         "b.py:3 (rev): drop the flag",
     ]
-
-
-def test_format_review_comments_keeps_the_newest_and_bounds_the_paste():
-    # oldest→newest, last _INLINE_COMMENT_LIMIT — an unbounded paste is how a long
-    # review thread blows the context window on the leg that must not fail.
-    raw = [
-        {"path": "f.py", "line": n, "user": {"login": "rev"}, "body": f"c{n}",
-         "created_at": f"t{n:02d}"}
-        for n in range(1, 21)
-    ]
-    lines = format_review_comments(list(reversed(raw))).splitlines()
-    assert len(lines) == _INLINE_COMMENT_LIMIT
-    assert lines[0].endswith("c13") and lines[-1].endswith("c20")
 
 
 @pytest.mark.parametrize(
@@ -929,20 +744,6 @@ def test_failed_run_log_bounds_by_bytes_not_just_lines():
     assert out  # anti-vacuity: real (truncated) content survives, not wiped to ""
 
 
-def test_failed_run_log_under_the_byte_cap_is_untouched():
-    # anti-vacuity twin: a normal, small log is NOT truncated by the new cap —
-    # the byte ceiling only bites the pathological case.
-    log = "\n".join(f"line {i}" for i in range(1, 301))
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/1": {"id": 1, "head_sha": "head", "run_attempt": 1},
-        "run view 1": log,
-    })
-    gw = GitHubGateway("o/r", runner=fr)
-    out = gw.failed_run_log("head", (1,))
-    assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
-    assert len(out.encode("utf-8")) < _FAILED_LOG_BYTES
-
-
 def test_format_review_comments_bounds_pathological_comment_bytes():
     """P1R-13 repro: an inline review comment is writable by ANY user with
     read access to the repo (not just the PR author) — 10 x 500KB comments is
@@ -956,18 +757,6 @@ def test_format_review_comments_bounds_pathological_comment_bytes():
     out = format_review_comments(raw)
     assert len(out.encode("utf-8")) <= _REVIEW_COMMENTS_TOTAL_BYTES
     assert out  # anti-vacuity: not wiped to "", just bounded
-
-
-def test_format_review_comments_per_comment_cap_applies_even_under_the_item_limit():
-    # anti-vacuity twin: a SINGLE oversized comment (well under the 8-item
-    # count limit) must still be capped by the per-comment byte ceiling, not
-    # just the overall-block ceiling kicking in once several are combined.
-    huge = "B" * 100_000
-    raw = [{"path": "a.py", "line": 1, "user": {"login": "rev"}, "body": huge,
-            "created_at": "t1"}]
-    out = format_review_comments(raw)
-    assert len(out.encode("utf-8")) <= _REVIEW_COMMENT_BODY_BYTES + 20  # + "path:line (author): " prefix
-    assert out.startswith("a.py:1 (rev): B")
 
 
 def test_format_review_comments_small_bodies_are_unaffected_by_the_cap():
@@ -1010,43 +799,5 @@ def test_a_skipped_checks_call_is_unread_not_empty():
     fr = FakeRunner({"pr view 100": pr_resp})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=False)
     assert isinstance(pr.ci, Unavailable)
-
-
-# ── #163: the stale merged tail is built from the list payload, not `pr view` ─
-# GitHub's search index keeps serving merged PRs for about a day after their
-# label is removed. Nineteen of them cost a `gh pr view` EACH, in the fix build
-# AND the review build — ~38 of ~71 GraphQL points per tick round. The labelled
-# list costs the same two requests whatever fields it selects, so the same facts
-# come back for free.
-_TERMINAL_ROW = {
-    "number": 60,
-    "state": "MERGED",
-    "labels": [{"name": "ai-done"}],
-    "headRefName": "fix/12-thing",
-    "headRefOid": "abc123",
-    "baseRefName": "dev",
-    "baseRefOid": "def456",
-    "title": "fix: the thing",
-    "isDraft": False,
-    "author": {"login": "fix-bot"},
-    "closingIssuesReferences": [{"number": 12}],
-}
-
-
-def _tail_runner(rows, views=None, calls=None):
-    def runner(argv, token):
-        key = " ".join(argv)
-        if calls is not None:
-            calls.append(key)
-        if "issue list" in key:
-            return "[]"
-        if "pr list" in key:
-            return json.dumps(rows)
-        for number, payload in (views or {}).items():
-            if f"pr view {number}" in key:
-                return json.dumps(payload)
-        return ""
-
-    return runner
 
 

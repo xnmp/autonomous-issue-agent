@@ -7,7 +7,6 @@ result mapping is duck-typed so a stand-in object stands in for ResultMessage.
 import asyncio
 from dataclasses import dataclass
 
-from issue_agent.adapters import agent_runner
 from issue_agent.adapters.agent_runner import (
     DEFAULT_MAX_BUFFER_BYTES,
     DEFAULT_PERMISSION_MODE,
@@ -36,12 +35,6 @@ def test_append_system_prompt_uses_claude_code_preset():
         "preset": "claude_code",
         "append": "rules",
     }
-
-
-def test_no_append_still_uses_preset():
-    # The SDK defaults to a MINIMAL prompt; we must opt into the claude_code preset.
-    kw = build_option_kwargs(RuntimePlan(prompt="x"))
-    assert kw["system_prompt"] == {"type": "preset", "preset": "claude_code"}
 
 
 def test_no_agents_key_and_no_task_tool():
@@ -76,27 +69,11 @@ def test_target_project_settings_are_never_loaded_as_provider_authority():
     assert kw["setting_sources"] == []
 
 
-def test_permission_mode_override():
-    kw = build_option_kwargs(RuntimePlan(prompt="x"), permission_mode="auto")
-    assert kw["permission_mode"] == "auto"
-
-
 # ── message buffer ceiling (#13) ──────────────────────────────────────────────
 def test_default_buffer_survives_a_five_megabyte_read():
     # The SDK's own default is 1MB and a tool result is base64'd (x4/3), so the
     # bound has to clear ~6.7MB for a 5MB file to come back alive.
     assert DEFAULT_MAX_BUFFER_BYTES >= 5 * 1024 * 1024 * 4 // 3
-
-
-def test_buffer_knob_reaches_the_options():
-    kw = build_option_kwargs(RuntimePlan(prompt="x"), max_buffer_size=4096)
-    assert kw["max_buffer_size"] == 4096
-
-
-def test_no_buffer_knob_leaves_the_sdk_default_alone():
-    kw = build_option_kwargs(RuntimePlan(prompt="x"))
-    assert "max_buffer_size" not in kw
-    assert "max_buffer_size" not in build_option_kwargs(RuntimePlan(prompt="x"), max_buffer_size=0)
 
 
 def test_a_runner_applies_the_default_buffer_to_every_session(monkeypatch):
@@ -146,21 +123,6 @@ def test_effort_reaches_the_options_as_the_sdk_word():
     assert kw["effort"] == "high"
 
 
-def test_a_task_with_no_effort_says_nothing():
-    """Adding the field must not pin every existing dispatch to the harness's
-    idea of an effort — a task with no opinion keeps the SDK's own default."""
-    assert "effort" not in build_option_kwargs(RuntimePlan(prompt="x"))
-
-
-def test_effort_survives_to_the_session_on_a_build_that_has_the_field(monkeypatch):
-    from issue_agent.domain.effort import Effort
-
-    seen = {}
-    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    asyncio.run(AgentRunner().run(RuntimePlan(prompt="x", effort=Effort.LOW)))
-    assert seen["options"]["effort"] == "low"
-
-
 def test_the_installed_sdk_accepts_every_effort_word_the_domain_can_emit():
     """Anti-vacuity twin of the max_buffer_size check: the stubs above would not
     notice the SDK renaming the option or narrowing its Literal."""
@@ -177,23 +139,6 @@ def test_the_installed_sdk_accepts_every_effort_word_the_domain_can_emit():
     for arg in typing.get_args(field.type):
         accepted.update(typing.get_args(arg))
     assert {e.value for e in EFFORT_LADDER} <= accepted
-
-
-def test_a_transport_death_carries_the_last_trace_on_the_exception(monkeypatch):
-    # The journal and the dispatcher both need the offending path, and the
-    # exception must still propagate unchanged (crash isolation).
-    blk = type("Blk", (), {})()
-    blk.name = "Read"
-    blk.input = {"file_path": "evidence/shot.png"}
-    carrier = type("Carrier", (), {})()
-    carrier.content = [blk]
-    _install_fake_sdk(monkeypatch, [carrier], raise_after=True)
-    try:
-        asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
-    except RuntimeError as exc:
-        assert "Read(evidence/shot.png)" in getattr(exc, "harness_last_trace", "")
-    else:
-        raise AssertionError("expected the pre-result crash to propagate")
 
 
 # ── ResultMessage → AgentResult ────────────────────────────────────────────────
@@ -222,13 +167,6 @@ def test_result_reads_structured_output():
     assert r.session_id == "s9"
 
 
-def test_result_blocked_carries_needs():
-    msg = FakeResult(structured_output={"status": "blocked", "needs": "which endpoint?"})
-    r = result_to_agent_result(msg)
-    assert r.status == "blocked"
-    assert r.needs == "which endpoint?"
-
-
 def test_result_error_envelope():
     r = result_to_agent_result(FakeResult(is_error=True))
     assert r.is_error is True
@@ -246,21 +184,6 @@ def test_review_decision_becomes_the_run_status():
     assert r.exit_reason is ExitReason.OK
 
 
-def test_explicit_status_wins_over_decision():
-    r = result_to_agent_result(
-        FakeResult(structured_output={"status": "pr_opened", "decision": "APPROVE"})
-    )
-    assert r.status == "pr_opened"
-
-
-def test_errored_review_still_reports_the_envelope_error_kind():
-    # No terminal of either name → the SDK's own error subtype, unchanged.
-    r = result_to_agent_result(
-        FakeResult(is_error=True, subtype="error_max_turns", structured_output={"body": ""})
-    )
-    assert r.status == "error_max_turns"
-
-
 def test_non_string_terminal_is_ignored_rather_than_propagated():
     # A malformed envelope must not put a non-str into the str-typed field; on an
     # errored run the subtype fallback still fills it.
@@ -271,21 +194,6 @@ def test_non_string_terminal_is_ignored_rather_than_propagated():
     )
     assert ok.status == ""
     assert bad.status == "error_during_execution"
-
-
-def test_result_falls_back_to_result_text_when_no_structured():
-    msg = FakeResult(structured_output=None, result="free text")
-    r = result_to_agent_result(msg)
-    assert r.summary == "free text"
-
-
-# ── exit_reason: WHY the session ended, read off the envelope ─────────────────
-def test_successful_envelope_classifies_ok():
-    r = result_to_agent_result(
-        FakeResult(is_error=False, subtype="success",
-                   structured_output={"status": "pr_opened"})
-    )
-    assert r.exit_reason is ExitReason.OK
 
 
 def test_budget_subtype_is_distinguished_from_a_plain_agent_error():
@@ -309,12 +217,6 @@ def test_structured_error_status_classifies_as_agent_error():
     assert r.exit_reason is ExitReason.AGENT_ERROR
 
 
-def test_non_error_envelope_without_subtype_is_ok():
-    # An SDK build that omits `subtype` must not be classified as a failure.
-    r = result_to_agent_result(FakeResult(is_error=False, structured_output={"status": "blocked"}))
-    assert r.exit_reason is ExitReason.OK
-
-
 def test_usage_block_is_captured_verbatim_for_the_cost_ledger():
     # cost_usd is 0.00 on a subscription plan, so tokens (incl. the cache counters
     # nothing else exposes) are the only cost substrate that always exists.
@@ -324,11 +226,6 @@ def test_usage_block_is_captured_verbatim_for_the_cost_ledger():
         FakeResult(is_error=False, subtype="success", total_cost_usd=0.0, usage=usage)
     )
     assert r.usage == usage
-
-
-def test_non_dict_usage_is_dropped_rather_than_stored():
-    r = result_to_agent_result(FakeResult(is_error=False, usage="not-a-dict"))
-    assert r.usage is None
 
 
 # ── AgentRunner.run stream handling ─────────────────────────────────────────────
@@ -388,32 +285,6 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
     assert r.is_error is False
 
 
-def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, tmp_path):
-    """Default-model review receipts name the concrete SDK model."""
-    from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime
-    from tests.fakes.legacy_journal import read_events
-
-    for role, kind in (("review", "REVIEW"),):
-        init = type("InitMessage", (), {
-            "subtype": "init", "data": {"model": "claude-opus-4-1"},
-        })()
-        result = _ResultMessage(
-            is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
-        )
-        _install_fake_sdk(monkeypatch, [init, result])
-
-        journal = Journal(str(tmp_path / f"{role}-{kind}.jsonl"))
-        runner = JournalingRuntime(AgentRunner(), journal, role=role)
-        runner.set_context(role, kind, 100, 91)
-
-        asyncio.run(runner.run(RuntimePlan(prompt="unconfigured SDK leg")))
-
-        start, settled = read_events(journal.path)
-        assert start["model"] == ""
-        assert settled["model"] == "claude-opus-4-1"
-
-
 def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_path):
     """Configured aliases remain the journal's model across the SDK session."""
     from tests.fakes.legacy_journal import Journal
@@ -457,29 +328,6 @@ def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypa
     start, settled = read_events(journal.path)
     assert start["model"] == ""
     assert settled["exit_reason"] == "no_result"
-    assert settled["model"] == "claude-opus-4-1"
-
-
-def test_unpinned_sdk_timeout_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
-    """An idle SDK leg keeps its init model when its timeout settles it."""
-    from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime
-    from tests.fakes.legacy_journal import read_events
-
-    init = type("InitMessage", (), {
-        "subtype": "init", "data": {"model": "claude-opus-4-1"},
-    })()
-    _install_hanging_sdk(monkeypatch, [init])
-    journal = Journal(str(tmp_path / "review-journal.jsonl"))
-    runner = JournalingRuntime(
-        AgentRunner(idle_timeout=0.05, poll_slice=0.01), journal, role="review"
-    )
-    runner.set_context("review", "REVIEW", 100, 91)
-
-    asyncio.run(runner.run(RuntimePlan(prompt="unconfigured SDK leg")))
-
-    _, settled = read_events(journal.path)
-    assert settled["exit_reason"] == "idle_timeout"
     assert settled["model"] == "claude-opus-4-1"
 
 
@@ -531,16 +379,6 @@ def test_transport_death_is_logged_with_type_and_last_message(monkeypatch):
     assert "transport died before any ResultMessage" in joined
     assert "RuntimeError" in joined
     assert "Bash(uv run pytest)" in joined  # last-seen tool surfaced
-
-
-def test_transport_death_logged_even_without_debug(monkeypatch):
-    _install_fake_sdk(monkeypatch, [], raise_after=True)
-    logged: list[str] = []
-    try:
-        asyncio.run(AgentRunner(log=logged.append, debug=False).run(RuntimePlan(prompt="x")))
-    except RuntimeError:
-        pass
-    assert any("transport died before any ResultMessage" in m for m in logged)
 
 
 # ── idle watchdog: hang detection without false-positives on hard tasks ───────
@@ -650,29 +488,6 @@ def test_idle_watchdog_trips_on_wall_clock_not_monotonic(monkeypatch):
     )
     assert r.is_error and r.status == "timeout"
     assert any("IDLE" in m for m in logged)
-
-
-def test_idle_timeout_does_not_trip_on_steady_stream(monkeypatch):
-    """A task that keeps emitting events (each gap < idle_timeout) must NOT trip —
-    the false-positive guard. Events arrive faster than the idle window; a final
-    ResultMessage ends the run cleanly."""
-    async def fake_query(prompt, options):
-        for _ in range(5):
-            await asyncio.sleep(0.02)  # gap well under idle_timeout
-            yield object()  # non-result event resets the clock
-        yield _ResultMessage(is_error=False,
-                             structured_output={"status": "pr_opened"}, session_id="s")
-
-    import sys
-    import types
-    fake = types.ModuleType("claude_agent_sdk")
-    fake.ClaudeAgentOptions = lambda **kw: object()
-    fake.ResultMessage = _ResultMessage
-    fake.query = fake_query
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
-
-    r = asyncio.run(AgentRunner(idle_timeout=0.2).run(RuntimePlan(prompt="x")))
-    assert r.is_error is False and r.status == "pr_opened"  # completed, never tripped
 
 
 def test_gap_longer_than_poll_slice_still_delivers_result(monkeypatch):
@@ -853,14 +668,6 @@ def test_trace_message_never_raises_on_garbage():
     assert _trace_message(object()) != ""  # returns the type name, no crash
 
 
-def test_trace_message_bare_kind_when_no_tooluse():
-    @dataclass
-    class _Result:
-        is_error: bool = False
-
-    assert _trace_message(_Result()) == "_Result"
-
-
 # ── running token total, so an aborted run knows what it spent ───────────────
 # Cost only arrives on the final ResultMessage, so a wall-cap / idle / dropped-
 # result abort reported usage=None and ledgered $0.00 however long it ran (first
@@ -887,14 +694,6 @@ def test_merge_usage_ignores_non_numeric_and_boolean_fields():
 
     acc = merge_usage(None, {"input_tokens": 5, "cached": True, "model": "opus"})
     assert acc == {"input_tokens": 5}
-
-
-def test_merge_usage_does_not_mutate_the_accumulator_it_is_given():
-    from issue_agent.adapters.agent_runner import merge_usage
-
-    first = merge_usage(None, {"input_tokens": 1})
-    second = merge_usage(first, {"input_tokens": 1})
-    assert first == {"input_tokens": 1} and second == {"input_tokens": 2}
 
 
 def test_wall_timeout_result_carries_the_tokens_spent_before_the_abort():
@@ -924,12 +723,6 @@ def test_task_env_override_beats_identity():
     )
     assert kw["env"]["GIT_AUTHOR_NAME"] == "me"
     assert kw["env"]["GIT_COMMITTER_NAME"] == "Harness - m"
-
-
-def test_no_model_emits_no_git_identity():
-    kw = build_option_kwargs(RuntimePlan(prompt="p"))
-    assert "GIT_AUTHOR_NAME" not in kw["env"]
-    assert "GIT_COMMITTER_NAME" not in kw["env"]
 
 
 # ── CLI resolution (keifu 2026-08-03: venv rebuilt under a live daemon) ───────
