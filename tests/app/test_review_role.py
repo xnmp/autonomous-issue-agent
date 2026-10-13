@@ -26,6 +26,7 @@ from issue_agent.domain.world import PullRequestDiff, Review
 from tests.app.test_fix_role import (
     FIX_BOT, REVIEW_BOT, Agent, FakeGitHub, FakeWorktrees, _now, died, dispatched, open_pr, ready, tick,
 )
+from tests.app.test_fix_role import later  # noqa: F401 — the shared backoff-clock fixture
 
 
 @dataclass
@@ -108,31 +109,20 @@ def roles(tmp_path):
         checkouts = FakeCheckouts(tmp_path / "checkouts")
 
         def review(self, gh, agent, checkouts=..., **env):
-            c = cfg(**env)
-            return compose_review_daemon(c, gh, agent,
-                                         checkouts=self.checkouts if checkouts is ... else checkouts,
-                                         log=lambda _line: None)
+            return compose_review_daemon(cfg(**env), gh, agent, log=lambda _line: None,
+                                         checkouts=self.checkouts if checkouts is ... else checkouts)
 
         def fix(self, gh, agent, **env):
-            c = cfg(**env)
-            return compose_fix_daemon(c, gh, FakeWorktrees(tmp_path / "worktrees"), agent,
+            return compose_fix_daemon(cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent,
                                       log=lambda _line: None)
     return Roles()
 
 
-@pytest.fixture
-def later(monkeypatch):
-    """Moves the roles' tick clock past every machine backoff."""
-    from datetime import datetime, timedelta
-
-    import issue_agent.app.tick as tick_module
-
-    class Later(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime.now(tz) + timedelta(hours=2)
-
-    return lambda: monkeypatch.setattr(tick_module, "datetime", Later)
+def green(**fields) -> ReviewGitHub:
+    """Issue 5 with its PR #100 open, CI green on h1."""
+    gh = ReviewGitHub(issues={5: ready()}, **fields)
+    open_pr(gh, head="h1", ci="pass")
+    return gh
 
 
 def capped_for_a_human(gh, roles) -> bool:
@@ -147,8 +137,7 @@ def capped_for_a_human(gh, roles) -> bool:
 # ── the design table's REVIEW row ────────────────────────────────────────────
 
 def test_a_green_head_without_a_bot_review_gets_one_review_leg_and_one_review_on_that_commit(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     agent = Agent(verdict("APPROVE", "Correct and tested."))
     review = roles.review(gh, agent)
 
@@ -162,8 +151,7 @@ def test_a_green_head_without_a_bot_review_gets_one_review_leg_and_one_review_on
 
 
 def test_a_review_on_a_moved_head_is_skipped_without_a_paid_leg(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     agent = Agent()
     review = roles.review(gh, agent)
     original = gh.get_pr
@@ -180,8 +168,7 @@ def test_a_review_on_a_moved_head_is_skipped_without_a_paid_leg(roles):
 # ── idempotent submission ────────────────────────────────────────────────────
 
 def test_a_crash_after_the_review_lands_never_posts_a_second_review(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     gh.lose_reply.add("submit_review")  # GitHub records the review; the reply is lost
     agent = Agent(verdict("REQUEST_CHANGES", "Handle None."))
     review = roles.review(gh, agent)
@@ -200,8 +187,7 @@ def test_a_crash_after_the_review_lands_never_posts_a_second_review(roles):
 def test_a_submission_github_fails_to_answer_is_resubmitted_after_backoff_without_buying_the_review_again(
     roles, later,
 ):
-    gh = ReviewGitHub(issues={5: ready()}, fail_submit=1)
-    open_pr(gh, head="h1", ci="pass")
+    gh = green(fail_submit=1)
     agent = Agent(verdict("APPROVE"))
     review = roles.review(gh, agent)
     tick(review)
@@ -217,8 +203,7 @@ def test_a_submission_github_fails_to_answer_is_resubmitted_after_backoff_withou
 def test_a_submission_github_refuses_stops_for_a_human_at_the_attempt_cap_after_one_paid_review(roles):
     # A 403 (token without pull-request write) or 422 never changes on retry;
     # as a machine end it retried free forever with no `needs-human`.
-    gh = ReviewGitHub(issues={5: ready()}, refuse_submit=99)
-    open_pr(gh, head="h1", ci="pass")
+    gh = green(refuse_submit=99)
     agent = Agent(verdict("APPROVE"))
     review = roles.review(gh, agent)
     for _ in range(4):
@@ -231,8 +216,7 @@ def test_a_submission_github_refuses_stops_for_a_human_at_the_attempt_cap_after_
 
 
 def test_a_dismissed_bot_verdict_buys_a_fresh_review_not_a_replay(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     agent = Agent(verdict("APPROVE", "First look."), verdict("REQUEST_CHANGES", "Second look: handle None."))
     review = roles.review(gh, agent)
     tick(review)
@@ -245,8 +229,7 @@ def test_a_dismissed_bot_verdict_buys_a_fresh_review_not_a_replay(roles):
 
 
 def test_the_bots_previous_review_reaches_the_next_rounds_reviewer(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     agent = Agent(verdict("REQUEST_CHANGES", "Handle a None token in parse()."), verdict("APPROVE"))
     review = roles.review(gh, agent)
     tick(review)
@@ -261,8 +244,7 @@ def test_the_bots_previous_review_reaches_the_next_rounds_reviewer(roles):
 
 
 def test_a_head_with_nothing_to_review_stops_for_a_human_without_a_paid_leg(roles):
-    gh = ReviewGitHub(issues={5: ready()}, diff="")
-    open_pr(gh, head="h1", ci="pass")
+    gh = green(diff="")
     agent = Agent()
     review = roles.review(gh, agent)
     for _ in range(3):
@@ -274,8 +256,7 @@ def test_a_head_with_nothing_to_review_stops_for_a_human_without_a_paid_leg(role
 
 
 def test_a_push_during_the_review_leaves_the_verdict_on_the_old_head_and_never_merges_on_it(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
 
     def author_pushes_meanwhile(_task):
         gh.push("fix/5-null-token-crashes", "h2", ci="pass")
@@ -325,8 +306,7 @@ def test_a_bot_change_request_is_addressed_by_the_fix_role_not_reviewed_again(ro
 
 
 def test_three_unparseable_verdicts_on_one_head_stop_for_a_human_written_by_the_fix_role(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     agent = Agent(garbled, garbled, garbled)
     review = roles.review(gh, agent)
     fix = roles.fix(gh, Agent())
@@ -344,8 +324,7 @@ def test_three_unparseable_verdicts_on_one_head_stop_for_a_human_written_by_the_
 
 
 def test_a_machine_death_counts_no_attempt_and_backs_off(roles, later):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
+    gh = green()
     review = roles.review(gh, Agent(died, died, died, died))
     assert dispatched(tick(review), AgentKind.REVIEW)
     assert tick(review) == []  # backing off: no redispatch, no stop
