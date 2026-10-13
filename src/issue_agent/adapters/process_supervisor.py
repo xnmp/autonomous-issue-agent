@@ -56,7 +56,6 @@ class ProcessSupervisor:
             raise ValueError("process grace period cannot be negative")
         self.state_dir = Path(state_dir).resolve()
         self.directory = self.state_dir / "process-groups"
-        self.tree_directory = self.state_dir / "process-trees"
         self.intent_directory = self.state_dir / "launch-intents"
         self.grace_seconds = grace_seconds
 
@@ -325,41 +324,6 @@ class ProcessSupervisor:
             self.kill_tree(registration.run_id, self.grace_seconds)
             recovered.append(registration.run_id)
 
-        for path in (
-            sorted(self.tree_directory.glob("*.json"))
-            if self.tree_directory.exists()
-            else ()
-        ):
-            run_id, identities = self._read_tree(path)
-            if run_id is None:
-                path.rename(path.with_suffix(".invalid"))
-                continue
-            live_pids = {
-                identity.pid
-                for identity in identities
-                if (
-                    (entry := table.get(identity.pid)) is not None
-                    and entry[0] == identity
-                )
-            }
-            externally_owned = any(
-                entry[1] > 1
-                and entry[1] not in live_pids
-                and entry[1] in table
-                for identity in identities
-                if (
-                    (entry := table.get(identity.pid)) is not None
-                    and entry[0] == identity
-                )
-            )
-            if externally_owned:
-                continue
-            self._terminate_identities(identities, self.grace_seconds)
-            recovered.append(run_id)
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
         self._discard_dead_launcher_intents()
         return tuple(recovered)
 
@@ -384,123 +348,13 @@ class ProcessSupervisor:
                 continue
             self.kill_tree(registration.run_id, grace_seconds)
             recovered.append(registration.run_id)
-        for path in (
-            sorted(self.tree_directory.glob("*.json"))
-            if self.tree_directory.exists()
-            else ()
-        ):
-            run_id, identities = self._read_tree(path)
-            if run_id is None:
-                path.rename(path.with_suffix(".invalid"))
-                continue
-            self._terminate_identities(identities, grace_seconds)
-            recovered.append(run_id)
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
         return tuple(recovered)
-
-    def direct_children(self, pid: int | None = None) -> tuple[ProcessIdentity, ...]:
-        parent = os.getpid() if pid is None else pid
-        table = self._process_table()
-        return tuple(
-            identity
-            for identity, ppid, _pgid in table.values()
-            if ppid == parent
-        )
-
-    def register_process_tree(
-        self, run_id: RunId, roots: tuple[ProcessIdentity, ...]
-    ) -> None:
-        """Persist roots and all currently visible descendants atomically."""
-
-        if not roots:
-            return
-        table = self._process_table()
-        identities = {identity.pid: identity for identity in roots}
-        frontier = set(identities)
-        while frontier:
-            parents = frontier
-            frontier = {
-                identity.pid
-                for identity, ppid, _pgid in table.values()
-                if ppid in parents and identity.pid not in identities
-            }
-            identities.update(
-                {
-                    pid: table[pid][0]
-                    for pid in frontier
-                    if pid in table
-                }
-            )
-        path = self._tree_path(run_id)
-        prior_run, prior = self._read_tree(path)
-        if prior_run == run_id:
-            identities.update({identity.pid: identity for identity in prior})
-        self.tree_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(
-            dir=self.tree_directory, prefix=f".{path.name}.", text=True
-        )
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(
-                    {
-                        "run_id": str(run_id),
-                        "processes": [
-                            {"pid": identity.pid, "start_ticks": identity.start_ticks}
-                            for identity in sorted(
-                                identities.values(), key=lambda item: item.pid
-                            )
-                        ],
-                    },
-                    stream,
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
-
-    def kill_process_tree(
-        self, run_id: RunId, grace_seconds: float | None = None
-    ) -> None:
-        path = self._tree_path(run_id)
-        stored_run, identities = self._read_tree(path)
-        if stored_run is None:
-            return
-        grace = self.grace_seconds if grace_seconds is None else grace_seconds
-        self._terminate_identities(identities, grace)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-    def registrations(self) -> tuple[ProcessRegistration, ...]:
-        if not self.directory.exists():
-            return ()
-        return tuple(
-            registration
-            for path in sorted(self.directory.glob("*.json"))
-            if (registration := self._read(path)) is not None
-        )
 
     def _path(self, run_id: RunId) -> Path:
         safe = str(run_id)
         if not safe or safe in {".", ".."} or "/" in safe or "\0" in safe:
             raise ValueError("run id is not safe for a registry filename")
         return self.directory / f"{safe}.json"
-
-    def _tree_path(self, run_id: RunId) -> Path:
-        safe = str(run_id)
-        if not safe or safe in {".", ".."} or "/" in safe or "\0" in safe:
-            raise ValueError("run id is not safe for a registry filename")
-        return self.tree_directory / f"{safe}.json"
 
     def _intent_path(self, run_id: RunId) -> Path:
         safe = str(run_id)
@@ -649,25 +503,6 @@ class ProcessSupervisor:
             return None
 
     @staticmethod
-    def _read_tree(
-        path: Path,
-    ) -> tuple[RunId | None, tuple[ProcessIdentity, ...]]:
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            run_id = RunId(str(raw["run_id"]))
-            identities = tuple(
-                ProcessIdentity(int(item["pid"]), int(item["start_ticks"]))
-                for item in raw["processes"]
-            )
-            if not str(run_id) or any(
-                item.pid <= 0 or item.start_ticks <= 0 for item in identities
-            ):
-                raise ValueError("invalid process identity")
-            return run_id, identities
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            return None, ()
-
-    @staticmethod
     def _proc_entry(path: Path) -> tuple[ProcessIdentity, int, int] | None:
         try:
             raw = path.read_text(encoding="utf-8")
@@ -801,16 +636,6 @@ class ProcessSupervisor:
                 os.kill(identity.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-
-    @staticmethod
-    def _alive(pgid: int) -> bool:
-        try:
-            os.killpg(pgid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
 
     @classmethod
     def _terminate(

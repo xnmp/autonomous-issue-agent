@@ -26,6 +26,12 @@ from issue_agent.domain.contracts import (
 )
 
 
+def _registrations(supervisor):
+    """The live registry receipts, read the way recovery reads them."""
+    paths = sorted(supervisor.directory.glob("*.json")) if supervisor.directory.exists() else ()
+    return tuple(r for path in paths if (r := ProcessSupervisor._read(path)) is not None)
+
+
 def _wait_dead(process: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + 3
     while process.poll() is None and time.monotonic() < deadline:
@@ -100,7 +106,7 @@ def test_registered_process_group_is_killed_and_receipt_removed(tmp_path) -> Non
     supervisor.kill_tree(run_id)
 
     _wait_dead(process)
-    assert supervisor.registrations() == ()
+    assert _registrations(supervisor) == ()
 
 
 def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
@@ -129,7 +135,7 @@ def test_legacy_recovery_does_not_reap_a_live_sibling_owner(tmp_path) -> None:
     try:
         assert supervisor.recover_abandoned_orphans() == ()
         assert process.poll() is None
-        assert supervisor.registrations()[0].run_id == run_id
+        assert _registrations(supervisor)[0].run_id == run_id
     finally:
         supervisor.kill_tree(run_id)
         _wait_dead(process)
@@ -162,38 +168,6 @@ def test_malformed_registration_is_quarantined_without_signalling(tmp_path) -> N
 
     assert ProcessSupervisor(str(tmp_path)).recover_orphans() == ()
     assert (directory / "bad.invalid").exists()
-
-
-def test_registered_pid_tree_kills_descendants_without_signalling_parent_group(
-    tmp_path,
-) -> None:
-    process = subprocess.Popen(["sleep", "30"])
-    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
-    root = next(
-        identity
-        for identity in supervisor.direct_children()
-        if identity.pid == process.pid
-    )
-    run_id = RunId("claude-run")
-    supervisor.register_process_tree(run_id, (root,))
-
-    supervisor.kill_process_tree(run_id)
-
-    _wait_dead(process)
-
-
-def test_boot_recovery_reaps_registered_pid_tree(tmp_path) -> None:
-    process = subprocess.Popen(["sleep", "30"])
-    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
-    root = next(
-        identity
-        for identity in supervisor.direct_children()
-        if identity.pid == process.pid
-    )
-    supervisor.register_process_tree(RunId("claude-run"), (root,))
-
-    assert supervisor.recover_orphans() == (RunId("claude-run"),)
-    _wait_dead(process)
 
 
 def test_stale_group_leader_identity_is_never_signalled(
@@ -248,7 +222,7 @@ def test_group_descendant_is_killed_after_registered_leader_exits(
     ):
         time.sleep(0.02)
     assert ProcessSupervisor.process_identity(child_pid) is None
-    assert supervisor.registrations() == ()
+    assert _registrations(supervisor) == ()
 
 
 def test_term_grace_kills_stubborn_descendant_after_leader_exits(
@@ -289,7 +263,7 @@ def test_term_grace_kills_stubborn_descendant_after_leader_exits(
         time.sleep(0.02)
     assert process.returncode == 0
     assert ProcessSupervisor.process_identity(child_pid) is None
-    assert supervisor.registrations() == ()
+    assert _registrations(supervisor) == ()
 
 
 def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
@@ -305,10 +279,10 @@ def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
     )
     process = subprocess.Popen(command, start_new_session=True)
     deadline = time.monotonic() + 3
-    while not supervisor.registrations() and time.monotonic() < deadline:
+    while not _registrations(supervisor) and time.monotonic() < deadline:
         time.sleep(0.02)
 
-    registration = supervisor.registrations()[0]
+    registration = _registrations(supervisor)[0]
     assert registration.run_id == run_id
     assert registration.pgid == process.pid
     assert registration.leader.pid == process.pid
@@ -357,7 +331,7 @@ def test_cancellation_before_wrapper_registration_prevents_paid_exec(
         assert os.WIFEXITED(status)
         assert os.WEXITSTATUS(status) != 0
         assert not marker.exists()
-        assert supervisor.registrations() == ()
+        assert _registrations(supervisor) == ()
     finally:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -400,13 +374,13 @@ def test_superseded_launch_token_cannot_register_against_a_retry(
     try:
         deadline = time.monotonic() + 3
         while (
-            not supervisor.registrations()
+            not _registrations(supervisor)
             and time.monotonic() < deadline
         ):
             time.sleep(0.02)
         assert stale_result.returncode != 0
         assert not stale_marker.exists()
-        assert supervisor.registrations()[0].leader.pid == process.pid
+        assert _registrations(supervisor)[0].leader.pid == process.pid
     finally:
         supervisor.kill_tree(run_id)
         _wait_dead(process)
@@ -651,7 +625,7 @@ def test_supervised_paid_command_refuses_exec_after_launcher_death(
     assert not marker.exists()
     # Only the daemon's claim remains: no child process was registered.
     assert [lease.pid for lease in store.leases()] == [os.getpid()]
-    assert supervisor.registrations() == ()
+    assert _registrations(supervisor) == ()
 
 
 def test_supervised_sdk_cli_registers_session_before_target_executes(
@@ -697,7 +671,7 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
         time.sleep(0.02)
 
     assert marker.exists()
-    registration = supervisor.registrations()[0]
+    registration = _registrations(supervisor)[0]
     assert registration.leader.pid == process.pid
     assert registration.pgid == process.pid
 

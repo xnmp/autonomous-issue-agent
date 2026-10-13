@@ -539,7 +539,7 @@ printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
     )
 
     assert result.status == "done"
-    assert supervisor.registrations() == ()
+    assert not any(supervisor.directory.glob("*.json"))
 
 
 def test_run_nonzero_exit_no_output_is_error():
