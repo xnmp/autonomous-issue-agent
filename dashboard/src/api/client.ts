@@ -196,13 +196,4 @@ export const api = {
       schemas.ActionResult,
       s,
     ),
-
-  /** Adds `needs-human` to the issue and its open harness PRs. */
-  park: (name: string, n: number, s?: AbortSignal) =>
-    postJson<ActionResult>(
-      `/api/repos/${enc(name)}/issues/${n}/park`,
-      {},
-      schemas.ActionResult,
-      s,
-    ),
 };

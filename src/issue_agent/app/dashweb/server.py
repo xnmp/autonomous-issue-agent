@@ -12,7 +12,7 @@ a `warnings` entry, because a dashboard that 500s during an incident is a
 dashboard that is not there during incidents. The only non-200s are 404 (a
 deployment or issue that does not exist) and 400 (a refused label change).
 
-The only writes are the three label changes (promote, park, unblock).
+The only writes are two label changes (promote, unblock).
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def create_app(
     harness_root: str | None = None,
     offload_backend: bool | None = None,
 ):
-    from fastapi import FastAPI, Header, HTTPException, Query
+    from fastapi import FastAPI, HTTPException, Query
     from fastapi.encoders import jsonable_encoder
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -199,60 +199,30 @@ def create_app(
             raise HTTPException(404, f"issue #{number} is unknown to '{name}'")
         return detail
 
+    async def label_write(verb: str, call, name: str, number: int) -> JSONResponse:
+        """Every write is a label change that reads GitHub first, so it has
+        collector failure modes: each is a refused action (4xx), never a 500."""
+        if number < 1:
+            raise HTTPException(400, "issue number must be positive")
+        try:
+            ok, detail = await invoke(call, name, number)
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"{verb} unavailable ({type(exc).__name__}: {exc})"
+        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
+
     @app.post(
         "/api/repos/{name}/issues/{number}/promote",
         response_model=contracts.ActionResult,
     )
     async def api_promote(name: str, number: int):
-        if number < 1:
-            raise HTTPException(400, "issue number must be positive")
-        ok, detail = await invoke(backend.promote, name, number)
-        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
+        return await label_write("promote", backend.promote, name, number)
 
     @app.post(
         "/api/repos/{name}/issues/{number}/unblock",
         response_model=contracts.ActionResult,
     )
-    async def api_unblock(
-        name: str,
-        number: int,
-        body: contracts.UnblockRequest | None = None,
-        user_agent: str = Header(default="", include_in_schema=False),
-    ):
-        if number < 1:
-            raise HTTPException(400, "issue number must be positive")
-        # Which hand pulled the lever (browser or bare API caller): a courtesy
-        # stamp `move_hold` takes, not authentication.
-        channel = "ui" if user_agent.startswith("Mozilla") else "api"
-        # It reads GitHub before it writes, so it has collector failure
-        # modes: report them as a refused action, never as a 500.
-        try:
-            ok, detail = await invoke(
-                backend.unblock, name, number, channel
-            )
-        except Exception as exc:  # noqa: BLE001
-            ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"
-        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
-
-    @app.post(
-        "/api/repos/{name}/issues/{number}/park",
-        response_model=contracts.ActionResult,
-    )
-    async def api_park(
-        name: str,
-        number: int,
-        user_agent: str = Header(default="", include_in_schema=False),
-    ):
-        if number < 1:
-            raise HTTPException(400, "issue number must be positive")
-        channel = "ui" if user_agent.startswith("Mozilla") else "api"
-        # Same collector failure modes as unblock: read before write, so a
-        # broken GitHub read is a refusal the operator can act on, not a 500.
-        try:
-            ok, detail = await invoke(backend.park, name, number, channel)
-        except Exception as exc:  # noqa: BLE001
-            ok, detail = False, f"park unavailable ({type(exc).__name__}: {exc})"
-        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
+    async def api_unblock(name: str, number: int):
+        return await label_write("unblock", backend.unblock, name, number)
 
     @app.get("/{full_path:path}")
     async def spa(full_path: str):

@@ -1165,6 +1165,17 @@
             "title": "Steps",
             "type": "array"
           },
+          "store_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Store Error"
+          },
           "title": {
             "anyOf": [
               {
@@ -1284,7 +1295,8 @@
               "changes_requested",
               "asked",
               "failed",
-              "done"
+              "done",
+              "carried"
             ],
             "title": "Outcome",
             "type": "string"
@@ -1490,6 +1502,17 @@
             ],
             "title": "Observed At"
           },
+          "store_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Store Error"
+          },
           "warnings": {
             "items": {
               "type": "string"
@@ -1597,6 +1620,11 @@
               }
             ],
             "title": "Merged Prs"
+          },
+          "merged_prs_partial": {
+            "default": false,
+            "title": "Merged Prs Partial",
+            "type": "boolean"
           },
           "needs_human": {
             "anyOf": [
@@ -1712,6 +1740,17 @@
             },
             "title": "Spend Per Hour",
             "type": "array"
+          },
+          "store_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Store Error"
           },
           "warnings": {
             "items": {
@@ -2183,13 +2222,6 @@
         "title": "TrackChip",
         "type": "object"
       },
-      "UnblockRequest": {
-        "additionalProperties": false,
-        "description": "Unblock is a label move; it accepts no body fields.",
-        "properties": {},
-        "title": "UnblockRequest",
-        "type": "object"
-      },
       "UsagePayload": {
         "additionalProperties": true,
         "properties": {
@@ -2503,54 +2535,6 @@
         "summary": "Api Issue"
       }
     },
-    "/api/repos/{name}/issues/{number}/park": {
-      "post": {
-        "operationId": "api_park_api_repos__name__issues__number__park_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ActionResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Park"
-      }
-    },
     "/api/repos/{name}/issues/{number}/promote": {
       "post": {
         "operationId": "api_promote_api_repos__name__issues__number__promote_post",
@@ -2622,23 +2606,6 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/UnblockRequest"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Body"
-              }
-            }
-          }
-        },
         "responses": {
           "200": {
             "content": {

@@ -2,19 +2,21 @@
 
 Per deployment it reads the launch configuration the daemons loaded, the
 observation the roles read (`GitHubGateway.build_world`) plus the two GitHub
-lists that observation leaves out, and the control store's `legs` and
-`leases` read-only. It derives every item with `domain.state.derive` over the
-same local facts the roles build (`app.tick.Facts`), so the board shows what
-the daemons will do, not a reconstruction.
+lists that observation leaves out, and the control store through one
+read-only connection per request (`ReadOnlyControlStore`). It derives every
+item with `domain.state.derive` over the local facts each role builds
+(`app.tick.Facts`, with that role's leg price), so the board shows what the
+daemons will do, not a reconstruction. An unreadable store derives nothing:
+the board says the store is unavailable rather than guess.
 
 The only writes are label changes through `operator_effects` (refactor
-decision Q19): promote adds `ai-ready`, park adds `needs-human`, unblock
-removes it.
+decision Q19): promote adds `ai-ready`, unblock removes `needs-human`.
 """
 
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -25,15 +27,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.control_path import control_store_path
-from ...adapters.control_store import SQLiteControlStore
+from ...adapters.control_store import ControlStoreError, ReadOnlyControlStore
 from ...adapters.dashweb import ghdata, system, usage, verification
-from ...adapters.dashweb.legs import LegsUnavailable, read_legs
+from ...adapters.dashweb.legs import read_legs
 from ...adapters.github import GitHubGateway
 from ...adapters.operator_effects import GitHubOperatorEffects, build_operator_effects
 from ...domain import dashboard as dash
+from ...domain.backoff import LegEnd
 from ...domain.labels import Label
-from ...domain.refs import harness_branch_issue
-from ...domain.state import Harness, Local, derive
+from ...domain.state import DerivedState, Harness, ItemKey, derive
 from ...domain.world import WorldState
 from .. import config
 from ..config import HarnessConfig
@@ -43,7 +45,6 @@ from .ports import GitHubQueries
 
 HARNESS_ROOT = str(Path(__file__).resolve().parents[4])
 OBSERVE_TTL_S = 20.0
-LEGS_TTL_S = 3.0
 CONFIG_TTL_S = 60.0
 
 
@@ -61,6 +62,24 @@ def daemon_control_path(cfg: HarnessConfig) -> str:
                               authority_root=cfg.control_authority_root)
 
 
+def _role_facts(cfg: HarnessConfig, store: ReadOnlyControlStore, leg_usd: float,
+                now: Callable[[], datetime]) -> Facts:
+    """The local facts one role builds, priced at its leg (`roles` wiring).
+    Nothing is in flight in this process; leases come from the store."""
+    # The roles' headroom and lifetime-cap helpers are private to roles.py on
+    # this base; slice 9 makes them public as `tick.headroom(cfg, control,
+    # leg_usd)` and `tick.lifetime_capped(cfg, control)`, which replace this.
+    from ..roles import _control_spend_gate, _headroom, _lifetime_capped
+
+    return Facts(store, cfg.repo, active=tuple, headroom=_headroom(_control_spend_gate(cfg, store, leg_usd)),
+                 lifetime_capped=_lifetime_capped(cfg, store), log=_unlogged, now=now)
+
+
+def _unlogged(_message: str) -> None:
+    """`Facts` logs an unreadable lifetime spend; the board already shows its
+    effect (paid legs wait on headroom), and the daemons log it themselves."""
+
+
 @dataclass(frozen=True)
 class Deployment:
     name: str
@@ -68,15 +87,33 @@ class Deployment:
     harness: Harness | None
     control_path: str
     problem: str = ""
+    store_problem: str = ""  # the control path could not be resolved
+
+
+@dataclass(frozen=True)
+class StoreRead:
+    """One request's read of the control store: the repository's legs and,
+    when there is a world to derive over, each item's state as its role sees
+    it. `problem` set means nothing was read."""
+
+    legs: tuple[dash.LegRow, ...] = ()
+    states: Mapping[ItemKey, DerivedState] | None = None
+    item_legs: Mapping[ItemKey, tuple[LegEnd, ...]] = field(default_factory=dict)
+    problem: str = ""
 
 
 @dataclass(frozen=True)
 class Observation:
+    """`failed` is a GitHub read that failed; truncation notices are only
+    warnings (`merged_partial` marks the merged-PR list's)."""
+
     world: WorldState | None
     issues: object
     merged: object
     observed_at: datetime
     warnings: tuple[str, ...] = ()
+    failed: bool = False
+    merged_partial: bool = False
 
 
 @dataclass
@@ -104,12 +141,7 @@ class _Observations:
         now = self.clock()
         with self._lock:
             entry = self._entries.setdefault(key, _Entry())
-            if entry.future is not None and entry.future.done():
-                try:
-                    entry.value = entry.future.result()
-                except Exception as exc:  # noqa: BLE001 - a failed read degrades
-                    entry.value = Observation(None, None, None, _utcnow(), (f"GitHub unavailable ({_detail(exc)})",))
-                entry.refreshed_at, entry.future = now, None
+            self._harvest(entry, now)
             due = entry.stale or entry.value is None or now - entry.refreshed_at >= self.ttl_s
             if entry.future is None and due:
                 entry.future, entry.stale = self.executor.submit(load), False
@@ -118,7 +150,21 @@ class _Observations:
     def cached(self, key: str) -> Observation | None:
         with self._lock:
             entry = self._entries.get(key)
-            return entry.value if entry else None
+            if entry is None:
+                return None
+            self._harvest(entry, self.clock())
+            return entry.value
+
+    @staticmethod
+    def _harvest(entry: _Entry, now: float) -> None:
+        if entry.future is None or not entry.future.done():
+            return
+        try:
+            entry.value = entry.future.result()
+        except Exception as exc:  # noqa: BLE001 - a failed read degrades
+            entry.value = Observation(None, None, None, _utcnow(), (f"GitHub unavailable ({_detail(exc)})",),
+                                      failed=True)
+        entry.refreshed_at, entry.future = now, None
 
     def invalidate(self, key: str) -> None:
         with self._lock:
@@ -154,7 +200,6 @@ class Backend:
         self._observations = _Observations(ttl_s=observe_ttl_s, **(
             {"executor": observe_executor} if observe_executor is not None else {}))
         self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
-        self._legs = ghdata.TtlCache(ttl_s=LEGS_TTL_S)
         self._self_repo = system.remote_repo(self.harness_root)
 
     # ── configuration ──
@@ -180,74 +225,75 @@ class Backend:
             harness: Harness | None = Harness(fix_bot=cfg.fix_runtime.bot, review_bot=cfg.review_runtime.bot)
         except ValueError as exc:
             harness, problem = None, problem or f"harness identity incomplete: {exc}"
-        return Deployment(name, cfg, harness, self.control_path(cfg), problem)
+        try:
+            path, store_problem = self.control_path(cfg), ""
+        except Exception as exc:  # noqa: BLE001 - shown as "store unavailable"; GitHub and writes still work
+            path, store_problem = "", f"control store path unresolved ({_detail(exc)})"
+        return Deployment(name, cfg, harness, path, problem, store_problem)
 
     # ── reads ──
-    def legs(self, dep: Deployment) -> tuple[tuple[dash.LegRow, ...], list[str]]:
+    def store(self, dep: Deployment, world: WorldState | None = None) -> StoreRead:
+        """One read-only connection: the legs, and with a world each item's
+        derived state. Any failure is "store unavailable", never a guess."""
+        if dep.store_problem:
+            return StoreRead(problem=dep.store_problem)
         try:
-            return self._legs.get_or_load((dep.control_path, dep.cfg.repo),
-                                          lambda: read_legs(dep.control_path, dep.cfg.repo)), []
-        except LegsUnavailable as exc:
-            return (), [str(exc)]
+            with ReadOnlyControlStore(dep.control_path) as store:
+                legs = read_legs(store, dep.cfg.repo)
+                if world is None or dep.harness is None:
+                    return StoreRead(legs)
+                fix = _role_facts(dep.cfg, store, dep.cfg.fix_runtime.budget_usd, self.now_fn)(world)
+                review = _role_facts(dep.cfg, store, dep.cfg.review_runtime.budget_usd, self.now_fn)(world)
+                states = dash.role_states(derive(world, fix, dep.harness), derive(world, review, dep.harness))
+                return StoreRead(legs, states, fix.legs)
+        except (ControlStoreError, sqlite3.Error, OSError) as exc:
+            return StoreRead(problem=f"control store unavailable: {_detail(exc)}")
+
+    def legs(self, dep: Deployment) -> tuple[tuple[dash.LegRow, ...], list[str]]:
+        read = self.store(dep)
+        return read.legs, [read.problem] if read.problem else []
 
     def _observe(self, dep: Deployment) -> Observation:
         warnings: list[str] = []
         world: WorldState | None
+        failed = False
         try:
             world = self.gateway_factory(dep.cfg.repo).build_world(dep.cfg.base_branch)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 - shown as a warning, retried next TTL
-            world = None
+            world, failed = None, True
             warnings.append(f"GitHub observation failed ({_detail(exc)})")
         issues, issues_error = self.gh.issues(dep.cfg.repo)
         merged, merged_error = self.gh.merged_prs(dep.cfg.repo)
-        warnings += [m for m in (issues_error, merged_error) if m]
+        errors = [m for m in (issues_error, merged_error) if m]
+        warnings += errors
         if isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
             warnings.append(f"issue history limited to {ghdata.ISSUE_HISTORY_LIMIT} records")
-        if isinstance(merged, list) and len(merged) >= ghdata.MERGED_PR_LIMIT:
+        partial = isinstance(merged, list) and len(merged) >= ghdata.MERGED_PR_LIMIT
+        if partial:
             warnings.append(f"merged PRs limited to the newest {ghdata.MERGED_PR_LIMIT}; totals undercount")
-        return Observation(world, issues, merged, self.now_fn(), tuple(warnings))
+        return Observation(world, issues, merged, self.now_fn(), tuple(warnings), failed or bool(errors), partial)
 
     def observation(self, dep: Deployment) -> Observation | None:
         if dep.problem:
             return None
         return self._observations.get(dep.name, lambda: self._observe(dep))
 
-    def _facts(self, dep: Deployment, warnings: list[str]) -> Callable[[WorldState], Local]:
-        """The roles' own local facts (`tick.Facts`) over the shared store,
-        with the fix role's headroom and lifetime-cap arithmetic. The store
-        is opened without `initialize()`: the dashboard never creates or cuts
-        over the authority."""
-        # Private to roles.py; reported to slice 9 as the seam to make public.
-        from ..roles import _control_spend_gate, _headroom, _lifetime_capped
-
-        control = SQLiteControlStore(dep.control_path)
-        return Facts(
-            control, dep.cfg.repo, active=tuple,
-            headroom=_headroom(_control_spend_gate(dep.cfg, control, dep.cfg.fix_budget_usd)),
-            lifetime_capped=_lifetime_capped(dep.cfg, control), log=warnings.append, now=self.now_fn,
-        )
-
-    def _items(self, dep: Deployment, obs: Observation | None, legs, warnings: list[str]) -> tuple[views.Item, ...] | None:
-        if obs is None or obs.world is None or dep.harness is None:
+    def _items(self, dep: Deployment, obs: Observation | None, read: StoreRead) -> tuple[views.Item, ...] | None:
+        if obs is None or obs.world is None or dep.harness is None or read.states is None:
             return None
-        try:
-            local = self._facts(dep, warnings)(obs.world)
-        except Exception as exc:  # noqa: BLE001 - derive without local facts, loudly
-            warnings.append(f"control store unreadable; running legs and caps are not shown ({_detail(exc)})")
-            local = Local(now=self.now_fn())
-        return views.items(obs.world, derive(obs.world, local, dep.harness), legs, dep.harness)
+        return views.items(obs.world, read.states, read.legs, dep.harness, read.item_legs)
 
     def _read(self, name: str, wait: bool = False):
-        """The deployment, its legs and its observation. `wait` reads GitHub
-        now (the one-shot renders); polls take the cached observation."""
+        """The deployment, its observation and one store read. `wait` reads
+        GitHub now (the one-shot renders); polls take the cached observation."""
         dep = self.deployment(name)
         warnings = [dep.problem] if dep.problem else []
-        legs, legs_warnings = self.legs(dep)
         obs = self._observe(dep) if wait and not dep.problem else self.observation(dep)
-        warnings += legs_warnings + list(obs.warnings if obs else ())
+        read = self.store(dep, obs.world if obs else None)
+        warnings += list(obs.warnings if obs else ())
         if obs is None and not dep.problem:
             warnings.append("reading GitHub…")
-        return dep, legs, obs, warnings
+        return dep, obs, read, warnings
 
     # ── endpoints ──
     def repos(self) -> dict:
@@ -260,16 +306,15 @@ class Backend:
             except Exception as exc:  # noqa: BLE001 - one bad overlay must not hide the rest
                 warnings.append(f"{name}: configuration unreadable ({_detail(exc)})")
                 continue
-            legs, _ = self.legs(dep)
-            stamps = [leg.at for leg in legs]
             obs = self._observations.cached(name)
+            read = self.store(dep, obs.world if obs else None)
+            stamps = [leg.at for leg in read.legs]
             merged = views.merged_harness_prs(obs.merged) if obs else ()
             beats = system.role_heartbeats({"fix": dep.cfg.state_dir, "review": dep.cfg.review_state_dir})
             roles = [self._role(role, beats.get(role), live.get(name, set()), scan_ok, now) for role in dash.ROLE_NAMES]
-            open_items = None
-            if obs is not None and obs.world is not None:
-                open_items = len({i.number for i in obs.world.issues if i.state == "open" and i.has(Label.AI_READY)} | {
-                    n for p in obs.world.prs if p.state == "OPEN" and (n := harness_branch_issue(p.head_ref_name))})
+            # The board's own rows, so the sidebar and the board agree.
+            open_items = (len(views.board_rows(obs.world, read.states))
+                          if obs is not None and obs.world is not None and read.states is not None else None)
             out.append({
                 "name": name,
                 "repo": dep.cfg.repo or None,
@@ -309,8 +354,9 @@ class Backend:
         return verification.verification_payload(verification.default_path(self.harness_root))
 
     def issues(self, name: str, wait: bool = False) -> dict:
-        dep, legs, obs, warnings = self._read(name, wait)
-        found = self._items(dep, obs, legs, warnings)
+        dep, obs, read, warnings = self._read(name, wait)
+        legs = read.legs
+        found = self._items(dep, obs, read)
         gh_issues = ghdata.index_by_number(obs.issues) if obs else {}
         merged = views.merged_harness_prs(obs.merged) if obs else ()
         active = {item.issue for item in found or ()}
@@ -319,16 +365,18 @@ class Backend:
             "in_flight": [views.issue_card(item, dep.cfg.repo, gh_issues.get(item.issue)) for item in found or ()],
             "done": views.done_cards(merged, legs, dep.cfg.repo, gh_issues),
             "backlog": views.backlog_cards(gh_issues, active, now) if obs and obs.issues is not None else [],
-            "gh_ok": obs is not None and not obs.warnings and found is not None,
+            "gh_ok": obs is None or not obs.failed,
             "observed_at": obs.observed_at.isoformat() if obs else None,
             "notifications": [asdict(n) for n in dash.notifications(
                 legs, ((item.issue, item.status) for item in found or () if isinstance(item.status, dash.NeedsYou)))],
             "warnings": warnings,
+            "store_error": read.problem or None,
         }
 
     def issue(self, name: str, number: int) -> dict | None:
-        dep, legs, obs, warnings = self._read(name)
-        found = self._items(dep, obs, legs, warnings)
+        dep, obs, read, warnings = self._read(name)
+        legs = read.legs
+        found = self._items(dep, obs, read)
         item = next((i for i in found or () if i.issue == number), None)
         merged = views.merged_harness_prs(obs.merged) if obs else ()
         gh_issue = ghdata.index_by_number(obs.issues).get(number) if obs else None
@@ -337,11 +385,13 @@ class Backend:
             return None
         detail = views.issue_detail(number, dep.cfg.repo, item, legs, merged, gh_issue)
         detail["warnings"] = warnings
+        detail["store_error"] = read.problem or None
         return detail
 
     def overview(self, name: str, timezone_name: str | None = None) -> dict:
-        dep, legs, obs, warnings = self._read(name)
-        found = self._items(dep, obs, legs, warnings)
+        dep, obs, read, warnings = self._read(name)
+        legs = read.legs
+        found = self._items(dep, obs, read)
         live, scan_ok = self.proc_scan()
         now = self.now_fn()
         beats = system.role_heartbeats({"fix": dep.cfg.state_dir, "review": dep.cfg.review_state_dir})
@@ -353,6 +403,7 @@ class Backend:
             legs, merged_prs=len({x.pr for x in merged}) if obs and obs.merged is not None else None,
             open_items=len(found) if found is not None else None,
             needs_human=len(needs) if found is not None else None, today_start=today,
+            merged_prs_partial=bool(obs and obs.merged_partial),
         )
         cfg = dep.cfg
         return {
@@ -369,21 +420,23 @@ class Backend:
             "health_trend": views.health_trend(obs.issues, _local_timezone(timezone_name)) if obs else [],
             "spend_per_hour": [asdict(b) for b in dash.spend_per_hour(legs, now)],
             "warnings": warnings,
+            "store_error": read.problem or None,
         }
 
     # ── label writes ──
     def promote(self, name: str, number: int) -> tuple[bool, str]:
-        return self._write(name, lambda effects: effects.set_issue_labels(number, add=("ai-ready",)))
+        """Add `ai-ready` to an open issue the last observation listed (the
+        backlog the operator promoted from); a PR or a closed issue is refused."""
+        obs = self._observations.cached(name) if self.known(name) else None
+        row = ghdata.index_by_number(obs.issues).get(number) if obs is not None else None
+        if self.known(name) and (row is None or not ghdata.is_open(row)):
+            return False, f"#{number} is not an open issue in the last GitHub read"
+        return self._write(name, lambda effects: effects.set_issue_labels(number, add=(Label.AI_READY.value,)))
 
-    def park(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]:
-        """Hand an issue to a human: `needs-human` on the issue and its open
-        harness PRs. Derive waits on the label until it is removed or a human
-        replies to a stop."""
-        return self._write(name, lambda effects: effects.move_hold(number, park=True, channel=channel))
-
-    def unblock(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]:
-        """Remove `needs-human` from the issue and its open harness PRs."""
-        return self._write(name, lambda effects: effects.move_hold(number, park=False, channel=channel))
+    def unblock(self, name: str, number: int) -> tuple[bool, str]:
+        """Remove `needs-human` from the issue and its open harness PRs
+        (`move_hold` reads both fresh and refuses a closed issue)."""
+        return self._write(name, lambda effects: effects.move_hold(number, park=False, channel="dashboard"))
 
     def _write(self, name: str, apply: Callable[[GitHubOperatorEffects], tuple[bool, str]]) -> tuple[bool, str]:
         if not self.known(name):

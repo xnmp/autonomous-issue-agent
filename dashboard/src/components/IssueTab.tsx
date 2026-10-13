@@ -8,7 +8,7 @@ import { GROUP_META, plainHarnessMessage, railNodes } from "../features/issues/b
 import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
 import { JsonBlock } from "./ui/Json";
-import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, SkeletonRows, StoreUnavailable, WarningList } from "./ui/Feedback";
 import { UnblockControl } from "./UnblockControl";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import { CiRunningBadge, StepBadge, StepStatusChip } from "./ui/StepBadge";
@@ -145,6 +145,7 @@ export function IssueTab({
       {detail.error ? (
         <ErrorBanner message={detail.error} onRetry={detail.refresh} stale={!!d} />
       ) : null}
+      <StoreUnavailable detail={d?.store_error} />
       <WarningList warnings={d?.warnings} />
       {detail.loading ? <SkeletonRows what={`issue #${issue}`} rows={6} /> : null}
 

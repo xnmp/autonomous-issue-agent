@@ -1,4 +1,4 @@
-"""The dashboard's read-only `legs` reader."""
+"""The dashboard's `legs` reader, over the store's read-only view."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import sqlite3
 
 import pytest
 
-from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.dashweb.legs import LegsUnavailable, read_legs
+from issue_agent.adapters.control_store import ControlStoreError, ReadOnlyControlStore, SQLiteControlStore
+from issue_agent.adapters.dashweb import legs as legs_module
 
 _INSERT = ("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
            "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
@@ -22,6 +22,11 @@ def store(tmp_path):
     path = tmp_path / "control.db"
     SQLiteControlStore(str(path)).initialize()
     return path
+
+
+def read_legs(path, repository=None):
+    with ReadOnlyControlStore(str(path)) as store:
+        return legs_module.read_legs(store, repository)
 
 
 def _add(path, leg_id, repository="o/r", reserved="2026-10-13T08:00:00.000Z", usage=None, result=None):
@@ -71,12 +76,20 @@ def test_an_unparseable_reservation_stamp_skips_only_that_row(store):
 
 def test_a_missing_or_foreign_store_is_unavailable_not_created(tmp_path):
     missing = tmp_path / "absent.db"
-    with pytest.raises(LegsUnavailable):
-        read_legs(str(missing), "o/r")
+    with pytest.raises(ControlStoreError):
+        read_legs(missing, "o/r")
     assert not missing.exists()
     foreign = tmp_path / "foreign.db"
     sqlite3.connect(foreign).close()
-    with pytest.raises(LegsUnavailable):
-        read_legs(str(foreign), "o/r")
-    with pytest.raises(LegsUnavailable):
-        read_legs("", "o/r")
+    with pytest.raises(ControlStoreError, match="schema 0"):
+        read_legs(foreign, "o/r")
+
+
+def test_the_read_only_view_refuses_every_write_path(store):
+    with ReadOnlyControlStore(str(store)) as view:
+        with pytest.raises(ControlStoreError):
+            view.initialize()
+        with pytest.raises(ControlStoreError):
+            view.lease("o/r", "fix", 1, "o/r:fix")
+        with pytest.raises(sqlite3.OperationalError):
+            view.query("DELETE FROM legs")

@@ -29,8 +29,8 @@ from .actions import AgentKind
 from .checks import Observed
 from .ci import Clear, Failed, Waiting as CiWaiting, parse_timestamp, reduce_ci
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason, Wait,
-    WaitReason, stop_tag,
+    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason,
+    Wait, WaitReason, stop_tag,
 )
 from .world import Comment, PRView
 
@@ -105,6 +105,19 @@ class LegRow:
         return self.state != "released"
 
     @property
+    def carried(self) -> bool:
+        """Copied from the legacy store at the cutover: money history only.
+        Derive never counts it (the store's `leg_runs` reads only fix and
+        review legs; attempts restart at the cutover), so neither do the
+        rail, the history chips, the failure counts or the toasts."""
+        return self.role not in ROLE_NAMES
+
+    @property
+    def derived(self) -> bool:
+        """A leg derive counts: it ran or may still run, and is not carried."""
+        return self.counted and not self.carried
+
+    @property
     def cost_usd(self) -> float:
         """What the leg costs now: its charge once settled, its reserved
         maximum while it may still spend, nothing once released."""
@@ -118,7 +131,9 @@ class LegRow:
 
     @property
     def outcome(self) -> str:
-        """running | passed | changes_requested | asked | failed | done."""
+        """running | passed | changes_requested | asked | failed | done | carried."""
+        if self.carried:
+            return "carried"
         if self.running:
             return "running"
         if self.verdict == "APPROVE":
@@ -274,13 +289,13 @@ def board_status(
     comments: Iterable[Comment],
     pr: PRView | None,
     legs: tuple[LegRow, ...],
+    last_end: datetime | None,
     harness: Harness,
 ) -> BoardStatus:
     """One item's board status from its derived state. `legs` are the item's
     issue's legs, oldest first; `comments` are the item's own (where its stop
-    comment is posted)."""
-    ended = [leg.ended_at for leg in legs if leg.ended_at is not None and not leg.running]
-    last_end = max(ended, default=None)
+    comment is posted); `last_end` is the newest end among the legs derive
+    keyed to this item (its episode boundary, `state._decide`)."""
     running = next((leg for leg in reversed(legs) if leg.running), None)
     if isinstance(state, NeedsHuman):
         # About to be stopped this tick: policy adds the label and the comment.
@@ -341,14 +356,28 @@ def _wait_status(reason: WaitReason, pr: PRView | None, last_end: datetime | Non
     return Waiting("github", "Reading GitHub", detail, since)
 
 
-def primary_action(status: BoardStatus) -> str | None:
-    """The one action a row offers: unblock a stop the label removal can
-    release; a question or a spent lifetime budget is answered elsewhere."""
+def primary_action(status: BoardStatus, *, held: bool) -> str | None:
+    """The one action a row offers: unblock a `needs-human` label whose
+    removal releases the item; a question or a spent lifetime budget is
+    answered elsewhere. A stop derive decided but policy has not written yet
+    carries no label to remove, so it offers to open the item instead."""
     if not isinstance(status, NeedsYou):
         return None
-    if status.reason in (StopReason.QUESTION.value, StopReason.LIFETIME_CAP.value):
+    if status.reason in (StopReason.QUESTION.value, StopReason.LIFETIME_CAP.value) or not held:
         return "open"
     return "unblock"
+
+
+def role_states(
+    fix: Mapping[ItemKey, DerivedState], review: Mapping[ItemKey, DerivedState],
+) -> dict[ItemKey, DerivedState]:
+    """One map from the two roles' derives (`tick.decide_with`), which differ
+    only in each role's leg-price headroom: a REVIEW dispatch is the review
+    role's to make or to wait on, every other act the fix role's."""
+    def reviews(state: DerivedState | None) -> bool:
+        return isinstance(state, Dispatch) and state.act is AgentKind.REVIEW
+
+    return {key: review[key] if reviews(state) or reviews(review.get(key)) else state for key, state in fix.items()}
 
 
 def ci_display(pr: PRView | None) -> str | None:
@@ -393,7 +422,7 @@ class StageVisit:
 
 def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRow, ...]) -> Stage:
     running = next((leg for leg in reversed(legs) if leg.running), None)
-    last = next((stage for leg in reversed(legs) if leg.counted and (stage := stage_of_kind(leg.kind))), None)
+    last = next((stage for leg in reversed(legs) if leg.derived and (stage := stage_of_kind(leg.kind))), None)
     fallback = last or (Stage.CI if has_pr else Stage.RESOLVE)
     if isinstance(state, (Dispatch, Backoff)):
         return _STAGE_OF_KIND[state.act.name]
@@ -420,7 +449,7 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
 
 
 def rail(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRow, ...], done: bool = False) -> Rail:
-    counted = [leg for leg in legs if leg.counted]
+    counted = [leg for leg in legs if leg.derived]
     current = Stage.MERGE if done else current_stage(state, has_pr=has_pr, legs=legs)
     reached = [stage for leg in counted if (stage := stage_of_kind(leg.kind))] + [current]
     furthest = max(reached, key=STAGE_ORDER.index)
@@ -441,7 +470,7 @@ def history(legs: tuple[LegRow, ...]) -> tuple[StageVisit, ...]:
     visits: list[tuple[Stage, list[TrackChip]]] = []
     for leg in legs:
         stage = stage_of_kind(leg.kind)
-        if stage is None or not leg.counted:
+        if stage is None or not leg.derived:
             continue
         if not visits or visits[-1][0] is not stage:
             visits.append((stage, []))
@@ -475,6 +504,7 @@ class Metrics:
     can answer. None means unknown (GitHub unread), never zero."""
 
     merged_prs: int | None
+    merged_prs_partial: bool  # GitHub listed only the newest merged PRs: the count and per-PR cost are bounds
     open_items: int | None
     needs_human: int | None
     total_cost_usd: float
@@ -501,6 +531,7 @@ def metrics(
     open_items: int | None,
     needs_human: int | None,
     today_start: datetime,
+    merged_prs_partial: bool = False,
 ) -> Metrics:
     rows = [leg for leg in legs if leg.counted]
     total = sum(leg.cost_usd for leg in rows)
@@ -518,6 +549,7 @@ def metrics(
     changes = len(verdicts) - approvals
     return Metrics(
         merged_prs=merged_prs,
+        merged_prs_partial=merged_prs_partial,
         open_items=open_items,
         needs_human=needs_human,
         total_cost_usd=_usd(total),
@@ -529,7 +561,7 @@ def metrics(
         first_pass_rate=approvals / len(verdicts) if verdicts else None,
         rounds_per_pr=sum(len(seen) for seen in verdicts.values()) / len(verdicts) if verdicts else None,
         legs=len(rows),
-        machine_legs=sum(1 for leg in rows if leg.outcome == "failed"),
+        machine_legs=sum(1 for leg in rows if leg.derived and leg.outcome == "failed"),
         today_usd=_usd(sum(leg.cost_usd for leg in rows if leg.at >= today_start)),
     )
 
@@ -537,7 +569,7 @@ def metrics(
 def metrics_line(m: Metrics) -> str:
     """One status line of the primary metrics."""
     per_pr = f"${m.cost_per_merged_pr_usd:.2f}/merged PR" if m.cost_per_merged_pr_usd is not None else "no merged PRs"
-    merged = "?" if m.merged_prs is None else str(m.merged_prs)
+    merged = "?" if m.merged_prs is None else f"{'≥' if m.merged_prs_partial else ''}{m.merged_prs}"
     return (f"spend ${m.total_cost_usd:.2f} over {m.legs} legs ({m.machine_legs} machine) · "
             f"merged {merged} · {per_pr} · today ${m.today_usd:.2f}")
 
@@ -611,7 +643,7 @@ def notifications(
     client toasts each once."""
     out: list[Notification] = []
     for leg in legs:
-        if not leg.counted or leg.issue is None:
+        if not leg.derived or leg.issue is None:
             continue
         pr = leg.number if leg.kind != AgentKind.RESOLVE.name and leg.number > 0 else None
         word = _ACT_WORDS.get(leg.kind, leg.kind)

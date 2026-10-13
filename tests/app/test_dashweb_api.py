@@ -114,14 +114,9 @@ class StubBackend:
         self._maybe("promote")
         return (True, "ok")
 
-    def unblock(self, name, number, channel="api"):
+    def unblock(self, name, number):
         self._maybe("unblock")
-        self.unblock_channel = channel
-        return (True, "ok")
-
-    def park(self, name, number, channel="api"):
-        self._maybe("park")
-        self.park_channel = channel
+        self.unblocked = number
         return (True, "ok")
 
 
@@ -249,55 +244,21 @@ def test_unblock_reports_success():
     }
 
 
-def test_park_and_unblock_report_success_and_stamp_the_channel():
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    assert c.post("/api/repos/demo/issues/9/park",
-                  headers={"User-Agent": "Mozilla/5.0"}).json() == {
-        "ok": True, "detail": "ok"
-    }
-    assert backend.park_channel == "ui"
-    assert c.post("/api/repos/demo/issues/9/unblock",
-                  headers={"User-Agent": "curl/8.5"}).json() == {
-        "ok": True, "detail": "ok"
-    }
-    assert backend.unblock_channel == "api"
-
-
 def test_the_removed_operator_command_routes_are_gone():
     c = TestClient(server.create_app(backend=StubBackend()), headers=WRITE_HEADERS, base_url=BASE_URL)
-    for path in ("/api/repos/demo/issues/9/unpark", "/api/repos/demo/issues/9/resolve-control/commands"):
+    for path in ("/api/repos/demo/issues/9/unpark", "/api/repos/demo/issues/9/park",
+                 "/api/repos/demo/issues/9/resolve-control/commands"):
         assert c.post(path).status_code in (404, 405)
     for path in ("/api/repos/demo/issues/9/resolve-control", "/api/repos/demo/workflow-families"):
         assert c.get(path).status_code == 404
 
 
-def test_a_park_whose_collectors_fail_is_refused_not_a_500():
-    backend = StubBackend(explode="park")
+@pytest.mark.parametrize("verb", ["promote", "unblock"])
+def test_a_write_whose_collectors_fail_is_refused_not_a_500(verb):
+    """Both read before they write: a failure is a readable refusal."""
+    backend = StubBackend(explode=verb)
     c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    response = c.post("/api/repos/demo/issues/9/park")
-    assert response.status_code == 400
-    assert response.json()["ok"] is False
-    assert "collector blew up" in response.json()["detail"]
-
-
-def test_unblock_stamps_the_channel_from_the_user_agent():
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    c.post("/api/repos/demo/issues/9/unblock",
-           headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
-    assert backend.unblock_channel == "ui"
-    c.post("/api/repos/demo/issues/9/unblock", headers={"User-Agent": "curl/8.5"})
-    assert backend.unblock_channel == "api"
-    c.post("/api/repos/demo/issues/9/unblock", headers={"User-Agent": ""})
-    assert backend.unblock_channel == "api"
-
-
-def test_an_unblock_whose_collectors_fail_is_refused_not_a_500():
-    """It reads GitHub before it writes: a failure is a readable refusal."""
-    backend = StubBackend(explode="unblock")
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    response = c.post("/api/repos/demo/issues/9/unblock")
+    response = c.post(f"/api/repos/demo/issues/9/{verb}")
     assert response.status_code == 400
     assert response.json()["ok"] is False
     assert "collector blew up" in response.json()["detail"]
@@ -305,37 +266,6 @@ def test_an_unblock_whose_collectors_fail_is_refused_not_a_500():
 
 def test_unblock_rejects_a_non_positive_issue_number():
     assert client().post("/api/repos/demo/issues/0/unblock").status_code == 400
-
-
-@pytest.mark.parametrize("body", [None, {}])
-def test_legacy_unblock_accepts_an_empty_body(body):
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    response = c.post("/api/repos/demo/issues/9/unblock", **({"json": body} if body is not None else {}))
-    assert response.status_code == 200
-    assert backend.unblock_channel == "api"
-
-
-@pytest.mark.parametrize("body", [
-    {"guidance": None}, {"guidance": ""}, {"guidance": "new scope"}, {"guidance": {"unexpected": True}},
-    {"guidance": "x" * 10000}, {"note": "new scope"},
-])
-def test_legacy_unblock_rejects_retired_review_guidance_before_mutation(body):
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    response = c.post("/api/repos/demo/issues/9/unblock", json=body)
-    assert response.status_code == 422
-    assert not hasattr(backend, "unblock_channel")
-
-
-def test_legacy_unblock_refuses_unencodable_fields_with_a_renderable_response():
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    response = c.post("/api/repos/demo/issues/9/unblock", content=rb'{"guidance": "\ud800"}',
-                      headers={"Content-Type": "application/json"})
-    assert response.status_code == 422
-    assert not hasattr(backend, "unblock_channel")
-    response.json()
 
 
 # ── static ────────────────────────────────────────────────────────────────────

@@ -53,6 +53,7 @@ import {
   GhUnavailableChip,
   SkeletonRows,
   SectionTitle,
+  StoreUnavailable,
   WarningList,
 } from "./ui/Feedback";
 import { IssuesBoard } from "./IssuesBoard";
@@ -221,6 +222,7 @@ export function IssuesTab({
       {issues.error ? (
         <ErrorBanner message={issues.error} onRetry={issues.refresh} stale={!!data} />
       ) : null}
+      <StoreUnavailable detail={data?.store_error} />
       <WarningList warnings={data?.warnings} />
       {sourceCount > 10 ? (
         <TableFilter

@@ -184,6 +184,7 @@ const IssuesPayload = z
     in_flight: z.array(IssueCard),
     notifications: z.array(ToastNotification).optional().default([]),
     observed_at: z.union([z.string(), z.null()]).optional(),
+    store_error: z.union([z.string(), z.null()]).optional(),
     warnings: z.array(z.string()),
   })
   .passthrough();
@@ -236,6 +237,7 @@ const IssueStep = z
       "asked",
       "failed",
       "done",
+      "carried",
     ]),
     pr: z.union([z.number(), z.null()]),
     pricing_basis: z.union([z.string(), z.null()]),
@@ -274,6 +276,7 @@ const IssueDetailPayload = z
     pull_requests: z.array(PullRequestLink),
     rail: z.union([StageRail, z.null()]).optional(),
     steps: z.array(IssueStep),
+    store_error: z.union([z.string(), z.null()]).optional(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
     warnings: z.array(z.string()),
@@ -282,11 +285,6 @@ const IssueDetailPayload = z
 const ActionResult = z
   .object({ detail: z.string(), ok: z.boolean() })
   .passthrough();
-const UnblockRequest = z.object({}).partial();
-const api_unblock_api_repos__name__issues__number__unblock_post_Body = z.union([
-  UnblockRequest,
-  z.null(),
-]);
 const timezone = z.union([z.string(), z.null()]).optional();
 const Caps = z
   .object({
@@ -321,6 +319,7 @@ const Metrics = z
     legs: z.number().int(),
     machine_legs: z.number().int(),
     merged_prs: z.union([z.number(), z.null()]),
+    merged_prs_partial: z.boolean().optional().default(false),
     needs_human: z.union([z.number(), z.null()]),
     open_items: z.union([z.number(), z.null()]),
     rounds_per_pr: z.union([z.number(), z.null()]),
@@ -355,6 +354,7 @@ const OverviewPayload = z
     metrics: z.union([Metrics, z.null()]),
     needs_attention: z.array(AttentionItem).optional().default([]),
     spend_per_hour: z.array(SpendBucket).optional().default([]),
+    store_error: z.union([z.string(), z.null()]).optional(),
     warnings: z.array(z.string()),
   })
   .passthrough();
@@ -439,8 +439,6 @@ export const schemas = {
   IssueStep,
   IssueDetailPayload,
   ActionResult,
-  UnblockRequest,
-  api_unblock_api_repos__name__issues__number__unblock_post_Body,
   timezone,
   Caps,
   HealthTrendDay,
@@ -510,6 +508,7 @@ const endpoints = makeApi([
         in_flight: z.array(IssueCard),
         notifications: z.array(ToastNotification).optional().default([]),
         observed_at: z.union([z.string(), z.null()]).optional(),
+        store_error: z.union([z.string(), z.null()]).optional(),
         warnings: z.array(z.string()),
       })
       .passthrough(),
@@ -561,37 +560,12 @@ const endpoints = makeApi([
         pull_requests: z.array(PullRequestLink),
         rail: z.union([StageRail, z.null()]).optional(),
         steps: z.array(IssueStep),
+        store_error: z.union([z.string(), z.null()]).optional(),
         title: z.union([z.string(), z.null()]),
         url: z.union([z.string(), z.null()]),
         warnings: z.array(z.string()),
       })
       .passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "post",
-    path: "/api/repos/:name/issues/:number/park",
-    alias: "api_park_api_repos__name__issues__number__park_post",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-    ],
-    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
     errors: [
       {
         status: 422,
@@ -632,11 +606,6 @@ const endpoints = makeApi([
     alias: "api_unblock_api_repos__name__issues__number__unblock_post",
     requestFormat: "json",
     parameters: [
-      {
-        name: "body",
-        type: "Body",
-        schema: api_unblock_api_repos__name__issues__number__unblock_post_Body,
-      },
       {
         name: "name",
         type: "Path",
@@ -682,6 +651,7 @@ const endpoints = makeApi([
         metrics: z.union([Metrics, z.null()]),
         needs_attention: z.array(AttentionItem).optional().default([]),
         spend_per_hour: z.array(SpendBucket).optional().default([]),
+        store_error: z.union([z.string(), z.null()]).optional(),
         warnings: z.array(z.string()),
       })
       .passthrough(),

@@ -13,6 +13,7 @@ from datetime import datetime, timezone, tzinfo
 
 from ...domain import dashboard as dash
 from ...domain.actions import Target
+from ...domain.backoff import LegEnd
 from ...domain.ci import parse_timestamp
 from ...domain.labels import Label
 from ...domain.refs import harness_branch_issue
@@ -54,16 +55,13 @@ class Item:
         return Label.NEEDS_HUMAN in labels
 
 
-def items(
-    world: WorldState, states: Mapping[ItemKey, DerivedState], legs: Iterable[dash.LegRow], harness: Harness,
-) -> tuple[Item, ...]:
-    """Derived items grouped by issue. An open PR shadows its issue in
-    derive; with two open harness PRs for one issue the newest is the row."""
-    issues = {i.number: i for i in world.issues}
+def board_rows(world: WorldState, keys: Iterable[ItemKey]) -> dict[int, tuple[ItemKey, PRView | None]]:
+    """Derive's items grouped by issue: the board's rows, and every count of
+    them. An open PR shadows its issue in derive; with two open harness PRs
+    for one issue the newest is the row."""
     prs = {p.number: p for p in world.prs if p.state == "OPEN"}
-    rows = tuple(legs)
     chosen: dict[int, tuple[ItemKey, PRView | None]] = {}
-    for key in sorted(states, key=lambda k: k.sort_key):
+    for key in sorted(keys, key=lambda k: k.sort_key):
         pr = prs.get(key.number) if key.target is Target.PR else None
         issue = harness_branch_issue(pr.head_ref_name) if pr is not None else key.number
         if issue is None:
@@ -71,13 +69,25 @@ def items(
         current = chosen.get(issue)
         if current is None or current[1] is None or (pr is not None and pr.number > current[1].number):
             chosen[issue] = (key, pr)
+    return dict(sorted(chosen.items()))
+
+
+def items(
+    world: WorldState, states: Mapping[ItemKey, DerivedState], legs: Iterable[dash.LegRow], harness: Harness,
+    item_legs: Mapping[ItemKey, tuple[LegEnd, ...]],
+) -> tuple[Item, ...]:
+    """One `Item` per board row. `item_legs` are the legs derive keyed to
+    each item (`Local.legs`), whose newest end bounds the item's episode."""
+    issues = {i.number: i for i in world.issues}
+    rows = tuple(legs)
     out = []
-    for issue, (key, pr) in sorted(chosen.items()):
+    for issue, (key, pr) in board_rows(world, states).items():
         own = dash.issue_legs(rows, issue)
         view = issues.get(issue)
         comments = pr.comments if pr is not None else (view.comments if view else ())
+        last_end = max((leg.ended_at for leg in item_legs.get(key, ())), default=None)
         status = dash.board_status(states[key], target="pr" if pr is not None else "issue", comments=comments,
-                                   pr=pr, legs=own, harness=harness)
+                                   pr=pr, legs=own, last_end=last_end, harness=harness)
         out.append(Item(issue, key, states[key], view, pr, status, own))
     return tuple(out)
 
@@ -114,7 +124,7 @@ def issue_card(item: Item, repo: str, gh_issue: Mapping | None) -> dict:
         "pr_url": pr_url(repo, item.pr.number) if item.pr else None,
         "pr_ci_state": dash.ci_display(item.pr),
         "board": asdict(item.status),
-        "action": dash.primary_action(item.status),
+        "action": dash.primary_action(item.status, held=item.held),
         "rail": asdict(dash.rail(item.state, has_pr=item.pr is not None, legs=item.legs)),
         "history": [asdict(visit) for visit in dash.history(item.legs)],
         "cost_usd": cost,
@@ -255,7 +265,7 @@ def issue_detail(
         "url": issue_url(repo, number),
         "labels": _labels(item, gh_issue) if item else (labels_of(dict(gh_issue)) if gh_issue else []),
         "board": asdict(item.status) if item else None,
-        "action": dash.primary_action(item.status) if item else None,
+        "action": dash.primary_action(item.status, held=item.held) if item else None,
         "done": done,
         "held_for_human": item.held if item else False,
         "pull_requests": pulls,

@@ -30,6 +30,15 @@ export function ErrorBanner({
   );
 }
 
+/**
+ * The control store could not be read, so the server derived no board: the
+ * daemons' view of each item (legs, leases, caps) is unknown, not guessed.
+ */
+export function StoreUnavailable({ detail }: { detail: string | null | undefined }) {
+  if (!detail) return null;
+  return <ErrorBanner message={`Board unavailable — ${detail}`} />;
+}
+
 /** Backend `warnings[]` — degraded collectors, not failures. */
 export function WarningList({ warnings }: { warnings: string[] | undefined }) {
   if (!warnings || warnings.length === 0) return null;
@@ -94,7 +103,7 @@ export function SkeletonRows({
 
 export function GhUnavailableChip() {
   return (
-    <Chip tone="fail" title="gh reads failed — journal-derived data only (titles, PR state and backlog may be missing)">
+    <Chip tone="fail" title="A GitHub read failed — the board, titles, PR state and backlog may be missing or stale">
       GitHub data unavailable
     </Chip>
   );

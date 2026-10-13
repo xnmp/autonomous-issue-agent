@@ -194,11 +194,15 @@ export interface WaitCell {
 /**
  * The fourth column. Needs you and Waiting count how long the row has waited
  * on the operator or its blocker; Working says how long ago something last
- * happened. A row whose wait has not started reads `queued`.
+ * happened. A row with no start says what it is instead: a working row is
+ * queued, a needs-you row (a park, say, which has no stop comment to date it)
+ * waits on you.
  */
+const UNDATED: Record<BoardStatus["status"], string> = { working: "queued", needs_you: "needs you", waiting: "—" };
+
 export function waitCell(board: BoardStatus, nowMs: number): WaitCell {
   const since = parseTs(board.since_ts);
-  if (since === null || !Number.isFinite(nowMs)) return { text: "queued", stale: false, title: null };
+  if (since === null || !Number.isFinite(nowMs)) return { text: UNDATED[board.status], stale: false, title: null };
   const seconds = Math.max(0, (nowMs - since) / 1000);
   const text = waitCompact(seconds);
   if (board.status === "working") {

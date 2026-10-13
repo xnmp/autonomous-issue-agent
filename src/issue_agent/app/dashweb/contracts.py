@@ -112,6 +112,9 @@ class BasisCost(Contract):
 class Metrics(Contract):
     # None when GitHub was not read: unknown, not zero.
     merged_prs: int | None
+    # GitHub listed only the newest merged PRs: merged_prs is a lower bound
+    # and cost_per_merged_pr_usd an upper one.
+    merged_prs_partial: bool = False
     open_items: int | None
     needs_human: int | None
     total_cost_usd: float
@@ -164,6 +167,8 @@ class OverviewPayload(Warned):
     needs_attention: list[AttentionItem] = []
     health_trend: list[HealthTrendDay] = []
     spend_per_hour: list[SpendBucket] = []
+    # Why the control store could not be read; no board is derived then.
+    store_error: str | None = None
 
 
 class BoardNeedsYou(Contract):
@@ -305,6 +310,8 @@ class IssuesPayload(Warned):
     # while the first one is still being read.
     observed_at: str | None = None
     notifications: list[ToastNotification] = []
+    # Why the control store could not be read; no board is derived then.
+    store_error: str | None = None
 
 
 class TokenUsage(Contract):
@@ -323,7 +330,8 @@ class IssueStep(Contract):
     role: str | None
     runtime: str | None
     state: Literal["reserved", "running", "ended", "released"]
-    outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done"]
+    # carried: copied from the legacy store at the cutover; money history only.
+    outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done", "carried"]
     started_ts: str | None
     ended_ts: str | None
     duration_s: float | None
@@ -366,14 +374,11 @@ class IssueDetailPayload(Warned):
     rail: StageRail | None = None
     history: list[StageVisit] = []
     steps: list[IssueStep]
+    # Why the control store could not be read; no board is derived then.
+    store_error: str | None = None
 
 
 class ActionResult(Contract):
     ok: bool
     detail: str
 
-
-class UnblockRequest(BaseModel):
-    """Unblock is a label move; it accepts no body fields."""
-
-    model_config = ConfigDict(extra="forbid")

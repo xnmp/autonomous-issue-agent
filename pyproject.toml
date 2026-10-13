@@ -143,15 +143,18 @@ forbidden_modules = ["fastapi", "uvicorn"]
 
 # The dashboard is a separate, read-only consumer of the core
 # (docs/open/2026-10-12-minimal-harness-design.md): the core never imports it.
-# The ignored edges are the CLI's and the journal's existing imports, kept
-# until the core drops them (reported by slice 8b; nothing may add another).
+# Sources are each layer's children, not the layers: import-linter skips a
+# source that contains a forbidden module, so `issue_agent.app` would let
+# `app.fix -> app.dashweb` through. The ignored edges are the CLI's and the
+# journal's existing imports, kept until the core drops them (reported by
+# slice 8b; nothing may add another).
 [[tool.importlinter.contracts]]
 name = "The core does not import the dashboard"
 type = "forbidden"
 source_modules = [
-    "issue_agent.domain",
-    "issue_agent.adapters",
-    "issue_agent.app",
+    "issue_agent.domain.*",
+    "issue_agent.adapters.*",
+    "issue_agent.app.*",
 ]
 forbidden_modules = [
     "issue_agent.domain.dashboard",

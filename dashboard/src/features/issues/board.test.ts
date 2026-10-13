@@ -109,11 +109,14 @@ describe("waitCell", () => {
     expect(waitCell({ ...working, since_ts: "2026-10-12T11:48:00Z" }, NOW)).toMatchObject({ text: "12m ago", stale: false });
   });
 
-  it("reads a row with no usable wait start as queued, and a future start as no wait", () => {
-    expect(waitCell(waiting, NOW).text).toBe("queued");
-    expect(waitCell(needs("garbage"), NOW).text).toBe("queued");
+  it("says what an undated row is instead of a wait, and reads a future start as no wait", () => {
+    expect(waitCell({ ...working, since_ts: null }, NOW).text).toBe("queued");
+    expect(waitCell(waiting, NOW).text).toBe("—");
+    // A park has no stop comment to date it: it waits on you, it is not queued.
+    expect(waitCell(needs(null), NOW).text).toBe("needs you");
+    expect(waitCell(needs("garbage"), NOW).text).toBe("needs you");
     expect(waitCell(needs("2026-10-13T12:00:00Z"), NOW).text).toBe("<1m");
-    expect(waitCell(needs("2026-10-12T11:00:00Z"), Number.NaN).text).toBe("queued");
+    expect(waitCell(needs("2026-10-12T11:00:00Z"), Number.NaN).text).toBe("needs you");
   });
 
   it("formats huge waits without switching unit", () => {

@@ -32,11 +32,11 @@ def stop(reason: StopReason, minutes: float, author: str = "fixbot", text: str =
 
 def leg(kind: str = "RESOLVE", minutes: float = 0, *, ended: float | None = None, state: str = "ended",
         cls: str = "agent", cost: float | None = 1.0, verdict: str = "", number: int = 0, issue: int = 7,
-        basis: str = "provider_reported", leg_id: str | None = None) -> dash.LegRow:
+        basis: str = "provider_reported", leg_id: str | None = None, role: str | None = None) -> dash.LegRow:
     running = state in ("reserved", "running")
     ended = minutes + 1 if ended is None else ended
     return dash.LegRow(
-        leg_id=leg_id or f"{kind}-{minutes}", role="review" if kind == "REVIEW" else "fix", kind=kind,
+        leg_id=leg_id or f"{kind}-{minutes}", role=role or ("review" if kind == "REVIEW" else "fix"), kind=kind,
         issue=issue, number=number, head="h1", runtime="claude", state=state, reserved_at=at(minutes),
         started_at=at(minutes) if state != "reserved" else None,
         ended_at=None if running else at(ended), reserved_usd=10.0,
@@ -45,8 +45,12 @@ def leg(kind: str = "RESOLVE", minutes: float = 0, *, ended: float | None = None
     )
 
 
-def status(state, *, comments=(), pr=None, legs=(), target="issue"):
-    return dash.board_status(state, target=target, comments=comments, pr=pr, legs=tuple(legs), harness=HARNESS)
+def status(state, *, comments=(), pr=None, legs=(), target="issue", last_end=None):
+    """`last_end` is derive's item boundary; by default the newest end of `legs`."""
+    if last_end is None:
+        last_end = max((x.ended_at for x in legs if x.ended_at is not None), default=None)
+    return dash.board_status(state, target=target, comments=comments, pr=pr, legs=tuple(legs), last_end=last_end,
+                             harness=HARNESS)
 
 
 # ── needs you ────────────────────────────────────────────────────────────────
@@ -62,32 +66,41 @@ def test_a_question_stop_is_needs_you_with_the_question_and_answered_on_github()
     assert HARNESS.marker not in (board.detail or "") and "needs-human:" not in (board.detail or "")
     assert board.since_ts == stamp(5)
     # Unblocking would release it unanswered: the row points at the reply instead.
-    assert dash.primary_action(board) == "open"
+    assert dash.primary_action(board, held=True) == "open"
 
 
 @pytest.mark.parametrize("reason", [StopReason.ATTEMPTS, StopReason.REVIEW_ROUNDS, StopReason.WORKFLOW_PATH])
 def test_a_labelled_stop_names_its_reason_and_offers_unblock(reason):
     board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(reason, 5)], legs=[leg(ended=2)], target="pr")
     assert isinstance(board, dash.NeedsYou)
-    assert (board.reason, board.target, dash.primary_action(board)) == (reason.value, "pr", "unblock")
+    assert (board.reason, board.target, dash.primary_action(board, held=True)) == (reason.value, "pr", "unblock")
 
 
 def test_a_spent_lifetime_budget_is_raised_elsewhere_not_unblocked():
     board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(StopReason.LIFETIME_CAP, 5)])
-    assert board.reason == "lifetime-cap" and dash.primary_action(board) == "open"
+    assert board.reason == "lifetime-cap" and dash.primary_action(board, held=True) == "open"
 
 
 def test_a_label_without_a_stop_comment_reads_as_parked():
     board = status(Wait(WaitReason.NEEDS_HUMAN), legs=[leg(ended=2)])
     assert isinstance(board, dash.NeedsYou)
     assert board.reason == "labelled" and board.since_ts is None
-    assert dash.primary_action(board) == "unblock"
+    assert dash.primary_action(board, held=True) == "unblock"
 
 
 def test_a_stop_older_than_the_last_leg_belongs_to_a_released_episode():
     # Stopped at 5, released, a leg ended at 9, then parked again.
     board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(StopReason.ATTEMPTS, 5)], legs=[leg(ended=9)])
     assert board.reason == "labelled"
+
+
+def test_the_episode_boundary_is_derives_item_legs_not_every_leg_of_the_issue():
+    # A carried pre-cutover leg (or another item's leg) ended after the stop;
+    # derive keyed no leg to this item after it, so the stop is this episode's.
+    issue_legs = [leg(ended=2), leg(ended=9, role="carried")]
+    board = status(Wait(WaitReason.NEEDS_HUMAN), comments=[stop(StopReason.ATTEMPTS, 5)], legs=issue_legs,
+                   last_end=at(2))
+    assert board.reason == "attempts" and board.since_ts == stamp(5)
 
 
 @pytest.mark.parametrize("comment", [
@@ -113,7 +126,10 @@ def test_a_stop_about_to_be_posted_is_already_needs_you():
     board = status(NeedsHuman(StopReason.QUESTION, "-", question="Proceed?"), legs=[leg(ended=3)])
     assert (board.reason, board.detail, board.since_ts) == ("question", "Proceed?", stamp(3))
     attempts = status(NeedsHuman(StopReason.ATTEMPTS, "-", AgentKind.FIX_CI))
-    assert attempts.reason == "attempts" and dash.primary_action(attempts) == "unblock"
+    assert attempts.reason == "attempts" and dash.primary_action(attempts, held=True) == "unblock"
+    # Policy has not labelled it yet: removing a label that is not there
+    # would do nothing, so the row offers to open the item instead.
+    assert dash.primary_action(attempts, held=False) == "open"
 
 
 # ── working and waiting ──────────────────────────────────────────────────────
@@ -123,7 +139,7 @@ def test_a_busy_item_names_its_running_leg():
     board = status(Busy(), legs=[leg(ended=1), leg("REVIEW", 4, state="running")])
     assert isinstance(board, dash.Working)
     assert (board.activity, board.act, board.since_ts) == ("agent", "REVIEW", stamp(4))
-    assert dash.primary_action(board) is None
+    assert dash.primary_action(board, held=True) is None
 
 
 @pytest.mark.parametrize("state,activity", [
@@ -147,6 +163,20 @@ def test_waits_name_what_they_wait_on():
     assert status(Wait(WaitReason.CI_UNKNOWN)).on == "github"
     backoff = status(Backoff(AgentKind.RESOLVE, at(30)))
     assert isinstance(backoff, dash.Waiting) and (backoff.on, backoff.until_ts) == ("backoff", stamp(30))
+
+
+def test_a_review_dispatch_is_the_review_roles_and_waits_on_its_own_headroom():
+    from issue_agent.domain.state import issue_key, pr_key
+
+    review, resolve, merge = pr_key(9), issue_key(4), pr_key(8)
+    fix = {review: Dispatch(AgentKind.REVIEW, "h"), resolve: Wait(WaitReason.HEADROOM), merge: Merge("h")}
+    # The review leg is dearer: the cap fits a fix leg but not a review leg.
+    rev = {review: Wait(WaitReason.HEADROOM), resolve: Dispatch(AgentKind.RESOLVE), merge: Merge("h")}
+    assert dash.role_states(fix, rev) == {review: Wait(WaitReason.HEADROOM), resolve: Wait(WaitReason.HEADROOM),
+                                          merge: Merge("h")}
+    # And the other way round: only the review role has room.
+    assert dash.role_states(rev, fix)[review] == Dispatch(AgentKind.REVIEW, "h")
+    assert dash.role_states({}, rev) == {}
 
 
 # ── rail and history ─────────────────────────────────────────────────────────
@@ -176,6 +206,20 @@ def test_history_folds_identical_consecutive_legs_per_stage_visit():
         ("review", [("REVIEW", "passed", 1)]),
         ("ci", [("FIX_CI", "running", 1)]),
     ]
+
+
+def test_carried_legs_are_money_history_not_attempts_failures_or_toasts():
+    carried = (leg("RESOLVE", 0, cls="", role="carried", leg_id="C1"),
+               leg("REVIEW", 1, cls="", role="carried", number=9, leg_id="C2"))
+    live = (leg("RESOLVE", 5, leg_id="L1"),)
+    legs = carried + live
+    assert [x.outcome for x in carried] == ["carried", "carried"]
+    rail = dash.rail(Dispatch(AgentKind.RESOLVE), has_pr=False, legs=legs)
+    assert (rail.resolve_attempts, rail.review_rounds, rail.steps, rail.furthest) == (1, 0, 1, "resolve")
+    assert [[c.outcome for c in v.steps] for v in dash.history(legs)] == [["done"]]
+    m = dash.metrics(legs, merged_prs=None, open_items=None, needs_human=None, today_start=T0)
+    assert (m.machine_legs, m.total_cost_usd) == (0, 3.0)
+    assert [n.id for n in dash.notifications(legs, [])] == ["leg:L1:start", "leg:L1:end"]
 
 
 # ── legs ─────────────────────────────────────────────────────────────────────
@@ -214,6 +258,13 @@ def test_metrics_report_unknown_rather_than_zero():
     assert m.cost_per_merged_pr_usd is None and m.first_pass_rate is None and m.rounds_per_pr is None
     assert dash.metrics([leg()], merged_prs=0, open_items=0, needs_human=0, today_start=T0).cost_per_merged_pr_usd is None
     assert "merged ?" in dash.metrics_line(m) and "no merged PRs" in dash.metrics_line(m)
+
+
+def test_a_truncated_merged_list_marks_the_merge_metrics_as_bounds():
+    m = dash.metrics([leg(cost=4.0)], merged_prs=2, open_items=0, needs_human=0, today_start=T0,
+                     merged_prs_partial=True)
+    assert m.merged_prs_partial and "merged ≥2" in dash.metrics_line(m)
+    assert not dash.metrics([], merged_prs=2, open_items=0, needs_human=0, today_start=T0).merged_prs_partial
 
 
 def test_hourly_spend_keeps_empty_hours_and_drops_stamps_outside_the_window():

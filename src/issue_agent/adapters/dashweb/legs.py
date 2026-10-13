@@ -1,19 +1,16 @@
-"""Read-only reads of the control store's `legs` table for the dashboard.
+"""The dashboard's read of the control store's `legs` table.
 
-The connection is opened `mode=ro` with `query_only`, so the dashboard can
-never create, migrate or write the authority the daemons own; a missing or
-unreadable store is reported, not repaired.
+Rows come through `ReadOnlyControlStore` (`mode=ro`, `query_only`), so the
+dashboard can never create, migrate or write the authority the daemons own.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
-from ..control_store import DEFAULT_BUSY_TIMEOUT_MS
+from ..control_store import ReadOnlyControlStore
 from ...domain.dashboard import LegRow, Tokens
 from ...domain.repository import canonical_repository
 
@@ -23,29 +20,10 @@ _COLUMNS = (
 )
 
 
-class LegsUnavailable(RuntimeError):
-    pass
-
-
-def read_legs(path: str, repository: str | None = None) -> tuple[LegRow, ...]:
-    """Every leg of `repository` (every repository when None), oldest first.
-    Raises `LegsUnavailable` when the store cannot be read."""
-    if not path or not os.path.isfile(path):
-        raise LegsUnavailable(f"control store does not exist: {path or '(unset)'}")
-    try:
-        db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
-                             timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000)
-    except sqlite3.Error as exc:
-        raise LegsUnavailable(f"control store could not be opened read-only: {exc}") from exc
-    try:
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA query_only=ON")
-        where, args = ("WHERE repository=?", (canonical_repository(repository),)) if repository else ("", ())
-        rows = db.execute(f"SELECT {_COLUMNS} FROM legs {where} ORDER BY reserved_at, rowid", args).fetchall()
-    except sqlite3.Error as exc:
-        raise LegsUnavailable(f"legs could not be read: {exc}") from exc
-    finally:
-        db.close()
+def read_legs(store: ReadOnlyControlStore, repository: str | None = None) -> tuple[LegRow, ...]:
+    """Every leg of `repository` (every repository when None), oldest first."""
+    where, args = ("WHERE repository=?", (canonical_repository(repository),)) if repository else ("", ())
+    rows = store.query(f"SELECT {_COLUMNS} FROM legs {where} ORDER BY reserved_at, rowid", args)
     return tuple(leg for row in rows if (leg := parse_leg(row)) is not None)
 
 

@@ -150,16 +150,8 @@ class FixtureBackend:
     def promote(self, _name: str, _number: int) -> tuple[bool, str]:
         return True, "promoted"
 
-    def unblock(
-        self, _name: str, _number: int, _channel: str = "api"
-    ) -> tuple[bool, str]:
+    def unblock(self, _name: str, _number: int) -> tuple[bool, str]:
         return True, "unblocked"
-
-    def park(
-        self, _name: str, _number: int, _channel: str = "api"
-    ) -> tuple[bool, str]:
-        return True, "parked"
-
 
 def fixture_app():
     """The real dashboard app over the fixture backend."""

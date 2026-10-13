@@ -8,7 +8,7 @@
  * cyan = links/models — holds everywhere by construction.
  */
 
-import type { IssueStep, KindCost, RoleHealth, TrackChip } from "../api/types";
+import type { IssueStep, KindCost, RoleHealth } from "../api/types";
 
 export type Tone =
   | "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral"
@@ -39,7 +39,7 @@ export function familyOf(kind: string): LegFamily {
 
 /* ---------------------------------------------------------- outcomes */
 
-export type Outcome = TrackChip["outcome"];
+export type Outcome = IssueStep["outcome"];
 
 export interface StatusMark {
   glyph: string;
@@ -51,7 +51,8 @@ export interface StatusMark {
  * The shared icon + colour vocabulary for a leg's outcome. A review that
  * requested changes did its job, but green would read as "converged": it is
  * yellow, the loop still going. An agent's question is the operator's to
- * answer, so it reads as an alarm.
+ * answer, so it reads as an alarm. A carried leg predates the store's
+ * cutover: money history, neither a success nor a failure.
  */
 const OUTCOME_MARKS: Record<Outcome, StatusMark> = {
   running: { glyph: "…", label: "running", tone: "running" },
@@ -60,6 +61,7 @@ const OUTCOME_MARKS: Record<Outcome, StatusMark> = {
   asked: { glyph: "?", label: "asked a question", tone: "fail" },
   failed: { glyph: "×", label: "failed", tone: "fail" },
   done: { glyph: "✓", label: "completed", tone: "ok" },
+  carried: { glyph: "·", label: "before the cutover", tone: "neutral" },
 };
 
 export function outcomeMark(outcome: Outcome): StatusMark {

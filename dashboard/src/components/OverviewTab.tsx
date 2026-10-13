@@ -17,7 +17,7 @@ import {
 import { ago, localHour, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Histogram, Meter, StatTile } from "./ui/Charts";
-import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, Loading, SkeletonRows, StoreUnavailable, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
 
@@ -64,14 +64,15 @@ export function OverviewTab({
       {ov.error ? (
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
+      <StoreUnavailable detail={ov.data?.store_error} />
       <WarningList warnings={ov.data?.warnings} />
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
       <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile
           label="Merged"
-          value={num(m?.merged_prs)}
-          sub={m?.merged_prs == null ? "GitHub not read yet" : "harness PRs"}
+          value={m?.merged_prs_partial ? `≥${num(m.merged_prs)}` : num(m?.merged_prs)}
+          sub={m?.merged_prs == null ? "GitHub not read yet" : m.merged_prs_partial ? "newest harness PRs only" : "harness PRs"}
           tone="ok"
           title="open done issues"
           onClick={() => onOpenIssues("done")}
@@ -87,8 +88,9 @@ export function OverviewTab({
         />
         <StatTile
           label="$ per merged PR"
-          value={usdCompact(m?.cost_per_merged_pr_usd)}
-          sub={m ? `${usd(m.total_cost_usd)} total` : null}
+          value={m?.merged_prs_partial && m.cost_per_merged_pr_usd != null
+            ? `≤${usdCompact(m.cost_per_merged_pr_usd)}` : usdCompact(m?.cost_per_merged_pr_usd)}
+          sub={m ? `${usd(m.total_cost_usd)} total${m.merged_prs_partial ? " · older merges not listed" : ""}` : null}
           tone="info"
           title="the primary efficiency number: total leg spend / merged harness PRs"
           primary

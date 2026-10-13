@@ -55,23 +55,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/repos/{name}/issues/{number}/park": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Park */
-        post: operations["api_park_api_repos__name__issues__number__park_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/repos/{name}/issues/{number}/promote": {
         parameters: {
             query?: never;
@@ -518,6 +501,8 @@ export interface components {
             rail?: components["schemas"]["StageRail"] | null;
             /** Steps */
             steps: components["schemas"]["IssueStep"][];
+            /** Store Error */
+            store_error?: string | null;
             /** Title */
             title: string | null;
             /** Url */
@@ -554,7 +539,7 @@ export interface components {
              * Outcome
              * @enum {string}
              */
-            outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done";
+            outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done" | "carried";
             /** Pr */
             pr: number | null;
             /** Pricing Basis */
@@ -601,6 +586,8 @@ export interface components {
             notifications: components["schemas"]["ToastNotification"][];
             /** Observed At */
             observed_at?: string | null;
+            /** Store Error */
+            store_error?: string | null;
             /** Warnings */
             warnings: string[];
         } & {
@@ -637,6 +624,11 @@ export interface components {
             machine_legs: number;
             /** Merged Prs */
             merged_prs: number | null;
+            /**
+             * Merged Prs Partial
+             * @default false
+             */
+            merged_prs_partial: boolean;
             /** Needs Human */
             needs_human: number | null;
             /** Open Items */
@@ -671,6 +663,8 @@ export interface components {
              * @default []
              */
             spend_per_hour: components["schemas"]["SpendBucket"][];
+            /** Store Error */
+            store_error?: string | null;
             /** Warnings */
             warnings: string[];
         } & {
@@ -834,11 +828,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /**
-         * UnblockRequest
-         * @description Unblock is a label move; it accepts no body fields.
-         */
-        UnblockRequest: Record<string, never>;
         /** UsagePayload */
         UsagePayload: {
             claude: components["schemas"]["ClaudeUsage"] | null;
@@ -982,38 +971,6 @@ export interface operations {
             };
         };
     };
-    api_park_api_repos__name__issues__number__park_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     api_promote_api_repos__name__issues__number__promote_post: {
         parameters: {
             query?: never;
@@ -1056,11 +1013,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["UnblockRequest"] | null;
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
