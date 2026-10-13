@@ -488,7 +488,10 @@ class Daemon:
         raises: a failed pass logs and yields []. GitHub being unavailable is
         an operating condition, not a bug: nothing is decided, one loud line,
         and the next poll is the retry (spaced by any Retry-After)."""
-        progress = scheduler_progress or (lambda: None)
+        def progress() -> None:
+            if scheduler_progress is not None:
+                scheduler_progress()
+
         progress()
         try:
             world = self.observe()
