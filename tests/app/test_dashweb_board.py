@@ -541,3 +541,16 @@ def test_a_malformed_lease_stamp_is_store_unavailable_not_a_server_error(deploym
 
     assert payload["repos"][0]["in_flight"] is None
     assert backend.overview("demo", "UTC")["store_error"].startswith("control store unavailable")
+
+
+def test_a_journal_line_appended_after_a_read_is_seen_on_the_next(deployment, tmp_path):
+    backend, *_ = deployment
+    journal = tmp_path / "state" / "fix" / "journal.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text("")
+    assert backend.issue("demo", 2)["steps"][0]["model"] is None
+
+    with journal.open("a") as stream:
+        stream.write(json.dumps({"event": "agent_run", "run_id": "L2", "model": "gpt-6.1-sol"}) + "\n")
+
+    assert backend.issue("demo", 2)["steps"][0]["model"] == "gpt-6.1-sol"

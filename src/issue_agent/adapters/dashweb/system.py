@@ -84,29 +84,48 @@ def role_beats(state_dirs: Mapping[str, str]) -> dict[str, Beat | None]:
 def leg_models(state_dirs: Mapping[str, str], tail_bytes: int = JOURNAL_TAIL_BYTES) -> dict[str, str]:
     """`legs.leg_id` -> model from each role journal's `agent_run` events
     (the legs table records the runtime, not the model). The table's leg id
-    is the journal's `run_id`; the journal's own `leg_id` is another id. A
-    torn or foreign line is skipped."""
+    is the journal's `run_id`; the journal's own `leg_id` is another id."""
     models: dict[str, str] = {}
     for role in ROLE_NAMES:
         directory = state_dirs.get(role)
-        if not directory:
+        if directory:
+            models.update(_journal_models(os.path.join(directory, "journal.jsonl"), tail_bytes))
+    return models
+
+
+# path -> ((size, mtime_ns, tail_bytes), models): an issue tab polls every 5s
+# and the journal tail is megabytes; re-read only when the file changed.
+_MODEL_CACHE: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
+
+
+def _journal_models(path: str, tail_bytes: int) -> dict[str, str]:
+    """One journal's run_id -> model. A torn or foreign line is skipped."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return {}
+    key = (stat.st_size, stat.st_mtime_ns, tail_bytes)
+    cached = _MODEL_CACHE.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        lines = tail_lines(path, tail_bytes)
+    except OSError:
+        return {}
+    models: dict[str, str] = {}
+    for line in lines:
+        if '"agent_run"' not in line:
             continue
         try:
-            lines = tail_lines(os.path.join(directory, "journal.jsonl"), tail_bytes)
-        except OSError:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
             continue
-        for line in lines:
-            if '"agent_run"' not in line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict) or event.get("event") != "agent_run":
-                continue
-            leg, model = event.get("run_id"), event.get("model")
-            if isinstance(leg, str) and leg and isinstance(model, str) and model:
-                models[leg] = model
+        if not isinstance(event, dict) or event.get("event") != "agent_run":
+            continue
+        leg, model = event.get("run_id"), event.get("model")
+        if isinstance(leg, str) and leg and isinstance(model, str) and model:
+            models[leg] = model
+    _MODEL_CACHE[path] = (key, models)
     return models
 
 
