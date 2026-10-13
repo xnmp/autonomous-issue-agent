@@ -350,7 +350,7 @@ class PoisonedJournal:
 
     path = "/dev/null/nope"
 
-    def emit(self, event, **fields):
+    def emit(self, event, fields=None):
         raise OSError("state dir went read-only")
 
 
@@ -525,23 +525,6 @@ def test_the_wrappers_own_attributes_win_over_the_inners(tmp_path):
 
 
 # ── Daemon: GhUnavailable is a countable event ────────────────────────────────
-def test_daemon_journals_a_skipped_tick_when_github_is_unavailable(tmp_path):
-    from issue_agent.adapters.github import GhUnavailable
-    from issue_agent.app.tick import Daemon
-
-    journal = Journal(str(tmp_path / "j.jsonl"))
-
-    def observe():
-        raise GhUnavailable("rate-limit", "API rate limit exceeded")
-
-    d = Daemon(name="fix", observe=observe, decide=lambda w: [],
-               executor=Executor(FakeGateway()), journal=journal)
-    assert d.tick() == []
-    ev = read_events(journal.path)[0]
-    assert ev["event"] == "gh_unavailable" and ev["kind"] == "rate-limit"
-    assert "rate limit" in ev["detail"]
-
-
 # ── CLI status summary ────────────────────────────────────────────────────────
 def test_status_summary_is_silent_with_no_spend():
     from issue_agent.app.cli import spend_status_lines

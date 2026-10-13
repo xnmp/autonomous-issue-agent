@@ -4,15 +4,14 @@ import json
 import threading
 
 from issue_agent.adapters.journal import Journal, read_events, read_events_tail
-from issue_agent.domain.events import Correlation, EscalationRaised, TelemetryEvent, TelemetryWarning
 
 
 def test_each_record_is_one_self_describing_json_line(tmp_path):
     path = tmp_path / "state" / "journal.jsonl"
     journal = Journal(str(path))
 
-    journal.emit(TelemetryEvent(EscalationRaised("pr", 7), Correlation(pr=7)))
-    journal.emit(TelemetryEvent(TelemetryWarning("pricing", "rate card missing"), Correlation()))
+    journal.emit("escalation", {"target": "pr", "number": 7})
+    journal.emit("telemetry_warning", {"warning": "rate card missing"})
 
     lines = [json.loads(line) for line in path.read_text().splitlines()]
     assert [line["event"] for line in lines] == ["escalation", "telemetry_warning"]
@@ -27,9 +26,9 @@ def test_an_unwritable_log_drops_the_line_without_raising(tmp_path, capsys):
     blocker.write_text("")
     journal = Journal(str(blocker / "journal.jsonl"))
 
-    journal.emit(TelemetryEvent(EscalationRaised("issue", 3), Correlation(issue=3)))
+    journal.emit("escalation", {"target": "issue", "number": 3})
 
-    assert "journal: dropped EscalationRaised" in capsys.readouterr().err
+    assert "journal: dropped escalation" in capsys.readouterr().err
 
 
 def test_concurrent_writers_never_interleave_a_line(tmp_path):
@@ -38,7 +37,7 @@ def test_concurrent_writers_never_interleave_a_line(tmp_path):
     huge = "x" * 200_000
 
     def write(index):
-        journal.emit(TelemetryEvent(TelemetryWarning("load", f"{index}:{huge}"), Correlation(issue=index + 1)))
+        journal.emit("telemetry_warning", {"warning": f"{index}:{huge}", "issue": index + 1})
 
     threads = [threading.Thread(target=write, args=(index,)) for index in range(16)]
     for thread in threads:
@@ -55,8 +54,8 @@ def test_a_record_with_embedded_newlines_is_still_exactly_one_line(tmp_path):
     body = "line one\nline two\r\n\nline four"
     journal = Journal(str(path))
 
-    journal.emit(TelemetryEvent(TelemetryWarning("w", body), Correlation()))
-    journal.emit(TelemetryEvent(EscalationRaised("pr", 7), Correlation(pr=7)))
+    journal.emit("telemetry_warning", {"code": "w", "warning": body})
+    journal.emit("escalation", {"target": "pr", "number": 7})
 
     raw = path.read_text()
     assert raw.count("\n") == 2
@@ -66,7 +65,7 @@ def test_a_record_with_embedded_newlines_is_still_exactly_one_line(tmp_path):
 def test_the_journal_is_private_to_the_operator(tmp_path):
     path = tmp_path / "state" / "journal.jsonl"
 
-    Journal(str(path)).emit(TelemetryEvent(EscalationRaised("pr", 7), Correlation(pr=7)))
+    Journal(str(path)).emit("escalation", {"target": "pr", "number": 7})
 
     assert (path.stat().st_mode & 0o777) == 0o600
     assert (path.parent.stat().st_mode & 0o777) == 0o700

@@ -9,22 +9,22 @@ Failure contracts are explicit:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Protocol
 
-from .events import TelemetryEvent
 from .contracts import RunId
 
 
 class EventSink(Protocol):
-    """Best-effort typed telemetry only; never a control-state reader.
+    """Best-effort telemetry only (one named record of flat fields); never a
+    control-state reader.
 
     Implementations contain write failures and may drop an event. The method
     has no success result because telemetry cannot authorize later behavior.
     """
 
-    def emit(self, event: TelemetryEvent) -> None: ...
+    def emit(self, event: str, fields: Mapping[str, object]) -> None: ...
 
 
 class ProcessSupervisor(Protocol):

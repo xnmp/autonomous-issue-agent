@@ -120,18 +120,6 @@ def test_deadly_ceiling_writes_repository_handover_and_journals_receipt(
     ):
         assert section in handover
 
-    receipts = [
-        event for event in read_events(journal.path)
-        if event["event"] == "handover_written"
-    ]
-    assert receipts == [
-        {
-            **receipts[0],
-            "event": "handover_written",
-            "trigger": trigger,
-            "bytes": len(handover.encode("utf-8")),
-        }
-    ]
     status = subprocess.run(
         ["git", "status", "--short"],
         cwd=repo,
@@ -176,10 +164,6 @@ def test_operator_cancellation_writes_state_handover_before_re_raising(
     settled = next(event for event in events if event["event"] == "agent_run")
     assert settled["status"] == "cancelled"
     assert settled["exit_reason"] == "operator_cancelled"
-    receipt = next(
-        event for event in events if event["event"] == "handover_written"
-    )
-    assert receipt["trigger"] == "operator_cancelled"
 
 
 def test_matching_handover_is_delivered_once_as_untrusted_context(tmp_path: Path) -> None:
@@ -350,9 +334,6 @@ def test_handover_io_failures_do_not_mask_the_original_result(
 
     assert actual is expected
     assert inner.tasks[0].rendered_prompt == original.rendered_prompt
-    assert not any(
-        event["event"] == "handover_written" for event in read_events(journal.path)
-    )
 
 
 def test_git_inspection_timeout_preserves_original_ceiling_result(
@@ -376,9 +357,6 @@ def test_git_inspection_timeout_preserves_original_ceiling_result(
 
     assert actual is expected
     assert not (repo / ".harness" / "handover.md").exists()
-    assert not any(
-        event["event"] == "handover_written" for event in read_events(journal.path)
-    )
 
 
 def test_git_inspection_nonzero_is_recorded_without_masking_the_result(
@@ -403,6 +381,3 @@ def test_git_inspection_nonzero_is_recorded_without_masking_the_result(
     written = (repo / ".harness" / "handover.md").read_text(encoding="utf-8")
     assert actual is expected
     assert "repository busy" in written
-    assert any(
-        event["event"] == "handover_written" for event in read_events(journal.path)
-    )

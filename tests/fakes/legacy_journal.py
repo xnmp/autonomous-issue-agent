@@ -8,8 +8,6 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from issue_agent.adapters.journal import record_fields
-from issue_agent.domain.events import TelemetryEvent
 
 
 def _stamp() -> str:
@@ -23,12 +21,10 @@ class Journal:
     path: str
     canonical: bool = False
 
-    def emit(self, event: str | TelemetryEvent, **fields: object) -> None:
+    def emit(self, event: str, fields: dict | None = None, **extra: object) -> None:
         try:
-            if isinstance(event, TelemetryEvent):
-                event, fields = record_fields(event)
             line = json.dumps(
-                {"ts": _stamp(), "event": event, **fields},
+                {"ts": _stamp(), "event": event, **(fields or {}), **extra},
                 default=str,
                 sort_keys=True,
             )

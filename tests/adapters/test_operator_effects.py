@@ -39,8 +39,8 @@ class Journal:
     def __init__(self):
         self.events = []
 
-    def emit(self, event):
-        self.events.append(event)
+    def emit(self, event, fields):
+        self.events.append((event, dict(fields)))
 
 
 def _effects(gateway, *, run=None, journal=None):
@@ -130,14 +130,14 @@ def test_an_applied_label_change_is_journalled_as_an_operator_action():
         action_kind="operator_unblock", action_attributes={"channel": "ui"},
     )
 
-    (event,) = journal.events
-    payload = event.payload
-    assert payload.kind == "operator_unblock"
-    assert payload.number == 9 and event.correlation.issue == 9
-    assert payload.attributes["add"] == ["ai-ready"]
-    assert payload.attributes["remove"] == ["needs-human"]
-    assert payload.attributes["operator"] == "o/r:dashboard"
-    assert payload.attributes["channel"] == "ui"
+    ((name, fields),) = journal.events
+    action = fields["action"]
+    assert name == "action" and action["type"] == "operator_unblock"
+    assert action["number"] == 9 and fields["issue"] == 9
+    assert action["add"] == ["ai-ready"]
+    assert action["remove"] == ["needs-human"]
+    assert action["operator"] == "o/r:dashboard"
+    assert action["channel"] == "ui"
 
 
 def test_a_label_change_that_changed_nothing_is_not_journalled():

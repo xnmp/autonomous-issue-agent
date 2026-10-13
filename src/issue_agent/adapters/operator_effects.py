@@ -12,14 +12,12 @@ from __future__ import annotations
 
 import json
 import subprocess
-import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .act import relabel
 from .github import GitHubGateway
-from ..domain.events import ActionApplied, Correlation, TelemetryEvent
 from ..domain.labels import Label
 from ..domain.ports import EventSink
 from ..domain.refs import harness_branch_issue
@@ -196,18 +194,16 @@ class GitHubOperatorEffects:
             return
         try:
             changes = " ".join([*(f"+{label}" for label in added), *(f"-{label}" for label in removed)])
-            self.journal.emit(TelemetryEvent(
-                ActionApplied(
-                    uuid.uuid4().hex,
-                    action_kind,
-                    kind,
-                    f"{action_kind.replace('_', ' ')} {kind} #{number}: {changes}",
-                    number,
-                    {"add": list(added), "remove": list(removed), "operator": self.identity,
-                     **dict(attributes or {})},
-                ),
-                Correlation(issue=number) if kind == "issue" else Correlation(pr=number),
-            ))
+            action = {"add": list(added), "remove": list(removed), "operator": self.identity,
+                      **dict(attributes or {})}
+            action.setdefault("type", action_kind)
+            action.setdefault("target", kind.upper())
+            action.setdefault("number", number)
+            self.journal.emit("action", {
+                ("issue" if kind == "issue" else "pr"): number,
+                "desc": f"{action_kind.replace('_', ' ')} {kind} #{number}: {changes}",
+                "action": action,
+            })
         except Exception:  # noqa: BLE001 - telemetry never fails the write
             pass
 

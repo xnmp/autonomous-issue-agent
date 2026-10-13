@@ -92,7 +92,7 @@ def test_target_agents_and_claude_files_are_low_authority_task_data(
     asyncio.run(runtime.run(RuntimePlan("authoritative task", cwd=str(worktree))))
 
     assert inner.task is not None
-    prompt = inner.task.prompt
+    prompt = inner.task.rendered_prompt
     assert prompt.startswith("authoritative task")
     assert prompt.count("<untrusted_repository_guidance_json>") == 1
     assert attack not in prompt
@@ -121,7 +121,7 @@ def test_target_agents_shares_the_repository_instruction_byte_limit(
     runtime = CodexHomeRuntime(inner, lambda _cwd: config)
     asyncio.run(runtime.run(RuntimePlan("task", cwd=str(worktree))))
     assert inner.task is not None
-    prompt = inner.task.prompt
+    prompt = inner.task.rendered_prompt
     assert "Additional target-repository guidance was omitted" in prompt
     assert "MUST-NOT-FIT" not in prompt
     encoded = prompt.split(

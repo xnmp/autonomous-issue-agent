@@ -26,7 +26,6 @@ import os
 import sys
 import threading
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
@@ -47,16 +46,10 @@ from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
-from ..domain.events import (
-    DaemonStateChanged,
-    GithubUnavailable,
-    StallDetected,
-    TelemetryEvent,
-)
 from ..domain.leg import Leg
 from ..domain.outcome import AgentResult, LegClass, pre_admission_refusal
 from ..domain.policy import question_text
-from ..domain.ports import EventSink, SpendReconciler
+from ..domain.ports import SpendReconciler
 from ..domain.recovery import RecoveryTrigger
 from ..domain.refs import harness_branch_issue
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, pr_key
@@ -239,9 +232,6 @@ class Daemon:
     executor: ActionExecutor
     poll_seconds: int = 60
     log: Callable[[str], None] = _ignore_log
-    # Optional typed telemetry sink. When set, skipped ticks become countable
-    # events rather than lines in a log nobody retained.
-    journal: EventSink | None = None
     # Paid dispatches run behind the observation loop in a worker pool of
     # this many threads.
     dispatch_capacity: int = 1
@@ -335,12 +325,6 @@ class Daemon:
             f"{self.name}: state {previous.value} -> {state.value}"
             + (f" ({reason})" if reason else "")
         )
-        if self.journal is not None:
-            self.journal.emit(
-                TelemetryEvent(
-                    DaemonStateChanged(previous.value, state.value, reason)
-                )
-            )
 
     def _write_heartbeat(self) -> None:
         if not self.heartbeat_path:
@@ -643,23 +627,6 @@ class Daemon:
                 f"{self.name}: world build failed: GitHub {exc.headline} — "
                 f"skipping tick, no actions taken ({exc.detail})"
             )
-            # Journalled too: a run of these is the difference between "the
-            # harness did nothing because there was nothing to do" and "the
-            # harness could not see" — indistinguishable from actions alone.
-            if self.journal is not None:
-                self.journal.emit(
-                    TelemetryEvent(
-                        GithubUnavailable(
-                            exc.kind,
-                            exc.detail,
-                            (
-                                int(exc.retry_after_s * 1000)
-                                if exc.retry_after_s is not None
-                                else None
-                            ),
-                        )
-                    )
-                )
             return []
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
@@ -731,37 +698,11 @@ class Daemon:
                     ).suspended_seconds
                 )
                 if elapsed >= self.poll_seconds * 4 and suspended > 0:
-                    stall_started = datetime.fromtimestamp(
-                        cur - suspended, tz=timezone.utc
-                    )
-                    woke_at = datetime.fromtimestamp(cur, tz=timezone.utc)
-                    # wall-minus-monotonic is stable across processes on one boot
-                    # and advances by the suspension amount. Unlike a wall-time
-                    # start estimate, it is not shifted by work after resume, so
-                    # dashboard readers can identify one box stall across roles.
-                    stall_clock_offset = round(cur - cur_active, 3)
                     self.log(
                         f"{self.name}: ♥ woke after {elapsed}s "
-                        f"(expected ~{self.poll_seconds}s) "
+                        f"(expected ~{self.poll_seconds}s, {suspended}s suspended) "
                         "— likely suspended/stalled; catching up"
                     )
-                    if self.journal is not None:
-                        self.journal.emit(
-                            TelemetryEvent(
-                                StallDetected(
-                                    (
-                                        f"{self.name}:"
-                                        f"{stall_clock_offset:g}:"
-                                        f"{uuid.uuid4().hex}"
-                                    ),
-                                    stall_started.isoformat(),
-                                    woke_at.isoformat(),
-                                    int(suspended * 1000),
-                                    int(elapsed * 1000),
-                                    int(stall_clock_offset * 1000),
-                                )
-                            )
-                        )
                     self._reconcile_wake()
                     last_logged = cur
                 elif cur - last_logged >= heartbeat_seconds:
@@ -1164,7 +1105,6 @@ def compose_role(
 
     daemon = Daemon(
         role, lambda: gateway.build_world(cfg.base_branch), lambda _world: [], act, cfg.poll_seconds, log,
-        journal=journal,
         dispatch_capacity=capacity,
         dispatch_key=dispatch_item,
         cancel_active_dispatches=dispatch.cancel_all,

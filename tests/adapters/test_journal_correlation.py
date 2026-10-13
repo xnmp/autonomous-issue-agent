@@ -14,11 +14,6 @@ import pytest
 
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.events import (
-    AgentRunCompleted,
-    AgentRunStarted,
-    TelemetryEvent,
-)
 from issue_agent.domain.outcome import AgentResult
 
 
@@ -29,10 +24,10 @@ class _CapturingSink:
     path = ""
 
     def __init__(self) -> None:
-        self.events: list[TelemetryEvent] = []
+        self.events: list[tuple[str, dict]] = []
 
-    def emit(self, event: TelemetryEvent) -> None:
-        self.events.append(event)
+    def emit(self, event: str, fields) -> None:
+        self.events.append((event, dict(fields)))
 
 
 class _Inner:
@@ -51,9 +46,9 @@ def _run_correlations(role: str, kind: str, number: int, issue: int | None):
     asyncio.run(runtime.run(RuntimePlan(prompt="p")))
 
     return [
-        event.correlation
-        for event in sink.events
-        if isinstance(event.payload, (AgentRunStarted, AgentRunCompleted))
+        (fields.get("issue"), fields.get("pr"))
+        for event, fields in sink.events
+        if event in ("agent_run_start", "agent_run")
     ]
 
 
@@ -61,12 +56,12 @@ def test_a_review_leg_correlates_with_both_its_pr_and_its_issue():
     correlations = _run_correlations("review", "REVIEW", 186, 185)
 
     assert correlations
-    assert {(c.issue, c.pr) for c in correlations} == {(185, 186)}
+    assert set(correlations) == {(185, 186)}
 
 
 @pytest.mark.parametrize("kind", ["RE_REVIEW", "FIX_CI", "ADDRESS_REVIEW", "REBASE"])
 def test_every_pr_numbered_kind_claims_its_pr(kind: str):
-    assert {(c.issue, c.pr) for c in _run_correlations("fix", kind, 186, 185)} == {
+    assert set(_run_correlations("fix", kind, 186, 185)) == {
         (185, 186)
     }
 
@@ -75,7 +70,6 @@ def test_every_pr_numbered_kind_claims_its_pr(kind: str):
     ("role", "kind", "number", "issue"),
     [
         ("fix", "RESOLVE", 142, 142),
-        ("fix", "RESUME", 142, 142),
         ("fix", "RESOLVE", 0, 142),
         ("review", "REVIEW", -1, 185),
         ("fix", "", 142, 142),
@@ -87,4 +81,4 @@ def test_issue_numbered_and_numberless_contexts_never_claim_a_pr(
     correlations = _run_correlations(role, kind, number, issue)
 
     assert correlations
-    assert {(c.issue, c.pr) for c in correlations} == {(issue, None)}
+    assert set(correlations) == {(issue, None)}
