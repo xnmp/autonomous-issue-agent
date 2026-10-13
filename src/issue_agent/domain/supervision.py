@@ -34,10 +34,6 @@ class ClockSample:
 class Suspension:
     suspended_seconds: float
 
-    @property
-    def detected(self) -> bool:
-        return self.suspended_seconds > 0
-
 
 def suspension_between(before: ClockSample, after: ClockSample) -> Suspension:
     """Attribute only wall time not explained by the monotonic active clock."""

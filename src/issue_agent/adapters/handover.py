@@ -9,14 +9,13 @@ or journals.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .atomic_file import atomic_write
 from .runtime_plan import RuntimePlan
 from ..domain.outcome import AgentResult, ExitReason
 from ..domain.trust import as_untrusted, encode_untrusted
@@ -44,7 +43,6 @@ _SCOPE_LINE = re.compile(r"^<!-- issue-agent-handover role=(\w+) issue=(\d+) -->
 @dataclass(frozen=True)
 class HandoverReceipt:
     trigger: str
-    byte_size: int
 
 
 @dataclass(frozen=True)
@@ -141,10 +139,9 @@ def write_exhaustion_handover(
             raise OSError(
                 f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes"
             )
-        _atomic_write(path, encoded)
+        atomic_write(path, encoded)
         return HandoverReceipt(
             trigger=reason.value,
-            byte_size=len(encoded),
         )
     except Exception as exc:  # noqa: BLE001 — preserve the original ceiling result
         _warn(f"could not write {path}: {exc}")
@@ -202,10 +199,9 @@ def write_shutdown_handover(
             raise OSError(
                 f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes"
             )
-        _atomic_write(path, encoded)
+        atomic_write(path, encoded)
         return HandoverReceipt(
             trigger=ExitReason.OPERATOR_CANCELLED.value,
-            byte_size=len(encoded),
         )
     except Exception as exc:  # noqa: BLE001 - deadline evidence is fail-soft
         _warn(f"could not write {path}: {exc}")
@@ -331,26 +327,6 @@ def _bounded_text(text: str, max_bytes: int) -> str:
         return text
     suffix = b"\n...[truncated by handover byte limit]"
     return (raw[: max_bytes - len(suffix)] + suffix).decode("utf-8", "ignore")
-
-
-def _atomic_write(path: Path, content: bytes) -> None:
-    descriptor, temporary = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=".handover-",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
 
 
 def _warn(message: str) -> None:

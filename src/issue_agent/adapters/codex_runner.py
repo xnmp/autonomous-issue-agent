@@ -18,7 +18,6 @@ import glob
 import hashlib
 import json
 import os
-import re
 import signal
 import tempfile
 import time
@@ -27,6 +26,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
+from .atomic_file import atomic_write
 from .child_env import child_process_env
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
@@ -78,20 +78,8 @@ def write_spend_evidence(directory: str, run_id: str, evidence: dict[str, Any]) 
     if not directory or not run_id:
         return
     os.makedirs(directory, exist_ok=True)
-    path = spend_evidence_path(directory, run_id)
-    temporary = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     payload = {"version": _SPEND_EVIDENCE_VERSION, "run_id": str(run_id), **evidence}
-    try:
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+    atomic_write(spend_evidence_path(directory, run_id), json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 def remove_spend_evidence(directory: str, run_id: str) -> None:
@@ -1063,13 +1051,6 @@ def _malformed_counters(detail: str, session_id: str, usage: dict | None) -> Age
     return AgentResult(is_error=True, status="error", exit_reason=ExitReason.AGENT_ERROR,
                        summary=f"codex rollout counters are malformed ({detail}); the leg cannot be priced",
                        session_id=session_id, usage=usage)
-
-
-def _unlink_quietly(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
 
 
 async def _cancel_quietly(task: asyncio.Future) -> None:

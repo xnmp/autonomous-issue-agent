@@ -12,10 +12,9 @@ the review role.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, MergePullRequest, RunAgent

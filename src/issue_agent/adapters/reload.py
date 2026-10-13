@@ -29,7 +29,6 @@ A broken watch (git missing, not a repo, unreadable env file) reads as
 
 from __future__ import annotations
 
-import os
 import subprocess
 import hashlib
 from collections.abc import Callable

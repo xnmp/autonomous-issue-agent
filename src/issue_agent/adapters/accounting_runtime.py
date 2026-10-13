@@ -5,10 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 import uuid
 import contextvars
-import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan

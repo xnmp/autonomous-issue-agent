@@ -285,12 +285,6 @@ _DDL = (
 )""",
 )
 
-# A leg's committed money: its charge once settled, nothing once released,
-# its reserved maximum while it may still spend.
-_COMMITTED = (
-    "CASE state WHEN 'ended' THEN charged_micros WHEN 'released' THEN 0 "
-    "ELSE reserved_micros END"
-)
 _UNSETTLED = "state IN ('reserved', 'running')"
 
 

@@ -449,7 +449,7 @@ exact APPROVE or REQUEST_CHANGES with a bounded body, or nothing),
 `adapters/accounting_runtime.py`, `adapters/act.py` (both roles' `act` step:
 idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
-`adapters/agent_runner.py`, `adapters/app_token.py`,
+`adapters/agent_runner.py`, `adapters/app_token.py`, `adapters/atomic_file.py`,
 `adapters/child_env.py`,
 `adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
 once per leg; native sub-agents disabled in the isolated profile),

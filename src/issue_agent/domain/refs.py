@@ -34,13 +34,6 @@ def harness_branch_issue(branch: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def is_governed_branch(branch: str) -> bool:
-    """True iff the branch carries harness work (a governed prefix)."""
-    return bool(_BRANCH_RE.match(branch or "")) or any(
-        (branch or "").startswith(p + "/") for p in BRANCH_PREFIXES
-    )
-
-
 def slugify(title: str, maxlen: int = 40) -> str:
     """lowercase, spaces→-, keep [a-z0-9-], truncate. Port of the resolve-issue.sh
     slug pipeline (used to pre-compute the worktree branch name)."""

@@ -473,7 +473,6 @@ def test_a_spawned_process_takes_over_its_legs_lease(tmp_path, monkeypatch):
     # A leg is one launch: a second process never takes over a running leg,
     # even once the first group is gone.
     monkeypatch.setattr(ProcessSupervisor, "matches_identity", classmethod(lambda cls, pid, ticks: False))
-    monkeypatch.setattr(ProcessSupervisor, "group_is_absent", staticmethod(lambda pgid: True))
     with pytest.raises(ControlStoreError, match="conflicting"):
         store.register_process_lease(run, expected_owner_id=OWNER, pid=5, pgid=5, process_start_ticks=1)
     assert store.leases()[0].pid == 4242

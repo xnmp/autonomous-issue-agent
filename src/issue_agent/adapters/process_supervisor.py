@@ -8,7 +8,6 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -17,6 +16,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
+from .atomic_file import atomic_write
 from ..domain.contracts import RunId
 
 
@@ -107,22 +107,7 @@ class ProcessSupervisor:
             "supervised_cli_main()\n"
         )
         if not wrapper.exists() or wrapper.read_text(encoding="utf-8") != content:
-            fd, temporary = tempfile.mkstemp(
-                dir=self.state_dir, prefix=".supervised-cli.", text=True
-            )
-            try:
-                os.fchmod(fd, 0o700)
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, wrapper)
-            except BaseException:
-                try:
-                    os.unlink(temporary)
-                except FileNotFoundError:
-                    pass
-                raise
+            atomic_write(wrapper, content, mode=0o700)
         return str(wrapper), {
             "ISSUE_AGENT_SUPERVISOR_STATE_DIR": str(self.state_dir),
             "ISSUE_AGENT_SUPERVISOR_RUN_ID": str(run_id),
@@ -203,34 +188,11 @@ class ProcessSupervisor:
         if leader is None:
             raise ProcessLookupError("process-group leader identity is unavailable")
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        target = self._path(run_id)
-        fd, temporary = tempfile.mkstemp(
-            dir=self.directory, prefix=f".{target.name}.", text=True
-        )
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(
-                    {
-                        "run_id": str(run_id),
-                        "pgid": pgid,
-                        "leader": {
-                            "pid": leader.pid,
-                            "start_ticks": leader.start_ticks,
-                        },
-                    },
-                    stream,
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-            return ProcessRegistration(run_id, pgid, leader)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+        atomic_write(self._path(run_id), json.dumps({
+            "run_id": str(run_id), "pgid": pgid,
+            "leader": {"pid": leader.pid, "start_ticks": leader.start_ticks},
+        }))
+        return ProcessRegistration(run_id, pgid, leader)
 
     def unregister(self, run_id: RunId) -> None:
         try:
@@ -376,34 +338,10 @@ class ProcessSupervisor:
 
     def _write_intent(self, intent: LaunchIntent) -> None:
         self.intent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        target = self._intent_path(intent.run_id)
-        fd, temporary = tempfile.mkstemp(
-            dir=self.intent_directory, prefix=f".{target.name}.", text=True
-        )
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(
-                    {
-                        "run_id": str(intent.run_id),
-                        "token": intent.token,
-                        "state": intent.state,
-                        "launcher": {
-                            "pid": intent.launcher.pid,
-                            "start_ticks": intent.launcher.start_ticks,
-                        },
-                    },
-                    stream,
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+        atomic_write(self._intent_path(intent.run_id), json.dumps({
+            "run_id": str(intent.run_id), "token": intent.token, "state": intent.state,
+            "launcher": {"pid": intent.launcher.pid, "start_ticks": intent.launcher.start_ticks},
+        }))
 
     @staticmethod
     def _read_intent(path: Path) -> LaunchIntent | None:
@@ -583,19 +521,6 @@ class ProcessSupervisor:
         """Return reuse-safe identities for every live member of a group."""
 
         return cls._group_identities(pgid)
-
-    @staticmethod
-    def group_is_absent(pgid: int) -> bool:
-        """Prove kernel group absence; an incomplete process scan cannot do so."""
-        if type(pgid) is not int or pgid <= 0:
-            return False
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return True
-        except OSError:
-            return False
-        return False
 
     @classmethod
     def process_identity(cls, pid: int) -> ProcessIdentity | None:
