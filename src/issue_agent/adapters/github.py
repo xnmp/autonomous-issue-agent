@@ -13,7 +13,7 @@ Two halves, the usual pure/impure split:
 
 Field names match what the bash queries (issue: number,title,body,labels,
 comments,updatedAt,author,state; pr: number,title,body,headRefName,headRefOid,
-baseRefName,labels,reviews,state,closingIssuesReferences; checks: name,state,
+baseRefName,labels,reviews,state; checks: name,state,
 bucket,startedAt,link) so the mapping is mechanical and auditable.
 """
 
@@ -43,7 +43,6 @@ from ..domain.world import (
     Push,
     Review,
     WorldState,
-    extract_declared_paths,
 )
 
 
@@ -65,17 +64,6 @@ _LOGGED_GH_ARGV_BYTES = 2 * 1024
 # below makes a hit LOUD instead of silent (P0.7).
 _LIST_LIMIT = 500
 
-# Cap on the CLOSED `ai-pr-open` slice the fix world adds for merge cleanup
-# (#28). Deliberately much smaller than _LIST_LIMIT: every number here costs a
-# `gh issue view`, and on a repo that ran the harness before the fix landed the
-# set is a BACKLOG of stuck issues, not a working set. Newest-first (gh's
-# default order), so a backlog deeper than the cap is worked off newest-first
-# over consecutive polls. `domain.fix.orphaned_cleanup_actions` is what makes
-# that terminate: it relabels each observed issue to ai-done, which removes
-# ai-pr-open and drops it out of this query for good. Without that arm this
-# slice would re-fetch the same stuck issues every poll forever. Steady state
-# is an empty set and one cheap list call.
-_CLOSED_CLEANUP_LIMIT = 100
 
 # Inline review comments pulled per PR (port of agent/address-review.sh:41's
 # `.[-8:]`) — the NEWEST 8. A bound is required: the whole list is pasted into a
@@ -466,18 +454,10 @@ def parse_issue(d: dict) -> IssueView:
         author=author or "",
         # gh issue state is "OPEN"/"CLOSED"; WorldState uses lower-case open/closed.
         state=(d.get("state", "open") or "open").lower(),
-        # GraphQL serves REOPENED; compare against one casing.
-        state_reason=str(d.get("stateReason") or "").lower(),
-        # File paths the body names in backticks → the file-overlap gate.
-        declared_paths=extract_declared_paths(body),
     )
 
 
 def parse_pr(d: dict) -> PRView:
-    closing = None
-    refs = d.get("closingIssuesReferences") or []
-    if refs and isinstance(refs[0], dict) and refs[0].get("number") is not None:
-        closing = int(refs[0]["number"])
     return PRView(
         number=int(d["number"]),
         head_ref_name=d.get("headRefName", "") or "",
@@ -491,31 +471,11 @@ def parse_pr(d: dict) -> PRView:
         reviews=_reviews(d.get("reviews")),
 
         state=(d.get("state", "OPEN") or "OPEN").upper(),
-        closing_issue=closing,
         changed_files=_changed_files(d.get("files")),
         mergeable=(d.get("mergeable", "") or "").upper(),
         merge_state=(d.get("mergeStateStatus", "") or "").upper(),
-        is_draft=bool(d.get("isDraft", False)),
         author=((d.get("author") or {}).get("login", "") or ""),
     )
-
-
-# Every DECISION field a terminal (MERGED/CLOSED) PRView needs, in one labelled
-# list call. Kept in lockstep with `parse_terminal_pr`'s required-key check: a
-# field this list stops carrying must make the parse FAIL (→ full `gh pr view`),
-# never silently default.
-#
-# Deliberately ABSENT, and therefore never defaulted-in silently either: the
-# connection-shaped fields (body, comments, reviews, files), whose GraphQL cost
-# scales with page size. A view built from this list carries
-# `content_known=False` so telemetry can tell "unread" from "empty"; no
-# lifecycle decision reads any of them off a non-OPEN PR.
-_PR_LIST_FIELDS = (
-    "number,state,labels,headRefName,headRefOid,baseRefName,baseRefOid,"
-    "title,isDraft,author,closingIssuesReferences"
-)
-
-_TERMINAL_STATES = ("MERGED", "CLOSED")
 
 
 def _changed_files(files: object) -> frozenset[str]:
@@ -641,7 +601,7 @@ _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage sta
             "nodes{{author{{login}} state submittedAt body commit{{oid}}}}}}")
 _FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
 _FIX_PR = (
-    "id number state headRefName headRefOid baseRefName baseRefOid isDraft title author{login} "
+    "id number state headRefName headRefOid baseRefName baseRefOid title author{login} "
     "mergeable mergeStateStatus " + _LABELS + " " + _COMMENTS.format(before="") + " "
     + _REVIEWS.format(before="") + " " + _FILES.format(after="")
     + " commits(last:1){nodes{commit{oid committedDate author{user{login}}}}}"
@@ -747,7 +707,7 @@ def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PR
         state=str(node.get("state") or ""), changed_files=_changed_files([{"path": f.get("path")} for f in files
                                                                          if isinstance(f, dict)]),
         mergeable=str(node.get("mergeable") or ""), merge_state=str(node.get("mergeStateStatus") or ""),
-        is_draft=node.get("isDraft") is True, author=_login(node.get("author")), pushes=pushes,
+        author=_login(node.get("author")), pushes=pushes,
     )
 
 
@@ -947,7 +907,7 @@ class GitHubGateway:
     def get_issue(self, number: int) -> IssueView:
         d = self._gh_json(
             ["issue", "view", str(number), "--repo", self.repo, "--json",
-             "number,title,body,labels,comments,updatedAt,author,state,stateReason"]
+             "number,title,body,labels,comments,updatedAt,author,state"]
         )
         return parse_issue(d)  # type: ignore[arg-type]
 
@@ -966,7 +926,7 @@ class GitHubGateway:
         enrichment set for days (list_pr_states). Absent checks parse to () →
         ci_state(()) is NONE, which no consumer reads for a non-open PR."""
         base = ("number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,labels,"
-                "comments,reviews,state,closingIssuesReferences,files,isDraft,author")
+                "comments,reviews,state,files,author")
         fields = base + (",mergeable,mergeStateStatus" if mergeability else "")
         d = self._gh_json(
             ["pr", "view", str(number), "--repo", self.repo, "--json", fields]
@@ -981,91 +941,6 @@ class GitHubGateway:
             return replace(pr, ci=Unavailable("checks not requested"))
         return replace(pr, ci=observe_checks(self.repo, pr, self._gh_json))
 
-    def _checks_for_head(
-        self, head_oid: str
-    ) -> list[dict[str, object]] | None:
-        """Read all check-runs and commit statuses for one immutable SHA."""
-
-        if not head_oid:
-            return None
-        check_pages = self._gh_json(
-            [
-                "api",
-                "--paginate",
-                "--slurp",
-                "-H",
-                "Accept: application/vnd.github+json",
-                f"repos/{self.repo}/commits/{head_oid}/check-runs"
-                "?filter=latest&per_page=100",
-            ]
-        )
-        status_pages = self._gh_json(
-            [
-                "api",
-                "--paginate",
-                "--slurp",
-                f"repos/{self.repo}/commits/{head_oid}/statuses?per_page=100",
-            ]
-        )
-        if not isinstance(check_pages, list) or not isinstance(
-            status_pages, list
-        ):
-            return None
-        runs: list[dict] = []
-        for page in check_pages:
-            if not isinstance(page, dict) or not isinstance(
-                page.get("check_runs"), list
-            ):
-                return None
-            if any(not isinstance(item, dict) for item in page["check_runs"]):
-                return None
-            runs.extend(page["check_runs"])
-        statuses: list[dict] = []
-        for page in status_pages:
-            if not isinstance(page, list) or any(
-                not isinstance(item, dict) for item in page
-            ):
-                return None
-            statuses.extend(page)
-        latest_runs: dict[tuple[str, str], dict] = {}
-        for item in runs:
-            app = item.get("app")
-            app_identity = (
-                str(app.get("id") or app.get("slug") or "")
-                if isinstance(app, dict)
-                else ""
-            )
-            key = (app_identity, str(item.get("name") or ""))
-            current = latest_runs.get(key)
-            score = (
-                int(item.get("id") or 0),
-                str(item.get("started_at") or item.get("created_at") or ""),
-            )
-            current_score = (
-                int(current.get("id") or 0),
-                str(
-                    current.get("started_at")
-                    or current.get("created_at")
-                    or ""
-                ),
-            ) if current is not None else (-1, "")
-            if current is None or score > current_score:
-                latest_runs[key] = item
-        latest_statuses: dict[str, dict] = {}
-        for item in statuses:
-            context = str(item.get("context") or "")
-            if context not in latest_statuses:
-                latest_statuses[context] = item
-        return [
-            *(
-                _check_run_observation(item)
-                for item in latest_runs.values()
-            ),
-            *(
-                _commit_status_observation(item)
-                for item in latest_statuses.values()
-            ),
-        ]
 
     @staticmethod
     def _skip_item(kind: str, number: int, exc: BaseException) -> None:

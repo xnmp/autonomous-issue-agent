@@ -84,12 +84,6 @@ class _Worktrees:
         return 0
 
 
-class _Commands:
-    def drain_pending_commands(self) -> int:
-        return 0
-
-    def pending_commands(self):
-        return ()
 
 
 class _NoTrustedUsage:
@@ -203,7 +197,7 @@ def _sweeper(store, now: datetime):
         _Supervisor(),
         store,
         _Worktrees(),
-        _Commands(),
+       
         _NoTrustedUsage(),
         OWNER,
         reservation_grace=GRACE,
@@ -422,7 +416,7 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
         _Supervisor(),
         store,
         _Worktrees(),
-        _Commands(),
+       
         _SettlesExactly(store, Money("USD", 10_000)),
         OWNER,
         reservation_grace=GRACE,

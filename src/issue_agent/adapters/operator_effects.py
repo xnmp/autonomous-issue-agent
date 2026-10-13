@@ -1,43 +1,34 @@
-"""Durable operator-initiated GitHub effects.
+"""Operator-initiated GitHub writes: the dashboard's label moves and the CLI's
+bootstrap steps.
 
-The dashboard, CLI bootstrap commands, and webhook supervisor all use this
-adapter.  Every mutation is committed as a ``LifecycleCommand`` before ``gh``
-runs, and every ambiguous result is reconciled from GitHub before retry.
+There is no command queue. Each write reads the current state first, does
+nothing when it already holds, and reads back after writing; a write that does
+not read back is reported as failed. Labels go through `act.relabel`, the same
+operation the fix role uses (refactor decision Q19: the dashboard only changes
+labels on GitHub).
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import subprocess
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
 
-from .control_path import control_store_path
-from .control_store import SQLiteControlStore
-from .deployment_authority import UnfencedEffectAuthority
-from .durable_effects import DurableEffectRunner, EffectOutcome
-from ..domain.contracts import (
-    CommandId,
-    CommandKind,
-    EffectStatus,
-    LifecycleCommand,
-)
+from .act import relabel
+from .github import GitHubGateway
 from ..domain.events import ActionApplied, Correlation, TelemetryEvent
+from ..domain.labels import Label
 from ..domain.ports import EventSink
+from ..domain.refs import harness_branch_issue
 from ..domain.repository import canonical_repository
 
 EFFECT_TIMEOUT_SECONDS = 60.0
 
 
 class OperatorEffectError(RuntimeError):
-    pass
-
-
-class UnknownOperatorEffect(OperatorEffectError):
     pass
 
 
@@ -51,63 +42,106 @@ class LabelEffect:
 
 def build_operator_effects(
     repository: str,
-    state_dirs: Iterable[str],
     *,
     identity: str,
-    config_version: str = "",
     run: Callable[..., Any] = subprocess.run,
     journal: EventSink | None = None,
-    control: SQLiteControlStore | None = None,
+    gateway: GitHubGateway | None = None,
 ) -> "GitHubOperatorEffects":
-    path = control_store_path(
-        state_dirs,
-        temporary_on_missing=False,
-    )
-    if control is None:
-        store = SQLiteControlStore(path)
-        store.initialize()
-    else:
-        if os.path.realpath(control.path) != os.path.realpath(path):
-            raise ValueError("operator effects disagree with the established control authority")
-        store = control
+    """Operator writes act as the ambient `gh` login (the operator's own)."""
     return GitHubOperatorEffects(
         repository,
-        store,
+        gateway or GitHubGateway(canonical_repository(repository)),
         identity=identity,
-        config_version=config_version,
         run=run,
         journal=journal,
     )
 
 
 class GitHubOperatorEffects:
-    """Closed, durable vocabulary for non-daemon GitHub mutations."""
+    """The closed vocabulary of non-daemon GitHub writes."""
 
     def __init__(
         self,
         repository: str,
-        store: SQLiteControlStore,
+        gateway,
         *,
         identity: str,
-        config_version: str = "",
         run: Callable[..., Any] = subprocess.run,
         journal: EventSink | None = None,
     ):
         if not repository or not identity:
             raise ValueError("operator effect repository and identity are required")
         self.repository = canonical_repository(repository)
-        self.store = store
+        self.gateway = gateway
         self.identity = identity
-        self.config_version = config_version
         self.run = run
-        # Optional: an operator mutation is durable with or without telemetry,
-        # and the CLI paths have no journal to write to.
+        # Optional: an operator write stands with or without telemetry, and the
+        # CLI paths have no journal to write to.
         self.journal = journal
-        self.effects = DurableEffectRunner(
-            store,
-            UnfencedEffectAuthority(),
-            executor_identity=identity,
+
+    def set_labels(
+        self,
+        kind: str,
+        number: int,
+        *,
+        add: Iterable[str] = (),
+        remove: Iterable[str] = (),
+        action_kind: str = "operator_relabel",
+        action_attributes: Mapping[str, Any] | None = None,
+    ) -> LabelEffect:
+        """Apply label changes to one issue or PR; report what actually moved."""
+        requested_add = tuple(dict.fromkeys(add))
+        requested_remove = tuple(label for label in dict.fromkeys(remove) if label not in requested_add)
+        if kind not in ("issue", "pr") or type(number) is not int or number <= 0 or not (requested_add or requested_remove):
+            return LabelEffect(False, "an issue or PR number and at least one label change are required")
+        try:
+            added, removed = relabel(self.gateway, kind, number, add=requested_add, remove=requested_remove)
+        except Exception as exc:  # noqa: BLE001 - operator-facing result
+            return LabelEffect(False, _detail(exc))
+        if added or removed:
+            self._journal_label_action(kind, number, added, removed, action_kind, action_attributes)
+        return LabelEffect(True, "ok", added, removed)
+
+    def set_issue_labels(
+        self, issue: int, *, add: Iterable[str] = (), remove: Iterable[str] = (),
+    ) -> tuple[bool, str]:
+        effect = self.set_labels("issue", issue, add=add, remove=remove)
+        return effect.applied, effect.detail
+
+    def move_hold(self, issue: int, *, park: bool, channel: str) -> tuple[bool, str]:
+        """Park (add `needs-human`) or unblock (remove it) an open issue and each
+        open harness PR for it; no other label moves (refactor decision Q19).
+        The issue and its PRs are read fresh: a cached view could relabel an
+        issue that has since closed or miss a PR opened since."""
+        try:
+            issue_row = self._json(["gh", "issue", "view", str(issue), "-R", self.repository, "--json", "state"])
+            open_prs = self._json([
+                "gh", "pr", "list", "-R", self.repository, "--state", "open",
+                "--json", "number,headRefName", "--limit", "200",
+            ])
+        except Exception as exc:  # noqa: BLE001 - operator-facing result
+            return False, f"could not read #{issue}: {_detail(exc)}"
+        if not isinstance(issue_row, dict) or str(issue_row.get("state") or "").upper() != "OPEN":
+            return False, f"issue #{issue} is not open on {self.repository}"
+        if not isinstance(open_prs, list):
+            return False, f"could not read the open PRs for #{issue}"
+        prs = sorted(
+            row["number"] for row in open_prs
+            if isinstance(row, dict) and type(row.get("number")) is int
+            and harness_branch_issue(str(row.get("headRefName") or "")) == issue
         )
+        hold = (Label.NEEDS_HUMAN.value,)
+        verb = "park" if park else "unblock"
+        failures = []
+        for kind, target in (("issue", issue), *(("pr", pr) for pr in prs)):
+            effect = self.set_labels(
+                kind, target, add=hold if park else (), remove=() if park else hold,
+                action_kind=f"operator_{verb}", action_attributes={"channel": channel},
+            )
+            if not effect.applied:
+                failures.append(f"{kind} #{target}: {effect.detail}")
+        return (False, "; ".join(failures)) if failures else (True, "ok")
 
     def ensure_label(
         self,
@@ -117,677 +151,107 @@ class GitHubOperatorEffects:
         description: str = "",
     ) -> tuple[bool, str]:
         try:
-            if self._label_exists(label):
-                return True, "ok"
-            command = self._command(
-                CommandKind.ENSURE_LABEL,
-                f"label:{label}",
-                "absent",
-                {
-                    "label": label,
-                    "color": color,
-                    "description": description,
-                },
-            )
-            self._execute(
-                command,
-                reconcile=lambda: self._label_exists(label),
-                revision=lambda: "present" if self._label_exists(label) else "absent",
-                apply=lambda: self._mutate(
-                    [
-                        "gh",
-                        "label",
-                        "create",
-                        label,
-                        "-R",
-                        self.repository,
-                        "--color",
-                        color,
-                        "--description",
-                        description,
-                    ]
-                ),
-            )
+            if not self._label_exists(label):
+                self._mutate([
+                    "gh", "label", "create", label, "-R", self.repository,
+                    "--color", color, "--description", description,
+                ])
+                if not self._label_exists(label):
+                    raise OperatorEffectError(f"label {label!r} was not created")
             return True, "ok"
         except Exception as exc:  # noqa: BLE001 - operator-facing result
             return False, _detail(exc)
-
-    def set_issue_labels(
-        self,
-        issue: int,
-        *,
-        add: Iterable[str] = (),
-        remove: Iterable[str] = (),
-        add_unless_present: Iterable[str] = (),
-        action_kind: str = "operator_relabel",
-        action_attributes: Mapping[str, Any] | None = None,
-    ) -> tuple[bool, str]:
-        effect = self.set_issue_labels_effect(
-            issue,
-            add=add,
-            remove=remove,
-            add_unless_present=add_unless_present,
-            action_kind=action_kind,
-            action_attributes=action_attributes,
-        )
-        return effect.applied, effect.detail
-
-    def set_issue_labels_effect(
-        self,
-        issue: int,
-        *,
-        add: Iterable[str] = (),
-        remove: Iterable[str] = (),
-        add_unless_present: Iterable[str] = (),
-        action_kind: str = "operator_relabel",
-        action_attributes: Mapping[str, Any] | None = None,
-    ) -> LabelEffect:
-        """Apply labels and report the move resolved from the command read."""
-        requested_add = tuple(dict.fromkeys(add))
-        suppress_add = frozenset(add_unless_present)
-        removed = tuple(
-            label for label in dict.fromkeys(remove) if label not in requested_add
-        )
-        if issue <= 0 or not requested_add and not removed:
-            return LabelEffect(
-                False,
-                "a positive issue and at least one label change are required",
-            )
-        try:
-            labels, revision = self._issue_labels(issue)
-            # Some transitions must restore a fallback label only when no
-            # equivalent lifecycle arm survives.  Resolve that condition from
-            # this revision-bound read, not from a caller's earlier snapshot:
-            # the latter can race an add-first daemon relabel and strand the
-            # target with no selectable label.
-            added = (
-                ()
-                if requested_add and suppress_add.intersection(labels)
-                else requested_add
-            )
-            effective_added = tuple(label for label in added if label not in labels)
-            effective_removed = tuple(label for label in removed if label in labels)
-            if _labels_match(labels, added, removed):
-                return LabelEffect(True, "ok")
-            payload = {
-                "issue": issue,
-                "add": list(added),
-                "remove": list(removed),
-            }
-            command = self._command(
-                CommandKind.SET_ISSUE_LABELS,
-                f"issue:{issue}",
-                revision,
-                payload,
-            )
-
-            def reconcile() -> bool:
-                current, _current_revision = self._issue_labels(issue)
-                return _labels_match(current, added, removed)
-
-            def current_revision() -> str:
-                _current, value = self._issue_labels(issue)
-                return value
-
-            # REST, not `gh issue edit`: the edit path's GraphQL metadata query
-            # needs read:org, which a repo-scoped bot PAT lacks (same failure
-            # class as the PR #171 relabel wedge — see build_relabel_args).
-            # Adds first so a failing second call strands "both labels", never
-            # a label-less target; deletes are limited to labels observed
-            # present because `gh api` raises on the 404 an absent label earns.
-            argvs: list[list[str]] = []
-            if added:
-                argvs.append(
-                    ["gh", "api", "--method", "POST",
-                     f"repos/{self.repository}/issues/{issue}/labels"]
-                    + [arg for label in added for arg in ("-f", f"labels[]={label}")]
-                )
-            argvs.extend(
-                ["gh", "api", "--method", "DELETE",
-                 f"repos/{self.repository}/issues/{issue}/labels/"
-                 f"{quote(label, safe='')}"]
-                for label in removed
-                if label in labels
-            )
-
-            def apply() -> None:
-                for argv in argvs:
-                    self._mutate(argv)
-
-            self._execute(
-                command,
-                reconcile=reconcile,
-                revision=current_revision,
-                apply=apply,
-            )
-            self._journal_label_action(
-                command, issue, added, removed, action_kind, action_attributes
-            )
-            return LabelEffect(True, "ok", effective_added, effective_removed)
-        except Exception as exc:  # noqa: BLE001 - operator-facing result
-            return LabelEffect(False, _detail(exc))
-
-    def _journal_label_action(
-        self,
-        command: LifecycleCommand,
-        issue: int,
-        added: tuple[str, ...],
-        removed: tuple[str, ...],
-        kind: str,
-        attributes: Mapping[str, Any] | None,
-    ) -> None:
-        """Make the intervention visible to the dashboard fold.
-
-        Only the path that actually mutated GitHub emits: a no-op relabel (the
-        labels already matched) is not an operator action, and journalling one
-        would render a step for something nobody did.
-
-        Contained end to end, payload construction included: the mutation has
-        already committed here, so nothing telemetry does may turn it into a
-        reported failure.
-        """
-        if self.journal is None:
-            return
-        try:
-            changes = " ".join(
-                [*(f"+{label}" for label in added), *(f"-{label}" for label in removed)]
-            )
-            event = TelemetryEvent(
-                ActionApplied(
-                    str(command.command_id),
-                    kind,
-                    "issue",
-                    f"{kind.replace('_', ' ')} issue #{issue}: {changes}",
-                    issue,
-                    {
-                        "add": list(added),
-                        "remove": list(removed),
-                        "operator": self.identity,
-                        **dict(attributes or {}),
-                    },
-                ),
-                Correlation(issue=issue),
-            )
-            self.journal.emit(event)
-        except Exception:  # noqa: BLE001 - telemetry never fails the mutation
-            pass
 
     def set_repository_auto_merge(self, enabled: bool) -> tuple[bool, str]:
         try:
-            current, revision = self._repository_auto_merge()
-            if current is enabled:
-                return True, "ok"
-            command = self._command(
-                CommandKind.SET_REPOSITORY_AUTO_MERGE,
-                f"repository:{self.repository}",
-                revision,
-                {"enabled": enabled},
-            )
-            self._execute(
-                command,
-                reconcile=lambda: self._repository_auto_merge()[0] is enabled,
-                revision=lambda: self._repository_auto_merge()[1],
-                apply=lambda: self._mutate(
-                    [
-                        "gh",
-                        "api",
-                        "-X",
-                        "PATCH",
-                        f"repos/{self.repository}",
-                        "-F",
-                        f"allow_auto_merge={'true' if enabled else 'false'}",
-                    ]
-                ),
-                unconfirmed_status=EffectStatus.PERMANENT_FAILURE,
-            )
+            if self._repository_auto_merge() is not enabled:
+                self._mutate([
+                    "gh", "api", "-X", "PATCH", f"repos/{self.repository}",
+                    "-F", f"allow_auto_merge={'true' if enabled else 'false'}",
+                ])
+                if self._repository_auto_merge() is not enabled:
+                    raise OperatorEffectError("repository auto-merge setting did not change")
             return True, "ok"
         except Exception as exc:  # noqa: BLE001 - operator-facing result
             return False, _detail(exc)
 
-    def publish_base_branch(
-        self,
-        cwd: str,
-        branch: str,
-    ) -> tuple[bool, str]:
+    def publish_base_branch(self, cwd: str, branch: str) -> tuple[bool, str]:
         """Create one missing remote base branch from a verified local head."""
-
         try:
-            local_head = self._text(
-                ["git", "-C", cwd, "rev-parse", f"refs/heads/{branch}"]
-            ).strip()
+            local_head = self._text(["git", "-C", cwd, "rev-parse", f"refs/heads/{branch}"]).strip()
             if not local_head:
                 raise OperatorEffectError(f"local branch {branch!r} has no head")
             remote = self._remote_branch(cwd, branch)
             if remote == local_head:
                 return True, "ok"
             if remote:
-                raise OperatorEffectError(
-                    f"origin/{branch} exists at an unexpected revision"
-                )
-            command = self._command(
-                CommandKind.PUBLISH_BRANCH,
-                f"branch:{self.repository}:{branch}",
-                "absent",
-                {
-                    "cwd": cwd,
-                    "branch": branch,
-                    "head": local_head,
-                    "remote": "origin",
-                },
-            )
-            self._execute(
-                command,
-                reconcile=lambda: self._remote_branch(cwd, branch) == local_head,
-                revision=lambda: self._remote_branch(cwd, branch) or "absent",
-                apply=lambda: self._mutate(
-                    ["git", "-C", cwd, "push", "-u", "origin", branch]
-                ),
-            )
+                raise OperatorEffectError(f"origin/{branch} exists at an unexpected revision")
+            self._mutate(["git", "-C", cwd, "push", "-u", "origin", branch])
+            if self._remote_branch(cwd, branch) != local_head:
+                raise OperatorEffectError(f"origin/{branch} did not reach {local_head[:12]}")
             return True, "ok"
         except Exception as exc:  # noqa: BLE001 - operator-facing result
             return False, _detail(exc)
 
-    def delete_relay_hooks(self) -> tuple[bool, str]:
-        try:
-            hooks = self._relay_hooks()
-            for hook in hooks:
-                hook_id = str(hook["id"])
-                expected = _digest(hook)
-                command = self._command(
-                    CommandKind.DELETE_RELAY_HOOK,
-                    f"relay-hook:{hook_id}",
-                    expected,
-                    {"hook_id": hook_id},
-                )
-                self._execute(
-                    command,
-                    reconcile=lambda hook_id=hook_id: all(
-                        str(item["id"]) != hook_id for item in self._relay_hooks()
-                    ),
-                    revision=lambda hook_id=hook_id: self._hook_revision(hook_id),
-                    apply=lambda hook_id=hook_id: self._mutate(
-                        [
-                            "gh",
-                            "api",
-                            "-X",
-                            "DELETE",
-                            f"repos/{self.repository}/hooks/{hook_id}",
-                        ]
-                    ),
-                )
-            return True, "ok"
-        except Exception as exc:  # noqa: BLE001 - webhook remains poll-capable
-            return False, _detail(exc)
-
-    def start_relay_forward(
+    def _journal_label_action(
         self,
-        events: str,
-        *,
-        spawn: Callable[..., Any] = subprocess.Popen,
-    ) -> Any:
-        """Start the extension only after a durable command has begun."""
-
-        self._reconcile_pending_relay_start()
-        deleted, detail = self.delete_relay_hooks()
-        if not deleted:
-            raise OperatorEffectError(f"relay-hook cleanup failed: {detail}")
-        baseline = _digest(self._relay_hooks())
-        command = self._command(
-            CommandKind.START_RELAY_FORWARD,
-            f"relay-forward:{self.repository}",
-            baseline,
-            {"events": events},
-        )
-        pending = self.effects.enqueue(command)
-        if pending.state == EffectStatus.SUCCEEDED.value:
-            pending = self.effects.enqueue_occurrence(command)
-            command = pending.command
-        elif pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
-            if self._relay_hooks():
-                self.effects.resolve_unknown(
-                    command,
-                    EffectOutcome(None, EffectStatus.SUCCEEDED),
-                )
-                pending = self.effects.enqueue_occurrence(command)
-                command = pending.command
-            else:
-                self.effects.retry_reconciled(command)
-        argv = [
-            "gh",
-            "webhook",
-            "forward",
-            f"--repo={self.repository}",
-            f"--events={events}",
-        ]
-
-        def spawn_and_verify() -> EffectOutcome[Any]:
-            try:
-                process = spawn(
-                    argv,
-                    stdout=subprocess.PIPE,
-                    stderr=None,
-                    text=True,
-                    bufsize=1,
-                )
-            except BaseException as exc:
-                return EffectOutcome(
-                    exc,
-                    EffectStatus.RETRYABLE_FAILURE,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            try:
-                hooks = self._relay_hooks()
-            except Exception as exc:  # noqa: BLE001 - outcome is ambiguous
-                return EffectOutcome(
-                    process,
-                    EffectStatus.UNKNOWN_OUTCOME,
-                    error=f"relay hook could not be verified: {exc}",
-                )
-            if hooks:
-                return EffectOutcome(
-                    process,
-                    EffectStatus.SUCCEEDED,
-                    remote_object_id=str(hooks[-1]["id"]),
-                    remote_revision=_digest(hooks),
-                )
-            return EffectOutcome(
-                process,
-                EffectStatus.UNKNOWN_OUTCOME,
-                error="forwarder started but relay hook is not yet observable",
-            )
-
-        result = self.effects.execute(command, spawn_and_verify)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    def _execute(
-        self,
-        command: LifecycleCommand,
-        *,
-        reconcile: Callable[[], bool],
-        revision: Callable[[], str],
-        apply: Callable[[], object],
-        unconfirmed_status: EffectStatus = EffectStatus.RETRYABLE_FAILURE,
+        kind: str,
+        number: int,
+        added: tuple[str, ...],
+        removed: tuple[str, ...],
+        action_kind: str,
+        attributes: Mapping[str, Any] | None,
     ) -> None:
-        pending = self.effects.enqueue(command)
-        command = pending.command
-        if pending.state == EffectStatus.SUCCEEDED.value:
-            if reconcile():
-                return
-            pending = self.effects.enqueue_occurrence(command)
-            command = pending.command
-        if pending.state == EffectStatus.PERMANENT_FAILURE.value:
-            pending = self.effects.enqueue_occurrence(command)
-            command = pending.command
-        if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
-            if reconcile():
-                self.effects.resolve_unknown(
-                    command,
-                    EffectOutcome(None, EffectStatus.SUCCEEDED),
-                )
-                return
-            if revision() != command.expected_revision:
-                raise UnknownOperatorEffect(
-                    f"{command.command_id}: target changed while outcome was unknown"
-                )
-            self.effects.retry_reconciled(command)
-        if revision() != command.expected_revision:
-            self.effects.execute(
-                command,
-                lambda: EffectOutcome(
-                    None,
-                    EffectStatus.PERMANENT_FAILURE,
-                    error="expected revision no longer matches remote target",
+        """Make the intervention visible to the dashboard fold. Only a write
+        that moved a label emits. Contained end to end: the write has already
+        landed, so nothing telemetry does may report it as failed."""
+        if self.journal is None:
+            return
+        try:
+            changes = " ".join([*(f"+{label}" for label in added), *(f"-{label}" for label in removed)])
+            self.journal.emit(TelemetryEvent(
+                ActionApplied(
+                    uuid.uuid4().hex,
+                    action_kind,
+                    kind,
+                    f"{action_kind.replace('_', ' ')} {kind} #{number}: {changes}",
+                    number,
+                    {"add": list(added), "remove": list(removed), "operator": self.identity,
+                     **dict(attributes or {})},
                 ),
-            )
-            raise OperatorEffectError("remote target changed before mutation")
-
-        def apply_and_verify() -> EffectOutcome[bool]:
-            try:
-                apply()
-            except BaseException:
-                try:
-                    applied = reconcile()
-                except Exception:
-                    applied = False
-                if not applied:
-                    raise
-                return EffectOutcome(True, EffectStatus.SUCCEEDED)
-            applied = reconcile()
-            error = (
-                None
-                if applied
-                else (
-                    "remote rejected the requested state"
-                    if unconfirmed_status is EffectStatus.PERMANENT_FAILURE
-                    else "remote state did not confirm mutation"
-                )
-            )
-            return EffectOutcome(
-                applied,
-                (
-                    EffectStatus.SUCCEEDED
-                    if applied
-                    else unconfirmed_status
-                ),
-                error=error,
-            )
-
-        applied = self.effects.execute(command, apply_and_verify)
-        if not applied:
-            error = (
-                "remote rejected the requested state"
-                if unconfirmed_status is EffectStatus.PERMANENT_FAILURE
-                else "remote state did not confirm mutation"
-            )
-            raise OperatorEffectError(error)
-
-    def _command(
-        self,
-        kind: CommandKind,
-        target: str,
-        expected_revision: str,
-        payload: Mapping[str, object],
-    ) -> LifecycleCommand:
-        encoded = json.dumps(
-            {
-                "kind": kind.value,
-                "target": target,
-                "expected_revision": expected_revision,
-                "payload": payload,
-                "repository": self.repository,
-                "identity": self.identity,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        digest = hashlib.sha256(encoded.encode()).hexdigest()
-        return LifecycleCommand(
-            CommandId(digest),
-            f"operator-github:{digest}",
-            kind,
-            target,
-            expected_revision,
-            payload,
-            self.config_version,
-            self.repository,
-            self.identity,
-        )
+                Correlation(issue=number) if kind == "issue" else Correlation(pr=number),
+            ))
+        except Exception:  # noqa: BLE001 - telemetry never fails the write
+            pass
 
     def _label_exists(self, label: str) -> bool:
-        rows = self._json(
-            [
-                "gh",
-                "label",
-                "list",
-                "-R",
-                self.repository,
-                "--json",
-                "name",
-                "--limit",
-                "1000",
-            ]
-        )
-        return isinstance(rows, list) and any(
-            isinstance(row, dict) and row.get("name") == label for row in rows
-        )
+        rows = self._json(["gh", "label", "list", "-R", self.repository, "--json", "name", "--limit", "1000"])
+        return isinstance(rows, list) and any(isinstance(row, dict) and row.get("name") == label for row in rows)
 
-    def _issue_labels(self, issue: int) -> tuple[frozenset[str], str]:
-        row = self._json(
-            [
-                "gh",
-                "issue",
-                "view",
-                str(issue),
-                "-R",
-                self.repository,
-                "--json",
-                "labels,updatedAt",
-            ]
-        )
-        if not isinstance(row, dict) or not isinstance(row.get("updatedAt"), str):
-            raise OperatorEffectError(f"issue #{issue} did not return a revision")
-        labels = frozenset(
-            str(item["name"])
-            for item in row.get("labels", [])
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        )
-        return labels, str(row["updatedAt"])
-
-    def _repository_auto_merge(self) -> tuple[bool, str]:
-        row = self._json(
-            [
-                "gh",
-                "api",
-                f"repos/{self.repository}",
-                "--jq",
-                "{allow_auto_merge,updated_at}",
-            ]
-        )
-        if not isinstance(row, dict) or not isinstance(row.get("updated_at"), str):
-            raise OperatorEffectError("repository did not return a revision")
-        return bool(row.get("allow_auto_merge")), str(row["updated_at"])
-
-    def _relay_hooks(self) -> list[dict[str, object]]:
-        rows = self._json(
-            [
-                "gh",
-                "api",
-                f"repos/{self.repository}/hooks",
-                "--jq",
-                '[.[] | select(.name == "cli") '
-                "| {id,active,updated_at,created_at}]",
-            ]
-        )
-        if not isinstance(rows, list):
-            raise OperatorEffectError("relay-hook query returned an invalid payload")
-        return [
-            dict(row)
-            for row in rows
-            if isinstance(row, dict) and row.get("id") is not None
-        ]
+    def _repository_auto_merge(self) -> bool:
+        row = self._json(["gh", "api", f"repos/{self.repository}", "--jq", "{allow_auto_merge}"])
+        if not isinstance(row, dict):
+            raise OperatorEffectError("repository settings could not be read")
+        return bool(row.get("allow_auto_merge"))
 
     def _remote_branch(self, cwd: str, branch: str) -> str:
-        output = self._text(
-            [
-                "git",
-                "-C",
-                cwd,
-                "ls-remote",
-                "--heads",
-                "origin",
-                f"refs/heads/{branch}",
-            ]
-        ).strip()
-        if not output:
-            return ""
-        return output.split()[0]
-
-    def _hook_revision(self, hook_id: str) -> str:
-        for hook in self._relay_hooks():
-            if str(hook["id"]) == hook_id:
-                return _digest(hook)
-        return "absent"
-
-    def _reconcile_pending_relay_start(self) -> None:
-        for pending in self.store.pending_commands(
-            repository=self.repository,
-            executor_identity=self.identity,
-        ):
-            if pending.command.kind is not CommandKind.START_RELAY_FORWARD:
-                continue
-            hooks = self._relay_hooks()
-            if hooks:
-                self.effects.resolve_unknown(
-                    pending.command,
-                    EffectOutcome(None, EffectStatus.SUCCEEDED),
-                )
-            elif pending.state in {
-                "executing",
-                EffectStatus.UNKNOWN_OUTCOME.value,
-            }:
-                self.effects.retry_reconciled(pending.command)
+        output = self._text(["git", "-C", cwd, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"]).strip()
+        return output.split()[0] if output else ""
 
     def _json(self, argv: list[str]) -> object:
-        completed = self.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=EFFECT_TIMEOUT_SECONDS,
-        )
-        if completed.returncode != 0:
-            raise OperatorEffectError(
-                (completed.stderr or completed.stdout or "gh command failed").strip()
-            )
         try:
-            return json.loads(completed.stdout or "null")
+            return json.loads(self._text(argv) or "null")
         except json.JSONDecodeError as exc:
             raise OperatorEffectError("gh returned malformed JSON") from exc
 
     def _text(self, argv: list[str]) -> str:
-        completed = self.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=EFFECT_TIMEOUT_SECONDS,
-        )
+        completed = self.run(argv, capture_output=True, text=True, timeout=EFFECT_TIMEOUT_SECONDS)
         if completed.returncode != 0:
-            raise OperatorEffectError(
-                (completed.stderr or completed.stdout or "command failed").strip()
-            )
+            raise OperatorEffectError((completed.stderr or completed.stdout or "command failed").strip())
         return str(completed.stdout or "")
 
     def _mutate(self, argv: list[str]) -> None:
-        completed = self.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=EFFECT_TIMEOUT_SECONDS,
-        )
-        if completed.returncode != 0:
-            raise OperatorEffectError(
-                (completed.stderr or completed.stdout or "gh mutation failed").strip()
-            )
-
-
-def _labels_match(
-    current: frozenset[str],
-    added: tuple[str, ...],
-    removed: tuple[str, ...],
-) -> bool:
-    return all(label in current for label in added) and all(
-        label not in current for label in removed
-    )
-
-
-def _digest(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(encoded.encode()).hexdigest()
+        self._text(argv)
 
 
 def _detail(exc: BaseException) -> str:

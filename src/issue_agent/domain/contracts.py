@@ -8,58 +8,20 @@ them, but application and domain code never infer failure from an empty value.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
-from types import MappingProxyType
-from typing import Mapping, NewType
+from typing import NewType
 from zoneinfo import ZoneInfo
 
 from .repository import canonical_repository
-from .workflow_identity import WorkflowBinding, WorkflowFamily, validate_workflow_identifier, validate_workflow_integer
 
 RunId = NewType("RunId", str)
-DispatchId = NewType("DispatchId", str)
-CommandId = NewType("CommandId", str)
 ReservationId = NewType("ReservationId", str)
 
 
-@dataclass(frozen=True)
-class WorkflowAttemptIdentity:
-    binding: WorkflowBinding
-    run_id: RunId
-    leg_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.binding, WorkflowBinding):
-            raise ValueError("workflow attempt requires a validated binding")
-        for name, value in (("run_id", self.run_id), ("leg_id", self.leg_id)):
-            validate_workflow_identifier(value, f"workflow attempt {name}")
-
-
-@dataclass(frozen=True)
-class ContinuationAdmission:
-    attempt: WorkflowAttemptIdentity
-    admission_version: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.attempt, WorkflowAttemptIdentity) or self.attempt.binding.authority.family not in (
-            WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR,
-        ):
-            raise ValueError("continuation admission requires a selected fixed component attempt")
-        validate_workflow_integer(self.admission_version, "continuation admission version", minimum=1)
-
-
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
-MAX_RECEIPT_ERROR_BYTES = 8 * 1024
-
-
-def _bounded_utf8(value: str, max_bytes: int) -> str:
-    encoded = value.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return value
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 @dataclass(frozen=True, order=True)
@@ -263,101 +225,6 @@ def daily_budget_scope(
         end,
         period_timezone,
     )
-
-
-class PolicyDisposition(str, Enum):
-    ALLOW = "allow"
-    DENY = "deny"
-    INDETERMINATE = "indeterminate"
-
-
-class EffectStatus(str, Enum):
-    SUCCEEDED = "succeeded"
-    RETRYABLE_FAILURE = "retryable_failure"
-    PERMANENT_FAILURE = "permanent_failure"
-    UNKNOWN_OUTCOME = "unknown_outcome"
-
-
-class CommandKind(str, Enum):
-    RELABEL = "relabel"
-    POST_COMMENT = "post_comment"
-    CLOSE_ISSUE = "close_issue"
-    ENABLE_AUTO_MERGE = "enable_auto_merge"
-    UPDATE_BRANCH = "update_branch"
-    RERUN_CHECKS = "rerun_checks"
-    CANCEL_CHECKS = "cancel_checks"
-    SUBMIT_REVIEW = "submit_review"
-    DISMISS_REVIEW = "dismiss_review"
-    PUBLISH_BRANCH = "publish_branch"
-    OPEN_PULL_REQUEST = "open_pull_request"
-    UPDATE_PULL_REQUEST_BODY = "update_pull_request_body"
-    ENSURE_LABEL = "ensure_label"
-    SET_ISSUE_LABELS = "set_issue_labels"
-    SET_REPOSITORY_AUTO_MERGE = "set_repository_auto_merge"
-    DELETE_RELAY_HOOK = "delete_relay_hook"
-    START_RELAY_FORWARD = "start_relay_forward"
-
-
-@dataclass(frozen=True)
-class LifecycleCommand:
-    command_id: CommandId
-    idempotency_key: str
-    kind: CommandKind
-    target: str
-    expected_revision: str | None
-    payload: Mapping[str, object] = field(default_factory=dict)
-    config_version: str = ""
-    repository: str = ""
-    executor_identity: str = ""
-    workflow: WorkflowBinding | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "repository", canonical_repository(self.repository)
-        )
-        if not str(self.command_id) or not self.idempotency_key or not self.target:
-            raise ValueError("command identity, idempotency key, and target are required")
-        if not self.repository or not self.executor_identity:
-            raise ValueError(
-                "command repository and executor identity are required"
-            )
-        if self.workflow is not None and (
-            not isinstance(self.workflow, WorkflowBinding)
-            or self.workflow.fence.key.repository != self.repository
-        ):
-            raise ValueError("command workflow binding must match its repository")
-        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
-
-
-@dataclass(frozen=True)
-class EffectReceipt:
-    command_id: CommandId
-    executor_identity: str
-    started_at: datetime
-    completed_at: datetime
-    status: EffectStatus
-    remote_object_id: str | None = None
-    remote_revision: str | None = None
-    error: str | None = None
-
-    def __post_init__(self) -> None:
-        if not str(self.command_id) or not self.executor_identity:
-            raise ValueError("command and executor identity are required")
-        _aware(self.started_at, "started_at")
-        _aware(self.completed_at, "completed_at")
-        if self.completed_at < self.started_at:
-            raise ValueError("effect completion cannot precede its start")
-        successful = self.status is EffectStatus.SUCCEEDED
-        if successful and self.error is not None:
-            raise ValueError("a successful effect cannot carry an error")
-        if not successful and not self.error:
-            raise ValueError("an unsuccessful effect must carry an error")
-        if self.error is not None:
-            object.__setattr__(
-                self,
-                "error",
-                _bounded_utf8(self.error, MAX_RECEIPT_ERROR_BYTES),
-            )
 
 
 def _aware(value: datetime, field_name: str) -> None:

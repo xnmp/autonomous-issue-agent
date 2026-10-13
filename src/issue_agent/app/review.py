@@ -36,7 +36,7 @@ from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, P
 from ..adapters.github import format_pr_discussion
 from .planners import tasks
 from .tick import Choose, leg_class, run_item
-from .workflows.base import run_leg
+from .tick import run_leg
 
 
 def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int) -> tuple[Action, ...]:
@@ -72,12 +72,9 @@ def stored_verdict(runs: Iterable[LegRun], pr: int, head: str) -> Verdict | None
 @dataclass(frozen=True)
 class ReviewAct:
     """The review role's act step: it only dispatches REVIEW legs, which
-    submit their own verdicts. Nothing is queued, so nothing replays."""
+    submit their own verdicts."""
 
     dispatch: Callable[[RunAgent], None]
-
-    def replay_pending(self) -> bool:
-        return True
 
     def execute(self, action: Action) -> None:
         if not isinstance(action, RunAgent):

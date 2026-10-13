@@ -492,11 +492,10 @@ def test_a_stall_never_shadows_a_leg_a_hold_an_escalation_or_running_ci(facts):
 
 
 def test_a_queued_issue_is_blocked_on_the_queue_with_no_wait_start():
-    status = dash.board_status(BoardFacts(track=EMPTY, queued=True, priority="P2"))
+    status = dash.board_status(BoardFacts(track=EMPTY, queued=True))
 
     assert isinstance(status, dash.Blocked)
-    assert (status.on, status.since) == (OnQueue("P2"), None)
-    assert "(P2)" in status.reason
+    assert (status.on, status.since) == (OnQueue(), None)
 
 
 def test_with_nothing_running_or_held_the_harness_owns_the_next_move():

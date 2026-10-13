@@ -46,7 +46,6 @@ const pendingIssue = {
   issue: 120,
   title: "Toast notifications for state transitions",
   url: "https://github.com/openai/autonomous-issue-agent/issues/120",
-  priority: "P1",
   labels: ["feature", "ai-ready"],
   held: false,
   hold_reason: null,

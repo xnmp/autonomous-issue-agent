@@ -140,7 +140,7 @@ if [ -n "${TARGET_DIR:-}" ] && git -C "$TARGET_DIR" rev-parse --is-inside-work-t
       git -C "$TARGET_DIR" fetch origin "$default" --quiet \
         && git -C "$TARGET_DIR" branch "$BASE_BRANCH" "origin/$default" 2>/dev/null \
         && run_harness_issue_agent publish-base-branch \
-             --repo "$REPO" --name "$NAME" --target-dir "$TARGET_DIR" \
+             --repo "$REPO" --target-dir "$TARGET_DIR" \
              --branch "$BASE_BRANCH" \
         && grn "  ✓ created and pushed '$BASE_BRANCH'" \
         || { red "  ✗ could not create '$BASE_BRANCH' (check push access to $REPO)"; exit 1; }
@@ -246,8 +246,8 @@ fi
 #       tree is left pristine.
 
 info "ensuring GitHub lifecycle labels on $REPO"
-if ! run_harness_issue_agent prepare-remote --repo "$REPO" --name "$NAME"; then
-  red "  ✗ lifecycle label preparation failed; refusing to start without the remote command receipts"
+if ! run_harness_issue_agent prepare-remote --repo "$REPO"; then
+  red "  ✗ lifecycle label preparation failed; refusing to start without the lifecycle labels"
   exit 1
 fi
 grn "  ✓ labels ensured"
@@ -259,7 +259,7 @@ grn "  ✓ labels ensured"
 # needs admin on the repo — a non-admin failure is a warning, not fatal.
 if [ "${ENSURE_AUTO_MERGE:-1}" != "0" ]; then
   info "ensuring GitHub auto-merge is enabled on $REPO"
-  if run_harness_issue_agent prepare-remote --repo "$REPO" --name "$NAME" \
+  if run_harness_issue_agent prepare-remote --repo "$REPO" \
       --skip-labels --ensure-auto-merge; then
     grn "  ✓ allow_auto_merge=true"
   else

@@ -268,7 +268,6 @@ class BlockedOnTriage(Contract):
 
 class BlockedOnQueue(Contract):
     kind: Literal["queue"]
-    priority: Literal["P1", "P2", "P3"] | None
 
 
 BlockedOn = Annotated[
@@ -364,7 +363,6 @@ class PendingCard(Contract):
     url: str | None
     # The drill-down renders the issue text, same as backlog rows.
     body: str | None = None
-    priority: Literal["P1", "P2", "P3"] | None
     labels: list[str]
     held: bool
     hold_reason: str | None
@@ -482,6 +480,8 @@ class IssueDetailPayload(Warned):
     stage: str | None
     attention_reason: str | None = None
     escalation_reason: str | None = None
+    # The issue or its newest PR carries `needs-human`: the Unblock control.
+    held_for_human: bool = False
     done: bool
     prs: list[int]
     pull_requests: list[PullRequestLink]
@@ -515,6 +515,6 @@ class ActionResult(Contract):
 
 
 class UnblockRequest(BaseModel):
-    """Legacy breaker release accepts no review guidance or re-arm authority."""
+    """Unblock is a label move; it accepts no body fields."""
 
     model_config = ConfigDict(extra="forbid")

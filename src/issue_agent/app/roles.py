@@ -37,7 +37,7 @@ from ..adapters.worktree import ReviewCheckouts, Worktrees
 from ..domain.actions import RunAgent
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
-from ..domain.ports import CommandRecovery, SpendReconciler, StaleReservationReconciler
+from ..domain.ports import SpendReconciler, StaleReservationReconciler
 from ..domain.recovery import RecoveryTrigger
 from ..domain.pricing import (
     BudgetPolicy,
@@ -61,7 +61,7 @@ from .config import (
     configured_prior_owner_ids,
 )
 from .fix import FixLegs, FixSettings, fix_choose
-from .loop import Daemon
+from .tick import Daemon
 from .planners.tasks import FixTaskConfig, ReviewTaskConfig
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
 from .review import ReviewAct, ReviewLegs, ReviewSettings, review_choose
@@ -341,7 +341,6 @@ def _recovery(
     state_dir: str,
     cfg: HarnessConfig,
     control: SQLiteControlStore,
-    effects: CommandRecovery,
     role: str,
     worktrees: Worktrees | None = None,
     *,
@@ -361,7 +360,6 @@ def _recovery(
         ),
         control,
         worktrees or NoWorktreeRecovery(),
-        effects,
         CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
         owner_id,
     )
@@ -384,23 +382,6 @@ def _force_kill(
         process_supervision_state_dir(cfg, role, state_dir)
     )
     return supervisor.force_kill_all
-
-
-def _shutdown_finalize(
-    control: SQLiteControlStore,
-    effects: CommandRecovery,
-    *,
-    owner_id: str,
-) -> Callable[[], object]:
-    """Persist remaining ownership and flush effects before forced teardown."""
-
-    def finalize() -> object:
-        control.record_owned_cancellation_intents(
-            owner_id, "shutdown_deadline_spend_unknown"
-        )
-        return effects.drain_pending_commands()
-
-    return finalize
 
 
 def _shutdown_prepare(
@@ -875,13 +856,6 @@ def _headroom(gate: Callable[[], str | None] | None) -> Callable[[], bool]:
     return headroom
 
 
-class _NoCommands:
-    """The fix role queues no durable commands: every write is idempotent."""
-
-    def drain_pending_commands(self) -> int:
-        return 0
-
-
 @dataclass(frozen=True)
 class FixDaemonComposition:
     """The fix role's composed authorities.
@@ -972,7 +946,7 @@ def compose_fix_daemon(
         log=log,
     )
     recovery = _recovery(
-        cfg.state_dir, cfg, control, _NoCommands(), "fix", worktrees,
+        cfg.state_dir, cfg, control, "fix", worktrees,
         owner_id=owner_id, reconciler=reconciler,
     )
     daemon = Daemon(
@@ -990,7 +964,6 @@ def compose_fix_daemon(
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
         reconcile=recovery.reconcile,
         prepare_shutdown=_shutdown_prepare(control, owner_id=owner_id),
-        finalize=_shutdown_finalize(control, _NoCommands(), owner_id=owner_id),
         terminalize=_shutdown_terminalize(
             control,
             CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
@@ -1088,7 +1061,7 @@ def compose_review_daemon(
         log=log,
     )
     recovery = _recovery(
-        cfg.review_state_dir, cfg, control, _NoCommands(), "review",
+        cfg.review_state_dir, cfg, control, "review",
         owner_id=owner_id, reconciler=reconciler,
     )
     daemon = Daemon(
@@ -1106,7 +1079,6 @@ def compose_review_daemon(
         heartbeat_path=os.path.join(cfg.review_state_dir, "heartbeat.json"),
         reconcile=recovery.reconcile,
         prepare_shutdown=_shutdown_prepare(control, owner_id=owner_id),
-        finalize=_shutdown_finalize(control, _NoCommands(), owner_id=owner_id),
         terminalize=_shutdown_terminalize(
             control,
             CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),

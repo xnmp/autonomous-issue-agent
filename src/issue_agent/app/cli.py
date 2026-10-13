@@ -38,6 +38,7 @@ from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
 from ..domain.dashboard import STALE_AFTER_S
 from ..domain.deployment import canonical_deployment_name
+from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
 from .codex_resolution import (
     CodexResolutionReport,
@@ -2203,9 +2204,7 @@ def _label_issues(args, label: str) -> int:
     if not repo:
         err("could not detect the repo. Pass --repo owner/name.")
         return 2
-    target_dir = detect_target_dir(os.getcwd())
-    name = resolve_name(repo, target_dir=target_dir)
-    effects = _operator_effects(repo, name, "cli")
+    effects = _operator_effects(repo, "cli")
     rc = 0
     for n in args.issues:
         try:
@@ -2227,64 +2226,23 @@ def cmd_ready(args) -> int:
     return _label_issues(args, "ai-ready")
 
 
-REMOTE_LABELS = (
-    "ai-ready",
-    "ai-working",
-    "ai-blocked",
-    "ai-pr-open",
-    "ai-done",
-    "needs-budget-review",
-    "trivial",
-    "minor",
-    "major",
-    "needs-human-review",
-    "needs-design",
-    "invariant",
-    "recurrence",
-    "P1",
-    "P2",
-    "P3",
-    "harness",
-)
+# The two labels of the minimal design: an operator adds ai-ready, policy
+# writes needs-human (docs/open/2026-10-12-minimal-harness-design.md).
+REMOTE_LABELS = (Label.AI_READY.value, Label.NEEDS_HUMAN.value)
 
 
-def _operator_effects(repo: str, name: str, channel: str):
-    overlay = os.path.join(REPOS_DIR, f"{name}.env")
-    fields = _source_env_file(overlay)
-    state_dirs = tuple(
-        fields.get(key, "")
-        for key in ("STATE_DIR", "REVIEW_STATE_DIR")
-    )
-    if not any(state_dirs):
-        state_dirs = (
-            os.path.expanduser(f"~/.local/state/issue-agent-{name}"),
-            os.path.expanduser(f"~/.local/state/review-agent-{name}"),
-        )
-    return build_operator_effects(
-        repo,
-        state_dirs,
-        identity=f"{repo}:operator:{channel}",
-    )
+def _operator_effects(repo: str, channel: str):
+    return build_operator_effects(repo, identity=f"{repo}:operator:{channel}")
 
 
 def cmd_prepare_remote(args) -> int:
-    """Durably provision the remote prerequisites used by point-at."""
+    """Provision the remote prerequisites used by point-at (each read back)."""
 
-    effects = _operator_effects(args.repo, args.name, "bootstrap")
+    effects = _operator_effects(args.repo, "bootstrap")
     failures = []
     if not args.skip_labels:
         for label in REMOTE_LABELS:
-            applied, detail = effects.ensure_label(
-                label,
-                color={"P1": "b60205", "P2": "d93f0b", "P3": "fbca04"}.get(
-                    label, "ededed"
-                ),
-                description=(
-                    f"harness priority {label}"
-                    if label in {"P1", "P2", "P3"}
-                    else ""
-                ),
-            )
+            applied, detail = effects.ensure_label(label)
             if not applied:
                 failures.append(f"label {label}: {detail}")
     if args.ensure_auto_merge:
@@ -2300,12 +2258,12 @@ def cmd_prepare_remote(args) -> int:
 
 
 def cmd_publish_base_branch(args) -> int:
-    effects = _operator_effects(args.repo, args.name, "bootstrap")
+    effects = _operator_effects(args.repo, "bootstrap")
     applied, detail = effects.publish_base_branch(args.target_dir, args.branch)
     if not applied:
         err(f"failed to publish base branch: {detail}")
         return 1
-    ok(f"published origin/{args.branch} with a durable effect receipt")
+    ok(f"published origin/{args.branch}")
     return 0
 
 
@@ -2641,14 +2599,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("prepare-remote", help=argparse.SUPPRESS)
     sp.add_argument("--repo", required=True)
-    sp.add_argument("--name", required=True, type=_deployment_name_arg)
     sp.add_argument("--ensure-auto-merge", action="store_true")
     sp.add_argument("--skip-labels", action="store_true")
     sp.set_defaults(func=cmd_prepare_remote)
 
     sp = sub.add_parser("publish-base-branch", help=argparse.SUPPRESS)
     sp.add_argument("--repo", required=True)
-    sp.add_argument("--name", required=True, type=_deployment_name_arg)
     sp.add_argument("--target-dir", required=True)
     sp.add_argument("--branch", required=True)
     sp.set_defaults(func=cmd_publish_base_branch)

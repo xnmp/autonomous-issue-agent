@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from issue_agent.app.loop import Daemon
+from issue_agent.app.tick import Daemon
 from issue_agent.domain.actions import AgentKind, RunAgent
 from issue_agent.domain.supervision import ExitCode
 from issue_agent.domain.world import WorldState
@@ -15,7 +15,7 @@ from tests.fakes.manual_clock import ManualClock
 
 def test_deadline_expiry_is_decided_by_the_injected_clock():
     clock = ManualClock()
-    finalized = []
+    terminalized = []
     daemon = Daemon(
         "fix",
         lambda: WorldState(),
@@ -25,12 +25,12 @@ def test_deadline_expiry_is_decided_by_the_injected_clock():
         shutdown_timeout_seconds=1,
         monotonic=clock,
         cancel_active_dispatches=lambda: clock.advance(10),
-        finalize=lambda: finalized.append(True),
+        terminalize=lambda: terminalized.append(True),
     )
 
     assert daemon.shutdown_dispatches(cancel=True) is False
 
-    assert finalized == []
+    assert terminalized == []
 
 
 def test_clock_expiry_while_killed_worker_unwinds_hard_exits_transient():
@@ -57,8 +57,7 @@ def test_clock_expiry_while_killed_worker_unwinds_hard_exits_transient():
         shutdown_timeout_seconds=30,
         monotonic=clock,
         cancel_active_dispatches=lambda: clock.advance(20),
-        force_kill_dispatches=lambda: clock.advance(2),
-        finalize=lambda: calls.append("finalize"),
+        force_kill_dispatches=lambda: clock.advance(7),
         terminalize=lambda: calls.append("terminalize"),
     )
 

@@ -11,7 +11,7 @@ the daemon logs it and the next tick re-derives from GitHub.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from ..domain.actions import (
     Action,
@@ -49,9 +49,34 @@ def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bo
     return True
 
 
+def relabel(
+    gateway, kind: str, number: int, *, add: Iterable[str] = (), remove: Iterable[str] = (),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Set labels on one issue or PR, each read back: the one label operation
+    both the fix role and operator writes use. Idempotent by read: a label
+    already present is not re-added, an absent one not removed. Adds go first,
+    so a failure strands "both labels", never an unlabelled item. Returns the
+    labels it actually added and removed; a write that does not read back
+    raises."""
+    added: list[str] = []
+    removed: list[str] = []
+    for label in dict.fromkeys(add):
+        if not gateway.has_label(kind, number, label):
+            gateway.relabel(kind, number, None, label)
+            added.append(label)
+        if not gateway.has_label(kind, number, label):
+            raise RuntimeError(f"{kind} #{number}: relabel +{label} did not land")
+    for label in dict.fromkeys(remove):
+        if gateway.has_label(kind, number, label):
+            gateway.relabel(kind, number, label, None)
+            removed.append(label)
+        if gateway.has_label(kind, number, label):
+            raise RuntimeError(f"{kind} #{number}: relabel -{label} did not land")
+    return tuple(added), tuple(removed)
+
+
 class GitHubAct:
-    """Executes the fix role's Actions; `RunAgent` goes to `dispatch`.
-    `replay_pending` is trivially clean: nothing is queued."""
+    """Executes the fix role's Actions; `RunAgent` goes to `dispatch`."""
 
     def __init__(
         self,
@@ -77,9 +102,6 @@ class GitHubAct:
         self.dispatch = dispatch
         self.remove_worktree = remove_worktree
         self.log = log
-
-    def replay_pending(self) -> bool:
-        return True
 
     def execute(self, action: Action) -> None:
         if isinstance(action, RunAgent):
@@ -116,15 +138,11 @@ class GitHubAct:
             self.log(f"issue #{issue}: worktree removal failed after merge: {exc}")
 
     def relabel(self, action: Relabel) -> None:
-        kind = "issue" if action.target is Target.ISSUE else "pr"
-        self.gateway.relabel(
-            kind, action.number,
-            action.remove.value if action.remove is not None else None,
-            action.add.value if action.add is not None else None,
+        relabel(
+            self.gateway, "issue" if action.target is Target.ISSUE else "pr", action.number,
+            add=(action.add.value,) if action.add is not None else (),
+            remove=(action.remove.value,) if action.remove is not None else (),
         )
-        for label, want in ((action.add, True), (action.remove, False)):
-            if label is not None and self.gateway.has_label(kind, action.number, label.value) is not want:
-                raise RuntimeError(f"{kind} #{action.number}: relabel {label.value} did not land")
 
     def post(self, action: PostComment) -> None:
         kind = "issue" if action.target is Target.ISSUE else "pr"
@@ -168,4 +186,4 @@ class GitHubAct:
         return str(latest.receipt["summary"]) if latest is not None and latest.receipt is not None else ""
 
 
-__all__ = ["GitHubAct", "submit_review"]
+__all__ = ["GitHubAct", "relabel", "submit_review"]

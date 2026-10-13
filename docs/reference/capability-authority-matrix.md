@@ -11,9 +11,9 @@ This is the deployment truth, not a security claim inferred from hooks.
 | Concern | Authority | Failure posture |
 |---|---|---|
 | Paid admission | SQLite reservations and charges | unavailable/corrupt/unpriceable with an armed cap blocks new paid work |
-| Remote mutation | lifecycle command + effect receipt + expected revision | unknown outcome reconciles; stale revision is permanent failure |
+| Remote mutation | idempotent act layer: naturally idempotent write plus read-back, or a SQLite idempotency key claimed before the write and confirmed after read-back | unknown outcome is read back, never blindly repeated |
 | Run/process ownership | SQLite lease plus PID/PGID/start-identity receipts | boot recovery kills/reclaims before admission |
-| Deduplication | namespaced SQLite keys/command idempotency | conflicts are loud; journal tails are never authority |
+| Deduplication | namespaced SQLite idempotency keys | conflicts are loud; journal tails are never authority |
 | Gate evidence | GitHub state, operator config | indeterminate is deny; worktree marker forgery has no authority |
 | Logs/dashboard | plain per-role JSONL log, SQLite legs/money tables, GitHub | may be incomplete; never changes control decisions |
 

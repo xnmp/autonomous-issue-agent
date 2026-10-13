@@ -17,8 +17,7 @@ import { Icon } from "./ui/Icon";
 import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
-import { ResolveControls } from "./resolve/ResolveControls";
-import { useLegacyUnblockRefusal } from "./legacy-unblock";
+import { UnblockControl } from "./UnblockControl";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import { CiRunningBadge, StepBadge, StepStatusChip } from "./ui/StepBadge";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
@@ -149,16 +148,8 @@ export function IssueTab({
     when: (step) => step.ts,
   }, { key: "when", direction: "asc" }, "issue-tasks");
 
-  // The detail payload carries no board status; a live issue that escalated,
-  // blocked, or asked a question is held by legacy choreography until its
-  // resolve authority says otherwise.
-  const heldForHuman = !!d && !d.done && (
-    !!d.escalation_reason
-    || d.stage === "blocked"
-    || d.stage === "escalated"
-    || d.stage === "awaiting human reply"
-  );
-  const legacyRefusal = useLegacyUnblockRefusal(repo, heldForHuman);
+  // `needs-human` on the issue or its PR: only a person releases it.
+  const heldForHuman = !!d && !d.done && !!d.held_for_human;
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
@@ -271,11 +262,10 @@ export function IssueTab({
             </div>
           ) : null}
           {d.done ? null : (
-            <ResolveControls
+            <UnblockControl
               deployment={repo}
               issue={issue}
               heldForHuman={heldForHuman}
-              legacyRefusal={legacyRefusal}
               onChanged={detail.refresh}
             />
           )}

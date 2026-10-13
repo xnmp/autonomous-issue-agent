@@ -165,10 +165,8 @@ about paid runners, not a harness fix).
 - **Never run `issue-agent dashboard` from a sandboxed assistant shell** — the
   server inherits the sandbox and every `gh` write dies with an h2 "stream
   CANCEL". Spawn it unsandboxed or the unblock lever silently can't write.
-- **Terminal GitHub writes are durable.** A comment/relabel/close that exhausts
-  transient retries remains a `lifecycle_commands` row in the SQLite control
-  store. The daemon drains that authority before its next world read, reaper
-  pass, or paid dispatch; ambiguous outcomes are reconciled against GitHub
-  before another occurrence is issued. If a role appears idle with GitHub
-  healthy, inspect nonterminal lifecycle commands and the typed
-  `action_failed`/`action_retry` events before re-queuing work.
+- **GitHub writes are idempotent, not queued.** Since slice 5d-1 a failed
+  comment/relabel/merge is not retried from a durable queue: the next tick
+  re-observes GitHub and re-derives the same Action, and a keyed write whose
+  reply was lost is read back before it is repeated. If a role appears idle
+  with GitHub healthy, read the daemon log for the failing write.

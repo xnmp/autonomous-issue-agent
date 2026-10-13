@@ -64,22 +64,23 @@ unchanged; name what it removes before writing it.
   transport I/O. It cannot import `app/`.
 - `app/` is the composition/orchestration layer.
 - Decisions return immutable `Action` values. Remote lifecycle mutations go
-  through durable commands and effect receipts.
+  through the idempotent act layer (keyed or read-back).
 - Make broken lifecycle states unrepresentable where practical: use explicit
   typed variants/discriminated unions instead of independent booleans, status
   strings, or optional fields that permit contradictions. Parse and validate
   untrusted inputs before constructing a trusted variant; retain runtime
   validation at external boundaries.
-- SQLite is authority for admission, spend, leases, runs, deduplication,
-  lifecycle commands, and receipts. JSONL is the daemon log only.
+- SQLite is authority for money, leases, legs/attempts and idempotency keys.
+  JSONL is the daemon log only.
 - Tests assert public behavior and observable outputs. Business rules include
   malformed, absent, boundary, and huge inputs.
 - Comments explain constraints or incident history, never narrate the next line.
 - New gate/review verdict inputs state their provenance (who can write them,
   in which trust domain); below harness-owned means laundered through a
   harness-side mint or treated as an untrusted claim. Retry/defer/skip loops
-  carry a log line and a ceiling (or are spaced by the machine backoff). (ADR 0012; existing code migrates when
-  touched.)
+  carry a log line and a ceiling (or are spaced by the machine backoff).
+  ([minimal-harness design](docs/open/2026-10-12-minimal-harness-design.md);
+  existing code migrates when touched.)
 
 Import-linter and AST contracts enforce these boundaries in `make test`.
 
@@ -127,7 +128,7 @@ paid admission while observation and reconciliation continue.
 `SIGTERM` stops admission, cancels/drains active work within a bound, writes
 handover/receipts, kills remaining groups, and exits with a
 stable taxonomy. Boot and suspension recovery kill orphans, reclaim leases,
-reconcile unsettled spend, and drain commands reconcile-first.
+and reconcile unsettled spend.
 
 There is no command governor. Current agent children still inherit publication
 capability, so the supported posture is trusted inbound content only. See the
@@ -161,7 +162,7 @@ the complete diff in a subagent.
 
 - `src/issue_agent/domain/` — value objects, policies, events, ports.
 - `src/issue_agent/adapters/` — GitHub/runtime/process/store/event/dashboard I/O.
-- `src/issue_agent/app/` — config, roles, workflows, daemon loop, CLI.
+- `src/issue_agent/app/` — config, role wiring, the shared tick, CLI, dashboard.
 - `plugin/` — fixer (`AGENT.md`) and reviewer prompt guidance.
 - `ops/` / `bin/` — service templates/installers and launch tooling.
 - `tests/domain`, `tests/adapters`, `tests/app` — mirrored test tiers.

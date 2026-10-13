@@ -64,27 +64,6 @@ def test_no_history_means_no_wait():
     assert machine_backoff_until((), AgentKind.RESOLVE) is None
 
 
-def test_a_normal_router_leg_before_each_dying_resolve_does_not_reset_the_streak():
-    """Routing runs a cheap ROUTE leg before every unpinned RESOLVE. It returns
-    normally; only the RESOLVE leg that ended the dispatch counts, so twenty
-    consecutive RESOLVE deaths still double the wait up to the cap."""
-    history: list[LegEnd] = []
-    waits = []
-    at = T
-    for _ in range(20):
-        route = dispatched_kind("ROUTE")
-        resolve = dispatched_kind("RESOLVE")
-        assert route is not None and resolve is not None
-        history.append(LegEnd(route, at + timedelta(seconds=10), False))
-        history.append(LegEnd(resolve, at + timedelta(seconds=40), True))
-        until = machine_backoff_until(history, AgentKind.RESOLVE)
-        assert until is not None
-        waits.append(until - (at + timedelta(seconds=40)))
-        at = until
-    assert waits[:7] == [timedelta(seconds=60 * 2 ** i) for i in range(6)] + [timedelta(hours=1)]
-    assert set(waits[7:]) == {timedelta(hours=1)}
-
-
 @pytest.mark.parametrize("run_kind", ["", "unknown", "resolve", "x" * 10_000])
 def test_unknown_run_kinds_are_not_agent_kinds(run_kind):
     assert dispatched_kind(run_kind) is None

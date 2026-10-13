@@ -207,7 +207,6 @@ describe("long-table filtering", () => {
       title: index === 6 ? "Parked pull request" : `Waiting issue ${index}`,
       url: null,
       body: null,
-      priority: null,
       labels: index === 6 ? ["ai-parked"] : ["ai-ready"],
       held: index === 6,
       hold_reason: index === 6 ? "parked" : null,

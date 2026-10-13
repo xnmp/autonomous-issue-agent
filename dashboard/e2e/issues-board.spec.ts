@@ -120,7 +120,7 @@ const boardIssues = {
   pending: [
     {
       issue: 1055, title: "add command palette command to open git issue list in browser", url: null,
-      labels: ["ai-ready"], priority: null, held: true, hold_reason: "waiting on #1082", overlap: null,
+      labels: ["ai-ready"], held: true, hold_reason: "waiting on #1082", overlap: null,
       board: {
         status: "blocked", on: { kind: "issue", issue: 1082 }, headline: "Waiting for #1082",
         reason: "Starts when #1082 merges.", since_ts: ago(26 * 60),
@@ -129,10 +129,10 @@ const boardIssues = {
     },
     {
       issue: 1010, title: "make it so that in fullscreen for pdf previews, left/right arrows goes to next/previous", url: null,
-      labels: ["ai-parked"], priority: null, held: true, hold_reason: "parked", overlap: null,
+      labels: ["needs-human"], held: true, hold_reason: "parked", overlap: null,
       board: {
         status: "blocked", on: { kind: "triage", why: "parked" }, headline: "Waiting on triage",
-        reason: "Parked for human review. Unpark it to queue it again.", since_ts: ago(3 * 24 * 60),
+        reason: "Held for a human (needs-human). Unblock removes the label.", since_ts: ago(3 * 24 * 60),
       },
       rail: rail({ current: "triage", furthest: "triage", review_rounds: 0, steps: 0 }),
     },

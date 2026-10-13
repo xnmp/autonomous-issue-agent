@@ -148,15 +148,6 @@ class StubBackend:
         self.park_channel = channel
         return (True, "ok")
 
-    def unpark(self, name, number, channel="api"):
-        self._maybe("unpark")
-        self.unpark_channel = channel
-        return (True, "ok")
-
-    def priority(self, name, number, priority):
-        self._maybe("priority")
-        self.priority_seen = priority
-        return (True, "ok")
 
 
 WRITE_HEADERS = {"X-Issue-Agent-Dashboard": "1"}
@@ -321,7 +312,7 @@ def test_unblock_reports_success():
     }
 
 
-def test_park_and_unpark_report_success_and_stamp_the_channel():
+def test_park_and_unblock_report_success_and_stamp_the_channel():
     backend = StubBackend()
     c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
     assert c.post("/api/repos/demo/issues/9/park",
@@ -329,11 +320,19 @@ def test_park_and_unpark_report_success_and_stamp_the_channel():
         "ok": True, "detail": "ok"
     }
     assert backend.park_channel == "ui"
-    assert c.post("/api/repos/demo/issues/9/unpark",
+    assert c.post("/api/repos/demo/issues/9/unblock",
                   headers={"User-Agent": "curl/8.5"}).json() == {
         "ok": True, "detail": "ok"
     }
-    assert backend.unpark_channel == "api"
+    assert backend.unblock_channel == "api"
+
+
+def test_the_removed_operator_command_routes_are_gone():
+    c = TestClient(server.create_app(backend=StubBackend()), headers=WRITE_HEADERS, base_url=BASE_URL)
+    for path in ("/api/repos/demo/issues/9/unpark", "/api/repos/demo/issues/9/resolve-control/commands"):
+        assert c.post(path).status_code in (404, 405)
+    for path in ("/api/repos/demo/issues/9/resolve-control", "/api/repos/demo/workflow-families"):
+        assert c.get(path).status_code == 404
 
 
 def test_a_park_whose_collectors_fail_is_refused_not_a_500():
@@ -403,23 +402,6 @@ def test_legacy_unblock_refuses_unencodable_fields_with_a_renderable_response():
     assert response.status_code == 422
     assert not hasattr(backend, "unblock_channel")
     response.json()
-
-
-def test_priority_accepts_the_three_labels_and_null():
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    for value in ("P1", "P2", "P3", None):
-        assert c.post("/api/repos/demo/issues/9/priority",
-                      json={"priority": value}).json()["ok"] is True
-        assert backend.priority_seen == value
-
-
-def test_an_unknown_priority_is_a_400_and_never_reaches_the_backend():
-    backend = StubBackend()
-    r = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL).post(
-        "/api/repos/demo/issues/9/priority", json={"priority": "P9"}
-    )
-    assert r.status_code == 400 and "priority" not in backend.calls
 
 
 # ── static ────────────────────────────────────────────────────────────────────
@@ -612,8 +594,6 @@ def test_a_non_positive_issue_number_never_reaches_gh(number):
     backend = StubBackend()
     c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
     assert c.post(f"/api/repos/demo/issues/{number}/promote").status_code == 400
-    assert c.post(f"/api/repos/demo/issues/{number}/priority",
-                  json={"priority": "P1"}).status_code == 400
     assert backend.calls == []
 
 

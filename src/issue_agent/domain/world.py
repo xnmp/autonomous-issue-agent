@@ -40,7 +40,6 @@ class ReviewDecision(str, Enum):
 # GitHub review states (as returned by the reviews API / pr view).
 REVIEW_APPROVED = "APPROVED"
 REVIEW_CHANGES_REQUESTED = "CHANGES_REQUESTED"
-REVIEW_COMMENTED = "COMMENTED"
 
 
 @dataclass(frozen=True)
@@ -110,33 +109,6 @@ class IssueView:
     updated_at: str = ""
     author: str = ""
     state: str = "open"  # open | closed
-    # GitHub's `stateReason`, lower-cased: "" | "completed" | "not_planned" |
-    # "reopened". Carried on the world (it costs nothing — the same `gh issue
-    # view` already runs) because it is the ONLY deterministic evidence that an
-    # issue's lifecycle already ended once: an OPEN issue reading "reopened" was
-    # closed and put back by a human, which is the #10 recurrence signal and must
-    # never be re-closed by the harness. "" = never closed.
-    state_reason: str = ""
-    # GitHub-native issue dependencies: True iff this issue has at least one OPEN
-    # "blocked by" dependency (the adapter resolves the summary + list; the domain
-    # only sees the settled boolean). The fixer must NOT pick up a blocked issue —
-    # it would implement against a base branch missing its prerequisite. Default
-    # False = no blockers (safe: an issue with no dependency graph is dispatchable).
-    blocked_by_open: bool = False
-    # The open dependency numbers behind ``blocked_by_open``. Keeping the
-    # witnesses lets operator surfaces name what will unblock the issue instead
-    # of exposing the gate's internal "held" terminology.
-    open_blocker_numbers: tuple[int, ...] = ()
-    # File paths the issue body explicitly names (backticked `pkg/mod.py` etc.),
-    # extracted by the adapter. Used to skip dispatching an issue whose files
-    # overlap an in-flight PR's changed files (would guarantee a merge conflict
-    # when that PR lands — the #59-vs-#60 collision). Empty = no paths declared →
-    # unpredictable → the gate can't apply (fail-open, don't over-block).
-    declared_paths: frozenset[str] = field(default_factory=frozenset)
-    # Repository-relative paths predicted by the cheap router. These are
-    # advisory like declared_paths: malformed or absent predictions remain empty
-    # and therefore cannot hold an issue.
-    predicted_paths: frozenset[str] = field(default_factory=frozenset)
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -158,10 +130,7 @@ class PRView:
     reviews: tuple[Review, ...] = ()
     ci: CIObservation = Unavailable("checks not observed")
     state: str = "OPEN"            # OPEN | MERGED | CLOSED
-    closing_issue: int | None = None  # GitHub closing-reference graph (default-branch only)
-    # Files this PR changes (adapter reads `gh pr view --json files`). Feeds the
-    # file-overlap gate: an ai-ready issue whose declared_paths intersect any OPEN
-    # PR's changed_files is held back (dispatching it races a guaranteed conflict).
+    # Files this PR changes; derive stops a PR touching `.github/` for a human.
     changed_files: frozenset[str] = field(default_factory=frozenset)
     # GitHub mergeability (mergeable: MERGEABLE|CONFLICTING|UNKNOWN). CONFLICTING
     # means the branch won't merge until rebased — the auto-rebase backup plan
@@ -175,10 +144,6 @@ class PRView:
     # `mergeable=CONFLICTING` (DIRTY) — BEHIND has no conflict, just needs a base
     # update, so it takes the cheap update-branch path, not a full agent rebase.
     merge_state: str = ""
-    # Draft PRs are work-in-progress → never auto-adopted for review. `author` is
-    # the PR opener's login; used to skip the review bot's OWN PRs when adopting
-    # rogue (unlabeled) PRs into the review pipeline.
-    is_draft: bool = False
     author: str = ""
     # Appended to preserve the positional compatibility of the historical
     # PRView fields while binding review evidence to an immutable base.
@@ -186,10 +151,7 @@ class PRView:
     # False when the connection-shaped fields (body, comments, reviews,
     # changed_files) were NOT fetched — the terminal-PR fast path builds a view
     # from the `gh pr list` payload, which carries none of them (#163). Same
-    # absence contract as the CI observation: absent ≠ empty. No lifecycle decision reads
-    # them off a non-OPEN PR, but telemetry does, and a metric that cannot tell
-    # "no files" from "files unread" reports a false zero (adversarial review
-    # F4: the predicted-path hit rate is a primary metric).
+    # absence contract as the CI observation: absent ≠ empty.
     content_known: bool = True
     # Head-branch pushes, any order. Empty = none observed.
     pushes: tuple[Push, ...] = ()
@@ -219,88 +181,6 @@ class PullRequestDiff:
     text: str
 
 
-import re
-
-# A backticked token that looks like a source path: has a slash OR a code-ish
-# extension, so prose words in backticks (`status`, `True`) don't count. Matches
-# `backend/app/x.py`, `services/fakes.py`, `foo.ts`. Anchored to the backtick
-# span so we only trust paths the author explicitly formatted as code.
-_PATH_RE = re.compile(
-    r"`([A-Za-z0-9_./-]+(?:\.(?:py|ts|tsx|js|jsx|md|sql|toml|yaml|yml)"
-    r"|/[A-Za-z0-9_./-]+))`"
-)
-
-
-def extract_declared_paths(body: str) -> frozenset[str]:
-    """File paths a GitHub issue body explicitly names in backticks. Pure. Used
-    to predict which files an issue will touch BEFORE it runs (it has no diff
-    yet), so the fixer can avoid dispatching an issue that overlaps an in-flight
-    PR. Conservative: only backticked tokens that look like real paths (a slash
-    or a source extension) — prose-in-backticks is ignored. A normalised set of
-    forward-slash paths; no leading `./`."""
-    out: set[str] = set()
-    for m in _PATH_RE.finditer(body or ""):
-        p = m.group(1).strip().lstrip("./")
-        if p:
-            out.add(p)
-    return frozenset(out)
-
-
-def normalize_predicted_paths(raw: object) -> frozenset[str]:
-    """Return safe, exact repo-relative router predictions, else no signal.
-
-    This input is structured model output, not GitHub ground truth. One malformed
-    value must never turn the overlap serializer into a broad deny gate, so an
-    invalid list fails open as a whole rather than preserving a partial guess.
-    """
-    if not isinstance(raw, (list, tuple, frozenset)) or len(raw) > 32:
-        return frozenset()
-    paths: set[str] = set()
-    for path in raw:
-        if not isinstance(path, str) or not path or path != path.strip():
-            return frozenset()
-        normalized = path.removeprefix("./")
-        parts = normalized.split("/")
-        if (
-            not normalized
-            or normalized.startswith("/")
-            or "\\" in normalized
-            or any(part in ("", ".", "..") for part in parts)
-        ):
-            return frozenset()
-        paths.add(normalized)
-    return frozenset(paths)
-
-
-@dataclass(frozen=True)
-class ClosingRef:
-    """An OPEN pull request GitHub's closing-reference graph says closes `issue`.
-
-    Deliberately SEPARATE from `WorldState.prs`, which the fix world populates
-    only from `ai-pr-open` — i.e. the harness's own PRs. The duplicate-resolve
-    guard (#39) needs the opposite population: PRs the harness has never touched,
-    typically a human's, which is exactly what `prs` cannot carry without
-    changing what every other fixer pass (path-overlap holds, reap, cleanup,
-    auto-merge) considers "a PR of ours". One cheap repo-wide `gh pr list` fills
-    this instead, and nothing but the guard reads it.
-
-    `author` is the opener's login, "" when GitHub didn't resolve it (a deleted
-    account) — the guard treats an unknown author as NOT the fix bot, the same
-    fail-safe direction `fixer_prs` uses.
-
-    `base_ref_name` is recorded but deliberately NOT gated on: GitHub only
-    AUTO-closes an issue when the PR merges into the default branch, so a PR
-    based elsewhere leaves the issue open — but the fix in it still exists, so
-    resolving the issue again would still buy a duplicate. The money is wasted
-    either way; the base is carried only so the comment can be honest about it
-    if that ever matters."""
-
-    pr: int
-    issue: int
-    author: str = ""
-    base_ref_name: str = ""
-
-
 @dataclass(frozen=True)
 class WorldState:
     """Everything a single daemon poll observes. A daemon reads only the slice
@@ -308,29 +188,15 @@ class WorldState:
 
     issues: tuple[IssueView, ...] = ()
     prs: tuple[PRView, ...] = ()
-    # Open PRs that close one of this repo's issues, harness-authored or not
-    # (#39). Empty = NOT COLLECTED (a hand-built world, a builder that predates
-    # this, a repo with no open PRs) — indistinguishable on purpose, because the
-    # only consumer is a guard that must fail OPEN: no evidence of a duplicate
-    # is not evidence of no duplicate, but refusing to dispatch on missing data
-    # would strand every issue on any world builder that doesn't fill this.
-    closing_refs: tuple[ClosingRef, ...] = ()
     # When this snapshot was BUILT (ISO-8601 UTC), stamped by the adapter. The
     # domain is pure and may not read a clock, so any decision with a time
     # component (the CI pending deadline, #30) reads it from here. Empty =
     # unstamped (a hand-built world, a builder that predates this) → every
     # time-based gate treats the elapsed time as unknown and does not fire.
-    # Safe to read only because a world is decided on the tick it was built:
-    # WorldProbe raises WorldUnchanged instead of re-serving a cached world.
     now: str = ""
     # Harness branches with no PR in any state. Empty = none observed.
     branches: tuple[Branch, ...] = ()
 
-    def open_issues(self) -> tuple[IssueView, ...]:
-        return tuple(i for i in self.issues if i.state == "open")
-
-    def issues_with(self, label: Label) -> tuple[IssueView, ...]:
-        return tuple(i for i in self.issues if i.has(label))
 
 # Convenience re-export so callers can `from .world import replace`.
 __all__ = [
@@ -338,7 +204,6 @@ __all__ = [
     "ReviewDecision",
     "REVIEW_APPROVED",
     "REVIEW_CHANGES_REQUESTED",
-    "REVIEW_COMMENTED",
     "Check",
     "Review",
     "Comment",
@@ -346,7 +211,6 @@ __all__ = [
     "Branch",
     "IssueView",
     "PRView",
-    "ClosingRef",
     "WorldState",
     "replace",
 ]

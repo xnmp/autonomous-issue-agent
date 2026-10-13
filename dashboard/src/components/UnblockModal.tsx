@@ -1,8 +1,6 @@
 import { ConfirmModal } from "./ui/Modal";
 
-/**
- * Confirmation for legacy breaker recovery while workflow families are inactive.
- */
+/** Confirmation for Unblock: one label move on GitHub (refactor decision Q19). */
 export function UnblockModal({
   issue,
   busy,
@@ -27,15 +25,13 @@ export function UnblockModal({
       body={
         <>
           <p>
-            Remove the holds on <strong className="mono">#{issue}</strong> —{" "}
-            <span className="mono">needs-human-review</span>,{" "}
-            <span className="mono">needs-budget-review</span> and{" "}
-            <span className="mono">ai-blocked</span>?
+            Remove <span className="mono">needs-human</span> from{" "}
+            <strong className="mono">#{issue}</strong> and its open harness PRs?
+            No other label changes.
           </p>
           <p className="muted">
-            This resets legacy retry breakers and may allow paid work to resume.
-            Review rejection holds require review control activation. If the
-            issue escalated with a question, answer it on GitHub first.
+            The harness may resume paid work on it. If it stopped with a
+            question, answer it on GitHub first.
           </p>
         </>
       }

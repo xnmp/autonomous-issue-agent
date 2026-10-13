@@ -123,7 +123,8 @@ def write_exhaustion_handover(
     therefore no grace spend. All inspection and writes are bounded and
     fail-soft; callers always return the original terminal result.
     """
-    if not scope.eligible or result.exit_reason not in _HANDOVER_TRIGGERS:
+    reason = result.exit_reason
+    if not scope.eligible or reason is None or reason not in _HANDOVER_TRIGGERS:
         return None
     path = _handover_path(task, scope)
     if path is None:
@@ -142,7 +143,7 @@ def write_exhaustion_handover(
             )
         _atomic_write(path, encoded)
         return HandoverReceipt(
-            trigger=result.exit_reason.value,
+            trigger=reason.value,
             byte_size=len(encoded),
         )
     except Exception as exc:  # noqa: BLE001 — preserve the original ceiling result

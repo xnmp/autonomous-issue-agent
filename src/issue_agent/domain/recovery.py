@@ -17,7 +17,6 @@ class RecoveryArm(str, Enum):
     REAP_ABANDONED_PROCESSES = "reap_abandoned_processes"
     RECLAIM_LEASES = "reclaim_leases"
     VALIDATE_WORKTREES = "validate_worktrees"
-    DRAIN_COMMANDS = "drain_commands"
     SWEEP_RESERVATIONS = "sweep_reservations"
 
 
@@ -58,7 +57,6 @@ _FULL_ARMS = frozenset(
     {
         RecoveryArm.RECLAIM_LEASES,
         RecoveryArm.VALIDATE_WORKTREES,
-        RecoveryArm.DRAIN_COMMANDS,
         RecoveryArm.SWEEP_RESERVATIONS,
     }
 )

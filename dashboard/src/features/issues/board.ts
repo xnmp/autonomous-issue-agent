@@ -89,15 +89,13 @@ const UNCLASSIFIED: BoardStatus = {
  * A queued card without a server status: a backlog promotion the client
  * shows before the next poll confirms it. Worded as the server words a queue.
  */
-function queued(priority: PendingCard["priority"]): BoardStatus {
-  return {
-    status: "blocked",
-    on: { kind: "queue", priority },
-    headline: "Queued",
-    reason: `Starts when the fixer picks it up${priority ? ` (${priority})` : ""}.`,
-    since_ts: null,
-  };
-}
+const QUEUED: BoardStatus = {
+  status: "blocked",
+  on: { kind: "queue" },
+  headline: "Queued",
+  reason: "Starts when the fixer picks it up.",
+  since_ts: null,
+};
 
 /**
  * In-flight and queued rows as one list. An issue
@@ -118,7 +116,7 @@ export function boardItems(payload: Pick<IssuesPayload, "in_flight" | "pending">
     add(fromIssueCard(card));
   }
   for (const card of payload.pending ?? []) {
-    add(fromPendingCard(card, card.board ?? queued(card.priority)));
+    add(fromPendingCard(card, card.board ?? QUEUED));
   }
   return items;
 }
@@ -373,7 +371,7 @@ export type PrimaryAction =
   | { kind: "budget"; label: "Approve spend" }
   | { kind: "open_issue"; label: "Open issue" }
   | { kind: "open_pr"; label: "Open PR" }
-  | { kind: "unpark"; label: "Unpark" };
+  | { kind: "unblock"; label: "Unblock" };
 
 /**
  * At most one action per row, and only where the operator is what moves it:
@@ -393,7 +391,7 @@ export function primaryAction(board: BoardStatus): PrimaryAction | null {
     }
   }
   if (board.status === "blocked" && board.on.kind === "triage") {
-    return { kind: "unpark", label: "Unpark" };
+    return { kind: "unblock", label: "Unblock" };
   }
   return null;
 }

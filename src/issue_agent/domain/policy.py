@@ -70,15 +70,15 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
             raise ValueError("a PR is opened exactly for an issue")
         return (OpenPullRequest(key.number, state.branch),)
     if isinstance(state, Release):
-        return (Relabel(key.target, key.number, remove=Label.NEEDS_HUMAN, add=None, harness_signal=True),)
+        return (Relabel(key.target, key.number, remove=Label.NEEDS_HUMAN, add=None),)
     if isinstance(state, NeedsHuman):
         why = _WHY[state.reason].format(act=state.act.name if state.act else "")
         asked = f"\n\n{question_text(state.question)}" if state.reason is StopReason.QUESTION else ""
         body = (f"{harness.marker}\n{stop_tag(state.reason)}\n"
                 f"**needs-human**: {why}{asked}\n\n{_HOW.get(state.reason, _DEFAULT_HOW)}")
         return (
-            Relabel(key.target, key.number, remove=None, add=Label.NEEDS_HUMAN, harness_signal=True),
-            PostComment(key.target, key.number, body, harness_signal=True, key=needs_human_key(key, state)),
+            Relabel(key.target, key.number, remove=None, add=Label.NEEDS_HUMAN),
+            PostComment(key.target, key.number, body, key=needs_human_key(key, state)),
         )
     if isinstance(state, (Wait, Busy, Backoff)):
         return ()

@@ -12,7 +12,6 @@ from issue_agent.domain.outcome import (
     ADMISSION_REFUSAL_SUBTYPES,
     AgentResult,
     ExitReason,
-    address_review_actions,
     infra_class_failure,
     no_session_evidence,
     PROVIDER_REFUSED_SUBTYPE,
@@ -134,17 +133,3 @@ def test_a_huge_negative_or_absent_num_turns_is_handled():
     assert not no_session_evidence(num_turns=10**9)
 
 
-# ── the counters that read it ────────────────────────────────────────────────
-def test_address_review_does_not_charge_a_round_it_never_bought():
-    """The review-round ceiling is a quality counter too: a runtime that
-    cannot start must not walk a healthy PR to needs-human-review."""
-    out = address_review_actions(7, result(exit_reason=ExitReason.RUNTIME_UNAVAILABLE))
-    assert out.bump_retry is False
-    assert out.actions == []
-
-
-def test_address_review_still_charges_a_round_that_ran():
-    out = address_review_actions(
-        7, result(session_id="s", exit_reason=ExitReason.AGENT_ERROR)
-    )
-    assert out.bump_retry is True

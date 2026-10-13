@@ -32,7 +32,7 @@ const needs = (since: string | null, ask: "rearm" | "escalated" | "budget" | "aw
   ({ status: "needs_you", ask, headline: "Answer the agent", reason: "why", since_ts: since });
 const working: BoardStatus = { status: "working", activity: "agent", headline: "Resolving", reason: "", since_ts: null };
 const queued: BoardStatus = {
-  status: "blocked", on: { kind: "queue", priority: null }, headline: "Queued", reason: "", since_ts: null,
+  status: "blocked", on: { kind: "queue" }, headline: "Queued", reason: "", since_ts: null,
 };
 
 function payload(over: Partial<IssuesPayload>): IssuesPayload {
@@ -48,8 +48,8 @@ describe("boardItems", () => {
   it("merges in-flight and queued rows, each issue once", () => {
     const items = boardItems(payload({
       in_flight: [card(1, working), card(9, null, { done: true })],
-      pending: [{ issue: 1, title: "dup", url: null, labels: [], priority: null, held: false, hold_reason: null, overlap: null, board: queued } as PendingCard,
-        { issue: 2, title: "queued", url: null, labels: [], priority: "P2", held: false, hold_reason: null, overlap: null } as PendingCard],
+      pending: [{ issue: 1, title: "dup", url: null, labels: [], held: false, hold_reason: null, overlap: null, board: queued } as PendingCard,
+        { issue: 2, title: "queued", url: null, labels: [], held: false, hold_reason: null, overlap: null } as PendingCard],
     }));
 
     expect(items.map((item) => [item.issue, item.board.status])).toEqual([
@@ -60,10 +60,10 @@ describe("boardItems", () => {
 
   it("words a queued card without a server status the way the server words a queue", () => {
     const [item] = boardItems(payload({
-      pending: [{ issue: 2, title: "t", url: null, labels: [], priority: "P1", held: false, hold_reason: null, overlap: null } as PendingCard],
+      pending: [{ issue: 2, title: "t", url: null, labels: [], held: false, hold_reason: null, overlap: null } as PendingCard],
     }));
 
-    expect(item?.board).toMatchObject({ status: "blocked", headline: "Queued", reason: "Starts when the fixer picks it up (P1)." });
+    expect(item?.board).toMatchObject({ status: "blocked", headline: "Queued", reason: "Starts when the fixer picks it up." });
   });
 
   it("keeps an unclassified running card on the board as Working rather than dropping it", () => {
@@ -215,7 +215,7 @@ describe("primaryAction", () => {
     for (const ask of ["escalated", "awaiting_reply", "stalled"] as const) {
       expect(primaryAction(needs(null, ask))?.label).toBe("Open issue");
     }
-    expect(primaryAction({ ...queued, on: { kind: "triage", why: "parked" } })?.label).toBe("Unpark");
+    expect(primaryAction({ ...queued, on: { kind: "triage", why: "parked" } })?.label).toBe("Unblock");
     expect(primaryAction(queued)).toBeNull();
     expect(primaryAction({ ...queued, on: { kind: "issue", issue: 4 } })).toBeNull();
     expect(primaryAction(working)).toBeNull();

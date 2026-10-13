@@ -42,3 +42,11 @@ whitespace-delimited words.
 Re-measured 2026-10-13 after slice 5c deleted the PR-repair acknowledgment
 paragraph with the code it described: 7,286 UTF-8 bytes and 981
 whitespace-delimited words.
+
+Re-measured 2026-10-13 after slice 5d-1 rewrote the durable-command and
+SQLite-authority rules for the idempotent act layer: 7,233 UTF-8 bytes and 977
+whitespace-delimited words.
+
+Re-measured 2026-10-13 after the slice 5d-1 fix round cited the minimal-harness
+design for the provenance rule and renamed the app/ map entry: 7,309 UTF-8
+bytes and 979 whitespace-delimited words.

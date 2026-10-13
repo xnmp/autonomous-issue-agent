@@ -8,7 +8,6 @@ GitHub.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import contextvars
 import json
 import os
@@ -16,12 +15,11 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .runtime_plan import AgentRuntime, ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.contracts import Money
-from ..domain.workflow_identity import WorkflowBinding
 from ..domain.dashboard import ISSUE_NUMBERED
 from ..domain.events import (
     ActionApplied,
@@ -40,7 +38,6 @@ from ..domain.events import (
     StallDetected,
     TelemetryEvent,
     TelemetryWarning,
-    TickGated,
 )
 from ..domain.outcome import pre_admission_refusal, AgentResult, ExitReason, deterministic_death
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage
@@ -174,8 +171,6 @@ def record_fields(event: TelemetryEvent) -> tuple[str, dict[str, object]]:
             **attributes,
             **({"issue": issue} if issue is not None else {}),
         }
-    if isinstance(payload, TickGated):
-        return "tick_gated", {**common, "reason": payload.reason}
     if isinstance(payload, GithubUnavailable):
         return "gh_unavailable", {
             **common,
@@ -318,7 +313,6 @@ class RunContext:
     issue: int | None = None
     claim_target: int | None = None
     dispatch_id: str = ""
-    workflow: WorkflowBinding | None = None
     # The PR head a fix leg was decided on (accounting records it per run).
     head: str = ""
     # A fix leg continuing a wall-capped leg (the resume-once rule's input).
@@ -354,32 +348,6 @@ def _run_correlation(
     )
 
 
-@dataclass
-class _DeferredRouteReceipt:
-    """A completed router receipt, held until its dispatch decision is known."""
-
-    task: RuntimePlan | None = None
-    result: AgentResult | None = None
-    duration_s: float = 0.0
-    model: str = ""
-    effort: str | None = None
-    selected_runtime: str | None = None
-    # The router's difficulty tier, when it named one on the ladder.
-    tier: str | None = None
-    context: RunContext | None = None
-    run_id: str = ""
-    leg_id: str = ""
-
-    def decide(
-        self, model: str | None, effort: object | None, runtime: str | None = None,
-        *, tier: str | None = None,
-    ) -> None:
-        self.selected_runtime = runtime
-        self.model = model or ""
-        self.effort = getattr(effort, "value", effort) or None
-        self.tier = tier
-
-
 class JournalingRuntime:
     """An `AgentRuntime` that wraps another and records what each run cost.
 
@@ -407,12 +375,6 @@ class JournalingRuntime:
         self._context = contextvars.ContextVar(
             f"journal_run_context_{id(self)}",
             default=RunContext(role=role),
-        )
-        self._deferred_route_receipt = contextvars.ContextVar[
-            _DeferredRouteReceipt | None
-        ](
-            f"journal_route_receipt_{id(self)}",
-            default=None,
         )
 
     def __getattr__(self, name: str):
@@ -442,13 +404,12 @@ class JournalingRuntime:
         issue: int | None,
         claim_target: int | None = None,
         *,
-        workflow: WorkflowBinding | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
         Mutable state on purpose: journaling and paid admission consume the
-        same dispatch context across every workflow leg.
+        same dispatch context.
 
         Each call mints a fresh `dispatch_id`; every leg the handler runs
         inherits it. Random rather than sequential because the counter's whole
@@ -461,7 +422,6 @@ class JournalingRuntime:
             issue=issue,
             claim_target=claim_target,
             dispatch_id=uuid.uuid4().hex[:12],
-            workflow=workflow,
             head=head,
             resumed=resumed,
         ))
@@ -472,79 +432,10 @@ class JournalingRuntime:
                 number,
                 issue,
                 claim_target=claim_target,
-                workflow=workflow,
                 head=head,
                 resumed=resumed,
             )
 
-    @contextlib.contextmanager
-    def leg_kind(self, kind: str):
-        """Journal the legs run inside this block under `kind` instead of the
-        dispatch's own (#40).
-
-        The `dispatch_id` is deliberately KEPT: a sub-leg is part of the
-        dispatch that ran it, and minting a new id would make the dispatch look
-        like two — `unsettled_starts` counts one death per dispatch, so a
-        daemon killed during a classify probe would be charged twice.
-
-        Only the NAME changes, so the leg still reaches the spend ledger (a
-        router run is real spend); it just lands in its own bucket instead of
-        inflating the one it precedes.
-        """
-        previous = self.context
-        token = self._context.set(replace(previous, kind=kind))
-        if isinstance(self.inner, ContextualRuntime):
-            self.inner.set_context(
-                previous.role,
-                kind,
-                previous.number,
-                previous.issue,
-                claim_target=previous.claim_target,
-                workflow=previous.workflow,
-                head=previous.head,
-                resumed=previous.resumed,
-            )
-        try:
-            yield
-        finally:
-            if isinstance(self.inner, ContextualRuntime):
-                self.inner.set_context(
-                    previous.role,
-                    previous.kind,
-                    previous.number,
-                    previous.issue,
-                    claim_target=previous.claim_target,
-                    workflow=previous.workflow,
-                    head=previous.head,
-                    resumed=previous.resumed,
-                )
-            self._context.reset(token)
-
-    @contextlib.contextmanager
-    def route_receipt(self):
-        """Delay one ROUTE settlement until its selected resolve stance is known.
-
-        A probe yields a difficulty tier, while the workflow selects the actual
-        resolve model and effort after applying its escalation policy. The start
-        receipt remains immediate; this only delays the successful settlement.
-        """
-        receipt = _DeferredRouteReceipt()
-        receipt_token = self._deferred_route_receipt.set(receipt)
-        try:
-            yield receipt.decide
-        finally:
-            self._deferred_route_receipt.reset(receipt_token)
-            if receipt.result is not None and receipt.task is not None:
-                context_token = self._context.set(receipt.context or self.context)
-                try:
-                    self._record(
-                        receipt.task, receipt.result, receipt.duration_s,
-                        route_decision=receipt,
-                        run_id=receipt.run_id,
-                        leg_id=receipt.leg_id,
-                    )
-                finally:
-                    self._context.reset(context_token)
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         """Journal the dispatch BEFORE the await and the settlement after it —
@@ -628,18 +519,7 @@ class JournalingRuntime:
                 )
             raise
         duration_s = time.monotonic() - t0
-        deferred = self._deferred_route_receipt.get()
-        if deferred is None:
-            self._record(
-                task, result, duration_s, run_id=run_id, leg_id=leg_id
-            )
-        else:
-            deferred.task = task
-            deferred.result = result
-            deferred.duration_s = duration_s
-            deferred.context = self.context
-            deferred.run_id = run_id
-            deferred.leg_id = leg_id
+        self._record(task, result, duration_s, run_id=run_id, leg_id=leg_id)
         retire_delivered_handover(
             task, result, scope, prepared.handover_digest
         )
@@ -677,7 +557,6 @@ class JournalingRuntime:
 
     def _record(
         self, task: RuntimePlan, result: AgentResult, duration_s: float,
-        route_decision: _DeferredRouteReceipt | None = None,
         *,
         run_id: str,
         leg_id: str,
@@ -694,30 +573,12 @@ class JournalingRuntime:
             # pair, and estimates below are priced in stream units against a rate
             # learned in stream units.
             stream = _usage(getattr(result, "stream_usage", None))
-            probe_model = task.model or getattr(result, "model", "") or ""
-            route_fields = (
-                {
-                    # ROUTE is a routing-decision event. Keep the probe model
-                    # explicit so its small spend remains attributable too.
-                    "model": route_decision.model,
-                    "effort": route_decision.effort,
-                    "probe_model": probe_model,
-                    "probe_runtime": actual_runtime,
-                    "selected_runtime": route_decision.selected_runtime,
-                    "tier": route_decision.tier,
-                }
-                if route_decision is not None else {"model": probe_model}
-            )
+            model = task.model or getattr(result, "model", "") or ""
             # Admission and settlement use the control store's configured rate
             # table. A telemetry stream must never become a pricing authority.
             attributes = {
                 "role": ctx.role,
                 "number": ctx.number,
-                "effort": route_fields.get("effort"),
-                "probe_model": route_fields.get("probe_model"),
-                "probe_runtime": route_fields.get("probe_runtime"),
-                "selected_runtime": route_fields.get("selected_runtime"),
-                "tier": route_fields.get("tier"),
                 "envelope_subtype": (
                     getattr(result, "envelope_subtype", "") or None
                 ),
@@ -760,7 +621,7 @@ class JournalingRuntime:
                             else None
                         ),
                         max(0, int(round(duration_s * 1000))),
-                        str(route_fields.get("model") or probe_model),
+                        model,
                         actual_runtime,
                         Money.from_major("USD", max(0.0, cost)).micros,
                         "USD",

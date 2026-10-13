@@ -89,23 +89,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/repos/{name}/issues/{number}/priority": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Priority */
-        post: operations["api_priority_api_repos__name__issues__number__priority_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/repos/{name}/issues/{number}/promote": {
         parameters: {
             query?: never;
@@ -117,40 +100,6 @@ export interface paths {
         put?: never;
         /** Api Promote */
         post: operations["api_promote_api_repos__name__issues__number__promote_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/repos/{name}/issues/{number}/resolve-control": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Api Resolve Control */
-        get: operations["api_resolve_control_api_repos__name__issues__number__resolve_control_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/repos/{name}/issues/{number}/resolve-control/commands": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Resolve Command */
-        post: operations["api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -191,23 +140,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/repos/{name}/issues/{number}/unpark": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Unpark */
-        post: operations["api_unpark_api_repos__name__issues__number__unpark_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/repos/{name}/overview": {
         parameters: {
             query?: never;
@@ -236,23 +168,6 @@ export interface paths {
         put?: never;
         /** Api Start */
         post: operations["api_start_api_repos__name__start_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/repos/{name}/workflow-families": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Api Workflow Families */
-        get: operations["api_workflow_families_api_repos__name__workflow_families_get"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -314,22 +229,6 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** AbsentControl */
-        AbsentControl: {
-            /** Epoch */
-            epoch: number;
-            /** Fix Recovery */
-            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
-            /** Issue */
-            issue: number;
-            /** Repository */
-            repository: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "absent";
-        };
         /** ActionResult */
         ActionResult: {
             /** Detail */
@@ -338,20 +237,6 @@ export interface components {
             ok: boolean;
         } & {
             [key: string]: unknown;
-        };
-        /** AttemptedRemediation */
-        AttemptedRemediation: {
-            /** Evidence Ids */
-            evidence_ids: string[];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "attempted";
-            /** Operation */
-            operation: string;
-            /** Outcome */
-            outcome: string;
         };
         /** AttentionItem */
         AttentionItem: {
@@ -365,33 +250,6 @@ export interface components {
             title?: string | null;
         } & {
             [key: string]: unknown;
-        };
-        /** AvailableControl */
-        AvailableControl: {
-            current_intent: components["schemas"]["Rearm"] | null;
-            expected: components["schemas"]["ResolveExpected"];
-            /** Failures */
-            failures: number;
-            /** Fix Recovery */
-            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
-            /** Gates */
-            gates: components["schemas"]["Gate"][];
-            /** Guidance */
-            guidance: string;
-            observation: components["schemas"]["Observation"] | null;
-            /** Requested Id */
-            requested_id: string | null;
-            requested_intent: components["schemas"]["Rearm"] | null;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "available";
-            /**
-             * Workflow Held
-             * @description SQLite workflow holds only, not a remote readiness assertion; submission rechecks external holds.
-             */
-            workflow_held: boolean;
         };
         /** BacklogCard */
         BacklogCard: {
@@ -469,8 +327,6 @@ export interface components {
              * @enum {string}
              */
             kind: "queue";
-            /** Priority */
-            priority: ("P1" | "P2" | "P3") | null;
         } & {
             [key: string]: unknown;
         };
@@ -550,21 +406,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** CancelRearm */
-        CancelRearm: {
-            /** Cancellation Id */
-            cancellation_id: string;
-            expected: components["schemas"]["ResolveExpected"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "cancel_rearm";
-            /** Reason */
-            reason: string;
-            /** Request Id */
-            request_id: string;
-        };
         /** Caps */
         Caps: {
             /** Daily Cap Usd */
@@ -611,14 +452,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** ClearGuidance */
-        ClearGuidance: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "clear";
-        };
         /** CodexUsage */
         CodexUsage: {
             /** Error */
@@ -637,18 +470,6 @@ export interface components {
             window_minutes: number | null;
         } & {
             [key: string]: unknown;
-        };
-        /** CommandResult */
-        CommandResult: {
-            /** Control */
-            control: components["schemas"]["AvailableControl"] | components["schemas"]["InactiveControl"] | components["schemas"]["AbsentControl"] | components["schemas"]["UnavailableControl"];
-            /**
-             * Outcome
-             * @enum {string}
-             */
-            outcome: "accepted" | "replayed" | "conflict" | "rejected" | "unavailable";
-            /** Reason */
-            reason: string;
         };
         /** CostMix */
         CostMix: {
@@ -669,41 +490,6 @@ export interface components {
             reason?: string | null;
         } & {
             [key: string]: unknown;
-        };
-        /** EvidenceUnavailable */
-        EvidenceUnavailable: {
-            /** Failed Reads */
-            failed_reads: number;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "evidence_unavailable";
-            /** Last Error */
-            last_error: string;
-            /** Source */
-            source: string;
-            /** Unresolved Since */
-            unresolved_since: string;
-        };
-        /** Gate */
-        Gate: {
-            /** Available Commands */
-            available_commands: ("request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry")[];
-            /** Cause */
-            cause: components["schemas"]["ResolveCeiling"] | components["schemas"]["RemoteUncertain"] | components["schemas"]["RetryAuthorizationRequired"] | components["schemas"]["EvidenceUnavailable"] | components["schemas"]["RearmNeedsDecision"];
-            /** Gate Id */
-            gate_id: string;
-            /** Opened Generation */
-            opened_generation: number;
-            pending_retry: components["schemas"]["PendingRetry"] | null;
-            /** Remediation */
-            remediation: components["schemas"]["NoRemediation"] | components["schemas"]["AttemptedRemediation"];
-            /**
-             * State
-             * @enum {string}
-             */
-            state: "open" | "rearming";
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -750,20 +536,6 @@ export interface components {
             recurrences: number;
         } & {
             [key: string]: unknown;
-        };
-        /** InactiveControl */
-        InactiveControl: {
-            /** Fix Recovery */
-            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
-            /** Issue */
-            issue: number;
-            /** Repository */
-            repository: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "inactive";
         };
         /** InterventionCount */
         InterventionCount: {
@@ -893,6 +665,11 @@ export interface components {
             /** Harness Message */
             harness_message?: string | null;
             /**
+             * Held For Human
+             * @default false
+             */
+            held_for_human: boolean;
+            /**
              * History
              * @default []
              */
@@ -929,35 +706,6 @@ export interface components {
             working_s: number | null;
         } & {
             [key: string]: unknown;
-        };
-        /** IssueRecoveryAvailable */
-        IssueRecoveryAvailable: {
-            /** Ci Failures */
-            ci_failures: number;
-            /**
-             * Family
-             * @constant
-             * @enum {string}
-             */
-            family: "issue_recovery";
-            /** Generation */
-            generation: number;
-            /** Holds */
-            holds: "workflow"[];
-            /** Rebase Failures */
-            rebase_failures: number;
-            /** Resumes */
-            resumes: number;
-            /** Review Failures */
-            review_failures: number;
-            /**
-             * Status
-             * @constant
-             * @enum {string}
-             */
-            status: "available";
-            /** Version */
-            version: number;
         };
         /** IssueStep */
         IssueStep: {
@@ -1065,14 +813,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** KeepGuidance */
-        KeepGuidance: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "keep";
-        };
         /** KindCost */
         KindCost: {
             /** Kind */
@@ -1136,27 +876,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** NoRemediation */
-        NoRemediation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "none_authorized";
-            /** Reason */
-            reason: string;
-        };
-        /** Observation */
-        Observation: {
-            /** Failed Reads */
-            failed_reads: number;
-            /** Last Error */
-            last_error: string;
-            /** Next Read At */
-            next_read_at: string;
-            /** Unresolved Since */
-            unresolved_since: string;
-        };
         /** OverviewPayload */
         OverviewPayload: {
             caps: components["schemas"]["Caps"] | null;
@@ -1198,31 +917,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** PRRepairAvailable */
-        PRRepairAvailable: {
-            /**
-             * Family
-             * @constant
-             * @enum {string}
-             */
-            family: "pr_repair";
-            /** Generation */
-            generation: number;
-            /** Pending Effects */
-            pending_effects: ("ci_rerun" | "ci_cancel" | "branch_refresh" | "pending_ci_escalation")[];
-            /** Resumes */
-            resumes: number;
-            /**
-             * Status
-             * @constant
-             * @enum {string}
-             */
-            status: "available";
-            /** Version */
-            version: number;
-            /** Workflow Held */
-            workflow_held: boolean;
-        };
         /** PendingCard */
         PendingCard: {
             /** Board */
@@ -1247,8 +941,6 @@ export interface components {
             pr_state?: string | null;
             /** Pr Url */
             pr_url?: string | null;
-            /** Priority */
-            priority: ("P1" | "P2" | "P3") | null;
             rail?: components["schemas"]["StageRail"] | null;
             /** Title */
             title: string | null;
@@ -1256,16 +948,6 @@ export interface components {
             url: string | null;
         } & {
             [key: string]: unknown;
-        };
-        /**
-         * PendingRetry
-         * @description One authorized retry accepted and awaiting the executor's decision.
-         */
-        PendingRetry: {
-            /** Authorization Id */
-            authorization_id: string;
-            /** Command Id */
-            command_id: string;
         };
         /** PullRequestLink */
         PullRequestLink: {
@@ -1277,80 +959,6 @@ export interface components {
             url: string | null;
         } & {
             [key: string]: unknown;
-        };
-        /** Rearm */
-        Rearm: {
-            /** Base Commit */
-            base_commit: string;
-            /** Base Ref */
-            base_ref: string;
-            /** Branch */
-            branch: string;
-            /** Episode Id */
-            episode_id: string;
-            /** Gate Id */
-            gate_id: string;
-            /** Generation */
-            generation: number;
-            /** Grant Request Id */
-            grant_request_id: string;
-            /** Handoff Id */
-            handoff_id: string;
-            /** Reason */
-            reason: string;
-            /** Request Id */
-            request_id: string;
-            /** Required Commands */
-            required_commands: string[];
-            /** Retired Commands */
-            retired_commands: string[];
-            /**
-             * State
-             * @enum {string}
-             */
-            state: "pending" | "completed" | "cancelled" | "superseded";
-            /** Verified Commands */
-            verified_commands: string[];
-        };
-        /** RearmNeedsDecision */
-        RearmNeedsDecision: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "rearm_needs_decision";
-            /** Obligations */
-            obligations: string[];
-            /** Reason */
-            reason: string;
-            /** Stopped Request Id */
-            stopped_request_id: string;
-        };
-        /** RecoveryUnavailable */
-        RecoveryUnavailable: {
-            /** Reason */
-            reason: string;
-            /**
-             * Status
-             * @enum {string}
-             */
-            status: "inactive" | "migration_required" | "unavailable";
-        };
-        /** RemoteUncertain */
-        RemoteUncertain: {
-            /** Command Id */
-            command_id: string;
-            /** Failed Reads */
-            failed_reads: number;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "remote_uncertain";
-            /** Last Error */
-            last_error: string;
-            /** Unresolved Since */
-            unresolved_since: string;
         };
         /** RepoSummary */
         RepoSummary: {
@@ -1386,102 +994,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** ResolveCeiling */
-        ResolveCeiling: {
-            /** Ceiling */
-            ceiling: number;
-            /** Episode Id */
-            episode_id: string;
-            /** Failures */
-            failures: number;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "resolve_ceiling";
-            /** Last Failure */
-            last_failure: string;
-        };
-        /** ResolveExpected */
-        ResolveExpected: {
-            /** Episode Id */
-            episode_id: string;
-            /** Epoch */
-            epoch: number;
-            /**
-             * Family
-             * @constant
-             * @enum {string}
-             */
-            family: "resolve";
-            /** Generation */
-            generation: number;
-            /** Issue */
-            issue: number;
-            /** Repository */
-            repository: string;
-            /** Version */
-            version: number;
-        };
-        /** ResolveGateSelection */
-        ResolveGateSelection: {
-            /** Gate Id */
-            gate_id: string;
-            /** Intent */
-            intent: components["schemas"]["ResumeGate"] | components["schemas"]["RetryAbsent"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "gate";
-        };
-        /** ResolveRelease */
-        ResolveRelease: {
-            expected: components["schemas"]["ResolveExpected"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "release";
-            /** Request Id */
-            request_id: string;
-            /** Selection */
-            selection: components["schemas"]["ResolveGateSelection"] | components["schemas"]["StoppedGrantSelection"];
-        };
-        /** ResumeGate */
-        ResumeGate: {
-            /** Guidance */
-            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "resume";
-        };
-        /** RetryAbsent */
-        RetryAbsent: {
-            /** Command Id */
-            command_id: string;
-            /** Evidence Id */
-            evidence_id: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "retry_absent";
-        };
-        /** RetryAuthorizationRequired */
-        RetryAuthorizationRequired: {
-            /** Absence Evidence Id */
-            absence_evidence_id: string;
-            /** Command Id */
-            command_id: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "retry_authorization_required";
-        };
         /** RoleHealth */
         RoleHealth: {
             /** Alive */
@@ -1500,16 +1012,6 @@ export interface components {
             stale: boolean;
         } & {
             [key: string]: unknown;
-        };
-        /** SetGuidance */
-        SetGuidance: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "set";
-            /** Text */
-            text: string;
         };
         /** SpendBucket */
         SpendBucket: {
@@ -1571,16 +1073,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** StoppedGrantSelection */
-        StoppedGrantSelection: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "stopped_grant";
-            /** Stopped Request Id */
-            stopped_request_id: string;
-        };
         /** ToastNotification */
         ToastNotification: {
             /** Detail */
@@ -1630,21 +1122,9 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** UnavailableControl */
-        UnavailableControl: {
-            /** Fix Recovery */
-            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
-            /** Reason */
-            reason: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "unavailable";
-        };
         /**
          * UnblockRequest
-         * @description Legacy breaker release accepts no review guidance or re-arm authority.
+         * @description Unblock is a label move; it accepts no body fields.
          */
         UnblockRequest: Record<string, never>;
         /** UsagePayload */
@@ -1697,31 +1177,6 @@ export interface components {
             status: string | null;
         } & {
             [key: string]: unknown;
-        };
-        /**
-         * WorkflowFamiliesAvailable
-         * @description The repository's activated workflow families; the legacy unblock is retired while any is active.
-         */
-        WorkflowFamiliesAvailable: {
-            /** Active Families */
-            active_families: ("resolve" | "review_rejections")[];
-            /** Repository */
-            repository: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "available";
-        };
-        /** WorkflowFamiliesUnavailable */
-        WorkflowFamiliesUnavailable: {
-            /** Reason */
-            reason: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "unavailable";
         };
     };
     responses: never;
@@ -1881,44 +1336,6 @@ export interface operations {
             };
         };
     };
-    api_priority_api_repos__name__issues__number__priority_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": {
-                    [key: string]: unknown;
-                };
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     api_promote_api_repos__name__issues__number__promote_post: {
         parameters: {
             query?: never;
@@ -1938,76 +1355,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_resolve_control_api_repos__name__issues__number__resolve_control_get: {
-        parameters: {
-            query?: {
-                request_id?: string | null;
-            };
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AvailableControl"] | components["schemas"]["InactiveControl"] | components["schemas"]["AbsentControl"] | components["schemas"]["UnavailableControl"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ResolveRelease"] | components["schemas"]["CancelRearm"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CommandResult"];
                 };
             };
             /** @description Validation Error */
@@ -2090,38 +1437,6 @@ export interface operations {
             };
         };
     };
-    api_unpark_api_repos__name__issues__number__unpark_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     api_overview_api_repos__name__overview_get: {
         parameters: {
             query?: {
@@ -2173,37 +1488,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_workflow_families_api_repos__name__workflow_families_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["WorkflowFamiliesAvailable"] | components["schemas"]["WorkflowFamiliesUnavailable"];
                 };
             };
             /** @description Validation Error */

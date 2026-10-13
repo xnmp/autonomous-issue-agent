@@ -3,7 +3,6 @@
 Failure contracts are explicit:
 
 * read ports raise their typed unavailable error; absence is a normal value;
-* write ports execute only durable, idempotency-keyed commands;
 * spend and control-store ports return typed dispositions and fail closed;
 * telemetry sinks may drop events but are never queried for authority.
 """
@@ -12,21 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol, TypeVar
+from typing import Protocol
 
 from .events import TelemetryEvent
 from .contracts import RunId
-
-T = TypeVar("T")
-
-
-class WorkflowControlError(ValueError):
-    """A present control record is unreadable or invalid, not an unused allowance."""
-
-    def __init__(self, path: str, reason: str):
-        self.path = path
-        self.reason = reason
-        super().__init__(f"Workflow control unavailable at {path}: {reason}")
 
 
 class EventSink(Protocol):
@@ -37,14 +25,6 @@ class EventSink(Protocol):
     """
 
     def emit(self, event: TelemetryEvent) -> None: ...
-
-
-class Clock(Protocol):
-    """Injected wall/monotonic time; invalid sleeps raise ``ValueError``."""
-
-    def now(self) -> datetime: ...
-    def monotonic_ns(self) -> int: ...
-    def sleep(self, seconds: float) -> None: ...
 
 
 class ProcessSupervisor(Protocol):
@@ -108,7 +88,6 @@ class RecoveryControl(Protocol):
         reason: str,
         retained_before: datetime,
     ) -> RecoveryRelease: ...
-    def pending_commands(self) -> tuple[object, ...]: ...
 
 
 class SpendReconciler(Protocol):
@@ -139,11 +118,3 @@ class WorktreeRecovery(Protocol):
     """Idempotent local checkout recovery; any validation failure is fatal."""
 
     def prune_validate(self) -> int: ...
-
-
-class CommandRecovery(Protocol):
-    """Reconcile-first remote command recovery; ambiguity stays pending."""
-
-    def drain_pending_commands(self) -> int: ...
-
-

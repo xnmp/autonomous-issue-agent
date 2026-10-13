@@ -11,7 +11,6 @@ from issue_agent.adapters.codex_runner import (
     write_spend_evidence,
 )
 from issue_agent.adapters.control_store import Lease, SQLiteControlStore
-from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money, RunId
 from issue_agent.domain.outcome import AgentResult, DAILY_HEADROOM_STATUS, ExitReason, MAX_BUDGET_STATUS
@@ -21,7 +20,6 @@ from issue_agent.domain.pricing import (
     RateTable,
     UnknownModelPolicy,
 )
-from tests.fakes.legacy_journal import Journal
 
 
 def _policy(maximum=2_000_000):
@@ -237,67 +235,6 @@ def test_production_runtime_releases_admission_when_claim_is_missing(
     assert store.active_reservation_runs() == ()
 
 
-def test_issue_less_multi_review_preserves_pr_claim_across_leg_context(
-    tmp_path,
-) -> None:
-    runtime = Runtime(
-        AgentResult(
-            False,
-            status="reviewed",
-            usage={"input_tokens": 1, "output_tokens": 1},
-        )
-    )
-    accounting, store = _wrapper(tmp_path, runtime)
-    owner = "o/r:review:deployment"
-    accounting = dataclasses.replace(
-        accounting,
-        role="review",
-        owner_id=owner,
-        require_dispatch_claim=True,
-        budget_policy=BudgetPolicy(
-            {("review", "REVIEW_GATE"): Money("USD", 2_000_000)}
-        ),
-    )
-    assert store.claim_dispatch(
-        "o/r",
-        "review",
-        -42,
-        "REVIEW",
-        owner,
-    )
-    journaled = JournalingRuntime(
-        accounting,
-        Journal(str(tmp_path / "events.jsonl")),
-        repo="o/r",
-        role="review",
-    )
-    journaled.set_context(
-        "review",
-        "REVIEW",
-        42,
-        None,
-        claim_target=-42,
-    )
-
-    with journaled.leg_kind("REVIEW_GATE"):
-        result = asyncio.run(
-            journaled.run(
-                RuntimePlan(
-                    "review gate",
-                    model="gpt-test",
-                    max_budget_usd=2,
-                )
-            )
-        )
-
-    assert result.status == "reviewed"
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM dispatch_claim_runs "
-            "WHERE repository='o/r' AND role='review' AND target='pr:42'"
-        ).fetchone()[0] == 1
-
-
 def test_linked_review_separates_issue_claim_from_pr_retry_key(tmp_path) -> None:
     runtime = Runtime(
         AgentResult(
@@ -344,7 +281,6 @@ def test_linked_review_separates_issue_claim_from_pr_retry_key(tmp_path) -> None
             db.execute("SELECT dispatch_id FROM runs").fetchone()[0]
         )
     assert payload["claim_target"] == 9
-    assert payload["breaker_key"] == -42
 
 
 def test_missing_issue_still_blocks_issue_scoped_fix_work(tmp_path) -> None:

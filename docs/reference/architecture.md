@@ -1,18 +1,16 @@
 # Architecture — how the harness works now
 
-Current as of 2026-10-06. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-13. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Slice 6a (2026-10) deleted the remaining
 `plugin/hooks/` gate stack, the governor and the fixer's publication gates.
 
-The [phase-4 simplification roadmap](../open/2026-09-30-phase-4-simplification-roadmap.md)
-and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern selected
-continuation authority. Current SQL state and a bounded unresolved suffix
-replace archive certification, lifetime verification and selected Store
-continuity writers. A2 whole-system acceptance and Phase 6's declared policy/
-independent-execution contracts are complete. Phase 5's offline contracts and
-live cutover are verified; actual unattended windows and readout remain pending.
-Current evidence is in the [execution record](../open/2026-10-05-phase-5-live-execution.md).
+The [minimal-harness design](../open/2026-10-12-minimal-harness-design.md)
+governs the current shape. Each tick, both roles derive every item's state from
+GitHub plus local leg facts; nothing persists a selected continuation. The
+phase-4 roadmap and [ADR 0016](../adr/0016-phase-4-current-state-authority.md)
+continuation authority are superseded (slices 5c and 5d-1 deleted the workflow
+model, the durable-command path and the continuation writers).
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
 harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
@@ -47,8 +45,8 @@ worktrees live below the hidden `.claude/worktrees` scratch path and that path i
 also excluded by the primary checkout's shared `.git/info/exclude`, but their type
 gate must be identical to the primary checkout's.
 
-Durable commands, captured-revision guards, SQLite ownership, and trusted
-readback are the publication authority.
+The idempotent act layer (read-back writes and SQLite idempotency keys,
+property 2) and SQLite ownership are the publication authority.
 
 ## The five properties worth preserving
 
@@ -60,23 +58,19 @@ tests pass.
    tuples; nothing in
    `domain/` performs a write. This is why adding escalation alerting and the
    journal were one-place changes.
-2. **One privileged write funnel.** Operator lifecycle mutations become durable
-   `LifecycleCommand`s and are executed by `GitHubOperatorEffects` with an
-   idempotency key, expected revision, and receipt. `DurableEffectRunner` alone owns the command transition/receipt
-   protocol, including reconcile-first async effects. Command/receipt identities
-   may be subsystem-namespaced for recovery and attribution, but authority is
-   always checked against the base deployment owner. Deployment-scoped effects
-   hold shared `DeploymentAuthority`; a repoint takes the same repo/role lock
-   exclusively, so an old mutation either completes before retirement or fails
-   its owner check after it. Peer effects remain concurrent and no SQLite
-   transaction spans network I/O. This includes
-   CLI/dashboard labels, bootstrap settings and base-branch creation.
-   The role daemons are the exception since slices 5b and 5c
-   (ADR 0001 amendment): `adapters/act.py` executes their Actions directly, each
-   write naturally idempotent or keyed in SQLite and confirmed by a GitHub
-   read-back. Fix agents push their own branch with git; the harness opens the
-   PR from it, once. Credential isolation remains separately trigger-gated,
-   so this is durability—not an untrusted-input security claim.
+2. **One idempotent write layer.** Every GitHub mutation goes through
+   `adapters/act.py`: each write is naturally idempotent and read back (a label
+   set, a merge or update-branch bound to the decided head, a PR opened only
+   when its branch has none), or claims an idempotency key in SQLite before
+   writing and confirms it only after a GitHub read-back. There is no command
+   queue or effect receipt (slice 5d-1; ADR 0001 amendment). Operator writes
+   (`adapters/operator_effects.py`) are label moves through the same
+   `act.relabel` plus the CLI's bootstrap steps; the dashboard changes labels
+   only (refactor decision Q19: park adds `needs-human`, unblock removes it and
+   changes nothing else, each on a fresh read that refuses a closed issue). No SQLite transaction spans network
+   I/O. Fix agents push their own branch with git; the harness opens the PR
+   from it, once. Credential isolation remains separately trigger-gated, so
+   this is durability—not an untrusted-input security claim.
 3. **Impure rules are higher-order.** `check_tests(test_cmd, run_tests, …)` is
    the template: pure policy, unit-tested, with ~3 lines of shell-out injected
    from an adapter.
@@ -103,9 +97,10 @@ is judged by CI and the independent reviewer.
 
 ## Operational state, telemetry, and money
 
-SQLite is authoritative for run/lease ownership, dedupe, lifecycle commands,
-effect receipts, reservations, and charges. Recovery kills registered orphan
-trees, reclaims dead leases, drains commands through reconcile-first effects,
+SQLite is authoritative for money (reservations and charges), leases,
+legs/attempts (runs) and idempotency keys. Tables of the deleted workflow and
+durable-command model are no longer read or written and leave the schema in
+slice 5d-2. Recovery kills registered orphan trees, reclaims dead leases,
 settles killed Codex runs from persisted rollout coordinates and locked rates,
 and makes genuinely unrecoverable spend visible before capacity is released.
 At upgrade, current and rotated legacy ledgers are imported idempotently into
@@ -186,7 +181,7 @@ accounting run, cleanup receipt, and post-canary invariants are captured in
 JSONL is the per-role daemon log only; losing it cannot authorize a write,
 deduplicate work, or admit spend. Metrics derive from the SQLite legs/money
 tables plus GitHub.
-Every lifecycle command and paid run is scoped to repository, role, and stable
+Every paid run is scoped to repository, role, and stable
 checkout deployment identity in the shared store. Cross-process dispatch
 claims remain repository/role-global, so two intentionally allowed checkouts
 cannot both admit the same target (targets are the only conflict; Q13 deleted
@@ -194,7 +189,7 @@ the path-overlap holds). A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
 The observed-world target used to acquire a dispatch claim is carried through
-workflow routing and paid admission. A fresh PR read may validate that target
+paid admission. A fresh PR read may validate that target
 but cannot replace it; changed linkage defers to a new observation. An issueless
 PR is claimed by negative PR number without manufacturing a per-issue spend
 scope (ADR 0008).
@@ -405,7 +400,7 @@ worktree paths, and resume tokens cannot enter domain objects. Operator
 configuration follows the same ownership rule: `HarnessConfig` field metadata
 is the sole env/coercion/choice table, drives `from_env`, and generates
 `config/agent.env.example`. The immutable config snapshot hash is recorded on
-every reservation and lifecycle command.
+every reservation and run.
 
 Untrusted repository, issue, review, and CI text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
@@ -469,15 +464,12 @@ Empty policies retain head report selection and escalate unverified green
 after same-head cancellation until the free rerun is spent. Unavailable reads
 leave durable escalations owed; settled Clear obsoletes other CI escalations),
 `domain/contracts.py`, `domain/dashboard.py`,
-`domain/eligibility.py`
-(action-specific allowed/held/invalid results and immutable completion facts;
-shared by lifecycle policy and durable action payloads without an import cycle),
 `domain/effort.py`,
 `domain/events.py`, `domain/fix.py`,
-`domain/git_remote.py`, `domain/identity.py`,
+`domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),
-`domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
+`domain/labels.py`, `domain/leg.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/pr_body.py` (completes a fixer's PR body with the issue's acceptance
 criteria and closing link when absent, instead of denying the publication),
@@ -491,16 +483,7 @@ role since slice 5c),
 exact APPROVE or REQUEST_CHANGES with a bounded body, or nothing),
 `domain/supervision.py`,
 `domain/trust.py`, and
-`domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
-`domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
-`domain/workflow_policy.py`,
-`domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`,
-`domain/resolve_workspace.py`, `domain/resolve_rearm.py`,
-`domain/deployment.py`
-(cycle-free typed target, generation, epoch and episode identities for the
-resolve gate/re-arm authority; workspace handoffs are explicit preparation
-obligations, not AUTHOR evidence or independent execution authority; slice 5d
-deletes this resolve workflow family, which no role reads since slice 5b).
+`domain/world.py`, and `domain/deployment.py` (canonical deployment names).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/act.py` (both roles' `act` step:
@@ -511,8 +494,6 @@ one review per head, no command queue),
 `adapters/codex_home.py`, `adapters/codex_runner.py`,
 `adapters/codex_child_usage.py` (bounded native lineage, own-response observation and frozen-card recovery),
 `adapters/control_path.py`, `adapters/control_store.py`,
-`adapters/deployment_authority.py`, `adapters/durable_effects.py`,
-`adapters/effects.py`,
 `adapters/env_file.py`,
 `adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
@@ -524,10 +505,7 @@ one review per head, no command queue),
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
-`adapters/worktree.py`, `adapters/workflow_codec.py`,
-`adapters/workflow_rows.py` (family-scoped authority reads),
-`adapters/workflow_commit.py` (family-neutral CAS receipt helpers),
-and `adapters/workflow_control.py`. Dashboard-specific read
+and `adapters/worktree.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
@@ -535,17 +513,17 @@ adapters live under `adapters/dashweb/`.
 `app/fix.py` (the fix role: one paid leg per dispatch, resuming the right
 session), `app/identity_pools.py`,
 `app/launchd_main.py`,
-`app/loop.py`, `app/main.py`,
+`app/main.py`,
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict
 once, resubmitting a stored verdict free when its submission never landed),
 `app/review_identity.py`, `app/roles.py`,
-`app/tick.py` (the tick both roles share: local facts from SQLite and
-derive → policy → choose),
+`app/tick.py` (the daemon both roles run: local facts from SQLite,
+derive → policy → choose, the action executor, bounded paid dispatch, the
+single `run_leg` path, and the SIGTERM drain),
 and `app/service_doctor.py`.
-Provider-neutral task construction is isolated in `app/planners/`; paid
-workflow sequencing and the single `run_leg` path are in `app/workflows/`;
-the web composition/read-model boundary is in `app/dashweb/`.
+Provider-neutral task construction is isolated in `app/planners/`; the web
+composition/read-model boundary is in `app/dashweb/`.
 
 ## Where the detail lives
 

@@ -1,56 +1,6 @@
 {
   "components": {
     "schemas": {
-      "AbsentControl": {
-        "additionalProperties": false,
-        "properties": {
-          "epoch": {
-            "title": "Epoch",
-            "type": "integer"
-          },
-          "fix_recovery": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IssueRecoveryAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/PRRepairAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/RecoveryUnavailable"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Fix Recovery"
-          },
-          "issue": {
-            "title": "Issue",
-            "type": "integer"
-          },
-          "repository": {
-            "title": "Repository",
-            "type": "string"
-          },
-          "status": {
-            "const": "absent",
-            "enum": [
-              "absent"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "repository",
-          "issue",
-          "epoch"
-        ],
-        "title": "AbsentControl",
-        "type": "object"
-      },
       "ActionResult": {
         "additionalProperties": true,
         "properties": {
@@ -68,42 +18,6 @@
           "detail"
         ],
         "title": "ActionResult",
-        "type": "object"
-      },
-      "AttemptedRemediation": {
-        "additionalProperties": false,
-        "properties": {
-          "evidence_ids": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Evidence Ids",
-            "type": "array"
-          },
-          "kind": {
-            "const": "attempted",
-            "enum": [
-              "attempted"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "operation": {
-            "title": "Operation",
-            "type": "string"
-          },
-          "outcome": {
-            "title": "Outcome",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "operation",
-          "evidence_ids",
-          "outcome"
-        ],
-        "title": "AttemptedRemediation",
         "type": "object"
       },
       "AttentionItem": {
@@ -145,114 +59,6 @@
           "kind"
         ],
         "title": "AttentionItem",
-        "type": "object"
-      },
-      "AvailableControl": {
-        "additionalProperties": false,
-        "properties": {
-          "current_intent": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Rearm"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "expected": {
-            "$ref": "#/components/schemas/ResolveExpected"
-          },
-          "failures": {
-            "title": "Failures",
-            "type": "integer"
-          },
-          "fix_recovery": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IssueRecoveryAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/PRRepairAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/RecoveryUnavailable"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Fix Recovery"
-          },
-          "gates": {
-            "items": {
-              "$ref": "#/components/schemas/Gate"
-            },
-            "title": "Gates",
-            "type": "array"
-          },
-          "guidance": {
-            "title": "Guidance",
-            "type": "string"
-          },
-          "observation": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Observation"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "requested_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Requested Id"
-          },
-          "requested_intent": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Rearm"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "status": {
-            "const": "available",
-            "enum": [
-              "available"
-            ],
-            "title": "Status",
-            "type": "string"
-          },
-          "workflow_held": {
-            "description": "SQLite workflow holds only, not a remote readiness assertion; submission rechecks external holds.",
-            "title": "Workflow Held",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "status",
-          "expected",
-          "workflow_held",
-          "gates",
-          "guidance",
-          "failures",
-          "current_intent",
-          "requested_id",
-          "requested_intent",
-          "observation"
-        ],
-        "title": "AvailableControl",
         "type": "object"
       },
       "BacklogCard": {
@@ -496,27 +302,10 @@
             ],
             "title": "Kind",
             "type": "string"
-          },
-          "priority": {
-            "anyOf": [
-              {
-                "enum": [
-                  "P1",
-                  "P2",
-                  "P3"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Priority"
           }
         },
         "required": [
-          "kind",
-          "priority"
+          "kind"
         ],
         "title": "BlockedOnQueue",
         "type": "object"
@@ -723,49 +512,6 @@
         "title": "BoardWorking",
         "type": "object"
       },
-      "CancelRearm": {
-        "additionalProperties": false,
-        "properties": {
-          "cancellation_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Cancellation Id",
-            "type": "string"
-          },
-          "expected": {
-            "$ref": "#/components/schemas/ResolveExpected"
-          },
-          "operation": {
-            "const": "cancel_rearm",
-            "enum": [
-              "cancel_rearm"
-            ],
-            "title": "Operation",
-            "type": "string"
-          },
-          "reason": {
-            "maxLength": 16384,
-            "minLength": 1,
-            "title": "Reason",
-            "type": "string"
-          },
-          "request_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Request Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation",
-          "expected",
-          "cancellation_id",
-          "request_id",
-          "reason"
-        ],
-        "title": "CancelRearm",
-        "type": "object"
-      },
       "Caps": {
         "additionalProperties": true,
         "properties": {
@@ -940,24 +686,6 @@
         "title": "ClaudeUsage",
         "type": "object"
       },
-      "ClearGuidance": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "const": "clear",
-            "enum": [
-              "clear"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind"
-        ],
-        "title": "ClearGuidance",
-        "type": "object"
-      },
       "CodexUsage": {
         "additionalProperties": true,
         "properties": {
@@ -1051,59 +779,6 @@
         "title": "CodexUsage",
         "type": "object"
       },
-      "CommandResult": {
-        "additionalProperties": false,
-        "properties": {
-          "control": {
-            "discriminator": {
-              "mapping": {
-                "absent": "#/components/schemas/AbsentControl",
-                "available": "#/components/schemas/AvailableControl",
-                "inactive": "#/components/schemas/InactiveControl",
-                "unavailable": "#/components/schemas/UnavailableControl"
-              },
-              "propertyName": "status"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/AvailableControl"
-              },
-              {
-                "$ref": "#/components/schemas/InactiveControl"
-              },
-              {
-                "$ref": "#/components/schemas/AbsentControl"
-              },
-              {
-                "$ref": "#/components/schemas/UnavailableControl"
-              }
-            ],
-            "title": "Control"
-          },
-          "outcome": {
-            "enum": [
-              "accepted",
-              "replayed",
-              "conflict",
-              "rejected",
-              "unavailable"
-            ],
-            "title": "Outcome",
-            "type": "string"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          }
-        },
-        "required": [
-          "outcome",
-          "reason",
-          "control"
-        ],
-        "title": "CommandResult",
-        "type": "object"
-      },
       "CostMix": {
         "additionalProperties": true,
         "properties": {
@@ -1172,147 +847,6 @@
           "issue"
         ],
         "title": "EscalationReason",
-        "type": "object"
-      },
-      "EvidenceUnavailable": {
-        "additionalProperties": false,
-        "properties": {
-          "failed_reads": {
-            "title": "Failed Reads",
-            "type": "integer"
-          },
-          "kind": {
-            "const": "evidence_unavailable",
-            "enum": [
-              "evidence_unavailable"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "last_error": {
-            "title": "Last Error",
-            "type": "string"
-          },
-          "source": {
-            "title": "Source",
-            "type": "string"
-          },
-          "unresolved_since": {
-            "title": "Unresolved Since",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "source",
-          "unresolved_since",
-          "failed_reads",
-          "last_error"
-        ],
-        "title": "EvidenceUnavailable",
-        "type": "object"
-      },
-      "Gate": {
-        "additionalProperties": false,
-        "properties": {
-          "available_commands": {
-            "items": {
-              "enum": [
-                "request_rearm",
-                "continue_rearm",
-                "cancel_rearm",
-                "authorize_retry"
-              ],
-              "type": "string"
-            },
-            "title": "Available Commands",
-            "type": "array"
-          },
-          "cause": {
-            "discriminator": {
-              "mapping": {
-                "evidence_unavailable": "#/components/schemas/EvidenceUnavailable",
-                "rearm_needs_decision": "#/components/schemas/RearmNeedsDecision",
-                "remote_uncertain": "#/components/schemas/RemoteUncertain",
-                "resolve_ceiling": "#/components/schemas/ResolveCeiling",
-                "retry_authorization_required": "#/components/schemas/RetryAuthorizationRequired"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ResolveCeiling"
-              },
-              {
-                "$ref": "#/components/schemas/RemoteUncertain"
-              },
-              {
-                "$ref": "#/components/schemas/RetryAuthorizationRequired"
-              },
-              {
-                "$ref": "#/components/schemas/EvidenceUnavailable"
-              },
-              {
-                "$ref": "#/components/schemas/RearmNeedsDecision"
-              }
-            ],
-            "title": "Cause"
-          },
-          "gate_id": {
-            "title": "Gate Id",
-            "type": "string"
-          },
-          "opened_generation": {
-            "title": "Opened Generation",
-            "type": "integer"
-          },
-          "pending_retry": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/PendingRetry"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "remediation": {
-            "discriminator": {
-              "mapping": {
-                "attempted": "#/components/schemas/AttemptedRemediation",
-                "none_authorized": "#/components/schemas/NoRemediation"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/NoRemediation"
-              },
-              {
-                "$ref": "#/components/schemas/AttemptedRemediation"
-              }
-            ],
-            "title": "Remediation"
-          },
-          "state": {
-            "enum": [
-              "open",
-              "rearming"
-            ],
-            "title": "State",
-            "type": "string"
-          }
-        },
-        "required": [
-          "gate_id",
-          "state",
-          "opened_generation",
-          "cause",
-          "remediation",
-          "available_commands",
-          "pending_retry"
-        ],
-        "title": "Gate",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -1455,51 +989,6 @@
           "first_observation"
         ],
         "title": "HealthTrendDay",
-        "type": "object"
-      },
-      "InactiveControl": {
-        "additionalProperties": false,
-        "properties": {
-          "fix_recovery": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IssueRecoveryAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/PRRepairAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/RecoveryUnavailable"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Fix Recovery"
-          },
-          "issue": {
-            "title": "Issue",
-            "type": "integer"
-          },
-          "repository": {
-            "title": "Repository",
-            "type": "string"
-          },
-          "status": {
-            "const": "inactive",
-            "enum": [
-              "inactive"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "repository",
-          "issue"
-        ],
-        "title": "InactiveControl",
         "type": "object"
       },
       "InterventionCount": {
@@ -2053,6 +1542,11 @@
             ],
             "title": "Harness Message"
           },
+          "held_for_human": {
+            "default": false,
+            "title": "Held For Human",
+            "type": "boolean"
+          },
           "history": {
             "default": [],
             "items": {
@@ -2202,87 +1696,6 @@
           "events"
         ],
         "title": "IssueDetailPayload",
-        "type": "object"
-      },
-      "IssueRecoveryAvailable": {
-        "additionalProperties": false,
-        "properties": {
-          "ci_failures": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Ci Failures",
-            "type": "integer"
-          },
-          "family": {
-            "const": "issue_recovery",
-            "enum": [
-              "issue_recovery"
-            ],
-            "title": "Family",
-            "type": "string"
-          },
-          "generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Generation",
-            "type": "integer"
-          },
-          "holds": {
-            "items": {
-              "const": "workflow",
-              "enum": [
-                "workflow"
-              ],
-              "type": "string"
-            },
-            "title": "Holds",
-            "type": "array"
-          },
-          "rebase_failures": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Rebase Failures",
-            "type": "integer"
-          },
-          "resumes": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Resumes",
-            "type": "integer"
-          },
-          "review_failures": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Review Failures",
-            "type": "integer"
-          },
-          "status": {
-            "const": "available",
-            "enum": [
-              "available"
-            ],
-            "title": "Status",
-            "type": "string"
-          },
-          "version": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Version",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "status",
-          "family",
-          "generation",
-          "version",
-          "resumes",
-          "ci_failures",
-          "review_failures",
-          "rebase_failures",
-          "holds"
-        ],
-        "title": "IssueRecoveryAvailable",
         "type": "object"
       },
       "IssueStep": {
@@ -2715,24 +2128,6 @@
         "title": "IssuesPayload",
         "type": "object"
       },
-      "KeepGuidance": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "const": "keep",
-            "enum": [
-              "keep"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind"
-        ],
-        "title": "KeepGuidance",
-        "type": "object"
-      },
       "KindCost": {
         "additionalProperties": true,
         "properties": {
@@ -2933,58 +2328,6 @@
         "title": "ModelBadge",
         "type": "object"
       },
-      "NoRemediation": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "const": "none_authorized",
-            "enum": [
-              "none_authorized"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "reason"
-        ],
-        "title": "NoRemediation",
-        "type": "object"
-      },
-      "Observation": {
-        "additionalProperties": false,
-        "properties": {
-          "failed_reads": {
-            "title": "Failed Reads",
-            "type": "integer"
-          },
-          "last_error": {
-            "title": "Last Error",
-            "type": "string"
-          },
-          "next_read_at": {
-            "title": "Next Read At",
-            "type": "string"
-          },
-          "unresolved_since": {
-            "title": "Unresolved Since",
-            "type": "string"
-          }
-        },
-        "required": [
-          "unresolved_since",
-          "next_read_at",
-          "failed_reads",
-          "last_error"
-        ],
-        "title": "Observation",
-        "type": "object"
-      },
       "OverviewPayload": {
         "additionalProperties": true,
         "properties": {
@@ -3097,73 +2440,6 @@
           "health_trend"
         ],
         "title": "OverviewPayload",
-        "type": "object"
-      },
-      "PRRepairAvailable": {
-        "additionalProperties": false,
-        "properties": {
-          "family": {
-            "const": "pr_repair",
-            "enum": [
-              "pr_repair"
-            ],
-            "title": "Family",
-            "type": "string"
-          },
-          "generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Generation",
-            "type": "integer"
-          },
-          "pending_effects": {
-            "items": {
-              "enum": [
-                "ci_rerun",
-                "ci_cancel",
-                "branch_refresh",
-                "pending_ci_escalation"
-              ],
-              "type": "string"
-            },
-            "title": "Pending Effects",
-            "type": "array"
-          },
-          "resumes": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Resumes",
-            "type": "integer"
-          },
-          "status": {
-            "const": "available",
-            "enum": [
-              "available"
-            ],
-            "title": "Status",
-            "type": "string"
-          },
-          "version": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Version",
-            "type": "integer"
-          },
-          "workflow_held": {
-            "title": "Workflow Held",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "status",
-          "family",
-          "generation",
-          "version",
-          "resumes",
-          "workflow_held",
-          "pending_effects"
-        ],
-        "title": "PRRepairAvailable",
         "type": "object"
       },
       "PendingCard": {
@@ -3293,22 +2569,6 @@
             ],
             "title": "Pr Url"
           },
-          "priority": {
-            "anyOf": [
-              {
-                "enum": [
-                  "P1",
-                  "P2",
-                  "P3"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Priority"
-          },
           "rail": {
             "anyOf": [
               {
@@ -3346,33 +2606,12 @@
           "issue",
           "title",
           "url",
-          "priority",
           "labels",
           "held",
           "hold_reason",
           "overlap"
         ],
         "title": "PendingCard",
-        "type": "object"
-      },
-      "PendingRetry": {
-        "additionalProperties": false,
-        "description": "One authorized retry accepted and awaiting the executor's decision.",
-        "properties": {
-          "authorization_id": {
-            "title": "Authorization Id",
-            "type": "string"
-          },
-          "command_id": {
-            "title": "Command Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "authorization_id",
-          "command_id"
-        ],
-        "title": "PendingRetry",
         "type": "object"
       },
       "PullRequestLink": {
@@ -3411,198 +2650,6 @@
           "state"
         ],
         "title": "PullRequestLink",
-        "type": "object"
-      },
-      "Rearm": {
-        "additionalProperties": false,
-        "properties": {
-          "base_commit": {
-            "title": "Base Commit",
-            "type": "string"
-          },
-          "base_ref": {
-            "title": "Base Ref",
-            "type": "string"
-          },
-          "branch": {
-            "title": "Branch",
-            "type": "string"
-          },
-          "episode_id": {
-            "title": "Episode Id",
-            "type": "string"
-          },
-          "gate_id": {
-            "title": "Gate Id",
-            "type": "string"
-          },
-          "generation": {
-            "title": "Generation",
-            "type": "integer"
-          },
-          "grant_request_id": {
-            "title": "Grant Request Id",
-            "type": "string"
-          },
-          "handoff_id": {
-            "title": "Handoff Id",
-            "type": "string"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "required_commands": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Required Commands",
-            "type": "array"
-          },
-          "retired_commands": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Retired Commands",
-            "type": "array"
-          },
-          "state": {
-            "enum": [
-              "pending",
-              "completed",
-              "cancelled",
-              "superseded"
-            ],
-            "title": "State",
-            "type": "string"
-          },
-          "verified_commands": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Verified Commands",
-            "type": "array"
-          }
-        },
-        "required": [
-          "request_id",
-          "state",
-          "gate_id",
-          "generation",
-          "grant_request_id",
-          "episode_id",
-          "handoff_id",
-          "branch",
-          "base_ref",
-          "base_commit",
-          "required_commands",
-          "verified_commands",
-          "retired_commands",
-          "reason"
-        ],
-        "title": "Rearm",
-        "type": "object"
-      },
-      "RearmNeedsDecision": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "const": "rearm_needs_decision",
-            "enum": [
-              "rearm_needs_decision"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "obligations": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Obligations",
-            "type": "array"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "stopped_request_id": {
-            "title": "Stopped Request Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "stopped_request_id",
-          "obligations",
-          "reason"
-        ],
-        "title": "RearmNeedsDecision",
-        "type": "object"
-      },
-      "RecoveryUnavailable": {
-        "additionalProperties": false,
-        "properties": {
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "status": {
-            "enum": [
-              "inactive",
-              "migration_required",
-              "unavailable"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "reason"
-        ],
-        "title": "RecoveryUnavailable",
-        "type": "object"
-      },
-      "RemoteUncertain": {
-        "additionalProperties": false,
-        "properties": {
-          "command_id": {
-            "title": "Command Id",
-            "type": "string"
-          },
-          "failed_reads": {
-            "title": "Failed Reads",
-            "type": "integer"
-          },
-          "kind": {
-            "const": "remote_uncertain",
-            "enum": [
-              "remote_uncertain"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "last_error": {
-            "title": "Last Error",
-            "type": "string"
-          },
-          "unresolved_since": {
-            "title": "Unresolved Since",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "command_id",
-          "unresolved_since",
-          "failed_reads",
-          "last_error"
-        ],
-        "title": "RemoteUncertain",
         "type": "object"
       },
       "RepoSummary": {
@@ -3720,297 +2767,6 @@
         "title": "ReposPayload",
         "type": "object"
       },
-      "ResolveCeiling": {
-        "additionalProperties": false,
-        "properties": {
-          "ceiling": {
-            "title": "Ceiling",
-            "type": "integer"
-          },
-          "episode_id": {
-            "title": "Episode Id",
-            "type": "string"
-          },
-          "failures": {
-            "title": "Failures",
-            "type": "integer"
-          },
-          "kind": {
-            "const": "resolve_ceiling",
-            "enum": [
-              "resolve_ceiling"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "last_failure": {
-            "title": "Last Failure",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "episode_id",
-          "failures",
-          "ceiling",
-          "last_failure"
-        ],
-        "title": "ResolveCeiling",
-        "type": "object"
-      },
-      "ResolveExpected": {
-        "additionalProperties": false,
-        "properties": {
-          "episode_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Episode Id",
-            "type": "string"
-          },
-          "epoch": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Epoch",
-            "type": "integer"
-          },
-          "family": {
-            "const": "resolve",
-            "enum": [
-              "resolve"
-            ],
-            "title": "Family",
-            "type": "string"
-          },
-          "generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Generation",
-            "type": "integer"
-          },
-          "issue": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Issue",
-            "type": "integer"
-          },
-          "repository": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Repository",
-            "type": "string"
-          },
-          "version": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Version",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "family",
-          "repository",
-          "epoch",
-          "generation",
-          "version",
-          "episode_id",
-          "issue"
-        ],
-        "title": "ResolveExpected",
-        "type": "object"
-      },
-      "ResolveGateSelection": {
-        "additionalProperties": false,
-        "properties": {
-          "gate_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Gate Id",
-            "type": "string"
-          },
-          "intent": {
-            "discriminator": {
-              "mapping": {
-                "resume": "#/components/schemas/ResumeGate",
-                "retry_absent": "#/components/schemas/RetryAbsent"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ResumeGate"
-              },
-              {
-                "$ref": "#/components/schemas/RetryAbsent"
-              }
-            ],
-            "title": "Intent"
-          },
-          "kind": {
-            "const": "gate",
-            "enum": [
-              "gate"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "gate_id",
-          "intent"
-        ],
-        "title": "ResolveGateSelection",
-        "type": "object"
-      },
-      "ResolveRelease": {
-        "additionalProperties": false,
-        "properties": {
-          "expected": {
-            "$ref": "#/components/schemas/ResolveExpected"
-          },
-          "operation": {
-            "const": "release",
-            "enum": [
-              "release"
-            ],
-            "title": "Operation",
-            "type": "string"
-          },
-          "request_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Request Id",
-            "type": "string"
-          },
-          "selection": {
-            "discriminator": {
-              "mapping": {
-                "gate": "#/components/schemas/ResolveGateSelection",
-                "stopped_grant": "#/components/schemas/StoppedGrantSelection"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ResolveGateSelection"
-              },
-              {
-                "$ref": "#/components/schemas/StoppedGrantSelection"
-              }
-            ],
-            "title": "Selection"
-          }
-        },
-        "required": [
-          "operation",
-          "request_id",
-          "expected",
-          "selection"
-        ],
-        "title": "ResolveRelease",
-        "type": "object"
-      },
-      "ResumeGate": {
-        "additionalProperties": false,
-        "properties": {
-          "guidance": {
-            "discriminator": {
-              "mapping": {
-                "clear": "#/components/schemas/ClearGuidance",
-                "keep": "#/components/schemas/KeepGuidance",
-                "set": "#/components/schemas/SetGuidance"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/KeepGuidance"
-              },
-              {
-                "$ref": "#/components/schemas/ClearGuidance"
-              },
-              {
-                "$ref": "#/components/schemas/SetGuidance"
-              }
-            ],
-            "title": "Guidance"
-          },
-          "kind": {
-            "const": "resume",
-            "enum": [
-              "resume"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "guidance"
-        ],
-        "title": "ResumeGate",
-        "type": "object"
-      },
-      "RetryAbsent": {
-        "additionalProperties": false,
-        "properties": {
-          "command_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Command Id",
-            "type": "string"
-          },
-          "evidence_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Evidence Id",
-            "type": "string"
-          },
-          "kind": {
-            "const": "retry_absent",
-            "enum": [
-              "retry_absent"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "command_id",
-          "evidence_id"
-        ],
-        "title": "RetryAbsent",
-        "type": "object"
-      },
-      "RetryAuthorizationRequired": {
-        "additionalProperties": false,
-        "properties": {
-          "absence_evidence_id": {
-            "title": "Absence Evidence Id",
-            "type": "string"
-          },
-          "command_id": {
-            "title": "Command Id",
-            "type": "string"
-          },
-          "kind": {
-            "const": "retry_authorization_required",
-            "enum": [
-              "retry_authorization_required"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "command_id",
-          "absence_evidence_id"
-        ],
-        "title": "RetryAuthorizationRequired",
-        "type": "object"
-      },
       "RoleHealth": {
         "additionalProperties": true,
         "properties": {
@@ -4081,31 +2837,6 @@
           "log_path"
         ],
         "title": "RoleHealth",
-        "type": "object"
-      },
-      "SetGuidance": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "const": "set",
-            "enum": [
-              "set"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "text": {
-            "maxLength": 4000,
-            "minLength": 1,
-            "title": "Text",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "text"
-        ],
-        "title": "SetGuidance",
         "type": "object"
       },
       "SpendBucket": {
@@ -4239,31 +2970,6 @@
           "events"
         ],
         "title": "StepEventsPayload",
-        "type": "object"
-      },
-      "StoppedGrantSelection": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "const": "stopped_grant",
-            "enum": [
-              "stopped_grant"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "stopped_request_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Stopped Request Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "stopped_request_id"
-        ],
-        "title": "StoppedGrantSelection",
         "type": "object"
       },
       "ToastNotification": {
@@ -4420,49 +3126,9 @@
         "title": "TrackChip",
         "type": "object"
       },
-      "UnavailableControl": {
-        "additionalProperties": false,
-        "properties": {
-          "fix_recovery": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IssueRecoveryAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/PRRepairAvailable"
-              },
-              {
-                "$ref": "#/components/schemas/RecoveryUnavailable"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Fix Recovery"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "status": {
-            "const": "unavailable",
-            "enum": [
-              "unavailable"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "reason"
-        ],
-        "title": "UnavailableControl",
-        "type": "object"
-      },
       "UnblockRequest": {
         "additionalProperties": false,
-        "description": "Legacy breaker release accepts no review guidance or re-arm authority.",
+        "description": "Unblock is a label move; it accepts no body fields.",
         "properties": {},
         "title": "UnblockRequest",
         "type": "object"
@@ -4665,65 +3331,6 @@
           "raw"
         ],
         "title": "VerificationRow",
-        "type": "object"
-      },
-      "WorkflowFamiliesAvailable": {
-        "additionalProperties": false,
-        "description": "The repository's activated workflow families; the legacy unblock is retired while any is active.",
-        "properties": {
-          "active_families": {
-            "items": {
-              "enum": [
-                "resolve",
-                "review_rejections"
-              ],
-              "type": "string"
-            },
-            "title": "Active Families",
-            "type": "array"
-          },
-          "repository": {
-            "title": "Repository",
-            "type": "string"
-          },
-          "status": {
-            "const": "available",
-            "enum": [
-              "available"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "repository",
-          "active_families"
-        ],
-        "title": "WorkflowFamiliesAvailable",
-        "type": "object"
-      },
-      "WorkflowFamiliesUnavailable": {
-        "additionalProperties": false,
-        "properties": {
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "status": {
-            "const": "unavailable",
-            "enum": [
-              "unavailable"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "reason"
-        ],
-        "title": "WorkflowFamiliesUnavailable",
         "type": "object"
       }
     }
@@ -4943,66 +3550,6 @@
         "summary": "Api Park"
       }
     },
-    "/api/repos/{name}/issues/{number}/priority": {
-      "post": {
-        "operationId": "api_priority_api_repos__name__issues__number__priority_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "additionalProperties": true,
-                "default": {},
-                "title": "Body",
-                "type": "object"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ActionResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Priority"
-      }
-    },
     "/api/repos/{name}/issues/{number}/promote": {
       "post": {
         "operationId": "api_promote_api_repos__name__issues__number__promote_post",
@@ -5049,167 +3596,6 @@
           }
         },
         "summary": "Api Promote"
-      }
-    },
-    "/api/repos/{name}/issues/{number}/resolve-control": {
-      "get": {
-        "operationId": "api_resolve_control_api_repos__name__issues__number__resolve_control_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "request_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "maxLength": 512,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Request Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "discriminator": {
-                    "mapping": {
-                      "absent": "#/components/schemas/AbsentControl",
-                      "available": "#/components/schemas/AvailableControl",
-                      "inactive": "#/components/schemas/InactiveControl",
-                      "unavailable": "#/components/schemas/UnavailableControl"
-                    },
-                    "propertyName": "status"
-                  },
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/AvailableControl"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InactiveControl"
-                    },
-                    {
-                      "$ref": "#/components/schemas/AbsentControl"
-                    },
-                    {
-                      "$ref": "#/components/schemas/UnavailableControl"
-                    }
-                  ],
-                  "title": "Response Api Resolve Control Api Repos  Name  Issues  Number  Resolve Control Get"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Resolve Control"
-      }
-    },
-    "/api/repos/{name}/issues/{number}/resolve-control/commands": {
-      "post": {
-        "operationId": "api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "discriminator": {
-                  "mapping": {
-                    "cancel_rearm": "#/components/schemas/CancelRearm",
-                    "release": "#/components/schemas/ResolveRelease"
-                  },
-                  "propertyName": "operation"
-                },
-                "oneOf": [
-                  {
-                    "$ref": "#/components/schemas/ResolveRelease"
-                  },
-                  {
-                    "$ref": "#/components/schemas/CancelRearm"
-                  }
-                ],
-                "title": "Body"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Resolve Command"
       }
     },
     "/api/repos/{name}/issues/{number}/steps/{idx}/events": {
@@ -5334,54 +3720,6 @@
         "summary": "Api Unblock"
       }
     },
-    "/api/repos/{name}/issues/{number}/unpark": {
-      "post": {
-        "operationId": "api_unpark_api_repos__name__issues__number__unpark_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ActionResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Unpark"
-      }
-    },
     "/api/repos/{name}/overview": {
       "get": {
         "operationId": "api_overview_api_repos__name__overview_get",
@@ -5475,60 +3813,6 @@
           }
         },
         "summary": "Api Start"
-      }
-    },
-    "/api/repos/{name}/workflow-families": {
-      "get": {
-        "operationId": "api_workflow_families_api_repos__name__workflow_families_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "discriminator": {
-                    "mapping": {
-                      "available": "#/components/schemas/WorkflowFamiliesAvailable",
-                      "unavailable": "#/components/schemas/WorkflowFamiliesUnavailable"
-                    },
-                    "propertyName": "status"
-                  },
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/WorkflowFamiliesAvailable"
-                    },
-                    {
-                      "$ref": "#/components/schemas/WorkflowFamiliesUnavailable"
-                    }
-                  ],
-                  "title": "Response Api Workflow Families Api Repos  Name  Workflow Families Get"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Workflow Families"
       }
     },
     "/api/usage": {

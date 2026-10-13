@@ -813,32 +813,39 @@ def test_projected_cost_groups_completed_issues_by_resolve_model():
     }
 
 
-def test_pending_card_reads_priority_and_the_newest_hold():
+def test_pending_card_reads_the_newest_hold():
     events = [{"ts": ts(hours=1), "event": "hold", "issue": 9, "reason": "overlap"}]
     row = row_for(events, 9)
     card = snapshots.pending_card(
         {"number": 9, "title": "t", "url": "u",
          "labels": [{"name": "ai-ready"}, {"name": "P2"}]}, row)
-    assert card["priority"] == "P2"
+    assert "priority" not in card
     assert (card["held"], card["hold_reason"]) == (True, "waiting on dependency")
     assert card["overlap"] is None
 
 
 def test_pending_card_with_no_journal_history_is_not_held():
     card = snapshots.pending_card({"number": 9, "labels": ["ai-ready"]}, None)
-    assert (card["held"], card["priority"]) == (False, None)
+    assert card["held"] is False
 
 
-def test_a_parked_issue_renders_as_a_held_pending_row_with_the_parked_reason():
+def test_a_needs_human_issue_renders_as_a_held_pending_row_with_the_parked_reason():
     card = snapshots.pending_card(
-        {"number": 34, "labels": ["ai-parked", "ai-triage"]}, None)
+        {"number": 34, "labels": ["ai-ready", "needs-human"]}, None)
     assert (card["held"], card["hold_reason"]) == (True, "parked")
+
+
+def test_a_retired_ai_parked_label_no_longer_holds_an_issue():
+    card = snapshots.pending_card(
+        {"number": 34, "labels": ["ai-ready", "ai-parked"]}, None)
+    assert card["held"] is False
+    assert board_of(card)["on"] == {"kind": "queue"}
 
 
 def test_a_parked_pending_card_keeps_its_pr_link_and_ci_state():
     row = replace(row_for([RESOLVE], 7), prs=(179,))
     card = snapshots.pending_card(
-        {"number": 7, "labels": ["ai-parked", "ai-triage"]},
+        {"number": 7, "labels": ["ai-ready", "needs-human"]},
         row,
         gh_prs={
             179: {
@@ -2657,13 +2664,13 @@ def test_a_malformed_stall_never_breaks_the_card(age, stamp):
     assert ask_of(card) == "stalled"
 
 
-def test_a_parked_pending_issue_is_blocked_on_triage():
-    card = snapshots.pending_card({"number": 34, "labels": ["ai-parked", "ai-triage"]}, None)
+def test_a_needs_human_pending_issue_is_blocked_on_triage():
+    card = snapshots.pending_card({"number": 34, "labels": ["ai-ready", "needs-human"]}, None)
 
     assert board_of(card) == {
         "status": "blocked", "on": {"kind": "triage", "why": "parked"},
         "headline": "Waiting on triage",
-        "reason": "Parked for human review. Unpark it to hand it back to the harness.",
+        "reason": "Held for a human (needs-human). Unblock removes the label.",
         "since_ts": None,
     }
 
@@ -2696,7 +2703,7 @@ def test_a_hold_is_blocked_on_its_target_from_when_it_began(event, on):
 def test_a_queued_pending_issue_waits_on_the_queue_with_no_wait_start():
     card = snapshots.pending_card({"number": 9, "labels": ["ai-ready", "P1"]}, None)
 
-    assert board_of(card)["on"] == {"kind": "queue", "priority": "P1"}
+    assert board_of(card)["on"] == {"kind": "queue"}
     assert board_of(card)["since_ts"] is None
     assert card["rail"] == {
         "current": "triage", "furthest": "triage", "resolve_attempts": 0,
@@ -2752,9 +2759,9 @@ def test_a_done_card_leaves_the_board():
 @pytest.mark.parametrize(
     "labels",
     [
-        ["ai-ready", "needs-human-review", "ai-parked", "ai-blocked", "needs-budget-review"],
+        ["ai-ready", "needs-human-review", "needs-human", "ai-blocked", "needs-budget-review"],
         ["ai-done", "ai-working", "P1", "P2"],
-        ["", "NEEDS-HUMAN-REVIEW", "ai-parked "],
+        ["", "NEEDS-HUMAN-REVIEW", "needs-human "],
     ],
 )
 def test_contradictory_label_sets_produce_one_coherent_board_state(labels):
@@ -2765,7 +2772,7 @@ def test_contradictory_label_sets_produce_one_coherent_board_state(labels):
     for board in (card["board"], pending["board"]):
         assert board["status"] in {"needs_you", "working", "blocked"}
         assert board["headline"] and board["reason"]
-    if "ai-parked" in labels:
+    if "needs-human" in labels:
         assert pending["board"]["on"] == {"kind": "triage", "why": "parked"}
 
 

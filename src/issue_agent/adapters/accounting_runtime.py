@@ -21,7 +21,6 @@ from ..domain.contracts import (
     RunId,
     TokenUsage,
     UsageSource,
-    WorkflowAttemptIdentity,
     daily_budget_scope,
 )
 from ..domain.outcome import (
@@ -39,7 +38,6 @@ from ..domain.review import parse_verdict
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
-from ..domain.workflow_identity import WorkflowBinding
 from ..domain.agent_task import run_input_fingerprint
 from .control_store import (
     LEG_NAMESPACE,
@@ -74,11 +72,11 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     _context: contextvars.ContextVar[
-        tuple[int | None, str, int, int | None, WorkflowBinding | None, str, bool]
+        tuple[int | None, str, int, int | None, str, bool]
     ] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}",
-            default=(None, "", 0, None, None, "", False),
+            default=(None, "", 0, None, "", False),
         ),
         init=False,
         repr=False,
@@ -101,15 +99,12 @@ class AccountingRuntime(AgentRuntime):
         issue: int | None,
         claim_target: int | None = None,
         *,
-        workflow: WorkflowBinding | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None:
         if not isinstance(head, str) or type(resumed) is not bool:
             raise ValueError("accounting context head must be text and resumed an exact bool")
-        if workflow is not None and not isinstance(workflow, WorkflowBinding):
-            raise ValueError("accounting context requires a validated workflow binding")
-        self._context.set((issue, kind, number, claim_target, workflow, head, resumed))
+        self._context.set((issue, kind, number, claim_target, head, resumed))
 
     def _reserve_reclaiming_dead_headroom(
         self,
@@ -179,16 +174,13 @@ class AccountingRuntime(AgentRuntime):
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return self._refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
-        issue, kind, number, claim_target, workflow, head, resumed = self._context.get()
-        if self.role in LEG_ROLES and workflow is not None:
-            return self._refused("a role's leg is a plain leg: no workflow binding")
+        issue, kind, number, claim_target, head, resumed = self._context.get()
         # ADR 0008: paid admission binds the decision-side target unchanged.
         target = (
             claim_target
             if claim_target is not None
-            else _breaker_key(kind, number, issue)
+            else _default_claim_target(kind, number, issue)
         )
-        retry_key = -number if self.role == "review" else target
         if (
             self.runtime_name == "codex"
             and self.rate_table is None
@@ -228,7 +220,6 @@ class AccountingRuntime(AgentRuntime):
                 # The PR head the leg was decided on: attempt counting keys
                 # REVIEW legs to it (refactor decision Q21).
                 "head": head,
-                "breaker_key": retry_key,
                 "claim_target": target,
                 "cwd": (
                     str(Path(task.cwd).resolve())
@@ -258,15 +249,12 @@ class AccountingRuntime(AgentRuntime):
             tuple(additional),
             kind or "paid",
             self.owner_id or f"{self.repository}:{self.role}",
-            workflow=workflow,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
-            if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
-                return self._refused(reservation.detail or reservation.disposition.value)
             # A fix refusal buys nothing; its zero-cost row spaces the retry.
             self.record_refused_leg()
             # Time restores daily headroom, so that refusal waits label-free
@@ -340,13 +328,6 @@ class AccountingRuntime(AgentRuntime):
                 # resubmit it after a crash) without buying the review again.
                 **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
             })
-        result = replace(
-            result,
-            workflow_attempt=(
-                WorkflowAttemptIdentity(workflow, run_id, _leg_id or str(run_id))
-                if workflow is not None else None
-            ),
-        )
         return self._settle_result(run_id, task.model or result.model or reserved_model, result)
 
     def _blocked(self, detail: str) -> AgentResult:
@@ -553,11 +534,11 @@ def _blocked(detail: str) -> AgentResult:
 
 
 _PR_KINDS = frozenset(
-    {"PR_RESUME", "ADDRESS_REVIEW", "FIX_CI", "REBASE", "REVIEW", "RE_REVIEW"}
+    {"ADDRESS_REVIEW", "FIX_CI", "REBASE", "REVIEW"}
 )
 
 
-def _breaker_key(kind: str, number: int, issue: int | None) -> int:
+def _default_claim_target(kind: str, number: int, issue: int | None) -> int:
     if issue is not None:
         return issue
     return -number if kind in _PR_KINDS else number

@@ -1,4 +1,3 @@
-import { releasePayload } from "../lib/release-command";
 /**
  * The single typed HTTP client. Every network call in the app goes through
  * `getJson` / `postJson` so that error shaping, aborting and JSON decoding have
@@ -14,15 +13,10 @@ import type {
   IssueDetailPayload,
   IssuesPayload,
   OverviewPayload,
-  Priority,
   ReposPayload,
   StepEventsPayload,
   UsagePayload,
   VerificationPayload,
-  ResolveControl,
-  ResolveCommand,
-  ResolveCommandResult,
-  WorkflowFamilies,
 } from "./types";
 import { z } from "zod";
 import { schemas } from "./generated-zod";
@@ -189,40 +183,9 @@ export function postJson<T>(
 }
 
 const enc = encodeURIComponent;
-const resolveReads = {
-  200: z.discriminatedUnion("status", [schemas.AvailableControl, schemas.InactiveControl]),
-  404: schemas.AbsentControl,
-  503: schemas.UnavailableControl,
-};
-const resolveWrites = Object.fromEntries(
-  [[202, "accepted"], [200, "replayed"], [409, "conflict"], [422, "rejected"], [503, "unavailable"]]
-    .map(([status, outcome]) => [status, schemas.CommandResult.refine((value) => value.outcome === outcome)]),
-);
-
-const familyReads = {
-  200: schemas.WorkflowFamiliesAvailable,
-  503: schemas.WorkflowFamiliesUnavailable,
-};
-
 /* -------------------------------------------------------------- endpoints */
 
 export const api = {
-  resolveControl: (name: string, n: number, requestId?: string, s?: AbortSignal) =>
-    getJson<ResolveControl>(
-      `/api/repos/${enc(name)}/issues/${n}/resolve-control${requestId ? `?request_id=${enc(requestId)}` : ""}`,
-      schemas.CommandResult.shape.control, s, undefined, resolveReads,
-    ),
-
-  resolveCommand: (name: string, n: number, command: ResolveCommand, s?: AbortSignal) =>
-    postJson<ResolveCommandResult>(
-      `/api/repos/${enc(name)}/issues/${n}/resolve-control/commands`, releasePayload(command),
-      schemas.CommandResult, s, resolveWrites,
-    ),
-
-  /** The repository's activated workflow families: the authority the legacy unblock refusal reads. */
-  workflowFamilies: (name: string, s?: AbortSignal) =>
-    getJson<WorkflowFamilies>(`/api/repos/${enc(name)}/workflow-families`, schemas.WorkflowFamiliesAvailable, s, undefined, familyReads),
-
   repos: (s?: AbortSignal) =>
     getJson<ReposPayload>("/api/repos", schemas.ReposPayload, s),
 
@@ -278,7 +241,7 @@ export const api = {
       s,
     ),
 
-  /** Drops the labels that hold an issue for a human, so the daemons resume. */
+  /** Removes `needs-human` from the issue and its open harness PRs and puts the issue back on `ai-ready`. */
   unblock: (name: string, n: number, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/unblock`,
@@ -287,27 +250,11 @@ export const api = {
       s,
     ),
 
-  /** Hands an issue's PR(s) to a human and frees the overlap queue. */
+  /** Adds `needs-human` to the issue and its open harness PRs. */
   park: (name: string, n: number, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/park`,
       {},
-      schemas.ActionResult,
-      s,
-    ),
-
-  unpark: (name: string, n: number, s?: AbortSignal) =>
-    postJson<ActionResult>(
-      `/api/repos/${enc(name)}/issues/${n}/unpark`,
-      {},
-      schemas.ActionResult,
-      s,
-    ),
-
-  setPriority: (name: string, n: number, priority: Priority, s?: AbortSignal) =>
-    postJson<ActionResult>(
-      `/api/repos/${enc(name)}/issues/${n}/priority`,
-      { priority },
       schemas.ActionResult,
       s,
     ),

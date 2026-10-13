@@ -214,9 +214,7 @@ def build_role(
             Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
             progress=scheduler_progress,
         )
-        # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
-        # legs, not feed the new runtime the old runtime's session ids.
-        store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)
+        store = Store(cfg.state_dir)
         return build_fix_daemon(cfg, gw, store, worktrees, runner)
     if role == "review":
         gw = GitHubGateway(
@@ -224,7 +222,7 @@ def build_role(
             _app_identity(env, warn=_commit_log),
             progress=scheduler_progress,
         )
-        store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime.value)
+        store = Store(cfg.review_state_dir)
         return build_review_daemon(cfg, gw, store, runner)
     raise SystemExit(f"unknown role: {role!r} (use fix|review)")
 

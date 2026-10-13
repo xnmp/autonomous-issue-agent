@@ -1,8 +1,11 @@
 """SQLite operational authority defined by ADR 0003.
 
-The store owns reservations, run/lease state, deduplication, lifecycle commands
-and effect receipts.  Transactions are intentionally short:
-no network, model, or subprocess work is accepted by this adapter.
+The store owns money (reservations, charges), runs and leases, dispatch
+claims, and idempotency keys. Transactions are intentionally short: no network,
+model, or subprocess work is accepted by this adapter.
+
+The workflow, lifecycle-command and effect-receipt tables are no longer read or
+written (slice 5d-1); their DDL stays until the store rewrite drops it.
 """
 
 from __future__ import annotations
@@ -16,24 +19,17 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import ExitStack, closing, contextmanager
-from dataclasses import asdict, dataclass, replace
+from contextlib import closing, contextmanager
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from ..domain import continuation_components as cc
 from .codex_child_usage import NativeFailure
-from ..domain.contracts import ContinuationAdmission
 
 from ..domain.contracts import (
     BudgetScope,
-    CommandId,
-    CommandKind,
-    EffectReceipt,
-    EffectStatus,
-    LifecycleCommand,
     Money,
     PriceQuote,
     PricingBasis,
@@ -41,134 +37,10 @@ from ..domain.contracts import (
     ReservationId,
     SettlementRequest,
     RunId,
-    WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import FamilyAuthority, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision
-from ..domain.workflow import (
-    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryDisposition, StandaloneCommand,
-    UnconsumedRetryAuthorization, NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
-    RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
-    CompletedRearm, PendingRearm, ResolveAdmission, ResolveEpisode, ResolveStage, WorkflowSnapshot,
-)
-from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
-from ..domain.workflow_retry import (
-    MAX_RELEVANT_AUTHORIZATIONS,
-    RetryAuthorization,
-    RetryAuthorizationFacts,
-)
-from ..domain.workflow_reconciliation import (
-    absent_reexecution, prewrite_evidence_gate_id, unknown_outcome_history,
-)
-from ..domain.resolve_return import FinalizedResolveReturn
 from ..domain.repository import canonical_repository
-from ..domain.refs import issue_from_branch
-from .deployment_authority import (
-    deployment_effect_barrier, deployment_effect_authority,
-    deployment_role,
-)
-from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
-from .workflow_rows import (
-    WorkflowAuthorityError,
-    active_families,
-    load_resolve_workflow_row,
-    load_workflow_row,
-    load_workspace_ack,
-    require_resolve_binding,
-    require_workflow_binding,
-    workflow_scope,
-    workflow_run_scope_bounds as workflow_run_scope_bounds,
-)
 
 SCHEMA_VERSION = 46
-
-
-def workflow_episode_key(binding: WorkflowBinding) -> str:
-    """An indexed projection of immutable admission scope, not an allowance."""
-    return json.dumps((*workflow_scope(binding.fence.key), binding.authority.family.value,
-                       binding.authority.epoch, binding.episode_id), ensure_ascii=False, separators=(",", ":"))
-
-
-def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool:
-    prefix = json.dumps((*workflow_scope(key), WorkflowFamily.RESOLVE.value), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
-    return db.execute(
-        "SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? "
-        "AND kind<>'ROUTE' LIMIT 1", (prefix, prefix + "\uffff"),
-    ).fetchone() is not None
-
-
-def episode_entry_admitted(db: sqlite3.Connection, snapshot: WorkflowSnapshot) -> bool:
-    """The first immutable paid admission consumes the handoff, including routing."""
-    row = db.execute(
-        "SELECT run_id,kind,dispatch_id,workflow_binding_json FROM runs "
-        "WHERE workflow_episode_key=? LIMIT 1", (workflow_episode_key(snapshot.binding),),
-    ).fetchone()
-    if row is None:
-        return False
-    binding = _indexed_run_binding(db, row)
-    if workflow_episode_key(binding) != workflow_episode_key(snapshot.binding):
-        raise WorkflowAuthorityError("episode entry index disagrees with its admitted scope")
-    receipt = db.execute(
-        "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
-        (binding.fence.key.repository, row["run_id"]),
-    ).fetchone()
-    admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
-    expected = snapshot.intent.handoff.handoff_id if isinstance(snapshot.intent, CompletedRearm) else None
-    if admission.workspace_handoff_id != expected:
-        raise WorkflowAuthorityError("episode admission lacks its immutable workspace handoff")
-    return True
-
-
-def _indexed_run_binding(db: sqlite3.Connection, row: sqlite3.Row) -> WorkflowBinding:
-    binding = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
-    reservation = db.execute("SELECT workload_repository FROM budget_reservations WHERE run_id=?", (row["run_id"],)).fetchone()
-    receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?", (binding.fence.key.repository, row["run_id"])).fetchone()
-    if reservation is None or reservation["workload_repository"] != binding.fence.key.repository or receipt is None:
-        raise WorkflowAuthorityError("indexed workflow run lacks its reservation and immutable admission")
-    admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
-    metadata = json.loads(row["dispatch_id"])
-    if (admission.attempt.binding != binding or str(admission.attempt.run_id) != row["run_id"]
-        or admission.stage.value != row["kind"] or not isinstance(metadata, dict)
-        or metadata.get("leg_id") != admission.attempt.leg_id):
-        raise WorkflowAuthorityError("indexed workflow run disagrees with its immutable admission")
-    return binding
-
-
-def latest_work_admission(db: sqlite3.Connection, binding: WorkflowBinding) -> ResolveAdmission | None:
-    latest = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest' AND scope=? AND key=?",
-                        (binding.fence.key.repository, f"issue:{binding.fence.key.target.number}")).fetchone()
-    if latest is None:
-        return None
-    admission = decode_workflow(latest["payload_json"], ResolveAdmission)
-    receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
-                         (binding.fence.key.repository, str(admission.attempt.run_id))).fetchone()
-    run = db.execute("SELECT workflow_binding_json,kind FROM runs WHERE run_id=?", (str(admission.attempt.run_id),)).fetchone()
-    if admission.attempt.binding.fence.key != binding.fence.key or receipt is None or decode_workflow(receipt["payload_json"], ResolveAdmission) != admission or run is None or run["kind"] != admission.stage.value or decode_workflow(run["workflow_binding_json"], WorkflowBinding) != admission.attempt.binding:
-        raise WorkflowAuthorityError("latest admission disagrees with its admitted target and run")
-    return admission
-
-
-def require_workspace_predecessor(db: sqlite3.Connection, snapshot: WorkflowSnapshot) -> ResolveAdmission | None:
-    """Only a verified completed handoff may bridge a retained episode pointer."""
-    latest = latest_work_admission(db, snapshot.binding)
-    if snapshot.intent is not None and not isinstance(snapshot.intent, CompletedRearm):
-        raise WorkflowAuthorityError("workspace admission requires a completed rearm")
-    if latest is None:
-        if target_has_work_admissions(db, snapshot.revision.fence.key):
-            raise WorkflowAuthorityError("retained workflow work has lost its latest-admission pointer")
-        if isinstance(snapshot.intent, CompletedRearm) and isinstance(snapshot.intent.handoff.predecessor, PriorResolveAdmission):
-            raise WorkflowAuthorityError("completed workspace handoff has lost its admitted predecessor")
-        return None
-    previous = latest.attempt.binding
-    if previous.fence.generation > snapshot.binding.fence.generation or latest.revision.version > snapshot.revision.version:
-        raise WorkflowAuthorityError("latest workspace admission belongs to a future revision")
-    if (previous.authority, previous.episode_id) == (snapshot.binding.authority, snapshot.binding.episode_id):
-        return latest
-    intent = snapshot.intent
-    if (not isinstance(intent, CompletedRearm)
-            or intent.handoff.predecessor != PriorResolveAdmission(latest.attempt, latest.revision.version)
-            or load_workspace_ack(db, intent.handoff) != intent.workspace):
-        raise WorkflowAuthorityError("foreign episode predecessor requires its exact completed workspace handoff")
-    return latest
 
 
 SCHEMA_BASELINE_VERSION = 9
@@ -176,22 +48,9 @@ LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
 )
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
-_RESOLVE_PAID_KINDS = frozenset(stage.value for stage in ResolveStage)
-# Paid review legs are admitted under the dispatched agent kind's name.
-_REVIEW_PAID_KINDS = frozenset({"REVIEW", "RE_REVIEW"})
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
-# One operator signal per review escalation (increment 6 N2): claimed by
-# escalation identity, and each succeeded hold projection is examined once.
-# An escalation whose signal is owed although no succeeded receipt of its own
-# will carry it: its hold was found already on GitHub, its re-plans were
-# exhausted, or its restoration was contested (written by the review workflow
-# control). Scoped by the owing executor identity, so the executor's owner
-# lineage filters the rows in SQL before any claim limit applies.
-# A malformed owed record is quarantined once, per row (same scope and key),
-# and journalled: at-most-once paging never wedges every drain on one corrupt
-# row, and a well-formed signal of the same escalation is still sent.
 class ControlStoreError(RuntimeError):
     pass
 
@@ -224,6 +83,8 @@ class AccountingDisposition(str, Enum):
 # 5b's name, kept like every stored namespace (act's `fix-comment`): a rename
 # orphans the receipts already written under the old one.
 LEG_NAMESPACE = "fix-leg"
+# The column default of runs.continuations_json: a run bound to no continuation.
+_EMPTY_CONTINUATIONS = '{"format":1,"value":[]}'
 
 
 @dataclass(frozen=True)
@@ -361,28 +222,14 @@ class ReservationRequest:
     additional_limits: tuple["BudgetLimit", ...] = ()
     kind: str = "paid"
     owner_id: str = "reservation"
-    workflow: WorkflowBinding | None = None
-    continuations: tuple[cc.ContinuationPurchase, ...] = ()
 
     def __post_init__(self) -> None:
-        if (not isinstance(self.continuations, tuple) or len(self.continuations) > 3
-                or any(not isinstance(item, (cc.IssueInfraPurchase, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.IssueReviewPurchase, cc.IssueRebasePurchase, cc.PRRepairPurchase)) for item in self.continuations)):
-            raise ValueError("reservation requires bounded fixed continuation purchases")
-        if len({item.capture.binding.authority.family for item in self.continuations}) != len(self.continuations):
-            raise ValueError("reservation selects each continuation family once")
         workload_repository = canonical_repository(
             self.workload_repository
         )
         object.__setattr__(
             self, "workload_repository", workload_repository
         )
-        if self.workflow is not None and (
-            not isinstance(self.workflow, WorkflowBinding)
-            or self.workflow.fence.key.repository != workload_repository
-        ):
-            raise ValueError("reservation workflow binding must match its workload repository")
-        if any(item.capture.binding.fence.key.repository != workload_repository for item in self.continuations):
-            raise ValueError("reservation continuation belongs to another repository")
         if self.scope.currency != self.quote.maximum_charge.currency:
             raise ValueError("reservation scope and quote currency differ")
         if self.cap.currency != self.scope.currency:
@@ -495,38 +342,12 @@ class ActiveDispatchClaim:
 
 
 @dataclass(frozen=True)
-class PublicationAuthority:
-    run_id: RunId
-    repository: str
-    owner_id: str
-    role: str
-    kind: str
-    issue: int | None
-    cwd: str
-    branch: str
-    pgid: int
-    process_start_ticks: int
-    workflow: WorkflowBinding | None = None
-
-
-@dataclass(frozen=True)
 class RunCancellationIntent:
     run_id: RunId
     dispatch_id: str
     kind: str
     issue_number: int | None
     reason: str
-
-
-@dataclass(frozen=True)
-class PendingCommand:
-    command: LifecycleCommand
-    state: str
-    attempts: int
-    # Verified GitHub REFUSALS only — readbacks that proved the requested state
-    # absent. `attempts` also counts executions an outage interrupted, so the
-    # ADR 0012 retry ceiling reads this instead (see control-store v18).
-    refusals: int = 0
 
 
 @dataclass(frozen=True)
@@ -1048,45 +869,17 @@ bound history aborts the entire migration. Never use the current workflow row.
 
 
 def _backfill_workflow_episode_index_v20(db: sqlite3.Connection) -> None:
-    # This versioned transform belongs to v20's immutable migration contract.
-    # Ambiguous historical authority blocks migration, never buys fresh rounds.
-    for row in db.execute("SELECT run_id,kind,dispatch_id,workflow_binding_json FROM runs WHERE workflow_binding_json IS NOT NULL"):
-        try:
-            binding = _indexed_run_binding(db, row)
-        except ValueError as exc:
-            raise IncompatibleSchema(f"cannot project historical workflow run {row['run_id']!r}: {exc}") from exc
-        db.execute("UPDATE runs SET workflow_episode_key=? WHERE run_id=?", (workflow_episode_key(binding), row["run_id"]))
+    # The workflow model this transform decoded was deleted (slice 5d-1). A
+    # pre-v20 store holding bound runs cannot be projected any more, so it
+    # refuses: migrate it with a release from before the deletion first.
+    if db.execute("SELECT 1 FROM runs WHERE workflow_binding_json IS NOT NULL LIMIT 1").fetchone() is not None:
+        raise IncompatibleSchema("a pre-v20 store with workflow-bound runs predates the deleted workflow model")
 
 
 def _backfill_workflow_components_v25(db: sqlite3.Connection) -> None:
-    for row in db.execute("SELECT repository,target_kind,target_number,episode_json FROM workflows"):
-        try:
-            family = decode_workflow(row["episode_json"], tuple)
-            if len(family) != 2 or not isinstance(family[0], FamilyAuthority):
-                raise ValueError("legacy workflow family is malformed")
-            authority, episode = family
-            # Pre-v25 review-rejection rows no longer decode (slice 5c deleted
-            # the family): such a store refuses this migration as incompatible.
-            expected = (
-                WorkflowFamily.RESOLVE if row["target_kind"] == "issue" and isinstance(episode, ResolveEpisode)
-                else None
-            )
-            if expected is None or authority.family is not expected:
-                raise ValueError("legacy workflow family disagrees with its target")
-            active = db.execute(
-                "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
-                (row["repository"], expected.value),
-            ).fetchone()
-            if active is None or active["epoch"] != authority.epoch:
-                raise ValueError("legacy workflow family disagrees with activation")
-            db.execute(
-                "INSERT INTO workflow_components(repository,target_kind,target_number,family,epoch,episode_id) "
-                "VALUES (?,?,?,?,?,?)",
-                (row["repository"], row["target_kind"], row["target_number"],
-                 expected.value, authority.epoch, episode.episode_id),
-            )
-        except (ValueError, TypeError) as exc:
-            raise IncompatibleSchema(f"cannot project historical workflow component: {exc}") from exc
+    # As for v20: pre-v25 workflow rows predate the deleted workflow model.
+    if db.execute("SELECT 1 FROM workflows LIMIT 1").fetchone() is not None:
+        raise IncompatibleSchema("a pre-v25 store with workflow rows predates the deleted workflow model")
     for row in db.execute("SELECT repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,claimed_at FROM dispatch_claims"):
         digest = hashlib.sha256(_json(tuple(row)).encode()).hexdigest()
         occurrence_id = f"legacy:{digest}"
@@ -1197,6 +990,7 @@ _FIX_DISPATCH_REPOSITORY = "CASE WHEN json_valid(dispatch_id) THEN json_extract(
 _FIX_DISPATCH_ISSUE = "CASE WHEN json_valid(dispatch_id) THEN json_extract(dispatch_id,'$.issue') END"
 
 
+# Migration 39's digest and its partial indices use this exact text.
 _REPAIR_BINDING = "$.value[1].fields.attempt.fields.binding"
 _REPAIR_VERSION = "$.value[1].fields.admission_version"
 _REPAIR_ADMISSION = ("namespace='continuation-admission' AND json_valid(payload_json) AND "
@@ -2409,42 +2203,6 @@ class SQLiteControlStore:
     def authority_witness_path(self) -> str:
         return f"{self.path}.authority"
 
-    def require_initialized(self) -> None:
-        """Open operator authority without creating, migrating or adopting it."""
-        if not self._database_exists() or not self._authority_witness_exists():
-            raise CorruptControlStore("operator control requires initialized authority")
-        self._validate_authority_witness()
-        with closing(self._connect()) as db, db:
-            self._validate_migration_history(self._migration_history(db), require_current=True)
-
-    @contextmanager
-    def legacy_resolve_authority(self, repository: str) -> Iterator[None]:
-        """A legacy operator write cannot cross a resolve-family activation."""
-        from ..domain.workflow_identity import canonical_workflow_repository
-
-        repository = canonical_workflow_repository(repository)
-        # Initialization has a different lock order; operator writes never
-        # create, adopt or migrate accounting while holding these barriers.
-        self.require_initialized()
-        with ExitStack() as barriers:
-            for role in ("fix", "review"):
-                barriers.enter_context(deployment_effect_barrier(self.path, repository, role))
-            with closing(self._connect()) as db:
-                db.execute("BEGIN")
-                # A retained review-family epoch is inert since slice 5c (the
-                # family is deleted), so only resolve authority refuses.
-                if WorkflowFamily.RESOLVE in active_families(db, repository):
-                    raise WorkflowAuthorityError("legacy unblock is retired for active resolve control; use a typed re-arm command")
-            yield
-
-    def active_workflow_families(self, repository: str) -> tuple[WorkflowFamily, ...]:
-        """The families activated for a repository, read-only. Only resolve makes `legacy_resolve_authority` refuse."""
-        from ..domain.workflow_identity import canonical_workflow_repository
-
-        self.require_initialized()
-        with closing(self._connect()) as db:
-            db.execute("BEGIN")
-            return active_families(db, canonical_workflow_repository(repository))
 
     def _database_exists(self, *, allow_empty: bool = False) -> bool:
         try:
@@ -2702,10 +2460,6 @@ class SQLiteControlStore:
 
         violations = (
             (
-                "workflow binding lacks its episode projection",
-                "SELECT run_id FROM runs WHERE (workflow_binding_json IS NULL) != (workflow_episode_key IS NULL) LIMIT 1",
-            ),
-            (
                 "never-launched release contradicts execution or accounting evidence",
                 """
                 SELECT r.run_id FROM runs r
@@ -2804,22 +2558,6 @@ class SQLiteControlStore:
                 """,
             ),
             (
-                "lifecycle command and effect receipt states disagree",
-                """
-                SELECT c.command_id
-                FROM lifecycle_commands AS c
-                LEFT JOIN effect_receipts AS r ON r.command_id=c.command_id
-                WHERE (
-                    c.state IN (
-                        'succeeded', 'retryable_failure',
-                        'permanent_failure', 'unknown_outcome'
-                    )
-                ) <> (r.command_id IS NOT NULL)
-                   OR (r.command_id IS NOT NULL AND r.status<>c.state)
-                LIMIT 1
-                """,
-            ),
-            (
                 "retired owner scope disagrees with its successor",
                 """
                 SELECT retired.owner_id
@@ -2840,30 +2578,18 @@ class SQLiteControlStore:
                     f"({row[0]})"
                 )
 
-        from .workflow_commit import owns_command
-        from ..domain.workflow_identity import WorkflowWriter
+        # A run bound to a claim belongs to the claim's owner or to a retired
+        # predecessor of it.
         for row in db.execute(
-            "SELECT r.run_id,r.owner_id,r.continuations_json,dc.repository,dc.role,dc.owner_id AS successor "
+            "SELECT r.run_id,r.owner_id,dc.repository,dc.owner_id AS successor "
             "FROM dispatch_claim_runs dcr JOIN dispatch_claims dc "
             "ON dc.repository=dcr.repository AND dc.role=dcr.role AND dc.target=dcr.target "
             "JOIN runs r ON r.run_id=dcr.run_id WHERE dc.owner_id<>r.owner_id"
         ):
-            if (row["continuations_json"] == encode_workflow(()) or not owns_command(
-                    db, WorkflowWriter(row["repository"], row["role"], row["successor"]), row["owner_id"])):
+            if row["owner_id"] not in SQLiteControlStore._owner_lineage(
+                    db, canonical_repository(row["repository"]), row["successor"]):
                 raise CorruptControlStore(
                     f"dispatch claim and bound run owners disagree ({row['run_id']})"
-                )
-
-        for row in db.execute(
-            "SELECT * "
-            "FROM lifecycle_commands"
-        ).fetchall():
-            binding = row["workflow_binding_json"] if "workflow_binding_json" in row.keys() else None
-            digest = _encoded_payload_digest(str(row["payload_json"]), binding)
-            if digest != row["payload_digest"]:
-                raise CorruptControlStore(
-                    "control-store semantic integrity failed: lifecycle "
-                    f"command payload digest disagrees ({row['command_id']})"
                 )
 
     @staticmethod
@@ -2902,19 +2628,19 @@ class SQLiteControlStore:
         owner_id: str,
         *,
         prior_owner_ids: tuple[str, ...] = (),
-    ) -> tuple[int, int]:
+    ) -> int:
         """Atomically move pre-deployment ownership into the first upgrader.
 
         Older schemas scoped all same-repository role daemons as
         ``<repository>:<role>``. The first deployment to boot after the
         deployment-identity cutover adopts that legacy scope, preserving active
-        run recovery and reconcile-before-retry effect semantics.
+        run recovery. Returns the number of runs adopted.
         """
 
         legacy = f"{repository}:{role}"
         if not repository or not role or not owner_id:
             raise ValueError("legacy owner adoption identity is incomplete")
-        if deployment_role(repository, owner_id) != role:
+        if _deployment_role(repository, owner_id) != role:
             raise ValueError("legacy owner adoption role does not match owner")
         prior = tuple(
             candidate
@@ -2922,16 +2648,16 @@ class SQLiteControlStore:
             if candidate and candidate != owner_id
         )
         if not prior:
-            return (0, 0)
-        if any(deployment_role(repository, f"{canonical_repository(candidate.partition(':')[0])}:{candidate.partition(':')[2]}") != role
+            return 0
+        if any(_deployment_role(repository, f"{canonical_repository(candidate.partition(':')[0])}:{candidate.partition(':')[2]}") != role
                for candidate in prior):
             raise ValueError("prior owner adoption must retain repository and role")
         placeholders = ",".join("?" for _candidate in prior)
-        with deployment_effect_barrier(
-            self.path,
-            repository,
-            role,
-        ), self.transaction() as db:
+        # The single_instance lock keys on (role, repo, target dir), so a repoint
+        # to another checkout does not exclude the old deployment: stop it first.
+        # _assert_owner_active fences its money transactions once retired, not
+        # its in-flight GitHub writes.
+        with self.transaction() as db:
             self._assert_owner_active(db, owner_id)
             prior_rows = db.execute(
                 f"SELECT owner_id, repository, role FROM retired_owners "
@@ -2948,9 +2674,13 @@ class SQLiteControlStore:
                         f"{row['repository']}:{row['role']}, not "
                         f"{repository}:{role}"
                     )
+            # Trigger runs_continuation_identity_update aborts an owner change on
+            # a continuation-bound run, so those rows stay with the retired owner.
+            # Exit: slice 5d-2 drops the trigger, the column and this adoption.
             runs = db.execute(
-                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders}) AND continuations_json=?",
-                (owner_id, *prior, encode_workflow(())),
+                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders}) "
+                "AND continuations_json=?",
+                (owner_id, *prior, _EMPTY_CONTINUATIONS),
             ).rowcount
             db.execute(
                 f"UPDATE leases SET owner_id=? WHERE owner_id IN ({placeholders})",
@@ -2962,13 +2692,6 @@ class SQLiteControlStore:
                 f"AND owner_id IN ({placeholders})",
                 (owner_id, repository, role, *prior),
             )
-            commands = db.execute(
-                "UPDATE lifecycle_commands SET executor_identity=? "
-                f"WHERE repository=? AND executor_identity IN ({placeholders}) "
-                "AND state IN ('pending','executing','retryable_failure',"
-                "'unknown_outcome')",
-                (owner_id, repository, *prior),
-            ).rowcount
             retired_at = _stamp(self._now())
             db.executemany(
                 "INSERT INTO retired_owners("
@@ -2988,7 +2711,7 @@ class SQLiteControlStore:
                     for candidate in prior
                 ),
             )
-            return (runs, commands)
+            return runs
 
 
     def now(self) -> datetime:
@@ -3087,15 +2810,10 @@ class SQLiteControlStore:
 
     def register_lease(self, lease: Lease) -> None:
         with self.transaction() as db:
-            run = db.execute(
-                "SELECT state,workflow_binding_json,continuations_json,owner_id,dispatch_id FROM runs WHERE run_id=?", (str(lease.run_id),),
-            ).fetchone()
+            run = db.execute("SELECT state FROM runs WHERE run_id=?", (str(lease.run_id),)).fetchone()
             if run is None or run["state"] in {"completed", "cancelled", "abandoned"}:
                 raise ControlStoreError("process lease requires a nonterminal run")
-            if run["continuations_json"] != encode_workflow(()) and (lease.owner_id != run["owner_id"] or lease.dispatch_id != run["dispatch_id"]):
-                raise ControlStoreError("continuation lease conflicts with its actual run identity")
             self._assert_owner_active(db, lease.owner_id)
-            self._require_continuation_launch(db, lease.run_id)
             db.execute(
                 "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, "
                 "process_start_ticks, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3148,8 +2866,7 @@ class SQLiteControlStore:
         with self.transaction() as db:
             self._assert_owner_active(db, expected_owner_id)
             run = db.execute(
-                "SELECT dispatch_id, kind, owner_id, state, workflow_binding_json, "
-                "workflow_episode_key FROM runs WHERE run_id=?",
+                "SELECT dispatch_id, kind, owner_id, state FROM runs WHERE run_id=?",
                 (str(run_id),),
             ).fetchone()
             if run is None:
@@ -3166,8 +2883,6 @@ class SQLiteControlStore:
                 (str(run_id),),
             ).fetchone()
             if existing is not None:
-                from .workflow_commit import owns_command
-                from ..domain.workflow_identity import WorkflowWriter
                 repository = expected_owner_id.partition(":")[0]
                 identical = (
                     int(existing["pid"]) == pid
@@ -3175,8 +2890,8 @@ class SQLiteControlStore:
                     and int(existing["process_start_ticks"]) == process_start_ticks
                     and existing["owner_id"] == expected_owner_id
                     and existing["dispatch_id"] == run["dispatch_id"]
-                    and (run["owner_id"] == expected_owner_id or owns_command(
-                        db, WorkflowWriter(repository, deployment_role(repository, expected_owner_id), expected_owner_id), run["owner_id"]))
+                    and (run["owner_id"] == expected_owner_id
+                         or run["owner_id"] in self._owner_lineage(db, repository, expected_owner_id))
                 )
                 if not identical:
                     from .process_supervisor import ProcessSupervisor
@@ -3192,7 +2907,6 @@ class SQLiteControlStore:
                             or ProcessSupervisor.matches_identity(existing["pid"], existing["process_start_ticks"])
                             or not ProcessSupervisor.group_is_absent(existing["pgid"])):
                         raise ControlStoreError(f"conflicting live process lease for run: {run_id}")
-                    self._require_continuation_launch(db, run_id)
                     # A transport retry shares its paid run. It can replace
                     # ownership only after the prior process group is gone.
                     started_at = _parse_stamp(_stamp(self._now()))
@@ -3214,7 +2928,6 @@ class SQLiteControlStore:
                     f"reserved run owner changed from {expected_owner_id!r} "
                     f"to {run['owner_id']!r} before process registration"
                 )
-            self._require_continuation_launch(db, run_id)
             started_at = _parse_stamp(_stamp(self._now()))
             lease = Lease(
                 run_id,
@@ -3250,9 +2963,6 @@ class SQLiteControlStore:
             )
             return lease
 
-    def release_lease(self, run_id: RunId) -> None:
-        with self.transaction() as db:
-            db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
 
     def leases(self, owner_id: str | None = None) -> tuple[Lease, ...]:
         with closing(self._connect()) as db, db:
@@ -3283,56 +2993,6 @@ class SQLiteControlStore:
             for row in rows
         )
 
-    def publication_authority(
-        self, run_id: RunId
-    ) -> PublicationAuthority | None:
-        """Return authority only for an active, supervised paid run."""
-
-        with closing(self._connect()) as db, db:
-            row = db.execute(
-                "SELECT b.repository, r.owner_id, r.dispatch_id, l.pgid, "
-                "l.process_start_ticks, r.workflow_binding_json FROM runs r "
-                "JOIN budget_reservations b ON b.run_id=r.run_id "
-                "JOIN leases l ON l.run_id=r.run_id "
-                "WHERE r.run_id=? "
-                "AND r.state IN ('starting', 'running') "
-                "AND b.state='active'",
-                (str(run_id),),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            dispatch = json.loads(str(row["dispatch_id"]))
-            role = str(dispatch["role"])
-            kind = str(dispatch["kind"])
-            raw_issue = dispatch.get("issue")
-            issue = int(raw_issue) if raw_issue is not None else None
-            cwd = str(dispatch["cwd"])
-            branch = str(dispatch["publication_branch"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
-        if (
-            role != "fix"
-            or (issue is not None and issue <= 0)
-            or not kind
-            or not cwd
-            or not branch
-            or not Path(cwd).is_absolute()
-        ):
-            return None
-        return PublicationAuthority(
-            run_id,
-            str(row["repository"]),
-            str(row["owner_id"]),
-            role,
-            kind,
-            issue,
-            cwd,
-            branch,
-            int(row["pgid"]),
-            int(row["process_start_ticks"]),
-            decode_workflow(row["workflow_binding_json"], WorkflowBinding) if row["workflow_binding_json"] is not None else None,
-        )
 
     def reclaim_dead_leases(
         self,
@@ -3660,47 +3320,6 @@ class SQLiteControlStore:
             if updated.rowcount != 1:
                 raise KeyError(str(run_id))
 
-    def claim(
-        self,
-        namespace: str,
-        scope: str,
-        key: str,
-        *,
-        reusable_after: datetime | None = None,
-    ) -> bool:
-        if not namespace or not scope or not key:
-            raise ValueError("dedupe namespace, scope, and key are required")
-        now = self._now()
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT reusable_after FROM dedupe_keys "
-                "WHERE namespace=? AND scope=? AND key=?",
-                (namespace, scope, key),
-            ).fetchone()
-            if row is not None:
-                expires = (
-                    _parse_stamp(row["reusable_after"])
-                    if row["reusable_after"] is not None
-                    else None
-                )
-                if expires is None or expires > now:
-                    return False
-                db.execute(
-                    "DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                    (namespace, scope, key),
-                )
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, "
-                "reusable_after) VALUES (?, ?, ?, ?, ?)",
-                (
-                    namespace,
-                    scope,
-                    key,
-                    _stamp(now),
-                    _stamp(reusable_after) if reusable_after else None,
-                ),
-            )
-            return True
 
     def claim_dispatch(
         self,
@@ -4143,51 +3762,11 @@ class SQLiteControlStore:
         *,
         lease: Lease | None = None,
     ) -> ReservationResult:
-        if request.workflow is None and not request.continuations:
-            return self._reserve(request, lease=lease)
-        # A reset/retirement owns the exclusive side of this existing barrier.
-        # Never wait for Git while retaining a reservation or SQL transaction.
-        try:
-            with deployment_effect_authority(self.path, request.workload_repository,
-                                             deployment_role(request.workload_repository, request.owner_id), blocking=False):
-                return self._reserve(request, lease=lease)
-        except (OSError, sqlite3.DatabaseError) as exc:
-            return ReservationResult(AccountingDisposition.UNAVAILABLE, None,
-                Money.zero(request.scope.currency), request.quote.maximum_charge,
-                request.cap, f"deployment effect authority unavailable: {exc}")
+        return self._reserve(request, lease=lease)
 
-    @contextmanager
-    def workspace_entry_authority(self, request: ReservationRequest) -> Iterator[EpisodeWorkspacePrepared | None]:
-        """Keep Git verification and first admission inside the deployment fence."""
-        if request.workflow is None:
-            raise WorkflowAuthorityError("workspace entry requires a workflow binding")
-        with ExitStack() as barriers:
-            for role in ("fix", "review"):
-                barriers.enter_context(deployment_effect_barrier(self.path, request.workload_repository, role))
-            with self.transaction() as db:
-                prepared = self._workspace_entry(db, request)
-            yield prepared
-
-    def requires_workspace_entry(self, request: ReservationRequest) -> bool:
-        if request.workflow is None or request.workflow.authority.family is not WorkflowFamily.RESOLVE:
-            return False
-        with closing(self._connect()) as db:
-            db.execute("BEGIN")
-            return self._workspace_entry(db, request) is not None
-
-    def _workspace_entry(self, db: sqlite3.Connection, request: ReservationRequest) -> EpisodeWorkspacePrepared | None:
-        self._assert_owner_active(db, request.owner_id)
-        if request.workflow is None or deployment_role(request.workload_repository, request.owner_id) != "fix":
-            raise WorkflowAuthorityError("workspace entry requires the bound fix owner")
-        snapshot = require_resolve_binding(db, request.workflow)
-        if not isinstance(snapshot.intent, CompletedRearm):
-            return None
-        require_workspace_predecessor(db, snapshot)
-        return None if episode_entry_admitted(db, snapshot) else snapshot.intent.workspace
 
     def _reserve(
         self, request: ReservationRequest, *, lease: Lease | None = None,
-        workspace_verified: EpisodeWorkspacePrepared | None = None,
     ) -> ReservationResult:
         requested = request.quote.maximum_charge
         if lease is not None and (
@@ -4229,10 +3808,6 @@ class SQLiteControlStore:
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
                     )
-                workflow_snapshot = self._validate_workflow_reservation(
-                    db, request, workspace_verified=workspace_verified,
-                )
-                continuation_updates, continuation_receipts = self._prepare_continuation_admissions(db, request)
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -4253,30 +3828,15 @@ class SQLiteControlStore:
                             limit.scope.dimension,
                         )
                 now = _stamp(self._now())
-                if workflow_snapshot is not None:
-                    self._record_workflow_admission(db, request, workflow_snapshot, now)
-                from .workflow_rows import persist_workflow_snapshot
-                for aggregate in continuation_updates:
-                    persist_workflow_snapshot(db, aggregate)
-                for purchase, admission in continuation_receipts:
-                    db.execute(
-                        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-admission',?,?,?,?)",
-                        (request.workload_repository, self._continuation_receipt_key(request.run_id, purchase.capture.binding.authority.family),
-                         now, encode_workflow((purchase, admission))),
-                    )
                 db.execute(
                     "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
-                    "config_version, workflow_binding_json, workflow_episode_key,continuations_json) "
-                    "VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)",
+                    "config_version) VALUES (?, ?, ?, ?, 'reserved', ?)",
                     (
                         str(request.run_id),
                         request.dispatch_id,
                         request.kind,
                         request.owner_id,
                         request.config_version,
-                        encode_workflow(request.workflow) if request.workflow is not None else None,
-                        workflow_episode_key(request.workflow) if request.workflow is not None else None,
-                        encode_workflow(request.continuations),
                     ),
                 )
                 db.execute(
@@ -4384,7 +3944,7 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
-        except (sqlite3.DatabaseError, OSError, WorkflowAuthorityError, WorkflowEncodingError) as exc:
+        except (sqlite3.DatabaseError, OSError) as exc:
             return ReservationResult(
                 AccountingDisposition.UNAVAILABLE,
                 None,
@@ -4394,315 +3954,6 @@ class SQLiteControlStore:
                 str(exc),
             )
 
-    @staticmethod
-    def _continuation_receipt_key(run_id: RunId, family: WorkflowFamily) -> str:
-        return hashlib.sha256(str(run_id).encode()).hexdigest() + ":" + family.value
-
-    @staticmethod
-    def _require_issue_reply_projection(db: sqlite3.Connection, key: WorkflowKey, marker: str, *, allow_unresolved: bool = False) -> None:
-        if not marker:
-            return
-        receipt_key = hashlib.sha256(encode_workflow((key, marker)).encode()).hexdigest()
-        receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='issue-reply-noop' AND scope=? AND key=? AND typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=262144", (key.repository, receipt_key)).fetchone()
-        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=? AND typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=262144", (receipt_key,)).fetchone()
-        if receipt is None and row is None:
-            return
-        if receipt is None or row is None:
-            raise WorkflowAuthorityError("blank reply lost its selected consumption or projection source")
-        request = decode_workflow(receipt[0], tuple)
-        command = _command_from_row(row)
-        if (len(request) != 4 or not isinstance(request[0], WorkflowBinding)
-                or request[0].fence.key != key or request[1] != marker
-                or command.workflow != request[0] or command.kind is not CommandKind.RELABEL
-                or command.repository != key.repository or command.target != f"issue:{key.target.number}"
-                or command.expected_revision is not None or command.config_version != ""
-                or request[2] != command.executor_identity
-                or request[3] != json.dumps(dict(command.payload), sort_keys=True, separators=(",", ":"))
-                or command.idempotency_key != "issue-reply-noop:" + receipt_key):
-            raise WorkflowAuthorityError("blank reply projection disagrees with its selected source")
-        if row["state"] not in ("succeeded", "permanent_failure"):
-            if allow_unresolved:
-                return
-            raise WorkflowAuthorityError("blank reply re-block projection is still unresolved")
-        effect = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (receipt_key,)).fetchone()
-        if effect is None or effect["status"] != row["state"] or effect["executor_identity"] != row["attempt_owner"]:
-            raise WorkflowAuthorityError("blank reply lost its selected terminal projection effect")
-        settled = EffectReceipt(command.command_id, effect["executor_identity"], _parse_stamp(effect["started_at"]),
-                                _parse_stamp(effect["completed_at"]), EffectStatus(effect["status"]),
-                                effect["remote_object_id"], effect["remote_revision"], effect["error"])
-        if _receipt_digest(settled) != effect["receipt_digest"]:
-            raise WorkflowAuthorityError("blank reply terminal effect disagrees with its receipt")
-
-    def _require_continuation_launch(self, db: sqlite3.Connection, run_id: RunId) -> None:
-        from .workflow_rows import load_issue_aggregate
-        run = db.execute("SELECT r.continuations_json,r.workflow_binding_json,b.workload_repository FROM runs r "
-                         "LEFT JOIN budget_reservations b USING(run_id) WHERE r.run_id=?", (str(run_id),)).fetchone()
-        if run is None:
-            return
-        purchases = decode_workflow(run["continuations_json"], tuple)
-        if (len(purchases) > 3 or any(not isinstance(item, (cc.IssueInfraPurchase, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.IssueReviewPurchase, cc.IssueRebasePurchase, cc.PRRepairPurchase)) for item in purchases)
-                or len({item.capture.binding.authority.family for item in purchases}) != len(purchases)):
-            raise WorkflowAuthorityError("run continuation selections are malformed")
-        if run["workflow_binding_json"] is not None:
-            principal = decode_workflow(run["workflow_binding_json"], WorkflowBinding)
-            if (principal.authority.family in (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR)
-                    and not any(item.capture.binding == principal for item in purchases)):
-                raise WorkflowAuthorityError("continuation run lacks its selected principal")
-        for purchase in purchases:
-            family = purchase.capture.binding.authority.family
-            receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-                                 (run["workload_repository"], self._continuation_receipt_key(run_id, family))).fetchone()
-            if receipt is None:
-                raise WorkflowAuthorityError("continuation launch lacks its selected admission receipt")
-            captured = decode_workflow(receipt[0], tuple)
-            if (len(captured) != 2 or captured[0] != purchase or not isinstance(captured[1], ContinuationAdmission)
-                    or captured[1].attempt != WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id)
-                    or captured[1].admission_version != purchase.capture.revision.version + 1):
-                raise WorkflowAuthorityError("continuation launch lost its exact run admission")
-            admission = captured[1]
-            key = admission.attempt.binding.fence.key
-            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
-            aggregate = None if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
-            selection = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-            if (not isinstance(selection, cc.SelectedIssueRecovery)
-                    or getattr(aggregate, "gates", ()) or selection.component.gates
-                    or not (selection.binding == admission.attempt.binding and admission.admission_version <= selection.revision.version
-                            if isinstance(purchase, cc.IssueInfraPurchase) else cc.ci_return_is_current(selection, admission) if isinstance(purchase, cc.IssueCIPurchase)
-                            and isinstance(selection, cc.SelectedIssueRecovery) else cc.review_return_is_current(selection, admission)
-                            if isinstance(purchase, cc.IssueReviewPurchase) and isinstance(selection, cc.SelectedIssueRecovery)
-                            else cc.rebase_return_is_current(selection, admission)
-                            if isinstance(purchase, cc.IssueRebasePurchase) and isinstance(selection, cc.SelectedIssueRecovery)
-                            else cc.continuation_return_is_current(selection, admission))):
-                raise WorkflowAuthorityError("continuation launch admission is stale or held")
-
-    def reserve_issue_recovery(self, request: ReservationRequest, purchase: cc.IssueRecoveryPurchase | cc.IssueReplyPurchase) -> ReservationResult:
-        if not isinstance(purchase, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase)):
-            raise ValueError("issue recovery reservation requires its typed purchase")
-        return self.reserve(replace(request, continuations=(purchase,)))
-
-    def _prepare_continuation_admissions(self, db: sqlite3.Connection, request: ReservationRequest) -> tuple[tuple, tuple]:
-        # Slice 5b: a fix leg is a plain leg with no continuation purchase, so
-        # the per-kind purchase shapes below bind only legacy purchases (5d
-        # deletes them with their last test producer).
-        if not request.continuations:
-            return (), ()
-        from .workflow_rows import load_issue_aggregate
-        updates, receipts = {}, []
-        role = deployment_role(request.workload_repository, request.owner_id) if request.continuations else None
-        if request.kind == "ADDRESS_REVIEW" and (len(request.continuations) != 2
-                or sum(isinstance(item, cc.PRRepairPurchase) and bool(item.branch) for item in request.continuations) != 1
-                or sum(isinstance(item, cc.IssueReviewPurchase) for item in request.continuations) != 1):
-            raise WorkflowAuthorityError("address-review admission requires its selected PR and issue allowance")
-        if request.kind == "REBASE" and (len(request.continuations) != 2
-                or sum(isinstance(item, cc.PRRepairPurchase) and bool(item.branch) for item in request.continuations) != 1
-                or sum(isinstance(item, cc.IssueRebasePurchase) for item in request.continuations) != 1):
-            raise WorkflowAuthorityError("rebase admission requires its selected PR and issue allowance")
-        if request.kind == "PR_RESUME" and (sum(isinstance(item, cc.PRRepairPurchase) and bool(item.branch) for item in request.continuations) != 1
-                or len(request.continuations) not in (1, 2)
-                or len(request.continuations) == 2 and sum(isinstance(item, (cc.IssueReplyPurchase, cc.IssueInfraPurchase)) for item in request.continuations) != 1):
-            raise WorkflowAuthorityError("PR resume requires selected repair and optional linked issue reply")
-        for repair in (item for item in request.continuations if isinstance(item, cc.PRRepairPurchase) and item.branch):
-            reviews = [item for item in request.continuations if isinstance(item, cc.IssueReviewPurchase)]
-            rebases = [item for item in request.continuations if isinstance(item, cc.IssueRebasePurchase)]
-            linked_replies = [item for item in request.continuations if isinstance(item, cc.IssueReplyPurchase)]
-            if (request.kind not in {"FIX_CI", "ADDRESS_REVIEW", "REBASE", "PR_RESUME"}
-                    or request.kind == "ADDRESS_REVIEW" and (len(reviews) != 1 or not repair.advance_resume
-                        or repair.allowance is not cc.RepairAllowance.REVIEW)
-                    or request.kind == "FIX_CI" and (reviews or rebases or repair.advance_resume or repair.allowance is not cc.RepairAllowance.CI)
-                    or request.kind == "REBASE" and (reviews or len(rebases) != 1 or repair.advance_resume or repair.allowance is not cc.RepairAllowance.REBASE)
-                    or request.kind == "PR_RESUME" and (reviews or rebases or bool(repair.reply_at) == bool(linked_replies) or not repair.advance_resume
-                        or repair.allowance is not cc.RepairAllowance.INFRA)):
-                raise WorkflowAuthorityError("repair admission lacks its fixed selected lane and issue allowance")
-        for purchase in request.continuations:
-            capture = purchase.capture
-            key = capture.binding.fence.key
-            if isinstance(purchase, cc.IssueInfraPurchase):
-                dispatch = json.loads(request.dispatch_id)
-                if (not isinstance(dispatch, dict) or dispatch.get("repository") != key.repository
-                        or dispatch.get("role") != "fix" or dispatch.get("kind") != request.kind
-                        or dispatch.get("issue") != key.target.number or type(dispatch.get("issue")) is not int
-                        or dispatch.get("leg_id") != capture.leg_id or request.workflow is None
-                        or request.workflow.authority.family not in (WorkflowFamily.RESOLVE, WorkflowFamily.PR_REPAIR)):
-                    raise WorkflowAuthorityError("fix infrastructure capture differs from its actual paid context")
-            if isinstance(purchase, cc.IssueRebasePurchase):
-                dispatch = json.loads(request.dispatch_id)
-                if not isinstance(dispatch, dict):
-                    raise WorkflowAuthorityError("rebase allowance requires its bounded dispatch object")
-                repairs = [item for item in request.continuations if isinstance(item, cc.PRRepairPurchase)]
-                if (request.kind != "REBASE" or dispatch.get("kind") != "REBASE"
-                        or dispatch.get("repository") != key.repository or dispatch.get("role") != "fix"
-                        or type(dispatch.get("issue")) is not int or dispatch.get("issue") != key.target.number
-                        or type(dispatch.get("number")) is not int or dispatch.get("number") != purchase.pr.number
-                        or dispatch.get("rebase_input") != encode_workflow((purchase.head, purchase.branch))
-                        or dispatch.get("leg_id") != capture.leg_id or len(repairs) != 1
-                        or repairs[0].advance_resume or repairs[0].allowance is not cc.RepairAllowance.REBASE
-                        or repairs[0].branch != purchase.branch or request.workflow != repairs[0].capture.binding
-                        or repairs[0].capture.binding.fence.key != WorkflowKey(key.repository, purchase.pr)):
-                    raise WorkflowAuthorityError("rebase allowance differs from its exact issue/PR/head/branch context")
-            if isinstance(purchase, cc.IssueCIPurchase):
-                dispatch = json.loads(request.dispatch_id)
-                repairs = [item for item in request.continuations if isinstance(item, cc.PRRepairPurchase)]
-                if (request.kind != "FIX_CI" or dispatch.get("repository") != key.repository
-                        or dispatch.get("role") != "fix" or dispatch.get("issue") != key.target.number
-                        or dispatch.get("number") != purchase.pr.number or dispatch.get("ci_head") != purchase.head
-                        or dispatch.get("leg_id") != capture.leg_id or len(repairs) != 1
-                        or repairs[0].head != purchase.head
-                        or repairs[0].capture.binding.fence.key != WorkflowKey(key.repository, purchase.pr)):
-                    raise WorkflowAuthorityError("CI allowance differs from its exact issue/PR/head context")
-            if isinstance(purchase, cc.IssueReviewPurchase):
-                dispatch = json.loads(request.dispatch_id)
-                repairs = [item for item in request.continuations if isinstance(item, cc.PRRepairPurchase)]
-                if (request.kind != "ADDRESS_REVIEW" or dispatch.get("kind") != "ADDRESS_REVIEW"
-                        or dispatch.get("repository") != key.repository
-                        or dispatch.get("role") != "fix" or type(dispatch.get("issue")) is not int
-                        or dispatch.get("issue") != key.target.number or type(dispatch.get("number")) is not int
-                        or dispatch.get("number") != purchase.pr.number
-                        or dispatch.get("review_input") != encode_workflow((purchase.head, purchase.review_at))
-                        or dispatch.get("leg_id") != capture.leg_id or len(repairs) != 1
-                        or not repairs[0].advance_resume or repairs[0].allowance is not cc.RepairAllowance.REVIEW
-                        or request.workflow != repairs[0].capture.binding
-                        or repairs[0].capture.binding.fence.key != WorkflowKey(key.repository, purchase.pr)):
-                    raise WorkflowAuthorityError("review allowance differs from its exact issue/PR/head/timestamp context")
-            if isinstance(purchase, cc.IssueReplyPurchase) or (
-                    isinstance(purchase, cc.IssueRecoveryPurchase) and request.workflow is not None
-                    and request.workflow.authority.family is WorkflowFamily.RESOLVE
-                    and request.kind == "RESUME"):
-                try:
-                    if not isinstance(request.dispatch_id, str) or len(request.dispatch_id.encode()) > MAX_WORKFLOW_PAYLOAD_BYTES:
-                        raise ValueError("issue reply dispatch exceeds its bound")
-                    dispatch = json.loads(request.dispatch_id)
-                    if not isinstance(dispatch, dict) or not isinstance(dispatch.get("issue_reply"), str):
-                        raise ValueError("issue reply dispatch lacks its selected input")
-                    inputs = decode_workflow(dispatch["issue_reply"], tuple)
-                except (ValueError, TypeError) as exc:
-                    raise WorkflowAuthorityError("issue reply lacks its exact bounded dispatch input") from exc
-                if (len(inputs) != 3 or inputs[0] != purchase.reply_at or not isinstance(inputs[1], str)
-                        or not inputs[1].strip() or len(inputs[1]) > 65536 or "\x00" in inputs[1]
-                        or dispatch.get("repository") != key.repository or dispatch.get("role") != "fix"
-                        or dispatch.get("kind") != request.kind or type(dispatch.get("issue")) is not int
-                        or dispatch["issue"] != key.target.number or dispatch.get("leg_id") != capture.leg_id):
-                    raise WorkflowAuthorityError("issue reply disagrees with its selected timestamp/body/leg context")
-                if isinstance(purchase, cc.IssueReplyPurchase):
-                    repairs = [item for item in request.continuations if isinstance(item, cc.PRRepairPurchase)]
-                    if (request.kind != "PR_RESUME" or len(repairs) != 1 or request.workflow != repairs[0].capture.binding
-                            or type(dispatch.get("number")) is not int or not 0 < dispatch["number"] < 2**63
-                            or repairs[0].capture.binding.fence.key.repository != key.repository
-                            or repairs[0].capture.binding.fence.key.target.number != dispatch["number"]
-                            or type(inputs[2]) is not int or inputs[2] != dispatch["number"]):
-                        raise WorkflowAuthorityError("linked PR issue reply disagrees with its actual PR context")
-                elif inputs[2] != purchase.branch or dispatch.get("number") != key.target.number or issue_from_branch(purchase.branch) != key.target.number:
-                    raise WorkflowAuthorityError("issue reply disagrees with its selected issue branch")
-            aggregate = None if isinstance(purchase, cc.PRRepairPurchase) else load_issue_aggregate(db, key)
-            if aggregate is None or aggregate.revision != capture.revision:
-                raise WorkflowAuthorityError("captured continuation aggregate is absent or stale")
-            if getattr(aggregate, "gates", ()):
-                raise WorkflowAuthorityError("continuation aggregate has unresolved primary gates")
-            if role != "fix":
-                raise WorkflowAuthorityError("continuation admission belongs to another deployment role")
-            version = aggregate.revision.version + 1
-            after = updates.get(key, aggregate)
-            try:
-                if isinstance(purchase, (cc.IssueInfraPurchase, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.IssueReviewPurchase, cc.IssueRebasePurchase)):
-                    selection = cc.select_issue_recovery(aggregate)
-                    if not isinstance(selection, cc.SelectedIssueRecovery):
-                        raise ValueError("issue recovery is inactive or migration blocked")
-                    self._require_issue_reply_projection(db, key, selection.component.state.consumed_reply_at)
-                    if isinstance(purchase, cc.IssueInfraPurchase):
-                        if selection.binding != capture.binding or selection.component.gates:
-                            raise ValueError("fix infrastructure capture is stale or held")
-                        after = replace(after, revision=WorkflowRevision(aggregate.revision.fence, version))
-                    else:
-                        after = replace(after, issue_recovery=(cc.consume_issue_rebase(selection, purchase, ContinuationAdmission(
-                        WorkflowAttemptIdentity(capture.binding, request.run_id, capture.leg_id), version)) if isinstance(purchase, cc.IssueRebasePurchase)
-                        else cc.consume_issue_review(selection, purchase, ContinuationAdmission(
-                        WorkflowAttemptIdentity(capture.binding, request.run_id, capture.leg_id), version)) if isinstance(purchase, cc.IssueReviewPurchase)
-                        else cc.consume_issue_ci(selection, purchase, ContinuationAdmission(
-                        WorkflowAttemptIdentity(capture.binding, request.run_id, capture.leg_id), version)) if isinstance(purchase, cc.IssueCIPurchase)
-                        else cc.consume_issue_recovery(selection, purchase, version) if isinstance(purchase, cc.IssueRecoveryPurchase) else cc.consume_issue_reply(selection, purchase, version)),
-                                        revision=WorkflowRevision(aggregate.revision.fence, version))
-            except (ValueError, TypeError) as exc:
-                raise WorkflowAuthorityError(str(exc)) from exc
-            updates[key] = after
-            receipts.append((purchase, ContinuationAdmission(
-                WorkflowAttemptIdentity(capture.binding, request.run_id, capture.leg_id), version)))
-        return tuple(updates.values()), tuple(receipts)
-
-    def _validate_workflow_reservation(
-        self, db: sqlite3.Connection, request: ReservationRequest, *,
-        workspace_verified: EpisodeWorkspacePrepared | None = None,
-    ) -> WorkflowSnapshot | None:
-        binding = request.workflow
-        if binding is not None and binding.authority.family in (
-            WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR,
-        ):
-            if not any(item.capture.binding == binding for item in request.continuations):
-                raise WorkflowAuthorityError("secondary workflow admission requires its captured consumption")
-            return None
-        if binding is None:
-            # A plain leg (both roles since slices 5b/5c) carries no workflow.
-            return None
-        if binding.authority.family is not WorkflowFamily.RESOLVE:
-            raise WorkflowAuthorityError("only resolve workflows admit bound legs")
-        try:
-            role = deployment_role(request.workload_repository, request.owner_id)
-        except ValueError as exc:
-            raise WorkflowAuthorityError(str(exc)) from exc
-        if role != "fix":
-            raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
-        try:
-            snapshot = require_resolve_binding(db, binding)
-            if isinstance(snapshot.issue_recovery, cc.ActiveIssueRecovery):
-                self._require_issue_reply_projection(db, binding.fence.key, snapshot.issue_recovery.state.consumed_reply_at)
-            dispatch = json.loads(request.dispatch_id)
-            if not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository or type(dispatch.get("issue")) is not int or dispatch["issue"] != binding.fence.key.target.number:
-                raise WorkflowAuthorityError("paid dispatch identity disagrees with its workflow")
-            stage = ResolveStage(request.kind)
-            if isinstance(snapshot.intent, CompletedRearm) and not episode_entry_admitted(db, snapshot):
-                if workspace_verified != snapshot.intent.workspace:
-                    raise WorkflowAuthorityError("first episode admission requires fresh workspace verification")
-                if stage not in (ResolveStage.ROUTE, ResolveStage.RESOLVE):
-                    raise WorkflowAuthorityError("first episode admission must start fresh work")
-            if dispatch.get("kind") != stage.value or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]:
-                raise WorkflowAuthorityError("resolve admission requires its captured stage and leg identity")
-            require_workspace_predecessor(db, snapshot)
-            return snapshot
-        except (ValueError, TypeError) as exc:
-            raise WorkflowAuthorityError(str(exc)) from exc
-
-    @staticmethod
-    def _record_workflow_admission(
-        db: sqlite3.Connection, request: ReservationRequest, snapshot: WorkflowSnapshot, now: str,
-    ) -> None:
-        """Admission order is a durable revision, independent of clocks and delivery."""
-        if request.workflow is None or request.workflow.authority.family is not WorkflowFamily.RESOLVE or snapshot.binding != request.workflow:
-            raise WorkflowAuthorityError("only a resolve binding records a resolve admission receipt")
-        try:
-            metadata = json.loads(request.dispatch_id)
-            revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
-            admission = ResolveAdmission(
-                WorkflowAttemptIdentity(snapshot.binding, request.run_id, metadata["leg_id"]),
-                revision, ResolveStage(request.kind), metadata.get("input_fingerprint"),
-                snapshot.intent.handoff.handoff_id if isinstance(snapshot.intent, CompletedRearm) else None,
-            )
-            db.execute(
-                "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
-                (revision.version, *workflow_scope(revision.fence.key)),
-            )
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission',?,?,?,?)",
-                (request.workload_repository, str(request.run_id), now, encode_workflow(admission)),
-            )
-            indexes = []
-            if admission.stage is not ResolveStage.ROUTE:
-                indexes.append(("workflow-work-latest", f"issue:{snapshot.binding.fence.key.target.number}"))
-            for namespace, key in indexes:
-                db.execute(
-                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
-                    "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,payload_json=excluded.payload_json",
-                    (namespace, request.workload_repository, key, now, encode_workflow(admission)),
-                )
-        except (ValueError, TypeError, KeyError) as exc:
-            raise WorkflowAuthorityError(f"invalid workflow admission: {exc}") from exc
 
     @staticmethod
     def _reservation_request_matches(
@@ -4715,48 +3966,11 @@ class SQLiteControlStore:
         """Match the complete authority, not a convenient subset of its IDs."""
 
         run = db.execute(
-            "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json, "
-            "workflow_episode_key,continuations_json "
-            "FROM runs WHERE run_id=?",
+            "SELECT dispatch_id, kind, owner_id, state, config_version FROM runs WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
         if run is None:
             return False
-        if run["continuations_json"] != encode_workflow(request.continuations):
-            return False
-        selected = {item.capture.binding.authority.family: item for item in request.continuations}
-        for family in (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR):
-            receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-                (request.workload_repository, SQLiteControlStore._continuation_receipt_key(request.run_id, family))).fetchone()
-            purchase = selected.get(family)
-            if (receipt is None) != (purchase is None):
-                return False
-            if receipt is not None and purchase is not None:
-                captured = decode_workflow(receipt["payload_json"], tuple)
-                if (len(captured) != 2 or captured[0] != purchase or not isinstance(captured[1], ContinuationAdmission)
-                        or captured[1].attempt != WorkflowAttemptIdentity(purchase.capture.binding, request.run_id, purchase.capture.leg_id)
-                        or captured[1].admission_version != purchase.capture.revision.version + 1):
-                    return False
-        if request.workflow is not None and request.workflow.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-            return False
-        elif request.workflow is not None and request.workflow.authority.family is WorkflowFamily.RESOLVE:
-            if run["workflow_episode_key"] != workflow_episode_key(request.workflow):
-                return False
-            receipt = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
-                (request.workload_repository, str(request.run_id)),
-            ).fetchone()
-            if receipt is None:
-                return False
-            try:
-                admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
-                metadata = json.loads(request.dispatch_id)
-                expected_attempt = WorkflowAttemptIdentity(request.workflow, request.run_id, metadata["leg_id"])
-                current = load_resolve_workflow_row(db, request.workflow.fence.key)
-            except (ValueError, TypeError, KeyError) as exc:
-                raise WorkflowAuthorityError("invalid admitted workflow receipt") from exc
-            if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.input_fingerprint != metadata.get("input_fingerprint") or admission.revision.version > current.revision.version:
-                return False
         actual_reservation = tuple(
             prior[name]
             for name in (
@@ -4806,7 +4020,6 @@ class SQLiteControlStore:
                 "owner_id",
                 "state",
                 "config_version",
-                "workflow_binding_json",
             )
         )
         expected_run = (
@@ -4815,7 +4028,6 @@ class SQLiteControlStore:
             request.owner_id,
             "running" if lease is not None else "reserved",
             request.config_version,
-            encode_workflow(request.workflow) if request.workflow is not None else None,
         )
         actual_limits = [
             tuple(row)
@@ -4871,381 +4083,6 @@ class SQLiteControlStore:
         with self.transaction() as db:
             return self._settle(db, request)
 
-    def settle_issue_recovery(self, request: SettlementRequest, admission: ContinuationAdmission,
-                              state: cc.IssueRecoveryState) -> SettlementResult:
-        if not isinstance(state, cc.IssueRecoveryState):
-            raise ValueError("issue recovery return requires typed state")
-        return self._settle_continuation(request, admission, state, WorkflowFamily.ISSUE_RECOVERY)
-
-    def pr_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        with self.transaction() as db:
-            return self._pr_repair_admission(db, attempt)
-
-    def ci_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        with self.transaction() as db:
-            return self._ci_repair_admission(db, attempt)
-
-    def review_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        with self.transaction() as db:
-            return self._review_repair_admission(db, attempt)
-
-    def rebase_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        with self.transaction() as db:
-            return self._rebase_repair_admission(db, attempt)
-
-    def _rebase_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        run = db.execute("SELECT continuations_json FROM runs WHERE run_id=?", (str(attempt.run_id),)).fetchone()
-        purchases = decode_workflow(run[0], tuple) if run is not None else ()
-        selected = [item for item in purchases if isinstance(item, cc.IssueRebasePurchase)]
-        if len(selected) != 1:
-            raise WorkflowAuthorityError("rebase output lacks its exact selected issue purchase")
-        purchase = selected[0]
-        key = purchase.capture.binding.fence.key
-        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-            (key.repository, self._continuation_receipt_key(attempt.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-        if raw is None:
-            raise WorkflowAuthorityError("rebase output lacks its selected issue admission receipt")
-        admission = decode_workflow(raw[0], tuple)[1]
-        expected = WorkflowAttemptIdentity(purchase.capture.binding, attempt.run_id, attempt.leg_id)
-        if not isinstance(admission, ContinuationAdmission) or admission.attempt != expected:
-            raise WorkflowAuthorityError("rebase output conflicts with its selected issue attempt")
-        self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        return admission
-
-    def _review_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        run = db.execute("SELECT continuations_json FROM runs WHERE run_id=?", (str(attempt.run_id),)).fetchone()
-        purchases = decode_workflow(run[0], tuple) if run is not None else ()
-        selected = [item for item in purchases if isinstance(item, cc.IssueReviewPurchase)]
-        if len(selected) != 1:
-            raise WorkflowAuthorityError("review output lacks its exact selected issue purchase")
-        purchase = selected[0]
-        key = purchase.capture.binding.fence.key
-        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-            (key.repository, self._continuation_receipt_key(attempt.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-        if raw is None:
-            raise WorkflowAuthorityError("review output lacks its selected issue admission receipt")
-        admission = decode_workflow(raw[0], tuple)[1]
-        expected = WorkflowAttemptIdentity(purchase.capture.binding, attempt.run_id, attempt.leg_id)
-        if not isinstance(admission, ContinuationAdmission) or admission.attempt != expected:
-            raise WorkflowAuthorityError("review output conflicts with its selected issue attempt")
-        self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        return admission
-
-    def _ci_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        run = db.execute("SELECT continuations_json FROM runs WHERE run_id=?", (str(attempt.run_id),)).fetchone()
-        purchases = decode_workflow(run[0], tuple) if run is not None else ()
-        selected = [item for item in purchases if isinstance(item, cc.IssueCIPurchase)]
-        if len(selected) != 1:
-            raise WorkflowAuthorityError("CI output lacks its exact selected issue purchase")
-        purchase = selected[0]
-        key = purchase.capture.binding.fence.key
-        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-            (key.repository, self._continuation_receipt_key(attempt.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-        if raw is None:
-            raise WorkflowAuthorityError("CI output lacks its selected issue admission receipt")
-        admission = decode_workflow(raw[0], tuple)[1]
-        expected = WorkflowAttemptIdentity(purchase.capture.binding, attempt.run_id, attempt.leg_id)
-        if not isinstance(admission, ContinuationAdmission) or admission.attempt != expected:
-            raise WorkflowAuthorityError("CI output conflicts with its selected issue attempt")
-        self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        return admission
-
-    def _pr_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
-        if attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR:
-            raise WorkflowAuthorityError("repair lookup requires its family attempt")
-        key = attempt.binding.fence.key
-        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
-            (key.repository, self._continuation_receipt_key(attempt.run_id, WorkflowFamily.PR_REPAIR))).fetchone()
-        if raw is None:
-            raise WorkflowAuthorityError("repair output lacks its selected admission receipt")
-        admission = decode_workflow(raw[0], tuple)[1]
-        if not isinstance(admission, ContinuationAdmission) or admission.attempt != attempt:
-            raise WorkflowAuthorityError("repair output conflicts with its admitted attempt")
-        self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
-        return admission
-    def read_issue_recovery(self, key: WorkflowKey) -> cc.IssueRecoverySelection:
-        from .workflow_rows import load_issue_aggregate
-        with self.transaction() as db:
-            aggregate = load_issue_aggregate(db, key)
-            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
-            if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.pending_ci is not None:
-                pending = selected.component.state.pending_ci
-                purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
-                if not isinstance(purchase, cc.IssueCIPurchase) or pending.attempt.binding.fence.generation > selected.revision.fence.generation:
-                    raise WorkflowAuthorityError("pending CI lacks its selected admitted provenance")
-            if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.review_failures.pending is not None:
-                pending = selected.component.state.review_failures.pending
-                purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
-                if (not isinstance(purchase, cc.IssueReviewPurchase)
-                        or pending.attempt.binding.fence.generation > selected.revision.fence.generation
-                        or purchase.review_at != selected.component.state.review_failures.review_at
-                        or purchase.pr != selected.component.state.review_failures.pr):
-                    raise WorkflowAuthorityError("pending review lacks its selected admitted provenance")
-            if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.pending_rebase is not None:
-                pending = selected.component.state.pending_rebase
-                purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
-                if (not isinstance(purchase, cc.IssueRebasePurchase)
-                        or pending.attempt.binding.fence.generation > selected.revision.fence.generation):
-                    raise WorkflowAuthorityError("pending rebase lacks its selected admitted provenance")
-            return selected
-
-    def _require_repair_writer(self, db, writer, admission, historical_owner):
-        from .workflow_commit import owns_command
-        if writer is None or writer.repository != admission.attempt.binding.fence.key.repository or writer.role != "fix":
-            raise WorkflowAuthorityError("repair output requires its current bound fix writer")
-        self._assert_owner_active(db, writer.owner_id)
-        if not owns_command(db, writer, historical_owner):
-            raise WorkflowAuthorityError("repair output belongs to another deployment owner")
-
-    def _continuation_return_admission(self, db, admission: ContinuationAdmission, family: WorkflowFamily):
-        key = admission.attempt.binding.fence.key
-        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, family)
-        row = db.execute(
-            "SELECT d.payload_json,r.owner_id,r.dispatch_id,r.continuations_json,r.workflow_binding_json,r.started_at,b.state AS reservation_state FROM dedupe_keys d JOIN runs r ON r.run_id=? "
-            "JOIN budget_reservations b USING(run_id) WHERE d.namespace='continuation-admission' "
-            "AND d.scope=? AND d.key=? AND b.workload_repository=?",
-            (str(admission.attempt.run_id), key.repository, receipt_key, key.repository),
-        ).fetchone()
-        if row is None:
-            raise WorkflowAuthorityError("continuation return lacks its immutable run admission")
-        captured = decode_workflow(row["payload_json"], tuple)
-        if (len(captured) != 2 or captured[1] != admission
-                or not isinstance(captured[0], (cc.IssueInfraPurchase, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.IssueReviewPurchase, cc.IssueRebasePurchase, cc.PRRepairPurchase))
-                or captured[0].capture.binding != admission.attempt.binding
-                or captured[0].capture.leg_id != admission.attempt.leg_id
-                or captured[0].capture.revision.version + 1 != admission.admission_version
-                or deployment_role(key.repository, row["owner_id"]) != "fix"):
-            raise WorkflowAuthorityError("continuation return conflicts with its exact admission")
-        if captured[0] not in decode_workflow(row["continuations_json"], tuple):
-            raise WorkflowAuthorityError("continuation return was never selected on its actual run")
-        if row["workflow_binding_json"] is not None:
-            principal = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
-            if (principal.fence.key == key and principal.fence != admission.attempt.binding.fence
-                    or principal.authority.family is family and principal != admission.attempt.binding):
-                raise WorkflowAuthorityError("continuation return conflicts with its actual run binding")
-        return captured[0], row
-
-    def _linked_issue_reply_admission(self, db, attempt: WorkflowAttemptIdentity, run):
-        purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueReplyPurchase)]
-        if not purchases:
-            return None
-        if len(purchases) != 1:
-            raise WorkflowAuthorityError("linked reply has conflicting selected issue purchases")
-        purchase = purchases[0]
-        admission = ContinuationAdmission(WorkflowAttemptIdentity(purchase.capture.binding, attempt.run_id, attempt.leg_id),
-                                          purchase.capture.revision.version + 1)
-        verified, _ = self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        dispatch = json.loads(run["dispatch_id"])
-        if (verified != purchase or dispatch.get("kind") != "PR_RESUME"
-                or type(dispatch.get("issue")) is not int or dispatch["issue"] != purchase.capture.binding.fence.key.target.number
-                or type(dispatch.get("number")) is not int or dispatch["number"] != attempt.binding.fence.key.target.number):
-            raise WorkflowAuthorityError("linked reply lost its selected issue/PR admission")
-        return admission, purchase
-
-    def _finish_linked_issue_reply(self, db, pair) -> None:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        admission, _ = pair
-        key = admission.attempt.binding.fence.key
-        issue = load_issue_aggregate(db, key)
-        selected = cc.select_issue_recovery(issue) if issue is not None else None
-        if isinstance(selected, cc.SelectedIssueRecovery) and cc.continuation_return_is_current(selected, admission):
-            assert issue is not None
-            persist_workflow_snapshot(db, replace(issue, revision=replace(issue.revision, version=issue.revision.version+1),
-                issue_recovery=replace(selected.component, watermarks=replace(selected.component.watermarks,
-                                                                            last_applied=admission.admission_version))))
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-            (key.repository, self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY),
-             _stamp(self._now()), encode_workflow(pair)))
-
-    def _settle_continuation(self, request: SettlementRequest, admission: ContinuationAdmission,
-                             state, family: WorkflowFamily, *, writer=None) -> SettlementResult:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        if (not isinstance(admission, ContinuationAdmission) or request.run_id != admission.attempt.run_id
-                or admission.attempt.binding.authority.family is not family):
-            raise ValueError("continuation return requires its exact run and family")
-        key = admission.attempt.binding.fence.key
-        receipt_key = self._continuation_receipt_key(request.run_id, family)
-        with self.transaction() as db, self.mutation_savepoint(db):
-            purchase, run = self._continuation_return_admission(db, admission, family)
-            if isinstance(purchase, (cc.IssueCIPurchase, cc.IssueReviewPurchase, cc.IssueRebasePurchase)):
-                raise WorkflowAuthorityError("paired issue settlement requires its captured paired repair result")
-            if isinstance(purchase, cc.IssueReplyPurchase) and any(isinstance(item, cc.PRRepairPurchase) and item.branch
-                    for item in decode_workflow(run["continuations_json"], tuple)):
-                raise WorkflowAuthorityError("linked issue settlement requires its captured paired repair result")
-            ci = None
-            review = None
-            rebase = None
-            linked_reply = None
-            captured = None
-            if isinstance(purchase, cc.PRRepairPurchase) and purchase.branch:
-                self._require_repair_writer(db, writer, admission, run["owner_id"])
-                if state.branch != purchase.branch:
-                    raise WorkflowAuthorityError("repair return changed its purchased branch")
-                raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
-                    (key.repository, receipt_key)).fetchone()
-                captured = decode_workflow(raw[0], cc.PRRepairResult) if raw is not None else None
-                if captured is None or (captured.admission, captured.state, captured.settlement) != (admission, state, request):
-                    raise WorkflowAuthorityError("repair settlement conflicts with its captured result")
-                ci = captured.ci
-                review = captured.review
-                rebase = captured.rebase
-                linked_reply = self._linked_issue_reply_admission(db, admission.attempt, run)
-            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                               (key.repository, receipt_key)).fetchone()
-            encoded = encode_workflow((admission, state))
-            if prior is not None and family is WorkflowFamily.PR_REPAIR:
-                acknowledged = decode_workflow(prior["payload_json"], tuple)
-                if acknowledged == (admission, cc.PRRepairUnreturned(admission)):
-                    # Recovery already classified the run (no attempt) and cleared
-                    # its pending source. Capture the real output and correct
-                    # money without replaying paired workflow effects.
-                    return self._settle(db, request)
-            if prior is not None and prior["payload_json"] != encoded:
-                raise WorkflowAuthorityError("continuation return conflicts with its immutable result")
-            if linked_reply is not None and prior is not None:
-                paired = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                    (key.repository, self._continuation_receipt_key(request.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-                if paired is None or paired[0] != encode_workflow(linked_reply):
-                    raise WorkflowAuthorityError("linked reply exact retry lost its selected applied receipt")
-            if ci is not None:
-                selected_ci = self._ci_repair_admission(db, admission.attempt)
-                if selected_ci != ci.admission:
-                    raise WorkflowAuthorityError("CI settlement changed its selected issue source")
-                if prior is not None:
-                    paired = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                        (key.repository, self._continuation_receipt_key(request.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-                    if paired is None or paired[0] != encode_workflow((ci.admission, ci)):
-                        raise WorkflowAuthorityError("CI exact retry lost its selected applied result receipt")
-            if review is not None:
-                if self._review_repair_admission(db, admission.attempt) != review.admission:
-                    raise WorkflowAuthorityError("review settlement changed its selected issue source")
-                if prior is not None:
-                    paired = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                        (key.repository, self._continuation_receipt_key(request.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-                    if paired is None or paired[0] != encode_workflow((review.admission, review)):
-                        raise WorkflowAuthorityError("review exact retry lost its selected applied result receipt")
-            if rebase is not None:
-                if self._rebase_repair_admission(db, admission.attempt) != rebase.admission:
-                    raise WorkflowAuthorityError("rebase settlement changed its selected issue source")
-                if prior is not None:
-                    paired = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                        (key.repository, self._continuation_receipt_key(request.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
-                    if paired is None or paired[0] != encode_workflow((rebase.admission, rebase)):
-                        raise WorkflowAuthorityError("rebase exact retry lost its selected applied result receipt")
-            settled = self._settle(db, request)
-            if settled.disposition is not AccountingDisposition.AVAILABLE or prior is not None:
-                return settled
-            if ci is not None:
-                self._apply_ci_result(db, ci)
-            if review is not None:
-                self._apply_review_result(db, review)
-            if rebase is not None:
-                self._apply_rebase_result(db, rebase)
-            if linked_reply is not None:
-                self._finish_linked_issue_reply(db, linked_reply)
-            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
-            aggregate = None if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
-            selection = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-            if aggregate is not None and isinstance(selection, cc.SelectedIssueRecovery) and cc.continuation_return_is_current(selection, admission):
-                component = selection.component
-                watermarks = replace(component.watermarks, last_applied=admission.admission_version)
-                revision = WorkflowRevision(aggregate.revision.fence, aggregate.revision.version + 1)
-                from ..domain.workflow import IssueWorkflowShell
-                if not isinstance(aggregate, (WorkflowSnapshot, IssueWorkflowShell)):
-                    raise WorkflowAuthorityError("issue return lost its issue aggregate")
-                applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
-                                  ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci,
-                                  review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
-                                  pending_rebase=component.state.pending_rebase)
-                after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
-                persist_workflow_snapshot(db, after)
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-                       (key.repository, receipt_key, _stamp(self._now()), encoded))
-            return settled
-
-    def _apply_rebase_result(self, db, returned: cc.RebaseRepairResult) -> None:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        admission = returned.admission
-        purchase, _ = self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        if not isinstance(purchase, cc.IssueRebasePurchase):
-            raise WorkflowAuthorityError("rebase result selected another issue recovery operation")
-        key = admission.attempt.binding.fence.key
-        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY)
-        encoded = encode_workflow((admission, returned))
-        prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                           (key.repository, receipt_key)).fetchone()
-        if prior is not None:
-            if prior[0] != encoded:
-                raise WorkflowAuthorityError("rebase return conflicts with its immutable result")
-            return
-        aggregate = load_issue_aggregate(db, key)
-        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-        if aggregate is not None and isinstance(selected, cc.SelectedIssueRecovery) and cc.rebase_return_is_current(selected, admission):
-            component = selected.component
-            state = replace(component.state, pending_rebase=None,
-                rebase_failures=component.state.rebase_failures + (1 if returned.charge is cc.RebaseCharge.ATTEMPT else 0))
-            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
-                issue_recovery=replace(component, state=state, watermarks=replace(component.watermarks,
-                    last_applied=max(component.watermarks.last_applied, admission.admission_version))))
-            persist_workflow_snapshot(db, after)
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-                   (key.repository, receipt_key, _stamp(self._now()), encoded))
-
-    def _apply_review_result(self, db, returned: cc.ReviewRepairResult) -> None:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        admission = returned.admission
-        purchase, _ = self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        if not isinstance(purchase, cc.IssueReviewPurchase):
-            raise WorkflowAuthorityError("review result selected another issue recovery operation")
-        key = admission.attempt.binding.fence.key
-        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY)
-        encoded = encode_workflow((admission, returned))
-        prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                           (key.repository, receipt_key)).fetchone()
-        if prior is not None:
-            if prior[0] != encoded:
-                raise WorkflowAuthorityError("review return conflicts with its immutable result")
-            return
-        aggregate = load_issue_aggregate(db, key)
-        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-        if aggregate is not None and isinstance(selected, cc.SelectedIssueRecovery) and cc.review_return_is_current(selected, admission):
-            component = selected.component
-            debt = replace(component.state.review_failures, pending=None,
-                count=component.state.review_failures.count + (1 if returned.charge is cc.ReviewCharge.ATTEMPT else 0))
-            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
-                issue_recovery=replace(component, state=replace(component.state, review_failures=debt), watermarks=replace(component.watermarks,
-                    last_applied=max(component.watermarks.last_applied, admission.admission_version))))
-            persist_workflow_snapshot(db, after)
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-                   (key.repository, receipt_key, _stamp(self._now()), encoded))
-
-    def _apply_ci_result(self, db, returned: cc.CIRepairResult) -> None:
-        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        admission = returned.admission
-        purchase, _ = self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
-        if not isinstance(purchase, cc.IssueCIPurchase):
-            raise WorkflowAuthorityError("CI result selected another issue recovery operation")
-        key = admission.attempt.binding.fence.key
-        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY)
-        encoded = encode_workflow((admission, returned))
-        prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                           (key.repository, receipt_key)).fetchone()
-        if prior is not None:
-            if prior[0] != encoded:
-                raise WorkflowAuthorityError("CI return conflicts with its immutable result")
-            return
-        aggregate = load_issue_aggregate(db, key)
-        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
-        if aggregate is not None and isinstance(selected, cc.SelectedIssueRecovery) and cc.ci_return_is_current(selected, admission):
-            component = selected.component
-            state = replace(component.state, pending_ci=None,
-                ci_failures=component.state.ci_failures + (1 if returned.charge is cc.CICharge.ATTEMPT else 0))
-            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
-                issue_recovery=replace(component, state=state, watermarks=replace(component.watermarks,
-                    last_applied=max(component.watermarks.last_applied, admission.admission_version))))
-            persist_workflow_snapshot(db, after)
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-                   (key.repository, receipt_key, _stamp(self._now()), encoded))
 
     def _settle(
         self, db: sqlite3.Connection, request: SettlementRequest,
@@ -5554,335 +4391,6 @@ class SQLiteControlStore:
         db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
         return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
-    def enqueue_command(self, command: LifecycleCommand) -> PendingCommand:
-        with self.transaction() as db, self.mutation_savepoint(db):
-            return self._enqueue_command(db, command)
-
-    def _enqueue_command(
-        self, db: sqlite3.Connection, command: LifecycleCommand,
-    ) -> PendingCommand:
-        """Use the existing outbox inside either a command or workflow transaction."""
-        payload = _json(command.payload)
-        digest = _command_payload_digest(command, payload)
-        now = _stamp(self._now())
-        self._assert_owner_active(db, command.executor_identity)
-        self._validate_workflow_command(db, command)
-        row = db.execute(
-            "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
-            (command.idempotency_key,),
-        ).fetchone()
-        if row is not None:
-            if (
-                row["command_id"] != str(command.command_id)
-                or row["kind"] != command.kind.value
-                or row["target"] != command.target
-                or row["expected_revision"] != command.expected_revision
-                or row["repository"] != command.repository
-                or row["executor_identity"] != command.executor_identity
-                or row["payload_digest"] != digest
-                or row["workflow_binding_json"] != _encoded_command_binding(command)
-            ):
-                raise ControlStoreError(
-                    f"idempotency key {command.idempotency_key!r} conflicts"
-                )
-            return PendingCommand(
-                _command_from_row(row),
-                row["state"],
-                row["attempts"],
-                int(row["refusals"]),
-            )
-        db.execute(
-            "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
-            "logical_key, occurrence, kind, "
-            "target, expected_revision, config_version, repository, "
-            "executor_identity, payload_json, "
-            "payload_digest, state, created_at, updated_at, workflow_binding_json) "
-            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-            (
-                str(command.command_id),
-                command.idempotency_key,
-                command.idempotency_key,
-                command.kind.value,
-                command.target,
-                command.expected_revision,
-                command.config_version,
-                command.repository,
-                command.executor_identity,
-                payload,
-                digest,
-                now,
-                now,
-                _encoded_command_binding(command),
-            ),
-        )
-        return PendingCommand(command, "pending", 0)
-
-    def _command_reconciliation_binding(self, db, command):
-        if command.workflow is not None:
-            return command.workflow
-        raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
-
-    def _validate_workflow_command(
-        self, db: sqlite3.Connection, command: LifecycleCommand,
-    ) -> None:
-        if "pr_recovery" in command.payload or "ci_remediation" in command.payload:
-            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
-            raise ControlStoreError("PR recovery commands have no workflow authority")
-        binding = command.workflow
-        publication = command.kind in {CommandKind.PUBLISH_BRANCH, CommandKind.OPEN_PULL_REQUEST, CommandKind.UPDATE_PULL_REQUEST_BODY}
-        captured_run = self._publication_command_run(db, command) if publication else None
-        if binding is None:
-            if publication:
-                branch = command.payload.get("branch")
-                issue = issue_from_branch(branch) if isinstance(branch, str) else None
-                activated = db.execute(
-                    "SELECT 1 FROM workflows JOIN workflow_authority_epochs USING(repository) "
-                    "WHERE repository=? AND target_kind='issue' AND target_number=? AND family='resolve'",
-                    (command.repository, issue),
-                ).fetchone()
-                if activated is not None:
-                    if captured_run is None or captured_run["kind"] in _RESOLVE_PAID_KINDS:
-                        raise ControlStoreError("activated resolve publication requires captured workflow authority")
-            if command.target.startswith("issue:") and db.execute(
-                "SELECT 1 FROM workflows JOIN workflow_authority_epochs USING(repository) "
-                "WHERE repository=? AND target_kind='issue' AND target_number=? AND family='resolve'",
-                (command.repository, command.target.partition(":")[2]),
-            ).fetchone() is not None:
-                if deployment_role(command.repository, command.executor_identity) == "fix":
-                    raise ControlStoreError("activated issue command requires captured workflow authority")
-            return
-        self._assert_owner_active(db, command.executor_identity)
-        try:
-            role = deployment_role(command.repository, command.executor_identity)
-            if role != "fix":
-                raise WorkflowAuthorityError("resolve commands require the repository's fix owner")
-            if binding.authority.family is not WorkflowFamily.RESOLVE:
-                raise WorkflowAuthorityError("only resolve workflows bind commands")
-            require_resolve_binding(db, binding, allow_gated=True)
-            if command.target.startswith("issue:") and command.target != f"issue:{binding.fence.key.target.number}":
-                raise WorkflowAuthorityError("issue command target disagrees with its workflow")
-            if publication and captured_run is None:
-                raise WorkflowAuthorityError("publication command lacks its captured run authority")
-        except (ValueError, TypeError) as exc:
-            raise ControlStoreError(str(exc)) from exc
-
-    @staticmethod
-    def _publication_command_run(db: sqlite3.Connection, command: LifecycleCommand) -> sqlite3.Row | None:
-        run_id = command.payload.get("run_id")
-        if run_id is None:
-            return None
-        if not isinstance(run_id, str) or not run_id:
-            raise ControlStoreError("publication run identity is malformed")
-        row = db.execute(
-            "SELECT kind, owner_id, dispatch_id, workflow_binding_json FROM runs WHERE run_id=?", (run_id,),
-        ).fetchone()
-        if row is None or row["owner_id"] != command.executor_identity or row["workflow_binding_json"] != _encoded_command_binding(command):
-            raise ControlStoreError("publication command lacks its captured run authority")
-        try:
-            dispatch = json.loads(row["dispatch_id"])
-        except (ValueError, TypeError) as exc:
-            raise ControlStoreError("publication run metadata is malformed") from exc
-        if not isinstance(dispatch, dict) or dispatch.get("repository") != command.repository or dispatch.get("role") != "fix" or dispatch.get("publication_branch") != command.payload.get("branch") or dispatch.get("cwd") != command.payload.get("cwd"):
-            raise ControlStoreError("publication command disagrees with captured branch authority")
-        issue = dispatch.get("issue")
-        if issue is not None and (type(issue) is not int or issue <= 0 or issue_from_branch(str(command.payload.get("branch", ""))) != issue):
-            raise ControlStoreError("publication branch disagrees with its captured issue")
-        return row
-
-    def enqueue_command_occurrence(
-        self, command: LifecycleCommand
-    ) -> PendingCommand:
-        """Start a new durable occurrence of a previously satisfied effect.
-
-        This is used only after authoritative readback proves a terminal
-        command's desired state was later reversed. The generation allocation
-        and insert share one transaction, preventing concurrent daemons from
-        executing the same recurrence twice.
-        """
-
-        payload = _json(command.payload)
-        payload_digest = _command_payload_digest(command, payload)
-        now = _stamp(self._now())
-        with self.transaction() as db:
-            self._assert_owner_active(db, command.executor_identity)
-            self._validate_workflow_command(db, command)
-            existing = db.execute(
-                "SELECT logical_key FROM lifecycle_commands WHERE command_id=?",
-                (str(command.command_id),),
-            ).fetchone()
-            logical_key = (
-                str(existing["logical_key"])
-                if existing is not None
-                else command.idempotency_key
-            )
-            latest = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE logical_key=? "
-                "ORDER BY occurrence DESC LIMIT 1",
-                (logical_key,),
-            ).fetchone()
-            if latest is not None and (command.workflow is not None or latest["workflow_binding_json"] is not None):
-                self._validate_workflow_reexecution(latest)
-                if db.execute(
-                    "SELECT 1 FROM workflow_rearm_commands WHERE command_id=?", (latest["command_id"],),
-                ).fetchone() is not None:
-                    raise ControlStoreError("rearm obligations cannot acquire new command occurrences; use authorized retry or continuation")
-            if latest is not None and latest["state"] in {
-                "pending",
-                "executing",
-                "retryable_failure",
-                "unknown_outcome",
-            }:
-                if (
-                    latest["kind"] != command.kind.value
-                    or latest["target"] != command.target
-                    or latest["expected_revision"] != command.expected_revision
-                    or latest["repository"] != command.repository
-                    or latest["executor_identity"] != command.executor_identity
-                    or latest["payload_digest"] != payload_digest
-                    or latest["workflow_binding_json"] != _encoded_command_binding(command)
-                ):
-                    raise ControlStoreError(
-                        f"logical command {logical_key!r} has a conflicting "
-                        "active occurrence"
-                    )
-                return PendingCommand(
-                    _command_from_row(latest),
-                    str(latest["state"]),
-                    int(latest["attempts"]),
-                    int(latest["refusals"]),
-                )
-            occurrence = (
-                int(latest["occurrence"]) + 1 if latest is not None else 0
-            )
-            occurrence_key = f"{logical_key}:occurrence:{occurrence}"
-            command_id = CommandId(
-                hashlib.sha256(occurrence_key.encode()).hexdigest()
-            )
-            repeated = LifecycleCommand(
-                command_id,
-                occurrence_key,
-                command.kind,
-                command.target,
-                command.expected_revision,
-                dict(command.payload),
-                command.config_version,
-                command.repository,
-                command.executor_identity,
-                command.workflow,
-            )
-            db.execute(
-                "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
-                "logical_key, occurrence, kind, target, expected_revision, "
-                "config_version, repository, executor_identity, payload_json, "
-                "payload_digest, state, created_at, updated_at, workflow_binding_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-                (
-                    str(command_id),
-                    occurrence_key,
-                    logical_key,
-                    occurrence,
-                    command.kind.value,
-                    command.target,
-                    command.expected_revision,
-                    command.config_version,
-                    command.repository,
-                    command.executor_identity,
-                    payload,
-                    payload_digest,
-                    now,
-                    now,
-                    _encoded_command_binding(command),
-                ),
-            )
-            return PendingCommand(repeated, "pending", 0)
-
-    def last_published_revision(self, target: str) -> str | None:
-        """The revision this deployment most recently PUBLISHED to `target`
-        (newest succeeded PUBLISH_BRANCH receipt), or None when it never has.
-
-        The publish broker's foreign-write fence (ADR 0012 §2): a remote tip
-        equal to this value is our own published history — the agent may
-        rewrite it; anything else was written by someone else and must be
-        incorporated, not replaced."""
-        with closing(self._connect()) as db, db:
-            row = db.execute(
-                "SELECT r.remote_revision FROM effect_receipts AS r "
-                "JOIN lifecycle_commands AS c ON c.command_id=r.command_id "
-                "WHERE c.target=? AND c.kind=? AND r.status='succeeded' "
-                "ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1",
-                (target, CommandKind.PUBLISH_BRANCH.value),
-            ).fetchone()
-        if row is None or not row[0]:
-            return None
-        return str(row[0])
-
-    def pending_commands(
-        self,
-        *,
-        repository: str | None = None,
-        executor_identity: str | None = None,
-    ) -> tuple[PendingCommand, ...]:
-        predicates = [
-            "state IN ('pending','executing','retryable_failure','unknown_outcome')"
-        ]
-        params: list[str] = []
-        if repository is not None:
-            predicates.append("repository=?")
-            params.append(repository)
-        if executor_identity is not None:
-            predicates.append("executor_identity=?")
-            params.append(executor_identity)
-        with closing(self._connect()) as db, db:
-            rows = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE "
-                + " AND ".join(predicates)
-                + " ORDER BY created_at, command_id",
-                tuple(params),
-            ).fetchall()
-        return tuple(
-            PendingCommand(
-                _command_from_row(row),
-                row["state"],
-                row["attempts"],
-                int(row["refusals"]),
-            )
-            for row in rows
-        )
-
-    @staticmethod
-    def _command_reconciliation(row: sqlite3.Row) -> CommandReconciliation | None:
-        raw = row["workflow_reconciliation_json"]
-        return None if raw is None else decode_workflow(
-            raw, ActiveReconciliation | ReconciliationOnly | RetiredUncertainCommand | RetiredSettledCommand,
-        )
-
-    def _require_reconciliation_gate(
-        self, db: sqlite3.Connection, command: LifecycleCommand,
-        state: ReconciliationOnly | RetiredUncertainCommand,
-    ) -> OpenGate:
-        binding = self._command_reconciliation_binding(db, command)
-        # The binding's family selects the only rows that can hold its gate.
-        current = load_workflow_row(db, binding.fence.key)
-        if current is None:
-            raise WorkflowAuthorityError("command uncertainty workflow is absent")
-        uncertainty = state.uncertainty if isinstance(state, RetiredUncertainCommand) else state
-        gate = next((opened for item in current.gates
-                     if (opened := item.gate if isinstance(item, RearmingGate) else item).gate_id == uncertainty.gate_id), None)
-        if gate is None or not isinstance(gate.cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired)) or gate.cause.command_id != command.command_id:
-            raise WorkflowAuthorityError("command uncertainty has no matching visible gate")
-        if isinstance(gate.cause, RemoteOutcomeUncertain) and (
-            gate.cause.unresolved_since != uncertainty.history.unresolved_since
-            or gate.cause.failed_reads != uncertainty.history.failed_reads
-        ):
-            raise WorkflowAuthorityError("command uncertainty gate disagrees with its read history")
-        if isinstance(gate.cause, RetryAuthorizationRequired):
-            row = db.execute("SELECT * FROM workflow_evidence WHERE evidence_id=?", (gate.cause.absence_evidence_id,)).fetchone()
-            if row is None or row["kind"] != "absence" or row["command_id"] != str(command.command_id):
-                raise WorkflowAuthorityError("known-absence gate lacks command evidence")
-            evidence = decode_workflow(row["payload_json"], CommandAbsenceEvidence)
-            if evidence.binding != binding or evidence.command_id != command.command_id:
-                raise WorkflowAuthorityError("known-absence evidence belongs to another command")
-        return gate
 
     @classmethod
     def _recovery_owners(cls, db: sqlite3.Connection, owner_id: str) -> tuple[str, ...]:
@@ -5898,7 +4406,7 @@ class SQLiteControlStore:
         executor that settled it, so a predecessor's unclaimed rows belong
         to its successor. Bounded like that walk.
         """
-        role = deployment_role(repository, owner_id)
+        role = _deployment_role(repository, owner_id)
         lineage, frontier = [owner_id], [owner_id]
         for _ in range(64):
             if not frontier:
@@ -5912,660 +4420,6 @@ class SQLiteControlStore:
             lineage.extend(found)
             frontier = found
         return tuple(lineage)
-
-    @classmethod
-    def _unresolved_history(cls, row: sqlite3.Row) -> ActiveReconciliation | None:
-        """The one durable source of a command's unresolved read history.
-
-        Persisted history wins; otherwise an executing or unknown command has
-        been unresolved since the store stamped its current state. That
-        fallback relies on no write touching `updated_at` between the
-        uncertain receipt and the first persisted history; anything that
-        would must persist history first.
-        """
-        state = cls._command_reconciliation(row)
-        if isinstance(state, ActiveReconciliation):
-            return state
-        if isinstance(state, ReconciliationOnly):
-            return state.history
-        if isinstance(state, RetiredUncertainCommand):
-            return state.uncertainty.history
-        if row["state"] not in ("executing", "unknown_outcome"):
-            return None
-        since = datetime.fromisoformat(row["updated_at"])
-        return ActiveReconciliation(since, since, 0)
-
-    @classmethod
-    def _schedule_unresolved(
-        cls, db: sqlite3.Connection, row: sqlite3.Row, status: EffectStatus | None, now: datetime,
-    ) -> None:
-        """Enter or leave the bounded pre-expiry schedule with the outcome itself.
-
-        ADR 0015: a workflow command whose outcome becomes unknown persists its
-        first unresolved time, next read and read count in the same transaction
-        that records the outcome, so it is never re-read on every drain. An
-        already-running history keeps its start and count, including across
-        a proven-absent re-execution (`retry_reconciled_command` keeps it), so
-        repeated unknowns reach the age/read ceiling. A known outcome ends a
-        pre-expiry history; expired or retired histories are owned by the
-        reconciliation-only and retirement paths.
-        """
-        if row["workflow_binding_json"] is None:
-            return
-        prior = cls._command_reconciliation(row)
-        if prior is not None and not isinstance(prior, ActiveReconciliation):
-            return
-        if status is EffectStatus.UNKNOWN_OUTCOME:
-            encoded: str | None = encode_workflow(unknown_outcome_history(prior, now))
-        else:
-            encoded = None
-        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
-                   (encoded, row["command_id"]))
-
-    @staticmethod
-    def _retry_judged_inapplicable(db: sqlite3.Connection, command_id: CommandId) -> bool:
-        return db.execute(
-            "SELECT 1 FROM workflow_retry_authorizations WHERE command_id=? AND disposition='inapplicable'",
-            (str(command_id),),
-        ).fetchone() is not None
-
-    def _retire_workflow_command(
-        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand,
-        current: WorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
-    ) -> CommandReconciliation:
-        """One receipt/history boundary for rearm retirement and supersession."""
-        binding = command.workflow
-        if binding is None or binding.fence.key != current.binding.fence.key:
-            raise WorkflowAuthorityError("retired command belongs to another workflow")
-        scope = workflow_scope(binding.fence.key)
-        receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command.command_id),)).fetchone()
-        if receipt is not None and (not row["attempt_owner"] or receipt["executor_identity"] != row["attempt_owner"]):
-            raise WorkflowAuthorityError("retired obligation receipt does not match its executing owner")
-        if row["state"] in ("executing", "unknown_outcome"):
-            prior = self._command_reconciliation(row)
-            history = prior.history if isinstance(prior, ReconciliationOnly) else prior
-            gate = next((opened for item in current.gates
-                         for opened in (item.gate if isinstance(item, RearmingGate) else item,)
-                         if isinstance(cause := opened.cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired))
-                         and cause.command_id == command.command_id), None)
-            if gate is None and not create_uncertainty:
-                raise WorkflowAuthorityError("retiring an uncertain command requires its visible uncertainty gate")
-            if history is None:
-                unresolved = self._unresolved_history(row)
-                assert unresolved is not None
-                since = unresolved.unresolved_since
-                if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) and gate.cause.unresolved_since != since:
-                    raise WorkflowAuthorityError("command uncertainty must retain its recorded start")
-                history = ActiveReconciliation(since, max(since, self._now()), gate.cause.failed_reads if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) else 0)
-            if not isinstance(history, ActiveReconciliation):
-                raise WorkflowAuthorityError("superseded command has incompatible uncertainty history")
-            if isinstance(prior, ReconciliationOnly) and (gate is None or prior.gate_id != gate.gate_id):
-                raise WorkflowAuthorityError("command reconciliation lacks its matching uncertainty gate")
-            if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) and (
-                gate.cause.unresolved_since != history.unresolved_since or gate.cause.failed_reads != history.failed_reads
-            ):
-                raise WorkflowAuthorityError("retirement cannot reset command uncertainty history")
-            gate_id = gate.gate_id if gate is not None else "command-uncertain:" + hashlib.sha256(str(command.command_id).encode()).hexdigest()
-            state = RetiredUncertainCommand(ReconciliationOnly(history, gate_id), retirement_id)
-            if gate is None:
-                self._reconciliation_gate(db, binding, gate_id, OpenGate(
-                    gate_id, binding.fence.generation,
-                    RemoteOutcomeUncertain(command.command_id, history.unresolved_since, history.failed_reads, "superseded command outcome remains unverified"),
-                    NoAuthorizedRemediation("read-only outcome reconciliation required"),
-                ))
-        else:
-            if row["state"] == "pending" and row["attempts"] == 0 and receipt is None:
-                outcome = json.dumps({"command": str(command.command_id), "observation": "never_began_locally"}, sort_keys=True)
-            elif receipt is not None and receipt["status"] == row["state"] and row["state"] in ("retryable_failure", "permanent_failure", "succeeded"):
-                outcome = json.dumps(dict(receipt), sort_keys=True)
-            elif row["state"] == "retryable_failure" and receipt is None and (archived := [
-                r["evidence_id"] for r in db.execute(
-                    "SELECT evidence_id FROM workflow_evidence WHERE command_id=? AND kind='prior_receipt' "
-                    "ORDER BY evidence_id", (str(command.command_id),))
-            ]):
-                # A trusted read proved the unknown attempt absent and archived
-                # its receipt (`retry_reconciled_command`); it never settled.
-                outcome = json.dumps({"command": str(command.command_id), "observation": "proven_absent_never_settled",
-                                      "prior_receipts": archived}, sort_keys=True)
-            else:
-                raise WorkflowAuthorityError("superseded command lacks settled or uncertain outcome evidence")
-            outcome_id = "command-outcome:" + hashlib.sha256(outcome.encode()).hexdigest()
-            db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, 'observation', ?)",
-                       (outcome_id, *scope, str(command.command_id), outcome))
-            state = RetiredSettledCommand(retirement_id, outcome_id)
-        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
-                   (encode_workflow(state), str(command.command_id)))
-        grant = self._open_authorization(db, command.command_id)
-        if grant is not None:
-            # A retired command can never execute, so its grant ends with it.
-            self._dispose_grant(db, grant, RetryDisposition.VOID.value, "the command was retired before the grant was spent",
-                                details={"evidence_id": retirement_id})
-        return state
-
-    def _reconciliation_gate(
-        self, db: sqlite3.Connection, binding: WorkflowBinding, gate_id: str, gate: OpenGate | None,
-    ) -> None:
-        scope = workflow_scope(binding.fence.key)
-        current = load_workflow_row(db, binding.fence.key)
-        if current is None:
-            raise WorkflowAuthorityError("command reconciliation workflow is absent")
-        existing = db.execute("SELECT * FROM workflow_gates WHERE gate_id=?", (gate_id,)).fetchone()
-        if existing is not None and (existing["repository"], existing["target_kind"], existing["target_number"]) != scope:
-            raise WorkflowAuthorityError("command uncertainty gate belongs to another workflow")
-        retained = tuple(item for item in current.gates if (item.gate if isinstance(item, RearmingGate) else item).gate_id != gate_id)
-        # Reconciliation is not exempt from the same bounded snapshot contract
-        # used by operator and result transitions.
-        replace(current, gates=retained + ((gate,) if gate is not None else ()))
-        if gate is None:
-            changed = db.execute("UPDATE workflow_gates SET state='closed' WHERE gate_id=? AND state<>'closed'", (gate_id,)).rowcount
-        else:
-            db.execute(
-                "INSERT INTO workflow_gates VALUES (?, ?, ?, ?, ?, ?, 'open', ?) "
-                "ON CONFLICT(gate_id) DO UPDATE SET opened_generation=excluded.opened_generation, cause_key=excluded.cause_key, state='open', payload_json=excluded.payload_json",
-                (gate_id, *scope, gate.opened_generation, hashlib.sha256(encode_workflow(gate.cause).encode()).hexdigest(), encode_workflow(gate)),
-            )
-            changed = 1
-        if changed:
-            db.execute("UPDATE workflows SET version=version+1 WHERE repository=? AND target_kind=? AND target_number=?", scope)
-
-    def begin_command(self, command_id: CommandId) -> None:
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE command_id=?",
-                (str(command_id),),
-            ).fetchone()
-            if row is None:
-                raise KeyError(str(command_id))
-            command = _command_from_row(row)
-            self._validate_workflow_command(db, command)
-            if not self._workspace_projection_ready(db, command):
-                raise ControlStoreError("rearm projection awaits verified workspace preparation")
-            self._validate_return_projection(db, command)
-            self._validate_workflow_reexecution(row)
-            if row["state"] not in {"pending", "retryable_failure"}:
-                raise ControlStoreError(
-                    f"command {command_id} cannot execute from {row['state']}"
-                )
-            if row["state"] == "retryable_failure":
-                self._replace_effect_receipt(db, command)
-            self._mark_executing(db, command_id)
-
-    def _mark_executing(self, db: sqlite3.Connection, command_id: CommandId) -> None:
-        """The one attempt increment shared by ordinary and authorized execution.
-
-        Beginning ends any pre-write evidence schedule (the executor only
-        begins after a complete guard read) and closes its visible hold.
-        """
-        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?",
-                         (str(command_id),)).fetchone()
-        now = _stamp(self._now())
-        db.execute(
-            "UPDATE lifecycle_commands SET state='executing', attempts=attempts+1, "
-            "updated_at=?, attempt_owner=executor_identity, prewrite_read_json=NULL WHERE command_id=?",
-            (now, str(command_id)),
-        )
-        if row is not None and row["prewrite_read_json"] is not None:
-            binding = self._command_reconciliation_binding(db, _command_from_row(row))
-            self._reconciliation_gate(db, binding, prewrite_evidence_gate_id(command_id), None)
-
-    @staticmethod
-    def _workspace_projection_ready(db: sqlite3.Connection, command: LifecycleCommand) -> bool:
-        """Whether a re-arm obligation may execute now; other commands always may.
-
-        Resolve obligations also wait for their verified workspace handoff.
-        """
-        association = db.execute(
-            "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?",
-            (str(command.command_id),),
-        ).fetchone()
-        pending_type = PendingRearm
-        if association is None:
-            if command.workflow is not None:
-                current = load_workflow_row(db, command.workflow.fence.key)
-                if current is not None and isinstance(current.intent, pending_type) and command.command_id in current.intent.required_commands:
-                    raise WorkflowAuthorityError("rearm projection lacks its recorded operation association")
-            return True
-        if command.workflow is None:
-            raise WorkflowAuthorityError("rearm projection lacks its workflow binding")
-        current = require_workflow_binding(db, command.workflow, allow_gated=True)
-        intent = current.intent
-        if (association["disposition"] != "required" or not isinstance(intent, pending_type)
-                or intent.request_id != association["request_id"]
-                or command.command_id not in intent.required_commands):
-            raise WorkflowAuthorityError("rearm projection no longer belongs to a pending authorized intent")
-        # ADR 0015: an unresolved prior effect on this workflow could conflict
-        # with the replacement projection, so it waits for reconciliation.
-        if any(isinstance((g.gate if isinstance(g, RearmingGate) else g).cause, RemoteOutcomeUncertain) for g in current.gates):
-            return False
-        if isinstance(intent, PendingRearm):
-            return load_workspace_ack(db, intent.handoff) is not None
-        return True
-
-    @staticmethod
-    def _return_projection_attempt(db: sqlite3.Connection, command: LifecycleCommand) -> WorkflowAttemptIdentity | None:
-        if not command.idempotency_key.startswith("resolve-return:"):
-            return None
-        source = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-command' AND scope=? AND key=?",
-            (command.repository, str(command.command_id)),
-        ).fetchone()
-        if source is None:
-            raise ControlStoreError("resolve completion command lacks its paid-return provenance")
-        attempt = decode_workflow(source["payload_json"], WorkflowAttemptIdentity)
-        if command.workflow != attempt.binding:
-            raise ControlStoreError("resolve completion command disagrees with its paid return")
-        disposition = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-disposition' AND scope=? AND key=?",
-            (command.repository, str(attempt.run_id)),
-        ).fetchone()
-        if disposition is None:
-            raise ControlStoreError("resolve completion has not been finalized")
-        finalized = decode_workflow(disposition["payload_json"], FinalizedResolveReturn)
-        if finalized.result.attempt != attempt or command.command_id not in finalized.commands:
-            raise ControlStoreError("resolve completion is not an authorized returned-result obligation")
-        return attempt
-
-    def _validate_return_projection(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
-        attempt = self._return_projection_attempt(db, command)
-        if attempt is None:
-            return
-        # Classification and its outbox obligation may commit while another
-        # gate holds. Only execution needs an unheld current generation.
-        require_resolve_binding(db, attempt.binding)
-
-    def retry_reconciled_command(self, command_id: CommandId) -> None:
-        """A trusted read proved an ambiguous mutation did not land."""
-
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE command_id=?",
-                (str(command_id),),
-            ).fetchone()
-            if row is None:
-                raise KeyError(str(command_id))
-            command = _command_from_row(row)
-            self._validate_workflow_command(db, command)
-            self._validate_workflow_reexecution(row)
-            if row["state"] not in {"executing", "unknown_outcome"}:
-                raise ControlStoreError(
-                    f"command {command_id} cannot be reconciled from {row['state']}"
-                )
-            self._replace_effect_receipt(db, command)
-            db.execute(
-                "UPDATE lifecycle_commands SET state='retryable_failure', "
-                "updated_at=? WHERE command_id=?",
-                (_stamp(self._now()), str(command_id)),
-            )
-            # The pre-expiry history is kept and charged one re-execution: an
-            # attempt that is unknown again continues the same age and read
-            # count and backs off exponentially, so the unknown -> absent ->
-            # re-execute cycle reaches the ADR 0015 ceiling (unknown outcomes
-            # charge no refusals).
-            history = self._command_reconciliation(row)
-            if isinstance(history, ActiveReconciliation):
-                db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
-                           (encode_workflow(absent_reexecution(history)), str(command_id)))
-
-    @staticmethod
-    def _validate_workflow_reexecution(row: sqlite3.Row) -> None:
-        raw = row["workflow_reconciliation_json"]
-        if raw is not None:
-            try:
-                decode_workflow(raw, ActiveReconciliation)
-            except ValueError as exc:
-                raise ControlStoreError("workflow command is reconciliation-only or retired; execution is not authorized") from exc
-
-    @staticmethod
-    def _open_authorization(db: sqlite3.Connection, command_id: CommandId) -> UnconsumedRetryAuthorization | None:
-        # A unique partial index admits at most one open grant per command.
-        row = db.execute(
-            "SELECT * FROM workflow_retry_authorizations WHERE command_id=? AND disposition IS NULL",
-            (str(command_id),),
-        ).fetchone()
-        if row is None:
-            return None
-        grant = _retry_authorization_from_row(row)
-        assert isinstance(grant, UnconsumedRetryAuthorization)
-        return grant
-
-    def retry_authorization(self, command_id: CommandId) -> UnconsumedRetryAuthorization | None:
-        """The open grant awaiting the executor's one spend decision (read-only).
-
-        It is returned even when newer evidence moved the gate on, so the
-        executor's next read ends it rather than leaving it matchable forever.
-        """
-        with closing(self._connect()) as db:
-            db.execute("BEGIN")
-            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
-            if row is None:
-                raise KeyError(str(command_id))
-            state = self._command_reconciliation(row)
-            if not isinstance(state, ReconciliationOnly):
-                return None
-            self._require_reconciliation_gate(db, _command_from_row(row), state)
-            return self._open_authorization(db, command_id)
-
-    def _dispose_grant(
-        self, db: sqlite3.Connection, grant: UnconsumedRetryAuthorization, disposition: str, reason: str,
-        *, attempt: int | None = None, details: dict[str, object] | None = None,
-    ) -> None:
-        """Every grant ends here exactly once; the schema refuses a second disposal."""
-        if db.execute(
-            "UPDATE workflow_retry_authorizations SET disposition=?, disposition_reason=?, disposed_at=?, "
-            "consumed_attempt=? WHERE authorization_id=? AND disposition IS NULL",
-            (disposition, reason[:4096], _stamp(self._now()), attempt, grant.authorization_id),
-        ).rowcount != 1:
-            raise WorkflowAuthorityError("retry grant was disposed concurrently")
-
-    def _attempt_uncertainty(
-        self, db: sqlite3.Connection, command: LifecycleCommand, state: ReconciliationOnly, detail: str,
-    ) -> None:
-        """Report an authorized attempt's unverified outcome on its retained gate.
-
-        Unresolved history is kept; the rewritten state makes every read taken
-        before this point fail its compare-and-set, and the gate stops showing
-        the absence the attempt already spent.
-        """
-        binding = command.workflow
-        assert binding is not None
-        history = state.history
-        rotated = ReconciliationOnly(replace(history, next_read_at=max(
-            self._now() + timedelta(seconds=ReconciliationPolicy().initial_delay_seconds), history.unresolved_since,
-        )), state.gate_id)
-        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
-                   (encode_workflow(rotated), str(command.command_id)))
-        self._reconciliation_gate(db, binding, state.gate_id, OpenGate(
-            state.gate_id, binding.fence.generation,
-            RemoteOutcomeUncertain(command.command_id, history.unresolved_since, history.failed_reads, detail),
-            NoAuthorizedRemediation("read-only outcome reconciliation required"),
-        ))
-
-    def _settle_authorized_retry(self, db: sqlite3.Connection, receipt: EffectReceipt) -> None:
-        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(receipt.command_id),)).fetchone()
-        state = self._command_reconciliation(row)
-        if not isinstance(state, ReconciliationOnly):
-            return
-        grant = db.execute(
-            "SELECT authorization_id FROM workflow_retry_authorizations "
-            "WHERE command_id=? AND disposition='consumed' AND consumed_attempt=?",
-            (str(receipt.command_id), int(row["attempts"])),
-        ).fetchone()
-        if grant is None:
-            return
-        command = _command_from_row(row)
-        assert command.workflow is not None
-        if receipt.status is EffectStatus.SUCCEEDED:
-            db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=NULL WHERE command_id=?",
-                       (str(receipt.command_id),))
-            self._reconciliation_gate(db, command.workflow, state.gate_id, None)
-        elif receipt.status is EffectStatus.UNKNOWN_OUTCOME:
-            # Original expiry history is retained; any absence read during the
-            # write is superseded, so a later write needs a new proof and grant.
-            self._attempt_uncertainty(db, command, state, f"authorized retry attempt {int(row['attempts'])} outcome unknown")
-        else:
-            raise ControlStoreError("an authorized retry settles only as verified success or unknown outcome")
-
-    @staticmethod
-    def _archive_workflow_receipt(db: sqlite3.Connection, command: LifecycleCommand) -> None:
-        if command.workflow is None:
-            return
-        receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command.command_id),)).fetchone()
-        if receipt is None:
-            return
-        payload = _json(dict(receipt))
-        evidence_id = hashlib.sha256(f"prior-receipt:{command.command_id}:{payload}".encode()).hexdigest()
-        # Scoped by the binding's own target: a pull request workflow's receipt
-        # is never filed under an issue of the same number.
-        db.execute(
-            "INSERT OR IGNORE INTO workflow_evidence(evidence_id, repository, target_kind, target_number, command_id, kind, payload_json) "
-            "VALUES (?, ?, ?, ?, ?, 'prior_receipt', ?)",
-            (evidence_id, command.repository, *workflow_scope(command.workflow.fence.key)[1:], str(command.command_id), payload),
-        )
-
-    def _replace_effect_receipt(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
-        """All receipt replacement paths retain migrated authority evidence."""
-        self._archive_workflow_receipt(db, command)
-        db.execute("DELETE FROM effect_receipts WHERE command_id=?", (str(command.command_id),))
-
-    def resolve_unknown_effect(self, receipt: EffectReceipt) -> bool:
-        """Replace an ambiguous receipt after authoritative remote verification.
-
-        True means THIS call performed the reconciliation. False means the
-        command was ALREADY settled `succeeded` by another actor and this call
-        is a no-op that asserts the same outcome — benign, not an error.
-
-        The False answer exists because command enumeration and reconciliation
-        cannot share a transaction: `pending_commands` returns a snapshot, and
-        the reconciling reads between it and this call are remote. keifu PR
-        #177 (2026-08-02): the executing process submitted the review and
-        committed its succeeded receipt while a second drain — hot reload makes
-        two drains overlap routinely — was mid-`has_review` on the same
-        command. The second drain then verified the very effect the first had
-        just settled and got "command is not awaiting reconciliation", a scary
-        line for an outcome both actors agreed on. Two actors independently
-        proving the same success is a benign convergence; the earlier receipt
-        is authoritative (it carries the real execution window) and is kept.
-
-        Every other non-reconcilable state still RAISES. `pending` means a
-        receipt exists for a command that never executed; `retryable_failure` /
-        `permanent_failure` mean a verified success contradicts a recorded
-        failure; a missing row means the receipt has no command. Those are
-        corruption, not convergence, and must stay loud. `succeeded` without a
-        succeeded receipt is likewise corruption — it is the settled state
-        without the evidence that produces it.
-
-        Convergence is also NOT assumed when the two actors demonstrably
-        produced DIFFERENT remote objects. A reconciling read need not be
-        read-only: a search-then-create leg run by two overlapping actors can
-        create two remote objects for one command. Silently answering False there
-        would let the caller persist the key the authoritative receipt does
-        not name, orphaning a paid duplicate with no log line. Differing
-        non-null `remote_object_id`s therefore raise: that is provable
-        divergence, not convergence. Either side null carries no evidence of
-        disagreement (most effects never name a remote object) and stays
-        benign.
-        """
-
-        if receipt.status is not EffectStatus.SUCCEEDED:
-            raise ValueError("unknown effect can only resolve to succeeded here")
-        with self.transaction() as db, self.mutation_savepoint(db):
-            row = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE command_id=?",
-                (str(receipt.command_id),),
-            ).fetchone()
-            if row is None:
-                raise ControlStoreError("command is not awaiting reconciliation")
-            command = _command_from_row(row)
-            state = str(row["state"])
-            if state == EffectStatus.SUCCEEDED.value:
-                settled = db.execute(
-                    "SELECT status, remote_object_id FROM effect_receipts "
-                    "WHERE command_id=?",
-                    (str(receipt.command_id),),
-                ).fetchone()
-                if (
-                    settled is None
-                    or str(settled["status"]) != EffectStatus.SUCCEEDED.value
-                ):
-                    raise ControlStoreError(
-                        "command is succeeded without a succeeded receipt"
-                    )
-                surviving = settled["remote_object_id"]
-                if (
-                    surviving
-                    and receipt.remote_object_id
-                    and str(surviving) != str(receipt.remote_object_id)
-                ):
-                    raise ControlStoreError(
-                        "command already succeeded against a different remote "
-                        f"object: {surviving} != {receipt.remote_object_id}"
-                    )
-                return False
-            if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
-                raise ControlStoreError("command is not awaiting reconciliation")
-            command = _command_from_row(row)
-            if command.workflow is not None or "ci_remediation" in command.payload or "pr_recovery" in command.payload:
-                self._assert_owner_active(db, command.executor_identity)
-                if receipt.executor_identity != command.executor_identity:
-                    raise ControlStoreError("workflow reconciliation receipt requires the current command owner")
-                db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (receipt.executor_identity, str(receipt.command_id)))
-            self._replace_effect_receipt(db, command)
-            self._insert_effect(db, receipt, _receipt_digest(receipt))
-            return True
-
-    def exhaust_command(self, receipt: EffectReceipt) -> bool:
-        """Retire a command that has burned its retry ceiling (ADR 0012).
-
-        A remote write GitHub keeps refusing for a permanent reason — the
-        keifu incident: a review identity whose PAT lacked Issues:Write, so
-        every relabel returned 403, verified as "not applied", and was
-        re-executed on every tick forever — is not retryable. Crossing the
-        ceiling is the only transition into `permanent_failure` from
-        `retryable_failure`, and it is a REPLACEMENT of the last failure
-        receipt so the command keeps exactly one receipt.
-
-        The lifecycle_commands row (payload included) is deliberately left in
-        place: once the operator fixes the identity they must still be able to
-        see what never posted. `enqueue_command_occurrence` is the existing
-        primitive for deliberately re-running such an effect.
-
-        Returns False for ANY state that is no longer `retryable_failure` —
-        another daemon retired it, or the write actually landed between the
-        ceiling test and this call. Neither is an error: a concurrent SUCCESS
-        raising here would surface as an exception out of `execute_all` and
-        charge the caller a spurious stall. The False answer means "not retired
-        by me", which is exactly what a once-only escalation needs.
-        """
-
-        if receipt.status is not EffectStatus.PERMANENT_FAILURE:
-            raise ValueError("an exhausted command must receipt permanent_failure")
-        with self.transaction() as db, self.mutation_savepoint(db):
-            row = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE command_id=?",
-                (str(receipt.command_id),),
-            ).fetchone()
-            if row is None:
-                raise KeyError(str(receipt.command_id))
-            if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
-                return False
-            command = _command_from_row(row)
-            if command.workflow is not None or "ci_remediation" in command.payload or "pr_recovery" in command.payload:
-                self._assert_owner_active(db, command.executor_identity)
-                if receipt.executor_identity != command.executor_identity:
-                    raise ControlStoreError("workflow exhaustion receipt requires the current command owner")
-                db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (receipt.executor_identity, str(receipt.command_id)))
-            self._replace_effect_receipt(db, command)
-            self._insert_effect(db, receipt, _receipt_digest(receipt))
-            return True
-
-    def record_effect(self, receipt: EffectReceipt) -> bool:
-        digest = _receipt_digest(receipt)
-        with self.transaction() as db:
-            row = db.execute(
-                "SELECT receipt_digest FROM effect_receipts WHERE command_id=?",
-                (str(receipt.command_id),),
-            ).fetchone()
-            if row is not None:
-                return row["receipt_digest"] == digest
-            self._insert_effect(db, receipt, digest)
-            self._settle_authorized_retry(db, receipt)
-            return True
-
-    def _insert_effect(
-        self, db: sqlite3.Connection, receipt: EffectReceipt, digest: str
-    ) -> None:
-        with self.mutation_savepoint(db):
-            self._insert_effect_mutation(db, receipt, digest)
-
-    def _insert_effect_mutation(
-        self, db: sqlite3.Connection, receipt: EffectReceipt, digest: str
-    ) -> None:
-        command_row = db.execute(
-            "SELECT * FROM lifecycle_commands WHERE command_id=?", (str(receipt.command_id),),
-        ).fetchone()
-        if command_row is None:
-            raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
-        command = _command_from_row(command_row)
-        if "pr_recovery" in command.payload or "ci_remediation" in command.payload:
-            # PR repair lived on the review-rejection aggregate (deleted in slice 5c).
-            raise WorkflowAuthorityError("PR recovery commands have no workflow authority")
-        # Retiring/adopting a deployment changes the command executor, not the
-        # identity that actually began this attempt and may receipt its result.
-        if command.workflow is not None and (not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]):
-            raise ControlStoreError("workflow effect receipt does not match the captured attempt owner")
-        if command.kind is CommandKind.SUBMIT_REVIEW and receipt.remote_object_id is not None:
-            # Defence in depth behind the review marker: one GitHub review is
-            # the receipt of at most one submission, so two verdicts can never
-            # both be settled by the same review.
-            holder = db.execute(
-                "SELECT r.command_id FROM effect_receipts r JOIN lifecycle_commands c ON c.command_id=r.command_id "
-                "WHERE r.remote_object_id=? AND r.command_id<>? AND c.kind=? AND c.repository=? LIMIT 1",
-                (receipt.remote_object_id, str(receipt.command_id), CommandKind.SUBMIT_REVIEW.value, command.repository),
-            ).fetchone()
-            if holder is not None:
-                raise ControlStoreError(
-                    f"review {receipt.remote_object_id} is already the receipt of command {holder['command_id']}"
-                )
-        db.execute(
-            "INSERT INTO effect_receipts(command_id, executor_identity, "
-            "started_at, completed_at, status, remote_object_id, "
-            "remote_revision, error, receipt_digest) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                str(receipt.command_id),
-                receipt.executor_identity,
-                _stamp(receipt.started_at),
-                _stamp(receipt.completed_at),
-                receipt.status.value,
-                receipt.remote_object_id,
-                receipt.remote_revision,
-                receipt.error,
-                digest,
-            ),
-        )
-        # `refusals` counts only outcomes GitHub actually refused — a readback
-        # that proved the requested state absent. A SUCCEEDED receipt clears it
-        # (the command is done, and a later occurrence starts clean); every
-        # other status leaves it UNCHANGED. Unknown outcomes carry no
-        # information about the token's permissions, so neither charging them
-        # (which lets an outage retire a good command) nor clearing on them
-        # (which lets a flaky network make the ceiling unreachable for a
-        # permanently denied write) is correct — ADR 0012.
-        now = self._now()
-        db.execute(
-            "UPDATE lifecycle_commands SET state=?, updated_at=?, "
-            "refusals=CASE ?"
-            " WHEN 'retryable_failure' THEN refusals+1"
-            " WHEN 'succeeded' THEN 0"
-            " ELSE refusals END "
-            "WHERE command_id=?",
-            (
-                receipt.status.value,
-                _stamp(now),
-                receipt.status.value,
-                str(receipt.command_id),
-            ),
-        )
-        self._schedule_unresolved(db, command_row, receipt.status, now)
-
-    def effect_receipt(self, command_id: CommandId) -> EffectReceipt | None:
-        with closing(self._connect()) as db, db:
-            row = db.execute(
-                "SELECT * FROM effect_receipts WHERE command_id=?",
-                (str(command_id),),
-            ).fetchone()
-        if row is None:
-            return None
-        return EffectReceipt(
-            command_id=CommandId(row["command_id"]),
-            executor_identity=row["executor_identity"],
-            started_at=_parse_stamp(row["started_at"]),
-            completed_at=_parse_stamp(row["completed_at"]),
-            status=EffectStatus(row["status"]),
-            remote_object_id=row["remote_object_id"],
-            remote_revision=row["remote_revision"],
-            error=row["error"],
-        )
 
 
     def backup(self, destination: str) -> None:
@@ -6861,125 +4715,15 @@ class SQLiteControlStore:
         return db
 
 
-def _authorization(value: RetryAuthorization) -> UnconsumedRetryAuthorization:
-    return value if isinstance(value, UnconsumedRetryAuthorization) else value.authorization
-
-
-def _retry_authorization_from_row(row: sqlite3.Row) -> RetryAuthorization:
-    try:
-        association = (StandaloneCommand() if row["association_kind"] == "standalone"
-                       else RearmObligation(row["request_id"]))
-        grant = UnconsumedRetryAuthorization(
-            row["authorization_id"], CommandId(row["command_id"]), row["gate_id"], row["evidence_id"],
-            decode_workflow(row["binding_json"], WorkflowBinding), association,
-        )
-        disposition = row["disposition"]
-        if disposition is None:
-            return grant
-        if disposition == "consumed":
-            return ConsumedRetryAuthorization(grant, int(row["consumed_attempt"]))
-        return ClosedRetryAuthorization(grant, RetryDisposition(disposition), row["disposition_reason"])
-    except (ValueError, TypeError) as exc:
-        raise WorkflowAuthorityError("persisted retry authorization is malformed") from exc
-
-
-def load_retry_authorization_facts(
-    store: SQLiteControlStore, db: sqlite3.Connection, command_id: CommandId, evidence_id: str,
-) -> RetryAuthorizationFacts:
-    """Mint harness-owned acceptance and spend facts inside the caller's transaction.
-
-    The same facts back acceptance, the operator view and the spend decision,
-    including the store's own execution-authority check, so nothing is offered
-    that the executor would have to discard.
-    """
-    row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
-    if row is None:
-        raise WorkflowAuthorityError("retry authorization names an unknown command")
-    command = _command_from_row(row)
-    binding = command.workflow
-    if binding is None:
-        raise WorkflowAuthorityError("retry authorization requires a workflow-bound command")
-    evidence: CommandAbsenceEvidence | None = None
-    stored = db.execute("SELECT * FROM workflow_evidence WHERE evidence_id=?", (evidence_id,)).fetchone()
-    if (stored is not None and stored["kind"] == "absence" and stored["command_id"] == str(command_id)
-            and (stored["repository"], stored["target_kind"], stored["target_number"]) == workflow_scope(binding.fence.key)):
-        candidate = decode_workflow(stored["payload_json"], CommandAbsenceEvidence)
-        evidence = candidate if candidate.command_id == command.command_id else None
-    link = db.execute(
-        "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?", (str(command_id),),
-    ).fetchone()
-    current = load_workflow_row(db, binding.fence.key)
-    intent = current.intent if current is not None else None
-    workspace_ready = link is not None and (
-        isinstance(intent, PendingRearm) and intent.request_id == link["request_id"]
-        and load_workspace_ack(db, intent.handoff) is not None
-    )
-    prior = tuple(_retry_authorization_from_row(item) for item in db.execute(
-        "SELECT * FROM workflow_retry_authorizations WHERE command_id=? "
-        "AND (disposition IS NULL OR disposition='inapplicable' OR evidence_id=?) "
-        "ORDER BY authorization_id LIMIT ?",
-        (str(command_id), evidence_id, MAX_RELEVANT_AUTHORIZATIONS),
-    ))
-    attempted, attempts = db.execute(
-        "SELECT max(disposed_at), count(*) FROM workflow_retry_authorizations "
-        "WHERE command_id=? AND disposition='consumed'",
-        (str(command_id),),
-    ).fetchone()
-    refusal: str | None = None
-    db.execute("SAVEPOINT retry_execution_check")
-    try:
-        store._validate_workflow_command(db, command)
-    except CorruptControlStore:
-        raise
-    except (ControlStoreError, ValueError) as exc:
-        refusal = str(exc)[:4096] or type(exc).__name__
-    finally:
-        # The check is read-only by contract; never let it leave writes behind.
-        db.execute("ROLLBACK TO retry_execution_check")
-        db.execute("RELEASE retry_execution_check")
-    return RetryAuthorizationFacts(
-        command.command_id, binding, SQLiteControlStore._command_reconciliation(row), evidence,
-        RearmObligation(link["request_id"]) if link is not None else StandaloneCommand(), prior,
-        returns_resolve_result=SQLiteControlStore._return_projection_attempt(db, command) is not None,
-        obligation_active=link is not None and link["disposition"] == "required",
-        workspace_ready=workspace_ready,
-        last_attempt_at=datetime.fromisoformat(attempted) if attempted is not None else None,
-        authorized_attempts=int(attempts), execution_refusal=refusal,
-    )
-
-
-def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:
-    payload = json.loads(row["payload_json"])
-    if not isinstance(payload, dict):
-        raise CorruptControlStore("lifecycle command payload is not an object")
-    command = LifecycleCommand(
-        CommandId(row["command_id"]),
-        row["idempotency_key"],
-        CommandKind(row["kind"]),
-        row["target"],
-        row["expected_revision"],
-        payload,
-        row["config_version"],
-        row["repository"],
-        row["executor_identity"],
-        decode_workflow(row["workflow_binding_json"], WorkflowBinding) if row["workflow_binding_json"] is not None else None,
-    )
-    return command
-
-
-def _encoded_command_binding(command: LifecycleCommand) -> str | None:
-    return encode_workflow(command.workflow) if command.workflow is not None else None
-
-
-def _command_payload_digest(command: LifecycleCommand, payload: str) -> str:
-    return _encoded_payload_digest(payload, _encoded_command_binding(command))
-
-
-def _encoded_payload_digest(payload: str, binding: str | None) -> str:
-    identity = payload if binding is None else payload + "\n" + binding
-    return hashlib.sha256(identity.encode()).hexdigest()
-
-
+def _deployment_role(repository: str, owner_id: str) -> str:
+    """The role an owner identity (`<repository>:<role>:…`) names."""
+    prefix = f"{canonical_repository(repository)}:"
+    if not owner_id.startswith(prefix):
+        raise ValueError("deployment owner does not match its repository")
+    role = owner_id.removeprefix(prefix).partition(":")[0]
+    if not role:
+        raise ValueError("deployment owner role is unavailable")
+    return role
 
 
 def _dispatch_issue(dispatch_id: str) -> int | None:
@@ -7007,22 +4751,6 @@ def _dispatch_claim_issue(target: str) -> int | None:
     if value <= 0:
         return None
     return value if prefix == "issue" else -value
-
-
-def _receipt_digest(receipt: EffectReceipt) -> str:
-    encoded = _json(
-        {
-            "command_id": str(receipt.command_id),
-            "executor_identity": receipt.executor_identity,
-            "started_at": _stamp(receipt.started_at),
-            "completed_at": _stamp(receipt.completed_at),
-            "status": receipt.status.value,
-            "remote_object_id": receipt.remote_object_id,
-            "remote_revision": receipt.remote_revision,
-            "error": receipt.error,
-        }
-    )
-    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _json(value: object) -> str:

@@ -23,14 +23,11 @@ import sys
 import threading
 from collections.abc import Callable
 
-from ...adapters.dashweb import actions, costchart
+from ...adapters.dashweb import costchart
 from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
 from ...adapters.control_path import canonical_control_store_path
-from ...adapters.workflow_codec import validate_operator_json, WorkflowEncodingError
 from .. import cli
 from . import contracts
-from . import resolve_contracts
-from .resolve_control import control_error, unavailable_command, unavailable_control
 from .ports import DashboardBackend
 from .service import Backend
 
@@ -77,7 +74,7 @@ def create_app(
     harness_root: str | None = None,
     offload_backend: bool | None = None,
 ):
-    from fastapi import Body, FastAPI, Header, HTTPException, Query
+    from fastapi import FastAPI, Header, HTTPException, Query
     from fastapi.encoders import jsonable_encoder
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -131,11 +128,6 @@ def create_app(
             return JSONResponse(
                 {"detail": f"missing {CSRF_HEADER} header"}, status_code=403
             )
-        if request.method == "POST" and request.url.path.endswith("/resolve-control/commands"):
-            try:
-                validate_operator_json(await request.body())
-            except WorkflowEncodingError as exc:
-                return JSONResponse({"detail": str(exc)}, status_code=422)
         return await call_next(request)
 
     async def invoke(call, *args):
@@ -277,48 +269,6 @@ def create_app(
         ok, detail = await invoke(backend.promote, name, number)
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
-    @app.get("/api/repos/{name}/issues/{number}/resolve-control", response_model=resolve_contracts.ResolveControl)
-    async def api_resolve_control(name: str, number: int, request_id: str | None = Query(default=None, max_length=512)):
-        await require_known(name)
-        if number < 1 or number > 2**63 - 1:
-            raise HTTPException(422, "issue number is outside the supported range")
-        if request_id is not None:
-            try:
-                resolve_contracts.validate_identifier(request_id)
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-        try:
-            result = await invoke(backend.resolve_control, name, number, request_id)
-        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
-            result = unavailable_control(exc)
-        code = 503 if result.status == "unavailable" else 404 if result.status == "absent" else 200
-        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
-
-    @app.post("/api/repos/{name}/issues/{number}/resolve-control/commands", response_model=resolve_contracts.CommandResult)
-    async def api_resolve_command(name: str, number: int, body: resolve_contracts.ResolveCommand):
-        await require_known(name)
-        if number < 1 or number > 2**63 - 1:
-            raise HTTPException(422, "issue number is outside the supported range")
-        try:
-            body.command()
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        try:
-            result = await invoke(backend.resolve_command, name, number, body)
-        except Exception as exc:  # noqa: BLE001 - command identity makes an uncertain response retryable
-            result = unavailable_command(exc)
-        code = {"accepted": 202, "replayed": 200, "conflict": 409, "rejected": 422, "unavailable": 503}[result.outcome]
-        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
-
-    @app.get("/api/repos/{name}/workflow-families", response_model=resolve_contracts.WorkflowFamilies)
-    async def api_workflow_families(name: str):
-        await require_known(name)
-        try:
-            result = await invoke(backend.workflow_families, name)
-        except Exception as exc:  # noqa: BLE001 - an unread activation never reads as none active
-            result = resolve_contracts.WorkflowFamiliesUnavailable(status="unavailable", reason=control_error(exc))
-        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=503 if result.status == "unavailable" else 200)
-
     @app.post(
         "/api/repos/{name}/issues/{number}/unblock",
         response_model=contracts.ActionResult,
@@ -347,50 +297,24 @@ def create_app(
             ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
-    def _park_route(path: str, method_name: str):
-        async def api_park(
-            name: str,
-            number: int,
-            user_agent: str = Header(default="", include_in_schema=False),
-        ):
-            if number < 1:
-                raise HTTPException(400, "issue number must be positive")
-            channel = "ui" if user_agent.startswith("Mozilla") else "api"
-            # Same collector failure modes as unblock: read before write, so a
-            # broken GitHub read is a refusal the operator can act on, not a 500.
-            try:
-                ok, detail = await invoke(
-                    getattr(backend, method_name), name, number, channel
-                )
-            except Exception as exc:  # noqa: BLE001
-                ok, detail = False, (
-                    f"{path} unavailable ({type(exc).__name__}: {exc})"
-                )
-            return JSONResponse(
-                {"ok": ok, "detail": detail}, status_code=200 if ok else 400
-            )
-
-        # Unique names so the two routes get distinct OpenAPI operation ids.
-        api_park.__name__ = f"api_{method_name}"
-        app.post(
-            f"/api/repos/{{name}}/issues/{{number}}/{path}",
-            response_model=contracts.ActionResult,
-        )(api_park)
-
-    _park_route("park", "park")
-    _park_route("unpark", "unpark")
-
     @app.post(
-        "/api/repos/{name}/issues/{number}/priority",
+        "/api/repos/{name}/issues/{number}/park",
         response_model=contracts.ActionResult,
     )
-    async def api_priority(name: str, number: int, body: dict = Body(default={})):
+    async def api_park(
+        name: str,
+        number: int,
+        user_agent: str = Header(default="", include_in_schema=False),
+    ):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
-        priority = body.get("priority") if isinstance(body, dict) else None
-        if priority is not None and priority not in actions.PRIORITY_LABELS:
-            raise HTTPException(400, "priority must be P1, P2, P3 or null")
-        ok, detail = await invoke(backend.priority, name, number, priority)
+        channel = "ui" if user_agent.startswith("Mozilla") else "api"
+        # Same collector failure modes as unblock: read before write, so a
+        # broken GitHub read is a refusal the operator can act on, not a 500.
+        try:
+            ok, detail = await invoke(backend.park, name, number, channel)
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"park unavailable ({type(exc).__name__}: {exc})"
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
     @app.get("/{full_path:path}")

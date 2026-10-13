@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/domain/supervision.py src/issue_agent/adapters/process_supervisor.py src/issue_agent/adapters/supervised_exec.py src/issue_agent/app/loop.py src/issue_agent/app/main.py ops/
+Governs: src/issue_agent/domain/supervision.py src/issue_agent/adapters/process_supervisor.py src/issue_agent/adapters/supervised_exec.py src/issue_agent/app/tick.py src/issue_agent/app/main.py ops/
 
 ## Decision
 

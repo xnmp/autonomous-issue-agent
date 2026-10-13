@@ -2,7 +2,8 @@
 
 Governs: src/issue_agent/domain/dashboard.py
 
-Status: proposed (2026-08-02). Motivating incidents: the 2026-08-02 keifu
+Status: Superseded by the minimal-harness refactor (slice 5d-1, 2026-10-13): the single stop is the `needs-human` label written by policy (docs/open/2026-10-12-minimal-harness-design.md).
+Previously: proposed (2026-08-02). Motivating incidents: the 2026-08-02 keifu
 supervised session, especially issue #25 / PR #173.
 
 ## Problem

@@ -556,9 +556,9 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Settings", exact: true }).click();
 
   await page.getByRole("button", { name: "Collapse sidebar" }).click();
-  await page.getByRole("button", { name: "Quota", exact: true }).click();
-  await expectVerticallyContained(".quota-card");
-  await page.getByRole("button", { name: "Quota", exact: true }).click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expectVerticallyContained(".options-popover");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Expand sidebar" }).click();
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(page.getByRole("tab", { name: /In flight/ })).toBeVisible();
@@ -599,25 +599,25 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("separator", { name: "Resize sidebar" })).toBeVisible();
   await page.getByRole("button", { name: "Collapse sidebar" }).click();
   await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Quota" })).toBeVisible();
-  await page.getByRole("button", { name: "Quota", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Quota" })).toHaveClass(/compact/);
+  // Collapsed, the rail is gone: the bottom-left button opens settings, not quota.
+  await expect(page.getByRole("button", { name: "Quota", exact: true })).toHaveCount(0);
   const expandBounds = await page.getByRole("button", { name: "Expand sidebar" }).boundingBox();
   const repoTitleBounds = await page.locator(".repo-context-name").boundingBox();
   expect(expandBounds).not.toBeNull();
   expect(repoTitleBounds).not.toBeNull();
   expect(expandBounds!.x + expandBounds!.width).toBeLessThanOrEqual(repoTitleBounds!.x);
-  const collapsedQuotaBounds = await page.getByRole("button", { name: "Quota", exact: true }).boundingBox();
-  expect(collapsedQuotaBounds?.width).toBeGreaterThanOrEqual(40);
-  expect(collapsedQuotaBounds?.height).toBeGreaterThanOrEqual(40);
-  const compactTrack = page.locator(".compact-quota-track").first();
-  const compactTrackBounds = await compactTrack.boundingBox();
-  expect(compactTrackBounds!.width).toBeGreaterThan(compactTrackBounds!.height);
+  const collapsedSettings = page.getByRole("button", { name: "Settings", exact: true });
+  const collapsedSettingsBounds = await collapsedSettings.boundingBox();
+  expect(collapsedSettingsBounds?.width).toBeGreaterThanOrEqual(40);
+  expect(collapsedSettingsBounds?.height).toBeGreaterThanOrEqual(40);
+  expect(collapsedSettingsBounds!.x).toBeLessThan(100);
+  await collapsedSettings.click();
+  await expect(page.getByRole("group", { name: "Dashboard options" })).toBeInViewport();
   await page.screenshot({
     path: "../evidence/dashboard-sidebar-collapsed.png",
     fullPage: true,
   });
-  await page.getByRole("button", { name: "Quota", exact: true }).click();
+  await collapsedSettings.click();
   await page.getByRole("button", { name: "Expand sidebar" }).click();
   await page.getByRole("button", { name: "Settings" }).click();
   await page.getByLabel("Theme").selectOption("nord");

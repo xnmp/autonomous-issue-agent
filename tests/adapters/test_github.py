@@ -7,7 +7,7 @@ records argv and returns canned JSON (no network, no real gh)."""
 import errno
 import json
 
-from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _INLINE_COMMENT_LIMIT, _LIST_LIMIT, _REVIEW_COMMENT_BODY_BYTES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, MissingListLimit, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_issue, parse_pr
+from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _INLINE_COMMENT_LIMIT, _REVIEW_COMMENT_BODY_BYTES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, MissingListLimit, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_issue, parse_pr
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Comment
 from issue_agent.domain.checks import Unavailable
@@ -36,7 +36,7 @@ def test_parse_issue_maps_fields():
     assert all(isinstance(x, Label) for x in iss.labels)
 
 
-def test_parse_pr_maps_reviews_and_closing_ref():
+def test_parse_pr_maps_reviews():
     d = {
         "number": 100,
         "headRefName": "fix/5-null-token",
@@ -49,14 +49,12 @@ def test_parse_pr_maps_reviews_and_closing_ref():
             "commit": {"oid": "sha-graphql"},
         }],
         "state": "OPEN",
-        "closingIssuesReferences": [{"number": 5}],
     }
     pr = parse_pr(d)
     assert pr.number == 100
     assert pr.head_ref_name == "fix/5-null-token"
     assert pr.base_ref_oid == "base123"
     assert pr.head_ref_oid == "abc123"
-    assert pr.closing_issue == 5
     assert pr.reviews[0].author == "review-bot"
     assert pr.reviews[0].state == "APPROVED"
     # GraphQL shape (`gh pr view --json reviews`) nests the commit under commit.oid.
@@ -111,15 +109,6 @@ def test_parse_pr_checks_feed_ci_state():
     assert isinstance(pr.ci, Unavailable)
 
 
-
-
-def test_parse_issue_extracts_declared_paths():
-    d = {"number": 5, "state": "OPEN",
-         "body": "Implement `backend/app/infra/s3_file_store.py` per ADR-0007."}
-    iss = parse_issue(d)
-    assert "backend/app/infra/s3_file_store.py" in iss.declared_paths
-
-
 def test_parse_pr_extracts_changed_files():
     d = {"number": 100, "state": "OPEN",
          "files": [{"path": "backend/app/__init__.py"}, {"path": "backend/x.py"}]}
@@ -138,13 +127,11 @@ def test_parse_pr_reads_mergeable():
     assert not parse_pr({"number": 1, "state": "OPEN"}).is_conflicting()
 
 
-def test_parse_pr_reads_draft_and_author():
-    d = {"number": 1, "state": "OPEN", "isDraft": True, "author": {"login": "alice"}}
-    p = parse_pr(d)
-    assert p.is_draft is True and p.author == "alice"
+def test_parse_pr_reads_author():
+    p = parse_pr({"number": 1, "state": "OPEN", "author": {"login": "alice"}})
+    assert p.author == "alice"
     # defaults when absent
-    p2 = parse_pr({"number": 2, "state": "OPEN"})
-    assert p2.is_draft is False and p2.author == ""
+    assert parse_pr({"number": 2, "state": "OPEN"}).author == ""
 
 
 # ── identity ────────────────────────────────────────────────────────────────
@@ -161,8 +148,6 @@ def test_identity_provider_overrides():
 
 def test_identity_ambient_is_none():
     assert Identity().env_token() is None
-
-
 
 
 # ── gateway with a fake runner ────────────────────────────────────────────────
@@ -446,69 +431,6 @@ def test_get_issue_parses_response():
     assert iss.number == 5 and iss.has(Label.AI_READY)
 
 
-def test_get_pr_checks_are_head_bound_and_keep_only_latest_attempt():
-    calls = []
-
-    def runner(argv, token):
-        del token
-        calls.append(argv)
-        command = " ".join(argv)
-        if "pr view 100" in command:
-            return json.dumps(
-                {
-                    "number": 100,
-                    "headRefOid": "h1",
-                    "state": "OPEN",
-                }
-            )
-        if "/commits/h1/check-runs" in command:
-            return json.dumps(
-                [
-                    {
-                        "check_runs": [
-                            {
-                                "id": 1,
-                                "name": "unit",
-                                "app": {"id": 7},
-                                "status": "completed",
-                                "conclusion": "failure",
-                                "started_at": "2026-01-01T00:00:00Z",
-                            },
-                            {
-                                "id": 2,
-                                "name": "unit",
-                                "app": {"id": 7},
-                                "status": "completed",
-                                "conclusion": "success",
-                                "started_at": "2026-01-01T01:00:00Z",
-                            },
-                        ]
-                    }
-                ]
-            )
-        if "/commits/h1/statuses" in command:
-            return json.dumps(
-                [
-                    [
-                        {"context": "legacy", "state": "success"},
-                        {"context": "legacy", "state": "failure"},
-                    ]
-                ]
-            )
-        if "/commits/h2/" in command:
-            raise AssertionError("moving current head must not select CI")
-        return ""
-
-    checks = GitHubGateway("o/r", runner=runner)._checks_for_head("h1")
-    assert [check["bucket"] for check in checks] == ["pass", "pass"]
-    assert [check["name"] for check in checks] == ["unit", "legacy"]
-    assert all(
-        "/commits/h1/" in " ".join(call)
-        for call in calls
-        if "/commits/" in " ".join(call)
-    )
-
-
 # ── external-repo reviewer: build_review_world + ai-review parsing ────────────
 def test_parse_pr_round_trips_ai_review_label():
     # the ai-review tag must survive parsing into PRView (it's an enum member now;
@@ -551,41 +473,6 @@ def _pr_with_red_run(conclusion: str):
         return ""
 
     return GitHubGateway("o/r", runner=runner)
-
-
-def test_a_cancelled_run_reads_as_a_settled_failure_not_as_green():
-    """The load-bearing half of the wedged-run remediation (keifu PR #177).
-
-    The harness cancels a wedged run so the pre-existing free re-run can act on
-    it, and that handoff exists ONLY because a cancelled run observes as a
-    settled FAILURE. If it ever read as pass/none instead, the harness would
-    have cancelled a PR's CI and then armed auto-merge on the silence.
-    """
-
-    def runner(argv, token):
-        key = " ".join(argv)
-        if "pr view 177" in key:
-            return json.dumps({
-                "number": 177, "state": "OPEN", "headRefOid": "head-177",
-            })
-        if "/commits/head-177/check-runs" in key:
-            return json.dumps([{"check_runs": [{
-                "name": "Test (windows-latest)",
-                "status": "completed",
-                "conclusion": "cancelled",
-                "details_url": (
-                    "https://github.com/o/r/actions/runs/4242/job/99"
-                ),
-            }]}])
-        if "/commits/head-177/statuses" in key:
-            return json.dumps([[]])
-        if "actions/runs/4242" in key:
-            return json.dumps({"conclusion": "cancelled"})
-        return ""
-
-    checks = GitHubGateway("o/r", runner=runner)._checks_for_head("head-177")
-    assert checks[0]["bucket"] == "fail"
-    assert "/actions/runs/4242" in checks[0]["link"]
 
 
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
@@ -854,19 +741,9 @@ def _raising_runner(exc):
     return runner
 
 
-
-
 # ── review C2: every `gh … list` states its ceiling ───────────────────────────
 def _limit_of(argv):
     return argv[argv.index("--limit") + 1] if "--limit" in argv else None
-
-
-
-
-
-
-
-
 
 
 def test_gh_rejects_a_list_subcommand_without_limit():
@@ -886,8 +763,6 @@ def test_gh_rejects_a_list_subcommand_without_limit():
     gw._gh(["pr", "view", "1", "--repo", "o/r"])
     gw._gh(["api", "repos/o/r/issues/5/dependencies/blocked_by"])
     assert len(fr.calls) == 3
-
-
 
 
 # ── PR conversation → review prompt (2026-08-08, tauri #613/#614) ─────────────
@@ -1139,15 +1014,7 @@ def test_format_review_comments_small_bodies_are_unaffected_by_the_cap():
     assert format_review_comments(raw) == "a.py:12 (rev): rename this"
 
 
-
-
-
-
-
-
 # ── check start times + world timestamp (#30) ────────────────────────────────
-
-
 
 
 # ── merge cleanup end-to-end: merge → GitHub auto-close → next poll (#28) ─────
@@ -1216,7 +1083,5 @@ def _tail_runner(rows, views=None, calls=None):
         return ""
 
     return runner
-
-
 
 

@@ -5,15 +5,9 @@ import pytest
 
 from issue_agent.domain.contracts import (
     BudgetScope,
-    CommandId,
-    CommandKind,
-    EffectReceipt,
-    EffectStatus,
-    LifecycleCommand,
     Money,
     PriceQuote,
     PricingBasis,
-    ChargeOrigin,
     RunId,
     SettlementRequest,
     TokenUsage,
@@ -128,35 +122,3 @@ def test_daily_budget_periods_follow_civil_dst_and_leap_boundaries(
     assert scope.period_id == period_id
 
 
-def test_lifecycle_payload_is_immutable_and_receipt_state_is_total():
-    command = LifecycleCommand(
-        CommandId("cmd-1"),
-        "comment:issue:1:digest",
-        CommandKind.POST_COMMENT,
-        "issue/1",
-        None,
-        {"body": "hello"},
-        repository="o/r",
-        executor_identity="o/r:fix",
-    )
-    with pytest.raises(TypeError):
-        command.payload["body"] = "changed"  # type: ignore[index]
-
-    now = datetime.now(timezone.utc)
-    receipt = EffectReceipt(
-        command.command_id,
-        "broker",
-        now,
-        now,
-        EffectStatus.SUCCEEDED,
-        remote_object_id="comment-1",
-    )
-    assert receipt.error is None
-    with pytest.raises(ValueError, match="must carry an error"):
-        EffectReceipt(
-            command.command_id,
-            "broker",
-            now,
-            now,
-            EffectStatus.UNKNOWN_OUTCOME,
-        )

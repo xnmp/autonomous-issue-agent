@@ -6,9 +6,10 @@ Governs: src/issue_agent/adapters/control_store.py src/issue_agent/app/recovery.
 
 ## Decision
 
-A local SQLite database is authoritative for runs, leases, dedupe keys,
-reservations, charges, lifecycle commands, effect receipts, and the event
-outbox. It uses versioned migrations, foreign keys, WAL where supported, a busy
+A local SQLite database is authoritative for money (reservations and
+charges), leases, legs/attempts (runs) and idempotency keys. Tables the
+deleted workflow and durable-command model used are no longer read or written;
+they leave the schema in refactor slice 5d-2. It uses versioned migrations, foreign keys, WAL where supported, a busy
 timeout, restrictive permissions, short `BEGIN IMMEDIATE` transactions, and a
 startup integrity check.
 
@@ -17,9 +18,9 @@ previously shipped v8 initializer retain their exact v8 digest and upgrade
 through v9 and v10; startup accepts both histories, validates every recorded
 digest, and never rewrites an applied migration.
 
-No network, model, or subprocess work occurs inside a transaction. Telemetry
-is emitted from committed transitions via the outbox and is never read to make
-an authorization, accounting, or idempotency decision.
+No network, model, or subprocess work occurs inside a transaction. The JSONL
+journal is never read to make an authorization, accounting, or idempotency
+decision.
 
 ## Operations
 

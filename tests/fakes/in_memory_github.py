@@ -87,9 +87,6 @@ class InMemoryGitHub:
         current = self.issues.get(issue)
         return current is not None and current.state.casefold() != "open"
 
-    def issue_closure(self, issue: int) -> tuple[bool, str]:
-        current = self.get_issue(issue)
-        return current.state.casefold() == "closed", current.state_reason
 
     def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
         return (pr, event, body, head) in self.submitted_reviews
@@ -202,7 +199,7 @@ class InMemoryGitHub:
         self.calls.append(("close", number, reason, comment))
         current = self.issues.get(number)
         if current is not None:
-            self.issues[number] = replace(current, state="closed", state_reason=reason)
+            self.issues[number] = replace(current, state="closed")
 
     def enable_auto_merge(
         self, pr: int, method: str, expected_head: str

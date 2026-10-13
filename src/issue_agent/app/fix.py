@@ -31,7 +31,7 @@ from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from .planners import tasks
 from .tick import Choose, dispatch_item, leg_class, run_item
-from .workflows.base import run_leg
+from .tick import run_leg
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 
