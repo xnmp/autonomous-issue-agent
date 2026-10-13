@@ -276,9 +276,7 @@ def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
 
     class Config:
         repo = "o/r"
-        repo_input = "o/r"
         target_dir = ""
-        repointed_from_deployments = ()
         state_dir = str(tmp_path / "fix")
         review_state_dir = str(tmp_path / "review")
 

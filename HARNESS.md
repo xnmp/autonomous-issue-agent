@@ -54,14 +54,11 @@ Important fields:
 
 - `REPO=owner/name` and `TARGET_DIR=/absolute/path` are required.
 - `issue-agent start --write-config` may repoint an existing overlay only to a
-  new checkout of the same repository. It preserves a bounded
-  `REPOINTED_FROM_DEPLOYMENTS` lineage so the first boot can reap those exact
-  old deployments' process registries. Before replacing the overlay, the CLI
+  new checkout of the same repository. Before replacing the overlay, the CLI
   stops and verifies every foreground or installed process carrying that
   deployment name; a stop failure leaves the old overlay unchanged. The new
   deployment's recovery (scoped by repository and role) settles any leg the
-  old one left unsettled. Use a different `--name` for another repository; do
-  not hand-author the lineage.
+  old one left unsettled. Use a different `--name` for another repository.
 - `FIX_BOT` must differ from `REVIEW_BOT`.
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
@@ -231,9 +228,7 @@ reservations whose process never registered. A leg that may have reached a
 paid provider keeps its reservation while its lease is live. Once its process
 is gone, recovery settles it from surviving request evidence (Codex rollouts),
 or else at a zero `estimate` charge, so usage-blind ends cannot exhaust
-admission capacity. An explicit same-repository repoint first reaps the
-recorded prior checkout registries; unrelated sibling checkouts remain
-isolated. Historical JSONL is never queried for these decisions.
+admission capacity. Historical JSONL is never queried for these decisions.
 
 A missing `control.db` is recreated only on a machine that never had one. If
 its companions remain (`control.db.initialize.lock`, `-wal`, `-shm`,

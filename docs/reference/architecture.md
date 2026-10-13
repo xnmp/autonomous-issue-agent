@@ -201,11 +201,9 @@ Offline family activation and legacy import were deleted (slice 5a). A family
 epoch's plan evidence remains authority; a target's family state is initialized
 only by its live first observation.
 
-The supported exception is an explicit same-repository checkout repoint:
-`issue-agent start --write-config` records a bounded lineage of exact prior
-checkout identities. The first boot reaps only those process registries; the
-predecessor's unsettled legs are recovered by repository/role-scoped recovery.
-Before the overlay changes, the CLI stops and verifies all foreground and
+The supported exception is an explicit same-repository checkout repoint
+(`issue-agent start --write-config`): the predecessor's unsettled legs are
+recovered by repository/role-scoped recovery. Before the overlay changes, the CLI stops and verifies all foreground and
 service-owned processes carrying its stable name; failure preserves the old
 snapshot. Cross-repository overlay reuse is refused.
 Process-group, process-tree, and launch-intent receipts use the same stable
@@ -333,8 +331,8 @@ application coordinator. Boot performs an unconditional current-deployment
 reap plus lease, worktree, command, and immediate reservation reconciliation;
 suspend-wake uses only the ownership-checked abandoned-process reaper and the
 configured reservation grace; periodic resync reclaims dead leases and sweeps
-stale reservations without touching processes, worktrees, or commands. Legacy,
-explicitly repointed, and current-deployment process registries are reaped in
+stale reservations without touching processes, worktrees, or commands. Legacy and
+current-deployment process registries are reaped in
 the boot trigger's pre-adapter phase. The remaining current-state
 reconciliation runs explicitly after graph construction and legacy-spend
 migration but before readiness; a missing production trigger hook fails

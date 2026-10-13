@@ -33,7 +33,6 @@ from .config import HarnessConfig, from_env, render_agent_md
 from .roles import (
     build_fix_daemon,
     build_review_daemon,
-    prior_process_supervision_state_dirs,
     process_supervision_state_dir,
 )
 from .review_identity import review_identity as _app_identity
@@ -73,17 +72,10 @@ def _recover_pre_adapter_processes(
     from ..adapters.process_supervisor import ProcessSupervisor
 
     legacy = ProcessSupervisor(state_dir).recover_abandoned_orphans()
-    repointed = tuple(
-        run_id
-        for prior_state_dir in prior_process_supervision_state_dirs(
-            cfg, role, state_dir
-        )
-        for run_id in ProcessSupervisor(prior_state_dir).recover_orphans()
-    )
     current = ProcessSupervisor(
         process_supervision_state_dir(cfg, role, state_dir)
     ).recover_orphans()
-    return (*legacy, *repointed, *current)
+    return (*legacy, *current)
 
 
 def _validate_reload_candidate(env: dict[str, str]) -> None:
@@ -199,7 +191,6 @@ def build_role(
     runner = AgentRunner(
         log=_commit_log, debug=debug,
         idle_timeout=_idle, max_runtime=_wall,
-        max_buffer_size=cfg.sdk_max_buffer_bytes or None,
         process_supervisor=ProcessSupervisor(
             process_supervision_state_dir(cfg, role, runner_state_dir)
         ),

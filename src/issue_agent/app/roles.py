@@ -50,14 +50,7 @@ from ..domain.pricing import (
 )
 from ..domain.state import Harness
 from ..domain.identity import login_eq
-from .config import (
-    CodexRuntimeConfig,
-    HarnessConfig,
-    ReviewRuntimeConfig,
-    deployment_identity_for_target,
-    owner_identity_for_target,
-    prior_deployment_identities,
-)
+from .config import HarnessConfig, deployment_identity_for_target, owner_identity_for_target
 from .fix import FixLegs, FixSettings, fix_choose
 from .tick import Daemon
 from .planners.tasks import FixTaskConfig, ReviewTaskConfig
@@ -118,22 +111,6 @@ def process_supervision_state_dir(
         root,
         "process-supervision",
         _deployment_identity(cfg, role),
-    )
-
-
-def prior_process_supervision_state_dirs(
-    cfg: HarnessConfig,
-    role: str,
-    state_dir: str | None = None,
-) -> tuple[str, ...]:
-    """Registries this explicit repoint is authorized to reap at boot."""
-
-    root = state_dir if state_dir is not None else _role_state_dir(cfg, role)
-    if not root:
-        raise ValueError("process supervisor state directory is required")
-    return tuple(
-        os.path.join(root, "process-supervision", deployment)
-        for _repository, deployment in prior_deployment_identities(cfg, role)
     )
 
 
@@ -573,24 +550,24 @@ def _build_codex_runner(
     from ..adapters.codex_runner import CodexProvider, CodexRunner
     from ..adapters.process_supervisor import ProcessSupervisor
 
-    runtime = cfg.codex_runtime
+    runtime = cfg
     return CodexRunner(
-        codex_bin=runtime.binary,
+        codex_bin=runtime.codex_bin,
         provider=CodexProvider(
-            provider_id=runtime.provider_id,
-            name=runtime.provider_name,
-            base_url=runtime.base_url,
-            env_key=runtime.env_key,
-            wire_api=runtime.wire_api,
+            provider_id=runtime.codex_provider_id,
+            name=runtime.codex_provider_name,
+            base_url=runtime.codex_base_url,
+            env_key=runtime.codex_env_key,
+            wire_api=runtime.codex_wire_api,
         ),
         sandbox=sandbox,
         resume_on_retry=resume_on_retry,
-        reasoning_effort=runtime.reasoning_effort,
+        reasoning_effort=runtime.codex_reasoning_effort,
         inject_system_prompt=inject_system_prompt,
         log=log,
         debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
-        idle_timeout=(runtime.idle_timeout if runtime.idle_timeout > 0 else None),
-        max_runtime=(runtime.max_runtime if runtime.max_runtime > 0 else None),
+        idle_timeout=(runtime.agent_idle_timeout if runtime.agent_idle_timeout > 0 else None),
+        max_runtime=(runtime.agent_max_runtime if runtime.agent_max_runtime > 0 else None),
         process_supervisor=(
             ProcessSupervisor(
                 process_supervision_state_dir(cfg, leg_role, state_dir)
@@ -612,7 +589,7 @@ class _FixRuntimeBinding:
 
 def _bind_claude_fix_runtime(
     _cfg: HarnessConfig,
-    _runtime_config: CodexRuntimeConfig,
+    _runtime_config: HarnessConfig,
     runner: AgentRuntime,
 ) -> _FixRuntimeBinding:
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
@@ -624,7 +601,7 @@ def _bind_claude_fix_runtime(
 
 def _bind_codex_fix_runtime(
     cfg: HarnessConfig,
-    runtime_config: CodexRuntimeConfig,
+    runtime_config: HarnessConfig,
     _runner: AgentRuntime,
 ) -> _FixRuntimeBinding:
     from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
@@ -632,8 +609,8 @@ def _bind_codex_fix_runtime(
     log = _log("fix")
     runner = _build_codex_runner(
         cfg,
-        default_model=runtime_config.model or None,
-        sandbox=runtime_config.sandbox,
+        default_model=runtime_config.codex_model or None,
+        sandbox=runtime_config.codex_sandbox,
         inject_system_prompt=False,
         resume_on_retry=True,
         leg_role="fix",
@@ -661,7 +638,7 @@ def _bind_codex_fix_runtime(
 _FIX_RUNTIME_REGISTRY: Mapping[
     RuntimeName,
     Callable[
-        [HarnessConfig, CodexRuntimeConfig, AgentRuntime],
+        [HarnessConfig, HarnessConfig, AgentRuntime],
         _FixRuntimeBinding,
     ],
 ] = {
@@ -681,7 +658,7 @@ class _ReviewRuntimeBinding:
 
 def _bind_claude_review_runtime(
     cfg: HarnessConfig,
-    _runtime_config: ReviewRuntimeConfig,
+    _runtime_config: HarnessConfig,
     runner: AgentRuntime,
 ) -> _ReviewRuntimeBinding:
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
@@ -691,7 +668,7 @@ def _bind_claude_review_runtime(
 
 def _bind_codex_review_runtime(
     cfg: HarnessConfig,
-    runtime_config: ReviewRuntimeConfig,
+    runtime_config: HarnessConfig,
     _runner: AgentRuntime,
 ) -> _ReviewRuntimeBinding:
     from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
@@ -699,7 +676,7 @@ def _bind_codex_review_runtime(
     log = _log("review")
     runner = _build_codex_runner(
         cfg,
-        default_model=runtime_config.model,
+        default_model=runtime_config.review_model,
         sandbox="read-only",
         inject_system_prompt=True,
         resume_on_retry=False,
@@ -724,7 +701,7 @@ def _bind_codex_review_runtime(
 _REVIEW_RUNTIME_REGISTRY: Mapping[
     RuntimeName,
     Callable[
-        [HarnessConfig, ReviewRuntimeConfig, AgentRuntime],
+        [HarnessConfig, HarnessConfig, AgentRuntime],
         _ReviewRuntimeBinding,
     ],
 ] = {
@@ -814,8 +791,7 @@ def compose_fix_daemon(
     """observe -> derive -> policy -> act, with paid legs in a bounded pool."""
     log = log or _log("fix")
     journal = _journal(store)
-    fix_runtime = cfg.fix_runtime
-    binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](cfg, cfg.codex_runtime, runner)
+    binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](cfg, cfg, runner)
     control = _control_store(cfg, cfg.state_dir)
     owner_id = _owner_identity(cfg, "fix")
     settings = FixSettings(
@@ -824,7 +800,7 @@ def compose_fix_daemon(
         base_branch=cfg.base_branch,
         runtime=cfg.fixer_runtime.value,
         owner_id=owner_id,
-        harness=Harness(fix_bot=fix_runtime.bot, review_bot=cfg.review_bot),
+        harness=Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
     )
     reconciler = _LateReservationReconciler()
     accounting = _with_accounting(
@@ -841,8 +817,8 @@ def compose_fix_daemon(
         accounting=accounting,
         worktrees=worktrees,
         task_config=FixTaskConfig(
-            cfg.repo, cfg.base_branch, cfg.agent_md, fix_runtime.budget_usd,
-            fix_runtime.model, fix_runtime.effort, runtime=cfg.fixer_runtime,
+            cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,
+            cfg.fix_model, cfg.fix_effort, runtime=cfg.fixer_runtime,
         ),
         prepare_cwd=binding.prepare_cwd,
         log=log,
@@ -853,14 +829,13 @@ def compose_fix_daemon(
         repository=cfg.repo,
         base_branch=cfg.base_branch,
         merge_method=cfg.merge_method,
-        close_issue_on_merge=cfg.close_issue_on_merge,
         marker=settings.harness.marker,
         dispatch=dispatch, remove_worktree=worktrees.remove, log=log,
     )
     facts = Facts(
         control, cfg.repo,
         active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
-        headroom=_headroom(_control_spend_gate(cfg, control, fix_runtime.budget_usd)),
+        headroom=_headroom(_control_spend_gate(cfg, control, cfg.fix_budget_usd)),
         lifetime_capped=_lifetime_capped(cfg, control),
         log=log,
     )
@@ -873,7 +848,7 @@ def compose_fix_daemon(
         lambda: gateway.build_world(cfg.base_branch),
         decide_with("fix", facts, settings.harness, fix_choose(settings, log), lease_slots(daemon_ref), log),
         act,
-        cfg.tick_interval_seconds,
+        cfg.poll_seconds,
         log,
         journal=journal,
         dispatch_capacity=cfg.fix_dispatch_concurrency,
@@ -930,33 +905,32 @@ def compose_review_daemon(
     review credential that is not REVIEW_BOT. The latter posted a duplicate
     review on every retry, since the read-back looked for the wrong login."""
     log = log or _log("review")
-    review_runtime = cfg.review_runtime
     if checkouts is None:
         if not cfg.target_dir:
             raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
         checkouts = ReviewCheckouts(cfg.target_dir, worktree_root=cfg.worktree_root)
     acting_as = gateway.viewer_login()
-    if not login_eq(acting_as, review_runtime.bot):
+    if not login_eq(acting_as, cfg.review_bot):
         raise ValueError(
-            f"REVIEW_BOT is {review_runtime.bot!r} but the review credential acts as "
+            f"REVIEW_BOT is {cfg.review_bot!r} but the review credential acts as "
             f"{acting_as or 'nobody GitHub would name'!r}: set REVIEW_BOT to the "
             "credential's login, or give the review role REVIEW_BOT's credential"
         )
     journal = _journal(store)
-    binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](cfg, review_runtime, runner)
+    binding = _REVIEW_RUNTIME_REGISTRY[cfg.reviewer_runtime](cfg, cfg, runner)
     control = _control_store(cfg, cfg.review_state_dir)
     owner_id = _owner_identity(cfg, "review")
     settings = ReviewSettings(
         repository=cfg.repo, owner_id=owner_id,
-        harness=Harness(fix_bot=cfg.fix_runtime.bot, review_bot=review_runtime.bot),
+        harness=Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
     )
     reconciler = _LateReservationReconciler()
     accounting = _with_accounting(
-        binding.runner, control, cfg, "review", review_runtime.runtime.value, reconciler,
+        binding.runner, control, cfg, "review", cfg.reviewer_runtime.value, reconciler,
     )
     runtime = JournalingRuntime(
         accounting, journal, repo=cfg.repo, role="review",
-        runtime=review_runtime.runtime.value, state_dir=cfg.review_state_dir,
+        runtime=cfg.reviewer_runtime.value, state_dir=cfg.review_state_dir,
     )
     daemon_ref: dict[str, Daemon] = {}
     legs = ReviewLegs(
@@ -966,7 +940,7 @@ def compose_review_daemon(
         checkouts=checkouts,
         prepare_cwd=binding.prepare_cwd,
         task_config=ReviewTaskConfig(
-            cfg.repo, cfg.base_branch, review_runtime.prompt, review_runtime.budget_usd, review_runtime.model,
+            cfg.repo, cfg.base_branch, cfg.review_prompt, cfg.review_budget_usd, cfg.review_model,
         ),
         log=log,
     )
@@ -975,7 +949,7 @@ def compose_review_daemon(
     facts = Facts(
         control, cfg.repo,
         active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
-        headroom=_headroom(_control_spend_gate(cfg, control, review_runtime.budget_usd)),
+        headroom=_headroom(_control_spend_gate(cfg, control, cfg.review_budget_usd)),
         lifetime_capped=_lifetime_capped(cfg, control),
         log=log,
     )
@@ -988,7 +962,7 @@ def compose_review_daemon(
         lambda: gateway.build_world(cfg.base_branch),
         decide_with("review", facts, settings.harness, review_choose(settings.harness), lease_slots(daemon_ref), log),
         act,
-        cfg.tick_interval_seconds,
+        cfg.poll_seconds,
         log,
         journal=journal,
         dispatch_capacity=1,
@@ -1007,5 +981,5 @@ def compose_review_daemon(
         ),
     )
     daemon_ref["daemon"] = daemon
-    log(f"review: capabilities: review=on runtime={review_runtime.runtime.value}")
+    log(f"review: capabilities: review=on runtime={cfg.reviewer_runtime.value}")
     return ReviewDaemonComposition(daemon, control, journal, act, legs, recovery, owner_id)

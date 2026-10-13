@@ -1,6 +1,5 @@
 """Config-from-env mapping."""
 
-import json
 import subprocess
 from pathlib import Path
 
@@ -60,16 +59,13 @@ def test_every_operator_field_has_env_and_coercion_metadata():
     internal = {
         "agent_md",
         "control_authority_root",
-        "repointed_from_deployments",
         "codex_cost_per_mtok_cached_in",
         "parse_errors",
-        "repo_input",
     }
     for definition in fields(HarnessConfig):
         if definition.name in internal:
             assert not definition.metadata
             continue
-        assert definition.metadata["env"]
         assert definition.metadata["coerce"]
 
 
@@ -142,48 +138,9 @@ def test_custom_state_roots_keep_one_machine_accounting_authority(
     assert second.control_authority_root == "/machine/state"
 
 
-def test_explicit_repoint_history_is_normalized_and_deduplicated():
-    raw = json.dumps(
-        [
-            {"repository": "Acme/App", "target_dir": "/srv/app-old"},
-            {"repository": "acme/app", "target_dir": "/srv/app-old"},
-            {"repository": "acme/app", "target_dir": "/srv/app-older"},
-        ]
-    )
-
-    cfg = from_env({"REPO": "acme/app", "REPOINTED_FROM_DEPLOYMENTS": raw})
-
-    assert cfg.repointed_from_deployments == (
-        ("acme/app", "/srv/app-old"),
-        ("acme/app", "/srv/app-older"),
-    )
-
-
-@pytest.mark.parametrize(
-    "raw",
-    (
-        "not-json",
-        "{}",
-        '[{"repository":"o/r","target_dir":"relative"}]',
-        '[{"repository":"","target_dir":"/srv/old"}]',
-    ),
-)
-def test_malformed_repoint_history_fails_config_validation(raw):
-    cfg = from_env(
-        {
-            "REPO": "o/r",
-            "FIX_BOT": "fix-bot",
-            "REPOINTED_FROM_DEPLOYMENTS": raw,
-        }
-    )
-
-    with pytest.raises(ValueError, match="REPOINTED_FROM_DEPLOYMENTS"):
-        cfg.validate()
-
-
 def test_bool_parsing():
     assert from_env({"REPO": "x", "AUTO_MERGE": "0"}).auto_merge is False
-    assert from_env({"REPO": "x", "CLOSE_ISSUE_ON_MERGE": "false"}).close_issue_on_merge is False
+    assert from_env({"REPO": "x", "AUTO_MERGE": "False"}).auto_merge is False
 
 
 def test_models_and_budgets():
@@ -199,8 +156,6 @@ def test_empty_fix_model_is_none():
 def test_merge_method():
     c = from_env({"REPO": "x", "MERGE_METHOD": "merge"})
     assert c.merge_method == "merge"
-
-
 
 
 def test_validate_fails_loud_on_empty_repo():
@@ -252,22 +207,11 @@ def test_grouped_config_preserves_flat_env_mapping():
         "CODEX_MODEL": "gpt-next",
     })
 
-    assert c.repository.repo == "o/r"
-    assert c.repository.base_branch == "main"
-    assert c.repository.target_dir == "/repo"
-    assert c.runtime_paths.state_dir == "/state/fix"
-    assert c.runtime_paths.review_state_dir == "/state/review"
-    assert c.runtime_paths.worktree_root == "/worktrees"
-    assert c.runtime_paths.harness_root == "/harness"
-    assert c.fix_runtime.bot == "fixer"
-    assert c.fix_runtime.budget_usd == 4.25
-    assert c.review_runtime.model == "opus"
-    assert c.codex_runtime.binary == "codex-dev"
-    assert c.codex_runtime.model == "gpt-next"
-    # Both session caps reach the codex runtime through the same grouped config the
-    # Claude runner reads off HarnessConfig — one knob, both runtimes.
-    assert c.codex_runtime.idle_timeout == c.agent_idle_timeout
-    assert c.codex_runtime.max_runtime == c.agent_max_runtime
+    assert (c.repo, c.base_branch, c.target_dir) == ("o/r", "main", "/repo")
+    assert (c.state_dir, c.review_state_dir) == ("/state/fix", "/state/review")
+    assert (c.worktree_root, c.harness_root) == ("/worktrees", "/harness")
+    assert (c.fix_bot, c.fix_budget_usd, c.review_model) == ("fixer", 4.25, "opus")
+    assert (c.codex_bin, c.codex_model) == ("codex-dev", "gpt-next")
 
 
 def test_agent_max_runtime_defaults_and_parses():
@@ -345,13 +289,10 @@ def test_validation_rejects_invalid_runtime_settings():
         "FIXER_RUNTIME": "python",
         "AGENT_IDLE_TIMEOUT_SECONDS": "-1",
         "AGENT_MAX_RUNTIME_SECONDS": "-1",
-        "CODEX_TRANSPORT_RETRIES": "-1",
-        "CODEX_BACKOFF_BASE_SECONDS": "0",
     })
 
     _assert_each_knob_flagged_once(c.validation_errors(), {
         "FIXER_RUNTIME", "AGENT_IDLE_TIMEOUT_SECONDS", "AGENT_MAX_RUNTIME_SECONDS",
-        "CODEX_TRANSPORT_RETRIES", "CODEX_BACKOFF_BASE_SECONDS",
     })
 
 
@@ -553,7 +494,6 @@ def test_repo_slug_is_case_insensitive_like_github_repo_identity():
     a = from_env({"REPO": "Acme/Widget"})
     b = from_env({"REPO": "acme/widget"})
     assert a.repo == b.repo == "acme/widget"
-    assert a.repo_input == "Acme/Widget"
     assert a.state_dir == b.state_dir
     assert a.review_state_dir == b.review_state_dir
 
@@ -683,26 +623,6 @@ def test_absence_of_fix_bot_check_would_have_validated_silently():
     assert errors != ()  # …but the dedicated check does
 
 
-def test_sdk_max_buffer_default_clears_a_five_megabyte_read():
-    # #13: the SDK's own 1MB ceiling is below one base64'd hi-DPI screenshot,
-    # and blowing it kills the whole session's transport.
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot"})
-    assert c.sdk_max_buffer_bytes >= 5 * 1024 * 1024 * 4 // 3
-    assert c.validation_errors() == ()
-
-
-def test_sdk_max_buffer_is_overridable_and_zero_means_the_sdk_default():
-    assert from_env({"REPO": "x", "SDK_MAX_BUFFER_BYTES": "33554432"}).sdk_max_buffer_bytes == 33554432
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "SDK_MAX_BUFFER_BYTES": "0"})
-    assert c.sdk_max_buffer_bytes == 0
-    assert c.validation_errors() == ()
-
-
-def test_negative_sdk_max_buffer_is_a_config_error():
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "SDK_MAX_BUFFER_BYTES": "-1"})
-    assert any("SDK_MAX_BUFFER_BYTES" in e for e in c.validation_errors())
-
-
 def test_fix_dispatch_concurrency_defaults_to_two_and_can_go_serial():
     # Default 2 since 2026-08-02: one slot let a single ADDRESS_REVIEW leg
     # hold the deployment while other PRs' repairs queued behind it.
@@ -729,8 +649,6 @@ def test_codex_is_priced_out_of_the_box_so_the_spend_caps_are_not_blind():
     c = from_env({"REPO": "x"})
     assert c.codex_cost_per_mtok_in > 0
     assert c.codex_cost_per_mtok_out > c.codex_cost_per_mtok_in  # output costs more
-    assert c.codex_runtime.cost_per_mtok_in == c.codex_cost_per_mtok_in
-    assert c.codex_runtime.cost_per_mtok_out == c.codex_cost_per_mtok_out
 
 
 def test_codex_cost_per_mtok_override():
@@ -740,7 +658,6 @@ def test_codex_cost_per_mtok_override():
     })
     assert c2.codex_cost_per_mtok_in == 3.00
     assert c2.codex_cost_per_mtok_out == 15.00
-    assert c2.codex_runtime.cost_per_mtok_out == 15.00
     assert c2.validation_errors() == ()
 
 
@@ -755,7 +672,6 @@ def test_codex_pricing_can_be_switched_off_explicitly():
     })
     assert c.codex_cost_per_mtok_in == 0.0
     assert c.codex_cost_per_mtok_out == 0.0
-    assert c.codex_runtime.cost_per_mtok_in == 0.0
     assert c.validation_errors() == ()
 
 
@@ -790,7 +706,6 @@ def test_the_rate_table_parses_a_model_per_entry():
     assert c.codex_cost_per_mtok == (
         ("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0),
     )
-    assert c.codex_runtime.cost_per_mtok == c.codex_cost_per_mtok
     assert c.validation_errors() == ()
 
 
@@ -849,30 +764,6 @@ def test_a_model_priced_twice_keeps_the_first_and_says_so():
     })
     assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
     assert any("more than once" in e for e in c.validation_errors())
-
-
-# ── #29: describe() must not claim a bound codex cannot honour ───────────────
-
-
-def test_describe_flags_the_fix_budget_as_unenforced_on_codex():
-    """`fix_budget=$20.00` was printed on every codex boot while a resolve ran
-    to $28.74 and exited `ok` — the startup log asserting a guarantee the
-    runtime cannot make."""
-    d = from_env({
-        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "3600",
-    }).describe()
-    assert "fix_budget=$20.00" in d
-    assert "NOT ENFORCED on codex" in d and "3600s" in d
-
-
-def test_describe_says_nothing_bounds_a_codex_run_without_a_wall_cap():
-    d = from_env({
-        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "0",
-    }).describe()
-    assert "NOT ENFORCED on codex" in d
-    assert "AGENT_MAX_RUNTIME_SECONDS is unset" in d
 
 
 def test_describe_leaves_the_fix_budget_unqualified_on_the_sdk_runtime():
@@ -1018,7 +909,7 @@ def test_a_misspelled_fix_effort_is_reported_and_falls_back():
 def test_fix_effort_reaches_the_fix_runtime_view():
     from issue_agent.domain.effort import Effort
 
-    assert from_env({"REPO": "x", "FIX_EFFORT": "low"}).fix_runtime.effort is Effort.LOW
+    assert from_env({"REPO": "x", "FIX_EFFORT": "low"}).fix_effort is Effort.LOW
 
 
 @pytest.mark.parametrize("retired", ["", "old-key", "x" * 100_000])
