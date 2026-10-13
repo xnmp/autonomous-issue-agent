@@ -28,21 +28,21 @@ const next = () => screen.getAllByRole("button", { name: "Next" })[0]!;
 const bodyRows = () => screen.getAllByRole("row").slice(1);
 
 describe("IssuesTab pagination", () => {
-  it("shows 50 rows, then the next 50 with a matching range, then the remainder", async () => {
-    render(view(doneRows(120)));
-    expect(bodyRows()).toHaveLength(50);
-    expect(screen.getAllByText("1–50 of 120").length).toBeGreaterThan(0);
-    expect(screen.getByText("Done item 120")).toBeVisible();
+  it("shows 25 rows, then the next 25 with a matching range, then the remainder", async () => {
+    render(view(doneRows(60)));
+    expect(bodyRows()).toHaveLength(25);
+    expect(screen.getAllByText("1–25 of 60").length).toBeGreaterThan(0);
+    expect(screen.getByText("Done item 60")).toBeVisible();
 
     await userEvent.click(next());
-    expect(bodyRows()).toHaveLength(50);
-    expect(screen.getAllByText("51–100 of 120").length).toBeGreaterThan(0);
-    expect(screen.getByText("Done item 70")).toBeVisible();
-    expect(screen.queryByText("Done item 120")).not.toBeInTheDocument();
+    expect(bodyRows()).toHaveLength(25);
+    expect(screen.getAllByText("26–50 of 60").length).toBeGreaterThan(0);
+    expect(screen.getByText("Done item 30")).toBeVisible();
+    expect(screen.queryByText("Done item 60")).not.toBeInTheDocument();
 
     await userEvent.click(next());
-    expect(bodyRows()).toHaveLength(20);
-    expect(screen.getAllByText("101–120 of 120").length).toBeGreaterThan(0);
+    expect(bodyRows()).toHaveLength(10);
+    expect(screen.getAllByText("51–60 of 60").length).toBeGreaterThan(0);
     for (const next of screen.getAllByRole("button", { name: "Next" })) expect(next).toBeDisabled();
   });
 
@@ -54,11 +54,11 @@ describe("IssuesTab pagination", () => {
   it("returns to page 1 when the filter changes", async () => {
     render(view(doneRows(150)));
     await userEvent.click(next());
-    expect(screen.getAllByText("51–100 of 150").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("26–50 of 150").length).toBeGreaterThan(0);
     await userEvent.type(screen.getByRole("searchbox"), "Done item 1");
     // 1, 10-19 and 100-150 match: 62 rows.
-    expect(screen.getAllByText("1–50 of 62").length).toBeGreaterThan(0);
-    expect(bodyRows()).toHaveLength(50);
+    expect(screen.getAllByText("1–25 of 62").length).toBeGreaterThan(0);
+    expect(bodyRows()).toHaveLength(25);
   });
 
   it("clamps to the last page when a refresh shrinks the list", async () => {
@@ -71,8 +71,8 @@ describe("IssuesTab pagination", () => {
   });
 
   it("hides the controls when everything fits on one page", () => {
-    render(view(doneRows(50)));
-    expect(bodyRows()).toHaveLength(50);
+    render(view(doneRows(25)));
+    expect(bodyRows()).toHaveLength(25);
     expect(screen.queryByRole("navigation", { name: "Pagination" })).not.toBeInTheDocument();
   });
 
@@ -88,7 +88,7 @@ describe("IssuesTab pagination", () => {
     await userEvent.click(next());
     rerender(<IssuesTab repo="demo" sub="backlog" onOpenIssue={vi.fn()} issues={issues} />);
     rerender(<IssuesTab repo="demo" sub="done" onOpenIssue={vi.fn()} issues={issues} />);
-    expect(screen.getAllByText("51–100 of 120").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("26–50 of 120").length).toBeGreaterThan(0);
   });
 });
 
