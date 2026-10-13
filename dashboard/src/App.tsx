@@ -20,14 +20,13 @@ import { useIssues } from "./features/issues/useIssues";
 import type {
   BacklogCard,
   IssuesPayload,
-  PendingCard,
 } from "./api/types";
 import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
 import { Chip, Dot } from "./components/ui/Chip";
 import { HEALTH_LABEL, HEALTH_TONE, roleHealth, type Tone } from "./lib/semantics";
-import { boardItems, GROUP_META, type BoardGroup } from "./features/issues/board";
+import { boardItems, GROUP_META, queuedCard, type BoardGroup } from "./features/issues/board";
 import {
   DASHBOARD_THEMES,
   type DashboardOptions,
@@ -50,19 +49,7 @@ function storedBoolean(
 }
 
 /** An open issue tab names the board group its issue is in. */
-const BOARD_TONE: Record<BoardGroup, Tone> = { needs_you: "fail", working: "ok", blocked: "neutral" };
-
-function pendingCardFromBacklog(card: BacklogCard): PendingCard {
-  return {
-    issue: card.issue,
-    title: card.title,
-    url: card.url,
-    labels: Array.from(new Set([...card.labels, "ai-ready"])),
-    held: false,
-    hold_reason: null,
-    overlap: null,
-  };
-}
+const BOARD_TONE: Record<BoardGroup, Tone> = { needs_you: "fail", working: "ok", waiting: "neutral" };
 
 interface OptimisticPromotion {
   card: BacklogCard;
@@ -74,8 +61,7 @@ function promotionConfirmed(
   issues: IssuesPayload,
 ): boolean {
   const issue = promotion.card.issue;
-  const active = issues.in_flight.some((card) => card.issue === issue)
-    || issues.pending.some((card) => card.issue === issue);
+  const active = issues.in_flight.some((card) => card.issue === issue);
   const stillBacklogged = issues.backlog.some((card) => card.issue === issue);
   return active || (
     promotion.requestSucceeded
@@ -86,7 +72,6 @@ function promotionConfirmed(
 
 function storedOptions(): DashboardOptions {
   const defaults: DashboardOptions = {
-    showProjectedCost: true,
     showPerRepoQuotas: true,
     showDurationSeconds: true,
     showOverviewDaemonHealth: false,
@@ -102,9 +87,6 @@ function storedOptions(): DashboardOptions {
       ? parsed.theme as DashboardOptions["theme"]
       : defaults.theme;
     return {
-      showProjectedCost: storedBoolean(
-        parsed, "showProjectedCost", defaults.showProjectedCost,
-      ),
       showPerRepoQuotas: storedBoolean(
         parsed, "showPerRepoQuotas", defaults.showPerRepoQuotas,
       ),
@@ -201,9 +183,9 @@ export default function App() {
           backlog: issues.data.backlog.filter(
             (card) => !promotedIssueNumbers.has(card.issue),
           ),
-          pending: [
-            ...issues.data.pending,
-            ...unresolvedPromotions.map(({ card }) => pendingCardFromBacklog(card)),
+          in_flight: [
+            ...issues.data.in_flight,
+            ...unresolvedPromotions.map(({ card }) => queuedCard(card)),
           ],
         }
       : null,
@@ -293,13 +275,11 @@ export default function App() {
     }
 
     for (const n of openIssues[repo] ?? []) {
-      const card =
-        displayedIssues.data?.in_flight.find((c) => c.issue === n) ??
-        displayedIssues.data?.done.find((c) => c.issue === n) ??
-        null;
+      const card = displayedIssues.data?.in_flight.find((c) => c.issue === n) ?? null;
+      const done = displayedIssues.data?.done.find((c) => c.issue === n) ?? null;
       tabs.push({
         key: `issue-${n}`,
-        title: `#${n}${card?.title ? ` — ${card.title}` : ""}`,
+        title: `#${n}${(card ?? done)?.title ? ` — ${(card ?? done)?.title}` : ""}`,
         label: (
           <>
             <span className="mono">#{n}</span>
@@ -310,7 +290,7 @@ export default function App() {
               >
                 {GROUP_META[card.board.status].label}
               </Chip>
-            ) : card?.done ? <Chip tone="ok">done</Chip> : null}
+            ) : done ? <Chip tone="ok">done</Chip> : null}
           </>
         ),
         active: route.view === "issue" && route.issue === n,
@@ -381,7 +361,6 @@ export default function App() {
             onBacklogPromotion={setBacklogPromotion}
             hasRepos={repoList.length > 0}
             reposLoading={repos.loading}
-            showProjectedCost={options.showProjectedCost}
             showDurationSeconds={options.showDurationSeconds}
             showOverviewDaemonHealth={options.showOverviewDaemonHealth}
             showOverviewIssueHealthTrend={options.showOverviewIssueHealthTrend}
@@ -408,7 +387,6 @@ function Body({
   onBacklogPromotion,
   hasRepos,
   reposLoading,
-  showProjectedCost,
   showDurationSeconds,
   showOverviewDaemonHealth,
   showOverviewIssueHealthTrend,
@@ -422,7 +400,6 @@ function Body({
   onBacklogPromotion: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
   hasRepos: boolean;
   reposLoading: boolean;
-  showProjectedCost: boolean;
   showDurationSeconds: boolean;
   showOverviewDaemonHealth: boolean;
   showOverviewIssueHealthTrend: boolean;
@@ -446,8 +423,6 @@ function Body({
         issues={issues}
         onOpenIssue={onOpenIssue}
         onBacklogPromotion={onBacklogPromotion}
-        showProjectedCost={showProjectedCost}
-        showDurationSeconds={showDurationSeconds}
       />
     );
   if (selectedRepo) {

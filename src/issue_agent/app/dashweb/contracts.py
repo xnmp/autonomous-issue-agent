@@ -1,8 +1,12 @@
-"""Validated HTTP response contracts for the interactive dashboard."""
+"""Validated HTTP response contracts for the interactive dashboard.
+
+The shapes mirror `domain.dashboard`'s read model; `generate:api` turns them
+into the frontend's types.
+"""
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -17,12 +21,11 @@ class Warned(Contract):
 
 class RoleHealth(Contract):
     role: str
+    # From the process table; None when foreign processes are unreadable.
     alive: bool | None
+    # No running heartbeat within the staleness bound.
     stale: bool
-    last_event_ts: str | None
-    last_event: str | None
-    events: int
-    log_path: str | None
+    heartbeat_ts: str | None
 
 
 class RepoSummary(Contract):
@@ -34,8 +37,9 @@ class RepoSummary(Contract):
     roles: list[RoleHealth]
     frecency: float
     last_activity_ts: str | None
-    in_flight: int
-    done: int
+    # From the last GitHub observation, None until one is cached.
+    in_flight: int | None
+    done: int | None
 
 
 class ReposPayload(Warned):
@@ -100,44 +104,36 @@ class KindCost(Contract):
     runs: int
 
 
-class InterventionCount(Contract):
-    # `name` is one of domain.dashboard.INTERVENTION_CLASSES — rearm, policy,
-    # or other. Not typed as a Literal: a class this build does not know must
-    # still render, not fail the whole overview payload.
-    name: str
-    count: int
+class BasisCost(Contract):
+    basis: str
+    usd: float
 
 
 class Metrics(Contract):
-    done_issues: int
-    in_flight_issues: int
-    total_cost_usd: float | None
-    cost_per_done_usd: float | None
-    first_pass_approvals: int | None
-    first_pass_changes: int | None
+    # None when GitHub was not read: unknown, not zero.
+    merged_prs: int | None
+    # GitHub listed only the newest merged PRs: merged_prs is a lower bound
+    # and cost_per_merged_pr_usd an upper one.
+    merged_prs_partial: bool = False
+    open_items: int | None
+    needs_human: int | None
+    total_cost_usd: float
+    cost_per_merged_pr_usd: float | None
+    by_basis: list[BasisCost]
+    by_kind: list[KindCost]
+    first_pass_approvals: int
+    first_pass_changes: int
     first_pass_rate: float | None
     rounds_per_pr: float | None
-    escalations: int
-    recurrences: int
-    spend_blocks: int
-    today_usd: float | None
-    by_kind: list[KindCost]
-    interventions_total: int = 0
-    # None when nothing merged — "nobody intervened" and "nothing to divide by"
-    # must not both render as 0.
-    interventions_per_merged_pr: float | None = None
-    interventions_by_class: list[InterventionCount] = []
-
-
-class CostMix(Contract):
-    resolve_usd: float | None
-    review_usd: float | None
-    repair_usd: float | None
+    legs: int
+    machine_legs: int
+    today_usd: float
 
 
 class Caps(Contract):
     issue_cap_usd: float | None
     daily_cap_usd: float | None
+    global_daily_cap_usd: float | None
     today_usd: float | None
 
 
@@ -146,8 +142,6 @@ class HealthTrendDay(Contract):
     opened: int
     closed: int
     net_open: int
-    recurrences: int
-    first_observation: bool
 
 
 class SpendBucket(Contract):
@@ -155,87 +149,85 @@ class SpendBucket(Contract):
     usd: float
 
 
+StopReasonId = Literal["question", "attempts", "review-rounds", "lifetime-cap", "workflow-path", "labelled"]
+
+
 class AttentionItem(Contract):
     issue: int
     title: str | None = None
-    # One of snapshots.ATTENTION_ORDER. Open-typed: a class this build does not
-    # know must still render rather than fail the overview.
-    kind: str
-    detail: str | None = None
-
-
-class EscalationReason(Contract):
-    issue: int
-    # None when the escalating pass recorded no comment: the escalation is
-    # still real, so the row is listed with an unrecorded reason rather than
-    # dropped.
-    reason: str | None = None
-
-
-class InterventionEvent(Contract):
-    ts: str | None
-    # One of domain.dashboard.INTERVENTION_TIMELINE_CLASSES — rearm, guidance,
-    # relabel, policy, other. Open-typed for the same reason as
-    # InterventionCount.name: an unknown class must render, not 500.
-    action_class: str
-    kind: str
-    issue: int | None = None
-    pr: int | None = None
+    reason: StopReasonId
+    headline: str
     detail: str | None = None
 
 
 class OverviewPayload(Warned):
     metrics: Metrics | None
-    cost_mix: CostMix | None
     caps: Caps | None
     health: list[RoleHealth]
     needs_attention: list[AttentionItem] = []
-    escalation_reasons: list[EscalationReason] = []
-    interventions: list[InterventionEvent] = []
-    # Events the fold could correlate to no issue. Nonzero is a telemetry bug
-    # signal, so the number is published while the bodies stay in the journal.
-    unattributed_count: int = 0
-    health_trend: list[HealthTrendDay]
-    first_observed_day: str | None = None
+    health_trend: list[HealthTrendDay] = []
     spend_per_hour: list[SpendBucket] = []
+    # Why the control store could not be read; no board is derived then.
+    store_error: str | None = None
 
 
-class CardStep(Contract):
-    kind: str
-    state: str
-    status: str | None
-    cost_usd: float | None
-    # Consecutive same-kind attempts folded into this episode (retries).
-    count: int = 1
+class BoardNeedsYou(Contract):
+    status: Literal["needs_you"]
+    reason: StopReasonId
+    headline: str
+    # What releases the stop, in one line.
+    hint: str
+    # The stop comment (or the agent's question). Agent prose: clients
+    # render it as text, never as Markdown.
+    detail: str | None
+    # Where a reply releases the stop.
+    target: Literal["issue", "pr"]
+    since_ts: str | None
 
 
-class ModelBadge(Contract):
-    model: str
-    effort: str | None
+class BoardWorking(Contract):
+    status: Literal["working"]
+    activity: Literal["agent", "queued", "ci", "merge", "update", "open_pr", "release"]
+    act: str | None
+    headline: str
+    reason: str
+    since_ts: str | None
 
 
-StageId = Literal["triage", "resolve", "review", "ci", "merge"]
+class BoardWaiting(Contract):
+    status: Literal["waiting"]
+    on: Literal["branch-protection", "human-review", "headroom", "backoff", "github"]
+    headline: str
+    reason: str
+    since_ts: str | None
+    until_ts: str | None = None
+
+
+BoardStatus = Annotated[
+    BoardNeedsYou | BoardWorking | BoardWaiting,
+    Field(discriminator="status"),
+]
+
+StageId = Literal["resolve", "ci", "review", "merge"]
 
 
 class StageRail(Contract):
-    """Where the issue is on the five-stage track, from one stage-visit fold."""
-
     current: StageId
     # A stage past `current` but at or before `furthest` was reached earlier
-    # and rewound (e.g. a CI fix sent the patch back to review).
+    # and rewound (e.g. a CI fix after review).
     furthest: StageId
     resolve_attempts: int
     review_rounds: int
     ci_runs: int
     steps: int
-    # A paid leg is running now.
+    # A leg is running now.
     live: bool
 
 
 class TrackChip(Contract):
     kind: str
-    outcome: Literal["passed", "failed", "changes_requested", "done", "running"]
-    # Consecutive identical steps folded into this one.
+    outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done"]
+    # Consecutive identical legs folded into this one.
     count: int
 
 
@@ -244,137 +236,45 @@ class StageVisit(Contract):
     steps: list[TrackChip]
 
 
-class BlockedOnIssue(Contract):
-    kind: Literal["issue"]
-    # None when GitHub reports an open dependency without naming it.
-    issue: int | None
-
-
-class BlockedOnPr(Contract):
-    kind: Literal["pr"]
-    pr: int
-
-
-class BlockedOnOverlap(Contract):
-    kind: Literal["overlap"]
-    issue: int | None
-    pr: int | None
-
-
-class BlockedOnTriage(Contract):
-    kind: Literal["triage"]
-    why: Literal["parked"]
-
-
-class BlockedOnQueue(Contract):
-    kind: Literal["queue"]
-
-
-BlockedOn = Annotated[
-    BlockedOnIssue | BlockedOnPr | BlockedOnOverlap | BlockedOnTriage | BlockedOnQueue,
-    Field(discriminator="kind"),
-]
-
-
-class BoardNeedsYou(Contract):
-    status: Literal["needs_you"]
-    ask: Literal["rearm", "escalated", "budget", "awaiting_reply", "merge", "stalled"]
-    headline: str
-    reason: str
-    # When the operator's wait began.
-    since_ts: str | None
-
-
-class BoardWorking(Contract):
-    status: Literal["working"]
-    activity: Literal["agent", "ci", "merge", "handoff"]
-    headline: str
-    reason: str
-    # The row's last activity.
-    since_ts: str | None
-
-
-class BoardBlocked(Contract):
-    status: Literal["blocked"]
-    on: BlockedOn
-    headline: str
-    reason: str
-    # When the hold began; None for a row still queued.
-    since_ts: str | None
-
-
-BoardStatus = Annotated[
-    BoardNeedsYou | BoardWorking | BoardBlocked,
-    Field(discriminator="status"),
-]
+CiState = Literal["passing", "failing", "pending"]
 
 
 class IssueCard(Contract):
+    """One board row: a harness item, by its issue."""
+
     issue: int
     title: str | None
     url: str | None
-    # Presentational only, and optional: a deployment that cannot read labels
-    # (no GitHub, no projected facts) still renders a card.
     labels: list[str] = []
     pr: int | None
     pr_url: str | None
-    pr_state: str | None
-    pr_review_state: Literal["mergeable", "changes_requested"] | None = None
-    # None when the PR has no checks or the rollup was unreadable: the chip
-    # must show no CI signal rather than a guessed green.
-    pr_ci_state: Literal["passing", "failing", "pending"] | None = None
-    stage: str | None
-    done: bool
-    steps: list[CardStep]
-    cost_usd: float | None
+    # None when unread or for another head: no guessed green.
+    pr_ci_state: CiState | None = None
+    board: BoardStatus
+    action: Literal["unblock", "open"] | None = None
+    rail: StageRail
+    history: list[StageVisit] = []
+    cost_usd: float
     estimated: bool
-    projected_cost_usd: float | None
-    projected_model: str | None = None
+    legs: int
     started_ts: str | None
     last_ts: str | None
-    elapsed_s: float | None
-    working_s: float | None
-    idle_s: float | None
-    idle_active: bool
-    # A paid leg is executing right now. The client tick predicate reads this
-    # directly: a human-owned row must not dead-stop both clocks while a leg
-    # is visibly spending (keifu #142/#181, 2026-08-03).
-    leg_running: bool = False
-    # The issues board group; None once the issue is done.
-    board: BoardStatus | None = None
-    rail: StageRail | None = None
-    # cost / projected cost, present only at or above the 2x alarm.
-    overspend_ratio: float | None = None
-    # The router's difficulty tier; None means untriaged.
-    tier: Literal["trivial", "standard", "complex", "exceptional"] | None = None
-    models: list[str]
-    model_badges: list[ModelBadge] = []
-    rounds: int | None
-    issue_verification: str | None = None
-    pr_verification: str | None = None
-    issue_verification_reason: str | None = None
-    pr_verification_reason: str | None = None
-    merged_ts: str | None = None
+    leg_running: bool
 
 
-class PendingCard(Contract):
+class DoneCard(Contract):
+    """A merged harness PR."""
+
     issue: int
     title: str | None
     url: str | None
-    # The drill-down renders the issue text, same as backlog rows.
-    body: str | None = None
-    labels: list[str]
-    held: bool
-    hold_reason: str | None
-    overlap: Any | None
-    # A parked issue remains human-owned work on an open PR. Moving it to the
-    # pending lane must not discard the link or current-head CI rollup.
-    pr: int | None = None
-    pr_url: str | None = None
-    pr_state: str | None = None
-    pr_ci_state: Literal["passing", "failing", "pending"] | None = None
-    board: BoardStatus | None = None
-    rail: StageRail | None = None
+    pr: int
+    pr_url: str | None
+    merged_ts: str | None
+    cost_usd: float
+    legs: int
+    review_rounds: int
+    labels: list[str] = []
 
 
 class BacklogCard(Contract):
@@ -383,8 +283,6 @@ class BacklogCard(Contract):
     url: str | None
     body: str | None
     labels: list[str]
-    recurrence: bool
-    recurrence_count: int
     age_days: int | None
     age_s: int | None = None
     comments: int | None
@@ -405,116 +303,82 @@ class ToastNotification(Contract):
 
 class IssuesPayload(Warned):
     in_flight: list[IssueCard]
-    pending: list[PendingCard]
-    done: list[IssueCard]
+    done: list[DoneCard]
     backlog: list[BacklogCard]
     gh_ok: bool
+    # When the GitHub observation the board derives from was taken; None
+    # while the first one is still being read.
+    observed_at: str | None = None
     notifications: list[ToastNotification] = []
+    # Why the control store could not be read; no board is derived then.
+    store_error: str | None = None
 
 
 class TokenUsage(Contract):
-    input_tokens: int | None
-    output_tokens: int | None
-    cache_read_input_tokens: int | None
-    cache_creation_input_tokens: int | None
-
-
-class IssueStepEscalation(Contract):
-    notches: int
-    from_effort: str | None = None
-    to_effort: str | None = None
-    after_review_round: int | None = None
-
-
-class IssueStepReview(Contract):
-    # Agent-authored and therefore untrusted. The server bounds it before it
-    # reaches a client; clients must render it as text, never as Markdown/HTML.
-    verdict_excerpt: str | None = None
-    rejection: int | None = None
-
-
-class IssueStepChange(Contract):
-    pr: int
-    branch: str | None = None
-    head_sha: str | None = None
-    commit_subjects: list[str] = Field(default_factory=list)
-    files_changed_count: int | None = None
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
 
 
 class IssueStep(Contract):
+    """One leg."""
+
     idx: int
+    leg_id: str
     kind: str
     role: str | None
-    ts: str | None
-    state: str
-    status: str | None
-    exit_reason: str | None
+    runtime: str | None
+    state: Literal["reserved", "running", "ended", "released"]
+    # carried: copied from the legacy store at the cutover; money history only.
+    outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done", "carried"]
+    started_ts: str | None
+    ended_ts: str | None
     duration_s: float | None
-    cost_usd: float | None
+    cost_usd: float
     estimated: bool
-    model: str | None
-    effort: str | None = None
-    runtime: str | None = None
+    pricing_basis: str | None
+    end_reason: str | None
     session_id: str | None
-    turns: int | None
     usage: TokenUsage | None
-    has_transcript: bool
-    note: str | None = None
-    pricing_basis: str | None = None
-    budget_cap_usd: float | None = None
-    escalation: IssueStepEscalation | None = None
-    review: IssueStepReview | None = None
-    change: IssueStepChange | None = None
+    head: str | None
+    pr: int | None
+    # Agent-authored and bounded: render as text.
+    summary: str | None = None
+    question: str | None = None
+    verdict: str | None = None
+    verdict_excerpt: str | None = None
 
 
 class PullRequestLink(Contract):
     number: int
     url: str | None
-    state: str | None
+    state: Literal["open", "merged"]
+    ci_state: CiState | None = None
 
 
 class IssueDetailPayload(Warned):
     issue: int
     title: str | None
     url: str | None
-    stage: str | None
-    attention_reason: str | None = None
-    escalation_reason: str | None = None
-    # The issue or its newest PR carries `needs-human`: the Unblock control.
-    held_for_human: bool = False
+    labels: list[str] = []
+    # None when the issue is not a harness item right now.
+    board: BoardStatus | None = None
+    action: Literal["unblock", "open"] | None = None
     done: bool
-    prs: list[int]
+    # The issue or its PR carries `needs-human`: the Unblock control.
+    held_for_human: bool = False
     pull_requests: list[PullRequestLink]
-    # Current-head check rollup for the newest PR. A completed repair leg is
-    # not evidence that GitHub checks subsequently passed.
-    pr_ci_state: Literal["passing", "failing", "pending"] | None = None
-    cost_usd: float | None
-    elapsed_s: float | None
-    working_s: float | None
-    idle_s: float | None
-    idle_active: bool
-    # See IssueCard.leg_running.
-    leg_running: bool = False
-    steps: list[IssueStep]
-    events: list[dict[str, Any]]
+    cost_usd: float
+    estimated: bool
     rail: StageRail | None = None
-    # One entry per visit to a stage, oldest first.
     history: list[StageVisit] = []
-    # The harness's full escalation comment while the escalation is active.
-    # It relays agent prose: clients render it as text, never as Markdown.
-    harness_message: str | None = None
-
-
-class StepEventsPayload(Warned):
-    events: list[dict[str, Any]]
+    steps: list[IssueStep]
+    # Why the control store could not be read; no board is derived then.
+    store_error: str | None = None
 
 
 class ActionResult(Contract):
     ok: bool
     detail: str
 
-
-class UnblockRequest(BaseModel):
-    """Unblock is a label move; it accepts no body fields."""
-
-    model_config = ConfigDict(extra="forbid")

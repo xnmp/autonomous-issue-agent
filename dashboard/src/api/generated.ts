@@ -55,40 +55,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/repos/{name}/issues/{number}/cost-chart": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Api Cost Chart */
-        get: operations["api_cost_chart_api_repos__name__issues__number__cost_chart_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/repos/{name}/issues/{number}/park": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Park */
-        post: operations["api_park_api_repos__name__issues__number__park_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/repos/{name}/issues/{number}/promote": {
         parameters: {
             query?: never;
@@ -100,23 +66,6 @@ export interface paths {
         put?: never;
         /** Api Promote */
         post: operations["api_promote_api_repos__name__issues__number__promote_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/repos/{name}/issues/{number}/steps/{idx}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Api Step Events */
-        get: operations["api_step_events_api_repos__name__issues__number__steps__idx__events_get"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -151,23 +100,6 @@ export interface paths {
         get: operations["api_overview_api_repos__name__overview_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/repos/{name}/start": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Start */
-        post: operations["api_start_api_repos__name__start_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -242,10 +174,15 @@ export interface components {
         AttentionItem: {
             /** Detail */
             detail?: string | null;
+            /** Headline */
+            headline: string;
             /** Issue */
             issue: number;
-            /** Kind */
-            kind: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "question" | "attempts" | "review-rounds" | "lifetime-cap" | "workflow-path" | "labelled";
             /** Title */
             title?: string | null;
         } & {
@@ -271,10 +208,6 @@ export interface components {
             issue_type?: string | null;
             /** Labels */
             labels: string[];
-            /** Recurrence */
-            recurrence: boolean;
-            /** Recurrence Count */
-            recurrence_count: number;
             /** Title */
             title: string | null;
             /** Url */
@@ -282,99 +215,28 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** BlockedOnIssue */
-        BlockedOnIssue: {
-            /** Issue */
-            issue: number | null;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "issue";
-        } & {
-            [key: string]: unknown;
-        };
-        /** BlockedOnOverlap */
-        BlockedOnOverlap: {
-            /** Issue */
-            issue: number | null;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "overlap";
-            /** Pr */
-            pr: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** BlockedOnPr */
-        BlockedOnPr: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "pr";
-            /** Pr */
-            pr: number;
-        } & {
-            [key: string]: unknown;
-        };
-        /** BlockedOnQueue */
-        BlockedOnQueue: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "queue";
-        } & {
-            [key: string]: unknown;
-        };
-        /** BlockedOnTriage */
-        BlockedOnTriage: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            kind: "triage";
-            /**
-             * Why
-             * @constant
-             * @enum {string}
-             */
-            why: "parked";
-        } & {
-            [key: string]: unknown;
-        };
-        /** BoardBlocked */
-        BoardBlocked: {
-            /** Headline */
-            headline: string;
-            /** On */
-            on: components["schemas"]["BlockedOnIssue"] | components["schemas"]["BlockedOnPr"] | components["schemas"]["BlockedOnOverlap"] | components["schemas"]["BlockedOnTriage"] | components["schemas"]["BlockedOnQueue"];
-            /** Reason */
-            reason: string;
-            /** Since Ts */
-            since_ts: string | null;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "blocked";
+        /** BasisCost */
+        BasisCost: {
+            /** Basis */
+            basis: string;
+            /** Usd */
+            usd: number;
         } & {
             [key: string]: unknown;
         };
         /** BoardNeedsYou */
         BoardNeedsYou: {
-            /**
-             * Ask
-             * @enum {string}
-             */
-            ask: "rearm" | "escalated" | "budget" | "awaiting_reply" | "merge" | "stalled";
+            /** Detail */
+            detail: string | null;
             /** Headline */
             headline: string;
-            /** Reason */
-            reason: string;
+            /** Hint */
+            hint: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "question" | "attempts" | "review-rounds" | "lifetime-cap" | "workflow-path" | "labelled";
             /** Since Ts */
             since_ts: string | null;
             /**
@@ -382,16 +244,46 @@ export interface components {
              * @enum {string}
              */
             status: "needs_you";
+            /**
+             * Target
+             * @enum {string}
+             */
+            target: "issue" | "pr";
+        } & {
+            [key: string]: unknown;
+        };
+        /** BoardWaiting */
+        BoardWaiting: {
+            /** Headline */
+            headline: string;
+            /**
+             * On
+             * @enum {string}
+             */
+            on: "branch-protection" | "human-review" | "headroom" | "backoff" | "github";
+            /** Reason */
+            reason: string;
+            /** Since Ts */
+            since_ts: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "waiting";
+            /** Until Ts */
+            until_ts?: string | null;
         } & {
             [key: string]: unknown;
         };
         /** BoardWorking */
         BoardWorking: {
+            /** Act */
+            act: string | null;
             /**
              * Activity
              * @enum {string}
              */
-            activity: "agent" | "ci" | "merge" | "handoff";
+            activity: "agent" | "queued" | "ci" | "merge" | "update" | "open_pr" | "release";
             /** Headline */
             headline: string;
             /** Reason */
@@ -410,28 +302,12 @@ export interface components {
         Caps: {
             /** Daily Cap Usd */
             daily_cap_usd: number | null;
+            /** Global Daily Cap Usd */
+            global_daily_cap_usd: number | null;
             /** Issue Cap Usd */
             issue_cap_usd: number | null;
             /** Today Usd */
             today_usd: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** CardStep */
-        CardStep: {
-            /** Cost Usd */
-            cost_usd: number | null;
-            /**
-             * Count
-             * @default 1
-             */
-            count: number;
-            /** Kind */
-            kind: string;
-            /** State */
-            state: string;
-            /** Status */
-            status: string | null;
         } & {
             [key: string]: unknown;
         };
@@ -471,23 +347,34 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** CostMix */
-        CostMix: {
-            /** Repair Usd */
-            repair_usd: number | null;
-            /** Resolve Usd */
-            resolve_usd: number | null;
-            /** Review Usd */
-            review_usd: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** EscalationReason */
-        EscalationReason: {
+        /**
+         * DoneCard
+         * @description A merged harness PR.
+         */
+        DoneCard: {
+            /** Cost Usd */
+            cost_usd: number;
             /** Issue */
             issue: number;
-            /** Reason */
-            reason?: string | null;
+            /**
+             * Labels
+             * @default []
+             */
+            labels: string[];
+            /** Legs */
+            legs: number;
+            /** Merged Ts */
+            merged_ts: string | null;
+            /** Pr */
+            pr: number;
+            /** Pr Url */
+            pr_url: string | null;
+            /** Review Rounds */
+            review_rounds: number;
+            /** Title */
+            title: string | null;
+            /** Url */
+            url: string | null;
         } & {
             [key: string]: unknown;
         };
@@ -526,65 +413,33 @@ export interface components {
             closed: number;
             /** Day */
             day: string;
-            /** First Observation */
-            first_observation: boolean;
             /** Net Open */
             net_open: number;
             /** Opened */
             opened: number;
-            /** Recurrences */
-            recurrences: number;
         } & {
             [key: string]: unknown;
         };
-        /** InterventionCount */
-        InterventionCount: {
-            /** Count */
-            count: number;
-            /** Name */
-            name: string;
-        } & {
-            [key: string]: unknown;
-        };
-        /** InterventionEvent */
-        InterventionEvent: {
-            /** Action Class */
-            action_class: string;
-            /** Detail */
-            detail?: string | null;
-            /** Issue */
-            issue?: number | null;
-            /** Kind */
-            kind: string;
-            /** Pr */
-            pr?: number | null;
-            /** Ts */
-            ts: string | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** IssueCard */
+        /**
+         * IssueCard
+         * @description One board row: a harness item, by its issue.
+         */
         IssueCard: {
+            /** Action */
+            action?: ("unblock" | "open") | null;
             /** Board */
-            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
+            board: components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardWaiting"];
             /** Cost Usd */
-            cost_usd: number | null;
-            /** Done */
-            done: boolean;
-            /** Elapsed S */
-            elapsed_s: number | null;
+            cost_usd: number;
             /** Estimated */
             estimated: boolean;
-            /** Idle Active */
-            idle_active: boolean;
-            /** Idle S */
-            idle_s: number | null;
+            /**
+             * History
+             * @default []
+             */
+            history: components["schemas"]["StageVisit"][];
             /** Issue */
             issue: number;
-            /** Issue Verification */
-            issue_verification?: string | null;
-            /** Issue Verification Reason */
-            issue_verification_reason?: string | null;
             /**
              * Labels
              * @default []
@@ -592,78 +447,38 @@ export interface components {
             labels: string[];
             /** Last Ts */
             last_ts: string | null;
-            /**
-             * Leg Running
-             * @default false
-             */
+            /** Leg Running */
             leg_running: boolean;
-            /** Merged Ts */
-            merged_ts?: string | null;
-            /**
-             * Model Badges
-             * @default []
-             */
-            model_badges: components["schemas"]["ModelBadge"][];
-            /** Models */
-            models: string[];
-            /** Overspend Ratio */
-            overspend_ratio?: number | null;
+            /** Legs */
+            legs: number;
             /** Pr */
             pr: number | null;
             /** Pr Ci State */
             pr_ci_state?: ("passing" | "failing" | "pending") | null;
-            /** Pr Review State */
-            pr_review_state?: ("mergeable" | "changes_requested") | null;
-            /** Pr State */
-            pr_state: string | null;
             /** Pr Url */
             pr_url: string | null;
-            /** Pr Verification */
-            pr_verification?: string | null;
-            /** Pr Verification Reason */
-            pr_verification_reason?: string | null;
-            /** Projected Cost Usd */
-            projected_cost_usd: number | null;
-            /** Projected Model */
-            projected_model?: string | null;
-            rail?: components["schemas"]["StageRail"] | null;
-            /** Rounds */
-            rounds: number | null;
-            /** Stage */
-            stage: string | null;
+            rail: components["schemas"]["StageRail"];
             /** Started Ts */
             started_ts: string | null;
-            /** Steps */
-            steps: components["schemas"]["CardStep"][];
-            /** Tier */
-            tier?: ("trivial" | "standard" | "complex" | "exceptional") | null;
             /** Title */
             title: string | null;
             /** Url */
             url: string | null;
-            /** Working S */
-            working_s: number | null;
         } & {
             [key: string]: unknown;
         };
         /** IssueDetailPayload */
         IssueDetailPayload: {
-            /** Attention Reason */
-            attention_reason?: string | null;
+            /** Action */
+            action?: ("unblock" | "open") | null;
+            /** Board */
+            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardWaiting"]) | null;
             /** Cost Usd */
-            cost_usd: number | null;
+            cost_usd: number;
             /** Done */
             done: boolean;
-            /** Elapsed S */
-            elapsed_s: number | null;
-            /** Escalation Reason */
-            escalation_reason?: string | null;
-            /** Events */
-            events: {
-                [key: string]: unknown;
-            }[];
-            /** Harness Message */
-            harness_message?: string | null;
+            /** Estimated */
+            estimated: boolean;
             /**
              * Held For Human
              * @default false
@@ -674,118 +489,81 @@ export interface components {
              * @default []
              */
             history: components["schemas"]["StageVisit"][];
-            /** Idle Active */
-            idle_active: boolean;
-            /** Idle S */
-            idle_s: number | null;
             /** Issue */
             issue: number;
             /**
-             * Leg Running
-             * @default false
+             * Labels
+             * @default []
              */
-            leg_running: boolean;
-            /** Pr Ci State */
-            pr_ci_state?: ("passing" | "failing" | "pending") | null;
-            /** Prs */
-            prs: number[];
+            labels: string[];
             /** Pull Requests */
             pull_requests: components["schemas"]["PullRequestLink"][];
             rail?: components["schemas"]["StageRail"] | null;
-            /** Stage */
-            stage: string | null;
             /** Steps */
             steps: components["schemas"]["IssueStep"][];
+            /** Store Error */
+            store_error?: string | null;
             /** Title */
             title: string | null;
             /** Url */
             url: string | null;
             /** Warnings */
             warnings: string[];
-            /** Working S */
-            working_s: number | null;
         } & {
             [key: string]: unknown;
         };
-        /** IssueStep */
+        /**
+         * IssueStep
+         * @description One leg.
+         */
         IssueStep: {
-            /** Budget Cap Usd */
-            budget_cap_usd?: number | null;
-            change?: components["schemas"]["IssueStepChange"] | null;
             /** Cost Usd */
-            cost_usd: number | null;
+            cost_usd: number;
             /** Duration S */
             duration_s: number | null;
-            /** Effort */
-            effort?: string | null;
-            escalation?: components["schemas"]["IssueStepEscalation"] | null;
+            /** End Reason */
+            end_reason: string | null;
+            /** Ended Ts */
+            ended_ts: string | null;
             /** Estimated */
             estimated: boolean;
-            /** Exit Reason */
-            exit_reason: string | null;
-            /** Has Transcript */
-            has_transcript: boolean;
+            /** Head */
+            head: string | null;
             /** Idx */
             idx: number;
             /** Kind */
             kind: string;
-            /** Model */
-            model: string | null;
-            /** Note */
-            note?: string | null;
+            /** Leg Id */
+            leg_id: string;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done" | "carried";
+            /** Pr */
+            pr: number | null;
             /** Pricing Basis */
-            pricing_basis?: string | null;
-            review?: components["schemas"]["IssueStepReview"] | null;
+            pricing_basis: string | null;
+            /** Question */
+            question?: string | null;
             /** Role */
             role: string | null;
             /** Runtime */
-            runtime?: string | null;
+            runtime: string | null;
             /** Session Id */
             session_id: string | null;
-            /** State */
-            state: string;
-            /** Status */
-            status: string | null;
-            /** Ts */
-            ts: string | null;
-            /** Turns */
-            turns: number | null;
+            /** Started Ts */
+            started_ts: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "reserved" | "running" | "ended" | "released";
+            /** Summary */
+            summary?: string | null;
             usage: components["schemas"]["TokenUsage"] | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** IssueStepChange */
-        IssueStepChange: {
-            /** Branch */
-            branch?: string | null;
-            /** Commit Subjects */
-            commit_subjects?: string[];
-            /** Files Changed Count */
-            files_changed_count?: number | null;
-            /** Head Sha */
-            head_sha?: string | null;
-            /** Pr */
-            pr: number;
-        } & {
-            [key: string]: unknown;
-        };
-        /** IssueStepEscalation */
-        IssueStepEscalation: {
-            /** After Review Round */
-            after_review_round?: number | null;
-            /** From Effort */
-            from_effort?: string | null;
-            /** Notches */
-            notches: number;
-            /** To Effort */
-            to_effort?: string | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** IssueStepReview */
-        IssueStepReview: {
-            /** Rejection */
-            rejection?: number | null;
+            /** Verdict */
+            verdict?: string | null;
             /** Verdict Excerpt */
             verdict_excerpt?: string | null;
         } & {
@@ -796,7 +574,7 @@ export interface components {
             /** Backlog */
             backlog: components["schemas"]["BacklogCard"][];
             /** Done */
-            done: components["schemas"]["IssueCard"][];
+            done: components["schemas"]["DoneCard"][];
             /** Gh Ok */
             gh_ok: boolean;
             /** In Flight */
@@ -806,8 +584,10 @@ export interface components {
              * @default []
              */
             notifications: components["schemas"]["ToastNotification"][];
-            /** Pending */
-            pending: components["schemas"]["PendingCard"][];
+            /** Observed At */
+            observed_at?: string | null;
+            /** Store Error */
+            store_error?: string | null;
             /** Warnings */
             warnings: string[];
         } & {
@@ -826,76 +606,52 @@ export interface components {
         };
         /** Metrics */
         Metrics: {
+            /** By Basis */
+            by_basis: components["schemas"]["BasisCost"][];
             /** By Kind */
             by_kind: components["schemas"]["KindCost"][];
-            /** Cost Per Done Usd */
-            cost_per_done_usd: number | null;
-            /** Done Issues */
-            done_issues: number;
-            /** Escalations */
-            escalations: number;
+            /** Cost Per Merged Pr Usd */
+            cost_per_merged_pr_usd: number | null;
             /** First Pass Approvals */
-            first_pass_approvals: number | null;
+            first_pass_approvals: number;
             /** First Pass Changes */
-            first_pass_changes: number | null;
+            first_pass_changes: number;
             /** First Pass Rate */
             first_pass_rate: number | null;
-            /** In Flight Issues */
-            in_flight_issues: number;
+            /** Legs */
+            legs: number;
+            /** Machine Legs */
+            machine_legs: number;
+            /** Merged Prs */
+            merged_prs: number | null;
             /**
-             * Interventions By Class
-             * @default []
+             * Merged Prs Partial
+             * @default false
              */
-            interventions_by_class: components["schemas"]["InterventionCount"][];
-            /** Interventions Per Merged Pr */
-            interventions_per_merged_pr?: number | null;
-            /**
-             * Interventions Total
-             * @default 0
-             */
-            interventions_total: number;
-            /** Recurrences */
-            recurrences: number;
+            merged_prs_partial: boolean;
+            /** Needs Human */
+            needs_human: number | null;
+            /** Open Items */
+            open_items: number | null;
             /** Rounds Per Pr */
             rounds_per_pr: number | null;
-            /** Spend Blocks */
-            spend_blocks: number;
             /** Today Usd */
-            today_usd: number | null;
+            today_usd: number;
             /** Total Cost Usd */
-            total_cost_usd: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** ModelBadge */
-        ModelBadge: {
-            /** Effort */
-            effort: string | null;
-            /** Model */
-            model: string;
+            total_cost_usd: number;
         } & {
             [key: string]: unknown;
         };
         /** OverviewPayload */
         OverviewPayload: {
             caps: components["schemas"]["Caps"] | null;
-            cost_mix: components["schemas"]["CostMix"] | null;
-            /**
-             * Escalation Reasons
-             * @default []
-             */
-            escalation_reasons: components["schemas"]["EscalationReason"][];
-            /** First Observed Day */
-            first_observed_day?: string | null;
             /** Health */
             health: components["schemas"]["RoleHealth"][];
-            /** Health Trend */
-            health_trend: components["schemas"]["HealthTrendDay"][];
             /**
-             * Interventions
+             * Health Trend
              * @default []
              */
-            interventions: components["schemas"]["InterventionEvent"][];
+            health_trend: components["schemas"]["HealthTrendDay"][];
             metrics: components["schemas"]["Metrics"] | null;
             /**
              * Needs Attention
@@ -907,54 +663,24 @@ export interface components {
              * @default []
              */
             spend_per_hour: components["schemas"]["SpendBucket"][];
-            /**
-             * Unattributed Count
-             * @default 0
-             */
-            unattributed_count: number;
+            /** Store Error */
+            store_error?: string | null;
             /** Warnings */
             warnings: string[];
         } & {
             [key: string]: unknown;
         };
-        /** PendingCard */
-        PendingCard: {
-            /** Board */
-            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
-            /** Body */
-            body?: string | null;
-            /** Held */
-            held: boolean;
-            /** Hold Reason */
-            hold_reason: string | null;
-            /** Issue */
-            issue: number;
-            /** Labels */
-            labels: string[];
-            /** Overlap */
-            overlap: unknown | null;
-            /** Pr */
-            pr?: number | null;
-            /** Pr Ci State */
-            pr_ci_state?: ("passing" | "failing" | "pending") | null;
-            /** Pr State */
-            pr_state?: string | null;
-            /** Pr Url */
-            pr_url?: string | null;
-            rail?: components["schemas"]["StageRail"] | null;
-            /** Title */
-            title: string | null;
-            /** Url */
-            url: string | null;
-        } & {
-            [key: string]: unknown;
-        };
         /** PullRequestLink */
         PullRequestLink: {
+            /** Ci State */
+            ci_state?: ("passing" | "failing" | "pending") | null;
             /** Number */
             number: number;
-            /** State */
-            state: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "open" | "merged";
             /** Url */
             url: string | null;
         } & {
@@ -965,11 +691,11 @@ export interface components {
             /** Active */
             active: boolean | null;
             /** Done */
-            done: number;
+            done: number | null;
             /** Frecency */
             frecency: number;
             /** In Flight */
-            in_flight: number;
+            in_flight: number | null;
             /** Is Self */
             is_self: boolean;
             /** Last Activity Ts */
@@ -998,14 +724,8 @@ export interface components {
         RoleHealth: {
             /** Alive */
             alive: boolean | null;
-            /** Events */
-            events: number;
-            /** Last Event */
-            last_event: string | null;
-            /** Last Event Ts */
-            last_event_ts: string | null;
-            /** Log Path */
-            log_path: string | null;
+            /** Heartbeat Ts */
+            heartbeat_ts: string | null;
             /** Role */
             role: string;
             /** Stale */
@@ -1022,10 +742,7 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /**
-         * StageRail
-         * @description Where the issue is on the five-stage track, from one stage-visit fold.
-         */
+        /** StageRail */
         StageRail: {
             /** Ci Runs */
             ci_runs: number;
@@ -1033,12 +750,12 @@ export interface components {
              * Current
              * @enum {string}
              */
-            current: "triage" | "resolve" | "review" | "ci" | "merge";
+            current: "resolve" | "ci" | "review" | "merge";
             /**
              * Furthest
              * @enum {string}
              */
-            furthest: "triage" | "resolve" | "review" | "ci" | "merge";
+            furthest: "resolve" | "ci" | "review" | "merge";
             /** Live */
             live: boolean;
             /** Resolve Attempts */
@@ -1056,20 +773,9 @@ export interface components {
              * Stage
              * @enum {string}
              */
-            stage: "triage" | "resolve" | "review" | "ci" | "merge";
+            stage: "resolve" | "ci" | "review" | "merge";
             /** Steps */
             steps: components["schemas"]["TrackChip"][];
-        } & {
-            [key: string]: unknown;
-        };
-        /** StepEventsPayload */
-        StepEventsPayload: {
-            /** Events */
-            events: {
-                [key: string]: unknown;
-            }[];
-            /** Warnings */
-            warnings: string[];
         } & {
             [key: string]: unknown;
         };
@@ -1097,14 +803,14 @@ export interface components {
         };
         /** TokenUsage */
         TokenUsage: {
-            /** Cache Creation Input Tokens */
-            cache_creation_input_tokens: number | null;
-            /** Cache Read Input Tokens */
-            cache_read_input_tokens: number | null;
+            /** Cache Read Tokens */
+            cache_read_tokens: number;
+            /** Cache Write Tokens */
+            cache_write_tokens: number;
             /** Input Tokens */
-            input_tokens: number | null;
+            input_tokens: number;
             /** Output Tokens */
-            output_tokens: number | null;
+            output_tokens: number;
         } & {
             [key: string]: unknown;
         };
@@ -1118,15 +824,10 @@ export interface components {
              * Outcome
              * @enum {string}
              */
-            outcome: "passed" | "failed" | "changes_requested" | "done" | "running";
+            outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done";
         } & {
             [key: string]: unknown;
         };
-        /**
-         * UnblockRequest
-         * @description Unblock is a label move; it accepts no body fields.
-         */
-        UnblockRequest: Record<string, never>;
         /** UsagePayload */
         UsagePayload: {
             claude: components["schemas"]["ClaudeUsage"] | null;
@@ -1270,72 +971,6 @@ export interface operations {
             };
         };
     };
-    api_cost_chart_api_repos__name__issues__number__cost_chart_get: {
-        parameters: {
-            query?: {
-                session_id?: string;
-            };
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_park_api_repos__name__issues__number__park_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     api_promote_api_repos__name__issues__number__promote_post: {
         parameters: {
             query?: never;
@@ -1368,39 +1003,6 @@ export interface operations {
             };
         };
     };
-    api_step_events_api_repos__name__issues__number__steps__idx__events_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-                idx: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["StepEventsPayload"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     api_unblock_api_repos__name__issues__number__unblock_post: {
         parameters: {
             query?: never;
@@ -1411,11 +1013,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["UnblockRequest"] | null;
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -1457,37 +1055,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["OverviewPayload"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_start_api_repos__name__start_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ActionResult"];
                 };
             };
             /** @description Validation Error */

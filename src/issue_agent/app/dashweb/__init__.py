@@ -1,9 +1,8 @@
-"""Interactive web dashboard — FastAPI backend over the journal-only aggregation.
+"""Interactive web dashboard: a FastAPI backend over the derived state.
 
-`app/dashboard.py` stays the single source of truth for costs, stages and legs;
-this package adds the three things a text snapshot cannot have: live polling,
-cached read-only `gh` context (titles, PR state, the backlog), and the three
-operator actions that only a loopback server can offer.
+The board is `domain.state.derive` over the roles' observation and the
+control store (read-only); metrics come from the `legs` table plus GitHub.
+The only writes are two label changes (promote, unblock).
 
 fastapi/uvicorn live in the optional `dash` extra, so nothing here may be
 imported by a daemon path. The submodules are exposed lazily for exactly that

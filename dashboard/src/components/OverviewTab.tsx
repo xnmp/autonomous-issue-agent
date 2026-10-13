@@ -1,33 +1,31 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import type {
-  EscalationReason,
+  AttentionItem,
   HealthTrendDay,
-  InterventionEvent,
   OverviewPayload,
   RoleHealth,
 } from "../api/types";
 import {
   HEALTH_LABEL,
   HEALTH_TONE,
+  mixSlices,
   roleHealth,
   utilTone,
 } from "../lib/semantics";
-import { localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
+import { ago, localHour, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Histogram, Meter, StatTile } from "./ui/Charts";
-import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
-import { Icon } from "./ui/Icon";
+import { EmptyState, ErrorBanner, Loading, SkeletonRows, StoreUnavailable, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
-import { tipProps } from "./ui/Tip";
 
 const POLL_MS = 10_000;
 
 /**
- * The "is this on rails?" view. Live human blockers and operator actions lead;
- * measurements and historical diagnostics follow in progressively quieter
+ * The "is this on rails?" view. Items waiting on a human lead; measurements
+ * (all folded from `legs` and GitHub merges) follow in progressively quieter
  * groups so urgent work never competes with lifetime counters.
  */
 export function OverviewTab({
@@ -49,13 +47,8 @@ export function OverviewTab({
 
   const m = ov.data?.metrics ?? null;
   const caps = ov.data?.caps ?? null;
-
-  const escalations = m?.escalations ?? 0;
-  const recurrences = m?.recurrences ?? 0;
-  const spendBlocks = m?.spend_blocks ?? 0;
-  const byClass = new Map(
-    (m?.interventions_by_class ?? []).map((row) => [row.name, row.count]),
-  );
+  const needsHuman = m?.needs_human ?? 0;
+  const mix = mixSlices(m?.by_kind);
 
   const todayUsd = caps?.today_usd ?? m?.today_usd ?? null;
   const dailyPct =
@@ -71,14 +64,15 @@ export function OverviewTab({
       {ov.error ? (
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
+      <StoreUnavailable detail={ov.data?.store_error} />
       <WarningList warnings={ov.data?.warnings} />
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
       <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile
-          label="Done"
-          value={num(m?.done_issues)}
-          sub={ov.data?.first_observed_day ? `since ${ov.data.first_observed_day}` : "deployment start unknown"}
+          label="Merged"
+          value={m?.merged_prs_partial ? `≥${num(m.merged_prs)}` : num(m?.merged_prs)}
+          sub={m?.merged_prs == null ? "GitHub not read yet" : m.merged_prs_partial ? "newest harness PRs only" : "harness PRs"}
           tone="ok"
           title="open done issues"
           onClick={() => onOpenIssues("done")}
@@ -86,68 +80,57 @@ export function OverviewTab({
         />
         <StatTile
           label="In flight"
-          value={num(m?.in_flight_issues)}
-          tone={(m?.in_flight_issues ?? 0) > 0 ? "running" : "neutral"}
-          title="open in-flight and pending issues"
+          value={num(m?.open_items)}
+          tone={(m?.open_items ?? 0) > 0 ? "running" : "neutral"}
+          title="open in-flight issues"
           onClick={() => onOpenIssues("inflight")}
           primary
         />
         <StatTile
-          label="$ per done"
-          value={usdCompact(m?.cost_per_done_usd)}
-          sub={m?.total_cost_usd != null ? `${usd(m.total_cost_usd)} total` : null}
+          label="$ per merged PR"
+          value={m?.merged_prs_partial && m.cost_per_merged_pr_usd != null
+            ? `≤${usdCompact(m.cost_per_merged_pr_usd)}` : usdCompact(m?.cost_per_merged_pr_usd)}
+          sub={m ? `${usd(m.total_cost_usd)} total${m.merged_prs_partial ? " · older merges not listed" : ""}` : null}
           tone="info"
-          title="the primary efficiency number: total journalled spend / done issues"
+          title="the primary efficiency number: total leg spend / merged harness PRs"
           primary
         />
         <CapsTile
           todayUsd={todayUsd}
           dailyCapUsd={caps?.daily_cap_usd ?? null}
           issueCapUsd={caps?.issue_cap_usd ?? null}
-          spendBlocks={spendBlocks}
+          globalCapUsd={caps?.global_daily_cap_usd ?? null}
           dailyPct={dailyPct}
         />
       </div>
       <div className="tiles overview-metrics overview-metrics-secondary">
         <StatTile
+          label="Needs you"
+          value={num(m?.needs_human)}
+          tone={needsHuman > 0 ? "fail" : "neutral"}
+          title="items labelled needs-human: nothing moves until a person acts"
+          onClick={() => onOpenIssues("inflight")}
+        />
+        <StatTile
           label="First-pass rate"
           value={rate(m?.first_pass_rate)}
-          sub={
-            m?.first_pass_approvals != null || m?.first_pass_changes != null
-              ? `${num(m?.first_pass_approvals)} approve / ${num(m?.first_pass_changes)} changes`
-              : null
-          }
+          sub={m ? `${num(m.first_pass_approvals)} approve / ${num(m.first_pass_changes)} changes` : null}
           tone={(m?.first_pass_rate ?? 1) < 0.5 ? "running" : "ok"}
           title="review APPROVE vs REQUEST_CHANGES on the first round — the power guardrail"
         />
         <StatTile label="Rounds / PR" value={num(m?.rounds_per_pr, 2)} tone="neutral" />
         <StatTile
-          label="Interventions / PR"
-          value={num(m?.interventions_per_merged_pr, 2)}
-          sub={`${byClass.get("rearm") ?? 0} rearm / ${byClass.get("policy") ?? 0} policy / ${byClass.get("other") ?? 0} other`}
-          tone={(m?.interventions_per_merged_pr ?? 0) > 0 ? "running" : "ok"}
-          title="journalled operator re-arms per merged PR — the unattended-operation metric; policy promotes are counted but excluded from the ratio"
-        />
-        {/* Lifetime counters, not live alarms: the value carries the tone,
-            the tile frame stays quiet. A red-bordered tile that can never go
-            calm again teaches the operator to ignore red. */}
-        <StatTile
-          label="Escalations"
-          value={num(escalations)}
-          sub={
-            <EscalationDetail
-              reasons={ov.data?.escalation_reasons ?? []}
-              spendBlocks={spendBlocks}
-            />
-          }
-          tone={escalations > 0 || spendBlocks > 0 ? "fail" : "neutral"}
-          title="needs-human-review relabels, retry exhaustion, infra deaths"
+          label="Legs"
+          value={num(m?.legs)}
+          sub={mix.map((slice) => `${slice.label.toLowerCase()} ${usdCompact(slice.usd)}`).join(" · ")}
+          tone="neutral"
+          title="paid agent legs, with spend by leg family"
         />
         <StatTile
-          label="Recurrences"
-          value={num(recurrences)}
-          tone={recurrences > 0 ? "fail" : "neutral"}
-          title="harness-resolved issues that came back — the ground-truth guardrail"
+          label="Machine failures"
+          value={num(m?.machine_legs)}
+          tone={(m?.machine_legs ?? 0) > 0 ? "running" : "neutral"}
+          title="legs that ended without a usable return (crash, timeout, cancellation) — the infra-death guardrail"
         />
       </div>
 
@@ -155,11 +138,11 @@ export function OverviewTab({
         <section className="overview-health panel">
           <div className="panel-hd">
             <span className="panel-title">Daemon health</span>
-            <span className="faint">live role journals</span>
+            <span className="faint">role heartbeats</span>
           </div>
           <div className="panel-bd health-list">
             {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
-              <EmptyState>no role journals found for this deployment</EmptyState>
+              <EmptyState>no role heartbeats found for this deployment</EmptyState>
             ) : null}
             {(ov.data?.health ?? []).map((h) => (
               <HealthRow key={h.role} health={h} />
@@ -168,16 +151,13 @@ export function OverviewTab({
         </section>
       ) : null}
 
-      <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
+      <section className={`panel operator-actions-panel${(ov.data?.needs_attention ?? []).length > 0 ? " operator-actions-active" : ""}`}>
         <div className="panel-hd">
-          <span className="panel-title">Operator actions</span>
-          <span className="faint">newest first</span>
+          <span className="panel-title">Needs you</span>
+          <span className="faint">stopped and labelled needs-human</span>
         </div>
         <div className="panel-bd flush">
-          <InterventionList
-            rows={ov.data?.interventions ?? []}
-            loading={ov.loading}
-          />
+          <AttentionList rows={ov.data?.needs_attention ?? []} loading={ov.loading} />
         </div>
       </section>
 
@@ -186,8 +166,6 @@ export function OverviewTab({
       {showIssueHealthTrend ? (
         <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
       ) : null}
-
-      <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
     </div>
   );
 }
@@ -196,13 +174,13 @@ function CapsTile({
   todayUsd,
   dailyCapUsd,
   issueCapUsd,
-  spendBlocks,
+  globalCapUsd,
   dailyPct,
 }: {
   todayUsd: number | null;
   dailyCapUsd: number | null;
   issueCapUsd: number | null;
-  spendBlocks: number;
+  globalCapUsd: number | null;
   dailyPct: number | null;
 }) {
   const tone = utilTone(dailyPct);
@@ -231,9 +209,9 @@ function CapsTile({
       />
       <div className="cap-meta">
         <span className="faint">Per issue <span className="mono">{usd(issueCapUsd)}</span></span>
-        <span className={spendBlocks > 0 ? "tone-fail" : "faint"}>
-          {num(spendBlocks)} {spendBlocks === 1 ? "block" : "blocks"}
-        </span>
+        {globalCapUsd !== null ? (
+          <span className="faint">All repos <span className="mono">{usd(globalCapUsd)}</span></span>
+        ) : null}
       </div>
     </section>
   );
@@ -255,13 +233,13 @@ function SpendPerHour({ buckets }: { buckets: OverviewPayload["spend_per_hour"] 
     <section className="panel">
       <div className="panel-hd">
         <span className="panel-title">Spend per hour</span>
-        <span className="faint">last {bars.length || 48} hours, journal-settled</span>
+        <span className="faint">last {bars.length || 48} hours, from legs</span>
       </div>
       <div className="panel-bd">
         <Histogram
           bars={bars}
           unit="spend"
-          emptyText="no journalled spend in the last 48 hours"
+          emptyText="no leg spend in the last 48 hours"
         />
       </div>
     </section>
@@ -273,7 +251,7 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return rows;
-    return rows.filter((row) => [row.day, row.opened, row.closed, row.net_open, row.recurrences]
+    return rows.filter((row) => [row.day, row.opened, row.closed, row.net_open]
       .some((value) => String(value).toLowerCase().includes(needle)));
   }, [query, rows]);
   const sorted = useSortedRows(
@@ -283,7 +261,6 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
       opened: (row) => row.opened,
       closed: (row) => row.closed,
       net: (row) => row.net_open,
-      recurrences: (row) => row.recurrences,
     },
     { key: "day", direction: "desc" },
     "overview-health-trend",
@@ -306,7 +283,7 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
           </div>
         ) : null}
         {rows.length === 0 && !loading ? (
-          <EmptyState>no issue activity or recurrences recorded yet</EmptyState>
+          <EmptyState>no issue activity recorded yet</EmptyState>
         ) : rows.length > 0 && filtered.length === 0 ? (
           <EmptyState>no health rows match “{query.trim()}”</EmptyState>
         ) : (
@@ -316,14 +293,12 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
               { key: "opened", label: "Opened", className: "r", width: 90 },
               { key: "closed", label: "Closed", className: "r", width: 90 },
               { key: "net", label: "Net", className: "r", width: 90 },
-              { key: "recurrences", label: "Recurrences", className: "r", width: 120 },
             ]} sort={sorted.sort} onSort={sorted.onSort}>
               <tbody>{sorted.rows.map((row) => (
                 <tr key={row.day}>
                   <td className="mono">{row.day}</td>
                   <td className="r num">{num(row.opened)}</td><td className="r num">{num(row.closed)}</td>
-                  <td className={`r num${row.net_open > 0 && !row.first_observation ? " tone-fail" : ""}`}>{row.net_open > 0 ? `+${row.net_open}` : num(row.net_open)}</td>
-                  <td className={`r num${row.recurrences > 0 ? " tone-fail" : ""}`}>{num(row.recurrences)}</td>
+                  <td className={`r num${row.net_open > 0 ? " tone-fail" : ""}`}>{row.net_open > 0 ? `+${row.net_open}` : num(row.net_open)}</td>
                 </tr>
               ))}</tbody>
             </ResizableTable>
@@ -343,163 +318,44 @@ function HealthRow({ health }: { health: RoleHealth }) {
       <span className="health-role">{health.role}</span>
       <Chip tone={tone}>{HEALTH_LABEL[h]}</Chip>
       <span className="spacer" />
-      <span className="faint num">{num(health.events)} ev</span>
-      {health.log_path ? <CopyLogPathButton path={health.log_path} role={health.role} /> : null}
-    </div>
-  );
-}
-
-function CopyLogPathButton({ path, role }: { path: string; role: string }) {
-  const [notice, setNotice] = useState<"copied" | "failed" | null>(null);
-  useEffect(() => {
-    if (notice === null) return;
-    const timer = window.setTimeout(() => setNotice(null), 2_200);
-    return () => window.clearTimeout(timer);
-  }, [notice]);
-
-  const copy = async () => {
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
-      await navigator.clipboard.writeText(path);
-      setNotice("copied");
-    } catch {
-      setNotice("failed");
-    }
-  };
-
-  return (
-    <span className="log-copy">
-      <button
-        className="log-copy-button"
-        type="button"
-        aria-label={`Copy ${role} log path`}
-        {...tipProps(path)}
-        onClick={() => void copy()}
-      >
-        <Icon name="copy" size={15} />
-      </button>
-      {notice ? (
-        <span className={`log-copy-toast${notice === "failed" ? " tone-fail" : ""}`} role="status">
-          {/* No clipboard (non-localhost http) must still hand over the path:
-              show it selectable instead of a dead-end error. */}
-          {notice === "copied" ? "Log path copied" : `Couldn’t copy — ${path}`}
-        </span>
-      ) : null}
-    </span>
-  );
-}
-
-/**
- * The escalation count on its own says a human was needed, never what for.
- * The reasons are the currently-live ones only, so the list shrinks as they
- * are cleared — a count that only ever grows teaches the operator to ignore it.
- */
-function EscalationDetail({
-  reasons,
-  spendBlocks,
-}: {
-  reasons: EscalationReason[];
-  spendBlocks: number;
-}) {
-  const blocked = spendBlocks > 0 ? `${spendBlocks} spend-blocked` : null;
-  if (reasons.length === 0) return blocked ? <>{blocked}</> : null;
-  return (
-    <details>
-      <summary>
-        {blocked ? `${blocked} · ` : ""}
-        {reasons.length} still open
-      </summary>
-      <ul className="tile-reasons">
-        {reasons.map((row) => (
-          <li key={row.issue}>
-            <span className="mono">#{row.issue}</span>
-            <span className="trunc" title={row.reason ?? undefined}>
-              {row.reason ?? <span className="faint">reason unrecorded</span>}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </details>
-  );
-}
-
-const INTERVENTION_TONE: Record<string, "fail" | "running" | "meta" | "info"> = {
-  rearm: "fail",
-  guidance: "running",
-  relabel: "info",
-  policy: "meta",
-  other: "info",
-};
-
-/**
- * An event the fold could correlate to no issue is a producer that failed to
- * stamp its correlation — a telemetry bug, not deployment news. The number
- * stays visible so the bug is noticeable; the bodies live in the journal.
- */
-function UnattributedCount({ count }: { count: number }) {
-  return (
-    <div className="usage-line">
-      <span className="muted">Uncorrelated journal events</span>
-      <span className="spacer" />
-      <span
-        className={`mono num${count > 0 ? " tone-fail" : ""}`}
-        title="events naming no issue — nonzero means a producer is not stamping correlation"
-      >
-        {num(count)}
+      <span className="faint num" title={health.heartbeat_ts ?? undefined}>
+        {health.heartbeat_ts ? `heartbeat ${ago(health.heartbeat_ts)}` : "no heartbeat"}
       </span>
     </div>
   );
 }
 
-function InterventionList({
-  rows,
-  loading,
-}: {
-  rows: InterventionEvent[];
-  loading: boolean;
-}) {
+/** The items a person must move: the stop's headline and, as text, its comment. */
+function AttentionList({ rows, loading }: { rows: AttentionItem[]; loading: boolean }) {
   const sorted = useSortedRows(
     rows,
     {
-      when: (row) => row.ts,
-      class: (row) => row.action_class,
-      target: (row) => row.issue ?? row.pr,
-      action: (row) => row.kind,
+      issue: (row) => row.issue,
+      reason: (row) => row.headline,
     },
-    { key: "when", direction: "desc" },
-    "overview-interventions",
+    { key: "issue", direction: "asc" },
+    "overview-attention",
   );
-  if (loading) return <Loading what="operator actions" />;
+  if (loading) return <Loading what="items waiting on you" />;
   if (rows.length === 0) {
-    return <EmptyState>no journalled operator actions — the harness ran unattended</EmptyState>;
+    return <EmptyState>nothing is waiting on you — the harness is running unattended</EmptyState>;
   }
   return (
     <div className="operator-actions-table">
-      <ResizableTable storageKey="overview-interventions" columns={[
-        { key: "when", label: "When", width: 160 },
-        { key: "class", label: "Class", width: 110 },
-        { key: "target", label: "Target", width: 110 },
-        { key: "action", label: "Action", width: 420 },
+      <ResizableTable storageKey="overview-attention" columns={[
+        { key: "issue", label: "Issue", width: 260 },
+        { key: "reason", label: "Why", width: 520 },
       ]} sort={sorted.sort} onSort={sorted.onSort}>
         <tbody>
-          {sorted.rows.map((row, i) => (
-            <tr key={`${row.ts ?? "?"}-${i}`}>
-              <td className="mono faint" title={row.ts ?? ""}>{localTime(row.ts)}</td>
-              <td>
-                <Chip tone={INTERVENTION_TONE[row.action_class] ?? "info"} square>
-                  {row.action_class}
-                </Chip>
+          {sorted.rows.map((row) => (
+            <tr key={row.issue}>
+              <td className="trunc" title={row.title ?? undefined}>
+                <span className="mono">#{row.issue}</span>
+                {row.title ? <span className="faint"> {row.title}</span> : null}
               </td>
-              <td className="mono">
-                {row.issue !== null && row.issue !== undefined ? `#${row.issue}` : null}
-                {row.pr !== null && row.pr !== undefined ? (
-                  <span className="faint"> PR #{row.pr}</span>
-                ) : null}
-                {row.issue == null && row.pr == null ? <span className="faint">—</span> : null}
-              </td>
-              <td className="trunc" title={row.detail ?? row.kind}>
-                <span className="mono">{row.kind}</span>
-                {row.detail ? <span className="faint"> — {row.detail}</span> : null}
+              <td className="trunc" title={row.detail ?? row.headline}>
+                <Chip tone="fail" square>{row.headline}</Chip>
+                {row.detail ? <span className="faint"> {row.detail}</span> : null}
               </td>
             </tr>
           ))}

@@ -11,9 +11,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import TypeVar
 
 # The three verdicts plus the default. Ordered longest-first so `MISBEHAVED`
 # cannot be swallowed by a prefix match.
@@ -27,8 +25,6 @@ _VERDICT_PREFIX_RE = re.compile(
 _REASON_CHARS = 240
 _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|$")
 _ID_RE = re.compile(r"#\d+")
-_PR_RE = re.compile(r"\bPR\s+#(\d+)\b", re.IGNORECASE)
-_ISSUE_RE = re.compile(r"(?<!PR )#(\d+)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -139,36 +135,3 @@ def verification_payload(path: str) -> dict:
     except OSError as exc:
         return {"rows": [], "warnings": [f"field-verification.md unreadable ({exc.strerror or 'error'})"]}
     return {"rows": [asdict(r) for r in parse_verification(text)], "warnings": []}
-
-
-_T = TypeVar("_T")
-
-
-def _indexes(
-    rows: list[dict], value_of: Callable[[dict], _T]
-) -> tuple[dict[int, _T], dict[int, _T]]:
-    issues: dict[int, _T] = {}
-    prs: dict[int, _T] = {}
-    for row in rows:
-        change = str(row.get("change") or "")
-        shipped = str(row.get("shipped") or "")
-        value = value_of(row)
-        for match in _PR_RE.finditer(f"{change} {shipped}"):
-            prs[int(match.group(1))] = value
-        for match in _ISSUE_RE.finditer(change):
-            issues[int(match.group(1))] = value
-    return issues, prs
-
-
-def status_indexes(rows: list[dict]) -> tuple[dict[int, str], dict[int, str]]:
-    """Newest ledger verdict by issue and PR reference."""
-    return _indexes(rows, lambda row: str(row.get("status") or "pending"))
-
-
-def reason_indexes(
-    rows: list[dict],
-) -> tuple[dict[int, str | None], dict[int, str | None]]:
-    """Newest ledger reason text by issue and PR reference."""
-    return _indexes(
-        rows, lambda row: str(row["reason"]) if row.get("reason") else None
-    )

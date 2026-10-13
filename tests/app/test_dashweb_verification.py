@@ -81,15 +81,6 @@ def test_the_real_ledger_parses_with_verdicts_on_both_sides(tmp_path):
     assert all(r["change"] for r in payload["rows"])
 
 
-def test_status_indexes_distinguish_issue_and_pr_references():
-    issue_status, pr_status = verification.status_indexes([
-        {"change": "#62 capability ceiling", "shipped": "PR #76", "status": "pending"},
-        {"change": "#62 capability ceiling — verdict", "shipped": None, "status": "VERIFIED"},
-    ])
-    assert issue_status == {62: "VERIFIED"}
-    assert pr_status == {76: "pending"}
-
-
 def test_reason_is_the_verdict_prose_with_the_keyword_removed():
     assert [r.reason for r in rows()] == [
         "never fired",
@@ -139,13 +130,3 @@ def test_a_bounded_reason_is_taken_from_the_fallback_column_too():
     )[0]
     assert row.reason is not None and len(row.reason) == 240
 
-
-def test_reason_indexes_distinguish_issue_and_pr_references():
-    issue_reason, pr_reason = verification.reason_indexes([
-        {"change": "#62 capability ceiling", "shipped": "PR #76",
-         "status": "pending", "reason": "never fired"},
-        {"change": "#63 relabel", "shipped": None, "status": "VERIFIED",
-         "reason": None},
-    ])
-    assert issue_reason == {62: "never fired", 63: None}
-    assert pr_reason == {76: "never fired"}

@@ -1,43 +1,38 @@
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Polled } from "../api/hooks";
 import type {
   BacklogCard,
+  DoneCard,
   IssueCard,
   IssuesPayload,
-  PendingCard,
 } from "../api/types";
+import type { Polled } from "../api/hooks";
 import { IssuesTab } from "./IssuesTab";
 
-const done: IssueCard = {
+const done: DoneCard = {
   issue: 50,
   title: "Explain completed work",
   url: "https://github.com/o/r/issues/50",
-  labels: [],
   pr: 75,
   pr_url: "https://github.com/o/r/pull/75",
-  pr_state: "merged",
-  stage: "done",
-  done: true,
-  steps: [],
-  cost_usd: 2,
-  estimated: false,
-  projected_cost_usd: 2,
-  started_ts: "2026-07-29T07:00:00Z",
-  last_ts: "2026-07-29T08:00:00Z",
   merged_ts: "2026-07-29T08:00:00Z",
-  elapsed_s: 3600,
-  working_s: 3600,
-  idle_s: 0,
-  idle_active: false,
-  leg_running: false,
-  models: [],
-  model_badges: [],
-  rounds: 1,
-  issue_verification: "VERIFIED",
-  pr_verification: "VERIFIED",
+  cost_usd: 2,
+  legs: 2,
+  review_rounds: 1,
+  labels: [],
 };
+
+function inflight(issue: number, title: string, over: Partial<IssueCard> = {}): IssueCard {
+  return {
+    issue, title, url: null, labels: ["ai-ready"], pr: null, pr_url: null, pr_ci_state: null,
+    board: { status: "working", activity: "queued", act: "RESOLVE", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null },
+    action: null,
+    rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
+    history: [], cost_usd: 0, estimated: false, legs: 0, started_ts: null, last_ts: null, leg_running: false,
+    ...over,
+  };
+}
 
 const backlog: BacklogCard = {
   issue: 63,
@@ -45,8 +40,6 @@ const backlog: BacklogCard = {
   url: "https://github.com/o/r/issues/63",
   body: "long body",
   labels: ["type:enhancement", "difficulty:complex"],
-  recurrence: false,
-  recurrence_count: 0,
   age_days: 1,
   comments: 0,
   issue_type: "enhancement",
@@ -58,14 +51,14 @@ function polled(payload: Partial<IssuesPayload>): Polled<IssuesPayload> {
   return {
     data: {
       in_flight: [],
-      pending: [],
       done: [],
       backlog: [],
       gh_ok: true,
+      observed_at: "2026-07-29T09:00:00Z",
       notifications: [],
       warnings: [],
       ...payload,
-    } as IssuesPayload,
+    },
     error: null,
     loading: false,
     updatedAt: 0,
@@ -78,27 +71,6 @@ function board(sub: "inflight" | "done" | "backlog", payload: Partial<IssuesPayl
     <IssuesTab repo="demo" sub={sub} issues={polled(payload)} onOpenIssue={vi.fn()} />,
   );
 }
-
-describe("merge readiness on the PR chip", () => {
-  it("marks a mergeable PR", () => {
-    board("done", { done: [{ ...done, pr_review_state: "mergeable" }] });
-
-    expect(screen.getByRole("img", { name: "approved and mergeable" })).toHaveTextContent("✓");
-  });
-
-  it("marks a PR whose review asked for changes", () => {
-    board("done", { done: [{ ...done, pr_review_state: "changes_requested" }] });
-
-    expect(screen.getByRole("img", { name: "review requested changes" })).toHaveTextContent("±");
-  });
-
-  it("says nothing about merge readiness when the backend could not tell", () => {
-    board("done", { done: [{ ...done, pr_review_state: null }] });
-
-    expect(screen.queryByRole("img", { name: /merge|changes/ })).not.toBeInTheDocument();
-    expect(screen.getByText(/PR #75/)).toBeVisible();
-  });
-});
 
 describe("done timing columns", () => {
   beforeEach(() => {
@@ -118,7 +90,7 @@ describe("done timing columns", () => {
   });
 
   it("renders an unknown completion instant as absent, never as just now", () => {
-    board("done", { done: [{ ...done, merged_ts: null, last_ts: null }] });
+    board("done", { done: [{ ...done, merged_ts: null }] });
 
     const cells = screen.getAllByRole("cell").map((cell) => cell.textContent);
     expect(cells).toContain("—");
@@ -201,29 +173,20 @@ describe("long-table filtering", () => {
     expect(screen.getByText("1/12")).toBeVisible();
   });
 
-  it("finds a visible parked PR by its number", async () => {
-    const pending: PendingCard[] = Array.from({ length: 11 }, (_, index) => ({
-      issue: 200 + index,
-      title: index === 6 ? "Parked pull request" : `Waiting issue ${index}`,
-      url: null,
-      body: null,
-      labels: index === 6 ? ["ai-parked"] : ["ai-ready"],
-      held: index === 6,
-      hold_reason: index === 6 ? "parked" : null,
-      overlap: null,
-      pr: index === 6 ? 179 : null,
-      pr_url: index === 6 ? "https://github.com/o/r/pull/179" : null,
-      pr_state: index === 6 ? "open" : null,
-      pr_ci_state: index === 6 ? "passing" : null,
-    }));
-    board("inflight", { pending });
+  it("finds an in-flight item by its PR number", async () => {
+    const cards = Array.from({ length: 11 }, (_, index) => inflight(
+      200 + index,
+      index === 6 ? "Item with a pull request" : `Waiting issue ${index}`,
+      index === 6 ? { pr: 179, pr_url: "https://github.com/o/r/pull/179" } : {},
+    ));
+    board("inflight", { in_flight: cards });
 
     await userEvent.type(
       screen.getByRole("searchbox", { name: "Filter active issues" }),
       "179",
     );
 
-    expect(screen.getByText("Parked pull request")).toBeVisible();
+    expect(screen.getByText("Item with a pull request")).toBeVisible();
     expect(screen.getByRole("link", { name: "PR #179" })).toBeVisible();
     expect(screen.queryByText("Waiting issue 0")).not.toBeInTheDocument();
     expect(screen.getByText("1/11")).toBeVisible();
@@ -232,7 +195,7 @@ describe("long-table filtering", () => {
 
 describe("page chrome", () => {
   it("omits the redundant Issues page heading and shown-count line", () => {
-    board("inflight", { in_flight: [{ ...done, done: false, merged_ts: null }] });
+    board("inflight", { in_flight: [inflight(50, "Explain completed work")] });
 
     expect(screen.queryByRole("heading", { name: "Issues" })).not.toBeInTheDocument();
     expect(screen.queryByText(/shown$/)).not.toBeInTheDocument();

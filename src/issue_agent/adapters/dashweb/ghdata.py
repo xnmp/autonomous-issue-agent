@@ -1,17 +1,11 @@
-"""Infrastructure adapter for cached, read-only ``gh`` queries.
+"""Cached, read-only `gh` list reads the role observation does not cover.
 
-The v1 dashboard is journal-only on purpose (a diagnostic that fails when
-GitHub does is worse than one that is honest about its scope). This module
-keeps that posture while adding what the journal structurally cannot know —
-titles, human-applied labels, whether a PR actually merged — under two rules:
-
-  * **cached** — one `gh` invocation per (repo, query) per TTL, however many
-    clients poll;
-  * **degrading** — a failure returns `(None, error)`, never raises, and the
-    payload it feeds carries `gh_ok: false` plus a warning.
-
-`gh` shells out rather than talking to the API directly so it inherits the
-operator's auth, host config and proxy exactly as every other harness call does.
+The board itself is derived from `GitHubGateway.build_world`, the observation
+the roles read. This module adds only the lists that observation leaves out:
+every issue (backlog, titles of done work, the opened/closed trend) and the
+merged harness PRs (done work, merges for cost per merged PR). Each read is
+cached per TTL however many clients poll, and degrades: a failure returns
+`(None, error)` and never raises.
 """
 
 from __future__ import annotations
@@ -21,36 +15,16 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 DEFAULT_TTL_S = 45.0
-PR_DETAIL_TTL_S = 180.0
 GH_TIMEOUT_S = 30.0
 
-ISSUE_FIELDS = (
-    "number,title,url,body,labels,state,createdAt,closedAt,updatedAt,comments"
-)
-# `gh issue list` paginates to this bound. Reaching it is surfaced to callers:
-# a long-run trend that quietly omitted history would be worse than no trend.
+ISSUE_FIELDS = "number,title,url,body,labels,state,createdAt,closedAt,comments"
+# `gh issue list` paginates to this bound; reaching it is reported to callers.
 ISSUE_HISTORY_LIMIT = 1000
-PR_FIELDS = (
-    "number,title,url,state,mergedAt,updatedAt,reviewDecision,"
-    "statusCheckRollup,autoMergeRequest,latestReviews,labels,comments,"
-    "isDraft,mergeable,mergeStateStatus,headRefName,closingIssuesReferences,"
-    # `reviews` (not `latestReviews`) is the field gh fills with each review's
-    # commit oid; the board needs it to tell a head-bound approval from a stale one.
-    "headRefOid,reviews"
-)
-# Closed-PR CI/comments fall back to journal/unknown: tauri's 200-PR GraphQL timeout (2026-10-12).
-PR_HISTORY_FIELDS = (
-    "number,title,url,state,mergedAt,updatedAt,labels,headRefName,headRefOid,"
-    "closingIssuesReferences,reviewDecision,mergeable"
-)
-PR_DETAIL_FIELDS = (
-    "number,url,state,headRefName,headRefOid,closingIssuesReferences,"
-    "commits,files"
-)
+MERGED_PR_FIELDS = "number,title,url,mergedAt,headRefName"
+MERGED_PR_LIMIT = 200
 
 
 @dataclass
@@ -147,26 +121,13 @@ def run_gh(args: list[str]) -> tuple[str, str]:
 class GhReader:
     """Read-only `gh` façade. `run` is injectable so tests never shell out."""
 
-    def __init__(
-        self,
-        run=None,
-        ttl_s: float = DEFAULT_TTL_S,
-        clock=time.monotonic,
-        pr_ttl_s: float = PR_DETAIL_TTL_S,
-    ):
+    def __init__(self, run=None, ttl_s: float = DEFAULT_TTL_S, clock=time.monotonic):
         self._run = run or run_gh
         self._cache = TtlCache(ttl_s=ttl_s, clock=clock)
-        self._pr_cache = TtlCache(ttl_s=pr_ttl_s, clock=clock)
 
     def json(self, repo: str, args: list[str]) -> tuple[object | None, str]:
-        return self._cached_json(self._cache, repo, args)
-
-    def _cached_json(
-        self, cache: TtlCache, repo: str, args: list[str]
-    ) -> tuple[object | None, str]:
         if not repo:
             return None, "no REPO configured for this deployment"
-        key = (repo, tuple(args))
 
         def load() -> tuple[object | None, str]:
             out, error = self._run([*args, "-R", repo])
@@ -178,53 +139,24 @@ class GhReader:
                 return None, "gh returned unparseable JSON"
             return payload, ""
 
-        return cache.get_or_load(key, load)
+        return self._cache.get_or_load((repo, tuple(args)), load)
 
     def issues(self, repo: str, limit: int = ISSUE_HISTORY_LIMIT) -> tuple[object | None, str]:
-        """Open AND closed issues in one call: the done cards need titles for
-        issues that have since been closed, and a second query would double the
-        rate-limit cost to answer the same question."""
-        return self.json(
-            repo,
-            ["issue", "list", "--state", "all", "--limit", str(limit),
-             "--json", ISSUE_FIELDS],
-        )
+        """Open and closed issues in one call."""
+        return self.json(repo, ["issue", "list", "--state", "all", "--limit", str(limit), "--json", ISSUE_FIELDS])
 
-    def prs(self, repo: str, limit: int = 200) -> tuple[object | None, str]:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            reads = [
-                executor.submit(
-                    self.json, repo,
-                    ["pr", "list", "--state", state, "--limit", str(limit),
-                     "--json", fields],
-                )
-                for state, fields in (("all", PR_HISTORY_FIELDS), ("open", PR_FIELDS))
-            ]
-            history, opened = [read.result() for read in reads]
-        error = history[1] or opened[1]
-        if error:
-            return None, error
-        return merge_pr_reads(history[0], opened[0]), ""
-
-    def pr(self, repo: str, number: int) -> tuple[object | None, str]:
-        """One PR's change history, fetched only for the issue detail view."""
-        return self._cached_json(
-            self._pr_cache,
-            repo,
-            ["pr", "view", str(number), "--json", PR_DETAIL_FIELDS],
-        )
+    def merged_prs(self, repo: str, limit: int = MERGED_PR_LIMIT) -> tuple[object | None, str]:
+        return self.json(repo, ["pr", "list", "--state", "merged", "--limit", str(limit), "--json", MERGED_PR_FIELDS])
 
 
-def merge_pr_reads(history, opened) -> list[dict]:
-    """The two reads are cached and fetched independently, so a PR can be OPEN
-    in one and already MERGED, or on a newer head, in the other. The row GitHub
-    updated last wins; the full open row is kept only when it is not the stale one."""
-    merged = index_by_number(history)
-    for number, row in index_by_number(opened).items():
-        light = merged.get(number)
-        if light is None or str(row.get("updatedAt") or "") >= str(light.get("updatedAt") or ""):
-            merged[number] = row
-    return list(merged.values())
+def labels_of(issue: dict) -> list[str]:
+    """gh renders labels as objects; a hand-built fixture may use strings."""
+    out = []
+    for label in issue.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else label
+        if name:
+            out.append(str(name))
+    return out
 
 
 def index_by_number(payload) -> dict[int, dict]:
@@ -236,14 +168,9 @@ def index_by_number(payload) -> dict[int, dict]:
     for item in payload:
         if not isinstance(item, dict):
             continue
-        raw_number = item.get("number")
-        if raw_number is None:
-            continue
-        try:
-            number = int(raw_number)
-        except (TypeError, ValueError):
-            continue
-        out[number] = item
+        number = item.get("number")
+        if type(number) is int and number > 0:
+            out[number] = item
     return out
 
 

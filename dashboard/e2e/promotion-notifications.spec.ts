@@ -33,8 +33,6 @@ const backlogIssue = {
   url: "https://github.com/openai/autonomous-issue-agent/issues/120",
   body: "Important state changes arrive silently.",
   labels: ["feature"],
-  recurrence: false,
-  recurrence_count: 0,
   age_days: 0,
   comments: 0,
   issue_type: "feature",
@@ -42,14 +40,24 @@ const backlogIssue = {
   impact: "high",
 };
 
-const pendingIssue = {
+const queuedIssue = {
   issue: 120,
   title: "Toast notifications for state transitions",
   url: "https://github.com/openai/autonomous-issue-agent/issues/120",
   labels: ["feature", "ai-ready"],
-  held: false,
-  hold_reason: null,
-  overlap: null,
+  pr: null,
+  pr_url: null,
+  board: {
+    status: "working", activity: "queued", act: "RESOLVE", headline: "Queued",
+    reason: "Dispatches when a slot is free.", since_ts: null,
+  },
+  rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
+  cost_usd: 0,
+  estimated: false,
+  legs: 0,
+  started_ts: null,
+  last_ts: null,
+  leg_running: false,
 };
 
 async function json(route: Route, body: unknown) {
@@ -76,13 +84,13 @@ async function mockApi(page: Page) {
     if (path === "/api/repos/self/issues") {
       issuePolls += 1;
       return json(route, {
-        in_flight: [],
-        pending: promoted ? [pendingIssue] : [],
+        in_flight: promoted ? [queuedIssue] : [],
         done: [],
         backlog: promoted ? [] : [backlogIssue],
         gh_ok: true,
+        observed_at: "2026-07-30T08:00:00Z",
         notifications: issuePolls <= 2 ? [] : [{
-          id: "dispatch-120",
+          id: "leg:L120:start",
           ts: "2026-07-30T08:01:00Z",
           severity: "info",
           title: "Issue #120 dispatched",
@@ -108,7 +116,7 @@ test("promotion updates both tabs and a new dispatch raises a toast", async ({ p
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
   await expect(page.getByRole("tab", { name: /In flight/ })).toContainText("1");
   await page.getByRole("tab", { name: /In flight/ }).click();
-  const queued = page.getByRole("region", { name: "Blocked" }).locator(".board-row", { hasText: "#120" });
+  const queued = page.getByRole("region", { name: "Working" }).locator(".board-row", { hasText: "#120" });
   await expect(queued.locator(".board-headline")).toHaveText("Queued");
 
   await expect(page.getByRole("status").filter({ hasText: "Issue #120 dispatched" }))

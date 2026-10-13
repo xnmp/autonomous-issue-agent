@@ -6,40 +6,37 @@
  */
 
 import type {
+  BacklogCard,
+  BoardStatus,
   IssueCard,
   IssuesPayload,
-  PendingCard,
+  StageId,
+  StageRail,
+  StageVisit,
+  TrackChip,
 } from "../../api/types";
-import type { components } from "../../api/generated";
 import { parseTs } from "../../lib/format";
 import { CANONICAL, railSummary, type RailNode } from "../../components/ui/LifecycleStepper";
 
-type Schema = components["schemas"];
-
-export type BoardStatus = Schema["BoardNeedsYou"] | Schema["BoardWorking"] | Schema["BoardBlocked"];
+export type { BoardStatus, StageId, StageRail, StageVisit, TrackChip };
 export type BoardGroup = BoardStatus["status"];
-export type StageRail = Schema["StageRail"];
-export type StageVisit = Schema["StageVisit"];
-export type TrackChip = Schema["TrackChip"];
-export type StageId = StageRail["current"];
-export type Tier = NonNullable<IssueCard["tier"]>;
 
-export const GROUP_ORDER: readonly BoardGroup[] = ["needs_you", "working", "blocked"];
+export const GROUP_ORDER: readonly BoardGroup[] = ["needs_you", "working", "waiting"];
 
 export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone: "fail" | "ok" | "muted" }> = {
   needs_you: {
     label: "Needs you",
-    hint: "Nothing moves until you act. The highlighted line says what to do.",
+    hint: "The harness stopped and labelled it needs-human. Nothing moves until you act.",
     tone: "fail",
   },
   working: {
     label: "Working",
-    hint: "An agent or CI is running, or the PR is approved and green and about to merge.",
+    hint: "An agent or CI is running, or the harness is about to act (start, open a PR, merge).",
     tone: "ok",
   },
-  blocked: {
-    label: "Blocked",
-    hint: "Waiting on triage or on another issue to merge.",
+  waiting: {
+    label: "Waiting",
+    hint: "Held by something outside the harness: branch protection, a human review, spend headroom, a retry backoff or GitHub. Nothing for you to do.",
     tone: "muted",
   },
 };
@@ -47,17 +44,17 @@ export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone:
 export const COLUMN_HEADINGS: Record<BoardGroup, { now: string; wait: string }> = {
   needs_you: { now: "What to do", wait: "Waiting" },
   working: { now: "Now", wait: "Last activity" },
-  blocked: { now: "Waiting for", wait: "Waiting" },
+  waiting: { now: "Waiting for", wait: "Waiting" },
 };
 
-/** The five stages, in rail order: the same track the issue page draws. */
+/** The four stages, in rail order: the same track the issue page draws. */
 export const STAGES = CANONICAL;
 
 export function stageLabel(id: StageId): string {
   return STAGES.find((stage) => stage.id === id)?.label ?? id;
 }
 
-/** One board row, whichever lane the server put it in. */
+/** One board row: a harness item and the state the server derived for it. */
 export interface BoardItem {
   issue: number;
   title: string | null;
@@ -65,90 +62,64 @@ export interface BoardItem {
   pr: number | null;
   prUrl: string | null;
   board: BoardStatus;
-  rail: StageRail | null;
+  rail: StageRail;
   labels: string[];
-  tier: Tier | null;
-  /** Only an in-flight issue has spend, clocks and models. */
-  card: IssueCard | null;
+  card: IssueCard;
 }
 
 /**
- * A running card the server could not classify (an older server, or a field
- * lost in transit) still has to land somewhere. Working is the one group that
- * asks nothing of the operator and claims no blocker.
+ * A backlog promotion the client shows before the next observation confirms
+ * it, worded as the server words a queued item.
  */
-const UNCLASSIFIED: BoardStatus = {
-  status: "working",
-  activity: "handoff",
-  headline: "Status unavailable",
-  reason: "The dashboard server did not classify this issue.",
-  since_ts: null,
-};
+export function queuedCard(card: BacklogCard): IssueCard {
+  return {
+    issue: card.issue,
+    title: card.title,
+    url: card.url,
+    labels: Array.from(new Set([...card.labels, "ai-ready"])),
+    pr: null,
+    pr_url: null,
+    board: {
+      status: "working",
+      activity: "queued",
+      act: null,
+      headline: "Queued",
+      reason: "Starts when the fixer picks it up.",
+      since_ts: null,
+    },
+    action: null,
+    rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
+    history: [],
+    cost_usd: 0,
+    estimated: false,
+    legs: 0,
+    started_ts: null,
+    last_ts: null,
+    leg_running: false,
+  };
+}
 
-/**
- * A queued card without a server status: a backlog promotion the client
- * shows before the next poll confirms it. Worded as the server words a queue.
- */
-const QUEUED: BoardStatus = {
-  status: "blocked",
-  on: { kind: "queue" },
-  headline: "Queued",
-  reason: "Starts when the fixer picks it up.",
-  since_ts: null,
-};
-
-/**
- * In-flight and queued rows as one list. An issue
- * appears once: a lane earlier in that order wins, because it carries more
- * of the issue's state.
- */
-export function boardItems(payload: Pick<IssuesPayload, "in_flight" | "pending"> | null | undefined): BoardItem[] {
+/** The in-flight rows, once per issue. */
+export function boardItems(payload: Pick<IssuesPayload, "in_flight"> | null | undefined): BoardItem[] {
   if (!payload) return [];
   const seen = new Set<number>();
   const items: BoardItem[] = [];
-  const add = (item: BoardItem) => {
-    if (seen.has(item.issue)) return;
-    seen.add(item.issue);
-    items.push(item);
-  };
   for (const card of payload.in_flight ?? []) {
-    if (card.done) continue;
-    add(fromIssueCard(card));
-  }
-  for (const card of payload.pending ?? []) {
-    add(fromPendingCard(card, card.board ?? QUEUED));
+    if (seen.has(card.issue)) continue;
+    seen.add(card.issue);
+    items.push({
+      issue: card.issue,
+      title: card.title,
+      url: card.url,
+      pr: card.pr,
+      prUrl: card.pr_url,
+      board: card.board,
+      rail: card.rail,
+      labels: card.labels ?? [],
+      card,
+    });
   }
   return items;
-}
-
-function fromIssueCard(card: IssueCard): BoardItem {
-  return {
-    issue: card.issue,
-    title: card.title,
-    url: card.url,
-    pr: card.pr,
-    prUrl: card.pr_url,
-    board: card.board ?? UNCLASSIFIED,
-    rail: card.rail ?? null,
-    labels: card.labels ?? [],
-    tier: card.tier ?? null,
-    card,
-  };
-}
-
-function fromPendingCard(card: PendingCard, board: BoardStatus): BoardItem {
-  return {
-    issue: card.issue,
-    title: card.title,
-    url: card.url,
-    pr: card.pr ?? null,
-    prUrl: card.pr_url ?? null,
-    board,
-    rail: card.rail ?? null,
-    labels: card.labels ?? [],
-    tier: null,
-    card: null,
-  };
 }
 
 export interface BoardSection {
@@ -181,7 +152,7 @@ function byLongestWait(a: BoardItem, b: BoardItem): number {
 }
 
 export function groupCounts(items: readonly BoardItem[]): Record<BoardGroup, number> {
-  const counts: Record<BoardGroup, number> = { needs_you: 0, working: 0, blocked: 0 };
+  const counts: Record<BoardGroup, number> = { needs_you: 0, working: 0, waiting: 0 };
   for (const item of items) counts[item.board.status] += 1;
   return counts;
 }
@@ -195,7 +166,7 @@ export function matchesQuery(item: BoardItem, query: string): boolean {
     item.title,
     item.pr === null ? null : `PR #${item.pr}`,
     item.board.headline,
-    item.board.reason,
+    item.board.status === "needs_you" ? item.board.detail : item.board.reason,
     ...item.labels,
   ].some((value) => String(value ?? "").toLowerCase().includes(query));
 }
@@ -221,13 +192,17 @@ export interface WaitCell {
 }
 
 /**
- * The fourth column. Needs you and Blocked count how long the row has waited
+ * The fourth column. Needs you and Waiting count how long the row has waited
  * on the operator or its blocker; Working says how long ago something last
- * happened. A row whose wait has not started reads `queued`.
+ * happened. A row with no start says what it is instead: a working row is
+ * queued, a needs-you row (a park, say, which has no stop comment to date it)
+ * waits on you.
  */
+const UNDATED: Record<BoardStatus["status"], string> = { working: "queued", needs_you: "needs you", waiting: "—" };
+
 export function waitCell(board: BoardStatus, nowMs: number): WaitCell {
   const since = parseTs(board.since_ts);
-  if (since === null || !Number.isFinite(nowMs)) return { text: "queued", stale: false, title: null };
+  if (since === null || !Number.isFinite(nowMs)) return { text: UNDATED[board.status], stale: false, title: null };
   const seconds = Math.max(0, (nowMs - since) / 1000);
   const text = waitCompact(seconds);
   if (board.status === "working") {
@@ -238,21 +213,6 @@ export function waitCell(board: BoardStatus, nowMs: number): WaitCell {
     stale: seconds >= DAY_S,
     title: board.status === "needs_you" ? `Waiting on you for ${text}` : `Waiting for ${text}`,
   };
-}
-
-/* ------------------------------------------------------------ overspend */
-
-export interface Overspend {
-  ratio: number;
-  cost: number | null;
-  budget: number | null;
-}
-
-/** The server only sends a ratio at or past twice the projection. */
-export function overspendOf(card: IssueCard | null): Overspend | null {
-  const ratio = card?.overspend_ratio;
-  if (typeof ratio !== "number" || !Number.isFinite(ratio) || ratio < 2) return null;
-  return { ratio, cost: card?.cost_usd ?? null, budget: card?.projected_cost_usd ?? null };
 }
 
 /* ------------------------------------------------------------ the rail */
@@ -360,6 +320,7 @@ export const OUTCOME_MARK: Record<TrackChip["outcome"], { glyph: string; label: 
   passed: { glyph: "✓", label: "passed" },
   failed: { glyph: "✕", label: "failed" },
   changes_requested: { glyph: "±", label: "changes requested" },
+  asked: { glyph: "?", label: "asked a question" },
   done: { glyph: "•", label: "done" },
   running: { glyph: "…", label: "running" },
 };
@@ -367,46 +328,28 @@ export const OUTCOME_MARK: Record<TrackChip["outcome"], { glyph: string; label: 
 /* ------------------------------------------------------------ the one action */
 
 export type PrimaryAction =
-  | { kind: "rearm"; label: "Re-arm" }
-  | { kind: "budget"; label: "Approve spend" }
   | { kind: "open_issue"; label: "Open issue" }
   | { kind: "open_pr"; label: "Open PR" }
   | { kind: "unblock"; label: "Unblock" };
 
 /**
- * At most one action per row, and only where the operator is what moves it:
- * Needs you, and Blocked on triage. Every other row has none.
+ * At most one action per row, and only on Needs you: the server says whether
+ * a reply (open the issue or PR) or removing `needs-human` (Unblock) releases
+ * the stop.
  */
-export function primaryAction(board: BoardStatus): PrimaryAction | null {
-  if (board.status === "needs_you") {
-    switch (board.ask) {
-      case "rearm":
-        return { kind: "rearm", label: "Re-arm" };
-      case "budget":
-        return { kind: "budget", label: "Approve spend" };
-      case "merge":
-        return { kind: "open_pr", label: "Open PR" };
-      default:
-        return { kind: "open_issue", label: "Open issue" };
-    }
-  }
-  if (board.status === "blocked" && board.on.kind === "triage") {
-    return { kind: "unblock", label: "Unblock" };
-  }
-  return null;
+export function primaryAction(board: BoardStatus, action: IssueCard["action"]): PrimaryAction | null {
+  if (board.status !== "needs_you") return null;
+  if (action === "unblock") return { kind: "unblock", label: "Unblock" };
+  return board.target === "pr" ? { kind: "open_pr", label: "Open PR" } : { kind: "open_issue", label: "Open issue" };
 }
 
-/** A Blocked row the operator unblocks reads as an alarm, not a wait. */
-export function operatorOwned(board: BoardStatus): boolean {
-  return board.status === "needs_you" || (board.status === "blocked" && board.on.kind === "triage");
+/** The row's second line: why it is in its group, in one line. */
+export function sayLine(board: BoardStatus): string {
+  return board.status === "needs_you" ? board.hint : board.reason;
 }
-
-/* ------------------------------------------------------------ the harness note */
 
 /** The harness comment as plain text: markdown emphasis markers dropped. */
 export function plainHarnessMessage(message: string | null | undefined): string | null {
   const text = message?.replaceAll("**", "").replaceAll("__", "").trim();
   return text ? text : null;
 }
-
-export const TIERS: readonly Tier[] = ["trivial", "standard", "complex", "exceptional"];

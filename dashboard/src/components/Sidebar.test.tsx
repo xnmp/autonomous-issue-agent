@@ -24,7 +24,6 @@ const usage: UsagePayload = {
   warnings: [],
 } as unknown as UsagePayload;
 const options: DashboardOptions = {
-  showProjectedCost: false,
   showPerRepoQuotas: false,
   showDurationSeconds: false,
   showOverviewDaemonHealth: false,
