@@ -70,6 +70,8 @@ interface IssuesTabProps {
   issues: Polled<IssuesPayload>;
   onOpenIssue: (issue: number) => void;
   onBacklogPromotion?: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
+  /** Done issues to render as unread (see useDoneUnread). */
+  unreadDone?: ReadonlySet<number>;
 }
 
 /**
@@ -133,6 +135,7 @@ export function IssuesTab({
   issues,
   onOpenIssue,
   onBacklogPromotion = () => {},
+  unreadDone = NO_UNREAD,
 }: IssuesTabProps) {
   const [visibility, setVisibility] = useState<Visibility>(storedVisibility);
   const [queries, setQueries] = useState<Record<IssuesSub, string>>({
@@ -269,6 +272,7 @@ export function IssuesTab({
             loading={issues.loading}
             visible={visible}
             onOpen={onOpenIssue}
+            unread={unreadDone}
           />
         </>
       ) : null}
@@ -306,6 +310,8 @@ function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
   });
 }
 
+const NO_UNREAD: ReadonlySet<number> = new Set();
+
 function DoneTable({
   repo,
   cards,
@@ -314,7 +320,9 @@ function DoneTable({
   loading,
   visible,
   onOpen,
+  unread,
 }: {
+  unread: ReadonlySet<number>;
   repo: string;
   cards: DoneCard[];
   page: number;
@@ -364,16 +372,17 @@ function DoneTable({
         <tbody>
           {page.rows.map((card) => {
             const open = expanded === card.issue;
+            const isNew = unread.has(card.issue);
             return (
               <Fragment key={card.issue}>
                 <tr
-                  className={`clickable${open ? " expanded" : ""}`}
+                  className={`clickable${open ? " expanded" : ""}${isNew ? " unread" : ""}`}
                   tabIndex={0}
                   aria-expanded={open}
                   onClick={() => setExpanded(open ? null : card.issue)}
                   onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
                 >
-                  <td><IssueSummary card={card} open={open} /></td>
+                  <td><IssueSummary card={card} open={open} isNew={isNew} /></td>
                   {visible.has("cost") ? (
                     <td className="r mono cost-cell">{usd(card.cost_usd)}</td>
                   ) : null}
@@ -647,7 +656,7 @@ function TaskStoryLine({ step }: { step: IssueStep }) {
   );
 }
 
-function IssueSummary({ card, open }: { card: DoneCard; open: boolean }) {
+function IssueSummary({ card, open, isNew }: { card: DoneCard; open: boolean; isNew: boolean }) {
   return (
     <div className="issue-cell">
       <div className="issue-summary">
@@ -657,6 +666,7 @@ function IssueSummary({ card, open }: { card: DoneCard; open: boolean }) {
             {card.title ?? <span className="faint">title unavailable</span>}
           </span>
           <div className="row-wrap">
+            {isNew ? <span className="sr-only">New: </span> : null}
             <IssueNumber issue={card.issue} url={card.url} />
             <PrLink pr={card.pr} url={card.pr_url} />
           </div>

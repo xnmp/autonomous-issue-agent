@@ -221,3 +221,22 @@ describe("backlog triage taxonomy", () => {
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
   });
 });
+
+describe("unread done rows", () => {
+  it("marks only the rows named unread", () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="done"
+        issues={polled({ done: [done, { ...done, issue: 51, title: "Older work" }] })}
+        onOpenIssue={vi.fn()}
+        unreadDone={new Set([50])}
+      />,
+    );
+    const rows = screen.getAllByRole("row").filter((row) => row.classList.contains("clickable"));
+    const unread = rows.filter((row) => row.classList.contains("unread"));
+    expect(unread).toHaveLength(1);
+    expect(unread[0]).toHaveTextContent("Explain completed work");
+    expect(unread[0]).toHaveTextContent("New:");
+  });
+});
