@@ -366,6 +366,12 @@ summary:focus-visible,
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
+/* Done in the last 24 h: --recency is 1 (just now) fading to 0, so the tint
+   is at most 11% of the accent. Declared before .unread so an unread row keeps
+   its stronger tint and bar. */
+.tbl tbody tr.recent {
+  background: color-mix(in srgb, var(--accent) calc(var(--recency) * 11%), transparent);
+}
 .tbl tbody tr.unread > td:first-child {
   box-shadow: inset 3px 0 0 var(--accent);
 }

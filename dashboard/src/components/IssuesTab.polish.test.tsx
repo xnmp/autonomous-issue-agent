@@ -240,3 +240,42 @@ describe("unread done rows", () => {
     expect(unread[0]).toHaveTextContent("New:");
   });
 });
+
+describe("recent done rows", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-08-01T08:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("tints rows done within 24 h in proportion to recency and leaves older rows plain", () => {
+    board("done", {
+      done: [
+        { ...done, issue: 1, title: "just now", merged_ts: "2026-08-01T08:00:00Z" },
+        { ...done, issue: 2, title: "half a day", merged_ts: "2026-07-31T20:00:00Z" },
+        { ...done, issue: 3, title: "two days", merged_ts: "2026-07-30T08:00:00Z" },
+        { ...done, issue: 4, title: "no time", merged_ts: null },
+      ],
+    });
+    const row = (title: string) => screen.getByText(title).closest("tr") as HTMLElement;
+    expect(Number(row("just now").style.getPropertyValue("--recency"))).toBeCloseTo(1, 2);
+    expect(Number(row("half a day").style.getPropertyValue("--recency"))).toBeCloseTo(0.5, 2);
+    expect(row("two days").style.getPropertyValue("--recency")).toBe("");
+    expect(row("no time").style.getPropertyValue("--recency")).toBe("");
+  });
+
+  it("keeps the unread marker on a recent row", () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="done"
+        issues={polled({ done: [{ ...done, merged_ts: "2026-08-01T07:00:00Z" }] })}
+        onOpenIssue={vi.fn()}
+        unreadDone={new Set([50])}
+      />,
+    );
+    const row = screen.getByText("Explain completed work").closest("tr") as HTMLElement;
+    expect(row.classList.contains("unread")).toBe(true);
+    expect(row.style.getPropertyValue("--recency")).not.toBe("");
+  });
+});
