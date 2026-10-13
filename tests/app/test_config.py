@@ -5,29 +5,17 @@ from pathlib import Path
 
 import pytest
 
-from issue_agent.app.config import (
-    HarnessConfig,
-    from_env,
-    generated_env_reference,
-    render_agent_md,
-)
+from dataclasses import fields
+
+from issue_agent.app.config import HarnessConfig, from_env, generated_env_reference, render_agent_md
 from issue_agent.app.main import _load_agent_env
 from issue_agent.domain.effort import Effort
 
 
 def test_metadata_backed_choices_drive_parsing_and_the_example():
-    cfg = from_env(
-        {
-            "REPO": "o/r",
-            "FIX_BOT": "fix-bot",
-            "MERGE_METHOD": "octopus",
-
-        }
-    )
+    cfg = from_env({"REPO": "o/r", "FIX_BOT": "fix-bot", "MERGE_METHOD": "octopus"})
     assert cfg.merge_method == "squash"
-    assert {error.split()[0] for error in cfg.parse_errors} >= {
-        "MERGE_METHOD",
-    }
+    assert {error.split()[0] for error in cfg.parse_errors} >= {"MERGE_METHOD"}
 
     example = generated_env_reference()
     assert "ARM_ON_OPEN" not in example
@@ -48,14 +36,7 @@ def test_reviewer_runtime_defaults_to_codex_at_the_fixer_tier_or_above():
 
 
 def test_every_operator_field_has_env_and_coercion_metadata():
-    from dataclasses import fields
-
-    internal = {
-        "agent_md",
-        "control_authority_root",
-        "codex_cost_per_mtok_cached_in",
-        "parse_errors",
-    }
+    internal = {"agent_md", "control_authority_root", "codex_cost_per_mtok_cached_in", "parse_errors"}
     for definition in fields(HarnessConfig):
         if definition.name in internal:
             assert not definition.metadata
@@ -80,15 +61,8 @@ def test_render_agent_md_expands_and_strips():
 
 
 def test_rendered_agent_contract_names_the_configured_non_default_base():
-    cfg = HarnessConfig(
-        repo="o/harness",
-        base_branch="canary/dashboard-e2e",
-    )
-    template = (
-        Path(__file__).parents[2] / "plugin" / "AGENT.md"
-    ).read_text()
-
-    rendered = render_agent_md(template, cfg)
+    cfg = HarnessConfig(repo="o/harness", base_branch="canary/dashboard-e2e")
+    rendered = render_agent_md((Path(__file__).parents[2] / "plugin" / "AGENT.md").read_text(), cfg)
 
     assert "running headless on a prepared issue branch" in rendered
     assert "The integration base is `canary/dashboard-e2e`" in rendered
@@ -186,61 +160,26 @@ def test_state_dirs_are_per_repo_case_insensitive_and_collision_free():
     assert HarnessConfig(repo="x").poll_seconds == 20
 
 
-def test_custom_state_roots_keep_one_machine_accounting_authority(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        "issue_agent.app.config.machine_control_authority_root",
-        lambda: "/machine/state",
-    )
+def test_custom_state_roots_keep_one_machine_accounting_authority(monkeypatch):
+    monkeypatch.setattr("issue_agent.app.config.machine_control_authority_root", lambda: "/machine/state")
 
-    first = from_env(
-        {
-            "REPO": "o/one",
-            "STATE_DIR": "/srv/one/fix",
-            "REVIEW_STATE_DIR": "/srv/one/review",
-        }
-    )
-    second = from_env(
-        {
-            "REPO": "o/two",
-            "STATE_DIR": "/var/lib/two/fix",
-            "REVIEW_STATE_DIR": "/var/lib/two/review",
-        }
-    )
+    first = from_env({"REPO": "o/one", "STATE_DIR": "/srv/one/fix", "REVIEW_STATE_DIR": "/srv/one/review"})
+    second = from_env({"REPO": "o/two", "STATE_DIR": "/var/lib/two/fix", "REVIEW_STATE_DIR": "/var/lib/two/review"})
 
-    assert first.control_authority_root == "/machine/state"
-    assert second.control_authority_root == "/machine/state"
+    assert first.control_authority_root == second.control_authority_root == "/machine/state"
 
 
-def test_validate_fails_loud_on_empty_repo():
-    # Silent-default class (#50): an empty REPO must die at startup with a
-    # pointed message, not surface as an opaque gh error on the first poll.
-    import pytest
-
+# Silent-default class (#50): an empty REPO must die at startup with a
+# pointed message, not surface as an opaque gh error on the first poll.
+@pytest.mark.parametrize("repository", (None, "github.com/o/r", "https://github.com/o/r", "o/r.git", "o//r",
+                                        "owner_name/repo"))
+def test_validate_rejects_an_empty_repository_and_alias_or_url_shapes(repository):
     with pytest.raises(ValueError, match="REPO"):
-        from_env({}).validate()
-
-
-@pytest.mark.parametrize(
-    "repository",
-    (
-        "github.com/o/r",
-        "https://github.com/o/r",
-        "o/r.git",
-        "o//r",
-        "owner_name/repo",
-    ),
-)
-def test_validate_rejects_repository_alias_and_url_shapes(repository):
-    with pytest.raises(ValueError, match="REPO"):
-        from_env({"REPO": repository}).validate()
+        from_env({} if repository is None else {"REPO": repository}).validate()
 
 
 def test_describe_reports_effective_values_and_no_secrets():
-    c = from_env({"REPO": "o/r", "POLL_SECONDS": "45",
-                  "FIX_BOT_TOKEN": "sekret-token"})
-    d = c.describe()
+    d = from_env({"REPO": "o/r", "POLL_SECONDS": "45", "FIX_BOT_TOKEN": "sekret-token"}).describe()
     assert "repo=o/r" in d
     assert "poll=45s" in d
     assert "sekret" not in d
@@ -248,17 +187,9 @@ def test_describe_reports_effective_values_and_no_secrets():
 
 def test_grouped_config_preserves_flat_env_mapping():
     c = from_env({
-        "REPO": "o/r",
-        "BASE_BRANCH": "main",
-        "TARGET_DIR": "/repo",
-        "STATE_DIR": "/state/fix",
-        "REVIEW_STATE_DIR": "/state/review",
-        "WORKTREE_ROOT": "/worktrees",
-        "HARNESS_ROOT_DIR": "/harness",
-        "FIX_BOT": "fixer",
-        "MAX_BUDGET_USD": "4.25",
-        "REVIEW_MODEL": "opus",
-        "CODEX_BIN": "codex-dev",
+        "REPO": "o/r", "BASE_BRANCH": "main", "TARGET_DIR": "/repo", "STATE_DIR": "/state/fix",
+        "REVIEW_STATE_DIR": "/state/review", "WORKTREE_ROOT": "/worktrees", "HARNESS_ROOT_DIR": "/harness",
+        "FIX_BOT": "fixer", "MAX_BUDGET_USD": "4.25", "REVIEW_MODEL": "opus", "CODEX_BIN": "codex-dev",
         "CODEX_MODEL": "gpt-next",
     })
 
@@ -288,15 +219,10 @@ def test_each_invalid_knob_is_flagged_exactly_once(env, knobs):
 
 
 # ── P1R-8: `_b` must strip+casefold and reject unrecognized tokens ───────────
-@pytest.mark.parametrize(
-    "token,expected",
-    [
-        ("False", False), ("FALSE", False), (" false ", False), ("No", False),
-        ("Off", False), ("0", False), (" 0 ", False),
-        ("True", True), ("TRUE", True), (" true ", True), ("Yes", True),
-        ("On", True), ("1", True), (" 1 ", True),
-    ],
-)
+@pytest.mark.parametrize("token,expected", [
+    *((token, False) for token in ("False", "FALSE", " false ", "No", "Off", "0", " 0 ")),
+    *((token, True) for token in ("True", "TRUE", " true ", "Yes", "On", "1", " 1 ")),
+])
 def test_b_is_case_and_whitespace_insensitive(token, expected):
     # THE P1R-8 repro: AUTO_MERGE=False (capital F) used to compare unstripped
     # and case-sensitively against a raw ("0","false","no","off") tuple, miss
@@ -318,32 +244,18 @@ def test_codex_is_priced_out_of_the_box_so_the_spend_caps_are_not_blind():
 def test_codex_pricing_can_be_switched_off_explicitly():
     # "0" is a real operator choice (don't track codex spend), not a missing
     # value to be replaced by the default — and it must validate clean.
-    c = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0",
-        "ISSUE_SPEND_CAP_USD": "0", "DAILY_SPEND_CAP_USD": "0",
-        "GLOBAL_DAILY_SPEND_CAP_USD": "0",
-    })
+    c = from_env({**_VALID, "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0", "ISSUE_SPEND_CAP_USD": "0",
+                  "DAILY_SPEND_CAP_USD": "0", "GLOBAL_DAILY_SPEND_CAP_USD": "0"})
     assert c.codex_cost_per_mtok_in == 0.0
     assert c.codex_cost_per_mtok_out == 0.0
     assert c.validation_errors() == ()
 
 
 def test_armed_caps_require_pricing_for_subscription_runtimes_too():
-    c = from_env({
-        "REPO": "x",
-        "FIX_BOT": "fix-bot",
-        "FIXER_RUNTIME": "claude",
-        "REVIEWER_RUNTIME": "claude",
-        "CODEX_COST_PER_MTOK_IN": "0",
-        "CODEX_COST_PER_MTOK_OUT": "0",
-        "ISSUE_SPEND_CAP_USD": "5",
-    })
+    c = from_env({**_VALID, "FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude", "CODEX_COST_PER_MTOK_IN": "0",
+                  "CODEX_COST_PER_MTOK_OUT": "0", "ISSUE_SPEND_CAP_USD": "5"})
 
-    assert any(
-        "armed spend caps require positive input/output pricing" in error
-        for error in c.validation_errors()
-    )
+    assert any("armed spend caps require positive input/output pricing" in error for error in c.validation_errors())
 
 
 # ── #43: a PER-MODEL codex rate table ────────────────────────────────────────
@@ -369,15 +281,10 @@ def test_a_malformed_rate_entry_is_named_and_fails_validation():
     """A silently-dropped entry is indistinguishable from a model the operator
     did not mean to override — both read as 'the fallback price', which is the
     bug this knob exists to fix."""
-    c = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK": "gpt-5.6-luna,gpt-5.6-terra=10/60",
-    })
+    c = from_env({**_VALID, "CODEX_COST_PER_MTOK": "gpt-5.6-luna,gpt-5.6-terra=10/60"})
     errors = c.validation_errors()
     assert any("gpt-5.6-luna" in e for e in errors), errors
-    assert c.codex_cost_per_mtok == (("gpt-5.6-terra", 10.0, 60.0),), (
-        "the well-formed entries survive"
-    )
+    assert c.codex_cost_per_mtok == (("gpt-5.6-terra", 10.0, 60.0),), "the well-formed entries survive"
 
 
 @pytest.mark.parametrize("raw", [
@@ -395,32 +302,20 @@ def test_malformed_rate_entries_never_reach_the_table(raw):
 
 
 def test_a_model_priced_twice_keeps_the_first_and_says_so():
-    c = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,GPT-5.6-Luna=99/99",
-    })
+    c = from_env({**_VALID, "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,GPT-5.6-Luna=99/99"})
     assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
     assert any("more than once" in e for e in c.validation_errors())
 
 
 def test_agent_env_file_is_loaded_with_shell_expansion(tmp_path):
     env_file = tmp_path / "agent.env"
-    env_file.write_text(
-        'REPO="o/r"\n'
-        'TARGET_DIR="$HOME/repo"\n'
-        'OPENAI_API_KEY="${ANTHROPIC_AUTH_TOKEN:-${OPENAI_API_KEY:-}}"\n'
-    )
+    env_file.write_text('REPO="o/r"\nTARGET_DIR="$HOME/repo"\n'
+                        'OPENAI_API_KEY="${ANTHROPIC_AUTH_TOKEN:-${OPENAI_API_KEY:-}}"\n')
 
-    env = _load_agent_env({
-        "AGENT_ENV": str(env_file),
-        "HOME": "/home/alice",
-        "ANTHROPIC_AUTH_TOKEN": "pk-from-shell",
-        "OPENAI_API_KEY": "sk-inherited",
-    })
+    env = _load_agent_env({"AGENT_ENV": str(env_file), "HOME": "/home/alice", "ANTHROPIC_AUTH_TOKEN": "pk-from-shell",
+                           "OPENAI_API_KEY": "sk-inherited"})
 
-    assert env["REPO"] == "o/r"
-    assert env["TARGET_DIR"] == "/home/alice/repo"
-    assert env["OPENAI_API_KEY"] == "pk-from-shell"
+    assert (env["REPO"], env["TARGET_DIR"], env["OPENAI_API_KEY"]) == ("o/r", "/home/alice/repo", "pk-from-shell")
 
 
 # --- AGENT_ENV file is the authority for harness knobs (#12) -----------------
@@ -428,49 +323,35 @@ def test_agent_env_file_is_loaded_with_shell_expansion(tmp_path):
 # knob the operator DELETED is still exported from the previous reload. These
 # pin the bidirectional contract: set AND unset both take effect.
 
-def test_removed_knob_falls_back_to_default_not_inherited_value(tmp_path):
+def _from_file(tmp_path, content: str, **inherited):
     env_file = tmp_path / "active.env"
-    env_file.write_text('REPO=o/r\nDAILY_SPEND_CAP_USD=250\n')
+    env_file.write_text(content)
+    return from_env({"AGENT_ENV": str(env_file), **inherited})
 
-    c = from_env({
-        "AGENT_ENV": str(env_file),
-        "REPO": "o/r",
-        "FIX_MODEL": "gpt-5.6-sol",   # stale export from an earlier reload
-        "DAILY_SPEND_CAP_USD": "150",
-    })
+
+def test_removed_knob_falls_back_to_default_not_inherited_value(tmp_path):
+    c = _from_file(tmp_path, "REPO=o/r\nDAILY_SPEND_CAP_USD=250\n", REPO="o/r",
+                   FIX_MODEL="gpt-5.6-sol",  # stale export from an earlier reload
+                   DAILY_SPEND_CAP_USD="150")
 
     assert c.fix_model is None        # absent from the file → dataclass default
     assert c.daily_spend_cap_usd == 250.0
 
 
 def test_file_value_wins_over_inherited_value(tmp_path):
-    env_file = tmp_path / "active.env"
-    env_file.write_text('REPO=o/r\nFIX_MODEL=haiku\nPOLL_SECONDS=45\n')
+    c = _from_file(tmp_path, "REPO=o/r\nFIX_MODEL=haiku\nPOLL_SECONDS=45\n", FIX_MODEL="opus", POLL_SECONDS="20")
 
-    c = from_env({
-        "AGENT_ENV": str(env_file),
-        "FIX_MODEL": "opus",
-        "POLL_SECONDS": "20",
-    })
-
-    assert c.fix_model == "haiku"
-    assert c.poll_seconds == 45
+    assert (c.fix_model, c.poll_seconds) == ("haiku", 45)
 
 
 def test_shell_escaped_values_survive_the_file_read(tmp_path):
     # compose-env.sh writes `printf '%s=%q'`, so a value with shell syntax
     # lands backslash-escaped.
-    env_file = tmp_path / "active.env"
     cmd = "set -e; (cd backend && uv run pytest) && pnpm exec tsc -b"
-    quoted = subprocess.run(
-        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "REVIEW_PROMPT", cmd],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    env_file.write_text(f"REPO=o/r\n{quoted}\n")
+    quoted = subprocess.run(["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "REVIEW_PROMPT", cmd],
+                            capture_output=True, text=True, check=True).stdout
 
-    c = from_env({"AGENT_ENV": str(env_file)})
-
-    assert c.review_prompt == cmd
+    assert _from_file(tmp_path, f"REPO=o/r\n{quoted}\n").review_prompt == cmd
 
 
 @pytest.mark.parametrize("content", [
