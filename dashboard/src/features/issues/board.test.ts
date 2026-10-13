@@ -105,8 +105,12 @@ describe("waitCell", () => {
     expect(waitCell(needs("2026-10-11T12:00:00Z"), NOW)).toMatchObject({ text: "1d", stale: true });
   });
 
-  it("reads Working rows as time since the last activity", () => {
-    expect(waitCell({ ...working, since_ts: "2026-10-12T11:48:00Z" }, NOW)).toMatchObject({ text: "12m ago", stale: false });
+  it("reads Working rows as time in the current step, without 'ago'", () => {
+    expect(waitCell({ ...working, since_ts: "2026-10-12T11:48:00Z" }, NOW)).toMatchObject({
+      text: "12m", stale: false, title: "In resolving for 12m",
+    });
+    expect(waitCell({ ...working, since_ts: "2026-10-11T11:00:00Z" }, NOW)).toMatchObject({ text: "1d", stale: true });
+    expect(waitCell({ ...working, since_ts: "2026-10-13T12:00:00Z" }, NOW).text).toBe("<1m");
   });
 
   it("says what an undated row is instead of a wait, and reads a future start as no wait", () => {

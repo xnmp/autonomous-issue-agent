@@ -313,7 +313,7 @@ class Backend:
     def _items(self, dep: Deployment, obs: Observation | None, read: StoreRead) -> tuple[views.Item, ...] | None:
         if obs is None or obs.world is None or dep.harness is None or read.states is None:
             return None
-        return views.items(obs.world, read.states, read.legs, dep.harness, read.item_legs)
+        return views.items(obs.world, read.states, read.legs, dep.harness, read.item_legs, obs.observed_at)
 
     def _read(self, name: str, wait: bool = False):
         """The deployment, its observation and one store read. `wait` reads
