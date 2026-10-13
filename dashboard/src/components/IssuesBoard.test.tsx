@@ -96,6 +96,20 @@ afterEach(() => {
 });
 
 describe("issues board groups", () => {
+  it("lists an item whose resolve has not started under Waiting, not Working", () => {
+    stubFetch();
+    renderBoard({
+      in_flight: [
+        card(131, { status: "waiting", on: "slot", headline: "Resolve next", reason: "Waiting for a free agent slot.", since_ts: null }),
+        card(132, { status: "working", activity: "queued", act: "FIX_CI", headline: "Fix CI next", reason: "Dispatches when a slot is free.", since_ts: null }),
+      ],
+    });
+
+    expect(within(section("Waiting")).getByText("Resolve next")).toBeVisible();
+    expect(within(section("Working")).queryByText("Resolve next")).not.toBeInTheDocument();
+    expect(within(section("Working")).getByText("Fix CI next")).toBeVisible();
+  });
+
   it("puts each row in its server-derived group, in order, longest Needs-you wait first", () => {
     stubFetch();
     renderBoard({

@@ -108,6 +108,7 @@ const BoardWaiting = z
       "headroom",
       "backoff",
       "github",
+      "slot",
     ]),
     reason: z.string(),
     since_ts: z.union([z.string(), z.null()]),

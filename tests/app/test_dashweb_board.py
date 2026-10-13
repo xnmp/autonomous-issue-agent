@@ -207,7 +207,7 @@ def test_the_board_shows_each_items_derived_state(deployment):
     board = {card["issue"]: card for card in payload["in_flight"]}
 
     assert sorted(board) == [1, 2, 3, 4, 5]
-    assert board[1]["board"]["status"] == "working" and board[1]["board"]["act"] == "TRIAGE"
+    assert board[1]["board"]["status"] == "waiting" and board[1]["board"]["on"] == "slot"
     assert board[2]["board"] | {"detail": None} == {
         "status": "needs_you",
         "reason": "question",
@@ -402,7 +402,7 @@ def test_a_review_waits_on_the_review_legs_price_while_a_fix_leg_still_fits(depl
 
     board = {card["issue"]: card["board"] for card in backend.issues("demo")["in_flight"]}
 
-    assert (board[1]["status"], board[1]["act"]) == ("working", "TRIAGE")
+    assert (board[1]["status"], board[1]["on"]) == ("waiting", "slot")
     assert (board[9]["status"], board[9]["on"]) == ("waiting", "headroom")
 
 

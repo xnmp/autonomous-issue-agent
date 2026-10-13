@@ -308,7 +308,8 @@
               "human-review",
               "headroom",
               "backoff",
-              "github"
+              "github",
+              "slot"
             ],
             "title": "On",
             "type": "string"

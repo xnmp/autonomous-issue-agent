@@ -2,6 +2,7 @@
 history from legs, and the legs metrics."""
 
 from __future__ import annotations
+from dataclasses import replace
 
 from datetime import datetime, timedelta, timezone
 
@@ -160,6 +161,25 @@ def test_a_stop_about_to_be_posted_is_already_needs_you():
 def test_moving_states_are_working(state, activity):
     board = status(state)
     assert isinstance(board, dash.Working) and board.activity == activity
+
+
+@pytest.mark.parametrize("act", [AgentKind.TRIAGE, AgentKind.RESOLVE])
+def test_an_item_whose_resolve_has_not_started_waits_for_a_slot(act):
+    for legs in ([], [leg("TRIAGE", 0, ended=2)], [replace(leg("RESOLVE", 0, state="released", ended=1), started_at=None)]):
+        board = status(Dispatch(act), legs=legs)
+        assert isinstance(board, dash.Waiting)
+        assert (board.on, board.headline, board.reason) == ("slot", f"{dash._ACT_WORDS[act.name]} next",
+                                                            "Waiting for a free agent slot.")
+    assert status(Dispatch(act), legs=[leg("TRIAGE", 0, ended=3)], last_end=at(3)).since_ts == stamp(3)
+    assert status(Dispatch(act), legs=[]).since_ts is None
+
+
+def test_a_retried_resolve_is_working_and_pr_acts_stay_working():
+    retried = status(Dispatch(AgentKind.RESOLVE), legs=[leg("RESOLVE", 0, ended=2)])
+    assert isinstance(retried, dash.Working) and retried.activity == "queued"
+    for act in (AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE):
+        board = status(Dispatch(act, "h1"), legs=[])
+        assert isinstance(board, dash.Working) and board.activity == "queued"
 
 
 def _ci_pr(*states):
