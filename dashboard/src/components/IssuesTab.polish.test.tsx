@@ -53,7 +53,7 @@ function polled(payload: Partial<IssuesPayload>): Polled<IssuesPayload> {
       in_flight: [],
       done: [],
       backlog: [],
-      gh_ok: true,
+      gh_ok: true, merged_partial: false,
       observed_at: "2026-07-29T09:00:00Z",
       notifications: [],
       warnings: [],

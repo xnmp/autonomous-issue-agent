@@ -296,8 +296,6 @@ class Backend:
         if isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
             warnings.append(f"issue history limited to {ghdata.ISSUE_HISTORY_LIMIT} records")
         partial = isinstance(merged, list) and len(merged) >= ghdata.MERGED_PR_LIMIT
-        if partial:
-            warnings.append(f"merged PRs limited to the newest {ghdata.MERGED_PR_LIMIT}; totals undercount")
         return Observation(world, issues, merged, self.now_fn(), tuple(warnings), failed or bool(errors), partial)
 
     def observation(self, dep: Deployment) -> Observation | None:
@@ -404,6 +402,7 @@ class Backend:
                 legs, ((item.issue, item.status) for item in found or () if isinstance(item.status, dash.NeedsYou)))],
             "warnings": warnings,
             "store_error": read.problem or None,
+            "merged_partial": bool(obs and obs.merged_partial),
         }
 
     def issue(self, name: str, number: int) -> dict | None:

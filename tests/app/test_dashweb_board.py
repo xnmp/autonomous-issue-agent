@@ -419,7 +419,7 @@ def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
     payload = backend.issues("demo")
     metrics = backend.overview("demo", "UTC")["metrics"]
 
-    assert payload["gh_ok"] is True and any(f"limited to the newest {ghdata.MERGED_PR_LIMIT}" in w for w in payload["warnings"])
+    assert payload["gh_ok"] is True and payload["warnings"] == [] and payload["merged_partial"] is True
     assert metrics["merged_prs"] == ghdata.MERGED_PR_LIMIT and metrics["merged_prs_partial"] is True
 
 

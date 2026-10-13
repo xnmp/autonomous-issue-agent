@@ -54,7 +54,7 @@ function card(issue: number, board: BoardStatus, over: Partial<IssueCard> = {}):
 
 function polled(payload: Partial<IssuesPayload>): Polled<IssuesPayload> {
   return {
-    data: { in_flight: [], done: [], backlog: [], gh_ok: true, observed_at: NOW, notifications: [], warnings: [], ...payload },
+    data: { in_flight: [], done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: NOW, notifications: [], warnings: [], ...payload },
     error: null,
     loading: false,
     updatedAt: Date.parse(NOW),

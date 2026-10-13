@@ -38,7 +38,7 @@ const working: BoardStatus = { status: "working", activity: "agent", act: "RESOL
 const waiting: BoardStatus = { status: "waiting", on: "branch-protection", headline: "Waiting on branch protection", reason: "GitHub blocks the merge.", since_ts: null };
 
 function payload(over: Partial<IssuesPayload>): IssuesPayload {
-  return { in_flight: [], done: [], backlog: [], gh_ok: true, observed_at: null, notifications: [], warnings: [], ...over };
+  return { in_flight: [], done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: null, notifications: [], warnings: [], ...over };
 }
 
 describe("boardItems", () => {

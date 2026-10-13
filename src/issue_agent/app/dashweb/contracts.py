@@ -344,6 +344,9 @@ class IssuesPayload(Warned):
     notifications: list[ToastNotification] = []
     # Why the control store could not be read; no board is derived then.
     store_error: str | None = None
+    # The merged-PR list hit its read limit, so `done` and merged totals are
+    # the newest PRs only; shown in the Done section, not as a global warning.
+    merged_partial: bool = False
 
 
 class TokenUsage(Contract):
