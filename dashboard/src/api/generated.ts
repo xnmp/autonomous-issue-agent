@@ -182,7 +182,7 @@ export interface components {
              * Reason
              * @enum {string}
              */
-            reason: "question" | "attempts" | "review-rounds" | "lifetime-cap" | "workflow-path" | "labelled";
+            reason: "question" | "attempts" | "review-rounds" | "lifetime-cap" | "workflow-path" | "duplicate" | "labelled";
             /** Title */
             title?: string | null;
         } & {
@@ -236,7 +236,7 @@ export interface components {
              * Reason
              * @enum {string}
              */
-            reason: "question" | "attempts" | "review-rounds" | "lifetime-cap" | "workflow-path" | "labelled";
+            reason: "question" | "attempts" | "review-rounds" | "lifetime-cap" | "workflow-path" | "duplicate" | "labelled";
             /** Since Ts */
             since_ts: string | null;
             /**
@@ -283,7 +283,7 @@ export interface components {
              * Activity
              * @enum {string}
              */
-            activity: "agent" | "queued" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "release";
+            activity: "agent" | "queued" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "triage_note" | "release";
             /** Headline */
             headline: string;
             /** Reason */
@@ -531,6 +531,7 @@ export interface components {
             store_error?: string | null;
             /** Title */
             title: string | null;
+            triage?: components["schemas"]["TriageSummary"] | null;
             /** Url */
             url: string | null;
             /** Warnings */
@@ -589,6 +590,8 @@ export interface components {
             state: "reserved" | "running" | "ended" | "released";
             /** Summary */
             summary?: string | null;
+            /** Tier */
+            tier?: ("low" | "med" | "high" | "xhigh") | null;
             usage: components["schemas"]["TokenUsage"] | null;
             /** Verdict */
             verdict?: string | null;
@@ -825,12 +828,12 @@ export interface components {
              * Current
              * @enum {string}
              */
-            current: "resolve" | "ci" | "review" | "merge";
+            current: "triage" | "resolve" | "ci" | "review" | "merge";
             /**
              * Furthest
              * @enum {string}
              */
-            furthest: "resolve" | "ci" | "review" | "merge";
+            furthest: "triage" | "resolve" | "ci" | "review" | "merge";
             /** Live */
             live: boolean;
             /** Resolve Attempts */
@@ -848,7 +851,7 @@ export interface components {
              * Stage
              * @enum {string}
              */
-            stage: "resolve" | "ci" | "review" | "merge";
+            stage: "triage" | "resolve" | "ci" | "review" | "merge";
             /** Steps */
             steps: components["schemas"]["TrackChip"][];
         } & {
@@ -900,6 +903,31 @@ export interface components {
              * @enum {string}
              */
             outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done";
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * TriageSummary
+         * @description The issue's triage: tier, acceptance criteria and a suspected
+         *     duplicate. Agent-authored, laundered and bounded: render as text.
+         */
+        TriageSummary: {
+            /**
+             * Acceptance Criteria
+             * @default []
+             */
+            acceptance_criteria: string[];
+            /** Duplicate Of */
+            duplicate_of?: number | null;
+            /** Duplicate Reason */
+            duplicate_reason?: string | null;
+            /** Rationale */
+            rationale?: string | null;
+            /**
+             * Tier
+             * @enum {string}
+             */
+            tier: "low" | "med" | "high" | "xhigh";
         } & {
             [key: string]: unknown;
         };

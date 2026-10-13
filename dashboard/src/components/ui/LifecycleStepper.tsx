@@ -1,8 +1,9 @@
 import type { StageId } from "../../api/types";
 import { tipProps } from "./Tip";
 
-/** The four stages, in the order an item moves through them. */
+/** The five stages, in the order an item moves through them. */
 export const CANONICAL: readonly { id: StageId; label: string }[] = [
+  { id: "triage", label: "Triage" },
   { id: "resolve", label: "Resolve" },
   { id: "ci", label: "CI" },
   { id: "review", label: "Review" },
@@ -34,7 +35,7 @@ export function railSummary(nodes: readonly RailNode[]): string {
 }
 
 interface RailProps {
-  /** The server's rail; the four stages are always all drawn. */
+  /** The server's rail; the five stages are always all drawn. */
   rail: RailNode[];
   /** The current node takes its row's group colour. */
   tone: RailTone;
@@ -45,7 +46,7 @@ interface RailProps {
   id?: string;
 }
 
-/** The four-stage track, from the server's rail, with round counts. */
+/** The five-stage track, from the server's rail, with round counts. */
 export function LifecycleStepper(props: RailProps) {
   return <RailStepper {...props} />;
 }

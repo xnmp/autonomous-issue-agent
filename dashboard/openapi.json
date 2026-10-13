@@ -49,6 +49,7 @@
               "review-rounds",
               "lifetime-cap",
               "workflow-path",
+              "duplicate",
               "labelled"
             ],
             "title": "Reason",
@@ -248,6 +249,7 @@
               "review-rounds",
               "lifetime-cap",
               "workflow-path",
+              "duplicate",
               "labelled"
             ],
             "title": "Reason",
@@ -379,6 +381,7 @@
               "merge",
               "update",
               "open_pr",
+              "triage_note",
               "release"
             ],
             "title": "Activity",
@@ -1255,6 +1258,16 @@
             ],
             "title": "Title"
           },
+          "triage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TriageSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "url": {
             "anyOf": [
               {
@@ -1476,6 +1489,23 @@
               }
             ],
             "title": "Summary"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "low",
+                  "med",
+                  "high",
+                  "xhigh"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tier"
           },
           "usage": {
             "anyOf": [
@@ -2247,6 +2277,7 @@
           },
           "current": {
             "enum": [
+              "triage",
               "resolve",
               "ci",
               "review",
@@ -2257,6 +2288,7 @@
           },
           "furthest": {
             "enum": [
+              "triage",
               "resolve",
               "ci",
               "review",
@@ -2299,6 +2331,7 @@
         "properties": {
           "stage": {
             "enum": [
+              "triage",
               "resolve",
               "ci",
               "review",
@@ -2447,6 +2480,68 @@
           "count"
         ],
         "title": "TrackChip",
+        "type": "object"
+      },
+      "TriageSummary": {
+        "additionalProperties": true,
+        "description": "The issue's triage: tier, acceptance criteria and a suspected\nduplicate. Agent-authored, laundered and bounded: render as text.",
+        "properties": {
+          "acceptance_criteria": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Acceptance Criteria",
+            "type": "array"
+          },
+          "duplicate_of": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Of"
+          },
+          "duplicate_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Reason"
+          },
+          "rationale": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rationale"
+          },
+          "tier": {
+            "enum": [
+              "low",
+              "med",
+              "high",
+              "xhigh"
+            ],
+            "title": "Tier",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tier"
+        ],
+        "title": "TriageSummary",
         "type": "object"
       },
       "UsagePayload": {

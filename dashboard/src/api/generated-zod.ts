@@ -71,6 +71,7 @@ const BoardNeedsYou = z
       "review-rounds",
       "lifetime-cap",
       "workflow-path",
+      "duplicate",
       "labelled",
     ]),
     since_ts: z.union([z.string(), z.null()]),
@@ -89,6 +90,7 @@ const BoardWorking = z
       "merge",
       "update",
       "open_pr",
+      "triage_note",
       "release",
     ]),
     headline: z.string(),
@@ -129,15 +131,15 @@ const TrackChip = z
   .passthrough();
 const StageVisit = z
   .object({
-    stage: z.enum(["resolve", "ci", "review", "merge"]),
+    stage: z.enum(["triage", "resolve", "ci", "review", "merge"]),
     steps: z.array(TrackChip),
   })
   .passthrough();
 const StageRail = z
   .object({
     ci_runs: z.number().int(),
-    current: z.enum(["resolve", "ci", "review", "merge"]),
-    furthest: z.enum(["resolve", "ci", "review", "merge"]),
+    current: z.enum(["triage", "resolve", "ci", "review", "merge"]),
+    furthest: z.enum(["triage", "resolve", "ci", "review", "merge"]),
     live: z.boolean(),
     resolve_attempts: z.number().int(),
     review_rounds: z.number().int(),
@@ -258,9 +260,21 @@ const IssueStep = z
     started_ts: z.union([z.string(), z.null()]),
     state: z.enum(["reserved", "running", "ended", "released"]),
     summary: z.union([z.string(), z.null()]).optional(),
+    tier: z
+      .union([z.enum(["low", "med", "high", "xhigh"]), z.null()])
+      .optional(),
     usage: z.union([TokenUsage, z.null()]),
     verdict: z.union([z.string(), z.null()]).optional(),
     verdict_excerpt: z.union([z.string(), z.null()]).optional(),
+  })
+  .passthrough();
+const TriageSummary = z
+  .object({
+    acceptance_criteria: z.array(z.string()).optional().default([]),
+    duplicate_of: z.union([z.number(), z.null()]).optional(),
+    duplicate_reason: z.union([z.string(), z.null()]).optional(),
+    rationale: z.union([z.string(), z.null()]).optional(),
+    tier: z.enum(["low", "med", "high", "xhigh"]),
   })
   .passthrough();
 const IssueDetailPayload = z
@@ -289,6 +303,7 @@ const IssueDetailPayload = z
     steps: z.array(IssueStep),
     store_error: z.union([z.string(), z.null()]).optional(),
     title: z.union([z.string(), z.null()]),
+    triage: z.union([TriageSummary, z.null()]).optional(),
     url: z.union([z.string(), z.null()]),
     warnings: z.array(z.string()),
   })
@@ -369,6 +384,7 @@ const AttentionItem = z
       "review-rounds",
       "lifetime-cap",
       "workflow-path",
+      "duplicate",
       "labelled",
     ]),
     title: z.union([z.string(), z.null()]).optional(),
@@ -471,6 +487,7 @@ export const schemas = {
   PullRequestLink,
   TokenUsage,
   IssueStep,
+  TriageSummary,
   IssueDetailPayload,
   ActionResult,
   timezone,
@@ -600,6 +617,7 @@ const endpoints = makeApi([
         steps: z.array(IssueStep),
         store_error: z.union([z.string(), z.null()]).optional(),
         title: z.union([z.string(), z.null()]),
+        triage: z.union([TriageSummary, z.null()]).optional(),
         url: z.union([z.string(), z.null()]),
         warnings: z.array(z.string()),
       })

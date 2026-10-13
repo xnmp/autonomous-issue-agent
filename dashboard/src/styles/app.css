@@ -2118,3 +2118,17 @@
     min-width: 316px;
   }
 }
+.issue-triage-panel {
+  padding-bottom: var(--space-3);
+}
+.issue-triage-panel p,
+.issue-triage-panel ul {
+  margin: 0 var(--space-4) var(--space-2);
+}
+.triage-criteria {
+  padding-left: var(--space-5);
+  font-size: var(--text-xs);
+}
+.triage-criteria-label {
+  font-size: var(--text-xs);
+}
