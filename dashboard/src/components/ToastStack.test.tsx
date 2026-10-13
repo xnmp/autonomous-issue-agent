@@ -59,6 +59,7 @@ describe("ToastStack", () => {
       alive: true,
       stale: false,
       heartbeat_ts: null,
+      in_flight: [],
     };
     const { rerender } = render(
       <ToastStack repo="demo" notifications={[]} roles={[role]} />,

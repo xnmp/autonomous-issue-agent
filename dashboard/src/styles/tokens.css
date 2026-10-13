@@ -67,24 +67,12 @@
   --meta-br: var(--c-magenta-br);
   --link: var(--c-cyan);
   --link-br: var(--c-cyan-br);
-  --tier-luna: var(--c-yellow);
-  --tier-terra: #ffb56b;
-  --tier-sol: #f08a3c;
-  --tier-high: var(--c-red-br);
   /* ink on filled shapes: strong accent/ok fills, and series/running fills */
   --ink-on-accent: var(--c-fg);
   --ink-on-fill: var(--c-bg);
 
-  /* ---- categorical series (cost mix) ----
-   * Slot order is FIXED and never cycled. Validated with the dataviz palette
-   * validator against the --panel surface: CVD separation, normal-vision floor
-   * and contrast all PASS in this order (blue -> bright cyan -> yellow). The lightness/chroma-band checks fail by construction —
-   * a desaturated terminal theme cannot satisfy them — so every chart that
-   * uses these also ships a legend + direct labels (secondary encoding).
-   */
-  --series-1: var(--c-blue); /* resolve */
-  --series-2: var(--c-cyan-br); /* review  */
-  --series-3: var(--c-yellow); /* repair  */
+  /* ---- single-series fill (the spend histogram) ---- */
+  --series-1: var(--c-blue);
 
   /* ---- meter severity (utilization) ---- */
   --meter-low: var(--c-green);
@@ -329,8 +317,6 @@
   --scrim: color-mix(in srgb, var(--c-fg) 28%, transparent);
   --ink-on-accent: var(--c-panel);
   --ink-on-fill: var(--c-panel);
-  --tier-terra: #b24608;
-  --tier-sol: #a8313c;
 }
 
 @media (prefers-reduced-motion: reduce) {

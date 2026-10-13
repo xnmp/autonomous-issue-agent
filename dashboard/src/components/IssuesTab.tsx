@@ -561,6 +561,7 @@ function TaskDetailRow({
     0,
   );
   const steps = detail.data?.steps ?? [];
+  const carried = detail.data?.carried ?? null;
   return (
     <tr className="detail-row">
       <td colSpan={colSpan}>
@@ -573,11 +574,20 @@ function TaskDetailRow({
             <ErrorBanner message={detail.error} onRetry={detail.refresh} />
           ) : !detail.data ? (
             <span className="faint">loading legs…</span>
-          ) : steps.length > 0 ? (
-            <ol className="task-story">
-              {steps.map((step) => <TaskStoryLine key={step.leg_id} step={step} />)}
-            </ol>
-          ) : <EmptyState>no legs recorded</EmptyState>}
+          ) : (
+            <>
+              {carried ? (
+                <span className="faint carried-note">
+                  {carried.legs} {carried.legs === 1 ? "leg" : "legs"} before the cutover · {usd(carried.cost_usd)}
+                </span>
+              ) : null}
+              {steps.length > 0 ? (
+                <ol className="task-story">
+                  {steps.map((step) => <TaskStoryLine key={step.leg_id} step={step} />)}
+                </ol>
+              ) : carried ? null : <EmptyState>no legs recorded</EmptyState>}
+            </>
+          )}
         </div>
       </td>
     </tr>

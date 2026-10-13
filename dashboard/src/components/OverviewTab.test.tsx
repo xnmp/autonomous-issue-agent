@@ -9,14 +9,24 @@ const metrics: Metrics = {
   by_basis: [{ basis: "provider_reported", usd: 20 }],
   by_kind: [{ kind: "RESOLVE", usd: 12, runs: 4 }, { kind: "REVIEW", usd: 5, runs: 5 }, { kind: "FIX_CI", usd: 3, runs: 2 }],
   first_pass_approvals: 3, first_pass_changes: 1, first_pass_rate: 0.75, rounds_per_pr: 1.25,
-  legs: 11, machine_legs: 1, today_usd: 2,
+  legs: 11, machine_legs: 1,
 };
 
 function overview(over: Partial<OverviewPayload> = {}) {
   const body: OverviewPayload = {
     metrics,
-    caps: { issue_cap_usd: 5, daily_cap_usd: 10, global_daily_cap_usd: 40, today_usd: 2 },
-    health: [{ role: "fix", alive: true, stale: false, heartbeat_ts: "2026-08-01T08:00:00Z" }],
+    caps: {
+      issue_cap_usd: 5, daily_cap_usd: 10, global_daily_cap_usd: 40, today_usd: 2, global_today_usd: 30,
+      headroom: [{ role: "fix", leg_usd: 10, fits: true }, { role: "review", leg_usd: 15, fits: false }],
+    },
+    health: [{
+      role: "fix", alive: true, stale: false, heartbeat_ts: "2026-08-01T08:00:00Z", state: "running",
+      in_flight: [{ kind: "REBASE", number: 999 }],
+    }],
+    leases: [{
+      role: "fix", issue: 755, pr: 999, leg_id: "L1", kind: "REBASE", leg_state: "running", pid: 4242,
+      acquired_ts: "2026-08-01T08:00:00Z",
+    }],
     health_trend: [],
     needs_attention: [{
       issue: 50, title: "Needs a decision", reason: "question", headline: "Answer the agent's question",
@@ -31,7 +41,7 @@ function overview(over: Partial<OverviewPayload> = {}) {
   })));
   const onOpenIssues = vi.fn();
   const view = render(
-    <OverviewTab repo="demo" onOpenIssues={onOpenIssues} showDaemonHealth showIssueHealthTrend />,
+    <OverviewTab repo="demo" onOpenIssues={onOpenIssues} showIssueHealthTrend />,
   );
   return { ...view, onOpenIssues };
 }
@@ -50,9 +60,34 @@ describe("OverviewTab", () => {
     expect(screen.getByText("$ per merged PR").closest(".tile")).toHaveTextContent("$5");
     expect(screen.getByText("$ per merged PR").closest(".tile")).toHaveTextContent("$20.00 total");
     expect(screen.getByText("First-pass rate").closest(".tile")).toHaveTextContent("3 approve / 1 changes");
-    expect(screen.getByText("Legs").closest(".tile")).toHaveTextContent("resolve $12.00 · review $5.00 · repair $3.00");
-    expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent("$2.00today / $10.00");
-    expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent("All repos $40.00");
+    expect(screen.getByText("Legs").closest(".tile")).toHaveTextContent("resolve $12.00 · fix ci $3.00 · review $5.00");
+  });
+
+  it("shows committed spend against both daily caps and each role's headroom", async () => {
+    overview();
+
+    const caps = await screen.findByRole("region", { name: "Spending caps" });
+    expect(caps).toHaveTextContent("$2.00today / $10.00");
+    expect(caps).toHaveTextContent("$30.00 / $40.00");
+    expect(caps).toHaveTextContent("fix fits");
+    expect(caps).toHaveTextContent("review waits");
+    expect(caps).toHaveClass("tile-alert");
+  });
+
+  it("lists the leases the roles hold, with their legs", async () => {
+    overview();
+
+    const leases = await screen.findByRole("region", { name: "Leases" });
+    expect(leases).toHaveTextContent("#755");
+    expect(leases).toHaveTextContent("PR #999");
+    expect(leases).toHaveTextContent("Rebase");
+    expect(leases).toHaveTextContent("4242");
+  });
+
+  it("says no role holds an item when there are no leases", async () => {
+    overview({ leases: [] });
+
+    expect(await screen.findByText("no role holds an item")).toBeVisible();
   });
 
   it("lists each item stopped for a person with its stop, as text", async () => {
@@ -92,8 +127,10 @@ describe("OverviewTab", () => {
     expect(onOpenIssues).toHaveBeenCalledWith("inflight");
   });
 
-  it("shows each role's last heartbeat", async () => {
+  it("shows each role's heartbeat, its state and what it holds", async () => {
     overview();
-    expect(await screen.findByText(/heartbeat/, { selector: ".health-row span" })).toBeVisible();
+    const row = (await screen.findByText(/heartbeat/, { selector: ".health-row span" })).closest(".health-row");
+    expect(row).toHaveTextContent("running");
+    expect(row).toHaveTextContent("Rebase #999");
   });
 });

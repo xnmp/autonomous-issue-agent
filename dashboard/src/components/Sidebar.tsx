@@ -54,7 +54,8 @@ interface SidebarProps {
 
 /**
  * Left rail: active deployments (with live role-health dots) on top, past ones
- * below with a start button, then verification + the usage meters.
+ * below, then verification + the usage meters. The rail starts nothing: the
+ * dashboard's only writes are label changes.
  *
  * The list arrives pre-sorted by frecency (server-side); the client only
  * partitions active/inactive and never re-sorts — the operator's muscle memory

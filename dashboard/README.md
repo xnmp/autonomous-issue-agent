@@ -74,17 +74,16 @@ src/
     hash.ts                Route union, parse/serialize, useRoute()
   lib/
     format.ts              null-tolerant $ / % / duration / relative-time formatters
-    semantics.ts           domain value -> Tone; leg families; explicit kind labels
+    semantics.ts           domain value -> Tone; act cost order; explicit kind labels
   features/issues/
     useIssues.ts           issues polling seam, independent of presentation
   components/
-    Sidebar.tsx            repo rail (active/past), self-repo treatment, start-daemons modal
+    Sidebar.tsx            repo rail (active/past), self-repo treatment, quota and settings
     UsageBlock.tsx         claude 5h/7d + codex weekly meters + harness $ vs caps
     TabStrip.tsx           tab strip + sub-tab pills
-    OverviewTab.tsx        stat tiles, cost mix, caps, daemon health, unattributed events
-    IssuesTab.tsx          in-flight / pending / done / backlog tables + actions
-    IssueTab.tsx           per-issue header, run table, per-run detail panes
-    EventTimeline.tsx      journal events as a readable timeline with raw JSON
+    OverviewTab.tsx        stat tiles, cost by act, caps + role headroom, daemon health, leases
+    IssuesTab.tsx          in-flight board / done / backlog tables + promote
+    IssueTab.tsx           per-issue header, legs table (runtime/model, basis), leg detail
     VerificationTab.tsx    docs/field-verification.md ledger
     ui/                    Chip, Modal, Feedback (banners/empty), Charts (meter,
                            stat tile, stacked bar, ETA progress), StepBadge, Json

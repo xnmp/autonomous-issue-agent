@@ -58,16 +58,17 @@ describe("IssuesTab", () => {
     expect(screen.queryByText("GitHub data unavailable")).not.toBeInTheDocument();
   });
 
-  it("shows a carried pre-cutover leg as history, not a failure", async () => {
-    const carried = { ...detail.steps[0], leg_id: "C1", role: "carried", outcome: "carried" as const, summary: null };
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ...detail, steps: [carried] }), {
-      status: 200, headers: { "Content-Type": "application/json" },
-    })));
+  it("shows pre-cutover legs as one money-history total, not legacy leg rows or failures", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ ...detail, steps: [], carried: { legs: 3, cost_usd: 4.5 } }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    )));
     render(<IssuesTab repo="demo" sub="done" issues={polled({ done: [doneCard] })} onOpenIssue={vi.fn()} />);
 
     await userEvent.click(screen.getByRole("row", { name: /Explain completed work/ }));
-    expect(await screen.findByText("before the cutover")).toBeVisible();
+    expect(await screen.findByText("3 legs before the cutover · $4.50")).toBeVisible();
     expect(screen.queryByText("failed")).not.toBeInTheDocument();
+    expect(screen.queryByText("no legs recorded")).not.toBeInTheDocument();
   });
 
   it("expands a done row into its legs before opening the full issue, and hides rounds by default", async () => {

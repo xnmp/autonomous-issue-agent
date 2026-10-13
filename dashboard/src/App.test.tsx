@@ -159,7 +159,7 @@ describe("App navigation", () => {
     expect(seconds).not.toBeChecked();
   });
 
-  it("defaults optional Overview sections off and persists their toggles", async () => {
+  it("always shows daemon health, defaults the issue health trend off and persists its toggle", async () => {
     window.location.hash = "#/repo/demo/overview";
     vi.stubGlobal(
       "fetch",
@@ -176,6 +176,7 @@ describe("App navigation", () => {
             alive: true,
             stale: false,
             heartbeat_ts: "2026-08-09T01:00:00Z",
+            in_flight: [],
           }],
           health_trend: [],
           needs_attention: [],
@@ -188,26 +189,19 @@ describe("App navigation", () => {
     const first = render(<App />);
 
     expect(await screen.findByText("Merged", { selector: ".tile-label" })).toBeVisible();
-    expect(screen.queryByText("Daemon health", { selector: ".panel-title" }))
-      .not.toBeInTheDocument();
+    expect(screen.getByText("Daemon health", { selector: ".panel-title" })).toBeVisible();
     expect(screen.queryByText("Issue health trend", { selector: ".panel-title" }))
       .not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Settings" }));
-    const daemonHealth = screen.getByRole("checkbox", { name: "Daemon health" });
+    expect(screen.queryByRole("checkbox", { name: "Daemon health" })).not.toBeInTheDocument();
     const issueHealthTrend = screen.getByRole("checkbox", { name: "Issue health trend" });
-    expect(daemonHealth).not.toBeChecked();
     expect(issueHealthTrend).not.toBeChecked();
 
-    await userEvent.click(daemonHealth);
     await userEvent.click(issueHealthTrend);
-    expect(await screen.findByText("Daemon health", { selector: ".panel-title" })).toBeVisible();
-    expect(screen.getByText("Issue health trend", { selector: ".panel-title" })).toBeVisible();
+    expect(await screen.findByText("Issue health trend", { selector: ".panel-title" })).toBeVisible();
     expect(JSON.parse(localStorage.getItem("issue-agent.dashboard.options") ?? "{}"))
-      .toMatchObject({
-        showOverviewDaemonHealth: true,
-        showOverviewIssueHealthTrend: true,
-      });
+      .toMatchObject({ showOverviewIssueHealthTrend: true });
 
     first.unmount();
     render(<App />);
@@ -221,7 +215,6 @@ describe("App navigation", () => {
     localStorage.setItem(
       "issue-agent.dashboard.options",
       JSON.stringify({
-        showOverviewDaemonHealth: "false",
         showOverviewIssueHealthTrend: "true",
       }),
     );
@@ -248,7 +241,6 @@ describe("App navigation", () => {
 
     expect(await screen.findByText("Merged", { selector: ".tile-label" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Settings" }));
-    expect(screen.getByRole("checkbox", { name: "Daemon health" })).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Issue health trend" })).not.toBeChecked();
   });
 

@@ -26,7 +26,6 @@ const usage: UsagePayload = {
 const options: DashboardOptions = {
   showPerRepoQuotas: false,
   showDurationSeconds: false,
-  showOverviewDaemonHealth: false,
   showOverviewIssueHealthTrend: false,
   theme: "cosmic-dusk" as DashboardOptions["theme"],
 };
