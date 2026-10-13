@@ -38,6 +38,7 @@ from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
 from ..domain.dashboard import STALE_AFTER_S
 from ..domain.deployment import canonical_deployment_name
+from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
 from .codex_resolution import (
     CodexResolutionReport,
@@ -2225,25 +2226,9 @@ def cmd_ready(args) -> int:
     return _label_issues(args, "ai-ready")
 
 
-REMOTE_LABELS = (
-    "ai-ready",
-    "ai-working",
-    "ai-blocked",
-    "ai-pr-open",
-    "ai-done",
-    "needs-budget-review",
-    "trivial",
-    "minor",
-    "major",
-    "needs-human-review",
-    "needs-design",
-    "invariant",
-    "recurrence",
-    "P1",
-    "P2",
-    "P3",
-    "harness",
-)
+# The two labels of the minimal design: an operator adds ai-ready, policy
+# writes needs-human (docs/open/2026-10-12-minimal-harness-design.md).
+REMOTE_LABELS = (Label.AI_READY.value, Label.NEEDS_HUMAN.value)
 
 
 def _operator_effects(repo: str, channel: str):
@@ -2257,17 +2242,7 @@ def cmd_prepare_remote(args) -> int:
     failures = []
     if not args.skip_labels:
         for label in REMOTE_LABELS:
-            applied, detail = effects.ensure_label(
-                label,
-                color={"P1": "b60205", "P2": "d93f0b", "P3": "fbca04"}.get(
-                    label, "ededed"
-                ),
-                description=(
-                    f"harness priority {label}"
-                    if label in {"P1", "P2", "P3"}
-                    else ""
-                ),
-            )
+            applied, detail = effects.ensure_label(label)
             if not applied:
                 failures.append(f"label {label}: {detail}")
     if args.ensure_auto_merge:

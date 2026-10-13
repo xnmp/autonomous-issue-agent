@@ -872,6 +872,8 @@ _RELABEL_ACTION_KIND = "operator_relabel"
 # other lifecycle label arriving from an operator endpoint is a new behaviour
 # nobody has classified, and `other` is where it should surface.
 _POLICY_ADD_LABELS = frozenset({Label.AI_READY.value})
+# The deleted dashboard priority action journalled these moves; past journals
+# still carry them and the intervention metric keeps counting them as re-arms.
 _PRIORITY_LABELS = frozenset({Label.P1.value, Label.P2.value, Label.P3.value})
 
 
@@ -1459,7 +1461,7 @@ class OnTriage:
 
 @dataclass(frozen=True)
 class OnQueue:
-    priority: str | None = None
+    """On `ai-ready`, waiting for the fixer to pick it up."""
 
 
 BlockedOn = OnIssue | OnPr | OnOverlap | OnTriage | OnQueue
@@ -1559,7 +1561,6 @@ class BoardFacts:
     stall: StallObserved | None = None
     # An ai-ready issue with nothing in progress: it waits for the fixer.
     queued: bool = False
-    priority: str | None = None
     merge_ready: MergeReady | None = None
     merge_owner: MergeOwner = "operator"
     # GitHub's review decision on the current head: False when it requires a
@@ -1797,7 +1798,7 @@ def board_status(facts: BoardFacts) -> BoardStatus:
     """Which group a row belongs to, and the one line that says why.
 
     Precedence, first match wins:
-      1. parked: the operator moved it out of the pipeline on purpose;
+      1. held for a human (`needs-human`): nothing moves until a person acts;
       2. escalated or awaiting a reply: nothing moves until a person acts,
          even while a leg is still running (that leg cannot clear the hold);
       3. a leg is running: a reviewer re-reading a new head outranks the
@@ -1817,7 +1818,7 @@ def board_status(facts: BoardFacts) -> BoardStatus:
         return Blocked(
             OnTriage("parked"),
             "Waiting on triage",
-            "Parked for human review. Unpark it to hand it back to the harness.",
+            "Held for a human (needs-human). Unblock removes the label.",
             triage.since,
         )
     if facts.attention is not None:
@@ -1851,11 +1852,10 @@ def board_status(facts: BoardFacts) -> BoardStatus:
             facts.stall.since,
         )
     if facts.queued:
-        priority = f" ({facts.priority})" if facts.priority else ""
         return Blocked(
-            OnQueue(facts.priority),
+            OnQueue(),
             "Queued",
-            f"Starts when the fixer picks it up{priority}.",
+            "Starts when the fixer picks it up.",
             None,
         )
     return _handoff(facts)

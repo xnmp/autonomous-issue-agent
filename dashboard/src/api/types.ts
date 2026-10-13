@@ -11,7 +11,6 @@ import type { components } from "./generated";
 type Schema = components["schemas"];
 
 export type Nullable<T> = T | null;
-export type Priority = "P1" | "P2" | "P3" | null;
 export type RoleHealth = Schema["RoleHealth"];
 export type RepoSummary = Schema["RepoSummary"];
 export type ReposPayload = Schema["ReposPayload"];

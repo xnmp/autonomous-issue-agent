@@ -87,12 +87,7 @@ const BlockedOnOverlap = z
 const BlockedOnTriage = z
   .object({ kind: z.literal("triage"), why: z.literal("parked") })
   .passthrough();
-const BlockedOnQueue = z
-  .object({
-    kind: z.literal("queue"),
-    priority: z.union([z.enum(["P1", "P2", "P3"]), z.null()]),
-  })
-  .passthrough();
+const BlockedOnQueue = z.object({ kind: z.literal("queue") }).passthrough();
 const BoardBlocked = z
   .object({
     headline: z.string(),
@@ -223,7 +218,6 @@ const PendingCard = z
       .optional(),
     pr_state: z.union([z.string(), z.null()]).optional(),
     pr_url: z.union([z.string(), z.null()]).optional(),
-    priority: z.union([z.enum(["P1", "P2", "P3"]), z.null()]),
     rail: z.union([StageRail, z.null()]).optional(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
@@ -347,6 +341,7 @@ const IssueDetailPayload = z
     escalation_reason: z.union([z.string(), z.null()]).optional(),
     events: z.array(z.object({}).partial().passthrough()),
     harness_message: z.union([z.string(), z.null()]).optional(),
+    held_for_human: z.boolean().optional().default(false),
     history: z.array(StageVisit).optional().default([]),
     idle_active: z.boolean(),
     idle_s: z.union([z.number(), z.null()]),
@@ -677,6 +672,7 @@ const endpoints = makeApi([
         escalation_reason: z.union([z.string(), z.null()]).optional(),
         events: z.array(z.object({}).partial().passthrough()),
         harness_message: z.union([z.string(), z.null()]).optional(),
+        held_for_human: z.boolean().optional().default(false),
         history: z.array(StageVisit).optional().default([]),
         idle_active: z.boolean(),
         idle_s: z.union([z.number(), z.null()]),
@@ -741,37 +737,6 @@ const endpoints = makeApi([
     alias: "api_park_api_repos__name__issues__number__park_post",
     requestFormat: "json",
     parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-    ],
-    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "post",
-    path: "/api/repos/:name/issues/:number/priority",
-    alias: "api_priority_api_repos__name__issues__number__priority_post",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "body",
-        type: "Body",
-        schema: z.object({}).partial().passthrough().default({}),
-      },
       {
         name: "name",
         type: "Path",

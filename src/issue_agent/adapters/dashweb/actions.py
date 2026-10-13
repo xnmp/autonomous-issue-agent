@@ -12,11 +12,6 @@ from __future__ import annotations
 import os
 import subprocess
 
-PRIORITY_LABELS = ("P1", "P2", "P3")
-# Neutral-to-hot, so P1 reads as the urgent one in the GitHub UI too.
-PRIORITY_COLORS = {"P1": "b60205", "P2": "d93f0b", "P3": "fbca04"}
-
-
 def start_command(harness_root: str, name: str) -> list[str]:
     """Detached launcher. `setsid` matters: the daemons must outlive the HTTP
     request that started them, and `point-at.sh` runs them in the foreground
@@ -32,16 +27,6 @@ def start_command(harness_root: str, name: str) -> list[str]:
 
 def start_log_path(log_dir: str, name: str) -> str:
     return os.path.join(log_dir, f"dashboard-start-{name}.log")
-
-
-def priority_change(priority: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Return the atomic add/remove intent for one priority selection."""
-
-    if priority is not None and priority not in PRIORITY_LABELS:
-        raise ValueError(f"priority must be one of {PRIORITY_LABELS} or null")
-    added = (priority,) if priority else ()
-    removed = tuple(label for label in PRIORITY_LABELS if label != priority)
-    return added, removed
 
 
 def launch_detached(argv: list[str], log_path: str) -> tuple[bool, str]:

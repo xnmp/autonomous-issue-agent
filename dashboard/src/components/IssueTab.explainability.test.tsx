@@ -9,6 +9,7 @@ const detail = {
   url: null,
   stage: "escalated",
   escalation_reason: "budget cap reached — approve more spend or close the issue",
+  held_for_human: true,
   done: false,
   prs: [],
   pull_requests: [],
@@ -86,7 +87,7 @@ describe("issue explainability", () => {
   });
 
   it("offers no unblock for an issue nobody holds", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json({ ...detail, stage: "awaiting review", escalation_reason: null })));
+    vi.stubGlobal("fetch", vi.fn(async () => json({ ...detail, held_for_human: false })));
 
     render(<IssueTab repo="demo" issue={77} />);
 

@@ -113,11 +113,14 @@ describe("backlog promotion", () => {
                 issue: 120,
                 title: "Toast notifications",
                 url: "https://github.com/o/r/issues/120",
-                priority: "P1",
                 labels: ["feature", "ai-ready"],
                 held: false,
                 hold_reason: null,
                 overlap: null,
+                board: {
+                  status: "blocked", on: { kind: "queue" }, headline: "Queued",
+                  reason: "Confirmed by the server.", since_ts: null,
+                },
               }],
             });
           }
@@ -150,7 +153,7 @@ describe("backlog promotion", () => {
 
     serverPromoted = true;
     finishPromotion(json({ ok: true, detail: "promoted" }));
-    expect(await screen.findByText(/picks it up \(P1\)/)).toBeVisible();
+    expect(await screen.findByText("Confirmed by the server.")).toBeVisible();
     expect(screen.getAllByText("Toast notifications")).toHaveLength(1);
   });
 

@@ -13,7 +13,6 @@ import type {
   IssueDetailPayload,
   IssuesPayload,
   OverviewPayload,
-  Priority,
   ReposPayload,
   StepEventsPayload,
   UsagePayload,
@@ -256,14 +255,6 @@ export const api = {
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/park`,
       {},
-      schemas.ActionResult,
-      s,
-    ),
-
-  setPriority: (name: string, n: number, priority: Priority, s?: AbortSignal) =>
-    postJson<ActionResult>(
-      `/api/repos/${enc(name)}/issues/${n}/priority`,
-      { priority },
       schemas.ActionResult,
       s,
     ),

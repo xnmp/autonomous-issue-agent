@@ -722,6 +722,39 @@ def test_legacy_owner_adoption_preserves_active_runs_and_leases(
     assert store.active_reservation_runs(current) == (request.run_id,)
 
 
+def test_repoint_leaves_continuation_bound_runs_with_the_retired_owner(
+    tmp_path,
+) -> None:
+    # A live store held 143 continuation-bound runs under the prior owner; the
+    # identity trigger aborted the whole adoption and the repoint crashed boot.
+    store = _store(tmp_path)
+    old_owner = "o/r:fix:deployment-1"
+    current = "o/r:fix:deployment-2"
+    bound = dataclasses.replace(_request(1, maximum=10), owner_id=old_owner)
+    plain = dataclasses.replace(_request(2, maximum=10), owner_id=old_owner)
+    assert store.reserve(bound).admitted
+    assert store.reserve(plain).admitted
+    with store._connect() as db:
+        (trigger_sql,) = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='runs_continuation_selections_update'"
+        ).fetchone()
+        db.execute("DROP TRIGGER runs_continuation_selections_update")
+        db.execute(
+            "UPDATE runs SET continuations_json=? WHERE run_id=?",
+            ('{"format":1,"value":[{"legacy":true}]}', bound.run_id),
+        )
+        db.execute(trigger_sql)
+
+    assert store.adopt_legacy_owner(
+        "o/r", "fix", current, prior_owner_ids=(old_owner,)
+    ) == 1
+
+    with store._connect() as db:
+        owners = dict(db.execute("SELECT run_id, owner_id FROM runs").fetchall())
+    assert owners == {bound.run_id: old_owner, plain.run_id: current}
+
+
 def test_case_alias_owner_is_adopted_by_canonical_deployment(tmp_path) -> None:
     store = _store(tmp_path)
     prior = "Acme/App:fix:old-deployment"

@@ -21,7 +21,6 @@ import type {
   BacklogCard,
   IssuesPayload,
   PendingCard,
-  Priority,
 } from "./api/types";
 import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
@@ -50,15 +49,6 @@ function storedBoolean(
   return stored[key] === undefined ? fallback : stored[key] === true;
 }
 
-function priorityFromLabels(labels: string[]): Priority {
-  const priority = labels
-    .map((label) => label.toUpperCase())
-    .find((label): label is Exclude<Priority, null> => (
-      label === "P1" || label === "P2" || label === "P3"
-    ));
-  return priority ?? null;
-}
-
 /** An open issue tab names the board group its issue is in. */
 const BOARD_TONE: Record<BoardGroup, Tone> = { needs_you: "fail", working: "ok", blocked: "neutral" };
 
@@ -67,7 +57,6 @@ function pendingCardFromBacklog(card: BacklogCard): PendingCard {
     issue: card.issue,
     title: card.title,
     url: card.url,
-    priority: priorityFromLabels(card.labels),
     labels: Array.from(new Set([...card.labels, "ai-ready"])),
     held: false,
     hold_reason: null,

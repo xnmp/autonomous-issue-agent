@@ -16,9 +16,7 @@ from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verif
 from ...adapters.journal import Journal, default_ledger_path
 from ...adapters.operator_effects import build_operator_effects
 from ...domain import dashboard as dash
-from ...domain.labels import Label
 from ...domain.fix import harness_merges_branch
-from ...domain.refs import harness_branch_issue
 
 from .. import cli, config
 from . import snapshots
@@ -486,28 +484,6 @@ class Backend:
         effects = self._operator_effects(name, repo)
         return effects.set_issue_labels(number, add=("ai-ready",))
 
-    def priority(self, name: str, number: int, priority: str | None) -> tuple[bool, str]:
-        if not self.known(name):
-            return False, f"unknown deployment '{name}'"
-        repo = self.overlay_field(name, "REPO")
-        if not repo:
-            return False, f"no REPO configured for deployment '{name}'"
-        effects = self._operator_effects(name, repo)
-        if priority:
-            ensured, detail = effects.ensure_label(
-                priority,
-                color=actions.PRIORITY_COLORS[priority],
-                description=f"harness priority {priority}",
-            )
-            if not ensured:
-                return False, detail
-        add, remove = actions.priority_change(priority)
-        return effects.set_issue_labels(
-            number,
-            add=add,
-            remove=remove,
-        )
-
     def park(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]:
         """Hand an issue to a human: `needs-human` on the issue and on each open
         harness PR for it (refactor decision Q19). The fix policy waits on
@@ -516,8 +492,7 @@ class Backend:
 
     def unblock(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]:
         """Release a held issue: remove `needs-human` from the issue and its open
-        harness PRs, and put the issue back on `ai-ready` so a released issue
-        with no PR is selectable again."""
+        harness PRs, and nothing else."""
         return self._move_hold(name, number, channel, park=False)
 
     def _move_hold(self, name: str, number: int, channel: str, *, park: bool) -> tuple[bool, str]:
@@ -526,34 +501,7 @@ class Backend:
         repo = self.overlay_field(name, "REPO")
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
-        try:
-            gh_issues, gh_prs, warnings = self._gh_context(repo)
-        except Exception as exc:  # noqa: BLE001 - operator-facing result
-            return False, f"could not read #{number}: {exc}"
-        if gh_issues.get(number) is None:
-            return False, warnings[0] if warnings else f"issue #{number} is not open on {repo}"
-        prs = sorted(
-            pr for pr, data in gh_prs.items()
-            if str(data.get("state", "")).upper() == "OPEN"
-            and harness_branch_issue(str(data.get("headRefName") or "")) == number
-        )
-        hold = Label.NEEDS_HUMAN.value
-        verb = "park" if park else "unblock"
-        effects = self._operator_effects(name, repo)
-        attributes = {"channel": channel}
-        changes: list[tuple[str, int, tuple[str, ...], tuple[str, ...]]] = [
-            ("issue", number, (hold,), ()) if park else ("issue", number, (Label.AI_READY.value,), (hold,)),
-            *(("pr", pr, (hold,), ()) if park else ("pr", pr, (), (hold,)) for pr in prs),
-        ]
-        failures = []
-        for kind, target, add, remove in changes:
-            effect = effects.set_labels(
-                kind, target, add=add, remove=remove,
-                action_kind=f"operator_{verb}", action_attributes=attributes,
-            )
-            if not effect.applied:
-                failures.append(f"{kind} #{target}: {effect.detail}")
-        return (False, "; ".join(failures)) if failures else (True, "ok")
+        return self._operator_effects(name, repo).move_hold(number, park=park, channel=channel)
 
     def _operator_effects(self, name: str, repo: str):
         journal = self._operator_journal(name, repo)

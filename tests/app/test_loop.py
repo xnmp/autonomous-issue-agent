@@ -91,14 +91,17 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
             RunAgent(AgentKind.REBASE, 534),
         ],
         ex,
+        dispatch_capacity=2,
     )
-    d.tick()
-    assert executed == [
+    taken = d.tick()
+    d.wait_for_dispatches()
+    assert executed[:2] == [
         ("relabel", 500),      # the dispatch's own label move still precedes it
         ("comment", 537),      # finished work lands before any session starts
-        ("run", 500),
-        ("run", 534),          # dispatch order among dispatches preserved
     ]
+    assert sorted(executed[2:]) == [("run", 500), ("run", 534)]
+    # Dispatch order among dispatches is preserved at submission.
+    assert [a.number for a in taken if isinstance(a, RunAgent)] == [500, 534]
 
 
 def test_observation_and_lifecycle_continue_while_the_only_dispatch_slot_is_busy():

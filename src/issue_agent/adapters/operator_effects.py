@@ -20,7 +20,9 @@ from typing import Any
 from .act import relabel
 from .github import GitHubGateway
 from ..domain.events import ActionApplied, Correlation, TelemetryEvent
+from ..domain.labels import Label
 from ..domain.ports import EventSink
+from ..domain.refs import harness_branch_issue
 from ..domain.repository import canonical_repository
 
 EFFECT_TIMEOUT_SECONDS = 60.0
@@ -106,6 +108,40 @@ class GitHubOperatorEffects:
     ) -> tuple[bool, str]:
         effect = self.set_labels("issue", issue, add=add, remove=remove)
         return effect.applied, effect.detail
+
+    def move_hold(self, issue: int, *, park: bool, channel: str) -> tuple[bool, str]:
+        """Park (add `needs-human`) or unblock (remove it) an open issue and each
+        open harness PR for it; no other label moves (refactor decision Q19).
+        The issue and its PRs are read fresh: a cached view could relabel an
+        issue that has since closed or miss a PR opened since."""
+        try:
+            issue_row = self._json(["gh", "issue", "view", str(issue), "-R", self.repository, "--json", "state"])
+            open_prs = self._json([
+                "gh", "pr", "list", "-R", self.repository, "--state", "open",
+                "--json", "number,headRefName", "--limit", "200",
+            ])
+        except Exception as exc:  # noqa: BLE001 - operator-facing result
+            return False, f"could not read #{issue}: {_detail(exc)}"
+        if not isinstance(issue_row, dict) or str(issue_row.get("state") or "").upper() != "OPEN":
+            return False, f"issue #{issue} is not open on {self.repository}"
+        if not isinstance(open_prs, list):
+            return False, f"could not read the open PRs for #{issue}"
+        prs = sorted(
+            row["number"] for row in open_prs
+            if isinstance(row, dict) and type(row.get("number")) is int
+            and harness_branch_issue(str(row.get("headRefName") or "")) == issue
+        )
+        hold = (Label.NEEDS_HUMAN.value,)
+        verb = "park" if park else "unblock"
+        failures = []
+        for kind, target in (("issue", issue), *(("pr", pr) for pr in prs)):
+            effect = self.set_labels(
+                kind, target, add=hold if park else (), remove=() if park else hold,
+                action_kind=f"operator_{verb}", action_attributes={"channel": channel},
+            )
+            if not effect.applied:
+                failures.append(f"{kind} #{target}: {effect.detail}")
+        return (False, "; ".join(failures)) if failures else (True, "ok")
 
     def ensure_label(
         self,

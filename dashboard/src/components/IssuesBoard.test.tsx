@@ -123,7 +123,7 @@ describe("issues board groups", () => {
         card(103, needs("rearm", "2026-09-21T12:00:00Z", "Re-arm or close")),
       ],
       pending: [{
-        issue: 104, title: "Waits for another", url: null, labels: ["ai-ready"], priority: null, held: true,
+        issue: 104, title: "Waits for another", url: null, labels: ["ai-ready"], held: true,
         hold_reason: "waiting on #102", overlap: null,
         board: { status: "blocked", on: { kind: "issue", issue: 102 }, headline: "Waiting for #102", reason: "Starts when #102 merges.", since_ts: "2026-10-12T09:00:00Z" },
       } as PendingCard],
@@ -385,7 +385,7 @@ describe("issues board actions", () => {
     renderBoard({
       in_flight: [card(210, { status: "working", activity: "agent", headline: "Resolving", reason: "", since_ts: null })],
       pending: [{
-        issue: 211, title: "Waits", url: null, labels: [], priority: null, held: true, hold_reason: null, overlap: null,
+        issue: 211, title: "Waits", url: null, labels: [], held: true, hold_reason: null, overlap: null,
         board: { status: "blocked", on: { kind: "issue", issue: 210 }, headline: "Waiting for #210", reason: "", since_ts: null },
       } as PendingCard],
     });
@@ -397,20 +397,23 @@ describe("issues board actions", () => {
     expect(screen.queryAllByRole("button", { name: secondary })).toEqual([]);
   });
 
-  it("unparks a parked issue through the unblock label move", async () => {
+  it("unblocks a needs-human issue through one confirmed label move", async () => {
     const calls = stubFetch();
     const refresh = vi.fn();
     const issues = polled({
       pending: [{
-        issue: 220, title: "Parked work", url: null, labels: ["ai-parked"], priority: null, held: true, hold_reason: "parked", overlap: null,
+        issue: 220, title: "Parked work", url: null, labels: ["needs-human"], held: true, hold_reason: "parked", overlap: null,
         board: { status: "blocked", on: { kind: "triage", why: "parked" }, headline: "Parked", reason: "A human owns its PR.", since_ts: null },
       } as PendingCard],
     });
     render(<IssuesTab repo="demo" sub="inflight" issues={{ ...issues, refresh }} onOpenIssue={vi.fn()} />);
 
     await userEvent.click(row("Parked work"));
-    await userEvent.click(screen.getByRole("button", { name: "Unpark" }));
+    await userEvent.click(screen.getByRole("button", { name: "Unblock" }));
+    expect(calls.filter(({ method }) => method !== "GET")).toEqual([]);
+    expect(screen.getByText(/No other label changes/)).toBeVisible();
 
+    await userEvent.click(screen.getByRole("button", { name: "Unblock #220" }));
     expect(calls.filter(({ method }) => method === "POST").map(({ url }) => url)).toEqual(["/api/repos/demo/issues/220/unblock"]);
     expect(refresh).toHaveBeenCalled();
   });

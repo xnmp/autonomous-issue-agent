@@ -148,14 +148,8 @@ export function IssueTab({
     when: (step) => step.ts,
   }, { key: "when", direction: "asc" }, "issue-tasks");
 
-  // The detail payload carries no board status; a live issue that escalated,
-  // blocked, or asked a question is held for a person.
-  const heldForHuman = !!d && !d.done && (
-    !!d.escalation_reason
-    || d.stage === "blocked"
-    || d.stage === "escalated"
-    || d.stage === "awaiting human reply"
-  );
+  // `needs-human` on the issue or its PR: only a person releases it.
+  const heldForHuman = !!d && !d.done && !!d.held_for_human;
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>

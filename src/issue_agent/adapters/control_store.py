@@ -83,6 +83,8 @@ class AccountingDisposition(str, Enum):
 # 5b's name, kept like every stored namespace (act's `fix-comment`): a rename
 # orphans the receipts already written under the old one.
 LEG_NAMESPACE = "fix-leg"
+# The column default of runs.continuations_json: a run bound to no continuation.
+_EMPTY_CONTINUATIONS = '{"format":1,"value":[]}'
 
 
 @dataclass(frozen=True)
@@ -2651,8 +2653,10 @@ class SQLiteControlStore:
                for candidate in prior):
             raise ValueError("prior owner adoption must retain repository and role")
         placeholders = ",".join("?" for _candidate in prior)
-        # single_instance keeps one daemon per role, so no other writer races
-        # this adoption (Q17: it is the only deployment fence).
+        # The single_instance lock keys on (role, repo, target dir), so a repoint
+        # to another checkout does not exclude the old deployment: stop it first.
+        # _assert_owner_active fences its money transactions once retired, not
+        # its in-flight GitHub writes.
         with self.transaction() as db:
             self._assert_owner_active(db, owner_id)
             prior_rows = db.execute(
@@ -2670,9 +2674,13 @@ class SQLiteControlStore:
                         f"{row['repository']}:{row['role']}, not "
                         f"{repository}:{role}"
                     )
+            # Trigger runs_continuation_identity_update aborts an owner change on
+            # a continuation-bound run, so those rows stay with the retired owner.
+            # Exit: slice 5d-2 drops the trigger, the column and this adoption.
             runs = db.execute(
-                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders})",
-                (owner_id, *prior),
+                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders}) "
+                "AND continuations_json=?",
+                (owner_id, *prior, _EMPTY_CONTINUATIONS),
             ).rowcount
             db.execute(
                 f"UPDATE leases SET owner_id=? WHERE owner_id IN ({placeholders})",

@@ -3,16 +3,18 @@ executed.
 
 An action test that shelled out would either need a live repo or a mock deep
 enough to prove nothing. What matters is the command: `start` must go through
-`make point-at` (not a reimplemented launch), a priority swap must be ONE
-edit so a half-applied change cannot leave an issue with no priority at all,
-and park/unblock are label moves on GitHub and nothing else (refactor
-decision Q19).
+`make point-at` (not a reimplemented launch), and park/unblock move only
+`needs-human` on GitHub, read fresh (refactor decision Q19).
 """
 
+
+import json
+from types import SimpleNamespace
 
 import pytest
 
 from issue_agent.adapters.dashweb import actions, costchart
+from issue_agent.adapters.operator_effects import GitHubOperatorEffects
 from issue_agent.app.dashweb import service
 
 
@@ -47,25 +49,6 @@ def test_launch_failure_is_reported_not_raised(tmp_path):
     assert ok is False and "launch" in detail
 
 
-# ── priority ──────────────────────────────────────────────────────────────────
-def test_setting_a_priority_is_one_atomic_label_intent():
-    add, remove = actions.priority_change("P2")
-    assert add == ("P2",)
-    assert remove == ("P1", "P3")
-
-
-def test_clearing_a_priority_removes_all_three_and_creates_nothing():
-    add, remove = actions.priority_change(None)
-    assert add == ()
-    assert remove == ("P1", "P2", "P3")
-
-
-def test_an_unknown_priority_is_rejected_before_any_command_is_built():
-    with pytest.raises(ValueError):
-        actions.priority_change("P9")
-
-
-# ── cost chart ────────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("bad", ["", "../../etc/passwd", "a b", "id;rm -rf /", "x/y"])
 def test_a_session_id_that_could_escape_a_path_is_rejected(bad):
     assert costchart.valid_session_id(bad) is False
@@ -122,144 +105,149 @@ def test_a_generated_chart_is_returned_verbatim(monkeypatch, tmp_path):
 
 
 # ── promote / park / unblock: label moves only ───────────────────────────────
-class _Labels:
-    """GitHub's label state for the backend's effects, keyed by (kind, number)."""
+class _GitHub:
+    """GitHub behind the real operator effects: label state keyed by
+    (kind, number), one issue (#7) and `prs` [(number, head branch)] open."""
 
-    def __init__(self, labels):
+    def __init__(self, labels, prs, issue_state, read_error):
         self.labels = {key: set(value) for key, value in labels.items()}
+        self.prs = prs
+        self.issue_state = issue_state
+        self.read_error = read_error
         self.refuse = set()
-        self.moves = []
+        self.writes = []
+        self.events = []
+
+    # GitHubGateway's label surface.
+    def has_label(self, kind, number, label):
+        return label in self.labels.setdefault((kind, number), set())
+
+    def relabel(self, kind, number, remove, add):
+        if (kind, number) in self.refuse:
+            raise OSError("gh refused")
+        self.writes.append((kind, number, remove, add))
+        current = self.labels.setdefault((kind, number), set())
+        current.discard(remove)
+        if add is not None:
+            current.add(add)
+
+    # The `gh` reads the effects make before a hold move.
+    def run(self, argv, **_kwargs):
+        if self.read_error:
+            return SimpleNamespace(returncode=1, stdout="", stderr=self.read_error)
+        if argv[:3] == ["gh", "issue", "view"]:
+            payload = {"number": int(argv[3]), "state": self.issue_state}
+        elif argv[:3] == ["gh", "pr", "list"]:
+            payload = [{"number": n, "headRefName": head} for n, head in self.prs]
+        else:
+            raise AssertionError(f"unexpected command: {argv}")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    def emit(self, event):
+        self.events.append(event.payload)
 
     def effects(self, repo, *, identity, journal=None):
         assert repo == "o/r" and identity == "o/r:dashboard"
-        return self
-
-    def set_labels(self, kind, number, *, add=(), remove=(), action_kind="", action_attributes=None):
-        from issue_agent.adapters.operator_effects import LabelEffect
-
-        if (kind, number) in self.refuse:
-            return LabelEffect(False, "gh refused")
-        current = self.labels.setdefault((kind, number), set())
-        added = tuple(label for label in add if label not in current)
-        removed = tuple(label for label in remove if label in current and label not in add)
-        current.update(added)
-        current.difference_update(removed)
-        if added or removed:
-            self.moves.append((action_kind, kind, number, added, removed))
-        return LabelEffect(True, "ok", added, removed)
-
-    def set_issue_labels(self, issue, *, add=(), remove=()):
-        effect = self.set_labels("issue", issue, add=add, remove=remove, action_kind="operator_relabel")
-        return effect.applied, effect.detail
+        return GitHubOperatorEffects(repo, self, identity=identity, run=self.run, journal=self)
 
 
-def _label_backend(monkeypatch, labels, *, prs=(), issue_open=True, gh_error=""):
-    """A Backend over one issue (#7) and `prs` [(number, head branch, state)]."""
-    store = _Labels(labels)
-
-    class Gh:
-        def issues(self, _repo, limit=1000):
-            rows = [{"number": 7, "state": "OPEN"}] if issue_open else []
-            return (None, gh_error) if gh_error else (rows, "")
-
-        def prs(self, _repo, limit=200):
-            return ([{"number": n, "headRefName": head, "state": state} for n, head, state in prs], "")
-
+def _label_backend(monkeypatch, labels, *, prs=(), issue_state="OPEN", read_error=""):
+    github = _GitHub(labels, prs, issue_state, read_error)
     monkeypatch.setattr(service.system, "remote_repo", lambda _root: "harness/repo")
-    backend = service.Backend(gh=Gh(), effects_factory=store.effects)
+    backend = service.Backend(effects_factory=github.effects)
     monkeypatch.setattr(backend, "known", lambda name: name == "demo")
     monkeypatch.setattr(backend, "overlay_field", lambda _name, field: {"REPO": "o/r"}[field])
     monkeypatch.setattr(service.cli, "journal_paths", lambda _name: ["/state/fix/journal.jsonl"])
-    return backend, store
+    return backend, github
 
 
 def test_promote_puts_the_issue_on_ai_ready(monkeypatch):
-    backend, store = _label_backend(monkeypatch, {("issue", 7): set()})
+    backend, github = _label_backend(monkeypatch, {("issue", 7): set()})
 
     assert backend.promote("demo", 7) == (True, "ok")
 
-    assert store.labels[("issue", 7)] == {"ai-ready"}
+    assert github.labels[("issue", 7)] == {"ai-ready"}
 
 
 def test_park_adds_needs_human_to_the_issue_and_its_open_harness_prs(monkeypatch):
-    backend, store = _label_backend(
+    backend, github = _label_backend(
         monkeypatch,
-        {("issue", 7): {"ai-ready"}, ("pr", 12): set(), ("pr", 13): set(), ("pr", 14): set()},
-        prs=((12, "fix/7-a", "OPEN"), (13, "feature/7-x", "OPEN"), (14, "fix/7-old", "MERGED"),
-             (15, "fix/8-other", "OPEN")),
+        {("issue", 7): {"ai-ready"}, ("pr", 12): set(), ("pr", 13): set()},
+        prs=((12, "fix/7-a"), (13, "feature/7-x"), (15, "fix/8-other")),
     )
 
     assert backend.park("demo", 7, "ui") == (True, "ok")
 
-    assert store.labels[("issue", 7)] == {"ai-ready", "needs-human"}
-    assert store.labels[("pr", 12)] == {"needs-human"}
-    # Not a harness branch, not open, or another issue's PR: untouched.
-    assert store.labels[("pr", 13)] == set() and store.labels[("pr", 14)] == set()
-    assert ("pr", 15) not in store.labels
-    assert {move[0] for move in store.moves} == {"operator_park"}
+    assert github.labels[("issue", 7)] == {"ai-ready", "needs-human"}
+    assert github.labels[("pr", 12)] == {"needs-human"}
+    # Not a harness branch, or another issue's PR: untouched.
+    assert github.labels[("pr", 13)] == set()
+    assert ("pr", 15) not in github.labels
+    assert {event.kind for event in github.events} == {"operator_park"}
 
 
-def test_unblock_removes_needs_human_everywhere_and_rearms_the_issue(monkeypatch):
-    backend, store = _label_backend(
+def test_unblock_removes_only_needs_human(monkeypatch):
+    backend, github = _label_backend(
         monkeypatch,
-        {("issue", 7): {"needs-human"}, ("pr", 12): {"needs-human", "keep"}},
-        prs=((12, "fix/7-a", "OPEN"),),
+        {("issue", 7): {"needs-human", "bug"}, ("pr", 12): {"needs-human", "keep"}},
+        prs=((12, "fix/7-a"),),
     )
 
     assert backend.unblock("demo", 7, "api") == (True, "ok")
 
-    assert store.labels[("issue", 7)] == {"ai-ready"}
-    assert store.labels[("pr", 12)] == {"keep"}
-    assert {move[0] for move in store.moves} == {"operator_unblock"}
+    assert github.labels[("issue", 7)] == {"bug"}
+    assert github.labels[("pr", 12)] == {"keep"}
+    assert {event.kind for event in github.events} == {"operator_unblock"}
 
 
-def test_park_then_unblock_round_trips_to_a_selectable_issue(monkeypatch):
-    backend, store = _label_backend(monkeypatch, {("issue", 7): {"ai-ready"}})
+def test_park_then_unblock_restores_the_original_labels(monkeypatch):
+    backend, github = _label_backend(monkeypatch, {("issue", 7): {"ai-ready"}})
 
     backend.park("demo", 7)
     backend.unblock("demo", 7)
 
-    assert store.labels[("issue", 7)] == {"ai-ready"}
+    assert github.labels[("issue", 7)] == {"ai-ready"}
 
 
 def test_repeating_park_moves_no_label_twice(monkeypatch):
-    backend, store = _label_backend(monkeypatch, {("issue", 7): set()}, prs=((12, "fix/7-a", "OPEN"),))
+    backend, github = _label_backend(monkeypatch, {("issue", 7): set()}, prs=((12, "fix/7-a"),))
 
     backend.park("demo", 7)
-    moves = list(store.moves)
+    writes = list(github.writes)
     assert backend.park("demo", 7) == (True, "ok")
 
-    assert store.moves == moves
+    assert github.writes == writes
 
 
 def test_a_refused_write_is_reported_per_target(monkeypatch):
-    backend, store = _label_backend(
-        monkeypatch, {("issue", 7): set(), ("pr", 12): set()}, prs=((12, "fix/7-a", "OPEN"),),
+    backend, github = _label_backend(
+        monkeypatch, {("issue", 7): set(), ("pr", 12): set()}, prs=((12, "fix/7-a"),),
     )
-    store.refuse.add(("pr", 12))
+    github.refuse.add(("pr", 12))
 
     ok, detail = backend.park("demo", 7)
 
-    assert ok is False and detail == "pr #12: gh refused"
-    assert store.labels[("issue", 7)] == {"needs-human"}
+    assert ok is False and detail.startswith("pr #12:") and "gh refused" in detail
+    assert github.labels[("issue", 7)] == {"needs-human"}
 
 
 @pytest.mark.parametrize("kwargs, expected", [
-    ({"issue_open": False}, "issue #7 is not open on o/r"),
-    ({"gh_error": "gh unavailable"}, "gh unavailable"),
+    ({"issue_state": "CLOSED"}, "issue #7 is not open on o/r"),
+    ({"read_error": "gh unavailable"}, "could not read #7"),
 ])
-def test_park_and_unblock_refuse_without_a_write_when_the_issue_cannot_be_read(monkeypatch, kwargs, expected):
-    backend, store = _label_backend(monkeypatch, {("issue", 7): set()}, **kwargs)
+def test_park_and_unblock_refuse_without_a_write_on_a_closed_or_unreadable_issue(monkeypatch, kwargs, expected):
+    backend, github = _label_backend(monkeypatch, {("issue", 7): {"needs-human"}}, **kwargs)
 
-    assert backend.park("demo", 7) == (False, expected)
-    assert backend.unblock("demo", 7) == (False, expected)
-    assert store.moves == []
+    for action in (backend.park, backend.unblock):
+        ok, detail = action("demo", 7)
+        assert ok is False and detail.startswith(expected)
+    assert github.writes == []
 
 
 def test_label_actions_on_an_unknown_deployment_never_reach_github(monkeypatch):
-    backend, store = _label_backend(monkeypatch, {("issue", 7): set()})
+    backend, github = _label_backend(monkeypatch, {("issue", 7): set()})
 
     for action in (backend.park, backend.unblock):
         ok, detail = action("other", 7)
         assert ok is False and "unknown deployment" in detail
-    assert store.moves == []
+    assert github.writes == []

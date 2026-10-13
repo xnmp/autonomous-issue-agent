@@ -89,23 +89,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/repos/{name}/issues/{number}/priority": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Api Priority */
-        post: operations["api_priority_api_repos__name__issues__number__priority_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/repos/{name}/issues/{number}/promote": {
         parameters: {
             query?: never;
@@ -344,8 +327,6 @@ export interface components {
              * @enum {string}
              */
             kind: "queue";
-            /** Priority */
-            priority: ("P1" | "P2" | "P3") | null;
         } & {
             [key: string]: unknown;
         };
@@ -684,6 +665,11 @@ export interface components {
             /** Harness Message */
             harness_message?: string | null;
             /**
+             * Held For Human
+             * @default false
+             */
+            held_for_human: boolean;
+            /**
              * History
              * @default []
              */
@@ -955,8 +941,6 @@ export interface components {
             pr_state?: string | null;
             /** Pr Url */
             pr_url?: string | null;
-            /** Priority */
-            priority: ("P1" | "P2" | "P3") | null;
             rail?: components["schemas"]["StageRail"] | null;
             /** Title */
             title: string | null;
@@ -1331,44 +1315,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ActionResult"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    api_priority_api_repos__name__issues__number__priority_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                name: string;
-                number: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": {
-                    [key: string]: unknown;
-                };
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {

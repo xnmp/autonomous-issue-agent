@@ -148,10 +148,6 @@ class StubBackend:
         self.park_channel = channel
         return (True, "ok")
 
-    def priority(self, name, number, priority):
-        self._maybe("priority")
-        self.priority_seen = priority
-        return (True, "ok")
 
 
 WRITE_HEADERS = {"X-Issue-Agent-Dashboard": "1"}
@@ -408,23 +404,6 @@ def test_legacy_unblock_refuses_unencodable_fields_with_a_renderable_response():
     response.json()
 
 
-def test_priority_accepts_the_three_labels_and_null():
-    backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    for value in ("P1", "P2", "P3", None):
-        assert c.post("/api/repos/demo/issues/9/priority",
-                      json={"priority": value}).json()["ok"] is True
-        assert backend.priority_seen == value
-
-
-def test_an_unknown_priority_is_a_400_and_never_reaches_the_backend():
-    backend = StubBackend()
-    r = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL).post(
-        "/api/repos/demo/issues/9/priority", json={"priority": "P9"}
-    )
-    assert r.status_code == 400 and "priority" not in backend.calls
-
-
 # ── static ────────────────────────────────────────────────────────────────────
 def _write_fresh_spa(tmp_path):
     dashboard = tmp_path / "dashboard"
@@ -615,8 +594,6 @@ def test_a_non_positive_issue_number_never_reaches_gh(number):
     backend = StubBackend()
     c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
     assert c.post(f"/api/repos/demo/issues/{number}/promote").status_code == 400
-    assert c.post(f"/api/repos/demo/issues/{number}/priority",
-                  json={"priority": "P1"}).status_code == 400
     assert backend.calls == []
 
 

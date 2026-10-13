@@ -1824,7 +1824,7 @@ def test_remote_bootstrap_uses_effect_commands_for_every_requested_write(
     )
 
     assert cli.cmd_prepare_remote(args) == 0
-    assert tuple(labels) == cli.REMOTE_LABELS
+    assert labels == ["ai-ready", "needs-human"]
     assert auto_merge == [True]
 
 

@@ -23,7 +23,7 @@ import sys
 import threading
 from collections.abc import Callable
 
-from ...adapters.dashweb import actions, costchart
+from ...adapters.dashweb import costchart
 from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
 from ...adapters.control_path import canonical_control_store_path
 from .. import cli
@@ -74,7 +74,7 @@ def create_app(
     harness_root: str | None = None,
     offload_backend: bool | None = None,
 ):
-    from fastapi import Body, FastAPI, Header, HTTPException, Query
+    from fastapi import FastAPI, Header, HTTPException, Query
     from fastapi.encoders import jsonable_encoder
     from fastapi.exceptions import RequestValidationError
     from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -315,19 +315,6 @@ def create_app(
             ok, detail = await invoke(backend.park, name, number, channel)
         except Exception as exc:  # noqa: BLE001
             ok, detail = False, f"park unavailable ({type(exc).__name__}: {exc})"
-        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
-
-    @app.post(
-        "/api/repos/{name}/issues/{number}/priority",
-        response_model=contracts.ActionResult,
-    )
-    async def api_priority(name: str, number: int, body: dict = Body(default={})):
-        if number < 1:
-            raise HTTPException(400, "issue number must be positive")
-        priority = body.get("priority") if isinstance(body, dict) else None
-        if priority is not None and priority not in actions.PRIORITY_LABELS:
-            raise HTTPException(400, "priority must be P1, P2, P3 or null")
-        ok, detail = await invoke(backend.priority, name, number, priority)
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
     @app.get("/{full_path:path}")

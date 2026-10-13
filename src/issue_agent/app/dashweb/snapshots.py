@@ -24,7 +24,7 @@ from ...domain.effort import TIER_LADDER
 from ...domain.world import Check
 from ...domain.actions import AgentKind
 from ...domain.identity import is_bot_login, login_eq
-from ...domain.labels import LIFECYCLE_LABELS as _CANONICAL_LIFECYCLE_LABELS
+from ...domain.labels import LIFECYCLE_LABELS as _CANONICAL_LIFECYCLE_LABELS, Label
 from ...domain.outcome import ExitReason
 from ...domain.world import ReviewDecision
 
@@ -38,7 +38,6 @@ FRECENCY_WINDOWS = ((86400.0, 3.0), (7 * 86400.0, 1.0), (30 * 86400.0, 0.25))
 # canonical set rather than restated: a local copy silently omitted `ai-pr-open`
 # and put every issue with a live PR in both In Flight and Backlog (#144).
 LIFECYCLE_LABELS = frozenset(label.value for label in _CANONICAL_LIFECYCLE_LABELS)
-PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
 _PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
 
@@ -2016,7 +2015,7 @@ def board_json(status: dash.BoardStatus) -> dict:
     elif isinstance(on, dash.OnTriage):
         target = {"kind": "triage", "why": on.why}
     else:
-        target = {"kind": "queue", "priority": on.priority}
+        target = {"kind": "queue"}
     return {"status": "blocked", "on": target, **common}
 
 
@@ -2087,7 +2086,7 @@ def board_status(
     hold, deferral = _board_hold(row)
     triage = (
         dash.TriageHold("parked", _parked_since(row))
-        if "ai-parked" in label_set
+        if Label.NEEDS_HUMAN.value in label_set
         else None
     )
     ci = _pr_ci_state(gh_pr, row) if row is not None else None
@@ -2103,7 +2102,6 @@ def board_status(
         ci=ci if ci in {"pending", "passing", "failing"} and _pr_state(gh_pr) not in {"merged", "closed"} else None,
         stall=_active_stall(row, deferral),
         queued=queued,
-        priority=priority_of(label_set),
         merge_owner=merge_owner,
         github_approved=github_approved,
         head_approved=_head_approved(gh_pr),
@@ -2270,12 +2268,13 @@ def hold_state(
 ) -> tuple[bool, str | None]:
     """Whether this issue is waiting rather than working, and why.
 
-    Parked outranks any journalled dependency hold: the operator's decision is
-    the reason the issue is waiting, not the hold that preceded it. One
+    `needs-human` (an operator park or a policy stop) outranks any journalled
+    dependency hold: the person it waits on is the reason, not the hold that
+    preceded it. One
     definition, because a pending card that said "held" while the attention
     panel stayed silent would be two answers to the same question.
     """
-    parked = "ai-parked" in set(labels)
+    parked = Label.NEEDS_HUMAN.value in set(labels)
     defer = {} if parked else (_deferred_event(row) if row else {})
     return (parked or bool(defer), "parked" if parked else waiting_label(defer))
 
@@ -2303,7 +2302,6 @@ def pending_card(
         "title": issue.get("title"),
         "url": issue.get("url"),
         "body": issue.get("body"),
-        "priority": priority_of(labels),
         "labels": labels,
         "held": held,
         "hold_reason": hold_reason,
@@ -2570,13 +2568,6 @@ def card_labels(row: dash.IssueRow, gh_issue: dict | None) -> list[str]:
     if isinstance(projected, (tuple, list)):
         return [str(label) for label in projected]
     return labels_of(gh_issue or {})
-
-
-def priority_of(labels) -> str | None:
-    for p in PRIORITY_LABELS:
-        if p in labels:
-            return p
-    return None
 
 
 def is_backlog(issue: dict) -> bool:
@@ -2950,6 +2941,7 @@ def issue_detail(
         "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
         "escalation_reason": _escalation_reason(row),
+        "held_for_human": Label.NEEDS_HUMAN.value in _labels_set(gh_issue) | _labels_set(gh_pr),
         "done": row.done,
         "prs": list(row.prs),
         "pull_requests": [

@@ -248,10 +248,9 @@ class Daemon:
     # Optional typed telemetry sink. When set, skipped ticks become countable
     # events rather than lines in a log nobody retained.
     journal: EventSink | None = None
-    # Paid dispatches may run behind the observation loop. Zero preserves the
-    # synchronous behavior used by review and by existing hand-built
-    # daemons; a positive value bounds the background worker pool.
-    dispatch_capacity: int = 0
+    # Paid dispatches run behind the observation loop in a worker pool of
+    # this many threads.
+    dispatch_capacity: int = 1
     # Stable identity for duplicate suppression. Fix wiring maps every issue-
     # and PR-keyed leg to its underlying issue; the generic fallback prevents
     # an identical RunAgent from being submitted twice.
@@ -277,9 +276,7 @@ class Daemon:
     _state: DaemonState = field(
         default=DaemonState.STARTING, init=False, repr=False
     )
-    _dispatch_pool: ThreadPoolExecutor | None = field(
-        default=None, init=False, repr=False
-    )
+    _dispatch_pool: ThreadPoolExecutor = field(init=False, repr=False)
     _dispatch_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -304,13 +301,12 @@ class Daemon:
     _wake_recovery_pending: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.dispatch_capacity < 0:
-            raise ValueError("dispatch_capacity must be >= 0")
-        if self.dispatch_capacity:
-            self._dispatch_pool = ThreadPoolExecutor(
-                max_workers=self.dispatch_capacity,
-                thread_name_prefix=f"{self.name}-dispatch",
-            )
+        if self.dispatch_capacity < 1:
+            raise ValueError("dispatch_capacity must be >= 1")
+        self._dispatch_pool = ThreadPoolExecutor(
+            max_workers=self.dispatch_capacity,
+            thread_name_prefix=f"{self.name}-dispatch",
+        )
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown timeout must be positive")
         if self.reservation_sweep_ticks <= 0:
@@ -396,8 +392,6 @@ class Daemon:
         drains, so the domain never emits a claim relabel for work this process
         will not start.
         """
-        if self._dispatch_pool is None:
-            return 1
         with self._dispatch_lock:
             if (
                 not self._accept_dispatches
@@ -421,10 +415,6 @@ class Daemon:
             self.log(f"{self.name}: action {action!r} failed: {exc}")
 
     def _submit_dispatch(self, action: RunAgent) -> bool:
-        pool = self._dispatch_pool
-        if pool is None:
-            self.executor.execute(action)
-            return True
         key = self.dispatch_key(action)
         with self._dispatch_lock:
             active_keys = {active_key for _action, active_key in self._dispatches.values()}
@@ -436,7 +426,7 @@ class Daemon:
                 or key in active_keys
             ):
                 return False
-            future = pool.submit(self.executor.execute, action)
+            future = self._dispatch_pool.submit(self.executor.execute, action)
             self._dispatches[future] = (action, key)
         # A Future that already completed invokes callbacks synchronously from
         # add_done_callback; register outside the lock so that fast fake/runtime
@@ -464,8 +454,6 @@ class Daemon:
 
     def _shutdown_dispatches(self, *, cancel: bool) -> bool:
         pool = self._dispatch_pool
-        if pool is None:
-            return True
         self._shutdown_terminalization_required |= cancel
         if self._shutdown_deadline is None:
             self._shutdown_deadline = (
@@ -686,14 +674,7 @@ class Daemon:
         for action in order_for_execution(actions):
             try:
                 if isinstance(action, RunAgent):
-                    if self._dispatch_pool is None:
-                        # Preserve the synchronous tick contract: the decision
-                        # was taken even when its execution raises and is crash-
-                        # isolated below (convergence accounting counts paid
-                        # attempts, including pre-result deaths).
-                        taken.append(action)
-                        self.executor.execute(action)
-                    elif self._submit_dispatch(action):
+                    if self._submit_dispatch(action):
                         taken.append(action)
                     else:
                         self.log(

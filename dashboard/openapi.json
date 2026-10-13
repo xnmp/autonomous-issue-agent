@@ -302,27 +302,10 @@
             ],
             "title": "Kind",
             "type": "string"
-          },
-          "priority": {
-            "anyOf": [
-              {
-                "enum": [
-                  "P1",
-                  "P2",
-                  "P3"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Priority"
           }
         },
         "required": [
-          "kind",
-          "priority"
+          "kind"
         ],
         "title": "BlockedOnQueue",
         "type": "object"
@@ -1559,6 +1542,11 @@
             ],
             "title": "Harness Message"
           },
+          "held_for_human": {
+            "default": false,
+            "title": "Held For Human",
+            "type": "boolean"
+          },
           "history": {
             "default": [],
             "items": {
@@ -2581,22 +2569,6 @@
             ],
             "title": "Pr Url"
           },
-          "priority": {
-            "anyOf": [
-              {
-                "enum": [
-                  "P1",
-                  "P2",
-                  "P3"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Priority"
-          },
           "rail": {
             "anyOf": [
               {
@@ -2634,7 +2606,6 @@
           "issue",
           "title",
           "url",
-          "priority",
           "labels",
           "held",
           "hold_reason",
@@ -3577,66 +3548,6 @@
           }
         },
         "summary": "Api Park"
-      }
-    },
-    "/api/repos/{name}/issues/{number}/priority": {
-      "post": {
-        "operationId": "api_priority_api_repos__name__issues__number__priority_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "additionalProperties": true,
-                "default": {},
-                "title": "Body",
-                "type": "object"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ActionResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Priority"
       }
     },
     "/api/repos/{name}/issues/{number}/promote": {

@@ -52,7 +52,7 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.store import Store
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.main import _recover_pre_adapter_processes
-from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_store, _control_store_path, _owner_identity, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
+from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_spend_gate, _control_store, _headroom, _control_store_path, _owner_identity, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
@@ -65,6 +65,24 @@ from issue_agent.domain.contracts import (
     RunId,
 )
 from issue_agent.domain.recovery import RecoveryTrigger
+
+
+class _UnreadableLedger:
+    def snapshot(self, _scope):
+        raise OSError("database disk image is malformed")
+
+
+def test_paid_headroom_follows_the_daily_cap_and_fails_closed_on_an_unreadable_ledger(tmp_path):
+    cfg = HarnessConfig(repo="o/r", daily_spend_cap_usd=10.0)
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+
+    assert _headroom(_control_spend_gate(cfg, store, 5.0))() is True
+    assert _headroom(_control_spend_gate(cfg, store, 11.0))() is False
+    assert _headroom(_control_spend_gate(cfg, _UnreadableLedger(), 5.0))() is False
+    # No cap configured: nothing to read, nothing to wait on.
+    uncapped = HarnessConfig(repo="o/r", daily_spend_cap_usd=0.0)
+    assert _headroom(_control_spend_gate(uncapped, _UnreadableLedger(), 5.0))() is True
 
 
 def test_runtime_wiring_registries_cover_every_supported_runtime():
@@ -270,6 +288,21 @@ def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
             1,
         )
     )
+    # A continuation-bound run (pre-5d schema) must not abort the boot adoption.
+    bound = replace(
+        request,
+        reservation_id=ReservationId("repoint-bound-reservation"),
+        run_id=RunId("repoint-bound-run"),
+        dispatch_id="repoint-bound-dispatch",
+        quote=replace(request.quote, maximum_charge=Money("USD", 10)),
+    )
+    assert store.reserve(bound).admitted
+    with store._connect() as db:
+        db.execute("DROP TRIGGER runs_continuation_selections_update")
+        db.execute(
+            "UPDATE runs SET continuations_json=? WHERE run_id=?",
+            ('{"format":1,"value":[{"legacy":true}]}', bound.run_id),
+        )
 
     adopted = _control_store(current, state, "fix")
     current_owner = _owner_identity(current, "fix")

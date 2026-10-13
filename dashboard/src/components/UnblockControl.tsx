@@ -5,15 +5,15 @@ import { UnblockModal } from "./UnblockModal";
 interface UnblockControlProps {
   deployment: string;
   issue: number;
-  /** The issue is held for a human (a `needs-human` stop or an escalation). */
+  /** The issue or its PR carries `needs-human`. */
   heldForHuman: boolean;
   onChanged: () => void;
 }
 
 /**
  * Unblock is a label move on GitHub (refactor decision Q19): it removes
- * `needs-human` from the issue and its open harness PRs and puts the issue
- * back on `ai-ready`. Keyed by deployment and issue so an in-flight unblock
+ * `needs-human` from the issue and its open harness PRs, and nothing else.
+ * Keyed by deployment and issue so an in-flight unblock
  * never surfaces under another issue's heading.
  */
 export function UnblockControl(props: UnblockControlProps) {
