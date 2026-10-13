@@ -802,6 +802,115 @@ def test_a_suspected_duplicate_waits_for_a_human_and_a_reply_lets_it_resolve(rol
     assert Label.NEEDS_HUMAN not in gh.issues[5].labels
 
 
+# ── TRIAGE holds no dispatch slot (owner, 2026-10-14) ───────────────────────
+
+
+class SplitAgent:
+    """Routes by act: a TRIAGE task (the only one with a schema) runs `light`,
+    every other leg runs `heavy`. Each call is recorded with its kind."""
+
+    def __init__(self, heavy, light):
+        self.heavy, self.light, self.tasks = heavy, light, []
+
+    async def run(self, task):
+        self.tasks.append(task)
+        return await asyncio.to_thread(self.light if task.schema is not None else self.heavy, task)
+
+
+def _blocked(gate: threading.Event, result):
+    def step(task):
+        assert gate.wait(timeout=10)
+        return result
+    return step
+
+
+_DONE = AgentResult(False, status="pushed", cost_usd=0.1, session_id="s")
+
+
+def _seed_triage(composed, number: int) -> None:
+    composed.control.record_unpaid_leg(
+        RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
+        issue=number, number=number, head="", runtime="claude", leg_class="agent", result={})
+
+
+def test_triage_dispatches_while_the_only_heavy_slot_is_busy(role):
+    gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Other bug")})
+    gate = threading.Event()
+    agent = SplitAgent(_blocked(gate, _DONE), triaged())
+    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
+    _seed_triage(composed, 5)
+    try:
+        taken = composed.daemon.tick()  # RESOLVE 5 holds the slot; TRIAGE 6 still starts
+        assert dispatched(taken, AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+        assert dispatched(taken, AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 6)]
+    finally:
+        gate.set()
+        composed.daemon.wait_for_dispatches()
+
+
+def test_a_running_triage_does_not_take_the_heavy_slot(role):
+    gh = FakeGitHub(issues={6: ready(6, "Other bug")})
+    gate = threading.Event()
+    agent = SplitAgent(_blocked(gate, _DONE), _blocked(gate, triaged()(None)))
+    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
+    try:
+        assert dispatched(composed.daemon.tick(), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 6)]
+        gh.issues[5] = ready(5)
+        _seed_triage(composed, 5)
+        assert dispatched(composed.daemon.tick(), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+    finally:
+        gate.set()
+        composed.daemon.wait_for_dispatches()
+
+
+def test_heavy_acts_still_cap_at_the_concurrency(role):
+    gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Other bug"), 7: ready(7, "Third")})
+    gate = threading.Event()
+    agent = SplitAgent(_blocked(gate, _DONE), triaged())
+    composed, _ = role(gh, agent, FIX_DISPATCH_CONCURRENCY="2")
+    try:
+        assert len(dispatched(composed.daemon.tick(), AgentKind.RESOLVE)) == 2
+        assert not dispatched(composed.daemon.tick(), AgentKind.RESOLVE)  # both slots busy, 7 waits
+    finally:
+        gate.set()
+        composed.daemon.wait_for_dispatches()
+
+
+def test_triage_keeps_its_per_issue_lease_and_the_spend_headroom(role):
+    gh = FakeGitHub(issues={5: ready(5)})
+    gate = threading.Event()
+    agent = SplitAgent(_DONE, _blocked(gate, triaged()(None)))
+    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
+    try:
+        assert dispatched(composed.daemon.tick(), AgentKind.TRIAGE)
+        assert not dispatched(composed.daemon.tick(), AgentKind.TRIAGE)  # one leg per issue
+    finally:
+        gate.set()
+        composed.daemon.wait_for_dispatches()
+    assert len(agent.tasks) == 1
+
+    broke, _ = role(FakeGitHub(issues={5: ready(5)}), SplitAgent(_DONE, triaged()), triaged=False,
+                    DAILY_SPEND_CAP_USD="0.5")
+    assert not dispatched(tick(broke), AgentKind.TRIAGE)  # a 2.0 budget does not fit under a 0.5 cap
+
+
+def test_many_untriaged_issues_triage_up_to_the_concurrency_at_once_and_all_finish(role):
+    numbers = range(5, 11)
+    gh = FakeGitHub(issues={n: ready(n, f"Bug {n}") for n in numbers})
+    gate = threading.Event()
+    agent = SplitAgent(_DONE, _blocked(gate, triaged()(None)))
+    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="2")
+    try:
+        assert len(dispatched(composed.daemon.tick(), AgentKind.TRIAGE)) == 2  # the ceiling is the concurrency
+    finally:
+        gate.set()
+        composed.daemon.wait_for_dispatches()
+    for _ in range(12):
+        tick(composed)
+    graded = [r for r in composed.control.leg_runs("o/r", tuple(numbers)) if r.kind == "TRIAGE"]
+    assert {r.number for r in graded} == set(numbers)
+
+
 def test_a_repeated_fix_act_escalates_its_model_one_tier_per_attempt(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")

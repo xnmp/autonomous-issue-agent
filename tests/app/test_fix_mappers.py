@@ -133,14 +133,15 @@ def local(**kw):
     return Local(now=T0 + timedelta(days=1), legs={}, **kw)
 
 
-def test_paid_dispatches_fit_the_free_slots_issues_first():
+def test_heavy_dispatches_fit_the_free_slots_and_triage_needs_none():
+    triage = tuple(RunAgent(AgentKind.TRIAGE, n) for n in (1, 2, 3))
     world = WorldState(
         issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)),
-        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),),
+        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")), harness_pr(101, issue=8, ci=ci(bucket="fail"))),
     )
-    chosen = fix_actions(derive(world, local(), H), H, slots=2)
-    assert chosen == (RunAgent(AgentKind.TRIAGE, 1), RunAgent(AgentKind.TRIAGE, 2))
-    assert fix_actions(derive(world, local(), H), H, slots=0) == ()
+    chosen = fix_actions(derive(world, local(), H), H, slots=1)
+    assert chosen[:3] == triage and [a.kind for a in chosen[3:]] == [AgentKind.FIX_CI]
+    assert fix_actions(derive(world, local(), H), H, slots=0) == triage
 
 
 def test_free_actions_ignore_the_slot_budget_and_review_is_never_the_fix_roles():
@@ -152,8 +153,8 @@ def test_free_actions_ignore_the_slot_budget_and_review_is_never_the_fix_roles()
 
 
 @pytest.mark.parametrize("slots", [-1, 0])
-def test_no_slots_means_no_paid_dispatch(slots):
-    world = WorldState(issues=(IssueView(1, labels=frozenset({Label.AI_READY})),))
+def test_no_slots_means_no_heavy_dispatch(slots):
+    world = WorldState(prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),))
     assert fix_actions(derive(world, local(), H), H, slots=slots) == ()
 
 

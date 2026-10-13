@@ -32,6 +32,8 @@ TRIAGE runs once per admitted issue, with no tools, and returns a tier (`low`, `
 
 Every fix act (RESOLVE, FIX_CI, ADDRESS_REVIEW, REBASE) runs on `FIX_MODEL_<TIER>` (`runtime:model`), escalated one tier per earlier attempt in its attempt run, capped at `xhigh`. Escalation is derived from the legs, never stored. REVIEW runs at the tier of the fix leg that produced the reviewed head, else the issue's triaged tier, else `REVIEW_MODEL`. An unset tier spec falls back to the role's single model, so a one-model config still works.
 
+TRIAGE holds no fix dispatch slot (`AgentKind.holds_dispatch_slot`): it never waits behind a heavy leg and never crowds one out. At most `FIX_DISPATCH_CONCURRENCY` triage legs run at once, a second pool of the same size, still under headroom, backoff and the per-issue lease.
+
 The triage record is a flat object, so a later act (tech-debt tracking) can add fields without new state.
 
 ## Labels

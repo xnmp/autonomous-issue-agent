@@ -275,7 +275,9 @@ class Daemon:
     def __post_init__(self) -> None:
         if self.dispatch_capacity < 1:
             raise ValueError("dispatch_capacity must be >= 1")
-        self._dispatch_pool = ThreadPoolExecutor(max_workers=self.dispatch_capacity,
+        # Heavy legs fill `dispatch_capacity`; light ones (TRIAGE) get as many
+        # more, their ceiling, so a queued light leg can never hide in the pool.
+        self._dispatch_pool = ThreadPoolExecutor(max_workers=2 * self.dispatch_capacity,
                                                  thread_name_prefix=f"{self.name}-dispatch")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown timeout must be positive")
@@ -331,7 +333,11 @@ class Daemon:
         """Capacity visible to decide, so it never chooses work this process
         will not start."""
         with self._dispatch_lock:
-            return max(0, self.dispatch_capacity - len(self._dispatches)) if self._admitting() else 0
+            return max(0, self.dispatch_capacity - self._in_flight(heavy=True)) if self._admitting() else 0
+
+    def _in_flight(self, *, heavy: bool) -> int:
+        # Caller holds _dispatch_lock.
+        return sum(a.kind.holds_dispatch_slot is heavy for a, _k in self._dispatches.values())
 
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
@@ -346,7 +352,8 @@ class Daemon:
     def _submit_dispatch(self, action: RunAgent) -> bool:
         key = self.dispatch_key(action)
         with self._dispatch_lock:
-            if (not self._admitting() or len(self._dispatches) >= self.dispatch_capacity
+            if (not self._admitting()
+                    or self._in_flight(heavy=action.kind.holds_dispatch_slot) >= self.dispatch_capacity
                     or key in {k for _a, k in self._dispatches.values()}):
                 return False
             future = self._dispatch_pool.submit(self.executor.execute, action)

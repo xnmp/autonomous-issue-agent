@@ -45,16 +45,18 @@ def fix_actions(
     states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int, *, merge: bool = True,
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches, with at
-    most `slots` paid dispatches (issues first, then PRs, by number). With
+    most `slots` slot-holding dispatches (issues first, then PRs, by number);
+    a TRIAGE needs none (the daemon bounds it). With
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     out: list[Action] = []
     for action in policy_actions(states, harness):
         if isinstance(action, MergePullRequest) and not merge:
             continue
         if isinstance(action, RunAgent):
-            if action.kind not in _FIX_ACTS or slots <= 0:
+            holds = action.kind.holds_dispatch_slot
+            if action.kind not in _FIX_ACTS or (holds and slots <= 0):
                 continue
-            slots -= 1
+            slots -= holds
         out.append(action)
     return tuple(out)
 
