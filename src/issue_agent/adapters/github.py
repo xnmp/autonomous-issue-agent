@@ -693,6 +693,18 @@ class GitHubGateway:
                              "— red PR checks are charged to the PR\n")
             return None
 
+    def issue_index(self, limit: int = 300) -> tuple[tuple[int, str, str], ...]:
+        """(number, state, title) of the repository's most recent issues, open
+        and closed: the candidates a TRIAGE leg may name as a duplicate. An
+        unreadable listing raises; the leg then offers none."""
+        data = self._gh_json(["issue", "list", "--repo", self.repo, "--state", "all", "--json",
+                              "number,state,title", "--limit", str(limit)])
+        if not isinstance(data, list):
+            raise FixObservationIncomplete("issue listing is unreadable")
+        return tuple((row["number"], str(row.get("state") or "").lower(), str(row.get("title") or ""))
+                     for row in data if isinstance(row, dict) and type(row.get("number")) is int
+                     and row["number"] > 0)
+
     def pull_request_for_branch(self, branch: str) -> int | None:
         """The open PR whose head is `branch` in this repository. A closed one
         does not count: a branch pushed after its PR was closed is reopened

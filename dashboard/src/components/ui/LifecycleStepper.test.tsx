@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
+import { railNodes } from "../../features/issues/board";
 import { LifecycleStepper, type RailNode } from "./LifecycleStepper";
 
 describe("LifecycleStepper", () => {
@@ -36,5 +37,17 @@ describe("LifecycleStepper", () => {
 
     rerender(<LifecycleStepper rail={rail()} tone="ok" live={false} />);
     expect(screen.getByText("CI").closest("li")).not.toHaveClass("rail-live");
+  });
+
+  it("draws Triage first and marks it current while the issue is being triaged", () => {
+    const nodes = railNodes({
+      current: "triage", furthest: "triage", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false,
+    });
+    render(<LifecycleStepper rail={nodes} tone="ok" live={false} label="Issue #9 stage" />);
+
+    const items = screen.getAllByRole("listitem");
+    expect(items.map((node) => node.textContent)).toEqual(["Triage", "Resolve", "CI", "Review", "Merge"]);
+    expect(items[0]).toHaveAttribute("aria-current", "step");
+    expect(items[1]).not.toHaveAttribute("aria-current");
   });
 });

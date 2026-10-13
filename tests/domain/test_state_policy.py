@@ -45,6 +45,7 @@ from issue_agent.domain.state import (
     pr_key,
     stop_tag,
 )
+from issue_agent.domain.routing import Tier
 from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Push, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -100,6 +101,12 @@ def legs(kind: AgentKind, *minutes: float, machine: bool = False) -> tuple[LegEn
     return tuple(LegEnd(kind, at(m), machine) for m in minutes)
 
 
+# A triage leg that returned nothing usable: the issue proceeds at the default
+# tier with no triage comment owed (test_triage_routing covers the rest).
+TRIAGE_END = LegEnd(AgentKind.TRIAGE, T0 - timedelta(hours=1), False)
+TRIAGED = {issue_key(3): (TRIAGE_END,)}
+
+
 def local(legs_by: dict | None = None, **kw) -> Local:
     return Local(now=kw.pop("now", NOW), legs=legs_by or {}, **kw)
 
@@ -123,8 +130,8 @@ def pr_legs(*ends: LegEnd, number: int = 7) -> dict:
 
 def test_ready_issue_without_a_harness_pr_dispatches_resolve():
     world = WorldState(issues=(issue(3),))
-    assert derive(world, local(), H) == {issue_key(3): Dispatch(AgentKind.RESOLVE)}
-    assert actions(derive(world, local(), H), H) == (RunAgent(AgentKind.RESOLVE, 3, head=""),)
+    assert derive(world, local(TRIAGED), H) == {issue_key(3): Dispatch(AgentKind.RESOLVE)}
+    assert actions(derive(world, local(TRIAGED), H), H) == (RunAgent(AgentKind.RESOLVE, 3, head="", tier=Tier.MED),)
 
 
 @pytest.mark.parametrize(
@@ -151,7 +158,7 @@ def test_only_fix_issue_branches_are_harness_prs(branch):
 
 def test_closed_harness_pr_does_not_shadow_the_issue():
     world = WorldState(issues=(issue(3),), prs=(pr(7, 3, state="CLOSED"),))
-    assert derive(world, local(), H) == {issue_key(3): Dispatch(AgentKind.RESOLVE)}
+    assert derive(world, local(TRIAGED), H) == {issue_key(3): Dispatch(AgentKind.RESOLVE)}
 
 
 @pytest.mark.parametrize("raw", [None, 3, "fix/12345678901-x"])
@@ -378,7 +385,7 @@ def test_issue_stage_needs_human_uses_the_issue_thread():
 
 def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
     view = pr(ci=RED)
-    assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2)))) == Dispatch(FIX, HEAD)
+    assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2)))) == Dispatch(FIX, HEAD, Tier.XHIGH)
     states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 1, 2, 3))), H)
     assert states == {pr_key(7): NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)}
     label, comment = actions(states, H)
@@ -387,13 +394,13 @@ def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
 
 
 def test_resolve_attempts_cap_on_the_issue():
-    states = derive(WorldState(issues=(issue(3),)), local({issue_key(3): legs(AgentKind.RESOLVE, 1, 2, 3)}), H)
+    states = derive(WorldState(issues=(issue(3),)), local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
     assert states == {issue_key(3): NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)}
 
 
 def test_machine_failures_never_count_as_attempts():
     history = legs(FIX, 1, 2, 3, 4, 5, machine=True) + legs(FIX, 6, 7)
-    assert pr_state(pr(ci=RED), local(pr_legs(*history))) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED), local(pr_legs(*history))) == Dispatch(FIX, HEAD, Tier.XHIGH)
 
 
 def test_attempts_are_per_action_and_per_item():
@@ -411,7 +418,7 @@ def test_attempts_are_per_action_and_per_item():
 )
 def test_a_non_harness_comment_review_or_push_resets_attempts(change):
     loc = local(pr_legs(*legs(FIX, 1, 2, 3, 11)))
-    assert pr_state(pr(ci=RED, **change), loc) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED, **change), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
 
 
 @pytest.mark.parametrize(
@@ -454,7 +461,7 @@ def test_fix_ci_red_fix_red_three_times_caps():
 def test_alternating_successful_rebases_and_reviews_never_cap():
     rebase = AgentKind.REBASE
     loc = local(seq((rebase, "a"), (REVIEW, "b"), (rebase, "b"), (REVIEW, "c"), (rebase, "c")))
-    assert pr_state(pr(mergeable="CONFLICTING"), loc) == Dispatch(rebase, HEAD)
+    assert pr_state(pr(mergeable="CONFLICTING"), loc) == Dispatch(rebase, HEAD, Tier.HIGH)
     assert pr_state(pr(), loc) == Dispatch(REVIEW, HEAD)
 
 
@@ -472,12 +479,12 @@ def test_machine_legs_inside_a_run_neither_break_nor_count():
     loc = local(seq((FIX, "a"), (FIX, "a", True), (REVIEW, "a", True), (FIX, "b"), (FIX, "b", True), (FIX, HEAD)))
     assert pr_state(pr(ci=RED), local(loc.legs, now=at(100))) == NeedsHuman(StopReason.ATTEMPTS, iso(5), FIX)
     two = local(seq((FIX, "a"), (FIX, "a", True), (FIX, HEAD)), now=at(100))
-    assert pr_state(pr(ci=RED), two) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED), two) == Dispatch(FIX, HEAD, Tier.XHIGH)
 
 
 def test_another_acts_agent_leg_ends_the_run():
     loc = local(seq((FIX, "a"), (FIX, "b"), (AgentKind.ADDRESS_REVIEW, "b"), (FIX, HEAD)))
-    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
 
 
 def test_leg_end_head_must_be_a_string():
@@ -684,7 +691,7 @@ def test_policy_stop_comment_is_read_back_as_the_stop():
 
 def test_actions_are_ordered_issues_first_then_by_number():
     world = WorldState(issues=(issue(9), issue(2)), prs=(pr(5, 30, ci=RED), pr(4, 31, ci=RED)))
-    numbers = [(a.kind, a.number) for a in actions(derive(world, local(), H), H)]
+    numbers = [(a.kind, a.number) for a in actions(derive(world, local({issue_key(n): (TRIAGE_END,) for n in (2, 9)}), H), H)]
     assert numbers == [(AgentKind.RESOLVE, 2), (AgentKind.RESOLVE, 9), (FIX, 4), (FIX, 5)]
 
 
@@ -733,7 +740,7 @@ def test_local_legs_cannot_be_mutated_after_construction():
     source = {pr_key(7): legs(FIX, 1)}
     loc = local(source)
     source[pr_key(7)] = legs(FIX, 1, 2, 3)
-    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
 
 
 def test_ten_thousand_comments_with_a_late_reply_release():
@@ -754,10 +761,10 @@ def test_ten_thousand_machine_legs_do_not_stop_and_back_off_at_most_an_hour():
 
 def test_many_items_derive_independently():
     world = WorldState(issues=tuple(issue(n) for n in range(1, 2001)))
-    states = derive(world, local({issue_key(5): legs(AgentKind.RESOLVE, 1, 2, 3)}), H)
+    states = derive(world, local({issue_key(5): (TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
     assert len(states) == 2000
     assert states[issue_key(5)] == NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)
-    assert states[issue_key(6)] == Dispatch(AgentKind.RESOLVE)
+    assert states[issue_key(6)] == Dispatch(AgentKind.TRIAGE)
 
 
 # ── Agent questions (slice 5b) ───────────────────────────────────────────────
@@ -825,13 +832,13 @@ def test_a_question_waits_once_labelled_and_a_reply_releases_it():
 
 def test_after_release_the_answered_question_redispatches_with_a_fresh_count():
     released = issue(3, comments=(stop(StopReason.QUESTION, 6), human(7)))
-    loc = local({issue_key(3): (*legs(AgentKind.RESOLVE, 1, 2), asked(AgentKind.RESOLVE, 5))})
+    loc = local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2), asked(AgentKind.RESOLVE, 5))})
     assert one(WorldState(issues=(released,)), loc) == Dispatch(AgentKind.RESOLVE)
 
 
 def test_a_later_agent_leg_supersedes_an_old_question():
     loc = local(pr_legs(asked(FIX, 1), *legs(FIX, 2)))
-    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD, Tier.XHIGH)
 
 
 def test_a_machine_end_after_a_question_does_not_hide_it():
@@ -872,7 +879,7 @@ def test_the_agents_own_unmarked_comment_inside_its_leg_is_not_a_reset():
 def test_the_same_comment_outside_every_leg_window_resets():
     between = Comment("alice", "try the other approach", iso(3.5))
     loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
-    assert pr_state(pr(ci=RED, comments=(between,)), loc) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED, comments=(between,)), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
 
 
 # ── One definition of a human comment (#342) ────────────────────────────────
@@ -935,7 +942,7 @@ def test_a_comment_at_the_leg_start_instant_is_outside_the_window():
     # The window is (start, end]: a human comment the leg was dispatched on is a reset.
     edge = Comment("alice", "go", iso(4))
     loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
-    assert pr_state(pr(ci=RED, comments=(edge,)), loc) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED, comments=(edge,)), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
 
 
 # ── Publication: the agent pushes, the harness opens (Q11, slice 5b) ─────────
@@ -956,7 +963,7 @@ def test_the_latest_committed_branch_wins_and_untimed_ones_lose():
 
 def test_another_issues_branch_does_not_open_a_pr():
     world = WorldState(issues=(issue(3),), branches=(Branch("fix/4-slug", iso(1)), Branch("feat/3-x", iso(1))))
-    assert one(world) == Dispatch(AgentKind.RESOLVE)
+    assert one(world, local(TRIAGED)) == Dispatch(AgentKind.RESOLVE)
 
 
 def test_a_stopped_issue_with_a_pushed_branch_waits_for_the_human():
@@ -993,15 +1000,15 @@ def test_open_pull_request_action_is_validated():
 def test_a_leg_that_ended_after_the_observation_holds_its_item_busy():
     # P0-1: the world was read before the leg pushed; its end is already local.
     world = WorldState(issues=(issue(3),), now=iso(10))
-    loc = local({issue_key(3): legs(AgentKind.RESOLVE, 11)})
+    loc = local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 11))})
     assert one(world, loc) == Busy()
-    assert one(WorldState(issues=(issue(3),), now=iso(12)), loc) == Dispatch(AgentKind.RESOLVE)
+    assert one(WorldState(issues=(issue(3),), now=iso(12)), loc) == Dispatch(AgentKind.RESOLVE, tier=Tier.HIGH)
 
 
 @pytest.mark.parametrize("now", ["", "not-a-time"])
 def test_an_unstamped_observation_does_not_hold_items(now):
-    loc = local({issue_key(3): legs(AgentKind.RESOLVE, 11)})
-    assert one(WorldState(issues=(issue(3),), now=now), loc) == Dispatch(AgentKind.RESOLVE)
+    loc = local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 11))})
+    assert one(WorldState(issues=(issue(3),), now=now), loc) == Dispatch(AgentKind.RESOLVE, tier=Tier.HIGH)
 
 
 def test_a_labelled_item_whose_stop_comment_never_landed_is_stopped_again():

@@ -16,7 +16,7 @@ These answer the questions in `/tmp/refactor-audit.md` §5. Each answer is the m
 12. **Runtimes.**
     - GLM (`claude_profile`) is deleted.
     - Codex native sub-agents are disabled and their child-usage accounting deleted. Independent review is its own leg.
-    - **Owner:** the ROUTE classifier and difficulty ladder are deleted, leaving one configured model per role. This removes a cost lever (luna for trivial issues). Revisit once there is cost data.
+    - **Owner:** the ROUTE classifier and difficulty ladder are deleted, leaving one configured model per role. This removes a cost lever (luna for trivial issues). Revisit once there is cost data. *Superseded by 15.*
 13. **Extras: all deleted.**
     - Blocked-by dependency holds. **Owner:** keifu used these.
     - Path-overlap holds and predicted paths.
@@ -39,3 +39,4 @@ These answer the questions in `/tmp/refactor-audit.md` §5. Each answer is the m
 22. **Human CHANGES_REQUESTED.** A non-harness reviewer whose latest APPROVED/CHANGES_REQUESTED/DISMISSED review is CHANGES_REQUESTED blocks merge. On the current head it dispatches ADDRESS_REVIEW (an attempt, not a bot round). On an older head the bot still reviews the new head, but approval waits instead of merging. A later approval or dismissal by the same reviewer clears it.
 23. **Review rounds since reset.** Bot CHANGES_REQUESTED reviews are counted since the latest reset event (Q3), including a released `needs-human` comment. A lifetime count would re-stop a PR the moment a reply released it.
 24. **Push provenance.** A push is read from the head commit's author login and date in the observe GraphQL query. A push by a harness login is not a reset event.
+15. **Triage and routing restored (owner, 2026-10-13).** One TRIAGE act in the fix role replaces the deleted ROUTE classifier and difficulty ladder: it grades the issue into a tier, writes acceptance criteria to the issue as one idempotent harness comment, and flags a suspected duplicate, which is the one new `needs-human` reason. Fix acts run on `FIX_MODEL_<TIER>` with derived escalation (one tier per earlier attempt). The review leg runs at the same tier as the fix leg that produced its head (owner: "Review model should be the same tier as the fixer model"), falling back to the triaged tier, then `REVIEW_MODEL`. The steward stays deleted; triage is a fix-role act, not a role. See the design page's Routing section.

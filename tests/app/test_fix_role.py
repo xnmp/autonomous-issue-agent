@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,10 +21,11 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
-from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.contracts import RunId
+from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Review, WorldState
 
@@ -82,6 +84,9 @@ class FakeGitHub:
 
     def get_issue(self, number: int) -> IssueView:
         return self.issues[number]
+
+    def issue_index(self) -> tuple[tuple[int, str, str], ...]:
+        return tuple((n, i.state, i.title) for n, i in sorted(self.issues.items()))
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         return self.prs[number]
@@ -241,7 +246,7 @@ def asked(needs: str, session: str = "s1"):
 
 @pytest.fixture
 def role(tmp_path):
-    def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, **env):
+    def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, *, triaged: bool = True, **env):
         cfg = replace(
             from_env(
                 {
@@ -258,6 +263,13 @@ def role(tmp_path):
         )
         worktrees = FakeWorktrees(tmp_path / "worktrees")
         composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log)
+        if triaged:
+            # A triage that returned nothing usable: the issue resolves at the
+            # default tier with no triage comment (test_triage_routing covers triage).
+            for number in gh.issues:
+                composed.control.record_unpaid_leg(
+                    RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
+                    issue=number, number=number, head="", runtime="claude", leg_class="agent", result={})
         return composed, worktrees
 
     return compose
@@ -642,7 +654,7 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     legs = [
         r.receipt["leg"]
         for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
-        if r.receipt is not None
+        if r.receipt is not None and r.kind == "FIX_CI"
     ]
     assert legs == ["machine", "agent"]
 
@@ -657,7 +669,8 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)  # dies, no receipt
     assert dispatched(tick(composed), AgentKind.FIX_CI)  # continues the wall-capped session
-    runs = sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "FIX_CI"),
+                  key=lambda r: r.completed_at)
     assert [r.receipt["leg"] if r.receipt else None for r in runs] == ["machine", None, "agent"]
     assert agent.tasks[2].resume == "s-wall"
 
@@ -696,7 +709,8 @@ def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session
     assert dispatched(tick(composed), AgentKind.RESOLVE)
 
     assert resumes == [None, "s-init"]
-    runs = sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind != "TRIAGE"),
+                  key=lambda r: r.completed_at)
     assert [(r.receipt["leg"], r.receipt["session"]) for r in runs] == [("machine", "s-init"), ("agent", "s-init")]
 
 
@@ -707,3 +721,105 @@ def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(role
     composed, _ = role(gh, Agent(), log=lines.append)
     assert tick(composed) == [] and gh.merged == []
     assert any("PR #100 waits to merge" in line and "BLOCKED" in line for line in lines)
+
+
+# ── TRIAGE and routing (owner, 2026-10-13) ───────────────────────────────────
+
+
+def triaged(tier: str = "high", duplicate_of: int | None = None, session: str = "t1"):
+    claim = {"tier": tier, "acceptance_criteria": ["A null token returns 401, not 500"],
+             "duplicate_of": duplicate_of, "duplicate_reason": "Same crash" if duplicate_of else "",
+             "rationale": "One handler."}
+    return lambda _task: AgentResult(False, structured=claim, cost_usd=0.01, session_id=session)
+
+
+ROUTES = {"TRIAGE_MODEL": "claude:claude-haiku-5-5", "FIX_MODEL_HIGH": "claude:claude-opus-5-5",
+          "FIX_MODEL_XHIGH": "claude:claude-fable-5-1"}
+
+
+def test_triage_grades_posts_its_criteria_once_then_resolve_runs_on_the_tiers_model(role):
+    gh = FakeGitHub(issues={5: ready(), 2: IssueView(2, title="Login is slow")})
+    agent = Agent(triaged("high"), pushed(gh, "fix/5-null-token-crashes", "h1", session="s-resolve"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES)
+
+    assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
+    triage_task = agent.tasks[0]
+    assert triage_task.model == "claude-haiku-5-5" and triage_task.max_budget_usd == 2.0
+    assert triage_task.schema["properties"]["duplicate_of"]["enum"] == [2, None]  # never itself
+    assert "Login is slow" in triage_task.prompt
+
+    tick(composed)  # the triage comment
+    tick(composed)  # nothing new to say: RESOLVE
+    (comment,) = gh.comments_with("issue", 5, "Acceptance criteria")
+    assert "A null token returns 401, not 500" in comment.body and "`high`" in comment.body
+    resolve = agent.tasks[1]
+    assert resolve.model == "claude-opus-5-5" and resolve.resume is None  # never the triage session
+    assert "A null token returns 401, not 500" in resolve.prompt
+    assert tick(composed) == [OpenPullRequest(5, "fix/5-null-token-crashes")]
+    assert "A null token returns 401, not 500" in gh.prs[100].body
+    assert len(gh.comments_with("issue", 5, "Acceptance criteria")) == 1
+
+
+def test_an_issue_with_its_own_criteria_keeps_them_as_the_contract(role):
+    own = "Crash on null token.\n\n## Acceptance criteria\n- [ ] The API answers 401"
+    gh = FakeGitHub(issues={5: replace(ready(), body=own)})
+    agent = Agent(triaged("high"), pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES)
+    tick(composed)
+    assert "acceptance_criteria" not in agent.tasks[0].schema["properties"]
+    tick(composed)  # the triage comment: the tier only
+    tick(composed)  # RESOLVE
+    assert gh.comments_with("issue", 5, "Acceptance criteria") == []
+    assert tick(composed) == [OpenPullRequest(5, "fix/5-null-token-crashes")]
+    assert "The API answers 401" in gh.prs[100].body and "A null token returns 401" not in gh.prs[100].body
+
+
+def test_a_triage_cut_off_by_the_wall_cap_counts_once_and_the_issue_resolves_at_the_default_tier(role):
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(_capped, pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES, FIX_MODEL_MED="claude:claude-sonnet-5-5")
+    assert dispatched(tick(composed), AgentKind.TRIAGE)
+    # Not a machine end retried (and re-paid) every backoff window.
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+    assert agent.tasks[1].model == "claude-sonnet-5-5"
+
+
+def test_a_suspected_duplicate_waits_for_a_human_and_a_reply_lets_it_resolve(role):
+    gh = FakeGitHub(issues={5: ready(), 2: IssueView(2, title="Null token crash")})
+    agent = Agent(triaged("low", duplicate_of=2), pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES)
+    tick(composed)
+    tick(composed)
+    assert Label.NEEDS_HUMAN in gh.issues[5].labels
+    (stop,) = gh.comments_with("issue", 5, stop_tag(StopReason.DUPLICATE))
+    assert "#2" in stop.body
+    assert tick(composed) == []  # held
+
+    gh.comment("issue", 5, "Not a duplicate: #2 is the web client.", author="alice")
+    tick(composed)  # release
+    tick(composed)  # triage comment
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.LOW)]
+    assert Label.NEEDS_HUMAN not in gh.issues[5].labels
+
+
+def test_a_repeated_fix_act_escalates_its_model_one_tier_per_attempt(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(did_nothing(), did_nothing())
+    composed, _ = role(gh, agent, **ROUTES, FIX_MODEL_MED="claude:claude-sonnet-5-5")
+    tick(composed)
+    tick(composed)
+    # No triage data (a PR from before routing): MED, then one rung up.
+    assert [t.model for t in agent.tasks] == ["claude-sonnet-5-5", "claude-opus-5-5"]
+    tiers = [r.receipt["tier"] for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+             if r.kind == "FIX_CI"]
+    assert tiers == ["med", "high"]
+
+
+def test_unset_tier_specs_keep_the_single_configured_fixer(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(did_nothing())
+    composed, _ = role(gh, agent, FIX_MODEL="claude-sonnet-5-5")
+    tick(composed)
+    assert agent.tasks[0].model == "claude-sonnet-5-5"

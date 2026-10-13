@@ -48,6 +48,7 @@ export type IssuesPayload = Schema["IssuesPayload"];
 export type TokenUsage = Schema["TokenUsage"];
 export type IssueStep = Schema["IssueStep"];
 export type PullRequestLink = Schema["PullRequestLink"];
+export type TriageSummary = Schema["TriageSummary"];
 export type CarriedLegs = Schema["CarriedLegs"];
 export type IssueDetailPayload = Schema["IssueDetailPayload"];
 export type ActionResult = Schema["ActionResult"];

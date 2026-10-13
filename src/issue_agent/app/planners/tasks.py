@@ -1,4 +1,4 @@
-"""Pure RuntimePlan builders for the five acts (and the fixer's resume
+"""Pure RuntimePlan builders for the six acts (and the fixer's resume
 shapes): prompt, schema, tool policy, budget, model and session.
 
 A fresh fixer leg carries the full AGENT.md; a resumed one only
@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from ...domain.trust import Untrusted, untrusted_block
 from ...domain.agent_task import RuntimeName
 from ...domain.effort import Effort
+from ...domain.triage import triage_schema
 from .schemas import FIX_SCHEMA, REVIEW_SCHEMA
 from ...adapters.runtime_plan import RuntimePlan
 
@@ -170,16 +171,89 @@ def build_resolve_task(
     cwd: str,
     cfg: FixTaskConfig,
     branch: str,
+    criteria: Untrusted | None = None,
 ) -> RuntimePlan:
-    """Initial resolution of an ai-ready issue on its prepared branch."""
+    """Initial resolution of an ai-ready issue on its prepared branch.
+    `criteria` are triage's acceptance criteria, when it wrote any."""
+    triaged = (
+        "Triage derived these acceptance criteria from the issue (also posted on it). "
+        "Satisfy them unless the issue itself contradicts one; the issue wins.\n"
+        f"{_fenced('triage acceptance criteria', criteria)}\n\n"
+        if criteria is not None and criteria.value.strip() else ""
+    )
     prompt = (
         f"Resolve issue #{issue_number} in {cfg.repo} on the prepared branch `{branch}` "
         f"(off {cfg.base_branch}).\n\n"
         f"{_fenced('issue title', title)}\n\n"
         f"{_fenced('issue body', body)}\n\n"
+        + triaged
         + _PUSH_CONTRACT.format(branch=branch)
     )
     return _fix_run(cfg, prompt, cwd)
+
+
+# The TRIAGE act's tool policy: it reads only the prompt. Its cwd is an empty
+# scratch directory, and the deny list closes the write and shell paths.
+TRIAGE_DENY: tuple[str, ...] = ("Bash", "Edit", "Write", "NotebookEdit", "Task", *FIXER_DENY)
+
+
+def build_triage_task(
+    issue_number: int,
+    title: Untrusted,
+    body: Untrusted,
+    others: Untrusted,
+    offered: tuple[int, ...],
+    cwd: str,
+    *,
+    model: str | None,
+    runtime: RuntimeName | None,
+    max_budget_usd: float,
+    criteria_wanted: bool = True,
+) -> RuntimePlan:
+    """TRIAGE: grade difficulty, state testable acceptance criteria and flag a
+    suspected duplicate among `offered` (the other issues listed in `others`).
+    Deliberately no plan: the fixer designs, the reviewer judges. The tier
+    rubric is the deleted router's (#8), renamed low/med/high/xhigh. An issue
+    that states its own criteria is not asked for any: its section stays the
+    contract the PR body carries."""
+    criteria = (
+        "## acceptance_criteria — what done means\n"
+        "Short, testable statements of observable behaviour, one per item, covering what "
+        "the issue asks and only that. Write criteria only for what the issue already "
+        "settles; state a reasonable, reversible assumption as a criterion rather than "
+        "asking. Never describe files, functions, steps or an approach.\n\n"
+        if criteria_wanted else ""
+    )
+    prompt = (
+        f"Triage GitHub issue #{issue_number} in one pass. Do not plan or design the "
+        "implementation, and do not explore the code: answer from the text below.\n\n"
+        "## tier — implementation difficulty\n"
+        "low = one-liner / config / copy / doc change, or a small, well-specified change "
+        "that follows an existing pattern (adding a palette command, menu entry, setting, "
+        "label or similar), even if it touches a few files.\n"
+        "med = typical feature or bug fix that needs design choices or touches a few files "
+        "without an existing pattern to follow.\n"
+        "high = architectural change, new subsystem, or deep debugging.\n"
+        "xhigh = exceptionally difficult work with interacting architectural constraints or "
+        "unresolved root causes across subsystems that requires the strongest implementer. "
+        "Reserve it for concrete difficulty in the task, not merely a long description or "
+        "high priority.\n\n"
+        + criteria
+        + "## duplicate_of — a suspected duplicate\n"
+        "Set it only when this issue clearly asks for the same change as one of the other "
+        "issues listed below, with a one-line duplicate_reason naming what they share. "
+        "Never claim a duplicate merely because the reports look similar or touch the same "
+        "area; when unsure, null. A human judges every claim.\n\n"
+        "## rationale\nOne or two sentences on why this tier.\n\n"
+        f"{_fenced('issue title', title)}\n\n"
+        f"{_fenced('issue body', body)}\n\n"
+        f"{_fenced('other issues', others)}"
+    )
+    return RuntimePlan(
+        prompt=prompt, schema=triage_schema(offered, criteria_wanted), disallowed_tools=TRIAGE_DENY,
+        read_only=True,
+        model=model, runtime=runtime, max_budget_usd=max_budget_usd, cwd=cwd,
+    )
 
 
 # Q11: the agent pushes its branch with git; the harness opens the PR.

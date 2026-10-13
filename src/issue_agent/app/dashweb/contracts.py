@@ -180,7 +180,8 @@ class SpendBucket(Contract):
     usd: float
 
 
-StopReasonId = Literal["question", "attempts", "review-rounds", "lifetime-cap", "workflow-path", "labelled"]
+StopReasonId = Literal["question", "attempts", "review-rounds", "lifetime-cap", "workflow-path", "duplicate",
+                       "labelled"]
 
 
 class AttentionItem(Contract):
@@ -219,7 +220,7 @@ class BoardNeedsYou(Contract):
 
 class BoardWorking(Contract):
     status: Literal["working"]
-    activity: Literal["agent", "queued", "ci", "ci_queued", "merge", "update", "open_pr", "release"]
+    activity: Literal["agent", "queued", "ci", "ci_queued", "merge", "update", "open_pr", "triage_note", "release"]
     act: str | None
     headline: str
     reason: str
@@ -240,7 +241,7 @@ BoardStatus = Annotated[
     Field(discriminator="status"),
 ]
 
-StageId = Literal["resolve", "ci", "review", "merge"]
+StageId = Literal["triage", "resolve", "ci", "review", "merge"]
 
 
 class StageRail(Contract):
@@ -366,6 +367,8 @@ class IssueStep(Contract):
     runtime: str | None
     # From the role journal's agent_run event; None when not found.
     model: str | None = None
+    # The routed tier the leg ran at (TRIAGE: the tier it graded); None before routing.
+    tier: Literal["low", "med", "high", "xhigh"] | None = None
     state: Literal["reserved", "running", "ended", "released"]
     outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done"]
     started_ts: str | None
@@ -384,6 +387,17 @@ class IssueStep(Contract):
     question: str | None = None
     verdict: str | None = None
     verdict_excerpt: str | None = None
+
+
+class TriageSummary(Contract):
+    """The issue's triage: tier, acceptance criteria and a suspected
+    duplicate. Agent-authored, laundered and bounded: render as text."""
+
+    tier: Literal["low", "med", "high", "xhigh"]
+    acceptance_criteria: list[str] = []
+    duplicate_of: int | None = None
+    duplicate_reason: str | None = None
+    rationale: str | None = None
 
 
 class CarriedLegs(Contract):
@@ -417,6 +431,8 @@ class IssueDetailPayload(Warned):
     steps: list[IssueStep]
     # Pre-cutover legs, money history only: their count and cost.
     carried: CarriedLegs | None = None
+    # None when the issue has no usable triage (untriaged, or pre-routing).
+    triage: TriageSummary | None = None
     # Why the control store could not be read; no board is derived then.
     store_error: str | None = None
 

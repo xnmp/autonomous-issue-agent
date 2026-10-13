@@ -12,19 +12,24 @@ the review role.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from ..adapters.control_store import LegRun
-from ..domain.actions import Action, AgentKind, MergePullRequest, RunAgent
+from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent
+from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.ci import failed_checks
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions
+from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
+from ..domain.routing import DEFAULT_TIER, Tier
+from ..domain.triage import Triage, triage_from_record
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Wait, WaitReason, human_comments
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
@@ -60,6 +65,9 @@ def human_reply(comments: Iterable[Comment], after: datetime, harness: Harness, 
     return "\n\n".join(f"@{c.author}: {c.body}" for at, c in human_comments(comments, harness, legs) if at > after)
 
 
+Route = tuple[RuntimeName, "str | None"]
+
+
 @dataclass(frozen=True)
 class FixSettings:
     repository: str
@@ -68,6 +76,15 @@ class FixSettings:
     runtime: str
     owner_id: str
     harness: Harness
+    # (runtime, model) per tier (FIX_MODEL_<TIER>) and for TRIAGE (TRIAGE_MODEL).
+    routes: Mapping[Tier, Route] = field(default_factory=dict)
+    triage_route: Route | None = None
+    triage_budget_usd: float = 2.0
+    # An empty scratch directory: TRIAGE reads only its prompt.
+    triage_cwd: str = ""
+
+    def route(self, tier: Tier | None) -> Route:
+        return self.routes.get(tier or DEFAULT_TIER) or (RuntimeName(self.runtime), None)
 
 
 class FixLegs:
@@ -88,7 +105,7 @@ class FixLegs:
         accounting,
         worktrees,
         task_config: tasks.FixTaskConfig,
-        prepare_cwd: Callable[[str], None] | None,
+        prepare_cwd: Callable[[str, RuntimeName | None], None] | None,
         log: Callable[[str], None],
     ) -> None:
         self.gateway = gateway
@@ -105,10 +122,10 @@ class FixLegs:
         if action.kind not in _FIX_ACTS:
             raise ValueError(f"the fix role does not run {action.kind.name}")
         item = dispatch_item(action)
-        if action.kind is AgentKind.RESOLVE:
+        if action.kind in ISSUE_ACTS:
             subject = self.gateway.get_issue(action.number)
             if subject.state != "open" or Label.AI_READY not in subject.labels or Label.NEEDS_HUMAN in subject.labels:
-                self.log(f"RESOLVE #{action.number}: skipped — issue no longer ready")
+                self.log(f"{action.kind.name} #{action.number}: skipped — issue no longer ready")
                 return
             issue = action.number
         else:
@@ -128,9 +145,14 @@ class FixLegs:
             self.control.unlease(repo, "fix", issue, owner)
 
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
-        # The review role's legs are not this role's sessions to continue.
+        if action.kind is AgentKind.TRIAGE:
+            await self._triage(action, subject)
+            return
         recorded = self.control.leg_runs(self.settings.repository, (issue,))
-        runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS), key=lambda r: r.completed_at)
+        runtime, model = self.settings.route(action.tier)
+        # The review role's legs and TRIAGE's are not this role's sessions to continue.
+        runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS - {AgentKind.TRIAGE}),
+                      key=lambda r: r.completed_at)
         mine = [r for r in runs if run_item(r) == item]
         # The newest agent leg, the rule derive uses: machine and transport
         # deaths after it neither drop its question nor reset resume-once.
@@ -138,9 +160,12 @@ class FixLegs:
         asked = mine[last] if last >= 0 and leg_class(mine[last]) is LegClass.ASKED else None
         # Resume once (classify_leg): continue the newest machine end since that
         # leg that left a session; a wall cap on the continuation is an attempt.
-        cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r])), None)
+        cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r], runtime)), None)
+        self.log(f"{action.kind.name} #{action.number}: tier {getattr(action.tier, 'value', '?')} -> "
+                 f"{runtime.value}:{model or '(default model)'}")
         self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue,
-                                 head=action.head, resumed=cut_off is not None)
+                                 head=action.head, resumed=cut_off is not None,
+                                 tier=action.tier.value if action.tier is not None else "")
         try:
             if action.kind is AgentKind.RESOLVE:
                 branch = self._resolve_branch(issue, subject.title)
@@ -148,11 +173,13 @@ class FixLegs:
             else:
                 cwd = self.worktrees.sync(issue, subject.head_ref_name, action.head)
             if self.prepare_cwd is not None:
-                self.prepare_cwd(cwd)
+                self.prepare_cwd(cwd, runtime)
             # Every leg of the item, either role's, as derive sees them (#342).
             reply = human_reply(subject.comments, asked.completed_at, self.settings.harness,
                                 local_legs(recorded).get(item, ())) if asked else ""
-            task = self._task(action, subject, cwd, runs, cut_off, asked, reply)
+            cfg = replace(self.task_config, runtime=runtime, model=model)
+            criteria = _criteria(recorded) if action.kind is AgentKind.RESOLVE else ()
+            task = self._task(action, subject, cwd, runs, cut_off, asked, reply, cfg, runtime, criteria)
             task = replace(task, env={**task.env, **self._git_identity()})
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")
@@ -178,26 +205,58 @@ class FixLegs:
         recovered = self.worktrees.branch_for_issue(issue, fallback)
         return recovered if recovered and harness_branch_issue(recovered) == issue else fallback
 
-    def _session(self, runs: list[LegRun]) -> str:
+    async def _triage(self, action: RunAgent, subject) -> None:
+        """One TRIAGE leg. The issues it may name as a duplicate are read from
+        GitHub here and enumerated in its schema, which is what the accounting
+        runtime launders its `duplicate_of` against."""
+        runtime, model = self.settings.triage_route or self.settings.route(Tier.LOW)
+        # resumed: triage never resumes, so a wall timeout is its one attempt
+        # (the issue runs at DEFAULT_TIER), not a machine end retried forever.
+        self.runtime.set_context("fix", action.kind.name, action.number, action.number, claim_target=action.number,
+                                 resumed=True)
+        try:
+            # Per issue: concurrent triage legs never share a cwd (or a CODEX_HOME).
+            cwd = os.path.join(self.settings.triage_cwd, str(action.number))
+            # No prepare_cwd: that writes the fix contract into Codex's home; a
+            # read-only leg's home is written without it at launch.
+            os.makedirs(cwd, mode=0o700, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
+            self.log(f"TRIAGE #{action.number}: preparation failed: {exc}")
+            self.accounting.record_refused_leg()
+            return
+        index = [row for row in _soft_rows(self.gateway.issue_index, self.log) if row[0] != action.number]
+        listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title in index) or "(none)"
+        task = tasks.build_triage_task(
+            action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
+            tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime,
+            max_budget_usd=self.settings.triage_budget_usd,
+            criteria_wanted=not has_acceptance_criteria(subject.body or ""),
+        )
+        self.log(f"TRIAGE #{action.number}: {runtime.value}:{model or '(default model)'}")
+        await run_leg(self.runtime, self.log, Leg("TRIAGE", LegTarget.ISSUE, action.number, True,
+                                                  ("global", "repository", "issue")), task)
+
+    def _session(self, runs: list[LegRun], runtime: RuntimeName) -> str:
+        """The newest resumable session of `runtime`: a leg routed to another
+        runtime starts fresh rather than resume a transcript it cannot read."""
         for run in reversed(runs):
             receipt = run.receipt or {}
             session = receipt.get("session")
-            if receipt.get("runtime") == self.settings.runtime and isinstance(session, str) and session:
+            if receipt.get("runtime") == runtime.value and isinstance(session, str) and session:
                 return session
         return ""
 
     def _task(
         self, action: RunAgent, subject, cwd: str, runs: list[LegRun], cut_off: LegRun | None, asked: LegRun | None,
-        reply: str,
+        reply: str, cfg: tasks.FixTaskConfig, runtime: RuntimeName, criteria: tuple[str, ...] = (),
     ):
         """`cut_off` is the machine end this leg continues; `asked` the agent
         leg whose question a human has since answered with `reply`."""
-        cfg = self.task_config
         if action.kind is AgentKind.RESOLVE:
             if cut_off is not None:
-                return tasks.build_continue_task(cwd, self._session([cut_off]), cfg)
+                return tasks.build_continue_task(cwd, self._session([cut_off], runtime), cfg)
             if asked is not None:
-                if session := self._session([asked]):
+                if session := self._session([asked], runtime):
                     return tasks.build_resume_task(as_untrusted(reply), cwd, session, cfg)
                 return tasks.build_fresh_reply_task(
                     action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(reply), cwd, cfg,
@@ -205,9 +264,10 @@ class FixLegs:
             return tasks.build_resolve_task(
                 action.number, as_untrusted(subject.title), as_untrusted(subject.body), cwd, cfg,
                 self._resolve_branch(action.number, subject.title),
+                as_untrusted("\n".join(f"- {c}" for c in criteria)) if criteria else None,
             )
-        # PR-stage legs continue the issue's latest session: it wrote the code.
-        session = self._session(runs)
+        # PR-stage legs continue the issue's latest session on their runtime: it wrote the code.
+        session = self._session(runs, runtime)
         if action.kind is AgentKind.FIX_CI:
             checks = failed_checks(subject.ci)
             run_ids = tuple(dict.fromkeys(c.run_id for c in checks if c.run_id is not None))
@@ -230,6 +290,23 @@ class FixLegs:
                 cwd, session, cfg,
             )
         return tasks.with_human_reply(task, as_untrusted(reply)) if reply else task
+
+
+def _criteria(runs: Iterable[LegRun]) -> tuple[str, ...]:
+    """The acceptance criteria of the issue's latest agent-ended TRIAGE leg."""
+    triaged = [r for r in runs if r.kind == AgentKind.TRIAGE.name and leg_class(r) is not LegClass.MACHINE]
+    latest = max(triaged, key=lambda r: r.completed_at, default=None)
+    found: Triage | None = triage_from_record((latest.receipt or {}).get("triage")) if latest is not None else None
+    return found.acceptance_criteria if found is not None else ()
+
+
+def _soft_rows(read: Callable[[], tuple], log: Callable[[str], None]) -> tuple:
+    """A listing as prompt input: a failed read offers nothing."""
+    try:
+        return tuple(read())
+    except Exception as exc:  # noqa: BLE001 - context, never control flow
+        log(f"prompt input unavailable: {exc}")
+        return ()
 
 
 def _soft(read: Callable[[], str], log: Callable[[str], None]) -> str:
@@ -261,7 +338,10 @@ def compose_fix_daemon(
     FIX_DISPATCH_CONCURRENCY."""
     log = log or stderr_log("fix")
     settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, cfg.fixer_runtime.value,
-                           "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot))
+                           "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
+                           routes={tier: cfg.fix_route(tier) for tier in Tier}, triage_route=cfg.triage_route(),
+                           triage_budget_usd=cfg.triage_budget_usd,
+                           triage_cwd=os.path.join(cfg.state_dir, "triage"))
     task_config = tasks.FixTaskConfig(cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,
                                       cfg.fix_model, cfg.fix_effort, runtime=cfg.fixer_runtime)
 
@@ -278,7 +358,7 @@ def compose_fix_daemon(
     role = compose_role(cfg, "fix", gateway, runner, make_legs=make_legs, make_act=make_act,
                         choose=fix_choose(settings, log), worktrees=worktrees,
                         capacity=cfg.fix_dispatch_concurrency, log=log)
-    log(f"fix: capabilities: resolve=on merge={'on' if cfg.auto_merge else 'off'}")
+    log(f"fix: capabilities: triage=on resolve=on merge={'on' if cfg.auto_merge else 'off'}")
     return role
 
 

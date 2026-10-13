@@ -65,3 +65,21 @@ def test_a_stop_comment_is_withheld_until_its_needs_human_label_is_on_the_item(t
     with pytest.raises(RuntimeError, match="withheld"):
         _act(tmp_path, gh).execute(STOP)
     assert gh.posted == []
+
+
+def test_the_triage_comment_posts_once_however_often_derive_asks_for_it(tmp_path):
+    from issue_agent.domain.policy import triage_comment
+    from issue_agent.domain.routing import Tier
+    from issue_agent.domain.state import Harness, TriageNote
+    from issue_agent.domain.triage import Triage
+
+    note = TriageNote(Triage(Tier.LOW, ("Esc closes it",)), "2026-10-01T12:00:00+00:00")
+    action = PostComment(Target.ISSUE, 5, triage_comment(note, Harness("fix-bot", "review-bot")),
+                         key=f"triage:issue:5:{note.anchor}")
+    gh = Gateway(lose_reply=True)
+    act = _act(tmp_path, gh)
+    with pytest.raises(RuntimeError, match="reply was lost"):
+        act.execute(action)
+    act.execute(action)
+    act.execute(action)  # an observation that lags the post asks again
+    assert gh.posted == [action.body]

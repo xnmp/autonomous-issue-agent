@@ -36,9 +36,15 @@ def _unquoted(value: str) -> str:
     return parts[0] if len(parts) == 1 else value
 
 
+_ROUTES = ("FIX_MODEL_LOW", "FIX_MODEL_MED", "FIX_MODEL_HIGH", "FIX_MODEL_XHIGH", "TRIAGE_MODEL")
+
+
 def _runtimes(env: dict) -> set[str]:
-    return {_unquoted(str(env.get(k) or "").strip()).lower()
-            for k in ("FIXER_RUNTIME", "REVIEWER_RUNTIME")} - {""}
+    """The role runtimes plus every runtime a `runtime:model` route names."""
+    roles = {_unquoted(str(env.get(k) or "").strip()).lower() for k in ("FIXER_RUNTIME", "REVIEWER_RUNTIME")}
+    routes = {_unquoted(str(env.get(k) or "").strip()).partition(":")[0].lower() for k in _ROUTES
+              if ":" in str(env.get(k) or "")}
+    return (roles | routes) - {""}
 
 
 def _runtime_binaries(env: dict) -> tuple[tuple[str, str], ...]:

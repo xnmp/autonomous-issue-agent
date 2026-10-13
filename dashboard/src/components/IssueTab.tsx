@@ -1,7 +1,7 @@
 import { useMemo, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
-import type { IssueStep } from "../api/types";
+import type { IssueStep, TriageSummary } from "../api/types";
 import { legNote, outcomeMark, prStateTone } from "../lib/semantics";
 import { duration, localTime, tokens, usd } from "../lib/format";
 import { GROUP_META, boardTone, plainHarnessMessage, railNodes } from "../features/issues/board";
@@ -228,6 +228,8 @@ export function IssueTab({
             </section>
           ) : null}
 
+          {d.triage ? <TriagePanel issue={issue} triage={d.triage} /> : null}
+
           {stopNote ? (
             <div className="banner banner-error" role="status">
               <span className="banner-mark" aria-hidden="true">!</span>
@@ -361,6 +363,7 @@ function StepRow({
         {visible.has("runtime") ? <td className="mono trunc" title={step.model ?? undefined}>
           {step.runtime ?? <span className="faint">—</span>}
           {step.model ? <span className="faint"> · {step.model}</span> : null}
+          {step.tier ? <span className="faint"> · tier: {step.tier}</span> : null}
         </td> : null}
         {visible.has("status") ? <td className="row-wrap">
           <StepStatusChip outcome={step.outcome} />
@@ -409,6 +412,34 @@ function StepRow({
 
 type DetailPane = "summary" | "raw";
 const PANES: readonly DetailPane[] = ["summary", "raw"];
+
+/** Agent-authored triage text: rendered as text, never as Markdown. */
+function TriagePanel({ issue, triage }: { issue: number; triage: TriageSummary }) {
+  const titleId = `issue-${issue}-triage-title`;
+  return (
+    <section className="panel issue-triage-panel" aria-labelledby={titleId}>
+      <div className="panel-hd">
+        <span className="panel-title" id={titleId}>Triage</span>
+        <Chip tone="info" square>tier: {triage.tier}</Chip>
+      </div>
+      {triage.duplicate_of != null ? (
+        <p className="issue-attention triage-duplicate">
+          Suspected duplicate of #{triage.duplicate_of}
+          {triage.duplicate_reason ? `: ${triage.duplicate_reason}` : ""}
+        </p>
+      ) : null}
+      {triage.rationale ? <p className="triage-rationale">{triage.rationale}</p> : null}
+      {triage.acceptance_criteria.length > 0 ? (
+        <>
+          <p className="faint triage-criteria-label">Acceptance criteria</p>
+          <ul className="triage-criteria">
+            {triage.acceptance_criteria.map((criterion, index) => <li key={index}>{criterion}</li>)}
+          </ul>
+        </>
+      ) : null}
+    </section>
+  );
+}
 
 function StepDetail({ id, step }: { id: string; step: IssueStep }) {
   const [pane, setPane] = useState<DetailPane>("summary");

@@ -139,7 +139,7 @@ def test_paid_dispatches_fit_the_free_slots_issues_first():
         prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),),
     )
     chosen = fix_actions(derive(world, local(), H), H, slots=2)
-    assert chosen == (RunAgent(AgentKind.RESOLVE, 1), RunAgent(AgentKind.RESOLVE, 2))
+    assert chosen == (RunAgent(AgentKind.TRIAGE, 1), RunAgent(AgentKind.TRIAGE, 2))
     assert fix_actions(derive(world, local(), H), H, slots=0) == ()
 
 

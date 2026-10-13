@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .actions import AgentKind
+from .routing import Tier
+from .triage import Triage
 
 BACKOFF_BASE = timedelta(seconds=60)
 BACKOFF_CAP = timedelta(hours=1)
@@ -53,6 +55,10 @@ class LegEnd:
     # agent's own (it posts acceptance criteria and test plans under the bot's
     # login, without the harness marker), so they never reset attempts.
     started_at: datetime | None = None
+    # A TRIAGE agent end's laundered result; None when it returned nothing usable.
+    triage: Triage | None = None
+    # The routed tier the leg ran at, when recorded (legs before routing have none).
+    tier: Tier | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -70,6 +76,12 @@ class LegEnd:
             or self.started_at > self.ended_at
         ):
             raise ValueError("leg start must be an aware time no later than its end")
+        if self.triage is not None and (
+            not isinstance(self.triage, Triage) or self.kind is not AgentKind.TRIAGE or self.machine
+        ):
+            raise ValueError("only a TRIAGE agent end carries a triage result")
+        if self.tier is not None and not isinstance(self.tier, Tier):
+            raise ValueError("leg tier must be a Tier")
 
 
 def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime | None:

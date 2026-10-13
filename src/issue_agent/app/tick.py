@@ -45,7 +45,7 @@ from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
-from ..domain.actions import Action, AgentKind, RunAgent
+from ..domain.actions import ISSUE_ACTS, Action, AgentKind, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.leg import Leg
 from ..domain.outcome import AgentResult, LegClass, pre_admission_refusal
@@ -54,6 +54,8 @@ from ..domain.ports import SpendReconciler
 from ..domain.recovery import RecoveryTrigger
 from ..domain.refs import harness_branch_issue
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, pr_key
+from ..domain.routing import parse_tier
+from ..domain.triage import triage_from_record
 from ..domain.supervision import (
     ClockSample,
     DaemonState,
@@ -65,13 +67,13 @@ from .config import HarnessConfig, budget_policy, owner_identity_for_target, rat
 from .recovery import RecoveryCoordinator
 
 def run_item(run: LegRun) -> ItemKey | None:
-    """The item a recorded leg belongs to: its issue for RESOLVE, its PR for
-    PR-stage legs. Pre-5b kinds (RESUME, PR_RESUME, ROUTE) belong to no act:
-    under the cutover rule those legs simply stop counting."""
+    """The item a recorded leg belongs to: its issue for TRIAGE and RESOLVE,
+    its PR for PR-stage legs. Pre-5b kinds (RESUME, PR_RESUME, ROUTE) belong
+    to no act: under the cutover rule those legs simply stop counting."""
     kind = dispatched_kind(run.kind)
-    if kind is AgentKind.RESOLVE and run.issue > 0:
+    if kind in ISSUE_ACTS and run.issue > 0:
         return issue_key(run.issue)
-    if kind in DISPATCHABLE and kind is not AgentKind.RESOLVE and run.number > 0:
+    if kind in DISPATCHABLE and kind not in ISSUE_ACTS and run.number > 0:
         return pr_key(run.number)
     return None
 
@@ -93,7 +95,10 @@ def leg_end(run: LegRun) -> LegEnd | None:
     if started is not None and (started.utcoffset() is None or started > run.completed_at):
         started = None
     question = question_text((run.receipt or {}).get("question")) if leg is LegClass.ASKED else None
-    return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started)
+    triage = (triage_from_record((run.receipt or {}).get("triage"))
+              if kind is AgentKind.TRIAGE and leg is not LegClass.MACHINE else None)
+    return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
+                  triage=triage, tier=parse_tier((run.receipt or {}).get("tier")))
 
 
 def local_legs(runs: Iterable[LegRun]) -> dict[ItemKey, tuple[LegEnd, ...]]:
@@ -106,7 +111,7 @@ def local_legs(runs: Iterable[LegRun]) -> dict[ItemKey, tuple[LegEnd, ...]]:
 
 
 def dispatch_item(action: RunAgent) -> ItemKey:
-    return issue_key(action.number) if action.kind is AgentKind.RESOLVE else pr_key(action.number)
+    return issue_key(action.number) if action.kind in ISSUE_ACTS else pr_key(action.number)
 
 
 def leased_items(active: Iterable[RunAgent], held_issues: Iterable[int]) -> frozenset[ItemKey]:
@@ -782,15 +787,14 @@ def lifetime_capped(cfg: HarnessConfig, control) -> Callable[[int], bool]:
 
 
 def bind_runtime(
-    cfg: HarnessConfig, role: str, runner: AgentRuntime, log: Callable[[str], None],
+    cfg: HarnessConfig, role: str, runtime: RuntimeName, runner: AgentRuntime, log: Callable[[str], None],
 ) -> tuple[AgentRuntime, Callable[[str], object] | None]:
-    """The role's runtime and the per-checkout preparation its legs run first.
-    Claude runs the passed SDK runner with repository guidance. Codex builds
-    its own runner: fixes get the git-capable sandbox, reviews are read-only
-    and carry the system prompt inline."""
+    """One of the role's runtimes and the per-checkout preparation its legs
+    run first. Claude runs the passed SDK runner with repository guidance.
+    Codex builds its own runner: fixes get the git-capable sandbox, reviews
+    are read-only and carry the system prompt inline."""
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
 
-    runtime = cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime
     if runtime is RuntimeName.CLAUDE:
         return RepositoryGuidanceRuntime(runner, log=log), None
     from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
@@ -888,11 +892,13 @@ def compose_role(
     runtime; shutdown records cancellation intents, then reconciles killed
     work and writes handovers."""
     from ..adapters.process_supervisor import ProcessSupervisor
+    from ..adapters.runtime_switch import RuntimeSwitch
 
     state_dir = cfg.state_dir_for(role)
-    runtime_name = (cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime).value
+    default = cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime
+    # Legs route across runtimes (FIX_MODEL_<TIER>, TRIAGE_MODEL).
+    names = sorted(cfg.runtimes(role), key=lambda n: n.value)
     journal = Journal(os.path.join(state_dir, "journal.jsonl"))
-    bound, prepare_cwd = bind_runtime(cfg, role, runner, log)
     control = control_store(cfg, role)
     owner_id = owner_identity(cfg, role)
     supervisor = ProcessSupervisor(supervision_dir(cfg, role))
@@ -902,16 +908,26 @@ def compose_role(
     def cap(value: float) -> Money | None:
         return Money.from_major("USD", value) if value > 0 else None
 
-    accounting = AccountingRuntime(
-        bound, control, cfg.repo, role, cap(cfg.daily_spend_cap_usd), cap(cfg.global_daily_spend_cap_usd),
-        cap(cfg.issue_spend_cap_usd), cfg.config_version, runtime_name, budget_policy(cfg),
-        rate_table(cfg, runtime_name), spend_evidence_dir(state_dir), owner_id=owner_id,
-        reservation_reconciler=recovery,
-    )
-    runtime = JournalingRuntime(accounting, journal, repo=cfg.repo, role=role, runtime=runtime_name,
-                                state_dir=state_dir)
-    legs = make_legs(runtime=runtime, accounting=accounting, control=control, owner_id=owner_id,
-                     prepare_cwd=prepare_cwd)
+    chains: dict[RuntimeName, AgentRuntime] = {}
+    accountings: dict[RuntimeName, AccountingRuntime] = {}
+    prepares: dict[RuntimeName, Callable[[str], object] | None] = {}
+    for name in names:
+        bound, prepares[name] = bind_runtime(cfg, role, name, runner, log)
+        accountings[name] = AccountingRuntime(
+            bound, control, cfg.repo, role, cap(cfg.daily_spend_cap_usd), cap(cfg.global_daily_spend_cap_usd),
+            cap(cfg.issue_spend_cap_usd), cfg.config_version, name.value, budget_policy(cfg),
+            rate_table(cfg, name.value), spend_evidence_dir(state_dir), owner_id=owner_id,
+            reservation_reconciler=recovery,
+        )
+        chains[name] = JournalingRuntime(accountings[name], journal, repo=cfg.repo, role=role, runtime=name.value,
+                                         state_dir=state_dir)
+
+    def prepare_cwd(cwd: str, runtime: RuntimeName | None = None) -> None:
+        if (prepare := prepares.get(runtime or default)) is not None:
+            prepare(cwd)
+
+    legs = make_legs(runtime=RuntimeSwitch(chains, default), accounting=accountings[default], control=control,
+                     owner_id=owner_id, prepare_cwd=prepare_cwd)
     dispatch = CancellableAsyncDispatch(legs.run)
     act = make_act(dispatch, control)
 

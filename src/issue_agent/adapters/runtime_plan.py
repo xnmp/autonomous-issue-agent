@@ -27,6 +27,10 @@ class RuntimePlan:
     resume: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     runtime: RuntimeName | None = None
+    # A leg that writes nothing and needs no checkout (TRIAGE): Codex runs it
+    # read-only outside any git repository, with the task's own system prompt
+    # instead of the fix contract; Claude closes its tools by disallowed_tools.
+    read_only: bool = False
     # Scratch history and repository guidance: execution context around the
     # task, never authoritative task input.
     context_prefix: str = ""
@@ -61,6 +65,7 @@ class ContextualRuntime(AgentRuntime, Protocol):
         *,
         head: str = "",
         resumed: bool = False,
+        tier: str = "",
     ) -> None: ...
 
 

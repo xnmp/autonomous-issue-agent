@@ -21,6 +21,7 @@ from issue_agent.app.review import compose_review_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import PullRequestDiff, Review
 from tests.app.test_fix_role import (
@@ -33,6 +34,7 @@ from tests.app.test_fix_role import (
     died,
     dispatched,
     open_pr,
+    pushed,
     ready,
     tick,
 )
@@ -366,3 +368,27 @@ def test_a_machine_death_counts_no_attempt_and_backs_off(roles, later):
         assert dispatched(tick(review), AgentKind.REVIEW)
     assert not capped_for_a_human(gh, roles)
     assert Label.NEEDS_HUMAN not in gh.prs[100].labels
+
+
+# ── the reviewer's tier (owner, 2026-10-13) ──────────────────────────────────
+
+TIERS = {"FIX_MODEL_MED": "claude:claude-sonnet-5-5", "FIX_MODEL_HIGH": "claude:claude-opus-5-5",
+         "REVIEW_MODEL": "claude-fable-5-1"}
+
+
+def test_the_reviewer_runs_on_the_model_of_the_tier_that_pushed_the_head(roles):
+    gh = ReviewGitHub(issues={5: ready()})
+    open_pr(gh, head="h1", ci="fail")
+    fixer = Agent(pushed(gh, "fix/5-null-token-crashes", "h2", ci="pass"))
+    tick(roles.fix(gh, fixer, **TIERS))  # FIX_CI at MED (no triage data) pushes h2
+    reviewer = Agent(verdict("APPROVE"))
+    taken = tick(roles.review(gh, reviewer, **TIERS))
+    assert dispatched(taken, AgentKind.REVIEW) == [RunAgent(AgentKind.REVIEW, 100, head="h2", tier=Tier.MED)]
+    assert fixer.tasks[0].model == reviewer.tasks[0].model == "claude-sonnet-5-5"
+
+
+def test_with_no_routed_fix_leg_the_reviewer_keeps_review_model(roles):
+    gh = green()
+    reviewer = Agent(verdict("APPROVE"))
+    tick(roles.review(gh, reviewer, **TIERS))
+    assert reviewer.tasks[0].model == "claude-fable-5-1"

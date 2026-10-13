@@ -199,6 +199,42 @@ describe("IssueTab", () => {
     expect(rows[1]).toHaveTextContent("reserved");
   });
 
+  it("shows the issue's triage as plain text, with the suspected duplicate called out", async () => {
+    serve(detail({
+      triage: {
+        tier: "high",
+        acceptance_criteria: ["Retries stop after 3 attempts", "**Bold** is not rendered"],
+        duplicate_of: 12,
+        duplicate_reason: "Same crash in the retry loop",
+        rationale: "Touches the scheduler",
+      },
+      steps: [leg(0, { tier: "xhigh" })],
+    }));
+    render(<IssueTab repo="demo" issue={50} />);
+
+    const triage = await screen.findByRole("region", { name: "Triage" });
+    expect(triage).toHaveTextContent("tier: high");
+    expect(triage).toHaveTextContent("Touches the scheduler");
+    expect(within(triage).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "Retries stop after 3 attempts", "**Bold** is not rendered",
+    ]);
+    expect(triage).toHaveTextContent("Suspected duplicate of #12: Same crash in the retry loop");
+    expect((await screen.findAllByRole("row"))[1]).toHaveTextContent("tier: xhigh");
+  });
+
+  it("omits the triage section, and the duplicate line, when there is nothing to show", async () => {
+    serve(detail({ triage: null, steps: [leg(0)] }));
+    render(<IssueTab repo="demo" issue={50} />);
+    await screen.findAllByRole("row");
+    expect(screen.queryByRole("region", { name: "Triage" })).not.toBeInTheDocument();
+
+    vi.unstubAllGlobals();
+    serve(detail({ triage: { tier: "low", acceptance_criteria: [], duplicate_of: null }, steps: [leg(0)] }));
+    render(<IssueTab repo="demo" issue={51} />);
+    const triage = await screen.findByRole("region", { name: "Triage" });
+    expect(triage).not.toHaveTextContent("duplicate");
+  });
+
   it("states pre-cutover legs as one total and counts them in the header", async () => {
     serve(detail({ steps: [leg(0)], carried: { legs: 8, cost_usd: 1.7 } }));
     render(<IssueTab repo="demo" issue={50} />);

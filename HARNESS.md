@@ -71,15 +71,17 @@ Important fields:
 - `FIXER_RUNTIME=claude|codex`;
   `REVIEWER_RUNTIME=claude|codex`.
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
-- The fixer runs one configured model and effort: `FIX_MODEL` and
-  `FIX_EFFORT` (blank keeps the runtime default). There is no difficulty
-  router or per-tier model ladder (refactor decision Q12). Review model
-  settings are independent.
-- Unpinned implementers route by difficulty: `complex` uses Sol/Opus;
-  `exceptional` uses Astra/Fable under Codex/Claude. Recurrence or two
-  completed resolve/CI failures also select that exceptional ceiling. A pinned
-  `FIX_MODEL` wins, and repair legs retain the model of their existing session.
-  Astra has built-in standard-context accounting estimates ($10/$50 per
+- Routing (refactor decision 15): a TRIAGE leg grades each admitted issue
+  `low|med|high|xhigh` and posts its acceptance criteria as one harness
+  comment. Fix legs run on `FIX_MODEL_<TIER>` (`runtime:model`, e.g.
+  `claude:claude-sonnet-5-5`), one tier stronger per earlier attempt in the
+  attempt run, capped at `xhigh`. Review legs run at the tier of the fix leg
+  that produced the head, else the triaged tier, else `REVIEW_MODEL`. An unset
+  tier spec falls back to `FIX_MODEL` on `FIXER_RUNTIME`. `TRIAGE_MODEL`
+  (blank: the `low` spec) and `TRIAGE_BUDGET_USD` bound the triage leg. A
+  suspected duplicate stops the issue with `needs-human`; a reply or label
+  removal releases it. Effort stays `FIX_EFFORT` / `CODEX_REASONING_EFFORT`.
+- Astra has built-in standard-context accounting estimates ($10/$50 per
   million input/output tokens, $1 cached input); existing configured model
   rates override them. These estimates are not provider invoices and do not
   model the provider's long-context surcharges.

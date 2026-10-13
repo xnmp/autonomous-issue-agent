@@ -145,6 +145,35 @@ def test_argv_prepends_system_prompt_to_prompt():
     assert argv[-1].endswith("the task")
 
 
+def test_a_read_only_leg_runs_read_only_outside_git_with_its_own_rules_even_on_a_fix_runner():
+    # TRIAGE on Codex: the fix role's runner is workspace-write and carries
+    # the fix contract in CODEX_HOME; a read-only leg overrides both, and its
+    # scratch cwd is no git repository (codex refuses one without the flag).
+    plan = RuntimePlan(prompt="grade it", append_system_prompt="TRIAGE RULES", cwd="/scratch/3", read_only=True)
+    argv = build_codex_argv(plan, sandbox="workspace-write", inject_system_prompt=False)
+    assert argv[argv.index("--sandbox") + 1] == "read-only" and "--skip-git-repo-check" in argv
+    assert argv[-1].startswith("TRIAGE RULES")
+    fix = build_codex_argv(RuntimePlan(prompt="fix", cwd="/wt"), sandbox="workspace-write", inject_system_prompt=False)
+    assert fix[fix.index("--sandbox") + 1] == "workspace-write" and "--skip-git-repo-check" not in fix
+
+
+def test_a_read_only_leg_home_carries_no_fix_contract(tmp_path):
+    from issue_agent.adapters.codex_home import CodexHomeRuntime, write_codex_home
+
+    seen: list[str] = []
+
+    class Inner:
+        async def run(self, task):
+            seen.append(open(os.path.join(task.env["CODEX_HOME"], "config.toml")).read())
+            return None
+
+    prepare = lambda cwd, **kw: write_codex_home(cwd, **{"agents_md": "FIX CONTRACT", "state_dir": str(tmp_path), **kw})
+    home = CodexHomeRuntime(Inner(), prepare)
+    asyncio.run(home.run(RuntimePlan(prompt="x", cwd=str(tmp_path / "t"), read_only=True)))
+    asyncio.run(home.run(RuntimePlan(prompt="x", cwd=str(tmp_path / "w"))))
+    assert "FIX CONTRACT" not in seen[0] and "FIX CONTRACT" in seen[1]
+
+
 def test_argv_provider_block():
     prov = CodexProvider(provider_id="acme", name="Acme", base_url="https://x/y", env_key="ACME_KEY", wire_api="chat")
     argv = build_codex_argv(RuntimePlan(prompt="x"), codex_bin="/opt/codex", provider=prov)

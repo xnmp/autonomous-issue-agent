@@ -207,7 +207,7 @@ def test_the_board_shows_each_items_derived_state(deployment):
     board = {card["issue"]: card for card in payload["in_flight"]}
 
     assert sorted(board) == [1, 2, 3, 4, 5]
-    assert board[1]["board"]["status"] == "working" and board[1]["board"]["act"] == "RESOLVE"
+    assert board[1]["board"]["status"] == "working" and board[1]["board"]["act"] == "TRIAGE"
     assert board[2]["board"] | {"detail": None} == {
         "status": "needs_you",
         "reason": "question",
@@ -402,7 +402,7 @@ def test_a_review_waits_on_the_review_legs_price_while_a_fix_leg_still_fits(depl
 
     board = {card["issue"]: card["board"] for card in backend.issues("demo")["in_flight"]}
 
-    assert (board[1]["status"], board[1]["act"]) == ("working", "RESOLVE")
+    assert (board[1]["status"], board[1]["act"]) == ("working", "TRIAGE")
     assert (board[9]["status"], board[9]["on"]) == ("waiting", "headroom")
 
 
@@ -586,3 +586,29 @@ def test_a_refresh_waits_for_the_slowest_github_read_not_the_sum(deployment):
 
     assert payload["gh_ok"] is True and payload["warnings"] == []
 
+
+
+def test_triage_is_the_first_stage_and_the_issue_page_shows_its_tier_criteria_and_duplicate(deployment, tmp_path):
+    backend, *_ = deployment
+    triage = {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": 2,
+              "duplicate_reason": "Same dialog", "rationale": "One handler."}
+    db = sqlite3.connect(tmp_path / "control.db")
+    db.execute(
+        "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, reserved_at, "
+        "started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, provider_receipt_id, "
+        "settled_at, leg_class, session_id, result_json) VALUES ('T1', 'o/r', 'fix', 'TRIAGE', 1, 1, '', 'o/r:fix', "
+        "'claude', 'ended', ?, ?, ?, 'USD', 2000000, 10000, 'provider_reported', 'normal_return', 'rt1', ?, 'agent', "
+        "'t', ?)",
+        (store_ts(-30), store_ts(-30), store_ts(-29), store_ts(-29), json.dumps({"triage": triage, "summary": ""})),
+    )
+    db.commit()
+    db.close()
+
+    card = next(c for c in backend.issues("demo")["in_flight"] if c["issue"] == 1)
+    assert card["board"]["reason"] == "duplicate" and "#2" in card["board"]["detail"]
+    assert card["rail"]["current"] == "triage"
+    detail = backend.issue("demo", 1)
+    assert detail["triage"] == {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": 2,
+                                "duplicate_reason": "Same dialog", "rationale": "One handler."}
+    assert [(s["kind"], s["tier"]) for s in detail["steps"]] == [("TRIAGE", "low")]
+    assert [visit["stage"] for visit in detail["history"]] == ["triage"]

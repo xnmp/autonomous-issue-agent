@@ -151,7 +151,7 @@ describe("the rail", () => {
     const nodes = railNodes(rail({ current: "ci", furthest: "review", ci_runs: 2, review_rounds: 2 }));
 
     expect(nodes.map((node) => [node.id, node.state])).toEqual([
-      ["resolve", "done"], ["ci", "current"], ["review", "rewound"], ["merge", "future"],
+      ["triage", "done"], ["resolve", "done"], ["ci", "current"], ["review", "rewound"], ["merge", "future"],
     ]);
     expect(nodes.find((node) => node.id === "ci")?.count).toBe("run 2");
     expect(nodes.find((node) => node.id === "review")?.count).toBe("2 rounds");
