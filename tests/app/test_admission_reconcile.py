@@ -13,34 +13,15 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
-from issue_agent.adapters.control_store import (
-    BudgetLimit,
-    ReservationRequest,
-    SettlementRequest,
-    SQLiteControlStore,
-)
+from issue_agent.adapters.control_store import BudgetLimit, ReservationRequest, SettlementRequest, SQLiteControlStore
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.app.recovery import RecoveryCoordinator
-from issue_agent.domain.contracts import (
-    Money,
-    PricingBasis,
-    RunId,
-)
-from issue_agent.domain.outcome import (
-    MAX_BUDGET_STATUS,
-    AgentResult,
-    ExitReason,
-)
-from issue_agent.domain.pricing import (
-    BudgetPolicy,
-    ModelRates,
-    RateTable,
-    UnknownModelPolicy,
-)
+from issue_agent.domain.contracts import Money, PricingBasis, RunId
+from issue_agent.domain.outcome import MAX_BUDGET_STATUS, AgentResult, ExitReason
+from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable, UnknownModelPolicy
 
 
 REPOSITORY = "o/r"
@@ -48,6 +29,7 @@ ISSUE = 34
 OWNER = "o/r:fix"
 LEG_MAXIMUM = Money("USD", 2_000_000)
 GRACE = timedelta(minutes=2)
+SCOPE = accounting_runtime.issue_budget_scope(REPOSITORY, ISSUE, "USD")
 
 
 class _Runtime:
@@ -58,13 +40,8 @@ class _Runtime:
 
     async def run(self, _task):
         self.calls += 1
-        return AgentResult(
-            False,
-            status="ok",
-            cost_usd=1.0,
-            session_id="receipt",
-            usage={"input_tokens": 100, "output_tokens": 10},
-        )
+        return AgentResult(False, status="ok", cost_usd=1.0, session_id="receipt",
+                           usage={"input_tokens": 100, "output_tokens": 10})
 
 
 class _Supervisor:
@@ -104,117 +81,66 @@ class _Exploding:
         raise RuntimeError("control store unreadable")
 
 
-def _rates() -> RateTable:
-    return RateTable(
-        "test",
-        "v1",
-        "USD",
-        {},
-        UnknownModelPolicy.USE_FALLBACK,
-        ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000),
-    )
-
-
 def _store(tmp_path, stamped_at: datetime):
     """A control store whose writes are stamped at ``stamped_at``.
 
     Reservations planted in the past are what make them eligible for the
     existing reconciliation grace, exactly as a leg that died minutes ago is.
     """
-
-    store = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: stamped_at
-    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: stamped_at)
     store.initialize()
     return store
-
-
-def _scope(now: datetime):
-    return accounting_runtime.issue_budget_scope(REPOSITORY, ISSUE, "USD")
-
-
-def _reserve(store, scope, run_id: str, cap: Money, target: int):
-    """Plant one leg on ISSUE under its own item lease ``target``; the
-    admission under test leases ISSUE itself."""
-    identifier = RunId(run_id)
-    assert store.lease(REPOSITORY, "fix", target, OWNER)
-    result = store.reserve(
-        ReservationRequest(
-            identifier, REPOSITORY, "fix", "RESOLVE", OWNER, LEG_MAXIMUM,
-            (BudgetLimit(scope, cap),), target, issue=ISSUE,
-        )
-    )
-    assert result.admitted, result.detail
-    return identifier
 
 
 _targets = iter(range(1000, 10**6))
 
 
-def _dead_leg(store, scope, run_id: str, cap: Money, at: datetime) -> RunId:
-    """A leg that died usage-blind and retained its reservation."""
-
-    identifier = _reserve(store, scope, run_id, cap, next(_targets))
-    assert store.record_reservation_retained(
-        identifier, "trusted usage and provider charge unavailable"
-    )
+def _reserve(store, run_id: str, cap: Money) -> RunId:
+    """Plant one leg on ISSUE under its own item lease; the admission under
+    test leases ISSUE itself."""
+    identifier, target = RunId(run_id), next(_targets)
+    assert store.lease(REPOSITORY, "fix", target, OWNER)
+    result = store.reserve(ReservationRequest(identifier, REPOSITORY, "fix", "RESOLVE", OWNER, LEG_MAXIMUM,
+                                              (BudgetLimit(SCOPE, cap),), target, issue=ISSUE))
+    assert result.admitted, result.detail
     return identifier
 
 
-def _live_leg(store, scope, run_id: str, cap: Money, at: datetime) -> RunId:
-    """A leg that is still running and still owns a verifiable lease."""
+def _dead_leg(store, run_id: str, cap: Money) -> RunId:
+    """A leg that died usage-blind and retained its reservation."""
+    identifier = _reserve(store, run_id, cap)
+    assert store.record_reservation_retained(identifier, "trusted usage and provider charge unavailable")
+    return identifier
 
+
+def _live_leg(store, run_id: str, cap: Money) -> RunId:
+    """A leg that is still running and still owns a verifiable lease."""
     identity = ProcessSupervisor.process_identity(os.getpid())
     assert identity is not None
-    identifier = _reserve(store, scope, run_id, cap, next(_targets))
-    store.register_process_lease(
-        identifier, expected_owner_id=OWNER, pid=identity.pid,
-        pgid=os.getpgid(identity.pid), process_start_ticks=identity.start_ticks,
-    )
+    identifier = _reserve(store, run_id, cap)
+    store.register_process_lease(identifier, expected_owner_id=OWNER, pid=identity.pid,
+                                 pgid=os.getpgid(identity.pid), process_start_ticks=identity.start_ticks)
     return identifier
 
 
-def _sweeper(store, now: datetime):
-    coordinator = RecoveryCoordinator(
-        _Supervisor(),
-        store,
-        _Worktrees(),
-       
-        _NoTrustedUsage(),
-        OWNER,
-        reservation_grace=GRACE,
-        now=lambda: now,
-    )
-    return coordinator
+def _sweeper(store, now: datetime, spend=None):
+    return RecoveryCoordinator(_Supervisor(), store, _Worktrees(), spend or _NoTrustedUsage(), OWNER,
+                               reservation_grace=GRACE, now=lambda: now)
 
 
 def _admission(store, runtime, cap: Money, reconciler):
-    wrapper = AccountingRuntime(
-        runtime,
-        store,
-        REPOSITORY,
-        "fix",
-        None,
-        None,
-        cap,
-        "cfg",
-        "codex",
-        BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}),
-        _rates(),
-        owner_id=OWNER,
-        reservation_reconciler=reconciler,
-    )
+    rates = RateTable("test", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
+                      ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000))
+    wrapper = AccountingRuntime(runtime, store, REPOSITORY, "fix", None, None, cap, "cfg", "codex",
+                                BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}), rates, owner_id=OWNER,
+                                reservation_reconciler=reconciler)
     wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE)
     return wrapper
 
 
 def _resolve(wrapper):
     wrapper.store.lease(REPOSITORY, "fix", ISSUE, OWNER)
-    return asyncio.run(
-        wrapper.run(
-            RuntimePlan("resolve", model="gpt-test", max_budget_usd=2)
-        )
-    )
+    return asyncio.run(wrapper.run(RuntimePlan("resolve", model="gpt-test", max_budget_usd=2)))
 
 
 def test_phantom_reservations_are_reclaimed_instead_of_escalated(tmp_path):
@@ -226,14 +152,10 @@ def test_phantom_reservations_are_reclaimed_instead_of_escalated(tmp_path):
     # harness still refused to dispatch because the label is human-terminal.
     died_at = now - timedelta(minutes=10)
     store = _store(tmp_path, died_at)
-    scope = _scope(now)
     # MAX_BUDGET_USD leaves room for exactly three concurrent legs.
     cap = Money("USD", 6_000_000)
-    dead = tuple(
-        _dead_leg(store, scope, f"broken-binary-{index}", cap, died_at)
-        for index in range(3)
-    )
-    assert store.snapshot(scope).reserved == Money("USD", 6_000_000)
+    dead = tuple(_dead_leg(store, f"broken-binary-{index}", cap) for index in range(3))
+    assert store.snapshot(SCOPE).reserved == Money("USD", 6_000_000)
 
     runtime = _Runtime()
     reconciler = _CountingReconciler(_sweeper(store, now))
@@ -251,10 +173,9 @@ def test_reconciliation_never_releases_a_still_running_leg(tmp_path):
     now = datetime.now(timezone.utc)
     started_at = now - timedelta(minutes=10)
     store = _store(tmp_path, started_at)
-    scope = _scope(now)
     cap = Money("USD", 4_000_000)
-    dead = _dead_leg(store, scope, "broken-binary", cap, started_at)
-    alive = _live_leg(store, scope, "still-running", cap, started_at)
+    dead = _dead_leg(store, "broken-binary", cap)
+    alive = _live_leg(store, "still-running", cap)
 
     runtime = _Runtime()
     result = _resolve(_admission(store, runtime, cap, _sweeper(store, now)))
@@ -272,10 +193,9 @@ def test_a_genuine_cap_exhaustion_still_escalates_to_a_human(tmp_path):
 
     now = datetime.now(timezone.utc)
     store = _store(tmp_path, now)
-    scope = _scope(now)
     cap = Money("USD", 4_000_000)
-    _live_leg(store, scope, "running-a", cap, now)
-    _live_leg(store, scope, "running-b", cap, now)
+    _live_leg(store, "running-a", cap)
+    _live_leg(store, "running-b", cap)
 
     runtime = _Runtime()
     reconciler = _CountingReconciler(_sweeper(store, now))
@@ -304,9 +224,8 @@ def test_admission_reconciles_at_most_once_per_dispatch(tmp_path):
 
     now = datetime.now(timezone.utc)
     store = _store(tmp_path, now)
-    scope = _scope(now)
     cap = Money("USD", 2_000_000)
-    _live_leg(store, scope, "running", cap, now)
+    _live_leg(store, "running", cap)
 
     runtime = _Runtime()
     reconciler = _CountingReconciler(_sweeper(store, now))
@@ -326,7 +245,7 @@ def test_unreadable_reconciliation_escalates_without_admitting(tmp_path):
     now = datetime.now(timezone.utc)
     store = _store(tmp_path, now)
     cap = Money("USD", 2_000_000)
-    _dead_leg(store, _scope(now), "just-died", cap, now)
+    _dead_leg(store, "just-died", cap)
 
     runtime = _Runtime()
     result = _resolve(_admission(store, runtime, cap, _Exploding()))
@@ -343,17 +262,8 @@ class _SettlesExactly:
         self.amount = amount
 
     def reconcile(self, run_id) -> bool:
-        self.store.settle(
-            SettlementRequest(
-                run_id,
-                self.amount,
-                PricingBasis.RECONCILED,
-                f"recovered-{run_id}",
-                None,
-                None,
-                None,
-            )
-        )
+        self.store.settle(SettlementRequest(run_id, self.amount, PricingBasis.RECONCILED, f"recovered-{run_id}",
+                                            None, None, None))
         return True
 
 
@@ -363,24 +273,12 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
     now = datetime.now(timezone.utc)
     died_at = now - timedelta(minutes=10)
     store = _store(tmp_path, died_at)
-    scope = _scope(now)
     # Room for one leg plus the small recovered charge, so admission turns on
     # the reservation being converted to its real, much smaller cost.
     cap = Money("USD", 2_100_000)
-    _dead_leg(store, scope, "died-with-receipt", cap, died_at)
+    _dead_leg(store, "died-with-receipt", cap)
 
-    coordinator = RecoveryCoordinator(
-        _Supervisor(),
-        store,
-        _Worktrees(),
-       
-        _SettlesExactly(store, Money("USD", 10_000)),
-        OWNER,
-        reservation_grace=GRACE,
-        now=lambda: now,
-    )
-    reconciler = coordinator
-
+    reconciler = _sweeper(store, now, _SettlesExactly(store, Money("USD", 10_000)))
     runtime = _Runtime()
     result = _resolve(_admission(store, runtime, cap, reconciler))
 
@@ -392,7 +290,7 @@ def test_recent_completed_accounting_gap_settles_before_admission_without_grace(
     now = datetime.now(timezone.utc)
     store = _store(tmp_path, now)
     cap = Money("USD", 2_000_000)
-    dead = _dead_leg(store, _scope(now), "just-completed", cap, now)
+    dead = _dead_leg(store, "just-completed", cap)
     runtime = _Runtime()
 
     result = _resolve(_admission(store, runtime, cap, _sweeper(store, now)))
