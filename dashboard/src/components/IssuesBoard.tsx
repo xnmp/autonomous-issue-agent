@@ -104,8 +104,8 @@ export function IssuesBoard({
         ))}
       </div>
       {sections
-        // With a filter on, only that group shows, and not at all when empty.
-        .filter(({ group, items: members }) => filter === null || (group === filter && members.length > 0))
+        // An empty group shows no section; its chip still reads 0.
+        .filter(({ group, items: members }) => members.length > 0 && (filter === null || group === filter))
         .map(({ group, items: members }) => (
           <section
             key={group}
@@ -118,30 +118,24 @@ export function IssuesBoard({
               <span className="board-group-hint">{GROUP_META[group].hint}</span>
             </div>
             <div className="board-panel panel">
-              {members.length === 0 ? (
-                <div className="board-empty">Nothing here right now.</div>
-              ) : (
-                <>
-                  <div className="board-cols board-grid" aria-hidden="true">
-                    <span>Issue</span>
-                    <span>{COLUMN_HEADINGS[group].now}</span>
-                    <span>Stage</span>
-                    <span>{COLUMN_HEADINGS[group].wait}</span>
-                    <span />
-                  </div>
-                  {members.map((item) => (
-                    <BoardRow
-                      key={item.issue}
-                      repo={repo}
-                      item={item}
-                      open={open.has(item.issue)}
-                      onToggle={() => toggle(item.issue)}
-                      onRefresh={onRefresh}
-                      onOpenIssue={onOpenIssue}
-                    />
-                  ))}
-                </>
-              )}
+              <div className="board-cols board-grid" aria-hidden="true">
+                <span>Issue</span>
+                <span>{COLUMN_HEADINGS[group].now}</span>
+                <span>Stage</span>
+                <span>{COLUMN_HEADINGS[group].wait}</span>
+                <span />
+              </div>
+              {members.map((item) => (
+                <BoardRow
+                  key={item.issue}
+                  repo={repo}
+                  item={item}
+                  open={open.has(item.issue)}
+                  onToggle={() => toggle(item.issue)}
+                  onRefresh={onRefresh}
+                  onOpenIssue={onOpenIssue}
+                />
+              ))}
             </div>
           </section>
         ))}

@@ -85,11 +85,6 @@
   color: var(--ink-muted);
   font-size: var(--text-sm);
 }
-.board-empty {
-  padding: var(--space-5) var(--space-6);
-  color: var(--ink-faint);
-}
-
 .board-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(0, 1.5fr) 100px 14px;
