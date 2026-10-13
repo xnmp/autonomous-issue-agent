@@ -82,13 +82,14 @@ class FakeGitHub:
     def pull_request_for_branch(self, branch: str) -> int | None:
         return next((n for n, p in self.prs.items() if p.head_ref_name == branch and p.state == "OPEN"), None)
 
+    def _subject(self, kind: str, number: int) -> IssueView | PRView:
+        return self.issues[number] if kind == "issue" else self.prs[number]
+
     def has_label(self, kind: str, number: int, label: str) -> bool:
-        subject = self.issues[number] if kind == "issue" else self.prs[number]
-        return any(lab.value == label for lab in subject.labels)
+        return any(lab.value == label for lab in self._subject(kind, number).labels)
 
     def has_comment(self, kind: str, number: int, body: str) -> bool:
-        subject = self.issues[number] if kind == "issue" else self.prs[number]
-        return any(c.body == body for c in subject.comments)
+        return any(c.body == body for c in self._subject(kind, number).comments)
 
     def is_issue_closed(self, issue: int) -> bool:
         return self.issues[issue].state != "open"
@@ -161,8 +162,7 @@ class FakeGitHub:
             self.closed_at[number] = _now()
 
     def comments_with(self, kind: str, number: int, text: str) -> list[Comment]:
-        subject = self.issues[number] if kind == "issue" else self.prs[number]
-        return [c for c in subject.comments if text in c.body]
+        return [c for c in self._subject(kind, number).comments if text in c.body]
 
 
 class FakeWorktrees:
@@ -224,7 +224,7 @@ def asked(needs: str, session: str = "s1"):
 
 @pytest.fixture
 def role(tmp_path):
-    def compose(gh: FakeGitHub, agent: Agent, **env):
+    def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, **env):
         cfg = replace(
             from_env({
                 "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "BASE_BRANCH": "dev",
@@ -234,7 +234,7 @@ def role(tmp_path):
             control_authority_root=str(tmp_path / "machine-state"),
         )
         worktrees = FakeWorktrees(tmp_path / "worktrees")
-        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=lambda _line: None)
+        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log)
         return composed, worktrees
     return compose
 
@@ -251,6 +251,13 @@ def dispatched(taken, kind: AgentKind) -> list[RunAgent]:
 
 def ready(number: int = 5, title: str = "Null token crashes") -> IssueView:
     return IssueView(number=number, title=title, body="Steps: ...", labels=frozenset({Label.AI_READY}))
+
+
+_APPROVED = (Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),)
+
+
+def _capped(_task):
+    return AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT, cost_usd=0.1, session_id="s-wall")
 
 
 def open_pr(gh: FakeGitHub, issue: int = 5, *, head: str = "h1", ci: str = "pass", **kw) -> int:
@@ -351,7 +358,7 @@ def test_three_unproductive_attempts_stop_with_one_label_and_one_comment(role):
 
 def test_an_approved_green_head_merges_bound_to_that_head_and_closes_the_issue(role):
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
+    open_pr(gh, reviews=_APPROVED)
     composed, worktrees = role(gh, Agent())
 
     assert MergePullRequest(100, "h1") in tick(composed)
@@ -362,7 +369,7 @@ def test_an_approved_green_head_merges_bound_to_that_head_and_closes_the_issue(r
 
 def test_auto_merge_off_leaves_an_approved_pr_for_a_human(role):
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
+    open_pr(gh, reviews=_APPROVED)
     composed, _ = role(gh, Agent(), AUTO_MERGE="false")
 
     assert tick(composed) == []
@@ -536,9 +543,7 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     # P2-1: resume once; a PR-stage leg always resumes the issue's session.
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    capped = lambda _task: AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT,  # noqa: E731
-                                       cost_usd=0.1, session_id="s-wall")
-    composed, _ = role(gh, Agent(capped, capped))
+    composed, _ = role(gh, Agent(_capped, _capped))
     assert dispatched(tick(composed), AgentKind.FIX_CI)
     assert tick(composed) == []  # a machine end: backing off, no attempt
     later()
@@ -552,9 +557,7 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     # Round 2: a receipt-less death between two wall caps does not reset resume-once.
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    capped = lambda _task: AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT,  # noqa: E731
-                                       cost_usd=0.1, session_id="s-wall")
-    agent = Agent(capped, died, capped)
+    agent = Agent(_capped, died, _capped)
     composed, _ = role(gh, agent)
     assert dispatched(tick(composed), AgentKind.FIX_CI)
     later()
@@ -565,15 +568,10 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     assert agent.tasks[2].resume == "s-wall"
 
 
-def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(tmp_path):
+def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(role):
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, merge_state="BLOCKED",
-            reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
-    cfg = replace(from_env({"REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "BASE_BRANCH": "dev",
-                            "STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "rs")}),
-                  control_authority_root=str(tmp_path / "ms"))
+    open_pr(gh, merge_state="BLOCKED", reviews=_APPROVED)
     lines: list[str] = []
-    composed = compose_fix_daemon(cfg, gh, FakeWorktrees(tmp_path / "wt"), Agent(),
-                                  log=lines.append)
+    composed, _ = role(gh, Agent(), log=lines.append)
     assert tick(composed) == [] and gh.merged == []
     assert any("PR #100 waits to merge" in line and "BLOCKED" in line for line in lines)
