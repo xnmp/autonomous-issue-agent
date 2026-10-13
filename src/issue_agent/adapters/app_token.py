@@ -48,7 +48,10 @@ def load_cache(path: str) -> CachedToken | None:
     try:
         with open(path) as f:
             data = json.load(f)
-        return CachedToken(token=data.get("token", ""), expires_epoch=int(data.get("expires_epoch", 0) or 0))
+        return CachedToken(
+            token=data.get("token", ""),
+            expires_epoch=int(data.get("expires_epoch", 0) or 0),
+        )
     except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
         return None
 
@@ -56,7 +59,9 @@ def load_cache(path: str) -> CachedToken | None:
 def write_cache(path: str, token: str, expires_at: str, expires_epoch: int) -> None:
     """Persist the cache (0600), matching the bash file shape."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = json.dumps({"token": token, "expires_at": expires_at, "expires_epoch": expires_epoch})
+    payload = json.dumps(
+        {"token": token, "expires_at": expires_at, "expires_epoch": expires_epoch}
+    )
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(payload + "\n")
@@ -138,7 +143,11 @@ def default_mint_fn(creds: AppCredentials) -> tuple[str, str, int]:
     now = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
     with open(creds.key_file) as f:
         private_key = f.read()
-    assertion = _jwt.encode({"iat": now - 60, "exp": now + 540, "iss": creds.app_id}, private_key, algorithm="RS256")
+    assertion = _jwt.encode(
+        {"iat": now - 60, "exp": now + 540, "iss": creds.app_id},
+        private_key,
+        algorithm="RS256",
+    )
     req = urllib.request.Request(
         f"https://api.github.com/app/installations/{creds.install_id}/access_tokens",
         method="POST",
@@ -158,7 +167,9 @@ def default_mint_fn(creds: AppCredentials) -> tuple[str, str, int]:
     if expires_at:
         try:
             exp_epoch = int(
-                _dt.datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp()
+                _dt.datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=_dt.timezone.utc)
+                .timestamp()
             )
         except ValueError:
             pass

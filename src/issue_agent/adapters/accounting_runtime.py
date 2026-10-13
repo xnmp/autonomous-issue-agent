@@ -12,7 +12,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan
-from ..domain.contracts import BudgetScope, Money, PricingBasis, RunId, TokenUsage, UsageSource, daily_budget_scope
+from ..domain.contracts import (
+    BudgetScope,
+    Money,
+    PricingBasis,
+    RunId,
+    TokenUsage,
+    UsageSource,
+    daily_budget_scope,
+)
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
@@ -58,16 +66,21 @@ class AccountingRuntime(AgentRuntime):
     spend_evidence_dir: str = ""
     owner_id: str = ""
     reservation_reconciler: StaleReservationReconciler | None = None
-    _context: contextvars.ContextVar[tuple[int | None, str, int, int | None, str, bool]] = field(
+    _context: contextvars.ContextVar[
+        tuple[int | None, str, int, int | None, str, bool]
+    ] = field(
         default_factory=lambda: contextvars.ContextVar(
-            f"accounting_context_{uuid.uuid4().hex}", default=(None, "", 0, None, "", False)
+            f"accounting_context_{uuid.uuid4().hex}",
+            default=(None, "", 0, None, "", False),
         ),
         init=False,
         repr=False,
         compare=False,
     )
     _identity: contextvars.ContextVar[tuple[str, str]] = field(
-        default_factory=lambda: contextvars.ContextVar(f"accounting_identity_{uuid.uuid4().hex}", default=("", "")),
+        default_factory=lambda: contextvars.ContextVar(
+            f"accounting_identity_{uuid.uuid4().hex}", default=("", "")
+        ),
         init=False,
         repr=False,
         compare=False,
@@ -88,7 +101,10 @@ class AccountingRuntime(AgentRuntime):
             raise ValueError("accounting context head must be text and resumed an exact bool")
         self._context.set((issue, kind, number, claim_target, head, resumed))
 
-    def _reserve_reclaiming_dead_headroom(self, request: ReservationRequest) -> ReservationResult:
+    def _reserve_reclaiming_dead_headroom(
+        self,
+        request: ReservationRequest,
+    ) -> ReservationResult:
         """Recover terminal reservations before conceding a cap denial.
 
         Boot and admission share settlement authority. ADR 0012 allows one
@@ -97,13 +113,17 @@ class AccountingRuntime(AgentRuntime):
         """
 
         reservation = self.store.reserve(request)
-        if reservation.disposition is not AccountingDisposition.EXHAUSTED or self.reservation_reconciler is None:
+        if (
+            reservation.disposition is not AccountingDisposition.EXHAUSTED
+            or self.reservation_reconciler is None
+        ):
             return reservation
         try:
             self.reservation_reconciler.reconcile_stale_reservations()
         except Exception:  # noqa: BLE001 - escalate exactly as before
             return reservation
         return self.store.reserve(request)
+
 
     def set_run_identity(self, run_id: str, leg_id: str) -> None:
         if not run_id or not leg_id:
@@ -132,17 +152,9 @@ class AccountingRuntime(AgentRuntime):
             return
         try:
             self.store.record_unpaid_leg(
-                RunId(uuid.uuid4().hex),
-                repository=self.repository,
-                role=self.role,
-                kind=kind,
-                owner_id=self._owner(),
-                issue=issue,
-                number=number,
-                head=head,
-                runtime=self.runtime_name,
-                leg_class=LegClass.AGENT.value if attempt is not None else None,
-                result=attempt,
+                RunId(uuid.uuid4().hex), repository=self.repository, role=self.role, kind=kind,
+                owner_id=self._owner(), issue=issue, number=number, head=head, runtime=self.runtime_name,
+                leg_class=LegClass.AGENT.value if attempt is not None else None, result=attempt,
             )
         except Exception:  # noqa: BLE001 - the refusal itself must still return
             pass
@@ -153,8 +165,16 @@ class AccountingRuntime(AgentRuntime):
         now = datetime.now(timezone.utc)
         issue, kind, number, claim_target, head, resumed = self._context.get()
         # ADR 0008: paid admission binds the decision-side target unchanged.
-        target = claim_target if claim_target is not None else _default_claim_target(kind, number, issue)
-        if self.runtime_name == "codex" and self.rate_table is None and self._caps_armed():
+        target = (
+            claim_target
+            if claim_target is not None
+            else _default_claim_target(kind, number, issue)
+        )
+        if (
+            self.runtime_name == "codex"
+            and self.rate_table is None
+            and self._caps_armed()
+        ):
             return self._blocked("codex pricing is unavailable")
         if self.issue_cap is not None and issue is None:
             return self._blocked("issue spend scope is unavailable")
@@ -162,13 +182,16 @@ class AccountingRuntime(AgentRuntime):
         primary = limits[0]
         budget_kind = kind or ""
         try:
-            maximum = self.budget_policy.maximum_for(self.role, budget_kind)
+            maximum = self.budget_policy.maximum_for(
+                self.role, budget_kind
+            )
         except KeyError as exc:
             return self._blocked(str(exc))
         declared = Money.from_major("USD", task.max_budget_usd)
         if declared != maximum:
             return self._blocked(
-                f"task budget {declared.micros} disagrees with policy {maximum.micros} for {self.role}/{kind}"
+                f"task budget {declared.micros} disagrees with policy "
+                f"{maximum.micros} for {self.role}/{kind}"
             )
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
@@ -207,28 +230,26 @@ class AccountingRuntime(AgentRuntime):
             self.record_refused_leg()
             # Time restores daily headroom, so that refusal waits label-free
             # (DAILY_HEADROOM_STATUS); a lifetime issue cap needs a decision.
-            daily = reservation.disposition is AccountingDisposition.EXHAUSTED and (
-                reservation.tripped_dimension or primary.scope.dimension
-            ) in {"repository", "global"}
+            daily = (reservation.disposition is AccountingDisposition.EXHAUSTED
+                     and (reservation.tripped_dimension or primary.scope.dimension) in {"repository", "global"})
             status = DAILY_HEADROOM_STATUS if daily else MAX_BUDGET_STATUS
             return AgentResult(
                 is_error=True,
                 status=status,
                 envelope_subtype=status,
-                summary=(f"paid admission blocked: {reservation.disposition.value} ({reservation.detail})"),
+                summary=(
+                    "paid admission blocked: "
+                    f"{reservation.disposition.value} ({reservation.detail})"
+                ),
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
             )
         authority = {
             "ISSUE_AGENT_RUN_ID": str(run_id),
             "ISSUE_AGENT_CONFIG_VERSION": self.config_version,
-            **(
-                {
-                    "ISSUE_AGENT_RATE_CARD_ID": self.rate_table.rate_card_id,
-                    "ISSUE_AGENT_RATE_CARD_VERSION": self.rate_table.version,
-                }
-                if self.rate_table is not None
-                else {}
-            ),
+            **({
+                "ISSUE_AGENT_RATE_CARD_ID": self.rate_table.rate_card_id,
+                "ISSUE_AGENT_RATE_CARD_VERSION": self.rate_table.version,
+            } if self.rate_table is not None else {}),
             "ISSUE_AGENT_CONTROL_DB": self.store.path,
             "ISSUE_AGENT_REPOSITORY": self.repository,
             "ISSUE_AGENT_OWNER_ID": request.owner_id,
@@ -244,21 +265,16 @@ class AccountingRuntime(AgentRuntime):
             # without this receipt (died, reclaimed, refused) is a machine end.
             leg = classify_leg(result, resumed=resumed)
             verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
-            self.store.record_result(
-                run_id,
-                leg.value,
-                session=resumable_session(result) or "",
-                result={
-                    # The PR body the harness opens a RESOLVE's branch with (Q11).
-                    "summary": (result.summary or "")[:_SUMMARY_LIMIT],
-                    # The question the QUESTION stop comment embeds: recorded with
-                    # the leg so no separate post can lose it.
-                    **({"question": question_text(result.needs)} if leg is LegClass.ASKED else {}),
-                    # A review's parsed verdict: the harness submits it (and can
-                    # resubmit it after a crash) without buying the review again.
-                    **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
-                },
-            )
+            self.store.record_result(run_id, leg.value, session=resumable_session(result) or "", result={
+                # The PR body the harness opens a RESOLVE's branch with (Q11).
+                "summary": (result.summary or "")[:_SUMMARY_LIMIT],
+                # The question the QUESTION stop comment embeds: recorded with
+                # the leg so no separate post can lose it.
+                **({"question": question_text(result.needs)} if leg is LegClass.ASKED else {}),
+                # A review's parsed verdict: the harness submits it (and can
+                # resubmit it after a crash) without buying the review again.
+                **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
+            })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result)
 
     def _owner(self) -> str:
@@ -280,14 +296,10 @@ class AccountingRuntime(AgentRuntime):
                 usage = total_usage(observed.samples)
                 card = observed.rates or self.rate_table
                 amount = price_run_usage(observed, card)
-                if isinstance(observed, MeasuredRunUsage) and all(
-                    s.reported_cost is not None for s in observed.samples
-                ):
+                if isinstance(observed, MeasuredRunUsage) and all(s.reported_cost is not None for s in observed.samples):
                     basis = PricingBasis.PROVIDER_REPORTED
-                elif (
-                    isinstance(observed, MeasuredRunUsage)
-                    and card is not None
-                    and all(card.priceable(s.model) for s in observed.samples)
+                elif isinstance(observed, MeasuredRunUsage) and card is not None and all(
+                    card.priceable(s.model) for s in observed.samples
                 ):
                     basis = PricingBasis.CONFIGURED_RATE_CARD
                 else:
@@ -317,10 +329,7 @@ class AccountingRuntime(AgentRuntime):
                     amount = price(usage, self.rate_table.rates_for(model), self.rate_table.currency)
                     card = self.rate_table
                     gap = "request receipts unavailable; streamed usage priced at configured rates"
-                elif provider_amount.micros > 0 and not (
-                    isinstance(result.usage, dict)
-                    and result.usage.get("source") not in {"provider", "rollout", "reconciled"}
-                ):
+                elif provider_amount.micros > 0 and not (isinstance(result.usage, dict) and result.usage.get("source") not in {"provider", "rollout", "reconciled"}):
                     amount = provider_amount
                     gap = "only the runtime's priced usage estimate is available"
                 else:
@@ -333,18 +342,16 @@ class AccountingRuntime(AgentRuntime):
             basis = PricingBasis.ESTIMATE
             gap = "request prices exceed SQLite's money bound; unusable requests charged zero"
         request = SettlementRequest(
-            run_id,
-            amount,
-            basis,
+            run_id, amount, basis,
             f"{self.runtime_name}:{result.session_id or 'no-session'}:{run_id}",
-            usage,
-            card.rate_card_id if card else None,
-            card.version if card else None,
+            usage, card.rate_card_id if card else None, card.version if card else None,
             gap,
         )
         settlement = self.store.settle(request)
         if settlement.disposition is not AccountingDisposition.AVAILABLE:
-            raise RuntimeError(f"accounting settlement failed closed: {settlement.detail}")
+            raise RuntimeError(
+                f"accounting settlement failed closed: {settlement.detail}"
+            )
         if self.spend_evidence_dir:
             from .codex_runner import remove_spend_evidence
 
@@ -352,7 +359,14 @@ class AccountingRuntime(AgentRuntime):
         return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis)
 
     def _caps_armed(self) -> bool:
-        return any(cap is not None for cap in (self.repository_cap, self.global_cap, self.issue_cap))
+        return any(
+            cap is not None
+            for cap in (
+                self.repository_cap,
+                self.global_cap,
+                self.issue_cap,
+            )
+        )
 
     def _recover_or_release(self, run_id: RunId) -> None:
         """Give every returned failure path a terminal accounting outcome."""
@@ -362,13 +376,24 @@ class AccountingRuntime(AgentRuntime):
             if self.runtime_name == "codex" and self.spend_evidence_dir:
                 from .spend_recovery import CodexSpendReconciler
 
-                reconciled = CodexSpendReconciler(self.store, (self.spend_evidence_dir,)).reconcile(run_id)
-            forced_shutdown = self.runtime_name == "codex" and self.store.has_cancellation_intent(run_id)
+                reconciled = CodexSpendReconciler(
+                    self.store, (self.spend_evidence_dir,)
+                ).reconcile(run_id)
+            forced_shutdown = (
+                self.runtime_name == "codex"
+                and self.store.has_cancellation_intent(run_id)
+            )
             if not reconciled and not forced_shutdown:
-                released = self.store.release_unlaunched(run_id, "runtime_exception_before_launch")
-                if released.disposition is not AccountingDisposition.AVAILABLE:
+                released = self.store.release_unlaunched(
+                    run_id, "runtime_exception_before_launch"
+                )
+                if (
+                    released.disposition
+                    is not AccountingDisposition.AVAILABLE
+                ):
                     self.store.record_reservation_retained(
-                        run_id, "runtime failed after paid execution may have started"
+                        run_id,
+                        "runtime failed after paid execution may have started",
                     )
         except Exception:
             # Preserve the causal runtime/normalization/settlement exception.
@@ -376,31 +401,49 @@ class AccountingRuntime(AgentRuntime):
             # retries the still-active reservation.
             pass
 
-    def _limits(self, now: datetime, issue: int | None) -> tuple[BudgetLimit, ...]:
+    def _limits(
+        self, now: datetime, issue: int | None
+    ) -> tuple[BudgetLimit, ...]:
         limits: list[BudgetLimit] = []
         if self.repository_cap is not None:
             limits.append(
                 BudgetLimit(
-                    _daily_scope(self.repository, "repository", self.repository_cap.currency, now), self.repository_cap
+                    _daily_scope(
+                        self.repository, "repository", self.repository_cap.currency, now
+                    ),
+                    self.repository_cap,
                 )
             )
         if self.global_cap is not None:
-            limits.append(BudgetLimit(_daily_scope("*", "global", self.global_cap.currency, now), self.global_cap))
+            limits.append(
+                BudgetLimit(
+                    _daily_scope("*", "global", self.global_cap.currency, now),
+                    self.global_cap,
+                )
+            )
         if self.issue_cap is not None and issue is not None:
             limits.append(
-                BudgetLimit(issue_budget_scope(self.repository, issue, self.issue_cap.currency), self.issue_cap)
+                BudgetLimit(
+                    issue_budget_scope(self.repository, issue, self.issue_cap.currency),
+                    self.issue_cap,
+                )
             )
         if not limits:
             limits.append(
                 BudgetLimit(
-                    _daily_scope(self.repository, "repository", "USD", now), Money("USD", _UNLIMITED_ACCOUNTING_MICROS)
+                    _daily_scope(self.repository, "repository", "USD", now),
+                    Money("USD", _UNLIMITED_ACCOUNTING_MICROS),
                 )
             )
         return tuple(limits)
 
 
-def _daily_scope(repository: str, dimension: str, currency: str, now: datetime) -> BudgetScope:
-    return daily_budget_scope(repository, dimension, currency, now, ZoneInfo("UTC"))
+def _daily_scope(
+    repository: str, dimension: str, currency: str, now: datetime
+) -> BudgetScope:
+    return daily_budget_scope(
+        repository, dimension, currency, now, ZoneInfo("UTC")
+    )
 
 
 def issue_budget_scope(repository: str, issue: int, currency: str) -> BudgetScope:
@@ -440,7 +483,9 @@ def _blocked(detail: str) -> AgentResult:
     )
 
 
-_PR_KINDS = frozenset({"ADDRESS_REVIEW", "FIX_CI", "REBASE", "REVIEW"})
+_PR_KINDS = frozenset(
+    {"ADDRESS_REVIEW", "FIX_CI", "REBASE", "REVIEW"}
+)
 
 
 def _default_claim_target(kind: str, number: int, issue: int | None) -> int:
@@ -461,26 +506,31 @@ def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
     }
     if not usage_keys.intersection(raw):
         return None
-    counters = tuple(
-        raw.get(key, 0)
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-            "total_tokens",
-        )
-    )
+    counters = tuple(raw.get(key, 0) for key in (
+        "input_tokens", "output_tokens", "cache_read_input_tokens",
+        "cache_creation_input_tokens", "total_tokens",
+    ))
     if any(type(value) is not int or not 0 <= value <= 10**12 for value in counters):
         raise ValueError("token counters are malformed or outside the supported bound")
     input_total, output, cache_read, cache_write, total_only = counters
     if runtime == "codex" and cache_read + cache_write > input_total:
         raise ValueError("cache counters exceed inclusive input")
-    if total_only > 0 and not any((input_total, output, cache_read, cache_write)):
+    if total_only > 0 and not any(
+        (
+            input_total,
+            output,
+            cache_read,
+            cache_write,
+        )
+    ):
         return None
     # Codex reports cached input as a subset of input.  Normalize to disjoint
     # counters exactly once at this adapter boundary.
-    disjoint_input = max(0, input_total - cache_read - cache_write) if runtime == "codex" else input_total
+    disjoint_input = (
+        max(0, input_total - cache_read - cache_write)
+        if runtime == "codex"
+        else input_total
+    )
     if runtime == "codex":
         try:
             source = UsageSource(str(raw.get("source") or ""))
@@ -488,4 +538,10 @@ def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
             source = UsageSource.STDERR
     else:
         source = UsageSource.PROVIDER
-    return TokenUsage(disjoint_input, output, cache_read, cache_write, source)
+    return TokenUsage(
+        disjoint_input,
+        output,
+        cache_read,
+        cache_write,
+        source,
+    )

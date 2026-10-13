@@ -9,7 +9,11 @@ import time
 from collections.abc import Mapping
 
 from ..domain.contracts import RunId
-from .child_env import CHILD_ENV_MANIFEST, child_process_env, without_supervisor_authority
+from .child_env import (
+    CHILD_ENV_MANIFEST,
+    child_process_env,
+    without_supervisor_authority,
+)
 from .control_store import SQLiteControlStore
 from .process_supervisor import ProcessSupervisor
 
@@ -36,20 +40,35 @@ def _require_live_launcher(environment: Mapping[str, str]) -> None:
         raise RuntimeError("supervised launcher identity is malformed") from exc
     identity = ProcessSupervisor.process_identity(pid)
     if identity is None or identity.start_ticks != start_ticks:
-        raise RuntimeError("supervised launcher exited before process registration")
+        raise RuntimeError(
+            "supervised launcher exited before process registration"
+        )
 
 
-def _register(state_dir: str, run_id: RunId, token: str, environment: Mapping[str, str]) -> None:
+def _register(
+    state_dir: str,
+    run_id: RunId,
+    token: str,
+    environment: Mapping[str, str],
+) -> None:
     _require_live_launcher(environment)
     supervisor = ProcessSupervisor(state_dir)
-    registration = supervisor.register_prepared_launch(run_id, token, os.getpgrp(), leader_pid=os.getpid())
+    registration = supervisor.register_prepared_launch(
+        run_id, token, os.getpgrp(), leader_pid=os.getpid()
+    )
     control_db = environment.get("ISSUE_AGENT_CONTROL_DB", "")
     accounting_run_id = environment.get("ISSUE_AGENT_RUN_ID", "")
     accounting_owner_id = environment.get("ISSUE_AGENT_OWNER_ID", "")
     if not control_db and not accounting_run_id and not accounting_owner_id:
         return
-    if not control_db or accounting_run_id != str(run_id) or not accounting_owner_id:
-        raise RuntimeError("supervised process identity does not match its accounting run")
+    if (
+        not control_db
+        or accounting_run_id != str(run_id)
+        or not accounting_owner_id
+    ):
+        raise RuntimeError(
+            "supervised process identity does not match its accounting run"
+        )
     SQLiteControlStore(control_db).register_process_lease(
         run_id,
         expected_owner_id=accounting_owner_id,
@@ -81,10 +100,15 @@ def _wait_for_target(pid: int) -> None:
     raise SystemExit(1)
 
 
-def _carry_authority_and_exec(command: list[str], environment: Mapping[str, str]) -> None:
+def _carry_authority_and_exec(
+    command: list[str], environment: Mapping[str, str]
+) -> None:
     """Apply ADR 0005: retain ancestor authority and scrub the provider."""
 
-    prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARDED_SIGNALS)
+    prior_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        _FORWARDED_SIGNALS,
+    )
     try:
         pid = os.fork()
     except BaseException:
@@ -108,12 +132,16 @@ def _carry_authority_and_exec(command: list[str], environment: Mapping[str, str]
             pass
         deadline = time.monotonic() + _FORWARDED_SIGNAL_GRACE_SECONDS
         targets = tuple(
-            identity for identity in ProcessSupervisor.live_group_identities(pgid) if identity.pid != os.getpid()
+            identity
+            for identity in ProcessSupervisor.live_group_identities(pgid)
+            if identity.pid != os.getpid()
         )
         while targets and time.monotonic() < deadline:
             time.sleep(0.02)
             targets = tuple(
-                identity for identity in ProcessSupervisor.live_group_identities(pgid) if identity.pid != os.getpid()
+                identity
+                for identity in ProcessSupervisor.live_group_identities(pgid)
+                if identity.pid != os.getpid()
             )
         if targets:
             try:
@@ -167,9 +195,17 @@ def supervised_cli_main() -> None:
     explicit_keys = environment.pop(CHILD_ENV_MANIFEST, "").split()
     environment.pop(_PARENT_PID_ENV, None)
     environment.pop(_PARENT_START_ENV, None)
-    environment = child_process_env(environment, additional_keys=explicit_keys)
+    environment = child_process_env(
+        environment,
+        additional_keys=explicit_keys,
+    )
     os.setsid()
-    _register(state_dir, RunId(raw_run_id), token, registration_environment)
+    _register(
+        state_dir,
+        RunId(raw_run_id),
+        token,
+        registration_environment,
+    )
     _carry_authority_and_exec([target, *sys.argv[1:]], environment)
 
 

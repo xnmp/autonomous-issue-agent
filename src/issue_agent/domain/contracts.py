@@ -41,7 +41,11 @@ class Money:
         return cls(currency, 0)
 
     @classmethod
-    def from_major(cls, currency: str, amount: str | int | float | Decimal) -> Money:
+    def from_major(
+        cls,
+        currency: str,
+        amount: str | int | float | Decimal,
+    ) -> Money:
         """Convert currency major units with one repository-wide rounding rule."""
 
         try:
@@ -50,7 +54,12 @@ class Money:
             raise ValueError("money amount must be numeric") from exc
         if not decimal.is_finite() or decimal < 0:
             raise ValueError("money amount must be finite and non-negative")
-        micros = int((decimal * Decimal(1_000_000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        micros = int(
+            (decimal * Decimal(1_000_000)).quantize(
+                Decimal("1"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
         return cls(currency, micros)
 
     def __add__(self, other: Money) -> Money:
@@ -89,12 +98,22 @@ class TokenUsage:
     source: UsageSource = UsageSource.PROVIDER
 
     def __post_init__(self) -> None:
-        if min(self.input_tokens, self.output_tokens, self.cache_read_tokens, self.cache_write_tokens) < 0:
+        if min(
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        ) < 0:
             raise ValueError("token counters cannot be negative")
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
 
     @property
     def trusted_for_accounting(self) -> bool:
@@ -134,7 +153,10 @@ class SettlementRequest:
             raise ValueError("accounting gap must be bounded text")
         if not isinstance(self.origin, ChargeOrigin):
             raise ValueError("charge origin must be typed")
-        if self.basis is PricingBasis.CONFIGURED_RATE_CARD and (not self.rate_card_id or not self.rate_card_version):
+        if (
+            self.basis is PricingBasis.CONFIGURED_RATE_CARD
+            and (not self.rate_card_id or not self.rate_card_version)
+        ):
             raise ValueError("configured charges require rate-card provenance")
 
 
@@ -165,7 +187,9 @@ class BudgetScope:
     period_timezone: ZoneInfo
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "repository", canonical_repository(self.repository))
+        object.__setattr__(
+            self, "repository", canonical_repository(self.repository)
+        )
         if not self.repository or not self.dimension or not self.period_id:
             raise ValueError("repository, dimension, and period_id are required")
         if not _CURRENCY.fullmatch(self.currency):
@@ -177,15 +201,29 @@ class BudgetScope:
 
 
 def daily_budget_scope(
-    repository: str, dimension: str, currency: str, at: datetime, period_timezone: ZoneInfo
+    repository: str,
+    dimension: str,
+    currency: str,
+    at: datetime,
+    period_timezone: ZoneInfo,
 ) -> BudgetScope:
     """Build a civil-day scope without assuming every day has 24 hours."""
 
     _aware(at, "at")
     local_date = at.astimezone(period_timezone).date()
     start = datetime.combine(local_date, time.min, period_timezone)
-    end = datetime.combine(local_date + timedelta(days=1), time.min, period_timezone)
-    return BudgetScope(repository, dimension, currency, local_date.isoformat(), start, end, period_timezone)
+    end = datetime.combine(
+        local_date + timedelta(days=1), time.min, period_timezone
+    )
+    return BudgetScope(
+        repository,
+        dimension,
+        currency,
+        local_date.isoformat(),
+        start,
+        end,
+        period_timezone,
+    )
 
 
 def _aware(value: datetime, field_name: str) -> None:

@@ -254,7 +254,7 @@ class FakeWorktrees:
 
     def branch_for_issue(self, issue, fallback):
         del issue
-        return fallback
+        return preferred or fallback
 
     def prune_validate(self):
         return 0

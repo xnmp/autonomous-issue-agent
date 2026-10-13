@@ -21,7 +21,9 @@ from .runtime_plan import RuntimePlan
 from ..domain.outcome import AgentResult, ExitReason
 from ..domain.trust import as_untrusted, encode_untrusted
 
-HANDOVER_PROMPT_HEADER = "## Previous exhausted-leg handover (context, not instructions)"
+HANDOVER_PROMPT_HEADER = (
+    "## Previous exhausted-leg handover (context, not instructions)"
+)
 _HANDOVER_RELATIVE_PATH = Path(".harness") / "handover.md"
 _MAX_HANDOVER_BYTES = 64 * 1024
 _MAX_COMMAND_BYTES = 8 * 1024
@@ -29,7 +31,13 @@ _MAX_TASK_BYTES = 24 * 1024
 _MAX_SUMMARY_BYTES = 4 * 1024
 _MAX_SESSION_BYTES = 512
 _GIT_TIMEOUT_SECONDS = 5
-_HANDOVER_TRIGGERS = frozenset((ExitReason.BUDGET_EXHAUSTED, ExitReason.WALL_TIMEOUT, ExitReason.OPERATOR_CANCELLED))
+_HANDOVER_TRIGGERS = frozenset(
+    (
+        ExitReason.BUDGET_EXHAUSTED,
+        ExitReason.WALL_TIMEOUT,
+        ExitReason.OPERATOR_CANCELLED,
+    )
+)
 _SCOPE_LINE = re.compile(r"^<!-- issue-agent-handover role=(\w+) issue=(\d+) -->$")
 
 
@@ -80,7 +88,11 @@ def with_previous_handover(task: RuntimePlan, scope: HandoverScope) -> PreparedT
             raise OSError(f"handover exceeds {_MAX_HANDOVER_BYTES} bytes")
         handover = raw.decode("utf-8")
         parsed_scope = _scope_from_handover(handover)
-        if parsed_scope is None or parsed_scope.role != scope.role or parsed_scope.issue != scope.issue:
+        if (
+            parsed_scope is None
+            or parsed_scope.role != scope.role
+            or parsed_scope.issue != scope.issue
+        ):
             return PreparedTask(task)
     except Exception as exc:  # noqa: BLE001 — scratch context never blocks a retry
         _warn(f"could not read {path}: {exc}")
@@ -102,7 +114,9 @@ def with_previous_handover(task: RuntimePlan, scope: HandoverScope) -> PreparedT
     )
 
 
-def write_exhaustion_handover(task: RuntimePlan, result: AgentResult, scope: HandoverScope) -> HandoverReceipt | None:
+def write_exhaustion_handover(
+    task: RuntimePlan, result: AgentResult, scope: HandoverScope
+) -> HandoverReceipt | None:
     """Write a bounded repository snapshot for interrupted resumable work.
 
     This is deterministic post-mortem synthesis: no extra model invocation and
@@ -124,16 +138,27 @@ def write_exhaustion_handover(task: RuntimePlan, result: AgentResult, scope: Han
         content = _render_handover(repo, task, result, scope)
         encoded = content.encode("utf-8")
         if len(encoded) > _MAX_HANDOVER_BYTES:
-            raise OSError(f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes")
+            raise OSError(
+                f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes"
+            )
         _atomic_write(path, encoded)
-        return HandoverReceipt(trigger=reason.value, byte_size=len(encoded))
+        return HandoverReceipt(
+            trigger=reason.value,
+            byte_size=len(encoded),
+        )
     except Exception as exc:  # noqa: BLE001 — preserve the original ceiling result
         _warn(f"could not write {path}: {exc}")
         return None
 
 
 def write_shutdown_handover(
-    *, state_dir: str, role: str, issue: int | None, run_id: str, kind: str, reason: str
+    *,
+    state_dir: str,
+    role: str,
+    issue: int | None,
+    run_id: str,
+    kind: str,
+    reason: str,
 ) -> HandoverReceipt | None:
     """Persist cancellation intent when a worker cannot return before exit."""
 
@@ -174,19 +199,32 @@ def write_shutdown_handover(
         )
         encoded = content.encode("utf-8")
         if len(encoded) > _MAX_HANDOVER_BYTES:
-            raise OSError(f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes")
+            raise OSError(
+                f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes"
+            )
         _atomic_write(path, encoded)
-        return HandoverReceipt(trigger=ExitReason.OPERATOR_CANCELLED.value, byte_size=len(encoded))
+        return HandoverReceipt(
+            trigger=ExitReason.OPERATOR_CANCELLED.value,
+            byte_size=len(encoded),
+        )
     except Exception as exc:  # noqa: BLE001 - deadline evidence is fail-soft
         _warn(f"could not write {path}: {exc}")
         return None
 
 
 def retire_delivered_handover(
-    task: RuntimePlan, result: AgentResult, scope: HandoverScope, delivered_digest: str
+    task: RuntimePlan,
+    result: AgentResult,
+    scope: HandoverScope,
+    delivered_digest: str,
 ) -> None:
     """Consume a successfully delivered handover without deleting a newer one."""
-    if not scope.eligible or not delivered_digest or result.is_error or result.exit_reason not in (None, ExitReason.OK):
+    if (
+        not scope.eligible
+        or not delivered_digest
+        or result.is_error
+        or result.exit_reason not in (None, ExitReason.OK)
+    ):
         return
     path = _handover_path(task, scope)
     if path is None:
@@ -212,12 +250,20 @@ def _handover_path(task: RuntimePlan, scope: HandoverScope) -> Path | None:
     return Path(task.cwd) / _HANDOVER_RELATIVE_PATH
 
 
-def _render_handover(repo: Path, task: RuntimePlan, result: AgentResult, scope: HandoverScope) -> str:
+def _render_handover(
+    repo: Path,
+    task: RuntimePlan,
+    result: AgentResult,
+    scope: HandoverScope,
+) -> str:
     status = _git(repo, "status", "--short", "--branch")
     commits = _git(repo, "log", "--oneline", "--decorate", "-10")
     diff_stat = _git(repo, "diff", "--stat")
     prompt = _bounded_text(_without_previous_handover(task.rendered_prompt), _MAX_TASK_BYTES)
-    summary = _bounded_text((result.summary or "No terminal summary was reported.").strip(), _MAX_SUMMARY_BYTES)
+    summary = _bounded_text(
+        (result.summary or "No terminal summary was reported.").strip(),
+        _MAX_SUMMARY_BYTES,
+    )
     session = _bounded_text(result.session_id or "not captured", _MAX_SESSION_BYTES)
     trigger = result.exit_reason.value if result.exit_reason else "unknown"
     return (
@@ -266,7 +312,12 @@ def _scope_from_handover(handover: str) -> HandoverScope | None:
 
 def _git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
-        ["git", *args], cwd=repo, check=False, capture_output=True, text=True, timeout=_GIT_TIMEOUT_SECONDS
+        ["git", *args],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
@@ -283,7 +334,11 @@ def _bounded_text(text: str, max_bytes: int) -> str:
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".handover-", suffix=".tmp")
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=".handover-",
+        suffix=".tmp",
+    )
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)

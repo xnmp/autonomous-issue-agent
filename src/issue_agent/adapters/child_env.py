@@ -47,10 +47,25 @@ _BASE_KEYS = frozenset(
     }
 )
 
-_RUNTIME_AUTH_KEYS = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "ZAI_API_KEY"})
+_RUNTIME_AUTH_KEYS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "ZAI_API_KEY",
+    }
+)
 
 _PUBLICATION_CREDENTIAL_KEYS = frozenset(
-    {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GIT_ASKPASS", "SSH_AGENT_PID", "SSH_ASKPASS", "SSH_AUTH_SOCK"}
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_AGENT_PID",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+    }
 )
 
 # ADR 0005: the supervised launcher retains ISSUE_AGENT_* control-plane values;
@@ -60,18 +75,34 @@ _PUBLICATION_CREDENTIAL_KEYS = frozenset(
 def without_supervisor_authority(environment: Mapping[str, str]) -> dict[str, str]:
     """Remove control-plane authority from a paid provider's environment."""
 
-    return {key: value for key, value in environment.items() if not key.startswith("ISSUE_AGENT_")}
+    return {
+        key: value
+        for key, value in environment.items()
+        if not key.startswith("ISSUE_AGENT_")
+    }
 
 
 def child_process_env(
-    inherited: Mapping[str, str], explicit: Mapping[str, str] | None = None, *, additional_keys: Iterable[str] = ()
+    inherited: Mapping[str, str],
+    explicit: Mapping[str, str] | None = None,
+    *,
+    additional_keys: Iterable[str] = (),
 ) -> dict[str, str]:
     """Select child variables and exclude publication credentials."""
 
     configured = dict(explicit or {})
     allowed = (
-        _BASE_KEYS | _RUNTIME_AUTH_KEYS | frozenset(additional_keys) | frozenset(configured)
+        _BASE_KEYS
+        | _RUNTIME_AUTH_KEYS
+        | frozenset(additional_keys)
+        | frozenset(configured)
     ) - _PUBLICATION_CREDENTIAL_KEYS
     selected = {key: value for key, value in inherited.items() if key in allowed}
-    selected.update({key: value for key, value in configured.items() if key not in _PUBLICATION_CREDENTIAL_KEYS})
+    selected.update(
+        {
+            key: value
+            for key, value in configured.items()
+            if key not in _PUBLICATION_CREDENTIAL_KEYS
+        }
+    )
     return selected

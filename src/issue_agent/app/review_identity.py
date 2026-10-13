@@ -6,7 +6,11 @@ import os
 import time
 from collections.abc import Callable
 
-from ..adapters.app_token import AppCredentials, AppTokenMinter, default_mint_fn
+from ..adapters.app_token import (
+    AppCredentials,
+    AppTokenMinter,
+    default_mint_fn,
+)
 from ..adapters.github import Identity
 
 
@@ -14,9 +18,16 @@ def _ignore_log(_message: str) -> None:
     pass
 
 
-def review_identity(cfg_env: dict[str, str], warn: Callable[[str], None] = _ignore_log) -> Identity:
+def review_identity(
+    cfg_env: dict[str, str],
+    warn: Callable[[str], None] = _ignore_log,
+) -> Identity:
     """Resolve the daemon's App → static token → ambient identity contract."""
-    if cfg_env.get("GH_APP_ID") and cfg_env.get("GH_APP_KEY_FILE") and cfg_env.get("GH_APP_INSTALL_ID"):
+    if (
+        cfg_env.get("GH_APP_ID")
+        and cfg_env.get("GH_APP_KEY_FILE")
+        and cfg_env.get("GH_APP_INSTALL_ID")
+    ):
         key_file = os.path.expanduser(cfg_env["GH_APP_KEY_FILE"])
         if os.access(key_file, os.R_OK):
             creds = AppCredentials(
@@ -24,10 +35,17 @@ def review_identity(cfg_env: dict[str, str], warn: Callable[[str], None] = _igno
                 install_id=cfg_env["GH_APP_INSTALL_ID"],
                 key_file=key_file,
                 cache_path=cfg_env.get(
-                    "GH_APP_TOKEN_CACHE", os.path.expanduser("~/.local/state/issue-agent-bot/app-token.json")
+                    "GH_APP_TOKEN_CACHE",
+                    os.path.expanduser(
+                        "~/.local/state/issue-agent-bot/app-token.json"
+                    ),
                 ),
             )
-            minter = AppTokenMinter(creds, default_mint_fn, now_fn=lambda: int(time.time()))
+            minter = AppTokenMinter(
+                creds,
+                default_mint_fn,
+                now_fn=lambda: int(time.time()),
+            )
             return Identity(token_provider=minter.get)
         if cfg_env.get("REVIEW_BOT_TOKEN"):
             warn(

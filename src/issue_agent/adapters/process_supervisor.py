@@ -59,7 +59,9 @@ class ProcessSupervisor:
         self.intent_directory = self.state_dir / "launch-intents"
         self.grace_seconds = grace_seconds
 
-    def supervised_command(self, run_id: RunId, argv: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    def supervised_command(
+        self, run_id: RunId, argv: tuple[str, ...] | list[str]
+    ) -> tuple[str, ...]:
         """Wrap a command so its new-session leader registers before exec."""
 
         if not argv:
@@ -83,10 +85,14 @@ class ProcessSupervisor:
             raise ProcessLookupError("launcher process identity is unavailable")
         return {
             "ISSUE_AGENT_SUPERVISOR_PARENT_PID": str(identity.pid),
-            "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": str(identity.start_ticks),
+            "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": str(
+                identity.start_ticks
+            ),
         }
 
-    def supervised_cli(self, run_id: RunId, executable: str) -> tuple[str, dict[str, str]]:
+    def supervised_cli(
+        self, run_id: RunId, executable: str
+    ) -> tuple[str, dict[str, str]]:
         """Return an SDK-compatible CLI path that registers before exec."""
 
         token = self.prepare_launch(run_id)
@@ -101,7 +107,9 @@ class ProcessSupervisor:
             "supervised_cli_main()\n"
         )
         if not wrapper.exists() or wrapper.read_text(encoding="utf-8") != content:
-            fd, temporary = tempfile.mkstemp(dir=self.state_dir, prefix=".supervised-cli.", text=True)
+            fd, temporary = tempfile.mkstemp(
+                dir=self.state_dir, prefix=".supervised-cli.", text=True
+            )
             try:
                 os.fchmod(fd, 0o700)
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -133,12 +141,21 @@ class ProcessSupervisor:
         with self._intent_lock():
             registration_path = self._path(run_id)
             if registration_path.exists():
-                raise RuntimeError(f"run {run_id} still has a process registration")
-            self._write_intent(LaunchIntent(run_id, token, "pending", identity))
+                raise RuntimeError(
+                    f"run {run_id} still has a process registration"
+                )
+            self._write_intent(
+                LaunchIntent(run_id, token, "pending", identity)
+            )
         return token
 
     def register_prepared_launch(
-        self, run_id: RunId, token: str, pgid: int, *, leader_pid: int | None = None
+        self,
+        run_id: RunId,
+        token: str,
+        pgid: int,
+        *,
+        leader_pid: int | None = None,
     ) -> ProcessRegistration:
         """Register only if cancellation has not tombstoned this generation."""
 
@@ -146,10 +163,20 @@ class ProcessSupervisor:
             raise ValueError("supervised launch token is required")
         with self._intent_lock():
             intent = self._read_intent(self._intent_path(run_id))
-            if intent is None or intent.token != token or intent.state != "pending":
-                raise RuntimeError("supervised launch was cancelled or superseded")
-            registration = self.register(run_id, pgid, leader_pid=leader_pid)
-            self._write_intent(LaunchIntent(run_id, token, "registered", intent.launcher))
+            if (
+                intent is None
+                or intent.token != token
+                or intent.state != "pending"
+            ):
+                raise RuntimeError(
+                    "supervised launch was cancelled or superseded"
+                )
+            registration = self.register(
+                run_id, pgid, leader_pid=leader_pid
+            )
+            self._write_intent(
+                LaunchIntent(run_id, token, "registered", intent.launcher)
+            )
             return registration
 
     def require_registered_launch(self, run_id: RunId, token: str) -> None:
@@ -163,9 +190,13 @@ class ProcessSupervisor:
                 or intent.state != "registered"
                 or self._read(self._path(run_id)) is None
             ):
-                raise RuntimeError("supervised launch is no longer authorized")
+                raise RuntimeError(
+                    "supervised launch is no longer authorized"
+                )
 
-    def register(self, run_id: RunId, pgid: int, *, leader_pid: int | None = None) -> ProcessRegistration:
+    def register(
+        self, run_id: RunId, pgid: int, *, leader_pid: int | None = None
+    ) -> ProcessRegistration:
         if not str(run_id) or pgid <= 0:
             raise ValueError("run id and positive pgid are required")
         leader = self._identity_for_pid(pgid if leader_pid is None else leader_pid)
@@ -173,7 +204,9 @@ class ProcessSupervisor:
             raise ProcessLookupError("process-group leader identity is unavailable")
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         target = self._path(run_id)
-        fd, temporary = tempfile.mkstemp(dir=self.directory, prefix=f".{target.name}.", text=True)
+        fd, temporary = tempfile.mkstemp(
+            dir=self.directory, prefix=f".{target.name}.", text=True
+        )
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -181,7 +214,10 @@ class ProcessSupervisor:
                     {
                         "run_id": str(run_id),
                         "pgid": pgid,
-                        "leader": {"pid": leader.pid, "start_ticks": leader.start_ticks},
+                        "leader": {
+                            "pid": leader.pid,
+                            "start_ticks": leader.start_ticks,
+                        },
                     },
                     stream,
                 )
@@ -209,10 +245,22 @@ class ProcessSupervisor:
             if intent is None:
                 identity = self.process_identity(os.getpid())
                 if identity is None:
-                    raise ProcessLookupError("cancelling process identity is unavailable")
-                intent = LaunchIntent(run_id, f"cancelled-{uuid.uuid4().hex}", "cancelled", identity)
+                    raise ProcessLookupError(
+                        "cancelling process identity is unavailable"
+                    )
+                intent = LaunchIntent(
+                    run_id,
+                    f"cancelled-{uuid.uuid4().hex}",
+                    "cancelled",
+                    identity,
+                )
             else:
-                intent = LaunchIntent(run_id, intent.token, "cancelled", intent.launcher)
+                intent = LaunchIntent(
+                    run_id,
+                    intent.token,
+                    "cancelled",
+                    intent.launcher,
+                )
             self._write_intent(intent)
             registration = self._read(self._path(run_id))
         if registration is None:
@@ -245,16 +293,33 @@ class ProcessSupervisor:
 
         table = self._process_table()
         recovered: list[RunId] = []
-        for path in sorted(self.directory.glob("*.json")) if self.directory.exists() else ():
+        for path in (
+            sorted(self.directory.glob("*.json"))
+            if self.directory.exists()
+            else ()
+        ):
             registration = self._read(path)
             if registration is None:
                 path.rename(path.with_suffix(".invalid"))
                 continue
-            intent = self._read_intent(self._intent_path(registration.run_id))
-            if intent is not None and self.matches_identity(intent.launcher.pid, intent.launcher.start_ticks):
+            intent = self._read_intent(
+                self._intent_path(registration.run_id)
+            )
+            if (
+                intent is not None
+                and self.matches_identity(
+                    intent.launcher.pid,
+                    intent.launcher.start_ticks,
+                )
+            ):
                 continue
             leader = table.get(registration.leader.pid)
-            if leader is not None and leader[0] == registration.leader and leader[1] > 1 and leader[1] in table:
+            if (
+                leader is not None
+                and leader[0] == registration.leader
+                and leader[1] > 1
+                and leader[1] in table
+            ):
                 continue
             self.kill_tree(registration.run_id, self.grace_seconds)
             recovered.append(registration.run_id)
@@ -270,7 +335,11 @@ class ProcessSupervisor:
 
     def _reap_registered(self, grace_seconds: float) -> tuple[RunId, ...]:
         recovered: list[RunId] = []
-        for path in sorted(self.directory.glob("*.json")) if self.directory.exists() else ():
+        for path in (
+            sorted(self.directory.glob("*.json"))
+            if self.directory.exists()
+            else ()
+        ):
             registration = self._read(path)
             if registration is None:
                 # A malformed ownership receipt cannot safely identify a target.
@@ -312,7 +381,9 @@ class ProcessSupervisor:
     def _write_intent(self, intent: LaunchIntent) -> None:
         self.intent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         target = self._intent_path(intent.run_id)
-        fd, temporary = tempfile.mkstemp(dir=self.intent_directory, prefix=f".{target.name}.", text=True)
+        fd, temporary = tempfile.mkstemp(
+            dir=self.intent_directory, prefix=f".{target.name}.", text=True
+        )
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -321,7 +392,10 @@ class ProcessSupervisor:
                         "run_id": str(intent.run_id),
                         "token": intent.token,
                         "state": intent.state,
-                        "launcher": {"pid": intent.launcher.pid, "start_ticks": intent.launcher.start_ticks},
+                        "launcher": {
+                            "pid": intent.launcher.pid,
+                            "start_ticks": intent.launcher.start_ticks,
+                        },
                     },
                     stream,
                 )
@@ -343,7 +417,10 @@ class ProcessSupervisor:
                 RunId(str(raw["run_id"])),
                 str(raw["token"]),
                 str(raw["state"]),
-                ProcessIdentity(int(raw["launcher"]["pid"]), int(raw["launcher"]["start_ticks"])),
+                ProcessIdentity(
+                    int(raw["launcher"]["pid"]),
+                    int(raw["launcher"]["start_ticks"]),
+                ),
             )
             if (
                 not str(intent.run_id)
@@ -365,23 +442,40 @@ class ProcessSupervisor:
 
     def _cancel_all_intents(self) -> None:
         with self._intent_lock():
-            paths = sorted(self.intent_directory.glob("*.json")) if self.intent_directory.exists() else ()
+            paths = (
+                sorted(self.intent_directory.glob("*.json"))
+                if self.intent_directory.exists()
+                else ()
+            )
             for path in paths:
                 intent = self._read_intent(path)
                 if intent is None:
                     path.rename(path.with_suffix(".invalid"))
                     continue
-                self._write_intent(LaunchIntent(intent.run_id, intent.token, "cancelled", intent.launcher))
+                self._write_intent(
+                    LaunchIntent(
+                        intent.run_id,
+                        intent.token,
+                        "cancelled",
+                        intent.launcher,
+                    )
+                )
 
     def _discard_dead_launcher_intents(self) -> None:
         with self._intent_lock():
-            paths = sorted(self.intent_directory.glob("*.json")) if self.intent_directory.exists() else ()
+            paths = (
+                sorted(self.intent_directory.glob("*.json"))
+                if self.intent_directory.exists()
+                else ()
+            )
             for path in paths:
                 intent = self._read_intent(path)
                 if intent is None:
                     path.rename(path.with_suffix(".invalid"))
                     continue
-                if not self.matches_identity(intent.launcher.pid, intent.launcher.start_ticks):
+                if not self.matches_identity(
+                    intent.launcher.pid, intent.launcher.start_ticks
+                ):
                     try:
                         path.unlink()
                     except FileNotFoundError:
@@ -394,8 +488,15 @@ class ProcessSupervisor:
             run_id = RunId(str(raw["run_id"]))
             pgid = int(raw["pgid"])
             leader_raw = raw["leader"]
-            leader = ProcessIdentity(int(leader_raw["pid"]), int(leader_raw["start_ticks"]))
-            if not str(run_id) or pgid <= 0 or leader.pid <= 0 or leader.start_ticks <= 0:
+            leader = ProcessIdentity(
+                int(leader_raw["pid"]), int(leader_raw["start_ticks"])
+            )
+            if (
+                not str(run_id)
+                or pgid <= 0
+                or leader.pid <= 0
+                or leader.start_ticks <= 0
+            ):
                 return None
             return ProcessRegistration(run_id, pgid, leader)
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -434,19 +535,26 @@ class ProcessSupervisor:
             return table
         try:
             completed = subprocess.run(
-                ["ps", "-axo", "pid=,ppid=,pgid=,state=,lstart="], check=True, capture_output=True, text=True
+                ["ps", "-axo", "pid=,ppid=,pgid=,state=,lstart="],
+                check=True,
+                capture_output=True,
+                text=True,
             )
         except (OSError, subprocess.SubprocessError):
             return table
         for line in completed.stdout.splitlines():
             try:
-                pid_text, ppid_text, pgid_text, state, started = line.split(maxsplit=4)
+                pid_text, ppid_text, pgid_text, state, started = line.split(
+                    maxsplit=4
+                )
                 if state.startswith(("Z", "X")):
                     continue
                 pid = int(pid_text)
                 ppid = int(ppid_text)
                 pgid = int(pgid_text)
-                start_ticks = int.from_bytes(sha256(started.encode()).digest()[:8], "big")
+                start_ticks = int.from_bytes(
+                    sha256(started.encode()).digest()[:8], "big"
+                )
                 table[pid] = (ProcessIdentity(pid, start_ticks), ppid, pgid)
             except ValueError:
                 continue
@@ -468,7 +576,11 @@ class ProcessSupervisor:
 
     @classmethod
     def _group_identities(cls, pgid: int) -> tuple[ProcessIdentity, ...]:
-        return tuple(identity for identity, _ppid, member_pgid in cls._process_table().values() if member_pgid == pgid)
+        return tuple(
+            identity
+            for identity, _ppid, member_pgid in cls._process_table().values()
+            if member_pgid == pgid
+        )
 
     @classmethod
     def live_group_identities(cls, pgid: int) -> tuple[ProcessIdentity, ...]:
@@ -502,7 +614,9 @@ class ProcessSupervisor:
         return cls._same_process(ProcessIdentity(pid, start_ticks))
 
     @classmethod
-    def _terminate_identities(cls, identities: tuple[ProcessIdentity, ...], grace_seconds: float) -> None:
+    def _terminate_identities(
+        cls, identities: tuple[ProcessIdentity, ...], grace_seconds: float
+    ) -> None:
         live = tuple(identity for identity in identities if cls._same_process(identity))
         for identity in reversed(live):
             try:
@@ -510,7 +624,10 @@ class ProcessSupervisor:
             except ProcessLookupError:
                 pass
         deadline = time.monotonic() + max(0.0, grace_seconds)
-        while any(cls._same_process(identity) for identity in live) and time.monotonic() < deadline:
+        while (
+            any(cls._same_process(identity) for identity in live)
+            and time.monotonic() < deadline
+        ):
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         for identity in reversed(live):
             if not cls._same_process(identity):
@@ -521,7 +638,9 @@ class ProcessSupervisor:
                 pass
 
     @classmethod
-    def _terminate(cls, registration: ProcessRegistration, grace_seconds: float) -> None:
+    def _terminate(
+        cls, registration: ProcessRegistration, grace_seconds: float
+    ) -> None:
         current_leader = cls._identity_for_pid(registration.leader.pid)
         if current_leader is not None and current_leader != registration.leader:
             # The numeric pid was reused. The receipt no longer proves ownership
@@ -532,16 +651,26 @@ class ProcessSupervisor:
             cls._terminate_identities(members, grace_seconds)
             return
         pgid = registration.pgid
-        owned = {identity.pid: identity for identity in cls._group_identities(pgid)}
+        owned = {
+            identity.pid: identity
+            for identity in cls._group_identities(pgid)
+        }
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             return
         deadline = time.monotonic() + max(0.0, grace_seconds)
         while time.monotonic() < deadline:
-            live_owned = tuple(identity for identity in owned.values() if cls._same_process(identity))
+            live_owned = tuple(
+                identity
+                for identity in owned.values()
+                if cls._same_process(identity)
+            )
             if not live_owned:
                 return
-            owned.update((identity.pid, identity) for identity in cls._group_identities(pgid))
+            owned.update(
+                (identity.pid, identity)
+                for identity in cls._group_identities(pgid)
+            )
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         cls._terminate_identities(tuple(owned.values()), 0.0)
