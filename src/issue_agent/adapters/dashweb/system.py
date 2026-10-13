@@ -82,9 +82,10 @@ def role_beats(state_dirs: Mapping[str, str]) -> dict[str, Beat | None]:
 
 
 def leg_models(state_dirs: Mapping[str, str], tail_bytes: int = JOURNAL_TAIL_BYTES) -> dict[str, str]:
-    """leg_id -> model from each role journal's `agent_run` events (the
-    legs table records the runtime, not the model). A torn or foreign line
-    is skipped."""
+    """`legs.leg_id` -> model from each role journal's `agent_run` events
+    (the legs table records the runtime, not the model). The table's leg id
+    is the journal's `run_id`; the journal's own `leg_id` is another id. A
+    torn or foreign line is skipped."""
     models: dict[str, str] = {}
     for role in ROLE_NAMES:
         directory = state_dirs.get(role)
@@ -103,7 +104,7 @@ def leg_models(state_dirs: Mapping[str, str], tail_bytes: int = JOURNAL_TAIL_BYT
                 continue
             if not isinstance(event, dict) or event.get("event") != "agent_run":
                 continue
-            leg, model = event.get("leg_id"), event.get("model")
+            leg, model = event.get("run_id"), event.get("model")
             if isinstance(leg, str) and leg and isinstance(model, str) and model:
                 models[leg] = model
     return models

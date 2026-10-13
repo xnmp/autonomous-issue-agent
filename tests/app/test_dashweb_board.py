@@ -496,9 +496,11 @@ def test_issue_legs_carry_their_model_from_the_role_journal(deployment, tmp_path
     fix = tmp_path / "state" / "fix"
     fix.mkdir(parents=True)
     (fix / "journal.jsonl").write_text("\n".join([
-        json.dumps({"event": "agent_run_start", "leg_id": "L2", "model": ""}),
+        json.dumps({"event": "agent_run_start", "run_id": "L2", "model": ""}),
         "{torn",
-        json.dumps({"event": "agent_run", "leg_id": "L2", "model": "gpt-6.1-sol"}),
+        # The journal's own leg_id is not the table's: run_id is.
+        json.dumps({"event": "agent_run", "run_id": "L2", "leg_id": "j-L8", "model": "gpt-6.1-sol"}),
+        json.dumps({"event": "agent_run", "run_id": "", "leg_id": "L8", "model": "wrong"}),
     ]) + "\n")
 
     steps = backend.issue("demo", 2)["steps"]
