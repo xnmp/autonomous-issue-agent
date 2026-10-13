@@ -83,7 +83,6 @@ def test_without_a_change_the_full_timeout_elapses(tmp_path):
 
 @pytest.mark.parametrize("change", [
     "a claim is taken",
-    "a claim is taken and handed back within the wait",
     "another repository frees an item",
     "a leg is recorded while its claim is still held",
 ])
@@ -93,7 +92,6 @@ def test_commits_that_free_nothing_here_do_not_wake(tmp_path, change):
     _claim(store, 9, repository="other/repo")
     script = {
         "a claim is taken": {1: lambda: _claim(store, 8)},
-        "a claim is taken and handed back within the wait": {1: lambda: _claim(store, 8), 8: lambda: _free(store, 8)},
         "another repository frees an item": {1: lambda: _free(store, 9, repository="other/repo")},
         "a leg is recorded while its claim is still held": {1: lambda: _record_leg(store, "ended")},
     }[change]
@@ -101,6 +99,16 @@ def test_commits_that_free_nothing_here_do_not_wake(tmp_path, change):
 
     assert wake.wait(60) is None
     assert clock() == 60
+
+
+def test_a_claim_taken_after_the_tick_began_wakes_when_it_is_handed_back(tmp_path):
+    # A light leg (STEWARD, TRIAGE) leases and releases inside one wait: the
+    # next act in the chain must not wait for the poll.
+    store, clock = _store(tmp_path), ManualClock()
+    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: _claim(store, 8), 8: lambda: _free(store, 8)}))
+
+    assert wake.wait(60) == STORE_CHANGED
+    assert clock() == 9
 
 
 def test_a_burst_wakes_once_after_the_store_goes_quiet(tmp_path):

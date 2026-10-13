@@ -579,7 +579,12 @@ class SQLiteControlStore:
         )
         # The claim stays until its owner's `unlease`, after the leg's GitHub
         # effects land: that release is what wakes the roles (`StoreWake`).
-        # Ended and bound to a dead process, it no longer holds the item.
+        # Rebound to the settling daemon, it holds the item until then, and a
+        # crash in between leaves it dead for reclaim. Recovery settles only
+        # unleased legs, so this matches no row there.
+        if (identity := ProcessSupervisor.process_identity(os.getpid())) is not None:
+            db.execute("UPDATE leases SET pid=?, pgid=?, start_ticks=? WHERE leg_id=?",
+                       (identity.pid, os.getpgid(0), identity.start_ticks, str(request.run_id)))
         return SettlementResult(AccountingDisposition.AVAILABLE, request.amount)
 
     def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool:
@@ -970,17 +975,18 @@ class StoreWake:
     """Ends a daemon's inter-tick wait early when an item of its repository is
     freed, in either role.
 
-    An item is freed when a lease the repository held as the tick began is
-    gone. A role hands its claim back only after the leg's GitHub effects and
-    records have landed (`unlease` in its `finally`), so the woken tick sees
-    them. New leases, a lease taken and handed back within the wait, and other
-    repositories wake nothing.
+    An item is freed when a claim (lease) of the repository seen since the
+    tick began is gone. A role hands its claim back only after the leg's
+    GitHub effects and records have landed (`unlease` last in its `finally`),
+    so the woken tick sees them. A new claim and other repositories wake
+    nothing; a claim held for less than one check can go unseen, and the poll
+    covers it.
 
-    `PRAGMA data_version` on the wait's connection gates the lease read: it
+    `PRAGMA data_version` on the wait's connection gates the lease reads: it
     changes when another connection commits, and every store operation opens
-    its own, so this process's commits count too. A change is judged once the
-    store has been quiet for one check (a burst lands whole) or has kept
-    moving for the settle time.
+    its own, so this process's commits count too. Claims are read on every
+    change; whether one is gone is judged once the store has been quiet for
+    one check (a burst lands whole) or has kept moving for the settle time.
 
     One wait spans the whole poll interval, so the baseline is always the
     tick's, and it feeds the scheduler watchdog itself. Its connection lives
@@ -1005,7 +1011,7 @@ class StoreWake:
         self._sleep = sleep
         self._monotonic = monotonic
         self._unavailable = False
-        self._baseline = self._held_now()
+        self._claims = self._held_now() or frozenset()  # seen since the tick began
 
     def wait(self, timeout: float) -> str | None:
         """Wait up to `timeout` seconds; return the wake reason, or None when
@@ -1016,13 +1022,14 @@ class StoreWake:
         try:
             with closing(self._open()) as db:
                 reason = self._watch(db, start, deadline)
-                self._baseline = _held_leases(db, self.repository)  # the tick about to run
+                self._claims = _held_leases(db, self.repository)  # the tick about to run
                 self._unavailable = False
                 return reason
         except (sqlite3.Error, OSError) as exc:
             self._report_unavailable(exc)
         while (remaining := deadline - self._monotonic()) > 0:
             self._pause(min(WAKE_CHECK_SECONDS, remaining))
+        self._claims = self._held_now() or self._claims
         return None
 
     def _watch(self, db: sqlite3.Connection, start: float, deadline: float) -> str | None:
@@ -1031,7 +1038,10 @@ class StoreWake:
         while (now := self._monotonic()) < deadline:
             self._pause(min(WAKE_CHECK_SECONDS, deadline - now))
             version = db.execute("PRAGMA data_version").fetchone()[0]
-            moved, seen, now = seen is not None and version != seen, version, self._monotonic()
+            first, moved, seen = seen is None, seen is not None and version != seen, version
+            if first or moved:
+                self._claims |= _held_leases(db, self.repository)
+            now = self._monotonic()
             moving_since = (moving_since if moving_since is not None else now) if moved else None
             dirty = dirty or moved
             settling = moving_since is not None and now - moving_since < WAKE_SETTLE_SECONDS
@@ -1039,10 +1049,9 @@ class StoreWake:
                 continue
             dirty, moving_since = False, None
             held = _held_leases(db, self.repository)
-            if self._baseline is None:
-                self._baseline = held
-            elif self._baseline - held:
+            if self._claims - held:
                 return STORE_CHANGED
+            self._claims |= held
         return None
 
     def _pause(self, seconds: float) -> None:
