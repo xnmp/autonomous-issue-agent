@@ -62,16 +62,22 @@ def needs_human_key(key: ItemKey, stop: NeedsHuman) -> str:
 def triage_comment(state: TriageNote, harness: Harness) -> str:
     """The one triage comment: the tier, triage's rationale and the acceptance
     criteria (a heading `pr_body.issue_acceptance_criteria` finds, so they
-    reach the PR body), never an implementation plan. Agent text was
-    neutralised and bounded by `triage.parse_triage`."""
+    reach the PR body), never an implementation plan. An issue that states
+    its own criteria was asked for none (`triage.criteria_wanted`). Agent text
+    was neutralised and bounded by `triage.parse_triage`; here it is also made
+    inert to mentions and images under the harness's name."""
     triage = state.triage
-    why = f" {triage.rationale}" if triage.rationale else ""
+    why = f" {_inert(triage.rationale)}" if triage.rationale else ""
     head = f"{harness.marker}\n{TRIAGE_TAG}\n**Triage**: difficulty tier `{triage.tier.value}`.{why}"
-    if state.has_section:
-        return head + "\n\nThe issue already states acceptance criteria, so triage does not restate them."
     if not triage.acceptance_criteria:
         return head
-    return head + "\n\n### Acceptance criteria\n" + "\n".join(f"- [ ] {c}" for c in triage.acceptance_criteria)
+    return head + "\n\n### Acceptance criteria\n" + "\n".join(f"- [ ] {_inert(c)}" for c in triage.acceptance_criteria)
+
+
+def _inert(text: str) -> str:
+    # A zero-width space breaks an @mention and image syntax without changing
+    # what a reader sees.
+    return text.replace("@", "@\u200b").replace("![", "!\u200b[")
 
 
 def _code_span(text: str) -> str:

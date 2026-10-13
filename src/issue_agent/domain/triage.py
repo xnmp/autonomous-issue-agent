@@ -54,13 +54,15 @@ def _text(raw: object, limit: int) -> str | None:
     """Agent text a harness comment may embed: one line, bounded, and with
     hidden-comment openers neutralised so it can never carry a stop tag or the
     harness marker inside a harness-written comment. None when not text or
-    over the bound (oversized output is malformed, not truncated)."""
+    over the bound (oversized output is malformed, not truncated). The
+    neutralised form is no longer than the input, so a record re-parses under
+    the same bounds."""
     if not isinstance(raw, str) or len(raw) > limit:
         return None
-    return " ".join(raw.replace("<!--", "<​!--").split())
+    return " ".join(raw.replace("<!--", "\u2039!--").split())
 
 
-def _parse(raw: object, allowed: Callable[[int], bool]) -> Triage | None:
+def _parse(raw: object, allowed: Callable[[int], bool], criteria_wanted: bool = True) -> Triage | None:
     if not isinstance(raw, Mapping):
         return None
     tier = parse_tier(raw.get("tier"))
@@ -78,15 +80,17 @@ def _parse(raw: object, allowed: Callable[[int], bool]) -> Triage | None:
     # A suspected duplicate needs a known target and a stated reason; failing
     # either drops only the claim, toward no stop.
     valid_dup = type(dup) is int and 0 < dup <= _MAX_ISSUE and allowed(dup) and bool(reason)
-    return Triage(tier, tuple(c for c in criteria if c), dup if valid_dup else None,  # type: ignore[arg-type]
+    kept = tuple(c for c in criteria if c) if criteria_wanted else ()
+    return Triage(tier, kept, dup if valid_dup else None,  # type: ignore[arg-type]
                   reason if valid_dup else "", rationale)
 
 
-def parse_triage(raw: object, offered: Iterable[int], issue: int) -> Triage | None:
+def parse_triage(raw: object, offered: Iterable[int], issue: int, criteria_wanted: bool = True) -> Triage | None:
     """The agent's output for issue `issue` as a Triage, or None if malformed.
-    `duplicate_of` survives only if it is one of `offered` and not `issue`."""
+    `duplicate_of` survives only if it is one of `offered` and not `issue`;
+    criteria survive only if the harness asked for them (`criteria_wanted`)."""
     numbers = frozenset(n for n in offered if type(n) is int and n != issue)
-    return _parse(raw, numbers.__contains__)
+    return _parse(raw, numbers.__contains__, criteria_wanted)
 
 
 def triage_from_record(raw: object) -> Triage | None:
@@ -94,23 +98,34 @@ def triage_from_record(raw: object) -> Triage | None:
     return _parse(raw, lambda _n: True)
 
 
-def triage_schema(offered: Iterable[int]) -> dict:
+def triage_schema(offered: Iterable[int], criteria_wanted: bool = True) -> dict:
     """The output contract. `duplicate_of` enumerates the issues the harness
-    offered (the laundering list `offered_duplicates` reads back)."""
+    offered (the laundering list `offered_duplicates` reads back). An issue
+    that states its own acceptance criteria gets none from triage: its section
+    stays the contract (`criteria_wanted` reads that back)."""
     numbers = sorted({n for n in offered if type(n) is int and 0 < n <= _MAX_ISSUE})[:MAX_OFFERED]
     dup: dict = {"type": ["integer", "null"], "enum": [*numbers, None]} if numbers else {"type": "null"}
     return {
         "type": "object",
         "properties": {
             "tier": {"type": "string", "enum": [t.value for t in TIER_LADDER]},
-            "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+            **({"acceptance_criteria": {"type": "array", "items": {"type": "string"}}} if criteria_wanted else {}),
             "duplicate_of": dup,
             "duplicate_reason": {"type": "string"},
             "rationale": {"type": "string"},
         },
-        "required": ["tier", "acceptance_criteria", "duplicate_of", "duplicate_reason", "rationale"],
+        "required": ["tier", *(["acceptance_criteria"] if criteria_wanted else []), "duplicate_of",
+                     "duplicate_reason", "rationale"],
         "additionalProperties": False,
     }
+
+
+def criteria_wanted(schema: object) -> bool:
+    """Whether a `triage_schema` asked for acceptance criteria."""
+    try:
+        return "acceptance_criteria" in schema["properties"]  # type: ignore[index]
+    except (KeyError, TypeError):
+        return True
 
 
 def offered_duplicates(schema: object) -> frozenset[int]:
@@ -124,4 +139,4 @@ def offered_duplicates(schema: object) -> frozenset[int]:
     return frozenset(n for n in values if type(n) is int and n > 0)
 
 
-__all__ = ["Triage", "offered_duplicates", "parse_triage", "triage_from_record", "triage_schema"]
+__all__ = ["Triage", "criteria_wanted", "offered_duplicates", "parse_triage", "triage_from_record", "triage_schema"]

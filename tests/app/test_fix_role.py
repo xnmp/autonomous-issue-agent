@@ -760,6 +760,30 @@ def test_triage_grades_posts_its_criteria_once_then_resolve_runs_on_the_tiers_mo
     assert len(gh.comments_with("issue", 5, "Acceptance criteria")) == 1
 
 
+def test_an_issue_with_its_own_criteria_keeps_them_as_the_contract(role):
+    own = "Crash on null token.\n\n## Acceptance criteria\n- [ ] The API answers 401"
+    gh = FakeGitHub(issues={5: replace(ready(), body=own)})
+    agent = Agent(triaged("high"), pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES)
+    tick(composed)
+    assert "acceptance_criteria" not in agent.tasks[0].schema["properties"]
+    tick(composed)  # the triage comment: the tier only
+    tick(composed)  # RESOLVE
+    assert gh.comments_with("issue", 5, "Acceptance criteria") == []
+    assert tick(composed) == [OpenPullRequest(5, "fix/5-null-token-crashes")]
+    assert "The API answers 401" in gh.prs[100].body and "A null token returns 401" not in gh.prs[100].body
+
+
+def test_a_triage_cut_off_by_the_wall_cap_counts_once_and_the_issue_resolves_at_the_default_tier(role):
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(_capped, pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES, FIX_MODEL_MED="claude:claude-sonnet-5-5")
+    assert dispatched(tick(composed), AgentKind.TRIAGE)
+    # Not a machine end retried (and re-paid) every backoff window.
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+    assert agent.tasks[1].model == "claude-sonnet-5-5"
+
+
 def test_a_suspected_duplicate_waits_for_a_human_and_a_reply_lets_it_resolve(role):
     gh = FakeGitHub(issues={5: ready(), 2: IssueView(2, title="Null token crash")})
     agent = Agent(triaged("low", duplicate_of=2), pushed(gh, "fix/5-null-token-crashes", "h1"))

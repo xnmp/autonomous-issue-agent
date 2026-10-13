@@ -248,7 +248,9 @@ def build_codex_argv(
     if is_resume:
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
-        argv += ["--sandbox", sandbox]
+        argv += ["--sandbox", "read-only" if task.read_only else sandbox]
+        if task.read_only:
+            argv += ["--skip-git-repo-check"]
         if task.cwd:
             argv += ["-C", task.cwd]
     if schema_path:
@@ -258,7 +260,7 @@ def build_codex_argv(
     # The fix contract rides CODEX_HOME's developer_instructions; without it
     # (inject_system_prompt) the system prompt is prepended to the task.
     prompt = task.rendered_prompt
-    if inject_system_prompt and task.append_system_prompt:
+    if (inject_system_prompt or task.read_only) and task.append_system_prompt:
         prompt = f"{task.append_system_prompt}\n\n---\n\n{prompt}"
     argv.append(prompt)
     return argv

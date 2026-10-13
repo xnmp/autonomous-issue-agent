@@ -94,8 +94,10 @@ class HarnessConfig:
     # Base reasoning effort for fix legs (#16). Unset leaves each runtime on
     # its own default (CODEX_REASONING_EFFORT for codex, the SDK's for Claude).
     fix_effort: Effort | None = _knob(None, coerce="effort", choices=tuple(e.value for e in EFFORT_LADDER))
-    # The independent reviewer is at least the fixer's tier: a reviewer at the
-    # fixer's own tier approved/cycled at parity. Claude reviewers default to opus.
+    # The reviewer when the reviewed head's fixer tier is unknown or that tier
+    # has no FIX_MODEL_<TIER> spec. With tier specs set, review runs at the
+    # fixer's tier (owner, 2026-10-13); independence is the separate leg and
+    # REVIEW_BOT identity. Claude reviewers default to opus.
     review_model: str | None = _knob("gpt-6.1-sol")
     # Routing: the `runtime:model` each triage tier's fix legs run on, e.g.
     # `codex:gpt-6-luna` or `claude:claude-haiku-5-5`. Blank keeps the fixer

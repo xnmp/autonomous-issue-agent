@@ -111,7 +111,7 @@ class CodexHomeRuntime(AgentRuntime):
     def __init__(
         self,
         inner: AgentRuntime,
-        prepare: Callable[[str], str],
+        prepare: Callable[..., str],
     ):
         self.inner = inner
         self.prepare = prepare
@@ -119,7 +119,8 @@ class CodexHomeRuntime(AgentRuntime):
     async def run(self, task: RuntimePlan) -> AgentResult:
         if not task.cwd:
             raise RuntimeError("Codex containment requires an explicit cwd")
-        config_path = self.prepare(task.cwd)
+        # A read-only leg is not a fix: no fix contract as developer authority.
+        config_path = self.prepare(task.cwd, agents_md="") if task.read_only else self.prepare(task.cwd)
         prepared = replace(
             task,
             env={**task.env, "CODEX_HOME": os.path.dirname(config_path)},

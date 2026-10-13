@@ -41,7 +41,9 @@ def escalate(tier: Tier, attempts: int) -> Tier:
     return TIER_LADDER[min(TIER_LADDER.index(tier) + steps, len(TIER_LADDER) - 1)]
 
 
-_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/\[\]-]{0,199}")
+# `:` is allowed for provider IDs such as Bedrock's `...-v1:0`; the runtime
+# prefix is split off at the first `:`.
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:\[\]-]{0,199}")
 _CLAUDE_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable"})
 
 

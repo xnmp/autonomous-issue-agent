@@ -174,18 +174,18 @@ def test_a_huge_drift_list_is_bounded(tmp_path):
     assert "+15 more" in findings[0].message
 
 
-def test_retired_tier_knobs_no_longer_require_codex(tmp_path):
-    # Slice 5b deleted the per-tier model ladder (Q12): a leftover tier knob
-    # selects no provider, so an all-claude deployment needs no codex binary.
-    env = {
-        "FIXER_RUNTIME": "claude",
-        "REVIEWER_RUNTIME": "claude",
-        "FIX_MODEL_LOW": "codex:gpt-6-luna",
-        "FIX_MODEL_MED": "codex:gpt-6.1-sol",
-    }
+@pytest.mark.parametrize("routes, needs_codex", [
+    ({"FIX_MODEL_LOW": "codex:gpt-6-luna", "FIX_MODEL_MED": "codex:gpt-6.1-sol"}, True),
+    ({"TRIAGE_MODEL": "codex:gpt-6-luna"}, True),
+    ({"FIX_MODEL_LOW": "claude:claude-haiku-5-5", "TRIAGE_MODEL": ""}, False),
+])
+def test_a_route_naming_codex_requires_the_codex_binary(tmp_path, routes, needs_codex):
+    # Routing (decision 15): a tier or triage route dispatches legs on its
+    # runtime, so an otherwise all-claude deployment then needs codex.
+    env = {"FIXER_RUNTIME": "claude", "REVIEWER_RUNTIME": "claude", **routes}
     snapshot = "\n".join(f'{key}="{value}"' for key, value in env.items()) + "\n"
     findings = _findings(tmp_path, composed=env, snapshot=snapshot, which=_WHICH_CORE)
-    assert not any("'codex'" in f.message for f in findings)
+    assert any("'codex'" in f.message for f in findings) is needs_codex
 
 
 # ── identity ──────────────────────────────────────────────────────────────────

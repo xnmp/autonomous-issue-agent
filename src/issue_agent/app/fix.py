@@ -26,6 +26,7 @@ from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions
+from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
 from ..domain.triage import Triage, triage_from_record
@@ -209,12 +210,16 @@ class FixLegs:
         GitHub here and enumerated in its schema, which is what the accounting
         runtime launders its `duplicate_of` against."""
         runtime, model = self.settings.triage_route or self.settings.route(Tier.LOW)
-        self.runtime.set_context("fix", action.kind.name, action.number, action.number, claim_target=action.number)
+        # resumed: triage never resumes, so a wall timeout is its one attempt
+        # (the issue runs at DEFAULT_TIER), not a machine end retried forever.
+        self.runtime.set_context("fix", action.kind.name, action.number, action.number, claim_target=action.number,
+                                 resumed=True)
         try:
-            cwd = self.settings.triage_cwd
+            # Per issue: concurrent triage legs never share a cwd (or a CODEX_HOME).
+            cwd = os.path.join(self.settings.triage_cwd, str(action.number))
+            # No prepare_cwd: that writes the fix contract into Codex's home; a
+            # read-only leg's home is written without it at launch.
             os.makedirs(cwd, mode=0o700, exist_ok=True)
-            if self.prepare_cwd is not None:
-                self.prepare_cwd(cwd, runtime)
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"TRIAGE #{action.number}: preparation failed: {exc}")
             self.accounting.record_refused_leg()
@@ -225,6 +230,7 @@ class FixLegs:
             action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
             tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime,
             max_budget_usd=self.settings.triage_budget_usd,
+            criteria_wanted=not has_acceptance_criteria(subject.body or ""),
         )
         self.log(f"TRIAGE #{action.number}: {runtime.value}:{model or '(default model)'}")
         await run_leg(self.runtime, self.log, Leg("TRIAGE", LegTarget.ISSUE, action.number, True,

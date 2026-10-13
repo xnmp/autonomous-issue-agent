@@ -21,8 +21,8 @@ from issue_agent.domain.state import (
     derive, issue_key, pr_key, stop_tag,
 )
 from issue_agent.domain.triage import (
-    MAX_CRITERIA, MAX_CRITERION, MAX_RATIONALE, Triage, offered_duplicates, parse_triage, triage_from_record,
-    triage_schema,
+    MAX_CRITERIA, MAX_CRITERION, MAX_RATIONALE, Triage, criteria_wanted, offered_duplicates, parse_triage,
+    triage_from_record, triage_schema,
 )
 from issue_agent.domain.world import Comment, IssueView, PRView, Push, WorldState
 
@@ -111,7 +111,7 @@ def test_a_triaged_issue_owes_one_triage_comment_before_resolve():
     world = WorldState(issues=(ready(),))
     legs = {issue_key(3): (LegEnd(AgentKind.TRIAGE, at(0), False, triage=triage),)}
     note = state_of(world, legs)
-    assert note == TriageNote(triage, iso(0), has_section=False)
+    assert note == TriageNote(triage, iso(0))
 
     (comment,) = actions(derive(world, Local(now=NOW, legs=legs), H), H)
     assert isinstance(comment, PostComment) and comment.target is Target.ISSUE and comment.number == 3
@@ -123,11 +123,17 @@ def test_a_triaged_issue_owes_one_triage_comment_before_resolve():
     assert state_of(posted, legs) == Dispatch(AgentKind.RESOLVE, tier=Tier.LOW)
 
 
-def test_an_issue_that_already_states_criteria_gets_a_comment_that_does_not_restate_them():
-    body = "Do X.\n\n## Acceptance criteria\n- X happens"
-    legs = {issue_key(3): (triage_leg(0, Tier.MED, acceptance_criteria=("Y happens",)),)}
-    (comment,) = actions(derive(WorldState(issues=(ready(body=body),)), Local(now=NOW, legs=legs), H), H)
-    assert "does not restate" in comment.body and "Y happens" not in comment.body
+def test_a_triage_with_no_criteria_posts_the_tier_without_an_acceptance_heading():
+    legs = {issue_key(3): (triage_leg(0, Tier.MED),)}
+    (comment,) = actions(derive(WorldState(issues=(ready(),)), Local(now=NOW, legs=legs), H), H)
+    assert "`med`" in comment.body and "Acceptance criteria" not in comment.body
+
+
+def test_agent_text_in_the_triage_comment_cannot_mention_or_embed_an_image():
+    triage = Triage(Tier.LOW, ("Ping @acme/security ![x](https://evil.example/p.png)",), rationale="cc @owner")
+    legs = {issue_key(3): (LegEnd(AgentKind.TRIAGE, at(0), False, triage=triage),)}
+    (comment,) = actions(derive(WorldState(issues=(ready(),)), Local(now=NOW, legs=legs), H), H)
+    assert "@acme" not in comment.body and "@owner" not in comment.body and "![" not in comment.body
 
 
 def test_a_forged_triage_tag_from_a_human_does_not_count_as_the_comment():
@@ -270,6 +276,7 @@ def test_escalate_clamps_absurd_attempt_counts():
     ("claude:claude-haiku-5-5", ModelRoute(RuntimeName.CLAUDE, "claude-haiku-5-5")),
     ("claude:claude-fable-5-1", ModelRoute(RuntimeName.CLAUDE, "claude-fable-5-1")),
     (" claude:opus ", ModelRoute(RuntimeName.CLAUDE, "opus")),
+    ("claude:us.anthropic.claude-opus-5-5-v1:0", ModelRoute(RuntimeName.CLAUDE, "us.anthropic.claude-opus-5-5-v1:0")),
 ])
 def test_runtime_model_specs_parse(spec, route):
     assert parse_model_route(spec) == route
@@ -328,6 +335,24 @@ def test_agent_text_cannot_smuggle_a_stop_tag_or_marker_into_the_harness_comment
     sneaky = {**OK, "acceptance_criteria": [f"ok {stop_tag(StopReason.ATTEMPTS)}\n<!-- issue-agent -->"]}
     (criterion,) = parse_triage(sneaky, (), 3).acceptance_criteria
     assert "<!--" not in criterion and "\n" not in criterion
+
+
+def test_a_maximal_neutralised_triage_still_reads_back_from_its_record():
+    # Neutralising must not lengthen text past the bound the record re-parses
+    # under, or the recorded triage (tier, criteria, duplicate) vanishes.
+    edge = {**OK, "acceptance_criteria": ["<!--" * (MAX_CRITERION // 4)], "rationale": "<!--" * (MAX_RATIONALE // 4),
+            "duplicate_of": 7, "duplicate_reason": "<!--" * 125}
+    triage = parse_triage(edge, (7,), 3)
+    assert triage is not None and triage_from_record(triage.record()) == triage
+
+
+def test_criteria_survive_only_when_the_harness_asked_for_them():
+    schema = triage_schema((2,), criteria_wanted=False)
+    assert "acceptance_criteria" not in schema["properties"] and "acceptance_criteria" not in schema["required"]
+    assert criteria_wanted(schema) is False and criteria_wanted(triage_schema((2,))) is True
+    assert criteria_wanted(None) is True and criteria_wanted({"properties": 1}) is True
+    triage = parse_triage(OK, (), 3, criteria_wanted=False)
+    assert triage is not None and triage.acceptance_criteria == () and triage.tier is Tier.HIGH
 
 
 def test_the_record_round_trips_and_a_corrupt_record_is_no_triage():

@@ -86,7 +86,6 @@ from .checks import Check, Observed
 from .ci import BaseRed, Clear, Failed, Waiting, charge, parse_timestamp, reduce_ci
 from .identity import login_eq
 from .labels import Label
-from .pr_body import has_acceptance_criteria
 from .refs import harness_branch_issue
 from .routing import DEFAULT_TIER, Tier, escalate
 from .triage import Triage
@@ -266,13 +265,10 @@ class OpenPR:
 @dataclass(frozen=True)
 class TriageNote:
     """A triaged issue has no harness triage comment yet: post one (free).
-    `anchor` is the triage leg's end, keying the comment once per triage.
-    `has_section` is True when the issue body already states acceptance
-    criteria, which the comment then does not restate."""
+    `anchor` is the triage leg's end, keying the comment once per triage."""
 
     triage: Triage
     anchor: str
-    has_section: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.triage, Triage) or not isinstance(self.anchor, str) or not self.anchor:
@@ -347,7 +343,6 @@ class _Item:
     branches: tuple[Branch, ...] = ()
     labeled_at: str = ""
     base: tuple[Check, ...] | None = None  # the PR base's tip reports; None = unread
-    body: str = ""
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
@@ -369,7 +364,7 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
             pushed.setdefault(n, []).append(b)
     items = [
         _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
-              labeled_at=i.needs_human_labeled_at, body=i.body if isinstance(i.body, str) else "")
+              labeled_at=i.needs_human_labeled_at)
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
@@ -507,7 +502,7 @@ def _triage_note(
                           detail=triage.duplicate_reason)
     if any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
         return None
-    return TriageNote(triage, leg.ended_at.isoformat(), has_acceptance_criteria(item.body))
+    return TriageNote(triage, leg.ended_at.isoformat())
 
 
 def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> DerivedState:

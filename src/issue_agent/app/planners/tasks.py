@@ -208,11 +208,22 @@ def build_triage_task(
     model: str | None,
     runtime: RuntimeName | None,
     max_budget_usd: float,
+    criteria_wanted: bool = True,
 ) -> RuntimePlan:
     """TRIAGE: grade difficulty, state testable acceptance criteria and flag a
     suspected duplicate among `offered` (the other issues listed in `others`).
     Deliberately no plan: the fixer designs, the reviewer judges. The tier
-    rubric is the deleted router's (#8), renamed low/med/high/xhigh."""
+    rubric is the deleted router's (#8), renamed low/med/high/xhigh. An issue
+    that states its own criteria is not asked for any: its section stays the
+    contract the PR body carries."""
+    criteria = (
+        "## acceptance_criteria — what done means\n"
+        "Short, testable statements of observable behaviour, one per item, covering what "
+        "the issue asks and only that. Write criteria only for what the issue already "
+        "settles; state a reasonable, reversible assumption as a criterion rather than "
+        "asking. Never describe files, functions, steps or an approach.\n\n"
+        if criteria_wanted else ""
+    )
     prompt = (
         f"Triage GitHub issue #{issue_number} in one pass. Do not plan or design the "
         "implementation, and do not explore the code: answer from the text below.\n\n"
@@ -227,12 +238,8 @@ def build_triage_task(
         "unresolved root causes across subsystems that requires the strongest implementer. "
         "Reserve it for concrete difficulty in the task, not merely a long description or "
         "high priority.\n\n"
-        "## acceptance_criteria — what done means\n"
-        "Short, testable statements of observable behaviour, one per item, covering what "
-        "the issue asks and only that. Write criteria only for what the issue already "
-        "settles; state a reasonable, reversible assumption as a criterion rather than "
-        "asking. Never describe files, functions, steps or an approach.\n\n"
-        "## duplicate_of — a suspected duplicate\n"
+        + criteria
+        + "## duplicate_of — a suspected duplicate\n"
         "Set it only when this issue clearly asks for the same change as one of the other "
         "issues listed below, with a one-line duplicate_reason naming what they share. "
         "Never claim a duplicate merely because the reports look similar or touch the same "
@@ -243,7 +250,8 @@ def build_triage_task(
         f"{_fenced('other issues', others)}"
     )
     return RuntimePlan(
-        prompt=prompt, schema=triage_schema(offered), disallowed_tools=TRIAGE_DENY,
+        prompt=prompt, schema=triage_schema(offered, criteria_wanted), disallowed_tools=TRIAGE_DENY,
+        read_only=True,
         model=model, runtime=runtime, max_budget_usd=max_budget_usd, cwd=cwd,
     )
 
