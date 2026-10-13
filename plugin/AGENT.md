@@ -47,7 +47,9 @@ typechecks and compiler suites sequentially; honor configured worker counts.
 6. For UI-facing changes, commit screenshots from the running app in `evidence/`,
    each at most 700KB; the reviewer judges whether they show the changed behavior.
 7. `docs:` update folder `CLAUDE.md` with non-obvious learnings.
-8. Adversarial review — overlap it with evidence capture instead of serializing.
+8. Adversarial review — if your runtime can spawn subagents, do it as below;
+   otherwise review your own diff in one fresh pass against the same acceptance
+   and FAIL criteria. Overlap it with evidence capture instead of serializing.
    The review judges the diff + acceptance criteria (tests, layers, seams); it does
    not need the screenshots, which you and the harness reviewer verify separately.
    So:
