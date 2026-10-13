@@ -79,7 +79,6 @@ class ExitReason(str, Enum):
     # TRANSPORT_DEATH, which is a session that started and then lost its stream,
     # and from AGENT_ERROR, which is a session that ran and reported failure.
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
-    ACCOUNTING_UNAVAILABLE = "accounting_unavailable"  # live budget authority failed; terminal spend still settles
     # The leg ended its own turn while a background child task it started was
     # still pending. A headless leg can never receive that child's notification,
     # so a `blocked` it declares is waiting on itself, not on a human (#255).
@@ -178,12 +177,6 @@ def no_session_evidence(
     )
 
 
-# Infra-class reasons beyond the death/unavailability predicates. A pending
-# background child is NOT one: the agent started it and ended its turn (#255),
-# a full paid session of its own behaviour, so it counts as an attempt.
-_INFRA_CLASS_EXTRA: frozenset[ExitReason] = frozenset({ExitReason.ACCOUNTING_UNAVAILABLE})
-
-
 def reclassify_pending_background_block(
     result: AgentResult, pending_children: int
 ) -> AgentResult:
@@ -234,7 +227,6 @@ def infra_class_failure(result: AgentResult) -> bool:
     return (
         infra_death(result.exit_reason)
         or runtime_unavailable(result.exit_reason)
-        or result.exit_reason in _INFRA_CLASS_EXTRA
         or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
     )
 

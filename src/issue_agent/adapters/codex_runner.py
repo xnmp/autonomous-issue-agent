@@ -1,46 +1,44 @@
-"""CodexRunner — runs a headless agent task on the OpenAI **Codex CLI** instead
-of the Claude Agent SDK, so the *fixer* leg can use a different/cheaper model
-(e.g. GPT-5.5 via an OpenAI-compatible gateway). Drop-in for `AgentRunner`: same `run(RuntimePlan) ->
-AgentResult` contract, so the domain/orchestration layer is unchanged.
+"""CodexRunner: the second runtime adapter, over the OpenAI Codex CLI.
 
-This is the SECOND runtime adapter (see docs/CODEX-RUNNER.md). It speaks to
-`codex exec`, which is itself an agentic loop with a sandbox. The pure pieces
-(`build_codex_argv`, `parse_codex_envelope`) are factored out so they unit-test
-with no subprocess.
+Same `run(RuntimePlan) -> AgentResult` contract as `AgentRunner`. It speaks to
+`codex exec`, itself an agentic loop with a sandbox. The pure pieces
+(`build_codex_argv`, `parse_codex_envelope`) unit-test with no subprocess.
 
-Why `codex exec` and not the OpenAI SDK: the SDK is a chat API, not an agentic
-runtime; reusing Codex keeps the tool loop, worktree isolation, and structured
-output that our fixer depends on.
+Money: Codex reports no dollars, so this leg's spend is its root session's
+rollout token counters (minus the resumed session's pre-launch baseline) priced
+against the configured rate card. Native sub-agents are disabled in the
+CODEX_HOME config (`codex_home`), so the root counter is the whole leg. Stderr
+carries agent-controlled output and is never priced.
 """
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import hashlib
 import json
 import os
+import random
 import re
+import signal
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
 from .child_env import child_process_env
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
-from ..domain.pricing import (
-    BudgetSentinel,
-    ModelRates,
-    usd_per_million_to_micros,
-    with_default_model_rates,
-    default_cache_read_rate,
-    default_cache_write_rate,
-    RateTable,
+from ..domain.pricing import ModelRates, RateTable, UnknownModelPolicy
+from ..domain.run_usage import (
+    EstimatedRunUsage,
+    MeasuredRunUsage,
+    ModelUsage,
+    RunUsage,
+    price_run_usage,
 )
-from ..domain.run_usage import RunUsage, MeasuredRunUsage, EstimatedRunUsage, price_run_usage
-from .codex_child_usage import CodexChildUsageMeter, rate_table_evidence, normalize_usage
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
@@ -52,30 +50,27 @@ from ..domain.outcome import (
     no_session_evidence,
 )
 
-
-# Model the CodexRunner defaults to when neither CODEX_MODEL nor a task's `model`
-# (FIX_MODEL) is set. Override for your gateway — behind a proxy this is often the
-# provider's deployment/alias string rather than a bare model name.
-DEFAULT_CODEX_MODEL = ""
-
-# Codex hardcodes `.git` read-only under --sandbox workspace-write (no config
-# knob; OpenAI issues #12280/#14338), which breaks the git-driven fixer. We use
-# full-access — the SAME posture the Claude fixer runs in
-# (permission_mode=bypassPermissions).
+# Codex hardcodes `.git` read-only under --sandbox workspace-write (OpenAI
+# issues #12280/#14338), which breaks the git-driven fixer: full access is the
+# same posture the Claude fixer runs in (bypassPermissions).
 DEFAULT_SANDBOX = "danger-full-access"
 
-# `codex exec` left alone runs at reasoning effort LOW (observed in live
-# session_meta 2026-07-27) — too little thinking for an implementer writing
-# tests-first code. Medium is the deliberate default; operators override per
-# repo with CODEX_REASONING_EFFORT ("" = leave codex's own default alone).
+# `codex exec` left alone runs at reasoning effort LOW (live session_meta
+# 2026-07-27): too little for an implementer. A task's own effort wins.
 DEFAULT_REASONING_EFFORT = "medium"
 
-# Codex normally writes short progress records, but agent-controlled tool output
-# can make one stderr record arbitrarily large. Let ordinary multi-MiB records
-# through, while retaining only a bounded diagnostic if a producer goes larger.
+# One stderr record can be arbitrarily large (agent tool output). Let multi-MiB
+# records through, retaining a bounded diagnostic beyond that.
 _STDERR_STREAM_LIMIT = 4 * 1024 * 1024
 _STDERR_RETAINED_LINE_BYTES = 16 * 1024
-_SPEND_EVIDENCE_VERSION = 2
+_SPEND_EVIDENCE_VERSION = 3
+
+# Gateway retry: a stream drop or a 429 is upstream, not the agent. A fresh
+# `codex exec` (resumed) recovers it; codex's own in-TCP reconnects do not.
+_TRANSPORT_RETRIES = 4
+_BACKOFF_BASE = 2.0
+_RATE_LIMIT_BASE = 60.0
+_MAX_RETRY_WAIT = 180.0
 
 
 def spend_evidence_path(directory: str, run_id: str) -> str:
@@ -85,21 +80,15 @@ def spend_evidence_path(directory: str, run_id: str) -> str:
     return os.path.join(directory, f"{digest}.json")
 
 
-def write_spend_evidence(
-    directory: str, run_id: str, evidence: dict[str, Any]
-) -> None:
-    """Atomically persist the data needed to price a killed Codex rollout."""
+def write_spend_evidence(directory: str, run_id: str, evidence: dict[str, Any]) -> None:
+    """Atomically persist what boot recovery needs to price a killed rollout."""
 
     if not directory or not run_id:
         return
     os.makedirs(directory, exist_ok=True)
     path = spend_evidence_path(directory, run_id)
     temporary = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    payload = {
-        "version": _SPEND_EVIDENCE_VERSION,
-        "run_id": str(run_id),
-        **evidence,
-    }
+    payload = {"version": _SPEND_EVIDENCE_VERSION, "run_id": str(run_id), **evidence}
     try:
         with open(temporary, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
@@ -122,34 +111,77 @@ def remove_spend_evidence(directory: str, run_id: str) -> None:
         pass
 
 
+def rate_table_evidence(table: RateTable | None) -> dict | None:
+    """A rate card frozen into spend evidence, so recovery prices with it."""
+    if table is None:
+        return None
+    return {"id": table.rate_card_id, "version": table.version, "currency": table.currency,
+            "rates": {name: asdict(rates) for name, rates in table.rates.items()},
+            "unknown_model_policy": table.unknown_model_policy.value,
+            "fallback": asdict(table.fallback) if table.fallback is not None else None}
+
+
+def recovered_rate_table(raw: dict | None) -> RateTable | None:
+    """Parse a frozen rate card back; malformed evidence raises ValueError."""
+    if raw is None:
+        return None
+    if (not isinstance(raw, dict) or not isinstance(raw.get("rates"), dict) or len(raw["rates"]) > 256
+            or not all(isinstance(raw.get(key), str) and 0 < len(raw[key]) <= 256
+                       for key in ("id", "version", "currency"))
+            or not all(isinstance(name, str) and 0 < len(name) <= 256 for name in raw["rates"])):
+        raise ValueError("recovery price card is malformed")
+
+    def rates(value: dict) -> ModelRates:
+        if not isinstance(value, dict) or any(type(v) is not int or v <= 0 for v in value.values()):
+            raise ValueError("recovery rates require positive integers")
+        return ModelRates(**value)
+
+    return RateTable(raw["id"], raw["version"], raw["currency"],
+                     {name: rates(value) for name, value in raw["rates"].items()},
+                     UnknownModelPolicy(raw["unknown_model_policy"]),
+                     rates(raw["fallback"]) if raw.get("fallback") is not None else None)
+
+
+def leg_usage(session_id: str, model: str, usage: dict | None, rates: RateTable | None) -> RunUsage:
+    """This leg's spend evidence from its root rollout counter delta.
+
+    Counters are measured; their absence (no session, no completed turn, a
+    malformed record) is an explicit estimate that charges zero for the
+    interrupted requests rather than inventing a figure.
+    """
+    try:
+        if not session_id or not isinstance(usage, dict) or usage.get("source") != UsageSource.ROLLOUT.value:
+            raise ValueError("no trusted rollout counters")
+        values = tuple(usage.get(key, 0) for key in (
+            "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        if any(type(v) is not int or not 0 <= v <= 10**12 for v in values):
+            raise ValueError("rollout counters are malformed")
+        inputs, outputs, cached, written = values
+        if cached + written > inputs:
+            raise ValueError("cache tokens exceed inclusive input")
+        tokens = TokenUsage(inputs - cached - written, outputs, cached, written, UsageSource.ROLLOUT)
+        name = model.strip().casefold() or "<runtime-default>"
+        return MeasuredRunUsage((ModelUsage(session_id, name, tokens),), rates)
+    except (ValueError, TypeError):
+        return EstimatedRunUsage("rollout usage unavailable; interrupted requests charged zero", (), rates)
+
+
 @dataclass(frozen=True)
 class CodexProvider:
-    """The `-c model_providers.<id>.*` block. `base_url` must point at your
-    OpenAI-compatible endpoint; `env_key` names the env var Codex reads the key
-    from (we keep the secret in the env, never in argv)."""
+    """The `-c model_providers.<id>.*` block for an OpenAI-compatible gateway.
 
-    # NOT "openai": codex-cli ≥0.142 reserves the built-in provider IDs (`openai`,
-    # etc.) and aborts at config-load ("Built-in providers cannot be overridden")
-    # if you try to redefine one under `model_providers`. The id is purely an
-    # internal config-table key + `model_provider=` pointer (the model itself is
-    # passed via -m), so any non-reserved name works.
+    A blank `base_url` means codex's built-in provider with `codex login`
+    credentials. The id must not be a built-in one (codex-cli >= 0.142 refuses
+    to redefine `openai`). The key stays in the env named by `env_key`.
+    """
+
     provider_id: str = "openai-custom"
     name: str = "OpenAI"
-    base_url: str = ""                 # set to your OpenAI-compatible gateway
-    # Codex's convention is OPENAI_API_KEY; behind a proxy you typically alias it
-    # to the gateway's key in the agent env (OPENAI_API_KEY=$YOUR_GATEWAY_KEY).
+    base_url: str = ""
     env_key: str = "OPENAI_API_KEY"
     wire_api: str = "responses"
 
     def config_overrides(self) -> list[str]:
-        """`-c key=value` pairs defining the provider inline (avoids the legacy
-        [profiles.x] table, which codex 0.142 rejects with -p).
-
-        A BLANK base_url means "no custom gateway": emit nothing and let codex
-        use its built-in OpenAI provider with whatever `codex login` stored
-        (ChatGPT-subscription OAuth). Defining the custom provider block in that
-        case would force API-key auth and fail preflight on a machine that is
-        perfectly logged in."""
         if not self.base_url:
             return []
         p = f"model_providers.{self.provider_id}"
@@ -163,34 +195,19 @@ class CodexProvider:
 
 
 def _nullable(schema: dict) -> dict:
-    """Widen a property's type to admit null, the strict-mode way to say
-    "optional". No `type` to widen → returned unchanged."""
     declared = schema.get("type")
     if isinstance(declared, str):
-        if declared == "null":
-            return schema
-        return {**schema, "type": [declared, "null"]}
+        return schema if declared == "null" else {**schema, "type": [declared, "null"]}
     if isinstance(declared, list):
-        if "null" in declared:
-            return schema
-        return {**schema, "type": [*declared, "null"]}
+        return schema if "null" in declared else {**schema, "type": [*declared, "null"]}
     return schema
 
 
 def _strict_schema(schema: dict) -> dict:
-    """Azure OpenAI strict structured-output requires EVERY property listed in
-    `required` (no optional keys) and additionalProperties:false at each object.
-    Our domain schemas mark some fields optional, so tighten a shallow copy for
-    the Codex/azure path. Recurses into nested object properties.
-
-    A property that was NOT required becomes nullable as it is forced into
-    `required`. Optionality in these schemas is load-bearing, not incidental:
-    an optional field keeps an honest "no finding" expressible, and making it
-    mandatory-and-non-nullable puts a model reading untrusted text under
-    pressure to INVENT a value. Nullable keeps strict mode satisfied while
-    leaving "nothing found" sayable; every consumer already treats null exactly
-    like absent.
-    """
+    """Strict structured output requires every property in `required` and
+    additionalProperties:false at each object. A formerly optional property
+    becomes nullable rather than mandatory, so a model reading untrusted text
+    can still say "nothing found" instead of inventing a value."""
     if not isinstance(schema, dict):
         return schema
     out = dict(schema)
@@ -200,10 +217,7 @@ def _strict_schema(schema: dict) -> dict:
     for keyword in ("anyOf", "oneOf", "allOf"):
         alternatives = schema.get(keyword)
         if isinstance(alternatives, list):
-            out[keyword] = [
-                _strict_schema(alternative)
-                for alternative in alternatives
-            ]
+            out[keyword] = [_strict_schema(alternative) for alternative in alternatives]
     if schema.get("type") != "object":
         return out
     props = schema.get("properties")
@@ -225,76 +239,42 @@ def build_codex_argv(
     codex_bin: str = "codex",
     provider: CodexProvider | None = None,
     sandbox: str = DEFAULT_SANDBOX,
-    default_model: str = DEFAULT_CODEX_MODEL,
+    default_model: str = "",
     schema_path: str | None = None,
     output_path: str | None = None,
     inject_system_prompt: bool = True,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> list[str]:
-    """Pure: RuntimePlan → `codex exec` argv. No subprocess, no I/O (the caller
-    writes the schema/output temp files and passes their paths). Unit-tested.
-
-    `schema_path`: where the caller wrote the (strictified) JSON schema, mapped
-    to --output-schema. `output_path`: where codex should write the final
-    message (-o), which run() then parses into the envelope."""
+    """Pure: RuntimePlan -> `codex exec` argv."""
     provider = provider or CodexProvider()
     argv: list[str] = [codex_bin, "exec"]
-
-    # `codex exec resume <id>` has a NARROWER argument grammar than plain `codex
-    # exec`: it REJECTS `--sandbox` and `-C/--cd` (exit 2, "unexpected argument").
-    # It DOES accept -c / -m / --output-schema / -o / --dangerously-bypass-*. So
-    # the resume path must not emit the exec-only flags. Sandbox parity on resume
-    # is via --dangerously-bypass-approvals-and-sandbox (danger-full-access has no
-    # resume flag form); cwd on resume is set on the SUBPROCESS (create_subprocess
-    # _exec cwd=), not `-C`, so the resumed turn still runs in the worktree.
+    # `codex exec resume <id>` rejects `--sandbox` and `-C`; the resumed turn's
+    # cwd is set on the subprocess instead, and the bypass flag is the sandbox
+    # posture the resume grammar accepts.
     is_resume = bool(task.resume)
     if is_resume:
         argv += ["resume", task.resume]
-
-    # Provider definition + selection (inline -c overrides) — legal on both paths.
     for ov in provider.config_overrides():
         argv += ["-c", ov]
-
-    # Only name a model when one was actually configured: `-m ""` is not "the
-    # default", it is a broken flag. With no -m, codex uses the provider's own
-    # default — which in OAuth (blank base_url) mode is the subscription's
-    # current model, exactly what an operator with no CODEX_MODEL set wants.
+    # `-m ""` is a broken flag, not "the default".
     model = task.model or default_model
     if model:
         argv += ["-m", model]
-
-    # `codex exec`'s own default effort is LOW (observed in live session_meta,
-    # 2026-07-27) — an implementer tier that quietly under-thinks. Explicit on
-    # both paths (-c is legal on exec and resume); "" opts out entirely and
-    # leaves codex's default alone.
-    #
-    # The TASK's effort wins over the process-level knob when it has one (harness
-    # #16): `reasoning_effort` is the default for legs with no opinion, and the
-    # escalation ladder is an opinion about THIS leg specifically. Legs that
-    # carry none (review, triage, the router) keep the knob's value untouched,
-    # which is why adding the field changed no existing dispatch.
     effort = task.effort.value if task.effort is not None else reasoning_effort
     if effort:
         argv += ["-c", f"model_reasoning_effort={effort}"]
-
     if is_resume:
-        # danger-full-access equivalent that resume DOES accept.
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
         argv += ["--sandbox", sandbox]
         if task.cwd:
             argv += ["-C", task.cwd]
-
     if schema_path:
         argv += ["--output-schema", schema_path]
     if output_path:
         argv += ["-o", output_path]
-
-    # AGENT.md parity: Codex has no system-prompt-preset append. Preferred path —
-    # the contract rides the external CODEX_HOME's developer_instructions (see
-    # codex_home.write_codex_home) and inject_system_prompt is False, so we DON'T
-    # also prepend it here (that would duplicate the whole contract into every
-    # prompt). Without it (inject_system_prompt=True), fall back to prepending.
+    # The fix contract rides CODEX_HOME's developer_instructions; without it
+    # (inject_system_prompt) the system prompt is prepended to the task.
     prompt = task.prompt
     if inject_system_prompt and task.append_system_prompt:
         prompt = f"{task.append_system_prompt}\n\n---\n\n{prompt}"
@@ -302,162 +282,48 @@ def build_codex_argv(
     return argv
 
 
-# Linux caps a SINGLE argv element at MAX_ARG_STRLEN (32 pages = 131072 B);
-# exceeding it kills the spawn with E2BIG before any paid work happens.
-# 100 KB leaves headroom for multibyte counting differences and the
-# supervised_exec wrapper's own argv.
+# Linux caps one argv element at MAX_ARG_STRLEN (128 KiB); above this the
+# prompt goes on stdin (`-`). A prompt too large for any model context is
+# refused before spend (keifu #173: E2BIG on a diff-bearing prompt).
 _PROMPT_ARGV_LIMIT = 100_000
-
-# Ceiling for the stdin route (adversarial F1): removing the E2BIG floor must
-# not let a pathological prompt (a multi-MB `gh pr diff`) spawn and burn a
-# PAID leg on a guaranteed provider context overflow. Refused pre-spawn as an
-# agent error, so the existing retry breakers bound the repeats and escalate.
 _PROMPT_STDIN_HARD_LIMIT = 1_500_000
 
 
 def route_oversize_prompt(argv: list[str]) -> tuple[list[str], bytes | None]:
-    """Pure: move an oversize argv prompt onto stdin.
-
-    `codex exec` reads its instructions from stdin when the prompt argument is
-    `-` (per its own --help; the resume subcommand shares the [PROMPT]
-    grammar). The prompt is always the final element `build_codex_argv`
-    appends. Observed live 2026-08-02: RE_REVIEW keifu #173's diff-bearing
-    prompt exceeded MAX_ARG_STRLEN and the spawn died with `[Errno 7] Argument
-    list too long` — a deterministic death the retry ladder could only repeat,
-    and the dispatch failure then walked the PR to needs-human-review.
-    Threshold-gated rather than always-stdin so the long-proven argv path
-    keeps handling the common case."""
+    """Pure: move an oversize argv prompt (always the last element) onto stdin."""
     prompt = argv[-1]
     if len(prompt.encode()) <= _PROMPT_ARGV_LIMIT:
         return argv, None
     return [*argv[:-1], "-"], prompt.encode()
 
 
-# ── token accounting (review M1 / plan D12) ──────────────────────────────────
-# Codex reports no dollar figure — there is no `total_cost_usd` anywhere on the
-# `codex exec` path — so tokens × a configured price table is the ONLY substrate
-# from which codex spend can reach the ledger. Without it `cost_usd` stays 0.0,
-# the ledger write is gated on `cost > 0` (journal.py), and BOTH spend caps are
-# blind to every codex run by construction (review M1).
-#
-# Three stderr shapes seen across codex-cli versions. The first two are matched
-# WITHIN one line (never spanning lines), so an "input=" from one trace line and
-# an "output=" from another can never be stitched into a fake usage report:
-#   "Token usage: total=52341 input=48000 (+ 12000 cached) output=4341"
-#   "tokens used: 52341"           (older exec builds — total only, no split)
-# The third (codex-cli 0.145.x) puts the count on the NEXT line, so it is the
-# one sanctioned two-line pairing: a bare "tokens used" header followed
-# IMMEDIATELY by a digits-only line — nothing else can pair across lines:
-#   "tokens used\n1,820"
-_TOKEN_SPLIT_RE = re.compile(
-    r"input[\s_-]*(?:tokens)?[=:\s]+([\d,]+)"
-    r"(?:[^\d]{0,20}\+\s*([\d,]+)\s*cached)?"
-    r"[^\d]{0,40}?output[\s_-]*(?:tokens)?[=:\s]+([\d,]+)",
-    re.IGNORECASE,
-)
-_TOKEN_TOTAL_RE = re.compile(
-    r"tokens?[\s_-]*used[=:\s]+([\d,]+)|token[\s_-]*usage[^\d]{0,20}total[=:\s]+([\d,]+)",
-    re.IGNORECASE,
-)
-_TOKEN_HEADER_RE = re.compile(r"^\s*tokens?[\s_-]*used\s*:?\s*$", re.IGNORECASE)
-_TOKEN_BARE_COUNT_RE = re.compile(r"^\s*([\d,]+)\s*$")
-
-
-def _int_tokens(raw: str | None) -> int:
-    if not raw:
-        return 0
-    try:
-        return int(raw.replace(",", ""))
-    except (TypeError, ValueError):
-        return 0
-
-
-def parse_codex_usage(stderr: str) -> dict | None:
-    """Pure: codex stderr → the token counters, or None when codex printed none.
-
-    Shaped like the SDK usage block (`adapters.journal._USAGE_KEYS`) so the
-    journal records codex and Claude runs identically. `total_tokens` is carried
-    ONLY on the older total-only line, where no input/output split exists;
-    `cache_creation_input_tokens` is always 0 (codex reports no such counter, and
-    inventing one would be a fabricated receipt).
-
-    Only a terminal footer is trusted. Codex stderr contains the agent's tool
-    output, including source files and test fixtures with usage-shaped text; a
-    whole-transcript scan prices that echoed DATA as this run's spend and can
-    kill the process on a phantom budget overrun. Rollout counters are the
-    primary source, and this compatibility parser accepts only the final
-    nonblank line (or the final adjacent header/count pair) after process exit.
-    It is never used for in-flight enforcement."""
-    lines = [line for line in (stderr or "").splitlines() if line.strip()]
-    if not lines:
-        return None
-    line = lines[-1]
-    m = _TOKEN_SPLIT_RE.search(line)
-    if m:
-        return {
-            "input_tokens": _int_tokens(m.group(1)),
-            "output_tokens": _int_tokens(m.group(3)),
-            "cache_read_input_tokens": _int_tokens(m.group(2)),
-            "cache_creation_input_tokens": 0,
-            "source": UsageSource.STDERR.value,
-        }
-    m2 = _TOKEN_TOTAL_RE.search(line)
-    if m2:
-        return {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "total_tokens": _int_tokens(m2.group(1) or m2.group(2)),
-            "source": UsageSource.STDERR.value,
-        }
-    if len(lines) < 2 or not _TOKEN_HEADER_RE.match(lines[-2]):
-        return None
-    m3 = _TOKEN_BARE_COUNT_RE.match(line)
-    if not m3:
-        return None
-    return {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "total_tokens": _int_tokens(m3.group(1)),
-        "source": UsageSource.STDERR.value,
-    }
+def _codex_home(codex_home: str | None) -> str:
+    return codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
 
 def _rollout_timestamp(raw: Any) -> float | None:
-    """ISO-8601 rollout timestamp as epoch seconds, or None when malformed."""
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    return stamp.timestamp() if stamp.tzinfo is not None else None
 
 
-def discover_rollout_session(
-    cwd: str,
-    started_at: float,
-    codex_home: str | None = None,
-) -> str:
-    """Find this fresh root ``codex exec`` session from its rollout metadata.
+def discover_rollout_session(cwd: str, started_at: float, codex_home: str | None = None) -> str:
+    """This fresh root `codex exec` session, from its rollout `session_meta`.
 
-    Codex 0.146.0 no longer prints a ``session id:`` header, but persists a
-    machine-readable ``session_meta`` event before doing work. Identity is
-    constrained by originator, exact resolved cwd, and invocation start time.
-    ``source == "exec"`` is also load-bearing: Codex subagents use the same
-    originator and cwd, but carry an object-valued source and commonly create a
-    newer rollout than their parent. A malformed or incomplete candidate is
-    ignored so discovery can retry on the next budget sample.
+    Codex >= 0.146 prints no session header. Identity is the originator, the
+    exact resolved cwd, `source == "exec"` (sub-agents carry an object source)
+    and a start no earlier than this invocation.
     """
     if not cwd:
         return ""
-    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
     target_cwd = os.path.realpath(cwd)
     candidates: list[tuple[float, str]] = []
     try:
-        pattern = os.path.join(home, "sessions", "**", "rollout-*.jsonl")
+        pattern = os.path.join(_codex_home(codex_home), "sessions", "**", "rollout-*.jsonl")
         for path in glob.glob(pattern, recursive=True):
             try:
                 with open(path, encoding="utf-8") as rollout:
@@ -466,7 +332,7 @@ def discover_rollout_session(
                             continue
                         try:
                             event = json.loads(line)
-                        except (json.JSONDecodeError, ValueError):
+                        except ValueError:
                             continue
                         if event.get("type") != "session_meta":
                             continue
@@ -492,30 +358,35 @@ def discover_rollout_session(
     return max(candidates)[1] if candidates else ""
 
 
-def _rollout_event_time(event: dict) -> float:
-    raw = event.get("timestamp")
-    if not isinstance(raw, str):
-        raise ValueError("rollout event lacks a timestamp")
-    stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    if stamp.tzinfo is None:
-        raise ValueError("rollout timestamp is not timezone-aware")
-    return stamp.timestamp()
-
-
 def _rollout_path(session_id: str, codex_home: str | None) -> str | None:
-    """The newest rollout file codex wrote for this session, or None."""
     if not session_id:
         return None
-    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    paths = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*-{session_id}.jsonl"), recursive=True)
+    paths = glob.glob(os.path.join(_codex_home(codex_home), "sessions", "**",
+                                   f"rollout-*-{session_id}.jsonl"), recursive=True)
     return max(paths, key=os.path.getmtime) if paths else None
 
 
-# Provider refusals codex records on the rollout's terminal `task_complete`
-# event as `error.codex_error_info`. The codex client writes it from the
-# provider's response, the same trusted channel as the token counters; agent
-# output never reaches that field. Observed values also include "other", which
-# stays an agent error.
+def _rollout_events(session_id: str, codex_home: str | None, marker: str):
+    """Parsed rollout events whose line contains `marker`; unreadable lines skip."""
+    path = _rollout_path(session_id, codex_home)
+    if path is None:
+        return
+    with open(path) as f:
+        for line in f:
+            if marker not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if isinstance(payload, dict):
+                yield event, payload
+
+
+# Provider refusals codex writes on `task_complete` as `error.codex_error_info`,
+# from the provider's response (the counters' trusted channel; agent output
+# never reaches it). "other" stays an agent error.
 _PROVIDER_MACHINE_FAILURES = frozenset({"server_overloaded", "usage_limit_exceeded"})
 
 
@@ -525,29 +396,18 @@ def read_rollout_provider_failure(
     """The provider refusal that ended this run's last turn, or None.
 
     Only `task_complete` events at or after `since` count, so a resumed
-    session's earlier overloaded turn never classifies this run. Unreadable
-    evidence reads as None: the run keeps its ordinary classification.
+    session's earlier overloaded turn never classifies this run.
     """
     try:
-        path = _rollout_path(session_id, codex_home)
-        if path is None:
-            return None
         last: object = None
-        with open(path) as f:
-            for line in f:
-                if '"task_complete"' not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    payload = event.get("payload") or {}
-                    if payload.get("type") != "task_complete":
-                        continue
-                    if since is not None and _rollout_event_time(event) < since:
-                        continue
-                except (ValueError, TypeError, AttributeError):
-                    continue
-                error = payload.get("error")
-                last = error.get("codex_error_info") if isinstance(error, dict) else None
+        for event, payload in _rollout_events(session_id, codex_home, '"task_complete"'):
+            if payload.get("type") != "task_complete":
+                continue
+            stamp = _rollout_timestamp(event.get("timestamp"))
+            if since is not None and (stamp is None or stamp < since):
+                continue
+            error = payload.get("error")
+            last = error.get("codex_error_info") if isinstance(error, dict) else None
         return last if isinstance(last, str) and last in _PROVIDER_MACHINE_FAILURES else None
     except Exception:  # noqa: BLE001 — classification evidence must never kill a run
         return None
@@ -556,48 +416,25 @@ def read_rollout_provider_failure(
 def read_rollout_usage(
     session_id: str, codex_home: str | None = None, *, until: float | None = None
 ) -> dict | None:
-    """Exact token counters from codex's own session rollout file, or None.
+    """The session's cumulative token counters from its rollout, or None.
 
-    codex-cli persists `token_count` events (with a cumulative
-    `total_token_usage` split) to
-    `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`. This is
-    the PREFERRED usage source: the stderr line degraded to a total-only shape
-    in codex-cli 0.145 and a total priced at max(rate_in, rate_out) counts
-    cached reads at the $30/MTok output rate — a single warm resolve (~1.6M
-    total, ~99% cached input) would ledger ≈$48 and spuriously trip the $50
-    issue cap, where the real split prices it ≈$8.
-
-    Last `token_count` wins: the counter is cumulative for the session, same
-    convention as the stderr line (see parse_codex_usage). Any failure — no
-    session id, no file, unparseable lines — reads as None so the caller falls
-    back to stderr parsing; losing precision must never lose the run.
-
-    `until` excludes counters after the recorded end without erasing earlier
-    usage. Untimestamped counters cannot establish this run's invocation window.
+    The last valid timestamped `token_count` wins (the counter is cumulative).
+    `until` excludes counters after the run's recorded end, which a later leg
+    resuming the same session may have written.
     """
     try:
-        path = _rollout_path(session_id, codex_home)
-        if path is None:
-            return None
         found: dict | None = None
-        with open(path) as f:
-            for line in f:
-                if '"token_count"' not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    payload = event.get("payload") or {}
-                    if payload.get("type") != "token_count":
-                        continue
-                    observed_at = _rollout_event_time(event)
-                    if until is not None and observed_at > until:
-                        continue
-                    total = (payload.get("info") or {}).get("total_token_usage")
-                    normalize_usage(total)
-                except (ValueError, TypeError, AttributeError):
-                    continue
+        for event, payload in _rollout_events(session_id, codex_home, '"token_count"'):
+            if payload.get("type") != "token_count":
+                continue
+            stamp = _rollout_timestamp(event.get("timestamp"))
+            if stamp is None or (until is not None and stamp > until):
+                continue
+            total = (payload.get("info") or {}).get("total_token_usage")
+            if (isinstance(total, dict) and type(total.get("input_tokens")) is int
+                    and type(total.get("output_tokens")) is int):
                 found = total
-        if not found:
+        if found is None:
             return None
         return {
             "input_tokens": found["input_tokens"],
@@ -606,336 +443,45 @@ def read_rollout_usage(
             "cache_creation_input_tokens": found.get("cache_write_input_tokens", 0),
             "source": UsageSource.ROLLOUT.value,
         }
-    except Exception:  # noqa: BLE001 — accounting fallback must never kill a run
+    except Exception:  # noqa: BLE001 — losing precision must never lose the run
         return None
 
 
-def read_rollout_turns(session_id: str, codex_home: str | None = None) -> int | None:
-    """Model turns recorded in codex's session rollout, or None if unavailable.
-
-    Codex writes one cumulative ``token_count`` event after each model response.
-    Counting those events gives the same operator-facing quantity as the SDK's
-    ``num_turns``: paid model invocations, including tool-use continuations.
-    The count is kept separate from token parsing so a malformed usage payload
-    cannot erase otherwise observable turn telemetry.
-    """
-    try:
-        path = _rollout_path(session_id, codex_home)
-        if path is None:
-            return None
-        turns = 0
-        with open(path) as f:
-            for line in f:
-                if '"token_count"' not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                payload = event.get("payload") or {}
-                info = payload.get("info") or {}
-                if (
-                    payload.get("type") == "token_count"
-                    and info.get("last_token_usage") is not None
-                ):
-                    turns += 1
-        return turns
-    except Exception:  # noqa: BLE001 — telemetry fallback must never kill a run
-        return None
+_USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
 
 def usage_delta(end: dict | None, start: dict | None) -> dict | None:
-    """Pure: end-of-run counters minus a pre-run baseline, floored at zero.
+    """Pure: end counters minus the resumed session's baseline, floored at zero.
 
-    A follow-up leg (fix-ci/address-review/rebase) RESUMES the resolve's codex
-    session, and the rollout's `total_token_usage` is cumulative for the whole
-    session — so pricing the raw counter re-ledgers every token the previous
-    leg already paid for (observed 2026-07-27: a 114s fix-ci ledgered $39.57
-    because it carried its resolve's 6M tokens). The ledger wants per-leg
-    spend; the delta is that. `None` end stays None (no usage reported); a
-    missing baseline means the run started its own session — nothing to
-    subtract."""
+    A follow-up leg resumes the resolve's session, whose counter is cumulative:
+    pricing it raw re-ledgers every token an earlier leg already paid for
+    (2026-07-27: a 114s fix-ci ledgered $39.57 of its resolve's tokens).
+    """
     if not isinstance(end, dict):
         return None
     if not isinstance(start, dict):
         return end
-    keys = (
-        "input_tokens",
-        "output_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-        "total_tokens",
-    )
-    delta = {
-        key: max(
-            0,
-            int(end.get(key, 0) or 0) - int(start.get(key, 0) or 0),
-        )
-        for key in keys
+    delta: dict[str, Any] = {
+        key: max(0, int(end.get(key, 0) or 0) - int(start.get(key, 0) or 0))
+        for key in _USAGE_KEYS
         if key in end or key in start
     }
-    source = end.get("source")
-    if isinstance(source, str):
-        delta["source"] = source
+    if isinstance(end.get("source"), str):
+        delta["source"] = end["source"]
     return delta
 
 
-def codex_cost_usd(
-    usage: dict | None,
-    *,
-    cost_per_mtok_in: float,
-    cost_per_mtok_out: float,
-    cost_per_mtok_cached_in: float | None = None,
-) -> float:
-    """Pure: token counters × the configured USD-per-MILLION-token rates.
-
-    Both rates 0 → 0.0: an operator who zeroes the price table opts out of
-    codex spend tracking entirely, and the caps cannot see this runtime. HarnessConfig
-    ships non-zero list-price defaults, so this is an explicit choice, not the
-    common path.
-
-    Cache-read tokens are included in `input_tokens`; when the rollout reports
-    their count they are charged at the configured cached-input rate. Omitting
-    that rate uses one tenth of the normal input rate, matching Codex list
-    pricing. A rollout without cache-read tokens continues to charge all input
-    at the normal rate.
-
-    An older codex that printed only a TOTAL is priced at the HIGHER of the two
-    rates. Caps exist to stop runaway spend, so the only safe rounding direction
-    is over-estimation — an under-counted cap is a cap that never fires."""
-    if (
-        not isinstance(usage, dict)
-        or usage.get("source") == UsageSource.STDERR.value
-    ):
-        return 0.0
-    rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
-    rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
-    rate_cached_in = (
-        rate_in / 10 if cost_per_mtok_cached_in is None else float(cost_per_mtok_cached_in)
-    )
-    # A zero, negative or NaN cache rate would price cache reads FREE, which
-    # under-counts the leg — charge them at the full input rate instead. The
-    # configuration is rejected at parse time; this keeps a programmatic caller
-    # erring in the over-estimating direction too.
-    if not rate_cached_in > 0:
-        rate_cached_in = rate_in
-    if rate_in <= 0 and rate_out <= 0:
-        return 0.0
-    tokens_in = int(usage.get("input_tokens", 0) or 0)
-    tokens_out = int(usage.get("output_tokens", 0) or 0)
-    if tokens_in or tokens_out:
-        # Cached input reads are already inside `input_tokens` on the codex line
-        # (it prints "input=N (+ M cached)"), so price that contained portion at
-        # the cache tier without adding it a second time. A counter that is
-        # negative, or larger than the input total that must contain it, is
-        # telemetry we cannot trust: distrust it entirely and charge ALL input at
-        # the full rate rather than discount input the run may never have cached.
-        cached_in = int(usage.get("cache_read_input_tokens", 0) or 0)
-        if cached_in < 0 or cached_in > tokens_in:
-            cached_in = 0
-        uncached_in = tokens_in - cached_in
-        return (
-            uncached_in * rate_in + cached_in * rate_cached_in + tokens_out * rate_out
-        ) / 1_000_000.0
-    total = int(usage.get("total_tokens", 0) or 0)
-    return total * max(rate_in, rate_out) / 1_000_000.0
-
-
-def budget_overrun_usd(
-    usage: dict | None,
-    *,
-    cost_per_mtok_in: float,
-    cost_per_mtok_out: float,
-    cost_per_mtok_cached_in: float | None = None,
-    max_budget_usd: float,
-) -> float | None:
-    """Pure: this leg's spend so far IF it has already crossed `max_budget_usd`,
-    else None. The decision half of #29's mid-run budget check.
-
-    `usage` must ALREADY be the per-leg delta (see `usage_delta`), not a resumed
-    session's cumulative counter — the budget is a per-run bound, and a fix-ci
-    leg must not be killed on the resolve's tokens that a previous leg already
-    ledgered.
-
-    Two silences, both deliberate:
-
-    - `max_budget_usd <= 0` — no bound was configured, so there is nothing to
-      cross.
-    - the priced spend is 0 — either no usage has been reported yet, or the
-      price table is zeroed. A cap measured in dollars cannot bound a
-      runtime whose every run reads as free; staying silent keeps that
-      opt-out "unbounded" rather than "bounded by a number nobody can
-      measure".
-
-    Returns the spend rather than a bool so the caller can report what the run
-    had actually burned when it was stopped — a kill that cannot say how much
-    it cost is not evidence of anything."""
-    if (
-        max_budget_usd <= 0
-        or not isinstance(usage, dict)
-        or usage.get("source") == UsageSource.STDERR.value
-    ):
-        return None
-    rate_in = max(float(cost_per_mtok_in or 0), 0)
-    rate_out = max(float(cost_per_mtok_out or 0), 0)
-    rate_cached = (
-        rate_in / 10
-        if cost_per_mtok_cached_in is None
-        else float(cost_per_mtok_cached_in)
-    )
-    if not rate_cached > 0:
-        rate_cached = rate_in
-    if min(rate_in, rate_out, rate_cached) <= 0:
-        return None
-    tokens_in = int(usage.get("input_tokens", 0) or 0)
-    tokens_out = int(usage.get("output_tokens", 0) or 0)
-    if tokens_in or tokens_out:
-        cached = int(usage.get("cache_read_input_tokens", 0) or 0)
-        if cached < 0 or cached > tokens_in:
-            cached = 0
-        normalized = TokenUsage(
-            tokens_in - cached,
-            tokens_out,
-            cached,
-            0,
-            UsageSource.ROLLOUT,
-        )
-        rates = ModelRates(
-            usd_per_million_to_micros(rate_in),
-            usd_per_million_to_micros(rate_out),
-            usd_per_million_to_micros(rate_cached),
-            usd_per_million_to_micros(rate_in),
-        )
-    else:
-        total = int(usage.get("total_tokens", 0) or 0)
-        if total <= 0:
-            return None
-        conservative = max(rate_in, rate_out)
-        normalized = TokenUsage(
-            0, total, source=UsageSource.ROLLOUT
-        )
-        rates = ModelRates(
-            usd_per_million_to_micros(conservative),
-            usd_per_million_to_micros(conservative),
-            usd_per_million_to_micros(conservative),
-            usd_per_million_to_micros(conservative),
-        )
-    maximum = Money.from_major("USD", max_budget_usd)
-    sample = BudgetSentinel(lambda: normalized, rates, maximum).sample()
-    if sample is None:
-        return None
-    return sample[1].micros / 1_000_000
-
-
-def rates_for_model(
-    model: str | None,
-    table: tuple[tuple[str, float, float], ...] | None,
-    *,
-    fallback_in: float,
-    fallback_out: float,
-) -> tuple[float, float]:
-    """Pure: the (in, out) USD-per-MTok rates for one leg (#43)."""
-
-    key = (model or "").strip().casefold()
-    if key:
-        for name, rate_in, rate_out in with_default_model_rates(table or ()):
-            if name.strip().casefold() == key:
-                return rate_in, rate_out
-    return fallback_in, fallback_out
-
-
-def rates_with_cache_for_model(
-    model: str | None,
-    table: tuple[tuple[str, float, float], ...] | None,
-    cached_table: tuple[tuple[str, float], ...] | None,
-    *,
-    fallback_in: float,
-    fallback_out: float,
-) -> tuple[float, float, float]:
-    """Resolve cache-aware rates while retaining the legacy two-rate helper.
-
-    A table entry that prices cache reads at $0 or below is treated as absent
-    and charged at the full input rate: config rejects that entry at parse time,
-    and the budget check must stay armed on a rate that over-estimates rather
-    than disarm on one that reads as free."""
-    rate_in, rate_out = rates_for_model(
-        model, table, fallback_in=fallback_in, fallback_out=fallback_out
-    )
-    key = (model or "").strip().casefold()
-    for name, rate_cached_in in cached_table or ():
-        if name == key:
-            return rate_in, rate_out, rate_cached_in if rate_cached_in > 0 else rate_in
-    return rate_in, rate_out, default_cache_read_rate(model, rate_in)
-
-
-# ── the runtime could not start (keifu #130) ─────────────────────────────────
-# 2026-08-02: a broken `codex` binary answered three resolve dispatches on issue
-# #130 with an instant HTTP 400 — non-zero exit, no envelope, no session id, no
-# tokens, $0. They were classed AGENT_ERROR, marched the resolve breaker, and
-# the first HEALTHY dispatch hours later escalated `resolve failed 3×` to a
-# human. The same phantom count is router difficulty evidence.
-#
-# Classified POSITIVELY, from a signature, and never from the mere absence of
-# evidence: an ordinary codex failure often leaves nothing behind but a stderr
-# trace, and treating "we saw nothing" as "it never ran" would exempt every
-# genuine agent error from every breaker — an unbounded paid loop, the exact
-# failure the breakers exist to stop.
-#
-# Keep this list SHORT and specific, like DETERMINISTIC_DEATH_SIGNATURES: a
-# false positive here buys an unwinnable dispatch, spaced by the machine
-# backoff, until the money caps stop it. Everything unrecognised stays AGENT_ERROR — today's behaviour.
-#
-# ONE entry, on purpose. The obvious additions — "exec format error", "no such
-# file or directory", "command not found" — are all UNREACHABLE from the
-# runtime on the paid path: `supervised_exec` fails a bad exec with a silent
-# `os._exit(127)` and the unsupervised path raises `FileNotFoundError` before
-# this function is ever called. Nothing but codex's stream of the AGENT's tool
-# output can produce those strings (`bash: cargo: command not found`, a
-# failing test's traceback), so listing them would add no coverage and a
-# laundering channel: agent-authored text buying a real failure out of its
-# breaker. The missing-binary case is covered by exit code instead, below.
-_RUNTIME_FAULT_SIGNATURES: tuple[str, ...] = (
-    "unexpected status 400 bad request",  # the #130 shape: broken client build
-)
-
-# `supervised_exec`'s child exits 127 without writing anything when it cannot
-# exec the binary at all. A non-zero exit with NO output on any stream and no
-# session is not something a model can produce.
+# A runtime that never got a session off the ground is a machine failure
+# (keifu #130: a broken binary answered with an instant HTTP 400). Classified
+# only from a positive signature in the stderr TAIL, guarded by "no session
+# evidence at all"; strings agent output can produce are deliberately absent.
+_RUNTIME_FAULT_SIGNATURES: tuple[str, ...] = ("unexpected status 400 bad request",)
+# `supervised_exec` exits 127 silently when it cannot exec the binary.
 _EXEC_FAILURE_EXIT_CODE = 127
 
 
-def _runtime_could_not_start(
-    *,
-    exit_code: int,
-    session_id: str,
-    usage: dict | None,
-    cost: float,
-    raw: str,
-    stderr: str,
-) -> bool:
-    """Whether this non-zero exit is the RUNTIME failing rather than the agent.
-
-    Guarded first by `no_session_evidence`: a run that produced a session id,
-    tokens, spend or output made an attempt, whatever it then printed. Past
-    that guard, either of two POSITIVE observations classifies it:
-
-    1. a silent exec failure — exit 127 with nothing on stderr either;
-    2. a known runtime-fault signature in the stderr TAIL.
-
-    The tail window is the M17 discipline: codex streams the agent's entire
-    tool output to stderr, so matching the whole buffer would let the agent's
-    own text decide retry policy. A fatal startup error is the last thing codex
-    prints before exiting.
-
-    Absence of evidence is never sufficient on its own. An ordinary codex
-    failure often leaves nothing behind but a stderr trace, and treating "we
-    saw nothing" as "it never ran" would exempt every genuine agent error from
-    every breaker — an unbounded paid loop, the exact failure the breakers
-    exist to stop.
-    """
-    if not no_session_evidence(
-        session_id=session_id, usage=usage, cost_usd=cost, output=raw
-    ):
+def _runtime_could_not_start(*, exit_code: int, session_id: str, usage: dict | None, raw: str, stderr: str) -> bool:
+    if not no_session_evidence(session_id=session_id, usage=usage, output=raw):
         return False
     if exit_code == _EXEC_FAILURE_EXIT_CODE and not (stderr or "").strip():
         return True
@@ -949,22 +495,11 @@ def parse_codex_envelope(
     last_message: str,
     session_id: str = "",
     stderr: str = "",
-    cost_per_mtok_in: float = 0.0,
-    cost_per_mtok_out: float = 0.0,
-    cost_per_mtok_cached_in: float | None = None,
     usage: dict | None = None,
 ) -> AgentResult:
-    """Pure: codex exec result → AgentResult. Mirrors result_to_agent_result —
-    decision read from the ENVELOPE (the -o JSON), not the exit code. is_error
-    only when there is no parseable envelope AND exit was non-zero, OR the
-    envelope itself signals an error status.
-
-    Token usage: a caller-supplied `usage` (the exact split from the session
-    rollout file, see read_rollout_usage) wins; otherwise stderr telemetry is
-    retained but explicitly tagged as untrusted. Stderr includes arbitrary
-    agent-controlled output, so it is never priced or used for a budget verdict.
-    A run that died still carries trustworthy rollout usage on every return
-    path, not just the happy one."""
+    """Pure: codex exec result -> AgentResult, decided from the `-o` envelope,
+    never the exit code. An error only when no envelope parsed and the exit
+    was non-zero, or the envelope declares `error`. Pricing happens in `run`."""
     structured: dict | None = None
     raw = (last_message or "").strip()
     if raw:
@@ -972,174 +507,75 @@ def parse_codex_envelope(
             obj = json.loads(raw)
             if isinstance(obj, dict):
                 structured = obj
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             structured = None
-
-    if usage is not None:
-        usage = {
-            **usage,
-            "source": str(
-                usage.get("source") or UsageSource.ROLLOUT.value
-            ),
-        }
-    else:
-        usage = parse_codex_usage(stderr)
-    cost = codex_cost_usd(
-        usage,
-        cost_per_mtok_in=cost_per_mtok_in,
-        cost_per_mtok_out=cost_per_mtok_out,
-        cost_per_mtok_cached_in=cost_per_mtok_cached_in,
-    )
-
     if structured is None:
-        # No envelope. If codex also exited non-zero, it's a genuine failure;
-        # otherwise surface the free text as the summary (best-effort).
         if exit_code != 0:
-            # …unless the RUNTIME could not run the leg at all, in which case
-            # the failure measures the harness, not the issue (keifu #130). See
-            # `_runtime_could_not_start` for the two-part rule.
             stillborn = _runtime_could_not_start(
-                exit_code=exit_code, session_id=session_id, usage=usage,
-                cost=cost, raw=raw, stderr=stderr,
+                exit_code=exit_code, session_id=session_id, usage=usage, raw=raw, stderr=stderr,
             )
             return AgentResult(
                 is_error=True,
                 summary=(stderr.strip() or raw or f"codex exec exit {exit_code}")[:2000],
                 session_id=session_id,
-                cost_usd=cost,
                 usage=usage,
-                exit_reason=(
-                    ExitReason.RUNTIME_UNAVAILABLE
-                    if stillborn
-                    else ExitReason.AGENT_ERROR
-                ),
+                exit_reason=ExitReason.RUNTIME_UNAVAILABLE if stillborn else ExitReason.AGENT_ERROR,
             )
-        return AgentResult(
-            is_error=False, summary=raw[:2000], session_id=session_id,
-            cost_usd=cost, usage=usage,
-            exit_reason=ExitReason.OK,
-        )
-
+        return AgentResult(is_error=False, summary=raw[:2000], session_id=session_id,
+                           usage=usage, exit_reason=ExitReason.OK)
     status = declared_status(structured)
-    summary = str(structured.get("summary", "") or "")
-    needs = str(structured.get("needs", "") or "")
     is_error = status == "error"
     return AgentResult(
         is_error=is_error,
         status=status,
-        summary=summary,
-        needs=needs,
-        # Priced from the token counters codex prints (review M1): 0.0 only when
-        # no rates are configured or codex printed no usage line.
-        cost_usd=cost,
+        summary=str(structured.get("summary", "") or ""),
+        needs=str(structured.get("needs", "") or ""),
         usage=usage,
         session_id=session_id,
         structured=structured,
-        # A parsed envelope means the agentic loop reached its own terminal —
-        # including `blocked`, which is a normal completion, not a failure to run.
+        # A parsed envelope (including `blocked`) is the loop's own terminal.
         exit_reason=ExitReason.AGENT_ERROR if is_error else ExitReason.OK,
     )
 
 
 @dataclass
 class CodexRunner(AgentRuntime):
-    """Runs fixer tasks over `codex exec`. `provider`/`sandbox`/`model` are
-    process-level config; the task's CODEX_HOME is prepared by
-    `codex_home.CodexHomeRuntime`. All subprocess/IO
-    lives in `run`; `build_codex_argv` + `parse_codex_envelope` stay pure."""
+    """Runs tasks over `codex exec`. The task's CODEX_HOME is prepared by
+    `codex_home.CodexHomeRuntime`; all subprocess I/O lives here."""
 
     codex_bin: str = "codex"
     provider: CodexProvider = field(default_factory=CodexProvider)
     sandbox: str = DEFAULT_SANDBOX
-    default_model: str = DEFAULT_CODEX_MODEL
+    default_model: str = ""
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     env: dict[str, str] = field(default_factory=dict)
-    # When the AGENT.md contract is delivered via worktree AGENTS.override.md (the
-    # default for the fix daemon), set False so the prompt isn't ALSO prepended
-    # with it. True keeps the standalone prepend (e.g. tests / no project-doc use).
+    # False when the contract is delivered as CODEX_HOME developer_instructions.
     inject_system_prompt: bool = True
-    # Diagnostics: `log` is a str->None sink (stderr in prod). codex stderr is
-    # streamed LIVE (not buffered to exit) — milestone lines (TEST_CMD runs,
-    # commits, patches) always surface; `debug` adds the full verbose trace.
     log: Any = None
     debug: bool = False
-    # Idle watchdog: max seconds between codex stderr events before we call it a
-    # hang and kill the subprocess (not a total-runtime cap). None disables.
-    # Measured against the WALL clock (see wall_clock) so it survives laptop sleep —
-    # the monotonic clock freezes during macOS suspend, which would otherwise delay
-    # post-wake recovery by a full idle window (same fix as the Claude AgentRunner).
+    # Idle watchdog (seconds between stderr events) and total-runtime cap, both
+    # on the WALL clock so a laptop suspend counts (the monotonic clock freezes
+    # on macOS sleep). A limping stream defeats the idle cap; only the wall cap
+    # bounds it (FAILURE-MODES #60). None disables either.
     idle_timeout: float | None = None
-    # Total-runtime ceiling, the cap the idle watchdog cannot provide: a gateway
-    # stream that "limps" (a stderr line every few minutes) resets the idle clock
-    # forever and runs unbounded (FAILURE-MODES #60). Only elapsed wall time bounds
-    # that. Enforced in the same stderr pump, with the same killpg teardown. None
-    # disables. See AGENT_MAX_RUNTIME_SECONDS.
     max_runtime: float | None = None
-    # Injected wall clock (time.time) + poll slice for the idle watchdog: we wait for
-    # the next stderr line in `poll_slice` chunks and re-check wall-clock elapsed each
-    # chunk, so a sleep-spanning gap trips promptly on wake rather than after a fresh
-    # monotonic window. Injectable for tests.
     wall_clock: Any = None
     poll_slice: float = 30.0
-    # Post-stderr stdout-drain cap: once _pump_stderr has finished (EOF or idle
-    # kill), stdout normally hits EOF at once — but a descendant that survived the
-    # killpg and still holds the pipe could block the read forever. This bounds ONLY
-    # that residual drain; it is NOT a ceiling on the live run (the idle watchdog is).
-    # Active only when idle_timeout is set (matches the watchdog being enabled).
+    # Bounds only the residual stdout drain after stderr ends: a descendant that
+    # survived the group kill may hold the pipe forever.
     post_hang_drain_timeout: float = 30.0
-    # Gateway transport-drop retry. A `response.failed` / `stream disconnected`
-    # from the LLM gateway is upstream, not an agent error; codex's own in-TCP
-    # reconnects don't recover it, but a fresh `codex exec` (resumed) does. Retry
-    # up to `transport_retries` times with jittered exponential backoff
-    # (delay = backoff_base * 2**attempt + U[0, delay/2]). 0 disables the loop.
-    transport_retries: int = 4
-    # `codex exec resume` necessarily bypasses the sandbox because its grammar
-    # has no --sandbox form. Fix worktrees opt into recovery-by-resume; the
-    # read-only reviewer deliberately retries as a fresh sandboxed session.
+    transport_retries: int = _TRANSPORT_RETRIES
+    # `codex exec resume` bypasses the sandbox (no --sandbox form), so only the
+    # fix worktree recovers by resume; the read-only reviewer restarts fresh.
     resume_on_retry: bool = True
-    backoff_base: float = 2.0
-    # Rate-limit (HTTP 429) backoff — DISTINCT from the network-drop backoff above.
-    # A 429 must wait for the provider's throttle window to renew (Azure GPT-5.5:
-    # 60s), not the ~2s network base, or every retry lands inside the same throttled
-    # window and fails (observed: 345 rebase burned all 5 retries on a 60s window).
-    # We honour a parsed Retry-After when present, else wait rate_limit_backoff_base
-    # * (attempt+1), capped at max_rate_limit_wait. A rate-limited attempt does NOT
-    # consume the transport-retry budget (it's provider pushback, not a flaky
-    # connection) — bounded instead by max_rate_limit_retries.
-    rate_limit_backoff_base: float = 60.0
-    max_rate_limit_wait: float = 180.0
-    max_rate_limit_retries: int = 5
-    # Price table for codex spend (review M1 / D12), USD per MILLION tokens. Both
-    # 0 (the default) → cost_usd stays 0.0 and codex runs never reach the ledger,
-    # so the caps cannot see codex. Set them and every codex run becomes visible
-    # to both spend caps.
-    cost_per_mtok_in: float = 0.0
-    cost_per_mtok_out: float = 0.0
-    # PER-MODEL overrides of the scalar rates above (#43): (model, in, out, cached-in), USD
-    # per MILLION tokens. Each leg is priced with the model it actually ran
-    # (`task.model or self.default_model`), so a routed deployment's ledger can
-    # be split by tier. Empty (the default) → the scalars price everything,
-    # unchanged.
-    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
-    cost_per_mtok_cached_in: tuple[tuple[str, float], ...] | None = None
-    # Per-run spend ceiling (#29). codex has no per-session budget FLAG, so the
-    # only way `RuntimePlan.max_budget_usd` can bound a run is for us to watch the
-    # session's own streamed token counters and kill it. With this True (the
-    # default) the stderr pump samples those counters on the poll-slice cadence
-    # and, once THIS LEG's priced spend crosses the task budget, kills the
-    # process group and returns ExitReason.BUDGET_EXHAUSTED — the same exit the
-    # Claude SDK's `error_max_budget_usd` maps to, so retry/escalation needs no
-    # codex special case. False (CODEX_ENFORCE_BUDGET=0) keeps the old
-    # behaviour where the wall cap is the only per-run bound. Also inert when
-    # the price table is zeroed — see
-    # `budget_overrun_usd` for why a $0.00-per-run runtime must not be killed
-    # on a dollar threshold.
-    enforce_budget: bool = True
+    backoff_base: float = _BACKOFF_BASE
+    rate_limit_backoff_base: float = _RATE_LIMIT_BASE
+    max_retry_wait: float = _MAX_RETRY_WAIT
     process_supervisor: Any = None
-    # Accounting writes a reservation identity into RuntimePlan.env. Persisting
-    # its rollout coordinates here lets boot recovery settle measured usage
-    # after SIGKILL or machine loss, before releasing the reservation.
+    # Where the leg's rollout coordinates are persisted, so boot recovery can
+    # settle measured usage after SIGKILL or machine loss.
     spend_evidence_dir: str = ""
+    # The rate card both the mid-run budget kill and settlement price with.
     rate_table: RateTable | None = None
 
     def __post_init__(self) -> None:
@@ -1147,24 +583,8 @@ class CodexRunner(AgentRuntime):
         self._wall_clock = self.wall_clock or time.time
 
     def _resolved_model(self, task: RuntimePlan) -> str:
-        """The model this leg ACTUALLY runs on. An unpinned task carries
-        model=None and codex is invoked with the runner's default, so anything
-        that reports or prices a leg — commit attribution, the exec log, the
-        rate table, the journal — has to ask here rather than read task.model
-        and get None (#43)."""
+        """The model the leg actually runs on (an unpinned task carries None)."""
         return task.model or self.default_model
-
-    def _native_rates(self, model: str) -> RateTable | None:
-        if self.rate_table is not None:
-            return self.rate_table
-        rates = {}
-        for name in {model.strip().casefold() or "<runtime-default>"} | {row[0].strip().casefold() for row in with_default_model_rates(self.cost_per_mtok)}:
-            inputs, outputs, cached = rates_with_cache_for_model(name, self.cost_per_mtok, self.cost_per_mtok_cached_in,
-                fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out)
-            if min(inputs, outputs, cached) > 0:
-                rates[name] = ModelRates(*(usd_per_million_to_micros(value) for value in
-                    (inputs, outputs, cached, default_cache_write_rate(name, inputs))))
-        return RateTable("codex-config", "legacy", "USD", rates) if rates else None
 
     def _child_environment(self, task: RuntimePlan) -> dict[str, str]:
         return child_process_env(
@@ -1175,17 +595,14 @@ class CodexRunner(AgentRuntime):
 
     @staticmethod
     def _accounting_home(environment: dict[str, str], cwd: str | None) -> str:
-        # An explicit empty CODEX_HOME resets to the child's HOME, not the carrier's.
+        # An explicit empty CODEX_HOME resets to the child's HOME; codex
+        # resolves a relative home from its execution directory.
         home = environment.get("CODEX_HOME") or os.path.join(
             environment.get("HOME") or os.path.expanduser("~"), ".codex",
         )
-        # Codex resolves relative homes from its execution directory.
         return os.path.realpath(os.path.join(cwd or os.getcwd(), home))
 
     def _pump_slice(self) -> float:
-        """How long one stderr-readline chunk blocks. The poll slice floored by
-        whichever caps are armed, so a cap SHORTER than the slice still trips on
-        time instead of waiting out a full slice."""
         caps = [self.poll_slice]
         if self.idle_timeout is not None:
             caps.append(self.idle_timeout)
@@ -1193,657 +610,235 @@ class CodexRunner(AgentRuntime):
             caps.append(self.max_runtime)
         return min(caps)
 
-    def _usage_so_far(
-        self,
-        err_chunks: list[str],
-        usage_baseline: tuple[str, dict, int | None] | None,
-        session_id: str = "",
-        codex_home: str | None = None,
-    ) -> dict | None:
-        """THIS LEG's token counters as of right now, or None if nothing has
-        been reported yet (#29).
-
-        Deliberately the same arithmetic the end-of-run accounting does, in the
-        same order — rollout file, then the resumed session's already-ledgered
-        baseline subtracted (`usage_delta`). The
-        number the budget check compares against has to be the number that will
-        reach the ledger, or the harness would kill runs on a figure the
-        operator can never reconcile with the ledger's.
-
-        The baseline subtraction is the load-bearing part: a resumed session's
-        `total_token_usage` is CUMULATIVE, so without it every fix-ci /
-        address-review / rebase leg would be killed on its resolve's tokens the
-        first time it sampled.
-
-        The caller supplies rollout-discovered identity on headerless Codex
-        versions. Stderr is retained only as compatibility identity input for
-        older versions; usage-shaped stderr is never trusted mid-run because it
-        also contains arbitrary agent/test output."""
-        stderr = "\n".join(err_chunks)
-        sid = session_id or _session_id_from_lines(stderr)
-        usage = (
-            read_rollout_usage(sid, codex_home=codex_home)
-            if sid
-            else None
-        )
-        if usage_baseline is not None and sid == usage_baseline[0]:
-            usage = usage_delta(usage, usage_baseline[1])
-        return usage
-
     def _log_codex_line(self, line: str) -> None:
-        """Classify one live stderr line from `codex exec` and log it. Codex is a
-        Node subprocess (no Python API), so its stderr is our only window into the
-        agentic loop. MILESTONE lines (a TEST_CMD/pytest run, a commit, a patch,
-        an exec) are ALWAYS surfaced — the visibility the operator actually needs;
-        everything else is logged only under debug (verbose full trace)."""
+        """Surface milestone stderr lines (test runs, commits, patches) always;
+        everything else only under debug."""
         s = line.strip()
         if not s:
             return
         low = s.lower()
-        # Milestones worth seeing even without debug: test runs, commits, patches.
-        is_test = ("pytest" in low or "tsc -b" in low or "test_cmd" in low
-                   or "uv run" in low and "test" in low)
-        is_commit = "git commit" in low or low.startswith(("plan:", "red:", "green:", "docs:"))
-        is_patch = "apply_patch" in low or low.startswith("exec ")
-        if is_test:
+        if "pytest" in low or "tsc -b" in low or "test_cmd" in low or ("uv run" in low and "test" in low):
             self._log(f"codex TEST_CMD: {s[:200]}")
-        elif is_commit:
+        elif "git commit" in low or low.startswith(("plan:", "red:", "green:", "docs:")):
             self._log(f"codex commit: {s[:200]}")
-        elif is_patch:
+        elif "apply_patch" in low or low.startswith("exec "):
             self._log(f"codex tool: {s[:200]}")
         elif self.debug:
             self._log(f"codex| {s[:200]}")
 
     def preflight(self) -> str | None:
-        """Return a human-readable reason the Codex runtime is NOT usable, or None
-        if it looks ready. Checked once at startup so a misconfig is a clear log
-        line, not an opaque per-issue `codex exec exit 1`. Non-fatal: the caller
-        logs it; the daemon still starts (the operator can fix the env and the
-        next dispatch works)."""
+        """Why the runtime is NOT usable, or None. Logged at startup; a run
+        that finds it unready returns RUNTIME_UNAVAILABLE (a machine failure)."""
         import shutil
 
         if shutil.which(self.codex_bin) is None:
-            return (
-                f"codex binary '{self.codex_bin}' not found on PATH — install the "
-                "Codex CLI or set CODEX_BIN. (FIXER_RUNTIME=codex)"
-            )
+            return (f"codex binary '{self.codex_bin}' not found on PATH — install the "
+                    "Codex CLI or set CODEX_BIN.")
         key_var = self.provider.env_key
-        configured_key = self.env.get(key_var)
-        inherited_key = os.environ.get(key_var)
+        if self.env.get(key_var) or os.environ.get(key_var):
+            return None
         if not self.provider.base_url:
-            # OAuth mode (no custom gateway): codex authenticates from the
-            # credentials `codex login` stored. An env key ALSO satisfies it
-            # (codex accepts either), so only the absence of both is fatal.
-            auth_file = self.oauth_auth_file()
-            if configured_key or inherited_key or auth_file:
+            if self.oauth_auth_file():
                 return None
-            auth_file = os.path.join(
-                os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"),
-                "auth.json",
-            )
-            return (
-                f"codex has no credentials — no {auth_file} (run `codex login`) "
-                f"and {key_var} is unset. (FIXER_RUNTIME=codex, default provider)"
-            )
-        if not configured_key and not inherited_key:
-            return (
-                f"{key_var} is unset — the Codex fixer cannot authenticate to "
-                f"{self.provider.base_url}. Export {key_var} (or ANTHROPIC_AUTH_TOKEN, "
-                "which shared.env aliases) in the launching shell. (FIXER_RUNTIME=codex)"
-            )
-        return None
+            auth_file = os.path.join(_codex_home(None), "auth.json")
+            return f"codex has no credentials — no {auth_file} (run `codex login`) and {key_var} is unset."
+        return (f"{key_var} is unset — the Codex runtime cannot authenticate to "
+                f"{self.provider.base_url}. Export {key_var} in the launching shell.")
 
     def oauth_auth_file(self) -> str:
-        """Existing Codex-login file used by the isolated CODEX_HOME."""
-
+        """The `codex login` file the isolated CODEX_HOME links, if any."""
         if self.provider.base_url:
             return ""
         key_var = self.provider.env_key
         if self.env.get(key_var) or os.environ.get(key_var):
             return ""
-        codex_home = (
-            self.env.get("CODEX_HOME")
-            or os.environ.get("CODEX_HOME")
-            or os.path.expanduser("~/.codex")
-        )
-        auth_file = os.path.join(codex_home, "auth.json")
+        auth_file = os.path.join(self.env.get("CODEX_HOME") or _codex_home(None), "auth.json")
         return auth_file if os.path.isfile(auth_file) else ""
 
     async def run(self, task: RuntimePlan) -> AgentResult:
-        # Fail LOUD, not opaque: if the runtime isn't set up, surface the exact
-        # reason as the result summary (and log it) instead of a bare exit-1.
-        # RUNTIME_UNAVAILABLE is what routes this to the infra ceiling instead
-        # of the per-issue quality breaker: without it, three preflight
-        # failures on an unchanged environment burned the resolve budget and
-        # escalated "failed 3× without a reason" (tauri #650, harness #188) —
-        # the same classification bug the stillborn-exec path below already
-        # fixed. is_error stays True: every workflow's error path knows how to
-        # retry/hold safely, whereas a non-error "blocked" reads as a
-        # completed leg to the review gate (adversarial review 2026-08-10:
-        # an unreviewed PR could synthesize APPROVE).
         reason = self.preflight()
         if reason is not None:
             self._log(f"codex: NOT READY — {reason}")
-            stopped = AgentResult(
-                is_error=True,
-                status="blocked",
-                summary=reason,
-                exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
-            )
-            return stopped
-
-        # Review M17: the per-run scratch dir used to be an un-removed mkdtemp, so
-        # a long-lived daemon leaked one `codex-run-*` directory (schema + the last
-        # envelope) per dispatch into /tmp. TemporaryDirectory removes it on EVERY
-        # exit path below — return, raise, or cancellation. `ignore_cleanup_errors`
-        # keeps a stray file codex left behind from turning teardown into a failed
-        # run; a leaked temp file must never be the reason an issue doesn't resolve.
-        with tempfile.TemporaryDirectory(
-            prefix="codex-run-", ignore_cleanup_errors=True
-        ) as tmpdir:
+            return AgentResult(is_error=True, status="blocked", summary=reason,
+                               exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
+                               model=self._resolved_model(task))
+        # Removed on every exit path, including cancellation (review M17).
+        with tempfile.TemporaryDirectory(prefix="codex-run-", ignore_cleanup_errors=True) as tmpdir:
             result = await self._run_in(task, tmpdir)
-        # Stamp the model on EVERY exit path — including the aborted ones, which
-        # build their AgentResult by hand and are precisely the runs whose cost
-        # is estimated rather than measured (#43). Done once here rather than at
-        # each construction site so a new return path cannot forget it.
-        from dataclasses import replace as _replace
-
-        return _replace(result, model=result.model or self._resolved_model(task))
+        return replace(result, model=result.model or self._resolved_model(task))
 
     async def _run_in(self, task: RuntimePlan, tmpdir: str) -> AgentResult:
-        """The retry loop, given a scratch dir whose lifetime `run` owns."""
-        import asyncio
-        import random
-        from dataclasses import replace
-
+        """The gateway-retry loop around one priced invocation."""
         schema_path = None
         if task.schema is not None:
             schema_path = os.path.join(tmpdir, "schema.json")
             with open(schema_path, "w") as f:
                 json.dump(_strict_schema(task.schema), f)
         output_path = os.path.join(tmpdir, "last.json")
-
-        # Transport-retry loop. A gateway stream drop (`response.failed` /
-        # `stream disconnected before completion`) is an UPSTREAM failure, not an
-        # agent error — codex's own 5× SSE reconnects fire within one dead TCP
-        # session and don't help. A fresh `codex exec` gets a fresh connection, so
-        # we retry the whole invocation with jittered exponential backoff. We
-        # RESUME the session (via the parsed session id) rather than restart cold:
-        # codex persists its rollout only at `task_complete` turn boundaries, so a
-        # mid-generation drop never poisons the session — resume replays consistent
-        # state, and worktree git commits already landed persist regardless. A hang
-        # (idle-watchdog) is NOT retried here (different failure — see below); only
-        # transport drops are. Exhausting retries surfaces status=timeout (retryable
-        # → the daemon re-dispatches cold).
-        # Two INDEPENDENT retry budgets: a flaky connection (network drop) and
-        # provider rate-limiting (HTTP 429) are different failures with different
-        # recoveries, so a 429 storm must not exhaust the network-drop budget and
-        # vice versa. `net_attempts` counts network drops; `rl_attempts` counts
-        # rate-limits. Both carry the session id forward so the retry RESUMES.
-        resume_id = task.resume
-        # Per-leg accounting baseline: tokens the resumed session had ALREADY
-        # burned (and a previous leg already ledgered) before this run started.
-        # Captured once — retries inside this run resume a session whose earlier
-        # attempts were never ledgered, so their tokens must stay in the total.
-        baseline_sid = task.resume or ""
+        model = self._resolved_model(task) or "<runtime-default>"
         codex_home = self._accounting_home(self._child_environment(task), task.cwd)
-        baseline_usage = (
-            read_rollout_usage(baseline_sid, codex_home=codex_home)
-            if baseline_sid
-            else None
-        )
-        baseline_turns = (
-            read_rollout_turns(baseline_sid, codex_home=codex_home)
-            if baseline_sid
-            else None
-        )
-        net_attempts = 0
-        rl_attempts = 0
-        native_meter = CodexChildUsageMeter(
-            codex_home or os.path.expanduser("~/.codex"), time.time(),
-            self._native_rates(self._resolved_model(task)), task.cwd or os.getcwd(),
-        )
-        native_meter.seed_baseline(baseline_sid, baseline_usage)
-        transport_retries = self.transport_retries
-        rate_limit_retries = self.max_rate_limit_retries
+        # Tokens the resumed session had already burned (and an earlier leg
+        # ledgered). Captured once: retries inside this run resume a session
+        # whose earlier attempts were never ledgered.
+        baseline_sid = task.resume or ""
+        baseline = read_rollout_usage(baseline_sid, codex_home) if baseline_sid else None
+        resume_id = task.resume
+        attempt = 0
         while True:
-            # Review M17: truncate the envelope BEFORE each attempt. Codex writes
-            # `-o` only when a turn completes, so a retry after a mid-turn drop
-            # would otherwise re-read the PREVIOUS attempt's envelope and attribute
-            # it to this one — reporting a stale success (or a stale `blocked`) for
-            # a run that produced nothing.
+            # Codex writes `-o` only at a completed turn; a retry must never
+            # re-read the previous attempt's envelope (review M17).
             _unlink_quietly(output_path)
             run_task = replace(task, resume=resume_id) if resume_id else task
-            argv = build_codex_argv(
-                run_task,
-                codex_bin=self.codex_bin,
-                provider=self.provider,
-                sandbox=self.sandbox,
-                default_model=self.default_model,
-                schema_path=schema_path,
-                output_path=output_path,
-                inject_system_prompt=self.inject_system_prompt,
-                reasoning_effort=self.reasoning_effort,
-            )
-            argv, stdin_payload = route_oversize_prompt(argv)
-            if stdin_payload is not None:
-                if len(stdin_payload) > _PROMPT_STDIN_HARD_LIMIT:
-                    # Deterministic refusal BEFORE any spend: a prompt this
-                    # size cannot fit a provider context, so paying to find
-                    # out is strictly worse than the E2BIG death this route
-                    # replaced. AGENT_ERROR (a strike) keeps it bounded by
-                    # the ordinary retry ceilings.
-                    return AgentResult(
-                        is_error=True,
-                        status="prompt_oversize",
-                        exit_reason=ExitReason.AGENT_ERROR,
-                        summary=(
-                            f"prompt is {len(stdin_payload)} bytes "
-                            f"(> {_PROMPT_STDIN_HARD_LIMIT}); refusing to "
-                            "dispatch a leg that cannot fit a model context"
-                        ),
-                    )
-                self._log(
-                    f"codex: prompt {len(stdin_payload)}B exceeds the "
-                    f"{_PROMPT_ARGV_LIMIT}B argv bound — routing via stdin"
+            argv, stdin_payload = route_oversize_prompt(build_codex_argv(
+                run_task, codex_bin=self.codex_bin, provider=self.provider, sandbox=self.sandbox,
+                default_model=self.default_model, schema_path=schema_path, output_path=output_path,
+                inject_system_prompt=self.inject_system_prompt, reasoning_effort=self.reasoning_effort,
+            ))
+            if stdin_payload is not None and len(stdin_payload) > _PROMPT_STDIN_HARD_LIMIT:
+                return AgentResult(
+                    is_error=True, status="prompt_oversize", exit_reason=ExitReason.AGENT_ERROR,
+                    summary=(f"prompt is {len(stdin_payload)} bytes (> {_PROMPT_STDIN_HARD_LIMIT}); refusing "
+                             "to dispatch a leg that cannot fit a model context"),
                 )
-            result, exit_code, stderr, stdout, hung = await self._exec_once(
-                argv, run_task, output_path,
-                usage_baseline=(
-                    (baseline_sid, baseline_usage, baseline_turns)
-                    if baseline_usage else None
-                ),
-                stdin_payload=stdin_payload,
-                native_meter=native_meter,
+            result, exit_code, stderr = await self._exec_once(
+                argv, run_task, output_path, model, codex_home,
+                (baseline_sid, baseline) if baseline else None, stdin_payload,
             )
-            observed = native_meter.sample(
-                result.session_id, self._resolved_model(task) or "<runtime-default>",
-                (result.usage if isinstance(result.usage, dict)
-                 and result.usage.get("source") == UsageSource.ROLLOUT.value else None),
-                final=True,
-            )
-            amount = price_run_usage(observed, native_meter.rates)
+            observed = leg_usage(result.session_id, model, result.usage, self.rate_table)
+            amount = price_run_usage(observed, self.rate_table)
             result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
-            if self.enforce_budget and task.max_budget_usd > 0 and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros:
+            if task.max_budget_usd > 0 and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros:
                 result = replace(result, is_error=True, status=MAX_BUDGET_STATUS,
                                  envelope_subtype=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
-            if result.exit_reason is ExitReason.BUDGET_EXHAUSTED:
+            # A budget kill can leave a truncated stream that looks like a drop;
+            # retrying it would spend the budget again.
+            if result.exit_reason is ExitReason.BUDGET_EXHAUSTED or not _is_transport_drop(exit_code, stderr, result):
                 return result
-            if hung:
-                # A watchdog fired — surface as a retryable timeout, not a
-                # blocked verdict (the daemon leaves the issue ai-working →
-                # re-dispatch). A hang is not a transport drop; don't loop here.
-                if result.exit_reason is ExitReason.WALL_TIMEOUT:
-                    return replace(
-                        result, is_error=True, status="timeout",
-                        exit_reason=ExitReason.WALL_TIMEOUT,
-                        summary=(
-                            f"codex exceeded max runtime {self.max_runtime:.0f}s; killed"
-                        ),
-                    )
-                return replace(
-                    result, is_error=True, status="timeout",
-                    exit_reason=ExitReason.IDLE_TIMEOUT,
-                    summary=f"codex idle >{self.idle_timeout:.0f}s (no stderr event); killed",
-                )
-
-            if result.exit_reason is ExitReason.BUDGET_EXHAUSTED:
-                # #29: we stopped this run on purpose, for spending too much.
-                # Returned BEFORE the transport-drop classifier because a killed
-                # process can leave a truncated stream in stderr that looks like
-                # a gateway drop — and retrying would spend the budget again,
-                # which is the exact opposite of the point.
-                return result
-            if not _is_transport_drop(exit_code, stderr, result):
-                return result  # success, genuine error, or blocked — never retry over output
-
-            # Carry the session id forward so the retry RESUMES rather than restarts.
             if self.resume_on_retry:
                 resume_id = result.session_id or resume_id
-
-            if _is_rate_limited(stderr):
-                # Provider pushback (429): wait for the throttle window to renew.
-                # Honour a parsed Retry-After; else back off aligned to the window
-                # (rate_limit_backoff_base * (attempt+1)), capped. Does NOT consume
-                # the network-drop budget.
-                if rl_attempts >= rate_limit_retries:
-                    self._log(
-                        f"codex: rate limit (429) persisted after "
-                        f"{rl_attempts + 1} attempt(s) — giving up (retryable timeout)"
-                    )
-                    return replace(
-                        result, is_error=True, status="timeout",
-                        # Upstream refused to serve us at all — the agent never got a
-                        # turn, so this is transport, not an agent attempt.
-                        exit_reason=ExitReason.TRANSPORT_DEATH,
-                        summary=(
-                            "codex hit provider rate limit (HTTP 429) that survived "
-                            f"{rl_attempts + 1} attempts; retryable"
-                        ),
-                    )
-                hinted = _extract_retry_after_seconds(stderr)
-                delay = hinted if hinted is not None else (
-                    self.rate_limit_backoff_base * (rl_attempts + 1)
-                )
-                delay = min(delay, self.max_rate_limit_wait)
-                delay += random.uniform(0, delay / 4)  # jitter: de-sync fleet retries
-                rl_attempts += 1
-                self._log(
-                    f"codex: rate limited (429) — attempt {rl_attempts}/"
-                    f"{rate_limit_retries}; "
-                    f"{'resuming ' + resume_id if resume_id else 'restarting'} in "
-                    f"{delay:.1f}s{' (Retry-After)' if hinted is not None else ' (window-aligned)'}"
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            # Plain network drop: short jittered exponential backoff, fresh connection.
-            if net_attempts >= transport_retries:
-                self._log(
-                    f"codex: gateway stream-drop persisted after "
-                    f"{net_attempts + 1} attempt(s) — giving up (retryable timeout)"
-                )
-                return replace(
-                    result, is_error=True, status="timeout",
-                    # Every attempt died on the wire before a turn completed — the
-                    # textbook TRANSPORT_DEATH: no attempt was made, so no breaker.
-                    exit_reason=ExitReason.TRANSPORT_DEATH,
-                    summary=(
-                        "codex gateway stream drop (response.failed) survived "
-                        f"{net_attempts + 1} attempts; retryable"
-                    ),
-                )
-            delay = self.backoff_base * (2 ** net_attempts)
-            delay += random.uniform(0, delay / 2)  # jitter: de-sync flapping gateway
-            net_attempts += 1
-            self._log(
-                f"codex: gateway stream-drop (attempt {net_attempts}/"
-                f"{transport_retries + 1}); "
-                f"{'resuming ' + resume_id if resume_id else 'restarting'} "
-                f"in {delay:.1f}s"
-            )
+            limited = _is_rate_limited(stderr)
+            if attempt >= self.transport_retries:
+                self._log(f"codex: gateway failure persisted after {attempt + 1} attempt(s) — giving up")
+                # Every attempt died upstream before a turn completed: no attempt.
+                return replace(result, is_error=True, status="timeout", exit_reason=ExitReason.TRANSPORT_DEATH,
+                               summary=(f"codex gateway {'rate limit (HTTP 429)' if limited else 'stream drop'} "
+                                        f"survived {attempt + 1} attempts; retryable"))
+            hinted = _extract_retry_after_seconds(stderr) if limited else None
+            delay = hinted if hinted is not None else (
+                self.rate_limit_backoff_base * (attempt + 1) if limited else self.backoff_base * 2 ** attempt)
+            delay = min(delay, self.max_retry_wait)
+            delay += random.uniform(0, delay / 4)
+            attempt += 1
+            self._log(f"codex: {'rate limited (429)' if limited else 'gateway stream drop'} — attempt "
+                      f"{attempt}/{self.transport_retries}; {'resuming ' + resume_id if resume_id else 'restarting'} "
+                      f"in {delay:.1f}s")
             await asyncio.sleep(delay)
 
     async def _exec_once(
-        self, argv: list[str], task: RuntimePlan, output_path: str,
-        usage_baseline: tuple[str, dict, int | None] | None = None,
-        stdin_payload: bytes | None = None,
-        native_meter: CodexChildUsageMeter | None = None,
-    ) -> tuple[AgentResult, int, str, str, bool]:
-        """One `codex exec` invocation: spawn, stream stderr live, parse the
-        envelope. Returns (result, exit_code, stderr, stdout, hung) so run()'s
-        retry loop can classify a transport drop. All subprocess/IO is here; the
-        loop above owns only retry policy."""
-        import asyncio
-
-        model = self._resolved_model(task) or "<runtime-default>"
+        self, argv: list[str], task: RuntimePlan, output_path: str, model: str, codex_home: str,
+        baseline: tuple[str, dict] | None, stdin_payload: bytes | None,
+    ) -> tuple[AgentResult, int, str]:
+        """One `codex exec`: spawn, pump stderr under the watchdogs and the
+        budget, then read the envelope and this leg's rollout counters."""
         proc_env = self._child_environment(task)
-        codex_home = self._accounting_home(proc_env, task.cwd)
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
-        # Rollout ownership needs wall time; elapsed telemetry uses monotonic
-        # time without perturbing the injectable watchdog clock.
         rollout_started_at = time.time()
-        attempt_started_at = time.monotonic()
         execution_cwd = task.cwd or os.getcwd()
-        rate_in, rate_out, rate_cached_in = rates_with_cache_for_model(
-            model, self.cost_per_mtok, self.cost_per_mtok_cached_in,
-            fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
-        )
         accounting_run_id = proc_env.get("ISSUE_AGENT_RUN_ID", "")
-        native_meter = native_meter or CodexChildUsageMeter(
-            codex_home or os.path.expanduser("~/.codex"), rollout_started_at,
-            self._native_rates(model), execution_cwd,
-        )
         evidence = {
             "cwd": os.path.realpath(execution_cwd),
             "rollout_started_at": rollout_started_at,
             "session_id": task.resume or "",
-            "baseline_session_id": usage_baseline[0] if usage_baseline else "",
-            "baseline_usage": usage_baseline[1] if usage_baseline else None,
+            "baseline_session_id": baseline[0] if baseline else "",
+            "baseline_usage": baseline[1] if baseline else None,
             "model": model,
-            "cost_per_mtok_in": rate_in,
-            "cost_per_mtok_out": rate_out,
-            "cost_per_mtok_cached_in": rate_cached_in,
-            "codex_home": proc_env.get("CODEX_HOME", ""),
-            "config_version": proc_env.get("ISSUE_AGENT_CONFIG_VERSION", ""),
-            "rate_card_id": proc_env.get("ISSUE_AGENT_RATE_CARD_ID", ""),
-            "rate_card_version": proc_env.get("ISSUE_AGENT_RATE_CARD_VERSION", ""),
-            "native_usage_started_at": native_meter.started_at,
-            "native_root_sessions": {sid: sample.model for sid, sample in native_meter.roots.items()},
-            "native_rate_table": rate_table_evidence(native_meter.rates),
-            "native_usage_failure": native_meter.failure,
+            "codex_home": codex_home,
+            "rate_table": rate_table_evidence(self.rate_table),
         }
-        if task.resume:
-            evidence["native_root_sessions"][task.resume] = model
-        write_spend_evidence(
-            self.spend_evidence_dir, accounting_run_id, evidence
-        )
-        supervision_run_id = RunId(
-            accounting_run_id or f"codex-{uuid.uuid4().hex}"
-        )
-        spawn_argv = (
-            self.process_supervisor.supervised_command(
-                supervision_run_id, argv
-            )
-            if self.process_supervisor is not None
-            else tuple(argv)
-        )
+        write_spend_evidence(self.spend_evidence_dir, accounting_run_id, evidence)
+        supervision_run_id = RunId(accounting_run_id or f"codex-{uuid.uuid4().hex}")
+        spawn_argv = tuple(argv)
         if self.process_supervisor is not None:
+            spawn_argv = self.process_supervisor.supervised_command(supervision_run_id, argv)
             proc_env.update(self.process_supervisor.launch_guard_env())
-        # Set cwd on the subprocess too, not only via `-C`: the resume subcommand
-        # rejects `-C`, so this is how a resumed run still executes in the worktree
-        # (harmless on the exec path — it matches the `-C` we also pass there).
+        # A new session puts codex and every descendant (the test servers it
+        # spawns) in one process group the watchdogs kill whole; a leaked
+        # child holding stdout wedged the daemon (Myapp #310).
         proc = await asyncio.create_subprocess_exec(
             *spawn_argv,
-            # DEVNULL because codex waits on stdin otherwise; PIPE only when an
-            # oversize prompt was routed off argv (route_oversize_prompt).
-            stdin=(
-                asyncio.subprocess.PIPE
-                if stdin_payload is not None
-                else asyncio.subprocess.DEVNULL
-            ),
+            stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=proc_env,
             cwd=task.cwd or None,
-            # New session → codex and ALL its descendants (the TEST_CMD it spawns,
-            # e.g. `scripts/e2e-local.sh` → a vite/playwright server) share one
-            # process GROUP, so the idle-watchdog can kill the whole tree. Without
-            # this, killing only the codex pid orphaned a background test server
-            # that inherited the stdout pipe → _read_stdout()/proc.wait() never
-            # returned → the daemon wedged (observed on Myapp #310, tsc-hung e2e).
             start_new_session=True,
             limit=_STDERR_STREAM_LIMIT,
         )
-        feeder_task: asyncio.Task | None = None
+        feeder: asyncio.Task | None = None
         if stdin_payload is not None:
-            # Feed concurrently with the stderr pump below: a payload larger
-            # than the pipe buffer blocks until codex reads it, and codex may
-            # not read stdin before emitting its first stderr events. Errors
-            # are swallowed — a dead child surfaces through the pump/exit path,
-            # not through this write. The handle is held and cancelled in the
-            # teardown finally (adversarial F2): loop task refs are weak, and
-            # an unretrieved exception would otherwise warn at GC.
-            async def _feed_stdin(payload: bytes) -> None:
+            # Fed concurrently: codex may emit stderr before reading stdin.
+            async def _feed(payload: bytes) -> None:
                 try:
-                    if proc.stdin is None:
-                        return
-                    proc.stdin.write(payload)
-                    await proc.stdin.drain()
-                except Exception:  # noqa: BLE001 — see docstring above
+                    if proc.stdin is not None:
+                        proc.stdin.write(payload)
+                        await proc.stdin.drain()
+                except Exception:  # noqa: BLE001 — a dead child surfaces via exit
                     pass
                 finally:
                     if proc.stdin is not None:
                         proc.stdin.close()
 
-            feeder_task = asyncio.get_running_loop().create_task(
-                _feed_stdin(stdin_payload)
-            )
-        # Stream stderr LIVE rather than buffering to exit: codex exec emits its
-        # per-tool-call trace (exec/apply_patch/tokens) to stderr, so live-reading
-        # it is the only mid-run visibility we get (the whole resolve is one
-        # subprocess). Each governed tool call — notably a TEST_CMD run — is logged
-        # as it happens. stdout (small: the header) is drained concurrently so a
-        # full pipe can't deadlock the child. The readline is bounded by the idle
-        # watchdog: a gap > idle_timeout between stderr events is a hang → kill.
+            feeder = asyncio.get_running_loop().create_task(_feed(stdin_payload))
+
         err_chunks: list[str] = []
         hung = False
         wall_tripped = False
-        budget_stop: float | EstimatedRunUsage | None = None
-        # Wall-cap baseline, read ONLY when the cap is armed (the clock is injectable
-        # and a spurious read would shift a test's fake sequence).
+        budget_stop = False
+        budget_armed = task.max_budget_usd > 0 and self.rate_table is not None
+        budget = Money.from_major("USD", task.max_budget_usd) if budget_armed else None
         started_at = self._wall_clock() if self.max_runtime is not None else 0.0
-
-        # #43: price THIS leg with the model it ran on, not with one flat rate.
-        # Hoisted above the pump because the mid-run budget check (#29) has to
-        # price a sample with the SAME rates the end-of-run accounting will use;
-        # two lookups could drift apart and kill a run at a threshold the ledger
-        # then disagrees with.
-        # The budget check is armed only when it can actually fire: enforcement
-        # on, a budget set, and a non-zero price. An unpriced runtime reads every
-        # run as $0.00 (see budget_overrun_usd), so arming there would be a cap
-        # that never trips while looking like one that does. Same clock
-        # discipline as the wall cap above — no clock read unless armed.
-        budget_usd = task.max_budget_usd if self.enforce_budget else 0.0
-        budget_armed = (
-            budget_usd > 0 and (self.rate_table is not None
-                               or rate_in > 0 and rate_out > 0 and rate_cached_in > 0)
-        )
         last_budget_check = self._wall_clock() if budget_armed else 0.0
         session_id = task.resume or ""
-        evidence_session_id = session_id
-        stderr_usage_logged = False
         stderr_pending = b""
 
-        def _current_session_id(
-            extra_output: str = "", *, allow_legacy_header: bool = False
-        ) -> str:
-            """Cached identity from resume input or matching root rollout.
+        def _session() -> str:
+            nonlocal session_id
+            if not session_id:
+                session_id = discover_rollout_session(execution_cwd, rollout_started_at, codex_home)
+                if session_id:
+                    write_spend_evidence(self.spend_evidence_dir, accounting_run_id,
+                                         {**evidence, "session_id": session_id})
+            return session_id
 
-            A human-readable header is an exit-time compatibility fallback only.
-            Stderr contains arbitrary agent output, so caching a header-shaped
-            line during the run would let echoed data suppress later root-rollout
-            discovery and poison budget enforcement.
-            """
-            nonlocal session_id, evidence_session_id
-            if session_id:
-                return session_id
-            stderr = "\n".join(err_chunks)
-            session_id = discover_rollout_session(
-                execution_cwd,
-                rollout_started_at,
-                codex_home=codex_home,
-            )
-            if session_id and session_id != evidence_session_id:
-                evidence_session_id = session_id
-                write_spend_evidence(
-                    self.spend_evidence_dir,
-                    accounting_run_id,
-                    {**evidence, "session_id": session_id},
-                )
-            if session_id or not allow_legacy_header:
-                return session_id
-            legacy = (
-                _session_id_from_lines(stderr)
-                or _session_id_from_lines(extra_output)
-            )
-            if legacy and legacy != evidence_session_id:
-                evidence_session_id = legacy
-                write_spend_evidence(
-                    self.spend_evidence_dir,
-                    accounting_run_id,
-                    {**evidence, "session_id": legacy},
-                )
-            return legacy
+        def _usage() -> dict | None:
+            sid = _session()
+            usage = read_rollout_usage(sid, codex_home) if sid else None
+            return usage_delta(usage, baseline[1]) if baseline is not None and sid == baseline[0] else usage
 
-        def _trusted_usage(usage: dict | None) -> dict | None:
-            """Accept only provider-owned usage evidence."""
-            nonlocal stderr_usage_logged
-            if (
-                isinstance(usage, dict)
-                and usage.get("source") == UsageSource.STDERR.value
-            ):
-                if not stderr_usage_logged:
-                    self._log(
-                        "codex: UNTRUSTED USAGE — stderr counter retained only "
-                        "as telemetry, never priced or budget-enforced"
-                    )
-                    stderr_usage_logged = True
-                return None
-            return usage
-
-        def _native_usage(usage: dict | None, sid: str, *, final: bool = False) -> RunUsage | None:
-            observed = native_meter.sample(sid, model, usage, final=final)
-            roots = {root: sample.model for root, sample in native_meter.roots.items()}
-            if sid:
-                roots[sid] = model
-            if (roots != evidence["native_root_sessions"]
-                    or native_meter.failure != evidence["native_usage_failure"]):
-                evidence.update(native_root_sessions=roots, native_usage_failure=native_meter.failure)
-                write_spend_evidence(self.spend_evidence_dir, accounting_run_id,
-                                     {**evidence, "session_id": sid or session_id})
-            return observed
-
-        def _budget_overrun(now: float) -> float | EstimatedRunUsage | None:
-            """This leg's spend if it has crossed the budget, else None.
-
-            Sampled at most once per poll slice: each call globs and reads the
-            rollout file, while codex's own counters only advance at turn
-            boundaries — polling per stderr LINE would be thousands of file
-            reads to observe the same handful of updates. `now` is passed in
-            rather than read here so a caller that already took a clock reading
-            for the wall check shares it (one read per pass, which the
-            fake-clock watchdog tests depend on)."""
+        def _over_budget(now: float) -> bool:
+            """Sampled once per slice: each sample globs and reads the rollout,
+            and codex's counters only advance at turn boundaries."""
             nonlocal last_budget_check
-            if now - last_budget_check < self._pump_slice():
-                return None
+            if budget is None or now - last_budget_check < self._pump_slice():
+                return False
             last_budget_check = now
-            sid = _current_session_id()
-            usage = self._usage_so_far(
-                err_chunks,
-                usage_baseline,
-                sid,
-                codex_home,
-            )
-            trusted = _trusted_usage(usage)
-            observed = _native_usage(trusted, sid)
-            spent = price_run_usage(observed, native_meter.rates)
-            over = spent.micros / 1_000_000 if spent.micros >= Money.from_major("USD", budget_usd).micros else None
-            if over is not None:
-                return over
-            return EstimatedRunUsage(native_meter.failure) if native_meter.failure else None
+            spent = price_run_usage(leg_usage(_session(), model, _usage(), self.rate_table), self.rate_table)
+            if spent.micros < budget.micros:
+                return False
+            self._log(f"codex: BUDGET — this leg has spent ${spent.micros / 1e6:.2f}, crossing "
+                      f"${task.max_budget_usd:.2f}; killing subprocess")
+            return True
 
-        def _trip_budget(over: float | EstimatedRunUsage) -> None:
-            """Shared teardown for both sample points: same killpg as the
-            watchdogs (the whole process GROUP, or a leaked TEST_CMD server
-            holds the pipe open forever)."""
-            nonlocal budget_stop
-            budget_stop = over
-            self._log(f"codex: ACCOUNTING — {over.detail}; killing subprocess" if isinstance(over, EstimatedRunUsage) else
-                f"codex: BUDGET — this leg has spent ${over:.2f}, crossing "
-                f"MAX_BUDGET_USD=${budget_usd:.2f}; killing subprocess"
-            )
-            _kill_quietly(proc)
-
-        def _bounded_stderr_line(raw: bytes) -> str:
-            """Decode one stderr record without letting diagnostics grow forever."""
+        def _bounded(raw: bytes) -> str:
             if len(raw) <= _STDERR_RETAINED_LINE_BYTES:
                 return raw.decode("utf-8", "replace").rstrip("\n")
             prefix = raw[:_STDERR_RETAINED_LINE_BYTES].decode("utf-8", "replace")
-            return (
-                f"[oversized stderr line truncated: {len(raw)} bytes; retained "
-                f"{_STDERR_RETAINED_LINE_BYTES} bytes] {prefix}"
-            )
+            return (f"[oversized stderr line truncated: {len(raw)} bytes; retained "
+                    f"{_STDERR_RETAINED_LINE_BYTES} bytes] {prefix}")
 
         async def _read_stderr_line() -> bytes:
-            """Read one logical stderr line, draining an over-limit record safely.
-
-            Read with ``readuntil`` so an over-limit record remains buffered for
-            the bounded drain below. ``readline`` wraps the same condition in a
-            ``ValueError``, so retain that catch for stream implementations that
-            expose the wrapper instead. The next newline remains the boundary for
-            normal milestone classification.
-            """
+            """One logical line; an over-limit record is drained in bounded
+            chunks. `stderr_pending` survives a watchdog cancellation."""
             nonlocal stderr_pending
             assert proc.stderr is not None
             prefix = stderr_pending
@@ -1870,111 +865,50 @@ class CodexRunner(AgentRuntime):
                     if newline >= 0:
                         stderr_pending = chunk[newline + 1:]
                         break
-                return (
-                    b"[oversized stderr line truncated after stream limit] "
-                    + bytes(retained)
-                )
+                return b"[oversized stderr line truncated after stream limit] " + bytes(retained)
+            stderr_pending = b""
+            return prefix + raw
+
+        def _trip(now: float, idle: float | None) -> bool:
+            """Check every armed cap once against one clock reading; kill on a trip."""
+            nonlocal hung, wall_tripped, budget_stop
+            if idle is not None and self.idle_timeout is not None and idle >= self.idle_timeout:
+                hung = True
+                self._log(f"codex: IDLE — no stderr event for {idle:.0f}s (>{self.idle_timeout:.0f}s); "
+                          "killing subprocess")
+            elif self.max_runtime is not None and now - started_at >= self.max_runtime:
+                hung = wall_tripped = True
+                self._log(f"codex: WALL — total runtime {now - started_at:.0f}s exceeded max "
+                          f"{self.max_runtime:.0f}s; killing subprocess")
+            elif _over_budget(now):
+                budget_stop = True
             else:
-                # Keep `prefix` installed until the awaited read completes: a
-                # watchdog cancellation must not discard bytes already consumed
-                # after the previous oversized record's newline.
-                stderr_pending = b""
-                return prefix + raw
+                return False
+            _kill_quietly(proc)
+            return True
+
+        armed = self.idle_timeout is not None or self.max_runtime is not None or budget_armed
 
         async def _pump_stderr() -> None:
-            nonlocal hung, wall_tripped
-            assert proc.stderr is not None
             while True:
-                # Between-lines wall/budget checks. A chatty run never times out a
-                # chunk, so the in-chunk checks alone would leave a runaway session
-                # that keeps printing tool traces unbounded — the spend hole these
-                # caps close. ONE clock read, shared by both.
-                if self.max_runtime is not None or budget_armed:
-                    now = self._wall_clock()
-                    if self.max_runtime is not None:
-                        elapsed = now - started_at
-                        if elapsed >= self.max_runtime:
-                            hung = True
-                            wall_tripped = True
-                            self._log(
-                                f"codex: WALL — total runtime {elapsed:.0f}s exceeded "
-                                f"max {self.max_runtime:.0f}s; killing subprocess"
-                            )
-                            _kill_quietly(proc)
-                            return
-                    if budget_armed:
-                        over = _budget_overrun(now)
-                        if over is not None:
-                            _trip_budget(over)
-                            return
-                if (
-                    self.idle_timeout is None
-                    and self.max_runtime is None
-                    and not budget_armed
-                ):
-                    raw = await _read_stderr_line()
-                    if not raw:  # EOF
-                        return
-                    line = _bounded_stderr_line(raw)
-                    err_chunks.append(line)
-                    self._log_codex_line(line)
-                    continue
-                # Wall-clock watchdogs: wait for the next line in poll_slice chunks,
-                # re-checking elapsed WALL time each chunk. The monotonic clock
-                # freezes across macOS sleep, so a one-shot wait_for spanning a
-                # suspend would not count the sleep — polling wall time makes a
-                # sleep-spanning silence trip on the first chunk after wake. Both caps
-                # share this loop; each is checked only when armed, so arming only the
-                # wall cap must not fall through to the unbounded readline above.
-                last_line = self._wall_clock()
-                got = False
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(
-                            _read_stderr_line(), timeout=self._pump_slice()
-                        )
-                        got = True
-                        break
-                    except asyncio.TimeoutError:
-                        # ONE clock read per chunk, shared by both checks.
-                        now = self._wall_clock()
-                        idle = now - last_line
-                        if self.idle_timeout is not None and idle >= self.idle_timeout:
-                            hung = True
-                            self._log(
-                                f"codex: IDLE — no stderr event for {idle:.0f}s "
-                                f"(>{self.idle_timeout:.0f}s); treating as hung, "
-                                "killing subprocess"
-                            )
-                            _kill_quietly(proc)
-                            return
-                        elapsed = now - started_at
-                        if self.max_runtime is not None and elapsed >= self.max_runtime:
-                            # Limping stream: stderr keeps arriving so the idle
-                            # watchdog never fires, but the run has outlived any
-                            # plausible task. Same killpg teardown — the whole process
-                            # GROUP, or a leaked test server holds the pipe forever.
-                            hung = True
-                            wall_tripped = True
-                            self._log(
-                                f"codex: WALL — total runtime {elapsed:.0f}s exceeded "
-                                f"max {self.max_runtime:.0f}s; killing subprocess"
-                            )
-                            _kill_quietly(proc)
-                            return
-                        if budget_armed:
-                            # A silent stream still SPENDS — the model is
-                            # generating, it just isn't printing tool traces —
-                            # so the budget has to be sampled here too, not only
-                            # between lines. Reuses `now`: no extra clock read.
-                            over = _budget_overrun(now)
-                            if over is not None:
-                                _trip_budget(over)
-                                return
-                        # chunk elapsed but still inside both windows — keep waiting
-                if not got or not raw:  # EOF
+                # Checked between lines too: a chatty run never times out a slice.
+                if armed and (self.max_runtime is not None or budget_armed) and _trip(self._wall_clock(), None):
                     return
-                line = _bounded_stderr_line(raw)
+                if not armed:
+                    raw = await _read_stderr_line()
+                else:
+                    last_line = self._wall_clock()
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(_read_stderr_line(), timeout=self._pump_slice())
+                            break
+                        except asyncio.TimeoutError:
+                            now = self._wall_clock()
+                            if _trip(now, now - last_line):
+                                return
+                if not raw:
+                    return
+                line = _bounded(raw)
                 err_chunks.append(line)
                 self._log_codex_line(line)
 
@@ -1982,19 +916,12 @@ class CodexRunner(AgentRuntime):
             assert proc.stdout is not None
             try:
                 return (await proc.stdout.read()).decode("utf-8", "replace")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return ""
 
-        async def _observe_process_exit(timeout: float) -> bool:
-            """Wait on returncode without CPython's late Process.wait race.
-
-            After both pipe transports disconnect, ``Process.wait()`` can attach
-            an exit waiter after the transport has already scheduled its final
-            callback. In that race returncode is set but the new future sleeps
-            until timeout. The child watcher still reaps the process and updates
-            returncode, so bounded polling observes the authoritative state.
-            """
-
+        async def _observe_exit(timeout: float) -> bool:
+            # Polls returncode: CPython's Process.wait can attach after the
+            # final transport callback and sleep until timeout.
             deadline = asyncio.get_running_loop().time() + timeout
             while proc.returncode is None:
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -2003,373 +930,133 @@ class CodexRunner(AgentRuntime):
                 await asyncio.sleep(min(0.01, remaining))
             return True
 
-        # Drain stdout CONCURRENTLY with the live stderr pump — a full stdout pipe
-        # would otherwise deadlock the child — but bound each read SEPARATELY:
-        #
-        #   - _pump_stderr self-bounds via the per-line idle watchdog: a genuine hang
-        #     (no stderr for idle_timeout) → kill. A healthy resolve runs for MINUTES
-        #     while emitting per-tool-call stderr, so it must NOT be capped by any
-        #     total-runtime ceiling. (A single outer timeout on the joint read did
-        #     exactly that — killing every run > 30s with exit -9 and no IDLE line.)
-        #   - _read_stdout is capped only for the drain that REMAINS once stderr is
-        #     done: normally stdout hits EOF the instant codex exits, but a descendant
-        #     that survived the killpg and still holds the pipe could block the read
-        #     forever and wedge the poll loop. The 30s cap bounds that leaked-fd case.
         stdout_task = asyncio.ensure_future(_read_stdout())
         try:
-            await _pump_stderr()  # self-bounded by the idle watchdog
+            await _pump_stderr()
             try:
                 stdout = await asyncio.wait_for(
-                    stdout_task,
-                    timeout=(
-                        self.post_hang_drain_timeout
-                        if (self.idle_timeout or self.max_runtime or budget_stop is not None)
-                        else None
-                    ),
-                )
+                    stdout_task, timeout=self.post_hang_drain_timeout if armed else None)
             except asyncio.TimeoutError:
                 hung = True
                 _kill_quietly(proc)
-                stdout_task.cancel()
-                try:
-                    await stdout_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                await _cancel_quietly(stdout_task)
                 stdout = ""
-            if not await _observe_process_exit(10):
+            if not await _observe_exit(10):
                 hung = True
-                self._log(
-                    "codex: process exit was not observed within 10s after "
-                    "stream teardown"
-                )
+                self._log("codex: process exit was not observed within 10s after stream teardown")
                 _kill_quietly(proc)
         except asyncio.CancelledError:
-            # Cancellation may land during stderr pumping, residual stdout
-            # draining, or process reaping. All are post-spawn ownership:
-            # terminate the session and drain local tasks before releasing the
-            # dispatch lease, or an orphan can keep editing after restart.
+            # Post-spawn ownership: terminate the group and drain local tasks
+            # before the dispatch lease is released, or an orphan keeps editing.
             _kill_quietly(proc)
-            stdout_task.cancel()
-            try:
-                await stdout_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            if not await _observe_process_exit(10):
+            await _cancel_quietly(stdout_task)
+            if not await _observe_exit(10):
                 _kill_quietly(proc)
             raise
         finally:
-            if feeder_task is not None:
-                feeder_task.cancel()
-                try:
-                    await feeder_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            if feeder is not None:
+                await _cancel_quietly(feeder)
             if self.process_supervisor is not None:
-                # Successful leaders may leave background descendants that close
-                # inherited streams. Ownership ends only after the whole group is
-                # gone, never by deleting its durable receipt.
+                # Ownership ends only after the whole group is gone.
                 self.process_supervisor.kill_tree(supervision_run_id)
-            final_sid = _current_session_id()
-            _native_usage(_trusted_usage(self._usage_so_far(
-                err_chunks, usage_baseline, final_sid, codex_home,
-            )), final_sid, final=True)
         exit_code = proc.returncode if proc.returncode is not None else 124
         stderr = "\n".join(err_chunks)
         self._log(f"codex: exit {exit_code} (stderr {len(stderr)}B, out {len(stdout)}B)")
         if exit_code != 0 and stderr:
-            # The size of the stderr is not a diagnosis. The 0.3s cross-runtime
-            # resume failure ("no rollout found") sat invisible behind
-            # "stderr 125B" until reproduced by hand — on a nonzero exit the
-            # tail IS the reason, so log it.
             self._log(f"codex: stderr tail: {_stderr_tail(stderr, 3)[:500]}")
-
-        if isinstance(budget_stop, EstimatedRunUsage):
-            return (AgentResult(True, status="accounting_unavailable",
-                                exit_reason=ExitReason.ACCOUNTING_UNAVAILABLE,
-                                summary=f"live budget usage unavailable: {budget_stop.detail}; killed",
-                                session_id=_current_session_id(stdout, allow_legacy_header=True)),
-                    exit_code, stderr, stdout, False)
-        if budget_stop is not None:
-            # Checked BEFORE `hung`: the residual-stdout drain above sets `hung`
-            # when a descendant that survived our killpg still holds the pipe,
-            # and reporting that as an idle timeout would bury the real reason
-            # this run was stopped.
-            session_id = _current_session_id(stdout, allow_legacy_header=True)
-            final_usage = _trusted_usage(
-                self._usage_so_far(
-                    err_chunks,
-                    usage_baseline,
-                    session_id,
-                    codex_home,
-                ),
-            )
-            final_turns = read_rollout_turns(
-                session_id, codex_home=codex_home
-            )
-            if (
-                final_turns is not None
-                and usage_baseline is not None
-                and session_id == usage_baseline[0]
-                and usage_baseline[2] is not None
-            ):
-                final_turns = max(0, final_turns - usage_baseline[2])
-            # Re-price from the FINAL counters: the sampler priced a snapshot,
-            # and the session kept generating until the kill landed. `max` so a
-            # rollout that lost the last turn can never report LESS than what we
-            # already observed and killed on.
-            spend = max(
-                budget_stop,
-                codex_cost_usd(
-                    final_usage,
-                    cost_per_mtok_in=rate_in,
-                    cost_per_mtok_out=rate_out,
-                    cost_per_mtok_cached_in=rate_cached_in,
-                ),
-            )
-            self._log(
-                f"codex: killed on budget after ${spend:.2f} "
-                f"(MAX_BUDGET_USD=${budget_usd:.2f})"
-            )
-            return (
-                AgentResult(
-                    is_error=True,
-                    # The literal subtype the Claude SDK reports on ITS budget
-                    # abort. Reusing the exact string keeps one greppable value
-                    # in the journal across both runtimes.
-                    status=MAX_BUDGET_STATUS,
-                    envelope_subtype=MAX_BUDGET_STATUS,
-                    exit_reason=ExitReason.BUDGET_EXHAUSTED,
-                    summary=(
-                        f"codex spend ${spend:.2f} crossed MAX_BUDGET_USD="
-                        f"${budget_usd:.2f} mid-run; killed"
-                    ),
-                    # The run really burned this — carrying the cost/usage is
-                    # what keeps the money visible to the ledger and to the
-                    # issue/daily caps. A budget kill that reported $0.00 would
-                    # hide precisely the spend it exists to bound.
-                    cost_usd=spend,
-                    usage=final_usage,
-                    num_turns=final_turns,
-                    session_id=session_id,
-                ),
-                exit_code, stderr, stdout, False,
-            )
-
+        sid = _session()
+        usage = _usage()
+        if budget_stop:
+            # Checked before `hung`: the residual drain may set it after our kill.
+            return AgentResult(
+                is_error=True, status=MAX_BUDGET_STATUS, envelope_subtype=MAX_BUDGET_STATUS,
+                exit_reason=ExitReason.BUDGET_EXHAUSTED,
+                summary=f"codex spend crossed MAX_BUDGET_USD=${task.max_budget_usd:.2f} mid-run; killed",
+                usage=usage, session_id=sid,
+            ), exit_code, stderr
         if hung:
-            # Carry WHICH watchdog fired on the result so run() can phrase the
-            # summary without widening this tuple further.
-            return (
-                AgentResult(
-                    is_error=True, status="timeout", summary="hung",
-                    exit_reason=(
-                        ExitReason.WALL_TIMEOUT if wall_tripped
-                        else ExitReason.IDLE_TIMEOUT
-                    ),
-                    session_id=_current_session_id(stdout, allow_legacy_header=True),
-                    usage=_trusted_usage(self._usage_so_far(
-                        err_chunks, usage_baseline, _current_session_id(), codex_home,
-                    )),
-                ),
-                exit_code, stderr, stdout, True,
-            )
-
-        last_message = ""
+            limit = (f"exceeded max runtime {self.max_runtime:.0f}s" if wall_tripped
+                     else f"idle >{self.idle_timeout or 0:.0f}s (no stderr event)")
+            return AgentResult(
+                is_error=True, status="timeout", summary=f"codex {limit}; killed",
+                exit_reason=ExitReason.WALL_TIMEOUT if wall_tripped else ExitReason.IDLE_TIMEOUT,
+                session_id=sid, usage=usage,
+            ), exit_code, stderr
         try:
             with open(output_path) as f:
                 last_message = f.read()
         except OSError:
-            # codex didn't write -o (e.g. errored early) → fall back to stdout.
             last_message = stdout
-
-        # 0.146.0 removed the human-readable session header. The root rollout's
-        # session_meta is now the primary machine-readable identity source;
-        # legacy stderr/stdout headers and task.resume remain compatible.
-        session_id = _current_session_id(stdout, allow_legacy_header=True)
-        rollout_usage = read_rollout_usage(
-            session_id, codex_home=codex_home
-        )
-        if rollout_usage is None:
-            rollout_usage = parse_codex_usage(stderr)
-        # A resumed session's rollout counter is cumulative; subtract what the
-        # previous leg already ledgered (see usage_delta). Only when this run
-        # really continued THAT session — a resume that fell back to a fresh
-        # session has nothing pre-paid in its counter.
-        if usage_baseline is not None and session_id == usage_baseline[0]:
-            rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
-        rollout_usage = _trusted_usage(rollout_usage)
-        rollout_turns = read_rollout_turns(
-            session_id, codex_home=codex_home
-        )
-        if (
-            rollout_turns is not None
-            and usage_baseline is not None
-            and session_id == usage_baseline[0]
-            and usage_baseline[2] is not None
-        ):
-            rollout_turns = max(0, rollout_turns - usage_baseline[2])
-        # rate_in/rate_out come from the single rates_for_model lookup hoisted
-        # above the pump, so this leg is priced identically whether it finished
-        # or was killed on budget (#29/#43).
         result = parse_codex_envelope(
-            exit_code=exit_code,
-            last_message=last_message,
-            session_id=session_id,
-            stderr=stderr,
-            cost_per_mtok_in=rate_in,
-            cost_per_mtok_out=rate_out,
-            cost_per_mtok_cached_in=rate_cached_in,
-            usage=rollout_usage,
+            exit_code=exit_code, last_message=last_message, session_id=sid, stderr=stderr, usage=usage,
         )
-        from dataclasses import replace as _replace
-
-        result = _replace(result, num_turns=rollout_turns)
         provider_failure = (
-            read_rollout_provider_failure(session_id, codex_home=codex_home, since=rollout_started_at)
-            if result.is_error else None
+            read_rollout_provider_failure(sid, codex_home, since=rollout_started_at) if result.is_error else None
         )
         if provider_failure is not None:
-            # The provider refused the turn (capacity or quota): the agent never
-            # got to work, so this is a machine failure, not an agent attempt.
+            # The provider refused the turn (capacity or quota): a machine
+            # failure whose session stays resumable.
             self._log(f"codex: provider refused the turn ({provider_failure}) — machine failure, not an attempt")
-            # Keep TRANSPORT_DEATH: RESUME and review classify on exit_reason.
-            result = _replace(result, exit_reason=ExitReason.TRANSPORT_DEATH,
-                              envelope_subtype=PROVIDER_REFUSED_SUBTYPE,
-                              summary=f"provider refused the turn: {provider_failure}")
-        if (
-            result.status in ("pr_opened", "pushed")
-            and result.usage is None
-            and time.monotonic() > attempt_started_at
-        ):
-            warning = (
-                "productive Codex run settled with "
-                f"status={result.status!r} after "
-                f"{time.monotonic() - attempt_started_at:.1f}s but reported no "
-                "token usage; cost telemetry, spend caps, and resume may be blind"
-            )
-            self._log(f"codex: TELEMETRY WARNING — {warning}")
-        if exit_code < 0 and not hung:
-            # A NEGATIVE returncode means terminated by signal -exit_code, and we did
-            # not do it (our own killpg paths set `hung` and returned above). So this
-            # is the OOM/jetsam kill of FAILURE-MODES #58, an operator `kill`, or a
-            # Ctrl-C that reached the process group — infra death, not a failed
-            # attempt. The domain reads exit_reason to skip the breaker bump and the
-            # ai-ready relabel that raced a manual ai-blocked (#65).
-            self._log(
-                f"codex: killed by signal {-exit_code} (not by our watchdog) — "
-                "treating as infra death, not an agent attempt"
-            )
-            result = _replace(result, exit_reason=ExitReason.KILLED_EXTERNALLY)
-        return result, exit_code, stderr, stdout, False
+            result = replace(result, exit_reason=ExitReason.TRANSPORT_DEATH,
+                             envelope_subtype=PROVIDER_REFUSED_SUBTYPE,
+                             summary=f"provider refused the turn: {provider_failure}")
+        if exit_code < 0:
+            # A signal we did not send (our kills set `hung`/`budget_stop`):
+            # OOM, an operator kill, a Ctrl-C to the group. Not an attempt.
+            self._log(f"codex: killed by signal {-exit_code} (not by our watchdog) — infra death")
+            result = replace(result, exit_reason=ExitReason.KILLED_EXTERNALLY)
+        return result, exit_code, stderr
 
 
-# Gateway stream-drop signatures codex prints to stderr when the upstream LLM
-# connection fails mid-generation (SSE `response.failed`, or the socket dropping
-# before the response completes). These are UPSTREAM/transport failures — a
-# retry on a fresh connection is the right recovery, distinct from a real agent
-# error (bad code, failed tests) or a deliberate `blocked`.
+# Gateway stream-drop signatures codex prints when the upstream connection
+# fails mid-generation.
 _TRANSPORT_DROP_SIGNATURES = (
     "stream disconnected before completion",
     "response.failed event received",
 )
 
-# Rate-limit signatures — a SUBSET of transport drops that need a DIFFERENT
-# recovery. Azure/OpenAI surface HTTP 429 as `response.failed` mid-stream, so it
-# trips the transport-drop path, but the network-drop backoff (base ~2s: 2→5→11→
-# 22s) retries entirely INSIDE the provider's throttle window (observed: Azure
-# GPT-5.5 uses a 60s renewal period — `x-ratelimit-renewalperiod-*: 60`), so all
-# attempts fail. A 429 must back off ALIGNED to that window, honouring Retry-After
-# when present. Matched on the provider's own text (verified against an Azure
-# OpenAI gateway response body).
+# HTTP 429 arrives as `response.failed` too, but must wait out the provider's
+# throttle window (Azure: 60s), honouring Retry-After when present.
 _RATE_LIMIT_SIGNATURES = (
-    "rate limit",
-    "too many requests",
-    "rate_limit_exceeded",
-    "too_many_requests",
-    "usage limit",
-    "quota exceeded",
-    " 429",
-    "status 429",
-    "http 429",
+    "rate limit", "too many requests", "rate_limit_exceeded", "too_many_requests",
+    "usage limit", "quota exceeded", " 429", "status 429", "http 429",
 )
 
-# Retry-After / reset hints codex or the gateway may print, e.g.
-#   "retry-after: 23", "retry after 23s", "reset-tokens: 19", "try again in 12.5s"
 _RETRY_AFTER_RE = re.compile(
     r"(?:retry[\s_-]*after|retry[\s_-]*in|reset[\s_-]*(?:requests|tokens)?|try again in)"
     r"[^0-9]{0,12}?(\d+(?:\.\d+)?)\s*(m?s|sec|secs|seconds|s)?\b",
     re.IGNORECASE,
 )
 
-
-# Review M17: retry classification reads only the TAIL of stderr, never the whole
-# accumulated trace. Codex streams the agent's entire tool output (test runs,
-# diffs, greps) to stderr, so substring-matching the full buffer let the agent's
-# OWN text decide retry policy — a test named `test_rate_limit_backoff` scrolling
-# past was read as provider pushback, bought 15 minutes of 60s waits, and then
-# laundered a genuine agent error into TRANSPORT_DEATH, the one exit reason the
-# breakers exempt. A fatal transport error is the LAST thing codex prints before
-# exiting, so the tail is where it lives; the window is generous enough to cover
-# codex's own post-error reconnect chatter.
+# Retry classification reads only the stderr TAIL (review M17): codex streams
+# the agent's whole tool output to stderr, and a test named
+# `test_rate_limit_backoff` scrolling past once bought 15 minutes of waits and
+# laundered an agent error into a transport death. A fatal transport error is
+# the last thing codex prints.
 _CLASSIFY_TAIL_LINES = 20
 
 
 def _stderr_tail(stderr: str, lines: int = _CLASSIFY_TAIL_LINES) -> str:
-    """The last `lines` lines of stderr — the only window retry classification
-    may look at (see _CLASSIFY_TAIL_LINES)."""
     return "\n".join((stderr or "").splitlines()[-lines:])
 
 
 def _is_transport_drop(exit_code: int, stderr: str, result: AgentResult) -> bool:
-    """True iff this looks like a gateway stream drop worth retrying: codex
-    exited non-zero, the TAIL of its stderr carries a transport-drop signature,
-    and no envelope was produced (a captured envelope means the turn actually
-    completed — never retry over real output).
-
-    Review M17: the "real output" guard defers to `classify_outcome`, the single
-    place that knows the schemas' terminal vocabulary. The old hand-copied tuple
-    had drifted — it listed `done` (in no schema) while MISSING `pushed`, so a
-    completed force-push whose connection died on the way out was re-run on
-    resume: duplicate spend on the one branch-mutating leg. Deferring means a new
-    terminal status is covered the moment the schema and the domain agree on it,
-    with no third list to forget.
-
-    On this branch (exit_code != 0) a non-ERROR classification implies an envelope
-    was captured: `parse_codex_envelope` returns is_error=True for every nonzero
-    exit that produced no parseable envelope. So "not an error" IS "real output"."""
-    if exit_code == 0:
+    """A non-zero exit with a drop or 429 signature in the tail and no captured
+    envelope. `classify_outcome` decides "real output" so a completed turn
+    (any terminal status) is never re-run."""
+    if exit_code == 0 or classify_outcome(result) is not Outcome.ERROR:
         return False
-    if classify_outcome(result) is not Outcome.ERROR:
-        return False
-    tail = _stderr_tail(stderr)
-    low = tail.lower()
-    return any(sig in low for sig in _TRANSPORT_DROP_SIGNATURES) or _is_rate_limited(tail)
+    tail = _stderr_tail(stderr).lower()
+    return any(sig in tail for sig in _TRANSPORT_DROP_SIGNATURES) or _is_rate_limited(tail)
 
 
 def _is_rate_limited(stderr: str) -> bool:
-    """True iff the failure is a provider rate limit (HTTP 429 / quota), the
-    transport-drop subset that needs the LONGER window-aligned backoff. Matched
-    on the stderr TAIL only — see _CLASSIFY_TAIL_LINES."""
     low = _stderr_tail(stderr).lower()
     return any(sig in low for sig in _RATE_LIMIT_SIGNATURES)
 
 
-def _unlink_quietly(path: str) -> None:
-    """Remove a scratch file if it exists. Best-effort: a leftover temp file must
-    never be the reason a run fails."""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
 def _extract_retry_after_seconds(stderr: str) -> float | None:
-    """Parse a Retry-After / rate-limit-reset hint from stderr, in seconds. Returns
-    None when absent (caller falls back to the window-aligned default). Picks the
-    LARGEST hint found — the reset furthest out is the safe one to wait for.
-    Milliseconds ('ms') are normalised to seconds; a bare number is seconds.
-
-    Read from the stderr TAIL only, for the same reason the classifiers are
-    (review M17): a number the AGENT printed must never set how long we sleep."""
+    """The largest Retry-After/reset hint in the stderr tail, in seconds."""
     best: float | None = None
     for m in _RETRY_AFTER_RE.finditer(_stderr_tail(stderr)):
         try:
@@ -2383,43 +1070,30 @@ def _extract_retry_after_seconds(stderr: str) -> float | None:
     return best
 
 
-def _kill_quietly(proc: Any) -> None:
-    """Terminate a hung codex run and its ENTIRE process tree after an idle-timeout.
-    The subprocess is spawned with start_new_session=True, so its pid is the leader
-    of a process group that includes every descendant (the TEST_CMD it ran and any
-    background server that spawned — e.g. a vite/playwright dev server). Killing only
-    proc.pid would orphan those; they'd hold the inherited stdout pipe open and hang
-    the run's stdout read + proc.wait() forever (→ wedged daemon). So signal the whole
-    GROUP. Best-effort: never raises (the process may already be gone)."""
-    import os
-    import signal
-
+def _unlink_quietly(path: str) -> None:
     try:
-        pgid = os.getpgid(proc.pid)
-    except Exception:
-        pgid = None
-    # Kill the group if we have one; fall back to the single pid.
-    for sig in (signal.SIGKILL,):
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+async def _cancel_quietly(task: asyncio.Future) -> None:
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+
+
+def _kill_quietly(proc: Any) -> None:
+    """SIGKILL the run's whole process group (it leads one: start_new_session),
+    so no descendant keeps the pipes open. Never raises."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:  # noqa: BLE001
         try:
-            if pgid is not None:
-                os.killpg(pgid, sig)
-            else:
-                proc.kill()
-        except ProcessLookupError:
-            return
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return
-
-
-def _session_id_from_lines(stdout: str) -> str:
-    """codex exec prints `session id: <uuid>` in its header. Pull it out so the
-    resume/address-review legs can continue the session (mirrors save_session)."""
-    for line in stdout.splitlines():
-        s = line.strip()
-        if s.lower().startswith("session id:"):
-            return s.split(":", 1)[1].strip()
-    return ""
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass

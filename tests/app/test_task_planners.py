@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import issue_agent.app.planners.tasks as tasks_module
 import pytest
+from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.trust import as_untrusted
 from issue_agent.app.planners.schemas import FIX_SCHEMA, REVIEW_SCHEMA
 from issue_agent.app.planners.tasks import FIXER_DENY, FixTaskConfig, ReviewTaskConfig, build_address_review_task, build_fix_ci_task, build_fresh_reply_task, build_resolve_task, build_resume_task, build_rebase_task, build_review_task
@@ -53,8 +54,9 @@ def test_resolve_task():
     (build_rebase_task, (7, "dev", "/wt", "session")),
 ])
 def test_publishing_task_authorizes_bounded_native_review_in_user_prompt(builder, args):
-    cfg = replace(FIX_CFG, runtime="codex")
+    cfg = replace(FIX_CFG, runtime=RuntimeName.CLAUDE)
     task = builder(*args, cfg)
+    assert "native subagents" not in builder(*args, replace(FIX_CFG, runtime=RuntimeName.CODEX)).prompt
     authorization = task.prompt.split("\n\n", 1)[0]
     assert "user explicitly authorizes and requires independent native subagents" in authorization
     assert "fresh context" in authorization
@@ -86,8 +88,8 @@ def test_raw_text_cannot_cross_the_prompt_boundary():
 
 
 def test_resume_task_carries_session_and_reply():
-    t = build_resume_task(U("use endpoint X"), "/wt", "sess-1", FIX_CFG, fork=True)
-    assert t.resume == "sess-1" and t.fork_session is True
+    t = build_resume_task(U("use endpoint X"), "/wt", "sess-1", FIX_CFG)
+    assert t.resume == "sess-1"
     # T5 (review): "DATA, not new instructions" was prose-only (no fence, no
     # parser) — pruned. The interpolated reply text below is the real contract.
     assert "use endpoint X" in t.prompt
@@ -234,13 +236,6 @@ def test_resumed_legs_do_not_repay_for_agent_md():
         # after it is separately bounded and applies to every leg.
         reminder = task.append_system_prompt.split("\n\nAUTONOMY CONTRACT")[0]
         assert len(reminder) < 1000, f"{name} reminder is not short"
-
-
-def test_forked_legs_also_skip_agent_md():
-    # A fork inherits the parent transcript, so AGENT.md is in-context there too.
-    t = build_resume_task(U("reply"), "/wt", "sess-1", FIX_CFG, fork=True)
-    assert t.fork_session is True
-    assert "AGENTMD" not in t.append_system_prompt
 
 
 def test_fresh_legs_still_get_the_full_agent_md():

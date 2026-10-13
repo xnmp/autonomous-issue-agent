@@ -312,12 +312,6 @@ class HarnessConfig:
             "choices": ("", "low", "medium", "high", "xhigh"),
         },
     )
-    # FIXER_RUNTIME=glm: path to a Claude Code PROFILE's settings.json (e.g.
-    # ~/.cc-glm/settings.json). Its parent directory IS the profile dir, and both
-    # the settings `env` block and the profile's `.env` are read at build time to
-    # form the env injected into the fixer's SDK subprocess (see
-    # adapters/claude_profile.py). Blank is a config error under glm.
-    glm_settings_file: str = ""
     # Idle watchdog: max seconds between agent stream events before a run is deemed
     # hung and aborted (retryable). NOT a total-runtime cap — a hard task streams
     # events steadily and never trips it. The one legit long gap is a single
@@ -557,12 +551,6 @@ class HarnessConfig:
             ("REVIEW_BUDGET_USD", self.review_budget_usd),
         ):
             _require_positive(errors, name, value)
-        if self.fixer_runtime is RuntimeName.GLM and not self.glm_settings_file.strip():
-            # The glm runtime IS "the Claude runner plus a profile's env"; with no
-            # profile there is nothing to inject and the fixer would silently run
-            # on Anthropic credentials instead. Existence of the file is a
-            # build-time check (roles); emptiness is a config error.
-            errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)

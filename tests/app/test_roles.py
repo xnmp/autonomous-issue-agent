@@ -434,15 +434,6 @@ REVIEW_BOT = "review-bot"
 # ── CI pending-deadline reporting (#30) ──────────────────────────────────────
 
 
-# ── FIXER_RUNTIME=glm wiring (build_fix_daemon) ──────────────────────────────
-# The wrapping itself (env injection, task-env precedence) is proven in
-# tests/adapters/test_claude_profile.py; what these pin is the BUILD-TIME
-# contract of the glm branch — that a profile is resolved once at startup and
-# that its outcome is announced in one operator-facing line either way. The
-# composed runner is not reachable from the returned Daemon without reading a
-# private attribute, so it is deliberately not asserted here.
-
-
 class _BuildableGateway(FakeGateway):
     """FakeGateway plus the one member `build_fix_daemon` binds at build time."""
 
@@ -452,66 +443,11 @@ class _BuildableGateway(FakeGateway):
     def viewer_login(self) -> str:
         return REVIEW_BOT  # the review role's boot check: its credential is REVIEW_BOT
 
-def _glm_profile(tmp_path, settings: str) -> str:
-    d = tmp_path / ".cc-glm"
-    d.mkdir()
-    (d / "settings.json").write_text(settings)
-    return str(d / "settings.json")
-
-
 def _role_state_env(tmp_path) -> dict[str, str]:
     return {
         "STATE_DIR": str(tmp_path / "state"),
         "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
     }
-
-
-def _glm_daemon(tmp_path, settings_file: str):
-    from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_fix_daemon
-
-    cfg = replace(
-        from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "glm",
-            "GLM_SETTINGS_FILE": settings_file, **_role_state_env(tmp_path),
-        }),
-        control_authority_root=str(tmp_path / "machine-state"),
-    )
-    return build_fix_daemon(
-        cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
-        FakeRunner(AgentResult(is_error=False)),
-    )
-
-
-def test_a_glm_profile_is_resolved_once_at_startup_and_announced(tmp_path, capsys):
-    settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}})
-
-    daemon = _glm_daemon(tmp_path, _glm_profile(tmp_path, settings))
-
-    line = capsys.readouterr().err
-    assert "glm: runtime ready" in line
-    assert "api.z.ai" in line              # endpoint host: useful, not secret
-    assert "NOT READY" not in line
-    assert daemon.name == "fix"
-
-
-def test_a_missing_glm_profile_says_so_loudly_at_startup_instead_of_dying(tmp_path, capsys):
-    """A misconfig must surface as ONE startup line, not as an opaque failure on
-    the first dispatch — and the daemon must still be built (visibly wrong beats
-    a crash-looping fixer)."""
-    daemon = _glm_daemon(tmp_path, str(tmp_path / "absent" / "settings.json"))
-
-    err = capsys.readouterr().err
-    assert "glm: NOT READY at startup" in err
-    assert "settings.json" in err
-    assert daemon.name == "fix"
-
-
-def test_a_malformed_glm_profile_is_not_ready_rather_than_a_traceback(tmp_path, capsys):
-    daemon = _glm_daemon(tmp_path, _glm_profile(tmp_path, '{"env": {,,}'))
-
-    assert "glm: NOT READY at startup" in capsys.readouterr().err
-    assert daemon.name == "fix"
 
 
 # ── boot capability lines (#46) ───────────────────────────────────────────────
@@ -582,7 +518,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     )
 
     assert seen["default_model"] == "gpt-5.6-terra"
-    assert seen["enforce_budget"] is True
+    assert seen["rate_table"] is not None
     assert seen["sandbox"] == "read-only"
     assert seen["resume_on_retry"] is False
     assert composed.legs.task_config.model == "gpt-5.6-terra"

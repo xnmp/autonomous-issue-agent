@@ -13,7 +13,6 @@ from .effort import Effort
 class RuntimeName(str, Enum):
     CLAUDE = "claude"
     CODEX = "codex"
-    GLM = "glm"
 
 
 def run_input_fingerprint(intent: RunIntent) -> str:

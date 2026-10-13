@@ -161,7 +161,7 @@ def _selected_runtime_binaries(env: dict) -> tuple[tuple[str, str], ...]:
     if "codex" in runtimes or codex_pin:
         binaries.append((codex_pin or "codex", "error"))
     claude_pin = _unquoted((env.get("CLAUDE_BIN") or "").strip())
-    if runtimes & {"claude", "glm"} or claude_pin:
+    if "claude" in runtimes or claude_pin:
         binaries.append((claude_pin or "claude", "error" if claude_pin else "warn"))
     return tuple(binaries)
 

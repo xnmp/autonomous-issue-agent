@@ -591,16 +591,6 @@ def _build_codex_runner(
         debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
         idle_timeout=(runtime.idle_timeout if runtime.idle_timeout > 0 else None),
         max_runtime=(runtime.max_runtime if runtime.max_runtime > 0 else None),
-        transport_retries=runtime.transport_retries,
-        backoff_base=runtime.backoff_base,
-        rate_limit_backoff_base=runtime.rate_limit_backoff_base,
-        max_rate_limit_wait=runtime.max_rate_limit_wait,
-        max_rate_limit_retries=runtime.max_rate_limit_retries,
-        cost_per_mtok_in=runtime.cost_per_mtok_in,
-        cost_per_mtok_out=runtime.cost_per_mtok_out,
-        cost_per_mtok=runtime.cost_per_mtok,
-        cost_per_mtok_cached_in=runtime.cost_per_mtok_cached_in,
-        enforce_budget=runtime.enforce_budget,
         process_supervisor=(
             ProcessSupervisor(
                 process_supervision_state_dir(cfg, leg_role, state_dir)
@@ -668,37 +658,6 @@ def _bind_codex_fix_runtime(
     )
 
 
-def _bind_glm_fix_runtime(
-    cfg: HarnessConfig,
-    _runtime_config: CodexRuntimeConfig,
-    runner: AgentRuntime,
-) -> _FixRuntimeBinding:
-    from ..adapters.claude_profile import (
-        EnvInjectingRuntime,
-        claude_profile_env,
-        endpoint_host,
-    )
-
-    log = _log("fix")
-    try:
-        environment = claude_profile_env(cfg.glm_settings_file)
-    except ValueError as exc:
-        log(f"glm: NOT READY at startup — {exc}")
-        return _FixRuntimeBinding(runner)
-    log(
-        f"glm: runtime ready (endpoint {endpoint_host(environment)}, "
-        f"profile {environment['CLAUDE_CONFIG_DIR']})"
-    )
-    from ..adapters.repository_guidance import RepositoryGuidanceRuntime
-
-    return _FixRuntimeBinding(
-        RepositoryGuidanceRuntime(
-            EnvInjectingRuntime(runner, env=environment),
-            log=log,
-        )
-    )
-
-
 _FIX_RUNTIME_REGISTRY: Mapping[
     RuntimeName,
     Callable[
@@ -708,7 +667,6 @@ _FIX_RUNTIME_REGISTRY: Mapping[
 ] = {
     RuntimeName.CLAUDE: _bind_claude_fix_runtime,
     RuntimeName.CODEX: _bind_codex_fix_runtime,
-    RuntimeName.GLM: _bind_glm_fix_runtime,
 }
 
 if frozenset(_FIX_RUNTIME_REGISTRY) != frozenset(RuntimeName):

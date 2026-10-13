@@ -18,7 +18,7 @@ harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
 ## The shape
 
 Two role daemons — **fix** and **review** — reconcile GitHub and
-drive Claude, Codex, or GLM sessions. Each is assembled in `app/roles.py` from:
+drive Claude or Codex sessions. Each is assembled in `app/roles.py` from:
 
 ```
 observe   gateway.build_world()      one bounded GitHub observation
@@ -156,8 +156,7 @@ binaries do not recognise the new schema.
 Completed legs settle from the sum of usable request receipts, otherwise streamed
 usage at the captured rate card, otherwise zero for interrupted/unusable requests.
 Partial evidence produces `basis=estimate`;
-the reserved maximum is never charged as an estimate. Terminal, lease-free legacy
-`accounting_unavailable` rows follow the same idempotent boot recovery transaction.
+the reserved maximum is never charged as an estimate.
 Live work retains its reservation and stops its process group on a metering
 fault that prevents cap enforcement. See [ADR 0002](../adr/0002-money-and-accounting.md)
 for runtime provenance, Claude's remaining cumulative-cost gap, and deferred late
@@ -248,9 +247,8 @@ that matters is not "wrong answer" but "loop that bills forever":
   without progress, REVIEW counted per head, and bot change-request rounds,
   each stopping at `needs-human`; nothing is stored for them.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
-  harness prices streamed rollout counters and kills the process group on
-  crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
-  legacy token prices are available
+  harness prices the root rollout counters with the captured rate card and
+  kills the process group on crossing
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
@@ -261,33 +259,21 @@ attribution error.
 
 Provider-billed runtimes settle their reported cost. Subscription runtimes
 whose provider reports zero use the configured versioned rate card as an
-explicit synthetic token meter, so sequential Claude/GLM work cannot release
+explicit synthetic token meter, so sequential Claude work cannot release
 its reservation back to a nominally armed cap at zero. If the final usage
 envelope is missing, an armed cap conservatively prices the observed stream
 accumulator; if neither trustworthy usage nor pricing authority exists, the
 full reservation remains active instead of becoming new headroom.
 
-Codex 0.160 native review children share their parent's run and reservation.
-The run-scoped observer joins durable spawn call/output receipts to canonical
-child metadata and excludes copied fork prefixes and referenced ancestor history.
-Each root/child session contributes the per-token-category maximum of cumulative
-usage and deduplicated receipt totals, after subtracting pre-launch usage. Frozen
-Each receipt uses its usable provider dollars, otherwise its frozen token price;
-frozen rates price only the cumulative remainder after subtracting receipt tokens. The same
-observation drives the live cap watchdog and terminal settlement, so delayed
-receipts cannot discard another request's spend. Missing/unusable evidence contributes zero; live metering faults stop the process group when
-cap enforcement cannot be established. Complete terminal records are parsed even
-without their final newline; an unparseable tail contributes zero.
-
-Recovery bounds all root and child evidence by the harness-owned invocation start
-and `runs.completed_at`. A later leg's resumed usage cannot enter the ended run.
-Legacy version-1 evidence prices usable parent usage at its frozen scalar rates;
-missing native-child metadata contributes no child spend and never erases parent spend.
-Version-2 evidence uses the captured native card. Repeated recovery keeps one
-charge. A late real return supersedes a recovery estimate using signed correction
-events and durable output capture, including after repair unreturned acknowledgment.
-The persisted typed charge origin makes a normal return final even at estimated
-prices. No older or recovery receipt can overwrite it.
+Codex runs with native sub-agents disabled in the isolated profile
+(`[features] multi_agent = false`), so a leg's spend is its root rollout's
+cumulative `token_count`, minus a resumed session's pre-launch baseline, priced
+at the rate card captured before launch. The same reading drives the live
+budget kill and terminal settlement; missing rollout usage settles an
+estimate of zero for the interrupted request, never the reserved maximum.
+Recovery prices the root counter up to `runs.completed_at`, so a later leg's
+resumed usage cannot enter the ended run; unusable evidence settles a terminal
+estimate. Repeated recovery keeps one charge.
 JSONL remains evidence for authoritative SQLite settlement.
 The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
 scoped verifiers and required evidence capture within this same leg's budget.
@@ -463,9 +449,9 @@ exact APPROVE or REQUEST_CHANGES with a bounded body, or nothing),
 idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
-`adapters/child_env.py`, `adapters/claude_profile.py`,
-`adapters/codex_home.py`, `adapters/codex_runner.py`,
-`adapters/codex_child_usage.py` (bounded native lineage, own-response observation and frozen-card recovery),
+`adapters/child_env.py`,
+`adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
+once per leg; native sub-agents disabled in the isolated profile),
 `adapters/control_path.py`, `adapters/control_store.py`,
 `adapters/env_file.py`,
 `adapters/github.py`,

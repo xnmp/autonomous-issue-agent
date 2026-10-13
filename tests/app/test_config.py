@@ -361,34 +361,9 @@ def test_validate_raises_combined_error_message():
     try:
         c.validate()
     except ValueError as exc:
-        assert "FIXER_RUNTIME must be one of ['claude', 'codex', 'glm']" in str(exc)
+        assert "FIXER_RUNTIME must be one of ['claude', 'codex']" in str(exc)
     else:  # pragma: no cover - assertion branch
         raise AssertionError("validate should reject invalid config")
-
-
-def test_glm_is_an_accepted_fixer_runtime_when_a_profile_is_named():
-    c = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "FIXER_RUNTIME": "glm", "GLM_SETTINGS_FILE": "~/.cc-glm/settings.json",
-    })
-
-    assert c.fixer_runtime == "glm"
-    assert c.glm_settings_file == "~/.cc-glm/settings.json"
-    assert c.validation_errors() == ()
-
-
-def test_glm_without_a_profile_is_a_config_error():
-    """Unconfigured, the glm runtime is indistinguishable from plain Claude — it
-    would quietly bill an Anthropic account instead of Z.ai."""
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "FIXER_RUNTIME": "glm"})
-
-    _assert_each_knob_flagged_once(c.validation_errors(), {"GLM_SETTINGS_FILE"})
-
-
-def test_glm_settings_file_is_irrelevant_on_other_runtimes():
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "FIXER_RUNTIME": "claude"})
-
-    assert c.validation_errors() == ()
 
 
 def test_malformed_numeric_does_not_traceback_and_lands_in_validation_errors():

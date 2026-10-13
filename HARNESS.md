@@ -7,7 +7,7 @@ operator reference.
 ## First run
 
 Prerequisites: `git`, `gh`, `jq`, `uv`, and at least one configured runtime
-(`claude`, `codex`, or a GLM Claude profile).
+(`claude` or `codex`).
 
 ```bash
 make install
@@ -65,7 +65,7 @@ Important fields:
 - `FIX_BOT` must differ from `REVIEW_BOT`.
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
-- `FIXER_RUNTIME=claude|codex|glm`;
+- `FIXER_RUNTIME=claude|codex`;
   `REVIEWER_RUNTIME=claude|codex`.
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
 - The fixer runs one configured model and effort: `FIX_MODEL` and

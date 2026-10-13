@@ -6,7 +6,6 @@ This is the deployment truth, not a security claim inferred from hooks.
 |---|---|---|---|---|---|---|
 | Claude | SDK tool allow/deny; worktree cwd; broad fixer Bash | yes; sandbox preserved | provider result/usage; native limit | none (deleted in slice 6a) | publication env keys are scrubbed from supervised commands; same-account home/filesystem access remains | trusted inbound only |
 | Codex | `workspace-write`/`read-only` selection; child process group | supported, but resume cannot preserve every exec-only sandbox flag | rollout counters priced by configured card | none (deleted in slice 6a) | publication env keys are scrubbed; operator HOME and same-account filesystem access remain | trusted inbound only |
-| GLM | Claude SDK surface with a validated profile/environment | Claude semantics | provider result where supplied; otherwise explicit unknown | none (deleted in slice 6a) | publication env keys are scrubbed from supervised commands; same-account home/filesystem access remains | trusted inbound only |
 
 | Concern | Authority | Failure posture |
 |---|---|---|

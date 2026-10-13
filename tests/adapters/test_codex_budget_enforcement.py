@@ -13,11 +13,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from issue_agent.adapters.codex_runner import (
-    CodexRunner,
-    budget_overrun_usd,
-    read_rollout_turns,
-)
+from issue_agent.adapters.codex_runner import CodexRunner
+from issue_agent.domain.pricing import ModelRates, RateTable, UnknownModelPolicy
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -40,6 +37,12 @@ def _rollout_path(codex_home, sid: str = SID):
     return day / f"rollout-2026-07-28T00-00-00-{sid}.jsonl"
 
 
+def _session_meta(cwd: str | None = None, sid: str = SID) -> str:
+    """The root session's identity record; dated ahead so it postdates the run."""
+    return json.dumps({"timestamp": "2099-07-29T00:00:00Z", "type": "session_meta", "payload": {
+        "id": sid, "originator": "codex_exec", "source": "exec", "cwd": cwd or os.getcwd()}}) + "\n"
+
+
 def _write_rollout(
     codex_home,
     *,
@@ -47,6 +50,7 @@ def _write_rollout(
     output_tokens: int,
     cached_input_tokens: int = 0,
     sid: str = SID,
+    cwd: str | None = None,
 ) -> None:
     usage = {
         "input_tokens": input_tokens,
@@ -61,15 +65,19 @@ def _write_rollout(
             "info": {"last_token_usage": usage, "total_token_usage": usage},
         }
     }
-    _rollout_path(codex_home, sid).write_text(json.dumps(event) + "\n")
+    _rollout_path(codex_home, sid).write_text(_session_meta(cwd, sid) + json.dumps(event) + "\n")
+
+
+# $5 in / $30 out / $0.50 cached per MTok, the shipped fallback shape.
+CARD = RateTable("card", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
+                 ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000))
 
 
 def _runner(tmp_path, body: str, **overrides) -> CodexRunner:
     values = {
         "codex_bin": _fake_codex(tmp_path, body),
         "env": {"OPENAI_API_KEY": "k"},
-        "cost_per_mtok_in": 5.0,
-        "cost_per_mtok_out": 30.0,
+        "rate_table": CARD,
         "poll_slice": 0.05,
     }
     values.update(overrides)
@@ -80,7 +88,6 @@ def _chatty_body(sid: str = SID, seconds: int = 40) -> str:
     return (
         'out=""; prev=""\n'
         'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        f'echo "session id: {sid}" >&2\n'
         f'for i in $(seq 1 {seconds}); do echo "exec step $i" >&2; sleep 0.05; done\n'
         "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
     )
@@ -128,7 +135,7 @@ def test_accounting_uses_the_launched_child_home_without_scanning_foreign_archiv
         alias.symlink_to(actual, target_is_directory=True)
         runner_env["CODEX_HOME"] = str(alias / ".." / "relative-home")
         selected = actual.parent / "relative-home"
-    _write_rollout(selected, input_tokens=10_000, output_tokens=100)
+    _write_rollout(selected, input_tokens=10_000, output_tokens=100, cwd=str(worktree))
     observed = tmp_path / "observed-home"
     body = f'(cd -P -- "${{CODEX_HOME:-$HOME/.codex}}" && pwd -P) > "{observed}"\n' + _chatty_body(seconds=1)
     result = asyncio.run(_runner(tmp_path, body, env=runner_env).run(
@@ -137,22 +144,6 @@ def test_accounting_uses_the_launched_child_home_without_scanning_foreign_archiv
     assert observed.read_text().strip() == str(selected)
     assert result.exit_reason is ExitReason.OK
     assert result.cost_usd == pytest.approx(0.053)
-
-
-def test_priced_spend_reports_only_when_the_threshold_is_reached():
-    usage = {"input_tokens": 5_000_000, "output_tokens": 100_000}
-    assert budget_overrun_usd(
-        usage,
-        cost_per_mtok_in=5.0,
-        cost_per_mtok_out=30.0,
-        max_budget_usd=20.0,
-    ) == pytest.approx(28.0)
-    assert budget_overrun_usd(
-        usage,
-        cost_per_mtok_in=5.0,
-        cost_per_mtok_out=30.0,
-        max_budget_usd=100.0,
-    ) is None
 
 
 def test_crossing_budget_kills_run_and_settles_operator_receipt(tmp_path, monkeypatch):
@@ -180,7 +171,6 @@ def test_crossing_budget_kills_run_and_settles_operator_receipt(tmp_path, monkey
     assert event["usage"]["input_tokens"] == 5_000_000
     assert event["exit_reason"] == "budget_exhausted"
     assert event["envelope_subtype"] == "error_max_budget_usd"
-    assert event["turns"] == 1
     assert event["duration_s"] > 0
 
 
@@ -189,6 +179,7 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
     slice. Completion must re-check it instead of accepting an over-budget OK."""
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     rollout = _rollout_path(tmp_path)
+    rollout.write_text(_session_meta())
     usage = {
         "input_tokens": 5_000_000,
         "cached_input_tokens": 0,
@@ -205,8 +196,7 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
     body = (
         'out=""; prev=""\n'
         'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        f'echo "session id: {SID}" >&2\n'
-        f"printf '%s\\n' '{event}' > '{rollout}'\n"
+        f"printf '%s\\n' '{event}' >> '{rollout}'\n"
         "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
     )
 
@@ -269,7 +259,6 @@ def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert result.session_id == SID
     assert result.cost_usd == pytest.approx(28.0)
-    assert result.num_turns == 1
 
 
 def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(
@@ -363,7 +352,7 @@ def test_cache_heavy_live_budget_sampler_does_not_kill_a_sub_twenty_dollar_leg(
     assert result.cost_usd == pytest.approx(3.1765)
 
 
-def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):
+def test_resumed_leg_uses_its_own_usage_delta(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     _write_rollout(tmp_path, input_tokens=5_000_000, output_tokens=100_000)
 
@@ -375,7 +364,6 @@ def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):
 
     assert result.exit_reason is ExitReason.OK
     assert result.cost_usd == pytest.approx(0.0)
-    assert result.num_turns == 0
 
 
 def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monkeypatch):
@@ -435,17 +423,3 @@ def test_budget_only_watchdog_samples_a_silent_generation(tmp_path, monkeypatch)
 
     assert time.monotonic() - started < 2
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-
-
-def test_enforcement_switch_off_leaves_the_same_run_alone(tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    _write_rollout(tmp_path, input_tokens=5_000_000, output_tokens=100_000)
-
-    result = asyncio.run(
-        _runner(
-            tmp_path, _chatty_body(seconds=1), enforce_budget=False
-        ).run(RuntimePlan(prompt="x", max_budget_usd=20.0))
-    )
-
-    assert result.exit_reason is ExitReason.OK
-    assert read_rollout_turns(SID) == 1

@@ -519,7 +519,7 @@ def test_architecture_docs_name_authoritative_subsystems() -> None:
         "dashboard",
     ):
         assert required in architecture
-    for runtime in ("claude", "codex", "glm"):
+    for runtime in ("claude", "codex"):
         assert runtime in matrix
     for authority in (
         "paid admission",

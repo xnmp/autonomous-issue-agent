@@ -181,6 +181,24 @@ def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     return base + _STANDING_POLICY_NOTICE + "\n" + _HUMAN_MESSAGES
 
 
+def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None = None) -> PlannedRun:
+    """One fixer leg. Codex runs with native sub-agents disabled (refactor
+    decision Q12), so only other runtimes carry the delegation grant."""
+    grant = "" if cfg.runtime == RuntimeName.CODEX else _FIXER_REVIEW_AUTHORIZATION
+    return PlannedRun(
+        prompt=grant + prompt,
+        schema=FIX_SCHEMA,
+        append_system_prompt=_fix_system_prompt(cfg, session_id),
+        disallowed_tools=FIXER_DENY,
+        model=cfg.model,
+        runtime=cfg.runtime,
+        effort=cfg.effort,
+        max_budget_usd=cfg.max_budget_usd,
+        cwd=cwd,
+        resume=session_id,
+    )
+
+
 # ── fix side ──────────────────────────────────────────────────────────────────
 def build_resolve_task(
     issue_number: int,
@@ -198,17 +216,7 @@ def build_resolve_task(
         f"{_fenced('issue body', body)}\n\n"
         + _PUSH_CONTRACT.format(branch=branch)
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, None),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-    )
+    return _fix_run(cfg, prompt, cwd)
 
 
 # Shown AFTER the fenced reply in both resume shapes. The fence guards against
@@ -245,7 +253,6 @@ def build_resume_task(
     cwd: str,
     session_id: str,
     cfg: FixTaskConfig,
-    fork: bool = False,
 ) -> PlannedRun:
     """resume-issue.sh: feed a human reply back into a blocked issue's session."""
     prompt = (
@@ -256,19 +263,7 @@ def build_resume_task(
         + "\n\nContinue. Push your branch with `git push` when done (the harness "
         "opens the pull request), or return status=blocked with 'needs'."
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, session_id),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-        resume=session_id,
-        fork_session=fork,
-    )
+    return _fix_run(cfg, prompt, cwd, session_id)
 
 
 def build_fresh_reply_task(
@@ -293,18 +288,7 @@ def build_fresh_reply_task(
         "`git push` when done (the harness opens the pull request), or return "
         "status=blocked with 'needs' set to exactly what you need."
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, None),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-        resume="",
-    )
+    return _fix_run(cfg, prompt, cwd)
 
 
 def build_continue_task(cwd: str, session_id: str, cfg: FixTaskConfig) -> PlannedRun:
@@ -315,18 +299,7 @@ def build_continue_task(cwd: str, session_id: str, cfg: FixTaskConfig) -> Planne
         "Push your branch with `git push` when done (the harness opens the pull "
         "request), or return status=blocked with 'needs'."
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, session_id),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-        resume=session_id,
-    )
+    return _fix_run(cfg, prompt, cwd, session_id)
 
 
 def with_human_reply(task: PlannedRun, reply: Untrusted) -> PlannedRun:
@@ -351,7 +324,7 @@ def build_address_review_task(
     inline: Untrusted,
     cwd: str,
     session_id: str,
-    cfg: FixTaskConfig, fork: bool = False,
+    cfg: FixTaskConfig,
 ) -> PlannedRun:
     """address-review.sh: address reviewer feedback, push.
 
@@ -374,19 +347,7 @@ def build_address_review_task(
         f"{_fenced('review body', review_body)}\n\n"
         f"{_fenced('inline comments', inline)}"
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, session_id),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-        resume=session_id,
-        fork_session=fork,
-    )
+    return _fix_run(cfg, prompt, cwd, session_id)
 
 
 _FIX_CI_DIAGNOSE = """Diagnose by failure class:
@@ -416,7 +377,7 @@ def build_fix_ci_task(
     failed_log: Untrusted,
     cwd: str,
     session_id: str,
-    cfg: FixTaskConfig, fork: bool = False,
+    cfg: FixTaskConfig,
 ) -> PlannedRun:
     """fix-ci.sh: repair failing CI on an open PR.
 
@@ -441,24 +402,12 @@ def build_fix_ci_task(
         f"{_fenced('failed check names', failed_checks)}\n\n"
         f"{_fenced('ci log tail', failed_log)}"
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, session_id),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-        resume=session_id,
-        fork_session=fork,
-    )
+    return _fix_run(cfg, prompt, cwd, session_id)
 
 
 def build_rebase_task(
     pr_number: int, base_branch: str, cwd: str, session_id: str,
-    cfg: FixTaskConfig, fork: bool = False,
+    cfg: FixTaskConfig,
 ) -> PlannedRun:
     """Wake the fixer to rebase a CONFLICTING PR branch onto the (advanced) base.
     Resumes the original session so the agent still has its own implementation
@@ -478,19 +427,7 @@ def build_rebase_task(
         "`gh pr checks` loops per rebase). Return status=blocked with 'needs' only if "
         "the conflict genuinely requires a human decision."
     )
-    return PlannedRun(
-        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
-        schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, session_id),
-        disallowed_tools=FIXER_DENY,
-        model=cfg.model,
-        runtime=cfg.runtime,
-        effort=cfg.effort,
-        max_budget_usd=cfg.max_budget_usd,
-        cwd=cwd,
-        resume=session_id,
-        fork_session=fork,
-    )
+    return _fix_run(cfg, prompt, cwd, session_id)
 
 
 # ── review side ─────────────────────────────────────────────────────────────
