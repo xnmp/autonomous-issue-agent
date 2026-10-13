@@ -1,12 +1,17 @@
 import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
 import { z } from "zod";
 
+const Dispatch = z
+  .object({ kind: z.string(), number: z.number().int() })
+  .passthrough();
 const RoleHealth = z
   .object({
     alive: z.union([z.boolean(), z.null()]),
     heartbeat_ts: z.union([z.string(), z.null()]),
+    in_flight: z.array(Dispatch).optional().default([]),
     role: z.string(),
     stale: z.boolean(),
+    state: z.union([z.string(), z.null()]).optional(),
   })
   .passthrough();
 const RepoSummary = z
@@ -201,6 +206,9 @@ const HTTPValidationError = z
   .object({ detail: z.array(ValidationError) })
   .partial()
   .passthrough();
+const CarriedLegs = z
+  .object({ cost_usd: z.number(), legs: z.number().int() })
+  .passthrough();
 const PullRequestLink = z
   .object({
     ci_state: z
@@ -230,6 +238,7 @@ const IssueStep = z
     idx: z.number().int(),
     kind: z.string(),
     leg_id: z.string(),
+    model: z.union([z.string(), z.null()]).optional(),
     outcome: z.enum([
       "running",
       "passed",
@@ -237,7 +246,6 @@ const IssueStep = z
       "asked",
       "failed",
       "done",
-      "carried",
     ]),
     pr: z.union([z.number(), z.null()]),
     pricing_basis: z.union([z.string(), z.null()]),
@@ -266,6 +274,7 @@ const IssueDetailPayload = z
         z.null(),
       ])
       .optional(),
+    carried: z.union([CarriedLegs, z.null()]).optional(),
     cost_usd: z.number(),
     done: z.boolean(),
     estimated: z.boolean(),
@@ -286,10 +295,19 @@ const ActionResult = z
   .object({ detail: z.string(), ok: z.boolean() })
   .passthrough();
 const timezone = z.union([z.string(), z.null()]).optional();
+const RoleHeadroom = z
+  .object({
+    fits: z.union([z.boolean(), z.null()]),
+    leg_usd: z.number(),
+    role: z.string(),
+  })
+  .passthrough();
 const Caps = z
   .object({
     daily_cap_usd: z.union([z.number(), z.null()]),
     global_daily_cap_usd: z.union([z.number(), z.null()]),
+    global_today_usd: z.union([z.number(), z.null()]).optional(),
+    headroom: z.array(RoleHeadroom).optional().default([]),
     issue_cap_usd: z.union([z.number(), z.null()]),
     today_usd: z.union([z.number(), z.null()]),
   })
@@ -300,6 +318,18 @@ const HealthTrendDay = z
     day: z.string(),
     net_open: z.number().int(),
     opened: z.number().int(),
+  })
+  .passthrough();
+const LeaseRow = z
+  .object({
+    acquired_ts: z.union([z.string(), z.null()]),
+    issue: z.union([z.number(), z.null()]),
+    kind: z.union([z.string(), z.null()]),
+    leg_id: z.union([z.string(), z.null()]),
+    leg_state: z.union([z.string(), z.null()]),
+    pid: z.number().int(),
+    pr: z.union([z.number(), z.null()]),
+    role: z.string(),
   })
   .passthrough();
 const BasisCost = z
@@ -323,7 +353,6 @@ const Metrics = z
     needs_human: z.union([z.number(), z.null()]),
     open_items: z.union([z.number(), z.null()]),
     rounds_per_pr: z.union([z.number(), z.null()]),
-    today_usd: z.number(),
     total_cost_usd: z.number(),
   })
   .passthrough();
@@ -351,6 +380,7 @@ const OverviewPayload = z
     caps: z.union([Caps, z.null()]),
     health: z.array(RoleHealth),
     health_trend: z.array(HealthTrendDay).optional().default([]),
+    leases: z.array(LeaseRow).optional().default([]),
     metrics: z.union([Metrics, z.null()]),
     needs_attention: z.array(AttentionItem).optional().default([]),
     spend_per_hour: z.array(SpendBucket).optional().default([]),
@@ -418,6 +448,7 @@ const VerificationPayload = z
   .passthrough();
 
 export const schemas = {
+  Dispatch,
   RoleHealth,
   RepoSummary,
   ReposPayload,
@@ -434,14 +465,17 @@ export const schemas = {
   IssuesPayload,
   ValidationError,
   HTTPValidationError,
+  CarriedLegs,
   PullRequestLink,
   TokenUsage,
   IssueStep,
   IssueDetailPayload,
   ActionResult,
   timezone,
+  RoleHeadroom,
   Caps,
   HealthTrendDay,
+  LeaseRow,
   BasisCost,
   KindCost,
   Metrics,
@@ -550,6 +584,7 @@ const endpoints = makeApi([
             z.null(),
           ])
           .optional(),
+        carried: z.union([CarriedLegs, z.null()]).optional(),
         cost_usd: z.number(),
         done: z.boolean(),
         estimated: z.boolean(),
@@ -648,6 +683,7 @@ const endpoints = makeApi([
         caps: z.union([Caps, z.null()]),
         health: z.array(RoleHealth),
         health_trend: z.array(HealthTrendDay).optional().default([]),
+        leases: z.array(LeaseRow).optional().default([]),
         metrics: z.union([Metrics, z.null()]),
         needs_attention: z.array(AttentionItem).optional().default([]),
         spend_per_hour: z.array(SpendBucket).optional().default([]),

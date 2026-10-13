@@ -1,171 +1,144 @@
-"""Deterministic full-stack server for Playwright."""
+"""Full-stack server for Playwright: the real dashboard app and the real
+`Backend` (derive, the read-only control store, the role journals and
+heartbeats) over one fixture deployment. Only GitHub and the provider usage
+meters are fixtures, so the board text and the legs rows the specs assert are
+what the production read path produces."""
 
+from __future__ import annotations
+
+import json
+import sqlite3
+import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import uvicorn
 
-
+from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.dashweb.server import create_app
+from issue_agent.app.dashweb.service import Backend
+from issue_agent.domain.checks import Check, Observed
+from issue_agent.domain.labels import Label
+from issue_agent.domain.state import Harness, StopReason, stop_tag
+from issue_agent.domain.world import Comment, IssueView, PRView, WorldState
+
+# Noon of the current UTC day: every fixture leg falls inside the day the caps
+# sum, whenever the suite runs.
+NOW = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+REPO = "o/demo"
+HARNESS = Harness("fixbot", "reviewbot")
 
 
-def role(name: str) -> dict:
-    return {"role": name, "alive": True, "stale": False, "heartbeat_ts": "2026-07-29T08:00:00Z"}
+def at(minutes: float) -> str:
+    return (NOW + timedelta(minutes=minutes)).isoformat()
 
 
-DONE_CARD = {
-    "issue": 50,
-    "title": "Explain completed work",
-    "url": "https://github.com/openai/autonomous-issue-agent/issues/50",
-    "pr": 75,
-    "pr_url": "https://github.com/openai/autonomous-issue-agent/pull/75",
-    "merged_ts": "2026-07-29T08:00:00Z",
-    "cost_usd": 2,
-    "legs": 1,
-    "review_rounds": 0,
-    "labels": [],
-}
+def stamp(minutes: float) -> str:
+    return (NOW + timedelta(minutes=minutes)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-class FixtureBackend:
-    def known(self, name: str) -> bool:
-        return name == "self"
+def world() -> WorldState:
+    ready = frozenset({Label.AI_READY})
+    question = Comment("fixbot", f"{HARNESS.marker}\n{stop_tag(StopReason.QUESTION)}\nWhich API should it call?", at(-40))
+    pending = Observed("h3", "h3", frozenset(), (Check("test", state="IN_PROGRESS", bucket="pending"),))
+    return WorldState(
+        issues=(
+            IssueView(1, "Queued work", labels=ready),
+            IssueView(2, "Asked a question", labels=ready | {Label.NEEDS_HUMAN}, comments=(question,)),
+            IssueView(3, "Has a PR", labels=ready),
+            IssueView(4, "Running now", labels=ready),
+        ),
+        prs=(PRView(30, title="fix: has a PR", head_ref_name="fix/3-pr", head_ref_oid="h3", ci=pending,
+                    mergeable="MERGEABLE", merge_state="CLEAN"),),
+        now=at(0),
+    )
 
-    def repos(self) -> dict:
-        return {
-            "repos": [{
-                "name": "self",
-                "repo": "openai/autonomous-issue-agent",
-                "target_dir": "/tmp/self",
-                "is_self": True,
-                "active": True,
-                "roles": [role("fix"), role("review")],
-                "frecency": 1,
-                "last_activity_ts": "2026-07-29T08:00:00Z",
-                "in_flight": 0,
-                "done": 1,
-            }],
-            "warnings": [],
-        }
 
+def deployment(root: Path) -> None:
+    state = root / "state"
+    (root / "config" / "repos").mkdir(parents=True)
+    body = (f'REPO="{REPO}"\nFIX_BOT="fixbot"\nREVIEW_BOT="reviewbot"\nSTATE_DIR="{state}/fix"\n'
+            f'REVIEW_STATE_DIR="{state}/review"\nISSUE_SPEND_CAP_USD="25"\nDAILY_SPEND_CAP_USD="700"\n')
+    (root / "config" / "repos" / "demo.env").write_text(body)
+    (root / "config" / ".active.demo.env").write_text(body)
+    for role in ("fix", "review"):
+        (state / role).mkdir(parents=True)
+        (state / role / "heartbeat.json").write_text(json.dumps({
+            "in_flight": [{"kind": "RESOLVE", "number": 4}] if role == "fix" else [],
+            "pid": 1, "state": "running", "updated_at": at(0)}))
+    (state / "fix" / "journal.jsonl").write_text(
+        json.dumps({"event": "agent_run", "run_id": "L3", "model": "gpt-6.1-sol"}) + "\n")
+
+    path = root / "control.db"
+    SQLiteControlStore(str(path)).initialize()
+    db = sqlite3.connect(path)
+    settled = ("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
+               "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
+               "provider_receipt_id, settled_at, leg_class, session_id, result_json) VALUES "
+               "(?, ?, ?, ?, ?, ?, '', ?, 'codex', 'ended', ?, ?, ?, 'USD', 10000000, ?, ?, 'normal_return', ?, ?, ?, "
+               "'s', ?)")
+    db.execute(settled, ("L2", REPO, "fix", "RESOLVE", 2, 0, f"{REPO}:fix", stamp(-60), stamp(-60), stamp(-50),
+                         2_000_000, "provider_reported", "r2", stamp(-50), "asked",
+                         json.dumps({"question": "Which API should it call?"})))
+    db.execute(settled, ("L3", REPO, "fix", "RESOLVE", 3, 0, f"{REPO}:fix", stamp(-30), stamp(-30), stamp(-20),
+                         1_250_000, "configured_rate_card", "r3", stamp(-20), "agent",
+                         json.dumps({"summary": "Opened the fix branch."})))
+    db.execute(settled, ("C3", REPO, "carried", "ROUTE", 3, 0, "legacy", stamp(-90), stamp(-90), stamp(-89),
+                         400_000, "synthetic", "c3", stamp(-89), None, "{}"))
+    db.execute("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
+               "reserved_at, started_at, currency, reserved_micros) VALUES "
+               "('L4', ?, 'fix', 'RESOLVE', 4, 0, '', ?, 'codex', 'running', ?, ?, 'USD', 10000000)",
+               (REPO, f"{REPO}:fix", stamp(-5), stamp(-5)))
+    db.execute("INSERT INTO leases(repository, role, target, owner, leg_id, pid, pgid, start_ticks, acquired_at) "
+               "VALUES (?, 'fix', 4, ?, 'L4', 999999, 999999, 1, ?)", (REPO, f"{REPO}:fix", stamp(-5)))
+    db.commit()
+    db.close()
+
+
+class Gateway:
+    def build_world(self, _base):
+        return world()
+
+
+class Gh:
+    def issues(self, _repo, limit=1000):
+        return [{"number": 6, "title": "Someday", "state": "OPEN", "labels": [], "createdAt": at(-1440)}], ""
+
+    def merged_prs(self, _repo, limit=200):
+        return [], ""
+
+
+class Inline:
+    """Observations complete inside the poll that schedules them."""
+
+    def submit(self, fn, *args):
+        from concurrent.futures import Future
+
+        future: Future = Future()
+        future.set_result(fn(*args))
+        return future
+
+
+class FixtureBackend(Backend):
     def usage(self) -> dict:
-        return {
-            "claude": None,
-            "codex": None,
-            "harness": {
-                "global_daily_cap_usd": 50,
-                "today_all_repos_usd": 2,
-                "per_repo": [{
-                    "name": "self",
-                    "repo": "openai/autonomous-issue-agent",
-                    "daily_cap_usd": 10,
-                    "today_usd": 2,
-                }],
-            },
-            "warnings": [],
-        }
+        return {"claude": None, "codex": None, "harness": None, "warnings": []}
 
     def verification(self) -> dict:
-        return {
-            "rows": [{
-                "id": "V-1",
-                "change": "Dashboard",
-                "status": "verified",
-                "evidence": "E2E",
-                "shipped": "yes",
-                "raw": "",
-            }],
-            "warnings": [],
-        }
+        return {"rows": [], "warnings": []}
 
-    def overview(self, _name: str, _timezone_name: str | None = None) -> dict:
-        return {
-            "metrics": None,
-            "caps": {"issue_cap_usd": 5, "daily_cap_usd": 10, "global_daily_cap_usd": 50, "today_usd": 2},
-            "health": [],
-            "needs_attention": [],
-            "health_trend": [{"day": "2026-07-29", "opened": 3, "closed": 1, "net_open": 2}],
-            "spend_per_hour": [],
-            "warnings": [],
-        }
-
-    def issues(self, _name: str) -> dict:
-        return {
-            "in_flight": [],
-            "done": [DONE_CARD],
-            "backlog": [],
-            "gh_ok": True,
-            "observed_at": "2026-07-29T08:00:00Z",
-            "notifications": [],
-            "warnings": [],
-        }
-
-    def issue(self, _name: str, _number: int) -> dict | None:
-        if _number != 50:
-            return None
-        return {
-            "issue": 50,
-            "title": "Explain completed work",
-            "url": "https://github.com/openai/autonomous-issue-agent/issues/50",
-            "labels": [],
-            "board": None,
-            "action": None,
-            "done": True,
-            "held_for_human": False,
-            "pull_requests": [{
-                "number": 75,
-                "url": "https://github.com/openai/autonomous-issue-agent/pull/75",
-                "state": "merged",
-            }],
-            "cost_usd": 2,
-            "estimated": False,
-            "rail": {
-                "current": "merge", "furthest": "merge", "resolve_attempts": 1, "review_rounds": 0,
-                "ci_runs": 0, "steps": 1, "live": False,
-            },
-            "history": [{"stage": "resolve", "steps": [{"kind": "RESOLVE", "outcome": "done", "count": 1}]}],
-            "steps": [{
-                "idx": 0,
-                "leg_id": "leg-50-0",
-                "kind": "RESOLVE",
-                "role": "fix",
-                "runtime": "codex",
-                "state": "ended",
-                "outcome": "done",
-                "started_ts": "2026-07-29T07:59:00Z",
-                "ended_ts": "2026-07-29T08:00:00Z",
-                "duration_s": 60,
-                "cost_usd": 2,
-                "estimated": False,
-                "pricing_basis": "provider_reported",
-                "end_reason": "normal_return",
-                "session_id": "session-50",
-                "usage": None,
-                "head": None,
-                "pr": None,
-                "summary": "Explained the completed work.",
-            }],
-            "warnings": [],
-        }
-
-    def promote(self, _name: str, _number: int) -> tuple[bool, str]:
-        return True, "promoted"
-
-    def unblock(self, _name: str, _number: int) -> tuple[bool, str]:
-        return True, "unblocked"
 
 def fixture_app():
-    """The real dashboard app over the fixture backend."""
-    harness_root = Path(__file__).resolve().parents[2]
-    backend = FixtureBackend()
-    app = create_app(backend, harness_root=str(harness_root))
-
-    return app
+    root = Path(tempfile.mkdtemp(prefix="dashboard-e2e-"))
+    deployment(root)
+    backend = FixtureBackend(
+        str(root), gh=Gh(), gateway_factory=lambda _repo: Gateway(), now_fn=lambda: NOW,
+        environ={"PATH": "/usr/bin:/bin", "HOME": str(root)}, observe_executor=Inline(),  # type: ignore[arg-type]
+        proc_scan=lambda: ({"demo": {"fix", "review"}}, True), control_path=lambda _cfg: str(root / "control.db"),
+    )
+    backend.issues("demo")  # the first poll schedules the observation; the page then reads it
+    # The SPA bundle is this checkout's; the deployment is the fixture's.
+    return create_app(backend, harness_root=str(Path(__file__).resolve().parents[2]))
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        fixture_app(),
-        host="127.0.0.1",
-        port=4174,
-        log_level="warning",
-    )
+    uvicorn.run(fixture_app(), host="127.0.0.1", port=4174, log_level="warning")

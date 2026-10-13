@@ -287,18 +287,6 @@ summary:focus-visible,
 .chip-neutral {
   --chip-c: var(--ink-muted);
 }
-.chip-tier-luna {
-  --chip-c: var(--tier-luna);
-}
-.chip-tier-terra {
-  --chip-c: var(--tier-terra);
-}
-.chip-tier-sol {
-  --chip-c: var(--tier-sol);
-}
-.chip-tier-high {
-  --chip-c: var(--tier-high);
-}
 .chip-warn {
   --chip-c: var(--running);
 }

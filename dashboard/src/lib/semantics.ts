@@ -10,9 +10,7 @@
 
 import type { IssueStep, KindCost, RoleHealth } from "../api/types";
 
-export type Tone =
-  | "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral"
-  | "tier-luna" | "tier-terra" | "tier-sol" | "tier-high";
+export type Tone = "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral";
 
 /* --------------------------------------------------------- leg kinds */
 
@@ -28,13 +26,19 @@ export function kindLabel(kind: string): string {
   return KIND_LABEL[kind] ?? kind.replaceAll("_", " ").toLowerCase();
 }
 
-export type LegFamily = "resolve" | "review" | "repair" | "other";
+/** The design's acts in lifecycle order; anything else (the server's
+ * `carried` pre-cutover total) follows. */
+const ACT_ORDER = ["RESOLVE", "FIX_CI", "REBASE", "REVIEW", "ADDRESS_REVIEW"];
 
-export function familyOf(kind: string): LegFamily {
-  if (kind === "RESOLVE") return "resolve";
-  if (kind === "REVIEW") return "review";
-  if (kind === "FIX_CI" || kind === "ADDRESS_REVIEW" || kind === "REBASE") return "repair";
-  return "other";
+/** Spend by act, in lifecycle order, dropping acts with no legs. */
+export function actCosts(byKind: readonly KindCost[] | null | undefined): KindCost[] {
+  const rank = (kind: string) => {
+    const at = ACT_ORDER.indexOf(kind);
+    return at === -1 ? ACT_ORDER.length : at;
+  };
+  return [...(byKind ?? [])]
+    .filter((row) => row.runs > 0 && Number.isFinite(row.usd))
+    .sort((a, b) => rank(a.kind) - rank(b.kind) || a.kind.localeCompare(b.kind));
 }
 
 /* ---------------------------------------------------------- outcomes */
@@ -51,8 +55,7 @@ export interface StatusMark {
  * The shared icon + colour vocabulary for a leg's outcome. A review that
  * requested changes did its job, but green would read as "converged": it is
  * yellow, the loop still going. An agent's question is the operator's to
- * answer, so it reads as an alarm. A carried leg predates the store's
- * cutover: money history, neither a success nor a failure.
+ * answer, so it reads as an alarm.
  */
 const OUTCOME_MARKS: Record<Outcome, StatusMark> = {
   running: { glyph: "…", label: "running", tone: "running" },
@@ -61,7 +64,6 @@ const OUTCOME_MARKS: Record<Outcome, StatusMark> = {
   asked: { glyph: "?", label: "asked a question", tone: "fail" },
   failed: { glyph: "×", label: "failed", tone: "fail" },
   done: { glyph: "✓", label: "completed", tone: "ok" },
-  carried: { glyph: "·", label: "before the cutover", tone: "neutral" },
 };
 
 export function outcomeMark(outcome: Outcome): StatusMark {
@@ -227,31 +229,4 @@ export function utilTone(pct: number | null | undefined): Tone {
   if (pct >= 85) return "fail";
   if (pct >= 60) return "running";
   return "ok";
-}
-
-/* -------------------------------------------------------- cost mix */
-
-export interface MixSlice {
-  family: Exclude<LegFamily, "other">;
-  label: string;
-  usd: number;
-  /** fixed slot — assigned by identity, never by rank */
-  varName: string;
-}
-
-/**
- * Spend by leg family, from the per-kind fold. Fixed slot order, validated
- * with the dataviz validator against --panel: blue / bright-cyan / yellow
- * pass CVD separation, the normal-vision floor and 3:1 contrast. Never
- * reorder by size.
- */
-export function mixSlices(byKind: readonly KindCost[] | null | undefined): MixSlice[] {
-  const total = (family: LegFamily) => (byKind ?? [])
-    .filter((row) => familyOf(row.kind) === family && Number.isFinite(row.usd))
-    .reduce((sum, row) => sum + row.usd, 0);
-  return [
-    { family: "resolve", label: "Resolve", usd: total("resolve"), varName: "--series-1" },
-    { family: "review", label: "Review", usd: total("review"), varName: "--series-2" },
-    { family: "repair", label: "Repair", usd: total("repair"), varName: "--series-3" },
-  ];
 }

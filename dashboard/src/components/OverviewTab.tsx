@@ -3,14 +3,17 @@ import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import type {
   AttentionItem,
+  Caps,
   HealthTrendDay,
+  LeaseRow,
   OverviewPayload,
   RoleHealth,
 } from "../api/types";
 import {
+  actCosts,
   HEALTH_LABEL,
   HEALTH_TONE,
-  mixSlices,
+  kindLabel,
   roleHealth,
   utilTone,
 } from "../lib/semantics";
@@ -26,17 +29,16 @@ const POLL_MS = 10_000;
 /**
  * The "is this on rails?" view. Items waiting on a human lead; measurements
  * (all folded from `legs` and GitHub merges) follow in progressively quieter
- * groups so urgent work never competes with lifetime counters.
+ * groups so urgent work never competes with lifetime counters. Caps, leases
+ * and role health are the control store's and the daemons' own state.
  */
 export function OverviewTab({
   repo,
   onOpenIssues,
-  showDaemonHealth = false,
   showIssueHealthTrend = false,
 }: {
   repo: string;
   onOpenIssues: (sub: "inflight" | "done") => void;
-  showDaemonHealth?: boolean;
   showIssueHealthTrend?: boolean;
 }) {
   const ov = usePolled(
@@ -48,13 +50,7 @@ export function OverviewTab({
   const m = ov.data?.metrics ?? null;
   const caps = ov.data?.caps ?? null;
   const needsHuman = m?.needs_human ?? 0;
-  const mix = mixSlices(m?.by_kind);
-
-  const todayUsd = caps?.today_usd ?? m?.today_usd ?? null;
-  const dailyPct =
-    todayUsd != null && caps?.daily_cap_usd != null && caps.daily_cap_usd > 0
-      ? (todayUsd / caps.daily_cap_usd) * 100
-      : null;
+  const costs = actCosts(m?.by_kind);
 
   return (
     <div className="tabbody">
@@ -95,13 +91,7 @@ export function OverviewTab({
           title="the primary efficiency number: total leg spend / merged harness PRs"
           primary
         />
-        <CapsTile
-          todayUsd={todayUsd}
-          dailyCapUsd={caps?.daily_cap_usd ?? null}
-          issueCapUsd={caps?.issue_cap_usd ?? null}
-          globalCapUsd={caps?.global_daily_cap_usd ?? null}
-          dailyPct={dailyPct}
-        />
+        <CapsTile caps={caps} />
       </div>
       <div className="tiles overview-metrics overview-metrics-secondary">
         <StatTile
@@ -122,9 +112,9 @@ export function OverviewTab({
         <StatTile
           label="Legs"
           value={num(m?.legs)}
-          sub={mix.map((slice) => `${slice.label.toLowerCase()} ${usdCompact(slice.usd)}`).join(" · ")}
+          sub={costs.map((row) => `${kindLabel(row.kind).toLowerCase()} ${usdCompact(row.usd)}`).join(" · ")}
           tone="neutral"
-          title="paid agent legs, with spend by leg family"
+          title="paid agent legs, with spend by act; carried is the pre-cutover ledger"
         />
         <StatTile
           label="Machine failures"
@@ -134,22 +124,20 @@ export function OverviewTab({
         />
       </div>
 
-      {showDaemonHealth ? (
-        <section className="overview-health panel">
-          <div className="panel-hd">
-            <span className="panel-title">Daemon health</span>
-            <span className="faint">role heartbeats</span>
-          </div>
-          <div className="panel-bd health-list">
-            {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
-              <EmptyState>no role heartbeats found for this deployment</EmptyState>
-            ) : null}
-            {(ov.data?.health ?? []).map((h) => (
-              <HealthRow key={h.role} health={h} />
-            ))}
-          </div>
-        </section>
-      ) : null}
+      <section className="overview-health panel">
+        <div className="panel-hd">
+          <span className="panel-title">Daemon health</span>
+          <span className="faint">role heartbeats</span>
+        </div>
+        <div className="panel-bd health-list">
+          {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
+            <EmptyState>no role heartbeats found for this deployment</EmptyState>
+          ) : null}
+          {(ov.data?.health ?? []).map((h) => (
+            <HealthRow key={h.role} health={h} />
+          ))}
+        </div>
+      </section>
 
       <section className={`panel operator-actions-panel${(ov.data?.needs_attention ?? []).length > 0 ? " operator-actions-active" : ""}`}>
         <div className="panel-hd">
@@ -161,6 +149,8 @@ export function OverviewTab({
         </div>
       </section>
 
+      <Leases rows={ov.data?.leases ?? []} loading={ov.loading} />
+
       <SpendPerHour buckets={ov.data?.spend_per_hour ?? []} />
 
       {showIssueHealthTrend ? (
@@ -170,21 +160,21 @@ export function OverviewTab({
   );
 }
 
-function CapsTile({
-  todayUsd,
-  dailyCapUsd,
-  issueCapUsd,
-  globalCapUsd,
-  dailyPct,
-}: {
-  todayUsd: number | null;
-  dailyCapUsd: number | null;
-  issueCapUsd: number | null;
-  globalCapUsd: number | null;
-  dailyPct: number | null;
-}) {
-  const tone = utilTone(dailyPct);
-  const alert = dailyPct !== null && dailyPct >= 85;
+function capPct(used: number | null | undefined, cap: number | null | undefined): number | null {
+  return used != null && cap != null && cap > 0 ? (used / cap) * 100 : null;
+}
+
+/**
+ * The daily caps as the core reads them: committed today (settled plus
+ * reserved) against the repository and the all-repos cap, and whether each
+ * role's next leg still fits. A role whose leg does not fit waits silently.
+ */
+function CapsTile({ caps }: { caps: Caps | null }) {
+  const dailyPct = capPct(caps?.today_usd, caps?.daily_cap_usd);
+  const globalPct = capPct(caps?.global_today_usd, caps?.global_daily_cap_usd);
+  const blocked = (caps?.headroom ?? []).some((row) => row.fits === false);
+  const tone = utilTone(Math.max(dailyPct ?? 0, globalPct ?? 0));
+  const alert = blocked || tone === "fail";
   return (
     <section
       className={`tile tile-primary overview-cap-tile${alert ? " tile-alert" : ""}`}
@@ -196,22 +186,78 @@ function CapsTile({
       </div>
       <div className="cap-spend">
         <span className={`tile-value tone-${alert ? "fail" : tone}`}>
-          {usdCompact(todayUsd)}
+          {usdCompact(caps?.today_usd)}
         </span>
         <span className="faint">
-          today {dailyCapUsd !== null ? `/ ${usd(dailyCapUsd)}` : "· uncapped"}
+          today {caps?.daily_cap_usd != null ? `/ ${usd(caps.daily_cap_usd)}` : "· uncapped"}
         </span>
       </div>
       <Meter
-        label="Daily spend"
+        label="This repo today"
         pct={dailyPct}
-        unavailableReason="no daily cap configured for this deployment"
+        unavailableReason="no daily cap configured, or the store is unreadable"
       />
+      {caps?.global_daily_cap_usd != null ? (
+        <Meter
+          label="All repos today"
+          pct={globalPct}
+          note={`${usd(caps.global_today_usd)} / ${usd(caps.global_daily_cap_usd)}`}
+          unavailableReason="the store is unreadable"
+        />
+      ) : null}
       <div className="cap-meta">
-        <span className="faint">Per issue <span className="mono">{usd(issueCapUsd)}</span></span>
-        {globalCapUsd !== null ? (
-          <span className="faint">All repos <span className="mono">{usd(globalCapUsd)}</span></span>
-        ) : null}
+        <span className="faint">Per issue <span className="mono">{usd(caps?.issue_cap_usd)}</span></span>
+        {(caps?.headroom ?? []).map((row) => (
+          <Chip
+            key={row.role}
+            tone={row.fits === null ? "neutral" : row.fits ? "ok" : "fail"}
+            title={`the ${row.role} role's next leg reserves ${usd(row.leg_usd)}`}
+          >
+            {row.role} {row.fits === null ? "unknown" : row.fits ? "fits" : "waits"}
+          </Chip>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** The `leases` table: which role holds which item, through which leg. */
+function Leases({ rows, loading }: { rows: LeaseRow[]; loading: boolean }) {
+  return (
+    <section className="panel" aria-label="Leases">
+      <div className="panel-hd">
+        <span className="panel-title">Leases</span>
+        <span className="faint">items a role holds now</span>
+      </div>
+      <div className="panel-bd flush">
+        {rows.length === 0 ? (
+          loading ? <Loading what="leases" /> : <EmptyState>no role holds an item</EmptyState>
+        ) : (
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Role</th><th>Item</th><th>Leg</th><th>Leg state</th><th className="r">PID</th><th>Held</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <tr key={`${row.role}:${row.issue ?? -(row.pr ?? 0)}`}>
+                    <td><Chip tone="info" square>{row.role}</Chip></td>
+                    <td className="mono">
+                      {row.issue != null ? `#${row.issue}` : null}
+                      {row.pr != null ? <span className="faint"> PR #{row.pr}</span> : null}
+                    </td>
+                    <td>{row.kind ? kindLabel(row.kind) : <span className="faint">unbound</span>}</td>
+                    <td className="mono faint">{row.leg_state ?? "—"}</td>
+                    <td className="r mono">{row.pid}</td>
+                    <td className="mono faint" title={row.acquired_ts ?? undefined}>{ago(row.acquired_ts)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -317,6 +363,12 @@ function HealthRow({ health }: { health: RoleHealth }) {
       <span className={`dot dot-${tone}`} aria-hidden="true" />
       <span className="health-role">{health.role}</span>
       <Chip tone={tone}>{HEALTH_LABEL[h]}</Chip>
+      {health.state ? <span className="faint mono">{health.state}</span> : null}
+      <span className="faint">
+        {(health.in_flight ?? []).length === 0
+          ? "idle"
+          : (health.in_flight ?? []).map((d) => `${kindLabel(d.kind)} #${d.number}`).join(", ")}
+      </span>
       <span className="spacer" />
       <span className="faint num" title={health.heartbeat_ts ?? undefined}>
         {health.heartbeat_ts ? `heartbeat ${ago(health.heartbeat_ts)}` : "no heartbeat"}

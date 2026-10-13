@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from issue_agent.adapters.reload import RELOAD_EXIT_CODE, ReloadWatch
-from issue_agent.app import dashboard
 from issue_agent.app.dashweb import server as dashweb_server
 from issue_agent.app.dashweb.server import _run_server_until_reload
 from tests.fakes.executor import ImmediateExecutor as Executor
@@ -174,24 +173,3 @@ def test_dashboard_uvicorn_config_bounds_graceful_shutdown(monkeypatch):
 
     assert dashweb_server.serve(8321, backend=object()) == 0
     assert captured["timeout_graceful_shutdown"] == 30
-
-
-def test_fallback_dashboard_exits_for_supervisor_reload():
-    class Server:
-        def __init__(self):
-            self.stopped = threading.Event()
-            self.closed = False
-
-        def serve_forever(self):
-            assert self.stopped.wait(timeout=1)
-
-        def shutdown(self):
-            self.stopped.set()
-
-        def server_close(self):
-            self.closed = True
-
-    server = Server()
-
-    assert dashboard._serve_until_reload(server, reload_check=lambda: True, poll_seconds=0.001) == RELOAD_EXIT_CODE
-    assert server.closed

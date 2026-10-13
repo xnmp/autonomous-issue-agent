@@ -19,6 +19,11 @@ class Warned(Contract):
     warnings: list[str]
 
 
+class Dispatch(Contract):
+    kind: str
+    number: int
+
+
 class RoleHealth(Contract):
     role: str
     # From the process table; None when foreign processes are unreadable.
@@ -26,6 +31,10 @@ class RoleHealth(Contract):
     # No running heartbeat within the staleness bound.
     stale: bool
     heartbeat_ts: str | None
+    # The heartbeat's scheduler state (running, draining, stopped, ...).
+    state: str | None = None
+    # The dispatches the role held at its last heartbeat.
+    in_flight: list[Dispatch] = []
 
 
 class RepoSummary(Contract):
@@ -99,6 +108,7 @@ class VerificationPayload(Warned):
 
 
 class KindCost(Contract):
+    # A design act, or `carried` for every pre-cutover leg.
     kind: str
     usd: float
     runs: int
@@ -127,14 +137,35 @@ class Metrics(Contract):
     rounds_per_pr: float | None
     legs: int
     machine_legs: int
-    today_usd: float
+
+
+class RoleHeadroom(Contract):
+    role: str
+    leg_usd: float
+    # Whether this role's next leg fits under the daily caps, as the role
+    # decides it; None when the store was not read.
+    fits: bool | None
 
 
 class Caps(Contract):
     issue_cap_usd: float | None
     daily_cap_usd: float | None
     global_daily_cap_usd: float | None
+    # Committed today (settled + reserved, UTC day): the core's cap reads.
     today_usd: float | None
+    global_today_usd: float | None = None
+    headroom: list[RoleHeadroom] = []
+
+
+class LeaseRow(Contract):
+    role: str
+    issue: int | None
+    pr: int | None
+    leg_id: str | None
+    kind: str | None
+    leg_state: str | None
+    pid: int
+    acquired_ts: str | None
 
 
 class HealthTrendDay(Contract):
@@ -164,6 +195,7 @@ class OverviewPayload(Warned):
     metrics: Metrics | None
     caps: Caps | None
     health: list[RoleHealth]
+    leases: list[LeaseRow] = []
     needs_attention: list[AttentionItem] = []
     health_trend: list[HealthTrendDay] = []
     spend_per_hour: list[SpendBucket] = []
@@ -329,9 +361,10 @@ class IssueStep(Contract):
     kind: str
     role: str | None
     runtime: str | None
+    # From the role journal's agent_run event; None when not found.
+    model: str | None = None
     state: Literal["reserved", "running", "ended", "released"]
-    # carried: copied from the legacy store at the cutover; money history only.
-    outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done", "carried"]
+    outcome: Literal["running", "passed", "changes_requested", "asked", "failed", "done"]
     started_ts: str | None
     ended_ts: str | None
     duration_s: float | None
@@ -348,6 +381,11 @@ class IssueStep(Contract):
     question: str | None = None
     verdict: str | None = None
     verdict_excerpt: str | None = None
+
+
+class CarriedLegs(Contract):
+    legs: int
+    cost_usd: float
 
 
 class PullRequestLink(Contract):
@@ -374,6 +412,8 @@ class IssueDetailPayload(Warned):
     rail: StageRail | None = None
     history: list[StageVisit] = []
     steps: list[IssueStep]
+    # Pre-cutover legs, money history only: their count and cost.
+    carried: CarriedLegs | None = None
     # Why the control store could not be read; no board is derived then.
     store_error: str | None = None
 

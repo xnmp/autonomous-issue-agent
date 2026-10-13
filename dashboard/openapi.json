@@ -447,6 +447,25 @@
             ],
             "title": "Global Daily Cap Usd"
           },
+          "global_today_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Global Today Usd"
+          },
+          "headroom": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RoleHeadroom"
+            },
+            "title": "Headroom",
+            "type": "array"
+          },
           "issue_cap_usd": {
             "anyOf": [
               {
@@ -477,6 +496,25 @@
           "today_usd"
         ],
         "title": "Caps",
+        "type": "object"
+      },
+      "CarriedLegs": {
+        "additionalProperties": true,
+        "properties": {
+          "cost_usd": {
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "legs": {
+            "title": "Legs",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "legs",
+          "cost_usd"
+        ],
+        "title": "CarriedLegs",
         "type": "object"
       },
       "ClaudeUsage": {
@@ -651,6 +689,25 @@
           "error"
         ],
         "title": "CodexUsage",
+        "type": "object"
+      },
+      "Dispatch": {
+        "additionalProperties": true,
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "number"
+        ],
+        "title": "Dispatch",
         "type": "object"
       },
       "DoneCard": {
@@ -1104,6 +1161,16 @@
             ],
             "title": "Board"
           },
+          "carried": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CarriedLegs"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cost_usd": {
             "title": "Cost Usd",
             "type": "number"
@@ -1288,6 +1355,17 @@
             "title": "Leg Id",
             "type": "string"
           },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "outcome": {
             "enum": [
               "running",
@@ -1295,8 +1373,7 @@
               "changes_requested",
               "asked",
               "failed",
-              "done",
-              "carried"
+              "done"
             ],
             "title": "Outcome",
             "type": "string"
@@ -1555,6 +1632,97 @@
         "title": "KindCost",
         "type": "object"
       },
+      "LeaseRow": {
+        "additionalProperties": true,
+        "properties": {
+          "acquired_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acquired Ts"
+          },
+          "issue": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "leg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leg Id"
+          },
+          "leg_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leg State"
+          },
+          "pid": {
+            "title": "Pid",
+            "type": "integer"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "issue",
+          "pr",
+          "leg_id",
+          "kind",
+          "leg_state",
+          "pid",
+          "acquired_ts"
+        ],
+        "title": "LeaseRow",
+        "type": "object"
+      },
       "Metrics": {
         "additionalProperties": true,
         "properties": {
@@ -1659,10 +1827,6 @@
             ],
             "title": "Rounds Per Pr"
           },
-          "today_usd": {
-            "title": "Today Usd",
-            "type": "number"
-          },
           "total_cost_usd": {
             "title": "Total Cost Usd",
             "type": "number"
@@ -1681,8 +1845,7 @@
           "first_pass_rate",
           "rounds_per_pr",
           "legs",
-          "machine_legs",
-          "today_usd"
+          "machine_legs"
         ],
         "title": "Metrics",
         "type": "object"
@@ -1713,6 +1876,14 @@
               "$ref": "#/components/schemas/HealthTrendDay"
             },
             "title": "Health Trend",
+            "type": "array"
+          },
+          "leases": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/LeaseRow"
+            },
+            "title": "Leases",
             "type": "array"
           },
           "metrics": {
@@ -1949,6 +2120,37 @@
         "title": "ReposPayload",
         "type": "object"
       },
+      "RoleHeadroom": {
+        "additionalProperties": true,
+        "properties": {
+          "fits": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fits"
+          },
+          "leg_usd": {
+            "title": "Leg Usd",
+            "type": "number"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "leg_usd",
+          "fits"
+        ],
+        "title": "RoleHeadroom",
+        "type": "object"
+      },
       "RoleHealth": {
         "additionalProperties": true,
         "properties": {
@@ -1974,6 +2176,14 @@
             ],
             "title": "Heartbeat Ts"
           },
+          "in_flight": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Dispatch"
+            },
+            "title": "In Flight",
+            "type": "array"
+          },
           "role": {
             "title": "Role",
             "type": "string"
@@ -1981,6 +2191,17 @@
           "stale": {
             "title": "Stale",
             "type": "boolean"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
           }
         },
         "required": [

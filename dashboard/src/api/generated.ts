@@ -304,10 +304,26 @@ export interface components {
             daily_cap_usd: number | null;
             /** Global Daily Cap Usd */
             global_daily_cap_usd: number | null;
+            /** Global Today Usd */
+            global_today_usd?: number | null;
+            /**
+             * Headroom
+             * @default []
+             */
+            headroom: components["schemas"]["RoleHeadroom"][];
             /** Issue Cap Usd */
             issue_cap_usd: number | null;
             /** Today Usd */
             today_usd: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** CarriedLegs */
+        CarriedLegs: {
+            /** Cost Usd */
+            cost_usd: number;
+            /** Legs */
+            legs: number;
         } & {
             [key: string]: unknown;
         };
@@ -344,6 +360,15 @@ export interface components {
             weekly_pct: number | null;
             /** Window Minutes */
             window_minutes: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** Dispatch */
+        Dispatch: {
+            /** Kind */
+            kind: string;
+            /** Number */
+            number: number;
         } & {
             [key: string]: unknown;
         };
@@ -473,6 +498,7 @@ export interface components {
             action?: ("unblock" | "open") | null;
             /** Board */
             board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardWaiting"]) | null;
+            carried?: components["schemas"]["CarriedLegs"] | null;
             /** Cost Usd */
             cost_usd: number;
             /** Done */
@@ -535,11 +561,13 @@ export interface components {
             kind: string;
             /** Leg Id */
             leg_id: string;
+            /** Model */
+            model?: string | null;
             /**
              * Outcome
              * @enum {string}
              */
-            outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done" | "carried";
+            outcome: "running" | "passed" | "changes_requested" | "asked" | "failed" | "done";
             /** Pr */
             pr: number | null;
             /** Pricing Basis */
@@ -604,6 +632,27 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** LeaseRow */
+        LeaseRow: {
+            /** Acquired Ts */
+            acquired_ts: string | null;
+            /** Issue */
+            issue: number | null;
+            /** Kind */
+            kind: string | null;
+            /** Leg Id */
+            leg_id: string | null;
+            /** Leg State */
+            leg_state: string | null;
+            /** Pid */
+            pid: number;
+            /** Pr */
+            pr: number | null;
+            /** Role */
+            role: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** Metrics */
         Metrics: {
             /** By Basis */
@@ -635,8 +684,6 @@ export interface components {
             open_items: number | null;
             /** Rounds Per Pr */
             rounds_per_pr: number | null;
-            /** Today Usd */
-            today_usd: number;
             /** Total Cost Usd */
             total_cost_usd: number;
         } & {
@@ -652,6 +699,11 @@ export interface components {
              * @default []
              */
             health_trend: components["schemas"]["HealthTrendDay"][];
+            /**
+             * Leases
+             * @default []
+             */
+            leases: components["schemas"]["LeaseRow"][];
             metrics: components["schemas"]["Metrics"] | null;
             /**
              * Needs Attention
@@ -720,16 +772,34 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** RoleHeadroom */
+        RoleHeadroom: {
+            /** Fits */
+            fits: boolean | null;
+            /** Leg Usd */
+            leg_usd: number;
+            /** Role */
+            role: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** RoleHealth */
         RoleHealth: {
             /** Alive */
             alive: boolean | null;
             /** Heartbeat Ts */
             heartbeat_ts: string | null;
+            /**
+             * In Flight
+             * @default []
+             */
+            in_flight: components["schemas"]["Dispatch"][];
             /** Role */
             role: string;
             /** Stale */
             stale: boolean;
+            /** State */
+            state?: string | null;
         } & {
             [key: string]: unknown;
         };

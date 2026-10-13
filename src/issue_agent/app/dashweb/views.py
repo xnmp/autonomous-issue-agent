@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, tzinfo
 
+from ...adapters.control_store import Lease
 from ...domain import dashboard as dash
 from ...domain.actions import Target
 from ...domain.backoff import LegEnd
@@ -214,7 +215,7 @@ def backlog_cards(gh_issues: Mapping[int, Mapping], active: set[int], now: datet
     return cards
 
 
-def step(idx: int, leg: dash.LegRow) -> dict:
+def step(idx: int, leg: dash.LegRow, model: str = "") -> dict:
     duration = ((leg.ended_at - leg.started_at).total_seconds()
                 if leg.ended_at is not None and leg.started_at is not None else None)
     return {
@@ -223,6 +224,7 @@ def step(idx: int, leg: dash.LegRow) -> dict:
         "kind": leg.kind,
         "role": leg.role or None,
         "runtime": leg.runtime or None,
+        "model": model or None,
         "state": leg.state,
         "outcome": leg.outcome,
         "started_ts": _iso(leg.started_at or leg.reserved_at),
@@ -245,9 +247,12 @@ def step(idx: int, leg: dash.LegRow) -> dict:
 
 def issue_detail(
     number: int, repo: str, item: Item | None, legs: Iterable[dash.LegRow], merged: Iterable[Merged],
-    gh_issue: Mapping | None,
+    gh_issue: Mapping | None, models: Mapping[str, str] | None = None,
 ) -> dict:
+    """The issue page. Carried legs (pre-cutover money history, legacy kinds)
+    are one `carried` total, not steps: no act of the design ran them."""
     own = dash.issue_legs(legs, number)
+    carried = [leg for leg in own if leg.carried and leg.counted]
     merges = [m for m in merged if m.issue == number]
     cost, estimated = _spend(own)
     pulls = []
@@ -274,8 +279,31 @@ def issue_detail(
         "rail": asdict(dash.rail(item.state if item else None, has_pr=bool(pulls), legs=own, done=done))
         if (item or own or merges) else None,
         "history": [asdict(visit) for visit in dash.history(own)],
-        "steps": [step(idx, leg) for idx, leg in enumerate(own)],
+        "steps": [step(idx, leg, (models or {}).get(leg.leg_id, ""))
+                  for idx, leg in enumerate(leg for leg in own if not leg.carried)],
+        "carried": {"legs": len(carried), "cost_usd": _spend(carried)[0]} if carried else None,
     }
+
+
+def lease_rows(leases: Iterable[Lease], legs: Iterable[dash.LegRow]) -> list[dict]:
+    """The `leases` table: which role holds which item, through which leg.
+    A negative target is a PR with no resolvable issue."""
+    by_id = {leg.leg_id: leg for leg in legs}
+    rows = []
+    for lease in leases:
+        leg = by_id.get(str(lease.run_id)) if lease.run_id is not None else None
+        rows.append({
+            "role": lease.role,
+            "issue": lease.target if lease.target > 0 else None,
+            "pr": -lease.target if lease.target < 0 else (leg.number if leg and leg.kind != "RESOLVE" and leg.number > 0
+                                                         else None),
+            "leg_id": str(lease.run_id) if lease.run_id is not None else None,
+            "kind": leg.kind if leg else None,
+            "leg_state": leg.state if leg else None,
+            "pid": lease.pid,
+            "acquired_ts": _iso(lease.acquired_at),
+        })
+    return rows
 
 
 def attention(item_list: Iterable[Item], gh_issues: Mapping[int, Mapping]) -> list[dict]:

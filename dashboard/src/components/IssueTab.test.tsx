@@ -124,7 +124,7 @@ describe("IssueTab", () => {
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
 
     const stepDetail = document.querySelector(".stepdetail") as HTMLElement;
-    expect(stepDetail.closest("td")).toHaveAttribute("colspan", "7");
+    expect(stepDetail.closest("td")).toHaveAttribute("colspan", "8");
     expect(within(stepDetail).getByText("untrusted")).toBeVisible();
     expect(document.querySelector("script")).not.toBeInTheDocument();
     const facts = within(stepDetail).getByRole("group", { name: "Leg execution details" });
@@ -155,7 +155,7 @@ describe("IssueTab", () => {
     render(<IssueTab repo="demo" issue={50} showDurationSeconds={false} />);
 
     const header = await screen.findByRole("columnheader", { name: /Runtime/ });
-    await userEvent.click(within(header).getByRole("button", { name: "Sort by Runtime" }));
+    await userEvent.click(within(header).getByRole("button", { name: "Sort by Runtime / model" }));
     expect(header).toHaveAttribute("aria-sort", "ascending");
     const rows = screen.getAllByRole("row").slice(1);
     expect(within(rows[0]!).getByText("claude")).toBeVisible();
@@ -181,5 +181,30 @@ describe("IssueTab", () => {
 
     expect(screen.getByText("needle in the review")).toBeVisible();
     expect(screen.getByText("1/11")).toBeVisible();
+  });
+
+  it("shows each leg's runtime with its model and its pricing basis", async () => {
+    serve(detail({
+      steps: [
+        leg(0, { model: "gpt-6.1-sol", pricing_basis: "configured_rate_card" }),
+        leg(1, { state: "running", outcome: "running", pricing_basis: null, model: null, estimated: true }),
+      ],
+    }));
+    render(<IssueTab repo="demo" issue={50} />);
+
+    const rows = (await screen.findAllByRole("row")).slice(1);
+    expect(rows[0]).toHaveTextContent("codex · gpt-6.1-sol");
+    expect(rows[0]).toHaveTextContent("configured rate card");
+    expect(rows[1]).not.toHaveTextContent("·");
+    expect(rows[1]).toHaveTextContent("reserved");
+  });
+
+  it("states pre-cutover legs as one total and counts them in the header", async () => {
+    serve(detail({ steps: [leg(0)], carried: { legs: 8, cost_usd: 1.7 } }));
+    render(<IssueTab repo="demo" issue={50} />);
+
+    expect(await screen.findByText(/8 legs before the cutover/)).toHaveTextContent("$1.70");
+    expect(screen.getByText("legs").parentElement).toHaveTextContent("legs 9");
+    expect(screen.getAllByRole("row")).toHaveLength(2);
   });
 });

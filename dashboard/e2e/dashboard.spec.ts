@@ -594,7 +594,7 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.keyboard.press("Escape");
   await expect(page.getByRole("columnheader", { name: /Role/ })).toBeVisible();
   for (const [name, key, minimum] of [
-    ["Runtime", "runtime", 90],
+    ["Runtime / model", "runtime", 90],
     ["Outcome", "status", 96],
     ["Duration", "duration", 84],
     ["Cost", "cost", 76],
@@ -655,13 +655,10 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
 
   await expect(page.getByText("Needs attention")).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Spending caps" })).toContainText("$6.42");
-  const daemonHealthPanel = page.locator(".panel-title", { hasText: "Daemon health" });
-  await expect(daemonHealthPanel).toHaveCount(0);
+  // Role health is a design concept: always shown, never behind a setting.
+  await expect(page.locator(".panel-title", { hasText: "Daemon health" })).toBeVisible();
   await page.getByRole("button", { name: "Settings" }).click();
-  const daemonHealth = page.getByRole("checkbox", { name: "Daemon health" });
-  await expect(daemonHealth).not.toBeChecked();
-  await daemonHealth.check();
-  await expect(daemonHealthPanel).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Daemon health" })).toHaveCount(0);
   await page.getByRole("button", { name: "Settings" }).click();
   await expect(page.getByText("last", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("searchbox", { name: "Filter operator actions" })).toHaveCount(0);
@@ -738,34 +735,43 @@ test("shows a skeleton before the deployment request resolves", async ({ page })
   await expect(page.locator(".repo-name", { hasText: "self" })).toBeVisible();
 });
 
-test("serves a validated operator workflow through FastAPI and the production bundle", async ({
+/**
+ * The production bundle over the real backend (`e2e/server.py`): derive over a
+ * fixture world and a real control store. Every assertion is an outcome the
+ * read path produced — a derived state's words, a leg row, a lease, a cap.
+ */
+test("shows derived states, legs, leases and caps through FastAPI and the production bundle", async ({
   page,
 }) => {
-  await page.goto("http://127.0.0.1:4174/#/repo/self/issues/done");
+  await page.goto("http://127.0.0.1:4174/#/repo/demo/issues/inflight");
+
+  // Each row carries the state `derive` gave its item.
+  const headline = (title: string) =>
+    page.locator(".board-row").filter({ hasText: title }).locator(".board-headline");
+  await expect(headline("Asked a question")).toHaveText("Answer the agent's question");
+  await expect(headline("Running now")).toHaveText("Resolve running");
+  await expect(headline("Has a PR")).toHaveText("CI running");
+  await expect(headline("Queued work")).toHaveText("Resolve next");
+
   await page.getByRole("tab", { name: "Overview" }).click();
-  await page.getByRole("button", { name: "Settings" }).click();
-  const issueHealthTrend = page.getByRole("checkbox", { name: "Issue health trend" });
-  await expect(issueHealthTrend).not.toBeChecked();
-  await issueHealthTrend.check();
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(
-    page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ }),
-  ).toBeVisible();
-  await page.getByRole("tab", { name: /Done/ }).click();
-  await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
-  await page.getByRole("button", { name: "Open full issue" }).click();
-  await expect(page.getByRole("link", { name: /PR #75/ })).toHaveAttribute(
-    "href",
-    "https://github.com/openai/autonomous-issue-agent/pull/75",
-  );
-  await page.locator(".step-disclosure").click();
-  await expect(page.locator(".stepdetail")).toBeVisible();
-  expect((await page.locator(".stepdetail").boundingBox())?.width).toBeGreaterThan(700);
-  await expect(page.locator(".stepdetail").getByText("Explained the completed work.")).toBeVisible();
-  await page.screenshot({
-    path: "../evidence/dashboard-issue-tasks.png",
-    fullPage: true,
-  });
+  const leases = page.getByRole("region", { name: "Leases" });
+  await expect(leases.getByRole("row", { name: /#4/ })).toContainText("Resolve");
+  await expect(leases.getByRole("row", { name: /#4/ })).toContainText("running");
+  const caps = page.getByRole("region", { name: "Spending caps" });
+  // Committed today: $2 + $1.25 + $0.40 settled, $10 reserved by the running leg.
+  await expect(caps).toContainText("$13.65today / $700.00");
+  await expect(caps).toContainText("fix fits");
+  await expect(page.locator(".health-row", { hasText: "fix" })).toContainText("Resolve #4");
+
+  await page.goto("http://127.0.0.1:4174/#/repo/demo/issue/3");
+  const rows = page.locator(".steps tbody tr.clickable");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("Resolve");
+  await expect(rows.first()).toContainText("codex · gpt-6.1-sol");
+  await expect(rows.first()).toContainText("configured rate card");
+  await expect(rows.first()).toContainText("$1.25");
+  await expect(page.getByText(/1 leg before the cutover/)).toContainText("$0.40");
+  await expect(page.locator(".steps")).not.toContainText(/route/i);
 });
 
 /**

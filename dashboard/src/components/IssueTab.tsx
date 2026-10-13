@@ -24,10 +24,11 @@ const POLL_MS = 5_000;
 const ISSUE_COLUMNS_KEY = "issue-agent.dashboard.issue-columns";
 const ISSUE_COLUMNS: ColumnChoice[] = [
   { key: "role", label: "Role" },
-  { key: "runtime", label: "Runtime" },
+  { key: "runtime", label: "Runtime / model" },
   { key: "status", label: "Outcome" },
   { key: "duration", label: "Duration" },
   { key: "cost", label: "Cost" },
+  { key: "basis", label: "Basis" },
   { key: "tokens", label: "Tokens" },
   { key: "when", label: "When" },
 ];
@@ -79,10 +80,11 @@ export function IssueTab({
   const columns: TableColumn[] = [
     { key: "operation", label: "Operation", width: 158, minWidth: 142 },
     ...(visible.has("role") ? [{ key: "role", label: "Role", width: 90 }] : []),
-    ...(visible.has("runtime") ? [{ key: "runtime", label: "Runtime", width: 110, minWidth: 90 }] : []),
+    ...(visible.has("runtime") ? [{ key: "runtime", label: "Runtime / model", width: 190, minWidth: 90 }] : []),
     ...(visible.has("status") ? [{ key: "status", label: "Outcome", width: 190, minWidth: 96 }] : []),
     ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 100, minWidth: 84 }] : []),
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 90, minWidth: 76 }] : []),
+    ...(visible.has("basis") ? [{ key: "basis", label: "Basis", width: 160, minWidth: 90 }] : []),
     ...(visible.has("tokens") ? [{ key: "tokens", label: "Tokens", width: 260 }] : []),
     ...(visible.has("when") ? [{ key: "when", label: "When", width: 150 }] : []),
   ];
@@ -113,6 +115,7 @@ export function IssueTab({
       step.kind,
       step.role,
       step.runtime,
+      step.model,
       step.outcome,
       step.summary,
       step.question,
@@ -123,10 +126,11 @@ export function IssueTab({
   const sortedSteps = useSortedRows(filteredSteps, {
     operation: (step) => step.kind,
     role: (step) => step.role,
-    runtime: (step) => step.runtime,
+    runtime: (step) => `${step.runtime ?? ""} ${step.model ?? ""}`,
     status: (step) => step.outcome,
     duration: (step) => step.duration_s,
     cost: (step) => step.cost_usd,
+    basis: (step) => step.pricing_basis,
     tokens: (step) => (
       (step.usage?.input_tokens ?? 0)
       + (step.usage?.output_tokens ?? 0)
@@ -204,7 +208,7 @@ export function IssueTab({
               </span>
               <span className="issue-stat">
                 <span className="faint">legs</span>{" "}
-                <span className="mono">{d.steps.length}</span>
+                <span className="mono">{d.steps.length + (d.carried?.legs ?? 0)}</span>
               </span>
             </div>
           </header>
@@ -248,8 +252,14 @@ export function IssueTab({
             onClose={() => setColumnMenuAt(null)}
           />
 
+          {d.carried ? (
+            <p className="faint carried-note">
+              {d.carried.legs} {d.carried.legs === 1 ? "leg" : "legs"} before the cutover ·{" "}
+              <span className="mono">{usd(d.carried.cost_usd)}</span> (money history; not attempts)
+            </p>
+          ) : null}
           {d.steps.length === 0 ? (
-            <EmptyState>no legs recorded for this issue yet</EmptyState>
+            <EmptyState>{d.carried ? "no legs since the cutover" : "no legs recorded for this issue yet"}</EmptyState>
           ) : (
             <section aria-label={`Legs · ${d.steps.length}`}>
               {d.steps.length > 10 ? (
@@ -348,7 +358,10 @@ function StepRow({
             {step.role ?? "—"}
           </Chip>
         </td> : null}
-        {visible.has("runtime") ? <td className="mono">{step.runtime ?? <span className="faint">—</span>}</td> : null}
+        {visible.has("runtime") ? <td className="mono trunc" title={step.model ?? undefined}>
+          {step.runtime ?? <span className="faint">—</span>}
+          {step.model ? <span className="faint"> · {step.model}</span> : null}
+        </td> : null}
         {visible.has("status") ? <td className="row-wrap">
           <StepStatusChip outcome={step.outcome} />
           {step.end_reason && step.end_reason !== "normal_return" ? (
@@ -363,6 +376,9 @@ function StepRow({
         {visible.has("cost") ? <td className="r mono">
           {usd(step.cost_usd)}
           {step.estimated ? <span className="faint" title="estimated or still reserved"> ~</span> : null}
+        </td> : null}
+        {visible.has("basis") ? <td className="mono faint trunc">
+          {step.pricing_basis?.replaceAll("_", " ") ?? (step.state === "ended" ? "—" : "reserved")}
         </td> : null}
         {visible.has("tokens") ? <td className="mono faint nowrap">
           {u ? <TokenSummary usage={u} /> : "—"}
@@ -460,6 +476,7 @@ function StepDetail({ id, step }: { id: string; step: IssueStep }) {
 function StepFacts({ step }: { step: IssueStep }) {
   const facts = [
     { label: "runtime", value: step.runtime, mono: false },
+    { label: "model", value: step.model ?? null, mono: true },
     { label: "state", value: step.state, mono: false },
     { label: "pricing", value: step.pricing_basis ? `${step.pricing_basis.replaceAll("_", " ")}${step.estimated ? " · estimated" : ""}` : null, mono: false },
     { label: "ended", value: step.end_reason?.replaceAll("_", " ") ?? null, mono: false },

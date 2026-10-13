@@ -209,12 +209,13 @@ def test_carried_legs_are_money_history_not_attempts_failures_or_toasts():
     )
     live = (leg("RESOLVE", 5, leg_id="L1"),)
     legs = carried + live
-    assert [x.outcome for x in carried] == ["carried", "carried"]
     rail = dash.rail(Dispatch(AgentKind.RESOLVE), has_pr=False, legs=legs)
     assert (rail.resolve_attempts, rail.review_rounds, rail.steps, rail.furthest) == (1, 0, 1, "resolve")
     assert [[c.outcome for c in v.steps] for v in dash.history(legs)] == [["done"]]
-    m = dash.metrics(legs, merged_prs=None, open_items=None, needs_human=None, today_start=T0)
+    m = dash.metrics(legs, merged_prs=None, open_items=None, needs_human=None)
     assert (m.machine_legs, m.total_cost_usd) == (0, 3.0)
+    # Their legacy kinds name no act: by_kind folds them into one `carried` row.
+    assert {(k.kind, k.runs) for k in m.by_kind} == {("carried", 2), ("RESOLVE", 1)}
     assert [n.id for n in dash.notifications(legs, [])] == ["leg:L1:start", "leg:L1:end"]
 
 
@@ -241,31 +242,30 @@ def test_metrics_divide_spend_by_merges_and_count_first_pass_reviews():
         leg("FIX_CI", 6, cost=0.0, cls="machine", number=12, issue=2, basis="estimate"),
         leg("RESOLVE", 7, state="released", issue=3),
     ]
-    m = dash.metrics(legs, merged_prs=2, open_items=1, needs_human=0, today_start=at(4))
+    m = dash.metrics(legs, merged_prs=2, open_items=1, needs_human=0)
     assert m.total_cost_usd == 8.0 and m.cost_per_merged_pr_usd == 4.0
     assert (m.first_pass_approvals, m.first_pass_changes, m.first_pass_rate) == (1, 1, 0.5)
     assert m.rounds_per_pr == 1.5
     assert (m.legs, m.machine_legs) == (6, 1)
-    assert m.today_usd == 2.0  # the legs that ended at or after the day start
     assert {(b.basis, b.usd) for b in m.by_basis} == {("provider_reported", 8.0), ("estimate", 0.0)}
     assert {(k.kind, k.runs) for k in m.by_kind} == {("RESOLVE", 2), ("REVIEW", 3), ("FIX_CI", 1)}
 
 
 def test_metrics_report_unknown_rather_than_zero():
-    m = dash.metrics([], merged_prs=None, open_items=None, needs_human=None, today_start=T0)
+    m = dash.metrics([], merged_prs=None, open_items=None, needs_human=None)
     assert m.cost_per_merged_pr_usd is None and m.first_pass_rate is None and m.rounds_per_pr is None
     assert (
-        dash.metrics([leg()], merged_prs=0, open_items=0, needs_human=0, today_start=T0).cost_per_merged_pr_usd is None
+        dash.metrics([leg()], merged_prs=0, open_items=0, needs_human=0).cost_per_merged_pr_usd is None
     )
     assert "merged ?" in dash.metrics_line(m) and "no merged PRs" in dash.metrics_line(m)
 
 
 def test_a_truncated_merged_list_marks_the_merge_metrics_as_bounds():
     m = dash.metrics(
-        [leg(cost=4.0)], merged_prs=2, open_items=0, needs_human=0, today_start=T0, merged_prs_partial=True
+        [leg(cost=4.0)], merged_prs=2, open_items=0, needs_human=0, merged_prs_partial=True
     )
     assert m.merged_prs_partial and "merged ≥2" in dash.metrics_line(m)
-    assert not dash.metrics([], merged_prs=2, open_items=0, needs_human=0, today_start=T0).merged_prs_partial
+    assert not dash.metrics([], merged_prs=2, open_items=0, needs_human=0).merged_prs_partial
 
 
 def test_hourly_spend_keeps_empty_hours_and_drops_stamps_outside_the_window():

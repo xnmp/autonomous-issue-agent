@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from glob import glob
 
 from ..env_file import source_env_file
-from ..heartbeat import read_heartbeat_time
 from ...domain.dashboard import ROLE_NAMES
+from .usage import tail_lines
+
+# The newest journal bytes searched for leg models: a model older than this
+# reads as unknown, never guessed.
+JOURNAL_TAIL_BYTES = 4 * 1024 * 1024
 
 
 def deployment_names(repos_dir: str) -> tuple[str, ...]:
@@ -41,12 +47,86 @@ def deployment_env(harness_root: str, name: str, inherited: Mapping[str, str]) -
     return env
 
 
-def role_heartbeats(state_dirs: Mapping[str, str]) -> dict[str, datetime | None]:
-    """Each role's last scheduler heartbeat (None when absent or terminal)."""
+@dataclass(frozen=True)
+class Beat:
+    """One role's `heartbeat.json` (written by `tick.Daemon` every tick):
+    when, its scheduler state, and the dispatches it holds as (kind, number)."""
+
+    at: datetime
+    state: str
+    in_flight: tuple[tuple[str, int], ...] = ()
+
+
+def read_beat(path: str) -> Beat | None:
+    """A heartbeat, or None when absent, unreadable or naive-stamped."""
+    try:
+        with open(path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+        at = datetime.fromisoformat(payload["updated_at"])
+        state = payload["state"]
+        rows = payload.get("in_flight") or []
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if at.tzinfo is None or not isinstance(state, str) or not isinstance(rows, list):
+        return None
+    flight = tuple((str(row["kind"]), row["number"]) for row in rows
+                   if isinstance(row, dict) and isinstance(row.get("kind"), str) and type(row.get("number")) is int)
+    return Beat(at, state, flight)
+
+
+def role_beats(state_dirs: Mapping[str, str]) -> dict[str, Beat | None]:
     return {
-        role: read_heartbeat_time(os.path.join(state_dirs[role], "heartbeat.json")) if state_dirs.get(role) else None
+        role: read_beat(os.path.join(state_dirs[role], "heartbeat.json")) if state_dirs.get(role) else None
         for role in ROLE_NAMES
     }
+
+
+def leg_models(state_dirs: Mapping[str, str], tail_bytes: int = JOURNAL_TAIL_BYTES) -> dict[str, str]:
+    """`legs.leg_id` -> model from each role journal's `agent_run` events
+    (the legs table records the runtime, not the model). The table's leg id
+    is the journal's `run_id`; the journal's own `leg_id` is another id."""
+    models: dict[str, str] = {}
+    for role in ROLE_NAMES:
+        directory = state_dirs.get(role)
+        if directory:
+            models.update(_journal_models(os.path.join(directory, "journal.jsonl"), tail_bytes))
+    return models
+
+
+# path -> ((size, mtime_ns, tail_bytes), models): an issue tab polls every 5s
+# and the journal tail is megabytes; re-read only when the file changed.
+_MODEL_CACHE: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
+
+
+def _journal_models(path: str, tail_bytes: int) -> dict[str, str]:
+    """One journal's run_id -> model. A torn or foreign line is skipped."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return {}
+    key = (stat.st_size, stat.st_mtime_ns, tail_bytes)
+    cached = _MODEL_CACHE.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        lines = tail_lines(path, tail_bytes)
+    except OSError:
+        return {}
+    models: dict[str, str] = {}
+    for line in lines:
+        if '"agent_run"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(event, dict) or event.get("event") != "agent_run":
+            continue
+        leg, model = event.get("run_id"), event.get("model")
+        if isinstance(leg, str) and leg and isinstance(model, str) and model:
+            models[leg] = model
+    _MODEL_CACHE[path] = (key, models)
+    return models
 
 
 def _environ_agent_env(blob: bytes) -> str:

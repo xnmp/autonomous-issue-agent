@@ -74,7 +74,6 @@ function storedOptions(): DashboardOptions {
   const defaults: DashboardOptions = {
     showPerRepoQuotas: true,
     showDurationSeconds: true,
-    showOverviewDaemonHealth: false,
     showOverviewIssueHealthTrend: false,
     theme: "cosmic-dusk",
   };
@@ -92,9 +91,6 @@ function storedOptions(): DashboardOptions {
       ),
       showDurationSeconds: storedBoolean(
         parsed, "showDurationSeconds", defaults.showDurationSeconds,
-      ),
-      showOverviewDaemonHealth: storedBoolean(
-        parsed, "showOverviewDaemonHealth", defaults.showOverviewDaemonHealth,
       ),
       showOverviewIssueHealthTrend: storedBoolean(
         parsed,
@@ -362,7 +358,6 @@ export default function App() {
             hasRepos={repoList.length > 0}
             reposLoading={repos.loading}
             showDurationSeconds={options.showDurationSeconds}
-            showOverviewDaemonHealth={options.showOverviewDaemonHealth}
             showOverviewIssueHealthTrend={options.showOverviewIssueHealthTrend}
           />
         </div>
@@ -388,7 +383,6 @@ function Body({
   hasRepos,
   reposLoading,
   showDurationSeconds,
-  showOverviewDaemonHealth,
   showOverviewIssueHealthTrend,
 }: {
   route: Route;
@@ -401,7 +395,6 @@ function Body({
   hasRepos: boolean;
   reposLoading: boolean;
   showDurationSeconds: boolean;
-  showOverviewDaemonHealth: boolean;
   showOverviewIssueHealthTrend: boolean;
 }) {
   if (route.view === "verification") return <VerificationTab />;
@@ -430,7 +423,6 @@ function Body({
       <OverviewTab
         repo={selectedRepo}
         onOpenIssues={onSetSub}
-        showDaemonHealth={showOverviewDaemonHealth}
         showIssueHealthTrend={showOverviewIssueHealthTrend}
       />
     );

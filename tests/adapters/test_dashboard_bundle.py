@@ -7,11 +7,13 @@ from issue_agent.adapters.dashweb import bundle
 
 
 def _dashboard(tmp_path):
+    """A dashboard with one published build, `dist/builds/v0`."""
     dashboard = tmp_path / "dashboard"
     source = dashboard / "src"
-    dist = dashboard / "dist"
+    dist = dashboard / "dist" / "builds" / "v0"
     source.mkdir(parents=True)
-    dist.mkdir()
+    dist.mkdir(parents=True)
+    (dashboard / "dist" / bundle.POINTER_NAME).write_text(json.dumps({"schema": 1, "build": "builds/v0"}))
     (dashboard / "build-inputs.json").write_text(
         json.dumps({"schema": 1, "files": ["build-inputs.json", "index.html"], "directories": ["src", "public"]})
     )
@@ -27,7 +29,7 @@ def _record_current_inputs(tmp_path):
         "inputs": bundle.source_hashes(tmp_path),
         "outputs": bundle.output_hashes(tmp_path),
     }
-    (tmp_path / "dashboard" / "dist" / bundle.MANIFEST_NAME).write_text(json.dumps(manifest))
+    (tmp_path / "dashboard" / "dist" / "builds" / "v0" / bundle.MANIFEST_NAME).write_text(json.dumps(manifest))
 
 
 def test_missing_or_malformed_manifest_never_looks_ready(tmp_path):
@@ -37,7 +39,7 @@ def test_missing_or_malformed_manifest_never_looks_ready(tmp_path):
     assert missing.state == "stale"
     assert "manifest" in missing.detail
 
-    manifest = dashboard / "dist" / bundle.MANIFEST_NAME
+    manifest = dashboard / "dist" / "builds" / "v0" / bundle.MANIFEST_NAME
     manifest.write_text("{")
     malformed = bundle.bundle_status(tmp_path)
     assert malformed.state == "stale"
@@ -86,7 +88,7 @@ def test_symlinked_output_is_stale(tmp_path):
     outside = tmp_path / "secret.txt"
     outside.write_text("secret")
     _record_current_inputs(tmp_path)
-    (dashboard / "dist" / "leak.txt").symlink_to(outside)
+    (dashboard / "dist" / "builds" / "v0" / "leak.txt").symlink_to(outside)
 
     status = bundle.bundle_status(tmp_path)
 
@@ -104,3 +106,16 @@ def test_symlink_loop_in_pointer_degrades_to_stale(tmp_path):
 
     assert status.state == "stale"
     assert "pointer is invalid" in status.detail
+
+
+def test_files_at_the_top_of_dist_are_never_served_without_a_pointer(tmp_path):
+    """A pre-pointer build left in `dist/` (live: Jul 30 files beside the
+    current build) must not be selected when the pointer is absent."""
+    dashboard = _dashboard(tmp_path)
+    (dashboard / "dist" / bundle.POINTER_NAME).unlink()
+    (dashboard / "dist" / "index.html").write_text("<html>months old</html>")
+
+    snapshot = bundle.bundle_snapshot(tmp_path, pin=True)
+
+    assert snapshot.status.state == "missing" and "no build published" in snapshot.status.detail
+    assert snapshot.lease is None

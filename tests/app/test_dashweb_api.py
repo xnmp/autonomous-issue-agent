@@ -114,7 +114,6 @@ class StubBackend:
                 "rounds_per_pr": 1.0,
                 "legs": 1,
                 "machine_legs": 0,
-                "today_usd": 1.0,
             },
             "caps": {"issue_cap_usd": None, "daily_cap_usd": None, "global_daily_cap_usd": None, "today_usd": 1.0},
             "health": [],
@@ -287,8 +286,9 @@ def _manifest(tmp_path) -> str:
 
 
 def _dist(tmp_path, index: str | None = "<html>app</html>"):
-    dist = tmp_path / "dashboard" / "dist"
+    dist = tmp_path / "dashboard" / "dist" / "builds" / "v0"
     dist.mkdir(parents=True)
+    (dist.parent.parent / bundle.POINTER_NAME).write_text(json.dumps({"schema": 1, "build": "builds/v0"}))
     if index is not None:
         (dist / "index.html").write_text(index)
     return dist
@@ -335,7 +335,8 @@ def test_a_running_server_keeps_its_immutable_version_after_new_publication(tmp_
 
 
 def test_an_invalid_version_pointer_degrades_to_build_instructions(tmp_path):
-    (_dist(tmp_path, index=None) / bundle.POINTER_NAME).write_text("{")
+    _dist(tmp_path, index=None)
+    (tmp_path / "dashboard" / "dist" / bundle.POINTER_NAME).write_text("{")
 
     c = client(root=tmp_path, headers=None)
 

@@ -1,13 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   difficultyTone,
-  familyOf,
   impactTone,
   issueTypeTone,
   kindLabel,
   labelTone,
   legNote,
-  mixSlices,
+  actCosts,
   roleHealth,
 } from "./semantics";
 
@@ -65,20 +64,19 @@ describe("dashboard semantics", () => {
     expect(labelTone(label)).toBe(tone);
   });
 
-  it("folds per-kind spend into the three fixed families, ignoring unknown and non-finite rows", () => {
-    const slices = mixSlices([
-      { kind: "RESOLVE", usd: 4, runs: 2 },
+  it("orders spend by the design's acts, the carried total last, dropping empty and non-finite rows", () => {
+    const rows = actCosts([
+      { kind: "carried", usd: 9, runs: 4 },
       { kind: "REVIEW", usd: 1.5, runs: 3 },
-      { kind: "FIX_CI", usd: 1, runs: 1 },
-      { kind: "REBASE", usd: 0.5, runs: 1 },
       { kind: "ADDRESS_REVIEW", usd: Number.NaN, runs: 1 },
-      { kind: "MYSTERY", usd: 9, runs: 1 },
+      { kind: "REBASE", usd: 0, runs: 0 },
+      { kind: "FIX_CI", usd: 1, runs: 1 },
+      { kind: "RESOLVE", usd: 4, runs: 2 },
     ]);
-    expect(slices.map((slice) => [slice.family, slice.usd])).toEqual([
-      ["resolve", 4], ["review", 1.5], ["repair", 1.5],
+    expect(rows.map((row) => [row.kind, row.usd])).toEqual([
+      ["RESOLVE", 4], ["FIX_CI", 1], ["REVIEW", 1.5], ["carried", 9],
     ]);
-    expect(familyOf("MYSTERY")).toBe("other");
-    expect(mixSlices(null).map((slice) => slice.usd)).toEqual([0, 0, 0]);
+    expect(actCosts(null)).toEqual([]);
   });
 
   it("takes a leg's note from its question first, then the review, then its summary", () => {
@@ -89,8 +87,8 @@ describe("dashboard semantics", () => {
   });
 
   it("keeps unavailable process liveness distinct from dead", () => {
-    expect(roleHealth({ role: "fix", alive: null, stale: false, heartbeat_ts: null })).toBe("unknown");
-    expect(roleHealth({ role: "fix", alive: false, stale: true, heartbeat_ts: null })).toBe("dead");
-    expect(roleHealth({ role: "fix", alive: true, stale: true, heartbeat_ts: null })).toBe("stale");
+    expect(roleHealth({ role: "fix", alive: null, stale: false, heartbeat_ts: null, in_flight: [] })).toBe("unknown");
+    expect(roleHealth({ role: "fix", alive: false, stale: true, heartbeat_ts: null, in_flight: [] })).toBe("dead");
+    expect(roleHealth({ role: "fix", alive: true, stale: true, heartbeat_ts: null, in_flight: [] })).toBe("stale");
   });
 });
