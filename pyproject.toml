@@ -20,13 +20,13 @@ issue-agent = "issue_agent.app.cli:main"
 [project.optional-dependencies]
 # PyJWT[crypto] backs the GitHub App installation-token mint (adapters/app_token).
 sdk = [
-    "claude-agent-sdk>=0.2.158",
+    "claude-agent-sdk>=0.2.165",
     "pyjwt[crypto]>=2.8",
 ]
 dev = [
     "pytest>=8",
     "pytest-xdist>=3.6",
-    "claude-agent-sdk>=0.2.158",
+    "claude-agent-sdk>=0.2.165",
     "pyjwt[crypto]>=2.8",
     "import-linter>=2.0",
     # fastapi.testclient is httpx-backed; the full development gate includes
