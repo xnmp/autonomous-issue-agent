@@ -26,6 +26,7 @@ import json
 import os
 import sqlite3
 import stat
+import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
@@ -950,6 +951,90 @@ class SQLiteControlStore:
     def confirm_key(self, key: str) -> None:
         with self._transaction() as db:
             db.execute("UPDATE idempotency SET state='done' WHERE key=?", (key,))
+
+
+# Store-change wake (owner, 2026-10-14). The check is a free pragma read, so a
+# second's latency costs nothing; the gap bounds a chatty store to one GitHub
+# observation per 5 s per daemon (the GraphQL budget is shared with the sibling
+# role and the dashboard), and 5 s also spans a leg's end burst (record,
+# settle, unlease) so it lands as one tick.
+WAKE_CHECK_SECONDS = 1.0
+WAKE_MIN_GAP_SECONDS = 5.0
+STORE_CHANGED = "store changed"
+
+
+class StoreWake:
+    """Ends a daemon's inter-tick wait early when the control store changes.
+
+    `PRAGMA data_version` on one long-lived read-only connection changes only
+    when another connection commits. Every store operation opens its own
+    connection, so this process's leg transitions wake it as well as the
+    sibling role's. The version seen persists across waits, so a commit made
+    while a tick ran wakes the next wait: no change is lost between the two.
+    An unreadable store degrades to the plain timed wait, logged once per
+    outage; each later wait retries the connection."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        log: Callable[[str], None],
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.path = os.path.abspath(path)
+        self._log = log
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._db: sqlite3.Connection | None = None
+        self._seen: int | None = None
+        self._unavailable = False
+        self._changed()  # the baseline predates the first tick
+
+    def wait(self, timeout: float) -> str | None:
+        """Wait up to `timeout` seconds; return the wake reason, or None when
+        the time ran out. A change wakes no sooner than the minimum gap after
+        the wait began, and every commit inside that gap is the same wake."""
+        start = self._monotonic()
+        deadline = start + timeout
+        changed = False
+        while (now := self._monotonic()) < deadline:
+            if changed:
+                if now >= start + WAKE_MIN_GAP_SECONDS:
+                    self._changed()  # commits inside the gap precede the tick this wake starts
+                    return STORE_CHANGED
+                self._sleep(min(start + WAKE_MIN_GAP_SECONDS, deadline) - now)
+                continue
+            self._sleep(min(WAKE_CHECK_SECONDS, deadline - now))
+            seen = self._changed()
+            if seen is None:
+                if (remaining := deadline - self._monotonic()) > 0:
+                    self._sleep(remaining)
+                return None
+            changed = seen
+        return None
+
+    def _changed(self) -> bool | None:
+        """Whether another connection committed since the last read; None
+        when the store cannot be read."""
+        try:
+            if self._db is None:
+                self._db = sqlite3.connect(f"{Path(self.path).as_uri()}?mode=ro", uri=True, timeout=1.0,
+                                           isolation_level=None)
+                self._seen = None
+            version = int(self._db.execute("PRAGMA data_version").fetchone()[0])
+        except (sqlite3.Error, OSError) as exc:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+            if not self._unavailable:
+                self._log(f"store wake unavailable ({exc}); waking on the poll interval only")
+            self._unavailable = True
+            return None
+        self._unavailable = False
+        changed = self._seen is not None and version != self._seen
+        self._seen = version
+        return changed
 
 
 def _refuse_prior_use(path: str, opened_before: bool) -> None:

@@ -11,10 +11,12 @@ other act's attempt run).
 
 `Daemon.tick()` is the observe -> decide -> submit unit and is what tests
 drive. Cheap actions execute before it returns; paid dispatches continue in a
-bounded pool. `run_forever()` wraps it with the sleep and heartbeat (a periodic
+bounded pool. `run_forever()` wraps it with the wait and heartbeat (a periodic
 alive line plus the suspend-stall warning when wall-clock elapsed far exceeds
-the interval). The clock and sleep are injected so the loop is testable
-without real time.
+the interval). The wait ends early when an injected `wake` reports a change
+(the control store's, so a leg ending in either role starts the next tick);
+the poll interval stays the ceiling that picks up GitHub-side events. The
+clock, sleep and wake are injected so the loop is testable without real time.
 """
 
 from __future__ import annotations
@@ -224,7 +226,7 @@ class ActionExecutor(Protocol):
 
 
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
-DEFAULT_RESERVATION_SWEEP_TICKS = 30
+DEFAULT_RESERVATION_SWEEP_POLLS = 30
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
 _SHUTDOWN_PREPARE_RESERVE_SECONDS = 2.0
 _SHUTDOWN_TERMINALIZE_RESERVE_SECONDS = 3.0
@@ -265,7 +267,11 @@ class Daemon:
     # Injected so deadline expiry is a decision in tests, not a race.
     monotonic: Callable[[], float] = time.monotonic
     reconcile: Callable[[RecoveryTrigger], object] | None = None
-    reservation_sweep_ticks: int = DEFAULT_RESERVATION_SWEEP_TICKS
+    # Elapsed (monotonic) time in poll intervals: early wakes add ticks, not sweeps.
+    reservation_sweep_polls: int = DEFAULT_RESERVATION_SWEEP_POLLS
+    # Waits up to its argument in seconds; returns the wake reason, or None
+    # on timeout. None here means the plain timed sleep.
+    wake: Callable[[float], str | None] | None = None
     prepare_shutdown: Callable[[], object] | None = None
     terminalize: Callable[[], object] | None = None
     _state: DaemonState = field(default=DaemonState.STARTING, init=False, repr=False)
@@ -294,7 +300,7 @@ class Daemon:
                                                  thread_name_prefix=f"{self.name}-dispatch")
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown timeout must be positive")
-        if self.reservation_sweep_ticks <= 0:
+        if self.reservation_sweep_polls <= 0:
             raise ValueError("reservation sweep cadence must be positive")
 
     @property
@@ -564,7 +570,7 @@ class Daemon:
         self.log(f"{self.name}: watching (poll {self.poll_seconds}s)")
         self._transition(DaemonState.RUNNING)
         last, last_active = now(), active_now()
-        last_logged, ticks, reload_pending = last, 0, False
+        last_logged, last_swept, ticks, reload_pending = last, last_active, 0, False
         try:
             while max_ticks is None or ticks < max_ticks:
                 cur, cur_active = now(), active_now()
@@ -589,7 +595,9 @@ class Daemon:
                 if scheduler_progress is not None:
                     scheduler_progress()
                 ticks += 1
-                if self.reconcile is not None and ticks % self.reservation_sweep_ticks == 0:
+                if (self.reconcile is not None
+                        and cur_active - last_swept >= self.reservation_sweep_polls * self.poll_seconds):
+                    last_swept = cur_active
                     try:
                         self.reconcile(RecoveryTrigger.PERIODIC)
                     except Exception as exc:
@@ -607,7 +615,8 @@ class Daemon:
 
                     self.log(f"{self.name}: hot-reload — harness source changed; restarting with no session in flight")
                     raise SystemExit(RELOAD_EXIT_CODE)
-                self._sleep_interval(sleep, scheduler_progress)
+                if reason := self._sleep_interval(sleep, scheduler_progress):
+                    self.log(f"{self.name}: woke: {reason}")
             self._transition(DaemonState.DRAINING, "loop completed")
             clean = self.shutdown_dispatches(cancel=False)
             self._transition(DaemonState.STOPPED)
@@ -628,20 +637,27 @@ class Daemon:
                 raise SystemExit(ExitCode.TRANSIENT) from exc
             raise
 
-    def _sleep_interval(self, sleep: Callable[[int], None], scheduler_progress: Callable[[], None] | None = None) -> None:
-        """One poll interval (or a longer Retry-After), sliced to keep a
-        systemd watchdog fed when a notifier is present."""
+    def _sleep_interval(self, sleep: Callable[[int], None],
+                        scheduler_progress: Callable[[], None] | None = None) -> str | None:
+        """One poll interval, sliced to keep a systemd watchdog fed when a
+        notifier is present; returns the reason when `wake` ended it early.
+        After a Retry-After the interval is never woken early: a wake must
+        not turn GitHub's back-off into another request."""
         interval = max(self.poll_seconds, int(self._retry_after_seconds or 0))
+        wake = None if self._retry_after_seconds else self.wake
         self._retry_after_seconds = None
-        if scheduler_progress is None:
-            sleep(interval)
-            return
         remaining = interval
         while remaining > 0:
-            step = min(30, remaining)
-            sleep(step)
+            step = remaining if scheduler_progress is None else min(30, remaining)
+            reason = None if wake is None else wake(step)
+            if wake is None:
+                sleep(step)
             remaining -= step
-            scheduler_progress()
+            if scheduler_progress is not None:
+                scheduler_progress()
+            if reason:
+                return reason
+        return None
 
 
 async def run_leg(

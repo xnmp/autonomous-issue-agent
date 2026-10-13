@@ -3,11 +3,14 @@
 import asyncio
 import json
 import re
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
+from issue_agent.adapters.control_store import SQLiteControlStore, StoreWake
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.reload import RELOAD_EXIT_CODE
 from issue_agent.app.tick import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, CancellableAsyncDispatch, Daemon
@@ -561,31 +564,107 @@ def test_a_second_dispatch_for_a_running_target_is_not_submitted():
     assert started == [7]
 
 
-def test_reservation_sweep_runs_on_bounded_tick_cadence():
-    sweeps = []
+def test_reservation_sweep_cadence_is_elapsed_time_not_tick_count():
+    # Store wakes tick every 5 s against a 10 s poll; the sweep stays once per
+    # 3 poll intervals (30 s) of elapsed time, not once per 3 ticks.
+    sweeps, clock = [], ManualClock()
+
+    def wake(_timeout):
+        clock.advance(5)
+        return "store changed"
+
     daemon = Daemon(
         "fix",
         lambda: WorldState(),
         lambda _world: [],
         Executor(FakeGateway()),
-        poll_seconds=1,
+        poll_seconds=10,
         reconcile=sweeps.append,
-        reservation_sweep_ticks=2,
+        reservation_sweep_polls=3,
+        wake=wake,
     )
 
-    daemon.run_forever(sleep=lambda _seconds: None, now=lambda: 0, max_ticks=2)
+    daemon.run_forever(sleep=lambda _s: None, now=lambda: int(clock()), active_now=clock, max_ticks=13)
 
-    assert sweeps == [RecoveryTrigger.PERIODIC]
+    assert clock() == 65
+    assert sweeps == [RecoveryTrigger.PERIODIC] * 2
 
 
 def test_without_a_wake_the_full_interval_is_slept():
     d, _ = _daemon(lambda w: [])
-    d.poll_seconds, d.wake_check = 5, lambda: False
+    d.poll_seconds, d.wake = 5, lambda timeout: None
     slept = []
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert sum(slept) == 10
+    assert slept == []  # the wake owned the whole interval
     # Regression guard on the unwired path: no slicing, no extra sleep calls.
     unwired, _ = _daemon(lambda w: [])
     slept = []
     unwired.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert slept == [60, 60]
+
+
+def test_a_wake_starts_the_next_tick_and_logs_its_reason_once():
+    logs, ticks, waits = [], [], []
+
+    def wake(timeout):
+        waits.append(timeout)
+        return "store changed" if len(waits) == 1 else None
+
+    d, _ = _daemon(lambda w: ticks.append(w) or [], logs=logs)
+    d.wake = wake
+    d.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: 0, max_ticks=3)
+    assert len(ticks) == 3
+    assert waits == [60, 60, 60]
+    assert [m for m in logs if "woke" in m] == ["fix: woke: store changed"]
+
+
+def test_after_a_retry_after_no_wake_shortens_the_back_off():
+    calls, slept = [], []
+
+    def observe():
+        calls.append("observe")
+        if len(calls) == 1:
+            raise GhUnavailable("rate-limit", "HTTP 429", retry_after_s=120)
+        return WorldState()
+
+    d, _ = _daemon(lambda w: [], observe=observe)
+    d.wake = lambda _timeout: "store changed"
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    assert slept == [120]  # the back-off in full; the second interval was woken
+
+
+_END_LEG_ELSEWHERE = """
+import sys
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.domain.contracts import RunId
+SQLiteControlStore(sys.argv[1]).record_unpaid_leg(
+    RunId("review-leg"), repository="o/r", role="review", kind="REVIEW", owner_id="o/r:review",
+    issue=7, number=7, head="", runtime="claude")
+"""
+
+
+def test_a_leg_ending_in_another_process_starts_the_next_tick_before_the_poll(tmp_path):
+    store = SQLiteControlStore(str(tmp_path / "state" / "control.db"))
+    store.initialize()
+    clock, observed, logs = ManualClock(), [], []
+
+    def sleep(seconds):
+        clock.advance(seconds)
+        if clock() == 10:
+            subprocess.run([sys.executable, "-c", _END_LEG_ELSEWHERE, store.path], check=True, timeout=60)
+
+    daemon = Daemon(
+        "fix",
+        lambda: observed.append(clock()) or WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway()),
+        poll_seconds=60,
+        log=logs.append,
+        wake=StoreWake(store.path, log=logs.append, sleep=sleep, monotonic=clock).wait,
+    )
+
+    daemon.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: int(clock()),
+                       active_now=clock, max_ticks=2)
+
+    assert observed == [0, 10]
+    assert "fix: woke: store changed" in logs
