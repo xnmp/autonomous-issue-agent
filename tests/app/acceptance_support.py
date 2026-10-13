@@ -75,7 +75,7 @@ _CLOCKED_MODULES = (
     "issue_agent.adapters.accounting_runtime", "issue_agent.adapters.control_store",
     "issue_agent.adapters.durable_effects", "issue_agent.adapters.journal",
     "issue_agent.app.loop", "issue_agent.app.recovery",
-    "issue_agent.app.roles", "issue_agent.app.fix", "issue_agent.app.dashweb.service",
+    "issue_agent.app.roles", "issue_agent.app.fix", "issue_agent.app.tick", "issue_agent.app.dashweb.service",
 )
 
 

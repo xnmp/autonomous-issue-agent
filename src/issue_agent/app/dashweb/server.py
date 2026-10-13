@@ -30,9 +30,7 @@ from ...adapters.workflow_codec import validate_operator_json, WorkflowEncodingE
 from .. import cli
 from . import contracts
 from . import resolve_contracts
-from . import review_contracts
 from .resolve_control import control_error, unavailable_command, unavailable_control
-from .review_control import unavailable_review_command, unavailable_review_control
 from .ports import DashboardBackend
 from .service import Backend
 
@@ -133,7 +131,7 @@ def create_app(
             return JSONResponse(
                 {"detail": f"missing {CSRF_HEADER} header"}, status_code=403
             )
-        if request.method == "POST" and request.url.path.endswith(("/review-control/commands", "/resolve-control/commands")):
+        if request.method == "POST" and request.url.path.endswith("/resolve-control/commands"):
             try:
                 validate_operator_json(await request.body())
             except WorkflowEncodingError as exc:
@@ -312,48 +310,14 @@ def create_app(
         code = {"accepted": 202, "replayed": 200, "conflict": 409, "rejected": 422, "unavailable": 503}[result.outcome]
         return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
 
-    @app.get("/api/repos/{name}/pulls/{pr}/review-control", response_model=review_contracts.ReviewControl)
-    async def api_review_control(name: str, pr: int, request_id: str | None = Query(default=None, max_length=512)):
-        await require_known(name)
-        if pr < 1 or pr > 2**63 - 1:
-            raise HTTPException(422, "pull request number is outside the supported range")
-        if request_id is not None:
-            try:
-                resolve_contracts.validate_identifier(request_id)
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-        try:
-            result = await invoke(backend.review_control, name, pr, request_id)
-        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
-            result = unavailable_review_control(exc)
-        code = 503 if result.status == "unavailable" else 404 if result.status == "absent" else 200
-        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
-
-    @app.get("/api/repos/{name}/workflow-families", response_model=review_contracts.WorkflowFamilies)
+    @app.get("/api/repos/{name}/workflow-families", response_model=resolve_contracts.WorkflowFamilies)
     async def api_workflow_families(name: str):
         await require_known(name)
         try:
             result = await invoke(backend.workflow_families, name)
         except Exception as exc:  # noqa: BLE001 - an unread activation never reads as none active
-            result = review_contracts.WorkflowFamiliesUnavailable(status="unavailable", reason=control_error(exc))
+            result = resolve_contracts.WorkflowFamiliesUnavailable(status="unavailable", reason=control_error(exc))
         return JSONResponse(_encodable(jsonable_encoder(result)), status_code=503 if result.status == "unavailable" else 200)
-
-    @app.post("/api/repos/{name}/pulls/{pr}/review-control/commands",
-              response_model=review_contracts.ReviewCommandResult)
-    async def api_review_command(name: str, pr: int, body: review_contracts.ReviewCommand):
-        await require_known(name)
-        if pr < 1 or pr > 2**63 - 1:
-            raise HTTPException(422, "pull request number is outside the supported range")
-        try:
-            body.command()
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        try:
-            result = await invoke(backend.review_command, name, pr, body)
-        except Exception as exc:  # noqa: BLE001 - command identity makes an uncertain response retryable
-            result = unavailable_review_command(exc)
-        code = {"accepted": 202, "replayed": 200, "conflict": 409, "rejected": 422, "unavailable": 503}[result.outcome]
-        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
 
     @app.post(
         "/api/repos/{name}/issues/{number}/unblock",

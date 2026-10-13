@@ -2,7 +2,7 @@ import { parseOperatorCommand, prepareOperatorCommand, type ReleaseDraft, type R
 import { schemas } from "../../api/generated-zod";
 import type { AvailableResolveControl, ResolveCommand, ResolveCommandResult } from "../../api/types";
 
-export type ResolveDraft = ReleaseDraft<"request_rearm">;
+export type ResolveDraft = ReleaseDraft;
 
 export type ResolveOperation = ReleaseOperation<ResolveCommand, ResolveCommandResult>;
 

@@ -53,9 +53,9 @@ def _run_doctor(env: dict, cwd: Path | None = None) -> subprocess.CompletedProce
 
 
 # ── #33: toolchain-pin drift ────────────────────────────────────────────────
-# `REPO`/`FIX_BOT` are given realistic values and IDENTITY_MODE=solo so the
-# unrelated identity/CI-access checks stay quiet (warnings only) and don't
-# add noise to the specific substrings asserted here.
+# `REPO`/`FIX_BOT`/`REVIEW_BOT` are given realistic values so the unrelated
+# identity/CI-access checks stay quiet (warnings only) and don't add noise to
+# the specific substrings asserted here.
 def _fake_toolchain_bin(
     tmp_path: Path,
     *,
@@ -116,7 +116,7 @@ def _toolchain_doctor(
         "HARNESS_ROOT": str(harness),
         "REPO": "acme/widget",
         "FIX_BOT": "acme-fixer",
-        "IDENTITY_MODE": "solo",
+        "REVIEW_BOT": "acme-reviewer",
         "TARGET_DIR": str(target),
     }
     return _run_doctor(env)

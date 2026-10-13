@@ -878,8 +878,8 @@ class AgentRunner(AgentRuntime):
                 # re-raising unchanged is the crash-isolation contract above.
                 # Best-effort — an exception with __slots__ refuses the write.
                 try:
-                    exc.harness_last_trace = last_trace
-                    exc.harness_resolved_model = resolved_model
+                    setattr(exc, "harness_last_trace", last_trace)
+                    setattr(exc, "harness_resolved_model", resolved_model)
                 except Exception:
                     pass
                 raise

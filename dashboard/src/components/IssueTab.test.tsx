@@ -211,8 +211,6 @@ describe("IssueTab", () => {
                 review: {
                   verdict_excerpt: verdict,
                   rejection: 2,
-                  unproductive_rounds: 0,
-                  unproductive_cap: 5,
                 },
               }],
               events: [],
@@ -232,7 +230,6 @@ describe("IssueTab", () => {
     expect(screen.getByText(verdict)).toBeVisible();
     expect(document.querySelector("script")).not.toBeInTheDocument();
     expect(screen.getByText("change-request verdicts observed 2")).toBeVisible();
-    expect(screen.getByText("unproductive rounds 0/5")).toBeVisible();
     expect(screen.getByText("leg $0.40 / $8.00 cap")).toBeVisible();
     expect(screen.getByText("learned estimate · estimated")).toBeVisible();
   });

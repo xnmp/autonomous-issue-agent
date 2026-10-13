@@ -28,8 +28,10 @@ bound to the decided head, a PR opened only when the branch has no open one)
 or claims an idempotency key in SQLite before writing and confirms it only
 after a GitHub read-back. A failed read-back raises and the next tick
 re-derives from GitHub. The agent pushes its own branch with git; the publish
-broker is deleted (refactor decision Q11). The review role keeps durable
-commands until slice 5c.
+broker is deleted (refactor decision Q11). Slice 5c extends this to the
+review role: its one write, the bot's review of a head, claims
+`review:{pr}:{head}` and first reads back whether the bot already reviewed
+that commit, so a crash after submission never posts a second review.
 
 ## Consequences
 

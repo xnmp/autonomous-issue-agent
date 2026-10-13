@@ -1,12 +1,14 @@
 # ADR 0009 — Workflow continuation authority
 
-Status: Accepted; selected runtime continuity superseded by
+Status: Superseded by the minimal-harness refactor. Since slices 5b and 5c
+no role reads the typed SQL continuation components: the fix role resumes from
+its run receipts (`app/fix.py`) and the review role runs one fresh leg per head
+(`app/review.py`). Slice 5d deletes the retained components. Earlier history:
+selected runtime continuity was superseded by
 [ADR 0015](0015-generation-fenced-gate-rearm.md) and
-[ADR 0016](0016-phase-4-current-state-authority.md). Phase 4 whole-system
-acceptance is complete under A2; retained files are inert except for the
-explicitly preserved Jira counter path described below.
+[ADR 0016](0016-phase-4-current-state-authority.md).
 Date: 2026-08-01
-Governs: src/issue_agent/adapters/store.py src/issue_agent/app/workflows/review.py src/issue_agent/adapters/worktree.py
+Governs: src/issue_agent/adapters/store.py src/issue_agent/adapters/worktree.py
 
 ## Context
 

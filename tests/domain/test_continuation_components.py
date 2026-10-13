@@ -4,14 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from issue_agent.domain.continuation_components import (
-    ActiveIssueRecovery, ActivePRRepair,
-    ContinuationWatermarks, InactiveIssueRecovery, InactivePRRepair,
-    IssueRecoveryState, PRRepairState, RepairSession, SelectedIssueRecovery, SelectedPRRepair,
-    continuation_return_is_current, select_issue_recovery, select_pr_repair,
-)
-from issue_agent.domain.agent_task import RuntimeName
-from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
+from issue_agent.domain.continuation_components import ActiveIssueRecovery, ActivePRRepair, ContinuationWatermarks, InactiveIssueRecovery, InactivePRRepair, IssueRecoveryState, PRRepairState, SelectedIssueRecovery, SelectedPRRepair, continuation_return_is_current, select_issue_recovery
 from issue_agent.domain.contracts import CommandId, ContinuationAdmission, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow import (
     NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, WorkflowChanged,
@@ -21,7 +14,6 @@ from issue_agent.domain.workflow_identity import (
     WorkflowFence, WorkflowKey, WorkflowRevision,
 )
 from tests.domain.test_workflow_policy import NOW, exhausted, start
-from tests.domain.test_review_workflow_policy import accept, gated
 
 
 def identity(key, family, episode="secondary", epoch=2):
@@ -108,30 +100,6 @@ def test_resolve_generation_advance_preserves_recovery_state_and_fences_old_retu
     assert current_recovery.binding.authority == recovery.identity.authority
     assert current_recovery.binding.episode_id == recovery.identity.episode_id
     assert not continuation_return_is_current(current_recovery, old_recovery)
-
-
-def test_review_generation_advance_preserves_repair_session_allowance_and_its_original_provenance():
-    state = gated()
-    assert isinstance(state, ReviewWorkflowSnapshot)
-    key = state.revision.fence.key
-    component_identity = identity(key, WorkflowFamily.PR_REPAIR)
-    source = ContinuationAdmission(WorkflowAttemptIdentity(component_identity.bind(state.revision.fence),
-                                                          RunId("run:repair"), "CI_REPAIR"), 1)
-    session = RepairSession(source, "repair-handle", RuntimeName.CLAUDE, "repair-model")
-    repair = ActivePRRepair(component_identity, PRRepairState(NOW.isoformat(), "fix/7-work", session,
-                                                            ci_failures=2, rebase_failures=4),
-                            ContinuationWatermarks(1, 1), (hold(),))
-    state = replace(state, pr_repair=repair)
-    transition = accept(state)
-    assert isinstance(transition, WorkflowChanged)
-    after = transition.snapshot
-    selected = select_pr_repair(after)
-    assert after.pr_repair == repair and selected.component.state.session == session
-    assert selected.binding.fence == after.revision.fence
-    assert source.attempt.binding.fence == state.revision.fence
-    assert selected.binding.authority == source.attempt.binding.authority
-    assert not continuation_return_is_current(selected, source)
-    assert after.episode.episode_id == state.episode.episode_id
 
 
 @pytest.mark.parametrize("family,kind", [(WorkflowFamily.ISSUE_RECOVERY, IssueRef),
@@ -265,43 +233,3 @@ def test_selected_issue_reply_refuses_unknown_or_unowned_inputs(reply_at, body, 
         IssueReplyInput(selected, reply_at, body, branch)
 
 
-@pytest.mark.parametrize("branch,runtime", [(None, RuntimeName.CLAUDE), ("", RuntimeName.CLAUDE),
-    ("x" * 65537, RuntimeName.CLAUDE), ("fix/7-ci", None), ("fix/7-ci", "claude")])
-def test_repair_launch_refuses_missing_huge_or_untyped_inputs(branch, runtime):
-    from issue_agent.domain import continuation_components as cc
-    base = gated()
-    assert isinstance(base, ReviewWorkflowSnapshot)
-    component = cc.ActivePRRepair(identity(base.revision.fence.key, WorkflowFamily.PR_REPAIR), cc.PRRepairState())
-    selected = cc.select_pr_repair(replace(base, pr_repair=component))
-    with pytest.raises(ValueError):
-        cc.PRRepairInput(selected, branch, runtime)
-
-
-def test_repair_retirement_preserves_requeue_debt_but_retires_merged_state():
-    from issue_agent.domain import continuation_components as cc
-    state = cc.PRRepairState(branch="fix/7-ci", resumes=4, ci_failures=3, infra_failures=2)
-    requeued = cc.retire_pr_repair_continuity(state, False)
-    assert (requeued.resumes, requeued.ci_failures, requeued.infra_failures, requeued.branch) == (4, 3, 2, "fix/7-ci")
-    merged = cc.retire_pr_repair_continuity(state, True)
-    assert (merged.resumes, merged.ci_failures, merged.infra_failures, merged.branch) == (0, 0, 0, "")
-
-
-def test_blank_reply_source_cannot_originate_in_future_current_generation():
-    from issue_agent.domain import continuation_components as cc
-    from issue_agent.domain.workflow_identity import WorkflowBinding
-    base = gated()
-    assert isinstance(base, ReviewWorkflowSnapshot)
-    component = identity(base.revision.fence.key, WorkflowFamily.PR_REPAIR)
-    binding = WorkflowBinding(replace(base.revision.fence, generation=base.revision.fence.generation+1),
-                              component.authority, component.episode_id)
-    state = cc.PRRepairState(consumed_reply_at=NOW.isoformat(), blank_reply=cc.PRBlankReplySource(binding, NOW.isoformat()))
-    with pytest.raises(ValueError, match="future"):
-        replace(base, pr_repair=cc.ActivePRRepair(component, state))
-
-
-@pytest.mark.parametrize("timestamp,body", [(None, "x"), ("", "x"), ("yesterday", "x"),
-    ("2026-10-01", "x"), (NOW.isoformat(), " "), (NOW.isoformat(), None), (NOW.isoformat(), "x" * 65537)])
-def test_paid_pr_reply_requires_bounded_nonblank_body_and_aware_timestamp(timestamp, body):
-    from issue_agent.domain import continuation_components as cc
-    with pytest.raises(ValueError):
-        cc.PRReplyInput(timestamp, body)

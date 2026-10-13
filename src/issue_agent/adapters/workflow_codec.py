@@ -14,16 +14,7 @@ from typing import TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..domain import workflow as w
-from ..domain import review_workflow as rw
-from ..domain import review_dispatch_record as rd
-from ..domain import review_workflow_policy as rp
-from ..domain.review_evidence import EvidenceSchedule
-from ..domain import review_execution as rx
-from ..domain import review_rounds as rr
-from ..domain import review_preflight as preflight
-from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
-from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
 from ..domain.contracts import BudgetScope, WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, ChargeOrigin, SettlementRequest
 from ..domain import continuation_components as cc
@@ -43,7 +34,7 @@ T = TypeVar("T")
 
 
 _VALUES = (
-    EvidenceSchedule, EffectReceipt,
+    EffectReceipt,
     BudgetScope,
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
     cc.IssueRebasePurchase, cc.RebaseRepairResult,
@@ -75,7 +66,7 @@ _VALUES = (
     w.EvidenceUnavailable, w.RearmNeedsDecision, w.NoAuthorizedRemediation,
     w.RemediationAttempted, w.OpenGate, w.RearmingGate,
     w.KeepGuidance, w.ClearGuidance, w.SetGuidance, w.OperatorActor,
-    w.RequestRearm, w.RequestReviewExecutionRenewal, w.RequestReviewVerdictRelease,
+    w.RequestRearm,
     w.ContinueGrantedRearm, w.CancelRearm, w.ReconcileGate,
     w.AuthorizeAbsentRetry, w.RenewResolveAllowance, w.EnsureLifecycleProjection,
     w.PendingRearm, w.CompletedRearm, w.SupersededRearm, w.CancelledRearm,
@@ -84,56 +75,6 @@ _VALUES = (
     w.ConsumedRetryAuthorization, w.ClosedRetryAuthorization, w.ActiveReconciliation, w.ReconciliationOnly,
     w.RetiredUncertainCommand, w.RetiredSettledCommand, w.ResolveAttemptResult,
     w.AuthorizedOperatorCommand, w.ObservedTransition, w.WorkflowRejected,
-    # Review-rejection family (ADR 0015 review slice).
-    rw.CountedReview, rw.CountingRule, rw.ReviewRejectionCeiling, rw.ReviewRearmPreflight,
-    rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ReviewedBaseline,
-    rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection, rw.ReviewProjectionPlan,
-    rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
-    rw.ReviewRejectionGrant, rw.ReviewExecutionRenewalGrant, rw.ReviewVerdictReleaseGrant,
-    w.ReviewExecutionCeiling, w.ReviewVerdictHold,
-    rw.ReviewWorkflowSnapshot, rw.ReviewFamilyEpisodes, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
-    rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,
-    rw.ReviewProjectionRefused, rw.RecordedPullRequest,
-    # The review daemon's recorded dispatch decision (operator surface).
-    rp.ReviewHeld, rp.ReviewOwed, rp.ReviewNotOwed, rp.ReleaseProjectionPending, rp.SubmissionUnresolved,
-    rp.CeilingEscalation, rp.CeilingProductivityDecision,
-    rd.ReviewNotAdmitted, rd.ReviewDeferred, rd.ReviewTerminal, rd.ReviewWithheld, rd.ReviewInFlight,
-    rd.DecisionBasis, rd.DepartedReadFailure, rd.RecordedReviewDecision,
-    rx.ReviewExecutionBinding, rx.ReviewRoundIdentity, rx.ReviewChildIdentity,
-    rx.ReviewChildAdmission, rx.ReviewUnlaunchedRelease, rx.ReviewChildAdmissionRefusal, rx.ReviewChildLaunchRegistration,
-    review_return.ReviewReturnedEnvelope, review_return.ReturnedReviewChild,
-    review_return.ReviewRuntimePreflightStop,
-    rx.LaunchedReviewChild, rx.RenewedReviewSessionSource, rx.NoReviewSession,
-    rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
-    rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,
-    rx.PaidReviewProgress, rx.CopiedReviewProgress, rx.AddReviewStrike,
-    rx.SaturateReviewFailures, rx.ReviewRoundFailure, rx.ReviewInfrastructureDeath, rx.ReviewBudgetExhausted, rx.ReviewPinDeferred,
-    rx.ReviewAdmissionRefused, rx.ReviewReservationReleased, rx.ReviewUnlaunchedRound,
-    rx.ReviewPreparationFailure, rx.ReviewPreparationDeferred,
-    rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
-    rx.ReviewExecutionState, rx.ReviewExecutionBoundaryCursor,
-    rx.ReviewExecutionCheckpoint, rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
-    rx.ReviewExecutionTransitionProofSource,
-    rx.ReviewExecutionOrigin,
-    rx.InitializedReviewExecutionOriginReceipt, rx.RenewedReviewExecutionOriginReceipt,
-    rx.ExecutionNotActivated, rx.ActivatedReviewExecution, rx.CurrentReviewExecution,
-    rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
-    rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
-    rr.ReviewChildSettledWithoutLaunch, rr.ReviewChildNotAdmitted,
-    rr.ReviewChildPinDeferred, rr.ReviewChildSucceeded, rr.OrdinaryReviewFailure,
-    rr.DeterministicReviewFailure, rr.ReviewChildFailed, rr.ReviewChildCancelled,
-    rr.ReviewChildInfrastructureFailure, rr.ReviewChildBudgetExhausted,
-    rr.ReviewChildReturned, rr.ReviewSubmissionPending,
-    rr.ReviewSubmissionConfirmed, rr.ReviewSubmissionRefused,
-    rr.ReviewSubmissionEvidence, rr.ReviewPlanningOpen,
-    rr.ReviewPlanningComplete, rr.ReviewPlanningRefused, rr.ReviewPlanningSealed,
-    rr.ReviewParentAbandoned, rr.ReviewSealedParentAbandoned,
-    rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
-    rr.CurrentReviewOutcomeReceipt,
-    rr.CurrentStaleReviewProductivitySettlement,
-    rr.StaleReviewProductivitySettlement,
-    rr.FinalizedReviewRound, rr.DeferredReviewPreparation,
-    preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
     Target, EffectStatus,
@@ -144,10 +85,7 @@ _ENUMS = (
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
     w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
-    rw.SubmittedReviewState, rw.PullRequestState, rp.ReviewKind, rd.DecisionRead, rd.WithheldReason,
-    RuntimeName, ReviewMode, rx.ReviewChildKind, rx.ReviewPreparationKind,
-    rx.ReviewCancellationReason, rx.ReviewExecutionOriginKind,
-    rr.ReviewSubmissionKind, rr.ReviewSessionReuse, rr.ReviewRoundWait,
+    RuntimeName,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 if len(_TAGS) != len(_VALUES) + len(_ENUMS):
@@ -158,18 +96,7 @@ if len(_TAGS) != len(_VALUES) + len(_ENUMS):
 _VALUE_FIELDS = {value: fields(value) for value in _VALUES}
 _FIELD_NAMES = {value: frozenset(field.name for field in schema) for value, schema in _VALUE_FIELDS.items()}
 _ENUM_TYPES = frozenset(_ENUMS)
-_EVOLVED_TAGS = {"WorkflowSnapshotV2": "WorkflowSnapshot", "ReviewWorkflowSnapshotV3": "ReviewWorkflowSnapshot",
-                 "ReviewFamilyEpisodesV2": "ReviewFamilyEpisodes"}
-
-_CURRENT_REVIEW_SNAPSHOT_TAG = "ReviewWorkflowSnapshotV2"
-_LEGACY_REVIEW_SNAPSHOT_FIELDS = frozenset({"revision", "authority", "episode", "gates", "intent"})
-_CURRENT_ACTIVATED_EXECUTION_TAG = "ActivatedReviewExecutionV2"
-_CURRENT_EXECUTION_AUTHORITY_TAG = "CurrentReviewExecutionV1"
-_LEGACY_ACTIVATED_EXECUTION_FIELDS = frozenset({
-    "origin", "checkpoint", "state", "last_sequence", "checkpoint_receipt",
-})
-_CURRENT_EXECUTION_CHECKPOINT_TAG = "ReviewExecutionCheckpointV2"
-_LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "policy"})
+_EVOLVED_TAGS = {"WorkflowSnapshotV2": "WorkflowSnapshot"}
 
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
@@ -178,8 +105,6 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "WorkflowSnapshot": {
         "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}},
     },
-    "ReviewWorkflowSnapshot": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
-    "ReviewFamilyEpisodes": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None, "ci_rerun": None, "ci_cancel": None, "branch_refresh": None, "pending_ci_escalation": None},
@@ -187,16 +112,10 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "PRRepairResult": {"ci": None, "review": None, "rebase": None},
     "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None},
     "ResolveAdmission": {"workspace_handoff_id": None},
-    # Review facts observed before command markers were parsed name no command.
-    "SubmittedReviewFact": {"review_command": None},
     "RequestRearm": {"expected_binding": None},
     "ContinueGrantedRearm": {"expected_binding": None},
     "CancelRearm": {"expected_binding": None},
     "AuthorizeAbsentRetry": {"expected_binding": None},
-    "PendingReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
-    "CompletedReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
-    "SupersededReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
-    "CancelledReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
 }
 
 # Self-clear state (machine/budget holds and their allowance) and the fix
@@ -219,18 +138,12 @@ class WorkflowEncodingError(ValueError):
 def _encode(value: object, depth: int = 0) -> object:
     if depth > MAX_WORKFLOW_PAYLOAD_DEPTH:
         raise WorkflowEncodingError("workflow payload nesting is excessive")
-    if type(value) in _ENUM_TYPES:
+    if isinstance(value, Enum) and type(value) in _ENUM_TYPES:
         return {"type": type(value).__name__, "value": value.value}
     if type(value) in _VALUE_FIELDS and is_dataclass(value):
         return {
-            "type": ("ReviewWorkflowSnapshotV3" if type(value) is rw.ReviewWorkflowSnapshot and not isinstance(value.pr_repair, cc.InactivePRRepair)
-                     else _CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
-                     else "WorkflowSnapshotV2" if type(value) is w.WorkflowSnapshot and (
+            "type": ("WorkflowSnapshotV2" if type(value) is w.WorkflowSnapshot and (
                          not isinstance(value.issue_recovery, cc.InactiveIssueRecovery))
-                     else "ReviewFamilyEpisodesV2" if type(value) is rw.ReviewFamilyEpisodes and not isinstance(value.pr_repair, cc.InactivePRRepair)
-                     else _CURRENT_ACTIVATED_EXECUTION_TAG if type(value) is rx.ActivatedReviewExecution
-                     else _CURRENT_EXECUTION_AUTHORITY_TAG if type(value) is rx.CurrentReviewExecution
-                     else _CURRENT_EXECUTION_CHECKPOINT_TAG if type(value) is rx.ReviewExecutionCheckpoint
                      else type(value).__name__),
             "fields": {
                 # Only this historical field used a scalar wire format.
@@ -254,11 +167,8 @@ def _encode(value: object, depth: int = 0) -> object:
                         or field.name == "head" and not value.head))
                     and (field.name not in {"expected_binding", "lineage_sha256"}
                      or getattr(value, field.name) is not None)
-                    and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant))
-                    and not (field.name in {"issue_recovery", "pr_repair"}
-                             and isinstance(getattr(value, field.name), (cc.InactiveIssueRecovery, cc.InactivePRRepair))
-                             and (type(value) in (rw.ReviewWorkflowSnapshot, rw.ReviewFamilyEpisodes)
-                                  or type(value) is w.WorkflowSnapshot and isinstance(value.issue_recovery, cc.InactiveIssueRecovery))))
+                    and not (field.name == "issue_recovery"
+                             and type(value) is w.WorkflowSnapshot and isinstance(value.issue_recovery, cc.InactiveIssueRecovery)))
             },
         }
     if isinstance(value, ZoneInfo):
@@ -311,37 +221,9 @@ def _decode(value: object, depth: int = 0) -> object:
         if len(result) != len(items):
             raise WorkflowEncodingError("duplicate workflow set members")
         return result
-    if tag == "ReviewWorkflowSnapshot":
-        payload = value.get("fields")
-        if set(value) != {"type", "fields"} or not isinstance(payload, dict) or set(payload) != _LEGACY_REVIEW_SNAPSHOT_FIELDS:
-            raise WorkflowEncodingError("wrong fields for legacy review snapshot")
-        decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
-        return rw.ReviewWorkflowSnapshot(**decoded, execution=rx.ExecutionNotActivated())
-    if tag == "ActivatedReviewExecution":
-        payload = value.get("fields")
-        if (set(value) != {"type", "fields"} or not isinstance(payload, dict)
-                or set(payload) != _LEGACY_ACTIVATED_EXECUTION_FIELDS):
-            raise WorkflowEncodingError("wrong fields for legacy activated execution")
-        decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
-        return rx.ActivatedReviewExecution(**decoded, boundaries=())
-    if tag == "ReviewExecutionCheckpoint":
-        payload = value.get("fields")
-        if (set(value) != {"type", "fields"} or not isinstance(payload, dict)
-                or set(payload) != _LEGACY_EXECUTION_CHECKPOINT_FIELDS):
-            raise WorkflowEncodingError("wrong fields for legacy execution checkpoint")
-        decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
-        return rx.ReviewExecutionCheckpoint(**decoded, boundary_cursor=None)
     strict_evolution = tag in _EVOLVED_TAGS
     if strict_evolution:
         tag = _EVOLVED_TAGS[tag]
-    elif tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
-        tag = "ReviewWorkflowSnapshot"
-    if tag == _CURRENT_ACTIVATED_EXECUTION_TAG:
-        tag = "ActivatedReviewExecution"
-    if tag == _CURRENT_EXECUTION_AUTHORITY_TAG:
-        tag = "CurrentReviewExecution"
-    if tag == _CURRENT_EXECUTION_CHECKPOINT_TAG:
-        tag = "ReviewExecutionCheckpoint"
     constructor = _TAGS.get(tag)
     if constructor is None:
         raise WorkflowEncodingError(f"unknown workflow variant: {tag}")

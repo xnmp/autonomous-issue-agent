@@ -433,8 +433,6 @@ class IssueStepReview(Contract):
     # reaches a client; clients must render it as text, never as Markdown/HTML.
     verdict_excerpt: str | None = None
     rejection: int | None = None
-    unproductive_rounds: int | None = None
-    unproductive_cap: int | None = None
 
 
 class IssueStepChange(Contract):

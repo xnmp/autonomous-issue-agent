@@ -12,28 +12,21 @@ from issue_agent.adapters.control_store import (
     SQLiteControlStore,
 )
 from issue_agent.adapters.dashweb.ghdata import GhReader
-from issue_agent.adapters.effects import GitHubEffectExecutor
-from issue_agent.adapters.github import GitHubGateway
 from issue_agent.adapters.journal import Journal
 from issue_agent.adapters.process_supervisor import (
     ProcessSupervisor as DurableProcessSupervisor,
 )
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
-from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
-from issue_agent.adapters.store import Store
-from issue_agent.app.execute import Executor
 from issue_agent.app.dashweb.ports import GitHubQueries
 from issue_agent.app.recovery import NoWorktreeRecovery
 from issue_agent.app.roles import (
     _LateReservationReconciler,
+    _NoCommands,
     _SweepReservationReconciler,
 )
-import issue_agent.domain.workflow_ports as workflow_ports
 from issue_agent.domain.ports import (
-    ActionExecutor,
     CommandRecovery,
     EventSink,
-    GitHubReads,
     ProcessSupervisor,
     RecoveryControl,
     RecoveryDisposition,
@@ -41,8 +34,6 @@ from issue_agent.domain.ports import (
     RecoveryRelease,
     SpendReconciler,
     StaleReservationReconciler,
-    WorkflowGitHubReads,
-    WorkflowState,
     WorktreeRecovery,
 )
 
@@ -51,10 +42,8 @@ from issue_agent.domain.ports import (
 # without one production adapter; all authority-bearing ports stay structural.
 COVERED_PORTS = frozenset(
     {
-        "ActionExecutor",
         "CommandRecovery",
         "EventSink",
-        "GitHubReads",
         "ProcessSupervisor",
         "RecoveryControl",
         "RecoveryDisposition",
@@ -62,8 +51,6 @@ COVERED_PORTS = frozenset(
         "RecoveryRelease",
         "SpendReconciler",
         "StaleReservationReconciler",
-        "WorkflowGitHubReads",
-        "WorkflowState",
         "WorktreeRecovery",
     }
 )
@@ -75,42 +62,15 @@ EXEMPT_PORTS = frozenset(
 )
 
 
-def workflow_state(store: Store) -> WorkflowState:
-    return store
-
-
 dashboard_github_queries: GitHubQueries = GhReader()
-
 
 
 def recovery_control(store: SQLiteControlStore) -> RecoveryControl:
     return store
 
 
-
-
-
-
-def github_reads(gateway: GitHubGateway) -> GitHubReads:
-    return gateway
-
-
-def workflow_github_reads(
-    gateway: GitHubGateway,
-) -> WorkflowGitHubReads:
-    return gateway
-
-
-
-
-def action_executor(
-    executor: Executor,
-) -> ActionExecutor:
-    return executor
-
-
 def command_recovery(
-    executor: GitHubEffectExecutor,
+    executor: _NoCommands,
 ) -> CommandRecovery:
     return executor
 
@@ -149,7 +109,6 @@ def worktree_recovery(
     return recovery
 
 
-
 def recovery_lease(lease: Lease) -> RecoveryLease:
     return lease
 
@@ -163,10 +122,3 @@ def recovery_disposition(
 def recovery_release(release: ReleaseResult) -> RecoveryRelease:
     return release
 
-
-# Workflow authority ports live in domain/workflow_ports.py, outside the
-# domain/ports.py manifest above; the qualified name keeps them out of it.
-def review_workflow_control(
-    control: SQLiteReviewWorkflowControl,
-) -> workflow_ports.ReviewWorkflowControl:
-    return control

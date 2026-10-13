@@ -31,7 +31,6 @@ from __future__ import annotations
 from tests.domain.builders import observed_pr
 
 
-from issue_agent.domain import continuation_components as cc
 
 import json
 import os
@@ -52,26 +51,10 @@ from issue_agent.adapters.control_store import (
     SettlementRequest,
 )
 from issue_agent.adapters.store import Store
-from issue_agent.app.dispatch import AgentDispatcher
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.main import _recover_pre_adapter_processes
-from issue_agent.app.roles import (
-    DispatchReservations,
-    EffectRecovery,
-    _FIX_RUNTIME_REGISTRY,
-    _REVIEW_RUNTIME_REGISTRY,
-    _control_store,
-    _control_store_path,
-    _fix_holds,
-    _owner_identity,
-    _shutdown_finalize,
-    _shutdown_prepare,
-    _shutdown_terminalize,
-    process_supervision_state_dir,
-)
+from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_store, _control_store_path, _owner_identity, _shutdown_finalize, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
 from issue_agent.domain.agent_task import RuntimeName
-from issue_agent.domain.actions import AgentKind, RunAgent
-from issue_agent.domain.fix import breaker_key
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.contracts import (
@@ -83,14 +66,6 @@ from issue_agent.domain.contracts import (
     RunId,
 )
 from issue_agent.domain.recovery import RecoveryTrigger
-from issue_agent.domain.review import (
-    BoundReviewState,
-    ReviewConfig,
-    decide_bound_review,
-    fix_hold_ceiling_seconds,
-    hold_review_dispatch,
-)
-from issue_agent.domain.world import IssueView, WorldState
 
 
 
@@ -410,28 +385,31 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
     assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
 
 
-def test_effect_recovery_reconciles_workflows_then_drains_remote_actions():
-    calls = []
 
-    class Recovery:
-        def __init__(self, name, count):
-            self.name = name
-            self.count = count
 
-        def drain_pending_commands(self):
-            calls.append(self.name)
-            return self.count
+class FakeWorktrees:
+    def ensure(self, issue, branch):
+        return f"/wt/issue-{issue}"
 
-    def reconcile():
-        calls.append("workflows")
-        return 3
+    def remove(self, issue):
+        pass
 
-    recovery = EffectRecovery(Recovery("actions", 2), reconcile)
+    def branch_for_issue(self, issue, fallback, *, preferred=""):
+        del issue
+        return preferred or fallback
 
-    assert recovery.drain_pending_commands() == 5
-    assert calls == ["workflows", "actions"]
+    def prune_validate(self):
+        return 0
 
-from test_dispatch import FakeRunner, FakeWorktrees
+
+class FakeRunner:
+    def __init__(self, result):
+        self.result = result
+        self.tasks = []
+
+    async def run(self, task):
+        self.tasks.append(task)
+        return self.result
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 FIX_BOT = "fix-bot"
@@ -449,37 +427,6 @@ def _control(tmp_path) -> SQLiteControlStore:
 
 
 
-def test_distinct_checkouts_share_durable_fix_dispatch_claims(
-    tmp_path,
-) -> None:
-    path = str(tmp_path / "control.sqlite3")
-    first_store = SQLiteControlStore(path)
-    second_store = SQLiteControlStore(path)
-    first_store.initialize()
-    second_store.initialize()
-    first = DispatchReservations(
-        first_store,
-        repository="o/r",
-        role="fix",
-        owner_id="o/r:fix:checkout-a",
-    )
-    second = DispatchReservations(
-        second_store,
-        repository="o/r",
-        role="fix",
-        owner_id="o/r:fix:checkout-b",
-    )
-    action = RunAgent(AgentKind.RESOLVE, 7)
-
-    assert first.reserve(action, 7)
-    assert not second.reserve(action, 7)
-    # Another issue runs alongside: only the target conflicts (Q13).
-    assert second.reserve(RunAgent(AgentKind.RESOLVE, 8), 8)
-
-    first.finish(action)
-    assert second.reserve(action, 7)
-
-
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
 
 
@@ -488,7 +435,6 @@ def test_distinct_checkouts_share_durable_fix_dispatch_claims(
 
 
 
-# ── C4 key-agreement: breaker_key(pr) vs gateway.issue_for_pr(pr) ──────────────
 
 
 
@@ -506,16 +452,6 @@ def test_distinct_checkouts_share_durable_fix_dispatch_claims(
 # ══════════════════════════════════════════════════════════════════════════════
 REVIEW_BOT = "review-bot"
 
-from tests.fakes.review_authority import review_binding, review_state
-
-
-def _bound_review_state(store, world):
-    recorded = review_state(store)
-    errors = {}
-    counts = {}
-    owed = {pr.number: (AgentKind.RE_REVIEW if recorded.head(pr.number) else AgentKind.REVIEW,
-                       review_binding(pr.number)) for pr in world.prs if recorded.head(pr.number) != pr.head_ref_oid}
-    return BoundReviewState(owed=owed, unproductive_rounds=counts, control_errors=errors)
 
 
 # ── infra-death key split (review P1R-1) ───────────────────────────────────────
@@ -536,50 +472,11 @@ def _bound_review_state(store, world):
 class _BuildableGateway(FakeGateway):
     """FakeGateway plus the one member `build_fix_daemon` binds at build time."""
 
-    def build_fix_world(self):  # pragma: no cover - never ticked in these tests
+    def build_world(self):  # pragma: no cover - never ticked in these tests
         raise AssertionError("these tests build the daemon, they do not tick it")
 
-    def build_review_world(self):  # pragma: no cover - never ticked in these tests
-        raise AssertionError("these tests build the daemon, they do not tick it")
-
-
-class _BuildableReviewGateway(_BuildableGateway):
-    """Complete review reads include submissions made through the durable executor."""
-
-    def pull_request_reviews(self, pr):
-        from issue_agent.domain.review_workflow import (
-            CompleteReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
-        )
-
-        states = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "COMMENT": "COMMENTED"}
-        return CompleteReviews(tuple(
-            SubmittedReviewFact(str(index), REVIEW_BOT, SubmittedReviewState(states[event]), head,
-                                datetime(2026, 9, 27, tzinfo=timezone.utc), body_review_command(body))
-            for index, (number, event, body, head) in enumerate(sorted(self.submitted_reviews)) if number == pr
-        ))
-
-
-def _activate_review_fixture(cfg, gateway=None):
-    """Seed isolated family authority before composing a real review daemon."""
-    from issue_agent.domain.workflow_identity import WorkflowFamily
-    control = SQLiteControlStore(_control_store_path(cfg, cfg.review_state_dir))
-    control.initialize()
-    with control.transaction() as db:
-        db.execute("INSERT INTO workflow_authority_epochs VALUES (?, ?, 1, 'fixture', 'fixture', ?)",
-                   (cfg.repo, WorkflowFamily.REVIEW_REJECTIONS.value, datetime.now(timezone.utc).isoformat()))
-    if gateway is not None:
-        from issue_agent.app.review_runtime import configured_review_control
-        from issue_agent.app.config import owner_identity_for_target
-        from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
-        from tests.fakes.workflow_authority import seed_family_epoch
-        with control.transaction() as db:
-            seed_family_epoch(db, cfg.repo, WorkflowFamily.REVIEW_EXECUTION, datetime.now(timezone.utc))
-        workflow = configured_review_control(cfg, control, gateway, Store(cfg.review_state_dir),
-                                            owner_identity_for_target(cfg.repo, cfg.target_dir, "review"))
-        for pr in gateway.build_review_world().prs:
-            workflow.ensure_observed_workflow(WorkflowKey(cfg.repo, PullRequestRef(pr.number)))
-    return control
-
+    def viewer_login(self) -> str:
+        return REVIEW_BOT  # the review role's boot check: its credential is REVIEW_BOT
 
 def _glm_profile(tmp_path, settings: str) -> str:
     d = tmp_path / ".cc-glm"
@@ -652,55 +549,6 @@ def test_a_malformed_glm_profile_is_not_ready_rather_than_a_traceback(tmp_path, 
 # ── #29: a codex fixer announces that MAX_BUDGET_USD bounds nothing ──────────
 
 
-def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
-    """A codex review leg must use the same runner seam as fixes while carrying
-    its own per-review cap and model into the task-producing dispatcher."""
-    from issue_agent.adapters import codex_runner
-    from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_review_daemon
-
-    seen = {}
-
-    class CapturingCodexRunner:
-        def __init__(self, **kwargs):
-            seen.update(kwargs)
-
-        def preflight(self):
-            return None
-
-        def oauth_auth_file(self):
-            return ""
-
-    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
-    cfg = replace(
-        from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-            "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
-            **_role_state_env(tmp_path),
-            "TARGET_DIR": str(tmp_path),
-        }),
-        control_authority_root=str(tmp_path / "machine-state"),
-    )
-
-    daemon = build_review_daemon(
-        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
-        FakeRunner(AgentResult(is_error=False)),
-    )
-
-    dispatcher = daemon.executor._run_agent._dispatch.__self__
-    runtime = dispatcher.runner.inner
-    assert runtime.__class__.__name__ == "AccountingRuntime"
-    runtime = runtime.inner
-    assert runtime.__class__.__name__ == "CodexHomeRuntime"
-    assert isinstance(runtime.inner, CapturingCodexRunner)
-    assert seen["default_model"] == "gpt-5.6-terra"
-    assert seen["enforce_budget"] is True
-    assert seen["sandbox"] == "read-only"
-    assert seen["resume_on_retry"] is False
-    assert dispatcher.review_workflow.cfg.execution_cwd == str(tmp_path)
-    assert callable(dispatcher.review_workflow.cfg.prepare_cwd)
-
-
 def _git_target(tmp_path):
     """A real git checkout for TARGET_DIR. The Claude review binding arms the
     per-PR pinned checkout off TARGET_DIR (0d2e295 M1), so a review leg only
@@ -724,151 +572,47 @@ def _git_target(tmp_path):
     return str(repo), sha
 
 
-def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path, monkeypatch):
-    """A review claim and paid admission must identify the same target.
-
-    GitHub does not populate ``closing_issue`` for every non-default-base PR,
-    but the fixer's branch still carries its issue number.  The composed
-    review daemon must reach the runner and submit its verdict in that world;
-    otherwise the durable claim and accounting admission disagree before any
-    paid work can start.
-    """
+def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
+    """A codex review leg uses the fix role's runner seam, read-only, and
+    carries its own per-review cap and model into the review task."""
+    from issue_agent.adapters import codex_runner
     from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_review_daemon
+    from issue_agent.app.roles import compose_review_daemon
 
-    target_dir, head_sha = _git_target(tmp_path)
-    pr = observed_pr(
-        152,
-        head_ref_name="fix/150-live-e2e",
-        head_ref_oid=head_sha,
-        closing_issue=None,
-        title="dashboard health",
-        body="Adds a health endpoint.",
-        labels=frozenset({Label.AI_PR_OPEN}),
-        state="OPEN",
-        author=FIX_BOT,
-    )
-    world = WorldState(prs=(pr,))
+    seen = {}
 
-    class BranchLinkedReviewGateway(_BuildableReviewGateway):
-        def build_review_world(self):
-            return world
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
 
-    gateway = BranchLinkedReviewGateway(
-        prs={pr.number: pr},
-        issues={150: IssueView(150, title="dashboard health", state="open")},
-        fail_on={"issue_for_pr"},
-    )
-    from tests.app.acceptance_support import ScriptedProvider
-    from tests.app.review_acceptance_harness import register_review_launch
-    from issue_agent.domain.outcome import ExitReason
-    runner = ScriptedProvider([
-        AgentResult(
-            is_error=False,
-            exit_reason=ExitReason.OK,
-            session_id="review-session",
-            structured={"decision": "APPROVE", "body": "lgtm"},
-        )
-    ], during=register_review_launch)
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     cfg = replace(
         from_env({
-            "REPO": "o/r",
-            "FIX_BOT": FIX_BOT,
-            "REVIEW_BOT": REVIEW_BOT,
-            "REVIEWER_RUNTIME": "claude",
-            "TARGET_DIR": target_dir,
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "REVIEWER_RUNTIME": "codex",
+            "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
             **_role_state_env(tmp_path),
-        }),
-        control_authority_root=str(tmp_path / "machine-state"),
-    )
-    store = Store(str(tmp_path / "review-state"))
-    control = _activate_review_fixture(cfg, gateway)
-    daemon = build_review_daemon(cfg, gateway, store, runner)
-
-    actions = daemon.tick()
-    daemon.wait_for_dispatches()
-    assert daemon.shutdown_dispatches(cancel=False)
-
-    assert any(isinstance(a, RunAgent) and a.kind is AgentKind.REVIEW
-               and a.number == pr.number and a.workflow is not None for a in actions)
-    assert len(runner.tasks) == 1
-    # M1: the Claude leg executed in the pinned per-PR checkout, not the
-    # operator's live TARGET_DIR.
-    assert runner.tasks[0].cwd == os.path.join(
-        target_dir, ".claude", "worktrees", "review-pr-152"
-    )
-    assert any(c[:3] == ("review", pr.number, "APPROVE") and c[3].startswith("lgtm")
-               for c in gateway.calls)
-    from issue_agent.app.review_runtime import current_review_failures
-    assert current_review_failures(control, "o/r", pr.number) == 0
-    assert not os.path.exists(store.pr_path(pr.number, "session"))
-
-
-def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
-    tmp_path,
-):
-    from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_review_daemon
-
-    observed = observed_pr(
-        152,
-        head_ref_name="fix/150-live-e2e",
-        head_ref_oid="a" * 40,
-        closing_issue=None,
-        title="dashboard health",
-        body="Adds a health endpoint.",
-        labels=frozenset({Label.AI_PR_OPEN}),
-        state="OPEN",
-        author=FIX_BOT,
-    )
-    changed = replace(
-        observed,
-        head_ref_name="fix/151-relinked",
-        closing_issue=151,
-    )
-    world = WorldState(prs=(observed,))
-
-    class RelinkedReviewGateway(_BuildableReviewGateway):
-        def build_review_world(self):
-            return world
-
-    gateway = RelinkedReviewGateway(prs={changed.number: changed}, issues={
-        number: IssueView(number, title="dashboard health", state="open") for number in (150, 151)
-    })
-    from tests.app.acceptance_support import ScriptedProvider
-    from tests.app.review_acceptance_harness import register_review_launch
-    from issue_agent.domain.outcome import ExitReason
-    runner = ScriptedProvider([
-        AgentResult(
-            is_error=True,
-            status="must-not-run",
-        )
-    ], during=register_review_launch)
-    cfg = replace(
-        from_env({
-            "REPO": "o/r",
-            "FIX_BOT": FIX_BOT,
-            "REVIEW_BOT": REVIEW_BOT,
-            "REVIEWER_RUNTIME": "claude",
             "TARGET_DIR": str(tmp_path),
-            **_role_state_env(tmp_path),
         }),
         control_authority_root=str(tmp_path / "machine-state"),
     )
-    store = Store(str(tmp_path / "review-state"))
-    control = _activate_review_fixture(cfg, gateway)
-    daemon = build_review_daemon(cfg, gateway, store, runner)
 
-    actions = daemon.tick()
-    daemon.wait_for_dispatches()
-    assert daemon.shutdown_dispatches(cancel=False)
+    composed = compose_review_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
 
-    assert any(isinstance(a, RunAgent) and a.kind is AgentKind.REVIEW
-               and a.number == observed.number and a.workflow is not None for a in actions)
-    assert runner.tasks == []
-    assert not any(call[0] == "review" for call in gateway.calls)
-
-
+    assert seen["default_model"] == "gpt-5.6-terra"
+    assert seen["enforce_budget"] is True
+    assert seen["sandbox"] == "read-only"
+    assert seen["resume_on_retry"] is False
+    assert composed.legs.task_config.model == "gpt-5.6-terra"
+    assert composed.legs.task_config.max_budget_usd == 2.5
 
 
 def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, monkeypatch):
@@ -895,7 +639,7 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     )
     cfg = replace(
         from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "REVIEWER_RUNTIME": "codex",
             **_role_state_env(tmp_path),
             "TARGET_DIR": str(tmp_path / "target"),
         }),
@@ -927,124 +671,6 @@ def _held_pr(number=581, issue=500):
         head_ref_oid="abc", labels=frozenset({Label.AI_PR_OPEN}),
         author=FIX_BOT, state="OPEN",
     )
-
-
-def _review_cfg():
-    return ReviewConfig(review_bot="review-bot")
-
-
-def _decide(tmp_path, control, world_state, now):
-    actions = decide_bound_review(
-        world_state, _review_cfg(), _bound_review_state(Store(state_dir=str(tmp_path)), world_state)
-    )
-    return hold_review_dispatch(
-        actions,
-        _fix_holds(control, "o/r", world_state, now),
-        ceiling_seconds=fix_hold_ceiling_seconds(2700.0),
-    )
-
-
-def test_an_active_fix_leg_defers_the_review_of_the_same_pr(tmp_path):
-    """The 2026-08-08 tauri batch burned four complete paid review legs on PRs
-    the fixer was still pushing to. The claim the fixer already holds is enough
-    to know that at dispatch time."""
-    control = _control(tmp_path)
-    now = datetime.now(timezone.utc)
-    world_state = WorldState(prs=(_held_pr(),))
-    assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
-    )
-
-    plan = _decide(tmp_path, control, world_state, now)
-
-    assert plan.actions == ()
-    assert [hold.pr for hold in plan.deferred] == [581]
-
-    # The fix leg finishes between ticks; nothing persistent has to be undone.
-    assert control.release_dispatch_claim("o/r", "fix", 500, "owner-a")
-    assert _decide(tmp_path, control, world_state, now).actions == (
-        RunAgent(AgentKind.REVIEW, 581, workflow=review_binding(581)),
-    )
-
-
-def test_a_fix_hold_past_the_ceiling_stops_starving_the_review(tmp_path):
-    control = _control(tmp_path)
-    world_state = WorldState(prs=(_held_pr(),))
-    assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
-    )
-    wedged = datetime.now(timezone.utc) + timedelta(
-        seconds=fix_hold_ceiling_seconds(2700.0) + 1
-    )
-
-    plan = _decide(tmp_path, control, world_state, wedged)
-
-    assert plan.actions == (RunAgent(AgentKind.REVIEW, 581, workflow=review_binding(581)),)
-    assert [hold.pr for hold in plan.forced] == [581]
-
-
-def test_a_fix_hold_leaves_every_other_prs_review_alone(tmp_path):
-    control = _control(tmp_path)
-    world_state = WorldState(prs=(_held_pr(), _held_pr(614, 610)))
-    assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
-    )
-
-    plan = _decide(tmp_path, control, world_state, datetime.now(timezone.utc))
-
-    assert plan.actions == (RunAgent(AgentKind.REVIEW, 614, workflow=review_binding(614)),)
-
-
-def test_a_dead_fix_claim_does_not_defer_the_review(tmp_path):
-    control = _control(tmp_path)
-    assert control.claim_dispatch(
-        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a"
-    )
-    with control._connect() as db:
-        db.execute(
-            "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=?",
-            (2_000_000_000, 1),
-        )
-
-    plan = _decide(tmp_path, control, WorldState(prs=(_held_pr(),)), datetime.now(timezone.utc))
-
-    assert plan.actions == (RunAgent(AgentKind.REVIEW, 581, workflow=review_binding(581)),)
-
-
-def test_an_unreadable_control_store_fails_open_to_dispatch(tmp_path):
-    """Withholding is the only thing this reader does, and the submit-time head
-    fence still protects correctness — so an unreadable store must not be able
-    to stop review."""
-    class Broken:
-        def active_dispatch_claims(self, repository, role):
-            raise RuntimeError("control store unavailable")
-
-    assert _fix_holds(
-        Broken(), "o/r", WorldState(prs=(_held_pr(),)), datetime.now(timezone.utc)
-    ) == {}
-
-
-def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):
-    """`breaker_key` falls back to -PR for a PR with no closing ref and a
-    non-numeric branch; the fixer claims under that key, so the review side has
-    to address it the same way."""
-    control = _control(tmp_path)
-    issueless = observed_pr(
-        617, head_ref_name="feat/ACME-2468-x", head_ref_oid="abc",
-        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT, state="OPEN",
-    )
-    assert control.claim_dispatch(
-        "o/r", "fix", -617, "FIX_CI", "owner-a"
-    )
-
-    plan = _decide(
-        tmp_path, control, WorldState(prs=(issueless,)), datetime.now(timezone.utc)
-    )
-
-    assert plan.actions == ()
-    assert [hold.pr for hold in plan.deferred] == [617]
-
-
 
 
 @pytest.mark.parametrize("cap_usd, blocked", [(5.0, True), (10.0, False), (50.0, False)])

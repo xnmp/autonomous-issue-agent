@@ -2,14 +2,11 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 import uvicorn
 
-from fastapi import HTTPException
 
 from issue_agent.app.dashweb import resolve_contracts as rc
-from issue_agent.app.dashweb import review_contracts as wc
 from issue_agent.app.dashweb.server import create_app
 
 # Fixture-only repository slug for the resolve-control state machine; must be
@@ -273,314 +270,6 @@ class ResolveFixture:
         return result
 
 
-# Review-control scenarios (see e2e/review-control.spec.ts): issues in this
-# range link one open pull request numbered issue + 100, whose review
-# authority is ReviewFixture's; their resolve authority reads inactive so the
-# page shows the legacy unblock retired by the active review family.
-REVIEW_ISSUES = range(80, 100)
-REVIEW_PR_OFFSET = 100
-# A ceiling whose counted set exceeds one re-arm's authorization bound.
-HUGE_CEILING_PR = 183
-# An expired dismissal whose harness read proved it absent: one retry grant.
-REVIEW_RETRY_PR = 182
-EXECUTION_RENEWAL_PRS = frozenset({194, 195, 196})
-EXECUTION_BLOCKED_PR = 197
-EXECUTION_VERDICT_PR = 198
-REVIEW_HEAD = "c" * 40
-REVIEW_BOT = "review-bot[bot]"
-
-
-@dataclass
-class _ReviewState:
-    """One pull request's in-memory review authority; wire objects are replaced, never mutated."""
-
-    pr: int
-    generation: int = 1
-    version: int = 4
-    guidance: str = ""
-    counted: int = 2
-    current_intent: wc.ReviewPendingRearm | wc.ReviewCompletedRearm | wc.ReviewStoppedRearm | None = None
-    rearms: dict = field(default_factory=dict)
-    retry_authorization: str | None = None
-    retry_settled: bool = False
-    drained: bool = False
-    processed: dict = field(default_factory=dict)
-    execution_episode: str = ""
-    execution_failures: int = 5
-    execution_renewals: int = 0
-    verdict_released: bool = False
-
-    @property
-    def episode_id(self) -> str:
-        return f"review-episode-{self.pr}"
-
-    @property
-    def gate_id(self) -> str:
-        return f"review-ceiling-{self.pr}"
-
-
-class ReviewFixture:
-    """Deterministic review-control state machine for the dashboard E2E; a test double.
-
-    Production semantics are covered against real SQLite authority by
-    tests/app/test_review_operator_api.py; this double only feeds the SPA the
-    same wire contract, and `drain` stands in for the review daemon.
-    """
-
-    def __init__(self) -> None:
-        self._states: dict[int, _ReviewState] = {}
-
-    def _state(self, pr: int) -> _ReviewState:
-        return self._states.setdefault(pr, _ReviewState(pr=pr, counted=70 if pr == HUGE_CEILING_PR else 2))
-
-    def _expected(self, state: _ReviewState) -> wc.ReviewExpected:
-        return wc.ReviewExpected(
-            repository=RESOLVE_REPO, pull_request=state.pr, family="review_rejections", epoch=1,
-            generation=state.generation, version=state.version, episode_id=state.episode_id,
-        )
-
-    def _reviews(self, state: _ReviewState) -> list[str]:
-        return [f"PRR_kwDOfixture{state.pr}review{index:03d}" for index in range(state.counted)]
-
-    def _ceiling(self, state: _ReviewState) -> wc.ReviewGate:
-        intent = state.current_intent
-        reviews = self._reviews(state)
-        if isinstance(intent, wc.ReviewPendingRearm):
-            actions = [wc.ReviewActionOffered(state="offered", operation="cancel_rearm", effect=(
-                f"Stops request {intent.request_id}. Verified effects remain facts and its unexecuted obligations "
-                "are retired."))]
-        elif len(reviews) > 63:
-            actions = [wc.ReviewActionRefused(state="refused", operation="request_rearm", reason=(
-                f"{len(reviews)} counted reviews exceed the 63-dismissal bound of one re-arm; dismiss some on "
-                "GitHub so reconciliation can refresh the ceiling"))]
-        else:
-            actions = [wc.ReviewActionOffered(state="offered", operation="request_rearm", effect=(
-                f"Authorizes dismissal of exactly the {len(reviews)} counted bot reviews listed (never a human or "
-                "later review), owes a fresh review and returns the pull request to review once the dismissals "
-                "are verified. Other holds stay independent."))]
-        return wc.ReviewGate(
-            gate_id=state.gate_id, state="rearming" if isinstance(intent, wc.ReviewPendingRearm) else "open",
-            opened_generation=state.generation,
-            cause=wc.ReviewRejectionCeilingCause(
-                kind="review_rejection_ceiling", episode_id=state.episode_id, head_sha=REVIEW_HEAD,
-                review_bot=REVIEW_BOT, ceiling=2, counted_total=len(reviews),
-                counted=[wc.ReviewCountedReview(review_id=review, author=REVIEW_BOT, commit_id=REVIEW_HEAD)
-                         for review in reviews],
-                authorization_bound=63, non_resetting_commits=[],
-                hold=wc.ReviewHoldUncontested(state="restoring", restores=0, restore_limit=3),
-            ),
-            remediation=wc.ReviewNoRemediation(kind="none_authorized",
-                                               reason="a counted-review dismissal needs an operator decision"),
-            actions=actions, pending_retry=None,
-        )
-
-    def _retry_gate(self, state: _ReviewState) -> wc.ReviewGate:
-        granted = state.retry_authorization
-        return wc.ReviewGate(
-            gate_id=f"review-retry-{state.pr}", state="open", opened_generation=state.generation,
-            cause=wc.ReviewRetryAuthorizationRequiredCause(
-                kind="retry_authorization_required", command_id=f"dismiss-{state.pr}",
-                absence_evidence_id=f"absence-{state.pr}", retry_authorizable=granted is None),
-            remediation=wc.ReviewAttemptedRemediation(kind="attempted", operation="reconcile_remote",
-                                                      evidence_ids=[f"absence-{state.pr}"], outcome="verified_absent"),
-            actions=[wc.ReviewActionRefused(state="refused", operation="authorize_retry",
-                                            reason=f"authorization {granted} is already waiting for the executor")
-                     if granted else
-                     wc.ReviewActionOffered(state="offered", operation="authorize_retry", effect=(
-                         f"Permits exactly one more execution of command dismiss-{state.pr} under its current "
-                         "generation. The executor re-reads before writing; nothing is written if the effect has "
-                         "appeared meanwhile."))],
-            pending_retry=wc.ReviewPendingRetry(authorization_id=granted, command_id=f"dismiss-{state.pr}")
-            if granted else None,
-        )
-
-    def _gates(self, state: _ReviewState) -> list[wc.ReviewGate]:
-        if state.pr in EXECUTION_RENEWAL_PRS or state.pr == EXECUTION_VERDICT_PR:
-            return [wc.ReviewGate(
-                gate_id=f"sibling-{state.pr}", state="open", opened_generation=1,
-                cause=wc.ReviewEvidenceUnavailableCause(kind="evidence_unavailable", evidence="other",
-                    source="independent sibling hold", unresolved_since="2026-09-26T09:00:00+00:00",
-                    failed_reads=3, last_error="sibling source unavailable"),
-                remediation=wc.ReviewNoRemediation(kind="none_authorized", reason="wait for the sibling source"),
-                actions=[], pending_retry=None)]
-        if state.pr == EXECUTION_BLOCKED_PR:
-            return []
-        if state.pr == REVIEW_RETRY_PR:
-            return [] if state.retry_settled else [self._retry_gate(state)]
-        return [] if isinstance(state.current_intent, wc.ReviewCompletedRearm) else [self._ceiling(state)]
-
-    def _daemon(self, state: _ReviewState, gates: list[wc.ReviewGate]) -> wc.ReviewDaemonRecorded:
-        """What the review daemon's plan would have recorded for this state (the drain stands in for its tick).
-
-        A held ceiling swapped the trigger for needs-human-review, so the
-        pull request left the trigger-labelled review read and its own read
-        found it held by the gate that label projects; a retry gate holds a
-        still-listed one.
-        """
-        labels = ["ai-pr-open"]
-        dispatch: wc.ReviewDispatch = wc.ReviewDispatchOwed(kind="owed", review="re_review")
-        read: Literal["review_read", "departed_read"] = "review_read"
-        if gates and state.pr != REVIEW_RETRY_PR:
-            labels, read = ["needs-human-review"], "departed_read"
-        if gates:
-            dispatch = wc.ReviewDispatchHeld(kind="held", gate_ids=[gate.gate_id for gate in gates])
-        decided = "2026-09-26T10:05:00+00:00" if state.drained else "2026-09-26T09:55:00+00:00"
-        return wc.ReviewDaemonRecorded(
-            state="recorded", dispatch=dispatch, read=read, decided_at=decided, as_of=decided, read_failure=None,
-            pull_request=wc.ReviewDecisionBasis(head_sha=REVIEW_HEAD, state="open", labels=labels, external_holds=[]),
-        )
-
-    def _control(self, state: _ReviewState, request_id: str | None) -> wc.ReviewAvailableControl:
-        gates = self._gates(state)
-        return wc.ReviewAvailableControl(
-            status="available", expected=self._expected(state), workflow_held=bool(gates), gates=gates,
-            guidance=state.guidance,
-            continuation=wc.ReviewFreshReviewRequired(kind="fresh_review_required",
-                                                      owed_since_generation=state.generation),
-            daemon=self._daemon(state, gates), current_intent=state.current_intent, requested_id=request_id,
-            requested_intent=state.rearms.get(request_id) if request_id else None, observation=None,
-            execution=self._execution(state),
-            fix_recovery=(rc.PRRepairAvailable(status="available", family="pr_repair", generation=3, version=9,
-                resumes=4, workflow_held=True, pending_effects=["ci_rerun", "branch_refresh"]) if state.pr == 199 else
-                rc.RecoveryUnavailable(status="unavailable", reason="Selected PR repair source is unreadable.")
-                if state.pr == 198 else None),
-        )
-
-    def _execution(self, state: _ReviewState) -> wc.ReviewExecution:
-        if state.pr == EXECUTION_BLOCKED_PR:
-            return wc.ReviewExecutionBlocked(kind="blocked", execution_epoch=7, blockers=[
-                wc.ReviewMigrationBlocker(kind="origin", sources=[wc.ReviewMigrationSource(
-                    kind="file", identity="unassigned-review-counter", digest="a" * 64)])])
-        if state.pr not in EXECUTION_RENEWAL_PRS and state.pr != EXECUTION_VERDICT_PR:
-            return wc.ReviewExecutionInactive()
-        episode = state.execution_episode or f"execution-{state.pr}"
-        choices = []
-        if state.current_intent is None and (state.execution_failures >= 5 or
-                state.pr == EXECUTION_VERDICT_PR and not state.verdict_released):
-            verdict = state.pr == EXECUTION_VERDICT_PR
-            cause = (wc.ReviewVerdictHoldCause(kind="review_verdict_hold",
-                submission_command_id=f"confirmed-{state.pr}", head_sha=REVIEW_HEAD) if verdict else
-                wc.ReviewExecutionCeilingCause(kind="review_execution_ceiling", execution_epoch=7,
-                    execution_episode=episode, head_sha=REVIEW_HEAD, failures=state.execution_failures, ceiling=5))
-            choices = [wc.ReviewGate(gate_id=f"execution-choice-{state.pr}", state="open",
-                opened_generation=state.generation, cause=cause,
-                remediation=wc.ReviewNoRemediation(kind="none_authorized", reason="explicit operator recovery required"),
-                actions=[wc.ReviewActionOffered(state="offered",
-                    operation="release_verdict" if verdict else "renew_execution",
-                    effect="Releases the selected verdict only." if verdict else
-                    "Renews only execution allowance; rejection allowance and other holds remain.")], pending_retry=None)]
-        return wc.ReviewExecutionCurrent(kind="current", execution_epoch=7, execution_episode=episode,
-            failures=state.execution_failures, failure_ceiling=5, pin_deferrals=0,
-            displayed_round=19, recovery_choices=choices)
-
-    def control(self, pr: int, request_id: str | None) -> wc.ReviewControl:
-        if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
-            return wc.ReviewMigrationRequiredControl(status="migration_required", repository=RESOLVE_REPO,
-                                                     pull_request=pr, active_families=[])
-        return self._control(self._state(pr), request_id)
-
-    def _pending(self, state: _ReviewState, request_id: str) -> wc.ReviewPendingRearm:
-        reviews = self._reviews(state)
-        commands = [wc.ReviewRearmCommand(command_id=f"dismiss-{request_id[:8]}-{index}", status="pending",
-                                          obligation=wc.ReviewDismissalObligation(kind="dismiss_review",
-                                                                                  review_id=review))
-                    for index, review in enumerate(reviews)]
-        commands.append(wc.ReviewRearmCommand(
-            command_id=f"projection-{request_id[:8]}", status="pending",
-            obligation=wc.ReviewProjectionObligation(kind="projection", remove="needs-human-review",
-                                                     add="ai-pr-open")))
-        return wc.ReviewPendingRearm(state="pending", request_id=request_id, gate_id=state.gate_id,
-                                     generation=state.generation + 1, authorized_reviews=reviews, commands=commands)
-
-    def command(self, pr: int, body: wc.ReviewCommandBody) -> wc.ReviewCommandResult:
-        body = command_view(body)
-        if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
-            return wc.ReviewCommandResult(outcome="rejected", reason="review rejection control is not active",
-                                          control=self.control(pr, None))
-        state = self._state(pr)
-        identity = (body.cancellation_id if body.operation == "cancel_rearm"
-                    else body.authorization_id if body.operation == "authorize_retry" else body.request_id)
-        dumped = body.model_dump(mode="json")
-        prior = state.processed.get(identity)
-        if prior is not None:
-            outcome = "replayed" if prior == dumped else "conflict"
-            return wc.ReviewCommandResult(outcome=outcome, reason="" if outcome == "replayed" else
-                                          "This identifier was already used for a different command.",
-                                          control=self._control(state, None))
-        if body.expected != self._expected(state):
-            return wc.ReviewCommandResult(outcome="conflict", reason="the workflow revision changed",
-                                          control=self._control(state, None))
-        execution = self._execution(state)
-        gates = self._gates(state) + (execution.recovery_choices if isinstance(execution, wc.ReviewExecutionCurrent) else [])
-        gate = next((item for item in gates if item.gate_id == body.gate_id), None) \
-            if body.operation in ("request_rearm", "authorize_retry", "renew_execution", "release_verdict") else None
-        offered = gate is not None and any(action.state == "offered" and action.operation == body.operation
-                                           for action in gate.actions)
-        if body.operation in ("request_rearm", "authorize_retry", "renew_execution", "release_verdict") and not offered:
-            refusal = next((action.reason for action in (gate.actions if gate else [])
-                            if isinstance(action, wc.ReviewActionRefused)), "the gate does not offer this command")
-            return wc.ReviewCommandResult(outcome="rejected", reason=refusal, control=self._control(state, None))
-        if body.operation in ("renew_execution", "release_verdict"):
-            if not isinstance(execution, wc.ReviewExecutionCurrent) or (body.execution_epoch, body.execution_episode) != (
-                    execution.execution_epoch, execution.execution_episode):
-                return wc.ReviewCommandResult(outcome="conflict", reason="the execution episode changed",
-                                              control=self._control(state, None))
-            if body.operation == "renew_execution":
-                state.execution_renewals += 1
-                state.execution_episode = f"renewed-{state.pr}-{state.execution_renewals}"
-                state.execution_failures = 0
-            else:
-                if body.submission_command_id != f"confirmed-{state.pr}":
-                    return wc.ReviewCommandResult(outcome="rejected", reason="unknown selected verdict",
-                                                  control=self._control(state, None))
-                state.verdict_released = True
-            state.current_intent = wc.ReviewPendingRearm(state="pending", request_id=body.request_id,
-                gate_id=body.gate_id, generation=state.generation + 1, authorized_reviews=[], commands=[
-                    wc.ReviewRearmCommand(command_id=f"projection-{body.request_id[:8]}", status="pending",
-                        obligation=wc.ReviewProjectionObligation(kind="projection", remove=None, add="needs-human-review"))])
-        elif body.operation == "request_rearm":
-            state.guidance = (body.guidance.text if body.guidance.kind == "set" else
-                              "" if body.guidance.kind == "clear" else state.guidance)
-            state.current_intent = self._pending(state, body.request_id)
-        elif body.operation == "authorize_retry":
-            state.retry_authorization = body.authorization_id
-        elif body.operation == "cancel_rearm":
-            intent = state.current_intent
-            if not isinstance(intent, wc.ReviewPendingRearm) or intent.request_id != body.request_id:
-                return wc.ReviewCommandResult(outcome="conflict", reason="no matching pending request",
-                                              control=self._control(state, None))
-            state.current_intent = wc.ReviewStoppedRearm(
-                state="cancelled", request_id=intent.request_id, gate_id=intent.gate_id,
-                generation=intent.generation, reason=body.reason, authorized_reviews=intent.authorized_reviews,
-                verified_commands=[], retired_commands=[command.command_id for command in intent.commands])
-        else:
-            return wc.ReviewCommandResult(outcome="rejected", reason="no stopped request can be continued here",
-                                          control=self._control(state, None))
-        if state.current_intent is not None:
-            state.rearms[state.current_intent.request_id] = state.current_intent
-        state.version += 1
-        result = wc.ReviewCommandResult(outcome="accepted", reason="", control=self._control(state, None))
-        state.processed[identity] = dumped
-        return result
-
-    def drain(self, pr: int) -> None:
-        """What the review daemon's drain and reconciliation would do next for this pull request."""
-        state = self._state(pr)
-        intent = state.current_intent
-        if isinstance(intent, wc.ReviewPendingRearm):
-            state.current_intent = wc.ReviewCompletedRearm(
-                state="completed", request_id=intent.request_id, gate_id=intent.gate_id,
-                generation=intent.generation,
-                verified_commands=[command.command_id for command in intent.commands])
-            state.rearms[intent.request_id] = state.current_intent
-            state.generation = intent.generation
-            state.version += 1
-        elif state.retry_authorization and not state.retry_settled:
-            state.retry_settled = True
-            state.version += 1
-        state.drained = True
-
-
 def role(name: str) -> dict:
     return {
         "role": name,
@@ -621,7 +310,6 @@ ISSUE_CARD = {
 class FixtureBackend:
     def __init__(self) -> None:
         self._resolve = ResolveFixture()
-        self._review = ReviewFixture()
 
     def known(self, name: str) -> bool:
         return name == "self"
@@ -702,29 +390,6 @@ class FixtureBackend:
         }
 
     def issue(self, _name: str, _number: int) -> dict:
-        if _number in REVIEW_ISSUES:
-            pr = _number + REVIEW_PR_OFFSET
-            return {
-                "issue": _number,
-                "title": f"Review fixture issue #{_number}",
-                "url": f"https://github.com/openai/autonomous-issue-agent/issues/{_number}",
-                "stage": "escalated",
-                "escalation_reason": "The reviewer rejected the pull request at the ceiling.",
-                "done": False,
-                "prs": [pr],
-                "pull_requests": [{
-                    "number": pr, "url": f"https://github.com/openai/autonomous-issue-agent/pull/{pr}",
-                    "state": "open",
-                }],
-                "cost_usd": 1,
-                "elapsed_s": 30,
-                "working_s": 20,
-                "idle_s": 10,
-                "idle_active": False,
-                "steps": [],
-                "events": [],
-                "warnings": [],
-            }
         if _number != 50:
             # Resolve-control scenarios (see e2e/resolve-control.spec.ts): not
             # done and held for a human, so IssueTab.heldForHuman is true and
@@ -810,26 +475,14 @@ class FixtureBackend:
         return True, "updated"
 
     def resolve_control(self, _name: str, number: int, request_id: str | None = None) -> rc.ResolveControl:
-        if number in REVIEW_ISSUES:
-            return rc.InactiveControl(status="inactive", repository=RESOLVE_REPO, issue=number,
-                fix_recovery=(rc.IssueRecoveryAvailable(status="available", family="issue_recovery", generation=2,
-                    version=8, resumes=4, ci_failures=3, review_failures=2, rebase_failures=5,
-                    holds=["workflow"]) if number == 99 else None))
         return self._resolve.control(number, request_id)
 
     def resolve_command(self, _name: str, number: int, body: rc.ResolveCommand) -> rc.CommandResult:
         return self._resolve.command(number, body)
 
-    def review_control(self, _name: str, pr: int, request_id: str | None = None) -> wc.ReviewControl:
-        return self._review.control(pr, request_id)
-
-    def review_command(self, _name: str, pr: int, body: wc.ReviewCommandBody) -> wc.ReviewCommandResult:
-        return self._review.command(pr, body)
-
-    def workflow_families(self, _name: str) -> wc.WorkflowFamilies:
-        # No family active: the resolve specs' legacy unblock stays offered; the
-        # review spec routes this read to show the review family active.
-        return wc.WorkflowFamiliesAvailable(status="available", repository=RESOLVE_REPO, active_families=[])
+    def workflow_families(self, _name: str) -> rc.WorkflowFamilies:
+        # No family active: the resolve specs' legacy unblock stays offered.
+        return rc.WorkflowFamiliesAvailable(status="available", repository=RESOLVE_REPO, active_families=[])
 
     def unblock(
         self, _name: str, _number: int, _channel: str
@@ -838,25 +491,10 @@ class FixtureBackend:
 
 
 def fixture_app():
-    """The real dashboard app over the fixture backend, plus the E2E-only drain trigger."""
+    """The real dashboard app over the fixture backend."""
     harness_root = Path(__file__).resolve().parents[2]
     backend = FixtureBackend()
     app = create_app(backend, harness_root=str(harness_root))
-
-    # Stands in for the review daemon's next drain; guarded like every write.
-    @app.post("/fixture/review-drain/{pr}")
-    async def review_drain(pr: int):
-        if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
-            raise HTTPException(404, "no review fixture for this pull request")
-        backend._review.drain(pr)
-        return {"ok": True}
-
-    @app.post("/fixture/review-revision/{pr}")
-    async def review_revision(pr: int):
-        if pr not in EXECUTION_RENEWAL_PRS:
-            raise HTTPException(404, "no execution renewal fixture for this pull request")
-        backend._review._state(pr).version += 1
-        return {"ok": True}
 
     return app
 

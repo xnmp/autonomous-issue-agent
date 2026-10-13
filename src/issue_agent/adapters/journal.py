@@ -12,7 +12,6 @@ import contextlib
 import contextvars
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -20,10 +19,9 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
-from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
+from .runtime_plan import AgentRuntime, ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.contracts import Money
 from ..domain.workflow_identity import WorkflowBinding
-from ..domain.review_execution import ReviewChildIdentity
 from ..domain.dashboard import ISSUE_NUMBERED
 from ..domain.events import (
     ActionApplied,
@@ -298,35 +296,6 @@ def default_ledger_path() -> str:
     return os.path.join(base, "issue-agent", "spend.jsonl")
 
 
-# ── alert hook ────────────────────────────────────────────────────────────────
-def alert(cmd: str, event_json: str) -> None:
-    """Pipe `event_json` to `cmd` via `sh -c` (blank cmd → no-op).
-
-    Deliberately a shell string, not an executable + argv: the operator's alert
-    is invariably a pipeline (`jq -r .event | mail -s harness me@…`), and making
-    them wrap it in a script file is friction that ends with alerts unconfigured.
-    Bounded at 10s and swallows every failure — an unreachable pager must not
-    wedge the poll loop, and the event is already durably journalled.
-
-    The payload is newline-TERMINATED: every plausible alert sink is line
-    oriented (`tee -a alerts.jsonl`, `while read`, `jq`), and two unterminated
-    events appended to one file concatenate into a line nothing can parse.
-    """
-    if not (cmd or "").strip():
-        return
-    try:
-        subprocess.run(
-            ["/bin/sh", "-c", cmd],
-            input=event_json if event_json.endswith("\n") else event_json + "\n",
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception as exc:  # noqa: BLE001 — an alert that fails stays failed
-        sys.stderr.write(f"journal: alert command failed ({exc})\n")
-
-
 # ── journaling runtime decorator ──────────────────────────────────────────────
 @dataclass(frozen=True)
 class RunContext:
@@ -350,7 +319,6 @@ class RunContext:
     claim_target: int | None = None
     dispatch_id: str = ""
     workflow: WorkflowBinding | None = None
-    review_child: ReviewChildIdentity | None = None
     # The PR head a fix leg was decided on (accounting records it per run).
     head: str = ""
     # A fix leg continuing a wall-capped leg (the resume-once rule's input).
@@ -423,7 +391,7 @@ class JournalingRuntime:
 
     def __init__(
         self,
-        inner,
+        inner: AgentRuntime,
         journal: EventSink,
         repo: str = "",
         role: str = "",
@@ -475,7 +443,6 @@ class JournalingRuntime:
         claim_target: int | None = None,
         *,
         workflow: WorkflowBinding | None = None,
-        review_child: ReviewChildIdentity | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None:
@@ -495,7 +462,6 @@ class JournalingRuntime:
             claim_target=claim_target,
             dispatch_id=uuid.uuid4().hex[:12],
             workflow=workflow,
-            review_child=review_child,
             head=head,
             resumed=resumed,
         ))
@@ -507,7 +473,6 @@ class JournalingRuntime:
                 issue,
                 claim_target=claim_target,
                 workflow=workflow,
-                **({"review_child": review_child} if review_child is not None else {}),
                 head=head,
                 resumed=resumed,
             )
@@ -531,12 +496,11 @@ class JournalingRuntime:
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
                 previous.role,
-                previous.kind if previous.review_child is not None else kind,
+                kind,
                 previous.number,
                 previous.issue,
                 claim_target=previous.claim_target,
                 workflow=previous.workflow,
-                **({"review_child": previous.review_child} if previous.review_child is not None else {}),
                 head=previous.head,
                 resumed=previous.resumed,
             )
@@ -551,7 +515,6 @@ class JournalingRuntime:
                     previous.issue,
                     claim_target=previous.claim_target,
                     workflow=previous.workflow,
-                    **({"review_child": previous.review_child} if previous.review_child is not None else {}),
                     head=previous.head,
                     resumed=previous.resumed,
                 )

@@ -445,8 +445,8 @@ Status legend: **FIXED** · **OPEN / KNOWN** · **BY-DESIGN / OPERATIONAL**
 These are safety mechanisms firing correctly, environment constraints, or
 operator mistakes — recorded so they aren't re-diagnosed as bugs.
 
-**82. GitHub 422 self-approval in `solo` identity mode**
-- One identity can't approve its own PR (GitHub 422). `should_automerge` returns False unless `identity_mode=="three"`. Reviewer uses the App identity precisely to avoid this. By design.
+**82. GitHub 422 self-approval**
+- One identity can't approve its own PR (GitHub 422). Solo identity mode is deleted (slice 5c): the review role refuses to start unless its credential's login equals `REVIEW_BOT`, and a 4xx review refusal counts as a REVIEW attempt, so the attempt cap ends in `needs-human`.
 
 **83. Governor double-fires (in-process + installed script)**
 - `setting_sources=["project"]` auto-loads the target's `settings.json`, which may carry a `PreToolUse→dispatch.sh` hook → governor runs twice. Harmless (same fail-closed core). Addressed by not bootstrapping hooks into the target.

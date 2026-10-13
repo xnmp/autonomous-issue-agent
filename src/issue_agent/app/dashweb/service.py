@@ -11,16 +11,19 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
+from types import MappingProxyType
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .resolve_contracts import CommandResult, ResolveCommand, ResolveControl
-    from .review_contracts import ReviewCommandBody, ReviewCommandResult, ReviewControl, WorkflowFamilies
+    from .resolve_contracts import WorkflowFamilies
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
 from ...adapters.control_store import SQLiteControlStore
 from ...adapters.control_path import control_store_path
+from ...adapters.env_file import source_env_file
+from ...domain.deployment import canonical_deployment_name
 from ...adapters.journal import Journal, default_ledger_path
 from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
@@ -36,8 +39,6 @@ from ...domain.events import (
     TelemetryEvent,
 )
 from .. import cli, config
-from ..review_control import load_operator_configuration
-from ..review_control import open_review_operator
 from . import snapshots
 from .ports import GitHubQueries
 
@@ -46,11 +47,29 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def load_operator_configuration(name: str, *, harness_root: str) -> tuple[config.HarnessConfig, Mapping[str, str]]:
+    """Mutation scope comes from one launch snapshot, never per-field overlay fallbacks."""
+    if not isinstance(name, str) or not name or name != canonical_deployment_name(name) or name in (".", ".."):
+        raise ValueError("operator control requires a canonical deployment name")
+    snapshot = os.path.join(harness_root, "config", f".active.{name}.env")
+    env = source_env_file(snapshot, os.environ, assigned_only=True)
+    env.pop("AGENT_ENV", None)
+    if not env.get("REPO") or not env.get("TARGET_DIR"):
+        raise ValueError("operator control requires explicit repository and checkout in the active snapshot")
+    host = env.get("GH_HOST", "github.com")
+    if host != os.environ.get("GH_HOST", "github.com"):
+        raise ValueError("operator GitHub host differs from the deployment snapshot")
+    cfg = config.from_env(env)
+    cfg.validate()
+    if not cfg.repo or not cfg.target_dir or not os.path.isabs(cfg.target_dir):
+        raise ValueError("operator control requires an explicit repository checkout")
+    return cfg, MappingProxyType(env)
+
+
 _DETAIL_CONFIG_FIELDS = (
     "MAX_BUDGET_USD",
     "ROUTER_BUDGET_USD",
     "REVIEW_BUDGET_USD",
-    "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
 )
 _FIX_BUDGET_KINDS = (
     "RESOLVE", "RESUME", "PR_RESUME", "ADDRESS_REVIEW", "FIX_CI", "REBASE",
@@ -130,25 +149,21 @@ class _DeferredGhContexts:
             return entry.value, True
 
 
-def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
+def _detail_limits(name: str, repo: str) -> dict[str, float]:
     configured = {
         field: value
         for field in _DETAIL_CONFIG_FIELDS
         if (value := cli.deployment_env_field(name, field))
     }
     cfg = config.from_env({"REPO": repo, **configured})
-    caps = {
+    return {
         **{kind: max(0.0, cfg.fix_budget_usd) for kind in _FIX_BUDGET_KINDS},
         "REVIEW": max(0.0, cfg.review_budget_usd),
         "RE_REVIEW": max(0.0, cfg.review_budget_usd),
     }
-    return (
-        caps,
-        max(0, cfg.max_unproductive_review_rounds),
-    )
 
 
-_AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE", "IDENTITY_MODE")
+_AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE",)
 
 
 def _harness_merges(name: str, repo: str) -> Callable[[str], bool]:
@@ -172,7 +187,6 @@ def _harness_merges(name: str, repo: str) -> Callable[[str], bool]:
     return partial(
         harness_merges_branch,
         auto_merge=cfg.auto_merge,
-        identity_mode=cfg.identity_mode,
     )
 
 
@@ -199,7 +213,6 @@ class Backend:
         gh_enrichment_executor: ThreadPoolExecutor | None = None,
         effects_factory=build_operator_effects,
         control_db_path: str = "",
-        review_factory=open_review_operator,
     ):
         self.harness_root = harness_root or cli.HARNESS_ROOT
         self.gh = gh or ghdata.GhReader()
@@ -219,7 +232,6 @@ class Backend:
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
-        self._review_factory = review_factory
 
     # ── journal side ──
     def names(self) -> tuple[str, ...]:
@@ -370,7 +382,7 @@ class Backend:
 
     def _cached_detail_limits(
         self, name: str, repo: str
-    ) -> tuple[dict[str, float], int]:
+    ) -> dict[str, float]:
         key = (name, repo)
         return self._detail_configs.get_or_load(
             key, lambda: _detail_limits(name, repo)
@@ -380,32 +392,6 @@ class Backend:
         return self._detail_configs.get_or_load(
             ("automerge", name, repo), lambda: _harness_merges(name, repo)
         )
-
-    def _review_unproductive_rounds(
-        self, snapshot: dash.Snapshot, row: dash.IssueRow,
-    ) -> tuple[dict[int, int | None], list[str]]:
-        """Read selected Current execution allowance without initializing authority."""
-        from contextlib import closing
-        from ...adapters.workflow_rows import load_review_workflow_row
-        from ...domain.review_execution import CurrentReviewExecution
-        from ...domain.workflow_identity import PullRequestRef, WorkflowKey
-
-        counts: dict[int, int | None] = {number: None for number in row.prs}
-        warnings: list[str] = []
-        if not row.prs:
-            return counts, warnings
-        if not self.control_db_path:
-            return counts, ["review execution control database is unavailable"]
-        try:
-            with closing(SQLiteControlStore(self.control_db_path)._connect()) as db:
-                db.execute("BEGIN")
-                for number in row.prs:
-                    state = load_review_workflow_row(db, WorkflowKey(snapshot.repo, PullRequestRef(number)))
-                    if state is not None and isinstance(state.execution, CurrentReviewExecution):
-                        counts[number] = state.execution.state.failures
-        except Exception as exc:  # noqa: BLE001 - unreadable authority never becomes zero
-            return {number: None for number in row.prs}, [f"review execution state unavailable ({_detail(exc)})"]
-        return counts, warnings
 
     def issues(self, name: str) -> dict:
         snap = self.snapshot(name)
@@ -498,19 +484,13 @@ class Backend:
             ("issue", snap.repo, row.issue, row.prs),
             lambda: self._gh_issue_context(snap.repo, row.prs),
         )
-        budget_caps, unproductive_cap = self._cached_detail_limits(
-            name, snap.repo
-        )
-        unproductive_rounds, breaker_warnings = self._review_unproductive_rounds(snap, row)
-        warnings.extend(breaker_warnings)
+        budget_caps = self._cached_detail_limits(name, snap.repo)
         detail = snapshots.issue_detail(
             row,
             self.now_fn(),
             gh_issues.get(number),
             gh_prs,
             budget_caps=budget_caps,
-            unproductive_round_cap=unproductive_cap,
-            unproductive_round_counts=unproductive_rounds,
         )
         detail["warnings"] = warnings
         return detail
@@ -582,23 +562,9 @@ class Backend:
         body.command()
         return unavailable_command(RuntimeError("resolve control was removed with the fix workflow"))
 
-    def _review_operator(self, name: str):
-        if not self.known(name):
-            raise ValueError(f"unknown deployment '{name}'")
-        return self._review_factory(name, harness_root=self.harness_root,
-                                    control_db_path=self.control_db_path, now=self.now_fn)
-
-    def review_control(self, name: str, pr: int, request_id: str | None = None) -> ReviewControl:
-        from .review_control import read_review_control, unavailable_review_control
-
-        try:
-            return read_review_control(self._review_operator(name), pr, request_id)
-        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
-            return unavailable_review_control(exc)
-
     def workflow_families(self, name: str) -> WorkflowFamilies:
         """The repository's activated families, read exactly as the legacy unblock refusal reads them."""
-        from .review_contracts import WorkflowFamiliesAvailable, WorkflowFamiliesUnavailable
+        from .resolve_contracts import WorkflowFamiliesAvailable, WorkflowFamiliesUnavailable
         from .resolve_control import control_error
 
         try:
@@ -614,16 +580,6 @@ class Backend:
                                              active_families=[family.value for family in active])
         except Exception as exc:  # noqa: BLE001 - an unread activation never reads as none active
             return WorkflowFamiliesUnavailable(status="unavailable", reason=control_error(exc))
-
-    def review_command(self, name: str, pr: int, body: ReviewCommandBody) -> ReviewCommandResult:
-        from .review_control import submit_review_control, unavailable_review_command
-
-        # Reject malformed direct callers before opening configured authority.
-        body.command()
-        try:
-            return submit_review_control(self._review_operator(name), pr, body)
-        except Exception as exc:  # noqa: BLE001 - storage or authority failure is a 503, never a crash
-            return unavailable_review_command(exc)
 
     def unblock(
         self, name: str, number: int, channel: str = "api",
@@ -671,16 +627,7 @@ class Backend:
         if not held and not pr_held:
             return False, f"nothing to unblock on #{number}"
         issue_add, issue_remove = actions.issue_unblock_change(held)
-        raw_trigger = (
-            env.get("REVIEW_TRIGGER_LABEL")
-            or Label.AI_PR_OPEN.value
-        )
-        try:
-            review_trigger = Label(raw_trigger).value
-        except ValueError:
-            # Match ReviewWorkflow._trigger_label: an invalid configured label
-            # falls back to ai-pr-open rather than creating an unreadable arm.
-            review_trigger = Label.AI_PR_OPEN.value
+        review_trigger = Label.AI_PR_OPEN.value
         pr_changes: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {}
         candidate_pr = 0
         try:
@@ -688,7 +635,8 @@ class Backend:
                 candidate_pr = pr
                 hold_role = self._pr_hold_role(row, pr)
                 if Label.NEEDS_HUMAN_REVIEW.value in labels and hold_role != "fix":
-                    reason = ("review_migration_required; activate review control before re-arming review holds"
+                    reason = ("review_hold_unsupported; review control was deleted in slice 5c, so remove "
+                              "needs-human-review on GitHub to release this hold"
                               if hold_role == "review" else "hold source is unknown; cannot authorize a legacy release")
                     return False, f"pr #{pr}: {reason}"
                 pr_changes[pr] = actions.pr_unblock_change(

@@ -124,11 +124,8 @@ def parse_remote_url(url: str) -> str:
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR",
     "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
-    "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
-    # Read by the dashboard's operator re-arm: which login's change requests
-    # count toward the rejection ceiling, how many of them it takes, and the
-    # same App → token identity the review daemon used to author them.
-    "REVIEW_BOT", "REVIEW_MAX_REJECTIONS", "REVIEW_BOT_TOKEN",
+    "FIXER_RUNTIME", "REVIEWER_RUNTIME",
+    "REVIEW_BOT", "REVIEW_BOT_TOKEN",
     "GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE", "GH_APP_TOKEN_CACHE",
     REPOINT_HISTORY_ENV,
 )
@@ -425,7 +422,6 @@ def synth_repo_env(
     base_branch: str = "dev",
     base_branch_note: str = "",
     base_branch_suggestion: str = "",
-    review_mode: str = "",
     max_budget: str = "",
     review_budget: str = "",
     repointed_from_deployments: tuple[tuple[str, str], ...] = (),
@@ -464,7 +460,6 @@ def synth_repo_env(
             f"{_q(_encoded_repoint_history(repointed_from_deployments))}",
         ]
     opt = [
-        ("REVIEW_MODE", review_mode),
         ("MAX_BUDGET_USD", max_budget),
         ("REVIEW_BUDGET_USD", review_budget),
     ]
@@ -1459,7 +1454,7 @@ def cmd_start(args) -> int:
         content = synth_repo_env(
             repo=repo, target_dir=target_dir, name=name,
             base_branch=base_branch, base_branch_note=base_note,
-            base_branch_suggestion=base_suggestion, review_mode=args.review_mode or "",
+            base_branch_suggestion=base_suggestion,
             max_budget=args.max_budget or "", review_budget=args.review_budget or "",
             repointed_from_deployments=repoint_history,
         )
@@ -2433,10 +2428,6 @@ def cmd_init(args) -> int:
         return value
 
     fields: list[tuple[str, str]] = []
-    # Normalized once, here: every downstream comparison (and the reviewer-token
-    # prompt that hangs off it) must see the same value, whatever case was typed.
-    identity_mode = ask("Identity mode (three|solo)", "three").lower()
-    fields.append(("IDENTITY_MODE", identity_mode))
     gh_login = detect_fixer_login()
     if gh_login:
         ok(f"gh is authenticated as '{gh_login}'")
@@ -2457,7 +2448,7 @@ def cmd_init(args) -> int:
         fields.append(("GH_APP_ID", ask("GH App ID", "")))
         fields.append(("GH_APP_INSTALL_ID", ask("GH App installation ID", "")))
         fields.append(("GH_APP_KEY_FILE", ask("GH App private-key .pem path", "")))
-    elif identity_mode == "three":
+    else:
         # Without an App, approvals are posted with this PAT. Validating it here
         # (rather than only in doctor) is the difference between a wizard that
         # cannot produce a doctor-red config and one that reliably does.
@@ -2468,19 +2459,18 @@ def cmd_init(args) -> int:
         else:
             warn("no REVIEW_BOT_TOKEN set — the reviewer will act as the ambient gh "
                  "account and GitHub will 422 its approvals.")
-    if identity_mode == "three":
-        # Asked regardless of the App answer: the App covers review only,
-        # and the fixer's credential is FIX_BOT_TOKEN or nothing. Skipping this
-        # is what put keifu's fixer on a human account and its personal quota.
-        print()
-        print("  The fixer needs its OWN token too. Without FIX_BOT_TOKEN the fix")
-        print("  daemon falls through to the ambient `gh auth` credential: its")
-        print("  branches, comments and PRs are attributed to that human account,")
-        print("  and its GraphQL calls come out of that account's personal")
-        print("  5,000-point/hour pool.")
-        fix_token = prompt_fix_bot_token()
-        if fix_token:
-            fields.append(("FIX_BOT_TOKEN", fix_token))
+    # Asked regardless of the App answer: the App covers review only,
+    # and the fixer's credential is FIX_BOT_TOKEN or nothing. Skipping this
+    # is what put keifu's fixer on a human account and its personal quota.
+    print()
+    print("  The fixer needs its OWN token too. Without FIX_BOT_TOKEN the fix")
+    print("  daemon falls through to the ambient `gh auth` credential: its")
+    print("  branches, comments and PRs are attributed to that human account,")
+    print("  and its GraphQL calls come out of that account's personal")
+    print("  5,000-point/hour pool.")
+    fix_token = prompt_fix_bot_token()
+    if fix_token:
+        fields.append(("FIX_BOT_TOKEN", fix_token))
     _wizard_pool_summary(fields)
     print()
     claude_ready = detect_claude_auth()
@@ -2594,7 +2584,6 @@ def build_parser() -> argparse.ArgumentParser:
              "repo default branch, then 'dev')",
     )
     sp.add_argument("--no-init", action="store_true", help="don't auto-run init on first start; error instead")
-    sp.add_argument("--review-mode", default="", choices=["", "single", "multi", "delegated"], help="reviewer strategy")
     sp.add_argument("--max-budget", default="", help="MAX_BUDGET_USD per fix session")
     sp.add_argument("--review-budget", default="", help="REVIEW_BUDGET_USD per review")
     sp.add_argument("--max-ticks", type=int, default=None, help="bound each daemon's loop (dry run/CI)")

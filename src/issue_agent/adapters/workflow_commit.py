@@ -1,7 +1,6 @@
 """Family-neutral compare-and-swap commit helpers for workflow control; ADR 0015.
 
-Extracted from the resolve control without behaviour change so the review
-family commits through the same receipt, replay and CAS rules. Callers own the
+Extracted from the resolve control. Callers own the
 surrounding `BEGIN IMMEDIATE` transaction and all family-specific validation;
 nothing here performs remote I/O or decides policy.
 """
@@ -13,19 +12,13 @@ import json
 import sqlite3
 from dataclasses import replace
 
-from ..domain.review_workflow import (
-    AnyWorkflowSnapshot, ReviewRearmPreflight, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, ReviewRearmIntent,
-    SupersededReviewRearm,
-)
-from ..domain.review_execution import ExecutionNotActivated
-from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.workflow import (
     AuthorizeAbsentRetry, AuthorizedOperatorCommand, OperatorActor, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, OpenGate, PendingRearm, RearmIntent, RearmObligation, RearmingGate, RequestRearm,
     ResolveAttemptResult,
-    SupersededRearm, WorkflowChanged, WorkflowCommitted, WorkflowConflict,
+    SupersededRearm, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowSnapshot,
 )
-from ..domain.workflow_identity import PullRequestRef, WorkflowBinding, WorkflowKey, WorkflowWriter
+from ..domain.workflow_identity import WorkflowBinding, WorkflowKey, WorkflowWriter
 from ..domain.workflow_retry import RetryAuthorizationFacts, minted_authorization
 from .control_store import SQLiteControlStore, _stamp
 from .workflow_codec import decode_workflow, encode_workflow
@@ -34,8 +27,6 @@ from .workflow_rows import WorkflowAuthorityError, workflow_scope
 _INTENT_STATES: dict[type, str] = {
     PendingRearm: "pending", CompletedRearm: "completed",
     CancelledRearm: "cancelled", SupersededRearm: "superseded",
-    PendingReviewRearm: "pending", CompletedReviewRearm: "completed",
-    CancelledReviewRearm: "cancelled", SupersededReviewRearm: "superseded",
 }
 
 
@@ -43,12 +34,12 @@ def opened_gate(gate: OpenGate | RearmingGate) -> OpenGate:
     return gate.gate if isinstance(gate, RearmingGate) else gate
 
 
-def intent_state(intent: RearmIntent | ReviewRearmIntent) -> str:
-    """The indexed `workflow_rearms.state` of a typed intent of either family."""
+def intent_state(intent: RearmIntent) -> str:
+    """The indexed `workflow_rearms.state` of a typed intent."""
     return _INTENT_STATES[type(intent)]
 
 
-def retry_request_replay(db: sqlite3.Connection, prior: AnyWorkflowSnapshot, command: AuthorizeAbsentRetry,
+def retry_request_replay(db: sqlite3.Connection, prior: WorkflowSnapshot, command: AuthorizeAbsentRetry,
                          actor: OperatorActor, binding: WorkflowBinding | None = None) -> WorkflowCommitted | WorkflowConflict | None:
     row = db.execute("SELECT binding_json,actor_json FROM workflow_retry_authorizations WHERE authorization_id=?",
                      (command.authorization_id,)).fetchone()
@@ -56,10 +47,9 @@ def retry_request_replay(db: sqlite3.Connection, prior: AnyWorkflowSnapshot, com
         return None
     try:
         audit = decode_workflow(row["actor_json"], AuthorizedOperatorCommand)
-        if not isinstance(prior, ReviewWorkflowSnapshot):
-            granted = decode_workflow(row["binding_json"], WorkflowBinding)
-            if binding is not None and granted != binding:
-                return WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator")
+        granted = decode_workflow(row["binding_json"], WorkflowBinding)
+        if binding is not None and granted != binding:
+            return WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator")
     except (ValueError, TypeError) as exc:
         raise WorkflowAuthorityError("invalid accepted retry authorization audit") from exc
     return (WorkflowCommitted(prior, idempotent=True) if audit.command == command and audit.actor.subject == actor.subject
@@ -75,12 +65,12 @@ def accepted_rearm_audit(db: sqlite3.Connection, key: WorkflowKey, request_id: s
         raise WorkflowAuthorityError("re-arm request identity belongs to another workflow")
     try:
         audit = decode_workflow(row["actor_json"], AuthorizedOperatorCommand)
-        intent = decode_workflow(row["intent_json"], ReviewRearmIntent if isinstance(key.target, PullRequestRef) else RearmIntent)
+        intent = decode_workflow(row["intent_json"], RearmIntent)
     except (ValueError, TypeError) as exc:
         raise WorkflowAuthorityError("invalid accepted re-arm audit") from exc
     command = audit.command
     if (not isinstance(command, (RequestRearm, ContinueGrantedRearm)) or command.request_id != request_id
-            or command.expected.fence.key != key or (not isinstance(audit.preflight, ReviewRearmPreflight) if isinstance(key.target, PullRequestRef) else audit.preflight is None)
+            or command.expected.fence.key != key or audit.preflight is None
             or encode_workflow(audit) != row["actor_json"] or intent.request_id != request_id
             or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"]
             or row["state"] != intent_state(intent)
@@ -91,7 +81,7 @@ def accepted_rearm_audit(db: sqlite3.Connection, key: WorkflowKey, request_id: s
 
 def accepted_proposal(proposal: WorkflowChanged) -> str:
     """Retain accepted facts and plan; these are not the operator's identity."""
-    snapshot: AnyWorkflowSnapshot = replace(
+    snapshot: WorkflowSnapshot = replace(
         proposal.snapshot, gates=tuple(sorted(proposal.snapshot.gates, key=lambda g: opened_gate(g).gate_id)),
     )
     return json.dumps({
@@ -128,49 +118,13 @@ def same_receipt(raw: str, proposal: WorkflowChanged, encoded: str) -> bool:
     if not isinstance(proposal.audit, AuthorizedOperatorCommand):
         if raw == encoded:
             return True
-        # A v24 review observation embedded the five-field snapshot tag.
-        # Preserve its immutable receipt while accepting the identical current
-        # proposal with an explicitly inactive execution component.
-        if not isinstance(proposal.snapshot, ReviewWorkflowSnapshot) or not isinstance(proposal.snapshot.execution, ExecutionNotActivated):
-            return False
-        try:
-            accepted = json.loads(raw, object_pairs_hook=_unique_receipt_object)
-            current = json.loads(encoded, object_pairs_hook=_unique_receipt_object)
-            required = {"mutation", "expected", "snapshot", "audit", "commands"}
-            if not isinstance(accepted, dict) or not isinstance(current, dict) or set(accepted) != required or set(current) != required:
-                return False
-            if any(accepted[key] != current[key] for key in required - {"snapshot"}):
-                return False
-            old_snapshot = accepted["snapshot"]
-            if not isinstance(old_snapshot, str):
-                return False
-            envelope = json.loads(old_snapshot, object_pairs_hook=_unique_receipt_object)
-            if not isinstance(envelope, dict) or set(envelope) != {"format", "value"} or type(envelope["format"]) is not int or envelope["format"] != 1:
-                return False
-            value = envelope["value"]
-            if not isinstance(value, dict) or value.get("type") != "ReviewWorkflowSnapshot":
-                return False
-            normalized = current["snapshot"]
-            if not isinstance(normalized, str):
-                return False
-            return decode_workflow(old_snapshot, ReviewWorkflowSnapshot) == decode_workflow(normalized, ReviewWorkflowSnapshot)
-        except (ValueError, TypeError):
-            return False
+        return False
     audit = accepted_operator_audit(raw)
     # Authentication is established before this bound port is called. Replay
     # belongs to the same authenticated subject and exact operator command;
     # refreshed observations, channel provenance and regenerated plans do not
     # authorize a second write or replace the original accepted audit.
     return audit.actor.subject == proposal.audit.actor.subject and audit.command == proposal.audit.command
-
-
-def _unique_receipt_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate accepted workflow receipt field")
-        result[key] = value
-    return result
 
 
 def transition_dedupe_key(proposal: WorkflowChanged) -> tuple[str, str]:
@@ -191,7 +145,7 @@ def transition_dedupe_key(proposal: WorkflowChanged) -> tuple[str, str]:
 
 
 def replay_or_conflict(
-    db: sqlite3.Connection, repository: str, prior: AnyWorkflowSnapshot,
+    db: sqlite3.Connection, repository: str, prior: WorkflowSnapshot,
     transition: WorkflowChanged, encoded: str,
 ) -> WorkflowCommitted | WorkflowConflict | None:
     """An exact replay is idempotent; reuse or a moved revision conflicts; None proceeds."""
@@ -224,7 +178,7 @@ def record_commit(
 
 def insert_pending_rearm(
     db: sqlite3.Connection, scope: tuple[str, str, int],
-    intent: PendingRearm | PendingReviewRearm, audit: AuthorizedOperatorCommand,
+    intent: PendingRearm, audit: AuthorizedOperatorCommand,
 ) -> None:
     db.execute(
         "INSERT INTO workflow_rearms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -234,7 +188,7 @@ def insert_pending_rearm(
     )
 
 
-def update_rearm_state(db: sqlite3.Connection, intent: RearmIntent | ReviewRearmIntent) -> None:
+def update_rearm_state(db: sqlite3.Connection, intent: RearmIntent) -> None:
     db.execute(
         "UPDATE workflow_rearms SET state=?, intent_json=? WHERE request_id=?",
         (intent_state(intent), encode_workflow(intent), intent.request_id),
@@ -252,7 +206,7 @@ def record_stop_evidence(db: sqlite3.Connection, scope: tuple[str, str, int], pr
 
 
 def retire_rearm_obligation(
-    db: sqlite3.Connection, intent: CancelledRearm | SupersededRearm | CancelledReviewRearm | SupersededReviewRearm,
+    db: sqlite3.Connection, intent: CancelledRearm | SupersededRearm,
     command_id: str,
 ) -> None:
     db.execute(

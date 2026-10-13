@@ -31,60 +31,11 @@ def completion_guard(issue, operation: LifecycleOperation) -> IssueCompletionGua
     )
 
 
-def _labels_within(before: frozenset[Label], current: frozenset[Label],
-                   removed: tuple[Label, ...], added: tuple[Label, ...]) -> bool:
-    """Only this command's own declared label effects may separate the two sets."""
-    return not (current - before - set(added) or before - current - set(removed))
-
-
-def completion_matches(
-    guard: IssueCompletionGuard, issue, *, removed: tuple[Label, ...] = (),
-    added: tuple[Label, ...] = (), comment: str = "",
-) -> bool:
-    """Accept only the original facts plus this command's declared partial effects."""
-    if issue.state != "open" or (
-        issue.title, issue.body, issue.author, issue.state_reason
-    ) != (guard.title, guard.body, guard.author, guard.state_reason):
-        return False
-    if not _labels_within(guard.labels, issue.labels, removed, added):
-        return False
-    current = [(c.author, c.body, c.created_at) for c in issue.comments]
-    for original in guard.comments:
-        if original not in current:
-            return False
-        current.remove(original)
-    return not current or (bool(comment) and len(current) == 1 and current[0][1] == comment)
-
-
 def hold_guard(issue) -> IssueHoldGuard:
     """Capture the hold facts an accepted projection decision depends on."""
     if issue.state != "open":
         raise ValueError("a hold projection guard requires an open issue")
     return IssueHoldGuard(issue.state_reason, frozenset(issue.labels) - ORDERING_LABELS)
-
-
-def hold_guard_applies(
-    guard: IssueHoldGuard, issue, *, linked_pr: int | None,
-    removed: tuple[Label, ...] = (), added: tuple[Label, ...] = (),
-) -> bool:
-    """Whether the accepted hold facts still hold, modulo this command's own effects.
-
-    A comment or body edit leaves every one of these facts unchanged; a new
-    hold, recurrence or terminal label, a close/reopen, or a linked PR does not.
-    """
-    if not isinstance(guard, IssueHoldGuard):
-        raise ValueError("hold guard evaluation requires a typed guard")
-    if issue.state != "open" or issue.state_reason != guard.state_reason or linked_pr is not None:
-        return False
-    return _labels_within(guard.labels, frozenset(issue.labels) - ORDERING_LABELS, removed, added)
-
-
-def completion_eligibility(issue, operation: LifecycleOperation, action) -> Eligibility:
-    if isinstance(action, Relabel) and action.add in {
-        Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW, Label.NEEDS_HUMAN_REVIEW,
-    } and not set(action.removed_labels) & (_EXPLICIT_HOLDS | {Label.AI_BLOCKED}):
-        return AllowedEligibility(operation)
-    return issue_eligibility(issue, operation)
 
 
 def issue_eligibility(issue, operation: LifecycleOperation) -> Eligibility:
@@ -126,28 +77,6 @@ def issue_eligibility(issue, operation: LifecycleOperation) -> Eligibility:
         allowed = True
     return (AllowedEligibility(operation) if allowed else
             HeldEligibility(operation, ("workflow position does not permit this operation",)))
-
-
-def pr_eligibility(pr, operation: LifecycleOperation) -> Eligibility:
-    if operation not in {
-        LifecycleOperation.PR_RESUME, LifecycleOperation.REVIEW, LifecycleOperation.REPAIR,
-        LifecycleOperation.MERGE, LifecycleOperation.UPDATE_BRANCH, LifecycleOperation.REMEDIATE_CI,
-    }:
-        return InvalidEligibility(operation, "operation does not apply to a PR")
-    if pr.state not in {"OPEN", "CLOSED", "MERGED"}:
-        return InvalidEligibility(operation, "PR state is unavailable or malformed")
-    if pr.state != "OPEN" or Label.AI_DONE in pr.labels:
-        return HeldEligibility(operation, ("PR is terminal",))
-    holds = pr.labels & _EXPLICIT_HOLDS
-    if operation is LifecycleOperation.REVIEW:
-        holds = holds | (pr.labels & {Label.NO_AI_REVIEW, Label.AI_WORKING})
-    if Label.AI_BLOCKED in pr.labels and operation is not LifecycleOperation.PR_RESUME:
-        holds = holds | {Label.AI_BLOCKED}
-    if holds:
-        return HeldEligibility(operation, tuple(sorted(label.value for label in holds)))
-    if operation is LifecycleOperation.PR_RESUME and Label.AI_BLOCKED not in pr.labels:
-        return HeldEligibility(operation, ("PR is not awaiting a reply",))
-    return AllowedEligibility(operation)
 
 
 @dataclass(frozen=True)

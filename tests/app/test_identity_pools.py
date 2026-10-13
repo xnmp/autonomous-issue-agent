@@ -2,7 +2,7 @@
 (2026-08-02 keifu incidents).
 
 Two config-class gaps doctor could not see:
-  1. IDENTITY_MODE=three with FIX_BOT_TOKEN unset — the fixer silently acted as
+  1. FIX_BOT_TOKEN unset — the fixer silently acted as
      the operator's personal account and burned its GraphQL pool;
   2. fix and review on one credential at POLL_SECONDS=20 — one
      5,000-point/hour pool, two daemons, exhausted (issue #163).
@@ -44,7 +44,6 @@ def fires_about(report, *needles, level=None):
 
 
 DISTINCT = {
-    "IDENTITY_MODE": "three",
     "FIX_BOT": "human-operator",
     "FIX_BOT_TOKEN": "fix-secret",
     "REVIEW_BOT_TOKEN": "review-secret",
@@ -53,7 +52,6 @@ DISTINCT = {
 
 # fix and review resolve to one credential, so they spend one pool.
 SHARED = {
-    "IDENTITY_MODE": "three",
     "FIX_BOT": "human-operator",
     "FIX_BOT_TOKEN": "one-pat",
     "REVIEW_BOT_TOKEN": "one-pat",
@@ -62,9 +60,8 @@ SHARED = {
 
 
 # ── incident 1: the fixer falls through to ambient ────────────────────────────
-def test_three_identity_mode_without_a_fixer_token_names_the_account_and_the_cost():
+def test_a_missing_fixer_token_names_the_account_and_the_cost():
     report = identity_pool_report({
-        "IDENTITY_MODE": "three",
         "FIX_BOT": "human-operator",
         "REVIEW_BOT_TOKEN": "review-secret",
         "POLL_SECONDS": "60",
@@ -77,51 +74,13 @@ def test_three_identity_mode_without_a_fixer_token_names_the_account_and_the_cos
 
 
 def test_fixer_fallthrough_names_gh_auth_when_no_fixer_login_is_configured():
-    report = identity_pool_report({"IDENTITY_MODE": "three", "POLL_SECONDS": "600"})
+    report = identity_pool_report({"POLL_SECONDS": "600"})
     assert fires_about(report, "gh auth login", level="warn")
 
 
 def test_a_configured_fixer_token_is_silent_about_attribution():
     report = identity_pool_report(DISTINCT)
     assert not pool_of(report, "fix").ambient
-    assert not fires_about(report, "FIX_BOT_TOKEN is not set")
-
-
-def test_solo_mode_does_not_demand_a_fixer_token():
-    """solo mode has no bot identities to attribute to — the human IS the
-    reviewer, so ambient is the documented arrangement, not a finding."""
-    report = identity_pool_report({
-        "IDENTITY_MODE": "solo", "FIX_BOT": "human-operator", "POLL_SECONDS": "600",
-    })
-    assert pool_of(report, "fix").ambient
-    assert not fires_about(report, "FIX_BOT_TOKEN is not set")
-
-
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "three", " three ",            # the mode itself, trimmed
-        None, "", "   ",               # absent/empty → the THREE default
-        "Solo", "SOLO", "sOlO",        # case-SENSITIVE: these are NOT solo
-        "Three", "THREE", "banana",    # unrecognised → the THREE default
-    ],
-)
-def test_every_value_that_leaves_the_harness_in_three_mode_is_checked(mode):
-    """`IdentityMode.from_env` is deliberately case-sensitive — the bash half
-    compares `[ "$IDENTITY_MODE" = three ]` literally — and `config` defaults
-    anything unrecognised to THREE. So `IDENTITY_MODE=Solo` really does run in
-    three-identity mode. Folding case here would hand a clean bill of health to
-    exactly the config that reproduces the keifu incident."""
-    env = {"POLL_SECONDS": "600"}
-    if mode is not None:
-        env["IDENTITY_MODE"] = mode
-    report = identity_pool_report(env)
-    assert fires_about(report, "FIX_BOT_TOKEN is not set", level="warn")
-
-
-@pytest.mark.parametrize("mode", ["solo", " solo ", "solo\n"])
-def test_only_an_exactly_spelled_solo_suppresses_the_attribution_finding(mode):
-    report = identity_pool_report({"IDENTITY_MODE": mode, "POLL_SECONDS": "600"})
     assert not fires_about(report, "FIX_BOT_TOKEN is not set")
 
 
@@ -135,7 +94,6 @@ def test_a_shared_pool_at_60s_is_information_not_a_warning():
 
 def test_a_credential_per_role_at_a_sane_cadence_is_completely_silent():
     report = identity_pool_report({
-        "IDENTITY_MODE": "three",
         "FIX_BOT_TOKEN": "fix-secret",
         "REVIEW_BOT_TOKEN": "review-secret",
         "POLL_SECONDS": "600",
@@ -176,7 +134,7 @@ def test_only_the_warning_level_prescribes_a_remedy():
 def test_two_unset_tokens_share_a_pool_because_both_fall_through_to_ambient():
     """The grouping is on the RESOLVED credential, not on "both vars are empty".
     Both ambient roles really are one pool and the finding must say so."""
-    report = identity_pool_report({"IDENTITY_MODE": "solo", "POLL_SECONDS": "20"})
+    report = identity_pool_report({"POLL_SECONDS": "20"})
     assert [p.roles for p in report.shared_pools] == [("fix", "review")]
     assert fires_about(
         report, "fix + review", "all fall through to the ambient",
@@ -188,7 +146,7 @@ def test_an_unset_fixer_token_alongside_a_configured_reviewer_is_two_pools():
     """Ambient and REVIEW_BOT_TOKEN are different credentials; treating "unset"
     as equal to a real token would invent a shared pool that does not exist."""
     report = identity_pool_report({
-        "IDENTITY_MODE": "solo", "REVIEW_BOT_TOKEN": "review-secret",
+        "REVIEW_BOT_TOKEN": "review-secret",
         "POLL_SECONDS": "20",
     })
     assert not report.shared_pools
@@ -196,7 +154,6 @@ def test_an_unset_fixer_token_alongside_a_configured_reviewer_is_two_pools():
 
 def test_the_same_secret_in_two_vars_is_one_pool_and_is_named_as_such():
     report = identity_pool_report({
-        "IDENTITY_MODE": "three",
         "FIX_BOT_TOKEN": "one-pat",
         "REVIEW_BOT_TOKEN": "one-pat",
         "POLL_SECONDS": "20",
@@ -216,7 +173,7 @@ def test_no_report_field_carries_the_secret_or_a_digest_that_confirms_it():
 
     secret = "ghp_supersecret_value"
     env = {
-        "IDENTITY_MODE": "three", "FIX_BOT_TOKEN": secret,
+        "FIX_BOT_TOKEN": secret,
         "REVIEW_BOT_TOKEN": secret, "POLL_SECONDS": "20",
     }
     report = identity_pool_report(env)
@@ -232,7 +189,7 @@ def test_a_whitespace_only_token_is_an_error_not_a_silent_fallback(blank):
     """`main` tests FIX_BOT_TOKEN with `or None`, so whitespace is CONFIGURED —
     it goes out as a bearer token and there is no fallback behind it."""
     report = identity_pool_report({
-        "IDENTITY_MODE": "three", "FIX_BOT_TOKEN": blank, "POLL_SECONDS": "600",
+        "FIX_BOT_TOKEN": blank, "POLL_SECONDS": "600",
     })
     assert fires_about(report, "FIX_BOT_TOKEN is set to whitespace", level="error")
     assert not report.healthy
@@ -241,7 +198,7 @@ def test_a_whitespace_only_token_is_an_error_not_a_silent_fallback(blank):
 # ── the App branch mirrors main._app_identity ─────────────────────────────────
 def test_the_app_identity_is_used_only_when_its_key_file_is_readable():
     env = {
-        "IDENTITY_MODE": "three", "FIX_BOT_TOKEN": "fix-secret",
+        "FIX_BOT_TOKEN": "fix-secret",
         "GH_APP_ID": "1", "GH_APP_INSTALL_ID": "2",
         "GH_APP_KEY_FILE": "/keys/app.pem",
         "REVIEW_BOT_TOKEN": "review-secret", "POLL_SECONDS": "600",
@@ -335,7 +292,7 @@ def test_a_non_string_poll_seconds_does_not_traceback():
     not typed tightly enough to rule an int out."""
     assert parse_poll_seconds(45) == (45, True)
     assert parse_poll_seconds(0) == (DEFAULT_POLL_SECONDS, False)
-    report = identity_pool_report({"IDENTITY_MODE": "three", "POLL_SECONDS": 60})
+    report = identity_pool_report({"POLL_SECONDS": 60})
     assert report.poll_seconds == 60
 
 
@@ -369,7 +326,7 @@ def reported(capsys) -> str:
 
 def test_doctor_prints_a_line_per_role_and_every_finding(capsys):
     cli.report_identity_pools({
-        "IDENTITY_MODE": "three", "FIX_BOT": "human-operator",
+        "FIX_BOT": "human-operator",
         "POLL_SECONDS": "20",
     })
     out = reported(capsys)
@@ -383,7 +340,7 @@ def test_doctor_reads_the_composed_snapshot_the_daemons_will_see(tmp_path, capsy
     """The finding must describe AGENT_ENV, not the operator's shell — a doctor
     run that reports on the wrong env is the false green this check replaces."""
     snapshot = tmp_path / "active.env"
-    snapshot.write_text('IDENTITY_MODE="three"\nFIX_BOT="from-snapshot"\n')
+    snapshot.write_text('FIX_BOT="from-snapshot"\n')
     cli._doctor_identity_pools(
         cli._composed_env({"AGENT_ENV": str(snapshot), "FIX_BOT": "from-shell"})
     )
@@ -417,7 +374,7 @@ def _doctor_rc(tmp_path, monkeypatch, extra: dict, *, sh_rc: int) -> int:
         monkeypatch.setattr(cli, independent_check, lambda *a, **k: "")
     monkeypatch.setattr(cli, "_resolve_context", lambda _a: ("o/r", str(tmp_path), "r"))
     monkeypatch.setattr(
-        cli, "_composed_env", lambda _env: {"IDENTITY_MODE": "three", **extra}
+        cli, "_composed_env", lambda _env: {**extra}
     )
     monkeypatch.setattr(
         cli.subprocess, "run", lambda *a, **k: argparse.Namespace(returncode=sh_rc)
@@ -426,13 +383,12 @@ def _doctor_rc(tmp_path, monkeypatch, extra: dict, *, sh_rc: int) -> int:
 
 
 def test_an_unsourceable_snapshot_falls_back_to_the_inherited_environment():
-    env = {"AGENT_ENV": "/nonexistent/active.env", "IDENTITY_MODE": "three"}
+    env = {"AGENT_ENV": "/nonexistent/active.env", "FIX_BOT": "f"}
     assert cli._composed_env(env) == env
 
 
 def test_the_wizard_surfaces_the_same_two_facts_at_config_time(capsys):
     cli._wizard_pool_summary([
-        ("IDENTITY_MODE", "three"),
         ("FIX_BOT", "human-operator"),
     ])
     out = reported(capsys)
@@ -443,7 +399,6 @@ def test_the_wizard_surfaces_the_same_two_facts_at_config_time(capsys):
 
 def test_the_wizard_stops_flagging_attribution_once_a_fixer_token_is_collected(capsys):
     cli._wizard_pool_summary([
-        ("IDENTITY_MODE", "three"),
         ("FIX_BOT_TOKEN", "fix-secret"),
         ("REVIEW_BOT_TOKEN", "review-secret"),
     ])

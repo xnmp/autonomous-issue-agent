@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/adapters/control_path.py src/issue_agent/adapters/control_store.py src/issue_agent/adapters/deployment_authority.py src/issue_agent/adapters/single_instance.py src/issue_agent/adapters/accounting_runtime.py src/issue_agent/adapters/journal.py src/issue_agent/adapters/runtime_plan.py src/issue_agent/app/roles.py src/issue_agent/app/dispatch.py src/issue_agent/app/fix.py src/issue_agent/app/workflows/review.py src/issue_agent/app/cli.py
+Governs: src/issue_agent/adapters/control_path.py src/issue_agent/adapters/control_store.py src/issue_agent/adapters/deployment_authority.py src/issue_agent/adapters/single_instance.py src/issue_agent/adapters/accounting_runtime.py src/issue_agent/adapters/journal.py src/issue_agent/adapters/runtime_plan.py src/issue_agent/app/roles.py src/issue_agent/app/fix.py src/issue_agent/app/cli.py
 
 ## Context
 

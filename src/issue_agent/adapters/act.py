@@ -26,9 +26,27 @@ from ..domain.actions import (
 from ..domain.labels import Label
 from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
+from ..domain.review import Verdict
 
+# A stored-key namespace is never renamed: a rename orphans the keys already
+# claimed under the old name, and a claimed key decides whether to post.
 _COMMENT_NAMESPACE = "fix-comment"
 _PR_BODY_LIMIT = 60000
+
+
+def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bool:
+    """One review on exactly `head` under `bot`, the identity the review
+    gateway acts as (checked at boot). GitHub's read-back is the idempotency:
+    a standing bot verdict on `head` means it landed (a crash after the POST,
+    or a racing leg), so nothing is posted twice. False is GitHub's refusal (a
+    4xx), which no retry changes; no answer or no confirmation raises."""
+    if gateway.reviewed_on(pr, head, bot):
+        return True
+    if not gateway.submit_review(pr, verdict.event, verdict.body, head):
+        return False
+    if not gateway.reviewed_on(pr, head, bot):
+        raise RuntimeError(f"PR #{pr}: review of {head[:12]} not confirmed")
+    return True
 
 
 class GitHubAct:
@@ -143,11 +161,11 @@ class GitHubAct:
         """The agent's summary from the issue's latest returned resolve leg:
         an untrusted claim, used only as the PR description."""
         runs = [
-            r for r in self.control.fix_runs(self.repository, (issue,))
+            r for r in self.control.leg_runs(self.repository, (issue,))
             if r.kind == "RESOLVE" and r.receipt is not None and isinstance(r.receipt.get("summary"), str)
         ]
         latest = max(runs, key=lambda r: r.completed_at, default=None)
         return str(latest.receipt["summary"]) if latest is not None and latest.receipt is not None else ""
 
 
-__all__ = ["GitHubAct"]
+__all__ = ["GitHubAct", "submit_review"]

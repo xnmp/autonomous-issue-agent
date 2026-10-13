@@ -31,16 +31,11 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..domain.ci import parse_timestamp
+from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
-from ..domain.review_rejection import MAX_OBSERVED_REVIEWS, is_commit_sha
-from ..domain.review_workflow import (
-    CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
-)
-from .review_effects import ReviewReadUnavailable
 from ..domain.world import (
     Branch,
-    ClosingRef,
     Comment,
     IssueView,
     PRView,
@@ -173,24 +168,6 @@ def _cap_bytes(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
-
-
-def _warn_if_list_truncated(query: str, count: int, limit: int = _LIST_LIMIT) -> None:
-    """Emit a loud stderr warning when a `gh … list` call returns exactly as many
-    items as it asked for. Unlike the fail-soft gh-error path (transient,
-    re-derived next tick), a truncated listing recurs every poll and drops the
-    same items every time until an operator raises the cap or pagination ships —
-    so this is intentionally NOT swallowed. `limit` is a parameter because not
-    every world-building list uses `_LIST_LIMIT` (the closed ai-pr-open cleanup
-    slice is capped far lower — see `_CLOSED_CLEANUP_LIMIT`)."""
-    if count == limit:
-        import sys
-
-        sys.stderr.write(
-            f"WARNING: {query} returned {count} items (== --limit {limit}) — "
-            "results may be TRUNCATED; oldest items silently dropped this poll. "
-            "Raise the limit or add pagination.\n"
-        )
 
 
 # ── infra-failure detection (V10) ─────────────────────────────────────────────
@@ -541,63 +518,6 @@ _PR_LIST_FIELDS = (
 _TERMINAL_STATES = ("MERGED", "CLOSED")
 
 
-def parse_terminal_pr(row: object, *, label: str) -> PRView | None:
-    """A MERGED/CLOSED `PRView` built from a `gh pr list` row instead of a
-    per-PR `gh pr view` (#163) — or None, meaning "fetch it properly".
-
-    None on EVERY doubt, because a PRView is a trusted value that lifecycle
-    decisions read:
-
-    * a row missing any requested key, or with the wrong shape — partial data
-      must never be laundered into a trusted view;
-    * a state that is not terminal — an OPEN (or reopened, or unknown) PR keeps
-      the full fetch, including the mergeability and checks a terminal PR has no
-      use for;
-    * a row still showing `label`. The labelled `--state all` search index keeps
-      serving PRs for about a day after their label is removed, so membership is
-      untrustworthy — but a row whose own label set no longer carries the label
-      is a PR every cleanup arm already ignores, and one that still shows it is
-      exactly the PR whose cleanup must run off authoritative labels. So the
-      cheap path is taken only for the stale tail, and every PR that can still
-      DRIVE a decision keeps its `gh pr view`.
-
-    `ci=Unavailable("checks not requested")` / `content_known=False`: not fetching something is
-    UNREAD, never read-as-empty (#48 review F3) — the same contract
-    `get_pr(checks=False)` upholds.
-
-    It must also never RAISE. A world build has no per-item isolation around
-    this call (unlike `_safe_get_pr`), so one oddly-shaped row would otherwise
-    kill the whole poll — the V10 incident class (adversarial review F3)."""
-    if not isinstance(row, dict):
-        return None
-    required = ("number", "state", "labels", "headRefName", "headRefOid",
-                "baseRefName", "baseRefOid", "title", "isDraft", "author",
-                "closingIssuesReferences")
-    if any(key not in row for key in required):
-        return None
-    if not isinstance(row.get("labels"), list) or not isinstance(
-        row.get("closingIssuesReferences"), list
-    ):
-        return None
-    try:
-        number = int(row["number"])
-        state = str(row["state"] or "").upper()
-        if state not in _TERMINAL_STATES:
-            return None
-        # The label gate reads the SAME extraction the view path uses, so the
-        # two can never disagree about what "this PR carries the label" means
-        # (a bare-string label list used to read as "no labels" here and as the
-        # label there — adversarial review F3). Name-level, because the
-        # reviewer's trigger label is operator-configured and need not be a
-        # known `Label`.
-        if label in _label_names(row["labels"]):
-            return None
-        view = parse_pr({**row, "number": number, "state": state})
-    except Exception:  # noqa: BLE001 — see the docstring: never raise
-        return None
-    return replace(view, ci=Unavailable("checks not requested"), content_known=False)
-
-
 def _changed_files(files: object) -> frozenset[str]:
     """`gh pr view --json files` → [{path, additions, ...}]. Pull the paths for
     the file-overlap gate. Tolerant of a missing/oddly-shaped field (→ empty)."""
@@ -608,47 +528,6 @@ def _changed_files(files: object) -> frozenset[str]:
         if isinstance(f, dict) and f.get("path"):
             out.add(str(f["path"]))
     return frozenset(out)
-
-
-def parse_closing_refs(data: object) -> tuple[ClosingRef, ...]:
-    """`gh pr list --json number,author,closingIssuesReferences,baseRefName` →
-    one `ClosingRef` per (PR, closed issue) pair (#39).
-
-    Flattened rather than one-per-PR because the guard asks a question about an
-    ISSUE ("is anyone already fixing this?"), and a PR may close several. Total
-    tolerance for shape: a null author, a missing/odd references list, an
-    unparseable number — every one of them yields fewer refs, never an
-    exception. This feeds a guard that REFUSES work, so a parse error must
-    degrade to "no evidence of a duplicate" (dispatch, as before), never to a
-    crashed world build."""
-    if not isinstance(data, list):
-        return ()
-    out: list[ClosingRef] = []
-    for p in data:
-        if not isinstance(p, dict):
-            continue
-        try:
-            number = int(p["number"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        author = ""
-        if isinstance(p.get("author"), dict):
-            author = str(p["author"].get("login") or "")
-        base = str(p.get("baseRefName") or "")
-        refs = p.get("closingIssuesReferences")
-        if not isinstance(refs, list):
-            continue
-        for ref in refs:
-            if not isinstance(ref, dict):
-                continue
-            try:
-                issue = int(ref["number"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            out.append(
-                ClosingRef(pr=number, issue=issue, author=author, base_ref_name=base)
-            )
-    return tuple(out)
 
 
 def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> str:
@@ -918,64 +797,6 @@ def _owed(node: dict) -> bool:
 
 
 # ── write command builders ──────────────────────────────────────────────────
-_REVIEW_STATES = {state.value: state for state in SubmittedReviewState}
-
-
-def parse_review_pages(pages: object) -> CompleteReviews | PartialReviews:
-    """One `--paginate --slurp` reviews answer as a complete read, or why it is not one.
-
-    Every page must be a list of well-formed reviews; anything else is partial,
-    never a truncated "complete" (ADR 0015: a partial read can neither
-    establish nor disprove a rejection cause). A PENDING review is an unsent
-    draft, not a submission, so it is skipped rather than failing the read: a
-    crashed bot draft would otherwise make every read partial forever.
-    """
-    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-        return PartialReviews("review pages were unreadable or incomplete")
-    facts: list[SubmittedReviewFact] = []
-    for row in (item for page in pages for item in page):
-        if not isinstance(row, dict):
-            return PartialReviews("a review entry was malformed")
-        state = str(row.get("state") or "").upper()
-        if state == "PENDING":
-            continue
-        if state not in _REVIEW_STATES:
-            return PartialReviews(f"review has an unrecognized state {state[:64]!r}")
-        review_id, user = row.get("id"), row.get("user")
-        commit = row.get("commit_id") or ""
-        submitted = row.get("submitted_at")
-        if type(review_id) is not int or review_id <= 0 or not isinstance(submitted, str) or (
-            commit and not is_commit_sha(commit)
-        ):
-            return PartialReviews("a review entry lacked its identity, commit or submission time")
-        try:
-            submitted_at = datetime.fromisoformat(submitted.replace("Z", "+00:00"))
-            # A deleted account is GitHub's "ghost"; the review still counts as authored.
-            author = str(user.get("login") or "ghost") if isinstance(user, dict) else "ghost"
-            facts.append(SubmittedReviewFact(str(review_id), author, _REVIEW_STATES[state],
-                                             commit or None, submitted_at, body_review_command(row.get("body"))))
-        except ValueError:
-            return PartialReviews("a review entry was malformed")
-        if len(facts) > MAX_OBSERVED_REVIEWS:
-            return PartialReviews(f"more than {MAX_OBSERVED_REVIEWS} reviews exceed one bounded observation")
-    try:
-        # GitHub lists reviews chronologically; a stable sort only repairs
-        # equal-time or page-boundary ordering, never the identity set.
-        return CompleteReviews(tuple(sorted(facts, key=lambda fact: fact.submitted_at)))
-    except ValueError:
-        return PartialReviews("review pages repeated a review identity")
-
-
-def build_dismiss_review_args(repo: str, pr: int, review_id: str, message: str) -> list[str]:
-    if type(pr) is not int or pr <= 0 or not review_id.isdigit():
-        raise ValueError("a dismissal requires a positive pull request and a numeric review id")
-    return [
-        "api", "--method", "PUT",
-        f"repos/{repo}/pulls/{pr}/reviews/{quote(review_id, safe='')}/dismissals",
-        "-f", f"message={message}", "-f", "event=DISMISS",
-    ]
-
-
 def build_submit_review_args(
     repo: str,
     pr: int,
@@ -1102,20 +923,12 @@ class GitHubGateway:
         repo: str,
         identity: Identity | None = None,
         runner: Callable[[list[str], str | None], str] | None = None,
-        review_pr_label: str = "ai-pr-open",
-        review_adopt_unlabeled: bool = False,
         progress: Callable[[], None] | None = None,
     ):
         self.repo = repo
         self.identity = identity or Identity()
         self._run = runner or _subprocess_runner
         self._progress = progress
-        # PR label the review daemon selects on (see build_review_world). Default
-        # matches the harness pipeline; an external-repo reviewer passes "ai-review".
-        self.review_pr_label = review_pr_label
-        # When true, build_review_world ALSO fetches open PRs carrying no trigger
-        # label, so decide_bound_review can adopt rogue (non-pipeline) PRs into review.
-        self.review_adopt_unlabeled = review_adopt_unlabeled
 
     def _gh(self, args: list[str]) -> str:
         # Guard EVERY call, not just the _gh_json ones: a list subcommand read as
@@ -1137,101 +950,6 @@ class GitHubGateway:
              "number,title,body,labels,comments,updatedAt,author,state,stateReason"]
         )
         return parse_issue(d)  # type: ignore[arg-type]
-
-    def get_review_linked_issue(self, number: int) -> IssueView:
-        """Review authority cannot use the legacy parser's absent-field defaults."""
-        raw = self._gh_json([
-            "issue", "view", str(number), "--repo", self.repo, "--json",
-            "number,title,body,labels,comments,updatedAt,author,state,stateReason",
-        ])
-        if (not isinstance(raw, dict) or type(raw.get("number")) is not int or raw["number"] != number
-                or not isinstance(raw.get("state"), str) or raw["state"].lower() not in {"open", "closed"}
-                or not isinstance(raw.get("labels"), list)
-                or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
-                       or not label["name"] for label in raw["labels"])):
-            raise ValueError("linked issue lifecycle fields are incomplete or malformed")
-        return parse_issue(raw)
-
-    def open_blockers(self, number: int) -> tuple[int, ...]:
-        """Open GitHub-native ``blocked by`` issue numbers for ``number``.
-
-        dependency. Two-step, cheapest-first: the issue object embeds an
-        `issue_dependencies_summary` (no extra call) whose `blocked_by` is 0 when
-        nothing is declared → return False immediately (the common case). Only if
-        it's non-zero do we fetch the blocked_by LIST and check each blocker's
-        state — because the summary count may include already-CLOSED blockers, and
-        a closed blocker no longer blocks. Fail-soft: any API error → False (never
-        strand a dispatchable issue on a transient dependency-read failure)."""
-        try:
-            summary = self._gh_json(
-                ["api", f"repos/{self.repo}/issues/{number}",
-                 "--jq", ".issue_dependencies_summary.blocked_by // 0"]
-            )
-            if not summary or int(summary) == 0:  # type: ignore[arg-type]
-                return ()
-            blockers = self._gh_json(
-                ["api", f"repos/{self.repo}/issues/{number}/dependencies/blocked_by",
-                 "--jq", "[.[] | select((.state | ascii_downcase) == \"open\") | .number]"]
-            ) or []
-            return tuple(
-                int(value)
-                for value in blockers  # type: ignore[union-attr]
-                if isinstance(value, int) and not isinstance(value, bool)
-            )
-        except GhUnavailable:
-            # Fail-soft covers a genuine API ANSWER (endpoint absent, 404, odd
-            # shape). An infra failure answered nothing, and "False" here is not
-            # neutral — it says "not blocked", which DISPATCHES an issue that may
-            # well be blocked. Propagate: skipping the tick is the cheap mistake.
-            raise
-        except Exception:
-            return ()
-
-    def has_open_blocker(self, number: int) -> bool:
-        """Compatibility predicate over the structured blocker query."""
-        return bool(self.open_blockers(number))
-
-    def review_issue_blockers(self, number: int) -> tuple[int, ...]:
-        """Complete dependency evidence for review authority; failure is never clear.
-
-        The legacy summary shortcut defaults malformed answers to zero. Review
-        admission instead needs the paginated dependency rows, including closed
-        rows, so only a complete successful read can prove there is no hold.
-        """
-        pages = self._gh_json([
-            "api", "--paginate", "--slurp",
-            f"repos/{self.repo}/issues/{number}/dependencies/blocked_by?per_page=100",
-        ])
-        if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
-            raise ValueError("complete linked issue dependency pages are unavailable")
-        blockers: set[int] = set()
-        for page in pages:
-            for row in page:
-                if (not isinstance(row, dict) or type(row.get("number")) is not int
-                        or not 0 < row["number"] < 2**63 or row.get("state") not in {"open", "closed"}):
-                    raise ValueError("linked issue dependency row is malformed")
-                if row["state"] == "open":
-                    blockers.add(row["number"])
-        return tuple(sorted(blockers))
-
-    def get_review_pull_request(self, number: int) -> PRView:
-        """Complete hold/linkage facts before constructing a review observation."""
-        raw = self._gh_json([
-            "pr", "view", str(number), "--repo", self.repo, "--json",
-            "number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,labels,"
-            "comments,reviews,state,closingIssuesReferences,files,isDraft,author",
-        ])
-        if (not isinstance(raw, dict) or type(raw.get("number")) is not int or raw["number"] != number
-                or not isinstance(raw.get("state"), str) or raw["state"].upper() not in {"OPEN", "CLOSED", "MERGED"}
-                or not isinstance(raw.get("headRefName"), str) or not raw["headRefName"]
-                or not isinstance(raw.get("closingIssuesReferences"), list)
-                or any(not isinstance(issue, dict) or type(issue.get("number")) is not int
-                       or not 0 < issue["number"] < 2**63 for issue in raw["closingIssuesReferences"])
-                or not isinstance(raw.get("labels"), list)
-                or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
-                       or not label["name"] for label in raw["labels"])):
-            raise ValueError("review pull request lifecycle/linkage fields are incomplete or malformed")
-        return replace(parse_pr(raw), ci=Unavailable("checks not requested"))
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
@@ -1349,94 +1067,6 @@ class GitHubGateway:
             ),
         ]
 
-    def _safe_get_pr(
-        self, number: int, *, mergeability: bool = True, checks: bool = True
-    ) -> PRView | None:
-        """`get_pr` that isolates a single PR's failure. A hung/empty `gh pr view`
-        (→ parse_pr(None) → AttributeError) or any transient read error must NOT
-        abort the whole world-build: previously one such PR raised out of the
-        generator in build_*_world, killing the entire poll pass so EVERY later PR
-        (sorted after it) went unseen — a just-merged PR whose mergeable field hung
-        stranded newer PRs from review. Here a failed PR drops to None (logged) and
-        the poll re-derives it next tick.
-
-        The ONE thing it must not isolate is a systemic `GhUnavailable`: a rate
-        limit or a 5xx fails every subsequent PR fetch identically, so per-item
-        degradation would silently rebuild the exact empty world V10 is about.
-        Those propagate and the tick is skipped. A `timed_out` GhUnavailable is
-        the opposite — it is this ONE PR wedging the socket (the incident above,
-        which recurs every poll while the PR exists), so it stays isolated."""
-        try:
-            return self.get_pr(number, mergeability=mergeability, checks=checks)
-        except GhUnavailable as exc:
-            if not exc.timed_out:
-                raise
-            self._skip_item("PR", number, exc)
-            return None
-        except Exception as exc:  # noqa: BLE001 — deliberately broad: one PR ≠ whole pass
-            self._skip_item("PR", number, exc)
-            return None
-
-    def _safe_get_issue(self, number: int, *, blocker_gate: bool = False) -> IssueView | None:
-        """`get_issue` that isolates a single ISSUE's failure — the exact twin of
-        `_safe_get_pr` above, and for the exact same recorded incident on the other
-        item type (review M19). `parse_issue({})` raises KeyError and
-        `parse_issue(None)` AttributeError, so ONE unreadable issue (transferred to
-        another repo, converted to a discussion, locked, or simply a `gh issue view`
-        that returns empty) raised straight out of the world-build generator and
-        killed the whole fix/steward/triage poll — every tick, permanently, because
-        the bad issue is still there next tick. Here it drops to None (logged) and
-        every OTHER issue still reaches the domain.
-
-        Same one exception as the PR twin: a non-`timed_out` `GhUnavailable`
-        (rate limit, 5xx) fails every subsequent fetch identically, so isolating it
-        would silently rebuild the empty world V10 is about — those propagate and
-        the tick is skipped.
-
-        `blocker_gate` folds the ai-ready dependency read into the SAME isolation
-        boundary: a `gh api …/dependencies/blocked_by` that wedges on one issue is
-        that issue's problem, and dropping the issue for a tick is strictly safer
-        than either dispatching it ungated or killing the poll."""
-        try:
-            issue = self.get_issue(number)
-        except GhUnavailable as exc:
-            if not exc.timed_out:
-                raise
-            self._skip_item("issue", number, exc)
-            return None
-        except Exception as exc:  # noqa: BLE001 — deliberately broad: one issue ≠ whole pass
-            self._skip_item("issue", number, exc)
-            return None
-        if not blocker_gate:
-            return issue
-        try:
-            blockers = self.open_blockers(number)
-        except GhUnavailable as exc:
-            if not exc.timed_out:
-                raise
-            # Fail CLOSED, not dropped: dropping the issue used to be the safe
-            # direction when only pick_ready_issue consumed the flag, but the
-            # PR repair arm fails OPEN for an issue the world does not carry
-            # (adversarial review F1, 2026-08-03 — one wedged blocked_by read
-            # would have dispatched FIX_CI straight into the wedge the blocker
-            # tracks). An issue marked blocked with no witnesses holds both
-            # stages and reports "waiting on an open dependency"; the next
-            # clean tick re-derives the truth.
-            self._skip_item("issue-blockers", number, exc)
-            return replace(
-                issue, blocked_by_open=True, open_blocker_numbers=()
-            )
-        except Exception as exc:  # noqa: BLE001 — same boundary as above
-            self._skip_item("issue-blockers", number, exc)
-            return replace(
-                issue, blocked_by_open=True, open_blocker_numbers=()
-            )
-        return replace(
-            issue,
-            blocked_by_open=bool(blockers),
-            open_blocker_numbers=blockers,
-        )
-
     @staticmethod
     def _skip_item(kind: str, number: int, exc: BaseException) -> None:
         import sys
@@ -1444,111 +1074,6 @@ class GitHubGateway:
             f"skip {kind} #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
             "— re-derived next tick\n"
         )
-
-    def _pr_for_world(
-        self, row: dict, label: str, *, mergeability: bool = True
-    ) -> PRView | None:
-        """One PR for a world build: the list payload when that is provably
-        enough (`parse_terminal_pr`), a `gh pr view` otherwise.
-
-        `mergeability` is the OPEN-slice knob the review build turns off; a
-        terminal PR never asks for it either way."""
-        terminal = parse_terminal_pr(row, label=label)
-        if terminal is not None:
-            return terminal
-        number = int(row["number"])
-        is_open = str(row.get("state", "")).upper() == "OPEN"
-        return self._safe_get_pr(
-            number,
-            mergeability=mergeability and is_open,
-            checks=is_open,
-        )
-
-    def list_pr_states(self, label: str, state: str = "open") -> list[tuple[int, str]]:
-        """(number, state) pairs, so world builders can pick per-PR enrichment
-        depth BEFORE fetching. The `--state all` label list serves STALE search
-        results for closed PRs (merged PRs unlabeled a full day earlier still
-        listed, observed 2026-07-27), so the list's membership cannot be
-        trusted to mean "needs full enrichment" — but its `state` field is the
-        PR object's own, and a MERGED/CLOSED PR needs neither `mergeable`
-        (a hang-class lazy computation) nor a `gh pr checks` call. Nine stale
-        merged PRs were costing ~18 wasted gh calls per fix tick, growing with
-        every merge."""
-        return [
-            (int(row["number"]), str(row.get("state", "")))
-            for row in self.list_pr_rows(label, state)
-        ]
-
-    def list_pr_rows(self, label: str, state: str = "open") -> list[dict]:
-        """The same labelled list, carrying every field a TERMINAL PRView needs.
-
-        Costs what `--json number,state` costs: a labelled list is two GraphQL
-        requests (a SearchType introspection plus the search itself) whatever the
-        selection set, measured against the live repo on 2026-08-09. That is the
-        whole lever behind #163 — the stale merged tail (19 PRs on the flagship
-        target) was paying a `gh pr view` EACH, in both the fix and the review
-        build, for facts this payload already carries.
-
-        Connection-shaped fields (comments, reviews, files) are deliberately NOT
-        requested: they are the ones whose cost scales with page size, and no
-        lifecycle decision reads them off a non-OPEN PR (audit in the #163
-        commit)."""
-        data = self._gh_json(
-            ["pr", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", _PR_LIST_FIELDS,
-             "--limit", str(_LIST_LIMIT)]
-        ) or []
-        _warn_if_list_truncated(f"gh pr list --label {label} --state {state}", len(data))
-        rows = [r for r in data if isinstance(r, dict) and "number" in r]
-        if len(rows) != len(data):
-            # A dropped row is a PR the world will not carry — "could not look"
-            # must never be silently equal to "nothing to do".
-            import sys
-            sys.stderr.write(
-                f"gh pr list --label {label} --state {state}: "
-                f"{len(data) - len(rows)} unusable row(s) dropped — those PRs "
-                "are absent from this world\n"
-            )
-        return rows
-
-    def list_all_open_pr_numbers(self) -> list[int]:
-        """Every OPEN PR number, no label filter — feeds rogue-PR adoption."""
-        data = self._gh_json(
-            ["pr", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number", "--limit", str(_LIST_LIMIT)]
-        ) or []
-        _warn_if_list_truncated("gh pr list --state open", len(data))
-        return [int(p["number"]) for p in data]
-
-    def open_closing_refs(self) -> tuple[ClosingRef, ...]:
-        """Every OPEN PR's closing-issue references, repo-wide (#39).
-
-        ONE `gh pr list` per full fix world build — no label filter and no
-        per-PR fetch, because the guard's whole subject is PRs the harness never
-        labelled (an operator's own branch, a contributor's PR). Widening the
-        EXISTING per-PR enrichment to all open PRs would have cost two calls per
-        PR per poll and, worse, would have changed what `world.prs` means for the
-        path-overlap hold, the reaper and auto-merge — a large behavioural blast
-        radius for one boolean. This carries only the four fields the guard
-        reads.
-
-        Fail-soft to `()`: a guard that refuses work must never be the thing
-        that crashes a poll, and an empty result reads as "no duplicate known",
-        which is the pre-#39 behaviour. `GhUnavailable` still propagates — it is
-        raised inside `_gh_json` and means the whole world is unreadable, which
-        is `Daemon.tick`'s call, not this method's."""
-        try:
-            data = self._gh_json(
-                ["pr", "list", "--repo", self.repo, "--state", "open",
-                 "--json", "number,author,closingIssuesReferences,baseRefName",
-                 "--limit", str(_LIST_LIMIT)]
-            ) or []
-        except GhUnavailable:
-            raise
-        except Exception:  # noqa: BLE001 — see the docstring
-            return ()
-        _warn_if_list_truncated("gh pr list --state open (closing refs)", len(data))  # type: ignore[arg-type]
-        return parse_closing_refs(data)
 
     def _graphql(self, query: str, **variables: str) -> dict:
         """One query; `variables` must be exactly the ones it declares (GitHub
@@ -1593,7 +1118,7 @@ class GitHubGateway:
             return None
         return nodes
 
-    def build_fix_world(self, base: str) -> WorldState:
+    def build_world(self, base: str) -> WorldState:
         """The fix role's observation: open `ai-ready`/`needs-human` issues,
         open harness PRs (`fix/<issue>-`) with head, mergeability, required
         checks, reviews, comments, every changed file and the head push, and
@@ -1670,95 +1195,12 @@ class GitHubGateway:
         self._gh(["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
                   "--title", title, "--body", body])
 
-    def build_review_world(self) -> WorldState:
-        """The review daemon's slice: ONLY PRs carrying `self.review_pr_label` (open
-        + all, the latter for merged/closed session cleanup). No issues — the reviewer
-        never reads them. Used instead of `build_world` so the reviewer can be pointed
-        at an EXTERNAL repo (which has none of the harness's issue labels) and trigger
-        on a configurable PR tag. `gh pr list --label <missing>` returns [] (exit 0),
-        so an absent label degrades to "nothing to review" rather than crashing."""
-        pr_rows: dict[int, dict] = {}
-        for state in ("open", "all"):
-            for row in self.list_pr_rows(self.review_pr_label, state):
-                pr_rows.setdefault(int(row["number"]), row)
-        # Rogue-PR adoption: also pull EVERY open PR (no label filter) so a PR that
-        # never went through the pipeline (opened directly, no trigger label) is
-        # visible to decide_bound_review, which labels+adopts it. Draft/own-bot/opt-out
-        # filtering is the domain's job (it has the PRView fields); the adapter just
-        # widens the slice. Merged/closed still come only via the label (no need to
-        # adopt a closed rogue PR).
-        if self.review_adopt_unlabeled:
-            for n in self.list_all_open_pr_numbers():
-                pr_rows.setdefault(n, {"number": n, "state": "OPEN"})
-        # mergeability=False: the reviewer never reads mergeable/merge_state (only the
-        # fixer's rebase logic does), and requesting them can hang gh indefinitely on a
-        # just-merged PR — which previously froze the whole review poll. Fetch without
-        # them so a comment can always be left. Non-OPEN PRs (the stale --state all
-        # tail, see list_pr_states) also skip the checks call — session cleanup
-        # reads only number/state/labels — and the UNLABELLED half of that tail
-        # skips the `gh pr view` entirely, built from the list payload (#163).
-        prs = tuple(
-            p for n in sorted(pr_rows)
-            if (p := self._pr_for_world(
-                pr_rows[n], self.review_pr_label, mergeability=False
-            )) is not None
-        )
-        return WorldState(issues=(), prs=prs, now=build_time())
-
-
-    def pr_for_issue(self, issue: int, *, require_unique: bool = False) -> int | None:
-        """Open PR whose head branch identifies this issue under domain policy.
-        Port of agent/lib.sh:pr_for_issue (closing-ref graph is default-branch only)."""
-        data = self._gh_json(
-            ["pr", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number,headRefName,closingIssuesReferences" if require_unique else "number,headRefName",
-             "--limit", str(_LIST_LIMIT)]
-        )
-        if not require_unique:
-            data = data or []
-        if not isinstance(data, list):
-            raise ValueError("open PR linkage is unavailable")
-        _warn_if_list_truncated("gh pr list --state open (pr_for_issue)", len(data))
-        from ..domain.refs import issue_from_branch
-
-        if require_unique:
-            from ..domain.workflow_identity import validate_workflow_integer, validate_workflow_text
-            if len(data) >= _LIST_LIMIT:
-                raise ValueError("CI reset requires complete open PR linkage")
-            matches: set[int] = set()
-            for p in data:
-                if (not isinstance(p, dict) or not isinstance(p.get("number"), int)
-                        or not isinstance(p.get("headRefName"), str)
-                        or not isinstance(p.get("closingIssuesReferences"), list)):
-                    raise ValueError("CI reset open PR linkage is malformed")
-                validate_workflow_integer(p["number"], "CI reset pull request number", minimum=1)
-                validate_workflow_text(p["headRefName"], "CI reset branch")
-                refs = p["closingIssuesReferences"]
-                if any(not isinstance(ref, dict) or not isinstance(ref.get("number"), int) for ref in refs):
-                    raise ValueError("CI reset open PR linkage is malformed")
-                for ref in refs:
-                    validate_workflow_integer(ref["number"], "CI reset closing issue number", minimum=1)
-                if issue_from_branch(p["headRefName"]) == issue or any(ref["number"] == issue for ref in refs):
-                    matches.add(p["number"])
-            if len(matches) > 1:
-                raise ValueError("CI reset open PR linkage is ambiguous")
-            return next(iter(matches), None)
-        for p in data:
-            if issue_from_branch(p.get("headRefName", "")) == issue:
-                return int(p["number"])
-        return None
-
-    def issue_for_pr(self, pr: int) -> int | None:
-        p = self.get_pr(pr)
-        if p.closing_issue is not None:
-            return p.closing_issue
-        from ..domain.refs import issue_from_branch
-
-        return issue_from_branch(p.head_ref_name)
-
     def pr_diff(
         self, pr: int, base_oid: str, head_oid: str
     ) -> PullRequestDiff:
+        """base...head as GitHub compares it. Empty text is GitHub's answer
+        (no change between the commits, or a compare it refused); an outage
+        raises `GhUnavailable`. The review role refuses to review an empty diff."""
         if not base_oid or not head_oid:
             raise ValueError("pull-request diff revisions are required")
         text = self._gh(
@@ -1769,8 +1211,6 @@ class GitHubGateway:
                 f"repos/{self.repo}/compare/{base_oid}...{head_oid}",
             ]
         )
-        if not text.strip():
-            raise RuntimeError("immutable pull-request diff is unavailable")
         return PullRequestDiff(base_oid, head_oid, text)
 
     # ── prompt inputs for the two repair legs (review M13 / D6) ──
@@ -1802,100 +1242,6 @@ class GitHubGateway:
                 return None
             attempts[run_id] = attempt
         return attempts
-
-    def workflow_run_states(
-        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
-    ) -> dict[int, str] | None:
-        """Lifecycle status per workflow run, after SHA verification.
-
-        `queued`/`in_progress`/`requested`/`waiting`/`pending` = still running;
-        `completed` = down. None means the observation is not trustworthy —
-        unknown id, malformed answer, or (the guard this exists for) a run whose
-        `head_sha` is NOT the commit the decision was made about, which is how a
-        push landing mid-tick is prevented from having its fresh run cancelled.
-        """
-
-        if not head or not run_ids or any(run_id <= 0 for run_id in run_ids):
-            return None
-        states: dict[int, str] = {}
-        for run_id in dict.fromkeys(run_ids):
-            raw = self._gh_json(
-                ["api", f"repos/{self.repo}/actions/runs/{run_id}"]
-            )
-            if (
-                not isinstance(raw, dict)
-                or int(raw.get("id") or 0) != run_id
-                or str(raw.get("head_sha") or "") not in ((head,) if isinstance(head, str) else head)
-            ):
-                return None
-            status = str(raw.get("status") or "").strip().lower()
-            if not status:
-                return None
-            states[run_id] = status
-        return states
-
-    def cancel_workflow_runs(
-        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
-    ) -> tuple[int, ...] | None:
-        """Cancel the still-running workflow runs among `run_ids`.
-
-        GitHub refuses `rerun-failed-jobs` while a run is `in_progress` (403
-        "already running"), so a wedged run must come down before the harness's
-        re-run can do anything at all (keifu PR #177).
-
-        Every run is re-read and SHA-verified first: a cancel is a destructive
-        act on someone's CI, and cancelling a run belonging to a NEWER head would
-        destroy work the decision never looked at. A mismatch aborts the whole
-        cancel (None) rather than cancelling the subset that matched — a partial
-        cancel leaves the real pin in place while reading as handled.
-
-        An already-`completed` run is skipped, not re-cancelled: idempotent
-        replay of a durable command must not fail because GitHub got there first.
-        """
-
-        states = self.workflow_run_states(head, run_ids)
-        if states is None:
-            return None
-        cancelled: list[int] = []
-        for run_id, status in states.items():
-            if status == "completed":
-                continue
-            self._gh(
-                [
-                    "api",
-                    f"repos/{self.repo}/actions/runs/{run_id}/cancel",
-                    "--method",
-                    "POST",
-                ]
-            )
-            cancelled.append(run_id)
-        return tuple(cancelled)
-
-    def rerun_failed_checks(
-        self,
-        head: str | tuple[str, ...],
-        run_ids: tuple[int, ...],
-        expected_attempts: dict[int, int] | None = None,
-    ) -> tuple[int, ...] | None:
-        """Rerun the exact revision-bound workflow runs captured by observation."""
-
-        current = self.workflow_run_attempts(head, run_ids)
-        if current is None or (
-            expected_attempts is not None and current != expected_attempts
-        ):
-            return None
-        completed: list[int] = []
-        for run_id in dict.fromkeys(run_ids):
-            self._gh(
-                [
-                    "api",
-                    f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs",
-                    "--method",
-                    "POST",
-                ]
-            )
-            completed.append(run_id)
-        return tuple(completed)
 
     def failed_run_log(
         self, head: str, run_ids: tuple[int, ...], *, lines: int = _FAILED_LOG_LINES
@@ -1943,15 +1289,22 @@ class GitHubGateway:
             return ""
 
 
+    def viewer_login(self) -> str:
+        """The login this gateway's credential acts as, or "" when GitHub
+        refused to say. GraphQL `viewer`, not REST `/user`: an App installation
+        token answers it (as `slug[bot]`) and is refused by `/user`."""
+        return self._gh(
+            ["api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"]
+        ).strip()
+
     def submit_review(
         self, pr: int, event: str, body: str, head: str
     ) -> bool:
-        """POST a review. Returns True iff gh succeeded. A failed submit (e.g. 422
-        'can't approve your own PR' when the identity collides with the author, or a
-        403 from a misconfigured App) returns False so the caller does NOT record a
-        phantom 'reviewed' state — the daemon retries the same PR next poll. The
-        underlying gh failure is surfaced on stderr by `_subprocess_runner`. gh's
-        `api ... POST` prints the created-review JSON on success (non-empty)."""
+        """POST a review. True iff GitHub created it. False is GitHub's refusal
+        (a 4xx: 422 'can't approve your own PR', a 403 from a token without
+        pull-request write), which retrying cannot change; an outage raises
+        `GhUnavailable` instead. gh's `api ... POST` prints the created-review
+        JSON on success (non-empty)."""
         out = self._gh(
             build_submit_review_args(self.repo, pr, event, body, head)
         )
@@ -1997,84 +1350,27 @@ class GitHubGateway:
         ])
         return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 
-    def issue_closure(self, number: int) -> tuple[bool, str]:
-        """Strict close-effect readback; unlike recurrence reads, failures raise."""
-        data = self._gh_json(
-            [
-                "issue",
-                "view",
-                str(number),
-                "--repo",
-                self.repo,
-                "--json",
-                "state,stateReason",
-            ]
-        )
-        if not isinstance(data, dict):
-            return False, ""
-        return (
-            str(data.get("state") or "").upper() == "CLOSED",
-            str(data.get("stateReason") or "").lower(),
-        )
-
-    def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
-        """Whether a matching review exists; a read that did not answer raises.
-
-        Only a complete, list-shaped answer can say "absent": a refused read
-        (403/404, which `_gh` returns as "") or a malformed one used to answer
-        False, which reconciliation took as proof and re-submitted the review.
-        """
-        state = {
-            "APPROVE": "APPROVED",
-            "REQUEST_CHANGES": "CHANGES_REQUESTED",
-            "COMMENT": "COMMENTED",
-        }.get(event.upper(), event.upper())
-        data = self._gh_json(
-            [
-                "api",
-                f"repos/{self.repo}/pulls/{pr}/reviews",
-                "--paginate",
-                "--slurp",
-            ]
-        )
+    def reviewed_on(self, pr: int, head: str, login: str) -> bool:
+        """Whether `login` has a standing verdict (APPROVED or CHANGES_REQUESTED)
+        on commit `head`, read across every page. A read that did not answer
+        completely raises: "absent" is only ever said by a complete read, since
+        the review role submits on that answer."""
+        data = self._gh_json(["api", f"repos/{self.repo}/pulls/{pr}/reviews?per_page=100", "--paginate", "--slurp"])
         if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
-            raise ReviewReadUnavailable(f"review read refused: pull request {pr} reviews were not answered completely")
-        reviews = [item for page in data for item in page]
+            raise RuntimeError(f"pull request {pr} reviews were not answered completely")
         return any(
-            isinstance(item, dict)
-            and str(item.get("state") or "").upper() == state
-            and item.get("body") == body
+            isinstance(item, dict) and isinstance(item.get("user"), dict)
+            and login_eq(str(item["user"].get("login") or ""), login)
             and item.get("commit_id") == head
-            for item in reviews
+            and str(item.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED")
+            for page in data for item in page
         )
 
-    def pull_request_reviews(self, pr: int) -> CompleteReviews | PartialReviews:
-        """Every submitted review of `pr` across all pages, or a partial read.
+    def comment(self, kind: str, number: int, body: str) -> None:
+        self._gh(build_comment_args(self.repo, kind, number, body))
 
-        Any failed page, infra or not, is partial: "no reviews" and "could not
-        read every review" must never be the same answer.
-        """
-        try:
-            pages = self._gh_json([
-                "api", "--paginate", "--slurp",
-                f"repos/{self.repo}/pulls/{pr}/reviews?per_page=100",
-            ])
-        except GhUnavailable as exc:
-            return PartialReviews(f"review read failed: {exc.headline}")
-        except ValueError:
-            return PartialReviews("review pages were not valid JSON")
-        return parse_review_pages(pages)
-
-    def dismiss_review(self, pr: int, review_id: str, message: str) -> bool:
-        """Dismiss one review as this gateway's identity; never another credential.
-
-        True means GitHub accepted the request. False is GitHub's answer
-        refusing it (403 permission, 422 protection or state, 404): a verified
-        refusal the executor reports, never a reason to retry as someone else.
-        Infra failures raise `GhUnavailable`, an unknown outcome.
-        """
-        out = self._gh(build_dismiss_review_args(self.repo, pr, review_id, message))
-        return bool(out.strip())
+    def close_issue(self, number: int, reason: str, comment: str) -> None:
+        self._gh(build_close_issue_args(self.repo, number, reason, comment))
 
     def is_expected_head_merged(
         self, pr: int, expected_head: str
@@ -2167,13 +1463,6 @@ class GitHubGateway:
             and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
             and self.disable_auto_merge(pr, current_head)
         )
-
-
-    def comment(self, kind: str, number: int, body: str) -> None:
-        self._gh(build_comment_args(self.repo, kind, number, body))
-
-    def close_issue(self, number: int, reason: str, comment: str) -> None:
-        self._gh(build_close_issue_args(self.repo, number, reason, comment))
 
     def enable_auto_merge(
         self, pr: int, method: str, expected_head: str

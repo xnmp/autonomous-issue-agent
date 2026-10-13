@@ -134,6 +134,21 @@ def test_active_family_refuses_even_when_the_target_workflow_is_absent(control) 
             pytest.fail("active family admitted a legacy mutation")
 
 
+@pytest.mark.parametrize("family", ["review_rejections", "review_execution"])
+def test_a_retained_review_family_epoch_no_longer_retires_the_legacy_unblock(control, family) -> None:
+    """Slice 5c deleted the review families; their retained epochs are inert,
+    so they cannot strand an operator with no unblock and no typed command."""
+    with control.transaction() as db:
+        db.execute(
+            "INSERT INTO workflow_authority_epochs VALUES "
+            "(?, ?, 1, 'source', 'inventory', '2026-09-23T00:00:00+00:00')",
+            (REPOSITORY, family),
+        )
+
+    with control.legacy_resolve_authority(REPOSITORY):
+        pass
+
+
 def test_active_family_with_a_target_workflow_refuses_legacy_authority(control) -> None:
     install_workflow(control, resolve_snapshot())
 

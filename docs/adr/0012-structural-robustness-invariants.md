@@ -1,7 +1,7 @@
 # ADR 0012 — Structural robustness invariants (post-voyage)
 
 Status: Accepted
-Governs: src/issue_agent/domain/effect_retry.py src/issue_agent/app/cli.py
+Governs: src/issue_agent/app/cli.py
 
 Decided 2026-08-01.
 Evidence: the 2026-08-01 supervised keifu run (nine live defects; see

@@ -36,6 +36,7 @@ from ..domain.events import (
     TelemetryEvent,
     TickGated,
 )
+from ..domain.ports import EventSink
 from ..domain.recovery import RecoveryTrigger
 from ..domain.supervision import (
     ClockSample,
@@ -109,7 +110,7 @@ class Daemon:
     log: Callable[[str], None] = _ignore_log
     # Optional typed telemetry sink. When set, skipped ticks become countable
     # events rather than lines in a log nobody retained.
-    journal: object | None = None
+    journal: EventSink | None = None
     # Optional pre-observe gate (app.spend_gate). Returning a reason string
     # means "this whole tick is pointless" — checked BEFORE observe so a
     # level-triggered halt costs no GraphQL quota and writes no labels (#27).

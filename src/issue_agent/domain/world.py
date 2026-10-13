@@ -15,7 +15,6 @@ from enum import Enum
 
 from .identity import is_bot_login
 from .labels import Label
-from .refs import issue_from_branch
 from .checks import Check, CIObservation, Observed, Unavailable
 
 
@@ -211,17 +210,6 @@ class PRView:
         return self.merge_state.upper() == "BEHIND" and not self.is_conflicting()
 
 
-def issue_for_pr(pr: PRView) -> int | None:
-    """THE PR→issue linkage rule: prefer GitHub's closing-reference, fall back
-    to the branch number. `closing_issue` is default-branch-only (failure
-    modes #34/#35) — a consumer keying on it alone silently no-ops on any repo
-    whose working base is not the default branch (the self-hosting repo:
-    default main, base dev). Every linkage consumer must go through here."""
-    if pr.closing_issue is not None:
-        return pr.closing_issue
-    return issue_from_branch(pr.head_ref_name)
-
-
 @dataclass(frozen=True)
 class PullRequestDiff:
     """Immutable review evidence for one exact base/head pair."""
@@ -343,10 +331,6 @@ class WorldState:
 
     def issues_with(self, label: Label) -> tuple[IssueView, ...]:
         return tuple(i for i in self.issues if i.has(label))
-
-    def prs_with(self, label: Label) -> tuple[PRView, ...]:
-        return tuple(p for p in self.prs if p.has(label))
-
 
 # Convenience re-export so callers can `from .world import replace`.
 __all__ = [

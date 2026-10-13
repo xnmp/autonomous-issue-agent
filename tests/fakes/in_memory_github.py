@@ -4,7 +4,6 @@ from dataclasses import replace
 
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.domain.labels import Label
-from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.world import Comment, IssueView, PRView, PullRequestDiff
 
 
@@ -15,7 +14,6 @@ class InMemoryGitHub:
         self,
         issues: tuple[IssueView, ...] | dict[int, IssueView] | None = None,
         prs: dict[int, PRView] | None = None,
-        pr_for_issue: dict[int, int] | None = None,
         submit_ok: bool = True,
         fail_on: set[str] | None = None,
     ):
@@ -29,8 +27,6 @@ class InMemoryGitHub:
         self._prs = self.prs
         self.comments: dict[tuple[str, int], list[str]] = {}
         self.loose_labels: dict[tuple[str, int], set[str]] = {}
-        self.pr_issues: dict[int, int] = {}
-        self._pr_for_issue = dict(pr_for_issue or {})
         self.calls: list[tuple] = []
         self.submit_ok = submit_ok
         self.fail_on = set(fail_on or ())
@@ -63,25 +59,6 @@ class InMemoryGitHub:
             head_ref_oid=pr.head_ref_oid or "head-sha",
             base_ref_oid=pr.base_ref_oid or "base-sha",
         )
-
-    def pr_for_issue(self, issue: int, *, require_unique: bool = False) -> int | None:
-        self._maybe_fail("pr_for_issue")
-        if require_unique:
-            from issue_agent.domain.world import issue_for_pr
-            matches = {pr.number for pr in self.prs.values() if pr.state == "OPEN" and issue_for_pr(pr) == issue}
-            if len(matches) > 1:
-                raise ValueError("CI reset open PR linkage is ambiguous")
-            return next(iter(matches), None)
-        return self._pr_for_issue.get(issue)
-
-    def issue_for_pr(self, pr: int) -> int | None:
-        self._maybe_fail("issue_for_pr")
-        if pr in self.pr_issues:
-            return self.pr_issues[pr]
-        view = self.prs.get(pr)
-        if view is None:
-            return None
-        return view.closing_issue or issue_from_branch(view.head_ref_name)
 
     def pr_diff(
         self, pr: int, base_oid: str, head_oid: str

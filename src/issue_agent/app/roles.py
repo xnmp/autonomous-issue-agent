@@ -1,14 +1,12 @@
 """Assemble the two role daemons from config + adapters.
 
-Each `build_*_daemon` binds:
-  * observe  → gateway.build_world (the GitHub slice the role needs),
-  * decide   → the bound pure decision function (decide_fix / decide_bound_review),
-  * executor → applies the leaf Actions; its `run_agent` drives the (async)
-               AgentDispatcher for RunAgent actions.
+Each `compose_*_daemon` binds the same tick (`tick.py`):
+  * observe  → `gateway.build_world` (one GraphQL observation),
+  * decide   → derive + policy, keeping the role's own Actions,
+  * executor → `adapters.act.GitHubAct`; `RunAgent` goes to the role's legs.
 
-The dispatcher is async (SDK query is a coroutine). Each paid fix leg owns a
-bounded background worker and event loop; observation and lifecycle writes
-remain on the daemon thread. Review keeps synchronous dispatch.
+Each paid leg owns a bounded background worker and event loop; observation
+and GitHub writes remain on the daemon thread.
 """
 
 from __future__ import annotations
@@ -17,56 +15,30 @@ import asyncio
 import hashlib
 import json
 import os
-import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from ..adapters.act import GitHubAct
 from ..adapters.agent_runner import AgentRunner
-from ..adapters.control_store import ControlStoreError, LegacySpendMigrationError, SQLiteControlStore
-from ..adapters.control_path import control_store_path
-from ..adapters.effects import GitHubEffectExecutor
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
+from ..adapters.control_path import control_store_path
+from ..adapters.control_store import ControlStoreError, LegacySpendMigrationError, SQLiteControlStore
 from ..adapters.github import GitHubGateway
-from ..adapters.journal import (
-    JournalingRuntime,
-    Journal,
-    default_ledger_path,
-)
-from ..adapters.store import Store
-from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
-from ..adapters.worktree import ReviewCheckouts, Worktrees
-from ..adapters.review_effects import ReviewReads
-from ..adapters.review_execution_control import SQLiteReviewExecutionControl
-from ..adapters.review_workflow_control import review_family_activated
-from ..adapters.workflow_rows import WorkflowAuthorityError
-
-from ..domain.fix import breaker_key
-from ..domain.state import Harness
-from ..domain.review_dispatch_record import (
-    AdmissionInFlight, AdmissionOutcome, AdmissionWithheld, WithheldReason,
-)
-from ..domain.labels import Label
-from ..domain.workflow_identity import WorkflowWriter
-from ..domain.review import (
-    BoundReviewState,
-    FixHold,
-    IdentityMode,
-    ReviewConfig,
-    decide_bound_review,
-    fix_hold_ceiling_seconds,
-    hold_review_dispatch,
-)
-from .planners.tasks import REVIEW_DIMENSIONS, FixTaskConfig, ReviewTaskConfig
-from ..domain.actions import Relabel, RunAgent, Target
+from ..adapters.journal import Journal, JournalingRuntime, default_ledger_path
 from ..adapters.runtime_plan import AgentRuntime
-from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
+from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
+from ..adapters.store import Store
+from ..adapters.worktree import ReviewCheckouts, Worktrees
+from ..domain.actions import RunAgent
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
+from ..domain.ports import CommandRecovery, SpendReconciler, StaleReservationReconciler
+from ..domain.recovery import RecoveryTrigger
 from ..domain.pricing import (
     BudgetPolicy,
     ModelRates,
@@ -77,12 +49,8 @@ from ..domain.pricing import (
     default_cache_read_rate,
     default_cache_write_rate,
 )
-from ..domain.recovery import RecoveryTrigger
-from ..domain.events import (
-    TelemetryEvent,
-    TelemetryWarning,
-)
-from ..domain.ports import CommandRecovery, SpendReconciler, StaleReservationReconciler
+from ..domain.state import Harness
+from ..domain.identity import login_eq
 from .config import (
     CodexRuntimeConfig,
     HarnessConfig,
@@ -92,19 +60,12 @@ from .config import (
     prior_deployment_identities,
     configured_prior_owner_ids,
 )
-from .dispatch import AgentDispatcher, DispatchConfig
-from .execute import Executor
-from .review_runtime import (
-    ActiveReviewRuntime,
-    ReviewDispatchPlan,
-    configured_review_control,
-    current_review_failures,
-)
-from ..adapters.act import GitHubAct
-from .fix import FixFacts, FixLegs, FixSettings, decide_with, dispatch_item, lease_slots
+from .fix import FixLegs, FixSettings, fix_choose
 from .loop import Daemon
+from .planners.tasks import FixTaskConfig, ReviewTaskConfig
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
-
+from .review import ReviewAct, ReviewLegs, ReviewSettings, review_choose
+from .tick import Facts, decide_with, dispatch_item, lease_slots
 
 def _spend_evidence_dirs(cfg: HarnessConfig) -> tuple[str, ...]:
     return tuple(
@@ -318,17 +279,7 @@ def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
     limits: dict[tuple[str, str], Money] = {}
     for kind in ("RESOLVE", "ADDRESS_REVIEW", "FIX_CI", "REBASE"):
         limits[("fix", kind)] = money(cfg.fix_budget_usd)
-    for kind in ("REVIEW", "RE_REVIEW"):
-        limits[("review", kind)] = money(cfg.review_budget_usd)
-    limits[("review", "REVIEW_GATE")] = money(cfg.review_gate_budget_usd)
-    for key, _focus in REVIEW_DIMENSIONS:
-        normalized = key.upper().replace("-", "_")
-        limits[("review", f"REVIEW_{normalized}")] = money(
-            cfg.review_dimension_budget_usd
-        )
-        limits[("review", f"VALIDATE_{normalized}")] = money(
-            cfg.review_validation_budget_usd
-        )
+    limits[("review", "REVIEW")] = money(cfg.review_budget_usd)
     return BudgetPolicy(limits)
 
 
@@ -379,42 +330,6 @@ def _rate_table(
         UnknownModelPolicy.USE_FALLBACK,
         fallback,
     )
-
-
-@dataclass(frozen=True)
-class EffectRecovery:
-    actions: GitHubEffectExecutor
-    reconcile_workflow: Callable[[], int] | None = None
-
-    def drain_pending_commands(self) -> int:
-        recovered = self.reconcile_workflow() if self.reconcile_workflow is not None else 0
-        return recovered + self.actions.drain_pending_commands()
-
-
-def _effects(
-    gateway: GitHubGateway,
-    control: SQLiteControlStore,
-    *,
-    repository: str,
-    identity: str,
-    config_version: str,
-    retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
-    journal: Journal | None = None,
-    alert_cmd: str = "",
-    log: Callable[[str], None] | None = None,
-) -> EffectRecovery:
-    executor = GitHubEffectExecutor(
-        gateway,
-        control,
-        repository=repository,
-        identity=identity,
-        config_version=config_version,
-        retry_ceiling=retry_ceiling,
-        journal=journal,
-        alert_cmd=alert_cmd,
-        log=log,
-    )
-    return EffectRecovery(executor)
 
 
 @dataclass(frozen=True)
@@ -626,68 +541,6 @@ class CancellableAsyncDispatch:
                 continue
 
 
-class DispatchReservations:
-    """Atomic issue leases shared across threads and deployments: one paid
-    dispatch per target (Q13 deleted the path-overlap holds)."""
-
-    def __init__(
-        self,
-        control: SQLiteControlStore | None = None,
-        *,
-        repository: str = "",
-        role: str = "",
-        owner_id: str = "",
-    ) -> None:
-        self._lock = threading.Lock()
-        self._actions: dict[RunAgent, int] = {}
-        self._control = control
-        self._repository = repository
-        self._role = role
-        self._owner_id = owner_id
-        if control is not None and (
-            not repository or not role or not owner_id
-        ):
-            raise ValueError(
-                "durable dispatch claims require repository, role, and owner"
-            )
-
-    def reserve(self, action: RunAgent, issue: int) -> bool:
-        with self._lock:
-            if issue in self._actions.values():
-                return False
-            if self._control is not None and not self._control.claim_dispatch(
-                self._repository,
-                self._role,
-                issue,
-                action.kind.name,
-                self._owner_id,
-            ):
-                return False
-            self._actions[action] = issue
-            return True
-
-    def finish(self, action: RunAgent) -> None:
-        with self._lock:
-            issue = self._actions.pop(action, None)
-            if issue is not None:
-                if self._control is not None:
-                    self._control.release_dispatch_claim(
-                        self._repository,
-                        self._role,
-                        issue,
-                        self._owner_id,
-                    )
-
-    def issue_for(self, action: RunAgent) -> int | None:
-        with self._lock:
-            return self._actions.get(action)
-
-    def running(self, number: int) -> bool:
-        """Whether a dispatch this process reserved for target number `number` still holds its reservation."""
-        with self._lock:
-            return any(action.number == number for action in self._actions)
-
-
 def _log(name: str):
     import sys
 
@@ -698,32 +551,10 @@ def _log(name: str):
     return log
 
 
-def _onoff(enabled: bool) -> str:
-    return "on" if enabled else "off"
-
-
-def review_capability_line(*, can_approve: bool, adopt_unlabeled: bool) -> str:
-    """One boot line for the reviewer. `approve=off` is solo identity mode: the
-    reviewer still reviews and comments, but the verdict never becomes a GitHub
-    approval, so nothing it does can merge anything."""
-    return (
-        "review: capabilities: review=on "
-        f"approve={_onoff(can_approve)} adopt_unlabeled={_onoff(adopt_unlabeled)}"
-    )
-
-
 def _journal(store: Store) -> Journal:
     """The role's plain JSONL journal, beside its other local state."""
 
     return Journal(os.path.join(store.state_dir, "journal.jsonl"))
-
-
-def _spend_cfg(cfg: HarnessConfig, role: str) -> dict:
-    """Paid-run attribution; SQLite owns all admission decisions."""
-    return {
-        "role": role,
-        "repo": cfg.repo,
-    }
 
 
 def _control_spend_gate(
@@ -945,14 +776,7 @@ if frozenset(_FIX_RUNTIME_REGISTRY) != frozenset(RuntimeName):
 @dataclass(frozen=True)
 class _ReviewRuntimeBinding:
     runner: AgentRuntime
-    execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
-    runtime_preflight: Callable[[], str | None] | None = None
-
-
-def _claude_review_runtime_preflight() -> None:
-    """Claude has no local static preflight; changing runtimes resolves a prior Codex setup hold."""
-    return None
 
 
 def _bind_claude_review_runtime(
@@ -962,14 +786,7 @@ def _bind_claude_review_runtime(
 ) -> _ReviewRuntimeBinding:
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
 
-    # execution_cwd is what arms the pinned per-PR review checkout (roles
-    # builds ReviewCheckouts off it) — without it Claude review legs read
-    # whatever the operator's live checkout happens to contain (0d2e295 M1).
-    return _ReviewRuntimeBinding(
-        RepositoryGuidanceRuntime(runner, log=_log("review")),
-        execution_cwd=cfg.target_dir,
-        runtime_preflight=_claude_review_runtime_preflight,
-    )
+    return _ReviewRuntimeBinding(RepositoryGuidanceRuntime(runner, log=_log("review")))
 
 
 def _bind_codex_review_runtime(
@@ -996,27 +813,12 @@ def _bind_codex_review_runtime(
         if reason is not None
         else "codex: runtime ready (bin + key present)"
     )
-    execution_cwd = cfg.target_dir
-    if not execution_cwd:
-        log(
-            "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
-            "TARGET_DIR so its read-only leg has an explicit checkout"
-        )
-        return _ReviewRuntimeBinding(
-            runner,
-            runtime_preflight=lambda: "REVIEWER_RUNTIME=codex requires TARGET_DIR",
-        )
     prepare_cwd = partial(
         write_codex_home,
         state_dir=cfg.review_state_dir,
         auth_file=runner.oauth_auth_file(),
     )
-    return _ReviewRuntimeBinding(
-        CodexHomeRuntime(runner, prepare_cwd),
-        execution_cwd,
-        prepare_cwd,
-        runner.preflight,
-    )
+    return _ReviewRuntimeBinding(CodexHomeRuntime(runner, prepare_cwd), prepare_cwd)
 
 
 _REVIEW_RUNTIME_REGISTRY: Mapping[
@@ -1038,17 +840,20 @@ if frozenset(_REVIEW_RUNTIME_REGISTRY) != _SUPPORTED_REVIEW_RUNTIMES:
 
 
 def _lifetime_capped(cfg: HarnessConfig, control: SQLiteControlStore) -> Callable[[int], bool]:
-    """Whether an issue can no longer afford one more fix leg under its
-    lifetime cap: the same arithmetic paid admission applies."""
+    """Whether an issue can no longer afford one more leg under its lifetime
+    cap: the arithmetic paid admission applies, for the dearer of the two
+    roles' legs. Both roles must agree, since the stop it leads to is written
+    by fix alone: with each role's own leg price, a review the cap cannot
+    afford would be stopped by nobody and run by nobody."""
     if cfg.issue_spend_cap_usd <= 0:
         return lambda _issue: False
     cap = Money.from_major("USD", cfg.issue_spend_cap_usd)
-    leg = Money.from_major("USD", cfg.fix_budget_usd)
+    leg = Money.from_major("USD", max(cfg.fix_budget_usd, cfg.review_budget_usd))
 
     def capped(issue: int) -> bool:
         snapshot = control.snapshot(issue_budget_scope(cfg.repo, issue, "USD"))
         if snapshot.disposition.value != "available":
-            # FixFacts reads a failed read as no headroom: paid legs wait, free work goes on.
+            # `Facts` reads a failed read as no headroom: paid legs wait, free work goes on.
             raise ControlStoreError(f"issue #{issue} spend is unreadable: {snapshot.detail}")
         return snapshot.committed.micros + leg.micros > cap.micros
 
@@ -1159,8 +964,8 @@ def compose_fix_daemon(
         marker=settings.harness.marker,
         dispatch=dispatch, remove_worktree=worktrees.remove, log=log,
     )
-    facts = FixFacts(
-        control, settings,
+    facts = Facts(
+        control, cfg.repo,
         active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
         headroom=_headroom(_control_spend_gate(cfg, control, fix_runtime.budget_usd)),
         lifetime_capped=_lifetime_capped(cfg, control),
@@ -1172,8 +977,8 @@ def compose_fix_daemon(
     )
     daemon = Daemon(
         "fix",
-        lambda: gateway.build_fix_world(cfg.base_branch),
-        decide_with(facts, settings, lease_slots(daemon_ref), log),
+        lambda: gateway.build_world(cfg.base_branch),
+        decide_with("fix", facts, settings.harness, fix_choose(settings, log), lease_slots(daemon_ref), log),
         act,
         cfg.tick_interval_seconds,
         log,
@@ -1199,67 +1004,15 @@ def compose_fix_daemon(
     return FixDaemonComposition(daemon, control, journal, act, legs, recovery, owner_id)
 
 
-def _review_unproductive_rounds(
-    control: SQLiteControlStore, repository: str, world, errors: dict[int, str],
-) -> dict[int, int]:
-    """Current SQL allowance per target; unreadable authority withholds admission."""
-    counts = {}
-    for pr in world.prs:
-        try:
-            counts[pr.number] = current_review_failures(control, repository, pr.number)
-        except (WorkflowAuthorityError, ControlStoreError, sqlite3.Error, OSError) as exc:
-            errors[pr.number] = str(exc)
-            counts[pr.number] = 0
-    return counts
-
-
-def _fix_holds(control, repository: str, world, now: datetime) -> dict[int, FixHold]:
-    """PRs a live fix-role claim currently owns, keyed by PR number (#176).
-
-    Both roles derive a claim target from `breaker_key`, so the fixer's claim on
-    a PR (or on the issue that PR closes) is addressable from the review side
-    without any new state. Two open PRs closing one issue therefore share a
-    target and defer together — the same coarseness the dispatch reservation
-    itself has, deliberately not a second, finer notion of "same work".
-
-    A store that cannot answer is treated as no holds: this reader only
-    withholds paid work, and the submit-time head fence still protects
-    correctness, so it must never be the thing that stops review.
-    """
-    try:
-        claims = control.active_dispatch_claims(repository, "fix")
-    except Exception:  # noqa: BLE001 - see docstring: fail open to dispatch
-        return {}
-    by_target = {claim.target_key: claim for claim in claims}
-    holds: dict[int, FixHold] = {}
-    for pr in world.prs:
-        claim = by_target.get(breaker_key(pr))
-        if claim is None:
-            continue
-        holds[pr.number] = FixHold(
-            pr.number,
-            claim.claim_key,
-            max(0.0, (now - claim.claimed_at).total_seconds()),
-        )
-    return holds
-
-
 @dataclass(frozen=True)
 class ReviewDaemonComposition:
-    """The review role's composed authorities (see `FixDaemonComposition`).
-
-    `runtime` is None only when the gateway cannot read pull request reviews;
-    an activated review family then holds every paid review rather than
-    falling back to the legacy path.
-    """
+    """The review role's composed authorities (see `FixDaemonComposition`)."""
 
     daemon: Daemon
     control: SQLiteControlStore
     journal: Journal
-    executor: Executor
-    effects: EffectRecovery
-    dispatcher: AgentDispatcher
-    runtime: ActiveReviewRuntime | None
+    act: ReviewAct
+    legs: ReviewLegs
     recovery: _RecoveryHooks
     owner_id: str
 
@@ -1272,351 +1025,96 @@ def build_review_daemon(
 
 def compose_review_daemon(
     cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime,
-    *, log: Callable[[str], None] | None = None,
+    *, checkouts=None, log: Callable[[str], None] | None = None,
 ) -> ReviewDaemonComposition:
-    say: Callable[[str], None] = log or _log("review")
-    repo_cfg = cfg.repository
+    """observe -> derive -> policy -> act, keeping only REVIEW dispatches.
+
+    `checkouts` pins each leg to its head; by default a detached per-PR
+    worktree of TARGET_DIR (keifu #165: reviews of the operator's live
+    checkout produced phantom change requests under fresh SHAs).
+
+    Two misconfigurations no retry can fix refuse to start (ValueError, so
+    `main` exits INVALID_CONFIG): no TARGET_DIR to pin reviews to, and a
+    review credential that is not REVIEW_BOT. The latter posted a duplicate
+    review on every retry, since the read-back looked for the wrong login."""
+    log = log or _log("review")
     review_runtime = cfg.review_runtime
-    journal = _journal(store)
-    rcfg = ReviewConfig(
-        review_bot=review_runtime.bot, identity_mode=repo_cfg.identity_mode,
-        trigger_label=Label(review_runtime.trigger_label),
-        adopt_unlabeled=review_runtime.adopt_unlabeled,
-        # getattr, not a plain attribute read: the env knob
-        # (MAX_UNPRODUCTIVE_REVIEW_ROUNDS) is wired into ReviewRuntimeConfig
-        # separately from this ceiling. Until it lands the domain default
-        # applies — a missing knob must never mean "no ceiling", which is the
-        # unbounded state P0R-3 describes.
-        max_unproductive_rounds=review_runtime.max_unproductive_rounds,
-        # The SAME value the submission side applies (dcfg.max_review_rejections
-        # below), so the decide side's abandoned-at-ceiling arm can never
-        # disagree with the breaker that created the state it is healing.
-        max_rejections=review_runtime.max_rejections,
-    )
-    dcfg = DispatchConfig(
-        base_branch=repo_cfg.base_branch,
-        review=ReviewTaskConfig(
-            repo_cfg.repo, repo_cfg.base_branch, review_runtime.prompt,
-            review_runtime.budget_usd, review_runtime.model,
-            gate_model=review_runtime.gate_model,
-            validation_model=review_runtime.validation_model,
-            gate_budget_usd=review_runtime.gate_budget_usd,
-            dimension_budget_usd=review_runtime.dimension_budget_usd,
-            validation_budget_usd=review_runtime.validation_budget_usd,
-            scout_model=review_runtime.scout_model,
-        ),
-        max_review_rejections=review_runtime.max_rejections,
-        review_bot=review_runtime.bot,
-        reviewer_runtime=review_runtime.runtime,
-        review_trigger_label=review_runtime.trigger_label,
-        review_mode=review_runtime.mode,
-        log=say,
-        **_spend_cfg(cfg, "review"),
-    )
-    runtime_binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](
-        cfg, review_runtime, runner
-    )
-    review_runner = runtime_binding.runner
-    review_execution_cwd = runtime_binding.execution_cwd
-    review_prepare_cwd = runtime_binding.prepare_cwd
-
-    # Reviews must read the code the verdict binds. A pinned per-PR detached
-    # worktree replaces the operator's live checkout as execution cwd whenever
-    # a target checkout exists (keifu #165: stale-checkout reviews produced
-    # phantom REQUEST_CHANGES rounds under fresh SHAs).
-    review_checkout = None
-    review_checkout_cleanup = None
-    if review_execution_cwd:
-        _review_checkouts = ReviewCheckouts(
-            review_execution_cwd, worktree_root=cfg.worktree_root
+    if checkouts is None:
+        if not cfg.target_dir:
+            raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
+        checkouts = ReviewCheckouts(cfg.target_dir, worktree_root=cfg.worktree_root)
+    acting_as = gateway.viewer_login()
+    if not login_eq(acting_as, review_runtime.bot):
+        raise ValueError(
+            f"REVIEW_BOT is {review_runtime.bot!r} but the review credential acts as "
+            f"{acting_as or 'nobody GitHub would name'!r}: set REVIEW_BOT to the "
+            "credential's login, or give the review role REVIEW_BOT's credential"
         )
-        review_checkout = _review_checkouts.ensure
-        review_checkout_cleanup = _review_checkouts.remove
-
-    dcfg = replace(
-        dcfg,
-        review_execution_cwd=review_execution_cwd,
-        review_prepare_cwd=review_prepare_cwd,
-        review_checkout=review_checkout,
-        review_checkout_cleanup=review_checkout_cleanup,
-    )
-
-    # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
+    journal = _journal(store)
+    binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](cfg, review_runtime, runner)
     control = _control_store(cfg, cfg.review_state_dir, "review")
     owner_id = _owner_identity(cfg, "review")
-    effect_executor = _effects(
-        gateway,
-        control,
-        repository=cfg.repo,
-        identity=owner_id,
-        config_version=cfg.config_version,
-        retry_ceiling=cfg.effect_retry_ceiling,
-        journal=journal,
-        alert_cmd=cfg.alert_cmd,
-        log=say,
+    settings = ReviewSettings(
+        repository=cfg.repo, owner_id=owner_id,
+        harness=Harness(fix_bot=cfg.fix_runtime.bot, review_bot=review_runtime.bot),
     )
-    executor = Executor(
-        gateway,
-        log=say,
-        journal=journal,
-        alert_cmd=cfg.alert_cmd,
-        effect_executor=effect_executor.actions,
+    reconciler = _LateReservationReconciler()
+    accounting = _with_accounting(
+        binding.runner, control, cfg, "review", review_runtime.runtime.value, reconciler,
     )
-    reservations = DispatchReservations(
-        control,
-        repository=cfg.repo,
-        role="review",
-        owner_id=owner_id,
+    runtime = JournalingRuntime(
+        accounting, journal, repo=cfg.repo, role="review",
+        runtime=review_runtime.runtime.value, state_dir=cfg.review_state_dir,
     )
-    runtime = _active_review_runtime(
-        cfg, rcfg, control, gateway, store, effect_executor.actions, owner_id, say,
-        runtime_preflight=runtime_binding.runtime_preflight,
-    )
-    if runtime is not None:
-        executor.bind_workflow_reconciliation(runtime.reconcile)
-        effect_executor = replace(effect_executor, reconcile_workflow=runtime.reconcile)
-    review_reconciler = _LateReservationReconciler()
-    dispatcher = AgentDispatcher(
-        dcfg, gateway, store,
-        JournalingRuntime(
-            _with_accounting(
-                review_runner,
-                control,
-                cfg,
-                "review",
-                review_runtime.runtime.value,
-                review_reconciler,
-            ),
-            journal,
-            repo=cfg.repo,
-            role="review",
-            runtime=review_runtime.runtime.value,
-            state_dir=cfg.review_state_dir,
+    daemon_ref: dict[str, Daemon] = {}
+    legs = ReviewLegs(
+        gateway, control, settings,
+        runtime=runtime,
+        accounting=accounting,
+        checkouts=checkouts,
+        prepare_cwd=binding.prepare_cwd,
+        task_config=ReviewTaskConfig(
+            cfg.repo, cfg.base_branch, review_runtime.prompt, review_runtime.budget_usd, review_runtime.model,
         ),
-        executor,
-        journal=journal,
-        dispatch_claim_target=reservations.issue_for,
-        review_authority=runtime,
+        log=log,
     )
-    dispatch_runtime = CancellableAsyncDispatch(
-        dispatcher.dispatch,
-        finished=reservations.finish,
+    dispatch = CancellableAsyncDispatch(legs.run)
+    act = ReviewAct(dispatch)
+    facts = Facts(
+        control, cfg.repo,
+        active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),
+        headroom=_headroom(_control_spend_gate(cfg, control, review_runtime.budget_usd)),
+        lifetime_capped=_lifetime_capped(cfg, control),
+        log=log,
     )
-    executor.bind_dispatch(dispatch_runtime)
-
-    migration_reported_at: datetime | None = None
-
-    def decide_actions(world) -> tuple[list, ReviewDispatchPlan | None]:
-        nonlocal migration_reported_at
-        try:
-            active = review_family_activated(control, cfg.repo)
-        except WorkflowAuthorityError as exc:
-            # Unknown activation: neither path may buy a review this tick.
-            say(f"review dispatch held: {exc}")
-            return [], None
-        if not active:
-            now = datetime.now(timezone.utc)
-            if migration_reported_at is None or now - migration_reported_at >= timedelta(minutes=15):
-                migration_reported_at = now
-                say("review dispatch held: review_migration_required")
-                if journal is not None:
-                    journal.emit(TelemetryEvent(TelemetryWarning(
-                        "review_migration_required", "review family requires explicit activation",
-                        {"repository": cfg.repo},
-                    )))
-            return [], None
-        migration_reported_at = None
-        if runtime is None:
-            say("review dispatch held: the review family is active but this "
-                "gateway cannot read pull request reviews")
-            return [], None
-        # The breaker counters come first: the plan records the admission
-        # decision `decide_bound_review` applies with exactly these counts.
-        counter_errors: dict[int, str] = {}
-        unproductive = _review_unproductive_rounds(
-            control, cfg.repo, world, counter_errors
-        )
-        plan = runtime.plan(world, rcfg, unproductive, counter_errors)
-        errors: dict[int, str] = {**plan.errors, **counter_errors}
-        for target, reason in errors.items():
-            say(f"PR #{target} held: {reason}")
-        for target, reason in plan.held.items():
-            say(f"PR #{target} review held by its workflow: {reason}")
-        return decide_bound_review(world, rcfg, BoundReviewState(
-            owed=plan.owed, unproductive_rounds=unproductive, control_errors=errors,
-        )), plan
-
-    def decide(world):
-        actions, review_plan = decide_actions(world)
-        admissions: dict[int, AdmissionOutcome] = {}
-        acquired: list[RunAgent] = []
-        try:
-            admitted = _admit(world, actions, admissions, acquired)
-        except BaseException:
-            # Nothing reaches the executor when admission fails midway. Only
-            # this batch's claims are ours to release; running work keeps its own.
-            for action in acquired:
-                try:
-                    reservations.finish(action)
-                except Exception as exc:  # noqa: BLE001 - attempt every release
-                    say(f"review admission cleanup failed for PR #{action.number}: {exc}")
-            raise
-        if review_plan is not None and runtime is not None:
-            # After admission, so an owed review it did not start is recorded
-            # as withheld or running. `record_plan` never raises: the record
-            # is the operator view's projection, never dispatch authority.
-            runtime.record_plan(review_plan, admissions)
-        return admitted
-
-    def _admit(world, actions, admissions: dict[int, AdmissionOutcome], acquired: list[RunAgent]) -> list:
-        plan = hold_review_dispatch(
-            actions,
-            _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
-            ceiling_seconds=fix_hold_ceiling_seconds(cfg.agent_max_runtime),
-        )
-        for hold in plan.deferred:
-            admissions[hold.pr] = AdmissionWithheld(
-                WithheldReason.FIX_CLAIM, f"a fix run still holds this pull request's issue ({int(hold.held_seconds)}s)")
-        actions = list(plan.actions)
-        prs = {pr.number: pr for pr in world.prs}
-        rejected_prs: set[int] = set()
-        for action in actions:
-            if not isinstance(action, RunAgent):
-                continue
-            pr = prs.get(action.number)
-            # ADR 0008: the repository-global claim and paid admission must use
-            # one target identity. Branch linkage is authoritative when GitHub
-            # omits a closing issue on a non-default-base PR.
-            issue = breaker_key(pr) if pr is not None else -action.number
-            if reservations.reserve(action, issue):
-                acquired.append(action)
-                continue
-            rejected_prs.add(action.number)
-            if reservations.running(action.number):
-                # This pull request's own review still holds the target: it is
-                # the owed review, running, not a competing claim.
-                admissions[action.number] = AdmissionInFlight()
-                continue
-            admissions[action.number] = AdmissionWithheld(WithheldReason.RESERVED, (
-                f"target {issue} is already reserved (another pull request on the same issue here, or another "
-                "deployment's claim)"))
-            say(
-                f"dispatch {action.kind.name} PR #{action.number}: "
-                f"deferred — target {issue} is already reserved (another PR "
-                "on the same issue here, or another deployment's claim)"
-            )
-        if not rejected_prs:
-            return actions
-        return [
-            action
-            for action in actions
-            if not (
-                isinstance(action, RunAgent)
-                and action.number in rejected_prs
-            )
-            and not (
-                isinstance(action, Relabel)
-                and action.target is Target.PR
-                and action.number in rejected_prs
-            )
-        ]
-
-    say(review_capability_line(
-        can_approve=rcfg.identity_mode == IdentityMode.THREE,
-        adopt_unlabeled=rcfg.adopt_unlabeled,
-    ))
     recovery = _recovery(
-        cfg.review_state_dir,
-        cfg,
-        control,
-        effect_executor,
+        cfg.review_state_dir, cfg, control, _NoCommands(), "review",
+        owner_id=owner_id, reconciler=reconciler,
+    )
+    daemon = Daemon(
         "review",
-        owner_id=owner_id,
-        reconciler=review_reconciler,
+        lambda: gateway.build_world(cfg.base_branch),
+        decide_with("review", facts, settings.harness, review_choose(settings.harness), lease_slots(daemon_ref), log),
+        act,
+        cfg.tick_interval_seconds,
+        log,
+        journal=journal,
+        dispatch_capacity=1,
+        dispatch_key=lambda action: dispatch_item(action),
+        cancel_active_dispatches=dispatch.cancel_all,
+        force_kill_dispatches=_force_kill(cfg, "review", cfg.review_state_dir or store.state_dir),
+        heartbeat_path=os.path.join(cfg.review_state_dir, "heartbeat.json"),
+        reconcile=recovery.reconcile,
+        prepare_shutdown=_shutdown_prepare(control, owner_id=owner_id),
+        finalize=_shutdown_finalize(control, _NoCommands(), owner_id=owner_id),
+        terminalize=_shutdown_terminalize(
+            control,
+            CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
+            owner_id=owner_id,
+            state_dir=cfg.review_state_dir,
+            role="review",
+        ),
     )
-    if isinstance(gateway, ReviewReads):
-        execution_recovery = SQLiteReviewExecutionControl(
-            control, WorkflowWriter(cfg.repo, "review", owner_id), gateway,
-            preparation_control=runtime.control if runtime is not None else None,
-        )
-        base_reconcile = recovery.reconcile
-        blocked_reported_at: datetime | None = None
-
-        def reconcile_review(trigger: RecoveryTrigger) -> RecoveryReport:
-            nonlocal blocked_reported_at
-            report = base_reconcile(trigger)
-            sweep = execution_recovery.reconcile_review_rounds()
-            if sweep.sealed:
-                say(f"review recovery: fenced {len(sweep.sealed)} abandoned parent round(s)")
-            if sweep.finalized:
-                say(f"review recovery: finalized {len(sweep.finalized)} parent round(s)")
-            if sweep.blocked:
-                now = datetime.now(timezone.utc)
-                if blocked_reported_at is None or now - blocked_reported_at >= timedelta(minutes=15):
-                    blocked_reported_at = now
-                    detail = "; ".join(f"{round_id}: {reason}" for round_id, reason in sweep.blocked[:3])
-                    say(f"review recovery: {len(sweep.blocked)} parent round(s) could not be recovered: {detail}")
-            return report
-
-        recovery = _RecoveryHooks(reconcile_review)
-    else:
-        say("review execution recovery unavailable: the gateway cannot read pull request reviews")
-
-    daemon = Daemon("review", gateway.build_review_world, decide, executor,
-                  cfg.tick_interval_seconds, say, journal=journal,
-                  tick_gate=_control_spend_gate(cfg, control, cfg.review_budget_usd),
-                  dispatch_capacity=1,
-                  dispatch_key=lambda action: ("pr", action.number),
-                  cancel_active_dispatches=dispatch_runtime.cancel_all,
-                  dispatch_rejected=reservations.finish,
-                  force_kill_dispatches=_force_kill(
-                      cfg,
-                      "review",
-                      cfg.review_state_dir or store.state_dir
-                  ),
-                  heartbeat_path=os.path.join(
-                      cfg.review_state_dir, "heartbeat.json"
-                  ),
-                  reconcile=recovery.reconcile,
-                  prepare_shutdown=_shutdown_prepare(
-                      control,
-                      owner_id=owner_id,
-                  ),
-                  finalize=_shutdown_finalize(
-                      control,
-                      effect_executor,
-                      owner_id=owner_id,
-                  ),
-                  terminalize=_shutdown_terminalize(
-                      control,
-                      CodexSpendReconciler(
-                          control, _spend_evidence_dirs(cfg)
-                      ),
-                      owner_id=owner_id,
-                      state_dir=cfg.review_state_dir,
-                      role="review",
-                  ))
-    return ReviewDaemonComposition(
-        daemon, control, journal, executor, effect_executor, dispatcher, runtime,
-        recovery, owner_id,
-    )
-
-
-def _active_review_runtime(
-    cfg: HarnessConfig, rcfg: ReviewConfig, control: SQLiteControlStore, gateway,
-    store: Store, effects: GitHubEffectExecutor, owner_id: str, log,
-    *, runtime_preflight: Callable[[], str | None] | None = None,
-) -> ActiveReviewRuntime | None:
-    """The review family's runtime, or None when the gateway cannot read reviews."""
-    if not isinstance(gateway, ReviewReads):
-        return None
-    # `rcfg` is derived from `cfg.review_runtime`, the same values the shared
-    # composition reads, so the operator transport enforces this daemon's rule.
-    workflow = configured_review_control(
-        cfg, control, gateway, store, owner_id, runtime_preflight=runtime_preflight,
-    )
-    return ActiveReviewRuntime(
-        workflow, effects, gateway, review_bot=rcfg.review_bot, log=log,
-        mode=cfg.review_runtime.mode, runtime=cfg.review_runtime.runtime,
-        failure_ceiling=cfg.review_runtime.max_unproductive_rounds,
-    )
+    daemon_ref["daemon"] = daemon
+    log(f"review: capabilities: review=on runtime={review_runtime.runtime.value}")
+    return ReviewDaemonComposition(daemon, control, journal, act, legs, recovery, owner_id)

@@ -402,10 +402,11 @@ def test_orchestration_cannot_read_telemetry_for_control_state() -> None:
         }
     )
     control_paths = (
-        APP / "execute.py",
         APP / "loop.py",
         APP / "roles.py",
-        APP / "dispatch.py",
+        APP / "tick.py",
+        APP / "fix.py",
+        APP / "review.py",
         *_python_files(APP / "workflows"),
     )
     violations: list[str] = []

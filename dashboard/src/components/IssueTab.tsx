@@ -18,9 +18,7 @@ import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
 import { ResolveControls } from "./resolve/ResolveControls";
-import { reviewablePullRequests } from "./review/model";
-import { ReviewControls } from "./review/ReviewControls";
-import { useLegacyUnblockRefusal } from "./review/use-legacy-unblock";
+import { useLegacyUnblockRefusal } from "./legacy-unblock";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import { CiRunningBadge, StepBadge, StepStatusChip } from "./ui/StepBadge";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
@@ -154,15 +152,13 @@ export function IssueTab({
   // The detail payload carries no board status; a live issue that escalated,
   // blocked, or asked a question is held by legacy choreography until its
   // resolve authority says otherwise.
-  // Plan decision 9: each linked pull request carries its own review control.
-  const reviewPullRequests = d ? reviewablePullRequests(d.pull_requests, d.prs) : [];
   const heldForHuman = !!d && !d.done && (
     !!d.escalation_reason
     || d.stage === "blocked"
     || d.stage === "escalated"
     || d.stage === "awaiting human reply"
   );
-  const legacyRefusal = useLegacyUnblockRefusal(repo, reviewPullRequests, heldForHuman);
+  const legacyRefusal = useLegacyUnblockRefusal(repo, heldForHuman);
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
@@ -275,18 +271,13 @@ export function IssueTab({
             </div>
           ) : null}
           {d.done ? null : (
-            <>
-              <ResolveControls
-                deployment={repo}
-                issue={issue}
-                heldForHuman={heldForHuman}
-                legacyRefusal={legacyRefusal}
-                onChanged={detail.refresh}
-              />
-              {reviewPullRequests.map((pr) => (
-                <ReviewControls key={pr} deployment={repo} pr={pr} />
-              ))}
-            </>
+            <ResolveControls
+              deployment={repo}
+              issue={issue}
+              heldForHuman={heldForHuman}
+              legacyRefusal={legacyRefusal}
+              onChanged={detail.refresh}
+            />
           )}
 
           <div className="subtabs issue-section-tabs" role="tablist" aria-label="Issue detail">
@@ -700,26 +691,10 @@ function StepSummaryHeader({ step }: { step: IssueStep }) {
   ) : null;
 }
 
-function capFraction(value: number, cap: number | null | undefined): string {
-  if (cap === 0) return `${value} / off`;
-  return cap === null || cap === undefined ? String(value) : `${value}/${cap}`;
-}
-
 function StepContextLine({ step }: { step: IssueStep }) {
   const segments: string[] = [];
   if (step.review?.rejection !== null && step.review?.rejection !== undefined) {
     segments.push(`change-request verdicts observed ${step.review.rejection}`);
-  }
-  if (
-    step.review?.unproductive_rounds !== null
-    && step.review?.unproductive_rounds !== undefined
-  ) {
-    segments.push(
-      `unproductive rounds ${capFraction(
-        step.review.unproductive_rounds,
-        step.review.unproductive_cap,
-      )}`,
-    );
   }
   if (step.cost_usd !== null && step.cost_usd !== undefined) {
     segments.push(

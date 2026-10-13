@@ -48,20 +48,15 @@ def complete(store, pending, acknowledgement):
     )).snapshot
 
 
-def test_projection_waits_without_attempts_until_persisted_workspace_ack(control):
+def test_a_rearm_command_waits_without_attempts_until_persisted_workspace_ack(control):
     pending = pending_rearm(control)
     command = pending.intent.required_commands[0]
-    diagnostics = []
-    assert control.runnable_commands(repository="o/r", executor_identity=WRITER.owner_id,
-                                     diagnose=diagnostics.append) == ()
-    assert diagnostics == []
     with pytest.raises(ControlStoreError, match="workspace"):
         control.begin_command(command)
     assert command_row(control, command)["attempts"] == 0
     prepare_workspace(control, pending)
-    assert tuple(item.command.command_id for item in control.runnable_commands(
-        repository="o/r", executor_identity=WRITER.owner_id, diagnose=diagnostics.append,
-    )) == (command,)
+    control.begin_command(command)
+    assert command_row(control, command)["attempts"] == 1
 
 
 def test_acknowledged_workspace_does_not_admit_paid_work_before_remote_completion(control):

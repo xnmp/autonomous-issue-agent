@@ -20,7 +20,6 @@ from .workflow import (
     WorkflowMutation, WorkflowRejected, WorkflowRejection, WorkflowSnapshot, WorkflowTransition,
     ActiveReconciliation, ClosedRetryAuthorization, RearmingGate, RetryDisposition,
 )
-from .review_workflow import PendingReviewRearm, ReviewWorkflowSnapshot
 from .workflow_reconciliation import ABSENCE_FRESHNESS_SECONDS
 from .workflow_identity import WorkflowBinding, WorkflowRevision, validate_workflow_identifier
 
@@ -34,10 +33,8 @@ MAX_GRANT_UNAVAILABLE_READS = 5
 MAX_GRANT_AGE_SECONDS = 86400
 
 RetryAuthorization = UnconsumedRetryAuthorization | ConsumedRetryAuthorization | ClosedRetryAuthorization
-# Both families share one grant contract: the same scope, evidence, ceiling,
-# disposition and one-write rules (ADR 0015 review slice, increment 5).
-RetrySnapshot = WorkflowSnapshot | ReviewWorkflowSnapshot
-_SNAPSHOTS = (WorkflowSnapshot, ReviewWorkflowSnapshot)
+RetrySnapshot = WorkflowSnapshot
+_SNAPSHOTS = (WorkflowSnapshot,)
 
 
 def _authorization(value: RetryAuthorization) -> UnconsumedRetryAuthorization:
@@ -137,8 +134,8 @@ def _scope_refusal(
     if facts.command_binding != snapshot.binding:
         return "the command belongs to another workflow generation, epoch or episode"
     intent = snapshot.intent
-    pending = isinstance(intent, (PendingRearm, PendingReviewRearm))
-    required = intent.required_commands if isinstance(intent, (PendingRearm, PendingReviewRearm)) else ()
+    pending = isinstance(intent, PendingRearm)
+    required = intent.required_commands if isinstance(intent, PendingRearm) else ()
     if isinstance(facts.association, RearmObligation):
         if (not pending or intent.request_id != facts.association.request_id
                 or command_id not in required or not facts.obligation_active):
@@ -318,11 +315,8 @@ def authorize_absent_retry(
         return refusal
     current = snapshot.revision
     after = replace(snapshot, revision=WorkflowRevision(current.fence, current.version + 1))
-    # A review transition carries its exact prior as the witness the commit
-    # adapter proves equal to the stored row; resolve keeps none.
     return WorkflowChanged(
         current, WorkflowMutation.AUTHORIZE_RETRY, after, AuthorizedOperatorCommand(actor, command),
-        prior=snapshot if isinstance(snapshot, ReviewWorkflowSnapshot) else None,
     )
 
 

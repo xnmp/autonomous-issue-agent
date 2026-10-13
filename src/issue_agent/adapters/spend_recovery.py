@@ -38,8 +38,6 @@ class CodexSpendReconciler:
     evidence_dirs: tuple[str, ...]
 
     def reconcile(self, run_id: RunId) -> bool:
-        if self.store.reconcile_review_preflight_stop(run_id):
-            return True
         if not self._belongs_to_codex(run_id):
             return False
         ended_at = self.store.run_completed_at(run_id)

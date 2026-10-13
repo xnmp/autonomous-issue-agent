@@ -9,30 +9,6 @@ no error (review C1).
 
 from __future__ import annotations
 
-from enum import Enum
-
-
-class IdentityMode(str, Enum):
-    """How many distinct GitHub identities the harness runs under.
-
-    THREE lets a separate reviewer approve fixer PRs; SOLO disables automated
-    review because GitHub rejects self-approval. This must remain an enum: the
-    reviewer and auto-merge guards have opposite polarity, so an unknown string
-    must fail config validation rather than fall between both guards.
-    """
-
-    THREE = "three"
-    SOLO = "solo"
-
-    @classmethod
-    def from_env(cls, mode: str) -> "IdentityMode":
-        """Parse the case-sensitive shell contract without guessing a mode.
-
-        Shell launchers compare this value literally, so accepting alternate
-        casing here would make Python and shell supervision disagree.
-        """
-        return cls((mode or "").strip())
-
 
 def normalize_login(login: str) -> str:
     """Canonical form of a GitHub login: strip surrounding whitespace, casefold,

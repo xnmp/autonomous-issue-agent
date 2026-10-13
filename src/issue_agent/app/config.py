@@ -23,12 +23,9 @@ from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
 from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
-from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
-from ..domain.review_rejection import MAX_COUNTED_REVIEWS
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
-from ..domain.review import IdentityMode, ReviewMode
 from ..domain.repository import (
     canonical_repository,
     repository_validation_error,
@@ -43,7 +40,6 @@ def fix_runtime_names_from_env(env: dict) -> frozenset[str]:
     primary = str(env.get("FIXER_RUNTIME") or "").strip().strip("\"'").lower()
     return frozenset({primary} if primary else set())
 
-SHELL_CMD_LOG_LIMIT = 120
 REPOINT_HISTORY_ENV = "REPOINTED_FROM_DEPLOYMENTS"
 MAX_REPOINT_HISTORY = 32
 
@@ -138,33 +134,11 @@ def parse_repoint_history(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(result)
 
 
-def describe_command(value: str | None, *, empty: str = "EMPTY",
-                     limit: int = SHELL_CMD_LOG_LIMIT) -> str:
-    """Render a shell command for a boot log line: quoted, and truncated
-    DELIBERATELY rather than by accident.
-
-    The boot log used to print `TEST_CMD=set` — the literal word "set",
-    reporting presence only. For a real value like
-    `TEST_CMD='set -e; cargo test …'` that output is indistinguishable from a
-    value truncated at the first space (#35), and this is the one line an
-    operator reads to confirm which command arms the gate. So: print the value,
-    repr-quoted (whitespace and shell punctuation stay visible inside the
-    quotes), cut at `limit` with an explicit ellipsis, and always state the full
-    length so a truncation can never be mistaken for the whole command.
-    """
-    text = value or ""
-    if not text:
-        return empty
-    shown = text if len(text) <= limit else text[:limit] + "…"
-    return f"{shown!r} (len={len(text)})"
-
-
 @dataclass(frozen=True)
 class RepositoryConfig:
     repo: str
     base_branch: str
     target_dir: str
-    identity_mode: IdentityMode
 
 
 @dataclass(frozen=True)
@@ -191,18 +165,7 @@ class ReviewRuntimeConfig:
     runtime: RuntimeName
     model: str | None
     prompt: str
-    mode: ReviewMode
     budget_usd: float
-    max_rejections: int
-    trigger_label: str
-    adopt_unlabeled: bool
-    gate_model: str | None
-    validation_model: str | None
-    scout_model: str | None
-    gate_budget_usd: float
-    dimension_budget_usd: float
-    validation_budget_usd: float
-    max_unproductive_rounds: int
 
 
 @dataclass(frozen=True)
@@ -264,7 +227,6 @@ class HarnessConfig:
     repo_input: str = field(default="", repr=False, compare=False)
     base_branch: str = "dev"
     target_dir: str = ""
-    identity_mode: IdentityMode = IdentityMode.THREE
     fix_bot: str = ""
     review_bot: str = "my-reviewer-bot[bot]"
     state_dir: str = ""
@@ -297,27 +259,6 @@ class HarnessConfig:
         },
     )
     close_issue_on_merge: bool = True
-    # Escalation ceiling for the reviewer: after this many REQUEST_CHANGES verdicts
-    # on one PR (counting the reviewer's OWN rejections, NOT author pushes — a
-    # rebase/housekeeping push that ends in APPROVE never counts), the next
-    # unsatisfied review escalates to a human instead of bouncing back to the
-    # fixer. Default 4 = 3 rejections bounce, the 4th escalates.
-    max_review_rejections: int = 4
-    # Counts paid review
-    # rounds that advanced NOTHING — a session that died pre-result, but also a
-    # fan-out whose synthesis returned None, a failed submit POST, or an errored
-    # gate. Those returned-result stalls never touch the raise path, so before
-    # this the multi-mode fan-out (gate + dimensions + validators) re-ran every
-    # poll, forever, on a PR nobody was waiting on. 0 disables.
-    max_unproductive_review_rounds: int = 5
-    # ADR 0012 ceiling for durable GitHub writes: how many times one lifecycle
-    # command may be re-executed after its readback says "not applied" before it
-    # is retired to permanent_failure and escalated. Bounds the keifu incident
-    # (a write-denied PAT re-attempting the same 403 every tick, forever). Counts
-    # attempts, not time, and only verified refusals — infra failures receipt
-    # unknown_outcome and are reconciled instead. See domain/effect_retry.py.
-    effect_retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING
-    review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
     # FIX_EFFORT: base reasoning effort for the fix legs, runtime-agnostic
     # (harness #16). None = say nothing and leave each runtime on its own default
@@ -333,24 +274,6 @@ class HarnessConfig:
     # $15 not $8 since 2026-08-09: the sol default reviews at ~2.5x terra's
     # token rates; $8 sized for terra would clip sol mid-review.
     review_budget_usd: float = 15.0
-    # REVIEW_MODE: single (default) | multi | delegated.
-    #   multi  — the /code-review fan-out (skip-gate → parallel dimension
-    #            specialists → per-finding adversarial validation → synthesis).
-    #            Gate + validators run cheaper than the dimension specialists
-    #            (which use REVIEW_MODEL); each leg has its own small budget.
-    #   delegated — the single-pass reviewer + a cheap code-scout subagent it
-    #            delegates codebase search to (REVIEW_SCOUT_MODEL, default sonnet),
-    #            so the expensive reviewer reasons over summaries not raw files.
-    review_mode: ReviewMode = ReviewMode.SINGLE
-    # Adopt rogue PRs (opened directly, no trigger label) into review. Default on:
-    # a PR reviewed by nobody is the worse failure. Opt out per-PR with no-ai-review.
-    review_adopt_unlabeled: bool = True
-    review_gate_model: str | None = "haiku"
-    review_validation_model: str | None = "haiku"
-    review_scout_model: str | None = "sonnet"
-    review_gate_budget_usd: float = 0.10
-    review_dimension_budget_usd: float = 0.75
-    review_validation_budget_usd: float = 0.20
     agent_md: str = ""
     review_prompt: str = ""
     harness_root: str = ""
@@ -502,9 +425,6 @@ class HarnessConfig:
     issue_spend_cap_usd: float = 25.0
     daily_spend_cap_usd: float = 700.0
     global_daily_spend_cap_usd: float = 0.0
-    # Shell command fed each spend_block / escalation event as JSON on stdin.
-    # Blank = no alerting (the events are still journalled).
-    alert_cmd: str = ""
     # Malformed-numeric fallbacks recorded by from_env (review M2): a bad
     # POLL_SECONDS/MAX_BUDGET_USD/etc must not traceback at startup — from_env
     # substitutes the field default and records what it did here, so
@@ -536,7 +456,6 @@ class HarnessConfig:
             repo=self.repo,
             base_branch=self.base_branch,
             target_dir=self.target_dir,
-            identity_mode=self.identity_mode,
         )
 
     @property
@@ -564,18 +483,7 @@ class HarnessConfig:
             runtime=self.reviewer_runtime,
             model=self.review_model,
             prompt=self.review_prompt,
-            mode=self.review_mode,
             budget_usd=self.review_budget_usd,
-            max_rejections=self.max_review_rejections,
-            trigger_label=self.review_trigger_label,
-            adopt_unlabeled=self.review_adopt_unlabeled,
-            gate_model=self.review_gate_model,
-            validation_model=self.review_validation_model,
-            scout_model=self.review_scout_model,
-            gate_budget_usd=self.review_gate_budget_usd,
-            dimension_budget_usd=self.review_dimension_budget_usd,
-            validation_budget_usd=self.review_validation_budget_usd,
-            max_unproductive_rounds=self.max_unproductive_review_rounds,
         )
 
     @property
@@ -614,12 +522,6 @@ class HarnessConfig:
         _require_positive(
             errors, "FIX_DISPATCH_CONCURRENCY", self.fix_dispatch_concurrency
         )
-        _require_non_negative(
-            errors, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS", self.max_unproductive_review_rounds
-        )
-        # Positive, not non-negative: 0 here does not mean "disabled", it means
-        # "restore the unbounded retry loop ADR 0012 forbids".
-        _require_positive(errors, "EFFECT_RETRY_CEILING", self.effect_retry_ceiling)
         if not (self.repo or "").strip():
             # Fail LOUD at startup, not with an opaque gh error on the first
             # poll: an empty REPO means a missing/mis-composed overlay (the
@@ -651,28 +553,17 @@ class HarnessConfig:
                 "PRs/reviews can never be identified, and (pre-P1R-7) let an "
                 "unresolvable PR author read as the fixer's own"
             )
-        if self.identity_mode == IdentityMode.THREE and normalize_login(self.fix_bot) == normalize_login(
-            self.review_bot
-        ):
+        if normalize_login(self.fix_bot) == normalize_login(self.review_bot):
             # review C1/D1 belt-and-braces: a raw string compare would miss
             # `fix-bot` vs `fix-bot[bot]` and let a self-approving identity
             # pair through — GitHub then 422s every approval, forever.
             errors.append(
-                "FIX_BOT and REVIEW_BOT normalize to the same identity under "
-                "IDENTITY_MODE=three (GitHub rejects self-approval with a 422)"
-            )
-        _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
-        if self.max_review_rejections > MAX_COUNTED_REVIEWS:
-            errors.append(
-                f"REVIEW_MAX_REJECTIONS must be <= {MAX_COUNTED_REVIEWS} "
-                "(one review re-arm can dismiss at most that many counted reviews)"
+                "FIX_BOT and REVIEW_BOT normalize to the same identity "
+                "(GitHub rejects self-approval with a 422)"
             )
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
             ("REVIEW_BUDGET_USD", self.review_budget_usd),
-            ("REVIEW_GATE_BUDGET_USD", self.review_gate_budget_usd),
-            ("REVIEW_DIMENSION_BUDGET_USD", self.review_dimension_budget_usd),
-            ("REVIEW_VALIDATION_BUDGET_USD", self.review_validation_budget_usd),
         ):
             _require_positive(errors, name, value)
         if self.fixer_runtime is RuntimeName.GLM and not self.glm_settings_file.strip():
@@ -681,14 +572,6 @@ class HarnessConfig:
             # on Anthropic credentials instead. Existence of the file is a
             # build-time check (roles); emptiness is a config error.
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
-        if (
-            self.reviewer_runtime is RuntimeName.CODEX
-            and self.review_mode is not ReviewMode.SINGLE
-        ):
-            errors.append(
-                "REVIEWER_RUNTIME=codex supports REVIEW_MODE=single only; "
-                "multi/delegated rely on Claude subagents and model aliases"
-            )
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)
@@ -786,24 +669,19 @@ class HarnessConfig:
 
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
-            # getattr, not IdentityMode(...): describe() is the startup diagnostic
-            # and must print whatever it was handed rather than raise on it.
-            f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
             f"{cadence}",
             f"fixer={self.fixer_runtime.value} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} "
             f"{fix_budget}",
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
-            f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
-            f"rejections_cap={self.max_review_rejections}",
+            f"review_budget=${self.review_budget_usd:.2f}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
             f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
             f"daily/{self.repo or 'repo'}=${self.daily_spend_cap_usd:.2f} "
             f"daily/global="
             f"{f'${self.global_daily_spend_cap_usd:.2f}' if self.global_daily_spend_cap_usd > 0 else 'off'} "
-            f"alert={describe_command(self.alert_cmd, empty='none')}",
             f"state={self.state_dir or '(unset)'} "
             f"control={self.control_authority_root or '(deployment state parent)'} "
             f"target={self.target_dir or '(cwd)'} "
@@ -934,7 +812,6 @@ _INTERNAL_CONFIG_FIELDS = frozenset(
 )
 _ENV_NAME_OVERRIDES = {
     "fix_budget_usd": "MAX_BUDGET_USD",
-    "max_review_rejections": "REVIEW_MAX_REJECTIONS",
     "harness_root": "HARNESS_ROOT_DIR",
     "agent_idle_timeout": "AGENT_IDLE_TIMEOUT_SECONDS",
     "agent_max_runtime": "AGENT_MAX_RUNTIME_SECONDS",
@@ -943,24 +820,17 @@ _ENV_NAME_OVERRIDES = {
     "codex_max_rate_limit_wait": "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS",
 }
 _COERCE_OVERRIDES: dict[str, str] = {
-    "identity_mode": "identity_mode",
     "state_dir": "state_dir",
     "review_state_dir": "state_dir",
     "fix_effort": "effort",
     "review_model": "review_model",
-    "review_mode": "review_mode",
     "review_prompt": "stripped",
-    "review_gate_model": "optional_string",
-    "review_validation_model": "optional_string",
-    "review_scout_model": "optional_string",
     "fixer_runtime": "runtime",
     "reviewer_runtime": "runtime",
     "codex_cost_per_mtok": "rate_table",
 }
 _CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "identity_mode": tuple(item.value for item in IdentityMode),
     "fix_effort": tuple(item.value for item in EFFORT_LADDER),
-    "review_mode": tuple(item.value for item in ReviewMode),
     "fixer_runtime": tuple(item.value for item in RuntimeName),
     "reviewer_runtime": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
 }
@@ -1096,8 +966,6 @@ def _metadata_value(
         return _coerce_float(env, env_name, float(fallback), errors)
     if coercion == "choice":
         return _metadata_choice(env, field_name, errors)
-    if coercion == "identity_mode":
-        return _coerce_identity_mode(env, errors)
     if coercion == "effort":
         return _effort(env, env_name, fallback, errors)
     if coercion == "runtime":
@@ -1105,19 +973,6 @@ def _metadata_value(
             RuntimeName(value) for value in definition.metadata["choices"]
         )
         return _runtime(env, env_name, fallback, allowed, errors)
-    if coercion == "review_mode":
-        raw = env.get(env_name)
-        if raw is None or not str(raw).strip():
-            return fallback
-        value = str(raw).strip().casefold()
-        choices = tuple(str(item) for item in definition.metadata["choices"])
-        if value not in choices:
-            errors.append(
-                f"{env_name} must be one of {list(choices)}, got {raw!r} "
-                f"— using default {getattr(fallback, 'value', fallback)!r}"
-            )
-            return fallback
-        return ReviewMode(value)
     raw = env.get(env_name)
     if raw is None:
         return fallback
@@ -1184,33 +1039,6 @@ def _coerce_rate_tables(
     table, cached, parse_errors = parse_model_rate_table(env.get(key, ""))
     errors.extend(f"{key} {error} — ignoring it" for error in parse_errors)
     return table, cached
-
-
-def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
-    """IDENTITY_MODE → `IdentityMode`, with the same contract as `_coerce_int`:
-    empty/absent = unset (the field default), malformed = the default PLUS a
-    readable entry in validation_errors() (review M16).
-
-    `IDENTITY_MODE=Three` used to pass straight through as a string and land
-    BETWEEN the two guards that read it — `!= "three"` disabled auto-merge while
-    `== "solo"` left the reviewer enabled, so the harness reviewed, approved and
-    then never merged anything, with no log line naming the cause. There is no
-    safe silent fallback for this knob, so the value has to be named as wrong at
-    startup where `validate()` can refuse to run on it."""
-    raw = env.get("IDENTITY_MODE")
-    default: IdentityMode = _dc_default("identity_mode")
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return IdentityMode.from_env(raw)
-    except ValueError:
-        allowed = "|".join(m.value for m in IdentityMode)
-        errors.append(
-            f"IDENTITY_MODE must be exactly one of {allowed}, got {raw!r} "
-            f"(case-sensitive — the bash half compares it literally) — "
-            f"using default {default.value}"
-        )
-        return default
 
 
 def _repo_slug(repo: str) -> str:

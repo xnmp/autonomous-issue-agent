@@ -4,7 +4,7 @@ pool does it spend?
 2026-08-02 (keifu), config-class gaps doctor could not see, each of which
 cost an operator surgery:
 
-  1. IDENTITY_MODE=three with FIX_BOT_TOKEN unset. `main._daemon` builds the fix
+  1. FIX_BOT_TOKEN unset. `main._daemon` builds the fix
      gateway as `Identity(static_token=env.get("FIX_BOT_TOKEN") or None)`, and an
      Identity with no token is AMBIENT — the credential `gh auth login` stored
      for the human at the keyboard. So the fixer branched, commented and opened
@@ -34,7 +34,6 @@ from dataclasses import dataclass
 from typing import Callable
 
 from issue_agent.app.codex_resolution import Finding
-from issue_agent.domain.review import IdentityMode
 
 # GitHub's per-account GraphQL budget. Not configurable and not probed: it is
 # GitHub's published figure for a user-owned token, and the check exists to be
@@ -103,7 +102,6 @@ class SharedPool:
 
 @dataclass(frozen=True)
 class IdentityPoolReport:
-    identity_mode: IdentityMode
     roles: tuple[RoleIdentity, ...]
     poll_seconds: int
     """The cadence the estimate used — the configured value, or
@@ -118,22 +116,6 @@ class IdentityPoolReport:
     @property
     def healthy(self) -> bool:
         return not any(f.level in ("warn", "error") for f in self.findings)
-
-
-def resolve_identity_mode(raw: object) -> IdentityMode:
-    """IDENTITY_MODE as `config._coerce_identity_mode` resolves it: exact match
-    after trimming, and ANY other value — absent, empty, `Solo`, `SOLO`, junk —
-    lands on the THREE default.
-
-    Case must NOT be folded here. `IdentityMode.from_env` is deliberately
-    case-SENSITIVE because the bash half compares `[ "$IDENTITY_MODE" = three ]`
-    literally, so `IDENTITY_MODE=Solo` really does run the harness in
-    three-identity mode. Folding it in this check would report a clean bill of
-    health on precisely the config that reproduces the keifu incident."""
-    try:
-        return IdentityMode.from_env(str(raw or ""))
-    except ValueError:
-        return IdentityMode.THREE
 
 
 def parse_poll_seconds(raw: object) -> tuple[int, bool]:
@@ -251,7 +233,6 @@ def _unique(values) -> list[str]:
 
 
 def analyse_identity_pools(
-    identity_mode: IdentityMode,
     roles: tuple[RoleIdentity, ...],
     poll_seconds: int,
     poll_seconds_configured: str,
@@ -260,17 +241,16 @@ def analyse_identity_pools(
 ) -> IdentityPoolReport:
     """Pure: the findings implied by an already-resolved set of role identities."""
     findings: list[Finding] = []
-    mode = identity_mode
 
     fix = next((r for r in roles if r.role == "fix"), None)
-    if fix is not None and fix.ambient and mode is IdentityMode.THREE:
+    if fix is not None and fix.ambient:
         who = (
             f"'{fixer_account}'" if fixer_account
             else "whichever account ran `gh auth login`"
         )
         findings.append(Finding(
             "warn",
-            "IDENTITY_MODE=three but FIX_BOT_TOKEN is not set, so the fix daemon "
+            "FIX_BOT_TOKEN is not set, so the fix daemon "
             f"falls through to the ambient `gh auth` credential and acts as {who} "
             "— a human account, not a bot. Every branch, comment and pull request "
             "is attributed to that person, and the fixer's GraphQL calls are "
@@ -297,7 +277,6 @@ def analyse_identity_pools(
         ))
 
     return IdentityPoolReport(
-        identity_mode=mode,
         roles=roles,
         poll_seconds=poll_seconds,
         poll_seconds_configured=poll_seconds_configured,
@@ -398,7 +377,6 @@ def identity_pool_report(
     """Resolve every role's credential out of a composed env and analyse it."""
     poll_seconds, poll_valid = parse_poll_seconds(env.get("POLL_SECONDS"))
     return analyse_identity_pools(
-        identity_mode=resolve_identity_mode(env.get("IDENTITY_MODE")),
         roles=resolve_role_identities(env, key_readable=key_readable),
         poll_seconds=poll_seconds,
         poll_seconds_configured=str(env.get("POLL_SECONDS") or "").strip(),

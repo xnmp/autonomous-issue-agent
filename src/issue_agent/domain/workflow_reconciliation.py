@@ -6,8 +6,7 @@ import hashlib
 
 from .contracts import CommandId
 from .workflow import (
-    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, EvidenceUnavailable,
-    NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
+    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, OpenGate, ReconciliationOnly,
     ReconciliationPolicy, RemediationAttempted, RemediationOperation,
     RemediationOutcome, RemoteOutcomeUncertain, RetiredSettledCommand,
     RetiredUncertainCommand, RetryAuthorizationRequired,
@@ -100,22 +99,6 @@ def absent_reexecution(history: ActiveReconciliation) -> ActiveReconciliation:
     return replace(history, reexecutions=history.reexecutions + 1)
 
 
-def reexecution_exhausted(
-    history: ActiveReconciliation, now: datetime, policy: ReconciliationPolicy = ReconciliationPolicy(),
-) -> bool:
-    """Whether proven absence may still re-execute an unresolved command.
-
-    Unknown outcomes charge no refusals, so without this bound an
-    unknown -> absent -> re-execute cycle never ends. At the re-execution or
-    age ceiling the command expires to reconciliation-only, where absence
-    needs an operator grant (ADR 0015; ADR 0012 loops carry a ceiling).
-    """
-    if not isinstance(history, ActiveReconciliation) or not isinstance(policy, ReconciliationPolicy):
-        raise ValueError("re-execution bound requires pre-expiry history and a policy")
-    return (history.reexecutions >= policy.maximum_reexecutions
-            or (now - history.unresolved_since).total_seconds() >= policy.maximum_age_seconds)
-
-
 def reconciliation_due(state: CommandReconciliation, now: datetime) -> bool:
     if isinstance(state, RetiredSettledCommand):
         return False
@@ -188,54 +171,3 @@ def prewrite_evidence_gate_id(command_id: CommandId) -> str:
     return _PREWRITE_GATE_PREFIX + hashlib.sha256(str(command_id).encode()).hexdigest()
 
 
-def is_prewrite_gate(gate: object) -> bool:
-    """Whether a gate is a pre-write evidence hold: its command has not written.
-
-    Such a hold lives only as long as its command can still begin. A
-    transition that makes the command unable to begin (a generation advance,
-    retirement) removes it with that transition (ADR 0012/0015).
-    """
-    opened = gate.gate if isinstance(gate, RearmingGate) else gate
-    return (isinstance(opened, OpenGate) and isinstance(opened.cause, EvidenceUnavailable)
-            and opened.gate_id.startswith(_PREWRITE_GATE_PREFIX))
-
-
-def unavailable_prewrite_read(
-    binding: WorkflowBinding,
-    command_id: CommandId,
-    prior: ActiveReconciliation | None,
-    *,
-    now: datetime,
-    error: str,
-    policy: ReconciliationPolicy = ReconciliationPolicy(),
-) -> ReconciliationProgress:
-    """Schedule the next guard read of a command that has not written (ADR 0012).
-
-    No write happened, so nothing is uncertain; the command simply cannot
-    decide yet. Reads back off exponentially and, at the age/read ceiling,
-    an `EvidenceUnavailable` gate makes the stall visible. Reads continue at
-    the maximum delay; the first complete read ends the schedule and closes
-    the gate when the command begins.
-    """
-    validate_workflow_identifier(command_id, "command")
-    if not isinstance(binding, WorkflowBinding) or not isinstance(policy, ReconciliationPolicy):
-        raise ValueError("pre-write scheduling requires validated authority and policy")
-    if prior is not None and not isinstance(prior, ActiveReconciliation):
-        raise ValueError("pre-write history must be a validated schedule")
-    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("pre-write scheduling requires a timezone-aware clock")
-    if not isinstance(error, str) or not error:
-        raise ValueError("an unavailable pre-write read records why")
-    since = prior.unresolved_since if prior is not None else now
-    if now < since:
-        raise ValueError("pre-write read precedes its unresolved history")
-    reads = min(prior.failed_reads + 1, 2**63 - 1) if prior is not None else 1
-    delay = min(policy.maximum_delay_seconds, policy.initial_delay_seconds * 2 ** min(reads - 1, 17))
-    history = ActiveReconciliation(since, now + timedelta(seconds=delay), reads)
-    if reads < policy.maximum_reads and (now - since).total_seconds() < policy.maximum_age_seconds:
-        return ReconciliationProgress(history, None)
-    return ReconciliationProgress(history, OpenGate(
-        prewrite_evidence_gate_id(command_id), binding.fence.generation,
-        EvidenceUnavailable(f"pre-write guard read for command {command_id}", since, reads, error),
-        NoAuthorizedRemediation("a complete harness read of the guarded target is required before the write"),
-    ))

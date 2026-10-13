@@ -129,6 +129,6 @@ def ci_state(checks: CIObservation | Iterable[Check]) -> CIState:
         return CIState.PENDING
     if isinstance(result, Failed):
         return CIState.FAILURE
-    return CIState.OK if checks.reports else CIState.NONE
+    return CIState.OK if isinstance(checks, Observed) and checks.reports else CIState.NONE
 
 

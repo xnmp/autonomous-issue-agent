@@ -127,8 +127,6 @@ Prepare dependencies once, then run the specific behavioral contract:
 
 ```bash
 uv sync --extra dev --extra sdk --extra dash
-uv run --no-sync pytest tests/app/test_execute.py
-uv run --no-sync pytest tests/adapters/test_sql_read_budget.py
 uv run --no-sync pytest tests/app/test_loop.py
 make test-domain
 ```

@@ -10,14 +10,12 @@ Failure contracts are explicit:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar
 
-from .actions import Action
 from .events import TelemetryEvent
 from .contracts import RunId
-from .world import IssueView, PRView, PullRequestDiff
 
 T = TypeVar("T")
 
@@ -29,64 +27,6 @@ class WorkflowControlError(ValueError):
         self.path = path
         self.reason = reason
         super().__init__(f"Workflow control unavailable at {path}: {reason}")
-
-
-@runtime_checkable
-class GitHubReads(Protocol):
-    """Authoritative GitHub observations; transport failure raises."""
-
-    def issue_for_pr(self, pr: int) -> int | None: ...
-    def has_label(self, kind: str, number: int, label: str) -> bool: ...
-    def has_comment(self, kind: str, number: int, body: str) -> bool: ...
-    def is_issue_closed(self, issue: int) -> bool: ...
-
-
-@runtime_checkable
-class WorkflowGitHubReads(GitHubReads, Protocol):
-    """Read surface required by paid workflows.
-
-    Missing optional enrichment is represented by an empty value. A transport
-    failure raises the adapter's typed unavailable exception and aborts the
-    observation; it is never converted to an empty world.
-    """
-
-    def get_issue(self, number: int) -> IssueView: ...
-    def get_pr(
-        self, number: int, *, mergeability: bool = True, checks: bool = True
-    ) -> PRView: ...
-    def pr_for_issue(self, issue: int, *, require_unique: bool = False) -> int | None: ...
-    def pr_diff(
-        self, pr: int, base_oid: str, head_oid: str
-    ) -> PullRequestDiff: ...
-    def review_comments(self, pr: int) -> str: ...
-    def failed_run_log(self, head: str, run_ids: tuple[int, ...]) -> str: ...
-
-class WorkflowState(Protocol):
-    """Advisory repair context and the dispatcher infrastructure counter.
-
-    Selected lifecycle continuity uses typed SQL workflow control. CI history
-    and predictions may return empty context.
-    """
-
-    def save_predicted_paths(
-        self, issue: int, paths: frozenset[str]
-    ) -> None: ...
-
-
-class ActionExecutor(Protocol):
-    """Durable privileged effects.
-
-    ``False`` means at least one effect remains non-terminal. Transport and
-    ambiguous outcomes are persisted/reconciled by the implementation rather
-    than exposed as a successful return.
-    """
-
-    def execute_all(self, actions: Iterable[Action]) -> bool: ...
-    def replay_pending(self) -> bool: ...
-    def submit_review(
-        self, pr: int, event: str, body: str, expected_head: str
-    ) -> bool: ...
-
 
 
 class EventSink(Protocol):

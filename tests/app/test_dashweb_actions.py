@@ -509,7 +509,7 @@ def test_a_counter_reset_is_journalled_even_when_github_changed_nothing(
 
 
 @pytest.mark.parametrize("trigger", ["ai-pr-open", "ai-review"])
-def test_pr_review_hold_requires_migration_before_any_legacy_reset(monkeypatch, tmp_path, trigger):
+def test_pr_review_hold_is_refused_with_the_way_to_release_it(monkeypatch, tmp_path, trigger):
     backend, dirs, calls = _unblock_backend(
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
         hold_role="review",
@@ -520,7 +520,7 @@ def test_pr_review_hold_requires_migration_before_any_legacy_reset(monkeypatch, 
     evidence = dirs["review"] / "pr-12.last-sha"
     evidence.write_text("a" * 40)
     ok, detail = backend.unblock("demo", 7)
-    assert not ok and "review_migration_required" in detail
+    assert not ok and "review_hold_unsupported" in detail and "remove needs-human-review on GitHub" in detail
     assert counter.read_text() == "3" and evidence.read_text() == "a" * 40
     assert calls == [] and _journalled(dirs) == []
 
