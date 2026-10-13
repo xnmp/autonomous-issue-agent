@@ -207,62 +207,60 @@ def test_a_previously_optional_property_stays_sayable_as_null():
     assert out["properties"]["opt"]["type"] == ["integer", "null"]
 
 
-# ── parse_codex_envelope (pure) ──────────────────────────────────────────────────
-def test_envelope_success_maps_fields():
-    msg = json.dumps({"status": "pr_opened", "summary": "opened #5", "needs": ""})
-    r = parse_codex_envelope(exit_code=0, last_message=msg, session_id="s1")
-    assert r.is_error is False
-    assert r.status == "pr_opened"
-    assert r.summary == "opened #5"
-    assert r.session_id == "s1"
-    assert r.structured == {"status": "pr_opened", "summary": "opened #5", "needs": ""}
+_FAULT = "stream error: unexpected status 400 Bad Request"
+_OK, _AGENT, _UNAVAILABLE = ExitReason.OK, ExitReason.AGENT_ERROR, ExitReason.RUNTIME_UNAVAILABLE
 
 
-def test_envelope_blocked_carries_needs():
-    msg = json.dumps({"status": "blocked", "summary": "stuck", "needs": "which endpoint?"})
-    r = parse_codex_envelope(exit_code=0, last_message=msg)
-    assert r.status == "blocked" and r.needs == "which endpoint?"
-    assert r.is_error is False
+def _status(status, **kw):
+    return json.dumps({"status": status, **kw})
 
 
-def test_envelope_status_error_is_error():
-    msg = json.dumps({"status": "error", "summary": "boom", "needs": ""})
-    r = parse_codex_envelope(exit_code=0, last_message=msg)
-    assert r.is_error is True
+@pytest.mark.parametrize("exit_code,last_message,stderr,evidence,reason", [
+    (0, _status("pr_opened"), "", {}, _OK),
+    (0, _status("blocked", needs="?"), "", {}, _OK),  # a question is a NORMAL completion
+    (0, "PONG", "", {}, _OK),  # prose without a schema, exit 0
+    (0, "", _FAULT, {}, _OK),  # the fault branch may only narrow a FAILURE
+    (0, _status("error"), "", {}, _AGENT),
+    (1, "", "provider 401", {}, _AGENT),
+    (1, _status("error", summary="boom"), _FAULT, {}, _AGENT),  # a parsed envelope is never a fault
+    (1, "", _FAULT, {}, _UNAVAILABLE),  # a fault with no trace of a session
+    # supervised_exec fails a bad exec with a silent os._exit(127): no stream
+    # output and no session is not something a model can produce...
+    (127, "", "", {}, _UNAVAILABLE),
+    # ...but 127 is also a command the AGENT mistyped once anything printed,
+    # and only 127 is the exec-failure code.
+    (127, "", "bash: cargo: command not found", {}, _AGENT),
+    (1, "", "", {}, _AGENT),
+    (1, "", "boom", {}, _AGENT),  # the classification is POSITIVE
+    (3, "I rewrote the test helper", "unexpected status 400 Bad Request", {}, _AGENT),
+    # A leg with a session or tokens made an attempt (codex prices a
+    # subscription run at $0, so tokens matter on their own).
+    (1, "", _FAULT, {"session_id": "sess-1"}, _AGENT),
+    (1, "", _FAULT, {"usage": {"input_tokens": 4096, "output_tokens": 12}}, _AGENT),
+    # M17: only the stderr TAIL decides; a diff quoting a 400 cannot exempt a failure.
+    (1, "", "\n".join(['apply_patch: +    assert body == "unexpected status 400 Bad Request"']
+                      + [f"codex| trace line {i}" for i in range(40)] + ["Error: 2 tests failed"]), {}, _AGENT),
+    # The signature list holds one entry because agent tools write these.
+    (1, "", "bash: cargo: command not found", {}, _AGENT),
+    (1, "", "ls: /nope: No such file or directory", {}, _AGENT),
+    (1, "", "./tool: cannot execute binary file: Exec format error", {}, _AGENT),
+])
+def test_envelope_exit_reason(exit_code, last_message, stderr, evidence, reason):
+    r = parse_codex_envelope(exit_code=exit_code, last_message=last_message, stderr=stderr, **evidence)
+    assert r.exit_reason is reason
+    assert r.is_error is (reason is not _OK)
+    # None of these excuse a retry: they are attempts or a runtime that never ran.
+    assert not infra_death(r.exit_reason)
 
 
-def test_envelope_nonzero_exit_no_json_is_error():
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr="provider 401")
-    assert r.is_error is True
-    assert "provider 401" in r.summary
-
-
-def test_envelope_zero_exit_freetext_not_error():
-    # codex printed prose but no schema (e.g. no --output-schema) and exited 0.
-    r = parse_codex_envelope(exit_code=0, last_message="PONG")
-    assert r.is_error is False and r.summary == "PONG"
-
-
-# ── exit_reason on the codex envelope ────────────────────────────────────────
-def test_envelope_exit_reason_separates_agent_error_from_normal_terminals():
-    ok = parse_codex_envelope(
-        exit_code=0, last_message=json.dumps({"status": "pr_opened"})
-    )
-    # `blocked` is a NORMAL completion — the agent finished and asked a question.
-    blocked = parse_codex_envelope(
-        exit_code=0, last_message=json.dumps({"status": "blocked", "needs": "?"})
-    )
-    err = parse_codex_envelope(exit_code=0, last_message=json.dumps({"status": "error"}))
-    no_envelope = parse_codex_envelope(exit_code=1, last_message="", stderr="401")
-
-    assert ok.exit_reason is ExitReason.OK
-    assert blocked.exit_reason is ExitReason.OK
-    assert err.exit_reason is ExitReason.AGENT_ERROR
-    assert no_envelope.exit_reason is ExitReason.AGENT_ERROR
-    # None of these excuse a retry — they are all attempts the agent actually made.
-    assert not any(
-        infra_death(r.exit_reason) for r in (ok, blocked, err, no_envelope)
-    )
+def test_envelope_maps_fields():
+    msg = {"status": "pr_opened", "summary": "opened #5", "needs": ""}
+    r = parse_codex_envelope(exit_code=0, last_message=json.dumps(msg), session_id="s1")
+    assert (r.status, r.summary, r.session_id, r.structured) == ("pr_opened", "opened #5", "s1", msg)
+    blocked = parse_codex_envelope(exit_code=0, last_message=_status("blocked", summary="stuck", needs="which?"))
+    assert (blocked.status, blocked.needs) == ("blocked", "which?")
+    assert "provider 401" in parse_codex_envelope(exit_code=1, last_message="", stderr="provider 401").summary
+    assert "400 Bad Request" in parse_codex_envelope(exit_code=1, last_message="", stderr=_FAULT).summary
 
 
 # ── run() over a fake codex binary ───────────────────────────────────────────────
@@ -1404,132 +1402,5 @@ def test_only_the_stderr_tail_classifies_provider_pushback(tail, poison, signal)
     trace = _trace_with(tail, poison=poison)
     assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is signal
     assert _is_rate_limited(trace) is (signal and "rate limit" in tail)
-
-
-# ── the runtime could not start (keifu #130) ─────────────────────────────────
-# 2026-08-02: a broken codex binary answered every dispatch with an instant HTTP
-# 400 — exit non-zero, no envelope, no session id, no tokens, $0. This layer is
-# the only one that can see the difference between "the agent ran and failed"
-# and "the agent never ran": by the time the domain holds an AgentResult both
-# are is_error=True. Getting it wrong cost issue #130 a false `resolve failed
-# 3x` escalation on the first healthy dispatch hours later.
-def test_a_runtime_fault_with_no_trace_of_a_session_is_runtime_unavailable():
-    r = parse_codex_envelope(
-        exit_code=1,
-        last_message="",
-        stderr="stream error: unexpected status 400 Bad Request",
-    )
-    assert r.is_error is True
-    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
-    assert "400 Bad Request" in r.summary
-
-
-def test_a_silent_exec_failure_is_runtime_unavailable():
-    """`supervised_exec` fails a bad exec with a silent `os._exit(127)` — no
-    stderr at all — so the missing/wrong-architecture binary case is carried by
-    the exit code, not by a string. A non-zero exit with nothing on any stream
-    and no session is not something a model can produce."""
-    r = parse_codex_envelope(exit_code=127, last_message="", stderr="")
-    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
-
-
-def test_exit_127_that_printed_something_is_an_agent_error():
-    """127 is also what a shell returns for a command the AGENT mistyped. Once
-    codex has printed anything, the silence that made 127 unambiguous is gone."""
-    r = parse_codex_envelope(
-        exit_code=127, last_message="", stderr="bash: cargo: command not found",
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_an_ordinary_nonzero_exit_with_no_output_is_still_an_agent_error():
-    """Only 127 is the exec-failure code. A silent `exit 1` is codex reporting
-    failure, and must keep marching its breaker."""
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr="")
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_an_unrecognised_failure_stays_an_agent_error():
-    """The classification is POSITIVE. Absence of evidence is not evidence that
-    the leg never ran — an ordinary codex failure often leaves only a trace, and
-    exempting those would disarm every breaker."""
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr="boom")
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-@pytest.mark.parametrize(
-    "evidence",
-    [
-        {"session_id": "sess-1"},
-        {"usage": {"input_tokens": 4096, "output_tokens": 12}},
-    ],
-)
-def test_a_session_that_existed_is_an_agent_error_whatever_stderr_says(evidence):
-    """The guard half. A leg that produced a session id or tokens made an
-    attempt; a runtime-fault string scrolling past in its trace must not buy it
-    out of the breaker. (Tokens matter on their own: codex prices a
-    subscription run at $0, so a spend check alone would misread it.)"""
-    r = parse_codex_envelope(
-        exit_code=1,
-        last_message="",
-        stderr="stream error: unexpected status 400 Bad Request",
-        **evidence,
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_captured_agent_output_beats_a_runtime_fault_signature():
-    r = parse_codex_envelope(
-        exit_code=3,
-        last_message="I rewrote the test helper",
-        stderr="unexpected status 400 Bad Request",
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_a_runtime_fault_signature_deep_in_the_agent_trace_is_ignored():
-    """M17 discipline: only the stderr TAIL may decide. The agent's own output
-    scrolls past, and a test fixture or a diff quoting a 400 must never be able
-    to exempt a real failure from its breaker."""
-    trace = "\n".join(
-        ['apply_patch: +    assert body == "unexpected status 400 Bad Request"']
-        + [f"codex| trace line {i}" for i in range(40)]
-        + ["Error: 2 tests failed"]
-    )
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr=trace)
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_agent_authored_exec_errors_can_never_reach_the_signature_list():
-    """The signature list holds exactly one entry BECAUSE of this. `exec format
-    error` / `no such file or directory` / `command not found` are unreachable
-    from the runtime on the paid path, so listing them would have added no
-    coverage and one laundering channel: text the agent's own tools wrote,
-    buying a real failure out of its breaker."""
-    for agent_text in (
-        "bash: cargo: command not found",
-        "ls: /nope: No such file or directory",
-        "./tool: cannot execute binary file: Exec format error",
-    ):
-        r = parse_codex_envelope(exit_code=1, last_message="", stderr=agent_text)
-        assert r.exit_reason is ExitReason.AGENT_ERROR, agent_text
-
-
-def test_a_parsed_envelope_is_never_a_runtime_fault():
-    r = parse_codex_envelope(
-        exit_code=1,
-        last_message=json.dumps({"status": "error", "summary": "boom"}),
-        stderr="unexpected status 400 Bad Request",
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_a_clean_exit_is_never_reclassified():
-    """The branch may only ever narrow a FAILURE."""
-    r = parse_codex_envelope(
-        exit_code=0, last_message="", stderr="unexpected status 400 Bad Request",
-    )
-    assert r.is_error is False
-    assert r.exit_reason is ExitReason.OK
 
 

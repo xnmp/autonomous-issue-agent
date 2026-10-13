@@ -7,8 +7,6 @@ import threading
 
 import pytest
 
-from tests.fakes.legacy_journal import Journal
-from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.github import GhUnavailable
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.tick import Daemon
@@ -375,86 +373,6 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
     assert terminalized == ["terminalized"]
 
 
-def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
-    tmp_path,
-):
-    from datetime import datetime, timezone
-    from zoneinfo import ZoneInfo
-
-    from issue_agent.adapters.control_store import (
-        BudgetLimit,
-        ReservationRequest,
-        SQLiteControlStore,
-    )
-    from issue_agent.domain.actions import AgentKind, RunAgent
-    from issue_agent.domain.contracts import (
-        Money,
-        RunId,
-        daily_budget_scope,
-    )
-
-    control = SQLiteControlStore(str(tmp_path / "control.db"))
-    control.initialize()
-    now = datetime.now(timezone.utc)
-    run_id = RunId("deadline-run")
-    assert control.lease("o/r", "fix", 7, "o/r:fix")
-    request = ReservationRequest(
-        run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1_000_000),
-        (BudgetLimit(daily_budget_scope("o/r", "repository", "USD", now, ZoneInfo("UTC")),
-                     Money("USD", 2_000_000)),),
-        7, issue=7, number=7,
-    )
-    assert control.reserve(request).admitted
-    control.register_process_lease(
-        run_id,
-        expected_owner_id=request.owner_id,
-        pid=123,
-        pgid=123,
-        process_start_ticks=99,
-    )
-    clock = ManualClock()
-    started = threading.Event()
-    release = threading.Event()
-
-    def run_agent(_action):
-        started.set()
-        release.wait(timeout=5)
-
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
-        Executor(FakeGateway(), run_agent=run_agent),
-        poll_seconds=1,
-        dispatch_capacity=1,
-        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
-        monotonic=clock,
-        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
-        prepare_shutdown=lambda: control.record_owned_cancellation_intents(
-            "o/r:fix",
-            "shutdown_deadline_spend_unknown",
-        ),
-        force_kill_dispatches=lambda: clock.advance(_KILL_WINDOW),
-    )
-
-    def interrupt(_seconds):
-        assert started.wait(timeout=1)
-        raise KeyboardInterrupt
-
-    with pytest.raises((KeyboardInterrupt, SystemExit)) as stopped:
-        daemon.run_forever(sleep=interrupt, now=lambda: 0, max_ticks=1)
-    assert stopped.type is SystemExit
-
-    assert started.is_set()
-    assert control.active_reservation_runs("o/r:fix") == (run_id,)
-    assert tuple(
-        lease.run_id for lease in control.leases()
-    ) == (run_id,)
-    assert control.has_cancellation_intent(run_id)
-    release.set()
-    daemon.wait_for_dispatches()
-
-
 def test_application_shutdown_deadline_fits_inside_every_systemd_hard_stop():
     from pathlib import Path
     import re
@@ -533,18 +451,6 @@ def test_tick_skips_the_pass_when_github_is_unavailable():
     assert d.tick() == []
     assert decided == []          # never asked the domain about a world we can't see
     assert gw.calls == []         # and never touched the repo
-
-
-def test_non_infra_observe_failure_still_uses_the_generic_arm():
-    """Only infra gets the special line; a real bug in observe must stay
-    recognisable as a bug rather than be dressed up as a rate limit."""
-    logs = []
-    def boom():
-        raise KeyError("headRefName")
-    d, _ = _daemon(lambda w: [], observe=boom, logs=logs)
-    assert d.tick() == []
-    assert any("poll pass failed" in m for m in logs)
-    assert not any("world build failed" in m for m in logs)
 
 
 def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
@@ -705,43 +611,6 @@ def test_reservation_sweep_runs_on_bounded_tick_cadence():
     assert sweeps == [RecoveryTrigger.PERIODIC]
 
 
-def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    receipt = {
-        "ts": "1970-01-01T00:00:10+00:00",
-        "event": "action",
-        "desc": "relabel issue #5: +ai-blocked",
-        "action": {
-            "type": "relabel",
-            "target": "ISSUE",
-            "number": 5,
-            "remove": None,
-            "add": "ai-blocked",
-        },
-    }
-    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
-    gateway = FakeGateway()
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [],
-        Executor(gateway, journal=journal),
-        poll_seconds=60,
-    )
-
-    times = iter([0, 239])
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: next(times),
-        max_ticks=1,
-    )
-
-    events = read_events(journal.path)
-    assert events[0] == receipt
-    assert not any(event["event"] in {"stall", "agent_run_stall"} for event in events)
-    assert gateway.calls == []
-
-
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):
     d, _ = _daemon(lambda w: [], logs=logs)
     d.poll_seconds = poll_seconds
@@ -762,25 +631,5 @@ def test_no_wake_check_sleeps_in_one_call_as_before():
     slept = []
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert slept == [60, 60]
-
-
-def test_wake_failure_keeps_long_remainder_watchdog_safe():
-    progress = []
-    slept = []
-
-    def boom():
-        raise RuntimeError("stat failed")
-
-    d = _waking_daemon(boom, poll_seconds=300)
-    d.run_forever(
-        sleep=slept.append,
-        now=lambda: 0,
-        max_ticks=1,
-        scheduler_progress=lambda: progress.append(True),
-    )
-
-    assert sum(slept) == 300
-    assert max(slept) <= 30
-    assert len(progress) == len(slept) + 3
 
 

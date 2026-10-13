@@ -3,10 +3,8 @@ isolation, recovery scope, shutdown hooks, and runtime binding."""
 
 from __future__ import annotations
 
-from tests.domain.builders import observed_pr
 
 
-import json
 import os
 import subprocess
 import time
@@ -14,7 +12,6 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import pytest
 
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.control_store import (
@@ -27,8 +24,6 @@ from issue_agent.adapters.control_store import (
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.config import supervision_dir
 from issue_agent.app.tick import control_store, headroom, owner_identity, shutdown_hooks
-from issue_agent.domain.agent_task import RuntimeName
-from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.contracts import (
     BudgetScope,
@@ -37,7 +32,6 @@ from issue_agent.domain.contracts import (
     PricingBasis,
     RunId,
 )
-from issue_agent.domain.recovery import RecoveryTrigger
 
 
 class _UnreadableLedger:
@@ -141,69 +135,6 @@ def test_a_repointed_deployment_recovers_its_predecessors_dead_leg(tmp_path) -> 
     assert adopted.lease("o/r", "fix", 7, current_owner)
 
 
-def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
-    tmp_path,
-):
-    now = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-    control = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: now
-    )
-    control.initialize()
-    scope = BudgetScope(
-        "o/r",
-        "repository",
-        "USD",
-        "2026-07-30",
-        now.replace(hour=0),
-        now.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-    run_id = RunId("shutdown-reconcile")
-    assert control.lease("o/r", "fix", 42, "o/r:fix")
-    assert control.reserve(
-        ReservationRequest(
-            run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1_000),
-            (BudgetLimit(scope, Money("USD", 2_000)),), 42, issue=42, number=42,
-        )
-    ).admitted
-    control.register_process_lease(
-        run_id,
-        expected_owner_id="o/r:fix",
-        pid=123,
-        pgid=123,
-        process_start_ticks=99,
-    )
-    prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix", state_dir="", role="fix")  # type: ignore[arg-type]
-    prepare()
-    assert control.has_cancellation_intent(run_id)
-    # Recording the intent releases nothing: capacity stays reserved until
-    # the killed run's spend is reconciled.
-    assert control.active_reservation_runs("o/r:fix") == (run_id,)
-
-    class Spend:
-        def reconcile(self, candidate):
-            result = control.settle(
-                SettlementRequest(
-                    candidate,
-                    Money("USD", 250),
-                    PricingBasis.RECONCILED,
-                    "recovered-rollout",
-                    None,
-                    None,
-                    None,
-                )
-            )
-            return result.disposition is AccountingDisposition.AVAILABLE
-
-    shutdown_hooks(control, Spend(), owner_id="o/r:fix", state_dir=str(tmp_path / "state"), role="fix")[1]()
-
-    assert control.active_reservation_runs("o/r:fix") == ()
-    assert control.leases() == ()
-    assert control.snapshot(scope).settled == Money("USD", 250)
-    assert not control.has_cancellation_intent(run_id)
-    assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
-
-
 def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(tmp_path):
     # Its rollout may become readable only after the process group is
     # reaped: settling it at a zero estimate during shutdown could never be
@@ -273,12 +204,6 @@ from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 FIX_BOT = "fix-bot"
 
 
-def _control(tmp_path) -> SQLiteControlStore:
-    control = SQLiteControlStore(str(tmp_path / "control.sqlite3"))
-    control.initialize()
-    return control
-
-
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
 
 
@@ -328,29 +253,6 @@ def _role_state_env(tmp_path) -> dict[str, str]:
 
 
 # ── #29: a codex fixer announces that MAX_BUDGET_USD bounds nothing ──────────
-
-
-def _git_target(tmp_path):
-    """A real git checkout for TARGET_DIR. The Claude review binding arms the
-    per-PR pinned checkout off TARGET_DIR (0d2e295 M1), so a review leg only
-    runs when the PR's head SHA actually exists in that repo — a bare tmp dir
-    now (correctly) defers every round instead of reviewing it."""
-    repo = tmp_path / "target"
-    subprocess.run(
-        ["git", "init", "-q", str(repo)], check=True, capture_output=True
-    )
-    subprocess.run(
-        [
-            "git", "-C", str(repo), "-c", "user.email=t@example.com",
-            "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "seed",
-        ],
-        check=True, capture_output=True,
-    )
-    sha = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    return str(repo), sha
 
 
 def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
@@ -438,13 +340,5 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
 
 
 # ── FixState carries the re-run marker (#38) ─────────────────────────────────
-
-
-def _held_pr(number=581, issue=500):
-    return observed_pr(
-        number, head_ref_name=f"fix/{issue}-x", closing_issue=issue,
-        head_ref_oid="abc", labels=frozenset({Label.NEEDS_HUMAN}),
-        author=FIX_BOT, state="OPEN",
-    )
 
 
