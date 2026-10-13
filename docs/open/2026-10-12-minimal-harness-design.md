@@ -12,6 +12,8 @@ Draft, 2026-10-12. This is the yardstick for the subtractive refactor. Anything 
 ## Tick
 `observe` (one GraphQL query plus SQLite) → `derive` (a pure function, state never stored) → `act` (idempotent: label, comment, merge, dispatch a leg).
 
+Between ticks a daemon waits for a change, not just the clock. It wakes when either role frees an item of its repository: a claim (lease) seen since the tick began is gone. A role hands its claim back last, after the leg's records and GitHub effects (push, verdict) have landed, so the woken tick sees them. Settlement leaves the claim, rebound to the settling daemon, for its owner to release. `PRAGMA data_version`, checked once a second, gates the lease read (`adapters/control_store.py` `StoreWake`). A change is judged once the store has been quiet for a second, or after 3 s of continuous commits. Ticks stay at least 5 s apart. New claims and other repositories' commits wake nothing, so a busy store can't turn the loop into a hot GitHub poller. One wait spans the poll interval and feeds the watchdog. `POLL_SECONDS` stays the ceiling that picks up GitHub-side events (CI, human comments). After GitHub refuses a tick the interval is never cut short. If the store can't be read, the wait falls back to the timer and logs once.
+
 | Derived state | Action |
 |---|---|
 | issue `ai-ready`, never stewarded | STEWARD |

@@ -277,6 +277,7 @@ def test_resumed_session_uses_distinct_per_leg_settlement_receipts(tmp_path) -> 
     wrapper, store = _wrapper(tmp_path, runtime)
 
     _work(wrapper, "first", model="gpt-test")
+    wrapper.store.unlease("o/r", "fix", 1, "o/r:fix")  # the role hands its claim back after each leg
     _work(wrapper, "second", model="gpt-test")
 
     receipts = [receipt for (receipt,) in _ended(store, "provider_receipt_id")]

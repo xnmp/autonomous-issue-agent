@@ -585,6 +585,29 @@ def test_an_unsettled_leg_keeps_its_lease_until_its_process_is_gone(tmp_path):
     assert store.unlease(REPO, "fix", 1, OWNER) is False  # reclaim already dropped it
 
 
+def test_a_settled_legs_claim_is_held_until_its_owner_hands_it_back(tmp_path):
+    # The owner's release, after the leg's GitHub effects, is the store's
+    # signal that the item is free (StoreWake); settling must not pre-empt it.
+    store = _store(tmp_path)
+    run = _launch(store, 1)  # bound to its (dead) leg process
+    store.settle(_settlement(str(run), 1))
+
+    assert store.held_targets(REPO) == frozenset({1})  # rebound to the settling daemon
+    assert store.reclaim_dead_leases(OWNER, lambda pid, _ticks: pid == os.getpid()) == ()
+    assert not store.lease(REPO, "fix", 1, "o/r:fix:other")
+    assert store.unlease(REPO, "fix", 1, OWNER)
+    assert store.leases() == ()
+    assert store.lease(REPO, "fix", 1, OWNER)
+
+
+def test_a_settled_claim_whose_owner_died_is_reclaimable(tmp_path):
+    store = _store(tmp_path)
+    run = _launch(store, 1)
+    store.settle(_settlement(str(run), 1))
+
+    assert store.reclaim_dead_leases(OWNER, _dead) == ()  # the leg had ended: nothing to end
+    assert store.leases() == ()
+
 def test_unleasing_a_never_launched_leg_releases_its_reservation_with_the_lease(tmp_path):
     # The runtime's own release can fail on a transient SQLite error; the
     # claim's release must not then keep the reservation and the daemon-pid

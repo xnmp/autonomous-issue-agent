@@ -212,6 +212,7 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
             ).disposition.value
             == "available"
         )
+        assert control.unlease(repository, "fix", issue, owner)  # as the role does after each leg
     now = lambda: datetime(2026, 7, 29, 12, tzinfo=timezone.utc)  # noqa: E731
 
     def config_for(name):

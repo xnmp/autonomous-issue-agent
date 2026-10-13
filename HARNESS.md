@@ -251,6 +251,8 @@ over again and keeps the pre-cutover spend; only legs recorded since the
 cutover are lost. Do not delete a retired file. Only when none is listed may
 you delete the listed files to start deliberately with no spend history.
 
+While the daemons run, the latest commits can sit in `control.db-wal`: each daemon's store wake holds a connection through its idle wait. Back up with `sqlite3 control.db ".backup <file>"`, or stop every daemon first. Copying `control.db` alone can miss recent spend.
+
 ### Upgrading to the 3-table store (slice 5d-2)
 
 The first role daemon to open a pre-5d-2 `control.db` converts it in place,

@@ -26,6 +26,7 @@ import json
 import os
 import sqlite3
 import stat
+import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
@@ -576,7 +577,14 @@ class SQLiteControlStore:
              request.rate_card_id, request.rate_card_version, request.provider_receipt_id,
              settled_at, settled_at, str(request.run_id)),
         )
-        db.execute("DELETE FROM leases WHERE leg_id=?", (str(request.run_id),))
+        # The claim stays until its owner's `unlease`, after the leg's GitHub
+        # effects land: that release is what wakes the roles (`StoreWake`).
+        # Rebound to the settling daemon, it holds the item until then, and a
+        # crash in between leaves it dead for reclaim. Recovery settles only
+        # unleased legs, so this matches no row there.
+        if (identity := ProcessSupervisor.process_identity(os.getpid())) is not None:
+            db.execute("UPDATE leases SET pid=?, pgid=?, start_ticks=? WHERE leg_id=?",
+                       (identity.pid, os.getpgid(0), identity.start_ticks, str(request.run_id)))
         return SettlementResult(AccountingDisposition.AVAILABLE, request.amount)
 
     def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool:
@@ -952,6 +960,130 @@ class SQLiteControlStore:
             db.execute("UPDATE idempotency SET state='done' WHERE key=?", (key,))
 
 
+# Store-change wake (owner, 2026-10-14). The check is a free pragma read, so a
+# second's latency costs nothing. The gap bounds a daemon to one GitHub
+# observation per 5 s however busy the store is: the GraphQL budget is shared
+# with the sibling role and the dashboard. A store that never goes quiet (every
+# deployment of the user shares it) is judged anyway after the settle time.
+WAKE_CHECK_SECONDS = 1.0
+WAKE_MIN_GAP_SECONDS = 5.0
+WAKE_SETTLE_SECONDS = 3.0
+STORE_CHANGED = "store changed"
+
+
+class StoreWake:
+    """Ends a daemon's inter-tick wait early when an item of its repository is
+    freed, in either role.
+
+    An item is freed when a claim (lease) of the repository seen since the
+    tick began is gone. A role hands its claim back only after the leg's
+    GitHub effects and records have landed (`unlease` last in its `finally`),
+    so the woken tick sees them. A new claim and other repositories wake
+    nothing; a claim held for less than one check can go unseen, and the poll
+    covers it.
+
+    `PRAGMA data_version` on the wait's connection gates the lease reads: it
+    changes when another connection commits, and every store operation opens
+    its own, so this process's commits count too. Claims are read on every
+    change; whether one is gone is judged once the store has been quiet for
+    one check (a burst lands whole) or has kept moving for the settle time.
+
+    One wait spans the whole poll interval, so the baseline is always the
+    tick's, and it feeds the scheduler watchdog itself. Its connection lives
+    for that wait, read-write but query-only, so its close folds the WAL back
+    like every other store connection and a replaced file is reopened. An
+    unreadable store degrades to the timed wait, logged once per outage."""
+
+    def __init__(
+        self,
+        path: str,
+        repository: str,
+        *,
+        log: Callable[[str], None],
+        progress: Callable[[], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.path = os.path.abspath(path)
+        self.repository = canonical_repository(repository)
+        self._log = log
+        self._progress = progress
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._unavailable = False
+        self._claims = self._held_now() or frozenset()  # seen since the tick began
+
+    def wait(self, timeout: float) -> str | None:
+        """Wait up to `timeout` seconds; return the wake reason, or None when
+        the time ran out. No wake comes sooner than the minimum gap after the
+        wait began."""
+        start = self._monotonic()
+        deadline = start + timeout
+        try:
+            with closing(self._open()) as db:
+                reason = self._watch(db, start, deadline)
+                self._claims = _held_leases(db, self.repository)  # the tick about to run
+                self._unavailable = False
+                return reason
+        except (sqlite3.Error, OSError) as exc:
+            self._report_unavailable(exc)
+        while (remaining := deadline - self._monotonic()) > 0:
+            self._pause(min(WAKE_CHECK_SECONDS, remaining))
+        self._claims = self._held_now() or self._claims
+        return None
+
+    def _watch(self, db: sqlite3.Connection, start: float, deadline: float) -> str | None:
+        # Commits made while the tick ran predate this connection: judge once.
+        dirty, seen, moving_since = True, None, None
+        while (now := self._monotonic()) < deadline:
+            self._pause(min(WAKE_CHECK_SECONDS, deadline - now))
+            version = db.execute("PRAGMA data_version").fetchone()[0]
+            first, moved, seen = seen is None, seen is not None and version != seen, version
+            if first or moved:
+                self._claims |= _held_leases(db, self.repository)
+            now = self._monotonic()
+            moving_since = (moving_since if moving_since is not None else now) if moved else None
+            dirty = dirty or moved
+            settling = moving_since is not None and now - moving_since < WAKE_SETTLE_SECONDS
+            if not dirty or settling or now < start + WAKE_MIN_GAP_SECONDS:
+                continue
+            dirty, moving_since = False, None
+            held = _held_leases(db, self.repository)
+            if self._claims - held:
+                return STORE_CHANGED
+            self._claims |= held
+        return None
+
+    def _pause(self, seconds: float) -> None:
+        self._sleep(seconds)
+        if self._progress is not None:
+            self._progress()
+
+    def _open(self) -> sqlite3.Connection:
+        db = sqlite3.connect(f"{Path(self.path).as_uri()}?mode=rw", uri=True, timeout=1.0, isolation_level=None)
+        db.execute("PRAGMA query_only=ON")
+        return db
+
+    def _held_now(self) -> frozenset[tuple[str, int, str]] | None:
+        try:
+            with closing(self._open()) as db:
+                return _held_leases(db, self.repository)
+        except (sqlite3.Error, OSError) as exc:
+            self._report_unavailable(exc)
+            return None
+
+    def _report_unavailable(self, exc: Exception) -> None:
+        if not self._unavailable:
+            self._log(f"store wake unavailable ({exc}); waking on the poll interval only")
+        self._unavailable = True
+
+
+def _held_leases(db: sqlite3.Connection, repository: str) -> frozenset[tuple[str, int, str]]:
+    """Each claim on the repository, by role, item and when it was taken: a
+    claim taken again is a different claim."""
+    rows = db.execute("SELECT role, target, acquired_at FROM leases WHERE repository=?", (repository,)).fetchall()
+    return frozenset((str(role), int(target), str(acquired)) for role, target, acquired in rows)
+
 def _refuse_prior_use(path: str, opened_before: bool) -> None:
     """A missing store is created only where none ever was.
 
@@ -1178,7 +1310,9 @@ def _cut_over(path: str, now: datetime) -> None:
         # opens a connection per operation, so an idle one passes and its next
         # operation meets the new schema and fails closed. Stopping every
         # daemon first (HARNESS.md) is the real guard. It also folds the -wal
-        # into the file the retired name keeps.
+        # into the file the retired name keeps. (Releases from 2026-10-14 hold
+        # a `StoreWake` connection through each idle wait, so a future cutover
+        # leaving WAL must stop them first.)
         try:
             mode = legacy.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         except sqlite3.OperationalError:

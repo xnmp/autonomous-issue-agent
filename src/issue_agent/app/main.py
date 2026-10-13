@@ -18,6 +18,7 @@ from ..adapters.control_store import (
     CorruptControlStore,
     CutoverRefused,
     IncompatibleSchema,
+    StoreWake,
 )
 from ..adapters.env_file import source_env_file
 from ..adapters.github import GitHubGateway, Identity
@@ -32,6 +33,7 @@ from .config import HarnessConfig, from_env, render_agent_md, supervision_dir
 from .fix import compose_fix_daemon
 from .review import compose_review_daemon
 from .review_identity import review_identity as _app_identity
+from .tick import Daemon, Role
 
 
 def _load_agent_env(env: dict) -> dict:
@@ -111,6 +113,14 @@ def _review_prompt(cfg: HarnessConfig) -> str:
     return cfg.review_prompt or _plugin_text("REVIEW_PROMPT.md")
 
 
+def _store_woken(composed: Role, cfg: HarnessConfig, log: Callable[[str], None],
+                 progress: Callable[[], None] | None) -> Daemon:
+    """The role's daemon, its wait between ticks ended when either role frees
+    an item of the repository (read from the shared control store)."""
+    composed.daemon.wait_for_change = StoreWake(composed.control.path, cfg.repo, log=log, progress=progress).wait
+    return composed.daemon
+
+
 def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[[], None] | None = None):
     # `main()` already loaded AGENT_ENV once (a `bash -c ... env -0` shell-out);
     # only a standalone caller (env=None) pays for it here (review S7/D3).
@@ -145,10 +155,10 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
                            progress=scheduler_progress)
         worktrees = Worktrees(cfg.target_dir or os.getcwd(), cfg.worktree_root, cfg.base_branch)
-        return compose_fix_daemon(cfg, gw, worktrees, runner).daemon
+        return _store_woken(compose_fix_daemon(cfg, gw, worktrees, runner), cfg, log, scheduler_progress)
     if role == "review":
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=log), progress=scheduler_progress)
-        return compose_review_daemon(cfg, gw, runner).daemon
+        return _store_woken(compose_review_daemon(cfg, gw, runner), cfg, log, scheduler_progress)
     raise SystemExit(f"unknown role: {role!r} (use fix|review)")
 
 
