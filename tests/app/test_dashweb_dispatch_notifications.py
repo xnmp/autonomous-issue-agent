@@ -50,10 +50,10 @@ def test_agent_run_start_announces_each_new_dispatch():
             "ts": ts(3),
             "event": "agent_run_start",
             "role": "fix",
-            "kind": "PR_RESUME",
+            "kind": "ADDRESS_REVIEW",
             "number": 12,
             "issue": 7,
-            "dispatch": "pr-resume-12",
+            "dispatch": "address-review-12",
         },
     ]
 
@@ -62,7 +62,7 @@ def test_agent_run_start_announces_each_new_dispatch():
     assert [(item["title"], item["detail"]) for item in notifications] == [
         ("Issue #7 dispatched", "RESOLVE started"),
         ("Issue #7 dispatched", "REVIEW for PR #12 started"),
-        ("Issue #7 dispatched", "PR_RESUME for PR #12 started"),
+        ("Issue #7 dispatched", "ADDRESS_REVIEW for PR #12 started"),
     ]
     assert all(item["severity"] == "info" for item in notifications)
     assert len({item["id"] for item in notifications}) == 3

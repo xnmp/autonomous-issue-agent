@@ -31,8 +31,7 @@ import { liveClocks, useNow, useSnapshotOffset } from "../lib/clock";
 import { kindLabel } from "../lib/semantics";
 import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
-import { useLegacyUnblockRefusal } from "./legacy-unblock";
-import { ResolveControls } from "./resolve/ResolveControls";
+import { UnblockControl } from "./UnblockControl";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { tipProps } from "./ui/Tip";
 import { ErrorBanner, SkeletonRows } from "./ui/Feedback";
@@ -418,9 +417,8 @@ function TierBadge({ tier }: { tier: Tier | null }) {
 }
 
 /**
- * The row's single action. Re-arm and budget approval open the issue's own
- * resolve controls, which own the guarded prepare/confirm flow and the
- * legacy-unblock gate; the board never issues those writes itself.
+ * The row's single action. Re-arm and budget approval reveal the unblock
+ * control, which confirms before it moves any label.
  */
 function Action({
   repo,
@@ -494,8 +492,8 @@ function ActionControl({
             type="button"
             className="btn btn-primary"
             disabled={busy}
-            {...tipProps("Restore the PR to the harness: review, merge and overlap serialization resume")}
-            onClick={() => void run(() => api.unpark(repo, item.issue))}
+            {...tipProps("Remove needs-human and put the issue back on ai-ready")}
+            onClick={() => void run(() => api.unblock(repo, item.issue))}
           >
             {action.label}
           </button>
@@ -514,7 +512,7 @@ function ActionControl({
   }
 }
 
-/** The issue page's resolve controls, for a row the harness holds for a person. */
+/** The unblock control, for a row the harness holds for a person. */
 function HeldControls({
   repo,
   issue,
@@ -524,16 +522,9 @@ function HeldControls({
   issue: number;
   onChanged: () => void;
 }) {
-  const legacyRefusal = useLegacyUnblockRefusal(repo, true);
   return (
     <div className="board-held-controls">
-      <ResolveControls
-        deployment={repo}
-        issue={issue}
-        heldForHuman
-        legacyRefusal={legacyRefusal}
-        onChanged={onChanged}
-      />
+      <UnblockControl deployment={repo} issue={issue} heldForHuman onChanged={onChanged} />
     </div>
   );
 }

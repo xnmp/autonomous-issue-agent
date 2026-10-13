@@ -10,7 +10,6 @@ called — rather than merely that a label moved.
 from __future__ import annotations
 
 
-
 import asyncio
 import json
 import os
@@ -25,9 +24,7 @@ from issue_agent.adapters.journal import (
     read_events,
 )
 from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.domain.actions import Relabel, Target
 from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
-from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
@@ -67,36 +64,6 @@ def test_read_events_of_a_missing_file_is_an_empty_history(tmp_path):
     assert read_events(str(tmp_path / "nope.jsonl")) == []
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_default_ledger_path_is_global_and_honours_xdg(monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", "/xdg")
     assert default_ledger_path() == "/xdg/issue-agent/spend.jsonl"
@@ -118,20 +85,6 @@ def _run(dt, kind="RESOLVE", number=5, issue=5, dispatch="", role="fix", **extra
     return {"ts": _at(dt), "event": "agent_run", "role": role, "kind": kind,
             "number": number, "issue": issue, "cost_usd": 0.0,
             "dispatch": dispatch, **extra}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_the_real_runtime_stamps_one_dispatch_id_across_every_leg(tmp_path):
@@ -192,26 +145,10 @@ def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
     assert by_number[5][0]["dispatch"] != by_number[7][0]["dispatch"]
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ── read_events_tail ──────────────────────────────────────────────────────────
 # The poll-loop reader must not grow with the age of the install; a byte window
 # means its first line is usually torn, and a parser handed half an object must
 # skip it exactly like a killed writer's tail.
-
-
 
 
 # ── JournalingRuntime ─────────────────────────────────────────────────────────
@@ -327,59 +264,6 @@ def test_each_leg_of_a_multi_leg_dispatch_gets_its_own_attributed_line(tmp_path)
     assert sum(
         event["cost_usd"] for event in _settled(journal.path)
     ) == pytest.approx(1.5)
-
-
-# ── #40: one leg of a dispatch under its own kind ────────────────────────────
-def test_a_leg_kind_renames_only_the_legs_inside_the_block(tmp_path):
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.5))
-    rt.set_context("fix", "RESOLVE", 5, 5)
-    with rt.leg_kind("ROUTE"):
-        asyncio.run(rt.run(RuntimePlan(prompt="classify")))
-    asyncio.run(rt.run(RuntimePlan(prompt="resolve")))
-
-    assert [r["kind"] for r in _settled(journal.path)] == ["ROUTE", "RESOLVE"]
-
-
-def test_a_leg_kind_keeps_the_dispatch_id_and_the_rest_of_the_context(tmp_path):
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.5))
-    rt.set_context("fix", "RESOLVE", 5, 5)
-    with rt.leg_kind("ROUTE"):
-        asyncio.run(rt.run(RuntimePlan(prompt="classify")))
-    asyncio.run(rt.run(RuntimePlan(prompt="resolve")))
-
-    runs = _settled(journal.path)
-    assert len({r["dispatch"] for r in runs}) == 1, "one dispatch, one id"
-    assert all((r["role"], r["number"], r["issue"]) == ("fix", 5, 5) for r in runs)
-
-
-def test_a_renamed_leg_keeps_its_cost_attribution(tmp_path):
-    """A router run remains attributable under its own telemetry bucket."""
-    rt, journal, ledger = _runtime(
-        tmp_path, AgentResult(is_error=False, cost_usd=0.07)
-    )
-    rt.set_context("fix", "RESOLVE", 5, 5)
-    with rt.leg_kind("ROUTE"):
-        asyncio.run(rt.run(RuntimePlan(prompt="classify")))
-
-    assert [
-        (event["kind"], event["cost_usd"])
-        for event in _settled(journal.path)
-    ] == [("ROUTE", 0.07)]
-    assert read_events(ledger) == []
-
-
-def test_a_leg_kind_unwinds_when_the_leg_raises(tmp_path):
-    class Boom:
-        async def run(self, task):
-            raise RuntimeError("router transport died")
-
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    rt = JournalingRuntime(Boom(), journal, repo="o/r", role="fix")
-    rt.set_context("fix", "RESOLVE", 5, 5)
-    with pytest.raises(RuntimeError):
-        with rt.leg_kind("ROUTE"):
-            asyncio.run(rt.run(RuntimePlan(prompt="classify")))
-    assert rt.context.kind == "RESOLVE", "a dead leg must not leave the dispatch renamed"
 
 
 # ── #43: the journal records the model that RAN ──────────────────────────────
@@ -643,7 +527,7 @@ def test_the_wrappers_own_attributes_win_over_the_inners(tmp_path):
 # ── Daemon: GhUnavailable is a countable event ────────────────────────────────
 def test_daemon_journals_a_skipped_tick_when_github_is_unavailable(tmp_path):
     from issue_agent.adapters.github import GhUnavailable
-    from issue_agent.app.loop import Daemon
+    from issue_agent.app.tick import Daemon
 
     journal = Journal(str(tmp_path / "j.jsonl"))
 

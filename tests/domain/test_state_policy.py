@@ -200,7 +200,7 @@ def test_pr_touching_github_paths_needs_a_human(path):
     states = derive(WorldState(prs=(pr(changed_files=frozenset({"src/a.py", path})),)), local(), H)
     assert states == {pr_key(7): NeedsHuman(StopReason.WORKFLOW_PATH, "-")}
     label, comment = actions(states, H)
-    assert label == Relabel(Target.PR, 7, remove=None, add=Label.NEEDS_HUMAN, harness_signal=True)
+    assert label == Relabel(Target.PR, 7, remove=None, add=Label.NEEDS_HUMAN)
     assert isinstance(comment, PostComment) and H.marker in comment.body and comment.key
 
 
@@ -228,7 +228,7 @@ def test_reply_newer_than_stop_and_last_leg_releases_and_policy_removes_the_labe
     view = labelled([stop(StopReason.ATTEMPTS, 10), human(20)])
     states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 5))), H)
     assert states == {pr_key(7): Release()}
-    assert actions(states, H) == (Relabel(Target.PR, 7, remove=Label.NEEDS_HUMAN, add=None, harness_signal=True),)
+    assert actions(states, H) == (Relabel(Target.PR, 7, remove=Label.NEEDS_HUMAN, add=None),)
 
 
 @pytest.mark.parametrize("comments", [
@@ -262,7 +262,7 @@ def test_released_item_proceeds_with_attempts_reset_past_the_stop():
 def test_issue_stage_needs_human_uses_the_issue_thread():
     view = issue(3, Label.NEEDS_HUMAN, comments=(stop(StopReason.ATTEMPTS, 10), human(20)))
     states = derive(WorldState(issues=(view,)), local(), H)
-    assert actions(states, H) == (Relabel(Target.ISSUE, 3, remove=Label.NEEDS_HUMAN, add=None, harness_signal=True),)
+    assert actions(states, H) == (Relabel(Target.ISSUE, 3, remove=Label.NEEDS_HUMAN, add=None),)
 
 
 # ── Attempts (Q3) ────────────────────────────────────────────────────────────
@@ -558,7 +558,6 @@ def test_policy_refuses_resolve_on_a_pr():
     lambda: ItemKey(Target.PR, True),
     lambda: Dispatch(AgentKind.RESOLVE, "h"),
     lambda: Dispatch(FIX, ""),
-    lambda: Dispatch(AgentKind.RE_REVIEW, HEAD),
     lambda: Merge(""),
     lambda: NeedsHuman(StopReason.ATTEMPTS, "-"),
     lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", FIX),
@@ -616,7 +615,7 @@ def test_an_agent_question_stops_the_item_and_the_stop_comment_carries_it():
     states = derive(WorldState(issues=(issue(3),)), loc, H)
     assert states == {issue_key(3): NeedsHuman(StopReason.QUESTION, iso(5), question="404 or 410?")}
     label, comment = actions(states, H)
-    assert label == Relabel(Target.ISSUE, 3, remove=None, add=Label.NEEDS_HUMAN, harness_signal=True)
+    assert label == Relabel(Target.ISSUE, 3, remove=None, add=Label.NEEDS_HUMAN)
     assert isinstance(comment, PostComment) and stop_tag(StopReason.QUESTION) in comment.body
     assert "404 or 410?" in comment.body and "Reply here with the answer" in comment.body
 

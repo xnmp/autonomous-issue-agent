@@ -397,7 +397,7 @@ describe("issues board actions", () => {
     expect(screen.queryAllByRole("button", { name: secondary })).toEqual([]);
   });
 
-  it("unparks a parked issue through the unpark endpoint", async () => {
+  it("unparks a parked issue through the unblock label move", async () => {
     const calls = stubFetch();
     const refresh = vi.fn();
     const issues = polled({
@@ -411,18 +411,20 @@ describe("issues board actions", () => {
     await userEvent.click(row("Parked work"));
     await userEvent.click(screen.getByRole("button", { name: "Unpark" }));
 
-    expect(calls.filter(({ method }) => method === "POST").map(({ url }) => url)).toEqual(["/api/repos/demo/issues/220/unpark"]);
+    expect(calls.filter(({ method }) => method === "POST").map(({ url }) => url)).toEqual(["/api/repos/demo/issues/220/unblock"]);
     expect(refresh).toHaveBeenCalled();
   });
 
-  it("re-arms through the issue's guarded resolve controls, never a direct write", async () => {
+  it("re-arms through a confirmed unblock, never a direct write", async () => {
     const calls = stubFetch();
     renderBoard({ in_flight: [card(240, needs("rearm", null))] });
 
     await userEvent.click(row("Issue 240 title"));
     await userEvent.click(screen.getByRole("button", { name: "Re-arm" }));
-
-    await vi.waitFor(() => expect(calls.some(({ url }) => url.includes("/issues/240/resolve-control"))).toBe(true));
+    await userEvent.click(screen.getByRole("button", { name: "Unblock" }));
     expect(calls.filter(({ method }) => method !== "GET")).toEqual([]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Unblock #240" }));
+    expect(calls.filter(({ method }) => method === "POST").map(({ url }) => url)).toEqual(["/api/repos/demo/issues/240/unblock"]);
   });
 });

@@ -15,19 +15,16 @@ import sys
 import types
 from dataclasses import dataclass, field
 
-import pytest
 
 from issue_agent.adapters.agent_runner import AgentRunner
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.actions import PostComment, Relabel, Target
+from issue_agent.domain.actions import PostComment, Relabel
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import (
     ExitReason,
     Outcome,
     classify_outcome,
     infra_class_failure,
-    resolve_actions,
-    resume_actions,
 )
 
 
@@ -106,59 +103,12 @@ def test_blocked_over_pending_background_child_is_a_typed_attempt_outcome(monkey
     assert any("t1" in line and "BACKGROUND CHILD PENDING" in line for line in logged)
 
 
-def test_resolve_requeues_instead_of_asking_a_human(monkeypatch):
-    result = _run(monkeypatch, [_started("t1"), _ResultMessage(structured_output=_BLOCKED)])
-    actions = resolve_actions(253, result, None)
-    assert not _asks_human(actions)
-    assert actions == [Relabel(Target.ISSUE, 253, Label.AI_WORKING, Label.AI_READY)]
-
-
-def test_resume_requeues_instead_of_reblocking(monkeypatch):
-    result = _run(monkeypatch, [_started("t1"), _ResultMessage(structured_output=_BLOCKED)])
-    actions = resume_actions(253, result, None)
-    assert not _asks_human(actions)
-    assert actions == [Relabel(Target.ISSUE, 253, Label.AI_WORKING, Label.AI_READY)]
-
-
-def test_child_still_pending_at_result_counts_even_if_it_finishes_later(monkeypatch):
-    followup = _ResultMessage(structured_output={"status": "pr_opened"})
-    followup.origin = {"kind": "task-notification"}
-    result = _run(
-        monkeypatch,
-        [_started("t1"), _ResultMessage(structured_output=_BLOCKED), _notified("t1"), followup],
-    )
-    assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
-    assert not _asks_human(resolve_actions(253, result, None))
-
-
 def test_non_terminal_task_update_keeps_the_child_pending(monkeypatch):
     result = _run(
         monkeypatch,
         [_started("t1"), _updated("t1", "running"), _ResultMessage(structured_output=_BLOCKED)],
     )
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
-
-
-def test_genuine_clarification_block_still_surfaces_to_humans(monkeypatch):
-    result = _run(monkeypatch, [_ResultMessage(structured_output=_BLOCKED)])
-    assert classify_outcome(result) is Outcome.BLOCKED
-    assert result.exit_reason is ExitReason.OK
-    actions = resolve_actions(253, result, None)
-    assert _asks_human(actions)
-    assert any(isinstance(a, PostComment) and _BLOCKED["needs"] in a.body for a in actions)
-
-
-def test_block_after_children_finished_still_surfaces_to_humans(monkeypatch):
-    result = _run(
-        monkeypatch,
-        [
-            _started("t1"), _notified("t1", "failed"),
-            _started("t2"), _updated("t2", "killed"),
-            _ResultMessage(structured_output=_BLOCKED),
-        ],
-    )
-    assert classify_outcome(result) is Outcome.BLOCKED
-    assert _asks_human(resolve_actions(253, result, None))
 
 
 def test_malformed_task_events_are_ignored(monkeypatch):
@@ -183,31 +133,12 @@ def test_pending_child_does_not_demote_a_non_blocked_result(monkeypatch):
     assert result.exit_reason is ExitReason.OK
 
 
-
 def test_delegated_workflow_task_counts_as_a_pending_child(monkeypatch):
     result = _run(
         monkeypatch,
         [_started("w1", "local_workflow"), _ResultMessage(structured_output=_BLOCKED)],
     )
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
-
-
-@pytest.mark.parametrize(
-    "task_type",
-    ["local_bash", "monitor", None, "", 7, "x" * 100_000],
-    ids=["shell", "monitor", "absent", "empty", "non-string", "huge"],
-)
-def test_only_delegated_agent_work_is_a_pending_child(monkeypatch, task_type):
-    # A background shell (a dev server, `tail -f`) may never reach a terminal
-    # status, so it says nothing about whether a human question is genuine; the
-    # SDK's own in-flight ledger excludes it for the same reason. An untyped or
-    # malformed start is not evidence either.
-    started = _started("s1", task_type)
-    if task_type is None:
-        del started.data["task_type"]
-    result = _run(monkeypatch, [started, _ResultMessage(structured_output=_BLOCKED)])
-    assert classify_outcome(result) is Outcome.BLOCKED
-    assert _asks_human(resolve_actions(253, result, None))
 
 
 def test_thousands_of_settled_children_leave_no_pending_child(monkeypatch):

@@ -219,7 +219,7 @@ class BlockedRun:
 class ReviewVerdict:
     """A clean reviewer decision. Failed runs cannot inhabit this variant."""
 
-    kind: Literal[AgentKind.REVIEW, AgentKind.RE_REVIEW]
+    kind: Literal[AgentKind.REVIEW]
     decision: ReviewDecision
 
 
@@ -268,6 +268,10 @@ def leg_failed(is_error: bool, exit_reason: str) -> bool:
 
 
 def _agent_kind(raw: str) -> AgentKind | None:
+    # Journals from before refactor slice 5c record a re-review as RE_REVIEW.
+    # It is the same act; the read model goes with the dashboard rebuild (slice 8).
+    if raw == "RE_REVIEW":
+        return AgentKind.REVIEW
     try:
         return AgentKind[raw]
     except KeyError:
@@ -300,14 +304,11 @@ def settled_run(leg: RunSummary) -> SettledRun:
         return BlockedRun(kind or OtherAgentKind(leg.kind))
     if kind is None:
         return UnrecognizedRun(leg.kind)
-    if kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}:
+    if kind is AgentKind.REVIEW:
         try:
-            decision = ReviewDecision(leg.status)
+            return ReviewVerdict(AgentKind.REVIEW, ReviewDecision(leg.status))
         except ValueError:
             return CompletedRun(kind)
-        if kind is AgentKind.REVIEW:
-            return ReviewVerdict(AgentKind.REVIEW, decision)
-        return ReviewVerdict(AgentKind.RE_REVIEW, decision)
     return CompletedRun(kind)
 
 
@@ -332,7 +333,7 @@ def _settled_leg_stage(leg: RunSummary) -> str:
         return "reviewed"
     if (
         isinstance(outcome, CompletedRun)
-        and outcome.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}
+        and outcome.kind is AgentKind.REVIEW
     ):
         return "reviewed"
     if leg.kind in RESOLVE_KINDS | REPAIR_KINDS:

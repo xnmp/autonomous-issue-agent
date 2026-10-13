@@ -9,14 +9,12 @@ an adapter/application concern.
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from ..domain.agent_task import RunIntent, RuntimeName
 from ..domain.effort import Effort
 from ..domain.outcome import AgentResult
-from ..domain.workflow_identity import WorkflowBinding
 
 
 @dataclass(frozen=True)
@@ -164,7 +162,6 @@ class ContextualRuntime(AgentRuntime, Protocol):
         issue: int | None,
         claim_target: int | None = None,
         *,
-        workflow: WorkflowBinding | None = None,
         head: str = "",
         resumed: bool = False,
     ) -> None: ...
@@ -175,19 +172,3 @@ class RunIdentityRuntime(Protocol):
     def set_run_identity(self, run_id: str, leg_id: str) -> None: ...
 
 
-class RouteDecisionRecorder(Protocol):
-    def __call__(
-        self, model: str | None, effort: object | None, runtime: str | None = None,
-        *, tier: str | None = None,
-    ) -> None: ...
-
-
-@runtime_checkable
-class RunTelemetryRuntime(ContextualRuntime, Protocol):
-    def leg_kind(self, kind: str) -> AbstractContextManager[None]: ...
-
-    def route_receipt(
-        self,
-    ) -> AbstractContextManager[
-        RouteDecisionRecorder
-    ]: ...

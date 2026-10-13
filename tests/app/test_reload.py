@@ -16,7 +16,7 @@ from issue_agent.app import dashboard
 from issue_agent.app.dashweb import server as dashweb_server
 from issue_agent.app.dashweb.server import _run_server_until_reload
 from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.app.loop import Daemon
+from issue_agent.app.tick import Daemon
 from issue_agent.domain.world import WorldState
 
 

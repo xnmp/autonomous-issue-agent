@@ -148,11 +148,6 @@ class StubBackend:
         self.park_channel = channel
         return (True, "ok")
 
-    def unpark(self, name, number, channel="api"):
-        self._maybe("unpark")
-        self.unpark_channel = channel
-        return (True, "ok")
-
     def priority(self, name, number, priority):
         self._maybe("priority")
         self.priority_seen = priority
@@ -321,7 +316,7 @@ def test_unblock_reports_success():
     }
 
 
-def test_park_and_unpark_report_success_and_stamp_the_channel():
+def test_park_and_unblock_report_success_and_stamp_the_channel():
     backend = StubBackend()
     c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
     assert c.post("/api/repos/demo/issues/9/park",
@@ -329,11 +324,19 @@ def test_park_and_unpark_report_success_and_stamp_the_channel():
         "ok": True, "detail": "ok"
     }
     assert backend.park_channel == "ui"
-    assert c.post("/api/repos/demo/issues/9/unpark",
+    assert c.post("/api/repos/demo/issues/9/unblock",
                   headers={"User-Agent": "curl/8.5"}).json() == {
         "ok": True, "detail": "ok"
     }
-    assert backend.unpark_channel == "api"
+    assert backend.unblock_channel == "api"
+
+
+def test_the_removed_operator_command_routes_are_gone():
+    c = TestClient(server.create_app(backend=StubBackend()), headers=WRITE_HEADERS, base_url=BASE_URL)
+    for path in ("/api/repos/demo/issues/9/unpark", "/api/repos/demo/issues/9/resolve-control/commands"):
+        assert c.post(path).status_code in (404, 405)
+    for path in ("/api/repos/demo/issues/9/resolve-control", "/api/repos/demo/workflow-families"):
+        assert c.get(path).status_code == 404
 
 
 def test_a_park_whose_collectors_fail_is_refused_not_a_500():

@@ -21,11 +21,9 @@ from issue_agent.app.dashweb.ports import GitHubQueries
 from issue_agent.app.recovery import NoWorktreeRecovery
 from issue_agent.app.roles import (
     _LateReservationReconciler,
-    _NoCommands,
     _SweepReservationReconciler,
 )
 from issue_agent.domain.ports import (
-    CommandRecovery,
     EventSink,
     ProcessSupervisor,
     RecoveryControl,
@@ -37,12 +35,10 @@ from issue_agent.domain.ports import (
     WorktreeRecovery,
 )
 
-# An AST contract requires every Protocol in domain/ports.py to appear in
-# exactly one set. Exemptions are limited to obsolete/injected abstractions
-# without one production adapter; all authority-bearing ports stay structural.
+# An AST contract requires every Protocol in domain/ports.py to appear here
+# with a structural check against its production adapter.
 COVERED_PORTS = frozenset(
     {
-        "CommandRecovery",
         "EventSink",
         "ProcessSupervisor",
         "RecoveryControl",
@@ -54,12 +50,6 @@ COVERED_PORTS = frozenset(
         "WorktreeRecovery",
     }
 )
-EXEMPT_PORTS = frozenset(
-    {
-        # Time is injected as three callables in the current daemon loop.
-        "Clock",
-    }
-)
 
 
 dashboard_github_queries: GitHubQueries = GhReader()
@@ -67,12 +57,6 @@ dashboard_github_queries: GitHubQueries = GhReader()
 
 def recovery_control(store: SQLiteControlStore) -> RecoveryControl:
     return store
-
-
-def command_recovery(
-    executor: _NoCommands,
-) -> CommandRecovery:
-    return executor
 
 
 def process_supervisor(

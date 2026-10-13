@@ -31,7 +31,6 @@ from __future__ import annotations
 from tests.domain.builders import observed_pr
 
 
-
 import json
 import os
 import subprocess
@@ -53,7 +52,7 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.store import Store
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.main import _recover_pre_adapter_processes
-from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_store, _control_store_path, _owner_identity, _shutdown_finalize, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
+from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_store, _control_store_path, _owner_identity, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
@@ -66,7 +65,6 @@ from issue_agent.domain.contracts import (
     RunId,
 )
 from issue_agent.domain.recovery import RecoveryTrigger
-
 
 
 def test_runtime_wiring_registries_cover_every_supported_runtime():
@@ -339,20 +337,8 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
     )
     _shutdown_prepare(control, owner_id="o/r:fix")()
     assert control.has_cancellation_intent(run_id)
-    order = []
-
-    class Effects:
-        def drain_pending_commands(self):
-            order.append("effects")
-            return 0
-
-    _shutdown_finalize(
-        control,
-        Effects(),
-        owner_id="o/r:fix",
-    )()
-
-    assert order == ["effects"]
+    # Recording the intent releases nothing: capacity stays reserved until
+    # the killed run's spend is reconciled.
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
 
     class Spend:
@@ -385,8 +371,6 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
     assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
 
 
-
-
 class FakeWorktrees:
     def ensure(self, issue, branch):
         return f"/wt/issue-{issue}"
@@ -415,28 +399,16 @@ from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 FIX_BOT = "fix-bot"
 
 
-
-
 def _control(tmp_path) -> SQLiteControlStore:
     control = SQLiteControlStore(str(tmp_path / "control.sqlite3"))
     control.initialize()
     return control
 
 
-
-
-
-
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
 
 
 # ── machine deaths (issue-keyed) ───────────────────────────────────────────────
-
-
-
-
-
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -451,7 +423,6 @@ def _control(tmp_path) -> SQLiteControlStore:
 # rather than assumed.
 # ══════════════════════════════════════════════════════════════════════════════
 REVIEW_BOT = "review-bot"
-
 
 
 # ── infra-death key split (review P1R-1) ───────────────────────────────────────
@@ -654,15 +625,10 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     assert hook_calls == []
 
 
-
 # ── duplicate-PR guard reporting (#39) ───────────────────────────────────────
 
 
 # ── FixState carries the re-run marker (#38) ─────────────────────────────────
-
-
-
-
 
 
 def _held_pr(number=581, issue=500):

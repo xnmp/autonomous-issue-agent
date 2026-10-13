@@ -77,8 +77,6 @@ class _Control:
     def release_retained(self, _run_id, _reason, _retained_before):
         return _Release(_Disposition("conflict"))
 
-    def pending_commands(self):
-        return ("pending",)
 
 
 class _Spend:
@@ -96,9 +94,6 @@ class _Worktrees:
         return 2
 
 
-class _Commands:
-    def drain_pending_commands(self):
-        return 1
 
 
 def test_recovery_reconciles_dead_reservation_before_unknown_release():
@@ -106,16 +101,14 @@ def test_recovery_reconciles_dead_reservation_before_unknown_release():
     spend = _Spend((RunId("recovered"),))
 
     report = RecoveryCoordinator(
-        _Supervisor(), control, _Worktrees(), _Commands(),
+        _Supervisor(), control, _Worktrees(),
         spend, "o/r:fix"
     ).reconcile(RecoveryTrigger.BOOT)
 
     assert report.killed_orphans == ()
     assert report.reclaimed_leases == (RunId("recovered"),)
     assert report.validated_worktrees == 2
-    assert report.recovered_commands == 1
     assert report.spend_unknown == ()
-    assert report.pending_commands == 1
     assert spend.seen == [RunId("recovered")]
     assert control.released == []
 
@@ -125,7 +118,7 @@ def test_recovery_never_releases_indeterminate_spend_after_execution():
     spend = _Spend()
 
     report = RecoveryCoordinator(
-        _Supervisor(), control, _Worktrees(), _Commands(),
+        _Supervisor(), control, _Worktrees(),
         spend, "o/r:fix"
     ).reconcile(RecoveryTrigger.BOOT)
 
@@ -159,25 +152,17 @@ def test_recovery_runs_the_fixed_crash_consistency_sequence():
             calls.append("reconstruct_spend")
             return ()
 
-        def pending_commands(self):
-            calls.append("inspect_pending")
-            return ()
 
     class Worktrees:
         def prune_validate(self):
             calls.append("validate_worktrees")
             return 0
 
-    class Commands:
-        def drain_pending_commands(self):
-            calls.append("drain_commands")
-            return 0
 
     RecoveryCoordinator(
         Supervisor(),
         Control(),
         Worktrees(),
-        Commands(),
         _Spend(),
         "o/r:fix",
     ).reconcile(RecoveryTrigger.BOOT)
@@ -185,9 +170,7 @@ def test_recovery_runs_the_fixed_crash_consistency_sequence():
     assert calls == [
         "reclaim_leases",
         "validate_worktrees",
-        "drain_commands",
         "reconstruct_spend",
-        "inspect_pending",
     ]
 
 
@@ -216,25 +199,17 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
             calls.append("read_stale_reservations")
             return ()
 
-        def pending_commands(self):
-            calls.append("inspect_pending")
-            return ()
 
     class Worktrees:
         def prune_validate(self):
             calls.append("validate_worktrees")
             return 0
 
-    class Commands:
-        def drain_pending_commands(self):
-            calls.append("drain_commands")
-            return 0
 
     coordinator = RecoveryCoordinator(
         Supervisor(),
         Control(),
         Worktrees(),
-        Commands(),
         _Spend(),
         "o/r:fix",
     )
@@ -244,10 +219,8 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
         "reap_abandoned",
         "reclaim_leases",
         "validate_worktrees",
-        "drain_commands",
         "read_leases",
         "read_stale_reservations",
-        "inspect_pending",
     ]
 
     calls.clear()
@@ -313,7 +286,7 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
         "issue_agent.app.recovery._pid_alive", lambda _pid, _start: False
     )
     report = RecoveryCoordinator(
-        _Supervisor(), store, _Worktrees(), _Commands(),
+        _Supervisor(), store, _Worktrees(),
         Reconciler(), "o/r:fix"
     ).reconcile(RecoveryTrigger.BOOT)
 
@@ -385,7 +358,7 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
         SafeSupervisor(),
         store,
         _Worktrees(),
-        _Commands(),
+       
         _Spend(),
         "o/r:fix",
         now=lambda: now + timedelta(hours=1),
@@ -451,7 +424,7 @@ def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
         _Supervisor(),
         store,
         _Worktrees(),
-        _Commands(),
+       
         _Spend(),
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
@@ -530,7 +503,7 @@ def test_periodic_sweep_releases_only_stale_unlaunched_reservation(
         _Supervisor(),
         store,
         _Worktrees(),
-        _Commands(),
+       
         _Spend(),
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
@@ -599,7 +572,7 @@ def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
         _Supervisor(),
         store,
         _Worktrees(),
-        _Commands(),
+       
         RegisteringReconciler(),
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
@@ -632,7 +605,7 @@ def test_boot_settles_legacy_accounting_hold_once_and_preserves_money(tmp_path):
                    "started_at=?,completed_at=? WHERE run_id=?", (now.isoformat(), now.isoformat(), str(run_id)))
         db.execute("UPDATE reservation_recovery SET policy='reconcile_only',reason='unfinished turns' WHERE run_id=?",
                    (str(run_id),))
-    coordinator = RecoveryCoordinator(_Supervisor(), store, _Worktrees(), _Commands(),
+    coordinator = RecoveryCoordinator(_Supervisor(), store, _Worktrees(),
         CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)), "o/r:fix",
         now=lambda: now)
     assert coordinator.reconcile(RecoveryTrigger.BOOT).spend_unknown == ()

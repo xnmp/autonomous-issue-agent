@@ -21,7 +21,6 @@ from ..domain.reservation_recovery import (
 )
 from ..domain.ports import (
     ProcessSupervisor,
-    CommandRecovery,
     RecoveryControl,
     SpendReconciler,
     WorktreeRecovery,
@@ -34,9 +33,7 @@ class RecoveryReport:
     killed_orphans: tuple[RunId, ...]
     reclaimed_leases: tuple[RunId, ...]
     validated_worktrees: int
-    recovered_commands: int
     spend_unknown: tuple[RunId, ...]
-    pending_commands: int
 
 
 @dataclass
@@ -44,7 +41,6 @@ class RecoveryCoordinator:
     supervisor: ProcessSupervisor
     control: RecoveryControl
     worktrees: WorktreeRecovery
-    commands: CommandRecovery
     spend: SpendReconciler
     owner_id: str
     reservation_grace: timedelta = timedelta(minutes=2)
@@ -72,12 +68,6 @@ class RecoveryCoordinator:
             if RecoveryArm.VALIDATE_WORKTREES in arms
             else 0
         )
-        recovered_commands = (
-            self.commands.drain_pending_commands()
-            if RecoveryArm.DRAIN_COMMANDS in arms
-            else 0
-        )
-
         spend_unknown: tuple[RunId, ...] = ()
         if RecoveryArm.SWEEP_RESERVATIONS in arms:
             grace = (
@@ -92,13 +82,7 @@ class RecoveryCoordinator:
             killed,
             reclaimed,
             validated_worktrees,
-            recovered_commands,
             spend_unknown,
-            (
-                len(self.control.pending_commands())
-                if RecoveryArm.DRAIN_COMMANDS in arms
-                else 0
-            ),
         )
 
     def _sweep(

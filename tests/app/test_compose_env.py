@@ -585,7 +585,7 @@ def test_build_role_does_not_reload_env_when_already_provided(
 
 
 def test_world_probe_preserves_fix_daemon_dispatch_identity(monkeypatch, tmp_path):
-    from issue_agent.app.loop import Daemon
+    from issue_agent.app.tick import Daemon
     from issue_agent.domain.world import WorldState
 
     built = {}
@@ -613,31 +613,6 @@ def test_world_probe_preserves_fix_daemon_dispatch_identity(monkeypatch, tmp_pat
 
     assert daemon is built["daemon"]
     assert daemon.available_dispatch_slots == 2
-
-
-def test_review_role_runtime_tags_persisted_sessions(monkeypatch, tmp_path):
-    """A Codex upgrade must not resume a legacy Claude review session."""
-    captured = {}
-
-    class RecordingStore:
-        def __init__(self, state_dir, runtime="claude"):
-            captured.update(state_dir=state_dir, runtime=runtime)
-
-    monkeypatch.setattr(main_module, "Store", RecordingStore)
-    monkeypatch.setattr(
-        main_module, "build_review_daemon", lambda _cfg, _gw, store, _runner: store
-    )
-
-    store = main_module.build_role("review", {
-        "REPO": "o/r",
-        "FIX_BOT": "fix-bot",
-        "REVIEWER_RUNTIME": "codex",
-        "REVIEW_STATE_DIR": str(tmp_path),
-        "WORLD_PROBE": "0",
-    })
-
-    assert store is not None
-    assert captured == {"state_dir": str(tmp_path), "runtime": "codex"}
 
 
 def test_build_role_self_loads_env_when_called_standalone_without_one(
@@ -946,12 +921,6 @@ def test_doctor_accepts_a_base_branch_whose_prs_do_get_checks(tmp_path):
     )
     assert "NOT ONE of the last" not in result.stdout
     assert "PRs into 'trunk' receive checks (1 of the last 1 sampled)" in result.stdout
-
-
-
-
-
-
 
 
 def test_doctor_errors_when_the_repo_forbids_the_configured_merge_method(tmp_path):

@@ -369,256 +369,6 @@ const IssueDetailPayload = z
 const ActionResult = z
   .object({ detail: z.string(), ok: z.boolean() })
   .passthrough();
-const request_id = z.union([z.string(), z.null()]).optional();
-const Rearm = z.object({
-  base_commit: z.string(),
-  base_ref: z.string(),
-  branch: z.string(),
-  episode_id: z.string(),
-  gate_id: z.string(),
-  generation: z.number().int(),
-  grant_request_id: z.string(),
-  handoff_id: z.string(),
-  reason: z.string(),
-  request_id: z.string(),
-  required_commands: z.array(z.string()),
-  retired_commands: z.array(z.string()),
-  state: z.enum(["pending", "completed", "cancelled", "superseded"]),
-  verified_commands: z.array(z.string()),
-});
-const ResolveExpected = z.object({
-  episode_id: z.string().min(1).max(512),
-  epoch: z.number().int().gte(1).lte(9007199254740991),
-  family: z.literal("resolve"),
-  generation: z.number().int().gte(0).lte(9007199254740991),
-  issue: z.number().int().gte(1).lte(9007199254740991),
-  repository: z.string().min(1).max(512),
-  version: z.number().int().gte(0).lte(9007199254740991),
-});
-const IssueRecoveryAvailable = z.object({
-  ci_failures: z.number().int().gte(0).lte(9007199254740991),
-  family: z.literal("issue_recovery"),
-  generation: z.number().int().gte(0).lte(9007199254740991),
-  holds: z.array(z.literal("workflow")),
-  rebase_failures: z.number().int().gte(0).lte(9007199254740991),
-  resumes: z.number().int().gte(0).lte(9007199254740991),
-  review_failures: z.number().int().gte(0).lte(9007199254740991),
-  status: z.literal("available"),
-  version: z.number().int().gte(0).lte(9007199254740991),
-});
-const PRRepairAvailable = z.object({
-  family: z.literal("pr_repair"),
-  generation: z.number().int().gte(0).lte(9007199254740991),
-  pending_effects: z.array(
-    z.enum(["ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation"])
-  ),
-  resumes: z.number().int().gte(0).lte(9007199254740991),
-  status: z.literal("available"),
-  version: z.number().int().gte(0).lte(9007199254740991),
-  workflow_held: z.boolean(),
-});
-const RecoveryUnavailable = z.object({
-  reason: z.string(),
-  status: z.enum(["inactive", "migration_required", "unavailable"]),
-});
-const ResolveCeiling = z.object({
-  ceiling: z.number().int(),
-  episode_id: z.string(),
-  failures: z.number().int(),
-  kind: z.literal("resolve_ceiling"),
-  last_failure: z.string(),
-});
-const RemoteUncertain = z.object({
-  command_id: z.string(),
-  failed_reads: z.number().int(),
-  kind: z.literal("remote_uncertain"),
-  last_error: z.string(),
-  unresolved_since: z.string(),
-});
-const RetryAuthorizationRequired = z.object({
-  absence_evidence_id: z.string(),
-  command_id: z.string(),
-  kind: z.literal("retry_authorization_required"),
-});
-const EvidenceUnavailable = z.object({
-  failed_reads: z.number().int(),
-  kind: z.literal("evidence_unavailable"),
-  last_error: z.string(),
-  source: z.string(),
-  unresolved_since: z.string(),
-});
-const RearmNeedsDecision = z.object({
-  kind: z.literal("rearm_needs_decision"),
-  obligations: z.array(z.string()),
-  reason: z.string(),
-  stopped_request_id: z.string(),
-});
-const PendingRetry = z.object({
-  authorization_id: z.string(),
-  command_id: z.string(),
-});
-const NoRemediation = z.object({
-  kind: z.literal("none_authorized"),
-  reason: z.string(),
-});
-const AttemptedRemediation = z.object({
-  evidence_ids: z.array(z.string()),
-  kind: z.literal("attempted"),
-  operation: z.string(),
-  outcome: z.string(),
-});
-const Gate = z.object({
-  available_commands: z.array(
-    z.enum([
-      "request_rearm",
-      "continue_rearm",
-      "cancel_rearm",
-      "authorize_retry",
-    ])
-  ),
-  cause: z.discriminatedUnion("kind", [
-    ResolveCeiling,
-    RemoteUncertain,
-    RetryAuthorizationRequired,
-    EvidenceUnavailable,
-    RearmNeedsDecision,
-  ]),
-  gate_id: z.string(),
-  opened_generation: z.number().int(),
-  pending_retry: z.union([PendingRetry, z.null()]),
-  remediation: z.discriminatedUnion("kind", [
-    NoRemediation,
-    AttemptedRemediation,
-  ]),
-  state: z.enum(["open", "rearming"]),
-});
-const Observation = z.object({
-  failed_reads: z.number().int(),
-  last_error: z.string(),
-  next_read_at: z.string(),
-  unresolved_since: z.string(),
-});
-const AvailableControl = z.object({
-  current_intent: z.union([Rearm, z.null()]),
-  expected: ResolveExpected,
-  failures: z.number().int(),
-  fix_recovery: z
-    .union([
-      IssueRecoveryAvailable,
-      PRRepairAvailable,
-      RecoveryUnavailable,
-      z.null(),
-    ])
-    .optional(),
-  gates: z.array(Gate),
-  guidance: z.string(),
-  observation: z.union([Observation, z.null()]),
-  requested_id: z.union([z.string(), z.null()]),
-  requested_intent: z.union([Rearm, z.null()]),
-  status: z.literal("available"),
-  workflow_held: z.boolean(),
-});
-const InactiveControl = z.object({
-  fix_recovery: z
-    .union([
-      IssueRecoveryAvailable,
-      PRRepairAvailable,
-      RecoveryUnavailable,
-      z.null(),
-    ])
-    .optional(),
-  issue: z.number().int(),
-  repository: z.string(),
-  status: z.literal("inactive"),
-});
-const AbsentControl = z.object({
-  epoch: z.number().int(),
-  fix_recovery: z
-    .union([
-      IssueRecoveryAvailable,
-      PRRepairAvailable,
-      RecoveryUnavailable,
-      z.null(),
-    ])
-    .optional(),
-  issue: z.number().int(),
-  repository: z.string(),
-  status: z.literal("absent"),
-});
-const UnavailableControl = z.object({
-  fix_recovery: z
-    .union([
-      IssueRecoveryAvailable,
-      PRRepairAvailable,
-      RecoveryUnavailable,
-      z.null(),
-    ])
-    .optional(),
-  reason: z.string(),
-  status: z.literal("unavailable"),
-});
-const KeepGuidance = z.object({ kind: z.literal("keep") });
-const ClearGuidance = z.object({ kind: z.literal("clear") });
-const SetGuidance = z.object({
-  kind: z.literal("set"),
-  text: z.string().min(1).max(4000),
-});
-const ResumeGate = z.object({
-  guidance: z.discriminatedUnion("kind", [
-    KeepGuidance,
-    ClearGuidance,
-    SetGuidance,
-  ]),
-  kind: z.literal("resume"),
-});
-const RetryAbsent = z.object({
-  command_id: z.string().min(1).max(512),
-  evidence_id: z.string().min(1).max(512),
-  kind: z.literal("retry_absent"),
-});
-const ResolveGateSelection = z.object({
-  gate_id: z.string().min(1).max(512),
-  intent: z.discriminatedUnion("kind", [ResumeGate, RetryAbsent]),
-  kind: z.literal("gate"),
-});
-const StoppedGrantSelection = z.object({
-  kind: z.literal("stopped_grant"),
-  stopped_request_id: z.string().min(1).max(512),
-});
-const ResolveRelease = z.object({
-  expected: ResolveExpected,
-  operation: z.literal("release"),
-  request_id: z.string().min(1).max(512),
-  selection: z.discriminatedUnion("kind", [
-    ResolveGateSelection,
-    StoppedGrantSelection,
-  ]),
-});
-const CancelRearm = z.object({
-  cancellation_id: z.string().min(1).max(512),
-  expected: ResolveExpected,
-  operation: z.literal("cancel_rearm"),
-  reason: z.string().min(1).max(16384),
-  request_id: z.string().min(1).max(512),
-});
-const api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body =
-  z.discriminatedUnion("operation", [ResolveRelease, CancelRearm]);
-const CommandResult = z.object({
-  control: z.discriminatedUnion("status", [
-    AvailableControl,
-    InactiveControl,
-    AbsentControl,
-    UnavailableControl,
-  ]),
-  outcome: z.enum([
-    "accepted",
-    "replayed",
-    "conflict",
-    "rejected",
-    "unavailable",
-  ]),
-  reason: z.string(),
-});
 const StepEventsPayload = z
   .object({
     events: z.array(z.object({}).partial().passthrough()),
@@ -630,6 +380,7 @@ const api_unblock_api_repos__name__issues__number__unblock_post_Body = z.union([
   UnblockRequest,
   z.null(),
 ]);
+const timezone = z.union([z.string(), z.null()]).optional();
 const Caps = z
   .object({
     daily_cap_usd: z.union([z.number(), z.null()]),
@@ -723,15 +474,6 @@ const OverviewPayload = z
     warnings: z.array(z.string()),
   })
   .passthrough();
-const WorkflowFamiliesAvailable = z.object({
-  active_families: z.array(z.enum(["resolve", "review_rejections"])),
-  repository: z.string(),
-  status: z.literal("available"),
-});
-const WorkflowFamiliesUnavailable = z.object({
-  reason: z.string(),
-  status: z.literal("unavailable"),
-});
 const ClaudeUsage = z
   .object({
     error: z.union([z.string(), z.null()]),
@@ -823,40 +565,10 @@ export const schemas = {
   IssueStep,
   IssueDetailPayload,
   ActionResult,
-  request_id,
-  Rearm,
-  ResolveExpected,
-  IssueRecoveryAvailable,
-  PRRepairAvailable,
-  RecoveryUnavailable,
-  ResolveCeiling,
-  RemoteUncertain,
-  RetryAuthorizationRequired,
-  EvidenceUnavailable,
-  RearmNeedsDecision,
-  PendingRetry,
-  NoRemediation,
-  AttemptedRemediation,
-  Gate,
-  Observation,
-  AvailableControl,
-  InactiveControl,
-  AbsentControl,
-  UnavailableControl,
-  KeepGuidance,
-  ClearGuidance,
-  SetGuidance,
-  ResumeGate,
-  RetryAbsent,
-  ResolveGateSelection,
-  StoppedGrantSelection,
-  ResolveRelease,
-  CancelRearm,
-  api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body,
-  CommandResult,
   StepEventsPayload,
   UnblockRequest,
   api_unblock_api_repos__name__issues__number__unblock_post_Body,
+  timezone,
   Caps,
   CostMix,
   EscalationReason,
@@ -868,8 +580,6 @@ export const schemas = {
   AttentionItem,
   SpendBucket,
   OverviewPayload,
-  WorkflowFamiliesAvailable,
-  WorkflowFamiliesUnavailable,
   ClaudeUsage,
   CodexUsage,
   HarnessRepoSpend,
@@ -1110,76 +820,6 @@ const endpoints = makeApi([
   },
   {
     method: "get",
-    path: "/api/repos/:name/issues/:number/resolve-control",
-    alias:
-      "api_resolve_control_api_repos__name__issues__number__resolve_control_get",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-      {
-        name: "request_id",
-        type: "Query",
-        schema: request_id,
-      },
-    ],
-    response: z.discriminatedUnion("status", [
-      AvailableControl,
-      InactiveControl,
-      AbsentControl,
-      UnavailableControl,
-    ]),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "post",
-    path: "/api/repos/:name/issues/:number/resolve-control/commands",
-    alias:
-      "api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "body",
-        type: "Body",
-        schema:
-          api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body,
-      },
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-    ],
-    response: CommandResult,
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "get",
     path: "/api/repos/:name/issues/:number/steps/:idx/events",
     alias:
       "api_step_events_api_repos__name__issues__number__steps__idx__events_get",
@@ -1247,32 +887,6 @@ const endpoints = makeApi([
     ],
   },
   {
-    method: "post",
-    path: "/api/repos/:name/issues/:number/unpark",
-    alias: "api_unpark_api_repos__name__issues__number__unpark_post",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-    ],
-    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
     method: "get",
     path: "/api/repos/:name/overview",
     alias: "api_overview_api_repos__name__overview_get",
@@ -1286,7 +900,7 @@ const endpoints = makeApi([
       {
         name: "timezone",
         type: "Query",
-        schema: request_id,
+        schema: timezone,
       },
     ],
     response: z
@@ -1326,30 +940,6 @@ const endpoints = makeApi([
       },
     ],
     response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "get",
-    path: "/api/repos/:name/workflow-families",
-    alias: "api_workflow_families_api_repos__name__workflow_families_get",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-    ],
-    response: z.discriminatedUnion("status", [
-      WorkflowFamiliesAvailable,
-      WorkflowFamiliesUnavailable,
-    ]),
     errors: [
       {
         status: 422,

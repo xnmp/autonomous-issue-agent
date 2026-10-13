@@ -515,6 +515,6 @@ class ActionResult(Contract):
 
 
 class UnblockRequest(BaseModel):
-    """Legacy breaker release accepts no review guidance or re-arm authority."""
+    """Unblock is a label move; it accepts no body fields."""
 
     model_config = ConfigDict(extra="forbid")

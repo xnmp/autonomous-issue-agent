@@ -150,11 +150,6 @@ class TelemetryWarning(EventPayload):
 
 
 @dataclass(frozen=True)
-class TickGated(EventPayload):
-    reason: str
-
-
-@dataclass(frozen=True)
 class GithubUnavailable(EventPayload):
     kind: str
     detail: str

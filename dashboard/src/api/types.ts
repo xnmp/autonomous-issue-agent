@@ -7,7 +7,6 @@
  */
 
 import type { components } from "./generated";
-import type { ReleaseCommand } from "../lib/release-command";
 
 type Schema = components["schemas"];
 
@@ -43,14 +42,6 @@ export type IssueStep = Schema["IssueStep"];
 export type IssueDetailPayload = Schema["IssueDetailPayload"];
 export type StepEventsPayload = Schema["StepEventsPayload"];
 export type ActionResult = Schema["ActionResult"];
-export type ResolveControl = Schema["CommandResult"]["control"];
-export type AvailableResolveControl = Schema["AvailableControl"];
-export type ResolveGate = Schema["Gate"];
-export type ResolveRearm = Schema["Rearm"];
-export type ResolveCommand = Schema["CancelRearm"] | Extract<ReleaseCommand<Schema["ResolveExpected"]>, { operation: "request_rearm" | "continue_rearm" | "authorize_retry" }>;
-export type ResolveCommandResult = Schema["CommandResult"];
-export type ResolveGuidance = Schema["ResumeGate"]["guidance"];
-export type WorkflowFamilies = Schema["WorkflowFamiliesAvailable"] | Schema["WorkflowFamiliesUnavailable"];
 
 export type RoleName = "fix" | "review";
 export type VerificationStatus =

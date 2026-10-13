@@ -14,7 +14,6 @@ def test_every_recovery_trigger_has_the_expected_plan():
         {
             RecoveryArm.RECLAIM_LEASES,
             RecoveryArm.VALIDATE_WORKTREES,
-            RecoveryArm.DRAIN_COMMANDS,
             RecoveryArm.SWEEP_RESERVATIONS,
         }
     )

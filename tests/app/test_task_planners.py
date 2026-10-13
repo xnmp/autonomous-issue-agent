@@ -12,7 +12,6 @@ from issue_agent.domain.trust import as_untrusted
 from issue_agent.app.planners.schemas import FIX_SCHEMA, REVIEW_SCHEMA
 from issue_agent.app.planners.tasks import FIXER_DENY, FixTaskConfig, ReviewTaskConfig, build_address_review_task, build_fix_ci_task, build_fresh_reply_task, build_resolve_task, build_resume_task, build_rebase_task, build_review_task
 
-from issue_agent.app.dashweb import guidance as guidance_rules
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
 U = as_untrusted
@@ -299,7 +298,6 @@ def test_review_task_is_readonly_and_carries_the_review_prompt():
     assert "evidence/" in t.prompt
 
 
-# ── operator guidance (dashboard unblock → review prompt) ──
 # ── PR conversation (2026-08-08, tauri #613/#614) ──
 DISCUSSION = U("@fixer[bot]: this deployment has no display; no screenshot exists")
 

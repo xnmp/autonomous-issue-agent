@@ -40,7 +40,6 @@ FRECENCY_WINDOWS = ((86400.0, 3.0), (7 * 86400.0, 1.0), (30 * 86400.0, 0.25))
 LIFECYCLE_LABELS = frozenset(label.value for label in _CANONICAL_LIFECYCLE_LABELS)
 PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
-_DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
 _PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
 
 # Compact-row text budget: one line, bounded, for prose the harness did not
@@ -2436,7 +2435,7 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
         dispatch = event.get("dispatch")
         number = _event_number(event.get("number"))
         if (
-            kind not in _DISPATCH_AGENT_KINDS
+            kind not in _AGENT_KINDS
             or role not in dash.ROLE_NAMES
             or number is None
             or not isinstance(dispatch, str)

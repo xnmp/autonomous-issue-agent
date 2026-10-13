@@ -16,7 +16,7 @@ from issue_agent.adapters.process_supervisor import ProcessSupervisor
 CHILD = r'''
 import os, signal, subprocess, sys, time
 from issue_agent.app.main import _TerminationHandler
-from issue_agent.app.loop import Daemon
+from issue_agent.app.tick import Daemon
 from issue_agent.domain.actions import RunAgent, AgentKind
 from issue_agent.domain.world import WorldState
 from tests.fakes.executor import ImmediateExecutor
@@ -53,14 +53,14 @@ daemon = Daemon("private", lambda: WorldState(),
     lambda w: [RunAgent(AgentKind.RESOLVE, 1)] if active else [],
     ImmediateExecutor(InMemoryGitHub(), run_agent=run), poll_seconds=1,
     dispatch_capacity=1, shutdown_timeout_seconds=2, cancel_active_dispatches=cancel,
-    finalize=lambda: print("FINALIZED", flush=True), log=lambda s: print(s, flush=True))
+    terminalize=lambda: print("TERMINALIZED", flush=True), log=lambda s: print(s, flush=True))
 daemon.run_forever(sleep=sleep, now=lambda: 0)
 '''
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux uv service signal routing")
 @pytest.mark.parametrize("active", [False, True])
-def test_uv_main_signal_finalizes_daemon_and_reaps_owned_workers(tmp_path, active):
+def test_uv_main_signal_terminalizes_daemon_and_reaps_owned_workers(tmp_path, active):
     uv = shutil.which("uv")
     assert uv is not None
     process = subprocess.Popen(
@@ -90,7 +90,7 @@ def test_uv_main_signal_finalizes_daemon_and_reaps_owned_workers(tmp_path, activ
         output += rest
         assert process.returncode == 0, (output.decode(), stderr.decode())
         assert "draining" in output.decode()
-        assert "FINALIZED" in output.decode()
+        assert "TERMINALIZED" in output.decode()
         assert "stopped" in output.decode()
         assert output.decode().splitlines().count("TERM") == 1
         if active:

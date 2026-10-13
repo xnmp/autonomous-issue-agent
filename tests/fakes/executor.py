@@ -1,6 +1,6 @@
-"""A minimal `loop.ActionExecutor` for daemon-loop tests.
+"""A minimal `tick.ActionExecutor` for daemon-loop tests.
 
-The loop only needs `execute` and `replay_pending`. This fake applies the few
+The loop only needs `execute`. This fake applies the few
 lifecycle actions loop tests observe straight onto a gateway fake, hands
 `RunAgent` to `run_agent`, and records everything else. It deliberately has
 none of the production act's idempotency: loop tests assert scheduling, not
@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from issue_agent.domain.actions import Action, EnableAutoMerge, PostComment, Relabel, RerunFailedChecks, RunAgent, Target
+from issue_agent.domain.actions import Action, PostComment, Relabel, RunAgent, Target
 
 
 def _kind(target: Target) -> str:
@@ -24,9 +24,6 @@ class ImmediateExecutor:
         self.gateway = gateway
         self._run_agent = run_agent
         self.applied: list[Action] = []
-
-    def replay_pending(self) -> bool:
-        return True
 
     def execute(self, action: Action) -> None:
         if isinstance(action, RunAgent):
@@ -40,11 +37,6 @@ class ImmediateExecutor:
             self.gateway.relabel(kind, action.number, action.remove, action.add)
             if action.add is not None and not self.gateway.has_label(kind, action.number, action.add):
                 raise RuntimeError(f"relabel {kind} #{action.number} not confirmed")
-        elif isinstance(action, EnableAutoMerge):
-            if not self.gateway.enable_auto_merge(action.pr, action.method, action.head):
-                raise RuntimeError(f"auto-merge on PR #{action.pr} not armed")
         elif isinstance(action, PostComment):
             self.gateway.comment(_kind(action.target), action.number, action.body)
-        elif isinstance(action, RerunFailedChecks):
-            self.gateway.rerun_failed_checks(action.head, action.run_ids)
         self.applied.append(action)

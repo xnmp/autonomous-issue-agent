@@ -234,7 +234,6 @@ def test_every_domain_port_is_type_checked_or_explicitly_exempted() -> None:
         raise AssertionError(f"{name} must be one literal frozenset")
 
     covered = declared("COVERED_PORTS")
-    exempt = declared("EXEMPT_PORTS")
     checked = {
         node.returns.id
         for node in conformance_tree.body
@@ -242,8 +241,7 @@ def test_every_domain_port_is_type_checked_or_explicitly_exempted() -> None:
         and isinstance(node.returns, ast.Name)
     }
 
-    assert covered.isdisjoint(exempt)
-    assert covered | exempt == protocols
+    assert covered == protocols
     assert covered == checked
 
 
@@ -402,12 +400,10 @@ def test_orchestration_cannot_read_telemetry_for_control_state() -> None:
         }
     )
     control_paths = (
-        APP / "loop.py",
         APP / "roles.py",
         APP / "tick.py",
         APP / "fix.py",
         APP / "review.py",
-        *_python_files(APP / "workflows"),
     )
     violations: list[str] = []
     for path in control_paths:
@@ -545,7 +541,7 @@ def test_architecture_manifest_names_every_top_level_module_and_app_subtier() ->
             if path.name == "__init__.py":
                 continue
             assert f"`{tier}/{path.name}`" in architecture
-    for subtier in ("planners", "workflows", "dashweb"):
+    for subtier in ("planners", "dashweb"):
         assert f"`app/{subtier}/`" in architecture
 
 

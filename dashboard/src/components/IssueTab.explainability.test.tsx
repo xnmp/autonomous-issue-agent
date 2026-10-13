@@ -2,19 +2,6 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
-import {
-  absentControl,
-  availableControl,
-  binding,
-  ceilingGate,
-  commandResult,
-  controlResponse,
-  inactiveControl,
-  jsonResponse,
-  OUTCOME_STATUS,
-  rearm,
-  unavailableControl,
-} from "./resolve/test-fixtures";
 
 const detail = {
   issue: 77,
@@ -82,73 +69,28 @@ describe("issue explainability", () => {
     expect(screen.queryByText(/changed nothing visible/i)).not.toBeInTheDocument();
   });
 
-  it("offers the legacy unblock only when resolve authority is witnessed inactive", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === "POST") return json({ ok: true, detail: "unblocked" });
-      if (String(input).includes("/resolve-control")) return controlResponse(inactiveControl);
-      // The repository-scoped family read the server's legacy refusal also reads: none active.
-      if (String(input).includes("/workflow-families")) return json({ status: "available", repository: "o/r", active_families: [] });
-      return json(detail);
-    });
+  it("unblocks a held issue as one confirmed label move", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+      init?.method === "POST" ? json({ ok: true, detail: "ok" }) : json(detail));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<IssueTab repo="demo" issue={77} />);
 
-    await userEvent.click(await screen.findByRole("button", { name: "Review legacy unblock" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Unblock" }));
     expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit)?.method === "POST")).toBe(false);
 
     await userEvent.click(screen.getByRole("button", { name: "Unblock #77" }));
 
-    const post = fetchMock.mock.calls.find(([, init]) => (init as RequestInit)?.method === "POST");
-    expect(String(post?.[0])).toBe("/api/repos/demo/issues/77/unblock");
+    const posts = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit)?.method === "POST");
+    expect(posts.map(([input]) => String(input))).toEqual(["/api/repos/demo/issues/77/unblock"]);
   });
 
-  it.each([
-    ["available", () => controlResponse(availableControl())],
-    ["absent", () => controlResponse(absentControl)],
-    ["unavailable", () => controlResponse(unavailableControl)],
-    ["unreadable", () => new Response("not json", { status: 500 })],
-  ])("never falls back to the legacy unblock when authority is %s", async (_label, reply) => {
-    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) =>
-      String(input).includes("/resolve-control") ? reply() : json(detail)));
+  it("offers no unblock for an issue nobody holds", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json({ ...detail, stage: "awaiting review", escalation_reason: null })));
 
     render(<IssueTab repo="demo" issue={77} />);
 
-    expect(await screen.findByRole("heading", { name: /Resolve control/ })).toBeVisible();
-    await screen.findByText(/No reset is available|Resolve held|Status unavailable/);
-    expect(screen.queryByRole("button", { name: /legacy unblock/i })).not.toBeInTheDocument();
+    expect(await screen.findByText("REQUEST_CHANGES round 2")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Unblock" })).not.toBeInTheDocument();
   });
-
-  it("records a re-arm as pending intent, never as completed recovery", async () => {
-    const pending = availableControl({
-      gates: [ceilingGate({ state: "rearming", available_commands: ["cancel_rearm"] })],
-      current_intent: rearm(),
-    });
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === "POST") {
-        return jsonResponse(commandResult("accepted", pending, "re-arm recorded"), OUTCOME_STATUS.accepted);
-      }
-      if (String(input).includes("/resolve-control")) return controlResponse(availableControl());
-      return json(detail);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    render(<IssueTab repo="demo" issue={77} />);
-
-    await userEvent.click(await screen.findByRole("button", { name: "Request re-arm" }));
-    await userEvent.click(screen.getByRole("button", { name: "Review command" }));
-    await userEvent.click(screen.getByRole("button", { name: "Confirm command" }));
-
-    expect(await screen.findByRole("heading", { name: "Command recorded" })).toBeVisible();
-    expect(screen.getByText(/not necessarily completed/)).toBeVisible();
-    const post = fetchMock.mock.calls.find(([, init]) => (init as RequestInit)?.method === "POST");
-    expect(String(post?.[0])).toBe("/api/repos/demo/issues/77/resolve-control/commands");
-    expect(JSON.parse(String((post?.[1] as RequestInit).body))).toMatchObject({
-      operation: "release",
-      expected: binding,
-      selection: { kind: "gate", gate_id: "gate-77", intent: { kind: "resume", guidance: { kind: "keep" } } },
-    });
-  });
-
 });

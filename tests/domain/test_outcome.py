@@ -5,12 +5,10 @@ from issue_agent.domain.outcome import (
     ExitReason,
     MAX_BUDGET_STATUS,
     Outcome,
-    ResolveFollowup,
     classify_outcome,
     deterministic_death,
     infra_death,
     offending_path,
-    resolve_followup,
 )
 
 
@@ -30,22 +28,6 @@ def test_status_maps_to_outcome():
 
 def test_unknown_status_defaults_ok():
     assert classify_outcome(_ok("")) is Outcome.OK
-
-
-def test_ground_truth_pr_open_beats_blocked_prose():
-    # The model said blocked, but a PR actually opened → success (ground truth).
-    res = AgentResult(is_error=False, status="blocked", needs="???")
-    assert resolve_followup(res, pr_opened=True) is ResolveFollowup.PR_OPENED
-
-
-def test_blocked_without_pr_asks_human():
-    res = AgentResult(is_error=False, status="blocked", needs="which endpoint?")
-    assert resolve_followup(res, pr_opened=False) is ResolveFollowup.BLOCKED
-
-
-def test_error_without_pr_retries():
-    res = AgentResult(is_error=True)
-    assert resolve_followup(res, pr_opened=False) is ResolveFollowup.RETRY
 
 
 # ── field_bool: structured boolean accessor + fail-safe default ───────────────
