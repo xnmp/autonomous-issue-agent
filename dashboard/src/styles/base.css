@@ -366,6 +366,15 @@ summary:focus-visible,
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
+.tbl tbody tr.unread > td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.tbl tbody tr.unread {
+  background: var(--accent-soft);
+}
+.tbl tbody tr.unread .issue-summary-title {
+  font-weight: var(--weight-semibold);
+}
 .tbl .r {
   text-align: right;
 }

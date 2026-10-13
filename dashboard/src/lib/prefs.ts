@@ -32,3 +32,23 @@ export function writeFlag(key: string, value: boolean): void {
     // The preference stays in memory for this session.
   }
 }
+
+/** A stored finite, positive number, or null when absent, blank, non-numeric or unreadable. */
+export function readTimestamp(key: string): number | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null || raw.trim() === "") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeTimestamp(key: string, value: number): void {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    // The watermark stays in memory for this session.
+  }
+}

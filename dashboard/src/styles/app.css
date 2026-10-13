@@ -86,8 +86,13 @@
   gap: var(--space-4);
   min-height: 56px;
   padding: 0 var(--space-5);
-  border-bottom: 1px solid var(--border);
-  background: var(--surface-sidebar);
+  border-bottom: 1px solid var(--border-strong);
+  /* A raised surface, not the sidebar tint: the bar and the content below it
+     were near-identical greys in the light theme. */
+  background: var(--elevated);
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  z-index: 1;
 }
 .mainbody {
   flex: 1;
@@ -684,6 +689,11 @@
   background: var(--selection);
   color: var(--ink-muted);
   font-size: var(--fs-xs);
+}
+.tab-count-new {
+  background: var(--accent);
+  color: var(--ink-on-fill);
+  font-weight: var(--weight-semibold);
 }
 
 .subtabs {

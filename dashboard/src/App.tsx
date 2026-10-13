@@ -17,6 +17,7 @@ import {
   type BacklogPromotionPhase,
 } from "./components/IssuesTab";
 import { useIssues } from "./features/issues/useIssues";
+import { useDoneUnread } from "./features/issues/useDoneUnread";
 import type {
   BacklogCard,
   IssuesPayload,
@@ -158,6 +159,11 @@ export default function App() {
   }, [route]);
 
   const issues = useIssues(selectedRepo);
+  const doneUnread = useDoneUnread(
+    selectedRepo,
+    issues.data?.done,
+    route.view === "issues" && route.sub === "done",
+  );
   const [promotedBacklog, setPromotedBacklog] = useState<
     Record<string, OptimisticPromotion[]>
   >({});
@@ -263,6 +269,12 @@ export default function App() {
           <>
             {ISSUES_SUB_LABELS[sub]}
             {count !== null ? <span className="tab-count num">{count}</span> : null}
+            {sub === "done" && doneUnread.count > 0 ? (
+              <span className="tab-count tab-count-new num" title="new since you last viewed">
+                {doneUnread.count}
+                <span className="sr-only"> new</span>
+              </span>
+            ) : null}
           </>
         ),
         active: route.view === "issues" && route.sub === sub,
@@ -352,6 +364,7 @@ export default function App() {
             selectedRepo={selectedRepo}
             githubRepo={selectedRepoSummary?.repo ?? null}
             issues={displayedIssues}
+            unreadDone={doneUnread.unread}
             onSetSub={setSub}
             onOpenIssue={openIssue}
             onBacklogPromotion={setBacklogPromotion}
@@ -380,6 +393,7 @@ function Body({
   onSetSub,
   onOpenIssue,
   onBacklogPromotion,
+  unreadDone,
   hasRepos,
   reposLoading,
   showDurationSeconds,
@@ -392,6 +406,7 @@ function Body({
   onSetSub: (s: IssuesSub) => void;
   onOpenIssue: (n: number) => void;
   onBacklogPromotion: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
+  unreadDone: ReadonlySet<number>;
   hasRepos: boolean;
   reposLoading: boolean;
   showDurationSeconds: boolean;
@@ -416,6 +431,7 @@ function Body({
         issues={issues}
         onOpenIssue={onOpenIssue}
         onBacklogPromotion={onBacklogPromotion}
+        unreadDone={unreadDone}
       />
     );
   if (selectedRepo) {
