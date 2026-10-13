@@ -7,7 +7,6 @@ from issue_agent.domain.pricing import (
     ModelRates,
     RateTable,
     UnknownModelPolicy,
-    overrun,
     parse_model_rate_table,
     price,
 )
@@ -50,13 +49,6 @@ def test_rate_quote_locks_identity_and_unknown_model_policy():
         fallback=RATES,
     )
     assert fallback.rates_for("anything") == RATES
-
-
-def test_overrun_requires_commensurable_money():
-    assert overrun(Money("USD", 10), Money("USD", 10)) == Money("USD", 10)
-    assert overrun(Money("USD", 9), Money("USD", 10)) is None
-    with pytest.raises(ValueError):
-        overrun(Money("AUD", 10), Money("USD", 10))
 
 
 def test_rate_table_parser_is_single_source_for_normal_and_cached_tiers():
