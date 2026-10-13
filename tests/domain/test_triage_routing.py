@@ -148,6 +148,12 @@ def test_unusable_light_results_resolve_at_the_default_tier_with_no_comment_and_
     assert state_of(world, {issue_key(3): (steward_leg(-1, usable=False),)}) == Dispatch(AgentKind.TRIAGE)
 
 
+def test_a_failed_grade_still_posts_the_stewards_criteria_at_the_default_tier():
+    legs = {issue_key(3): (steward_leg(-1, acceptance_criteria=("Esc closes it",)), triage_leg(0, None))}
+    (comment,) = actions(derive(WorldState(issues=(ready(),)), Local(now=NOW, legs=legs), H), H)
+    assert "- [ ] Esc closes it" in comment.body and f"`{DEFAULT_TIER.value}`" in comment.body
+
+
 def test_light_acts_wait_under_the_same_gates_as_any_paid_act():
     world = WorldState(issues=(ready(),))
     assert state_of(world, headroom=False) == Wait(WaitReason.HEADROOM)

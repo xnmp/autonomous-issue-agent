@@ -241,7 +241,7 @@ class FixLegs:
         the steward's criteria from the recorded legs."""
         steward = action.kind is AgentKind.STEWARD
         name = action.kind.name
-        route = (self.settings.steward_route if steward else self.settings.triage_route)
+        route = (self.settings.steward_route or self.settings.triage_route) if steward else self.settings.triage_route
         runtime, model, effort = route or self.settings.route(Tier.LOW)
         # resumed: the light acts never resume, so a wall timeout is their one
         # attempt (STEWARD: no criteria; TRIAGE: DEFAULT_TIER), not a machine

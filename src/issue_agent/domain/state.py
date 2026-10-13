@@ -452,8 +452,11 @@ def _proceed(
         elif triage is None:
             step = Dispatch(AgentKind.TRIAGE)
         else:
-            if triage.triage is not None and not any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
-                return TriageNote(triage.triage, triage.ended_at.isoformat(), steward.steward or Steward())
+            criteria = steward.steward or Steward()
+            # An unusable grade still posts the steward's criteria, at the tier it runs at.
+            graded = triage.triage or (Triage(DEFAULT_TIER) if criteria.acceptance_criteria else None)
+            if graded is not None and not any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
+                return TriageNote(graded, triage.ended_at.isoformat(), criteria)
             step = Dispatch(AgentKind.RESOLVE)
     else:
         step = _pr_step(pr, harness, item.base)
