@@ -7,7 +7,7 @@ records argv and returns canned JSON (no network, no real gh)."""
 import errno
 import json
 
-from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _INLINE_COMMENT_LIMIT, _REVIEW_COMMENT_BODY_BYTES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, MissingListLimit, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_issue, parse_pr
+from issue_agent.adapters.github import _FAILED_LOG_BYTES, _FAILED_LOG_LINES, _INLINE_COMMENT_LIMIT, _REVIEW_COMMENT_BODY_BYTES, _REVIEW_COMMENTS_TOTAL_BYTES, GitHubGateway, Identity, format_pr_discussion, format_review_comments, build_close_issue_args, build_comment_args, build_enable_auto_merge_args, build_relabel_args, build_submit_review_args, parse_issue, parse_pr
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Comment
 from issue_agent.domain.checks import Unavailable
@@ -568,7 +568,6 @@ def test_runner_raises_rate_limit(monkeypatch, stderr):
     with pytest.raises(GhUnavailable) as ei:
         _run_with(monkeypatch, stderr)()
     assert ei.value.kind == "rate-limit"
-    assert ei.value.timed_out is False
 
 
 @pytest.mark.parametrize(
@@ -717,15 +716,14 @@ def test_auth_outages_are_transient_unavailability(stderr):
 
 def test_runner_raises_network_on_timeout(monkeypatch, capsys):
     """The bounded kill produced NO data; returning "" made a hung `gh pr view` look
-    like a successful read of an empty world. `timed_out` marks it as the
-    per-call case."""
+    like a successful read of an empty world."""
     def _timeout(argv, capture_output, text, env, timeout):
         raise _subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
 
     monkeypatch.setattr(_subprocess, "run", _timeout)
     with pytest.raises(GhUnavailable) as ei:
         _subprocess_runner(["gh", "pr", "view", "374", "--repo", "o/r"], None)
-    assert ei.value.kind == "network" and ei.value.timed_out is True
+    assert ei.value.kind == "network"
     assert "timed out" in capsys.readouterr().err
 
 
@@ -739,30 +737,6 @@ def _raising_runner(exc):
     def runner(argv, token):
         raise exc
     return runner
-
-
-# ── review C2: every `gh … list` states its ceiling ───────────────────────────
-def _limit_of(argv):
-    return argv[argv.index("--limit") + 1] if "--limit" in argv else None
-
-
-def test_gh_rejects_a_list_subcommand_without_limit():
-    """review C2, made structural: a `gh … list` argv with no --limit is a BUG in
-    this module (silent 30-item truncation), so it raises before gh ever runs
-    rather than returning a plausible-looking short answer."""
-    fr = FakeRunner()
-    gw = GitHubGateway("o/r", runner=fr)
-    with pytest.raises(ValueError):
-        gw._gh_json(["issue", "list", "--repo", "o/r", "--json", "number"])
-    with pytest.raises(MissingListLimit):
-        gw._gh(["pr", "list", "--repo", "o/r"])          # raw-text list calls too
-    assert fr.calls == []                                 # guard fires BEFORE gh runs
-    # anti-vacuity: the same calls WITH --limit go through, and non-list
-    # subcommands are untouched.
-    gw._gh_json(["issue", "list", "--repo", "o/r", "--json", "number", "--limit", "500"])
-    gw._gh(["pr", "view", "1", "--repo", "o/r"])
-    gw._gh(["api", "repos/o/r/issues/5/dependencies/blocked_by"])
-    assert len(fr.calls) == 3
 
 
 # ── PR conversation → review prompt (2026-08-08, tauri #613/#614) ─────────────
@@ -936,14 +910,6 @@ def test_failed_run_log_fails_soft_to_empty_string(runner):
     """D6: a log fetch may never kill a dispatch — the fixer can rediscover the
     failure itself, but only if it is actually dispatched."""
     assert GitHubGateway("o/r", runner=runner).failed_run_log("head", (1,)) == ""
-
-
-def test_failed_run_log_does_not_swallow_a_programmer_error():
-    """The fail-soft catch must not hide review C2's guard: a list argv built
-    without --limit is a bug in this module, not a transient gh failure."""
-    gw = GitHubGateway("o/r", runner=_raising_runner(MissingListLimit("no --limit")))
-    with pytest.raises(MissingListLimit):
-        gw.failed_run_log("head", (1,))
 
 
 # ── P1R-13: `tail -150` bounds LINE count, not bytes ──────────────────────────

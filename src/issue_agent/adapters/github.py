@@ -1,182 +1,71 @@
 """GitHubGateway — the only module that runs `gh`.
 
-Two halves, the usual pure/impure split:
-
-  * PURE PARSERS (`parse_issue`, `parse_pr`, `parse_world`) — gh `--json` dicts →
-    domain value objects (IssueView/PRView/Review/Check/Comment). These are the
-    real-vs-fake seam the bash kept getting wrong (the fake `gh` drifting from
-    real `gh`), so they are unit-tested against the documented JSON shapes.
-  * IMPURE GATEWAY — runs `gh` as a chosen identity (ambient / static PAT /
-    GitHub-App installation token) and applies side-effects (relabel, comment,
-    close, enable-auto-merge). The identity selection reproduces the bash
-    gh_fix / gh_review identity model.
-
-Field names match what the bash queries (issue: number,title,body,labels,
-comments,updatedAt,author,state; pr: number,title,body,headRefName,headRefOid,
-baseRefName,labels,reviews,state; checks: name,state,
-bucket,startedAt,link) so the mapping is mechanical and auditable.
+Pure parsers (`parse_issue`, `parse_pr`, `parse_fix_*`) turn gh JSON into
+domain value objects and are unit-tested against the documented shapes (the
+fake `gh` drifting from the real one was the bash harness's recurring bug).
+The gateway runs `gh` as one identity (ambient, static PAT or GitHub-App
+installation token) and applies the side effects.
 """
 
 from __future__ import annotations
 
 import errno
 import json
+import os
 import re
 import subprocess
-from .github_ci import observe_checks
-from ..domain.checks import Unavailable
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from ..domain.checks import Unavailable
 from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
-from ..domain.world import (
-    Branch,
-    Comment,
-    IssueView,
-    PRView,
-    PullRequestDiff,
-    Push,
-    Review,
-    WorldState,
-)
+from ..domain.world import Branch, Comment, IssueView, PRView, PullRequestDiff, Push, Review, WorldState
+from .github_ci import observe_checks
 
-
-# Hard ceiling on any single `gh` subprocess. A `gh pr view` requesting lazily
-# computed fields (mergeable / mergeStateStatus) can hang indefinitely on a
-# just-merged PR; without a timeout that wedges the synchronous poll loop. 120s is
-# far above a healthy call (<2s), below the service watchdog interval, and
-# paired with a scheduler-progress callback after every call.
+# Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
+# fields (mergeable / mergeStateStatus) once hung ~14 min on a just-merged PR
+# and froze the synchronous poll loop.
 _GH_TIMEOUT_S = 30.0
 _LOGGED_GH_ARGV_BYTES = 2 * 1024
 
-# Cap on `gh issue list` / `gh pr list` world-building calls. gh has no
-# "there were more" signal short of paginating (cursor-following, unshipped
-# here) — a returned count that HITS this ceiling is the only observable proxy
-# for truncation, and it means the OLDEST issues/PRs silently vanished from
-# consideration this poll, no error, no signal (suspected root cause of
-# FAILURE-MODES #66 — triage candidates going missing). 500 covers real-world
-# open-issue/PR counts with headroom over the old 200; _warn_if_list_truncated
-# below makes a hit LOUD instead of silent (P0.7).
-_LIST_LIMIT = 500
-
-
-# Inline review comments pulled per PR (port of agent/address-review.sh:41's
-# `.[-8:]`) — the NEWEST 8. A bound is required: the whole list is pasted into a
-# prompt, and an unbounded paste is how a long review thread blows the context
-# window on the one leg that must not fail.
+# Prompt-input bounds (review M13/P1R-13). Inline comments are writable by
+# anyone with read access, and `tail -N` bounds lines, not bytes: a 200MB CI
+# log's last 150 lines was once a 150M-char prompt.
 _INLINE_COMMENT_LIMIT = 8
-
-# Tail of the failed-CI log handed to the fixer (port of `tail -150` in
-# agent/fix-ci.sh:42). The failure is almost always in the last frames; the head
-# of a 50k-line Actions log is pure setup noise.
 _FAILED_LOG_LINES = 150
-
-# Byte ceiling on the SAME tail, independent of the line count (review P1R-13).
-# `tail -150` bounds LINES, not bytes: a log whose lines are individually huge —
-# one minified bundle, a base64 blob, a per-line JSON dump — sails straight
-# through it. Measured: a 200MB CI log's last 150 lines was still a
-# 150,001,711-char prompt. 20_000 bytes (~5-6k tokens at a typical ~3.5
-# bytes/token) comfortably fits a real multi-hundred-line stack trace (a
-# genuine failure line runs 80-150 bytes) while capping the fix-ci leg's
-# worst-case prompt to a few cents of context on even the cheapest model —
-# compare `_one_line`'s 200-char bound for a single gh error line.
 _FAILED_LOG_BYTES = 20_000
-
-# Per-comment + overall byte ceilings on the inline-review-comments block
-# (review P1R-13). Unlike an issue/PR body, an inline review comment is
-# writable by ANY user with read access to the repo — not just the PR author —
-# so it is a wider attack surface than most prompt inputs. 2_000 bytes/comment
-# is generous for an actual review remark (a paragraph is well under 500
-# bytes) while making a weaponized paste (measured repro: 10 x 500KB comments
-# -> ~4MB) harmless; the 20_000-byte overall ceiling matches the CI-log budget
-# above and is defense-in-depth beyond the per-comment cap (it also bounds a
-# future caller that raises `limit` past `_INLINE_COMMENT_LIMIT`).
 _REVIEW_COMMENT_BODY_BYTES = 2_000
 _REVIEW_COMMENTS_TOTAL_BYTES = 20_000
 
 
-class MissingListLimit(ValueError):
-    """Programmer error: a `gh … list` argv was built without `--limit`.
-
-    Not a runtime condition — a bug in this module, raised eagerly so it can
-    never reach production as a silent truncation. gh's default page size is 30,
-    and a `list` call without `--limit` therefore answers with the 30 NEWEST
-    items while looking exactly like a complete answer: past 30 ai-ready issues
-    the oldest were never dispatched, past 30 open PRs their CI was never fixed —
-    every poll, no error (review C2; FAILURE-MODES #66's signature). Subclasses
-    ValueError so it reads as the programmer error it is, but is distinguishable
-    from a JSONDecodeError in the fail-soft methods that swallow everything else.
-    """
-
-
-def _require_list_limit(args: list[str]) -> None:
-    """Reject a `gh <thing> list …` argv that carries no `--limit` (review C2).
-
-    Every list call in this module must state its ceiling so `_warn_if_list_truncated`
-    has something to compare against; this guard makes the omission impossible to
-    reintroduce rather than merely unlikely."""
-    if len(args) >= 2 and args[1] == "list" and "--limit" not in args:
-        raise MissingListLimit(
-            f"gh {args[0]} list built without --limit: {' '.join(args)} — "
-            "gh would silently return only the 30 newest items. Pass "
-            "--limit str(_LIST_LIMIT) (and call _warn_if_list_truncated on the count)."
-        )
-
-
 def _tail(text: str, lines: int, max_bytes: int | None = None) -> str:
-    """Last `lines` lines of `text` (port of `tail -N`), ADDITIONALLY capped to
-    the last `max_bytes` UTF-8 bytes when given (review P1R-13). The two caps
-    are independent: `tail -N` bounds line COUNT, not size, so a log with a
-    handful of enormous lines needs a separate byte cut to stay bounded.
-    Slicing bytes can land mid multi-byte character at the cut point;
-    `errors="ignore"` drops that partial character rather than raising.
-    Tolerates ""/None."""
+    """The last `lines` lines, then the last `max_bytes` UTF-8 bytes; a cut
+    multi-byte character is dropped."""
     out = "\n".join((text or "").splitlines()[-lines:])
-    if max_bytes is None:
-        return out
     encoded = out.encode("utf-8", errors="ignore")
-    if len(encoded) <= max_bytes:
+    if max_bytes is None or len(encoded) <= max_bytes:
         return out
     return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
 
 def _cap_bytes(text: str, max_bytes: int) -> str:
-    """Truncate `text` to at most `max_bytes` of UTF-8 encoded content, keeping
-    the FRONT (review P1R-13) — unlike `_tail`'s from-the-end truncation for a
-    CI log, a review comment's substance is normally stated up front, so
-    keeping the start preserves whatever legitimate point the comment opens
-    with. `errors="ignore"` drops a partial multi-byte character at the cut
-    point rather than raising."""
+    """The first `max_bytes` UTF-8 bytes (a comment states its point up front)."""
     encoded = text.encode("utf-8", errors="ignore")
-    if len(encoded) <= max_bytes:
-        return text
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return text if len(encoded) <= max_bytes else encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
-# ── infra-failure detection (V10) ─────────────────────────────────────────────
 class GhUnavailable(RuntimeError):
-    """GitHub could not ANSWER — the `gh` call failed for infrastructure reasons
-    (auth outage, rate limit, network, 5xx), not because the world is empty.
-
-    The lesson: `_subprocess_runner` used to map every failure to `""`, so a
-    rate-limited poll observed an EMPTY world — zero PRs, zero issues — and the
-    domain, being honest about what it saw, acted on it (nothing to review,
-    nothing in flight, cleanup fair game). "Nothing to do" and "I could not
-    look" must never be the same value. Raising is the entire fix: a world built
-    on a failed read is a lie, so the daemon skips the tick and the poll loop —
-    which IS the retry — looks again next interval. No backoff lives here.
-
-    `kind` is one of "auth" | "rate-limit" | "network" | "server" |
-    "local-resource";
-    `timed_out` marks the
-    one sub-case that is per-CALL rather than systemic (the `_GH_TIMEOUT_S` kill
-    of a single hung `gh pr view`), which `_safe_get_pr` still isolates per PR.
-    """
+    """GitHub could not ANSWER (auth, rate limit, network, 5xx, local resource
+    exhaustion), as opposed to answering "nothing" (V10). Mapping every
+    failure to "" once made a rate-limited poll observe an empty world and act
+    on it; raising makes the daemon skip the tick, and the next poll retries.
+    `kind` is one of `_HEADLINES`."""
 
     _HEADLINES = {
         "auth": "unavailable (authentication)",
@@ -187,113 +76,49 @@ class GhUnavailable(RuntimeError):
     }
     _MAX_DETAIL_BYTES = 8 * 1024
 
-    def __init__(
-        self,
-        kind: str,
-        detail: str,
-        argv: list[str] | None = None,
-        timed_out: bool = False,
-        retry_after_s: float | None = None,
-    ):
+    def __init__(self, kind: str, detail: str, argv: list[str] | None = None,
+                 retry_after_s: float | None = None):
         self.kind = kind
-        self.detail = _cap_bytes(
-            _one_line(detail), self._MAX_DETAIL_BYTES
-        )
+        self.detail = _cap_bytes(_one_line(detail), self._MAX_DETAIL_BYTES)
         self.argv = tuple(argv or ())
-        self.timed_out = timed_out
         self.retry_after_s = retry_after_s
         super().__init__(f"GitHub {self.headline}: {self.detail}")
 
     @property
     def headline(self) -> str:
-        """Operator-facing phrase for the kind (the loud loop line reads it)."""
         return self._HEADLINES.get(self.kind, self.kind)
 
 
 def _one_line(text: str, limit: int = 200) -> str:
-    """Collapse a multi-line gh error into ONE bounded line. Daemon logs are
-    scanned by eye and grepped by line; a 40-line curl dump buries the signal."""
     flat = " ".join((text or "").split())
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
-# Lower-cased substrings that mark a failed `gh` call as INFRA rather than as an
-# ordinary API answer. Pattern-matching is deliberate — a non-zero exit is ALSO
-# how gh reports "PR not found", "label does not exist", and a 422 self-approval,
-# and callers depend on those still degrading to "" (see `_safe_get_pr`,
-# `build_review_world`'s missing-label tolerance, `submit_review`'s False). A
-# blanket raise would trade a silent-empty-world bug for a wedged daemon.
-_RATE_LIMIT_PATTERNS = (
-    "rate limit",        # "API rate limit exceeded for user ID …" (arrives as HTTP 403)
-    "rate-limit",
-    "ratelimit",         # header echo, e.g. "x-ratelimit-remaining: 0"
-    "secondary rate",    # secondary/abuse limits (short-lived but real)
-    "abuse detection",
-    "http 429",
-    "too many requests",
-    "retry-after",
-)
-_AUTH_PATTERNS = (
-    "http 401",
-    "requires authentication",
-    "bad credentials",
-)
-# NB: a bare HTTP 403 is NOT infra — "Resource not accessible by integration"
-# (App token missing a scope) is a permanent, benign permission answer that the
-# reviewer already tolerates. Only 403s carrying rate-limit text match above.
-
-_NETWORK_PATTERNS = (
-    "error connecting",                     # gh: "error connecting to api.github.com"
-    # DNS — the "host" is load-bearing: gh's GraphQL 404 reads "Could not resolve
-    # to a PullRequest with the number of 999", a perfectly good ANSWER that a
-    # bare "could not resolve" would misfile as an outage and skip ticks over.
-    "could not resolve host",
-    "could not resolve hostname",
-    "no such host",
-    "temporary failure in name resolution",
-    "connection refused",
-    "connection reset",
-    "network is unreachable",
-    "dial tcp",
-    "tls handshake",
-    "proxyconnect",                         # broken/absent outbound proxy (see CLAUDE.md)
-    "i/o timeout",
-    "timed out",
-    "timeout",
-)
-
-_SERVER_PATTERNS = (
-    "bad gateway",
-    "service unavailable",
-    "gateway timeout",
-    "gateway time-out",
-    "internal server error",
-)
-_LOCAL_RESOURCE_PATTERNS = (
-    "pthread_create failed",
-    "resource temporarily unavailable",
-    "failed to create new os thread",
-    "fatal error: newosproc",
-    "cannot allocate memory",
-    "out of memory",
-)
-# Match the STATUS TOKEN only next to an explicit "HTTP": gh prints "HTTP 503
-# (https://api.github.com/…)". A bare "502" is not enough — it could be an issue
-# number in "issue #502 not found", and misreading that as an outage would skip
-# ticks forever.
+# Lower-cased substrings that mark a failed `gh` call as INFRA. A non-zero exit
+# is ALSO how gh reports "PR not found", "label does not exist" and a 422
+# self-approval, and those must keep degrading to "". A bare HTTP 403 is not
+# infra ("Resource not accessible by integration" is a permanent answer).
+_AUTH_PATTERNS = ("http 401", "requires authentication", "bad credentials")
+_RATE_LIMIT_PATTERNS = ("rate limit", "rate-limit", "ratelimit", "secondary rate", "abuse detection",
+                        "http 429", "too many requests", "retry-after")
+# "could not resolve HOST": gh's GraphQL "Could not resolve to a PullRequest"
+# is an answer, not an outage.
+_NETWORK_PATTERNS = ("error connecting", "could not resolve host", "could not resolve hostname", "no such host",
+                     "temporary failure in name resolution", "connection refused", "connection reset",
+                     "network is unreachable", "dial tcp", "tls handshake", "proxyconnect", "i/o timeout",
+                     "timed out", "timeout")
+_SERVER_PATTERNS = ("bad gateway", "service unavailable", "gateway timeout", "gateway time-out",
+                    "internal server error")
+_LOCAL_RESOURCE_PATTERNS = ("pthread_create failed", "resource temporarily unavailable",
+                            "failed to create new os thread", "fatal error: newosproc", "cannot allocate memory",
+                            "out of memory")
+# Only next to "HTTP": a bare "502" may be an issue number.
 _SERVER_RE = re.compile(r"http[/ ]?\s*5\d\d")
 
 
 def classify_gh_failure(detail: str) -> str | None:
-    """Map a failed `gh` invocation's stderr/stdout to an infra kind
-    ("rate-limit" | "network" | "server" | "local-resource"), or None when
-    the failure is an ordinary API answer the caller should keep treating as
-    "" (fail-soft).
-
-    Order matters: auth → rate-limit → server → network. "504 Gateway Timeout" contains
-    "timeout", so the 5xx test must run before the network test or a GitHub
-    outage would be misfiled as a local network fault (same tick-skip either way,
-    but the operator reads the kind to decide whether to fix their box)."""
+    """The infra kind of a failed `gh` call's output, or None for an ordinary
+    API answer. Server before network: "504 Gateway Timeout" contains "timeout"."""
     text = (detail or "").lower()
     if any(p in text for p in _AUTH_PATTERNS):
         return "auth"
@@ -310,18 +135,15 @@ def classify_gh_failure(detail: str) -> str | None:
 
 def _printable_gh_argv(argv: list[str]) -> str:
     """Bound command diagnostics without logging untrusted publication bodies."""
-
     rendered: list[str] = []
-    redact_next = False
-    field_value = False
+    redact_next = field_value = False
     for arg in argv:
         if redact_next:
             rendered.append(f"<body redacted: {len(arg.encode())} bytes>")
             redact_next = False
             continue
         if field_value and arg.startswith("body="):
-            body = arg.removeprefix("body=")
-            rendered.append(f"body=<redacted: {len(body.encode())} bytes>")
+            rendered.append(f"body=<redacted: {len(arg.removeprefix('body=').encode())} bytes>")
             field_value = False
             continue
         rendered.append(arg)
@@ -331,26 +153,12 @@ def _printable_gh_argv(argv: list[str]) -> str:
 
 
 # ── pure parsers ──────────────────────────────────────────────────────────────
-def _label_names(raw: list | None) -> frozenset[str]:
-    """Raw label names, in gh's two shapes: [{"name": "ai-ready"}, …] (issue/pr
-    view) or bare strings (some fakes). The name-level twin of `_labels`, for
-    callers that must ask about a label the `Label` enum does not know — the
-    reviewer's configurable trigger label. ONE extraction so a shape the two
-    read differently cannot exist (adversarial review F3)."""
+def _labels(raw: list | None) -> frozenset[Label]:
+    """Known label names from [{"name": …}] or bare strings; unknown repo
+    labels are dropped, never a parse failure."""
     out = set()
     for item in raw or []:
         name = item.get("name") if isinstance(item, dict) else item
-        if isinstance(name, str) and name:
-            out.add(name)
-    return frozenset(out)
-
-
-def _labels(raw: list | None) -> frozenset[Label]:
-    """gh returns labels as [{"name": "ai-ready"}, …] (issue/pr view) or as bare
-    strings (some fakes). Map known names to Label; silently drop unknown ones so
-    a stray repo label never crashes the parse."""
-    out = set()
-    for name in _label_names(raw):
         try:
             out.add(Label(name))
         except ValueError:
@@ -359,170 +167,65 @@ def _labels(raw: list | None) -> frozenset[Label]:
 
 
 def _comments(raw: list | None) -> tuple[Comment, ...]:
-    out = []
-    for c in raw or []:
-        author = (c.get("author") or {}).get("login", "") if isinstance(c.get("author"), dict) else c.get("author", "")
-        out.append(
-            Comment(author=author or "", body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "")
-        )
-    return tuple(out)
+    return tuple(
+        Comment(author=_login(c.get("author")) if isinstance(c.get("author"), dict) else c.get("author", "") or "",
+                body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "")
+        for c in raw or [])
 
 
 def _reviews(raw: list | None) -> tuple[Review, ...]:
+    """GraphQL (`author`, `commit.oid`) or REST (`user`, `commit_id`) shape.
+    An unknown commit is "": the ADDRESS_REVIEW supersession gate stays open."""
     out = []
     for r in raw or []:
-        author = ""
-        if isinstance(r.get("author"), dict):
-            author = r["author"].get("login", "")
-        elif isinstance(r.get("user"), dict):  # API shape
-            author = r["user"].get("login", "")
-        # `commit_id` feeds the ADDRESS_REVIEW supersession gate (Review docstring
-        # in domain/world.py). Two incompatible gh shapes carry it: the GraphQL-backed
-        # `gh pr view --json reviews` nests it under commit.oid; the plain REST
-        # reviews API (`/pulls/{n}/reviews`) has it flat as commit_id. Try both,
-        # defensively (isinstance guards a malformed/absent "commit"); "" (unknown)
-        # if neither is present — the gate stays open and the attempt-counting
-        # breaker is the backstop, never a crash on an unrecognized shape.
-        commit_id = ""
-        if isinstance(r.get("commit"), dict):  # GraphQL shape
-            commit_id = r["commit"].get("oid", "") or ""
-        if not commit_id:
-            commit_id = r.get("commit_id", "") or ""  # REST shape
-        out.append(
-            Review(
-                state=r.get("state", "") or "",
-                author=author or "",
-                submitted_at=r.get("submittedAt") or r.get("submitted_at") or "",
-                body=r.get("body", "") or "",
-                commit_id=commit_id,
-            )
-        )
+        author = _login(r.get("author")) or _login(r.get("user"))
+        commit = r.get("commit")
+        commit_id = (commit.get("oid", "") if isinstance(commit, dict) else "") or r.get("commit_id", "") or ""
+        out.append(Review(state=r.get("state", "") or "", author=author,
+                          submitted_at=r.get("submittedAt") or r.get("submitted_at") or "",
+                          body=r.get("body", "") or "", commit_id=commit_id))
     return tuple(out)
 
 
-def _check_run_observation(raw: dict) -> dict[str, object]:
-    status = str(raw.get("status") or "").lower()
-    conclusion = str(raw.get("conclusion") or "").lower()
-    if status != "completed":
-        bucket = "pending"
-    elif conclusion in {"success", "neutral", "skipped"}:
-        bucket = "pass"
-    else:
-        bucket = "fail"
-    return {
-        "name": str(raw.get("name") or ""),
-        "state": status.upper(),
-        "bucket": bucket,
-        "startedAt": str(
-            raw.get("started_at") or raw.get("created_at") or ""
-        ),
-        "link": str(raw.get("details_url") or ""),
-    }
-
-
-def _commit_status_observation(raw: dict) -> dict[str, object]:
-    state = str(raw.get("state") or "").lower()
-    return {
-        "name": str(raw.get("context") or ""),
-        "state": state.upper(),
-        "bucket": (
-            "pending"
-            if state == "pending"
-            else "pass"
-            if state == "success"
-            else "fail"
-        ),
-        "startedAt": str(
-            raw.get("created_at") or raw.get("updated_at") or ""
-        ),
-        "link": str(raw.get("target_url") or ""),
-    }
-
-
 def parse_issue(d: dict) -> IssueView:
-    author = ""
-    if isinstance(d.get("author"), dict):
-        author = d["author"].get("login", "")
-    body = d.get("body", "") or ""
     return IssueView(
-        number=int(d["number"]),
-        title=d.get("title", "") or "",
-        body=body,
-        labels=_labels(d.get("labels")),
-        comments=_comments(d.get("comments")),
-        updated_at=d.get("updatedAt", "") or "",
-        author=author or "",
-        # gh issue state is "OPEN"/"CLOSED"; WorldState uses lower-case open/closed.
+        number=int(d["number"]), title=d.get("title", "") or "", body=d.get("body", "") or "",
+        labels=_labels(d.get("labels")), comments=_comments(d.get("comments")),
+        updated_at=d.get("updatedAt", "") or "", author=_login(d.get("author")),
         state=(d.get("state", "open") or "open").lower(),
     )
 
 
 def parse_pr(d: dict) -> PRView:
     return PRView(
-        number=int(d["number"]),
-        head_ref_name=d.get("headRefName", "") or "",
-        head_ref_oid=d.get("headRefOid", "") or "",
-        base_ref_name=d.get("baseRefName", "") or "",
-        base_ref_oid=d.get("baseRefOid", "") or "",
-        title=d.get("title", "") or "",
-        body=d.get("body", "") or "",
-        labels=_labels(d.get("labels")),
-        comments=_comments(d.get("comments")),
-        reviews=_reviews(d.get("reviews")),
-
-        state=(d.get("state", "OPEN") or "OPEN").upper(),
-        changed_files=_changed_files(d.get("files")),
-        mergeable=(d.get("mergeable", "") or "").upper(),
-        merge_state=(d.get("mergeStateStatus", "") or "").upper(),
-        author=((d.get("author") or {}).get("login", "") or ""),
+        number=int(d["number"]), head_ref_name=d.get("headRefName", "") or "",
+        head_ref_oid=d.get("headRefOid", "") or "", base_ref_name=d.get("baseRefName", "") or "",
+        base_ref_oid=d.get("baseRefOid", "") or "", title=d.get("title", "") or "", body=d.get("body", "") or "",
+        labels=_labels(d.get("labels")), comments=_comments(d.get("comments")), reviews=_reviews(d.get("reviews")),
+        state=(d.get("state", "OPEN") or "OPEN").upper(), changed_files=_changed_files(d.get("files")),
+        mergeable=(d.get("mergeable", "") or "").upper(), merge_state=(d.get("mergeStateStatus", "") or "").upper(),
+        author=_login(d.get("author")),
     )
 
 
 def _changed_files(files: object) -> frozenset[str]:
-    """`gh pr view --json files` → [{path, additions, ...}]. Pull the paths for
-    the file-overlap gate. Tolerant of a missing/oddly-shaped field (→ empty)."""
     if not isinstance(files, list):
         return frozenset()
-    out = set()
-    for f in files:
-        if isinstance(f, dict) and f.get("path"):
-            out.add(str(f["path"]))
-    return frozenset(out)
+    return frozenset(str(f["path"]) for f in files if isinstance(f, dict) and f.get("path"))
 
 
 def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> str:
-    """`GET /repos/{repo}/pulls/{n}/comments` JSON → the prompt block the fixer
-    reads, one comment per entry as `path:line (author): body` (review M13, D6).
-
-    Port of agent/address-review.sh:41 with the formatting moved OUT of the jq
-    filter and into Python: jq inside an argv is invisible to the tests, and this
-    text is the fixer's only view of the file:line asks reviewers actually make.
-
-    Selection mirrors the bash exactly: top-level comments only (`in_reply_to_id
-    == null` — replies are the fixer's own thread, not new asks), oldest→newest,
-    the last `limit`. Tolerant of every shape it might be handed (a non-list error
-    object, a missing path/line/user) — this feeds a prompt, so a malformed field
-    degrades to a weaker prompt, never to a dead dispatch.
-
-    Each comment body is capped at `_REVIEW_COMMENT_BODY_BYTES` and the whole
-    formatted block at `_REVIEW_COMMENTS_TOTAL_BYTES` (review P1R-13): unlike an
-    issue/PR body, an inline comment is writable by ANY user with read access to
-    the repo, so `limit` alone (item COUNT) does not bound the paste — a handful
-    of huge comments still blow the prompt."""
+    """`GET /pulls/{n}/comments` → the fixer's `path:line (author): body` block:
+    top-level comments only (replies are the fixer's own thread), the newest
+    `limit`, each and the whole block byte-capped (review M13, P1R-13). Any
+    malformed shape degrades to a weaker prompt, never a dead dispatch."""
     if not isinstance(raw, list):
         return ""
-    tops = [
-        c for c in raw
-        if isinstance(c, dict) and c.get("in_reply_to_id") is None
-    ]
-    tops.sort(key=lambda c: str(c.get("created_at") or c.get("createdAt") or ""))
+    tops = sorted((c for c in raw if isinstance(c, dict) and c.get("in_reply_to_id") is None),
+                  key=lambda c: str(c.get("created_at") or c.get("createdAt") or ""))
     out = []
     for c in tops[-limit:] if limit > 0 else tops:
-        author = ""
-        for key in ("user", "author"):  # REST shape, then GraphQL shape
-            if isinstance(c.get(key), dict):
-                author = c[key].get("login", "") or ""
-                break
+        author = _login(c.get("user")) or _login(c.get("author"))
         line = c.get("line") or c.get("original_line") or 0
         body = _cap_bytes((c.get("body", "") or "").strip(), _REVIEW_COMMENT_BODY_BYTES)
         out.append(f"{c.get('path', '') or ''}:{line} ({author}): {body}")
@@ -530,55 +233,27 @@ def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> s
 
 
 def _marked_cap(text: str, max_bytes: int) -> str:
-    """`_cap_bytes` that says so when it cut. An unmarked truncation reads as a
-    complete statement that happens to trail off mid-sentence."""
     capped = _cap_bytes(text, max_bytes)
     return capped if capped == text else f"{capped} […comment truncated]"
 
 
 def format_pr_discussion(
-    comments: tuple[Comment, ...],
-    *,
-    body_bytes: int = _REVIEW_COMMENT_BODY_BYTES,
+    comments: tuple[Comment, ...], *, body_bytes: int = _REVIEW_COMMENT_BODY_BYTES,
     total_bytes: int = _REVIEW_COMMENTS_TOTAL_BYTES,
 ) -> str:
-    """The PR's conversation thread → the block the reviewer reads as DATA.
-
-    NEWEST FIRST, unlike the triage thread's oldest-first ordering: the byte
-    ceiling truncates the tail, and on a PR the answer to "did the author
-    already respond to this demand?" is at the recent end (2026-08-08 tauri
-    #613/#614 — the reviewer re-demanded evidence the thread had answered two
-    rounds earlier). Truncation is marked in-band so a bounded view is never
-    mistaken for the whole conversation.
-
-    Bot comments are KEPT: the harness's own fixer posts its blocked-reason
-    comment as a bot, and that comment is the one this exists to deliver.
-
-    Same ceilings as the inline-review-comment block — a PR comment is writable
-    by anyone with read access to the repo, so the comment COUNT does not bound
-    the paste. Both cuts (per comment, whole block) are MARKED: a reviewer
-    reading a silently amputated answer would re-raise the point it made, which
-    is the loop this whole feature exists to break."""
-    rendered = [
-        f"@{c.author or '(unknown)'}: {_marked_cap(c.body.strip(), body_bytes)}"
-        for c in reversed(comments)
-        if c.body.strip()
-    ]
+    """The PR conversation as the reviewer's DATA block, NEWEST FIRST: the byte
+    ceiling cuts the tail, and whether the author already answered a demand is
+    at the recent end (tauri #613/#614: the reviewer re-demanded evidence the
+    thread had answered). Bot comments are kept (the fixer's blocked-reason
+    comment is one), and both cuts are marked so a bounded view never reads as
+    the whole conversation."""
+    rendered = [f"@{c.author or '(unknown)'}: {_marked_cap(c.body.strip(), body_bytes)}"
+                for c in reversed(comments) if c.body.strip()]
     if not rendered:
         return ""
     joined = "\n\n---\n\n".join(rendered)
     capped = _cap_bytes(joined, total_bytes)
-    if capped != joined:
-        capped += "\n\n---\n\n[older comments truncated]"
-    return capped
-
-
-def build_time() -> str:
-    """The stamp every world builder puts in `WorldState.now`. The domain may not
-    read a clock, so this is the one place a poll's notion of "now" is taken —
-    and it is taken once per build, so every time-based gate in a tick judges
-    against the same instant."""
-    return datetime.now(timezone.utc).isoformat()
+    return capped if capped == joined else capped + "\n\n---\n\n[older comments truncated]"
 
 
 _FIX_MAX_PAGES = {"issues": 10, "pullRequests": 10, "refs": 10}
@@ -757,55 +432,29 @@ def _owed(node: dict) -> bool:
 
 
 # ── write command builders ──────────────────────────────────────────────────
-def build_submit_review_args(
-    repo: str,
-    pr: int,
-    event: str,
-    body: str,
-    head: str,
-) -> list[str]:
-    return [
-        "api", f"repos/{repo}/pulls/{pr}/reviews", "--method", "POST",
-        "-f", f"event={event}", "-f", f"body={body}",
-        "-f", f"commit_id={head}",
-    ]
+def build_submit_review_args(repo: str, pr: int, event: str, body: str, head: str) -> list[str]:
+    return ["api", f"repos/{repo}/pulls/{pr}/reviews", "--method", "POST",
+            "-f", f"event={event}", "-f", f"body={body}", "-f", f"commit_id={head}"]
 
 
 def build_relabel_args(
     repo: str, kind: str, number: int, remove: str | None, add: str | None,
 ) -> list[list[str]] | None:
-    """REST label commands (one per mutation), never `gh <kind> edit`.
+    """REST label commands, never `gh <kind> edit`: its GraphQL metadata query
+    demands `read:org`, which a repo-scoped bot PAT lacks (review daemon wedged
+    on PR #171, 2026-08-02). The issues endpoint covers PRs too.
 
-    `gh pr edit --add-label` runs a GraphQL metadata-resolution query (it
-    fetches assignable users/teams alongside labels) that demands `read:org`
-    — a classic PAT scoped to `repo` alone (the supported cross-account bot
-    credential) fails every relabel with a scope error (observed live: review
-    daemon wedged on PR #171, 2026-08-02). Plain `--json` reads are unaffected.
-    The REST issues/labels endpoints accept plain `repo` scope and cover PRs
-    too (a PR is an issue to this endpoint), so `kind` does not select a route.
-
-    ADD BEFORE REMOVE (deliberate, adversarial F1): the pair is no longer one
-    atomic edit, and a permanently failing second call must not strand the
-    target label-less — an unlabeled issue/PR is invisible to every daemon's
-    world build, so nothing would ever repair it. Add-first leaves "both
-    labels" as the stuck state, which the world still sees and re-derives.
-    A DELETE for an already-absent label 404s; the executor's membership
-    verification treats that end state as success, so the failure is benign.
-    """
+    ADD BEFORE REMOVE: if the second call fails permanently, "both labels"
+    stays visible to the world build, while "no label" would be invisible
+    forever. A DELETE of an absent label 404s; membership verification treats
+    that end state as success."""
     if not remove and not add:
         return None
     commands: list[list[str]] = []
     if add:
-        commands.append([
-            "api", "--method", "POST",
-            f"repos/{repo}/issues/{number}/labels",
-            "-f", f"labels[]={add}",
-        ])
+        commands.append(["api", "--method", "POST", f"repos/{repo}/issues/{number}/labels", "-f", f"labels[]={add}"])
     if remove:
-        commands.append([
-            "api", "--method", "DELETE",
-            f"repos/{repo}/issues/{number}/labels/{quote(remove, safe='')}",
-        ])
+        commands.append(["api", "--method", "DELETE", f"repos/{repo}/issues/{number}/labels/{quote(remove, safe='')}"])
     return commands
 
 
@@ -814,86 +463,42 @@ def build_comment_args(repo: str, kind: str, number: int, body: str) -> list[str
 
 
 def build_close_issue_args(repo: str, number: int, reason: str, comment: str) -> list[str]:
-    # The domain speaks GitHub's GraphQL stateReason enum ("not_planned"), but
-    # `gh issue close --reason` wants the CLI spelling ("not planned") and exits
-    # 1 on the enum token — keifu #193 sat labelled ai-closed but open for it.
-    args = ["issue", "close", str(number), "--repo", repo,
-            "--reason", reason.replace("_", " ")]
-    if comment:
-        args += ["--comment", comment]
-    return args
+    # `gh issue close --reason` wants "not planned", not the GraphQL enum
+    # "not_planned" (keifu #193 sat labelled ai-closed but open for it).
+    args = ["issue", "close", str(number), "--repo", repo, "--reason", reason.replace("_", " ")]
+    return args + ["--comment", comment] if comment else args
 
 
-def build_enable_auto_merge_args(
-    repo: str,
-    pr: int,
-    method: str,
-    expected_head: str,
-) -> list[str]:
-    return [
-        "pr",
-        "merge",
-        str(pr),
-        "--repo",
-        repo,
-        f"--{method}",
-        "--delete-branch",
-        "--match-head-commit",
-        expected_head,
-    ]
+def build_enable_auto_merge_args(repo: str, pr: int, method: str, expected_head: str) -> list[str]:
+    return ["pr", "merge", str(pr), "--repo", repo, f"--{method}", "--delete-branch",
+            "--match-head-commit", expected_head]
 
 
-def build_update_branch_args(
-    repo: str, pr: int, expected_head: str
-) -> list[str]:
-    return [
-        "api",
-        f"repos/{repo}/pulls/{pr}/update-branch",
-        "--method",
-        "PUT",
-        "-f",
-        f"expected_head_sha={expected_head}",
-    ]
-
-
-# ── identity ────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Identity:
-    """How to authenticate `gh`. Exactly one of these applies, in the bash
-    priority order: app-token mint → static token → ambient `gh auth`."""
+    """How `gh` authenticates: app-token mint, else static token, else ambient
+    `gh auth`."""
 
     static_token: str | None = None
     token_provider: Callable[[], str] | None = None  # e.g. AppTokenMinter.get
 
     def env_token(self) -> str | None:
-        if self.token_provider is not None:
-            return self.token_provider()
-        return self.static_token
+        return self.token_provider() if self.token_provider is not None else self.static_token
 
 
-# ── gateway ───────────────────────────────────────────────────────────────────
 class GitHubGateway:
-    """Runs `gh` for one repo as one identity. `runner` is injected
-    (subprocess by default) so tests drive it with a fake that records argv +
-    returns canned JSON — the same real-vs-fake contract the bash test `gh` had,
-    but now the PARSE is also unit-tested directly against JSON shapes."""
+    """Runs `gh` for one repo as one identity. `runner` is injected so tests
+    record argv and return canned JSON."""
 
-    def __init__(
-        self,
-        repo: str,
-        identity: Identity | None = None,
-        runner: Callable[[list[str], str | None], str] | None = None,
-        progress: Callable[[], None] | None = None,
-    ):
+    def __init__(self, repo: str, identity: Identity | None = None,
+                 runner: Callable[[list[str], str | None], str] | None = None,
+                 progress: Callable[[], None] | None = None):
         self.repo = repo
         self.identity = identity or Identity()
         self._run = runner or _subprocess_runner
         self._progress = progress
 
     def _gh(self, args: list[str]) -> str:
-        # Guard EVERY call, not just the _gh_json ones: a list subcommand read as
-        # raw text (`--jq`) truncates just as silently (review C2).
-        _require_list_limit(args)
         try:
             return self._run(["gh", *args], self.identity.env_token())
         finally:
@@ -904,51 +509,28 @@ class GitHubGateway:
         out = self._gh(args)
         return json.loads(out) if out.strip() else None
 
+    def _view(self, kind: str, number: int, fields: str) -> object:
+        return self._gh_json([kind, "view", str(number), "--repo", self.repo, "--json", fields])
+
     def get_issue(self, number: int) -> IssueView:
-        d = self._gh_json(
-            ["issue", "view", str(number), "--repo", self.repo, "--json",
-             "number,title,body,labels,comments,updatedAt,author,state"]
-        )
-        return parse_issue(d)  # type: ignore[arg-type]
+        return parse_issue(self._view("issue", number, "number,title,body,labels,comments,updatedAt,author,state"))  # type: ignore[arg-type]
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
-        """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
-        fields from the query — GitHub computes those lazily and can hang the call
-        indefinitely on a just-merged PR (see _GH_TIMEOUT_S). Only the fixer's
-        auto-rebase logic consumes them (is_conflicting / needs_rebase); the reviewer
-        never does, so the review world fetches without them and cannot hang on that
-        computation. Fields left absent parse to '' → is_conflicting/needs_rebase are
-        simply False, which is correct for the review path (it doesn't rebase).
-
-        `checks=False` skips the separate `gh pr checks` call the same way — a
-        MERGED/CLOSED PR's checks gate nothing (they gated the merge that already
-        happened), and the stale `--state all` label list keeps merged PRs in the
-        enrichment set for days (list_pr_states). Absent checks parse to () →
-        ci_state(()) is NONE, which no consumer reads for a non-open PR."""
-        base = ("number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,labels,"
-                "comments,reviews,state,files,author")
-        fields = base + (",mergeable,mergeStateStatus" if mergeability else "")
-        d = self._gh_json(
-            ["pr", "view", str(number), "--repo", self.repo, "--json", fields]
-        )
-        pr = parse_pr(d)  # type: ignore[arg-type]
+        """One PR. `mergeability=False` leaves out the lazily computed fields
+        that can hang on a just-merged PR. `checks=False` marks CI Unavailable
+        rather than empty: a PR re-opened between list and view must not read
+        as Clear (#48 review F3)."""
+        fields = ("number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,labels,comments,reviews,state,"
+                  "files,author" + (",mergeable,mergeStateStatus" if mergeability else ""))
+        pr = parse_pr(self._view("pr", number, fields))  # type: ignore[arg-type]
         if not checks:
-            # Never READ ≠ read-as-empty: a PR listed non-OPEN but re-opened
-            # between the list and this view would otherwise arrive
-            # state=OPEN with falsely empty evidence → Clear →
-            # mergeable. No consumer reads checks for the non-open PRs this
-            # arm is for, so UNKNOWN costs nothing (#48 review F3).
             return replace(pr, ci=Unavailable("checks not requested"))
         return replace(pr, ci=observe_checks(self.repo, pr, self._gh_json))
 
-
     @staticmethod
     def _skip_item(kind: str, number: int, exc: BaseException) -> None:
-        import sys
-        sys.stderr.write(
-            f"skip {kind} #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
-            "— re-derived next tick\n"
-        )
+        sys.stderr.write(f"skip {kind} #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
+                         "— re-derived next tick\n")
 
     def _graphql(self, query: str, **variables: str) -> dict:
         """One query; `variables` must be exactly the ones it declares (GitHub
@@ -999,7 +581,8 @@ class GitHubGateway:
         checks, reviews, comments, every changed file and the head push, and
         harness branches owed a PR against `base`. `GhUnavailable` and
         incomplete top-level reads propagate: the daemon skips the tick."""
-        now = build_time()
+        # The domain reads no clock: one stamp per build, so every gate in a tick judges one instant.
+        now = datetime.now(timezone.utc).isoformat()
         first = self._repository_page(" ".join(t.format(after="") for t in _FIX_CONNECTIONS.values()), base=base)
         collected: dict[str, list] = {}
         for name, template in _FIX_CONNECTIONS.items():
@@ -1070,47 +653,26 @@ class GitHubGateway:
         self._gh(["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
                   "--title", title, "--body", body])
 
-    def pr_diff(
-        self, pr: int, base_oid: str, head_oid: str
-    ) -> PullRequestDiff:
-        """base...head as GitHub compares it. Empty text is GitHub's answer
-        (no change between the commits, or a compare it refused); an outage
-        raises `GhUnavailable`. The review role refuses to review an empty diff."""
+    def pr_diff(self, pr: int, base_oid: str, head_oid: str) -> PullRequestDiff:
+        """base...head as GitHub compares it. Empty text is GitHub's answer; an
+        outage raises `GhUnavailable`. The review role refuses an empty diff."""
         if not base_oid or not head_oid:
             raise ValueError("pull-request diff revisions are required")
-        text = self._gh(
-            [
-                "api",
-                "-H",
-                "Accept: application/vnd.github.v3.diff",
-                f"repos/{self.repo}/compare/{base_oid}...{head_oid}",
-            ]
-        )
+        text = self._gh(["api", "-H", "Accept: application/vnd.github.v3.diff",
+                         f"repos/{self.repo}/compare/{base_oid}...{head_oid}"])
         return PullRequestDiff(base_oid, head_oid, text)
 
-    # ── prompt inputs for the two repair legs (review M13 / D6) ──
-    # Both of these feed a prompt and nothing else, so both fail SOFT to "": the
-    # CI-fix / address-review dispatch must still happen with a weaker prompt (the
-    # agent can rediscover the failure itself) rather than not happen at all. A log
-    # fetch may never kill a dispatch. The one exception is `MissingListLimit`,
-    # which is a bug in this module, not a runtime condition (review C2).
-    def workflow_run_attempts(
-        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
-    ) -> dict[int, int] | None:
+    # The two repair-prompt inputs fail SOFT to "": a weaker prompt beats no
+    # dispatch, since the agent can rediscover the failure itself (D6).
+    def workflow_run_attempts(self, head: str | tuple[str, ...], run_ids: tuple[int, ...]) -> dict[int, int] | None:
         """Attempt counters for exact workflow runs, after SHA verification."""
-
         if not head or not run_ids or any(run_id <= 0 for run_id in run_ids):
             return None
+        heads = (head,) if isinstance(head, str) else head
         attempts: dict[int, int] = {}
         for run_id in dict.fromkeys(run_ids):
-            raw = self._gh_json(
-                ["api", f"repos/{self.repo}/actions/runs/{run_id}"]
-            )
-            if (
-                not isinstance(raw, dict)
-                or int(raw.get("id") or 0) != run_id
-                or str(raw.get("head_sha") or "") not in ((head,) if isinstance(head, str) else head)
-            ):
+            raw = self._gh_json(["api", f"repos/{self.repo}/actions/runs/{run_id}"])
+            if not isinstance(raw, dict) or int(raw.get("id") or 0) != run_id or str(raw.get("head_sha") or "") not in heads:
                 return None
             attempt = raw.get("run_attempt")
             if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
@@ -1118,128 +680,76 @@ class GitHubGateway:
             attempts[run_id] = attempt
         return attempts
 
-    def failed_run_log(
-        self, head: str, run_ids: tuple[int, ...], *, lines: int = _FAILED_LOG_LINES
-    ) -> str:
-        """Bounded logs for the observed runs, verified against the observed head.
-
-        A branch's latest failed run may belong to an older revision. Reuse the
-        rerun authority's identity verifier and pin the log attempt so a later
-        rerun cannot silently change the evidence while it is being fetched.
-        """
+    def failed_run_log(self, head: str, run_ids: tuple[int, ...], *, lines: int = _FAILED_LOG_LINES) -> str:
+        """Bounded failed logs of the observed runs, verified against the
+        observed head (a branch's latest failed run may be an older revision)
+        and pinned to the attempt so a rerun cannot swap the evidence."""
         if not head or not run_ids or any(type(n) is not int or n <= 0 for n in run_ids):
             return ""
         try:
             attempts = self.workflow_run_attempts(head, run_ids)
             if attempts is None:
                 return ""
-            logs = []
-            for run_id, attempt in attempts.items():
-                log = self._gh([
-                    "run", "view", str(run_id), "--repo", self.repo,
-                    "--attempt", str(attempt), "--log-failed",
-                ])
-                logs.append(_tail(log, lines, max_bytes=_FAILED_LOG_BYTES))
+            logs = [_tail(self._gh(["run", "view", str(run_id), "--repo", self.repo, "--attempt", str(attempt),
+                                    "--log-failed"]), lines, max_bytes=_FAILED_LOG_BYTES)
+                    for run_id, attempt in attempts.items()]
             return _tail("\n\n".join(logs), lines, max_bytes=_FAILED_LOG_BYTES)
-        except MissingListLimit:
-            raise
         except Exception:  # noqa: BLE001 — a missing log must not block the fix
             return ""
 
     def review_comments(self, pr: int, *, limit: int = _INLINE_COMMENT_LIMIT) -> str:
-        """The PR's newest inline (file:line) review comments, formatted for the
-        prompt. Port of agent/address-review.sh:41; formatting lives in the pure
-        `format_review_comments` so it is testable without a real gh.
-
-        `per_page=100` is deliberate: the endpoint's default page is 30 and we take
-        the NEWEST `limit` — reading only the first page would hand the fixer the
-        OLDEST comments on a busy PR while looking complete (the same silent
-        truncation as review C2)."""
+        """The newest inline review comments. `per_page=100`: the default page
+        of 30 would hand the fixer the OLDEST comments on a busy PR."""
         try:
-            raw = self._gh_json(
-                ["api", f"repos/{self.repo}/pulls/{pr}/comments?per_page=100"]
-            )
-            return format_review_comments(raw, limit=limit)
+            return format_review_comments(self._gh_json(["api", f"repos/{self.repo}/pulls/{pr}/comments?per_page=100"]),
+                                          limit=limit)
         except Exception:  # noqa: BLE001 — a missing comment list must not block the fix
             return ""
 
-
     def viewer_login(self) -> str:
-        """The login this gateway's credential acts as, or "" when GitHub
-        refused to say. GraphQL `viewer`, not REST `/user`: an App installation
-        token answers it (as `slug[bot]`) and is refused by `/user`."""
-        return self._gh(
-            ["api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"]
-        ).strip()
+        """This credential's login, or "". GraphQL `viewer`, not REST `/user`:
+        an App installation token answers it (as `slug[bot]`)."""
+        return self._gh(["api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"]).strip()
 
-    def submit_review(
-        self, pr: int, event: str, body: str, head: str
-    ) -> bool:
-        """POST a review. True iff GitHub created it. False is GitHub's refusal
-        (a 4xx: 422 'can't approve your own PR', a 403 from a token without
-        pull-request write), which retrying cannot change; an outage raises
-        `GhUnavailable` instead. gh's `api ... POST` prints the created-review
-        JSON on success (non-empty)."""
-        out = self._gh(
-            build_submit_review_args(self.repo, pr, event, body, head)
-        )
-        return bool(out.strip())
+    def submit_review(self, pr: int, event: str, body: str, head: str) -> bool:
+        """True iff GitHub created the review. False is a 4xx refusal (422
+        self-approval, 403 without write) that retrying cannot change; an
+        outage raises `GhUnavailable`."""
+        return bool(self._gh(build_submit_review_args(self.repo, pr, event, body, head)).strip())
 
     # ── writes ──
     def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> None:
-        commands = build_relabel_args(self.repo, kind, number, remove, add)
-        for args in commands or []:
+        for args in build_relabel_args(self.repo, kind, number, remove, add) or []:
             self._gh(args)
 
     def has_label(self, kind: str, number: int, label: str) -> bool:
-        data = self._gh_json([
-            kind, "view", str(number), "--repo", self.repo, "--json", "labels",
-        ])
-        if not isinstance(data, dict):
-            return False
-        return any(
-            isinstance(item, dict) and item.get("name") == label
-            for item in (data.get("labels") or [])
-        )
+        data = self._view(kind, number, "labels")
+        return isinstance(data, dict) and any(isinstance(item, dict) and item.get("name") == label
+                                              for item in (data.get("labels") or []))
 
     def has_comment(self, kind: str, number: int, body: str) -> bool:
-        """Whether GitHub already contains this exact lifecycle comment.
-
-        Used only after an ambiguous failed write/restart. A timeout can arrive
-        after GitHub accepted the POST; probing before replay prevents a second
-        clarification comment while still retrying genuinely absent writes.
-        """
-        data = self._gh_json([
-            kind, "view", str(number), "--repo", self.repo, "--json", "comments",
-        ])
-        if not isinstance(data, dict):
-            return False
-        return any(
-            isinstance(item, dict) and item.get("body") == body
-            for item in (data.get("comments") or [])
-        )
+        """Whether this exact comment exists: probed after an ambiguous failed
+        write, since a timeout can arrive after GitHub accepted the POST."""
+        data = self._view(kind, number, "comments")
+        return isinstance(data, dict) and any(isinstance(item, dict) and item.get("body") == body
+                                              for item in (data.get("comments") or []))
 
     def is_issue_closed(self, issue: int) -> bool:
-        data = self._gh_json([
-            "issue", "view", str(issue), "--repo", self.repo, "--json", "state",
-        ])
+        data = self._view("issue", issue, "state")
         return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 
     def reviewed_on(self, pr: int, head: str, login: str) -> bool:
-        """Whether `login` has a standing verdict (APPROVED or CHANGES_REQUESTED)
-        on commit `head`, read across every page. A read that did not answer
-        completely raises: "absent" is only ever said by a complete read, since
-        the review role submits on that answer."""
+        """Whether `login` has a standing verdict on commit `head`, across every
+        page. Raises unless the read was complete: the review role submits on
+        "absent"."""
         data = self._gh_json(["api", f"repos/{self.repo}/pulls/{pr}/reviews?per_page=100", "--paginate", "--slurp"])
         if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
             raise RuntimeError(f"pull request {pr} reviews were not answered completely")
         return any(
             isinstance(item, dict) and isinstance(item.get("user"), dict)
-            and login_eq(str(item["user"].get("login") or ""), login)
-            and item.get("commit_id") == head
+            and login_eq(str(item["user"].get("login") or ""), login) and item.get("commit_id") == head
             and str(item.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED")
-            for page in data for item in page
-        )
+            for page in data for item in page)
 
     def comment(self, kind: str, number: int, body: str) -> None:
         self._gh(build_comment_args(self.repo, kind, number, body))
@@ -1247,244 +757,103 @@ class GitHubGateway:
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self._gh(build_close_issue_args(self.repo, number, reason, comment))
 
-    def is_expected_head_merged(
-        self, pr: int, expected_head: str
-    ) -> bool:
-        data = self._gh_json(
-            [
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                self.repo,
-                "--json",
-                "state,headRefOid",
-            ]
-        )
-        return (
-            isinstance(data, dict)
-            and data.get("headRefOid") == expected_head
-            and str(data.get("state") or "").upper() == "MERGED"
-        )
-
-    def disable_auto_merge(
-        self, pr: int, expected_head: str
-    ) -> bool:
-        """Revoke any legacy arm before a write that can advance the PR head."""
-
-        data = self._gh_json(
-            [
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                self.repo,
-                "--json",
-                "autoMergeRequest,headRefOid",
-            ]
-        )
-        if (
-            not isinstance(data, dict)
-            or data.get("headRefOid") != expected_head
-        ):
+    def _without_auto_merge(self, pr: int, expected_head: str) -> bool:
+        """Revoke any legacy GitHub auto-merge arm before a write that can
+        advance the head: an armed approval survives later pushes."""
+        data = self._view("pr", pr, "autoMergeRequest,headRefOid")
+        if not isinstance(data, dict) or data.get("headRefOid") != expected_head:
             return False
         if data.get("autoMergeRequest") is None:
             return True
-        self._gh(
-            [
-                "pr",
-                "merge",
-                str(pr),
-                "--repo",
-                self.repo,
-                "--disable-auto",
-            ]
-        )
-        verified = self._gh_json(
-            [
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                self.repo,
-                "--json",
-                "autoMergeRequest,headRefOid",
-            ]
-        )
-        return (
-            isinstance(verified, dict)
-            and verified.get("headRefOid") == expected_head
-            and verified.get("autoMergeRequest") is None
-        )
+        self._gh(["pr", "merge", str(pr), "--repo", self.repo, "--disable-auto"])
+        verified = self._view("pr", pr, "autoMergeRequest,headRefOid")
+        return (isinstance(verified, dict) and verified.get("headRefOid") == expected_head
+                and verified.get("autoMergeRequest") is None)
 
-    def is_branch_updated(self, pr: int, prior_head: str) -> bool:
-        data = self._gh_json(
-            [
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                self.repo,
-                "--json",
-                "headRefOid,mergeStateStatus",
-            ]
-        )
-        if not isinstance(data, dict):
+    def enable_auto_merge(self, pr: int, method: str, expected_head: str) -> bool:
+        """Merge only the observed, review-and-CI-qualified head, now (the name
+        is historical; persistent auto-merge is never armed). True iff the
+        expected head is read back as merged."""
+        if not self._without_auto_merge(pr, expected_head):
             return False
-        current_head = str(data.get("headRefOid") or "")
-        return (
-            bool(current_head)
-            and current_head != prior_head
-            and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
-            and self.disable_auto_merge(pr, current_head)
-        )
-
-    def enable_auto_merge(
-        self, pr: int, method: str, expected_head: str
-    ) -> bool:
-        """Merge only the observed, review-and-CI-qualified head.
-
-        The historical port name remains for command-schema compatibility.
-        Persistent GitHub auto-merge is deliberately not armed: its approval
-        survives later pushes on repositories without last-push protection.
-        """
-        if not self.disable_auto_merge(pr, expected_head):
-            return False
-        self._gh(
-            build_enable_auto_merge_args(
-                self.repo, pr, method, expected_head
-            )
-        )
+        self._gh(build_enable_auto_merge_args(self.repo, pr, method, expected_head))
         try:
-            return self.is_expected_head_merged(pr, expected_head)
+            data = self._view("pr", pr, "state,headRefOid")
         except Exception:  # noqa: BLE001 — unreadable is not confirmed
             return False
+        return (isinstance(data, dict) and data.get("headRefOid") == expected_head
+                and str(data.get("state") or "").upper() == "MERGED")
 
     def update_branch(self, pr: int, expected_head: str) -> bool:
-        """Bring a BEHIND PR branch up to date with base (merge base into head), so
-        an armed auto-merge can land it. Fail-soft: a transient 'already up to date'
-        / merge-conflict race must not abort the poll — it's re-evaluated next tick."""
+        """Merge base into a BEHIND head. Fail-soft: an 'already up to date' or
+        conflict race is re-evaluated next tick."""
         try:
-            if not self.disable_auto_merge(pr, expected_head):
+            if not self._without_auto_merge(pr, expected_head):
                 return False
-            updated = bool(
-                self._gh(
-                    build_update_branch_args(
-                        self.repo, pr, expected_head
-                    )
-                ).strip()
-            )
-            return updated and self.is_branch_updated(pr, expected_head)
-        except Exception:
+            if not self._gh(["api", f"repos/{self.repo}/pulls/{pr}/update-branch", "--method", "PUT",
+                             "-f", f"expected_head_sha={expected_head}"]).strip():
+                return False
+            data = self._view("pr", pr, "headRefOid,mergeStateStatus")
+            if not isinstance(data, dict):
+                return False
+            current = str(data.get("headRefOid") or "")
+            return (bool(current) and current != expected_head
+                    and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
+                    and self._without_auto_merge(pr, current))
+        except Exception:  # noqa: BLE001
             return False
 
 
 def _subprocess_runner(argv: list[str], token: str | None) -> str:
-    """Default runner: invoke gh, optionally with GH_TOKEN set. Returns stdout, and
-    "" on non-zero exit — the bash swallowed gh failures with 2>/dev/null so a
-    transient error never stranded a label; the domain re-derives next poll.
-
-    BUT a silently-swallowed failure once made a 422 (self-approval) look like the
-    reviewer "did nothing": the agent ran, state advanced, no review appeared, no
-    message. So on non-zero exit we now also write gh's stderr (and the command) to
-    OUR stderr. This stays fail-soft (still returns "" — callers that care, e.g.
-    submit_review, check the empty result) while making the failure visible.
-
-    AND (V10) fail-soft is wrong for INFRA failures. A rate limit, a dead network
-    or a GitHub 5xx is not an answer about the world; returning "" for those made
-    a throttled tick see zero issues and zero PRs — indistinguishable from a calm
-    repo, exactly when scale makes throttling likely. Those (and only those,
-    matched by `classify_gh_failure`) now raise `GhUnavailable`; every other
-    non-zero exit keeps returning "" so "PR not found" / "no such label" / 422
-    still degrade the way their callers expect."""
-    import os
-    import sys
-
+    """Run gh (with GH_TOKEN when given) under `_GH_TIMEOUT_S`. A non-zero exit
+    returns "" (callers such as `submit_review` read the empty answer) and is
+    written to stderr, since a silently swallowed 422 once made the reviewer
+    look idle. Infra failures (`classify_gh_failure`) raise `GhUnavailable`
+    instead (V10)."""
     env = dict(os.environ)
     if token:
         env["GH_TOKEN"] = token
-    # Bound EVERY gh call. `gh pr view --json mergeable,mergeStateStatus` triggers a
-    # server-side merge-commit computation that GitHub streams lazily; for a
-    # just-merged PR whose head ref was deleted it can never settle, so gh blocks on
-    # the open socket indefinitely (observed: a single `gh pr view` hung ~14 min and,
-    # because the poll loop is synchronous, froze the whole review daemon — no PR
-    # opened after it got reviewed). A hard timeout turns an unbounded wedge into a
-    # transient error the poll re-derives next tick.
     try:
-        res = subprocess.run(
-            argv, capture_output=True, text=True, env=env, timeout=_GH_TIMEOUT_S
-        )
+        res = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=_GH_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
-        # A killed call produced NO data — the one thing it must not look like is
-        # a successful read of an empty result. `timed_out=True` marks it as the
-        # per-CALL infra case (this PR hangs) rather than a systemic one, which is
-        # what lets `_safe_get_pr` keep isolating a single wedged `gh pr view`.
-        sys.stderr.write(
-            f"gh timed out (>{_GH_TIMEOUT_S:.0f}s): {' '.join(argv)}\n"
-            "  killed; treating as INFRA failure (poll re-derives next tick)\n"
-        )
-        raise GhUnavailable(
-            "network",
-            f"gh timed out after {_GH_TIMEOUT_S:.0f}s: {' '.join(argv[:4])}",
-            argv=argv,
-            timed_out=True,
-        ) from exc
+        # A killed call produced no data; it must not read as an empty answer.
+        sys.stderr.write(f"gh timed out (>{_GH_TIMEOUT_S:.0f}s): {' '.join(argv)}\n"
+                         "  killed; treating as INFRA failure (poll re-derives next tick)\n")
+        raise GhUnavailable("network", f"gh timed out after {_GH_TIMEOUT_S:.0f}s: {' '.join(argv[:4])}",
+                            argv=argv) from exc
     except OSError as exc:
         if exc.errno not in {errno.EAGAIN, errno.ENOMEM}:
             raise
-        printable = _printable_gh_argv(argv)
         detail = str(exc) or "process creation failed"
-        logged_detail = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
-        sys.stderr.write(
-            f"gh failed to start: {printable}\n"
-            f"  {logged_detail}\n"
-        )
-        raise GhUnavailable(
-            "local-resource",
-            detail,
-            argv=argv,
-        ) from exc
-    if res.returncode != 0:
-        # redact a token if one ever appears in argv (it shouldn't — gh reads GH_TOKEN
-        # from env, not argv — but be defensive about logging command lines).
-        printable = _printable_gh_argv(argv)
-        detail = (res.stderr or res.stdout or "").strip()
-        capability = "Upgrade to GitHub Pro or make this repository public to enable this feature."
-        if (any("/rules/branches/" in arg for arg in argv)
-                and detail.removeprefix("gh: ") == f"{capability} (HTTP 403)"):
-            try:
-                error = json.loads(res.stdout) if res.stdout.strip() else None
-                if isinstance(error, list) and len(error) == 1:
-                    error = error[0]
-                if error is None or (isinstance(error, dict) and error.get("status") == "403"
-                        and error.get("message") == capability):
-                    return "[[]]"
-            except ValueError:
-                pass
-        logged_detail = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
-        truncated = "\n  [gh stderr truncated]" if logged_detail != detail else ""
-        sys.stderr.write(f"gh failed (exit {res.returncode}): {printable}\n  {logged_detail}{truncated}\n")
-        # Infra? Then this is NOT an answer — raise so the caller can refuse to
-        # act on a world it never actually observed. The stderr line above is
-        # kept for the raise path too: some callers legitimately swallow
-        # GhUnavailable (update_branch, add_blocked_by), and a swallowed infra
-        # failure with no trace on stderr is the very bug this section fixes.
-        kind = classify_gh_failure(detail)
-        if kind is not None:
-            raise GhUnavailable(
-                kind,
-                detail,
-                argv=argv,
-                retry_after_s=_retry_after(detail),
-            )
-        return ""
-    return res.stdout
+        sys.stderr.write(f"gh failed to start: {_printable_gh_argv(argv)}\n"
+                         f"  {_cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)}\n")
+        raise GhUnavailable("local-resource", detail, argv=argv) from exc
+    if res.returncode == 0:
+        return res.stdout
+    detail = (res.stderr or res.stdout or "").strip()
+    # A private repo on a free plan has no rulesets API: that 403 means "no
+    # rules" (an empty page), not a failure.
+    capability = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    if any("/rules/branches/" in arg for arg in argv) and detail.removeprefix("gh: ") == f"{capability} (HTTP 403)":
+        try:
+            error = json.loads(res.stdout) if res.stdout.strip() else None
+            if isinstance(error, list) and len(error) == 1:
+                error = error[0]
+            if error is None or (isinstance(error, dict) and error.get("status") == "403"
+                                 and error.get("message") == capability):
+                return "[[]]"
+        except ValueError:
+            pass
+    logged = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
+    truncated = "\n  [gh stderr truncated]" if logged != detail else ""
+    # Written on the raise path too: some callers swallow GhUnavailable.
+    sys.stderr.write(f"gh failed (exit {res.returncode}): {_printable_gh_argv(argv)}\n  {logged}{truncated}\n")
+    kind = classify_gh_failure(detail)
+    if kind is not None:
+        raise GhUnavailable(kind, detail, argv=argv, retry_after_s=_retry_after(detail))
+    return ""
 
 
 def _retry_after(detail: str) -> float | None:
-    match = re.search(
-        r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)",
-        detail or "",
-        re.IGNORECASE,
-    )
+    match = re.search(r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)", detail or "", re.IGNORECASE)
     return float(match.group(1)) if match else None
