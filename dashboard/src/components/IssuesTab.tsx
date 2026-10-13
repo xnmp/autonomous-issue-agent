@@ -40,6 +40,7 @@ import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
 import { StepBadge } from "./ui/StepBadge";
 import { TableFilter } from "./ui/TableFilter";
+import { Pager, paginate } from "./ui/Pager";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import {
   ResizableTable,
@@ -139,6 +140,10 @@ export function IssuesTab({
     done: "",
     backlog: "",
   });
+  // Per sub-tab and event-reset: filter and sort changes zero it, and
+  // paginate() clamps it when a refresh shrinks the list.
+  const [pages, setPages] = useState<Record<TableSub, number>>({ done: 0, backlog: 0 });
+  const setPage = (which: TableSub) => (page: number) => setPages((current) => ({ ...current, [which]: page }));
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
@@ -229,7 +234,10 @@ export function IssuesTab({
         <TableFilter
           label={`Filter ${sub === "inflight" ? "active issues" : `${sub} issues`}`}
           value={query}
-          onChange={(value) => setQueries((current) => ({ ...current, [sub]: value }))}
+          onChange={(value) => {
+            setQueries((current) => ({ ...current, [sub]: value }));
+            if (table !== null) setPage(table)(0);
+          }}
           shown={filteredCount}
           total={sourceCount}
         />
@@ -255,6 +263,8 @@ export function IssuesTab({
           <DoneTable
             repo={repo}
             cards={filteredDone}
+            page={pages.done}
+            onPage={setPage("done")}
             loading={issues.loading}
             visible={visible}
             onOpen={onOpenIssue}
@@ -266,6 +276,8 @@ export function IssuesTab({
         <BacklogTable
           repo={repo}
           cards={filteredBacklog}
+          page={pages.backlog}
+          onPage={setPage("backlog")}
           loading={issues.loading}
           ghOk={ghOk}
           visible={visible}
@@ -296,12 +308,16 @@ function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
 function DoneTable({
   repo,
   cards,
+  page: requestedPage,
+  onPage,
   loading,
   visible,
   onOpen,
 }: {
   repo: string;
   cards: DoneCard[];
+  page: number;
+  onPage: (page: number) => void;
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
@@ -320,6 +336,7 @@ function DoneTable({
     since: (card) => doneAtMs(card),
     merged: (card) => doneAtMs(card),
   }, { key: "since", direction: "desc" }, "issues-done", sortableAndShown);
+  const page = paginate(sorted.rows, requestedPage);
   if (loading) return <SkeletonRows what="done issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>nothing merged by the harness in this deployment yet</EmptyState>;
   const columns: TableColumn[] = [
@@ -333,16 +350,18 @@ function DoneTable({
   ];
 
   return (
+    <>
+    <Pager page={page} onPage={onPage} />
     <div className="tbl-wrap panel">
       <ResizableTable
         storageKey="issues-done"
         columns={columns}
         className="issue-list-table"
         sort={sorted.sort}
-        onSort={sorted.onSort}
+        onSort={(key) => { sorted.onSort(key); onPage(0); }}
       >
         <tbody>
-          {sorted.rows.map((card) => {
+          {page.rows.map((card) => {
             const open = expanded === card.issue;
             return (
               <Fragment key={card.issue}>
@@ -385,12 +404,16 @@ function DoneTable({
         </tbody>
       </ResizableTable>
     </div>
+    <Pager page={page} onPage={onPage} />
+    </>
   );
 }
 
 function BacklogTable({
   repo,
   cards,
+  page: requestedPage,
+  onPage,
   loading,
   ghOk,
   visible,
@@ -400,6 +423,8 @@ function BacklogTable({
 }: {
   repo: string;
   cards: BacklogCard[];
+  page: number;
+  onPage: (page: number) => void;
   loading: boolean;
   ghOk: boolean;
   visible: ReadonlySet<string>;
@@ -420,6 +445,7 @@ function BacklogTable({
     comments: (card) => card.comments,
     labels: (card) => card.labels.join(" "),
   }, { key: "issue", direction: "asc" }, storageKey, sortableAndShown);
+  const page = paginate(sorted.rows, requestedPage);
   if (loading) return <SkeletonRows what="backlog" rows={5} />;
   if (cards.length === 0) {
     return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
@@ -453,16 +479,17 @@ function BacklogTable({
   return (
     <>
       {error ? <ErrorBanner message={error} /> : null}
+      <Pager page={page} onPage={onPage} />
       <div className="tbl-wrap panel">
         <ResizableTable
           storageKey={storageKey}
           columns={columns}
           className="issue-list-table"
           sort={sorted.sort}
-          onSort={sorted.onSort}
+          onSort={(key) => { sorted.onSort(key); onPage(0); }}
         >
           <tbody>
-            {sorted.rows.map((card) => {
+            {page.rows.map((card) => {
               const open = expanded === card.issue;
               return (
                 <Fragment key={card.issue}>
@@ -530,6 +557,7 @@ function BacklogTable({
           </tbody>
         </ResizableTable>
       </div>
+      <Pager page={page} onPage={onPage} />
 
       {promote ? (
         <PromoteConfirm
