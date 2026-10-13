@@ -70,9 +70,10 @@ def pr_node(number=100, head="h1", **kw) -> dict:
 
 
 def ref(name: str, *prs: dict, committed: str = "2026-10-01T00:00:00Z", ahead: int | None = 1) -> dict:
-    """A `fix/` ref node: its newest PR (if any), head commit date, and commits ahead of base."""
+    """A `fix/` ref node, named as a `refs/heads/` listing returns it: its newest PR
+    (if any), head commit date, and commits ahead of base."""
     return {
-        "name": name,
+        "name": f"fix/{name}",
         "associatedPullRequests": {"totalCount": len(prs), "nodes": list(prs[-1:])},
         "target": {"committedDate": committed},
         "compare": None if ahead is None else {"behindBy": ahead},
@@ -203,6 +204,11 @@ def test_a_branch_is_owed_a_pr_only_when_ahead_of_base_and_without_a_live_or_new
 def test_an_unjudgeable_branch_makes_only_its_issue_unknown(bad):
     owed, unknown = parse_fix_refs([bad, ref("6-y")])
     assert owed == (Branch("fix/6-y", "2026-10-01T00:00:00Z"),) and set(unknown) == {5}
+
+
+def test_a_name_that_only_contains_the_prefix_is_not_a_harness_branch():
+    # `query:"fix/"` matches anywhere in the name.
+    assert parse_fix_refs([{**ref("5-x"), "name": "hotfix/5-x"}, {**ref("6-y"), "name": "feat/fix/6-y"}]) == ((), {})
 
 
 @pytest.mark.parametrize("bad", [[None], [{"name": 5}]])
