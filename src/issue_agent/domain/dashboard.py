@@ -217,7 +217,7 @@ class Working:
     act: str | None
     headline: str
     reason: str
-    since_ts: str | None  # when this step began (see `_step_start`), not the last activity
+    since_ts: str | None  # when this step began (`board_status`; CI uses `_ci_start`), not the last activity
     status: str = "working"
 
 
