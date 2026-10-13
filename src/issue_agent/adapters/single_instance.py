@@ -55,12 +55,7 @@ class UnsafeLockFile(RuntimeError):
     """The lock path is not a regular file owned by this deployment."""
 
 
-def _lock_path(
-    role: str,
-    repo: str,
-    target_dir: str = "",
-    state_dir: str = "",
-) -> str:
+def _lock_path(role: str, repo: str, target_dir: str = "", state_dir: str = "") -> str:
     """Stable lock path unique to ``(role, repo, absolute target checkout)``."""
     if not repo.strip():
         raise ValueError("REPO must be non-empty before acquiring a daemon lock")
@@ -68,10 +63,7 @@ def _lock_path(
     key = hashlib.sha256(f"{role}\0{repo}\0{checkout}".encode()).hexdigest()[:20]
     safe_role = "".join(c if c.isalnum() else "-" for c in role)
     del state_dir
-    parent = os.path.join(
-        tempfile.gettempdir(),
-        f"issue-agent-{os.getuid()}-locks",
-    )
+    parent = os.path.join(tempfile.gettempdir(), f"issue-agent-{os.getuid()}-locks")
     return os.path.join(parent, f"issue-agent-{safe_role}-{key}.lock")
 
 
@@ -82,24 +74,11 @@ def _ensure_lock_parent(path: str) -> None:
     except FileExistsError:
         pass
     metadata = os.lstat(parent)
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) & 0o077
-    ):
-        raise UnsafeLockFile(
-            f"daemon lock directory must be private and owned by this user: "
-            f"{parent}"
-        )
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise UnsafeLockFile(f"daemon lock directory must be private and owned by this user: {parent}")
 
 
-def acquire(
-    role: str,
-    repo: str,
-    *,
-    target_dir: str = "",
-    state_dir: str = "",
-) -> InstanceLock:
+def acquire(role: str, repo: str, *, target_dir: str = "", state_dir: str = "") -> InstanceLock:
     """Take the deployment lock or fail without following a foreign symlink."""
     path = _lock_path(role, repo, target_dir, state_dir)
     _ensure_lock_parent(path)

@@ -29,13 +29,9 @@ CODEX_DEFAULT_MODEL_RATES: tuple[tuple[str, float, float], ...] = (
 )
 
 
-def with_default_model_rates(
-    configured: tuple[tuple[str, float, float], ...],
-) -> tuple[tuple[str, float, float], ...]:
+def with_default_model_rates(configured: tuple[tuple[str, float, float], ...]) -> tuple[tuple[str, float, float], ...]:
     names = {name.strip().casefold() for name, _, _ in configured}
-    return configured + tuple(
-        row for row in CODEX_DEFAULT_MODEL_RATES if row[0] not in names
-    )
+    return configured + tuple(row for row in CODEX_DEFAULT_MODEL_RATES if row[0] not in names)
 
 
 def default_cache_read_rate(model: str | None, input_rate: float) -> float:
@@ -61,12 +57,7 @@ class ModelRates:
     cache_write_micros: int
 
     def __post_init__(self) -> None:
-        if min(
-            self.input_micros,
-            self.output_micros,
-            self.cache_read_micros,
-            self.cache_write_micros,
-        ) <= 0:
+        if min(self.input_micros, self.output_micros, self.cache_read_micros, self.cache_write_micros) <= 0:
             raise ValueError("every token class must have a positive rate")
 
 
@@ -82,17 +73,10 @@ class RateTable:
     def __post_init__(self) -> None:
         if not self.rate_card_id or not self.version:
             raise ValueError("rate-card identity is required")
-        normalized = {
-            name.strip().casefold(): value
-            for name, value in self.rates.items()
-            if name.strip()
-        }
+        normalized = {name.strip().casefold(): value for name, value in self.rates.items() if name.strip()}
         if len(normalized) != len(self.rates):
             raise ValueError("model names must be non-empty and unique")
-        if (
-            self.unknown_model_policy is UnknownModelPolicy.USE_FALLBACK
-            and self.fallback is None
-        ):
+        if self.unknown_model_policy is UnknownModelPolicy.USE_FALLBACK and self.fallback is None:
             raise ValueError("fallback rates are required by unknown-model policy")
         object.__setattr__(self, "rates", MappingProxyType(normalized))
         Money(self.currency, 0)
@@ -101,10 +85,7 @@ class RateTable:
         rates = self.rates.get(model.strip().casefold())
         if rates is not None:
             return rates
-        if (
-            self.unknown_model_policy is UnknownModelPolicy.USE_FALLBACK
-            and self.fallback is not None
-        ):
+        if self.unknown_model_policy is UnknownModelPolicy.USE_FALLBACK and self.fallback is not None:
             return self.fallback
         raise KeyError(f"model {model!r} is not priceable by {self.rate_card_id}")
 
@@ -115,9 +96,7 @@ class RateTable:
             return False
         return True
 
-    def quote(
-        self, model: str, maximum_usage: TokenUsage, effective_at: datetime
-    ) -> PriceQuote:
+    def quote(self, model: str, maximum_usage: TokenUsage, effective_at: datetime) -> PriceQuote:
         return PriceQuote(
             model=model,
             rate_card_id=self.rate_card_id,
@@ -136,11 +115,7 @@ def price(usage: TokenUsage, rates: ModelRates, currency: str = "USD") -> Money:
         (usage.cache_read_tokens, rates.cache_read_micros),
         (usage.cache_write_tokens, rates.cache_write_micros),
     )
-    micros = sum(
-        (tokens * rate + TOKENS_PER_MILLION - 1) // TOKENS_PER_MILLION
-        for tokens, rate in products
-        if tokens
-    )
+    micros = sum((tokens * rate + TOKENS_PER_MILLION - 1) // TOKENS_PER_MILLION for tokens, rate in products if tokens)
     return Money(currency, micros)
 
 
@@ -155,9 +130,7 @@ class BudgetPolicy:
         try:
             return self.limits[(role, leg_kind)]
         except KeyError as exc:
-            raise KeyError(
-                f"no budget policy for role={role!r}, leg={leg_kind!r}"
-            ) from exc
+            raise KeyError(f"no budget policy for role={role!r}, leg={leg_kind!r}") from exc
 
 
 def usd_per_million_to_micros(value: str | float | Decimal) -> int:
@@ -194,28 +167,19 @@ def parse_model_rate_table(
         model = model.strip().casefold()
         components = tuple(part.strip() for part in rates_raw.split("/"))
         if not sep or not model or len(components) not in (2, 3):
-            errors.append(
-                f"entry {entry!r} must look like 'model=IN/OUT[/CACHED_IN]' "
-                "(USD per million tokens)"
-            )
+            errors.append(f"entry {entry!r} must look like 'model=IN/OUT[/CACHED_IN]' (USD per million tokens)")
             continue
         try:
             rate_in = float(components[0])
             rate_out = float(components[1])
-            rate_cached = (
-                float(components[2])
-                if len(components) == 3
-                else default_cache_read_rate(model, rate_in)
-            )
+            rate_cached = float(components[2]) if len(components) == 3 else default_cache_read_rate(model, rate_in)
             for value in (rate_in, rate_out, rate_cached):
                 usd_per_million_to_micros(value)
         except (ValueError, InvalidOperation):
             errors.append(f"entry {entry!r} must have finite, positive rates")
             continue
         if model in seen:
-            errors.append(
-                f"entry {entry!r} names {model!r} more than once; keeping the first"
-            )
+            errors.append(f"entry {entry!r} names {model!r} more than once; keeping the first")
             continue
         seen.add(model)
         table.append((model, rate_in, rate_out))

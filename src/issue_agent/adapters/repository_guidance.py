@@ -32,41 +32,21 @@ _OMISSION = (
 )
 
 
-def load_repository_guidance(
-    cwd: str,
-    *,
-    max_bytes: int = REPOSITORY_GUIDANCE_MAX_BYTES,
-) -> tuple[str, bool]:
+def load_repository_guidance(cwd: str, *, max_bytes: int = REPOSITORY_GUIDANCE_MAX_BYTES) -> tuple[str, bool]:
     """Read target guidance in stable path order under one encoded byte limit."""
 
     if max_bytes <= 0:
         return "", True
     root = Path(cwd)
     tracked = subprocess.run(
-        ["git", "-C", cwd, "ls-files", "--", "CLAUDE.md", "**/CLAUDE.md"],
-        capture_output=True,
-        text=True,
-        check=False,
+        ["git", "-C", cwd, "ls-files", "--", "CLAUDE.md", "**/CLAUDE.md"], capture_output=True, text=True, check=False
     )
     if tracked.returncode == 0:
         paths = [root / "AGENTS.md"]
         paths.extend(root / relative for relative in tracked.stdout.splitlines())
     else:
-        paths = [
-            root / "AGENTS.md",
-            *(
-                path
-                for path in root.glob("**/CLAUDE.md")
-                if ".git" not in path.parts
-            ),
-        ]
-    paths = sorted(
-        dict.fromkeys(paths),
-        key=lambda path: (
-            path.name != "AGENTS.md",
-            path.relative_to(root).as_posix(),
-        ),
-    )
+        paths = [root / "AGENTS.md", *(path for path in root.glob("**/CLAUDE.md") if ".git" not in path.parts)]
+    paths = sorted(dict.fromkeys(paths), key=lambda path: (path.name != "AGENTS.md", path.relative_to(root).as_posix()))
     sections: list[str] = []
     truncated = False
 
@@ -88,12 +68,7 @@ def load_repository_guidance(
             low, high = 0, len(section)
             while low < high:
                 middle = (low + high + 1) // 2
-                if (
-                    encoded_size(
-                        existing + section[:middle] + _OMISSION
-                    )
-                    <= max_bytes
-                ):
+                if encoded_size(existing + section[:middle] + _OMISSION) <= max_bytes:
                     low = middle
                 else:
                     high = middle - 1
@@ -106,11 +81,7 @@ def load_repository_guidance(
     return "".join(sections), truncated
 
 
-def append_repository_guidance(
-    task: RuntimePlan,
-    *,
-    log: Callable[[str], None] | None = None,
-) -> RuntimePlan:
+def append_repository_guidance(task: RuntimePlan, *, log: Callable[[str], None] | None = None) -> RuntimePlan:
     """Append target files to the user task, never to provider instructions."""
 
     if not task.cwd:
@@ -118,31 +89,20 @@ def append_repository_guidance(
     guidance, truncated = load_repository_guidance(task.cwd)
     if truncated:
         (log or (lambda _message: None))(
-            "repository guidance exceeded "
-            f"{REPOSITORY_GUIDANCE_MAX_BYTES} encoded bytes; task data truncated"
+            f"repository guidance exceeded {REPOSITORY_GUIDANCE_MAX_BYTES} encoded bytes; task data truncated"
         )
     if not guidance:
         return task
-    context = (
-        f"{task.context_suffix}{_HEADING}"
-        f"{untrusted_block('repository_guidance', as_untrusted(guidance))}"
-    )
+    context = f"{task.context_suffix}{_HEADING}{untrusted_block('repository_guidance', as_untrusted(guidance))}"
     return replace(task, context_suffix=context)
 
 
 class RepositoryGuidanceRuntime(AgentRuntime):
     """Provider-neutral low-authority repository-guidance boundary."""
 
-    def __init__(
-        self,
-        inner: AgentRuntime,
-        *,
-        log: Callable[[str], None] | None = None,
-    ):
+    def __init__(self, inner: AgentRuntime, *, log: Callable[[str], None] | None = None):
         self.inner = inner
         self.log = log
 
     async def run(self, task: RuntimePlan) -> AgentResult:
-        return await self.inner.run(
-            append_repository_guidance(task, log=self.log)
-        )
+        return await self.inner.run(append_repository_guidance(task, log=self.log))
