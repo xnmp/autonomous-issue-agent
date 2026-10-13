@@ -47,20 +47,11 @@ class StubBackend:
     def usage(self):
         self._maybe("usage")
         return {
-            "claude": {
-                "five_hour_pct": 1.0, "five_hour_resets_at": None,
-                "seven_day_pct": None, "seven_day_resets_at": None,
-                "source": "oauth", "error": None,
-            },
-            "codex": {
-                "weekly_pct": 2.0, "window_minutes": 10080, "resets_at": None,
-                "plan": None, "source": "rollout", "sampled_at": None,
-                "error": None,
-            },
-            "harness": {
-                "global_daily_cap_usd": None, "today_all_repos_usd": 0.0,
-                "per_repo": [],
-            },
+            "claude": {"five_hour_pct": 1.0, "five_hour_resets_at": None, "seven_day_pct": None,
+                       "seven_day_resets_at": None, "source": "oauth", "error": None},
+            "codex": {"weekly_pct": 2.0, "window_minutes": 10080, "resets_at": None, "plan": None,
+                      "source": "rollout", "sampled_at": None, "error": None},
+            "harness": {"global_daily_cap_usd": None, "today_all_repos_usd": 0.0, "per_repo": []},
             "warnings": [],
         }
 
@@ -127,12 +118,9 @@ WRITE_HEADERS = {"X-Issue-Agent-Dashboard": "1"}
 BASE_URL = "http://127.0.0.1:8321"
 
 
-def client(backend=None):
-    return TestClient(
-        server.create_app(backend=backend or StubBackend()),
-        headers=WRITE_HEADERS,
-        base_url=BASE_URL,
-    )
+def client(backend=None, root=None, headers=WRITE_HEADERS):
+    app = server.create_app(backend=backend or StubBackend(), **({"harness_root": str(root)} if root else {}))
+    return TestClient(app, headers=headers, base_url=BASE_URL)
 
 
 def test_usage_returns_all_three_meters():
@@ -168,37 +156,26 @@ def test_issue_detail_is_404_for_an_unknown_issue():
 
 
 # ── failure posture ───────────────────────────────────────────────────────────
-@pytest.mark.parametrize(
-    "collector,path",
-    [
-        ("repos", "/api/repos"),
-        ("usage", "/api/usage"),
-        ("verification", "/api/verification"),
-        ("overview", "/api/repos/demo/overview"),
-        ("issues", "/api/repos/demo/issues"),
-        ("issue", "/api/repos/demo/issues/7"),
-    ],
-)
+@pytest.mark.parametrize("collector,path", [
+    ("repos", "/api/repos"), ("usage", "/api/usage"), ("verification", "/api/verification"),
+    ("overview", "/api/repos/demo/overview"), ("issues", "/api/repos/demo/issues"),
+    ("issue", "/api/repos/demo/issues/7"),
+])
 def test_a_collector_failure_degrades_to_a_warning_never_a_500(collector, path):
-    r = TestClient(server.create_app(backend=StubBackend(explode=collector)),
-                    headers=WRITE_HEADERS, base_url=BASE_URL).get(path)
+    r = client(StubBackend(explode=collector)).get(path)
     assert r.status_code == 200
     assert r.json()["warnings"]
 
 
 # ── POST ──────────────────────────────────────────────────────────────────────
 def test_promote_reports_success():
-    assert client().post("/api/repos/demo/issues/9/promote").json() == {
-        "ok": True, "detail": "ok"
-    }
+    assert client().post("/api/repos/demo/issues/9/promote").json() == {"ok": True, "detail": "ok"}
 
 
 @pytest.mark.parametrize("verb", ["promote", "unblock"])
 def test_a_write_whose_collectors_fail_is_refused_not_a_500(verb):
     """Both read before they write: a failure is a readable refusal."""
-    backend = StubBackend(explode=verb)
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    response = c.post(f"/api/repos/demo/issues/9/{verb}")
+    response = client(StubBackend(explode=verb)).post(f"/api/repos/demo/issues/9/{verb}")
     assert response.status_code == 400
     assert response.json()["ok"] is False
     assert "collector blew up" in response.json()["detail"]
@@ -209,39 +186,34 @@ def test_unblock_rejects_a_non_positive_issue_number():
 
 
 # ── static ────────────────────────────────────────────────────────────────────
-def _write_fresh_spa(tmp_path):
-    dashboard = tmp_path / "dashboard"
-    dist = dashboard / "dist"
+_BUILD_INPUTS = '{"schema":1,"files":["build-inputs.json"],"directories":[]}'
+
+
+def _manifest(tmp_path) -> str:
+    return json.dumps({"schema": 1, "inputs": bundle.source_hashes(tmp_path),
+                       "outputs": bundle.output_hashes(tmp_path)})
+
+
+def _dist(tmp_path, index: str | None = "<html>app</html>"):
+    dist = tmp_path / "dashboard" / "dist"
     dist.mkdir(parents=True)
-    (dashboard / "build-inputs.json").write_text(
-        '{"schema":1,"files":["build-inputs.json"],"directories":[]}'
-    )
-    (dist / "index.html").write_text("<html>app</html>")
-    (dist / "assets").mkdir()
-    (dist / "assets" / "app.js").write_text("console.log(1)")
-    (dist / bundle.MANIFEST_NAME).write_text(
-        json.dumps(
-            {
-                "schema": 1,
-                "inputs": bundle.source_hashes(tmp_path),
-                "outputs": bundle.output_hashes(tmp_path),
-            }
-        )
-    )
+    if index is not None:
+        (dist / "index.html").write_text(index)
     return dist
 
 
 def test_without_a_built_spa_the_root_explains_how_to_build_it(tmp_path):
-    c = TestClient(server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-                   base_url=BASE_URL)
-    r = c.get("/")
+    r = client(root=tmp_path, headers=None).get("/")
     assert r.status_code == 200 and "make dashboard-ui" in r.text
 
 
 def test_a_built_spa_is_served_with_a_fallback_for_client_routes(tmp_path):
-    dist = _write_fresh_spa(tmp_path)
-    c = TestClient(server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-                   base_url=BASE_URL)
+    dist = _dist(tmp_path)
+    (tmp_path / "dashboard" / "build-inputs.json").write_text(_BUILD_INPUTS)
+    (dist / "assets").mkdir()
+    (dist / "assets" / "app.js").write_text("console.log(1)")
+    (dist / bundle.MANIFEST_NAME).write_text(_manifest(tmp_path))
+    c = client(root=tmp_path, headers=None)
     assert "app</html>" in c.get("/").text
     assert "console.log(1)" in c.get("/assets/app.js").text
     assert "app</html>" in c.get("/repo/demo/issue/7").text
@@ -250,81 +222,49 @@ def test_a_built_spa_is_served_with_a_fallback_for_client_routes(tmp_path):
 def test_a_running_server_keeps_its_immutable_version_after_new_publication(tmp_path):
     dashboard = tmp_path / "dashboard"
     dist_root = dashboard / "dist"
-    (dashboard / "build-inputs.json").parent.mkdir(parents=True)
-    (dashboard / "build-inputs.json").write_text(
-        '{"schema":1,"files":["build-inputs.json"],"directories":[]}'
-    )
+    dashboard.mkdir()
+    (dashboard / "build-inputs.json").write_text(_BUILD_INPUTS)
 
     def publish(build_id, content):
         version = dist_root / "builds" / build_id
         version.mkdir(parents=True)
         (version / "index.html").write_text(content)
-        (dist_root / bundle.POINTER_NAME).write_text(
-            json.dumps({"schema": 1, "build": f"builds/{build_id}"})
-        )
-        (version / bundle.MANIFEST_NAME).write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "inputs": bundle.source_hashes(tmp_path),
-                    "outputs": bundle.output_hashes(tmp_path),
-                }
-            )
-        )
+        (dist_root / bundle.POINTER_NAME).write_text(json.dumps({"schema": 1, "build": f"builds/{build_id}"}))
+        (version / bundle.MANIFEST_NAME).write_text(_manifest(tmp_path))
 
     publish("v1", "<html>version one</html>")
-    first = TestClient(
-        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-        base_url=BASE_URL,
-    )
+    first = client(root=tmp_path, headers=None)
     publish("v2", "<html>version two</html>")
     dashboard_build.garbage_collect_builds(dashboard)
-    second = TestClient(
-        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-        base_url=BASE_URL,
-    )
+    second = client(root=tmp_path, headers=None)
 
     assert "version one" in first.get("/").text
     assert "version two" in second.get("/").text
 
 
 def test_an_invalid_version_pointer_degrades_to_build_instructions(tmp_path):
-    dist = tmp_path / "dashboard" / "dist"
-    dist.mkdir(parents=True)
-    (dist / bundle.POINTER_NAME).write_text("{")
+    (_dist(tmp_path, index=None) / bundle.POINTER_NAME).write_text("{")
 
-    client = TestClient(
-        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-        base_url=BASE_URL,
-    )
+    c = client(root=tmp_path, headers=None)
 
-    assert "dashboard UI unavailable" in client.get("/").text
-    assert "make dashboard-ui" in client.get("/").text
+    assert "dashboard UI unavailable" in c.get("/").text
+    assert "make dashboard-ui" in c.get("/").text
 
 
 def test_an_unknown_api_path_is_a_404_not_the_spa(tmp_path):
-    dist = tmp_path / "dashboard" / "dist"
-    dist.mkdir(parents=True)
-    (dist / "index.html").write_text("<html>app</html>")
-    c = TestClient(server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-                   base_url=BASE_URL)
-    assert c.get("/api/nope").status_code == 404
+    _dist(tmp_path)
+    assert client(root=tmp_path, headers=None).get("/api/nope").status_code == 404
 
 
 def test_a_traversal_path_cannot_escape_the_build_directory(tmp_path):
-    dist = tmp_path / "dashboard" / "dist"
-    dist.mkdir(parents=True)
-    (dist / "index.html").write_text("<html>app</html>")
+    dist = _dist(tmp_path)
     (tmp_path / "secret.txt").write_text("SECRET")
-    c = TestClient(server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-                   base_url=BASE_URL)
-    assert "SECRET" not in c.get("/../secret.txt").text
+    assert "SECRET" not in client(root=tmp_path, headers=None).get("/../secret.txt").text
     assert server._safe_asset(str(dist), "../secret.txt") == ""
 
 
 def test_a_symlinked_asset_cannot_escape_the_build_directory(tmp_path):
-    dist = tmp_path / "dashboard" / "dist"
-    dist.mkdir(parents=True)
+    dist = _dist(tmp_path, index=None)
     outside = tmp_path / "secret.txt"
     outside.write_text("SECRET")
     (dist / "leak.txt").symlink_to(outside)
@@ -339,41 +279,34 @@ def test_a_symlinked_asset_cannot_escape_the_build_directory(tmp_path):
 # today the writes are label changes, which a visited page must not make either.
 def test_a_write_without_the_dashboard_header_is_refused():
     backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), base_url=BASE_URL)  # no header
-    r = c.post("/api/repos/demo/issues/9/park")
+    r = client(backend, headers=None).post("/api/repos/demo/issues/9/park")
     assert r.status_code == 403
     assert "park" not in backend.calls
 
 
 def test_a_cross_origin_write_is_refused_even_with_the_header():
     backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    r = c.post("/api/repos/demo/issues/9/park", headers={"Origin": "http://evil.example"})
+    r = client(backend).post("/api/repos/demo/issues/9/park", headers={"Origin": "http://evil.example"})
     assert r.status_code == 403
     assert "park" not in backend.calls
 
 
 def test_a_rebound_hostname_is_refused_on_reads_too():
     backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    r = c.get("/api/repos", headers={"Host": "attacker.example"})
+    r = client(backend).get("/api/repos", headers={"Host": "attacker.example"})
     assert r.status_code == 421
     assert "repos" not in backend.calls
 
 
 def test_same_origin_requests_pass_the_guard():
-    c = client()
-    assert c.get("/api/repos", headers={"Origin": BASE_URL}).status_code == 200
+    assert client().get("/api/repos", headers={"Origin": BASE_URL}).status_code == 200
 
 
-@pytest.mark.parametrize("path", [
-    "/api/repos/nosuch/overview",
-    "/api/repos/nosuch/issues",
-    "/api/repos/nosuch/issues/7",
-])
+@pytest.mark.parametrize("path", ["/api/repos/nosuch/overview", "/api/repos/nosuch/issues",
+                                  "/api/repos/nosuch/issues/7"])
 def test_an_unconfigured_deployment_name_is_404_and_reaches_no_collector(path):
     backend = StubBackend()
-    r = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL).get(path)
+    r = client(backend).get(path)
     assert r.status_code == 404
     assert backend.calls == []
 
@@ -381,8 +314,7 @@ def test_an_unconfigured_deployment_name_is_404_and_reaches_no_collector(path):
 @pytest.mark.parametrize("number", [0, -5])
 def test_a_non_positive_issue_number_never_reaches_gh(number):
     backend = StubBackend()
-    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
-    assert c.post(f"/api/repos/demo/issues/{number}/promote").status_code == 400
+    assert client(backend).post(f"/api/repos/demo/issues/{number}/promote").status_code == 400
     assert backend.calls == []
 
 
