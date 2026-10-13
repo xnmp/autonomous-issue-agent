@@ -863,6 +863,19 @@ def test_a_running_triage_does_not_take_the_heavy_slot(role):
         composed.daemon.wait_for_dispatches()
 
 
+def test_a_cycling_pr_does_not_starve_the_one_that_has_waited_longer(role):
+    """#1125 starved behind lower-numbered PRs that kept cycling through the slot."""
+    gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Other bug")})
+    open_pr(gh, issue=5, ci="fail")
+    gh.branches["fix/6-other-bug"] = "h2"
+    gh.prs[101] = replace(gh.prs[100], number=101, head_ref_name="fix/6-other-bug", head_ref_oid="h2", ci=_ci("h2", "fail"))
+    agent = Agent(did_nothing(), did_nothing())
+    composed, _ = role(gh, agent, FIX_DISPATCH_CONCURRENCY="1")
+    first = dispatched(tick(composed), AgentKind.FIX_CI)
+    second = dispatched(tick(composed), AgentKind.FIX_CI)
+    assert [a.number for a in first + second] == [100, 101]
+
+
 def test_heavy_acts_still_cap_at_the_concurrency(role):
     gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Other bug"), 7: ready(7, "Third")})
     gate = threading.Event()

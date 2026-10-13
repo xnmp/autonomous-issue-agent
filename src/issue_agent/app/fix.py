@@ -31,7 +31,7 @@ from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
 from ..domain.triage import Triage, triage_from_record
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from ..adapters.act import GitHubAct
@@ -58,7 +58,7 @@ def fix_actions(
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches. At most
     `slots` slot-holding dispatches, granted in `dispatch_order`; TRIAGE holds
-    no slot and is bounded by `light` (None: unbounded), by number. With
+    no slot and is bounded by `light` (None: unbounded), in the same order. With
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     per_item = {key: policy_actions({key: state}, harness) for key, state in states.items()}
     granted: set[RunAgent] = set()
@@ -353,6 +353,10 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
                 log(f"fix: PR #{key.number} waits to merge: mergeable={pr.mergeable or '?'} "
                     f"state={pr.merge_state or '?'}")
         waiting = {k: ends[-1].ended_at for k, ends in local.legs.items() if ends}
+        for pr in world.prs:  # a fresh PR waits from the leg that opened it, which is keyed by its issue
+            issue = harness_branch_issue(pr.head_ref_name)
+            if pr_key(pr.number) not in waiting and issue is not None and issue_key(issue) in waiting:
+                waiting[pr_key(pr.number)] = waiting[issue_key(issue)]
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
                            light=slots.light, waiting_since=waiting)
     return choose
