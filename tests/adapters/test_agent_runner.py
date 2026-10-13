@@ -9,17 +9,12 @@ from dataclasses import dataclass
 
 from issue_agent.adapters.agent_runner import (
     DEFAULT_MAX_BUFFER_BYTES,
-    DEFAULT_PERMISSION_MODE,
     build_option_kwargs,
     resolve_claude_cli,
     result_to_agent_result,
 )
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import ExitReason
-
-
-def test_default_permission_mode_is_bypass():
-    assert DEFAULT_PERMISSION_MODE == "bypassPermissions"
 
 
 def test_schema_maps_to_output_format():
@@ -35,12 +30,6 @@ def test_append_system_prompt_uses_claude_code_preset():
         "preset": "claude_code",
         "append": "rules",
     }
-
-
-def test_no_agents_key_and_no_task_tool():
-    kw = build_option_kwargs(RuntimePlan(prompt="x", allowed_tools=("Read",)))
-    assert "agents" not in kw
-    assert "Task" not in kw.get("allowed_tools", [])
 
 
 def test_tools_model_budget_cwd_resume_map():

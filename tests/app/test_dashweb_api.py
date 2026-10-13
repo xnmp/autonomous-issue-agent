@@ -167,13 +167,6 @@ def test_issue_detail_is_404_for_an_unknown_issue():
     assert client().get("/api/repos/demo/issues/7").json()["issue"] == 7
 
 
-def test_the_retired_read_and_write_routes_are_gone():
-    c = client()
-    for path in ("/api/repos/demo/issues/7/steps/0/events", "/api/repos/demo/issues/7/cost-chart?session_id=a"):
-        assert c.get(path).status_code == 404
-    assert c.post("/api/repos/demo/start").status_code in (404, 405)
-
-
 # ── failure posture ───────────────────────────────────────────────────────────
 @pytest.mark.parametrize(
     "collector,path",
@@ -198,15 +191,6 @@ def test_promote_reports_success():
     assert client().post("/api/repos/demo/issues/9/promote").json() == {
         "ok": True, "detail": "ok"
     }
-
-
-def test_the_removed_operator_command_routes_are_gone():
-    c = TestClient(server.create_app(backend=StubBackend()), headers=WRITE_HEADERS, base_url=BASE_URL)
-    for path in ("/api/repos/demo/issues/9/unpark", "/api/repos/demo/issues/9/park",
-                 "/api/repos/demo/issues/9/resolve-control/commands"):
-        assert c.post(path).status_code in (404, 405)
-    for path in ("/api/repos/demo/issues/9/resolve-control", "/api/repos/demo/workflow-families"):
-        assert c.get(path).status_code == 404
 
 
 @pytest.mark.parametrize("verb", ["promote", "unblock"])

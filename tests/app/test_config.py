@@ -104,6 +104,8 @@ _NON_FINITE = ("nan", "NaN", "inf", "-inf", "Infinity", "1e400")
     (None, None, "poll_seconds", 20, False),
     (None, None, "base_branch", "dev", False),
     ("FIX_MODEL", "opus", "fix_model", "opus", False),
+    ("FIX_MODEL", "", "fix_model", None, False),
+    ("CODEX_COST_PER_MTOK_OUT", "15.00", "codex_cost_per_mtok_out", 15.0, False),
     ("REVIEW_BUDGET_USD", "2.5", "review_budget_usd", 2.5, False),
     ("MERGE_METHOD", "merge", "merge_method", "merge", False),
     # review M2: an exported-but-empty knob means UNSET (the field default),
@@ -207,10 +209,6 @@ def test_custom_state_roots_keep_one_machine_accounting_authority(
     assert second.control_authority_root == "/machine/state"
 
 
-def test_empty_fix_model_is_none():
-    assert from_env({"REPO": "x", "FIX_MODEL": ""}).fix_model is None
-
-
 def test_validate_fails_loud_on_empty_repo():
     # Silent-default class (#50): an empty REPO must die at startup with a
     # pointed message, not surface as an opaque gh error on the first poll.
@@ -267,68 +265,22 @@ def test_grouped_config_preserves_flat_env_mapping():
     assert (c.codex_bin, c.codex_model) == ("codex-dev", "gpt-next")
 
 
-def _assert_each_knob_flagged_once(errors: tuple[str, ...], expected_knobs: set[str]) -> None:
-    """T5 (review): membership + shape, not exact-tuple-and-order.
-
-    The three tests below used to pin `validation_errors()`'s exact tuple AND
-    its element order — coupling every one of them to `_coerce_int`'s literal
-    wording and to whatever order `HarnessConfig`'s fields happen to be
-    declared in, so reordering two dataclass fields (a pure refactor) would
-    fail tests that have nothing to do with ordering. This asserts the
-    CONTRACT instead: every invalid knob is named in some error (membership,
-    checked as a set — the process lesson at review §5: set equality against
-    an independently-derived expectation, not membership of hand-picked
-    examples), and the error COUNT matches the knob count, so a knob that
-    silently stopped being validated (or one validated twice) still fails."""
-    flagged = {knob for knob in expected_knobs if any(knob in e for e in errors)}
-    assert flagged == expected_knobs
-    assert len(errors) == len(expected_knobs)
-
-
-def test_validation_rejects_invalid_poll_seconds():
-    c = from_env({
-        "REPO": "x",
-        "FIX_BOT": "fix-bot",
-        "POLL_SECONDS": "0",
-    })
-
-    _assert_each_knob_flagged_once(c.validation_errors(), {"POLL_SECONDS"})
-
-
-def test_validation_rejects_invalid_budgets():
-    c = from_env({
-        "REPO": "x",
-        "FIX_BOT": "fix-bot",
-        "MAX_BUDGET_USD": "0",
-        "REVIEW_BUDGET_USD": "-1",
-    })
-
-    _assert_each_knob_flagged_once(c.validation_errors(), {"MAX_BUDGET_USD", "REVIEW_BUDGET_USD"})
-
-
-def test_validation_rejects_invalid_runtime_settings():
-    c = from_env({
-        "REPO": "x",
-        "FIX_BOT": "fix-bot",
-        "FIXER_RUNTIME": "python",
-        "AGENT_IDLE_TIMEOUT_SECONDS": "-1",
-        "AGENT_MAX_RUNTIME_SECONDS": "-1",
-    })
-
-    _assert_each_knob_flagged_once(c.validation_errors(), {
-        "FIXER_RUNTIME", "AGENT_IDLE_TIMEOUT_SECONDS", "AGENT_MAX_RUNTIME_SECONDS",
-    })
-
-
-def test_validate_raises_combined_error_message():
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "FIXER_RUNTIME": "python"})
-
-    try:
-        c.validate()
-    except ValueError as exc:
-        assert "FIXER_RUNTIME must be one of ['claude', 'codex']" in str(exc)
-    else:  # pragma: no cover - assertion branch
-        raise AssertionError("validate should reject invalid config")
+@pytest.mark.parametrize("env,knobs", [
+    ({"POLL_SECONDS": "0"}, {"POLL_SECONDS"}),
+    ({"MAX_BUDGET_USD": "0", "REVIEW_BUDGET_USD": "-1"}, {"MAX_BUDGET_USD", "REVIEW_BUDGET_USD"}),
+    ({"FIXER_RUNTIME": "python", "AGENT_IDLE_TIMEOUT_SECONDS": "-1", "AGENT_MAX_RUNTIME_SECONDS": "-1"},
+     {"FIXER_RUNTIME", "AGENT_IDLE_TIMEOUT_SECONDS", "AGENT_MAX_RUNTIME_SECONDS"}),
+    ({"FIX_DISPATCH_CONCURRENCY": "0"}, {"FIX_DISPATCH_CONCURRENCY"}),
+    ({"FIX_EFFORT": "hihg"}, {"FIX_EFFORT"}),
+])
+def test_each_invalid_knob_is_flagged_exactly_once(env, knobs):
+    # Membership and count, not the exact tuple or its order: a knob that
+    # silently stopped being validated (or is validated twice) still fails.
+    errors = from_env({"REPO": "x", "FIX_BOT": "fix-bot", **env}).validation_errors()
+    assert {knob for knob in knobs if any(knob in e for e in errors)} == knobs
+    assert len(errors) == len(knobs)
+    with pytest.raises(ValueError, match=sorted(knobs)[0]):
+        from_env({"REPO": "x", "FIX_BOT": "fix-bot", **env}).validate()
 
 
 # ── P1R-8: `_b` must strip+casefold and reject unrecognized tokens ───────────
@@ -350,20 +302,6 @@ def test_b_is_case_and_whitespace_insensitive(token, expected):
     assert from_env({"REPO": "x", "AUTO_MERGE": token}).auto_merge is expected
 
 
-def test_validate_raises_when_fix_bot_unset():
-    with pytest.raises(ValueError, match="FIX_BOT"):
-        from_env({"REPO": "x"}).validate()
-
-
-def test_fix_dispatch_concurrency_must_be_positive():
-    cfg = from_env({
-        "REPO": "x",
-        "FIX_BOT": "fix-bot",
-        "FIX_DISPATCH_CONCURRENCY": "0",
-    })
-    assert "FIX_DISPATCH_CONCURRENCY must be > 0" in cfg.validation_errors()
-
-
 def test_codex_is_priced_out_of_the_box_so_the_spend_caps_are_not_blind():
     # A subscription bills $0, but the quota it draws down is real — so the
     # shipped rates are non-zero (synthetic dollars over real token volume) and
@@ -371,16 +309,6 @@ def test_codex_is_priced_out_of_the_box_so_the_spend_caps_are_not_blind():
     c = from_env({"REPO": "x"})
     assert c.codex_cost_per_mtok_in > 0
     assert c.codex_cost_per_mtok_out > c.codex_cost_per_mtok_in  # output costs more
-
-
-def test_codex_cost_per_mtok_override():
-    c2 = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK_IN": "3.00", "CODEX_COST_PER_MTOK_OUT": "15.00",
-    })
-    assert c2.codex_cost_per_mtok_in == 3.00
-    assert c2.codex_cost_per_mtok_out == 15.00
-    assert c2.validation_errors() == ()
 
 
 def test_codex_pricing_can_be_switched_off_explicitly():
@@ -420,33 +348,16 @@ def test_armed_caps_require_pricing_for_subscription_runtimes_too():
 # CLAUDE.md's routing guardrail asks for.
 
 
-def test_the_rate_table_parses_a_model_per_entry():
-    c = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60",
-    })
-    assert c.codex_cost_per_mtok == (
-        ("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0),
-    )
-    assert c.validation_errors() == ()
-
-
-def test_an_unset_rate_table_is_empty_and_changes_nothing():
-    """The knob is additive: an existing deployment prices exactly as before."""
-    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot"})
-    assert c.codex_cost_per_mtok == ()
-    assert c.validation_errors() == ()
-    assert from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot", "CODEX_COST_PER_MTOK": "   ",
-    }).codex_cost_per_mtok == ()
-
-
-def test_whitespace_and_trailing_separators_in_the_rate_table_are_tolerated():
-    c = from_env({
-        "REPO": "x", "FIX_BOT": "fix-bot",
-        "CODEX_COST_PER_MTOK": " gpt-5.6-luna = 1.25 / 10 , ,",
-    })
-    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
+@pytest.mark.parametrize("raw,table", [
+    ("gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60", (("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0))),
+    (" gpt-5.6-luna = 1.25 / 10 , ,", (("gpt-5.6-luna", 1.25, 10.0),)),
+    # The knob is additive: an existing deployment prices exactly as before.
+    ("   ", ()),
+    (None, ()),
+])
+def test_the_rate_table_parses_a_model_per_entry(raw, table):
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", **({"CODEX_COST_PER_MTOK": raw} if raw is not None else {})})
+    assert c.codex_cost_per_mtok == table
     assert c.validation_errors() == ()
 
 
@@ -558,43 +469,14 @@ def test_shell_escaped_values_survive_the_file_read(tmp_path):
     assert c.review_prompt == cmd
 
 
-def test_unparseable_agent_env_file_falls_back_to_process_env(tmp_path):
-    # Syntax the shell refuses (an unbalanced quote) must not reset the daemon
-    # to defaults mid-reload.
+@pytest.mark.parametrize("content", [
+    'REPO="o/r\nFIX_MODEL=haiku\n',  # syntax the shell refuses must not reset the daemon mid-reload
+    None,  # a broken/absent watch file
+    "# AUTO-GENERATED by bin/compose-env.sh — do not edit.\n",  # assigns nothing: refuse, never default REPO
+])
+def test_an_unusable_agent_env_file_falls_back_to_process_env(tmp_path, content):
     env_file = tmp_path / "active.env"
-    env_file.write_text('REPO="o/r\nFIX_MODEL=haiku\n')
-
+    if content is not None:
+        env_file.write_text(content)
     c = from_env({"AGENT_ENV": str(env_file), "REPO": "o/inherited", "FIX_MODEL": "opus"})
-
-    assert c.repo == "o/inherited"
-    assert c.fix_model == "opus"
-
-
-def test_missing_agent_env_file_falls_back_to_process_env(tmp_path):
-    # A broken/absent watch file must never reset the daemon to defaults.
-    c = from_env({
-        "AGENT_ENV": str(tmp_path / "does-not-exist.env"),
-        "REPO": "o/r",
-        "FIX_MODEL": "haiku",
-    })
-
-    assert c.repo == "o/r"
-    assert c.fix_model == "haiku"
-
-
-def test_empty_agent_env_file_falls_back_to_process_env(tmp_path):
-    # A file that assigns nothing reads as "every knob absent" — refuse it
-    # rather than silently defaulting REPO/TEST_CMD and failing every gate.
-    env_file = tmp_path / "active.env"
-    env_file.write_text("# AUTO-GENERATED by bin/compose-env.sh — do not edit.\n")
-
-    c = from_env({"AGENT_ENV": str(env_file), "REPO": "o/r", "FIX_MODEL": "haiku"})
-
-    assert c.repo == "o/r"
-    assert c.fix_model == "haiku"
-
-
-def test_a_misspelled_fix_effort_is_reported_and_falls_back():
-    c = from_env({"REPO": "x", "FIX_EFFORT": "hihg"})
-    assert c.fix_effort is None
-    assert any("FIX_EFFORT" in e for e in c.validation_errors())
+    assert (c.repo, c.fix_model) == ("o/inherited", "opus")

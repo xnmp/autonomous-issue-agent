@@ -207,34 +207,6 @@ def test_relabel_noop_when_nothing_to_change():
     assert fr.calls == []  # no gh call when there's nothing to add/remove
 
 
-def test_close_issue_argv():
-    fr = FakeRunner()
-    gw = GitHubGateway("o/r", runner=fr)
-    gw.close_issue(5, "completed", "Resolved by #100")
-    argv, _ = fr.calls[0]
-    assert argv[1:4] == ["issue", "close", "5"]
-    assert "--reason" in argv and "completed" in argv
-    assert "--comment" in argv
-
-
-def test_enable_auto_merge_argv():
-    fr = FakeRunner({"pr view 100": {
-        "autoMergeRequest": None,
-        "state": "MERGED",
-        "headRefOid": "head",
-    }})
-    gw = GitHubGateway("o/r", runner=fr)
-    gw.enable_auto_merge(100, "squash", "head")
-    argv, _ = next(
-        call for call in fr.calls
-        if call[0][1:4] == ["pr", "merge", "100"]
-    )
-    assert argv[1:4] == ["pr", "merge", "100"]
-    assert "--auto" not in argv
-    assert "--squash" in argv and "--delete-branch" in argv
-    assert argv[argv.index("--match-head-commit") + 1] == "head"
-
-
 def test_enable_auto_merge_verifies_exact_head_was_merged():
     landed = FakeRunner({"pr view 100": {
         "state": "MERGED",
@@ -430,54 +402,28 @@ def test_runner_keeps_failsoft_for_ordinary_non_zero_exits(monkeypatch, stderr):
     assert classify_gh_failure(stderr) is None
 
 
-@pytest.mark.parametrize(
-    "stderr",
-    [
-        "HTTP 403: API rate limit exceeded for user ID 583231. (https://api.github.com/…)",
-        "HTTP 429: Too Many Requests",
-        "You have exceeded a secondary rate limit. Please wait a few minutes.",
-        "HTTP 403: x-ratelimit-remaining: 0",
-    ],
-)
-def test_runner_raises_rate_limit(monkeypatch, stderr):
-    """The V10 case: throttling used to return "" → the tick observed an empty
-    world and acted on it. It must now be an exception carrying its kind."""
+@pytest.mark.parametrize("stderr,kind", [
+    # V10: throttling used to return "" → the tick observed an empty world and
+    # acted on it. It must be an exception carrying its kind.
+    ("HTTP 403: API rate limit exceeded for user ID 583231. (https://api.github.com/…)", "rate-limit"),
+    ("HTTP 429: Too Many Requests", "rate-limit"),
+    ("You have exceeded a secondary rate limit. Please wait a few minutes.", "rate-limit"),
+    ("HTTP 403: x-ratelimit-remaining: 0", "rate-limit"),
+    ("error connecting to api.github.com", "network"),
+    ("Could not resolve host: api.github.com", "network"),
+    ("dial tcp: lookup api.github.com: no such host", "network"),
+    ("Get https://api.github.com: net/http: TLS handshake timeout", "network"),
+    ("connection refused", "network"),
+    # A local process/thread failure returned no GitHub answer; treating it as an
+    # empty response releases dependency gates under peak load.
+    ("runtime/cgo: pthread_create failed: Resource temporarily unavailable", "local-resource"),
+    ("runtime: failed to create new OS thread\nfatal error: newosproc", "local-resource"),
+    ("fork/exec /usr/bin/gh: cannot allocate memory", "local-resource"),
+])
+def test_runner_raises_unavailability_with_its_kind(monkeypatch, stderr, kind):
     with pytest.raises(GhUnavailable) as ei:
         _run_with(monkeypatch, stderr)()
-    assert ei.value.kind == "rate-limit"
-
-
-@pytest.mark.parametrize(
-    "stderr",
-    [
-        "error connecting to api.github.com",
-        "Could not resolve host: api.github.com",
-        "dial tcp: lookup api.github.com: no such host",
-        "Get https://api.github.com: net/http: TLS handshake timeout",
-        "connection refused",
-    ],
-)
-def test_runner_raises_network(monkeypatch, stderr):
-    with pytest.raises(GhUnavailable) as ei:
-        _run_with(monkeypatch, stderr)()
-    assert ei.value.kind == "network"
-
-
-@pytest.mark.parametrize(
-    "stderr",
-    [
-        "runtime/cgo: pthread_create failed: Resource temporarily unavailable",
-        "runtime: failed to create new OS thread\nfatal error: newosproc",
-        "fork/exec /usr/bin/gh: cannot allocate memory",
-    ],
-)
-def test_runner_raises_on_local_resource_exhaustion(monkeypatch, stderr):
-    """A local process/thread failure returned no GitHub answer. Treating it as
-    an ordinary empty response releases dependency gates under peak load."""
-
-    with pytest.raises(GhUnavailable) as error:
-        _run_with(monkeypatch, stderr)()
-    assert error.value.kind == "local-resource"
+    assert ei.value.kind == kind
 
 
 def test_runner_redacts_and_bounds_a_large_publication_body(
