@@ -19,7 +19,7 @@ from ...domain.ci import parse_timestamp
 from ...domain.labels import Label
 from ...domain.refs import harness_branch_issue
 from ...domain.state import DerivedState, Harness, ItemKey
-from ...domain.triage import Triage
+from ...domain.triage import Steward, Triage
 from ...domain.world import IssueView, PRView, WorldState
 from ...adapters.dashweb.ghdata import index_by_number, is_open, labels_of
 
@@ -294,15 +294,16 @@ def issue_detail(
         "steps": [step(idx, leg, (models or {}).get(leg.leg_id, ""))
                   for idx, leg in enumerate(leg for leg in own if not leg.carried)],
         "carried": {"legs": len(carried), "cost_usd": _spend(carried)[0]} if carried else None,
-        "triage": _triage(dash.issue_triage(own)),
+        "triage": _triage(dash.issue_triage(own), dash.issue_steward(own)),
     }
 
 
-def _triage(triage: Triage | None) -> dict | None:
+def _triage(triage: Triage | None, steward: Steward | None) -> dict | None:
     if triage is None:
         return None
-    return {"tier": triage.tier.value, "acceptance_criteria": list(triage.acceptance_criteria),
-            "duplicate_of": triage.duplicate_of, "duplicate_reason": triage.duplicate_reason or None,
+    steward = steward or Steward()
+    return {"tier": triage.tier.value, "acceptance_criteria": list(steward.acceptance_criteria),
+            "duplicate_of": steward.duplicate_of, "duplicate_reason": steward.duplicate_reason or None,
             "rationale": triage.rationale or None}
 
 

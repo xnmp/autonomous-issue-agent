@@ -1,18 +1,24 @@
-"""The TRIAGE act's result: a difficulty tier, testable acceptance criteria and
-a suspected duplicate. Pure.
+"""The TRIAGE and STEWARD acts' results. Pure.
+
+STEWARD writes testable acceptance criteria and flags a suspected duplicate;
+TRIAGE grades the difficulty tier that routes the issue (owner, 2026-10-14:
+one act each, on its own model). Before the split one TRIAGE result carried
+all of it, and such legacy records still read back: `steward_from_record`
+accepts any record with the steward's keys, so a combined TRIAGE leg satisfies
+both acts.
 
 Provenance: the agent's structured output is an untrusted claim. It becomes a
-`Triage` only through `parse_triage`, which the accounting runtime applies to
-the leg's output before recording it in the leg's `result_json`. The one
-cross-reference, `duplicate_of`, is laundered against the issue numbers the
-harness itself offered the leg: the schema the harness writes enumerates them
-(read from GitHub at dispatch), so a number outside that list is dropped, not
-trusted. Anything malformed or oversized parses to None, which readers treat
-as no triage data: the issue runs at the default tier, with no duplicate stop
-and no comment.
+`Triage` or `Steward` only through `parse_triage` / `parse_steward`, which the
+accounting runtime applies to the leg's output before recording it in the
+leg's `result_json`. The one cross-reference, `duplicate_of`, is laundered
+against the issue numbers the harness itself offered the leg: the schema the
+harness writes enumerates them (read from GitHub at dispatch), so a number
+outside that list is dropped, not trusted. Anything malformed or oversized
+parses to None, which readers treat as no data: the issue runs at the default
+tier, with no criteria, no duplicate stop and no comment line for it.
 
-The record is a flat object of named fields, so a later act (tech-debt
-tracking) can add fields without disturbing these readers.
+Records are flat objects of named fields, so a later act (tech-debt tracking,
+a STEWARD extension) can add fields without disturbing these readers.
 """
 
 from __future__ import annotations
@@ -32,22 +38,34 @@ _MAX_ISSUE = 2_147_483_647
 
 @dataclass(frozen=True)
 class Triage:
+    """TRIAGE's result: the tier that routes the issue, and why."""
+
     tier: Tier
-    acceptance_criteria: tuple[str, ...] = ()
-    duplicate_of: int | None = None
-    duplicate_reason: str = ""
     rationale: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.tier, Tier):
             raise ValueError("triage requires a tier")
+
+    def record(self) -> dict[str, object]:
+        return {"tier": self.tier.value, "rationale": self.rationale}
+
+
+@dataclass(frozen=True)
+class Steward:
+    """STEWARD's result: what done means, and whether it was already asked for."""
+
+    acceptance_criteria: tuple[str, ...] = ()
+    duplicate_of: int | None = None
+    duplicate_reason: str = ""
+
+    def __post_init__(self) -> None:
         if self.duplicate_of is not None and (type(self.duplicate_of) is not int or self.duplicate_of <= 0):
             raise ValueError("duplicate_of is a positive issue number or None")
 
     def record(self) -> dict[str, object]:
-        return {"tier": self.tier.value, "acceptance_criteria": list(self.acceptance_criteria),
-                "duplicate_of": self.duplicate_of, "duplicate_reason": self.duplicate_reason,
-                "rationale": self.rationale}
+        return {"acceptance_criteria": list(self.acceptance_criteria),
+                "duplicate_of": self.duplicate_of, "duplicate_reason": self.duplicate_reason}
 
 
 def _text(raw: object, limit: int) -> str | None:
@@ -62,13 +80,25 @@ def _text(raw: object, limit: int) -> str | None:
     return " ".join(raw.replace("<!--", "\u2039!--").split())
 
 
-def _parse(raw: object, allowed: Callable[[int], bool], criteria_wanted: bool = True) -> Triage | None:
+def parse_triage(raw: object) -> Triage | None:
+    """The agent's output, or a recorded (already laundered) result read back
+    from SQLite, as a Triage; None if malformed. Keys of the legacy combined
+    result (criteria, duplicate) are ignored."""
     if not isinstance(raw, Mapping):
         return None
     tier = parse_tier(raw.get("tier"))
-    criteria_raw = raw.get("acceptance_criteria", [])
     rationale = _text(raw.get("rationale", ""), MAX_RATIONALE)
-    if tier is None or rationale is None or not isinstance(criteria_raw, list) or len(criteria_raw) > MAX_CRITERIA:
+    return Triage(tier, rationale) if tier is not None and rationale is not None else None
+
+
+def _steward(raw: object, allowed: Callable[[int], bool], criteria_wanted: bool) -> Steward | None:
+    if not isinstance(raw, Mapping):
+        return None
+    # The list is required whenever the schema asked for it, and in every
+    # record (which always carries it): that is what tells a steward result
+    # from a tier-only triage record.
+    criteria_raw = raw.get("acceptance_criteria", None if criteria_wanted else [])
+    if not isinstance(criteria_raw, list) or len(criteria_raw) > MAX_CRITERIA:
         return None
     criteria = tuple(_text(item, MAX_CRITERION) for item in criteria_raw)
     if any(item is None for item in criteria):
@@ -81,47 +111,60 @@ def _parse(raw: object, allowed: Callable[[int], bool], criteria_wanted: bool = 
     # either drops only the claim, toward no stop.
     valid_dup = type(dup) is int and 0 < dup <= _MAX_ISSUE and allowed(dup) and bool(reason)
     kept = tuple(c for c in criteria if c) if criteria_wanted else ()
-    return Triage(tier, kept, dup if valid_dup else None,  # type: ignore[arg-type]
-                  reason if valid_dup else "", rationale)
+    return Steward(kept, dup if valid_dup else None, reason if valid_dup else "")  # type: ignore[arg-type]
 
 
-def parse_triage(raw: object, offered: Iterable[int], issue: int, criteria_wanted: bool = True) -> Triage | None:
-    """The agent's output for issue `issue` as a Triage, or None if malformed.
+def parse_steward(raw: object, offered: Iterable[int], issue: int, criteria_wanted: bool = True) -> Steward | None:
+    """The agent's output for issue `issue` as a Steward, or None if malformed.
     `duplicate_of` survives only if it is one of `offered` and not `issue`;
     criteria survive only if the harness asked for them (`criteria_wanted`)."""
     numbers = frozenset(n for n in offered if type(n) is int and n != issue)
-    return _parse(raw, numbers.__contains__, criteria_wanted)
+    return _steward(raw, numbers.__contains__, criteria_wanted)
 
 
-def triage_from_record(raw: object) -> Triage | None:
-    """A recorded (already laundered) triage read back from SQLite."""
-    return _parse(raw, lambda _n: True)
+def steward_from_record(raw: object) -> Steward | None:
+    """A recorded (already laundered) steward result. A legacy combined
+    TRIAGE record has the same keys, so it reads as one; a tier-only record
+    (post-split TRIAGE) lacks the criteria list and reads as None. Records
+    always carry the list (`Steward.record`), even when empty."""
+    return _steward(raw, lambda _n: True, True)
 
 
-def triage_schema(offered: Iterable[int], criteria_wanted: bool = True) -> dict:
-    """The output contract. `duplicate_of` enumerates the issues the harness
-    offered (the laundering list `offered_duplicates` reads back). An issue
-    that states its own acceptance criteria gets none from triage: its section
-    stays the contract (`criteria_wanted` reads that back)."""
+def triage_schema() -> dict:
+    """TRIAGE's output contract."""
+    return {
+        "type": "object",
+        "properties": {
+            "tier": {"type": "string", "enum": [t.value for t in TIER_LADDER]},
+            "rationale": {"type": "string"},
+        },
+        "required": ["tier", "rationale"],
+        "additionalProperties": False,
+    }
+
+
+def steward_schema(offered: Iterable[int], criteria_wanted: bool = True) -> dict:
+    """STEWARD's output contract. `duplicate_of` enumerates the issues the
+    harness offered (the laundering list `offered_duplicates` reads back). An
+    issue that states its own acceptance criteria gets none: its section stays
+    the contract (`criteria_wanted` reads that back). The `acceptance_criteria`
+    property is omitted then."""
     numbers = sorted({n for n in offered if type(n) is int and 0 < n <= _MAX_ISSUE})[:MAX_OFFERED]
     dup: dict = {"type": ["integer", "null"], "enum": [*numbers, None]} if numbers else {"type": "null"}
     return {
         "type": "object",
         "properties": {
-            "tier": {"type": "string", "enum": [t.value for t in TIER_LADDER]},
             **({"acceptance_criteria": {"type": "array", "items": {"type": "string"}}} if criteria_wanted else {}),
             "duplicate_of": dup,
             "duplicate_reason": {"type": "string"},
-            "rationale": {"type": "string"},
         },
-        "required": ["tier", *(["acceptance_criteria"] if criteria_wanted else []), "duplicate_of",
-                     "duplicate_reason", "rationale"],
+        "required": [*(["acceptance_criteria"] if criteria_wanted else []), "duplicate_of", "duplicate_reason"],
         "additionalProperties": False,
     }
 
 
 def criteria_wanted(schema: object) -> bool:
-    """Whether a `triage_schema` asked for acceptance criteria."""
+    """Whether a `steward_schema` asked for acceptance criteria."""
     try:
         return "acceptance_criteria" in schema["properties"]  # type: ignore[index]
     except (KeyError, TypeError):
@@ -129,7 +172,7 @@ def criteria_wanted(schema: object) -> bool:
 
 
 def offered_duplicates(schema: object) -> frozenset[int]:
-    """The issue numbers a `triage_schema` offered; empty for anything else."""
+    """The issue numbers a `steward_schema` offered; empty for anything else."""
     try:
         values = schema["properties"]["duplicate_of"].get("enum", ())  # type: ignore[index]
     except (KeyError, TypeError, AttributeError):
@@ -139,4 +182,5 @@ def offered_duplicates(schema: object) -> frozenset[int]:
     return frozenset(n for n in values if type(n) is int and n > 0)
 
 
-__all__ = ["Triage", "criteria_wanted", "offered_duplicates", "parse_triage", "triage_from_record", "triage_schema"]
+__all__ = ["Steward", "Triage", "criteria_wanted", "offered_duplicates", "parse_steward", "parse_triage",
+           "steward_from_record", "steward_schema", "triage_schema"]

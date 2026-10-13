@@ -103,8 +103,9 @@ def legs(kind: AgentKind, *minutes: float, machine: bool = False) -> tuple[LegEn
 
 # A triage leg that returned nothing usable: the issue proceeds at the default
 # tier with no triage comment owed (test_triage_routing covers the rest).
+STEWARD_END = LegEnd(AgentKind.STEWARD, T0 - timedelta(hours=2), False)
 TRIAGE_END = LegEnd(AgentKind.TRIAGE, T0 - timedelta(hours=1), False)
-TRIAGED = {issue_key(3): (TRIAGE_END,)}
+TRIAGED = {issue_key(3): (STEWARD_END, TRIAGE_END)}
 
 
 def local(legs_by: dict | None = None, **kw) -> Local:
@@ -394,7 +395,7 @@ def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
 
 
 def test_resolve_attempts_cap_on_the_issue():
-    states = derive(WorldState(issues=(issue(3),)), local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
+    states = derive(WorldState(issues=(issue(3),)), local({issue_key(3): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
     assert states == {issue_key(3): NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)}
 
 
@@ -691,7 +692,7 @@ def test_policy_stop_comment_is_read_back_as_the_stop():
 
 def test_actions_are_ordered_issues_first_then_by_number():
     world = WorldState(issues=(issue(9), issue(2)), prs=(pr(5, 30, ci=RED), pr(4, 31, ci=RED)))
-    numbers = [(a.kind, a.number) for a in actions(derive(world, local({issue_key(n): (TRIAGE_END,) for n in (2, 9)}), H), H)]
+    numbers = [(a.kind, a.number) for a in actions(derive(world, local({issue_key(n): (STEWARD_END, TRIAGE_END) for n in (2, 9)}), H), H)]
     assert numbers == [(AgentKind.RESOLVE, 2), (AgentKind.RESOLVE, 9), (FIX, 4), (FIX, 5)]
 
 
@@ -761,10 +762,10 @@ def test_ten_thousand_machine_legs_do_not_stop_and_back_off_at_most_an_hour():
 
 def test_many_items_derive_independently():
     world = WorldState(issues=tuple(issue(n) for n in range(1, 2001)))
-    states = derive(world, local({issue_key(5): (TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
+    states = derive(world, local({issue_key(5): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2, 3))}), H)
     assert len(states) == 2000
     assert states[issue_key(5)] == NeedsHuman(StopReason.ATTEMPTS, iso(3), AgentKind.RESOLVE)
-    assert states[issue_key(6)] == Dispatch(AgentKind.TRIAGE)
+    assert states[issue_key(6)] == Dispatch(AgentKind.STEWARD)
 
 
 # ── Agent questions (slice 5b) ───────────────────────────────────────────────
@@ -832,7 +833,7 @@ def test_a_question_waits_once_labelled_and_a_reply_releases_it():
 
 def test_after_release_the_answered_question_redispatches_with_a_fresh_count():
     released = issue(3, comments=(stop(StopReason.QUESTION, 6), human(7)))
-    loc = local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2), asked(AgentKind.RESOLVE, 5))})
+    loc = local({issue_key(3): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 1, 2), asked(AgentKind.RESOLVE, 5))})
     assert one(WorldState(issues=(released,)), loc) == Dispatch(AgentKind.RESOLVE)
 
 
@@ -1000,14 +1001,14 @@ def test_open_pull_request_action_is_validated():
 def test_a_leg_that_ended_after_the_observation_holds_its_item_busy():
     # P0-1: the world was read before the leg pushed; its end is already local.
     world = WorldState(issues=(issue(3),), now=iso(10))
-    loc = local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 11))})
+    loc = local({issue_key(3): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 11))})
     assert one(world, loc) == Busy()
     assert one(WorldState(issues=(issue(3),), now=iso(12)), loc) == Dispatch(AgentKind.RESOLVE, tier=Tier.HIGH)
 
 
 @pytest.mark.parametrize("now", ["", "not-a-time"])
 def test_an_unstamped_observation_does_not_hold_items(now):
-    loc = local({issue_key(3): (TRIAGE_END, *legs(AgentKind.RESOLVE, 11))})
+    loc = local({issue_key(3): (STEWARD_END, TRIAGE_END, *legs(AgentKind.RESOLVE, 11))})
     assert one(WorldState(issues=(issue(3),), now=now), loc) == Dispatch(AgentKind.RESOLVE, tier=Tier.HIGH)
 
 

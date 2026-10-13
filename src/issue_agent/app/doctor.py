@@ -36,7 +36,8 @@ def _unquoted(value: str) -> str:
     return parts[0] if len(parts) == 1 else value
 
 
-_ROUTES = ("FIX_MODEL_LOW", "FIX_MODEL_MED", "FIX_MODEL_HIGH", "FIX_MODEL_XHIGH", "TRIAGE_MODEL")
+_ROUTES = ("FIX_MODEL_LOW", "FIX_MODEL_MED", "FIX_MODEL_HIGH", "FIX_MODEL_XHIGH", "TRIAGE_MODEL",
+           "STEWARD_MODEL")
 
 
 def _runtimes(env: dict) -> set[str]:

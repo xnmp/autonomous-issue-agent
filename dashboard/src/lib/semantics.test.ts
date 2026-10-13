@@ -12,6 +12,8 @@ import {
 
 describe("dashboard semantics", () => {
   it.each([
+    ["STEWARD", "Steward"],
+    ["TRIAGE", "Triage"],
     ["RESOLVE", "Resolve"],
     ["ADDRESS_REVIEW", "Address review"],
     ["FIX_CI", "Fix CI"],

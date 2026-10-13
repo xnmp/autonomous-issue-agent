@@ -177,6 +177,7 @@ def test_a_huge_drift_list_is_bounded(tmp_path):
 @pytest.mark.parametrize("routes, needs_codex", [
     ({"FIX_MODEL_LOW": "codex:gpt-6-luna", "FIX_MODEL_MED": "codex:gpt-6.1-sol"}, True),
     ({"TRIAGE_MODEL": "codex:gpt-6-luna"}, True),
+    ({"STEWARD_MODEL": "codex:gpt-6-luna"}, True),
     ({"FIX_MODEL_LOW": "claude:claude-haiku-5-5", "TRIAGE_MODEL": ""}, False),
 ])
 def test_a_route_naming_codex_requires_the_codex_binary(tmp_path, routes, needs_codex):

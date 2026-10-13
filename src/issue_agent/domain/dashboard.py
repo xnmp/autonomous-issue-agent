@@ -32,7 +32,7 @@ from .state import (
     Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason,
     TriageNote, Wait, WaitReason, stop_tag,
 )
-from .triage import Triage
+from .triage import Steward, Triage
 from .world import Comment, PRView
 
 ROLE_NAMES = ("fix", "review")
@@ -93,6 +93,7 @@ class LegRow:
     verdict_body: str = ""
     tier: str = ""  # the routed tier the leg ran at (a TRIAGE leg: the tier it graded)
     triage: Triage | None = None  # a TRIAGE leg's laundered result
+    steward: Steward | None = None  # a STEWARD leg's (or a legacy TRIAGE leg's) laundered result
 
     @property
     def running(self) -> bool:
@@ -161,6 +162,15 @@ def issue_triage(legs: Iterable[LegRow]) -> Triage | None:
     return latest.triage if latest is not None else None
 
 
+def issue_steward(legs: Iterable[LegRow]) -> Steward | None:
+    """The steward result derive reads: the newest agent-ended STEWARD leg's,
+    or a legacy combined TRIAGE leg's (see `state.latest_steward`)."""
+    stewarded = [leg for leg in legs if leg.derived and leg.leg_class in ("agent", "asked")
+                 and (leg.kind == AgentKind.STEWARD.name or leg.steward is not None)]
+    latest = max(stewarded, key=lambda leg: leg.at, default=None)
+    return latest.steward if latest is not None else None
+
+
 # ── board ────────────────────────────────────────────────────────────────────
 
 
@@ -174,6 +184,7 @@ class Stage(str, Enum):
 
 STAGE_ORDER: tuple[Stage, ...] = tuple(Stage)
 _STAGE_OF_KIND: Mapping[str, Stage] = {
+    AgentKind.STEWARD.name: Stage.TRIAGE,
     AgentKind.TRIAGE.name: Stage.TRIAGE,
     AgentKind.RESOLVE.name: Stage.RESOLVE,
     AgentKind.REBASE.name: Stage.CI,
@@ -182,7 +193,7 @@ _STAGE_OF_KIND: Mapping[str, Stage] = {
     AgentKind.ADDRESS_REVIEW.name: Stage.REVIEW,
 }
 _ACT_WORDS: Mapping[str, str] = {
-    "TRIAGE": "Triage", "RESOLVE": "Resolve", "REBASE": "Rebase", "FIX_CI": "Fix CI", "REVIEW": "Review",
+    "STEWARD": "Steward", "TRIAGE": "Triage", "RESOLVE": "Resolve", "REBASE": "Rebase", "FIX_CI": "Fix CI", "REVIEW": "Review",
     "ADDRESS_REVIEW": "Address review",
 }
 
@@ -233,7 +244,7 @@ class Waiting:
     status: str = "waiting"
 
 
-ISSUE_ACTS_NAMES = frozenset({AgentKind.TRIAGE.name, AgentKind.RESOLVE.name})
+ISSUE_ACTS_NAMES = frozenset({AgentKind.STEWARD.name, AgentKind.TRIAGE.name, AgentKind.RESOLVE.name})
 BoardStatus = NeedsYou | Working | Waiting
 
 _STOP_HEADLINE: Mapping[str, str] = {
@@ -251,7 +262,7 @@ _STOP_REASON: Mapping[str, str] = {
     StopReason.REVIEW_ROUNDS.value: "The reviewer kept requesting changes; reply or unblock to continue.",
     StopReason.LIFETIME_CAP.value: "Raise the per-issue budget, then reply or unblock.",
     StopReason.WORKFLOW_PATH.value: "The PR changes files under .github/; reply or unblock once judged.",
-    StopReason.DUPLICATE.value: "Triage suspects a duplicate; close it, or reply or unblock to resolve it.",
+    StopReason.DUPLICATE.value: "Steward suspects a duplicate; close it, or reply or unblock to resolve it.",
     "labelled": "Labelled needs-human with no stop comment; unblock to hand it back.",
 }
 

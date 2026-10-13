@@ -14,9 +14,10 @@ Draft, 2026-10-12. This is the yardstick for the subtractive refactor. Anything 
 
 | Derived state | Action |
 |---|---|
-| issue `ai-ready`, never triaged | TRIAGE |
-| triaged as a duplicate of an issue that is still open | `needs-human` (duplicate) |
-| triaged, no harness triage comment yet | post the tier and acceptance criteria |
+| issue `ai-ready`, never stewarded | STEWARD |
+| stewarded as a duplicate of an issue that is still open | `needs-human` (duplicate) |
+| stewarded, never triaged | TRIAGE |
+| triaged, no harness triage comment yet | post the tier, rationale and acceptance criteria |
 | issue `ai-ready`, no PR, no lease | RESOLVE |
 | required check red on head | FIX_CI |
 | conflicted | REBASE |
@@ -28,17 +29,22 @@ Draft, 2026-10-12. This is the yardstick for the subtractive refactor. Anything 
 Attempts are counted per `(item, action)`: agent-attempt legs since the last reset event on GitHub (a non-harness comment, review or push). The cap is 3. Review rounds are the bot's CHANGES_REQUESTED reviews on the PR, also capped at 3. Hitting either cap means `needs-human` plus a comment saying why. Decisions: [refactor decisions](2026-10-12-refactor-decisions.md).
 
 ## Routing
-TRIAGE runs once per admitted issue, with no tools, and returns a tier (`low`, `med`, `high`, `xhigh`), testable acceptance criteria and, at most, one suspected duplicate drawn from issue numbers the harness offered. The result is laundered (`domain/triage.py`) and recorded on the leg; malformed output means the default tier `med`, no comment and no duplicate stop. An issue whose body has its own acceptance-criteria section is asked for none, so that section stays the contract. A failed or wall-capped triage leg is not retried: the issue runs at `med`. On Codex, triage runs read-only, outside any checkout, without the fix contract.
+Two light acts run once per admitted issue before RESOLVE, each with no tools, in this order (owner, 2026-10-14):
+
+- **STEWARD** returns testable acceptance criteria and, at most, one suspected duplicate drawn from issue numbers the harness offered. It runs first so a duplicate stops the issue before anything else is spent, and so the grader can read the criteria. An issue whose body has its own acceptance-criteria section is asked for none, so that section stays the contract.
+- **TRIAGE** returns the tier (`low`, `med`, `high`, `xhigh`) and a one-line rationale. Its prompt carries the steward's criteria.
+
+Each result is laundered (`domain/triage.py`) and recorded on its leg; malformed output means no criteria and no duplicate stop (STEWARD) or the default tier `med` (TRIAGE), and the comment needs a usable tier. A failed or wall-capped light leg is not retried: the issue proceeds. Once both legs have ended, one keyed harness comment carries the tier, rationale and criteria. A legacy TRIAGE leg recorded by the earlier combined act (its result carries the criteria list) counts as both legs, so existing issues are not re-stewarded; the one case it cannot tell apart, a legacy leg with no usable result, costs one extra steward leg. On Codex, both run read-only, outside any checkout, without the fix contract.
 
 Every fix act (RESOLVE, FIX_CI, ADDRESS_REVIEW, REBASE) runs on `FIX_MODEL_<TIER>` (`runtime:model`), escalated one tier per earlier attempt in its attempt run, capped at `xhigh`. Escalation is derived from the legs, never stored. REVIEW runs at the tier of the fix leg that produced the reviewed head, else the issue's triaged tier, else `REVIEW_MODEL`. An unset tier spec falls back to the role's single model, so a one-model config still works.
 
-A route spec is `runtime:model[:effort]` (e.g. `claude:claude-sonnet-5-5:high`, `codex:gpt-6-luna:low`), so each tier is a (runtime, model, effort) triple; `TRIAGE_MODEL` takes the same grammar. Effort is the last colon-segment when it is all letters (a Bedrock `...-v1:0` stays part of the model). Valid efforts follow what each runner can render: Claude `low|medium|high|xhigh|max` (the SDK's `EffortLevel`), Codex `low|medium|high|xhigh` (`model_reasoning_effort`). An invalid effort fails config validation, like an invalid runtime. An omitted effort keeps today's behaviour, so existing configs are unchanged: fix legs use `FIX_EFFORT` when set; triage and review legs leave the runtime default (Codex: `CODEX_REASONING_EFFORT`). A model tag ending in letters needs an explicit effort (`codex:qwen3:latest:low`). The leg's plan carries the effort, and `result_json` records it beside `tier` when the plan set one.
+A route spec is `runtime:model[:effort]` (e.g. `claude:claude-sonnet-5-5:high`, `codex:gpt-6-luna:low`), so each tier is a (runtime, model, effort) triple; `TRIAGE_MODEL` and `STEWARD_MODEL` take the same grammar (blank `STEWARD_MODEL`: `TRIAGE_MODEL`'s route, then the `low` tier's; both light legs reserve `TRIAGE_BUDGET_USD`). Effort is the last colon-segment when it is all letters (a Bedrock `...-v1:0` stays part of the model). Valid efforts follow what each runner can render: Claude `low|medium|high|xhigh|max` (the SDK's `EffortLevel`), Codex `low|medium|high|xhigh` (`model_reasoning_effort`). An invalid effort fails config validation, like an invalid runtime. An omitted effort keeps today's behaviour, so existing configs are unchanged: fix legs use `FIX_EFFORT` when set; triage and review legs leave the runtime default (Codex: `CODEX_REASONING_EFFORT`). A model tag ending in letters needs an explicit effort (`codex:qwen3:latest:low`). The leg's plan carries the effort, and `result_json` records it beside `tier` when the plan set one.
 
 Scarce fix slots go PR-stage acts before issue-stage acts (finish work in progress before starting new), then to the item that has waited longest (its newest leg end; never served counts as oldest), then by number (`fix.dispatch_order`).
 
-TRIAGE holds no fix dispatch slot (`AgentKind.holds_dispatch_slot`): it never waits behind a heavy leg and never crowds one out. At most `FIX_DISPATCH_CONCURRENCY` triage legs run at once, a second pool of the same size, still under headroom, backoff and the per-issue lease.
+STEWARD and TRIAGE hold no fix dispatch slot (`AgentKind.holds_dispatch_slot`): they never wait behind a heavy leg and never crowd one out. At most `FIX_DISPATCH_CONCURRENCY` light legs run at once, a second pool of the same size, still under headroom, backoff and the per-issue lease.
 
-The triage record is a flat object, so a later act (tech-debt tracking) can add fields without new state.
+The records are flat objects, so a later act can add fields without new state: future tech-debt tracking would extend STEWARD (docs only; nothing built).
 
 ## Labels
 - `ai-ready`: a human admits the issue.
@@ -50,7 +56,7 @@ Harness PRs are identified by branch prefix, not by a label.
 Quality comes from the repo's required CI checks plus one model review on the exact head. PRs touching `.github/workflows/**` get `needs-human`.
 
 ## Agents
-TRIAGE runs before RESOLVE in the fix role (it is not a third role). Agents push and return; they never wait on CI. They ask a question only when they need judgment. A comment counts as a reply only if it is newer than the leg's end. A wall-cap hit is a machine failure: resume once.
+STEWARD and TRIAGE run before RESOLVE in the fix role (it is not a third role). Agents push and return; they never wait on CI. They ask a question only when they need judgment. A comment counts as a reply only if it is newer than the leg's end. A wall-cap hit is a machine failure: resume once.
 
 ## Defaults (owner may veto)
 - The TDD gate becomes prompt guidance plus reviewer judgment.

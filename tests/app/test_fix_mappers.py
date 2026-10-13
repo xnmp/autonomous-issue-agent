@@ -133,8 +133,8 @@ def local(**kw):
     return Local(now=T0 + timedelta(days=1), **{"legs": {}, **kw})
 
 
-def test_heavy_dispatches_fit_the_free_slots_and_triage_needs_none():
-    triage = tuple(RunAgent(AgentKind.TRIAGE, n) for n in (1, 2, 3))
+def test_heavy_dispatches_fit_the_free_slots_and_the_light_acts_need_none():
+    triage = tuple(RunAgent(AgentKind.STEWARD, n) for n in (1, 2, 3))
     world = WorldState(
         issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)),
         prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")), harness_pr(101, issue=8, ci=ci(bucket="fail"))),
@@ -152,10 +152,19 @@ def test_free_actions_ignore_the_slot_budget_and_review_is_never_the_fix_roles()
     assert fix_actions(derive(WorldState(prs=(approved, unreviewed)), local(), H), H, slots=5, merge=False) == ()
 
 
-def test_triage_is_bounded_by_the_light_ceiling_not_the_heavy_slots():
+def test_the_light_acts_are_bounded_by_the_light_ceiling_not_the_heavy_slots():
     world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)))
     chosen = fix_actions(derive(world, local(), H), H, slots=0, light=2)
-    assert chosen == (RunAgent(AgentKind.TRIAGE, 1), RunAgent(AgentKind.TRIAGE, 2))
+    assert chosen == (RunAgent(AgentKind.STEWARD, 1), RunAgent(AgentKind.STEWARD, 2))
+
+
+def test_steward_and_triage_share_the_light_ceiling_and_neither_takes_a_heavy_slot():
+    world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (1, 2, 3)))
+    stewarded = {issue_key(2): (LegEnd(AgentKind.STEWARD, T0, False),)}
+    states = derive(world, local(legs=stewarded), H)
+    assert fix_actions(states, H, slots=0) == (
+        RunAgent(AgentKind.STEWARD, 1), RunAgent(AgentKind.TRIAGE, 2), RunAgent(AgentKind.STEWARD, 3))
+    assert fix_actions(states, H, slots=0, light=2) == (RunAgent(AgentKind.STEWARD, 1), RunAgent(AgentKind.TRIAGE, 2))
 
 
 def _slot_world():
@@ -171,7 +180,7 @@ def _heavy(states, **kw):
 
 
 def test_a_pr_act_outranks_an_issue_resolve_for_the_one_slot():
-    triaged = {issue_key(5): (LegEnd(AgentKind.TRIAGE, T0, False),)}
+    triaged = {issue_key(5): (LegEnd(AgentKind.STEWARD, T0, False), LegEnd(AgentKind.TRIAGE, T0, False))}
     states = derive(_slot_world(), local(legs=triaged), H)
     assert _heavy(states, slots=3) == [(AgentKind.RESOLVE, 5), (AgentKind.FIX_CI, 100), (AgentKind.FIX_CI, 101)]
     assert _heavy(states, slots=1) == [(AgentKind.FIX_CI, 100)]
@@ -198,7 +207,7 @@ def test_1125_starved_behind_1039_1117_1122():
     states = derive(world, local(), H)
     waiting = {pr_key(1117): T0 + timedelta(minutes=50), pr_key(1122): T0 + timedelta(minutes=40),
                pr_key(1125): T0}
-    first = [(k, n) for k, n in _heavy(states, slots=1, waiting_since=waiting) if k is not AgentKind.TRIAGE]
+    first = [(k, n) for k, n in _heavy(states, slots=1, waiting_since=waiting) if k not in (AgentKind.STEWARD, AgentKind.TRIAGE)]
     assert first == [(AgentKind.FIX_CI, 1125)]
 
 

@@ -31,7 +31,7 @@ from ..domain.outcome import (
 )
 from ..domain.policy import question_text
 from ..domain.review import parse_verdict
-from ..domain.triage import criteria_wanted, offered_duplicates, parse_triage
+from ..domain.triage import criteria_wanted, offered_duplicates, parse_steward, parse_triage
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
@@ -264,13 +264,16 @@ class AccountingRuntime(AgentRuntime):
             # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
             leg = classify_leg(result, resumed=resumed)
-            triage = None
-            if kind == "TRIAGE":
-                # Triage asks no one: a `blocked` claim in its output is not a question.
+            triage = steward = None
+            if kind in ("TRIAGE", "STEWARD"):
+                # They ask no one: a `blocked` claim in their output is not a question.
                 leg = LegClass.MACHINE if leg is LegClass.MACHINE else LegClass.AGENT
                 if not result.is_error and issue is not None:
-                    triage = parse_triage(result.structured, offered_duplicates(task.schema), issue,
-                                          criteria_wanted(task.schema))
+                    if kind == "TRIAGE":
+                        triage = parse_triage(result.structured)
+                    else:
+                        steward = parse_steward(result.structured, offered_duplicates(task.schema), issue,
+                                                criteria_wanted(task.schema))
             verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
             self.store.record_result(run_id, leg.value, session=resumable_session(result) or "", result={
                 # The PR body the harness opens a RESOLVE's branch with (Q11).
@@ -281,8 +284,9 @@ class AccountingRuntime(AgentRuntime):
                 # A review's parsed verdict: the harness submits it (and can
                 # resubmit it after a crash) without buying the review again.
                 **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
-                # Triage's laundered result: tier, criteria, suspected duplicate.
+                # Triage's laundered result: the tier. Steward's: criteria, suspected duplicate.
                 **({"triage": triage.record()} if triage is not None else {}),
+                **({"steward": steward.record()} if steward is not None else {}),
                 # The routed tier the leg ran at: a REVIEW of the head it pushed runs at the same tier.
                 **({"tier": tier} if tier else {}),
                 # The effort the plan asked for (a runtime may degrade it, e.g. Claude xhigh off Opus); absent when none was set.

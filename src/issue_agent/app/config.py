@@ -84,7 +84,7 @@ class HarnessConfig:
     review_state_dir: str = _knob("")
     worktree_root: str = _knob(".claude/worktrees")
     poll_seconds: int = _knob(20)
-    # Slot-holding fix legs (all but TRIAGE, which has its own equal ceiling)
+    # Slot-holding fix legs (all but STEWARD and TRIAGE, which have their own equal ceiling)
     # run concurrently up to this bound (one leg per issue). 2 since 2026-08-02:
     # with one slot a single ADDRESS_REVIEW leg held the whole deployment while
     # other PRs' repairs queued.
@@ -109,8 +109,10 @@ class HarnessConfig:
     fix_model_xhigh: str = _knob("")
     # The TRIAGE leg's `runtime:model[:effort]`. Blank runs it on FIX_MODEL_LOW's route.
     triage_model: str = _knob("")
-    # TRIAGE reserves this, not MAX_BUDGET_USD: a cheap classifier must not
-    # hold a fix leg's reservation against the daily caps.
+    # The STEWARD leg's `runtime:model[:effort]`. Blank runs it on TRIAGE_MODEL's route.
+    steward_model: str = _knob("")
+    # TRIAGE and STEWARD each reserve this, not MAX_BUDGET_USD: a cheap
+    # classifier must not hold a fix leg's reservation against the daily caps.
     triage_budget_usd: float = _knob(2.0)
     fix_budget_usd: float = _knob(10.0, env="MAX_BUDGET_USD")
     # $15 since 2026-08-09: sol reviews at ~2.5x terra's token rates.
@@ -214,7 +216,7 @@ class HarnessConfig:
     def _route_specs(self) -> tuple[tuple[str, str], ...]:
         return (("FIX_MODEL_LOW", self.fix_model_low), ("FIX_MODEL_MED", self.fix_model_med),
                 ("FIX_MODEL_HIGH", self.fix_model_high), ("FIX_MODEL_XHIGH", self.fix_model_xhigh),
-                ("TRIAGE_MODEL", self.triage_model))
+                ("TRIAGE_MODEL", self.triage_model), ("STEWARD_MODEL", self.steward_model))
 
     def _tier_route(self, tier: Tier) -> ModelRoute | None:
         return _route(dict(zip(TIER_LADDER, (self.fix_model_low, self.fix_model_med, self.fix_model_high,
@@ -241,10 +243,14 @@ class HarnessConfig:
         route = _route(self.triage_model)
         return (route.runtime, route.model, route.effort) if route is not None else self.fix_route(Tier.LOW)
 
+    def steward_route(self) -> tuple[RuntimeName, str | None, Effort | None]:
+        route = _route(self.steward_model)
+        return (route.runtime, route.model, route.effort) if route is not None else self.triage_route()
+
     def runtimes(self, role: str) -> frozenset[RuntimeName]:
         """Every runtime a role may dispatch a leg on."""
         if role == "fix":
-            return frozenset({self.fixer_runtime, self.triage_route()[0],
+            return frozenset({self.fixer_runtime, self.triage_route()[0], self.steward_route()[0],
                               *(self.fix_route(t)[0] for t in TIER_LADDER)})
         return frozenset({self.reviewer_runtime, *(self.review_route(t)[0] for t in TIER_LADDER)})
 
@@ -284,8 +290,8 @@ class HarnessConfig:
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} {fix_budget}",
             "routes: " + " ".join(f"{name}={route[0].value}:{model(route[1])}{effort(route[2])}" for name, route in (
-                *((t.value, self.fix_route(t)) for t in TIER_LADDER), ("triage", self.triage_route())))
-            + f" triage_budget=${self.triage_budget_usd:.2f}",
+                *((t.value, self.fix_route(t)) for t in TIER_LADDER), ("steward", self.steward_route()), ("triage", self.triage_route())))
+            + f" triage_budget=${self.triage_budget_usd:.2f} (each of steward, triage)",
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"review_budget=${self.review_budget_usd:.2f}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s wall={self.agent_max_runtime:.0f}s",
@@ -305,6 +311,7 @@ def budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
     fix = Money.from_major("USD", cfg.fix_budget_usd)
     limits = {("fix", kind): fix for kind in ("RESOLVE", "ADDRESS_REVIEW", "FIX_CI", "REBASE")}
     return BudgetPolicy({**limits, ("fix", "TRIAGE"): Money.from_major("USD", cfg.triage_budget_usd),
+                         ("fix", "STEWARD"): Money.from_major("USD", cfg.triage_budget_usd),
                          ("review", "REVIEW"): Money.from_major("USD", cfg.review_budget_usd)})
 
 

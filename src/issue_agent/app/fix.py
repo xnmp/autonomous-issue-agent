@@ -31,16 +31,16 @@ from ..domain.policy import actions as policy_actions
 from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
-from ..domain.triage import Triage, triage_from_record
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, pr_key
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, latest_steward, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from ..adapters.act import GitHubAct
 from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, stderr_log
+from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, leg_end, local_legs, run_item, run_leg, stderr_log
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
+_LIGHT_ACTS = frozenset(kind for kind in AgentKind if not kind.holds_dispatch_slot)
 
 
 def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime]) -> list[ItemKey]:
@@ -58,7 +58,7 @@ def fix_actions(
     light: int | None = None, waiting_since: Mapping[ItemKey, datetime] = MappingProxyType({}),
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches. At most
-    `slots` slot-holding dispatches, granted in `dispatch_order`; TRIAGE holds
+    `slots` slot-holding dispatches, granted in `dispatch_order`; STEWARD and TRIAGE hold
     no slot and is bounded by `light` (None: unbounded), in the same order. With
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     per_item = {key: policy_actions({key: state}, harness) for key, state in states.items()}
@@ -101,11 +101,14 @@ class FixSettings:
     runtime: str
     owner_id: str
     harness: Harness
-    # (runtime, model, effort) per tier (FIX_MODEL_<TIER>) and for TRIAGE (TRIAGE_MODEL).
+    # (runtime, model, effort) per tier (FIX_MODEL_<TIER>), for TRIAGE (TRIAGE_MODEL)
+    # and for STEWARD (STEWARD_MODEL).
     routes: Mapping[Tier, Route] = field(default_factory=dict)
     triage_route: Route | None = None
+    steward_route: Route | None = None
+    # The reservation of each light leg, STEWARD and TRIAGE alike.
     triage_budget_usd: float = 2.0
-    # An empty scratch directory: TRIAGE reads only its prompt.
+    # An empty scratch directory: the light acts read only their prompt.
     triage_cwd: str = ""
 
     def route(self, tier: Tier | None) -> Route:
@@ -170,13 +173,13 @@ class FixLegs:
             self.control.unlease(repo, "fix", issue, owner)
 
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
-        if action.kind is AgentKind.TRIAGE:
-            await self._triage(action, subject)
+        if not action.kind.holds_dispatch_slot:
+            await self._light(action, subject)
             return
         recorded = self.control.leg_runs(self.settings.repository, (issue,))
         runtime, model, effort = self.settings.route(action.tier)
-        # The review role's legs and TRIAGE's are not this role's sessions to continue.
-        runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS - {AgentKind.TRIAGE}),
+        # The review role's legs and the light acts' are not this role's sessions to continue.
+        runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS - _LIGHT_ACTS),
                       key=lambda r: r.completed_at)
         mine = [r for r in runs if run_item(r) == item]
         # The newest agent leg, the rule derive uses: machine and transport
@@ -231,36 +234,49 @@ class FixLegs:
         recovered = self.worktrees.branch_for_issue(issue, fallback)
         return recovered if recovered and harness_branch_issue(recovered) == issue else fallback
 
-    async def _triage(self, action: RunAgent, subject) -> None:
-        """One TRIAGE leg. The issues it may name as a duplicate are read from
-        GitHub here and enumerated in its schema, which is what the accounting
-        runtime launders its `duplicate_of` against."""
-        runtime, model, effort = self.settings.triage_route or self.settings.route(Tier.LOW)
-        # resumed: triage never resumes, so a wall timeout is its one attempt
-        # (the issue runs at DEFAULT_TIER), not a machine end retried forever.
-        self.runtime.set_context("fix", action.kind.name, action.number, action.number, claim_target=action.number,
+    async def _light(self, action: RunAgent, subject) -> None:
+        """One STEWARD or TRIAGE leg. STEWARD's duplicate candidates are read
+        from GitHub here and enumerated in its schema, which is what the
+        accounting runtime launders its `duplicate_of` against; TRIAGE reads
+        the steward's criteria from the recorded legs."""
+        steward = action.kind is AgentKind.STEWARD
+        name = action.kind.name
+        route = (self.settings.steward_route if steward else self.settings.triage_route)
+        runtime, model, effort = route or self.settings.route(Tier.LOW)
+        # resumed: the light acts never resume, so a wall timeout is their one
+        # attempt (STEWARD: no criteria; TRIAGE: DEFAULT_TIER), not a machine
+        # end retried forever.
+        self.runtime.set_context("fix", name, action.number, action.number, claim_target=action.number,
                                  resumed=True)
         try:
-            # Per issue: concurrent triage legs never share a cwd (or a CODEX_HOME).
+            # Per issue: concurrent light legs never share a cwd (or a CODEX_HOME).
             cwd = os.path.join(self.settings.triage_cwd, str(action.number))
             # No prepare_cwd: that writes the fix contract into Codex's home; a
             # read-only leg's home is written without it at launch.
             os.makedirs(cwd, mode=0o700, exist_ok=True)
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
-            self.log(f"TRIAGE #{action.number}: preparation failed: {exc}")
+            self.log(f"{name} #{action.number}: preparation failed: {exc}")
             self.accounting.record_refused_leg()
             return
-        index = [row for row in _soft_rows(self.gateway.issue_index, self.log) if row[0] != action.number]
-        listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title in index) or "(none)"
-        task = tasks.build_triage_task(
-            action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
-            tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime, effort=effort,
-            max_budget_usd=self.settings.triage_budget_usd,
-            criteria_wanted=not has_acceptance_criteria(subject.body or ""),
-        )
-        self.log(f"TRIAGE #{action.number}: {runtime.value}:{model or '(default model)'}"
+        if steward:
+            index = [row for row in _soft_rows(self.gateway.issue_index, self.log) if row[0] != action.number]
+            listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title in index) or "(none)"
+            task = tasks.build_steward_task(
+                action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
+                tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime, effort=effort,
+                max_budget_usd=self.settings.triage_budget_usd,
+                criteria_wanted=not has_acceptance_criteria(subject.body or ""),
+            )
+        else:
+            criteria = _criteria(self.control.leg_runs(self.settings.repository, (action.number,)))
+            task = tasks.build_triage_task(
+                action.number, as_untrusted(subject.title), as_untrusted(subject.body), cwd,
+                model=model, runtime=runtime, effort=effort, max_budget_usd=self.settings.triage_budget_usd,
+                criteria=as_untrusted("\n".join(f"- {c}" for c in criteria)) if criteria else None,
+            )
+        self.log(f"{name} #{action.number}: {runtime.value}:{model or '(default model)'}"
                  f"{':' + effort.value if effort else ''}")
-        await run_leg(self.runtime, self.log, Leg("TRIAGE", LegTarget.ISSUE, action.number, True,
+        await run_leg(self.runtime, self.log, Leg(name, LegTarget.ISSUE, action.number, True,
                                                   ("global", "repository", "issue")), task)
 
     def _session(self, runs: list[LegRun], runtime: RuntimeName) -> str:
@@ -320,11 +336,12 @@ class FixLegs:
 
 
 def _criteria(runs: Iterable[LegRun]) -> tuple[str, ...]:
-    """The acceptance criteria of the issue's latest agent-ended TRIAGE leg."""
-    triaged = [r for r in runs if r.kind == AgentKind.TRIAGE.name and leg_class(r) is not LegClass.MACHINE]
-    latest = max(triaged, key=lambda r: r.completed_at, default=None)
-    found: Triage | None = triage_from_record((latest.receipt or {}).get("triage")) if latest is not None else None
-    return found.acceptance_criteria if found is not None else ()
+    """The acceptance criteria of the issue's latest agent-ended STEWARD leg
+    (or legacy combined TRIAGE leg), as derive reads it."""
+    ends = tuple(end for r in runs if r.kind in (AgentKind.STEWARD.name, AgentKind.TRIAGE.name)
+                 and (end := leg_end(r)) is not None)
+    found = latest_steward(ends)
+    return found.steward.acceptance_criteria if found is not None and found.steward is not None else ()
 
 
 def _soft_rows(read: Callable[[], tuple], log: Callable[[str], None]) -> tuple:
@@ -374,6 +391,7 @@ def compose_fix_daemon(
     settings = FixSettings(cfg.repo, cfg.auto_merge, cfg.base_branch, cfg.fixer_runtime.value,
                            "", Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot),
                            routes={tier: cfg.fix_route(tier) for tier in Tier}, triage_route=cfg.triage_route(),
+                           steward_route=cfg.steward_route(),
                            triage_budget_usd=cfg.triage_budget_usd,
                            triage_cwd=os.path.join(cfg.state_dir, "triage"))
     task_config = tasks.FixTaskConfig(cfg.repo, cfg.base_branch, cfg.agent_md, cfg.fix_budget_usd,

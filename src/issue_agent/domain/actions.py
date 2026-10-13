@@ -20,8 +20,9 @@ class Target(Enum):
 
 
 class AgentKind(Enum):
-    """The paid acts. TRIAGE and RESOLVE run on an issue; the rest on a PR head."""
+    """The paid acts. STEWARD, TRIAGE and RESOLVE run on an issue; the rest on a PR head."""
 
+    STEWARD = auto()
     TRIAGE = auto()
     RESOLVE = auto()
     ADDRESS_REVIEW = auto()
@@ -31,9 +32,10 @@ class AgentKind(Enum):
 
     @property
     def holds_dispatch_slot(self) -> bool:
-        """Whether a leg of this act occupies and needs a dispatch slot. TRIAGE
-        is light (no workspace), so it neither waits behind nor crowds out one."""
-        return self is not AgentKind.TRIAGE
+        """Whether a leg of this act occupies and needs a dispatch slot. STEWARD
+        and TRIAGE are light (no workspace), so they neither wait behind nor
+        crowd out one."""
+        return self not in (AgentKind.STEWARD, AgentKind.TRIAGE)
 
 
 @dataclass(frozen=True)
@@ -95,7 +97,7 @@ class UpdateBranch:
 
 @dataclass(frozen=True)
 class RunAgent:
-    """Dispatch one paid leg. `number` is the issue for TRIAGE and RESOLVE,
+    """Dispatch one paid leg. `number` is the issue for STEWARD, TRIAGE and RESOLVE,
     else the PR."""
 
     kind: AgentKind
@@ -111,14 +113,14 @@ class RunAgent:
         object.__setattr__(self, "tier", check_tier(self.kind, self.tier))
 
 
-ISSUE_ACTS = frozenset({AgentKind.TRIAGE, AgentKind.RESOLVE})
+ISSUE_ACTS = frozenset({AgentKind.STEWARD, AgentKind.TRIAGE, AgentKind.RESOLVE})
 ROUTED_ACTS = frozenset({AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE})
 
 
 def check_tier(kind: AgentKind, tier: Tier | None) -> Tier | None:
     """A routed fix act always has a tier (DEFAULT_TIER when none is given);
     REVIEW may (the tier of the leg that pushed its head; None falls back to
-    REVIEW_MODEL); TRIAGE never does."""
+    REVIEW_MODEL); STEWARD and TRIAGE never do."""
     if tier is not None and not isinstance(tier, Tier):
         raise ValueError("tier must be a Tier")
     if kind in ROUTED_ACTS:

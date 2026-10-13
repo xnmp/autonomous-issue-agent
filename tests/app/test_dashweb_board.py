@@ -614,6 +614,33 @@ def test_triage_is_the_first_stage_and_the_issue_page_shows_its_tier_criteria_an
     assert [visit["stage"] for visit in detail["history"]] == ["triage"]
 
 
+def test_steward_and_triage_legs_share_the_triage_stage_and_one_summary(deployment, tmp_path):
+    backend, *_ = deployment
+    kinds = {"STEWARD": ("S1", {"steward": {"acceptance_criteria": ["Esc closes it"], "duplicate_of": None,
+                                            "duplicate_reason": ""}}),
+             "TRIAGE": ("T1", {"triage": {"tier": "low", "rationale": "One handler."}})}
+    db_path = tmp_path / "control.db"
+    for at, (kind, (leg_id, result)) in zip((-30, -20), kinds.items()):
+        db = sqlite3.connect(db_path)
+        db.execute(
+            "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, reserved_at, "
+            "started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, provider_receipt_id, "
+            "settled_at, leg_class, session_id, result_json) VALUES (?, 'o/r', 'fix', ?, 1, 1, '', 'o/r:fix', "
+            "'claude', 'ended', ?, ?, ?, 'USD', 2000000, 10000, 'provider_reported', 'normal_return', ?, ?, 'agent', "
+            "'t', ?)",
+            (leg_id, kind, store_ts(at), store_ts(at), store_ts(at + 1), leg_id, store_ts(at + 1),
+             json.dumps({**result, "summary": ""})),
+        )
+        db.commit()
+        db.close()
+
+    detail = backend.issue("demo", 1)
+    assert detail["triage"] == {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": None,
+                                "duplicate_reason": None, "rationale": "One handler."}
+    assert [s["kind"] for s in detail["steps"]] == ["STEWARD", "TRIAGE"]
+    assert [visit["stage"] for visit in detail["history"]] == ["triage"]  # one visit covers both legs
+
+
 def test_loading_the_first_observation_is_not_a_warning(deployment):
     """The dashboard says "Reading GitHub…" from a null `observed_at`; a warning
     chip for the same state double-reported loading as a fault."""
