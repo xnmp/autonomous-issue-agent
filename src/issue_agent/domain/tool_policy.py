@@ -3,8 +3,9 @@
 One table feeds both enforcement points: the SDK's `disallowed_tools` (the
 boundary; a deny rule beats bypassPermissions) and a PreToolUse hook that
 returns the reason, because the bare deny tells the agent nothing and #1078
-read a denied curl probe as "dev server denied". The hook is advisory: it may
-only be narrower than the rules, never the sole enforcement.
+read a denied curl probe as "dev server denied". Security never depends on the
+hook: it denies only commands that really invoke a listed program (it may also
+catch wrapper forms such as `env curl`), and stays silent when unsure.
 """
 
 from __future__ import annotations
@@ -45,8 +46,11 @@ DENIED_TOOLS: tuple[DeniedTool, ...] = (
 FIXER_DENY: tuple[str, ...] = tuple(d.rule for d in DENIED_TOOLS)
 _REASONS: dict[str, str] = {d.rule: d.reason for d in DENIED_TOOLS}
 
+
+def has_reasons(rules: tuple[str, ...]) -> bool:
+    return any(r in _REASONS for r in rules)
+
 _RULE = re.compile(r"^(?P<tool>[A-Za-z_][\w]*)(?:\((?P<spec>.*)\))?$", re.S)
-_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|&\n]")
 _ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 # Prefixes that run their argument: `env curl x` is still curl.
 _WRAPPERS = frozenset({"env", "command", "exec", "nohup", "time", "sudo", "nice", "builtin"})
@@ -55,15 +59,33 @@ _MAX_CMD = 100_000  # beyond this the hook stays silent; the backstop still deni
 _MAX_DEPTH = 4
 
 
+def _tokens(command: str) -> list[str] | None:
+    """Quote-aware tokens with operators split out; None when unparseable."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";|&\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    try:
+        return list(lex)
+    except ValueError:
+        return None
+
+
 def _argvs(command: str, depth: int = 0) -> list[list[str]]:
     """Every simple command in `command`: compound segments, wrapper-stripped,
-    plus the body of `sh -c '...'`."""
+    plus the body of `sh -c '...'`. Unparseable input and heredocs (whose body
+    is data, not commands) yield nothing: the hook then stays silent and the
+    deny rule alone decides."""
+    toks = _tokens(command)
+    if toks is None or any("<<" in t for t in toks):
+        return []
+    segs: list[list[str]] = [[]]
+    for t in toks:
+        if t and set(t) <= set(";|&\n"):
+            segs.append([])
+        else:
+            segs[-1].append(t)
     out: list[list[str]] = []
-    for seg in _SEGMENT_SPLIT.split(command):
-        try:
-            words = shlex.split(seg)
-        except ValueError:
-            words = seg.split()
+    for words in segs:
         while words and (_ASSIGN.match(words[0]) or words[0] in _WRAPPERS):
             words = words[1:]
         if not words:

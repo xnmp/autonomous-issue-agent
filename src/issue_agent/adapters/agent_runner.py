@@ -26,7 +26,7 @@ from typing import Any
 from .child_env import CHILD_ENV_MANIFEST
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import RunId
-from ..domain.tool_policy import denial_reason
+from ..domain.tool_policy import denial_reason, has_reasons
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
@@ -368,7 +368,7 @@ class AgentRunner(AgentRuntime):
                 self._log(f"sdk-stderr: {s[:500]}")
         kwargs["stderr"] = _cli_stderr
 
-        if task.disallowed_tools:
+        if has_reasons(task.disallowed_tools):  # a hook keeps stdin open: only where it can speak
             from claude_agent_sdk import HookMatcher
             kwargs["hooks"] = {"PreToolUse": [HookMatcher(hooks=[deny_reason_hook(task.disallowed_tools)])]}
         options = ClaudeAgentOptions(**kwargs)

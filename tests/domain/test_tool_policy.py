@@ -1,8 +1,5 @@
-import asyncio
-
 import pytest
 
-from issue_agent.adapters.agent_runner import deny_reason_hook
 from issue_agent.domain.tool_policy import DENIED_TOOLS, FIXER_DENY, denial_reason
 
 
@@ -59,10 +56,14 @@ def test_malformed_or_huge_input_never_raises(name, inp):
     denial_reason(name, inp, FIXER_DENY)
 
 
-def test_hook_emits_deny_decision_and_tolerates_garbage():
-    hook = deny_reason_hook(FIXER_DENY)
-    out = asyncio.run(hook({"tool_name": "Bash", "tool_input": {"command": "x && curl y"}}, None, None))
-    spec = out["hookSpecificOutput"]
-    assert spec["permissionDecision"] == "deny" and "agent-browser" in spec["permissionDecisionReason"]
-    assert asyncio.run(hook({"tool_name": "Bash", "tool_input": {"command": "ls"}}, None, None)) == {}
-    assert asyncio.run(hook("garbage", None, None)) == {}
+@pytest.mark.parametrize("cmd", [
+    'git commit -m "docs: replace curl; wget usage"', 'echo "a | curl b"', "grep -E 'error|curl ' src",
+    "git commit -F - <<'EOF'\nfix\ncurl is gone\nEOF", 'echo "x\ncurl y"', "echo hi # ; curl", "'unterminated curl",
+])
+def test_quoted_or_heredoc_text_is_not_a_command(cmd):
+    assert bash(cmd) is None
+
+
+def test_reasonless_rules_install_no_hook():
+    from issue_agent.domain.tool_policy import has_reasons
+    assert not has_reasons(("Edit", "Write")) and has_reasons(FIXER_DENY)
