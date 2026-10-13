@@ -37,97 +37,86 @@ DOCTOR_SH = ROOT / "bin" / "doctor.sh"
 
 
 # ── shared fixtures ────────────────────────────────────────────────────────────
+_GH_BASE = (
+    'if [ "$1" = "--version" ]; then echo "gh version 0.0.0-fake"; exit 0; fi\n'
+    'if [ "$1" = "api" ] && [ "$2" = "user" ]; then echo "fake-user"; exit 0; fi\n'
+    'if [ "$1" = "repo" ] && [ "$2" = "view" ]; then exit 0; fi\n'
+)
+_STUBS = {
+    "claude": 'echo "claude 0.0.0-fake"\n',
+    # Any `uv run` doctor makes is stubbed so the check stays hermetic.
+    "uv": 'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\nexit 2\n',
+}
+
+
+def _tool_dir(path: Path, scripts: dict[str, str]) -> Path:
+    path.mkdir()
+    for name, body in scripts.items():
+        (path / name).write_text("#!/usr/bin/env bash\n" + body)
+        (path / name).chmod((path / name).stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
 def _fake_tool_path(tmp_path: Path) -> Path:
     """A PATH-prependable dir with fast, deterministic stand-ins for the
     external tools bin/doctor.sh shells out to, so tests never depend on real
     gh auth, network, or a real `uv` environment. `git` is
     deliberately NOT stubbed — the real one is already on PATH and
     `git --version` is harmless."""
-    fake_bin = tmp_path / "fake_bin"
-    fake_bin.mkdir()
-    scripts = {
-        "gh": (
-            '#!/usr/bin/env bash\n'
-            'if [ "$1" = "--version" ]; then echo "gh version 0.0.0-fake"; exit 0; fi\n'
-            'if [ "$1" = "api" ] && [ "$2" = "user" ]; then echo "fake-user"; exit 0; fi\n'
-            'if [ "$1" = "repo" ] && [ "$2" = "view" ]; then exit 0; fi\n'
-            'exit 0\n'
-        ),
-        "claude": '#!/usr/bin/env bash\necho "claude 0.0.0-fake"\n',
-        "jq": '#!/usr/bin/env bash\necho "jq-0.0.0-fake"\n',
-        # Any `uv run` doctor makes is stubbed so the check stays hermetic.
-        "uv": (
-            '#!/usr/bin/env bash\n'
-            'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\n'
-            'exit 2\n'
-        ),
-    }
-    for name, body in scripts.items():
-        p = fake_bin / name
-        p.write_text(body)
-        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return fake_bin
+    return _tool_dir(tmp_path / "fake_bin", {**_STUBS, "gh": _GH_BASE + "exit 0\n", "jq": 'echo "jq-0.0.0-fake"\n'})
 
 
 def _run_doctor(env: dict, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    full_env = dict(os.environ)
-    full_env.update(env)
+    full_env = {**os.environ, **env}
     # doctor requires an explicit config. An empty fixture keeps these checks
     # isolated from operator config while preserving the test's passed env.
     if "AGENT_ENV" not in env:
         empty = Path(tempfile.mkdtemp(prefix="doctor-cfg-")) / "empty.env"
         empty.write_text("")
         full_env["AGENT_ENV"] = str(empty)
-    return subprocess.run(
-        ["bash", str(DOCTOR_SH)],
-        env=full_env,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    return subprocess.run(["bash", str(DOCTOR_SH)], env=full_env, cwd=str(cwd) if cwd else None,
+                          capture_output=True, text=True, timeout=30)
 
 
-def _install_compose_env(tmp_path: Path) -> Path:
+def _doctor_with(fake_bin: Path, **env: str) -> subprocess.CompletedProcess:
+    return _run_doctor({"PATH": f"{fake_bin}:{os.environ.get('PATH', '')}", **env})
+
+
+def _install_compose_env(tmp_path: Path, shared: str, overlays: dict[str, str]) -> Path:
     """Copy the REAL compose-env.sh into <tmp_path>/bin/ so its self-locating
     root (`dirname "${BASH_SOURCE[0]}"/..`) resolves to the scratch tree, not
-    the real repo's config/. Reads the current file content each run, so the
-    test always exercises the shipped script. point-at.sh rides along because
-    compose-env parses the TARGET_ENV_ scrub floor from it (fail-closed)."""
+    the real repo's config/, beside a scratch shared.env and repos/<name>.env
+    overlays. Reads the current file content each run, so the test always
+    exercises the shipped script. point-at.sh rides along because compose-env
+    parses the TARGET_ENV_ scrub floor from it (fail-closed)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     dest = bin_dir / "compose-env.sh"
     dest.write_text(COMPOSE_ENV_SH.read_text())
     dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
-    point_at = bin_dir / "point-at.sh"
-    point_at.write_text((ROOT / "bin" / "point-at.sh").read_text())
+    (bin_dir / "point-at.sh").write_text((ROOT / "bin" / "point-at.sh").read_text())
+    (tmp_path / "config" / "repos").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config" / "shared.env").write_text(shared)
+    for name, text in overlays.items():
+        (tmp_path / "config" / "repos" / f"{name}.env").write_text(text)
     return dest
 
 
 def _compose(tmp_path: Path, shared: str, overlay: str, ambient: dict | None = None) -> Path:
-    """Write a shared.env + repos/demo.env fixture pair, run the REAL
-    compose-env.sh over them with `ambient` merged into the launching shell's
-    environment, and return the composed .active.env path. An `ambient` value
-    of None DELETES that var from the launching environment, so a test can
-    assert on the "operator has not exported it" case without depending on
-    whatever the developer's shell happens to hold."""
-    compose_env_sh = _install_compose_env(tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "shared.env").write_text(shared)
-    repos_dir = tmp_path / "config" / "repos"
-    repos_dir.mkdir(exist_ok=True)
-    (repos_dir / "demo.env").write_text(overlay)
-
+    """Run the REAL compose-env.sh over a shared.env + repos/demo.env pair with
+    `ambient` merged into the launching shell's environment, and return the
+    composed .active.env path. An `ambient` value of None DELETES that var from
+    the launching environment, so a test can assert on the "operator has not
+    exported it" case without depending on whatever the developer's shell
+    happens to hold."""
+    compose_env_sh = _install_compose_env(tmp_path, shared, {"demo": overlay})
     env = dict(os.environ)
     for key, value in (ambient or {}).items():
         if value is None:
             env.pop(key, None)
         else:
             env[key] = value
-    subprocess.run(
-        ["bash", str(compose_env_sh), "demo"],
-        check=True, capture_output=True, text=True, env=env,
-    )
+    subprocess.run(["bash", str(compose_env_sh), "demo"], check=True, capture_output=True, text=True, env=env)
     return tmp_path / "config" / ".active.demo.env"
 
 
@@ -136,13 +125,8 @@ def _emitted(active: Path) -> dict[str, str]:
     (still shell-quoted) values. `printf %q` always emits a single line, so
     line-splitting is safe even for values containing newlines. Use
     `_load_agent_env` when the unquoted value matters."""
-    out = {}
-    for line in active.read_text().splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        out[key] = value
-    return out
+    return dict(line.split("=", 1) for line in active.read_text().splitlines()
+                if line and not line.startswith("#") and "=" in line)
 
 
 # `NAME=` / `export NAME=` at the start of a line — an INDEPENDENT restatement
@@ -168,14 +152,9 @@ def test_compose_env_emits_the_files_with_overlay_precedence_and_nothing_ambient
 def test_compose_env_missing_overlay_fails_loud(tmp_path):
     # Anti-vacuity twin for the usage/error paths (unchanged by the rewrite,
     # but now exercised through the real script instead of assumed).
-    compose_env_sh = _install_compose_env(tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "shared.env").write_text('FIX_BOT="fix-bot"\n')
-    (tmp_path / "config" / "repos").mkdir()
+    compose_env_sh = _install_compose_env(tmp_path, 'FIX_BOT="fix-bot"\n', {})
 
-    result = subprocess.run(
-        ["bash", str(compose_env_sh), "nonexistent"], capture_output=True, text=True
-    )
+    result = subprocess.run(["bash", str(compose_env_sh), "nonexistent"], capture_output=True, text=True)
     assert result.returncode != 0
     assert "nonexistent.env" in result.stderr
 
@@ -211,13 +190,8 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
         # union is still load-bearing and was not replaced by the file scan.
         '. "$(dirname "${BASH_SOURCE[0]}")/nested.env"\n'
     )
-    overlay = (
-        'REPO="acme/widget"\n'
-        'MERGE_METHOD="squash"\n'
-        'CI_PENDING_MAX_SECONDS="3600"\n'
-        'EMPTY_ON_PURPOSE=\n'
-    )
-    (tmp_path / "config").mkdir(exist_ok=True)
+    overlay = 'REPO="acme/widget"\nMERGE_METHOD="squash"\nCI_PENDING_MAX_SECONDS="3600"\nEMPTY_ON_PURPOSE=\n'
+    (tmp_path / "config").mkdir()
     (tmp_path / "config" / "nested.env").write_text('INDIRECT_FROM_NESTED_SOURCE="via-nested"\n')
     active = _compose(
         tmp_path, shared, overlay,
@@ -241,12 +215,10 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
     assert set(emitted) == expected
 
     env = _load_agent_env({"AGENT_ENV": str(active)})
-    assert env["TEST_CMD"] == "uv run pytest -q"
-    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ambient-real"
-    assert env["MERGE_METHOD"] == "squash"
-    assert env["INDENTED_EXPORT"] == "yes"
-    assert env["EMPTY_ON_PURPOSE"] == ""
-    assert env["INDIRECT_FROM_NESTED_SOURCE"] == "via-nested"
+    assert {key: env[key] for key in ("TEST_CMD", "ANTHROPIC_AUTH_TOKEN", "MERGE_METHOD", "INDENTED_EXPORT",
+                                      "EMPTY_ON_PURPOSE", "INDIRECT_FROM_NESTED_SOURCE")} == {
+        "TEST_CMD": "uv run pytest -q", "ANTHROPIC_AUTH_TOKEN": "sk-ambient-real", "MERGE_METHOD": "squash",
+        "INDENTED_EXPORT": "yes", "EMPTY_ON_PURPOSE": "", "INDIRECT_FROM_NESTED_SOURCE": "via-nested"}
 
 
 def test_compose_env_emits_only_sourceable_identifier_names(tmp_path):
@@ -256,18 +228,12 @@ def test_compose_env_emits_only_sourceable_identifier_names(tmp_path):
     # ("BASH_FUNC_name%%=...: command not found"), which is exactly the file
     # both `_load_agent_env` and the bash tools `source`. Assert the composed
     # file is clean AND that sourcing it is silent.
-    active = _compose(
-        tmp_path,
-        shared='_helper() { HELPED="yes"; }\n_helper\nFIX_BOT="fix-bot"\n',
-        overlay='REPO="acme/widget"\n',
-    )
+    active = _compose(tmp_path, shared='_helper() { HELPED="yes"; }\n_helper\nFIX_BOT="fix-bot"\n',
+                      overlay='REPO="acme/widget"\n')
     assert not [k for k in _emitted(active) if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)]
-    proc = subprocess.run(
-        ["bash", "-c", 'set -a; source "$1"; set +a', "check", str(active)],
-        capture_output=True, text=True,
-    )
-    assert proc.returncode == 0
-    assert proc.stderr == ""
+    proc = subprocess.run(["bash", "-c", 'set -a; source "$1"; set +a', "check", str(active)],
+                          capture_output=True, text=True)
+    assert (proc.returncode, proc.stderr) == (0, "")
     # The variable the function set is still config and still arrives.
     assert _load_agent_env({"AGENT_ENV": str(active)})["HELPED"] == "yes"
 
@@ -289,12 +255,8 @@ def test_compose_env_omits_a_conditional_assignment_that_never_fired(tmp_path):
     # A name the file scan sees inside a branch that did not execute, and that
     # nothing else set, must NOT be emitted as an empty string — an empty
     # TEST_CMD reads as "no test command" and is as bad as a missing one.
-    active = _compose(
-        tmp_path,
-        shared='if [ -n "${TRIGGER:-}" ]; then\n  MAYBE_KNOB="fired"\nfi\n',
-        overlay='REPO="acme/widget"\n',
-        ambient={"MAYBE_KNOB": None, "TRIGGER": None},
-    )
+    active = _compose(tmp_path, shared='if [ -n "${TRIGGER:-}" ]; then\n  MAYBE_KNOB="fired"\nfi\n',
+                      overlay='REPO="acme/widget"\n', ambient={"MAYBE_KNOB": None, "TRIGGER": None})
     assert "MAYBE_KNOB" not in _emitted(active)
 
 
@@ -328,30 +290,19 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
     # runs (no real GitHub/worktree/adapter construction), but os.environ.
     # update(env) — the line under test — executes for real.
     env_file = tmp_path / "agent.env"
-    env_file.write_text(
-        'REPO="o/r"\nFIX_BOT="fixer"\n'
-        'CI_PENDING_MAX_SECONDS="3600"\nMAX_RESOLVE_RETRIES="9"\n'
-    )
+    env_file.write_text('REPO="o/r"\nFIX_BOT="fixer"\nCI_PENDING_MAX_SECONDS="3600"\nMAX_RESOLVE_RETRIES="9"\n')
     monkeypatch.setenv("AGENT_ENV", str(env_file))
     monkeypatch.delenv("CI_PENDING_MAX_SECONDS", raising=False)
     monkeypatch.delenv("MAX_RESOLVE_RETRIES", raising=False)
     # Avoid a real flock/tempfile side effect — the single-instance guard is
     # not what this test is about.
-    monkeypatch.setattr(
-        main_module, "acquire", lambda role, repo, **_scope: object()
-    )
-
-    stop = RuntimeError("stop-before-build-role")
+    monkeypatch.setattr(main_module, "acquire", lambda role, repo, **_scope: object())
 
     def _boom(role, env, _scheduler_progress=None):
-        raise stop
+        raise RuntimeError("stop-before-build-role")
 
     monkeypatch.setattr(main_module, "build_role", _boom)
-    monkeypatch.setattr(
-        main_module,
-        "_recover_pre_adapter_processes",
-        lambda *_args: (),
-    )
+    monkeypatch.setattr(main_module, "_recover_pre_adapter_processes", lambda *_args: ())
 
     with pytest.raises(RuntimeError):
         main_module.main(["fix"])
@@ -360,9 +311,13 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
     assert os.environ["MAX_RESOLVE_RETRIES"] == "9"
 
 
-def test_build_role_does_not_reload_env_when_already_provided(
-    tmp_path, monkeypatch
-):
+def _machine_state(monkeypatch, tmp_path) -> Path:
+    monkeypatch.setattr("issue_agent.app.config.machine_control_authority_root",
+                        lambda: str(tmp_path / "machine-state"))
+    return tmp_path / "state"
+
+
+def test_build_role_does_not_reload_env_when_already_provided(tmp_path, monkeypatch):
     # review S7: `_load_agent_env` shells out to `bash -c ... env -0`.
     # build_role used to call it unconditionally
     # (`_load_agent_env(env if env is not None else dict(os.environ))`), so
@@ -373,30 +328,15 @@ def test_build_role_does_not_reload_env_when_already_provided(
         raise AssertionError("build_role reloaded env via _load_agent_env")
 
     monkeypatch.setattr(main_module, "_load_agent_env", _must_not_be_called)
-    monkeypatch.setattr(
-        "issue_agent.app.config.machine_control_authority_root",
-        lambda: str(tmp_path / "machine-state"),
-    )
+    state = _machine_state(monkeypatch, tmp_path)
 
     # FIX_BOT is required as of review P1R-7 (an unset one made every
     # unresolvable PR author read as ours), so a config built here must carry it.
-    state = tmp_path / "state"
-    daemon = main_module.build_role(
-        "fix",
-        {
-            "REPO": "o/r",
-            "FIX_BOT": "fix-bot",
-
-            "STATE_DIR": str(state / "fix"),
-            "REVIEW_STATE_DIR": str(state / "review"),
-        },
-    )
-    assert daemon is not None
+    assert main_module.build_role("fix", {"REPO": "o/r", "FIX_BOT": "fix-bot", "STATE_DIR": str(state / "fix"),
+                                          "REVIEW_STATE_DIR": str(state / "review")}) is not None
 
 
-def test_build_role_self_loads_env_when_called_standalone_without_one(
-    tmp_path, monkeypatch
-):
+def test_build_role_self_loads_env_when_called_standalone_without_one(tmp_path, monkeypatch):
     # Anti-vacuity twin: a standalone caller that does NOT already have a
     # loaded env (env=None, the documented default) must still get AGENT_ENV
     # applied — the "load once" fix must not silently drop loading entirely.
@@ -408,40 +348,32 @@ def test_build_role_self_loads_env_when_called_standalone_without_one(
         return real(env)
 
     monkeypatch.setattr(main_module, "_load_agent_env", _counting)
-    monkeypatch.setattr(
-        "issue_agent.app.config.machine_control_authority_root",
-        lambda: str(tmp_path / "machine-state"),
-    )
+    state = _machine_state(monkeypatch, tmp_path)
     monkeypatch.setenv("REPO", "o/r")
     monkeypatch.setenv("FIX_BOT", "fix-bot")  # required since review P1R-7
-    state = tmp_path / "state"
     monkeypatch.setenv("STATE_DIR", str(state / "fix"))
     monkeypatch.setenv("REVIEW_STATE_DIR", str(state / "review"))
     monkeypatch.delenv("AGENT_ENV", raising=False)
 
-    daemon = main_module.build_role("fix")
-    assert daemon is not None
+    assert main_module.build_role("fix") is not None
     assert len(calls) == 1
 
 
 # ── D7: doctor state-dir collision check ───────────────────────────────────────
-def test_doctor_fails_on_two_overlays_sharing_a_state_dir(tmp_path):
-    fake_bin = _fake_tool_path(tmp_path)
+def _overlays(tmp_path: Path, overlays: dict[str, str]) -> Path:
     harness = tmp_path / "harness"
-    repos_dir = harness / "config" / "repos"
-    repos_dir.mkdir(parents=True)
-    (repos_dir / "repo-a.env").write_text('REPO="acme/widget"\n')
-    (repos_dir / "repo-b.env").write_text(
-        'REPO="other/thing"\nSTATE_DIR="/custom/shared-state"\n'
-    )
-    (repos_dir / "repo-c.env").write_text(
-        'REPO="third/repo"\nSTATE_DIR="/custom/shared-state"\n'
-    )
+    (harness / "config" / "repos").mkdir(parents=True)
+    for name, text in overlays.items():
+        (harness / "config" / "repos" / f"{name}.env").write_text(text)
+    return harness
 
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "HARNESS_ROOT": str(harness),
-    })
+
+def test_doctor_fails_on_two_overlays_sharing_a_state_dir(tmp_path):
+    harness = _overlays(tmp_path, {"repo-a": 'REPO="acme/widget"\n',
+                                   "repo-b": 'REPO="other/thing"\nSTATE_DIR="/custom/shared-state"\n',
+                                   "repo-c": 'REPO="third/repo"\nSTATE_DIR="/custom/shared-state"\n'})
+
+    result = _doctor_with(_fake_tool_path(tmp_path), HARNESS_ROOT=str(harness))
     assert result.returncode != 0
     # "state-dir collision:" (with the colon) is the bad() finding line —
     # distinct from the "== per-repo state-dir collisions (...) ==" section
@@ -458,24 +390,11 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
     receive its repository-derived defaults rather than inherit the active
     deployment's exported values.
     """
-    fake_bin = _fake_tool_path(tmp_path)
-    harness = tmp_path / "harness"
-    repos_dir = harness / "config" / "repos"
-    repos_dir.mkdir(parents=True)
-    (repos_dir / "older.env").write_text('REPO="acme/widget"\n')
-    (repos_dir / "active.env").write_text(
-        'REPO="other/thing"\n'
-        'STATE_DIR="/active/fix"\n'
-        'REVIEW_STATE_DIR="/active/review"\n'
-    )
+    active = {"REPO": "other/thing", "STATE_DIR": "/active/fix", "REVIEW_STATE_DIR": "/active/review"}
+    harness = _overlays(tmp_path, {"older": 'REPO="acme/widget"\n',
+                                   "active": "".join(f'{k}="{v}"\n' for k, v in active.items())})
 
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "HARNESS_ROOT": str(harness),
-        "REPO": "other/thing",
-        "STATE_DIR": "/active/fix",
-        "REVIEW_STATE_DIR": "/active/review",
-    })
+    result = _doctor_with(_fake_tool_path(tmp_path), HARNESS_ROOT=str(harness), **active)
 
     assert "state-dir collision:" not in result.stdout
     assert "no state-dir collisions across 2 overlay(s)" in result.stdout
@@ -484,13 +403,7 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
 def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
     # normalize_login casefolds first, then strips — a differently-cased
     # [BOT] suffix must be caught too.
-    fake_bin = _fake_tool_path(tmp_path)
-    result = _run_doctor({
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "FIX_BOT": "Acme-Fixer",
-        "REVIEW_BOT": "acme-fixer[BOT]",
-        "REPO": "o/r",
-    })
+    result = _doctor_with(_fake_tool_path(tmp_path), FIX_BOT="Acme-Fixer", REVIEW_BOT="acme-fixer[BOT]", REPO="o/r")
     assert result.returncode != 0
     assert "FIX_BOT distinct from it" in result.stdout
 
@@ -499,24 +412,14 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
     """Concurrent multi-repo deployments: composing repo B must not overwrite
     repo A's snapshot (the old fixed config/.active.env did exactly that, and
     the mtime hot-reload watch then re-pointed A's live daemons at B)."""
-    compose_env_sh = _install_compose_env(tmp_path)
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "shared.env").write_text("SHARED_KNOB=x\n")
-    repos_dir = tmp_path / "config" / "repos"
-    repos_dir.mkdir(exist_ok=True)
-    (repos_dir / "alpha.env").write_text("REPO=acme/alpha\n")
-    (repos_dir / "beta.env").write_text("REPO=acme/beta\n")
+    compose_env_sh = _install_compose_env(tmp_path, "SHARED_KNOB=x\n",
+                                          {"alpha": "REPO=acme/alpha\n", "beta": "REPO=acme/beta\n"})
 
     for name in ("alpha", "beta"):
-        subprocess.run(
-            ["bash", str(compose_env_sh), name],
-            check=True, capture_output=True, text=True,
-        )
+        subprocess.run(["bash", str(compose_env_sh), name], check=True, capture_output=True, text=True)
 
-    alpha = tmp_path / "config" / ".active.alpha.env"
-    beta = tmp_path / "config" / ".active.beta.env"
-    assert "REPO=acme/alpha" in alpha.read_text()
-    assert "REPO=acme/beta" in beta.read_text()
+    assert "REPO=acme/alpha" in (tmp_path / "config" / ".active.alpha.env").read_text()
+    assert "REPO=acme/beta" in (tmp_path / "config" / ".active.beta.env").read_text()
     assert not (tmp_path / "config" / ".active.env").exists()
 
 
@@ -539,24 +442,12 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
 # the section makes. `jq` is deliberately NOT stubbed here (unlike
 # _fake_tool_path) — the section's detection lives in its jq programs, so a
 # stubbed jq would test nothing.
-def _fake_ci_tools(
-    tmp_path: Path,
-    *,
-    workflows: int = 1,
-    prs: list | None = None,
-    allow_squash: bool = True,
-) -> Path:
-    """PATH dir whose `gh` answers the CI section's three queries from fixture
-    data. Everything else behaves like _fake_tool_path's stub."""
-    fake_bin = tmp_path / "fake_ci_bin"
-    fake_bin.mkdir()
-    pr_json = json.dumps(prs if prs is not None else [])
-    gh = f"""#!/usr/bin/env bash
-if [ "$1" = "--version" ]; then echo "gh version 0.0.0-fake"; exit 0; fi
-if [ "$1" = "api" ] && [ "$2" = "user" ]; then echo "fake-user"; exit 0; fi
-if [ "$1" = "repo" ] && [ "$2" = "view" ]; then exit 0; fi
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then cat <<'JSON'
-{pr_json}
+def _ci_doctor(tmp_path: Path, extra_env: dict, *, workflows: int = 1, prs: list | None = None,
+               allow_squash: bool = True) -> subprocess.CompletedProcess:
+    """Run doctor with a `gh` that answers the CI section's three queries from
+    fixture data; everything else behaves like _fake_tool_path's stubs."""
+    gh = _GH_BASE + f"""if [ "$1" = "pr" ] && [ "$2" = "list" ]; then cat <<'JSON'
+{json.dumps(prs if prs is not None else [])}
 JSON
 exit 0; fi
 if [ "$1" = "api" ]; then
@@ -567,42 +458,16 @@ if [ "$1" = "api" ]; then
 fi
 exit 0
 """
-    (fake_bin / "gh").write_text(gh)
-    for name, body in {
-        "claude": '#!/usr/bin/env bash\necho "claude 0.0.0-fake"\n',
-        "uv": (
-            '#!/usr/bin/env bash\n'
-            'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\n'
-            'exit 2\n'
-        ),
-    }.items():
-        (fake_bin / name).write_text(body)
-    for p in fake_bin.iterdir():
-        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return fake_bin
-
-
-def _ci_doctor(tmp_path: Path, extra_env: dict, **fixture) -> subprocess.CompletedProcess:
-    fake_bin = _fake_ci_tools(tmp_path, **fixture)
+    fake_bin = _tool_dir(tmp_path / "fake_ci_bin", {**_STUBS, "gh": gh})
     harness = tmp_path / "harness"
     (harness / "config" / "repos").mkdir(parents=True, exist_ok=True)
-    env = {
-        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "HARNESS_ROOT": str(harness),
-        "REPO": "acme/widget",
-        "BASE_BRANCH": "trunk",
-        "FIX_BOT": "acme-fixer",
-        "REVIEW_BOT": "acme-review",
-    }
-    env.update(extra_env)
-    return _run_doctor(env)
+    return _doctor_with(fake_bin, **{"HARNESS_ROOT": str(harness), "REPO": "acme/widget", "BASE_BRANCH": "trunk",
+                                     "FIX_BOT": "acme-fixer", "REVIEW_BOT": "acme-review", **extra_env})
 
 
 def test_doctor_checks_explicit_composed_snapshot(tmp_path):
-    active = _compose(
-        tmp_path, 'FIX_BOT=acme-fixer\n',
-        'REPO=acme/widget\nBASE_BRANCH=trunk\nTEST_CMD="uv run pytest -q"\n',
-    )
+    active = _compose(tmp_path, 'FIX_BOT=acme-fixer\n',
+                      'REPO=acme/widget\nBASE_BRANCH=trunk\nTEST_CMD="uv run pytest -q"\n')
     result = _ci_doctor(tmp_path, {"AGENT_ENV": str(active)}, workflows=0)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -620,11 +485,7 @@ def test_doctor_errors_when_no_pr_into_base_ever_got_a_check(tmp_path):
     branch, so every PR into the base reads CIState.NONE — which the harness
     merges on. Must be an ERROR, not a warning: it silently removes CI from the
     merge gate entirely."""
-    result = _ci_doctor(
-        tmp_path, {},
-        workflows=2,
-        prs=[_pr(9, []), _pr(8, []), _pr(7, None)],
-    )
+    result = _ci_doctor(tmp_path, {}, workflows=2, prs=[_pr(9, []), _pr(8, []), _pr(7, None)])
     assert result.returncode != 0
     assert "NOT ONE of the last 3 PR(s) into 'trunk' received a single check" in result.stdout
     # It must name the consequence, not just the symptom — an operator who does
@@ -633,12 +494,8 @@ def test_doctor_errors_when_no_pr_into_base_ever_got_a_check(tmp_path):
 
 
 def test_doctor_errors_when_the_repo_forbids_the_configured_merge_method(tmp_path):
-    result = _ci_doctor(
-        tmp_path, {"MERGE_METHOD": "squash"},
-        workflows=1,
-        prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
-        allow_squash=False,
-    )
+    result = _ci_doctor(tmp_path, {"MERGE_METHOD": "squash"}, prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
+                        allow_squash=False)
     assert result.returncode != 0
     assert "MERGE_METHOD=squash is DISABLED" in result.stdout
 
