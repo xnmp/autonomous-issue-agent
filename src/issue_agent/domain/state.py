@@ -31,8 +31,9 @@ Precedence, the single place it is defined (first match wins, per item):
                owed a PR -> OpenPR (free; the agent pushes, the harness
                opens, Q11).
 7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
-               for another head -> Wait; red -> FIX_CI; pending -> Wait; green
-               and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
+               for another head -> Wait; red -> FIX_CI, unless every red
+               check is red or rerunning on the base tip too -> Wait (#313);
+               pending -> Wait; green and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
                head -> ADDRESS_REVIEW; no bot verdict on head -> REVIEW; bot
                CHANGES_REQUESTED on head -> ADDRESS_REVIEW; bot APPROVED head ->
                Merge, unless a human's standing CHANGES_REQUESTED is on an
@@ -70,8 +71,8 @@ from types import MappingProxyType
 
 from .actions import AgentKind, Target
 from .backoff import LegEnd, machine_backoff_until
-from .checks import Observed
-from .ci import Clear, Failed, Waiting, parse_timestamp, reduce_ci
+from .checks import Check, Observed
+from .ci import BaseRed, Clear, Failed, Waiting, charge, parse_timestamp, reduce_ci
 from .identity import login_eq
 from .labels import Label
 from .refs import harness_branch_issue
@@ -173,6 +174,7 @@ class WaitReason(str, Enum):
     HEAD_UNKNOWN = "head-unknown"
     CI_UNKNOWN = "ci-unknown"
     CI_PENDING = "ci-pending"
+    BASE_RED = "base-red"  # the PR's red checks are red on the base tip too (#313)
     MERGEABILITY_UNKNOWN = "mergeability-unknown"  # or reported BLOCKED
     HUMAN_CHANGES_REQUESTED = "human-changes-requested"
     HEADROOM = "headroom"
@@ -300,6 +302,7 @@ class _Item:
     pr: PRView | None = None
     branches: tuple[Branch, ...] = ()
     labeled_at: str = ""
+    base: tuple[Check, ...] | None = None  # the PR base's tip reports; None = unread
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
@@ -324,7 +327,8 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
               labeled_at=i.needs_human_labeled_at)
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
-    ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at)
+    ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
+               base=world.base.reports if world.base and world.base.ref == p.base_ref_name else None)
          for p, n in prs if p.number > 0]
     observed = parse_timestamp(world.now)
     return {item.key: _decide(item, local, harness, observed) for item in items}
@@ -389,7 +393,7 @@ def _proceed(
         return OpenPR(max(item.branches, key=lambda b: (parse_timestamp(b.committed_at) is not None,
                                                         b.committed_at, b.name)).name)
 
-    step = _pr_step(pr, harness) if pr is not None else Dispatch(AgentKind.RESOLVE)
+    step = _pr_step(pr, harness, item.base) if pr is not None else Dispatch(AgentKind.RESOLVE)
     if not isinstance(step, Dispatch):
         return step
     floor = _reset_floor(item, [at for at, _ in human], last_stop, harness)
@@ -409,7 +413,7 @@ def _proceed(
     return step
 
 
-def _pr_step(pr: PRView, harness: Harness) -> DerivedState:
+def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> DerivedState:
     head = pr.head_ref_oid
     if not head:
         return Wait(WaitReason.HEAD_UNKNOWN)
@@ -420,7 +424,13 @@ def _pr_step(pr: PRView, harness: Harness) -> DerivedState:
         return Wait(WaitReason.CI_UNKNOWN)
     ci = reduce_ci(pr.ci)
     if isinstance(ci, Failed):
+        ci = charge(ci, base)
+    if isinstance(ci, Failed):
         return Dispatch(AgentKind.FIX_CI, head)
+    # The base is the repo's to fix (Q13: flakes are the repo's). The PR
+    # waits uncharged and resumes when the base tip stops failing.
+    if isinstance(ci, BaseRed):
+        return Wait(WaitReason.BASE_RED)
     if isinstance(ci, Waiting):
         return Wait(WaitReason.CI_PENDING)
     if not isinstance(ci, Clear):

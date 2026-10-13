@@ -20,7 +20,7 @@ from issue_agent.domain.actions import (
     UpdateBranch,
 )
 from issue_agent.domain.backoff import LegEnd
-from issue_agent.domain.checks import Check, Observed, RequiredCheck, Unavailable
+from issue_agent.domain.checks import BaseTip, Check, Observed, RequiredCheck, Unavailable
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import QUESTION_LIMIT, actions, question_text
 from issue_agent.domain.refs import harness_branch_issue
@@ -164,6 +164,48 @@ def test_harness_branch_parser_rejects_malformed_input(raw):
 
 def test_red_required_check_on_head_dispatches_fix_ci():
     assert pr_state(pr(ci=RED)) == Dispatch(FIX, HEAD)
+
+
+def _red_base(*red: str, ref: str = "dev") -> BaseTip:
+    return BaseTip(ref, "b9", tuple(Check(n, "FAILURE", "fail") for n in red) + (Check("lint", "SUCCESS", "pass"),))
+
+
+def _two_red() -> Observed:
+    checks = tuple(Check(n, "FAILURE", "fail", required=True) for n in ("test", "e2e"))
+    return Observed(HEAD, HEAD, frozenset({RequiredCheck("test"), RequiredCheck("e2e")}), checks)
+
+
+def test_313_a_red_base_is_not_charged_to_every_open_pr():
+    world = WorldState(prs=(pr(7, 3, ci=RED, base_ref_name="dev"), pr(8, 4, ci=RED, base_ref_name="dev")),
+                       base=_red_base("test"))
+    # Even with FIX_CI attempts spent, a base failure neither dispatches nor caps.
+    spent = {pr_key(7): legs(FIX, 1, 2, 3)}
+    assert derive(world, local(spent), H) == {pr_key(7): Wait(WaitReason.BASE_RED), pr_key(8): Wait(WaitReason.BASE_RED)}
+
+
+def test_313_a_pr_red_beyond_the_base_still_gets_fix_ci():
+    assert pr_state_in(pr(ci=_two_red(), base_ref_name="dev"), _red_base("test")) == Dispatch(FIX, HEAD)
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), _red_base("lint")) == Dispatch(FIX, HEAD)
+
+
+@pytest.mark.parametrize("base", [None, _red_base("test", ref="main")])
+def test_313_an_unread_or_other_base_charges_the_pr(base):
+    # Absent base evidence, or a tip of a branch this PR does not target.
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), base) == Dispatch(FIX, HEAD)
+
+
+def test_313_the_pr_resumes_when_the_base_goes_green():
+    green = BaseTip("dev", "b10", (Check("test", "SUCCESS", "pass"),))
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), green) == Dispatch(FIX, HEAD)
+
+
+def test_313_a_base_twin_still_running_is_waited_for():
+    running = BaseTip("dev", "b10", (Check("test", "FAILURE", "fail"), Check("test", "IN_PROGRESS", "pending")))
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), running) == Wait(WaitReason.CI_PENDING)
+
+
+def pr_state_in(p: PRView, base: BaseTip | None):
+    return one(WorldState(prs=(p,), base=base))
 
 
 def test_conflicted_pr_rebases_even_when_red_or_unread():

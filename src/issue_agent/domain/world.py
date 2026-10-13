@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 
 from .identity import is_bot_login
 from .labels import Label
-from .checks import Check, CIObservation, Observed, Unavailable
+from .checks import BaseTip, Check, CIObservation, Observed, Unavailable
 
 
 # GitHub review states (as returned by the reviews API / pr view).
@@ -180,6 +180,9 @@ class WorldState:
     now: str = ""
     # Harness branches with no PR in any state. Empty = none observed.
     branches: tuple[Branch, ...] = ()
+    # The configured base branch's tip and its checks. None = unread: a red PR
+    # check is then charged to the PR, as before #313.
+    base: BaseTip | None = None
 
 
 # Convenience re-export so callers can `from .world import replace`.

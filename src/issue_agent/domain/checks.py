@@ -59,3 +59,18 @@ class Observed:
 
 
 CIObservation = Unavailable | Observed
+
+
+@dataclass(frozen=True)
+class BaseTip:
+    """The base branch's tip commit and every check reported on it. Only a
+    complete read constructs one; an unread tip is absent, never empty (#313)."""
+
+    ref: str
+    oid: str
+    reports: tuple[Check, ...]
+
+    def __post_init__(self) -> None:
+        if (any(not isinstance(v, str) or not v for v in (self.ref, self.oid))
+                or not isinstance(self.reports, tuple) or any(not isinstance(c, Check) for c in self.reports)):
+            raise ValueError("base tip requires a ref, a commit and typed reports")
