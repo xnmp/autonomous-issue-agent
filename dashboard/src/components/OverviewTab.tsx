@@ -365,9 +365,9 @@ function HealthRow({ health }: { health: RoleHealth }) {
       <Chip tone={tone}>{HEALTH_LABEL[h]}</Chip>
       {health.state ? <span className="faint mono">{health.state}</span> : null}
       <span className="faint">
-        {health.in_flight.length === 0
+        {(health.in_flight ?? []).length === 0
           ? "idle"
-          : health.in_flight.map((d) => `${kindLabel(d.kind)} #${d.number}`).join(", ")}
+          : (health.in_flight ?? []).map((d) => `${kindLabel(d.kind)} #${d.number}`).join(", ")}
       </span>
       <span className="spacer" />
       <span className="faint num" title={health.heartbeat_ts ?? undefined}>

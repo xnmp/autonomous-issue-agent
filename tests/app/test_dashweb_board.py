@@ -528,3 +528,16 @@ def test_carried_legs_are_one_pre_cutover_total_not_legacy_kind_rows(deployment)
     assert [s["kind"] for s in detail["steps"]] == ["RESOLVE"]
     assert detail["carried"] == {"legs": 1, "cost_usd": 1.5} and detail["cost_usd"] == 3.5
     assert "ROUTE" not in kinds and "carried" in kinds
+
+
+def test_a_malformed_lease_stamp_is_store_unavailable_not_a_server_error(deployment):
+    backend, _log, db, _gateway = deployment
+    bad = sqlite3.connect(db)
+    bad.execute("UPDATE leases SET acquired_at='2026-10-13T11:55:00' WHERE leg_id='L4'")  # naive
+    bad.commit()
+    bad.close()
+
+    payload = backend.repos()
+
+    assert payload["repos"][0]["in_flight"] is None
+    assert backend.overview("demo", "UTC")["store_error"].startswith("control store unavailable")

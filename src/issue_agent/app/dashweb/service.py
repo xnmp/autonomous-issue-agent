@@ -263,7 +263,7 @@ class Backend:
                 fix, review = facts["fix"](world), facts["review"](world)
                 states = dash.role_states(derive(world, fix, dep.harness), derive(world, review, dep.harness))
                 return StoreRead(legs, states, fix.legs, leases, caps)
-        except (ControlStoreError, sqlite3.Error, OSError) as exc:
+        except (ControlStoreError, sqlite3.Error, OSError, ValueError) as exc:  # ValueError: a malformed stamp
             return StoreRead(problem=f"control store unavailable: {_detail(exc)}")
 
     def _caps(self, cfg: HarnessConfig, store: ReadOnlyControlStore, facts: Mapping[str, Facts]) -> Caps:
