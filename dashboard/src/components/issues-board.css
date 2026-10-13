@@ -160,12 +160,6 @@
 .board-refs .board-pr-link:hover .board-pr {
   background: color-mix(in srgb, var(--chip-c) 24%, transparent);
 }
-.board-overspend {
-  color: var(--fail);
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-}
 .board-say {
   display: flex;
   flex-direction: column;
@@ -471,40 +465,6 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   overflow-wrap: anywhere;
-}
-.board-tier {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: 0 7px 0 6px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  color: var(--ink-muted);
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  line-height: 20px;
-}
-.board-tier-meter {
-  display: inline-flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 10px;
-}
-.board-tier-meter b {
-  width: 3px;
-  border-radius: 1px;
-  background: var(--border-strong);
-}
-.board-tier-meter b:nth-child(1) { height: 4px; }
-.board-tier-meter b:nth-child(2) { height: 6px; }
-.board-tier-meter b:nth-child(3) { height: 8px; }
-.board-tier-meter b:nth-child(4) { height: 10px; }
-.board-tier-meter b.on {
-  background: var(--ink);
-}
-.board-tier-none {
-  border-style: dashed;
-  color: var(--ink-faint);
 }
 .board-actions {
   display: flex;
