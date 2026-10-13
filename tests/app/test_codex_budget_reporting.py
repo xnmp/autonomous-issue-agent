@@ -8,13 +8,9 @@ from issue_agent.app.config import from_env
 
 
 def _describe(**env: str) -> str:
-    return from_env({
-        "REPO": "o/r",
-        "FIXER_RUNTIME": "codex",
-        "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "3600",
-        **env,
-    }).describe()
+    return from_env(
+        {"REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20", "AGENT_MAX_RUNTIME_SECONDS": "3600", **env}
+    ).describe()
 
 
 def test_default_priced_config_reports_harness_enforcement():
@@ -25,11 +21,7 @@ def test_default_priced_config_reports_harness_enforcement():
 
 @pytest.mark.parametrize(
     "env",
-    [
-        {"CODEX_COST_PER_MTOK_IN": "0"},
-        {"CODEX_COST_PER_MTOK_OUT": "0"},
-        {"CODEX_COST_PER_MTOK": "gpt-5.6-terra=2/0"},
-    ],
+    [{"CODEX_COST_PER_MTOK_IN": "0"}, {"CODEX_COST_PER_MTOK_OUT": "0"}, {"CODEX_COST_PER_MTOK": "gpt-5.6-terra=2/0"}],
 )
 def test_incomplete_pricing_reports_unmeasurable_budget(env):
     description = _describe(**env)

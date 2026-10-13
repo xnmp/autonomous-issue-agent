@@ -44,9 +44,7 @@ class Journal:
 
 
 def _effects(gateway, *, run=None, journal=None):
-    return GitHubOperatorEffects(
-        "o/r", gateway, identity="o/r:dashboard", run=run or _unexpected, journal=journal,
-    )
+    return GitHubOperatorEffects("o/r", gateway, identity="o/r:dashboard", run=run or _unexpected, journal=journal)
 
 
 def _unexpected(argv, **_kwargs):
@@ -126,8 +124,12 @@ def test_an_applied_label_change_is_journalled_as_an_operator_action():
     journal = Journal()
 
     _effects(gateway, journal=journal).set_labels(
-        "issue", 9, add=("ai-ready",), remove=("needs-human",),
-        action_kind="operator_unblock", action_attributes={"channel": "ui"},
+        "issue",
+        9,
+        add=("ai-ready",),
+        remove=("needs-human",),
+        action_kind="operator_unblock",
+        action_attributes={"channel": "ui"},
     )
 
     ((name, fields),) = journal.events

@@ -28,10 +28,18 @@ def test_full_gate_uses_private_scratch_and_cleans_only_its_own_directory(tmp_pa
     if explicit:
         env["TMPDIR"] = str(chosen)
     result = subprocess.run(
-        ["bash", str(SCRIPT), "bash", "-c",
-         'printf "%s\\n" "$TMPDIR"; test -d "$TMPDIR"; touch "$TMPDIR/evidence"; exit "$1"',
-         "test", str(exit_code)],
-        env=env, capture_output=True, text=True,
+        [
+            "bash",
+            str(SCRIPT),
+            "bash",
+            "-c",
+            'printf "%s\\n" "$TMPDIR"; test -d "$TMPDIR"; touch "$TMPDIR/evidence"; exit "$1"',
+            "test",
+            str(exit_code),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
     )
     scratch = Path(result.stdout.strip())
     assert result.returncode == exit_code
@@ -45,7 +53,8 @@ def test_invalid_explicit_scratch_parent_fails_without_running_tests(tmp_path):
     result = subprocess.run(
         ["bash", str(SCRIPT), "touch", str(marker)],
         env={**os.environ, "TMPDIR": str(tmp_path / "missing")},
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode != 0
     assert not marker.exists()

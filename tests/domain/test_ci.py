@@ -10,12 +10,15 @@ def _observed(*checks: Check) -> Observed:
     return Observed("h", "h", frozenset(), checks)
 
 
-@pytest.mark.parametrize("checks,expected", [
-    ((), Clear),  # an honest empty read: nothing to wait on
-    ((Check("build", bucket="pass"),), Clear),
-    ((Check("a", bucket="pass"), Check("b", bucket="fail")), Failed),
-    ((Check("Security Audit", bucket="fail"),), Failed),  # advisory is never inferred
-])
+@pytest.mark.parametrize(
+    "checks,expected",
+    [
+        ((), Clear),  # an honest empty read: nothing to wait on
+        ((Check("build", bucket="pass"),), Clear),
+        ((Check("a", bucket="pass"), Check("b", bucket="fail")), Failed),
+        ((Check("Security Audit", bucket="fail"),), Failed),  # advisory is never inferred
+    ],
+)
 def test_settled_checks_reduce_to_clear_or_failed(checks, expected):
     assert type(reduce_ci(_observed(*checks))) is expected
 

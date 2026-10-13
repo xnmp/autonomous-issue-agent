@@ -18,6 +18,7 @@ The assertions below pin the CONTRACT ("which identity does the resolver hand
 back, and does it say so out loud"), not the mechanism — they observe the
 returned Identity and the warnings emitted, never how the branch is written.
 """
+
 from __future__ import annotations
 
 import os
@@ -81,12 +82,7 @@ def test_fallback_to_ambient_warns_that_approvals_will_422():
     approval as a self-approval. That consequence belongs in the warning."""
     seen, warn = _warnings()
     ident = _app_identity(
-        {
-            "GH_APP_ID": "123",
-            "GH_APP_INSTALL_ID": "456",
-            "GH_APP_KEY_FILE": "/nonexistent/private-key.pem",
-        },
-        warn=warn,
+        {"GH_APP_ID": "123", "GH_APP_INSTALL_ID": "456", "GH_APP_KEY_FILE": "/nonexistent/private-key.pem"}, warn=warn
     )
     assert ident.static_token is None and ident.token_provider is None  # ambient
     assert len(seen) == 1
@@ -116,11 +112,7 @@ def test_app_key_path_is_tilde_expanded(tmp_path, monkeypatch, key_file):
     monkeypatch.setenv("HOME", str(tmp_path))
     seen, warn = _warnings()
     ident = _app_identity(
-        {
-            "GH_APP_ID": "123",
-            "GH_APP_INSTALL_ID": "456",
-            "GH_APP_KEY_FILE": "~/" + os.path.basename(key_file),
-        },
+        {"GH_APP_ID": "123", "GH_APP_INSTALL_ID": "456", "GH_APP_KEY_FILE": "~/" + os.path.basename(key_file)},
         warn=warn,
     )
     assert ident.token_provider is not None
@@ -128,9 +120,7 @@ def test_app_key_path_is_tilde_expanded(tmp_path, monkeypatch, key_file):
 
 
 # ── the branch is never entered when the App is simply not configured ────────
-@pytest.mark.parametrize(
-    "missing", ["GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE"]
-)
+@pytest.mark.parametrize("missing", ["GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE"])
 def test_partial_app_config_uses_the_token_without_warning(key_file, missing):
     """A half-set App block is 'not configured', not 'broken' — no warning, and
     certainly no crash."""

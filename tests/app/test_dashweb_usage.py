@@ -26,10 +26,12 @@ def creds(tmp_path, token="sk-oauth-secret"):
 
 
 def test_utilization_objects_are_read_as_percentages():
-    parsed = usage.parse_claude_usage({
-        "five_hour": {"utilization": 12.5, "resets_at": "2026-07-29T15:00:00Z"},
-        "seven_day": {"utilization": 43.0, "resets_at": 1785728237},
-    })
+    parsed = usage.parse_claude_usage(
+        {
+            "five_hour": {"utilization": 12.5, "resets_at": "2026-07-29T15:00:00Z"},
+            "seven_day": {"utilization": 43.0, "resets_at": 1785728237},
+        }
+    )
     assert parsed["five_hour_pct"] == 12.5
     assert parsed["five_hour_resets_at"] == "2026-07-29T15:00:00Z"
     assert parsed["seven_day_pct"] == 43.0
@@ -48,8 +50,7 @@ def test_a_fetch_failure_reports_an_error_without_leaking_the_token(tmp_path):
     def fetch(token):
         raise OSError(f"connection refused while sending {token}")
 
-    result = usage.claude_usage(fetch=fetch, credentials_path=creds(tmp_path),
-                               cache=fresh_cache())
+    result = usage.claude_usage(fetch=fetch, credentials_path=creds(tmp_path), cache=fresh_cache())
     assert result["error"] and "sk-oauth-secret" not in result["error"]
     assert result["five_hour_pct"] is None
 
@@ -57,10 +58,7 @@ def test_a_fetch_failure_reports_an_error_without_leaking_the_token(tmp_path):
 def test_an_unexpected_response_keeps_the_last_successful_reading(tmp_path):
     last_good = {}
     usage.claude_usage(
-        fetch=lambda _token: {
-            "five_hour": {"utilization": 17.0},
-            "seven_day": {"utilization": 42.0},
-        },
+        fetch=lambda _token: {"five_hour": {"utilization": 17.0}, "seven_day": {"utilization": 42.0}},
         credentials_path=creds(tmp_path),
         cache=fresh_cache(),
         last_good=last_good,
@@ -82,9 +80,7 @@ def test_missing_credentials_are_reported_and_no_fetch_is_attempted(tmp_path):
     def fetch(token):
         raise AssertionError("must not be called without credentials")
 
-    result = usage.claude_usage(fetch=fetch,
-                               credentials_path=str(tmp_path / "absent.json"),
-                               cache=fresh_cache())
+    result = usage.claude_usage(fetch=fetch, credentials_path=str(tmp_path / "absent.json"), cache=fresh_cache())
     assert "credentials" in result["error"]
 
 
@@ -97,17 +93,18 @@ def test_a_malformed_credentials_file_yields_no_token(tmp_path):
 
 # ── codex ─────────────────────────────────────────────────────────────────────
 def rollout_line(pct, resets=1785728237, plan="plus"):
-    return json.dumps({
-        "type": "event_msg",
-        "payload": {
-            "rate_limits": {
-                "limit_id": "codex",
-                "primary": {"used_percent": pct, "window_minutes": 10080,
-                            "resets_at": resets},
-                "plan_type": plan,
-            }
-        },
-    })
+    return json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {"used_percent": pct, "window_minutes": 10080, "resets_at": resets},
+                    "plan_type": plan,
+                }
+            },
+        }
+    )
 
 
 def test_the_last_rate_limits_snapshot_in_the_rollout_wins():
@@ -162,7 +159,10 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
     from zoneinfo import ZoneInfo
 
     from issue_agent.adapters.control_store import (
-        BudgetLimit, ReservationRequest, SQLiteControlStore, SettlementRequest,
+        BudgetLimit,
+        ReservationRequest,
+        SQLiteControlStore,
+        SettlementRequest,
     )
     from issue_agent.domain.contracts import BudgetScope, Money, PricingBasis, RunId
 
@@ -172,34 +172,53 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
     clock = [datetime(2026, 7, 29, tzinfo=timezone.utc)]
     control = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: clock[0])
     control.initialize()
-    settled = (("2026-07-29T01:00:00+00:00", "o/r", 1, 1_500_000),
-               ("2026-07-29T02:00:00+00:00", "o/other", 2, 2_000_000),
-               ("2026-07-28T02:00:00+00:00", "o/r", 1, 9_000_000))
+    settled = (
+        ("2026-07-29T01:00:00+00:00", "o/r", 1, 1_500_000),
+        ("2026-07-29T02:00:00+00:00", "o/other", 2, 2_000_000),
+        ("2026-07-28T02:00:00+00:00", "o/r", 1, 9_000_000),
+    )
     for index, (stamp, repository, issue, micros) in enumerate(settled):
         clock[0] = datetime.fromisoformat(stamp)
         owner = f"{repository}:fix"
         assert control.lease(repository, "fix", issue, owner)
-        scope = BudgetScope(repository, "repository", "USD", "all", datetime(2026, 1, 1, tzinfo=timezone.utc),
-                            datetime(2027, 1, 1, tzinfo=timezone.utc), ZoneInfo("UTC"))
+        scope = BudgetScope(
+            repository,
+            "repository",
+            "USD",
+            "all",
+            datetime(2026, 1, 1, tzinfo=timezone.utc),
+            datetime(2027, 1, 1, tzinfo=timezone.utc),
+            ZoneInfo("UTC"),
+        )
         run = RunId(f"leg-{index}")
-        assert control.reserve(ReservationRequest(
-            run, repository, "fix", "RESOLVE", owner, Money("USD", micros),
-            (BudgetLimit(scope, Money("USD", 10**9)),), issue, issue=issue,
-        )).admitted
-        assert control.settle(SettlementRequest(
-            run, Money("USD", micros), PricingBasis.PROVIDER_REPORTED, f"receipt-{index}", None, None, None,
-        )).disposition.value == "available"
+        assert control.reserve(
+            ReservationRequest(
+                run,
+                repository,
+                "fix",
+                "RESOLVE",
+                owner,
+                Money("USD", micros),
+                (BudgetLimit(scope, Money("USD", 10**9)),),
+                issue,
+                issue=issue,
+            )
+        ).admitted
+        assert (
+            control.settle(
+                SettlementRequest(
+                    run, Money("USD", micros), PricingBasis.PROVIDER_REPORTED, f"receipt-{index}", None, None, None
+                )
+            ).disposition.value
+            == "available"
+        )
     now = lambda: datetime(2026, 7, 29, 12, tzinfo=timezone.utc)  # noqa: E731
+
     def config_for(name):
         path = tmp_path / "repos" / f"{name}.env"
         return cli.read_repo_env_field(str(path), "REPO"), cli.daily_cap(name), 0.0
 
-    result = usage.harness_usage(
-        ["demo"],
-        config_for,
-        control.path,
-        now_fn=now,
-    )
+    result = usage.harness_usage(["demo"], config_for, control.path, now_fn=now)
     assert result["today_all_repos_usd"] == 3.5
     assert result["per_repo"][0]["today_usd"] == 1.5
     assert result["per_repo"][0]["daily_cap_usd"] == 20.0
@@ -207,24 +226,12 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
 
 def test_harness_usage_never_reports_missing_authority_as_zero(tmp_path):
     with pytest.raises(RuntimeError, match="does not exist"):
-        usage.harness_usage(
-            [],
-            lambda _name: ("", 0.0, 0.0),
-            str(tmp_path / "missing" / "control.db"),
-        )
+        usage.harness_usage([], lambda _name: ("", 0.0, 0.0), str(tmp_path / "missing" / "control.db"))
 
 
 def test_usage_payload_marks_unavailable_harness_spend_unknown(monkeypatch):
-    monkeypatch.setattr(
-        usage,
-        "claude_usage",
-        lambda fetch=None: {"error": None},
-    )
-    monkeypatch.setattr(
-        usage,
-        "codex_usage",
-        lambda: {"error": None},
-    )
+    monkeypatch.setattr(usage, "claude_usage", lambda fetch=None: {"error": None})
+    monkeypatch.setattr(usage, "codex_usage", lambda: {"error": None})
 
     def unavailable_harness(*_args, **_kwargs):
         raise RuntimeError("control store does not exist")
@@ -234,6 +241,4 @@ def test_usage_payload_marks_unavailable_harness_spend_unknown(monkeypatch):
     result = usage.usage_payload([], lambda _name: ("", 0.0, 0.0))
 
     assert result["harness"]["today_all_repos_usd"] is None
-    assert result["warnings"] == [
-        "harness caps unreadable (control store does not exist)"
-    ]
+    assert result["warnings"] == ["harness caps unreadable (control store does not exist)"]

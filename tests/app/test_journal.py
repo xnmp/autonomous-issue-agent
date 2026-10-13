@@ -9,55 +9,34 @@ called — rather than merely that a label moved.
 
 from __future__ import annotations
 
-
 import asyncio
-from datetime import datetime, timezone
 
 import pytest
 
 from tests.fakes.legacy_journal import Journal, read_events
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
+from issue_agent.app.cli import spend_status_lines
 from issue_agent.domain.outcome import AgentResult, ExitReason
 
-NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 
-
-def _at(dt: datetime) -> str:
-    return dt.replace(microsecond=0).isoformat()
-
-
-# ── unsettled starts / bounded tail read (review P0R-4) ───────────────────────
-# The counter for the death nobody could record: SIGKILL / OOM / systemctl
-# restart mid-`await`. Every existing bump site is code that runs AFTER the
-# session ends, so a death that takes the daemon with it leaves an
-# `agent_run_start` and nothing else — and systemd brings the process back to
-# buy the same session again.
-def _start(dt, kind="RESOLVE", number=5, issue=5, dispatch="", role="fix"):
-    return {"ts": _at(dt), "event": "agent_run_start", "role": role,
-            "kind": kind, "number": number, "issue": issue, "model": "opus",
-            "dispatch": dispatch}
-
-
-def _run(dt, kind="RESOLVE", number=5, issue=5, dispatch="", role="fix", **extra):
-    return {"ts": _at(dt), "event": "agent_run", "role": role, "kind": kind,
-            "number": number, "issue": issue, "cost_usd": 0.0,
-            "dispatch": dispatch, **extra}
+def _leg(rt, prompt="p", **plan):
+    return asyncio.run(rt.run(RuntimePlan(prompt=prompt, **plan)))
 
 
 def test_the_real_runtime_stamps_one_dispatch_id_across_every_leg(tmp_path):
     """Pins the producer half of the rule: `set_context` is called once per
     dispatch, so every leg it runs must carry the SAME id — and the next
     dispatch a DIFFERENT one, or two polls' deaths collapse into one."""
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False))
+    rt, journal = _runtime(tmp_path, AgentResult(is_error=False))
     rt.set_context("review", "REVIEW", 100, 7)
-    asyncio.run(rt.run(RuntimePlan(prompt="gate")))
-    asyncio.run(rt.run(RuntimePlan(prompt="dimension")))
+    _leg(rt, "gate")
+    _leg(rt, "dimension")
     first = {e["dispatch"] for e in read_events(journal.path)}
     assert len(first) == 1 and "" not in first
 
     rt.set_context("review", "REVIEW", 100, 7)
-    asyncio.run(rt.run(RuntimePlan(prompt="gate")))
+    _leg(rt, "gate")
     assert len({e["dispatch"] for e in read_events(journal.path)}) == 2
 
 
@@ -68,38 +47,24 @@ def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
             return AgentResult(is_error=False, status="done")
 
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    runtime = JournalingRuntime(
-        YieldingRuntime(), journal, repo="o/r", role="fix"
-    )
+    runtime = JournalingRuntime(YieldingRuntime(), journal, repo="o/r", role="fix")
 
     async def dispatch(kind, number):
         runtime.set_context("fix", kind, number, number)
         await runtime.run(RuntimePlan(prompt=kind))
 
     async def run_both():
-        await asyncio.gather(
-            dispatch("RESOLVE", 5),
-            dispatch("RESUME", 7),
-        )
+        await asyncio.gather(dispatch("RESOLVE", 5), dispatch("RESUME", 7))
 
     asyncio.run(run_both())
 
     events = read_events(journal.path)
-    by_number = {
-        number: [event for event in events if event["number"] == number]
-        for number in (5, 7)
-    }
-    assert {
-        number: {(event["kind"], event["issue"]) for event in rows}
-        for number, rows in by_number.items()
-    } == {
+    by_number = {number: [event for event in events if event["number"] == number] for number in (5, 7)}
+    assert {number: {(event["kind"], event["issue"]) for event in rows} for number, rows in by_number.items()} == {
         5: {("RESOLVE", 5)},
         7: {("RESUME", 7)},
     }
-    assert all(
-        len({event["dispatch"] for event in rows}) == 1
-        for rows in by_number.values()
-    )
+    assert all(len({event["dispatch"] for event in rows}) == 1 for rows in by_number.values())
     assert by_number[5][0]["dispatch"] != by_number[7][0]["dispatch"]
 
 
@@ -114,14 +79,11 @@ class FakeInner:
         return self.result
 
 
-def _runtime(tmp_path, result, repo="o/r"):
+def _runtime(tmp_path, inner, role="fix"):
+    """A journaling runtime over ``inner`` (a bare result means a FakeInner)."""
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    ledger = str(tmp_path / "spend.jsonl")
-    return (
-        JournalingRuntime(FakeInner(result), journal, repo=repo, role="fix"),
-        journal,
-        ledger,
-    )
+    inner = FakeInner(inner) if isinstance(inner, AgentResult) else inner
+    return JournalingRuntime(inner, journal, repo="o/r", role=role), journal
 
 
 def _settled(journal_path) -> list[dict]:
@@ -132,14 +94,22 @@ def _settled(journal_path) -> list[dict]:
 
 def test_agent_run_records_context_cost_and_usage(tmp_path):
     result = AgentResult(
-        is_error=False, status="pr_opened", cost_usd=1.25, session_id="s5",
+        is_error=False,
+        status="pr_opened",
+        cost_usd=1.25,
+        session_id="s5",
         exit_reason=ExitReason.OK,
-        usage={"input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 30,
-               "cache_creation_input_tokens": 40, "ignored": "extra"},
+        usage={
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 40,
+            "ignored": "extra",
+        },
     )
-    rt, journal, ledger = _runtime(tmp_path, result)
+    rt, journal = _runtime(tmp_path, result)
     rt.set_context("fix", "RESOLVE", 5, 5)
-    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
+    _leg(rt, model="opus")
 
     run = _settled(journal.path)[0]
     assert run["event"] == "agent_run"
@@ -147,23 +117,21 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
     assert run["model"] == "opus" and run["cost_usd"] == 1.25
     assert run["status"] == "pr_opened" and run["is_error"] is False
     assert run["exit_reason"] == "ok" and run["session_id"] == "s5"
-    assert run["usage"] == {"input_tokens": 10, "output_tokens": 20,
-                            "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40}
+    assert run["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 30,
+        "cache_creation_input_tokens": 40,
+    }
     assert isinstance(run["duration_s"], float)
-
-    assert read_events(ledger) == [], "legacy spend JSONL is read-only"
 
 
 def test_agent_run_preserves_codex_total_only_usage(tmp_path):
-    result = AgentResult(
-        is_error=False,
-        status="pr_opened",
-        cost_usd=0.5,
-        usage={"total_tokens": 50_000},
+    rt, journal = _runtime(
+        tmp_path, AgentResult(is_error=False, status="pr_opened", cost_usd=0.5, usage={"total_tokens": 50_000})
     )
-    rt, journal, _ledger = _runtime(tmp_path, result)
 
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
+    _leg(rt)
 
     assert _settled(journal.path)[0]["usage"] == {
         "input_tokens": 0,
@@ -175,8 +143,8 @@ def test_agent_run_preserves_codex_total_only_usage(tmp_path):
 
 
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
+    rt, journal = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
+    _leg(rt)
     assert _settled(journal.path)[0]["usage"] is None
 
 
@@ -185,10 +153,8 @@ def test_the_model_the_run_reports_wins_over_the_one_the_task_asked_for(tmp_path
     """An unpinned task carries model=None and the runtime supplies its own
     default; without this the journal recorded nothing for a leg that certainly
     ran on something, and cost could not be split by routed tier."""
-    rt, journal, _ = _runtime(
-        tmp_path, AgentResult(is_error=False, cost_usd=1.0, model="gpt-5.6-terra")
-    )
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
+    rt, journal = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=1.0, model="gpt-5.6-terra"))
+    _leg(rt)
     assert _settled(journal.path)[0]["model"] == "gpt-5.6-terra"
 
 
@@ -237,18 +203,21 @@ def test_the_dispatch_is_journalled_before_the_await(tmp_path):
     # line, no ledger line — while the reaper requeued the issue and the fixer
     # re-dispatched it next poll. The start line is the only durable evidence
     # that this dispatch ever happened.
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    inner = SnoopingInner(journal.path, AgentResult(is_error=False))
-    rt = JournalingRuntime(inner, journal, repo="o/r", role="fix")
+    inner = SnoopingInner(str(tmp_path / "journal.jsonl"), AgentResult(is_error=False))
+    rt, _journal = _runtime(tmp_path, inner)
     rt.set_context("fix", "RESOLVE", 5, 5)
 
-    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
+    _leg(rt, model="opus")
 
     assert [e["event"] for e in inner.seen] == ["agent_run_start"]
     start = inner.seen[0]
-    assert (start["role"], start["kind"], start["number"], start["issue"]) == (
-        "fix", "RESOLVE", 5, 5)
-    assert start["model"] == "opus"
+    assert (start["role"], start["kind"], start["number"], start["issue"], start["model"]) == (
+        "fix",
+        "RESOLVE",
+        5,
+        5,
+        "opus",
+    )
 
 
 def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_path):
@@ -256,15 +225,11 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     # the issue keeps ai-working, the reaper requeues). It must reach the caller
     # untouched — the journal only witnesses it.
     boom = RuntimeError("Stream closed unexpectedly")
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    ledger = str(tmp_path / "spend.jsonl")
-    rt = JournalingRuntime(
-        RaisingInner(boom), journal, repo="o/r", role="fix"
-    )
+    rt, journal = _runtime(tmp_path, RaisingInner(boom))
     rt.set_context("fix", "RESOLVE", 5, 5)
 
     with pytest.raises(RuntimeError) as raised:
-        asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
+        _leg(rt, model="opus")
     assert raised.value is boom, "the exception object must propagate unchanged"
 
     start, settled = read_events(journal.path)
@@ -276,8 +241,6 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     assert settled["status"] == "raised" and settled["is_error"] is True
     assert settled["cost_usd"] == 0.0
     assert "RuntimeError" in settled["error"] and "Stream closed" in settled["error"]
-    # A session that never delivered a result costs nothing to attribute.
-    assert read_events(ledger) == []
 
 
 def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(tmp_path):
@@ -289,14 +252,11 @@ def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(t
         "exceeded maximum buffer size of 1048576 bytes"
     )
     boom.harness_last_trace = "AssistantMessage → Read(evidence/ac-3-titles.png)"
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    rt = JournalingRuntime(
-        RaisingInner(boom), journal, repo="o/r", role="review"
-    )
+    rt, journal = _runtime(tmp_path, RaisingInner(boom), role="review")
     rt.set_context("review", "REVIEW", 552, 545)
 
     with pytest.raises(RuntimeError):
-        asyncio.run(rt.run(RuntimePlan(prompt="p")))
+        _leg(rt)
 
     _, settled = read_events(journal.path)
     assert settled["exit_reason"] == "transport_death"
@@ -308,13 +268,11 @@ def test_a_journal_that_cannot_write_never_fails_a_run(tmp_path, capsys):
     # Observability is never a failure mode (module rule 1) — and that has to
     # hold for the two NEW writes as well, on both paths.
     expected = AgentResult(is_error=False, status="done")
-    ok = JournalingRuntime(FakeInner(expected), PoisonedJournal())
-    assert asyncio.run(ok.run(RuntimePlan(prompt="p"))) is expected
+    assert _leg(JournalingRuntime(FakeInner(expected), PoisonedJournal())) is expected
 
     boom = RuntimeError("Stream closed unexpectedly")
-    dead = JournalingRuntime(RaisingInner(boom), PoisonedJournal())
     with pytest.raises(RuntimeError) as raised:
-        asyncio.run(dead.run(RuntimePlan(prompt="p")))
+        _leg(JournalingRuntime(RaisingInner(boom), PoisonedJournal()))
     # The journal's own failure must not stand in for the run's failure.
     assert raised.value is boom
     assert "journal" in capsys.readouterr().err
@@ -343,31 +301,17 @@ def test_passthrough_does_not_invent_attributes_neither_object_has(tmp_path):
 
 # ── CLI status summary ────────────────────────────────────────────────────────
 def test_status_summary_is_silent_with_no_spend():
-    from issue_agent.app.cli import spend_status_lines
-
     assert spend_status_lines() == []
 
 
 def test_status_summary_reports_sqlite_spend_per_repo_and_globally():
-    from issue_agent.app.cli import spend_status_lines
-
-    output = "\n".join(
-        spend_status_lines(
-            50.0,
-            "o/r",
-            100.0,
-            repository_spent=1.25,
-            all_repositories_spent=3.5,
-        )
-    )
+    output = "\n".join(spend_status_lines(50.0, "o/r", 100.0, repository_spent=1.25, all_repositories_spent=3.5))
 
     assert "today, o/r: $1.25 / $50.00 cap" in output
     assert "today, all repos: $3.50 / $100.00 cap" in output
 
 
 def test_status_summary_without_a_repo_pairs_the_cap_with_the_global_total():
-    from issue_agent.app.cli import spend_status_lines
-
     out = "\n".join(spend_status_lines(50.0, all_repositories_spent=12.5))
 
     assert "$12.50" in out and "$50.00 cap" in out

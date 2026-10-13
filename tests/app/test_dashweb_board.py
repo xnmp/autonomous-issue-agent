@@ -80,8 +80,10 @@ class Effects:
 def _write_env(root: Path, state: Path) -> None:
     config = root / "config"
     (config / "repos").mkdir(parents=True)
-    body = (f'REPO="o/r"\nFIX_BOT="fixbot"\nREVIEW_BOT="reviewbot"\nSTATE_DIR="{state}/fix"\n'
-            f'REVIEW_STATE_DIR="{state}/review"\nISSUE_SPEND_CAP_USD="25"\nDAILY_SPEND_CAP_USD="700"\n')
+    body = (
+        f'REPO="o/r"\nFIX_BOT="fixbot"\nREVIEW_BOT="reviewbot"\nSTATE_DIR="{state}/fix"\n'
+        f'REVIEW_STATE_DIR="{state}/review"\nISSUE_SPEND_CAP_USD="25"\nDAILY_SPEND_CAP_USD="700"\n'
+    )
     (config / "repos" / "demo.env").write_text(body)
     (config / ".active.demo.env").write_text(body)
 
@@ -89,21 +91,58 @@ def _write_env(root: Path, state: Path) -> None:
 def _store(path: Path) -> None:
     SQLiteControlStore(str(path)).initialize()
     db = sqlite3.connect(path)
-    ended = ("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
-             "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
-             "provider_receipt_id, settled_at, leg_class, session_id, result_json) VALUES "
-             "(?, 'o/r', 'fix', ?, ?, ?, '', 'o/r:fix', 'claude', 'ended', ?, ?, ?, 'USD', 10000000, ?, "
-             "'provider_reported', 'normal_return', ?, ?, ?, 's', ?)")
-    db.execute(ended, ("L2", "RESOLVE", 2, 0, store_ts(-60), store_ts(-60), store_ts(-50), 2_000_000, "r2",
-                       store_ts(-50), "asked", json.dumps({"question": "Which API?"})))
-    db.execute(ended, ("L8", "RESOLVE", 8, 0, store_ts(-300), store_ts(-300), store_ts(-290), 3_000_000, "r8",
-                       store_ts(-290), "agent", "{}"))
-    db.execute("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
-               "reserved_at, started_at, currency, reserved_micros) VALUES "
-               "('L4', 'o/r', 'fix', 'RESOLVE', 4, 0, '', 'o/r:fix', 'codex', 'running', ?, ?, 'USD', 10000000)",
-               (store_ts(-5), store_ts(-5)))
-    db.execute("INSERT INTO leases(repository, role, target, owner, leg_id, pid, pgid, start_ticks, acquired_at) "
-               "VALUES ('o/r', 'fix', 4, 'o/r:fix', 'L4', 999999, 999999, 1, ?)", (store_ts(-5),))
+    ended = (
+        "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
+        "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
+        "provider_receipt_id, settled_at, leg_class, session_id, result_json) VALUES "
+        "(?, 'o/r', 'fix', ?, ?, ?, '', 'o/r:fix', 'claude', 'ended', ?, ?, ?, 'USD', 10000000, ?, "
+        "'provider_reported', 'normal_return', ?, ?, ?, 's', ?)"
+    )
+    db.execute(
+        ended,
+        (
+            "L2",
+            "RESOLVE",
+            2,
+            0,
+            store_ts(-60),
+            store_ts(-60),
+            store_ts(-50),
+            2_000_000,
+            "r2",
+            store_ts(-50),
+            "asked",
+            json.dumps({"question": "Which API?"}),
+        ),
+    )
+    db.execute(
+        ended,
+        (
+            "L8",
+            "RESOLVE",
+            8,
+            0,
+            store_ts(-300),
+            store_ts(-300),
+            store_ts(-290),
+            3_000_000,
+            "r8",
+            store_ts(-290),
+            "agent",
+            "{}",
+        ),
+    )
+    db.execute(
+        "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
+        "reserved_at, started_at, currency, reserved_micros) VALUES "
+        "('L4', 'o/r', 'fix', 'RESOLVE', 4, 0, '', 'o/r:fix', 'codex', 'running', ?, ?, 'USD', 10000000)",
+        (store_ts(-5), store_ts(-5)),
+    )
+    db.execute(
+        "INSERT INTO leases(repository, role, target, owner, leg_id, pid, pgid, start_ticks, acquired_at) "
+        "VALUES ('o/r', 'fix', 4, 'o/r:fix', 'L4', 999999, 999999, 1, ?)",
+        (store_ts(-5),),
+    )
     db.commit()
     db.close()
 
@@ -121,8 +160,9 @@ def _world() -> WorldState:
             IssueView(5, "parked by hand", labels=frozenset({Label.NEEDS_HUMAN})),
         ),
         prs=(
-            PRView(30, head_ref_name="fix/3-pr", head_ref_oid="h3", ci=pending, mergeable="MERGEABLE",
-                   merge_state="CLEAN"),
+            PRView(
+                30, head_ref_name="fix/3-pr", head_ref_oid="h3", ci=pending, mergeable="MERGEABLE", merge_state="CLEAN"
+            ),
             PRView(50, head_ref_name="fix/5-pr", head_ref_oid="h5", labels=frozenset({Label.NEEDS_HUMAN})),
         ),
         now=ts(0),
@@ -137,11 +177,16 @@ def deployment(tmp_path):
     gateway = Gateway(_world())
     backend = Backend(
         str(tmp_path / "root"),
-        gh=Gh(issues=[{"number": 6, "title": "someday", "state": "OPEN", "labels": [], "createdAt": ts(-1440)},
-                      {"number": 8, "title": "shipped", "state": "CLOSED", "labels": []}],
-              merged=[{"number": 80, "title": "fix 8", "url": "u80", "mergedAt": ts(-280),
-                       "headRefName": "fix/8-done"},
-                      {"number": 81, "title": "a human's", "headRefName": "feat/9-x", "mergedAt": ts(-10)}]),
+        gh=Gh(
+            issues=[
+                {"number": 6, "title": "someday", "state": "OPEN", "labels": [], "createdAt": ts(-1440)},
+                {"number": 8, "title": "shipped", "state": "CLOSED", "labels": []},
+            ],
+            merged=[
+                {"number": 80, "title": "fix 8", "url": "u80", "mergedAt": ts(-280), "headRefName": "fix/8-done"},
+                {"number": 81, "title": "a human's", "headRefName": "feat/9-x", "mergedAt": ts(-10)},
+            ],
+        ),
         gateway_factory=lambda repo: gateway,
         now_fn=lambda: NOW,
         effects_factory=lambda repo, identity: Effects(log),
@@ -162,15 +207,22 @@ def test_the_board_shows_each_items_derived_state(deployment):
     assert sorted(board) == [1, 2, 3, 4, 5]
     assert board[1]["board"]["status"] == "working" and board[1]["board"]["act"] == "RESOLVE"
     assert board[2]["board"] | {"detail": None} == {
-        "status": "needs_you", "reason": "question", "headline": "Answer the agent's question", "detail": None,
-        "target": "issue", "since_ts": ts(-40),
+        "status": "needs_you",
+        "reason": "question",
+        "headline": "Answer the agent's question",
+        "detail": None,
+        "target": "issue",
+        "since_ts": ts(-40),
         "hint": "Reply on GitHub with the answer; the agent resumes with it.",
     }
     assert "Which API?" in board[2]["board"]["detail"] and board[2]["action"] == "open"
     assert (board[3]["board"]["activity"], board[3]["pr"], board[3]["pr_ci_state"]) == ("ci", 30, "pending")
     assert board[3]["rail"]["current"] == "ci"
     assert (board[4]["board"]["activity"], board[4]["board"]["act"], board[4]["leg_running"]) == (
-        "agent", "RESOLVE", True)
+        "agent",
+        "RESOLVE",
+        True,
+    )
     assert board[5]["board"]["reason"] == "labelled" and board[5]["action"] == "unblock"
     assert board[2]["cost_usd"] == 2.0 and board[2]["rail"]["resolve_attempts"] == 1
     assert payload["observed_at"] == NOW.isoformat() and payload["gh_ok"] is True
@@ -193,8 +245,14 @@ def test_the_issue_page_lists_legs_and_the_unblock_control(deployment):
 def _every_read(backend) -> list:
     from issue_agent.app.dashboard import collect
 
-    return [backend.issues("demo"), backend.overview("demo", "UTC"), backend.issue("demo", 2), backend.repos(),
-            backend.issues("demo", wait=True), collect("demo", backend=backend, observe=True)]
+    return [
+        backend.issues("demo"),
+        backend.overview("demo", "UTC"),
+        backend.issue("demo", 2),
+        backend.repos(),
+        backend.issues("demo", wait=True),
+        collect("demo", backend=backend, observe=True),
+    ]
 
 
 def _fingerprint(db: Path) -> dict:
@@ -203,6 +261,7 @@ def _fingerprint(db: Path) -> dict:
     `-wal`/`-shm` pair when none exists and records its read mark in `-shm`,
     SQLite's shared-memory index, not durable state: absent `-wal` reads as
     empty and `-shm` is compared only by its existence."""
+
     def content(path: Path) -> str:
         return hashlib.sha256(path.read_bytes() if path.exists() else b"").hexdigest()
 
@@ -211,8 +270,12 @@ def _fingerprint(db: Path) -> dict:
         mode = probe.execute("PRAGMA journal_mode").fetchone()[0]
     finally:
         probe.close()
-    return {"main": content(db), "wal": content(Path(f"{db}-wal")), "mode": mode,
-            "others": sorted(p.name for p in db.parent.iterdir() if not p.name.startswith(db.name))}
+    return {
+        "main": content(db),
+        "wal": content(Path(f"{db}-wal")),
+        "mode": mode,
+        "others": sorted(p.name for p in db.parent.iterdir() if not p.name.startswith(db.name)),
+    }
 
 
 def test_no_read_path_writes_the_control_store(deployment):
@@ -286,8 +349,11 @@ def test_a_failing_write_is_a_refusal_not_a_server_error(deployment):
         raise RuntimeError("config gone")
 
     backend.deployment = explode
-    client = TestClient(server.create_app(backend=backend, offload_backend=False), base_url="http://127.0.0.1:8765",
-                        headers={"X-Issue-Agent-Dashboard": "1"})
+    client = TestClient(
+        server.create_app(backend=backend, offload_backend=False),
+        base_url="http://127.0.0.1:8765",
+        headers={"X-Issue-Agent-Dashboard": "1"},
+    )
     for verb in ("promote", "unblock"):
         response = client.post(f"/api/repos/demo/issues/6/{verb}")
         assert response.status_code == 400 and "config gone" in response.json()["detail"]
@@ -313,11 +379,22 @@ def test_a_review_waits_on_the_review_legs_price_while_a_fix_leg_still_fits(depl
     backend.control_path = lambda cfg: str(empty)
     backend._configs = type(backend._configs)(ttl_s=0)
     green = Observed("h9", "h9", frozenset(), (Check("test", state="SUCCESS", bucket="pass"),))
-    backend.gateway_factory = lambda repo: Gateway(WorldState(
-        issues=(IssueView(1, "fix me", labels=frozenset({Label.AI_READY})),),
-        prs=(PRView(90, head_ref_name="fix/9-pr", head_ref_oid="h9", ci=green, mergeable="MERGEABLE",
-                    merge_state="CLEAN"),),
-        now=ts(0)))
+    backend.gateway_factory = lambda repo: Gateway(
+        WorldState(
+            issues=(IssueView(1, "fix me", labels=frozenset({Label.AI_READY})),),
+            prs=(
+                PRView(
+                    90,
+                    head_ref_name="fix/9-pr",
+                    head_ref_oid="h9",
+                    ci=green,
+                    mergeable="MERGEABLE",
+                    merge_state="CLEAN",
+                ),
+            ),
+            now=ts(0),
+        )
+    )
     backend._observations = type(backend._observations)(executor=InlineExecutor())  # type: ignore[arg-type]
     backend.issues("demo")
 
@@ -329,8 +406,12 @@ def test_a_review_waits_on_the_review_legs_price_while_a_fix_leg_still_fits(depl
 
 def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
     backend, *_ = deployment
-    backend.gh = Gh(merged=[{"number": 1000 + n, "title": "t", "headRefName": f"fix/{2000 + n}-x",
-                             "mergedAt": ts(-n)} for n in range(200)])
+    backend.gh = Gh(
+        merged=[
+            {"number": 1000 + n, "title": "t", "headRefName": f"fix/{2000 + n}-x", "mergedAt": ts(-n)}
+            for n in range(200)
+        ]
+    )
     backend._observations.invalidate("demo")
     backend.issues("demo")
 

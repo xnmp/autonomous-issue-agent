@@ -12,20 +12,19 @@ log line preferred that claim to the envelope, printing:
 Two contracts pinned here: an errored run never renders as a bare success, and
 the envelope's diagnostic fields survive into the log.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from issue_agent.adapters.agent_runner import error_forensics, result_to_agent_result
-from issue_agent.domain.outcome import (
-    AgentResult,
-    ExitReason,
-)
+from issue_agent.domain.outcome import AgentResult, ExitReason
 
 
 @dataclass
 class _Result:
     """Stand-in for the SDK ResultMessage (duck-typed at the boundary)."""
+
     is_error: bool = True
     subtype: str = "error_during_execution"
     structured_output: dict | None = None
@@ -44,25 +43,24 @@ class _Result:
 # ── the envelope's error kind is no longer shadowed by the agent's claim ─────
 def test_envelope_subtype_survives_a_self_declared_status():
     """`if not status` used to gate this, so a claimed status erased the kind."""
-    msg = _Result(is_error=True, subtype="error_max_turns",
-                  structured_output={"status": "success"})
+    msg = _Result(is_error=True, subtype="error_max_turns", structured_output={"status": "success"})
     res = result_to_agent_result(msg)
-    assert res.status == "success"              # the claim is preserved verbatim
-    assert res.envelope_subtype == "error_max_turns"   # and so is the truth
+    assert res.status == "success"  # the claim is preserved verbatim
+    assert res.envelope_subtype == "error_max_turns"  # and so is the truth
     assert res.is_error is True
 
 
 def test_envelope_subtype_is_captured_on_success_too():
-    msg = _Result(is_error=False, subtype="success",
-                  structured_output={"status": "pr_opened"})
+    msg = _Result(is_error=False, subtype="success", structured_output={"status": "pr_opened"})
     assert result_to_agent_result(msg).envelope_subtype == "success"
 
 
 # ── forensics ────────────────────────────────────────────────────────────────
 def test_forensics_surface_permission_denials():
     """A permission-wedged agent is invisible in every other surface."""
-    msg = _Result(permission_denials=[{"tool": "Bash", "cmd": "git push --no-verify"}],
-                  num_turns=40, subtype="error_max_turns")
+    msg = _Result(
+        permission_denials=[{"tool": "Bash", "cmd": "git push --no-verify"}], num_turns=40, subtype="error_max_turns"
+    )
     line = error_forensics(msg)
     assert "permission_denials=1" in line
     assert "no-verify" in line
@@ -71,8 +69,7 @@ def test_forensics_surface_permission_denials():
 
 
 def test_forensics_surface_the_errors_list_and_result_text():
-    msg = _Result(errors=["tool 'Edit' failed: file not found"],
-                  result="I was unable to locate the keybinding module.")
+    msg = _Result(errors=["tool 'Edit' failed: file not found"], result="I was unable to locate the keybinding module.")
     line = error_forensics(msg)
     assert "file not found" in line
     assert "unable to locate" in line

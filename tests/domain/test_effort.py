@@ -8,10 +8,7 @@ covered in tests/adapters/test_fix_workflow.py.
 
 import pytest
 
-from issue_agent.domain.effort import (
-    Effort,
-    parse_effort,
-)
+from issue_agent.domain.effort import Effort, parse_effort
 
 
 # ── totality on junk ──────────────────────────────────────────────────────────

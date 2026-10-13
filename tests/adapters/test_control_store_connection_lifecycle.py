@@ -26,8 +26,15 @@ def _backup_and_collect(store: SQLiteControlStore, copy: Path) -> None:
 
 def _unpaid(store: SQLiteControlStore, run: str) -> None:
     store.record_unpaid_leg(
-        RunId(run), repository="o/r", role="fix", kind="RESOLVE", owner_id="o/r:fix",
-        issue=1, number=1, head="", runtime="claude",
+        RunId(run),
+        repository="o/r",
+        role="fix",
+        kind="RESOLVE",
+        owner_id="o/r:fix",
+        issue=1,
+        number=1,
+        head="",
+        runtime="claude",
     )
 
 

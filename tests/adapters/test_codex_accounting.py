@@ -36,40 +36,68 @@ def test_interrupted_unusaged_request_settles_zero_without_the_reserved_maximum(
     _run(wrapper, RuntimePlan("work", model="sol", max_budget_usd=2))
     assert control.active_reservation_runs("o/r:fix") == ()
     with _db(control) as db:
-        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (0, "estimate")
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (
+            0,
+            "estimate",
+        )
 
 
-@pytest.mark.parametrize("usage_kind,expected_basis", [
-    ("estimated", "estimate"), ("measured", "configured_rate_card"),
-    ("reported", "provider_reported"), ("streamed", "estimate"),
-])
+@pytest.mark.parametrize(
+    "usage_kind,expected_basis",
+    [
+        ("estimated", "estimate"),
+        ("measured", "configured_rate_card"),
+        ("reported", "provider_reported"),
+        ("streamed", "estimate"),
+    ],
+)
 def test_journalled_run_cost_matches_the_committed_settlement(tmp_path, usage_kind, expected_basis):
-    sample = ModelUsage(ROOT, "sol", TokenUsage(100, 0, source=UsageSource.ROLLOUT),
-                        reported_cost=Money("USD", 200) if usage_kind == "reported" else None)
-    observed = (EstimatedRunUsage("one request has no receipt", (sample,), RATES)
-                if usage_kind == "estimated" else MeasuredRunUsage((sample,), RATES))
-    result = AgentResult(False, status="pushed", session_id=ROOT,
-                         run_usage=None if usage_kind == "streamed" else observed,
-                         usage={"input_tokens": 100, "output_tokens": 0, "source": "rollout"})
+    sample = ModelUsage(
+        ROOT,
+        "sol",
+        TokenUsage(100, 0, source=UsageSource.ROLLOUT),
+        reported_cost=Money("USD", 200) if usage_kind == "reported" else None,
+    )
+    observed = (
+        EstimatedRunUsage("one request has no receipt", (sample,), RATES)
+        if usage_kind == "estimated"
+        else MeasuredRunUsage((sample,), RATES)
+    )
+    result = AgentResult(
+        False,
+        status="pushed",
+        session_id=ROOT,
+        run_usage=None if usage_kind == "streamed" else observed,
+        usage={"input_tokens": 100, "output_tokens": 0, "source": "rollout"},
+    )
     wrapper, store = _wrapper(tmp_path, Runtime(result))
     wrapper = replace(wrapper, rate_table=RATES)
-    journaled = JournalingRuntime(wrapper, Journal(str(tmp_path / "journal.jsonl")),
-                                  repo="o/r", role="fix", runtime="codex")
+    journaled = JournalingRuntime(
+        wrapper, Journal(str(tmp_path / "journal.jsonl")), repo="o/r", role="fix", runtime="codex"
+    )
     journaled.set_context("fix", "RESOLVE", 1, 1)
     _lease(wrapper)
 
     asyncio.run(journaled.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
-    completed = next(r for r in (json.loads(line) for line in (tmp_path / "journal.jsonl").read_text().splitlines())
-                     if r["event"] == "agent_run" and "cost_usd" in r)
+    completed = next(
+        r
+        for r in (json.loads(line) for line in (tmp_path / "journal.jsonl").read_text().splitlines())
+        if r["event"] == "agent_run" and "cost_usd" in r
+    )
     with _db(store) as db:
-        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (200, expected_basis)
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (
+            200,
+            expected_basis,
+        )
     assert completed["cost_usd"] == 0.0002
 
 
 def _fake_codex(tmp_path, mode):
     """A codex that writes its root rollout, then behaves per `mode`."""
     script = tmp_path / "fake-codex"
-    script.write_text(f"#!{sys.executable}\n" + f'''
+    script.write_text(
+        f"#!{sys.executable}\n"
+        + f"""
 import json, os, pathlib, subprocess, sys, time
 from datetime import datetime, timezone
 counter = pathlib.Path({str(tmp_path / "attempts")!r})
@@ -97,28 +125,33 @@ if {mode!r} == "hang":
         time.sleep(.05)
 worker.terminate(); worker.wait()
 pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text(json.dumps({{"status": "pushed", "summary": "done"}}))
-''')
+"""
+    )
     script.chmod(0o700)
     return script
 
 
 def _runner(tmp_path, mode, directory):
     return CodexRunner(
-        codex_bin=str(_fake_codex(tmp_path, mode)), default_model="sol", rate_table=RATES,
-        env={"OPENAI_API_KEY": "test-key"}, poll_slice=.02,
+        codex_bin=str(_fake_codex(tmp_path, mode)),
+        default_model="sol",
+        rate_table=RATES,
+        env={"OPENAI_API_KEY": "test-key"},
+        poll_slice=0.02,
         spend_evidence_dir=str(directory),
-        process_supervisor=ProcessSupervisor(str(tmp_path / "supervision"), grace_seconds=.05),
+        process_supervisor=ProcessSupervisor(str(tmp_path / "supervision"), grace_seconds=0.05),
     )
 
 
 def _plan(tmp_path):
-    return RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2,
-                       env={"CODEX_HOME": str(tmp_path / "codex")})
+    return RuntimePlan(
+        "work", cwd=str(tmp_path), model="sol", max_budget_usd=2, env={"CODEX_HOME": str(tmp_path / "codex")}
+    )
 
 
 def test_a_dropped_launch_is_one_leg_settled_at_its_rollout_and_its_evidence_removed(tmp_path):
     directory = tmp_path / "evidence"
-    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "retry", directory), evidence_dir=str(directory))
+    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "retry", directory), spend_evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
 
@@ -135,7 +168,7 @@ def test_a_dropped_launch_is_one_leg_settled_at_its_rollout_and_its_evidence_rem
 
 def test_cancellation_kills_owned_groups_and_recovery_settles_the_rollout(tmp_path):
     directory = tmp_path / "evidence"
-    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "hang", directory), evidence_dir=str(directory))
+    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "hang", directory), spend_evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
     identities = []
@@ -147,7 +180,7 @@ def test_cancellation_kills_owned_groups_and_recovery_settles_the_rollout(tmp_pa
         try:
             while not (tmp_path / "ready.json").exists():
                 assert time.monotonic() < deadline
-                await asyncio.sleep(.01)
+                await asyncio.sleep(0.01)
             for pid in json.loads((tmp_path / "ready.json").read_text()).values():
                 identity = ProcessSupervisor.process_identity(pid)
                 assert identity is not None

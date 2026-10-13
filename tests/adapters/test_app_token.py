@@ -70,9 +70,7 @@ def test_minter_raises_on_empty_mint():
     with tempfile.TemporaryDirectory() as d:
         creds = AppCredentials("1", "2", "key.pem", os.path.join(d, "t.json"))
         sleeps = []
-        m = AppTokenMinter(
-            creds, mint_fn=lambda c: ("", "", 0), now_fn=lambda: 0, sleep_fn=sleeps.append
-        )
+        m = AppTokenMinter(creds, mint_fn=lambda c: ("", "", 0), now_fn=lambda: 0, sleep_fn=sleeps.append)
         try:
             m.get()
             assert False, "expected RuntimeError"
@@ -97,9 +95,7 @@ def test_minter_retries_then_succeeds_on_transient_mint_failure():
                 raise RuntimeError("transient GitHub error")
             return ("fresh-tok", "2026-06-01T00:00:00Z", 9_999_999)
 
-        m = AppTokenMinter(
-            creds, mint_fn=flaky_mint, now_fn=lambda: 0, sleep_fn=sleeps.append
-        )
+        m = AppTokenMinter(creds, mint_fn=flaky_mint, now_fn=lambda: 0, sleep_fn=sleeps.append)
         assert m.get() == "fresh-tok"
         assert calls["n"] == MINT_ATTEMPTS
         # backoff recorded between attempts (not after the final, successful one)
@@ -117,9 +113,7 @@ def test_minter_raises_last_error_when_all_attempts_fail():
             calls["n"] += 1
             raise ValueError(f"boom {calls['n']}")
 
-        m = AppTokenMinter(
-            creds, mint_fn=always_fails, now_fn=lambda: 0, sleep_fn=sleeps.append
-        )
+        m = AppTokenMinter(creds, mint_fn=always_fails, now_fn=lambda: 0, sleep_fn=sleeps.append)
         try:
             m.get()
             assert False, "expected ValueError"

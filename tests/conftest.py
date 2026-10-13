@@ -21,8 +21,11 @@ _SCRUB_FLOOR = re.search(
     re.MULTILINE,
 )
 assert _SCRUB_FLOOR is not None, "bin/point-at.sh lost its RTC_SCRUB_STATIC floor"
-for _knob in (*_SCRUB_FLOOR.group(1).split(), *os.environ.get("HARNESS_DEPLOY_KNOBS", "").split(),
-              "HARNESS_DEPLOY_KNOBS"):
+for _knob in (
+    *_SCRUB_FLOOR.group(1).split(),
+    *os.environ.get("HARNESS_DEPLOY_KNOBS", "").split(),
+    "HARNESS_DEPLOY_KNOBS",
+):
     os.environ.pop(_knob, None)
 
 
@@ -47,9 +50,7 @@ def _process_signal_handlers_are_restored(request):
     before = {signum: signal.getsignal(signum) for signum in _GUARDED_SIGNALS}
     yield
     leaked = [
-        signal.Signals(signum).name
-        for signum, handler in before.items()
-        if signal.getsignal(signum) is not handler
+        signal.Signals(signum).name for signum, handler in before.items() if signal.getsignal(signum) is not handler
     ]
     for signum, handler in before.items():
         if handler is not None:

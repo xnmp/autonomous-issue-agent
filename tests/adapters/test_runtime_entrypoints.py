@@ -82,9 +82,7 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
 
 
 def test_systemd_dashboard_is_a_hot_reloading_host_singleton():
-    unit = _parse_unit(
-        _read("ops/systemd/issue-agent-dashboard.service")
-    )
+    unit = _parse_unit(_read("ops/systemd/issue-agent-dashboard.service"))
     service = unit["Service"]
     exec_start = service["ExecStart"][0].split()
 
@@ -111,12 +109,7 @@ def test_launchd_plists_run_python_from_harness_root_with_target_dir_env():
         data = plistlib.loads(_read(path).encode())
         argv = data["ProgramArguments"]
         assert argv[0] == "@UV_BIN@"
-        assert argv[-4:] == [
-            "python",
-            "-m",
-            "issue_agent.app.launchd_main",
-            role,
-        ]
+        assert argv[-4:] == ["python", "-m", "issue_agent.app.launchd_main", role]
         assert data["WorkingDirectory"] == "@HARNESS_ROOT@"
         assert data["EnvironmentVariables"]["TARGET_DIR"] == "@TARGET_DIR@"
         assert data["KeepAlive"] == {"SuccessfulExit": False}

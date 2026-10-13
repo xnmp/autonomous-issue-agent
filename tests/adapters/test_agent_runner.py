@@ -5,29 +5,51 @@ result mapping is duck-typed so a stand-in object stands in for ResultMessage.
 """
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass
+import subprocess
+import sys
+import types
+import typing
+from pathlib import Path
 
 import pytest
 
 from issue_agent.adapters.agent_runner import (
     DEFAULT_MAX_BUFFER_BYTES,
+    AgentRunner,
+    _trace_message,
     build_option_kwargs,
+    merge_usage,
     resolve_claude_cli,
     result_to_agent_result,
 )
 from issue_agent.adapters.runtime_plan import RuntimePlan
+from issue_agent.domain.effort import EFFORT_LADDER, Effort
 from issue_agent.domain.outcome import ExitReason
 
 
-def test_a_plan_maps_onto_the_sdk_options():
-    from issue_agent.domain.effort import Effort
+def _run(**runner):
+    """One leg through a runner built with ``runner`` options."""
+    return asyncio.run(AgentRunner(**runner).run(RuntimePlan(prompt="x")))
 
+
+def test_a_plan_maps_onto_the_sdk_options():
     schema = {"type": "object"}
-    kw = build_option_kwargs(RuntimePlan(
-        prompt="x", allowed_tools=("Read", "Bash(git *)"), disallowed_tools=("Edit", "Write"),
-        model="opus", max_budget_usd=1.5, cwd="/wt/issue-5", resume="sess-123",
-        schema=schema, append_system_prompt="rules", effort=Effort.HIGH,
-    ))
+    kw = build_option_kwargs(
+        RuntimePlan(
+            prompt="x",
+            allowed_tools=("Read", "Bash(git *)"),
+            disallowed_tools=("Edit", "Write"),
+            model="opus",
+            max_budget_usd=1.5,
+            cwd="/wt/issue-5",
+            resume="sess-123",
+            schema=schema,
+            append_system_prompt="rules",
+            effort=Effort.HIGH,
+        )
+    )
     assert kw["allowed_tools"] == ["Read", "Bash(git *)"]
     assert kw["disallowed_tools"] == ["Edit", "Write"]
     assert (kw["model"], kw["max_budget_usd"], kw["cwd"], kw["resume"]) == ("opus", 1.5, "/wt/issue-5", "sess-123")
@@ -58,7 +80,7 @@ def test_default_buffer_survives_a_five_megabyte_read():
 def test_a_runner_applies_the_default_buffer_to_every_session(monkeypatch):
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
+    _run()
     assert seen["options"]["max_buffer_size"] == DEFAULT_MAX_BUFFER_BYTES
 
 
@@ -66,13 +88,6 @@ def test_the_installed_sdk_accepts_the_options_we_pass():
     """Anti-vacuity: every other test stubs the SDK, so nothing else would notice
     the pinned build dropping max_buffer_size (the fix becoming a no-op) or
     renaming/narrowing `effort`. Skipped where the SDK is absent."""
-    import dataclasses
-    import typing
-
-    import pytest
-
-    from issue_agent.domain.effort import EFFORT_LADDER
-
     sdk = pytest.importorskip("claude_agent_sdk")
     fields = {f.name: f for f in dataclasses.fields(sdk.ClaudeAgentOptions)}
     assert "max_buffer_size" in fields
@@ -83,18 +98,12 @@ def test_the_installed_sdk_accepts_the_options_we_pass():
 
 
 def test_bundled_claude_cli_supports_configured_opus_55(tmp_path):
-    import subprocess
-    from pathlib import Path
-
-    import pytest
-
     sdk = pytest.importorskip("claude_agent_sdk")
     # SDK releases can lag the CLI required by a configured model. Check the
     # executable we actually launch, without making a paid provider request.
     executable = Path(sdk.__file__).parent / "_bundled" / "claude"
     completed = subprocess.run(
-        [str(executable), "--version"], cwd=tmp_path, capture_output=True,
-        text=True, check=True, timeout=10,
+        [str(executable), "--version"], cwd=tmp_path, capture_output=True, text=True, check=True, timeout=10
     )
     version = tuple(int(part) for part in completed.stdout.split()[0].split("."))
     assert version >= (2, 1, 280), completed.stdout
@@ -113,31 +122,46 @@ class FakeResult:
 
 
 def test_result_reads_structured_output():
-    msg = FakeResult(
-        structured_output={"status": "pr_opened", "summary": "opened", "needs": ""},
-        total_cost_usd=0.42,
-        session_id="s9",
+    r = result_to_agent_result(
+        FakeResult(
+            structured_output={"status": "pr_opened", "summary": "opened", "needs": ""},
+            total_cost_usd=0.42,
+            session_id="s9",
+        )
     )
-    r = result_to_agent_result(msg)
     assert (r.is_error, r.status, r.summary, r.cost_usd, r.session_id) == (False, "pr_opened", "opened", 0.42, "s9")
 
 
-@pytest.mark.parametrize("fake,status,reason", [
-    (FakeResult(is_error=True), "error", ExitReason.AGENT_ERROR),
-    # The review schema names its terminal `decision`, not `status`, so a clean
-    # review used to journal status="" and the verdict lived only on the PR.
-    (FakeResult(subtype="success", structured_output={"decision": "APPROVE", "body": "LGTM"}), "APPROVE", ExitReason.OK),
-    # A malformed envelope must not put a non-str into the str-typed field; on an
-    # errored run the subtype fallback still fills it.
-    (FakeResult(structured_output={"status": 7, "decision": None}), "", ExitReason.OK),
-    (FakeResult(is_error=True, subtype="error_during_execution", structured_output={"decision": ["APPROVE"]}),
-     "error_during_execution", ExitReason.AGENT_ERROR),
-    # A spend ceiling is an operator-knob outcome, not a failure of the agent's reasoning.
-    (FakeResult(is_error=True, subtype="error_max_budget_usd"), "error_max_budget_usd", ExitReason.BUDGET_EXHAUSTED),
-    (FakeResult(is_error=True, subtype="error_max_turns"), "error_max_turns", ExitReason.AGENT_ERROR),
-    # is_error false on the envelope but status=="error" inside it is the agent reporting failure.
-    (FakeResult(is_error=False, structured_output={"status": "error"}), "error", ExitReason.AGENT_ERROR),
-])
+@pytest.mark.parametrize(
+    "fake,status,reason",
+    [
+        (FakeResult(is_error=True), "error", ExitReason.AGENT_ERROR),
+        # The review schema names its terminal `decision`, not `status`, so a clean
+        # review used to journal status="" and the verdict lived only on the PR.
+        (
+            FakeResult(subtype="success", structured_output={"decision": "APPROVE", "body": "LGTM"}),
+            "APPROVE",
+            ExitReason.OK,
+        ),
+        # A malformed envelope must not put a non-str into the str-typed field; on an
+        # errored run the subtype fallback still fills it.
+        (FakeResult(structured_output={"status": 7, "decision": None}), "", ExitReason.OK),
+        (
+            FakeResult(is_error=True, subtype="error_during_execution", structured_output={"decision": ["APPROVE"]}),
+            "error_during_execution",
+            ExitReason.AGENT_ERROR,
+        ),
+        # A spend ceiling is an operator-knob outcome, not a failure of the agent's reasoning.
+        (
+            FakeResult(is_error=True, subtype="error_max_budget_usd"),
+            "error_max_budget_usd",
+            ExitReason.BUDGET_EXHAUSTED,
+        ),
+        (FakeResult(is_error=True, subtype="error_max_turns"), "error_max_turns", ExitReason.AGENT_ERROR),
+        # is_error false on the envelope but status=="error" inside it is the agent reporting failure.
+        (FakeResult(is_error=False, structured_output={"status": "error"}), "error", ExitReason.AGENT_ERROR),
+    ],
+)
 def test_result_envelope_classification(fake, status, reason):
     r = result_to_agent_result(fake)
     assert (r.status, r.exit_reason, r.is_error) == (status, reason, reason is not ExitReason.OK)
@@ -146,12 +170,8 @@ def test_result_envelope_classification(fake, status, reason):
 def test_usage_block_is_captured_verbatim_for_the_cost_ledger():
     # cost_usd is 0.00 on a subscription plan, so tokens (incl. the cache counters
     # nothing else exposes) are the only cost substrate that always exists.
-    usage = {"input_tokens": 12, "output_tokens": 3,
-             "cache_read_input_tokens": 900, "cache_creation_input_tokens": 40}
-    r = result_to_agent_result(
-        FakeResult(is_error=False, subtype="success", total_cost_usd=0.0, usage=usage)
-    )
-    assert r.usage == usage
+    usage = {"input_tokens": 12, "output_tokens": 3, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 40}
+    assert result_to_agent_result(FakeResult(subtype="success", total_cost_usd=0.0, usage=usage)).usage == usage
 
 
 # ── AgentRunner.run stream handling ─────────────────────────────────────────────
@@ -160,7 +180,6 @@ def test_usage_block_is_captured_verbatim_for_the_cost_ledger():
 # an is_error result). We read the ENVELOPE, never the exit code, so a result we
 # already captured must survive a post-result raise. Only a crash with NO result
 # is a genuine transport failure.
-from issue_agent.adapters.agent_runner import AgentRunner
 
 
 class _ResultMessage(FakeResult):
@@ -172,9 +191,6 @@ def _install_sdk(monkeypatch, fake_query, capture=None):
     # run() does `from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query`
     # at call time, so injecting a fake module into sys.modules is the whole
     # mechanism — there is no import cache on the runner to reset.
-    import sys
-    import types
-
     def _options(**kw):
         if capture is not None:
             capture["options"] = kw
@@ -193,17 +209,14 @@ def _install_fake_sdk(monkeypatch, messages, raise_after=False, capture=None):
             yield m
         if raise_after:
             raise RuntimeError("Claude Code returned an error result: success")
+
     _install_sdk(monkeypatch, fake_query, capture)
 
 
 def test_run_honours_result_despite_post_result_raise(monkeypatch):
-    msg = _ResultMessage(
-        is_error=False,
-        structured_output={"status": "pr_opened", "summary": "opened"},
-        session_id="s1",
-    )
+    msg = _ResultMessage(structured_output={"status": "pr_opened", "summary": "opened"}, session_id="s1")
     _install_fake_sdk(monkeypatch, [msg], raise_after=True)
-    r = asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
+    r = _run()
     # The post-result ProcessError must NOT clobber the captured envelope.
     assert r.status == "pr_opened"
     assert r.session_id == "s1"
@@ -212,13 +225,10 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
 
 def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
     """A dropped terminal envelope retains the SDK model in its settled receipt."""
-    from tests.fakes.legacy_journal import Journal
     from issue_agent.adapters.journal import JournalingRuntime
-    from tests.fakes.legacy_journal import read_events
+    from tests.fakes.legacy_journal import Journal, read_events
 
-    init = type("InitMessage", (), {
-        "subtype": "init", "data": {"model": "claude-opus-4-1"},
-    })()
+    init = type("InitMessage", (), {"subtype": "init", "data": {"model": "claude-opus-4-1"}})()
     _install_fake_sdk(monkeypatch, [init])
     journal = Journal(str(tmp_path / "review-journal.jsonl"))
     runner = JournalingRuntime(AgentRunner(), journal, role="review")
@@ -240,24 +250,17 @@ def test_run_skips_task_notification_followup_result(monkeypatch):
     former and return the latter, not clobber it."""
     followup = _ResultMessage(is_error=False, structured_output={"status": "ignored"})
     followup.origin = {"kind": "task-notification"}
-    real = _ResultMessage(
-        is_error=False, structured_output={"status": "pr_opened", "summary": "ok"},
-        session_id="real",
-    )
+    real = _ResultMessage(structured_output={"status": "pr_opened", "summary": "ok"}, session_id="real")
     _install_fake_sdk(monkeypatch, [followup, real])
-    r = asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
+    r = _run()
     assert r.status == "pr_opened"
     assert r.session_id == "real"
 
 
 def test_run_reraises_when_crash_before_any_result(monkeypatch):
     _install_fake_sdk(monkeypatch, [], raise_after=True)
-    try:
-        asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("expected the pre-result crash to propagate")
+    with pytest.raises(RuntimeError):
+        _run()
 
 
 def test_transport_death_is_logged_with_type_and_last_message(monkeypatch):
@@ -272,10 +275,8 @@ def test_transport_death_is_logged_with_type_and_last_message(monkeypatch):
     carrier.content = [blk]
     _install_fake_sdk(monkeypatch, [carrier], raise_after=True)  # raise, no result
     logged: list[str] = []
-    try:
-        asyncio.run(AgentRunner(log=logged.append, debug=True).run(RuntimePlan(prompt="x")))
-    except RuntimeError:
-        pass
+    with pytest.raises(RuntimeError):
+        _run(log=logged.append, debug=True)
     joined = "\n".join(logged)
     assert "transport died before any ResultMessage" in joined
     assert "RuntimeError" in joined
@@ -286,11 +287,13 @@ def test_transport_death_is_logged_with_type_and_last_message(monkeypatch):
 def _install_hanging_sdk(monkeypatch, messages, hang_after=True):
     """Fake query that yields `messages` fast, then (hang_after) blocks forever —
     the silent-hang shape (no more events, never returns/raises)."""
+
     async def fake_query(prompt, options):
         for m in messages:
             yield m
         if hang_after:
             await asyncio.Event().wait()  # never set → hang
+
     _install_sdk(monkeypatch, fake_query)
 
 
@@ -299,9 +302,7 @@ def test_idle_timeout_trips_on_hang(monkeypatch):
     not a permanent wedge. This is the #56 daemon-freeze made recoverable."""
     _install_hanging_sdk(monkeypatch, [], hang_after=True)
     logged: list[str] = []
-    r = asyncio.run(
-        AgentRunner(log=logged.append, idle_timeout=0.2).run(RuntimePlan(prompt="x"))
-    )
+    r = _run(log=logged.append, idle_timeout=0.2)
     assert r.is_error and r.status == "timeout"
     assert r.exit_reason is ExitReason.IDLE_TIMEOUT
     assert any("IDLE" in m for m in logged)
@@ -320,11 +321,7 @@ def test_dispatch_cancellation_joins_pending_watchdog_receive(monkeypatch):
     _install_sdk(monkeypatch, fake_query)
 
     async def scenario():
-        task = asyncio.create_task(
-            AgentRunner(idle_timeout=60.0, poll_slice=0.01).run(
-                RuntimePlan(prompt="x")
-            )
-        )
+        task = asyncio.create_task(AgentRunner(idle_timeout=60.0, poll_slice=0.01).run(RuntimePlan(prompt="x")))
         await asyncio.sleep(0.02)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -340,7 +337,7 @@ def test_clean_end_without_result_classifies_as_no_result(monkeypatch):
     yielded a ResultMessage. It is an error, but a DIFFERENT one from the agent
     reporting failure — the taxonomy has to say which."""
     _install_fake_sdk(monkeypatch, [])  # ends cleanly, no result, no raise
-    r = asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
+    r = _run()
     assert r.is_error is True
     assert r.exit_reason is ExitReason.NO_RESULT
 
@@ -359,11 +356,7 @@ def test_idle_watchdog_trips_on_wall_clock_not_monotonic(monkeypatch):
     logged: list[str] = []
     # idle_timeout large (900) but poll_slice tiny so real slices are fast; the trip
     # must come from the wall-clock jump, not from 900s of real waiting.
-    r = asyncio.run(
-        AgentRunner(
-            log=logged.append, idle_timeout=900.0, poll_slice=0.05, wall_clock=wall
-        ).run(RuntimePlan(prompt="x"))
-    )
+    r = _run(log=logged.append, idle_timeout=900.0, poll_slice=0.05, wall_clock=wall)
     assert r.is_error and r.status == "timeout"
     assert any("IDLE" in m for m in logged)
 
@@ -378,22 +371,18 @@ def test_gap_longer_than_poll_slice_still_delivers_result(monkeypatch):
     ended with NO ResultMessage. The watchdog must instead keep observing the SAME
     receive across slices: a gap > poll_slice but < idle_timeout must NOT drop the
     stream, and the terminal ResultMessage must still arrive."""
+
     async def fake_query(prompt, options):
-        yield object()                    # early event
-        await asyncio.sleep(0.15)         # gap > poll_slice (0.05), < idle_timeout (5.0)
-        yield object()                    # event after a multi-slice pause
-        await asyncio.sleep(0.15)         # another long-ish pause before the result
-        yield _ResultMessage(is_error=False,
-                             structured_output={"status": "pr_opened"}, session_id="s")
+        yield object()  # early event
+        await asyncio.sleep(0.15)  # gap > poll_slice (0.05), < idle_timeout (5.0)
+        yield object()  # event after a multi-slice pause
+        await asyncio.sleep(0.15)  # another long-ish pause before the result
+        yield _ResultMessage(structured_output={"status": "pr_opened"}, session_id="s")
 
     _install_sdk(monkeypatch, fake_query)
 
     logged: list[str] = []
-    r = asyncio.run(
-        AgentRunner(log=logged.append, idle_timeout=5.0, poll_slice=0.05).run(
-            RuntimePlan(prompt="x")
-        )
-    )
+    r = _run(log=logged.append, idle_timeout=5.0, poll_slice=0.05)
     # The result survives the > poll_slice gaps; no idle trip, no drop.
     assert r.is_error is False and r.status == "pr_opened"
     assert not any("IDLE" in m for m in logged)
@@ -408,6 +397,7 @@ def _jumping_wall(ticks):
     def wall():
         held[0] = next(remaining, held[0])
         return held[0]
+
     return wall
 
 
@@ -421,12 +411,7 @@ def test_wall_cap_trips_when_idle_timeout_is_disabled(monkeypatch):
     wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
     logged: list[str] = []
 
-    r = asyncio.run(
-        AgentRunner(
-            log=logged.append, idle_timeout=None, max_runtime=900.0,
-            poll_slice=0.05, wall_clock=wall,
-        ).run(RuntimePlan(prompt="x"))
-    )
+    r = _run(log=logged.append, idle_timeout=None, max_runtime=900.0, poll_slice=0.05, wall_clock=wall)
 
     assert r.is_error and r.status == "timeout"
     assert r.exit_reason is ExitReason.WALL_TIMEOUT
@@ -440,6 +425,7 @@ def test_wall_cap_trips_on_a_limping_stream_the_idle_watchdog_never_catches(monk
     burned 58 minutes on 3.6s of CPU. Here events arrive faster than a poll slice
     (so no slice ever expires) while the wall clock advances past the cap: only a
     between-receives elapsed check can stop this."""
+
     async def fake_query(prompt, options):
         while True:
             yield object()  # always ready → asyncio.wait returns before any timeout
@@ -449,11 +435,7 @@ def test_wall_cap_trips_on_a_limping_stream_the_idle_watchdog_never_catches(monk
     wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
     logged: list[str] = []
 
-    r = asyncio.run(
-        AgentRunner(
-            log=logged.append, idle_timeout=900.0, max_runtime=900.0, wall_clock=wall
-        ).run(RuntimePlan(prompt="x"))
-    )
+    r = _run(log=logged.append, idle_timeout=900.0, max_runtime=900.0, wall_clock=wall)
 
     assert r.exit_reason is ExitReason.WALL_TIMEOUT
     assert not any("IDLE" in m for m in logged)  # the idle watchdog never saw it
@@ -464,15 +446,11 @@ def test_wall_cap_honours_a_result_already_captured(monkeypatch):
     and only THEN the cap expires, the run must return that verdict — aborting it
     into a timeout would discard finished, paid-for work."""
     msg = _ResultMessage(
-        is_error=False, subtype="success",
-        structured_output={"status": "pr_opened", "summary": "opened"}, session_id="s1",
+        subtype="success", structured_output={"status": "pr_opened", "summary": "opened"}, session_id="s1"
     )
     _install_fake_sdk(monkeypatch, [msg])
-    wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
 
-    r = asyncio.run(
-        AgentRunner(max_runtime=900.0, wall_clock=wall).run(RuntimePlan(prompt="x"))
-    )
+    r = _run(max_runtime=900.0, wall_clock=_jumping_wall([1000.0, 1000.0, 1000.0, 4600.0]))
 
     assert r.status == "pr_opened"
     assert r.is_error is False
@@ -482,24 +460,16 @@ def test_wall_cap_honours_a_result_already_captured(monkeypatch):
 def test_healthy_short_run_is_not_capped(monkeypatch):
     """False-positive guard: a run well inside the cap completes normally, and the
     cap leaves no trace on the result."""
-    msg = _ResultMessage(
-        is_error=False, subtype="success", structured_output={"status": "pr_opened"}
-    )
-    _install_fake_sdk(monkeypatch, [msg])
+    _install_fake_sdk(monkeypatch, [_ResultMessage(subtype="success", structured_output={"status": "pr_opened"})])
     logged: list[str] = []
 
-    r = asyncio.run(
-        AgentRunner(log=logged.append, idle_timeout=900.0, max_runtime=2700.0).run(
-            RuntimePlan(prompt="x")
-        )
-    )
+    r = _run(log=logged.append, idle_timeout=900.0, max_runtime=2700.0)
 
     assert r.status == "pr_opened" and r.is_error is False
     assert not any("WALL" in m or "IDLE" in m for m in logged)
 
 
 # ── debug tracing: make a mid-session "Stream closed" wedge diagnosable ────────
-from issue_agent.adapters.agent_runner import _trace_message  # noqa: E402
 
 
 @dataclass
@@ -526,47 +496,31 @@ def test_trace_message_names_the_tool_and_its_first_argument_line():
 # real deployment: 906s, four commits, $0.00). AssistantMessage.usage is the API
 # call's OWN per-turn block, so summing across turns gives billed totals.
 def test_merge_usage_sums_numeric_per_turn_blocks_and_keeps_absent_distinct():
-    from issue_agent.adapters.agent_runner import merge_usage
-
     acc = merge_usage(None, {"input_tokens": 10, "output_tokens": 2})
     assert merge_usage(acc, {"input_tokens": 30, "output_tokens": 5}) == {"input_tokens": 40, "output_tokens": 7}
     assert merge_usage(None, {"input_tokens": 5, "cached": True, "model": "opus"}) == {"input_tokens": 5}
-    assert merge_usage(None, None) is None          # nothing ever reported
-    assert merge_usage(None, {}) == {}              # reported, and it was empty
+    assert merge_usage(None, None) is None  # nothing ever reported
+    assert merge_usage(None, {}) == {}  # reported, and it was empty
     assert merge_usage(None, "not-a-dict") is None
 
 
 def test_wall_timeout_result_carries_the_tokens_spent_before_the_abort():
     """The regression: this result used to be built with no usage at all, so the
     journal had nothing to price and the run ledgered $0.00."""
-    from issue_agent.adapters.agent_runner import AgentRunner
-
-    r = AgentRunner(max_runtime=900)
-    res = r._wall_timeout(906.0, "Bash(pytest)", {"output_tokens": 22349})
+    res = AgentRunner(max_runtime=900)._wall_timeout(906.0, "Bash(pytest)", {"output_tokens": 22349})
 
     assert res.exit_reason is ExitReason.WALL_TIMEOUT
     assert res.usage == {"output_tokens": 22349}
 
 
 # ── CLI resolution (keifu 2026-08-03: venv rebuilt under a live daemon) ───────
-def test_claude_cli_pin_wins_even_when_bundled_exists(tmp_path):
+def test_claude_cli_resolution_prefers_the_pin_then_the_bundled_cli_then_path(tmp_path):
     bundled = tmp_path / "claude"
     bundled.write_text("#!/bin/sh\n")
     bundled.chmod(0o755)
-    assert resolve_claude_cli(
-        " /pinned/claude ", bundled, which=lambda _: "/path/claude"
-    ) == "/pinned/claude"
-
-
-def test_claude_cli_bundled_then_path_when_unpinned(tmp_path):
-    bundled = tmp_path / "claude"
-    bundled.write_text("#!/bin/sh\n")
-    bundled.chmod(0o755)
+    assert resolve_claude_cli(" /pinned/claude ", bundled, which=lambda _: "/path/claude") == "/pinned/claude"
     assert resolve_claude_cli("", bundled) == str(bundled)
     # The stale-venv shape: the bundled path no longer exists on disk.
     gone = tmp_path / "deleted-venv" / "claude"
     assert resolve_claude_cli("", gone, which=lambda _: "/local/claude") == "/local/claude"
-
-
-def test_claude_cli_unresolvable_returns_none(tmp_path):
     assert resolve_claude_cli("", tmp_path / "missing", which=lambda _: None) is None

@@ -21,6 +21,7 @@ def gateway(answer, calls=None):
         if isinstance(answer, BaseException):
             raise answer
         return answer
+
     return GitHubGateway("o/r", runner=run)
 
 
@@ -37,15 +38,18 @@ def test_every_page_is_read_and_the_login_compares_normalized():
     assert "--paginate" in calls[0] and "--slurp" in calls[0]
 
 
-@pytest.mark.parametrize("review", [
-    row(state="DISMISSED"),
-    row(state="COMMENTED"),
-    row(state="PENDING"),
-    row(commit="b" * 40),
-    row(login="someone-else"),
-    {"id": 3, "state": "APPROVED", "user": None, "commit_id": HEAD},
-    "not a review",
-])
+@pytest.mark.parametrize(
+    "review",
+    [
+        row(state="DISMISSED"),
+        row(state="COMMENTED"),
+        row(state="PENDING"),
+        row(commit="b" * 40),
+        row(login="someone-else"),
+        {"id": 3, "state": "APPROVED", "user": None, "commit_id": HEAD},
+        "not a review",
+    ],
+)
 def test_anything_but_the_bots_standing_verdict_on_this_head_is_not_reviewed(review):
     assert gateway(json.dumps([[review]])).reviewed_on(7, HEAD, BOT) is False
 

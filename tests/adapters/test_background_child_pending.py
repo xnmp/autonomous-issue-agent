@@ -18,12 +18,7 @@ from dataclasses import dataclass, field
 
 from issue_agent.adapters.agent_runner import AgentRunner
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.outcome import (
-    ExitReason,
-    Outcome,
-    classify_outcome,
-    infra_class_failure,
-)
+from issue_agent.domain.outcome import ExitReason, Outcome, classify_outcome, infra_class_failure
 
 
 @dataclass
@@ -46,8 +41,7 @@ class _SystemMessage:
 
 def _started(task_id: str, task_type: object = "local_agent") -> _SystemMessage:
     return _SystemMessage(
-        "task_started",
-        {"task_id": task_id, "description": "adversarial review", "task_type": task_type},
+        "task_started", {"task_id": task_id, "description": "adversarial review", "task_type": task_type}
     )
 
 
@@ -82,11 +76,7 @@ def _run(monkeypatch, messages, log=None):
 
 def test_blocked_over_pending_background_child_is_a_typed_attempt_outcome(monkeypatch):
     logged: list[str] = []
-    result = _run(
-        monkeypatch,
-        [_started("t1"), _ResultMessage(structured_output=_BLOCKED)],
-        log=logged.append,
-    )
+    result = _run(monkeypatch, [_started("t1"), _ResultMessage(structured_output=_BLOCKED)], log=logged.append)
     assert classify_outcome(result) is Outcome.ERROR
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
     assert not infra_class_failure(result)
@@ -96,10 +86,7 @@ def test_blocked_over_pending_background_child_is_a_typed_attempt_outcome(monkey
 
 
 def test_non_terminal_task_update_keeps_the_child_pending(monkeypatch):
-    result = _run(
-        monkeypatch,
-        [_started("t1"), _updated("t1", "running"), _ResultMessage(structured_output=_BLOCKED)],
-    )
+    result = _run(monkeypatch, [_started("t1"), _updated("t1", "running"), _ResultMessage(structured_output=_BLOCKED)])
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
 
 
@@ -117,10 +104,7 @@ def test_malformed_task_events_are_ignored(monkeypatch):
 
 
 def test_delegated_workflow_task_counts_as_a_pending_child(monkeypatch):
-    result = _run(
-        monkeypatch,
-        [_started("w1", "local_workflow"), _ResultMessage(structured_output=_BLOCKED)],
-    )
+    result = _run(monkeypatch, [_started("w1", "local_workflow"), _ResultMessage(structured_output=_BLOCKED)])
     assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
 
 

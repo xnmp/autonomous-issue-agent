@@ -13,7 +13,7 @@ import pytest
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 
 
-CHILD = r'''
+CHILD = r"""
 import os, signal, subprocess, sys, time
 from issue_agent.app.main import _TerminationHandler
 from issue_agent.app.tick import Daemon
@@ -55,7 +55,7 @@ daemon = Daemon("private", lambda: WorldState(),
     dispatch_capacity=1, shutdown_timeout_seconds=2, cancel_active_dispatches=cancel,
     terminalize=lambda: print("TERMINALIZED", flush=True), log=lambda s: print(s, flush=True))
 daemon.run_forever(sleep=sleep, now=lambda: 0)
-'''
+"""
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux uv service signal routing")
@@ -65,7 +65,9 @@ def test_uv_main_signal_terminalizes_daemon_and_reaps_owned_workers(tmp_path, ac
     assert uv is not None
     process = subprocess.Popen(
         [uv, "run", "--no-sync", "python", "-u", "-c", CHILD, "active" if active else "idle"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
         env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
     )
     owned = []
@@ -75,10 +77,9 @@ def test_uv_main_signal_terminalizes_daemon_and_reaps_owned_workers(tmp_path, ac
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             deadline = time.monotonic() + 10
-            while not any(line.startswith(b"READY ") and line[6:].isdigit()
-                          for line in output.split(b"\n")[:-1]):
+            while not any(line.startswith(b"READY ") and line[6:].isdigit() for line in output.split(b"\n")[:-1]):
                 assert time.monotonic() < deadline, output.decode()
-                if selector.select(.1):
+                if selector.select(0.1):
                     chunk = os.read(process.stdout.fileno(), 65536)
                     assert chunk, output.decode()
                     output += chunk

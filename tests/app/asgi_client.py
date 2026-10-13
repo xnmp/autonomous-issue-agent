@@ -16,6 +16,7 @@ import httpx
 
 class ASGITestClient:
     __test__ = False
+
     def __init__(self, app, *, headers=None, base_url: str = "http://testserver"):
         self._app = app
         self._headers = headers or {}
@@ -24,11 +25,7 @@ class ASGITestClient:
     def request(self, method: str, path: str, **kwargs) -> httpx.Response:
         async def send() -> httpx.Response:
             transport = httpx.ASGITransport(app=self._app)
-            async with httpx.AsyncClient(
-                transport=transport,
-                headers=self._headers,
-                base_url=self._base_url,
-            ) as client:
+            async with httpx.AsyncClient(transport=transport, headers=self._headers, base_url=self._base_url) as client:
                 return await client.request(method, path, **kwargs)
 
         return asyncio.run(send())

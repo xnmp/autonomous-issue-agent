@@ -9,16 +9,13 @@ from issue_agent.domain.refs import BRANCH_PREFIXES, issue_from_branch
 
 
 def git(repo, *args):
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True,
-    ).stdout.strip()
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
 @pytest.fixture
 def repo(tmp_path):
     git(tmp_path, "init", "-b", "dev")
-    git(tmp_path, "-c", "user.name=Test", "-c", "user.email=test@example.com",
-        "commit", "--allow-empty", "-m", "base")
+    git(tmp_path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base")
     git(tmp_path, "remote", "add", "origin", str(tmp_path))
     return tmp_path
 

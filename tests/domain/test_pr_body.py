@@ -24,10 +24,16 @@ def test_code_examples_do_not_substitute_for_the_published_contract():
     assert completed.endswith("## Acceptance Criteria\n- actual\n\nCloses #42")
 
 
-@pytest.mark.parametrize("body", [
-    "````md\nexample\n````", "```md\nexample", "~~~~~\nexample\n~~~~~~",
-    "<!--\n## Acceptance Criteria\nCloses #42\n-->", "<!-- unfinished comment",
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "````md\nexample\n````",
+        "```md\nexample",
+        "~~~~~\nexample\n~~~~~~",
+        "<!--\n## Acceptance Criteria\nCloses #42\n-->",
+        "<!-- unfinished comment",
+    ],
+)
 def test_completion_keeps_appended_sections_visible_and_is_idempotent(body):
     completed = complete_pr_body(body, 42, "o/r", "- actual")
     assert completed.endswith("## Acceptance Criteria\n- actual\n\nCloses #42")
@@ -37,8 +43,7 @@ def test_completion_keeps_appended_sections_visible_and_is_idempotent(body):
 def test_fenced_payloads_inside_criteria_are_preserved():
     criteria = '- API returns exactly:\n```json\n{"success": true}\n```'
     assert issue_acceptance_criteria(f"## Acceptance Criteria\n{criteria}\n## Notes\nunrelated", []) == criteria
-    comment = ("<details><summary>Technical acceptance criteria (for the engineer)"
-               f"</summary>\n{criteria}\n</details>")
+    comment = f"<details><summary>Technical acceptance criteria (for the engineer)</summary>\n{criteria}\n</details>"
     assert issue_acceptance_criteria("", [comment]) == criteria
 
 
@@ -49,15 +54,24 @@ def test_unfinished_fenced_criteria_cannot_hide_issue_linkage():
 
 
 def test_latest_posted_contract_wins_and_stops_before_other_sections():
-    assert issue_acceptance_criteria("## Acceptance Criteria\n- original", [
-        "## Acceptance Criteria\n- old", "## Acceptance criteria\n- [ ] new\n## Test Plan\n- unrelated",
-        "ordinary later discussion",
-    ]) == "- [ ] new"
+    assert (
+        issue_acceptance_criteria(
+            "## Acceptance Criteria\n- original",
+            [
+                "## Acceptance Criteria\n- old",
+                "## Acceptance criteria\n- [ ] new\n## Test Plan\n- unrelated",
+                "ordinary later discussion",
+            ],
+        )
+        == "- [ ] new"
+    )
 
 
 def test_triage_parsed_criteria_are_recovered_from_the_existing_comment():
-    comment = ("Ready to build\n<details><summary>Technical acceptance criteria "
-               "(for the engineer)</summary>\n\n- result one\n- result two\n</details>")
+    comment = (
+        "Ready to build\n<details><summary>Technical acceptance criteria "
+        "(for the engineer)</summary>\n\n- result one\n- result two\n</details>"
+    )
     assert issue_acceptance_criteria("", [comment]) == "- result one\n- result two"
 
 
@@ -84,11 +98,14 @@ def test_a_thematic_break_after_a_blank_line_is_not_a_heading():
     assert completed.endswith("## Acceptance Criteria\n- actual\n\nCloses #42")
 
 
-@pytest.mark.parametrize("body", [
-    "    ## Acceptance Criteria\n    - example only\n    Closes #42",
-    "narrative\n\n    ## Acceptance Criteria\n    Closes #42\n\nmore narrative",
-    "\t## Acceptance Criteria\n\tCloses #42",
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    ## Acceptance Criteria\n    - example only\n    Closes #42",
+        "narrative\n\n    ## Acceptance Criteria\n    Closes #42\n\nmore narrative",
+        "\t## Acceptance Criteria\n\tCloses #42",
+    ],
+)
 def test_indented_code_examples_do_not_substitute_for_the_published_contract(body):
     completed = complete_pr_body(body, 42, "o/r", "- actual")
     assert completed.startswith(body)
@@ -102,9 +119,12 @@ def test_an_atx_heading_may_be_indented_up_to_three_spaces():
 
 
 def test_acceptance_subsections_are_kept_until_a_sibling_or_parent_heading():
-    issue = ("## Acceptance Criteria\n### Happy path\n- [ ] Return 200\n"
-             "### Failure path\n- [ ] Return 404\n## Notes\nOther text")
+    issue = (
+        "## Acceptance Criteria\n### Happy path\n- [ ] Return 200\n"
+        "### Failure path\n- [ ] Return 404\n## Notes\nOther text"
+    )
     assert issue_acceptance_criteria(issue, []) == (
-        "### Happy path\n- [ ] Return 200\n### Failure path\n- [ ] Return 404")
+        "### Happy path\n- [ ] Return 200\n### Failure path\n- [ ] Return 404"
+    )
     setext = "Acceptance Criteria\n===\n## Happy\n- [ ] a\nNotes\n===\nother"
     assert issue_acceptance_criteria(setext, []) == "## Happy\n- [ ] a"

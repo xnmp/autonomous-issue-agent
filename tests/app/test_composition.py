@@ -24,13 +24,7 @@ from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.config import supervision_dir
 from issue_agent.app.tick import control_store, headroom, owner_identity, shutdown_hooks
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.contracts import (
-    BudgetScope,
-    ChargeOrigin,
-    Money,
-    PricingBasis,
-    RunId,
-)
+from issue_agent.domain.contracts import BudgetScope, ChargeOrigin, Money, PricingBasis, RunId
 
 
 class _UnreadableLedger:
@@ -51,35 +45,20 @@ def test_paid_headroom_follows_the_daily_cap_and_fails_closed_on_an_unreadable_l
     assert headroom(uncapped, _UnreadableLedger(), 5.0)() is True
 
 
-def test_process_supervision_isolated_between_checkouts_sharing_state(
-    tmp_path,
-) -> None:
+def test_process_supervision_isolated_between_checkouts_sharing_state(tmp_path) -> None:
     shared = tmp_path / "shared-state"
     checkout_a = tmp_path / "checkout-a"
     checkout_b = tmp_path / "checkout-b"
     checkout_a.mkdir()
     checkout_b.mkdir()
-    common = {
-        "REPO": "owner/repo",
-        "STATE_DIR": str(shared),
-    }
+    common = {"REPO": "owner/repo", "STATE_DIR": str(shared)}
     cfg_a = from_env({**common, "TARGET_DIR": str(checkout_a)})
     cfg_b = from_env({**common, "TARGET_DIR": str(checkout_b)})
-    supervisor_a = ProcessSupervisor(
-        supervision_dir(cfg_a, "fix"),
-        grace_seconds=0.05,
-    )
-    supervisor_b = ProcessSupervisor(
-        supervision_dir(cfg_b, "fix"),
-        grace_seconds=0.05,
-    )
+    supervisor_a = ProcessSupervisor(supervision_dir(cfg_a, "fix"), grace_seconds=0.05)
+    supervisor_b = ProcessSupervisor(supervision_dir(cfg_b, "fix"), grace_seconds=0.05)
     assert supervisor_a.state_dir != supervisor_b.state_dir
 
-    process = subprocess.Popen(
-        ["sleep", "30"],
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-    )
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True, stdout=subprocess.DEVNULL)
     try:
         run_id = RunId("checkout-a-paid-run")
         supervisor_a.register(run_id, os.getpgid(process.pid))
@@ -100,8 +79,13 @@ def test_process_supervision_isolated_between_checkouts_sharing_state(
 
 def _daily(now: datetime) -> BudgetScope:
     return BudgetScope(
-        "o/r", "repository", "USD", now.date().isoformat(),
-        now.replace(hour=0), now.replace(hour=0) + timedelta(days=1), ZoneInfo("UTC"),
+        "o/r",
+        "repository",
+        "USD",
+        now.date().isoformat(),
+        now.replace(hour=0),
+        now.replace(hour=0) + timedelta(days=1),
+        ZoneInfo("UTC"),
     )
 
 
@@ -118,13 +102,20 @@ def test_a_repointed_deployment_recovers_its_predecessors_dead_leg(tmp_path) -> 
     store = control_store(old, "fix")
     run_id = RunId("repoint-old-run")
     assert store.lease("o/r", "fix", 7, old_owner)
-    assert store.reserve(ReservationRequest(
-        run_id, "o/r", "fix", "RESOLVE", old_owner, Money("USD", 1_000),
-        (BudgetLimit(_daily(datetime.now(timezone.utc)), Money("USD", 10_000)),), 7, issue=7,
-    )).admitted
-    store.register_process_lease(
-        run_id, expected_owner_id=old_owner, pid=999_999, pgid=999_999, process_start_ticks=1,
-    )
+    assert store.reserve(
+        ReservationRequest(
+            run_id,
+            "o/r",
+            "fix",
+            "RESOLVE",
+            old_owner,
+            Money("USD", 1_000),
+            (BudgetLimit(_daily(datetime.now(timezone.utc)), Money("USD", 10_000)),),
+            7,
+            issue=7,
+        )
+    ).admitted
+    store.register_process_lease(run_id, expected_owner_id=old_owner, pid=999_999, pgid=999_999, process_start_ticks=1)
 
     adopted = control_store(current, "fix")
     assert adopted.path == store.path
@@ -145,12 +136,22 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
     control.initialize()
     run_id = RunId("killed-at-shutdown")
     assert control.lease("o/r", "fix", 42, "o/r:fix")
-    assert control.reserve(ReservationRequest(
-        run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1_000),
-        (BudgetLimit(_daily(now), Money("USD", 2_000)),), 42, issue=42, runtime="codex",
-    )).admitted
+    assert control.reserve(
+        ReservationRequest(
+            run_id,
+            "o/r",
+            "fix",
+            "RESOLVE",
+            "o/r:fix",
+            Money("USD", 1_000),
+            (BudgetLimit(_daily(now), Money("USD", 2_000)),),
+            42,
+            issue=42,
+            runtime="codex",
+        )
+    ).admitted
     control.register_process_lease(
-        run_id, expected_owner_id="o/r:fix", pid=999_999, pgid=999_999, process_start_ticks=1,
+        run_id, expected_owner_id="o/r:fix", pid=999_999, pgid=999_999, process_start_ticks=1
     )
     prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix", state_dir="", role="fix")  # type: ignore[arg-type]
     prepare()
@@ -159,8 +160,11 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
     control.unlease("o/r", "fix", 42, "o/r:fix")  # the role's `finally` after the cancelled leg
 
     shutdown_hooks(
-        control, CodexSpendReconciler(control, (str(tmp_path / "unreadable-yet"),)),
-        owner_id="o/r:fix", state_dir=str(tmp_path / "state"), role="fix",
+        control,
+        CodexSpendReconciler(control, (str(tmp_path / "unreadable-yet"),)),
+        owner_id="o/r:fix",
+        state_dir=str(tmp_path / "state"),
+        role="fix",
     )[1]()
 
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
@@ -169,10 +173,18 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
     # Boot: the group is reaped, its lease reclaimed, and the measured
     # rollout settles the leg.
     assert control.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
-    measured = control.settle(SettlementRequest(
-        run_id, Money("USD", 250), PricingBasis.RECONCILED, "codex-recovered:s:killed", None, None, None,
-        origin=ChargeOrigin.RECOVERY_ESTIMATE,
-    ))
+    measured = control.settle(
+        SettlementRequest(
+            run_id,
+            Money("USD", 250),
+            PricingBasis.RECONCILED,
+            "codex-recovered:s:killed",
+            None,
+            None,
+            None,
+            origin=ChargeOrigin.RECOVERY_ESTIMATE,
+        )
+    )
     assert measured.disposition is AccountingDisposition.AVAILABLE
     assert control.snapshot(_daily(now)).settled == Money("USD", 250)
 
@@ -200,6 +212,8 @@ class FakeRunner:
     async def run(self, task):
         self.tasks.append(task)
         return self.result
+
+
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 FIX_BOT = "fix-bot"
@@ -234,11 +248,9 @@ class _BuildableGateway(FakeGateway):
     def viewer_login(self) -> str:
         return REVIEW_BOT  # the review role's boot check: its credential is REVIEW_BOT
 
+
 def _role_state_env(tmp_path) -> dict[str, str]:
-    return {
-        "STATE_DIR": str(tmp_path / "state"),
-        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
-    }
+    return {"STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "review-state")}
 
 
 # ── #29: a codex fixer announces that MAX_BUDGET_USD bounds nothing ──────────
@@ -265,19 +277,22 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
 
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     cfg = replace(
-        from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "REVIEWER_RUNTIME": "codex",
-            "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
-            **_role_state_env(tmp_path),
-            "TARGET_DIR": str(tmp_path),
-        }),
+        from_env(
+            {
+                "REPO": "o/r",
+                "FIX_BOT": FIX_BOT,
+                "REVIEW_BOT": REVIEW_BOT,
+                "REVIEWER_RUNTIME": "codex",
+                "REVIEW_MODEL": "gpt-5.6-terra",
+                "REVIEW_BUDGET_USD": "2.5",
+                **_role_state_env(tmp_path),
+                "TARGET_DIR": str(tmp_path),
+            }
+        ),
         control_authority_root=str(tmp_path / "machine-state"),
     )
 
-    composed = compose_review_daemon(
-        cfg, _BuildableGateway(),
-        FakeRunner(AgentResult(is_error=False)),
-    )
+    composed = compose_review_daemon(cfg, _BuildableGateway(), FakeRunner(AgentResult(is_error=False)))
 
     assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["rate_table"] is not None
@@ -305,21 +320,21 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
             return ""
 
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
-    monkeypatch.setattr(
-        codex_home, "write_codex_home", lambda *args, **kwargs: hook_calls.append((args, kwargs))
-    )
+    monkeypatch.setattr(codex_home, "write_codex_home", lambda *args, **kwargs: hook_calls.append((args, kwargs)))
     cfg = replace(
-        from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "REVIEWER_RUNTIME": "codex",
-            **_role_state_env(tmp_path),
-            "TARGET_DIR": str(tmp_path / "target"),
-        }),
+        from_env(
+            {
+                "REPO": "o/r",
+                "FIX_BOT": FIX_BOT,
+                "REVIEW_BOT": REVIEW_BOT,
+                "REVIEWER_RUNTIME": "codex",
+                **_role_state_env(tmp_path),
+                "TARGET_DIR": str(tmp_path / "target"),
+            }
+        ),
         control_authority_root=str(tmp_path / "machine-state"),
     )
 
-    compose_review_daemon(
-        cfg, _BuildableGateway(),
-        FakeRunner(AgentResult(is_error=False)),
-    )
+    compose_review_daemon(cfg, _BuildableGateway(), FakeRunner(AgentResult(is_error=False)))
 
     assert hook_calls == []

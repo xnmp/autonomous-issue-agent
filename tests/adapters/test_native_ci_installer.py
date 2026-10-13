@@ -109,9 +109,18 @@ def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=N
     mutation = tmp_path / "host-mutation"
     gh_log = tmp_path / "gh.log"
     fixture = {
-        "passwd": passwd, "group": group, "groups": groups, "proceed": proceed, "loaded": loaded, "registered": registered_to or profile.repository,
-        "user": profile.user, "dir": f"{profile.home}/runner", "service": profile.service,
-        "mutation": str(mutation), "gh_log": str(gh_log), "sudo_log": str(tmp_path / "sudo.log"),
+        "passwd": passwd,
+        "group": group,
+        "groups": groups,
+        "proceed": proceed,
+        "loaded": loaded,
+        "registered": registered_to or profile.repository,
+        "user": profile.user,
+        "dir": f"{profile.home}/runner",
+        "service": profile.service,
+        "mutation": str(mutation),
+        "gh_log": str(gh_log),
+        "sudo_log": str(tmp_path / "sudo.log"),
     }
     for tool in ("sudo", "gh", "id", "getent", "systemctl", "curl", "sha256sum", "shellcheck"):
         target = binaries / tool
@@ -120,7 +129,9 @@ def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=N
     result = subprocess.run(
         ["bash", str(installer), *(profile.args if args is None else args)],
         env={**os.environ, "PATH": f"{binaries}:/usr/bin:/bin", "CI_INSTALL_FIXTURE": json.dumps(fixture)},
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return result, mutation, gh_log
 
@@ -162,7 +173,7 @@ def test_existing_runner_identity_is_refused_before_any_host_mutation(tmp_path, 
 @pytest.mark.parametrize("args", [["unknown"], [""], ["default", "ballast"], ["BALLAST"]])
 def test_unknown_or_extra_profile_arguments_are_refused_before_any_work(tmp_path, args):
     result, mutation, gh_log = run_installer(
-        tmp_path, DEFAULT, [DEFAULT.dedicated], [DEFAULT.group], DEFAULT.uid, args=args,
+        tmp_path, DEFAULT, [DEFAULT.dedicated], [DEFAULT.group], DEFAULT.uid, args=args
     )
 
     assert result.returncode == 2
@@ -173,7 +184,7 @@ def test_unknown_or_extra_profile_arguments_are_refused_before_any_work(tmp_path
 def profile_values(name):
     """Evaluate the installer's own profile table, the single source of truth."""
     script = INSTALLER.read_text()
-    block = script[script.index("# BEGIN PROFILES"):script.index("# END PROFILES")]
+    block = script[script.index("# BEGIN PROFILES") : script.index("# END PROFILES")]
     fields = "repository runner_user runner_home runner_name runner_label service unit_file runner_dir"
     code = f'{block}\nload_profile "$1"\nfor f in {fields}; do printf "%s=%s\\n" "$f" "${{!f}}"; done'
     out = subprocess.run(["bash", "-c", code, "_", name], capture_output=True, text=True, check=True).stdout
@@ -221,7 +232,9 @@ def test_each_unit_runs_as_its_profile_account_and_confines_writes_to_its_home(p
 
 @PROFILES
 def test_fresh_install_registers_and_extracts_as_the_runner_user_with_profile_values(tmp_path, profile):
-    result, _, gh_log = run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="fresh")
+    result, _, gh_log = run_installer(
+        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="fresh"
+    )
     calls = sudo_calls(tmp_path)
     runner_dir = f"{profile.home}/runner"
 
@@ -252,7 +265,8 @@ def test_root_names_no_path_beneath_the_runner_home(tmp_path, profile):
 def test_installer_source_never_passes_a_runner_dir_path_to_root_sudo():
     script = INSTALLER.read_text()
     root_lines = [
-        line for line in script.splitlines()
+        line
+        for line in script.splitlines()
         if "sudo -n " in line and 'sudo -n -u "$runner_user"' not in line and not line.lstrip().startswith("#")
     ]
 
@@ -272,7 +286,7 @@ def test_runner_name_lookup_binds_the_name_with_jq_arg_not_interpolation():
 @PROFILES
 def test_reinstall_of_a_configured_runner_reuses_registration_and_restarts_the_service(tmp_path, profile):
     result, _, gh_log = run_installer(
-        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="configured", loaded=True,
+        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="configured", loaded=True
     )
     calls = sudo_calls(tmp_path)
 
@@ -286,8 +300,13 @@ def test_reinstall_of_a_configured_runner_reuses_registration_and_restarts_the_s
 @PROFILES
 def test_a_configured_runner_registered_to_another_repository_is_refused(tmp_path, profile):
     result, _, _ = run_installer(
-        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid,
-        proceed="configured", registered_to="someone/else",
+        tmp_path,
+        profile,
+        [profile.dedicated],
+        [profile.group],
+        profile.uid,
+        proceed="configured",
+        registered_to="someone/else",
     )
 
     assert result.returncode == 2
@@ -296,7 +315,9 @@ def test_a_configured_runner_registered_to_another_repository_is_refused(tmp_pat
 
 @PROFILES
 def test_a_loaded_service_is_stopped_before_any_runner_uid_step(tmp_path, profile):
-    run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="configured", loaded=True)
+    run_installer(
+        tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed="configured", loaded=True
+    )
     calls = sudo_calls(tmp_path)
 
     stop = calls.index(["-n", "systemctl", "stop", profile.service])
@@ -312,10 +333,15 @@ def test_a_checkout_inside_the_runner_home_is_refused_before_any_privileged_step
     binaries = tmp_path / "bin"
     binaries.mkdir()
     for tool in ("sudo", "gh"):
-        (binaries / tool).write_text("#!/bin/sh\necho called >> \"$0.log\"\nexit 99\n")
+        (binaries / tool).write_text('#!/bin/sh\necho called >> "$0.log"\nexit 99\n')
         (binaries / tool).chmod(0o755)
-    result = subprocess.run(["bash", str(INSTALLER)], env={**os.environ, "PATH": f"{binaries}:/usr/bin:/bin"},
-                            capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        ["bash", str(INSTALLER)],
+        env={**os.environ, "PATH": f"{binaries}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert result.returncode == 2
     assert "inside /var/lib/issue-agent-ci" in result.stderr
     assert not (binaries / "sudo.log").exists() and not (binaries / "gh.log").exists()

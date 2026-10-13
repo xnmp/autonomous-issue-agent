@@ -28,7 +28,8 @@ def _completed_payloads(tmp_path, result):
 
 def test_refused_leg_completed_event_carries_the_missing_authority(tmp_path):
     refused = AgentResult(
-        is_error=True, status="return_authority_unavailable",
+        is_error=True,
+        status="return_authority_unavailable",
         envelope_subtype="return_authority_unavailable",
         summary="paid admission refused: PR repair purchase is held, consumed or exhausted",
         exit_reason=ExitReason.RUNTIME_UNAVAILABLE,

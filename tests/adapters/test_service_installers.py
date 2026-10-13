@@ -23,16 +23,10 @@ def _executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def _environment(
-    tmp_path: Path, *, systemd: bool, fail_pattern: str = ""
-) -> tuple[dict[str, str], Path, Path]:
-    home = tmp_path / "home"
-    fake_bin = tmp_path / "bin"
-    target = tmp_path / "target-repo"
-    config = tmp_path / "agent.env"
-    home.mkdir()
-    fake_bin.mkdir()
-    target.mkdir()
+def _environment(tmp_path: Path, *, systemd: bool, fail_pattern: str = "") -> tuple[dict[str, str], Path, Path]:
+    home, fake_bin, target, config = (tmp_path / name for name in ("home", "bin", "target-repo", "agent.env"))
+    for directory in (home, fake_bin, target):
+        directory.mkdir()
     config.write_text(f'TARGET_DIR="{target}"\n')
     _executable(fake_bin / "uv", "exit 0")
     if systemd:
@@ -140,60 +134,62 @@ exit 0
     return env, home, fake_bin / "uv"
 
 
+def _script(systemd: bool) -> str:
+    return str(ROOT / "bin" / ("install-systemd.sh" if systemd else "install-launchd.sh"))
+
+
+def _install(env, *args, systemd: bool = True):
+    return _bash(env, _script(systemd), *args)
+
+
+def _artifacts(home: Path, systemd: bool) -> Path:
+    return home / ".config/systemd/user" if systemd else home / "Library/LaunchAgents"
+
+
+def _calls(env) -> list[str]:
+    return Path(env["SERVICE_LOG"]).read_text().splitlines()
+
+
+def _checksum(env, tmp_path: Path) -> str:
+    """The launchd job suffix the installer derives from (config, target)."""
+    return subprocess.run(
+        ["cksum"], input=f"{env['AGENT_ENV']}|{tmp_path / 'target-repo'}", capture_output=True, text=True, check=True
+    ).stdout.split()[0]
+
+
+def _launchd_snapshot(home: Path, checksum: str, target: Path) -> Path:
+    snapshot = home / "Library/Application Support/issue-agent" / f"{checksum}.env"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(f'REPO=""\nTARGET_DIR="{target}"\nKNOWN_GOOD=1\n')
+    return snapshot
+
+
 @pytest.mark.parametrize("systemd", (True, False))
-def test_service_installers_reject_noncanonical_deployment_identity(
-    tmp_path,
-    systemd,
-):
+def test_service_installers_reject_noncanonical_deployment_identity(tmp_path, systemd):
     env, home, _uv = _environment(tmp_path, systemd=systemd)
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "Acme App"
-    script = "install-systemd.sh" if systemd else "install-launchd.sh"
 
-    result = _bash(env, str(ROOT / "bin" / script))
+    result = _install(env, systemd=systemd)
 
     assert result.returncode == 2
     assert "non-canonical deployment identity" in result.stderr
-    assert not tuple(
-        (
-            home / ".config/systemd/user"
-            if systemd
-            else home / "Library/LaunchAgents"
-        ).glob("*")
-    )
+    assert not tuple(_artifacts(home, systemd).glob("*"))
 
 
 @pytest.mark.parametrize("systemd", (True, False))
-def test_service_installers_refuse_an_existing_identity_alias(
-    tmp_path,
-    systemd,
-):
+def test_service_installers_refuse_an_existing_identity_alias(tmp_path, systemd):
     env, home, _uv = _environment(tmp_path, systemd=systemd)
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
     if systemd:
-        artifact = (
-            home
-            / ".config/systemd/user"
-            / "issue-agent-fix-watcher-acme-app.service"
-        )
-        artifact.parent.mkdir(parents=True)
-        artifact.write_text(
-            "Environment=ISSUE_AGENT_DEPLOYMENT_ID=Acme App\n"
-        )
-        script = "install-systemd.sh"
+        artifact = _artifacts(home, systemd) / "issue-agent-fix-watcher-acme-app.service"
+        text = "Environment=ISSUE_AGENT_DEPLOYMENT_ID=Acme App\n"
     else:
-        artifact = (
-            home
-            / "Library/LaunchAgents"
-            / "dev.issue-agent.fix-watcher.123456.plist"
-        )
-        artifact.parent.mkdir(parents=True)
-        artifact.write_text(
-            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
-            "<string>Acme App</string>\n"
-        )
-        script = "install-launchd.sh"
+        artifact = _artifacts(home, systemd) / "dev.issue-agent.fix-watcher.123456.plist"
+        text = "<key>ISSUE_AGENT_DEPLOYMENT_ID</key><string>Acme App</string>\n"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(text)
 
-    result = _bash(env, str(ROOT / "bin" / script))
+    result = _install(env, systemd=systemd)
 
     assert result.returncode == 2
     assert "deployment identity alias" in result.stderr
@@ -201,28 +197,17 @@ def test_service_installers_refuse_an_existing_identity_alias(
 
 
 @pytest.mark.parametrize("systemd", (True, False))
-def test_service_uninstall_preserves_every_definition_when_stop_fails(
-    tmp_path,
-    systemd,
-):
+def test_service_uninstall_preserves_every_definition_when_stop_fails(tmp_path, systemd):
     env, home, _uv = _environment(tmp_path, systemd=systemd)
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
-    script = "install-systemd.sh" if systemd else "install-launchd.sh"
-    install = _bash(env, str(ROOT / "bin" / script))
+    Path(env["AGENT_ENV"]).write_text(f'REPO="acme/app"\nTARGET_DIR="{tmp_path / "target-repo"}"\n')
+    install = _install(env, systemd=systemd)
     assert install.returncode == 0, install.stderr
-    artifact_dir = (
-        home / ".config/systemd/user"
-        if systemd
-        else home / "Library/LaunchAgents"
-    )
-    artifacts = tuple(artifact_dir.glob("*"))
+    artifacts = tuple(_artifacts(home, systemd).glob("*"))
     assert len(artifacts) == (3 if systemd else 2)
 
     env["FAIL_UNINSTALL_PATTERN"] = "review-watcher"
-    uninstall = _bash(env, str(ROOT / "bin" / script), "uninstall", "acme-app")
+    uninstall = _install(env, "uninstall", "acme-app", systemd=systemd)
 
     assert uninstall.returncode != 0
     assert "REFUSING uninstall" in uninstall.stderr
@@ -230,36 +215,34 @@ def test_service_uninstall_preserves_every_definition_when_stop_fails(
     assert "removed 3" not in uninstall.stdout
 
 
+def _role_units(units) -> tuple[Path, ...]:
+    return tuple(unit for unit in units if unit.name != "issue-agent-dashboard.service")
+
+
 def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     env, home, uv = _environment(tmp_path, systemd=True)
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode == 0, result.stderr
-    units = sorted((home / ".config/systemd/user").glob("*.service"))
+    units = sorted(_artifacts(home, True).glob("*.service"))
     assert len(units) == 3
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
-    role_units = tuple(
-        unit for unit in units
-        if unit.name != "issue-agent-dashboard.service"
-    )
-    assert all("NotifyAccess=all" in unit.read_text() for unit in role_units)
-    assert all("WatchdogSec=300" in unit.read_text() for unit in role_units)
-    assert all("KillMode=mixed" in unit.read_text() for unit in role_units)
-    assert all("TimeoutStopSec=90" in unit.read_text() for unit in role_units)
-    assert all("FinalKillSignal=SIGKILL" in unit.read_text() for unit in role_units)
     terminal_hook = ROOT / "bin/service-terminal-evidence.sh"
     assert terminal_hook.is_file()
-    assert all(
-        f'ExecStopPost=-/bin/sh "{terminal_hook}"\n' in unit.read_text()
-        for unit in role_units
-    )
-    assert all(
-        "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"
-        in unit.read_text()
-        for unit in role_units
-    )
-    dashboard = home / ".config/systemd/user/issue-agent-dashboard.service"
+    for unit in _role_units(units):
+        text = unit.read_text()
+        for directive in (
+            "NotifyAccess=all",
+            "WatchdogSec=300",
+            "KillMode=mixed",
+            "TimeoutStopSec=90",
+            "FinalKillSignal=SIGKILL",
+            f'ExecStopPost=-/bin/sh "{terminal_hook}"\n',
+            "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo",
+        ):
+            assert directive in text, (unit.name, directive)
+    dashboard = _artifacts(home, True) / "issue-agent-dashboard.service"
     assert "Environment=AGENT_ENV=" not in dashboard.read_text()
     assert "Environment=TARGET_DIR=" not in dashboard.read_text()
     assert result.stdout.count("active (running)") == 3
@@ -267,48 +250,36 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
 
 def test_systemd_dashboard_install_is_singleton_and_latest_install_wins(tmp_path):
     env, home, _first_uv = _environment(tmp_path, systemd=True)
-    script = str(ROOT / "bin/install-systemd.sh")
-
-    first = _bash(env, script)
+    first = _install(env)
     assert first.returncode == 0, first.stderr
 
     latest_bin = tmp_path / "latest-bin"
     latest_bin.mkdir()
-    latest_uv = latest_bin / "uv"
-    _executable(latest_uv, "exit 0")
-    second_env = {
-        **env,
-        "ISSUE_AGENT_DEPLOYMENT_ID": "repo-b",
-        "PATH": f"{latest_bin}:{env['PATH']}",
-    }
-    second = _bash(second_env, script)
+    _executable(latest_bin / "uv", "exit 0")
+    second = _install({**env, "ISSUE_AGENT_DEPLOYMENT_ID": "repo-b", "PATH": f"{latest_bin}:{env['PATH']}"})
     assert second.returncode == 0, second.stderr
 
-    unit_dir = home / ".config/systemd/user"
+    unit_dir = _artifacts(home, True)
     dashboards = tuple(unit_dir.glob("issue-agent-dashboard.service"))
     assert len(dashboards) == 1
-    assert f"ExecStart={latest_uv} " in dashboards[0].read_text()
+    assert f"ExecStart={latest_bin / 'uv'} " in dashboards[0].read_text()
     assert len(tuple(unit_dir.glob("*.service"))) == 5
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    assert calls.count("restart issue-agent-dashboard.service") == 2
+    assert _calls(env).count("restart issue-agent-dashboard.service") == 2
 
 
 def test_systemd_dashboard_port_conflict_preserves_installed_roles(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
     port_check = tmp_path / "bin" / "dashboard-port-check"
-    _executable(
-        port_check,
-        "printf '4242\\tpython issue-agent dashboard\\n'; exit 0",
-    )
+    _executable(port_check, "printf '4242\\tpython issue-agent dashboard\\n'; exit 0")
     env["ISSUE_AGENT_DASHBOARD_PORT_CHECK"] = str(port_check)
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode != 0
     assert "TCP 8321 is already bound" in result.stderr
     assert "PID 4242 (python issue-agent dashboard)" in result.stderr
     assert "Stop the manual `issue-agent dashboard`" in result.stderr
-    units = tuple((home / ".config/systemd/user").glob("*.service"))
+    units = tuple(_artifacts(home, True).glob("*.service"))
     assert len(units) == 2
     assert all(path.name != "issue-agent-dashboard.service" for path in units)
     assert result.stdout.count("active (running)") == 2
@@ -318,232 +289,157 @@ def test_systemd_installer_rolls_back_if_unit_is_not_running(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
     env["SUB_STATE"] = "failed"
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode != 0
     assert "activation check failed" in result.stderr
-    assert not tuple(
-        (home / ".config/systemd/user").glob("*.service")
-    )
+    assert not tuple(_artifacts(home, True).glob("*.service"))
 
 
 def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
-    unit_dir = home / ".config/systemd/user"
+    unit_dir = _artifacts(home, True)
     unit_dir.mkdir(parents=True)
     for deployment in ("my-app", "other-app"):
         for role in ("fix-watcher", "review-watcher"):
-            (unit_dir / f"issue-agent-{role}-{deployment}.service").write_text(
-                deployment
-            )
+            (unit_dir / f"issue-agent-{role}-{deployment}.service").write_text(deployment)
     dashboard = unit_dir / "issue-agent-dashboard.service"
     dashboard.write_text("singleton")
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"), "uninstall", "My App")
+    result = _install(env, "uninstall", "My App")
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(unit_dir.glob("*.service"))
     assert len(remaining) == 3
     assert dashboard in remaining
-    assert sum(
-        path.name.endswith("-other-app.service") for path in remaining
-    ) == 2
+    assert sum(path.name.endswith("-other-app.service") for path in remaining) == 2
 
 
 @pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
-@pytest.mark.parametrize("unit,kind", [
-    ("issue-agent-fix-watcher-target-repo.service", "current"),
-    ("issue-agent-fix-watcher.service", "legacy"),
-])
+@pytest.mark.parametrize(
+    "unit,kind",
+    [("issue-agent-fix-watcher-target-repo.service", "current"), ("issue-agent-fix-watcher.service", "legacy")],
+)
 def test_systemd_refuses_a_live_unit_without_rollback_definition(tmp_path, state_var, unit, kind):
     env, home, _uv = _environment(tmp_path, systemd=True)
     env[state_var] = unit
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode == 2
     assert f"active/enabled {kind} unit" in result.stderr
     assert "no recoverable definition" in result.stderr
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    assert not any(
-        call.startswith(("stop ", "disable ", "restart ", "enable "))
-        for call in calls
-    )
-    assert not tuple(
-        (home / ".config/issue-agent").glob("*.env")
-    )
+    assert not any(call.startswith(("stop ", "disable ", "restart ", "enable ")) for call in _calls(env))
+    assert not tuple((home / ".config/issue-agent").glob("*.env"))
 
 
-def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
-    tmp_path,
-):
+_SERVICES = ("issue-agent-fix-watcher", "issue-agent-review-watcher")
+
+
+def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
-    unit_dir = home / ".config/systemd/user"
+    unit_dir = _artifacts(home, True)
     unit_dir.mkdir(parents=True)
-    services = (
-        "issue-agent-fix-watcher",
-        "issue-agent-review-watcher",
-    )
-    for service in services:
+    for service in _SERVICES:
         (unit_dir / f"{service}.service").write_text("legacy-unsuffixed")
-        (unit_dir / f"{service}-target-repo.service").write_text(
-            "legacy-target-name"
-        )
+        (unit_dir / f"{service}-target-repo.service").write_text("legacy-target-name")
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode == 0, result.stderr
-    assert sorted(path.name for path in unit_dir.glob("*.service")) == sorted([
-        *(f"{service}-stable-name.service" for service in services),
-        "issue-agent-dashboard.service",
-    ])
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    for service in services:
-        assert f"stop {service}.service" in calls
-        assert f"stop {service}-target-repo.service" in calls
-        assert f"stop {service}-stable-name.service" in calls
+    assert sorted(path.name for path in unit_dir.glob("*.service")) == sorted(
+        [*(f"{service}-stable-name.service" for service in _SERVICES), "issue-agent-dashboard.service"]
+    )
+    calls = _calls(env)
+    for service in _SERVICES:
+        for name in (service, f"{service}-target-repo", f"{service}-stable-name"):
+            assert f"stop {name}.service" in calls
 
 
 def test_systemd_failed_cutover_restores_legacy_units(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True, fail_pattern="review-watcher")
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
-    unit_dir = home / ".config/systemd/user"
+    unit_dir = _artifacts(home, True)
     unit_dir.mkdir(parents=True)
-    services = ("issue-agent-fix-watcher", "issue-agent-review-watcher")
-    for service in services:
+    for service in _SERVICES:
         (unit_dir / f"{service}-target-repo.service").write_text(f"legacy-{service}")
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode != 0
-    assert all((unit_dir / f"{s}-target-repo.service").read_text() == f"legacy-{s}" for s in services)
+    assert all((unit_dir / f"{s}-target-repo.service").read_text() == f"legacy-{s}" for s in _SERVICES)
     assert not any(unit_dir.glob("*-stable-name.service"))
 
 
-def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
-    tmp_path,
-):
+def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
     config = Path(env["AGENT_ENV"])
-    first_target = tmp_path / "acme" / "app"
-    second_target = tmp_path / "other" / "app"
-    first_target.mkdir(parents=True)
-    second_target.mkdir(parents=True)
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\n'
-    )
-    first_env = {
-        **env,
-        "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app",
-    }
-
-    first = _bash(first_env, str(ROOT / "bin/install-systemd.sh"))
-    assert first.returncode == 0, first.stderr
-
-    config.write_text(
-        f'REPO="other/app"\nTARGET_DIR="{second_target}"\n'
-    )
-    second_env = {
-        **env,
-        "ISSUE_AGENT_DEPLOYMENT_ID": "other-app",
-    }
-    second = _bash(second_env, str(ROOT / "bin/install-systemd.sh"))
-    assert second.returncode == 0, second.stderr
-    units = tuple((home / ".config/systemd/user").glob("*.service"))
+    for repo in ("acme/app", "other/app"):
+        target = tmp_path / repo
+        target.mkdir(parents=True)
+        config.write_text(f'REPO="{repo}"\nTARGET_DIR="{target}"\n')
+        installed = _install({**env, "ISSUE_AGENT_DEPLOYMENT_ID": repo.replace("/", "-")})
+        assert installed.returncode == 0, installed.stderr
+    units = tuple(_artifacts(home, True).glob("*.service"))
     assert len(units) == 5
     assert sum(path.name.endswith("-acme-app.service") for path in units) == 2
     assert sum(path.name.endswith("-other-app.service") for path in units) == 2
 
-    collision = _bash({
-            **env,
-            "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app",
-        }, str(ROOT / "bin/install-systemd.sh"))
+    collision = _install({**env, "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app"})
     assert collision.returncode == 2
     assert "REFUSING deployment 'acme-app'" in collision.stderr
-    snapshot = home / ".config/issue-agent/acme-app.env"
-    assert 'REPO="acme/app"' in snapshot.read_text()
+    assert 'REPO="acme/app"' in (home / ".config/issue-agent/acme-app.env").read_text()
 
 
-def test_systemd_same_name_repoint_replaces_all_units_atomically(
-    tmp_path,
-):
+def test_systemd_same_name_repoint_replaces_all_units_atomically(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
     config = Path(env["AGENT_ENV"])
-    first_target = tmp_path / "checkout-a"
-    second_target = tmp_path / "checkout-b"
+    first_target, second_target = tmp_path / "checkout-a", tmp_path / "checkout-b"
     first_target.mkdir()
     second_target.mkdir()
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\nKNOWN_GOOD=1\n'
-    )
+    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{first_target}"\nKNOWN_GOOD=1\n')
 
-    first = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    first = _install(env)
     assert first.returncode == 0, first.stderr
-    service_log = Path(env["SERVICE_LOG"])
-    first_call_count = len(service_log.read_text().splitlines())
+    first_call_count = len(_calls(env))
     snapshot = home / ".config/issue-agent/acme-app.env"
 
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n'
-    )
+    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n')
     env["REQUIRE_OLD_SNAPSHOT_DURING_STOP"] = "1"
     env["CUTOVER_SNAPSHOT"] = str(snapshot)
-    second = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    second = _install(env)
 
     assert second.returncode == 0, second.stderr
-    unit_dir = home / ".config/systemd/user"
-    units = tuple(unit_dir.glob("*.service"))
+    units = tuple(_artifacts(home, True).glob("*.service"))
     assert len(units) == 3
-    role_units = tuple(
-        path for path in units
-        if path.name != "issue-agent-dashboard.service"
-    )
+    role_units = _role_units(units)
     assert all(path.name.endswith("-acme-app.service") for path in role_units)
-    assert all(
-        f"Environment=TARGET_DIR={second_target}" in path.read_text()
-        for path in role_units
-    )
+    assert all(f"Environment=TARGET_DIR={second_target}" in path.read_text() for path in role_units)
     assert str(second_target) in snapshot.read_text()
-    second_calls = service_log.read_text().splitlines()[first_call_count:]
-    stops = [
-        second_calls.index(f"stop {path.name}")
-        for path in role_units
-    ]
-    restarts = [
-        second_calls.index(f"restart {path.name}")
-        for path in role_units
-    ]
+    second_calls = _calls(env)[first_call_count:]
+    stops = [second_calls.index(f"stop {path.name}") for path in role_units]
+    restarts = [second_calls.index(f"restart {path.name}") for path in role_units]
     assert max(stops) < min(restarts)
 
 
 def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
-    env, home, _uv = _environment(
-        tmp_path, systemd=True, fail_pattern="review-watcher"
-    )
-    unit_dir = home / ".config/systemd/user"
-    config_dir = home / ".config/issue-agent"
+    env, home, _uv = _environment(tmp_path, systemd=True, fail_pattern="review-watcher")
+    unit_dir, config_dir = _artifacts(home, True), home / ".config/issue-agent"
     unit_dir.mkdir(parents=True)
     config_dir.mkdir(parents=True)
-    names = (
-        "issue-agent-fix-watcher",
-        "issue-agent-review-watcher",
-    )
-    for name in names:
+    for name in _SERVICES:
         (unit_dir / f"{name}-target-repo.service").write_text("known-good")
     dashboard = unit_dir / "issue-agent-dashboard.service"
     dashboard.write_text("known-good-dashboard")
     snapshot = config_dir / "target-repo.env"
     snapshot.write_text("KNOWN_GOOD=1\n")
 
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+    result = _install(env)
 
     assert result.returncode != 0
-    assert all(
-        (unit_dir / f"{name}-target-repo.service").read_text() == "known-good"
-        for name in names
-    )
+    assert all((unit_dir / f"{name}-target-repo.service").read_text() == "known-good" for name in _SERVICES)
     assert dashboard.read_text() == "known-good-dashboard"
     assert snapshot.read_text() == "KNOWN_GOOD=1\n"
 
@@ -551,32 +447,24 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
 def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     env, home, uv = _environment(tmp_path, systemd=False)
 
-    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
+    result = _install(env, systemd=False)
 
     assert result.returncode == 0, result.stderr
-    plists = sorted((home / "Library/LaunchAgents").glob("*.plist"))
+    plists = [plistlib.loads(plist.read_bytes()) for plist in sorted(_artifacts(home, False).glob("*.plist"))]
     assert len(plists) == 2
-    assert all(
-        plistlib.loads(plist.read_bytes())["ProgramArguments"][0] == str(uv)
-        for plist in plists
-    )
-    assert all(
-        plistlib.loads(plist.read_bytes())["EnvironmentVariables"][
-            "ISSUE_AGENT_DEPLOYMENT_ID"
-        ]
-        for plist in plists
-    )
+    assert all(plist["ProgramArguments"][0] == str(uv) for plist in plists)
+    assert all(plist["EnvironmentVariables"]["ISSUE_AGENT_DEPLOYMENT_ID"] for plist in plists)
 
 
 @pytest.mark.parametrize("selector", ("--fix", "--review"))
 def test_launchd_refuses_partial_migration_cutover(tmp_path, selector):
     env, home, _uv = _environment(tmp_path, systemd=False)
 
-    result = _bash(env, str(ROOT / "bin/install-launchd.sh"), selector)
+    result = _install(env, selector, systemd=False)
 
     assert result.returncode == 2
     assert "every legacy writer stops" in result.stderr
-    assert tuple((home / "Library/LaunchAgents").glob("*.plist")) == ()
+    assert tuple(_artifacts(home, False).glob("*.plist")) == ()
 
 
 @pytest.mark.parametrize("fails", [False, True], ids=["migrates", "rolls-back"])
@@ -586,7 +474,7 @@ def test_launchd_stable_identity_cutover_of_checksum_predecessors(tmp_path, fail
     env, home, _uv = _environment(tmp_path, systemd=False, fail_pattern="review-watcher" if fails else "")
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
     Path(env["AGENT_ENV"]).write_text(f'REPO="acme/app"\nTARGET_DIR="{tmp_path / "target-repo"}"\n')
-    agents = home / "Library/LaunchAgents"
+    agents = _artifacts(home, False)
     agents.mkdir(parents=True)
     units = ("fix-watcher", "review-watcher")
     mine = tuple(agents / f"dev.issue-agent.{unit}.123456.plist" for unit in units)
@@ -595,9 +483,9 @@ def test_launchd_stable_identity_cutover_of_checksum_predecessors(tmp_path, fail
         for path in paths:
             path.write_text(f"<key>ISSUE_AGENT_DEPLOYMENT_ID</key><string>{owner}</string>\n")
 
-    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
+    result = _install(env, systemd=False)
 
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    calls = _calls(env)
     assert all(path.exists() for path in other)
     current = tuple(agents.glob("dev.issue-agent.*.acme-app.plist"))
     if fails:
@@ -613,26 +501,14 @@ def test_launchd_stable_identity_cutover_of_checksum_predecessors(tmp_path, fail
 
 def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=False)
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    checksum = subprocess.run(
-        ["cksum"],
-        input=f"{config}|{target}",
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()[0]
-    launch_agents = home / "Library/LaunchAgents"
+    checksum = _checksum(env, tmp_path)
+    launch_agents = _artifacts(home, False)
     launch_agents.mkdir(parents=True)
     for role in ("fix-watcher", "review-watcher"):
-        (launch_agents / f"dev.issue-agent.{role}.{checksum}.plist").write_text(
-            "current"
-        )
-        (launch_agents / f"dev.issue-agent.{role}.999999.plist").write_text(
-            "other"
-        )
+        (launch_agents / f"dev.issue-agent.{role}.{checksum}.plist").write_text("current")
+        (launch_agents / f"dev.issue-agent.{role}.999999.plist").write_text("other")
 
-    result = _bash(env, str(ROOT / "bin/install-launchd.sh"), "uninstall", "target-repo")
+    result = _install(env, "uninstall", "target-repo", systemd=False)
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(launch_agents.glob("*.plist"))
@@ -641,98 +517,41 @@ def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
 
 
 def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
-    env, home, _uv = _environment(
-        tmp_path, systemd=False, fail_pattern="review-watcher"
-    )
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    checksum = subprocess.run(
-        ["cksum"],
-        input=f"{config}|{target}",
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()[0]
-    launch_agents = home / "Library/LaunchAgents"
+    env, home, _uv = _environment(tmp_path, systemd=False, fail_pattern="review-watcher")
+    checksum = _checksum(env, tmp_path)
+    launch_agents = _artifacts(home, False)
     launch_agents.mkdir(parents=True)
-    labels = (
-        "dev.issue-agent.fix-watcher",
-        "dev.issue-agent.review-watcher",
-    )
+    labels = ("dev.issue-agent.fix-watcher", "dev.issue-agent.review-watcher")
     for label in labels:
         (launch_agents / f"{label}.{checksum}.plist").write_text("known-good")
         (launch_agents / f"{label}.plist").write_text("legacy-known-good")
-    snapshot = (
-        home
-        / "Library/Application Support/issue-agent"
-        / f"{checksum}.env"
-    )
-    snapshot.parent.mkdir(parents=True)
-    snapshot.write_text(
-        f'REPO=""\nTARGET_DIR="{target}"\nKNOWN_GOOD=1\n'
-    )
+    snapshot = _launchd_snapshot(home, checksum, tmp_path / "target-repo")
 
-    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
+    result = _install(env, systemd=False)
 
     assert result.returncode != 0
-    assert all(
-        (launch_agents / f"{label}.{checksum}.plist").read_text()
-        == "known-good"
-        for label in labels
-    )
-    assert all(
-        (launch_agents / f"{label}.plist").read_text()
-        == "legacy-known-good"
-        for label in labels
-    )
+    assert all((launch_agents / f"{label}.{checksum}.plist").read_text() == "known-good" for label in labels)
+    assert all((launch_agents / f"{label}.plist").read_text() == "legacy-known-good" for label in labels)
     assert "KNOWN_GOOD=1" in snapshot.read_text()
 
 
-def test_launchd_stops_every_current_writer_before_swapping_config(
-    tmp_path,
-):
+def test_launchd_stops_every_current_writer_before_swapping_config(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=False)
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    checksum = subprocess.run(
-        ["cksum"],
-        input=f"{config}|{target}",
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()[0]
-    launch_agents = home / "Library/LaunchAgents"
+    checksum = _checksum(env, tmp_path)
+    launch_agents = _artifacts(home, False)
     launch_agents.mkdir(parents=True)
-    labels = (
-        f"dev.issue-agent.fix-watcher.{checksum}",
-        f"dev.issue-agent.review-watcher.{checksum}",
-    )
-    for label in labels:
-        (launch_agents / f"{label}.plist").write_text("known-good")
-    snapshot = (
-        home
-        / "Library/Application Support/issue-agent"
-        / f"{checksum}.env"
-    )
-    snapshot.parent.mkdir(parents=True)
-    snapshot.write_text(
-        f'REPO=""\nTARGET_DIR="{target}"\nKNOWN_GOOD=1\n'
-    )
+    plists = [launch_agents / f"dev.issue-agent.{role}.{checksum}.plist" for role in ("fix-watcher", "review-watcher")]
+    for plist in plists:
+        plist.write_text("known-good")
+    snapshot = _launchd_snapshot(home, checksum, tmp_path / "target-repo")
     env["REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD"] = "1"
     env["CUTOVER_SNAPSHOT"] = str(snapshot)
 
-    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
+    result = _install(env, systemd=False)
 
     assert result.returncode == 0, result.stderr
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    unloads = [
-        calls.index(f"unload {launch_agents / f'{label}.plist'}")
-        for label in labels
-    ]
-    loads = [
-        calls.index(f"load {launch_agents / f'{label}.plist'}")
-        for label in labels
-    ]
+    calls = _calls(env)
+    unloads, loads = ([calls.index(f"{verb} {plist}") for plist in plists] for verb in ("unload", "load"))
     assert max(unloads) < min(loads)
     assert "KNOWN_GOOD=1" not in snapshot.read_text()
 
@@ -740,22 +559,19 @@ def test_launchd_stops_every_current_writer_before_swapping_config(
 @contextlib.contextmanager
 def _process_tree():
     """A real `bash → bash → sleep` tree; yields (root pid, grandchild pid)."""
-    root = subprocess.Popen(
-        ["bash", "-c", "bash -c 'sleep 60 & wait' & wait"], start_new_session=True
-    )
+    root = subprocess.Popen(["bash", "-c", "bash -c 'sleep 60 & wait' & wait"], start_new_session=True)
+
+    def children(pid) -> list[str]:
+        return subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+
     try:
         leaf = None
         for _ in range(100):
-            middle = subprocess.run(
-                ["pgrep", "-P", str(root.pid)], capture_output=True, text=True
-            ).stdout.split()
-            if middle:
-                found = subprocess.run(
-                    ["pgrep", "-P", middle[0]], capture_output=True, text=True
-                ).stdout.split()
-                if found:
-                    leaf = int(found[0])
-                    break
+            middle = children(root.pid)
+            found = children(middle[0]) if middle else []
+            if found:
+                leaf = int(found[0])
+                break
             time.sleep(0.05)
         assert leaf is not None
         yield root.pid, leaf
@@ -766,32 +582,25 @@ def _process_tree():
 
 def _install_with_port_owner(tmp_path, owner_pid, main_pid):
     env, home, _uv = _environment(tmp_path, systemd=True)
-    unit = home / ".config/systemd/user/issue-agent-dashboard.service"
+    unit = _artifacts(home, True) / "issue-agent-dashboard.service"
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text("[Service]\nExecStart=/old\n")
     port_check = tmp_path / "bin" / "dashboard-port-check"
     _executable(port_check, f"printf '{owner_pid}\\tissue-agent\\tdashboard\\n'")
     env["ISSUE_AGENT_DASHBOARD_PORT_CHECK"] = str(port_check)
     env["MAIN_PID"] = str(main_pid)
-    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
-    return result, unit
+    return _install(env), unit
 
 
-def test_systemd_dashboard_port_held_by_its_own_unit_descendant_reinstalls(tmp_path):
+@pytest.mark.parametrize("holder", ("descendant", "main-pid"))
+def test_systemd_dashboard_port_held_by_its_own_unit_reinstalls(tmp_path, holder):
     # Incident 2026-10-12: the unit's MainPID is `uv`; the listener is its
     # `issue-agent` child, so a PID comparison refused the unit's own socket.
     with _process_tree() as (main_pid, listener):
-        result, unit = _install_with_port_owner(tmp_path, listener, main_pid)
+        result, unit = _install_with_port_owner(tmp_path, listener if holder == "descendant" else main_pid, main_pid)
 
     assert result.returncode == 0, result.stderr
     assert "ExecStart=/old" not in unit.read_text()
-
-
-def test_systemd_dashboard_port_held_by_its_main_pid_reinstalls(tmp_path):
-    with _process_tree() as (main_pid, _listener):
-        result, _unit = _install_with_port_owner(tmp_path, main_pid, main_pid)
-
-    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("main_pid", ("unrelated", "0", "", "not-a-pid"))

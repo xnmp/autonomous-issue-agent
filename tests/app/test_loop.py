@@ -1,19 +1,22 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
-
 import asyncio
 import json
+import re
 import threading
+from pathlib import Path
 
 import pytest
 
 from issue_agent.adapters.github import GhUnavailable
-from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.app.tick import Daemon
-from issue_agent.domain.actions import PostComment, Relabel, Target
+from issue_agent.adapters.reload import RELOAD_EXIT_CODE
+from issue_agent.app.tick import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, CancellableAsyncDispatch, Daemon
+from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.labels import Label
 from issue_agent.domain.recovery import RecoveryTrigger
+from issue_agent.domain.supervision import ExitCode
 from issue_agent.domain.world import WorldState
+from tests.fakes.executor import ImmediateExecutor as Executor
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.manual_clock import ManualClock
 
@@ -28,24 +31,40 @@ _KILL_WINDOW = 7
 
 def _daemon(decide, observe=None, logs=None):
     gw = FakeGateway()
-    ex = Executor(gw)
     d = Daemon(
         name="fix",
         observe=observe or (lambda: WorldState()),
         decide=decide,
-        executor=ex,
+        executor=Executor(gw),
         poll_seconds=60,
         log=(logs.append if logs is not None else (lambda m: None)),
     )
     return d, gw
 
 
+def _paid(run_agent, name="fix", kind=AgentKind.RESOLVE, **daemon) -> Daemon:
+    """A daemon whose every tick decides one paid leg on item 7."""
+    return Daemon(
+        name,
+        lambda: WorldState(),
+        lambda _world: [RunAgent(kind, 7)],
+        Executor(FakeGateway(), run_agent=run_agent),
+        **{"poll_seconds": 1, "dispatch_capacity": 1, **daemon},
+    )
+
+
+def _interrupt(_seconds):
+    raise KeyboardInterrupt
+
+
 def test_tick_isolated_from_decide_crash():
     logs = []
+
     def boom(world):
         raise RuntimeError("decide blew up")
+
     d, gw = _daemon(boom, logs=logs)
-    assert d.tick() == []                # swallowed
+    assert d.tick() == []  # swallowed
     assert any("poll pass failed" in m for m in logs)
     assert gw.calls == []
 
@@ -57,8 +76,6 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
     # dispatched ahead of arming merge-ready #537). Cheap actions must land
     # first — but a dispatch's OWN preceding relabel keeps preceding it, and
     # dispatch order among dispatches is preserved.
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     executed = []
 
     class OrderGateway:
@@ -73,7 +90,8 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
 
     ex = Executor(OrderGateway(), run_agent=lambda a: executed.append(("run", a.number)))
     d = Daemon(
-        "fix", lambda: WorldState(),
+        "fix",
+        lambda: WorldState(),
         lambda w: [
             Relabel(Target.ISSUE, 500, Label.NEEDS_HUMAN, Label.AI_READY),
             RunAgent(AgentKind.RESOLVE, 500),
@@ -86,8 +104,8 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
     taken = d.tick()
     d.wait_for_dispatches()
     assert executed[:2] == [
-        ("relabel", 500),      # the dispatch's own label move still precedes it
-        ("comment", 537),      # finished work lands before any session starts
+        ("relabel", 500),  # the dispatch's own label move still precedes it
+        ("comment", 537),  # finished work lands before any session starts
     ]
     assert sorted(executed[2:]) == [("run", 500), ("run", 534)]
     # Dispatch order among dispatches is preserved at submission.
@@ -95,8 +113,6 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
 
 
 def test_background_dispatch_is_bounded_and_admits_independent_targets():
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     release = threading.Event()
     started: list[int] = []
     started_two = threading.Event()
@@ -130,9 +146,6 @@ def test_background_dispatch_is_bounded_and_admits_independent_targets():
 
 
 def test_hot_reload_drains_paid_work_while_observation_continues():
-    from issue_agent.adapters.reload import RELOAD_EXIT_CODE
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
@@ -157,9 +170,9 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
     daemon = Daemon(
         "fix",
         lambda: observations.append(len(observations) + 1) or WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)] + (
-            [PostComment(Target.PR, 100, "rerun")]
-            if len(observations) == 2 else []
+        lambda _world: (
+            [RunAgent(AgentKind.RESOLVE, 7)]
+            + ([PostComment(Target.PR, 100, "rerun")] if len(observations) == 2 else [])
         ),
         Executor(gateway, run_agent=run_agent),
         poll_seconds=1,
@@ -167,12 +180,7 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
     )
 
     with pytest.raises(SystemExit) as stopped:
-        daemon.run_forever(
-            sleep=sleep,
-            now=lambda: 0,
-            max_ticks=4,
-            reload_check=lambda: True,
-        )
+        daemon.run_forever(sleep=sleep, now=lambda: 0, max_ticks=4, reload_check=lambda: True)
 
     assert started.is_set()
     assert stopped.value.code == RELOAD_EXIT_CODE
@@ -180,9 +188,6 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
 
 
 def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
-    from issue_agent.app.tick import CancellableAsyncDispatch
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     started = threading.Event()
     cancelled = threading.Event()
     prepared = threading.Event()
@@ -201,16 +206,8 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
         terminalized.set()
 
     runtime = CancellableAsyncDispatch(dispatch)
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
-        Executor(FakeGateway(), run_agent=runtime),
-        poll_seconds=1,
-        dispatch_capacity=1,
-        prepare_shutdown=prepared.set,
-        cancel_active_dispatches=runtime.cancel_all,
-        terminalize=terminalize,
+    daemon = _paid(
+        runtime, prepare_shutdown=prepared.set, cancel_active_dispatches=runtime.cancel_all, terminalize=terminalize
     )
 
     def interrupt(_seconds):
@@ -228,9 +225,6 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
 
 @pytest.mark.parametrize("exhausted", [False, True], ids=["teardown-window", "budget-exhausted"])
 def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted):
-    from issue_agent.domain.actions import AgentKind, RunAgent
-    from issue_agent.domain.supervision import ExitCode
-
     clock = ManualClock()
     started = threading.Event()
     release = threading.Event()
@@ -244,13 +238,10 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
         forced.append(True)
         clock.advance(_KILL_WINDOW)
 
-    daemon = Daemon(
+    daemon = _paid(
+        run_agent,
         "review",
-        lambda: WorldState(),
-        lambda _world: [RunAgent(AgentKind.REVIEW, 7)],
-        Executor(FakeGateway(), run_agent=run_agent),
-        poll_seconds=1,
-        dispatch_capacity=1,
+        AgentKind.REVIEW,
         shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
         monotonic=clock,
         cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
@@ -267,11 +258,7 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
 
     try:
         with pytest.raises((KeyboardInterrupt, SystemExit)) as stopped:
-            daemon.run_forever(
-                sleep=before_shutdown,
-                now=lambda: 0,
-                max_ticks=1,
-            )
+            daemon.run_forever(sleep=before_shutdown, now=lambda: 0, max_ticks=1)
         assert stopped.type is SystemExit
         assert stopped.value.code is ExitCode.TRANSIENT
         assert forced == ([] if exhausted else [True])
@@ -282,8 +269,6 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
 
 
 def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     clock = ManualClock()
     release = threading.Event()
     worker_accounted = threading.Event()
@@ -303,16 +288,8 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
         assert worker_accounted.is_set()
         order.append("terminalize")
 
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
-        Executor(
-            FakeGateway(),
-            run_agent=run_agent,
-        ),
-        poll_seconds=1,
-        dispatch_capacity=1,
+    daemon = _paid(
+        run_agent,
         shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
         monotonic=clock,
         cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
@@ -320,19 +297,14 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
         terminalize=terminalize,
     )
 
-    def interrupt(_seconds):
-        raise KeyboardInterrupt
-
     with pytest.raises(KeyboardInterrupt):
-        daemon.run_forever(sleep=interrupt, now=lambda: 0, max_ticks=1)
+        daemon.run_forever(sleep=_interrupt, now=lambda: 0, max_ticks=1)
 
     assert order == ["kill", "worker_accounted", "terminalize"]
     daemon.wait_for_dispatches()
 
 
 def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     clock = ManualClock()
     started = threading.Event()
     release = threading.Event()
@@ -349,12 +321,9 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
         # and the worker has not settled yet.
         clock.set(_SHUTDOWN_TIMEOUT - 3)
 
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
-        Executor(FakeGateway(), run_agent=run_agent),
-        dispatch_capacity=1,
+    daemon = _paid(
+        run_agent,
+        poll_seconds=60,
         shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
         monotonic=clock,
         cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
@@ -374,30 +343,15 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
 
 
 def test_application_shutdown_deadline_fits_inside_every_systemd_hard_stop():
-    from pathlib import Path
-    import re
-
-    from issue_agent.app.tick import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
-
-    root = Path(__file__).parents[2]
-    units = tuple((root / "ops" / "systemd").glob("issue-agent-*.service"))
+    units = tuple((Path(__file__).parents[2] / "ops" / "systemd").glob("issue-agent-*.service"))
     assert units
-    hard_stops = []
     for path in units:
-        match = re.search(
-            r"^TimeoutStopSec=(\d+(?:\.\d+)?)$",
-            path.read_text(),
-            re.M,
-        )
+        match = re.search(r"^TimeoutStopSec=(\d+(?:\.\d+)?)$", path.read_text(), re.M)
         assert match is not None
-        hard_stops.append(float(match.group(1)))
-    assert all(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS + 5 < stop for stop in hard_stops)
+        assert DEFAULT_SHUTDOWN_TIMEOUT_SECONDS + 5 < float(match.group(1))
 
 
 def test_interrupt_before_worker_registration_is_sticky():
-    from issue_agent.app.tick import CancellableAsyncDispatch
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     registering = threading.Event()
     allow_registration = threading.Event()
 
@@ -415,15 +369,7 @@ def test_interrupt_before_worker_registration_is_sticky():
         await asyncio.Event().wait()
 
     runtime = PausedRegistration(dispatch)
-    daemon = Daemon(
-        "fix",
-        lambda: WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
-        Executor(FakeGateway(), run_agent=runtime),
-        poll_seconds=1,
-        dispatch_capacity=1,
-        cancel_active_dispatches=runtime.cancel_all,
-    )
+    daemon = _paid(runtime, cancel_active_dispatches=runtime.cancel_all)
 
     def interrupt(_seconds):
         assert registering.wait(timeout=1)
@@ -440,17 +386,20 @@ def test_tick_skips_the_pass_when_github_is_unavailable():
     decide, NO execute — not a pass over an empty world. Asserted on the observable
     outcome (zero side-effects on the gateway), not on how tick branches."""
     logs = []
+
     def rate_limited():
         raise GhUnavailable("rate-limit", "HTTP 403: API rate limit exceeded for user 42")
+
     decided = []
+
     def decide(world):
         decided.append(world)
         return [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)]
 
     d, gw = _daemon(decide, observe=rate_limited, logs=logs)
     assert d.tick() == []
-    assert decided == []          # never asked the domain about a world we can't see
-    assert gw.calls == []         # and never touched the repo
+    assert decided == []  # never asked the domain about a world we can't see
+    assert gw.calls == []  # and never touched the repo
 
 
 def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
@@ -458,12 +407,18 @@ def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
     mid-execute. The executor's per-action isolation must absorb it: the action is
     logged as failed and the daemon keeps polling."""
     logs = []
+
     class ThrottledGateway:
         def relabel(self, *a):
             raise GhUnavailable("rate-limit", "HTTP 429: Too Many Requests")
-    d = Daemon("fix", lambda: WorldState(),
-               lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, None)],
-               Executor(ThrottledGateway()), log=logs.append)
+
+    d = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, None)],
+        Executor(ThrottledGateway()),
+        log=logs.append,
+    )
     d.tick()  # must not raise
     assert any("action" in m and "failed" in m and "rate-limited" in m for m in logs)
 
@@ -473,11 +428,7 @@ def test_normal_shutdown_persists_stopped_heartbeat(tmp_path):
     d, _ = _daemon(lambda _world: [])
     d.heartbeat_path = str(heartbeat)
 
-    d.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: 0,
-        max_ticks=1,
-    )
+    d.run_forever(sleep=lambda _seconds: None, now=lambda: 0, max_ticks=1)
 
     payload = json.loads(heartbeat.read_text())
     assert payload["state"] == "stopped"
@@ -493,28 +444,18 @@ def test_scheduler_progress_covers_tick_and_quiet_wait():
 
     d, _ = _daemon(lambda _world: [], observe=observe)
     d.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: 0,
-        max_ticks=1,
-        scheduler_progress=lambda: progress.append("completed"),
+        sleep=lambda _seconds: None, now=lambda: 0, max_ticks=1, scheduler_progress=lambda: progress.append("completed")
     )
 
     assert progress == ["completed"] * 5
 
 
 def test_failed_shutdown_deadline_overrides_clean_signal_exit():
-    from issue_agent.domain.supervision import ExitCode
-
     d, _ = _daemon(lambda _world: [])
     d.shutdown_dispatches = lambda *, cancel: False
 
     with pytest.raises(SystemExit) as stopped:
-        d.run_forever(
-            sleep=lambda _seconds: (_ for _ in ()).throw(
-                SystemExit(ExitCode.CLEAN)
-            ),
-            now=lambda: 0,
-        )
+        d.run_forever(sleep=lambda _seconds: (_ for _ in ()).throw(SystemExit(ExitCode.CLEAN)), now=lambda: 0)
 
     assert stopped.value.code is ExitCode.TRANSIENT
 
@@ -529,8 +470,6 @@ def test_run_forever_warns_on_suspend_stall():
 
 
 def test_suspend_recovery_waits_for_active_dispatch_owner():
-    from issue_agent.domain.actions import AgentKind, RunAgent
-
     started = threading.Event()
     release = threading.Event()
     settled = threading.Event()
@@ -579,15 +518,47 @@ def test_suspend_recovery_waits_for_active_dispatch_owner():
     wall_times = iter([0, 0, 240, 300])
     active_times = iter([0, 0, 60, 120])
     daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: next(wall_times),
-        active_now=lambda: next(active_times),
-        max_ticks=3,
+        sleep=lambda _seconds: None, now=lambda: next(wall_times), active_now=lambda: next(active_times), max_ticks=3
     )
 
     assert started.is_set()
     assert started_actions == [7]
     assert recoveries == [RecoveryTrigger.WAKE]
+
+
+def test_a_late_tick_without_suspension_is_productive_not_a_wake():
+    # A long synchronous leg outruns the poll interval on both clocks: no
+    # wall time went unexplained, so nothing was suspended.
+    recoveries, logs = [], []
+    d, _ = _daemon(lambda w: [], logs=logs)
+    d.reconcile = recoveries.append
+    wall, active = iter([0, 0, 240, 300]), iter([0, 0, 240, 300])
+    d.run_forever(sleep=lambda _s: None, now=lambda: next(wall), active_now=lambda: next(active), max_ticks=3)
+    assert RecoveryTrigger.WAKE not in recoveries
+    assert not any("woke" in m for m in logs)
+
+
+def test_a_second_dispatch_for_a_running_target_is_not_submitted():
+    release, started = threading.Event(), []
+
+    def run_agent(action):
+        started.append(action.number)
+        assert release.wait(timeout=5)
+
+    d = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _w: [RunAgent(AgentKind.RESOLVE, 7)] * 2,
+        Executor(FakeGateway(), run_agent=run_agent),
+        poll_seconds=1,
+        dispatch_capacity=2,
+    )
+    try:
+        assert d.tick() == [RunAgent(AgentKind.RESOLVE, 7)]
+    finally:
+        release.set()
+        d.wait_for_dispatches()
+    assert started == [7]
 
 
 def test_reservation_sweep_runs_on_bounded_tick_cadence():
@@ -602,32 +573,19 @@ def test_reservation_sweep_runs_on_bounded_tick_cadence():
         reservation_sweep_ticks=2,
     )
 
-    daemon.run_forever(
-        sleep=lambda _seconds: None,
-        now=lambda: 0,
-        max_ticks=2,
-    )
+    daemon.run_forever(sleep=lambda _seconds: None, now=lambda: 0, max_ticks=2)
 
     assert sweeps == [RecoveryTrigger.PERIODIC]
 
 
-def _waking_daemon(wake_check, poll_seconds=60, logs=None):
-    d, _ = _daemon(lambda w: [], logs=logs)
-    d.poll_seconds = poll_seconds
-    d.wake_check = wake_check
-    return d
-
-
 def test_without_a_wake_the_full_interval_is_slept():
-    d = _waking_daemon(lambda: False, poll_seconds=5)
+    d, _ = _daemon(lambda w: [])
+    d.poll_seconds, d.wake_check = 5, lambda: False
     slept = []
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert sum(slept) == 10
-
-
-def test_no_wake_check_sleeps_in_one_call_as_before():
-    """Regression guard on the unwired path: no slicing, no extra sleep calls."""
-    d, _ = _daemon(lambda w: [])
+    # Regression guard on the unwired path: no slicing, no extra sleep calls.
+    unwired, _ = _daemon(lambda w: [])
     slept = []
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    unwired.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert slept == [60, 60]

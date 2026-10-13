@@ -33,8 +33,9 @@ def _now() -> str:
 
 def _ci(head: str, bucket: str) -> Observed:
     state = "IN_PROGRESS" if bucket == "pending" else "COMPLETED"
-    return Observed(head, head, frozenset({RequiredCheck("test")}),
-                    (Check("test", state=state, bucket=bucket, required=True),))
+    return Observed(
+        head, head, frozenset({RequiredCheck("test")}), (Check("test", state=state, bucket=bucket, required=True),)
+    )
 
 
 @dataclass
@@ -70,8 +71,11 @@ class FakeGitHub:
         if not prs:
             return True
         newest = max(prs)
-        return (self.prs[newest].state == "CLOSED" and newest in self.closed_at
-                and self.pushed_at.get(branch, "") > self.closed_at[newest])
+        return (
+            self.prs[newest].state == "CLOSED"
+            and newest in self.closed_at
+            and self.pushed_at.get(branch, "") > self.closed_at[newest]
+        )
 
     def get_issue(self, number: int) -> IssueView:
         return self.issues[number]
@@ -82,13 +86,14 @@ class FakeGitHub:
     def pull_request_for_branch(self, branch: str) -> int | None:
         return next((n for n, p in self.prs.items() if p.head_ref_name == branch and p.state == "OPEN"), None)
 
+    def _subject(self, kind: str, number: int) -> IssueView | PRView:
+        return self.issues[number] if kind == "issue" else self.prs[number]
+
     def has_label(self, kind: str, number: int, label: str) -> bool:
-        subject = self.issues[number] if kind == "issue" else self.prs[number]
-        return any(lab.value == label for lab in subject.labels)
+        return any(lab.value == label for lab in self._subject(kind, number).labels)
 
     def has_comment(self, kind: str, number: int, body: str) -> bool:
-        subject = self.issues[number] if kind == "issue" else self.prs[number]
-        return any(c.body == body for c in subject.comments)
+        return any(c.body == body for c in self._subject(kind, number).comments)
 
     def is_issue_closed(self, issue: int) -> bool:
         return self.issues[issue].state != "open"
@@ -124,8 +129,16 @@ class FakeGitHub:
             number = 100 + len(self.prs)
             head = self.branches[branch]
             self.prs[number] = PRView(
-                number=number, head_ref_name=branch, head_ref_oid=head, state="OPEN", title=title, body=body,
-                author=FIX_BOT, ci=_ci(head, "pending"), mergeable="MERGEABLE", merge_state="CLEAN",
+                number=number,
+                head_ref_name=branch,
+                head_ref_oid=head,
+                state="OPEN",
+                title=title,
+                body=body,
+                author=FIX_BOT,
+                ci=_ci(head, "pending"),
+                mergeable="MERGEABLE",
+                merge_state="CLEAN",
             )
         self._lossy("open_pull_request")
 
@@ -151,8 +164,9 @@ class FakeGitHub:
             self.pushed_at[branch] = _now()
             for number, p in self.prs.items():
                 if p.head_ref_name == branch and p.state == "OPEN":
-                    self.prs[number] = replace(p, head_ref_oid=head, ci=_ci(head, ci), reviews=(),
-                                               mergeable="MERGEABLE", merge_state="CLEAN")
+                    self.prs[number] = replace(
+                        p, head_ref_oid=head, ci=_ci(head, ci), reviews=(), mergeable="MERGEABLE", merge_state="CLEAN"
+                    )
 
     def close_pr(self, number: int) -> None:
         """A human closes the PR unmerged."""
@@ -161,8 +175,7 @@ class FakeGitHub:
             self.closed_at[number] = _now()
 
     def comments_with(self, kind: str, number: int, text: str) -> list[Comment]:
-        subject = self.issues[number] if kind == "issue" else self.prs[number]
-        return [c for c in subject.comments if text in c.body]
+        return [c for c in self._subject(kind, number).comments if text in c.body]
 
 
 class FakeWorktrees:
@@ -207,6 +220,7 @@ def pushed(gh: FakeGitHub, branch: str, head: str, ci: str = "pending", session:
     def step(_task):
         gh.push(branch, head, ci)
         return AgentResult(False, status="pushed", summary="Fixed the null token.", cost_usd=0.1, session_id=session)
+
     return step
 
 
@@ -224,18 +238,25 @@ def asked(needs: str, session: str = "s1"):
 
 @pytest.fixture
 def role(tmp_path):
-    def compose(gh: FakeGitHub, agent: Agent, **env):
+    def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, **env):
         cfg = replace(
-            from_env({
-                "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "BASE_BRANCH": "dev",
-                "STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
-                **env,
-            }),
+            from_env(
+                {
+                    "REPO": "o/r",
+                    "FIX_BOT": FIX_BOT,
+                    "REVIEW_BOT": REVIEW_BOT,
+                    "BASE_BRANCH": "dev",
+                    "STATE_DIR": str(tmp_path / "state"),
+                    "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+                    **env,
+                }
+            ),
             control_authority_root=str(tmp_path / "machine-state"),
         )
         worktrees = FakeWorktrees(tmp_path / "worktrees")
-        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=lambda _line: None)
+        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log)
         return composed, worktrees
+
     return compose
 
 
@@ -253,16 +274,32 @@ def ready(number: int = 5, title: str = "Null token crashes") -> IssueView:
     return IssueView(number=number, title=title, body="Steps: ...", labels=frozenset({Label.AI_READY}))
 
 
+_APPROVED = (Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),)
+
+
+def _capped(_task):
+    return AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT, cost_usd=0.1, session_id="s-wall")
+
+
 def open_pr(gh: FakeGitHub, issue: int = 5, *, head: str = "h1", ci: str = "pass", **kw) -> int:
     branch = f"fix/{issue}-null-token-crashes"
     gh.branches[branch] = head
-    gh.prs[100] = PRView(number=100, head_ref_name=branch, head_ref_oid=head, state="OPEN", author=FIX_BOT,
-                         ci=_ci(head, ci), mergeable=kw.pop("mergeable", "MERGEABLE"),
-                         merge_state=kw.pop("merge_state", "CLEAN"), **kw)
+    gh.prs[100] = PRView(
+        number=100,
+        head_ref_name=branch,
+        head_ref_oid=head,
+        state="OPEN",
+        author=FIX_BOT,
+        ci=_ci(head, ci),
+        mergeable=kw.pop("mergeable", "MERGEABLE"),
+        merge_state=kw.pop("merge_state", "CLEAN"),
+        **kw,
+    )
     return 100
 
 
 # ── RESOLVE → push → PR (Q11) ────────────────────────────────────────────────
+
 
 def test_resolve_runs_once_under_its_lease_then_the_harness_opens_one_pr(role):
     gh = FakeGitHub(issues={5: ready()})
@@ -310,16 +347,34 @@ def test_a_crash_between_push_and_pr_open_yields_exactly_one_pr(role):
 
 # ── PR-stage legs ────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("kind,shape", [
-    (AgentKind.FIX_CI, dict(ci="fail")),
-    (AgentKind.REBASE, dict(mergeable="CONFLICTING", merge_state="DIRTY")),
-    (AgentKind.ADDRESS_REVIEW, dict(reviews=(Review("CHANGES_REQUESTED", REVIEW_BOT, body="Handle None.",
-                                                    submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))),
-])
+
+@pytest.mark.parametrize(
+    "kind,shape",
+    [
+        (AgentKind.FIX_CI, dict(ci="fail")),
+        (AgentKind.REBASE, dict(mergeable="CONFLICTING", merge_state="DIRTY")),
+        (
+            AgentKind.ADDRESS_REVIEW,
+            dict(
+                reviews=(
+                    Review(
+                        "CHANGES_REQUESTED",
+                        REVIEW_BOT,
+                        body="Handle None.",
+                        submitted_at="2026-10-01T00:00:00Z",
+                        commit_id="h1",
+                    ),
+                )
+            ),
+        ),
+    ],
+)
 def test_each_pr_state_dispatches_its_leg_bound_to_the_head_and_resumes_the_session(role, kind, shape):
     gh = FakeGitHub(issues={5: ready()})
-    agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1", session="s-resolve"),
-                  pushed(gh, "fix/5-null-token-crashes", "h2", session="s-resolve"))
+    agent = Agent(
+        pushed(gh, "fix/5-null-token-crashes", "h1", session="s-resolve"),
+        pushed(gh, "fix/5-null-token-crashes", "h2", session="s-resolve"),
+    )
     composed, _ = role(gh, agent)
     tick(composed)
     tick(composed)  # opens the PR
@@ -351,7 +406,7 @@ def test_three_unproductive_attempts_stop_with_one_label_and_one_comment(role):
 
 def test_an_approved_green_head_merges_bound_to_that_head_and_closes_the_issue(role):
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
+    open_pr(gh, reviews=_APPROVED)
     composed, worktrees = role(gh, Agent())
 
     assert MergePullRequest(100, "h1") in tick(composed)
@@ -362,7 +417,7 @@ def test_an_approved_green_head_merges_bound_to_that_head_and_closes_the_issue(r
 
 def test_auto_merge_off_leaves_an_approved_pr_for_a_human(role):
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
+    open_pr(gh, reviews=_APPROVED)
     composed, _ = role(gh, Agent(), AUTO_MERGE="false")
 
     assert tick(composed) == []
@@ -387,10 +442,13 @@ def test_a_lost_stop_comment_reply_is_not_posted_twice(role):
 
 # ── Agent questions ──────────────────────────────────────────────────────────
 
+
 def test_a_question_stops_for_a_human_and_the_reply_resumes_the_same_session(role):
     gh = FakeGitHub(issues={5: ready()})
-    agent = Agent(asked("Should the API return 404 or 410?", session="s-q"),
-                  pushed(gh, "fix/5-null-token-crashes", "h1", session="s-q"))
+    agent = Agent(
+        asked("Should the API return 404 or 410?", session="s-q"),
+        pushed(gh, "fix/5-null-token-crashes", "h1", session="s-q"),
+    )
     composed, _ = role(gh, agent)
     tick(composed)  # the leg asks; its receipt records the question
     assert gh.issues[5].comments == ()
@@ -413,6 +471,7 @@ def test_a_question_stops_for_a_human_and_the_reply_resumes_the_same_session(rol
 
 
 # ── Fix round (slice 5b review): regressions ─────────────────────────────────
+
 
 @pytest.fixture
 def later(monkeypatch):
@@ -466,6 +525,7 @@ def test_two_issues_run_their_legs_concurrently(role):
             started[i].set()
             assert gate.wait(timeout=10)
             return AgentResult(False, status="pushed", cost_usd=0.1, session_id="s")
+
         return run
 
     composed, _ = role(gh, Agent(step(0), step(1)), FIX_DISPATCH_CONCURRENCY="2")
@@ -536,15 +596,16 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     # P2-1: resume once; a PR-stage leg always resumes the issue's session.
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    capped = lambda _task: AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT,  # noqa: E731
-                                       cost_usd=0.1, session_id="s-wall")
-    composed, _ = role(gh, Agent(capped, capped))
+    composed, _ = role(gh, Agent(_capped, _capped))
     assert dispatched(tick(composed), AgentKind.FIX_CI)
     assert tick(composed) == []  # a machine end: backing off, no attempt
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)
-    legs = [r.receipt["leg"] for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
-            if r.receipt is not None]
+    legs = [
+        r.receipt["leg"]
+        for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+        if r.receipt is not None
+    ]
     assert legs == ["machine", "agent"]
 
 
@@ -552,9 +613,7 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     # Round 2: a receipt-less death between two wall caps does not reset resume-once.
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    capped = lambda _task: AgentResult(True, status="", exit_reason=ExitReason.WALL_TIMEOUT,  # noqa: E731
-                                       cost_usd=0.1, session_id="s-wall")
-    agent = Agent(capped, died, capped)
+    agent = Agent(_capped, died, _capped)
     composed, _ = role(gh, agent)
     assert dispatched(tick(composed), AgentKind.FIX_CI)
     later()
@@ -565,15 +624,10 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     assert agent.tasks[2].resume == "s-wall"
 
 
-def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(tmp_path):
+def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(role):
     gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, merge_state="BLOCKED",
-            reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
-    cfg = replace(from_env({"REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "BASE_BRANCH": "dev",
-                            "STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "rs")}),
-                  control_authority_root=str(tmp_path / "ms"))
+    open_pr(gh, merge_state="BLOCKED", reviews=_APPROVED)
     lines: list[str] = []
-    composed = compose_fix_daemon(cfg, gh, FakeWorktrees(tmp_path / "wt"), Agent(),
-                                  log=lines.append)
+    composed, _ = role(gh, Agent(), log=lines.append)
     assert tick(composed) == [] and gh.merged == []
     assert any("PR #100 waits to merge" in line and "BLOCKED" in line for line in lines)

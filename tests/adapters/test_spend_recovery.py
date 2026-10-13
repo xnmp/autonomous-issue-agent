@@ -9,22 +9,16 @@ import pytest
 from issue_agent.adapters.codex_runner import rate_table_evidence, write_spend_evidence
 from issue_agent.domain.pricing import ModelRates, RateTable
 from issue_agent.adapters.control_store import (
+    AccountingDisposition,
     BudgetLimit,
     ReservationRequest,
     SQLiteControlStore,
-    AccountingDisposition,
 )
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
-from issue_agent.domain.contracts import (
-    BudgetScope,
-    Money,
-    RunId,
-)
+from issue_agent.domain.contracts import BudgetScope, Money, RunId
 
 
 NOW = datetime.now(timezone.utc)
-
-
 OWNER = "o/r:fix"
 
 
@@ -43,17 +37,24 @@ def _reserved_store(tmp_path, *, runtime="codex"):
     run_id = RunId("crashed-run")
     assert store.lease("o/r", "fix", 7, OWNER)
     request = ReservationRequest(
-        run_id, "o/r", "fix", "RESOLVE", OWNER, Money("USD", 1_000_000),
-        (BudgetLimit(scope, Money("USD", 2_000_000)),), 7, issue=7, runtime=runtime,
+        run_id,
+        "o/r",
+        "fix",
+        "RESOLVE",
+        OWNER,
+        Money("USD", 1_000_000),
+        (BudgetLimit(scope, Money("USD", 2_000_000)),),
+        7,
+        issue=7,
+        runtime=runtime,
     )
     assert store.reserve(request).admitted
     return store, scope, run_id
 
 
-@pytest.mark.parametrize("card,expected", [
-    ({}, ("codex-config", "cfg")),
-    ({"version": 2}, ("codex-config", "effective-prices")),
-])
+@pytest.mark.parametrize(
+    "card,expected", [({}, ("codex-config", "cfg")), ({"version": 2}, ("codex-config", "effective-prices"))]
+)
 def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monkeypatch, card, expected):
     store, scope, run_id = _reserved_store(tmp_path)
     settlements = []
@@ -65,12 +66,8 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
 
     monkeypatch.setattr(store, "settle", record_settlement)
     codex_home = tmp_path / "codex-home"
-    rollout_dir = codex_home / "sessions" / NOW.strftime("%Y/%m/%d")
-    rollout_dir.mkdir(parents=True)
-    (rollout_dir / "rollout-now-session-1.jsonl").write_text(
-        '{"timestamp":"' + NOW.isoformat() + '","type":"event_msg","payload":{"type":"token_count","info":'
-        '{"total_token_usage":{"input_tokens":1000,"output_tokens":200,'
-        '"cached_input_tokens":400}}}}\n'
+    _write_rollout(
+        codex_home, "session-1", [_count({"input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 400})]
     )
     evidence_dir = tmp_path / "state" / "spend-evidence"
     write_spend_evidence(
@@ -84,8 +81,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
             "baseline_usage": None,
             "model": "gpt",
             "codex_home": str(codex_home),
-            "rate_table": rate_table_evidence(RateTable(
-                expected[0], expected[1], "USD", {"gpt": ModelRates(10000000, 20000000, 1000000, 10000000)})),
+            "rate_table": rate_table_evidence(RateTable(expected[0], expected[1], "USD", CARD.rates)),
             **card,
         },
     )
@@ -104,18 +100,23 @@ def test_a_recovered_leg_whose_counters_are_malformed_settles_its_reserved_maxim
     that bound, never at zero."""
     store, scope, run_id = _reserved_store(tmp_path)
     codex_home = tmp_path / "codex-home"
-    rollout_dir = codex_home / "sessions" / NOW.strftime("%Y/%m/%d")
-    rollout_dir.mkdir(parents=True)
-    (rollout_dir / "rollout-now-session-1.jsonl").write_text(
-        '{"timestamp":"' + NOW.isoformat() + '","type":"event_msg","payload":{"type":"token_count","info":'
-        '{"total_token_usage":{"input_tokens":"1000"}}}}\n'
-    )
+    _write_rollout(codex_home, "session-1", [_count({"input_tokens": "1000"})])
     evidence_dir = tmp_path / "state" / "spend-evidence"
-    write_spend_evidence(str(evidence_dir), str(run_id), {
-        "cwd": str(tmp_path), "rollout_started_at": NOW.timestamp(), "session_id": "session-1",
-        "baseline_session_id": "", "baseline_usage": None, "model": "gpt", "codex_home": str(codex_home),
-        "rate_table": None, "max_budget_usd": 1.0,
-    })
+    write_spend_evidence(
+        str(evidence_dir),
+        str(run_id),
+        {
+            "cwd": str(tmp_path),
+            "rollout_started_at": NOW.timestamp(),
+            "session_id": "session-1",
+            "baseline_session_id": "",
+            "baseline_usage": None,
+            "model": "gpt",
+            "codex_home": str(codex_home),
+            "rate_table": None,
+            "max_budget_usd": 1.0,
+        },
+    )
 
     _end_run_at(store, run_id, END)
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
@@ -141,20 +142,26 @@ def test_missing_rollout_does_not_fabricate_recovered_spend(tmp_path):
         },
     )
 
-    assert not CodexSpendReconciler(
-        store, (str(evidence_dir),)
-    ).reconcile(run_id)
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
     assert store.active_reservation_runs(OWNER) == (run_id,)
 
 
 def test_legacy_receipt_without_native_invocation_contract_settles_estimate(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path)
     evidence_dir = tmp_path / "spend-evidence"
-    write_spend_evidence(str(evidence_dir), str(run_id), {
-        "version": 1, "cwd": str(tmp_path), "rollout_started_at": NOW.timestamp(),
-        "session_id": "prior-session", "cost_per_mtok_in": 10,
-        "cost_per_mtok_out": 20, "cost_per_mtok_cached_in": 1,
-    })
+    write_spend_evidence(
+        str(evidence_dir),
+        str(run_id),
+        {
+            "version": 1,
+            "cwd": str(tmp_path),
+            "rollout_started_at": NOW.timestamp(),
+            "session_id": "prior-session",
+            "cost_per_mtok_in": 10,
+            "cost_per_mtok_out": 20,
+            "cost_per_mtok_cached_in": 1,
+        },
+    )
     store.record_reservation_retained(run_id, "prior completed unmeasured run")
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
     assert store.active_reservation_runs(OWNER) == ()
@@ -209,25 +216,39 @@ def _write_rollout(home, sid, records):
 
 def _home(tmp_path, *records):
     home = tmp_path / "codex-home"
-    _write_rollout(home, ROOT, [_count({"input_tokens": 1000, "output_tokens": 10, "cached_input_tokens": 500}),
-                                *records])
+    _write_rollout(
+        home, ROOT, [_count({"input_tokens": 1000, "output_tokens": 10, "cached_input_tokens": 500}), *records]
+    )
     return home
 
 
 def _evidence(tmp_path, home, **overrides):
     evidence_dir = tmp_path / "state" / "spend-evidence"
-    write_spend_evidence(str(evidence_dir), "crashed-run", {
-        "cwd": str(tmp_path), "rollout_started_at": NOW.timestamp() - 5, "session_id": ROOT,
-        "baseline_session_id": "", "baseline_usage": None, "model": "gpt", "codex_home": str(home),
-        "rate_table": rate_table_evidence(CARD), **overrides})
+    write_spend_evidence(
+        str(evidence_dir),
+        "crashed-run",
+        {
+            "cwd": str(tmp_path),
+            "rollout_started_at": NOW.timestamp() - 5,
+            "session_id": ROOT,
+            "baseline_session_id": "",
+            "baseline_usage": None,
+            "model": "gpt",
+            "codex_home": str(home),
+            "rate_table": rate_table_evidence(CARD),
+            **overrides,
+        },
+    )
     return evidence_dir
 
 
 def _end_run_at(store, run_id, at):
     """The leg's process ended at ``at`` and gave up its lease, unsettled."""
     with closing(sqlite3.connect(store.path)) as db:
-        db.execute("UPDATE legs SET ended_at=? WHERE leg_id=?",
-                   (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)))
+        db.execute(
+            "UPDATE legs SET ended_at=? WHERE leg_id=?",
+            (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)),
+        )
         db.execute("DELETE FROM leases WHERE leg_id=?", (str(run_id),))
         db.commit()
 
@@ -267,14 +288,29 @@ def test_a_counter_exactly_at_the_end_counts_and_one_millisecond_later_does_not(
 def test_an_untimestamped_counter_is_not_this_runs_evidence(tmp_path):
     home = _home(tmp_path)
     with next(home.rglob(f"*{ROOT}.jsonl")).open("a") as stream:
-        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
-            "total_token_usage": {"input_tokens": 10**9, "output_tokens": 10**9}}}}) + "\n")
+        stream.write(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"input_tokens": 10**9, "output_tokens": 10**9}},
+                    },
+                }
+            )
+            + "\n"
+        )
     assert _recover(tmp_path, home) == Money("USD", ROOT_MICROS)
 
 
 def test_the_baseline_is_subtracted_only_from_its_own_session(tmp_path):
-    baseline = {"input_tokens": 400, "output_tokens": 5, "cache_read_input_tokens": 200,
-                "cache_creation_input_tokens": 0, "source": "rollout"}
+    baseline = {
+        "input_tokens": 400,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 200,
+        "cache_creation_input_tokens": 0,
+        "source": "rollout",
+    }
     resumed = _recover(tmp_path / "a", _home(tmp_path / "a"), baseline_session_id=ROOT, baseline_usage=baseline)
     other = _recover(tmp_path / "b", _home(tmp_path / "b"), baseline_session_id="another", baseline_usage=baseline)
     # The resumed delta: 300 uncached in, 5 out, 300 cached.

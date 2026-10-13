@@ -24,29 +24,59 @@ def labels(*names: str) -> dict:
 
 
 def issue_node(number=5, **kw) -> dict:
-    node = {"id": f"I{number}", "number": number, "title": "Null token", "state": "OPEN",
-            "author": {"login": "alice"}, "labels": labels("ai-ready"),
-            "comments": {"totalCount": 0, "pageInfo": {"hasPreviousPage": False}, "nodes": []},
-            "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": []}}
+    node = {
+        "id": f"I{number}",
+        "number": number,
+        "title": "Null token",
+        "state": "OPEN",
+        "author": {"login": "alice"},
+        "labels": labels("ai-ready"),
+        "comments": {"totalCount": 0, "pageInfo": {"hasPreviousPage": False}, "nodes": []},
+        "timelineItems": {"pageInfo": {"hasPreviousPage": False}, "nodes": []},
+    }
     node.update(kw)
     return node
 
 
 def pr_node(number=100, head="h1", **kw) -> dict:
-    node = {"id": f"P{number}", "number": number, "state": "OPEN", "headRefName": "fix/5-null-token",
-            "headRefOid": head, "baseRefName": "dev", "baseRefOid": "b1", "isDraft": False, "title": "Fix",
-            "author": {"login": "fix-bot"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
-            "labels": labels(),
-            "commits": {"nodes": [{"commit": {"oid": head, "committedDate": "2026-10-01T00:00:00Z",
-                                              "author": {"user": {"login": "fix-bot"}}}}]}}
+    node = {
+        "id": f"P{number}",
+        "number": number,
+        "state": "OPEN",
+        "headRefName": "fix/5-null-token",
+        "headRefOid": head,
+        "baseRefName": "dev",
+        "baseRefOid": "b1",
+        "isDraft": False,
+        "title": "Fix",
+        "author": {"login": "fix-bot"},
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "labels": labels(),
+        "commits": {
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": head,
+                        "committedDate": "2026-10-01T00:00:00Z",
+                        "author": {"user": {"login": "fix-bot"}},
+                    }
+                }
+            ]
+        },
+    }
     node.update(kw)
     return node
 
 
 def ref(name: str, *prs: dict, committed: str = "2026-10-01T00:00:00Z", ahead: int | None = 1) -> dict:
     """A `fix/` ref node: its newest PR (if any), head commit date, and commits ahead of base."""
-    return {"name": name, "associatedPullRequests": {"totalCount": len(prs), "nodes": list(prs[-1:])},
-            "target": {"committedDate": committed}, "compare": None if ahead is None else {"behindBy": ahead}}
+    return {
+        "name": name,
+        "associatedPullRequests": {"totalCount": len(prs), "nodes": list(prs[-1:])},
+        "target": {"committedDate": committed},
+        "compare": None if ahead is None else {"behindBy": ahead},
+    }
 
 
 def assoc(state: str, closed: str | None = None) -> dict:
@@ -60,28 +90,44 @@ def xref(number, state="MERGED", repo="o/r", head="fix/5-x") -> dict:
 # ── parsers ──────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("node", [
-    None, [], issue_node(number=0), issue_node(number="5"), issue_node(number=True), issue_node(state="DONE"),
-    issue_node(labels={"totalCount": 101, "nodes": [{"name": "ai-ready"}]}),  # labels past one page
-    issue_node(labels=None),
-])
+@pytest.mark.parametrize(
+    "node",
+    [
+        None,
+        [],
+        issue_node(number=0),
+        issue_node(number="5"),
+        issue_node(number=True),
+        issue_node(state="DONE"),
+        issue_node(labels={"totalCount": 101, "nodes": [{"name": "ai-ready"}]}),  # labels past one page
+        issue_node(labels=None),
+    ],
+)
 def test_a_malformed_or_partial_issue_node_is_incomplete_not_empty(node):
     with pytest.raises(FixObservationIncomplete):
         parse_fix_issue(node, [])
 
 
 def labeled(*events: tuple[str, str], earlier: bool = False) -> dict:
-    return {"pageInfo": {"hasPreviousPage": earlier},
-            "nodes": [{"createdAt": t, "label": {"name": n}} for n, t in events]}
+    return {
+        "pageInfo": {"hasPreviousPage": earlier},
+        "nodes": [{"createdAt": t, "label": {"name": n}} for n, t in events],
+    }
 
 
 def test_a_labelled_item_carries_when_needs_human_was_last_applied():
-    node = issue_node(labels=labels("ai-ready", "needs-human"), labeled=labeled(
-        ("needs-human", "2026-10-01T00:00:00Z"), ("ai-ready", "2026-10-01T01:00:00Z"),
-        ("needs-human", "2026-10-01T02:00:00Z")))
+    node = issue_node(
+        labels=labels("ai-ready", "needs-human"),
+        labeled=labeled(
+            ("needs-human", "2026-10-01T00:00:00Z"),
+            ("ai-ready", "2026-10-01T01:00:00Z"),
+            ("needs-human", "2026-10-01T02:00:00Z"),
+        ),
+    )
     assert parse_fix_issue(node, []).needs_human_labeled_at == "2026-10-01T02:00:00Z"
-    pr = parse_fix_pr(pr_node(labels=labels("needs-human"), labeled=labeled(("needs-human", "2026-10-02T00:00:00Z"))),
-                      [], [], [])
+    pr = parse_fix_pr(
+        pr_node(labels=labels("needs-human"), labeled=labeled(("needs-human", "2026-10-02T00:00:00Z"))), [], [], []
+    )
     assert pr.needs_human_labeled_at == "2026-10-02T00:00:00Z"
     # An unlabelled item does not need (or read) the events.
     assert parse_fix_issue(issue_node(), []).needs_human_labeled_at == ""
@@ -102,44 +148,58 @@ def test_a_pr_node_records_its_head_push_and_files():
 
 
 def test_an_unattributed_head_commit_is_a_push_by_no_login():
-    node = pr_node(commits={"nodes": [{"commit": {"oid": "h1", "committedDate": "2026-10-01T00:00:00Z",
-                                                  "author": {"user": None}}}]})
+    node = pr_node(
+        commits={
+            "nodes": [{"commit": {"oid": "h1", "committedDate": "2026-10-01T00:00:00Z", "author": {"user": None}}}]
+        }
+    )
     assert parse_fix_pr(node, [], [], []).pushes == (Push("", "2026-10-01T00:00:00Z"),)
 
 
-@pytest.mark.parametrize("node", [
-    pr_node(number=-1), pr_node(headRefOid=None), pr_node(headRefName=7),
-    pr_node(commits={"nodes": [{"commit": {"oid": "other"}}]}),  # head commit disagrees with head
-    pr_node(commits=None),
-])
+@pytest.mark.parametrize(
+    "node",
+    [
+        pr_node(number=-1),
+        pr_node(headRefOid=None),
+        pr_node(headRefName=7),
+        pr_node(commits={"nodes": [{"commit": {"oid": "other"}}]}),  # head commit disagrees with head
+        pr_node(commits=None),
+    ],
+)
 def test_a_malformed_pr_node_is_incomplete(node):
     with pytest.raises(FixObservationIncomplete):
         parse_fix_pr(node, [], [], [])
 
 
-@pytest.mark.parametrize(("node", "owed"), [
-    (ref("5-x"), True),                                                           # never had a PR
-    (ref("5-x", ahead=0), False),                                                 # nothing ahead of base (P1-9)
-    (ref("5-x", assoc("OPEN")), False),
-    (ref("5-x", assoc("MERGED", "2026-09-01T00:00:00Z")), False),
-    (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z")), True),                  # pushed after a human closed it (P1-8)
-    (ref("5-x", assoc("CLOSED", "2026-10-02T00:00:00Z")), False),                 # closed after its last push
-    (ref("5-x", assoc("CLOSED", None)), False),
-    (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z"), committed=""), False),   # untimed push proves nothing
-])
+@pytest.mark.parametrize(
+    ("node", "owed"),
+    [
+        (ref("5-x"), True),  # never had a PR
+        (ref("5-x", ahead=0), False),  # nothing ahead of base (P1-9)
+        (ref("5-x", assoc("OPEN")), False),
+        (ref("5-x", assoc("MERGED", "2026-09-01T00:00:00Z")), False),
+        (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z")), True),  # pushed after a human closed it (P1-8)
+        (ref("5-x", assoc("CLOSED", "2026-10-02T00:00:00Z")), False),  # closed after its last push
+        (ref("5-x", assoc("CLOSED", None)), False),
+        (ref("5-x", assoc("CLOSED", "2026-09-01T00:00:00Z"), committed=""), False),  # untimed push proves nothing
+    ],
+)
 def test_a_branch_is_owed_a_pr_only_when_ahead_of_base_and_without_a_live_or_newer_pr(node, owed):
     expected = (Branch("fix/5-x", node["target"]["committedDate"]),) if owed else ()
     assert parse_fix_refs([node]) == (expected, {})
 
 
-@pytest.mark.parametrize("bad", [
-    {**ref("5-x"), "associatedPullRequests": {"totalCount": "0", "nodes": []}},
-    {**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": []}},      # a hidden or deleted PR
-    {**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": [{"state": "DRAFT"}]}},
-    ref("5-x", ahead=None),                                                         # no comparison (missing base)
-    {**ref("5-x"), "compare": {"behindBy": "2"}},
-    {**ref("5-x"), "compare": []},
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {**ref("5-x"), "associatedPullRequests": {"totalCount": "0", "nodes": []}},
+        {**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": []}},  # a hidden or deleted PR
+        {**ref("5-x"), "associatedPullRequests": {"totalCount": 1, "nodes": [{"state": "DRAFT"}]}},
+        ref("5-x", ahead=None),  # no comparison (missing base)
+        {**ref("5-x"), "compare": {"behindBy": "2"}},
+        {**ref("5-x"), "compare": []},
+    ],
+)
 def test_an_unjudgeable_branch_makes_only_its_issue_unknown(bad):
     owed, unknown = parse_fix_refs([bad, ref("6-y")])
     assert owed == (Branch("fix/6-y", "2026-10-01T00:00:00Z"),) and set(unknown) == {5}
@@ -152,8 +212,13 @@ def test_a_malformed_ref_list_is_incomplete(bad):
 
 
 def test_an_issue_whose_branch_cannot_be_judged_waits_out_of_the_world():
-    runner = GraphQL({"issues": page([issue_node(5), issue_node(6)]), "pullRequests": page([]),
-                      "refs": page([ref("5-x", ahead=None), ref("6-y")])})
+    runner = GraphQL(
+        {
+            "issues": page([issue_node(5), issue_node(6)]),
+            "pullRequests": page([]),
+            "refs": page([ref("5-x", ahead=None), ref("6-y")]),
+        }
+    )
     world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [i.number for i in world.issues] == [6]
     assert world.branches == (Branch("fix/6-y", "2026-10-01T00:00:00Z"),)
@@ -173,12 +238,19 @@ def test_the_pr_lookup_for_a_branch_considers_open_prs_only():
 
 
 def test_merged_harness_prs_come_only_from_this_repository_and_fix_branches():
-    items = [xref(10, repo="O/R"), xref(11, state="CLOSED"), xref(12, repo="fork/r"), xref(13, head="feat/5-x"),
-             {"source": None}, None]
+    items = [
+        xref(10, repo="O/R"),
+        xref(11, state="CLOSED"),
+        xref(12, repo="fork/r"),
+        xref(13, head="feat/5-x"),
+        {"source": None},
+        None,
+    ]
     assert [(p.number, p.state) for p in parse_merged_harness_prs(items, "o/r")] == [(10, "MERGED")]
 
 
 # ── the bounded world build ──────────────────────────────────────────────────
+
 
 def page(nodes, more=False, cursor=None) -> dict:
     return {"pageInfo": {"hasNextPage": more, "endCursor": cursor}, "nodes": nodes}
@@ -199,11 +271,13 @@ class GraphQL:
 
 def test_the_world_carries_issues_merged_prs_and_unpublished_branches():
     merged = xref(9, head="fix/4-old")
-    runner = GraphQL({
-        "issues": page([issue_node(5), issue_node(4, timelineItems={"pageInfo": {}, "nodes": [merged]})]),
-        "pullRequests": page([pr_node(headRefName="feature/x")]),  # not a harness PR: never fetched further
-        "refs": page([ref("5-null-token")]),
-    })
+    runner = GraphQL(
+        {
+            "issues": page([issue_node(5), issue_node(4, timelineItems={"pageInfo": {}, "nodes": [merged]})]),
+            "pullRequests": page([pr_node(headRefName="feature/x")]),  # not a harness PR: never fetched further
+            "refs": page([ref("5-null-token")]),
+        }
+    )
     world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [i.number for i in world.issues] == [5, 4]
     assert [(p.number, p.state) for p in world.prs] == [(9, "MERGED")]
@@ -224,10 +298,15 @@ def test_a_top_level_connection_past_its_page_bound_skips_the_tick():
         GitHubGateway("o/r", runner=GraphQL(first, *more)).build_world("dev")
 
 
-@pytest.mark.parametrize("answer", [
-    {"errors": [{"message": "denied"}]}, {"data": None}, {"data": {"repository": None}},
-    {"data": {"repository": {"issues": page([]), "pullRequests": page([])}}},  # refs absent
-])
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"errors": [{"message": "denied"}]},
+        {"data": None},
+        {"data": {"repository": None}},
+        {"data": {"repository": {"issues": page([]), "pullRequests": page([])}}},  # refs absent
+    ],
+)
 def test_an_errored_or_partial_answer_skips_the_tick(answer):
     gateway = GitHubGateway("o/r", runner=lambda argv, token: json.dumps(answer))
     with pytest.raises(FixObservationIncomplete):
@@ -235,18 +314,26 @@ def test_an_errored_or_partial_answer_skips_the_tick(answer):
 
 
 def test_an_unreadable_open_pr_still_shadows_its_issue_with_no_head():
-    runner = GraphQL({"issues": page([issue_node(5)]),
-                      "pullRequests": page([pr_node(labels={"totalCount": 2, "nodes": []})]),
-                      "refs": page([])})
+    runner = GraphQL(
+        {
+            "issues": page([issue_node(5)]),
+            "pullRequests": page([pr_node(labels={"totalCount": 2, "nodes": []})]),
+            "refs": page([]),
+        }
+    )
     world = GitHubGateway("o/r", runner=runner).build_world("dev")
     assert [(p.number, p.head_ref_oid, p.content_known) for p in world.prs] == [(100, "", False)]
 
 
 # ── paged reads: the query text GitHub validates (P1-5) ──────────────────────
 
+
 def _back(nodes, cursor=None) -> dict:
-    return {"totalCount": None, "pageInfo": {"hasPreviousPage": cursor is not None, "startCursor": cursor},
-            "nodes": nodes}
+    return {
+        "totalCount": None,
+        "pageInfo": {"hasPreviousPage": cursor is not None, "startCursor": cursor},
+        "nodes": nodes,
+    }
 
 
 def _fwd(nodes, cursor=None) -> dict:
@@ -264,7 +351,9 @@ class PagedGitHub:
 
     def first(self) -> dict:
         issue = issue_node(5, comments=_back([], "ic"), timelineItems=_back([], "it0"))
-        harness = pr_node(comments=_back([], "pc"), reviews=_back([], "pr"), files={"totalCount": None, **_fwd([], "pf")})
+        harness = pr_node(
+            comments=_back([], "pc"), reviews=_back([], "pr"), files={"totalCount": None, **_fwd([], "pf")}
+        )
         return {"issues": page([issue]), "pullRequests": page([harness]), "refs": _fwd([], "r1")}
 
     def node(self, query: str, variables: dict) -> dict:
@@ -277,8 +366,19 @@ class PagedGitHub:
         if name == "files":
             return {name: _fwd([{"path": "src/a.py"}])}
         if name == "reviews":
-            return {name: _back([{"author": {"login": "review-bot"}, "state": "APPROVED",
-                                   "submittedAt": "2026-10-01T00:00:00Z", "body": "", "commit": {"oid": "h1"}}])}
+            return {
+                name: _back(
+                    [
+                        {
+                            "author": {"login": "review-bot"},
+                            "state": "APPROVED",
+                            "submittedAt": "2026-10-01T00:00:00Z",
+                            "body": "",
+                            "commit": {"oid": "h1"},
+                        }
+                    ]
+                )
+            }
         return {name: _back([{"author": {"login": "alice"}, "body": "older", "createdAt": "2026-09-01T00:00:00Z"}])}
 
     def __call__(self, argv, _token):
@@ -296,12 +396,12 @@ class PagedGitHub:
 
 
 def _declared(query: str) -> set[str]:
-    header = query[query.index("(") + 1:query.index(")")]
+    header = query[query.index("(") + 1 : query.index(")")]
     return set(re.findall(r"\$(\w+):", header))
 
 
 def _used(query: str) -> set[str]:
-    return set(re.findall(r"\$(\w+)", query[query.index(")") + 1:]))
+    return set(re.findall(r"\$(\w+)", query[query.index(")") + 1 :]))
 
 
 def test_every_paged_query_declares_exactly_the_variables_it_uses_and_is_sent_them():

@@ -46,7 +46,7 @@ Agents push and return; they never wait on CI. They ask a question only when the
 | | Start (2026-10-12) | Target | Now (slice 10) |
 |---|---|---|---|
 | core src lines (excludes dashboard) | 104,285 | **≤ 15,000** | 14,989 |
-| test lines | 148,404 | ≤ 20,000 | 22,790 (over target: coverage the review restored outranks the line budget) |
+| test lines | 148,404 | ≤ 20,000 | 21,739 (target retired by owner 2026-10-13: the remaining gap was layout, not surplus; ruff-normalised measurement: `ruff format --isolated --line-length 120 --config "format.skip-magic-trailing-comma = true" tests/`, then `git ls-files 'tests/*.py' \| xargs cat \| wc -l`) |
 | stop states | 34 | **1** | 1 (`NeedsHuman`, five reasons) |
 | labels | 16 | **2** | 2 (`ai-ready`, `needs-human`) |
 | SQLite tables | many workflow tables | **3**: legs+money, leases, idempotency | 3 |
