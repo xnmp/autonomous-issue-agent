@@ -879,7 +879,7 @@ def test_heavy_acts_still_cap_at_the_concurrency(role):
 def test_triage_keeps_its_per_issue_lease_and_the_spend_headroom(role):
     gh = FakeGitHub(issues={5: ready(5)})
     gate = threading.Event()
-    agent = SplitAgent(_DONE, _blocked(gate, triaged()(None)))
+    agent = SplitAgent(lambda _t: _DONE, _blocked(gate, triaged()(None)))
     composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
     try:
         assert dispatched(composed.daemon.tick(), AgentKind.TRIAGE)
@@ -889,7 +889,7 @@ def test_triage_keeps_its_per_issue_lease_and_the_spend_headroom(role):
         composed.daemon.wait_for_dispatches()
     assert len(agent.tasks) == 1
 
-    broke, _ = role(FakeGitHub(issues={5: ready(5)}), SplitAgent(_DONE, triaged()), triaged=False,
+    broke, _ = role(FakeGitHub(issues={5: ready(5)}), SplitAgent(lambda _t: _DONE, triaged()), triaged=False,
                     DAILY_SPEND_CAP_USD="0.5")
     assert not dispatched(tick(broke), AgentKind.TRIAGE)  # a 2.0 budget does not fit under a 0.5 cap
 
@@ -898,10 +898,13 @@ def test_many_untriaged_issues_triage_up_to_the_concurrency_at_once_and_all_fini
     numbers = range(5, 11)
     gh = FakeGitHub(issues={n: ready(n, f"Bug {n}") for n in numbers})
     gate = threading.Event()
-    agent = SplitAgent(_DONE, _blocked(gate, triaged()(None)))
-    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="2")
+    agent = SplitAgent(lambda _t: _DONE, _blocked(gate, triaged()(None)))
+    lines: list[str] = []
+    composed, _ = role(gh, agent, lines.append, triaged=False, FIX_DISPATCH_CONCURRENCY="2")
     try:
         assert len(dispatched(composed.daemon.tick(), AgentKind.TRIAGE)) == 2  # the ceiling is the concurrency
+        composed.daemon.tick()
+        assert not [line for line in lines if "not submitted" in line]  # decide never over-chooses
     finally:
         gate.set()
         composed.daemon.wait_for_dispatches()

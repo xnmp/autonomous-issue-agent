@@ -84,9 +84,10 @@ class HarnessConfig:
     review_state_dir: str = _knob("")
     worktree_root: str = _knob(".claude/worktrees")
     poll_seconds: int = _knob(20)
-    # Fix legs on different issues run concurrently up to this bound (one leg
-    # per issue). 2 since 2026-08-02: with one slot a single ADDRESS_REVIEW
-    # leg held the whole deployment while other PRs' repairs queued.
+    # Slot-holding fix legs (all but TRIAGE, which has its own equal ceiling)
+    # run concurrently up to this bound (one leg per issue). 2 since 2026-08-02:
+    # with one slot a single ADDRESS_REVIEW leg held the whole deployment while
+    # other PRs' repairs queued.
     fix_dispatch_concurrency: int = _knob(2)
     auto_merge: bool = _knob(True)
     merge_method: str = _knob("squash", coerce="choice", choices=("squash", "merge", "rebase"))

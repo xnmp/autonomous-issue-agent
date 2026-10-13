@@ -32,14 +32,14 @@ from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
 from ..domain.routing import Tier
-from ..domain.state import DerivedState, Harness, ItemKey, pr_key
+from ..domain.state import DerivedState, Harness, ItemKey, Local, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
 from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, Role, compose_role, leg_class, run_item, run_leg, stderr_log
+from .tick import Choose, Slots, Role, compose_role, leg_class, run_item, run_leg, stderr_log
 
 
 def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int) -> tuple[Action, ...]:
@@ -53,8 +53,9 @@ def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slo
 
 
 def review_choose(harness: Harness) -> Choose:
-    def choose(_world: WorldState, states: Mapping[ItemKey, DerivedState], slots: int) -> tuple[Action, ...]:
-        return review_actions(states, harness, slots)
+    def choose(_world: WorldState, states: Mapping[ItemKey, DerivedState], slots: Slots,
+               _local: Local) -> tuple[Action, ...]:
+        return review_actions(states, harness, slots.heavy)
     return choose
 
 

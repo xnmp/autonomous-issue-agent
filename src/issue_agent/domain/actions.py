@@ -32,8 +32,7 @@ class AgentKind(Enum):
     @property
     def holds_dispatch_slot(self) -> bool:
         """Whether a leg of this act occupies and needs a dispatch slot. TRIAGE
-        is a ~10s toolless call in an empty cwd: it adds no build or test load,
-        so it never waits behind (or crowds out) a heavy leg."""
+        is light (no workspace), so it neither waits behind nor crowds out one."""
         return self is not AgentKind.TRIAGE
 
 

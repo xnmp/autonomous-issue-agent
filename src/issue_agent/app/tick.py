@@ -32,7 +32,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from zoneinfo import ZoneInfo
 
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
@@ -179,7 +179,15 @@ class Facts:
         )
 
 
-Choose = Callable[[WorldState, Mapping[ItemKey, DerivedState], int], Iterable[Action]]
+class Slots(NamedTuple):
+    """Free dispatch capacity: `heavy` for acts that hold a slot, `light` for
+    those that do not (TRIAGE), which have their own ceiling."""
+
+    heavy: int
+    light: int
+
+
+Choose = Callable[[WorldState, Mapping[ItemKey, DerivedState], Slots, Local], Iterable[Action]]
 
 
 def decide_with(
@@ -187,13 +195,14 @@ def decide_with(
     facts: Callable[[WorldState], Local],
     harness: Harness,
     choose: Choose,
-    slots: Callable[[], int],
+    slots: Callable[[], Slots],
     log: Callable[[str], None],
 ) -> Callable[[WorldState], list[Action]]:
     """derive once, then the role's `choose` keeps its Actions (with at most
     `slots` paid dispatches)."""
     def decide(world: WorldState) -> list[Action]:
-        chosen = list(choose(world, derive(world, facts(world), harness), slots()))
+        local = facts(world)
+        chosen = list(choose(world, derive(world, local, harness), slots(), local))
         for action in chosen:
             log(f"{role}: {action!r}")
         return chosen
@@ -338,6 +347,11 @@ class Daemon:
     def _in_flight(self, *, heavy: bool) -> int:
         # Caller holds _dispatch_lock.
         return sum(a.kind.holds_dispatch_slot is heavy for a, _k in self._dispatches.values())
+
+    @property
+    def available_light_slots(self) -> int:
+        with self._dispatch_lock:
+            return max(0, self.dispatch_capacity - self._in_flight(heavy=False)) if self._admitting() else 0
 
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
@@ -955,5 +969,5 @@ def compose_role(
     facts = Facts(control, cfg.repo, active=lambda: daemon.active_dispatches,
                   headroom=headroom(cfg, control, leg_usd), lifetime_capped=lifetime_capped(cfg, control), log=log)
     harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
-    daemon.decide = decide_with(role, facts, harness, choose, lambda: daemon.available_dispatch_slots, log)
+    daemon.decide = decide_with(role, facts, harness, choose, lambda: Slots(daemon.available_dispatch_slots, daemon.available_light_slots), log)
     return Role(daemon, control, journal, act, legs, recovery, owner_id)

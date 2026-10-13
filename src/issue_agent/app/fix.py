@@ -15,10 +15,11 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
+from types import MappingProxyType
 
 from ..adapters.control_store import LegRun
-from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent
+from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
 from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.ci import failed_checks
@@ -30,34 +31,55 @@ from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
 from ..domain.triage import Triage, triage_from_record
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Wait, WaitReason, human_comments
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from ..adapters.act import GitHubAct
 from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, Role, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, stderr_log
+from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, stderr_log
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 
 
+def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime]) -> list[ItemKey]:
+    """Who gets a scarce slot first: PR-stage items before issue-stage (finish
+    work in progress before starting new), then the item that has waited longest
+    (its newest leg end; none = never served = oldest), then by number so the
+    order is total. #1125 starved behind #1039/#1117/#1122 under issues-first,
+    by-number order."""
+    never = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(keys, key=lambda k: (k.target is not Target.PR, waiting_since.get(k, never), k.number))
+
+
 def fix_actions(
     states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int, *, merge: bool = True,
+    light: int | None = None, waiting_since: Mapping[ItemKey, datetime] = MappingProxyType({}),
 ) -> tuple[Action, ...]:
-    """The tick's Actions for the fix role: all but REVIEW dispatches, with at
-    most `slots` slot-holding dispatches (issues first, then PRs, by number);
-    a TRIAGE needs none (the daemon bounds it). With
+    """The tick's Actions for the fix role: all but REVIEW dispatches. At most
+    `slots` slot-holding dispatches, granted in `dispatch_order`; TRIAGE holds
+    no slot and is bounded by `light` (None: unbounded), by number. With
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
-    out: list[Action] = []
-    for action in policy_actions(states, harness):
-        if isinstance(action, MergePullRequest) and not merge:
-            continue
-        if isinstance(action, RunAgent):
-            holds = action.kind.holds_dispatch_slot
-            if action.kind not in _FIX_ACTS or (holds and slots <= 0):
+    per_item = {key: policy_actions({key: state}, harness) for key, state in states.items()}
+    granted: set[RunAgent] = set()
+    for key in dispatch_order(per_item, waiting_since):
+        for action in per_item[key]:
+            if not isinstance(action, RunAgent) or action.kind not in _FIX_ACTS:
                 continue
-            slots -= holds
-        out.append(action)
+            if action.kind.holds_dispatch_slot:
+                if slots > 0:
+                    slots -= 1
+                    granted.add(action)
+            elif light is None or light > 0:
+                light = None if light is None else light - 1
+                granted.add(action)
+    out: list[Action] = []
+    for key in sorted(per_item, key=lambda k: k.sort_key):
+        for action in per_item[key]:
+            if isinstance(action, MergePullRequest) and not merge:
+                continue
+            if not isinstance(action, RunAgent) or action in granted:
+                out.append(action)
     return tuple(out)
 
 
@@ -322,14 +344,17 @@ def _soft(read: Callable[[], str], log: Callable[[str], None]) -> str:
 
 
 def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
-    def choose(world: WorldState, states: Mapping[ItemKey, DerivedState], slots: int) -> tuple[Action, ...]:
+    def choose(world: WorldState, states: Mapping[ItemKey, DerivedState], slots: Slots,
+               local: Local) -> tuple[Action, ...]:
         prs = {p.number: p for p in world.prs}
         for key, state in sorted(states.items(), key=lambda kv: kv[0].sort_key):
             if state == Wait(WaitReason.MERGEABILITY_UNKNOWN) and (pr := prs.get(key.number)) is not None:
                 # Approved and green but not mergeable now: BLOCKED waits on a human (branch protection).
                 log(f"fix: PR #{key.number} waits to merge: mergeable={pr.mergeable or '?'} "
                     f"state={pr.merge_state or '?'}")
-        return fix_actions(states, settings.harness, slots, merge=settings.auto_merge)
+        waiting = {k: ends[-1].ended_at for k, ends in local.legs.items() if ends}
+        return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
+                           light=slots.light, waiting_since=waiting)
     return choose
 
 
