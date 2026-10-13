@@ -38,7 +38,7 @@ from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
-from .config import HarnessConfig
+from .config import REVIEW_DISPATCH_CAPACITY, HarnessConfig
 from .planners import tasks
 from .tick import Choose, Slots, Role, compose_role, leg_class, run_item, run_leg, stderr_log
 
@@ -278,7 +278,7 @@ def compose_review_daemon(
 
     role = compose_role(cfg, "review", gateway, runner, make_legs=make_legs,
                         make_act=lambda dispatch, _control: ReviewAct(dispatch),
-                        choose=review_choose(harness), log=log)
+                        choose=review_choose(harness), capacity=REVIEW_DISPATCH_CAPACITY, log=log)
     log(f"review: capabilities: review=on runtime={cfg.reviewer_runtime.value}")
     return role
 

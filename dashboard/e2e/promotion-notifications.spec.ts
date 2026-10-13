@@ -48,7 +48,7 @@ const queuedIssue = {
   pr: null,
   pr_url: null,
   board: {
-    status: "working", activity: "queued", act: "RESOLVE", headline: "Queued",
+    status: "waiting", group: "slot", on: "slot", headline: "Queued",
     reason: "Dispatches when a slot is free.", since_ts: null,
   },
   rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
@@ -85,6 +85,7 @@ async function mockApi(page: Page) {
       issuePolls += 1;
       return json(route, {
         in_flight: promoted ? [queuedIssue] : [],
+        slots: { capacity: 3, heavy: 0, light: 0 },
         done: [],
         backlog: promoted ? [] : [backlogIssue],
         gh_ok: true,
@@ -116,7 +117,7 @@ test("promotion updates both tabs and a new dispatch raises a toast", async ({ p
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
   await expect(page.getByRole("tab", { name: /In flight/ })).toContainText("1");
   await page.getByRole("tab", { name: /In flight/ }).click();
-  const queued = page.getByRole("region", { name: "Working" }).locator(".board-row", { hasText: "#120" });
+  const queued = page.getByRole("region", { name: "Waiting for a slot" }).locator(".board-row", { hasText: "#120" });
   await expect(queued.locator(".board-headline")).toHaveText("Queued");
 
   await expect(page.getByRole("status").filter({ hasText: "Issue #120 dispatched" }))

@@ -85,12 +85,13 @@ function backlogIssue(issue: number, title: string, labels: string[], ageDays: n
 const pr = (n: number) => ({ pr: n, pr_url: `https://github.com/openai/autonomous-issue-agent/pull/${n}` });
 
 const boardIssues = {
+  slots: { capacity: 3, heavy: 1, light: 0 },
   in_flight: [
     card(710, "test: window-transfer-lifetime native smoke flake on windows (moved=false / listingHas)", {
       cost_usd: 10.63,
       action: "unblock",
       board: {
-        status: "needs_you", reason: "attempts", headline: "Attempts exhausted",
+        status: "needs_you", group: "needs_you", reason: "attempts", headline: "Attempts exhausted",
         hint: "The same act ran without progress; reply or unblock to let it try again.",
         detail: "**needs-human**: RESOLVE ran 3 times without opening a PR. Reply with guidance or unblock to let it try again.",
         target: "issue", since_ts: ago(30 * 24 * 60),
@@ -101,7 +102,7 @@ const boardIssues = {
       ...pr(1088),
       action: "open",
       board: {
-        status: "needs_you", reason: "question", headline: "Answer the agent's question",
+        status: "needs_you", group: "needs_you", reason: "question", headline: "Answer the agent's question",
         hint: "Reply on GitHub with the answer; the agent resumes with it.",
         detail: "Agent needs input: the merge action needs a confirmation dialog. Should it reuse the existing modal, or a new inline confirm?",
         target: "issue", since_ts: ago(72),
@@ -112,7 +113,7 @@ const boardIssues = {
       ...pr(1084),
       pr_ci_state: "pending",
       board: {
-        status: "working", activity: "ci", act: null, headline: "CI running",
+        status: "working", group: "ci", activity: "ci", act: null, headline: "CI running",
         reason: "Checks are running on the PR head.", since_ts: ago(41),
       },
       rail: rail({ current: "ci", furthest: "review", review_rounds: 5, ci_runs: 3, steps: 10 }),
@@ -121,7 +122,7 @@ const boardIssues = {
       ...pr(1090),
       leg_running: true,
       board: {
-        status: "working", activity: "agent", act: "ADDRESS_REVIEW", headline: "Address review running",
+        status: "working", group: "agent", activity: "agent", act: "ADDRESS_REVIEW", headline: "Address review running",
         reason: "An agent leg holds this item.", since_ts: ago(4),
       },
       rail: rail({ current: "review", furthest: "review", review_rounds: 1, steps: 3, live: true }),
@@ -129,7 +130,7 @@ const boardIssues = {
     card(1055, "add command palette command to open git issue list in browser", {
       ...pr(1095),
       board: {
-        status: "waiting", on: "branch-protection", headline: "Waiting on branch protection",
+        status: "waiting", group: "waiting", on: "branch-protection", headline: "Waiting on branch protection",
         reason: "GitHub blocks the merge until its rules pass.", since_ts: ago(26 * 60),
       },
       rail: rail({ current: "merge", furthest: "merge", review_rounds: 1, steps: 3 }),
@@ -138,7 +139,7 @@ const boardIssues = {
       labels: ["needs-human"],
       action: "unblock",
       board: {
-        status: "needs_you", reason: "labelled", headline: "Parked",
+        status: "needs_you", group: "needs_you", reason: "labelled", headline: "Parked",
         hint: "Labelled needs-human with no stop comment; unblock to hand it back.",
         detail: null, target: "issue", since_ts: null,
       },
@@ -222,11 +223,11 @@ for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844
       await expect(asked.getByText("3 runs")).toHaveClass(/rail-hot/);
       await expect(asked.locator(".board-reason")).toHaveText("Reply on GitHub with the answer; the agent resumes with it.");
 
-      const working = group(page, "Working");
-      await expect(working.locator(".board-headline")).toHaveText(["CI running", "Address review running"]);
+      await expect(group(page, "CI & GitHub").locator(".board-headline")).toHaveText(["CI running"]);
+      await expect(group(page, "Agent running").locator(".board-headline")).toHaveText(["Address review running"]);
       await expect(boardRow(page, "popup menu is in the wrong place").locator(".rail-stage", { hasText: "Review" }))
         .toHaveClass(/rail-rewound/);
-      await expect(boardRow(page, "popup menu is in the wrong place").locator(".board-wait")).toHaveText("41m ago");
+      await expect(boardRow(page, "popup menu is in the wrong place").locator(".board-wait")).toHaveText("41m");
       await expect(boardRow(page, "jump to merge-base").locator(".rail-stage.rail-current")).toHaveClass(/rail-live/);
 
       const waiting = group(page, "Waiting");
@@ -289,7 +290,7 @@ for (const theme of ["cosmic-dusk", "catppuccin-latte"] as const) {
     await page.screenshot({ path: `../evidence/dashboard-issues-board-${shade}.png`, fullPage: true, animations: "disabled" });
 
     await page.getByRole("button", { name: /Needs you/ }).first().click();
-    await expect(page.getByRole("region", { name: "Working" })).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "Agent running" })).toHaveCount(0);
     await page.screenshot({ path: `../evidence/dashboard-issues-board-${shade}-filter.png`, fullPage: true, animations: "disabled" });
   });
 }

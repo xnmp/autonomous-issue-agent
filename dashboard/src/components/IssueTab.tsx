@@ -33,7 +33,7 @@ const ISSUE_COLUMNS: ColumnChoice[] = [
   { key: "when", label: "When" },
 ];
 
-const BOARD_TONE = { needs_you: "fail", working: "ok", waiting: "neutral" } as const;
+const BOARD_TONE = { needs_you: "fail", agent: "ok", ci: "ok", slot: "running", waiting: "neutral" } as const;
 
 function storedIssueColumns(): Record<string, boolean> {
   const defaults = Object.fromEntries(
@@ -173,11 +173,11 @@ export function IssueTab({
               <span className="spacer" />
               {board && !d.done ? (
                 <Chip
-                  tone={BOARD_TONE[board.status]}
-                  pulse={board.status === "working" && board.activity === "agent"}
+                  tone={BOARD_TONE[board.group]}
+                  pulse={board.group === "agent"}
                   title={board.headline}
                 >
-                  {GROUP_META[board.status].label}
+                  {GROUP_META[board.group].label}
                 </Chip>
               ) : null}
               {d.done ? <Chip tone="ok">done</Chip> : null}

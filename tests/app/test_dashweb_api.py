@@ -137,8 +137,9 @@ class StubBackend:
                     "pr": None,
                     "pr_url": None,
                     "board": {
-                        "status": "working",
-                        "activity": "queued",
+                        "status": "waiting",
+                        "group": "slot",
+                        "on": "slot",
                         "act": "RESOLVE",
                         "headline": "Resolve next",
                         "reason": "r",
@@ -161,6 +162,7 @@ class StubBackend:
                     "leg_running": False,
                 }
             ],
+            "slots": {"capacity": 3, "heavy": 0, "light": 0},
             "done": [],
             "backlog": [],
             "gh_ok": True,
@@ -231,7 +233,7 @@ def test_a_degraded_overview_still_answers_with_an_empty_spend_series():
 def test_issues_returns_all_three_lanes_in_one_call():
     body = client().get("/api/repos/demo/issues").json()
     assert set(body) >= {"in_flight", "done", "backlog", "gh_ok"}
-    assert body["in_flight"][0]["board"]["status"] == "working"
+    assert body["in_flight"][0]["board"]["group"] == "slot"
 
 
 def test_issue_detail_is_404_for_an_unknown_issue():

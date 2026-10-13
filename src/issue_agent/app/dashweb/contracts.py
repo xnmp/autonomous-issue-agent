@@ -212,6 +212,7 @@ class OverviewPayload(Observed):
 
 class BoardNeedsYou(Contract):
     status: Literal["needs_you"]
+    group: Literal["needs_you"]
     reason: StopReasonId
     headline: str
     # What releases the stop, in one line.
@@ -226,7 +227,9 @@ class BoardNeedsYou(Contract):
 
 class BoardWorking(Contract):
     status: Literal["working"]
-    activity: Literal["agent", "queued", "ci", "ci_queued", "merge", "update", "open_pr", "triage_note", "release"]
+    # agent: a running leg; ci: CI and the free GitHub-side actions.
+    group: Literal["agent", "ci"]
+    activity: Literal["agent", "ci", "ci_queued", "merge", "update", "open_pr", "triage_note", "release"]
     act: str | None
     headline: str
     reason: str
@@ -235,6 +238,8 @@ class BoardWorking(Contract):
 
 class BoardWaiting(Contract):
     status: Literal["waiting"]
+    # slot: waiting for a dispatch slot; waiting: an external wait.
+    group: Literal["slot", "waiting"]
     on: Literal["branch-protection", "human-review", "headroom", "backoff", "github", "slot"]
     headline: str
     reason: str
@@ -347,8 +352,18 @@ class ToastNotification(Contract):
     pr: int | None = None
 
 
+class SlotUsage(Contract):
+    """Dispatch slots against the agent lane. Light legs (steward, triage)
+    run outside `capacity`."""
+
+    capacity: int
+    heavy: int
+    light: int
+
+
 class IssuesPayload(Observed):
     in_flight: list[IssueCard]
+    slots: SlotUsage
     done: list[DoneCard]
     backlog: list[BacklogCard]
     gh_ok: bool

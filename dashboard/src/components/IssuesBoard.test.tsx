@@ -19,7 +19,7 @@ const needs = (
   detail: string | null = null,
   target: "issue" | "pr" = "issue",
 ): BoardStatus => ({
-  status: "needs_you", reason, headline, hint: `hint for ${headline}`, detail, target, since_ts: since,
+  status: "needs_you", group: "needs_you", reason, headline, hint: `hint for ${headline}`, detail, target, since_ts: since,
 });
 
 const history: StageVisit[] = [
@@ -54,7 +54,7 @@ function card(issue: number, board: BoardStatus, over: Partial<IssueCard> = {}):
 
 function polled(payload: Partial<IssuesPayload>): Polled<IssuesPayload> {
   return {
-    data: { in_flight: [], done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: NOW, notifications: [], warnings: [], ...payload },
+    data: { in_flight: [], slots: { capacity: 3, heavy: 0, light: 0 }, done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: NOW, notifications: [], warnings: [], ...payload },
     error: null,
     loading: false,
     updatedAt: Date.parse(NOW),
@@ -96,36 +96,36 @@ afterEach(() => {
 });
 
 describe("issues board groups", () => {
-  it("lists an item whose resolve has not started under Waiting, not Working", () => {
+  it("lists every item waiting for a dispatch slot, issue or PR stage, under Waiting for a slot", () => {
     stubFetch();
     renderBoard({
       in_flight: [
-        card(131, { status: "waiting", on: "slot", headline: "Resolve next", reason: "Waiting for a free agent slot.", since_ts: null }),
-        card(132, { status: "working", activity: "queued", act: "FIX_CI", headline: "Fix CI next", reason: "Dispatches when a slot is free.", since_ts: null }),
+        card(131, { status: "waiting", group: "slot", on: "slot", headline: "Resolve next", reason: "Waiting for a free agent slot.", since_ts: null }),
+        card(132, { status: "waiting", group: "slot", on: "slot", headline: "Fix CI next", reason: "Dispatches when a slot is free.", since_ts: null }),
       ],
     });
 
-    expect(within(section("Waiting")).getByText("Resolve next")).toBeVisible();
-    expect(within(section("Working")).queryByText("Resolve next")).not.toBeInTheDocument();
-    expect(within(section("Working")).getByText("Fix CI next")).toBeVisible();
+    expect(within(section("Waiting for a slot")).getByText("Resolve next")).toBeVisible();
+    expect(within(section("Waiting for a slot")).getByText("Fix CI next")).toBeVisible();
+    expect(within(section("Waiting")).getByText("Nothing here right now.")).toBeVisible();
   });
 
   it("puts each row in its server-derived group, in order, longest Needs-you wait first", () => {
     stubFetch();
     renderBoard({
       in_flight: [
-        card(101, { status: "working", activity: "agent", act: "RESOLVE", headline: "Resolve running", reason: "An agent leg holds this item.", since_ts: "2026-10-12T11:48:00Z" }, { leg_running: true }),
+        card(101, { status: "working", group: "agent", activity: "agent", act: "RESOLVE", headline: "Resolve running", reason: "An agent leg holds this item.", since_ts: "2026-10-12T11:48:00Z" }, { leg_running: true }),
         card(102, needs("question", "2026-10-11T12:00:00Z", "Answer the agent's question")),
         card(103, needs("attempts", "2026-09-21T12:00:00Z", "Attempts exhausted")),
-        card(104, { status: "waiting", on: "branch-protection", headline: "Waiting on branch protection", reason: "GitHub blocks the merge until its rules pass.", since_ts: "2026-10-12T09:00:00Z" }),
+        card(104, { status: "waiting", group: "waiting", on: "branch-protection", headline: "Waiting on branch protection", reason: "GitHub blocks the merge until its rules pass.", since_ts: "2026-10-12T09:00:00Z" }),
       ],
     });
 
     const groups = screen.getAllByRole("region").map((node) => node.getAttribute("aria-labelledby"));
-    expect(groups).toEqual(["board-group-needs_you", "board-group-working", "board-group-waiting"]);
+    expect(groups).toEqual(["needs_you", "agent", "ci", "slot", "waiting"].map((g) => `board-group-${g}`));
     const needsRows = within(section("Needs you")).getAllByText(/title$/).map((node) => node.textContent);
     expect(needsRows).toEqual(["Issue 103 title", "Issue 102 title"]);
-    expect(within(section("Working")).getByText("Resolve running")).toBeVisible();
+    expect(within(section("Agent running")).getByText("Resolve running")).toBeVisible();
     expect(within(section("Waiting")).getByText("Waiting on branch protection")).toBeVisible();
     expect(within(section("Waiting")).getByText("GitHub blocks the merge until its rules pass.")).toBeVisible();
   });
@@ -143,14 +143,14 @@ describe("issues board groups", () => {
     renderBoard({
       in_flight: [
         card(120, needs("labelled", "2026-10-12T10:00:00Z", "Parked")),
-        card(121, { status: "working", activity: "ci", act: null, headline: "CI running", reason: "Checks are running on the PR head.", since_ts: "2026-10-12T11:48:00Z" }),
-        card(122, { status: "waiting", on: "human-review", headline: "Waiting on a human review", reason: "", since_ts: "2026-10-12T10:00:00Z" }),
+        card(121, { status: "working", group: "ci", activity: "ci", act: null, headline: "CI running", reason: "Checks are running on the PR head.", since_ts: "2026-10-12T11:48:00Z" }),
+        card(122, { status: "waiting", group: "waiting", on: "human-review", headline: "Waiting on a human review", reason: "", since_ts: "2026-10-12T10:00:00Z" }),
       ],
     });
 
     const headings = (label: string) => Array.from(section(label).querySelectorAll(".board-cols span")).map((node) => node.textContent);
     expect(headings("Needs you")).toEqual(["Issue", "What to do", "Stage", "Waiting", ""]);
-    expect(headings("Working")).toEqual(["Issue", "Now", "Stage", "In step", ""]);
+    expect(headings("CI & GitHub")).toEqual(["Issue", "Now", "Stage", "In step", ""]);
     expect(headings("Waiting")).toEqual(["Issue", "Waiting for", "Stage", "Waiting", ""]);
     expect(within(row("Issue 121 title")).getByText("12m")).toBeVisible();
     expect(within(row("Issue 120 title")).getByText("2h")).toBeVisible();
@@ -162,11 +162,11 @@ describe("issues board groups", () => {
 
     const chip = (name: RegExp) => screen.getByRole("button", { name });
     expect(chip(/^2 All$/)).toHaveAttribute("aria-pressed", "true");
-    expect(chip(/0 Working/)).toHaveClass("board-chip-zero");
+    expect(chip(/0 Agent running/)).toHaveClass("board-chip-zero");
     expect(chip(/2 Needs you/)).not.toHaveClass("board-chip-zero");
 
-    await userEvent.click(chip(/0 Working/));
-    expect(screen.queryByRole("region", { name: "Working" })).not.toBeInTheDocument();
+    await userEvent.click(chip(/0 Agent running/));
+    expect(screen.queryByRole("region", { name: "Agent running" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Needs you" })).not.toBeInTheDocument();
 
     await userEvent.click(chip(/2 Needs you/));
@@ -174,8 +174,8 @@ describe("issues board groups", () => {
     expect(screen.queryByRole("region", { name: "Waiting" })).not.toBeInTheDocument();
 
     await userEvent.click(chip(/2 Needs you/));
-    expect(screen.getAllByRole("region")).toHaveLength(3);
-    expect(screen.getAllByText("Nothing here right now.")).toHaveLength(2);
+    expect(screen.getAllByRole("region")).toHaveLength(5);
+    expect(screen.getAllByText("Nothing here right now.")).toHaveLength(4);
   });
 });
 
@@ -317,7 +317,7 @@ describe("issues board drawer", () => {
 
   it("says when there is no agent work yet", async () => {
     stubFetch();
-    renderBoard({ in_flight: [card(182, { status: "working", activity: "queued", act: "RESOLVE", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null }, { rail: rail({ steps: 0 }), history: [] })] });
+    renderBoard({ in_flight: [card(182, { status: "waiting", group: "slot", on: "slot", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null }, { rail: rail({ steps: 0 }), history: [] })] });
 
     await userEvent.click(row("Issue 182 title"));
 
@@ -346,8 +346,8 @@ describe("issues board actions", () => {
     stubFetch();
     renderBoard({
       in_flight: [
-        card(210, { status: "working", activity: "agent", act: "RESOLVE", headline: "Resolve running", reason: "", since_ts: null }),
-        card(211, { status: "waiting", on: "headroom", headline: "Waiting for spend headroom", reason: "", since_ts: null }),
+        card(210, { status: "working", group: "agent", activity: "agent", act: "RESOLVE", headline: "Resolve running", reason: "", since_ts: null }),
+        card(211, { status: "waiting", group: "waiting", on: "headroom", headline: "Waiting for spend headroom", reason: "", since_ts: null }),
       ],
     });
 
@@ -375,14 +375,15 @@ describe("issues board actions", () => {
 
   it("shows CI waiting on a runner or a leg waiting on a slot in yellow, and CI executing in green", () => {
     stubFetch();
-    const working = (activity: "ci" | "ci_queued" | "queued", headline: string): BoardStatus => ({
-      status: "working", activity, act: null, headline, reason: "r", since_ts: null,
+    const working = (activity: "ci" | "ci_queued", headline: string): BoardStatus => ({
+      status: "working", group: "ci", activity, act: null, headline, reason: "r", since_ts: null,
     });
+    const slotWait: BoardStatus = { status: "waiting", group: "slot", on: "slot", headline: "Fix CI next", reason: "r", since_ts: null };
     renderBoard({
       in_flight: [
         card(180, working("ci_queued", "CI queued"), { rail: rail({ current: "ci" }) }),
         card(181, working("ci", "CI running"), { rail: rail({ current: "ci" }) }),
-        card(182, working("queued", "Fix CI next"), { rail: rail({ current: "ci" }) }),
+        card(182, slotWait, { rail: rail({ current: "ci" }) }),
       ],
     });
 
@@ -396,5 +397,63 @@ describe("issues board actions", () => {
     const slot = row("Issue 182 title");
     expect(slot.closest(".board-item")).toHaveClass("board-tone-warn");
     expect(slot.querySelector(".lifecycle-rail")).toHaveClass("rail-tone-warn");
+  });
+});
+
+describe("board lanes and dispatch slots", () => {
+  const agent = (act: string, headline: string): BoardStatus => ({
+    status: "working", group: "agent", activity: "agent", act, headline, reason: "An agent leg holds this item.", since_ts: "2026-10-12T11:48:00Z",
+  });
+  const ci: BoardStatus = { status: "working", group: "ci", activity: "ci", act: null, headline: "CI running", reason: "r", since_ts: "2026-10-12T11:00:00Z" };
+  const merge: BoardStatus = { status: "working", group: "ci", activity: "merge", act: null, headline: "Merging", reason: "r", since_ts: null };
+  const slot: BoardStatus = { status: "waiting", group: "slot", on: "slot", headline: "Fix CI next", reason: "r", since_ts: "2026-10-12T11:30:00Z" };
+  const external: BoardStatus = { status: "waiting", group: "waiting", on: "headroom", headline: "Daily cap reached", reason: "r", since_ts: null };
+
+  it("renders the five lanes in order, counting each lane's rows", () => {
+    stubFetch();
+    renderBoard({
+      in_flight: [
+        card(1, agent("RESOLVE", "Resolve running")), card(2, ci), card(3, merge), card(4, slot), card(5, slot),
+        card(6, external), card(7, needs("question", "2026-10-12T10:00:00Z", "Answer")),
+      ],
+      slots: { capacity: 3, heavy: 1, light: 0 },
+    });
+
+    const order = screen.getAllByRole("region").map((node) => node.getAttribute("aria-labelledby"));
+    expect(order).toEqual(["needs_you", "agent", "ci", "slot", "waiting"].map((g) => `board-group-${g}`));
+    const count = (label: string) => section(label).querySelector(".board-group-count")?.textContent;
+    expect(count("Needs you")).toBe("1");
+    expect(count("CI & GitHub")).toBe("2");
+    expect(count("Waiting for a slot")).toBe("2");
+    expect(count("Waiting")).toBe("1");
+    // Slot rows show how long they have waited; CI rows how long in CI.
+    expect(within(row("Issue 4 title")).getByText("30m")).toBeVisible();
+    expect(within(row("Issue 2 title")).getByText("1h")).toBeVisible();
+  });
+
+  it("shows running legs against the slots, and keeps steward/triage legs out of that count", () => {
+    stubFetch();
+    renderBoard({
+      in_flight: [agent("RESOLVE", "Resolve running"), agent("REVIEW", "Review running"), agent("TRIAGE", "Triage running")]
+        .map((board, i) => card(10 + i, board)),
+      slots: { capacity: 2, heavy: 2, light: 1 },
+    });
+
+    const lane = section("Agent running");
+    expect(within(lane).getByText("2 / 2 slots")).toBeVisible();
+    expect(within(lane).getByText(/\+1 steward\/triage/)).toBeVisible();
+    expect(within(lane).getByText("Triage running")).toBeVisible();
+  });
+
+  it("has one filter chip per lane, each filtering to its lane", async () => {
+    stubFetch();
+    renderBoard({ in_flight: [card(1, ci), card(2, slot)] });
+
+    for (const name of [/^2 All$/, /Needs you/, /Agent running/, /1 CI & GitHub/, /1 Waiting for a slot/, /^0 Waiting$/]) {
+      expect(screen.getByRole("button", { name })).toBeVisible();
+    }
+    await userEvent.click(screen.getByRole("button", { name: /1 Waiting for a slot/ }));
+    expect(section("Waiting for a slot")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "CI & GitHub" })).not.toBeInTheDocument();
   });
 });

@@ -34,6 +34,7 @@ const usage = {
 
 const issues = {
   in_flight: [],
+  slots: { capacity: 3, heavy: 0, light: 0 },
   done: [],
   backlog: [],
   gh_ok: true, merged_partial: false,

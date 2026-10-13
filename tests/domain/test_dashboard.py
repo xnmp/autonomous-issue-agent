@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.domain import dashboard as dash
-from issue_agent.domain.actions import AgentKind
+from issue_agent.domain.actions import ISSUE_ACTS, AgentKind
 from issue_agent.domain.state import (
     Backoff,
     Dispatch,
@@ -151,35 +151,25 @@ def test_a_stop_about_to_be_posted_is_already_needs_you():
 
 @pytest.mark.parametrize(
     "state,activity",
-    [
-        (Dispatch(AgentKind.FIX_CI, "h1"), "queued"),
-        (Merge("h1"), "merge"),
-        (Release(), "release"),
-        (Wait(WaitReason.CI_PENDING), "ci"),
-    ],
+    [(Merge("h1"), "merge"), (Release(), "release"), (Wait(WaitReason.CI_PENDING), "ci")],
 )
 def test_moving_states_are_working(state, activity):
     board = status(state)
     assert isinstance(board, dash.Working) and board.activity == activity
 
 
-@pytest.mark.parametrize("act", [AgentKind.STEWARD, AgentKind.TRIAGE, AgentKind.RESOLVE])
-def test_an_item_whose_resolve_has_not_started_waits_for_a_slot(act):
-    for legs in ([], [leg("TRIAGE", 0, ended=2)], [replace(leg("RESOLVE", 0, state="released", ended=1), started_at=None)]):
-        board = status(Dispatch(act), legs=legs)
-        assert isinstance(board, dash.Waiting)
-        assert (board.on, board.headline, board.reason) == ("slot", f"{dash._ACT_WORDS[act.name]} next",
-                                                            "Waiting for a free agent slot.")
-    assert status(Dispatch(act), legs=[leg("TRIAGE", 0, ended=3)], last_end=at(3)).since_ts == stamp(3)
-    assert status(Dispatch(act), legs=[]).since_ts is None
+@pytest.mark.parametrize("act", list(AgentKind))
+@pytest.mark.parametrize("legs", [[], [leg("RESOLVE", 0, ended=2)]])
+def test_every_dispatch_waits_for_a_slot_whatever_the_leg_history(act, legs):
+    board = status(Dispatch(act, "" if act in ISSUE_ACTS else "h1"), legs=legs)
+    assert isinstance(board, dash.Waiting)
+    assert (board.on, board.headline, board.reason) == ("slot", f"{dash._ACT_WORDS[act.name]} next",
+                                                        "Waiting for a free agent slot.")
 
 
-def test_a_retried_resolve_is_working_and_pr_acts_stay_working():
-    retried = status(Dispatch(AgentKind.RESOLVE), legs=[leg("RESOLVE", 0, ended=2)])
-    assert isinstance(retried, dash.Working) and retried.activity == "queued"
-    for act in (AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE):
-        board = status(Dispatch(act, "h1"), legs=[])
-        assert isinstance(board, dash.Working) and board.activity == "queued"
+def test_a_slot_wait_is_dated_from_the_last_leg_end():
+    assert status(Dispatch(AgentKind.TRIAGE), legs=[leg("TRIAGE", 0, ended=3)], last_end=at(3)).since_ts == stamp(3)
+    assert status(Dispatch(AgentKind.TRIAGE), legs=[]).since_ts is None
 
 
 def _ci_pr(*states):
@@ -380,3 +370,50 @@ def test_label_values_and_frecency():
     assert dash.label_value(["bug"], ("type:",), exact=("bug",)) == "bug"
     assert dash.label_value(["impact:high"], ("impact:",)) == "high"
     assert dash.frecency([at(0), at(-60 * 24 * 3), at(-60 * 24 * 60), at(60)], at(0)) == 4.0
+
+
+# ── board groups ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "board,group",
+    [
+        (dash.Working("agent", "RESOLVE", "h", "r", None), "agent"),
+        (dash.Working("agent", "TRIAGE", "h", "r", None), "agent"),
+        (dash.Working("ci", None, "h", "r", None), "ci"),
+        (dash.Working("ci_queued", None, "h", "r", None), "ci"),
+        *((dash.Working(activity, None, "h", "r", None), "ci")
+          for activity in ("merge", "update", "open_pr", "release", "triage_note")),
+        (dash.Waiting("slot", "h", "r", None), "slot"),
+        *((dash.Waiting(on, "h", "r", None), "waiting")
+          for on in ("branch-protection", "human-review", "headroom", "backoff", "github")),
+        (dash.NeedsYou("question", "h", None, "issue", None), "needs_you"),
+    ],
+)
+def test_every_board_status_lands_in_one_group(board, group):
+    assert board.group == group
+
+
+@pytest.mark.parametrize(
+    "state,group",
+    [
+        (Dispatch(AgentKind.FIX_CI, "h1"), "slot"),
+        (Dispatch(AgentKind.RESOLVE), "slot"),
+        (Wait(WaitReason.CI_PENDING), "ci"),
+        (Merge("h1"), "ci"),
+        (Refresh("h1"), "ci"),
+        (Wait(WaitReason.HEADROOM), "waiting"),
+        (Backoff(AgentKind.RESOLVE, at(30)), "waiting"),
+        (NeedsHuman(StopReason.QUESTION, "-", question="q"), "needs_you"),
+    ],
+)
+def test_derived_states_map_to_their_group(state, group):
+    assert status(state).group == group
+
+
+def test_slot_usage_counts_heavy_legs_against_capacity_and_light_ones_beside_it():
+    agent = lambda act: dash.Working("agent", act, "h", "r", None)  # noqa: E731
+    boards = [agent("RESOLVE"), agent("REVIEW"), agent("TRIAGE"), agent("STEWARD"),
+              dash.Working("ci", None, "h", "r", None), dash.Waiting("slot", "h", "r", None)]
+    assert dash.slot_usage(boards, 3) == dash.SlotUsage(capacity=3, heavy=2, light=2)
+    assert dash.slot_usage([], 3) == dash.SlotUsage(3, 0, 0)

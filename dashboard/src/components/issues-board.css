@@ -77,6 +77,10 @@
   font-family: var(--font-mono);
   color: var(--ink-muted);
 }
+.board-group-note {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
 .board-group-hint {
   color: var(--ink-muted);
   font-size: var(--text-sm);

@@ -31,7 +31,21 @@ import { UnblockControl } from "./UnblockControl";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { tipProps } from "./ui/Tip";
 import { SkeletonRows } from "./ui/Feedback";
+import type { SlotUsage } from "../api/types";
 import "./issues-board.css";
+
+/** The agent lane counts heavy legs against the slots; light legs run beside them. */
+function GroupCount({ group, count, slots }: { group: BoardGroup; count: number; slots?: SlotUsage | null }) {
+  if (group !== "agent" || !slots || slots.capacity <= 0) {
+    return <span className="board-group-count num">{count}</span>;
+  }
+  return (
+    <>
+      <span className="board-group-count num">{slots.heavy} / {slots.capacity} slots</span>
+      {slots.light > 0 ? <span className="board-group-note">+{slots.light} steward/triage, outside the slots</span> : null}
+    </>
+  );
+}
 
 /** A title this long is clamped on the row, so the drawer repeats it whole. */
 const CLAMPED_TITLE_CHARS = 70;
@@ -39,12 +53,15 @@ const CLAMPED_TITLE_CHARS = 70;
 export function IssuesBoard({
   repo,
   items,
+  slots,
   loading,
   onRefresh,
   onOpenIssue,
 }: {
   repo: string;
   items: BoardItem[];
+  /** Dispatch slots against the agent lane; absent until the first read. */
+  slots?: SlotUsage | null;
   loading: boolean;
   onRefresh: () => void;
   onOpenIssue: (issue: number) => void;
@@ -97,7 +114,7 @@ export function IssuesBoard({
           >
             <div className="board-group-hd">
               <h2 id={`board-group-${group}`}><i aria-hidden="true" />{GROUP_META[group].label}</h2>
-              <span className="board-group-count num">{members.length}</span>
+              <GroupCount group={group} count={members.length} slots={slots} />
               <span className="board-group-hint">{GROUP_META[group].hint}</span>
             </div>
             <div className="board-panel panel">
@@ -156,7 +173,7 @@ function BoardRow({
   // the wait under its column heading.
   const ids = ["say", "rail", "waithead", "wait"].map((part) => `board-row-${item.issue}-${part}`);
   const [sayId, railId, waitHeadId, waitId] = ids;
-  const live = board.status === "working" && board.activity === "agent";
+  const live = board.group === "agent";
   const tone = boardTone(board);
   return (
     <div className={`board-item${open ? " open" : ""}${tone === "warn" ? " board-tone-warn" : ""}`}>
@@ -176,7 +193,7 @@ function BoardRow({
               {item.title ?? <span className="faint">title unavailable</span>}
             </span>
           </button>
-          <span id={waitHeadId} className="sr-only">{COLUMN_HEADINGS[board.status].wait}:</span>
+          <span id={waitHeadId} className="sr-only">{COLUMN_HEADINGS[board.group].wait}:</span>
           <div className="board-refs">
             <IssueLink issue={item.issue} url={item.url} />
             {item.pr !== null ? <PrNumber pr={item.pr} url={item.prUrl} /> : null}

@@ -19,20 +19,31 @@ import { parseTs } from "../../lib/format";
 import { CANONICAL, railSummary, type RailNode } from "../../components/ui/LifecycleStepper";
 
 export type { BoardStatus, StageId, StageRail, StageVisit, TrackChip };
-export type BoardGroup = BoardStatus["status"];
+/** The server's lane for a row (`board.group`); `board.status` stays the variant. */
+export type BoardGroup = BoardStatus["group"];
 
-export const GROUP_ORDER: readonly BoardGroup[] = ["needs_you", "working", "waiting"];
+export const GROUP_ORDER: readonly BoardGroup[] = ["needs_you", "agent", "ci", "slot", "waiting"];
 
-export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone: "fail" | "ok" | "muted" }> = {
+export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone: "fail" | "ok" | "muted" | "warn" }> = {
   needs_you: {
     label: "Needs you",
     hint: "The harness stopped and labelled it needs-human. Nothing moves until you act.",
     tone: "fail",
   },
-  working: {
-    label: "Working",
-    hint: "An agent or CI is running, or the harness is about to act (start, open a PR, merge).",
+  agent: {
+    label: "Agent running",
+    hint: "A leg is running. The count is heavy legs against the dispatch slots; steward and triage run outside the slots.",
     tone: "ok",
+  },
+  ci: {
+    label: "CI & GitHub",
+    hint: "CI is running or queued, or the harness is about to act on GitHub next tick (open a PR, update the branch, merge, release, post triage).",
+    tone: "ok",
+  },
+  slot: {
+    label: "Waiting for a slot",
+    hint: "Ready to run; it starts when a dispatch slot frees up.",
+    tone: "warn",
   },
   waiting: {
     label: "Waiting",
@@ -43,18 +54,17 @@ export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone:
 
 export type BoardTone = "fail" | "ok" | "muted" | "warn";
 
-/** Rows waiting for a turn (CI waiting on a runner, a leg waiting on a
- * dispatch slot) read yellow: nothing is executing yet, unlike the green of
- * work in progress. */
-const WAITING_TURN: ReadonlySet<string> = new Set(["ci_queued", "queued"]);
-
+/** CI waiting on a runner reads yellow like the slot lane: nothing is
+ * executing yet, unlike the green of work in progress. */
 export function boardTone(board: BoardStatus): BoardTone {
-  return board.status === "working" && WAITING_TURN.has(board.activity) ? "warn" : GROUP_META[board.status].tone;
+  return board.status === "working" && board.activity === "ci_queued" ? "warn" : GROUP_META[board.group].tone;
 }
 
 export const COLUMN_HEADINGS: Record<BoardGroup, { now: string; wait: string }> = {
   needs_you: { now: "What to do", wait: "Waiting" },
-  working: { now: "Now", wait: "In step" },
+  agent: { now: "Now", wait: "In step" },
+  ci: { now: "Now", wait: "In step" },
+  slot: { now: "Waiting for", wait: "Waiting" },
   waiting: { now: "Waiting for", wait: "Waiting" },
 };
 
@@ -91,9 +101,9 @@ export function queuedCard(card: BacklogCard): IssueCard {
     pr: null,
     pr_url: null,
     board: {
-      status: "working",
-      activity: "queued",
-      act: null,
+      status: "waiting",
+      group: "slot",
+      on: "slot",
       headline: "Queued",
       reason: "Starts when the fixer picks it up.",
       since_ts: null,
@@ -145,7 +155,7 @@ export interface BoardSection {
  */
 export function groupItems(items: readonly BoardItem[]): BoardSection[] {
   return GROUP_ORDER.map((group) => {
-    const members = items.filter((item) => item.board.status === group);
+    const members = items.filter((item) => item.board.group === group);
     const ordered = group === "needs_you"
       ? [...members].sort(byLongestWait)
       : [...members].sort((a, b) => a.issue - b.issue);
@@ -163,8 +173,8 @@ function byLongestWait(a: BoardItem, b: BoardItem): number {
 }
 
 export function groupCounts(items: readonly BoardItem[]): Record<BoardGroup, number> {
-  const counts: Record<BoardGroup, number> = { needs_you: 0, working: 0, waiting: 0 };
-  for (const item of items) counts[item.board.status] += 1;
+  const counts: Record<BoardGroup, number> = { needs_you: 0, agent: 0, ci: 0, slot: 0, waiting: 0 };
+  for (const item of items) counts[item.board.group] += 1;
   return counts;
 }
 
@@ -203,12 +213,13 @@ export interface WaitCell {
 }
 
 /**
- * The fourth column. Needs you and Waiting count how long the row has waited
- * on the operator or its blocker; Working says how long the current step has run. A row with no start says what it is instead: a working row is
- * queued, a needs-you row (a park, say, which has no stop comment to date it)
- * waits on you.
+ * The fourth column. Needs you, Waiting for a slot and Waiting count how long
+ * the row has waited on the operator or its blocker; the agent and CI lanes
+ * say how long the current step has run. A row with no start says what it is
+ * instead: a slot row is queued, a needs-you row (a park, say, which has no
+ * stop comment to date it) waits on you.
  */
-const UNDATED: Record<BoardStatus["status"], string> = { working: "queued", needs_you: "needs you", waiting: "—" };
+const UNDATED: Record<BoardGroup, string> = { needs_you: "needs you", slot: "queued", agent: "—", ci: "—", waiting: "—" };
 
 function stepName(board: BoardStatus): string {
   return board.status === "working" ? board.headline.toLowerCase() : "step";
@@ -216,7 +227,7 @@ function stepName(board: BoardStatus): string {
 
 export function waitCell(board: BoardStatus, nowMs: number): WaitCell {
   const since = parseTs(board.since_ts);
-  if (since === null || !Number.isFinite(nowMs)) return { text: UNDATED[board.status], stale: false, title: null };
+  if (since === null || !Number.isFinite(nowMs)) return { text: UNDATED[board.group], stale: false, title: null };
   const seconds = Math.max(0, (nowMs - since) / 1000);
   const text = waitCompact(seconds);
   if (board.status === "working") {

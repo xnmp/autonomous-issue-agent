@@ -248,6 +248,7 @@ export function IssuesTab({
         <IssuesBoard
           repo={repo}
           items={filteredBoard}
+          slots={data?.slots}
           loading={issues.loading}
           onRefresh={issues.refresh}
           onOpenIssue={onOpenIssue}

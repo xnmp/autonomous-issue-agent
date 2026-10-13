@@ -49,13 +49,13 @@ describe("IssueTab", () => {
 
   it("shows CI activity on the open PR beside the issue's status", async () => {
     serve(detail({
-      board: { status: "working", activity: "ci", act: null, headline: "CI running", reason: "Checks are running on the PR head.", since_ts: null },
+      board: { status: "working", group: "ci", activity: "ci", act: null, headline: "CI running", reason: "Checks are running on the PR head.", since_ts: null },
       pull_requests: [{ number: 75, url: null, state: "open", ci_state: "pending" }],
     }));
     render(<IssueTab repo="ci-demo" issue={50} />);
 
     expect(await screen.findByText("CI running", { selector: ".chip" })).toHaveClass("chip-running", "pulse");
-    expect(screen.getByText("Working")).toBeVisible();
+    expect(screen.getByText("CI & GitHub")).toBeVisible();
     expect(screen.getByText("CI running: Checks are running on the PR head.")).toBeVisible();
   });
 
@@ -79,7 +79,7 @@ describe("IssueTab", () => {
   it("shows a stop as Needs you, with what releases it and the stop comment as text", async () => {
     serve(detail({
       board: {
-        status: "needs_you", reason: "question", headline: "Answer the agent's question",
+        status: "needs_you", group: "needs_you", reason: "question", headline: "Answer the agent's question",
         hint: "Reply on GitHub with the answer; the agent resumes with it.",
         detail: "**needs-human**: Should retries use endpoint A or B?", target: "issue", since_ts: null,
       },

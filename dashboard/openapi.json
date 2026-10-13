@@ -234,6 +234,14 @@
             ],
             "title": "Detail"
           },
+          "group": {
+            "const": "needs_you",
+            "enum": [
+              "needs_you"
+            ],
+            "title": "Group",
+            "type": "string"
+          },
           "headline": {
             "title": "Headline",
             "type": "string"
@@ -285,6 +293,7 @@
         },
         "required": [
           "status",
+          "group",
           "reason",
           "headline",
           "hint",
@@ -298,6 +307,14 @@
       "BoardWaiting": {
         "additionalProperties": true,
         "properties": {
+          "group": {
+            "enum": [
+              "slot",
+              "waiting"
+            ],
+            "title": "Group",
+            "type": "string"
+          },
           "headline": {
             "title": "Headline",
             "type": "string"
@@ -351,6 +368,7 @@
         },
         "required": [
           "status",
+          "group",
           "on",
           "headline",
           "reason",
@@ -376,7 +394,6 @@
           "activity": {
             "enum": [
               "agent",
-              "queued",
               "ci",
               "ci_queued",
               "merge",
@@ -386,6 +403,14 @@
               "release"
             ],
             "title": "Activity",
+            "type": "string"
+          },
+          "group": {
+            "enum": [
+              "agent",
+              "ci"
+            ],
+            "title": "Group",
             "type": "string"
           },
           "headline": {
@@ -418,6 +443,7 @@
         },
         "required": [
           "status",
+          "group",
           "activity",
           "act",
           "headline",
@@ -1677,6 +1703,9 @@
             ],
             "title": "Observed At"
           },
+          "slots": {
+            "$ref": "#/components/schemas/SlotUsage"
+          },
           "store_error": {
             "anyOf": [
               {
@@ -1699,6 +1728,7 @@
         "required": [
           "warnings",
           "in_flight",
+          "slots",
           "done",
           "backlog",
           "gh_ok"
@@ -2320,6 +2350,31 @@
           "heartbeat_ts"
         ],
         "title": "RoleHealth",
+        "type": "object"
+      },
+      "SlotUsage": {
+        "additionalProperties": true,
+        "description": "Dispatch slots against the agent lane. Light legs (steward, triage)\nrun outside `capacity`.",
+        "properties": {
+          "capacity": {
+            "title": "Capacity",
+            "type": "integer"
+          },
+          "heavy": {
+            "title": "Heavy",
+            "type": "integer"
+          },
+          "light": {
+            "title": "Light",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity",
+          "heavy",
+          "light"
+        ],
+        "title": "SlotUsage",
         "type": "object"
       },
       "SpendBucket": {

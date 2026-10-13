@@ -26,7 +26,7 @@ const done: DoneCard = {
 function inflight(issue: number, title: string, over: Partial<IssueCard> = {}): IssueCard {
   return {
     issue, title, url: null, labels: ["ai-ready"], pr: null, pr_url: null, pr_ci_state: null,
-    board: { status: "working", activity: "queued", act: "RESOLVE", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null },
+    board: { status: "waiting", group: "slot", on: "slot", headline: "Resolve next", reason: "Dispatches when a slot is free.", since_ts: null },
     action: null,
     rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
     history: [], cost_usd: 0, estimated: false, legs: 0, started_ts: null, last_ts: null, leg_running: false,
@@ -51,6 +51,7 @@ function polled(payload: Partial<IssuesPayload>): Polled<IssuesPayload> {
   return {
     data: {
       in_flight: [],
+      slots: { capacity: 3, heavy: 0, light: 0 },
       done: [],
       backlog: [],
       gh_ok: true, merged_partial: false,

@@ -6,10 +6,11 @@ recorded, and keeps no state or lifecycle rules of its own.
 
 - **Board.** Each row is one harness item, mapped from the state
   `domain.state.derive` gives it over the same observation the roles read.
-  `needs-human` is "Needs you", worded by its stop reason; everything else is
-  either working (an agent, CI, or a free action is moving it) or a wait on
-  something outside the harness (branch protection, a human reviewer, money
-  headroom, a machine backoff, an unreadable GitHub field).
+  `needs-human` is "Needs you", worded by its stop reason; everything else
+  sits in one lane (`group`): a running agent leg, CI and the free GitHub
+  actions, a wait for a dispatch slot, or a wait on something outside the
+  harness (branch protection, a human reviewer, money headroom, a machine
+  backoff, an unreadable GitHub field).
 - **Legs.** The issue page, the rail, the history and every metric read the
   `legs` rows (refactor decision Q15: metrics from legs plus GitHub).
 
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
 
@@ -216,20 +217,25 @@ class NeedsYou:
     since_ts: str | None
     hint: str = ""  # what releases it, in one line
     status: str = "needs_you"
+    group: str = "needs_you"
 
 
 @dataclass(frozen=True)
 class Working:
-    """Moving without a human: an agent leg is running or next, CI is
-    running, or a free action (merge, branch update, PR open, release) runs
-    next tick."""
+    """Moving without a human: an agent leg is running, CI is running, or a
+    free action (merge, branch update, PR open, release) runs next tick.
+    `group` is the board lane: only a running leg is in the agent lane."""
 
-    activity: str  # agent | queued | ci | ci_queued | merge | update | open_pr | triage_note | release
+    activity: str  # agent | ci | ci_queued | merge | update | open_pr | triage_note | release
     act: str | None
     headline: str
     reason: str
     since_ts: str | None  # when this step began (`board_status`; CI uses `_ci_start`), not the last activity
     status: str = "working"
+    group: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "group", "agent" if self.activity == "agent" else "ci")
 
 
 @dataclass(frozen=True)
@@ -242,10 +248,14 @@ class Waiting:
     since_ts: str | None
     until_ts: str | None = None
     status: str = "waiting"
+    group: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "group", "slot" if self.on == "slot" else "waiting")
 
 
-ISSUE_ACTS_NAMES = frozenset({AgentKind.STEWARD.name, AgentKind.TRIAGE.name, AgentKind.RESOLVE.name})
 BoardStatus = NeedsYou | Working | Waiting
+_LIGHT_ACT_NAMES = frozenset(kind.name for kind in AgentKind if not kind.holds_dispatch_slot)
 
 _STOP_HEADLINE: Mapping[str, str] = {
     StopReason.QUESTION.value: "Answer the agent's question",
@@ -340,13 +350,7 @@ def board_status(
                        "An agent leg holds this item.", _iso(since))
     if isinstance(state, Dispatch):
         act = state.act.name
-        if act in ISSUE_ACTS_NAMES and not any(
-            leg.kind == AgentKind.RESOLVE.name and leg.started_at is not None for leg in legs
-        ):
-            # No resolve has begun: the item waits for a slot. A retried resolve has
-            # begun, so it stays Working like any PR-stage act.
-            return Waiting("slot", f"{_ACT_WORDS[act]} next", "Waiting for a free agent slot.", _iso(ended))
-        return Working("queued", act, f"{_ACT_WORDS[act]} next", "Dispatches when a slot is free.", _iso(ended))
+        return Waiting("slot", f"{_ACT_WORDS[act]} next", "Waiting for a free agent slot.", _iso(ended))
     if isinstance(state, Merge):
         return Working("merge", None, "Merging", "Approved on its head with green CI.", _iso(ended))
     if isinstance(state, Refresh):
@@ -424,6 +428,22 @@ def _wait_status(
         WaitReason.MERGEABILITY_UNKNOWN: "GitHub is still computing mergeability.",
     }.get(reason, "Waiting on GitHub.")
     return Waiting("github", "Reading GitHub", detail, since)
+
+
+@dataclass(frozen=True)
+class SlotUsage:
+    """Dispatch slots against the agent lane: `heavy` legs hold a slot of the
+    `capacity`; `light` legs (STEWARD, TRIAGE) run outside it."""
+
+    capacity: int
+    heavy: int
+    light: int
+
+
+def slot_usage(statuses: Iterable[BoardStatus], capacity: int) -> SlotUsage:
+    running = [s.act for s in statuses if isinstance(s, Working) and s.activity == "agent"]
+    light = sum(1 for act in running if act in _LIGHT_ACT_NAMES)
+    return SlotUsage(capacity, len(running) - light, light)
 
 
 def primary_action(status: BoardStatus, *, held: bool) -> str | None:

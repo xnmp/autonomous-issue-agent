@@ -171,7 +171,7 @@ def create_app(
         try:
             return await invoke(backend.issues, name)
         except Exception as exc:  # noqa: BLE001
-            return degraded("issues", exc, in_flight=[], done=[], backlog=[], gh_ok=False)
+            return degraded("issues", exc, in_flight=[], slots={"capacity": 0, "heavy": 0, "light": 0}, done=[], backlog=[], gh_ok=False)
 
     @app.get(
         "/api/repos/{name}/issues/{number}",
