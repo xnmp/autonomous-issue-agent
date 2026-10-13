@@ -9,6 +9,7 @@
 }
 .board-tone-fail { --board-tone: var(--fail); }
 .board-tone-ok { --board-tone: var(--ok); }
+.board-tone-warn { --board-tone: var(--running); }
 .board-tone-muted { --board-tone: var(--ink-muted); }
 
 .board-summary {
@@ -209,6 +210,7 @@
 }
 .rail-tone-fail { --rail-tone: var(--fail); }
 .rail-tone-ok { --rail-tone: var(--ok); }
+.rail-tone-warn { --rail-tone: var(--running); }
 .rail-tone-muted { --rail-tone: var(--ink-muted); }
 .rail-stage {
   --rail-ghost: color-mix(in srgb, var(--ink-muted) 60%, var(--panel));

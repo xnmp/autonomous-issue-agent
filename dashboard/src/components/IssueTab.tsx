@@ -4,7 +4,7 @@ import { usePolled } from "../api/hooks";
 import type { IssueStep } from "../api/types";
 import { legNote, outcomeMark, prStateTone } from "../lib/semantics";
 import { duration, localTime, tokens, usd } from "../lib/format";
-import { GROUP_META, plainHarnessMessage, railNodes } from "../features/issues/board";
+import { GROUP_META, boardTone, plainHarnessMessage, railNodes } from "../features/issues/board";
 import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
 import { JsonBlock } from "./ui/Json";
@@ -221,7 +221,7 @@ export function IssueTab({
               </div>
               <LifecycleStepper
                 rail={railNodes(d.rail)}
-                tone={board ? GROUP_META[board.status].tone : "ok"}
+                tone={board ? boardTone(board) : "ok"}
                 live={d.rail.live}
                 label={`Issue #${issue} lifecycle`}
               />

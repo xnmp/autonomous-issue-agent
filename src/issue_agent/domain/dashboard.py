@@ -27,7 +27,7 @@ from enum import Enum
 
 from .actions import AgentKind
 from .checks import Observed
-from .ci import Clear, Failed, Waiting as CiWaiting, parse_timestamp, reduce_ci
+from .ci import Clear, Executing, Failed, Queued, Waiting as CiWaiting, parse_timestamp, reduce_ci
 from .state import (
     Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason,
     Wait, WaitReason, stop_tag,
@@ -200,7 +200,7 @@ class Working:
     running, or a free action (merge, branch update, PR open, release) runs
     next tick."""
 
-    activity: str  # agent | queued | ci | merge | update | open_pr | release
+    activity: str  # agent | queued | ci | ci_queued | merge | update | open_pr | release
     act: str | None
     headline: str
     reason: str
@@ -330,10 +330,24 @@ def board_status(
     raise TypeError(f"unknown derived state {state!r}")
 
 
+def _ci_pending_status(pr: PRView | None, since: str | None) -> Working:
+    """Yellow "CI queued" only when every pending check awaits a runner
+    (reduce_ci's Queued); any executing check keeps "CI running"."""
+    ci = reduce_ci(pr.ci) if pr is not None else None
+    if isinstance(ci, CiWaiting) and isinstance(ci.reason, Queued):
+        return Working("ci_queued", None, "CI queued", f"{len(ci.reason.checks)} queued, waiting for a runner.", since)
+    if isinstance(ci, CiWaiting) and isinstance(ci.reason, Executing):
+        queued = sum(c.state == "QUEUED" for c in ci.reason.checks)
+        running = len(ci.reason.checks) - queued
+        counts = f"{running} running" + (f", {queued} queued" if queued else "")
+        return Working("ci", None, "CI running", counts, since)
+    return Working("ci", None, "CI running", "Required checks are still running.", since)
+
+
 def _wait_status(reason: WaitReason, pr: PRView | None, last_end: datetime | None) -> BoardStatus:
     since = _iso(last_end)
     if reason is WaitReason.CI_PENDING:
-        return Working("ci", None, "CI running", "Required checks are still running.", since)
+        return _ci_pending_status(pr, since)
     if reason is WaitReason.BASE_RED:
         return Waiting("github", "Base branch red",
                        "Its failing checks fail on the base tip too; it resumes when the base is fixed.", since)

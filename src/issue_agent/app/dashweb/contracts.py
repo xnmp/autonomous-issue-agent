@@ -219,7 +219,7 @@ class BoardNeedsYou(Contract):
 
 class BoardWorking(Contract):
     status: Literal["working"]
-    activity: Literal["agent", "queued", "ci", "merge", "update", "open_pr", "release"]
+    activity: Literal["agent", "queued", "ci", "ci_queued", "merge", "update", "open_pr", "release"]
     act: str | None
     headline: str
     reason: str

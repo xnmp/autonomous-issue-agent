@@ -283,7 +283,7 @@ export interface components {
              * Activity
              * @enum {string}
              */
-            activity: "agent" | "queued" | "ci" | "merge" | "update" | "open_pr" | "release";
+            activity: "agent" | "queued" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "release";
             /** Headline */
             headline: string;
             /** Reason */

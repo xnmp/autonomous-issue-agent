@@ -85,6 +85,7 @@ const BoardWorking = z
       "agent",
       "queued",
       "ci",
+      "ci_queued",
       "merge",
       "update",
       "open_pr",

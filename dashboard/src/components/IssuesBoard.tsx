@@ -6,6 +6,7 @@ import {
   GROUP_ORDER,
   OUTCOME_MARK,
   STAGES,
+  boardTone,
   groupCounts,
   groupItems,
   historyView,
@@ -156,8 +157,9 @@ function BoardRow({
   const ids = ["say", "rail", "waithead", "wait"].map((part) => `board-row-${item.issue}-${part}`);
   const [sayId, railId, waitHeadId, waitId] = ids;
   const live = board.status === "working" && board.activity === "agent";
+  const tone = boardTone(board);
   return (
-    <div className={`board-item${open ? " open" : ""}`}>
+    <div className={`board-item${open ? " open" : ""}${tone === "warn" ? " board-tone-warn" : ""}`}>
       {/* The whole row toggles for a pointer; the title is the disclosure
           button for keyboards and assistive tech, so the issue and PR links
           beside it are siblings rather than controls nested in a button. */}
@@ -187,7 +189,7 @@ function BoardRow({
         <div className="board-rail">
           <LifecycleStepper
             rail={railNodes(item.rail)}
-            tone={GROUP_META[board.status].tone}
+            tone={tone}
             live={item.rail.live || live}
             label={`Issue #${item.issue} stage`}
             id={railId}

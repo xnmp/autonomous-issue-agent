@@ -41,6 +41,14 @@ export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone:
   },
 };
 
+export type BoardTone = "fail" | "ok" | "muted" | "warn";
+
+/** The group tone, except CI waiting on a runner: nothing is executing yet, so
+ * it reads yellow rather than the green of work in progress. */
+export function boardTone(board: BoardStatus): BoardTone {
+  return board.status === "working" && board.activity === "ci_queued" ? "warn" : GROUP_META[board.status].tone;
+}
+
 export const COLUMN_HEADINGS: Record<BoardGroup, { now: string; wait: string }> = {
   needs_you: { now: "What to do", wait: "Waiting" },
   working: { now: "Now", wait: "Last activity" },
