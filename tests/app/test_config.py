@@ -458,10 +458,10 @@ def test_the_live_claude_routing_knobs_parse_into_per_tier_routes():
                   FIX_MODEL_XHIGH="claude:claude-fable-5-1", TRIAGE_MODEL="claude:claude-haiku-5-5",
                   REVIEWER_RUNTIME="claude", REVIEW_MODEL="claude-opus-5-5")
     assert cfg.validation_errors() == ()
-    assert cfg.fix_route(Tier.XHIGH) == (RuntimeName.CLAUDE, "claude-fable-5-1")
-    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5")
-    assert cfg.review_route(Tier.HIGH) == (RuntimeName.CLAUDE, "claude-opus-5-5")
-    assert cfg.review_route(None) == (RuntimeName.CLAUDE, "claude-opus-5-5")
+    assert cfg.fix_route(Tier.XHIGH) == (RuntimeName.CLAUDE, "claude-fable-5-1", None)
+    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5", None)
+    assert cfg.review_route(Tier.HIGH) == (RuntimeName.CLAUDE, "claude-opus-5-5", None)
+    assert cfg.review_route(None) == (RuntimeName.CLAUDE, "claude-opus-5-5", None)
     assert cfg.runtimes("fix") == cfg.runtimes("review") == frozenset({RuntimeName.CLAUDE})
     assert cfg.triage_budget_usd == 2.0
 
@@ -471,9 +471,9 @@ def test_unset_routes_fall_back_to_todays_single_models():
     from issue_agent.domain.routing import Tier
 
     cfg = _routed(FIXER_RUNTIME="codex", FIX_MODEL_LOW="claude:claude-haiku-5-5")
-    assert cfg.fix_route(Tier.MED) == (RuntimeName.CODEX, None)  # CODEX_MODEL applies in the runner
-    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5")  # TRIAGE_MODEL unset: LOW's route
-    assert cfg.review_route(Tier.MED) == (RuntimeName.CODEX, "gpt-6.1-sol")  # no MED spec: REVIEW_MODEL
+    assert cfg.fix_route(Tier.MED) == (RuntimeName.CODEX, None, None)  # CODEX_MODEL applies in the runner
+    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5", None)  # TRIAGE_MODEL unset: LOW's route
+    assert cfg.review_route(Tier.MED) == (RuntimeName.CODEX, "gpt-6.1-sol", None)  # no MED spec: REVIEW_MODEL
     assert cfg.runtimes("fix") == frozenset({RuntimeName.CODEX, RuntimeName.CLAUDE})
 
 
@@ -487,3 +487,30 @@ def test_malformed_routing_knobs_are_reported_and_fall_back(env):
     cfg = _routed(**env)
     assert cfg.validation_errors()
     assert cfg.fix_route(Tier.HIGH)[0] is cfg.fixer_runtime
+
+
+def test_route_effort_reaches_every_route_and_an_omitted_one_stays_unset():
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import Tier
+
+    cfg = _routed(FIX_MODEL_LOW="claude:claude-haiku-5-5:low", FIX_MODEL_HIGH="codex:gpt-6-luna:xhigh",
+                  TRIAGE_MODEL="claude:claude-haiku-5-5:medium", REVIEWER_RUNTIME="claude")
+    assert cfg.validation_errors() == ()
+    assert cfg.fix_route(Tier.LOW) == (RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.LOW)
+    assert cfg.fix_route(Tier.MED)[2] is None
+    assert cfg.review_route(Tier.HIGH) == (RuntimeName.CODEX, "gpt-6-luna", Effort.XHIGH)
+    assert cfg.triage_route()[2] is Effort.MEDIUM
+    assert "low=claude:claude-haiku-5-5:low" in cfg.describe()
+
+
+@pytest.mark.parametrize("name", ["FIX_MODEL_LOW", "FIX_MODEL_XHIGH", "TRIAGE_MODEL"])
+def test_an_invalid_route_effort_fails_config_validation(name):
+    cfg = _routed(**{name: "codex:gpt-6-luna:max"})
+    assert any(name in e and "effort" in e for e in cfg.validation_errors())
+    with pytest.raises(ValueError, match=name):
+        cfg.validate()
+
+
+@pytest.mark.parametrize("value", ["xhigh", "max"])
+def test_fix_effort_knob_rejects_route_only_efforts(value):
+    assert any("FIX_EFFORT" in e for e in _routed(FIX_EFFORT=value).parse_errors)

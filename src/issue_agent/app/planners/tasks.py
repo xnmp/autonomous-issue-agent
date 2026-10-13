@@ -209,6 +209,7 @@ def build_triage_task(
     runtime: RuntimeName | None,
     max_budget_usd: float,
     criteria_wanted: bool = True,
+    effort: Effort | None = None,
 ) -> RuntimePlan:
     """TRIAGE: grade difficulty, state testable acceptance criteria and flag a
     suspected duplicate among `offered` (the other issues listed in `others`).
@@ -252,7 +253,7 @@ def build_triage_task(
     return RuntimePlan(
         prompt=prompt, schema=triage_schema(offered, criteria_wanted), disallowed_tools=TRIAGE_DENY,
         read_only=True,
-        model=model, runtime=runtime, max_budget_usd=max_budget_usd, cwd=cwd,
+        model=model, runtime=runtime, effort=effort, max_budget_usd=max_budget_usd, cwd=cwd,
     )
 
 

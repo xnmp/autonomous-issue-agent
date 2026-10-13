@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .agent_task import RuntimeName
+from .effort import Effort, parse_effort
 
 
 class Tier(Enum):
@@ -44,16 +45,26 @@ def escalate(tier: Tier, attempts: int) -> Tier:
 # `:` is allowed for provider IDs such as Bedrock's `...-v1:0`; the runtime
 # prefix is split off at the first `:`.
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:\[\]-]{0,199}")
+# Efforts each runner can render: the Claude SDK's EffortLevel is
+# low|medium|high|xhigh|max; codex `model_reasoning_effort` is low..xhigh.
+_EFFORTS: dict[RuntimeName, tuple[Effort, ...]] = {
+    RuntimeName.CLAUDE: tuple(Effort),
+    RuntimeName.CODEX: (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH),
+}
+# A trailing all-letter segment is the effort; `...-v1:0` (Bedrock) stays model.
+_EFFORT_SEGMENT = re.compile(r"[A-Za-z]*")
 _CLAUDE_ALIASES = frozenset({"haiku", "sonnet", "opus", "fable"})
 
 
 @dataclass(frozen=True)
 class ModelRoute:
-    """One `runtime:model` spec. The explicit runtime prefix keeps a provider
-    switch from becoming a model alias the other runtime cannot resolve."""
+    """One `runtime:model[:effort]` spec. The explicit runtime prefix keeps a
+    provider switch from becoming a model alias the other runtime cannot
+    resolve. No effort leaves the global knob for the runtime in force."""
 
     runtime: RuntimeName
     model: str
+    effort: Effort | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.runtime, RuntimeName):
@@ -64,24 +75,35 @@ class ModelRoute:
         if (self.model.startswith("gpt-") and self.runtime is not RuntimeName.CODEX
                 or claude_model and self.runtime is not RuntimeName.CLAUDE):
             raise ValueError("model ID belongs to a different runtime")
+        if self.effort is not None and self.effort not in _EFFORTS[self.runtime]:
+            raise ValueError(f"effort {getattr(self.effort, 'value', self.effort)!r} is not valid for "
+                             f"{self.runtime.value} (one of {[e.value for e in _EFFORTS[self.runtime]]})")
 
     @property
     def spec(self) -> str:
-        return f"{self.runtime.value}:{self.model}"
+        return f"{self.runtime.value}:{self.model}" + (f":{self.effort.value}" if self.effort else "")
 
 
 def parse_model_route(value: object) -> ModelRoute:
-    """`runtime:model`, e.g. `codex:gpt-6-luna` or `claude:claude-haiku-5-5`."""
+    """`runtime:model[:effort]`, e.g. `codex:gpt-6-luna:low` or `claude:claude-haiku-5-5`."""
     if not isinstance(value, str):
-        raise ValueError("model route must be runtime:model text")
+        raise ValueError("model route must be runtime:model[:effort] text")
     runtime, separator, model = value.strip().partition(":")
     if not separator:
-        raise ValueError("expected runtime:model (claude or codex)")
+        raise ValueError("expected runtime:model[:effort] (claude or codex)")
     try:
         name = RuntimeName(runtime)
     except ValueError:
         raise ValueError(f"unknown runtime {runtime!r} (claude or codex)") from None
-    return ModelRoute(name, model)
+    head, colon, tail = model.rpartition(":")
+    effort = None
+    if colon and _EFFORT_SEGMENT.fullmatch(tail):
+        model = head
+        effort = parse_effort(tail)
+        if effort is None:
+            raise ValueError(f"unknown effort {tail!r} (one of {[e.value for e in _EFFORTS[name]]})"
+                             if tail else "empty effort after the model (omit the trailing ':')")
+    return ModelRoute(name, model, effort)
 
 
 __all__ = ["DEFAULT_TIER", "TIER_LADDER", "ModelRoute", "Tier", "escalate", "parse_model_route", "parse_tier"]

@@ -21,6 +21,7 @@ from issue_agent.app.review import compose_review_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import PullRequestDiff, Review
@@ -392,3 +393,13 @@ def test_with_no_routed_fix_leg_the_reviewer_keeps_review_model(roles):
     reviewer = Agent(verdict("APPROVE"))
     tick(roles.review(gh, reviewer, **TIERS))
     assert reviewer.tasks[0].model == "claude-fable-5-1"
+
+
+def test_the_reviewer_runs_at_the_effort_of_the_fixers_tier_route(roles):
+    gh = ReviewGitHub(issues={5: ready()})
+    open_pr(gh, head="h1", ci="fail")
+    tiers = {**TIERS, "FIX_MODEL_MED": "claude:claude-sonnet-5-5:high"}
+    tick(roles.fix(gh, Agent(pushed(gh, "fix/5-null-token-crashes", "h2", ci="pass")), **tiers))
+    reviewer = Agent(verdict("APPROVE"))
+    tick(roles.review(gh, reviewer, **tiers))
+    assert reviewer.tasks[0].effort is Effort.HIGH

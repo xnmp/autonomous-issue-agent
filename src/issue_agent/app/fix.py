@@ -23,6 +23,7 @@ from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, Ru
 from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.ci import failed_checks
+from ..domain.effort import Effort
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
@@ -89,7 +90,7 @@ def human_reply(comments: Iterable[Comment], after: datetime, harness: Harness, 
     return "\n\n".join(f"@{c.author}: {c.body}" for at, c in human_comments(comments, harness, legs) if at > after)
 
 
-Route = tuple[RuntimeName, "str | None"]
+Route = tuple[RuntimeName, "str | None", "Effort | None"]
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ class FixSettings:
     runtime: str
     owner_id: str
     harness: Harness
-    # (runtime, model) per tier (FIX_MODEL_<TIER>) and for TRIAGE (TRIAGE_MODEL).
+    # (runtime, model, effort) per tier (FIX_MODEL_<TIER>) and for TRIAGE (TRIAGE_MODEL).
     routes: Mapping[Tier, Route] = field(default_factory=dict)
     triage_route: Route | None = None
     triage_budget_usd: float = 2.0
@@ -108,7 +109,7 @@ class FixSettings:
     triage_cwd: str = ""
 
     def route(self, tier: Tier | None) -> Route:
-        return self.routes.get(tier or DEFAULT_TIER) or (RuntimeName(self.runtime), None)
+        return self.routes.get(tier or DEFAULT_TIER) or (RuntimeName(self.runtime), None, None)
 
 
 class FixLegs:
@@ -173,7 +174,7 @@ class FixLegs:
             await self._triage(action, subject)
             return
         recorded = self.control.leg_runs(self.settings.repository, (issue,))
-        runtime, model = self.settings.route(action.tier)
+        runtime, model, effort = self.settings.route(action.tier)
         # The review role's legs and TRIAGE's are not this role's sessions to continue.
         runs = sorted((r for r in recorded if dispatched_kind(r.kind) in _FIX_ACTS - {AgentKind.TRIAGE}),
                       key=lambda r: r.completed_at)
@@ -186,7 +187,7 @@ class FixLegs:
         # leg that left a session; a wall cap on the continuation is an attempt.
         cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r], runtime)), None)
         self.log(f"{action.kind.name} #{action.number}: tier {getattr(action.tier, 'value', '?')} -> "
-                 f"{runtime.value}:{model or '(default model)'}")
+                 f"{runtime.value}:{model or '(default model)'}{':' + effort.value if effort else ''}")
         self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue,
                                  head=action.head, resumed=cut_off is not None,
                                  tier=action.tier.value if action.tier is not None else "")
@@ -201,7 +202,8 @@ class FixLegs:
             # Every leg of the item, either role's, as derive sees them (#342).
             reply = human_reply(subject.comments, asked.completed_at, self.settings.harness,
                                 local_legs(recorded).get(item, ())) if asked else ""
-            cfg = replace(self.task_config, runtime=runtime, model=model)
+            # No route effort keeps the global FIX_EFFORT.
+            cfg = replace(self.task_config, runtime=runtime, model=model, effort=effort or self.task_config.effort)
             criteria = _criteria(recorded) if action.kind is AgentKind.RESOLVE else ()
             task = self._task(action, subject, cwd, runs, cut_off, asked, reply, cfg, runtime, criteria)
             task = replace(task, env={**task.env, **self._git_identity()})
@@ -233,7 +235,7 @@ class FixLegs:
         """One TRIAGE leg. The issues it may name as a duplicate are read from
         GitHub here and enumerated in its schema, which is what the accounting
         runtime launders its `duplicate_of` against."""
-        runtime, model = self.settings.triage_route or self.settings.route(Tier.LOW)
+        runtime, model, effort = self.settings.triage_route or self.settings.route(Tier.LOW)
         # resumed: triage never resumes, so a wall timeout is its one attempt
         # (the issue runs at DEFAULT_TIER), not a machine end retried forever.
         self.runtime.set_context("fix", action.kind.name, action.number, action.number, claim_target=action.number,
@@ -252,11 +254,12 @@ class FixLegs:
         listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title in index) or "(none)"
         task = tasks.build_triage_task(
             action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
-            tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime,
+            tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime, effort=effort,
             max_budget_usd=self.settings.triage_budget_usd,
             criteria_wanted=not has_acceptance_criteria(subject.body or ""),
         )
-        self.log(f"TRIAGE #{action.number}: {runtime.value}:{model or '(default model)'}")
+        self.log(f"TRIAGE #{action.number}: {runtime.value}:{model or '(default model)'}"
+                 f"{':' + effort.value if effort else ''}")
         await run_leg(self.runtime, self.log, Leg("TRIAGE", LegTarget.ISSUE, action.number, True,
                                                   ("global", "repository", "issue")), task)
 

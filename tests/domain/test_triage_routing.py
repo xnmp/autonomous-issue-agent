@@ -15,6 +15,7 @@ from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import actions
+from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import DEFAULT_TIER, ModelRoute, Tier, escalate, parse_model_route, parse_tier
 from issue_agent.domain.state import (
     TRIAGE_TAG, Backoff, Dispatch, Harness, Local, NeedsHuman, Release, StopReason, TriageNote, Wait, WaitReason,
@@ -282,6 +283,40 @@ def test_escalate_clamps_absurd_attempt_counts():
 ])
 def test_runtime_model_specs_parse(spec, route):
     assert parse_model_route(spec) == route
+
+
+@pytest.mark.parametrize(("spec", "route"), [
+    ("claude:claude-sonnet-5-5:high", ModelRoute(RuntimeName.CLAUDE, "claude-sonnet-5-5", Effort.HIGH)),
+    ("codex:gpt-6-luna:low", ModelRoute(RuntimeName.CODEX, "gpt-6-luna", Effort.LOW)),
+    ("  claude:opus:HIGH  ", ModelRoute(RuntimeName.CLAUDE, "opus", Effort.HIGH)),
+    ("claude:opus:xhigh", ModelRoute(RuntimeName.CLAUDE, "opus", Effort.XHIGH)),
+    ("claude:opus:max", ModelRoute(RuntimeName.CLAUDE, "opus", Effort.MAX)),
+    ("codex:gpt-6-luna:xhigh", ModelRoute(RuntimeName.CODEX, "gpt-6-luna", Effort.XHIGH)),
+    ("claude:us.anthropic.claude-opus-5-5-v1:0:medium",
+     ModelRoute(RuntimeName.CLAUDE, "us.anthropic.claude-opus-5-5-v1:0", Effort.MEDIUM)),
+])
+def test_an_optional_effort_segment_parses_and_round_trips(spec, route):
+    assert parse_model_route(spec) == route
+    assert parse_model_route(route.spec) == route
+
+
+@pytest.mark.parametrize("spec", [
+    "codex:gpt-6-luna:max",        # codex has no max
+    "claude:opus:turbo",           # unknown word
+    "claude:opus:",                # empty segment
+    "claude:opus:high:extra",      # extra segment: "extra" is not an effort
+    "claude:opus:high:",
+    "claude:opus: high",           # whitespace inside the spec
+    "claude::high",                # no model
+])
+def test_an_invalid_effort_is_refused_with_the_reason(spec):
+    with pytest.raises(ValueError):
+        parse_model_route(spec)
+
+
+def test_the_invalid_effort_message_names_the_runtimes_choices():
+    with pytest.raises(ValueError, match="xhigh"):
+        parse_model_route("codex:gpt-6-luna:max")
 
 
 @pytest.mark.parametrize("spec", [

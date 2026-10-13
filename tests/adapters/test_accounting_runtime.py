@@ -588,3 +588,16 @@ def test_a_leg_planned_for_another_runtime_is_refused_by_this_runtimes_accountin
     wrapper, store = _wrapper(tmp_path, runtime, context=("fix", "RESOLVE", 3, 3))  # a codex chain
     result = _work(wrapper, runtime=RuntimeName.CLAUDE)
     assert result.is_error and runtime.calls == 0
+
+
+def test_the_effort_a_plan_carried_is_recorded_and_absent_when_none_was_set(tmp_path) -> None:
+    from issue_agent.domain.effort import Effort
+
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", session_id="s")),
+                              context=("fix", "RESOLVE", 3, 3))
+    _work(wrapper, effort=Effort.HIGH)
+    assert _receipt(store)["effort"] == "high"
+    wrapper2, store2 = _wrapper(tmp_path / "b", Runtime(AgentResult(False, status="pushed", session_id="s")),
+                                context=("fix", "RESOLVE", 3, 3))
+    _work(wrapper2)
+    assert "effort" not in _receipt(store2)
