@@ -96,4 +96,3 @@ def recovery_disposition(
 
 def recovery_release(release: ReleaseResult) -> RecoveryRelease:
     return release
-

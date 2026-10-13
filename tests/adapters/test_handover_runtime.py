@@ -358,5 +358,3 @@ def test_git_inspection_timeout_preserves_original_ceiling_result(
 
     assert actual is expected
     assert not (repo / ".harness" / "handover.md").exists()
-
-

@@ -598,5 +598,3 @@ def test_a_misspelled_fix_effort_is_reported_and_falls_back():
     c = from_env({"REPO": "x", "FIX_EFFORT": "hihg"})
     assert c.fix_effort is None
     assert any("FIX_EFFORT" in e for e in c.validation_errors())
-
-

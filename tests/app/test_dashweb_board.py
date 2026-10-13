@@ -339,5 +339,3 @@ def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
 
     assert payload["gh_ok"] is True and any("limited to the newest 200" in w for w in payload["warnings"])
     assert metrics["merged_prs"] == 200 and metrics["merged_prs_partial"] is True
-
-

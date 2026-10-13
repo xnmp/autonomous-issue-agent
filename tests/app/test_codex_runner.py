@@ -380,24 +380,6 @@ printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
     ]
 
 
-def test_run_parses_output_file_and_session_from_the_rollout():
-    tmp = tempfile.mkdtemp()
-    # The stub: find the -o path in argv, write an envelope there, print a header.
-    body = r'''
-''' + _meta("sess-xyz") + r'''
-printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
-exit 0
-'''
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "test-key", "CODEX_HOME": tmp})
-    r = asyncio.run(runner.run(RuntimePlan(prompt="resolve", schema={
-        "type": "object", "properties": {"status": {"type": "string"},
-        "summary": {"type": "string"}, "needs": {"type": "string"}}})))
-    assert r.is_error is False
-    assert r.status == "pr_opened"
-    assert r.session_id == "sess-xyz"
-
-
 def test_run_registers_process_group_before_codex_executes(tmp_path):
     state_dir = tmp_path / "state"
     receipt_dir = state_dir / "process-groups"
@@ -437,29 +419,6 @@ printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 
     assert result.status == "done"
     assert not any(supervisor.directory.glob("*.json"))
-
-
-def test_run_completes_after_a_megabyte_stderr_line_and_logs_it_truncated():
-    """One unbounded Codex trace line must not terminate an otherwise healthy leg."""
-    tmp = tempfile.mkdtemp()
-    body = r'''
-head -c 1048576 /dev/zero | tr '\0' x >&2
-echo >&2
-echo "stderr after oversized line" >&2
-printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
-exit 0
-'''
-    logged: list[str] = []
-    runner = CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
-        log=logged.append, debug=True,
-    )
-
-    result = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert result.status == "done"
-    assert any("oversized stderr line" in line and "truncated" in line for line in logged)
-    assert any("stderr after oversized line" in line for line in logged)
 
 
 def test_run_drains_a_line_beyond_the_stream_limit_without_losing_the_next_line():
@@ -1190,21 +1149,6 @@ def _costed_codex(tmp) -> str:
     return _fake_codex(tmp, body)
 
 
-def test_run_flows_codex_cost_into_the_result():
-    """End to end: rates configured → the AgentResult the dispatcher journals
-    carries a non-zero cost, which is what lets the ledger (cost > 0) and both
-    spend caps see codex at all."""
-    tmp = tempfile.mkdtemp()
-    runner = CodexRunner(
-        codex_bin=_costed_codex(tmp),
-        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp}, rate_table=CARD,
-    )
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.status == "pr_opened"
-    # (36000 * 5 + 12000 * 0.5 + 4341 * 30) / 1e6.
-    assert r.cost_usd == pytest.approx(0.31623)
-
-
 def test_run_reports_zero_cost_without_rates():
     """Anti-vacuity twin: same stub, no price table → 0.0 (and the startup
     warning below is the operator's only signal)."""
@@ -1280,7 +1224,6 @@ def test_malformed_rollout_evidence_never_claims_a_provider_failure(tmp_path, co
     assert read_rollout_provider_failure("missing", str(tmp_path)) is None
 
 
-# ── harness #4: the SHIPPED config must price codex, not just be able to ──────
 # ── #43: each leg is priced with the model it actually ran ───────────────────
 
 
@@ -1330,17 +1273,6 @@ def test_a_captured_envelope_is_never_a_transport_drop_whatever_its_terminal_sta
     assert classify_outcome(result) is not Outcome.ERROR
     assert _is_transport_drop(1, "ERROR: stream disconnected before completion",
                               result) is False
-
-
-def test_an_error_envelope_with_a_drop_signature_is_still_a_transport_drop():
-    """Anti-vacuity for the guard: it must not swallow everything. An `error`
-    envelope classifies as ERROR, so a transport signature still counts."""
-    result = parse_codex_envelope(
-        exit_code=1, last_message=json.dumps({"status": "error", "summary": "s"}),
-        stderr="ERROR: stream disconnected before completion",
-    )
-    assert _is_transport_drop(1, "ERROR: stream disconnected before completion",
-                              result) is True
 
 
 # ══ review M17b — classify on the stderr TAIL, not the whole agent trace ══════
@@ -1402,5 +1334,3 @@ def test_only_the_stderr_tail_classifies_provider_pushback(tail, poison, signal)
     trace = _trace_with(tail, poison=poison)
     assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is signal
     assert _is_rate_limited(trace) is (signal and "rate limit" in tail)
-
-

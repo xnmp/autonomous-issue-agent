@@ -367,9 +367,6 @@ def test_parse_pr_keeps_known_labels_and_drops_retired_ones():
     assert pr.labels == frozenset({Label.NEEDS_HUMAN})
 
 
-# ── P0.7: loud warning when a world-building list hits the --limit cap ────────
-
-
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
 def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
     fr = FakeRunner({
@@ -768,16 +765,6 @@ def test_format_review_comments_small_bodies_are_unaffected_by_the_cap():
     assert format_review_comments(raw) == "a.py:12 (rev): rename this"
 
 
-# ── check start times + world timestamp (#30) ────────────────────────────────
-
-
-# ── merge cleanup end-to-end: merge → GitHub auto-close → next poll (#28) ─────
-# These drive the REAL world build, because the defect lived in what the build
-# FETCHES, not in what the domain does with it. Every previous cleanup test
-# handed `cleanup_actions` an `issue_observed_pr_open=True` that the post-merge
-# loop never supplies, so all of them passed while zero issues in five
-# deployment days ever reached ai-done.
-
 # ── #48: a failed `gh pr checks` is UNKNOWN, not an empty world ──────────────
 
 
@@ -799,5 +786,3 @@ def test_a_skipped_checks_call_is_unread_not_empty():
     fr = FakeRunner({"pr view 100": pr_resp})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=False)
     assert isinstance(pr.ci, Unavailable)
-
-

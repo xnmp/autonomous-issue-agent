@@ -4,7 +4,6 @@ isolation, recovery scope, shutdown hooks, and runtime binding."""
 from __future__ import annotations
 
 
-
 import os
 import subprocess
 import time
@@ -204,9 +203,6 @@ from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 FIX_BOT = "fix-bot"
 
 
-# ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
-
-
 # ── machine deaths (issue-keyed) ───────────────────────────────────────────────
 
 
@@ -222,9 +218,6 @@ FIX_BOT = "fix-bot"
 # rather than assumed.
 # ══════════════════════════════════════════════════════════════════════════════
 REVIEW_BOT = "review-bot"
-
-
-# ── infra-death key split (review P1R-1) ───────────────────────────────────────
 
 
 # ── CI pending-deadline reporting (#30) ──────────────────────────────────────
@@ -244,12 +237,6 @@ def _role_state_env(tmp_path) -> dict[str, str]:
         "STATE_DIR": str(tmp_path / "state"),
         "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
     }
-
-
-# ── boot capability lines (#46) ───────────────────────────────────────────────
-# The log line IS the contract here: an operator watching three healthy daemons
-# reasonably concludes the daemons are doing the same thing, so these assert on
-# the rendered text.
 
 
 # ── #29: a codex fixer announces that MAX_BUDGET_USD bounds nothing ──────────
@@ -334,11 +321,3 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     )
 
     assert hook_calls == []
-
-
-# ── duplicate-PR guard reporting (#39) ───────────────────────────────────────
-
-
-# ── FixState carries the re-run marker (#38) ─────────────────────────────────
-
-

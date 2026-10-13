@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
-
 def _stamp() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 

@@ -280,8 +280,6 @@ def test_review_task_carries_the_bots_prior_review_as_fenced_data():
     assert "Fix the parser." in body
 
 
-# ── delegated review (REVIEW_MODE=delegated) ──
-# ── multi-agent review legs ──
 # ── M23 invariant: every review-judgment builder fences its untrusted inputs ──
 # _fenced() exists so title/body/diff can never reach the reviewer as raw,
 # LLM-steerable text (the asymmetry the review found: gate/dimension/validation/

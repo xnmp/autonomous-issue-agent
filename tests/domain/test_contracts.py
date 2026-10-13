@@ -120,5 +120,3 @@ def test_daily_budget_periods_follow_civil_dst_and_leap_boundaries(
     )
     assert elapsed == timedelta(hours=hours)
     assert scope.period_id == period_id
-
-

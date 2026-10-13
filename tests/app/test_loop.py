@@ -631,5 +631,3 @@ def test_no_wake_check_sleeps_in_one_call_as_before():
     slept = []
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
     assert slept == [60, 60]
-
-

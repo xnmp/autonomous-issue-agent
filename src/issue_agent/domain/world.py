@@ -11,24 +11,10 @@ submittedAt, createdAt) so the adapter mapping is mechanical.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from enum import Enum
 
 from .identity import is_bot_login
 from .labels import Label
 from .checks import Check, CIObservation, Observed, Unavailable
-
-
-class CIState(str, Enum):
-    """Settled state of a PR's checks. CRITICAL precedence (watcher-lib.sh
-    ci_state): pending OUTRANKS failure — a run with one failed check but
-    others still queued/running is NOT yet a failure. Acting on it would push
-    a commit that re-triggers in-flight jobs (the #49 loop)."""
-
-    OK = "ok"            # settled, all gating checks passed
-    PENDING = "pending"  # at least one gating check queued/in-progress
-    FAILURE = "failure"  # settled, at least one gating check failed
-    NONE = "none"        # no checks configured (nothing to wait on)
-    UNKNOWN = "unknown"  # the checks read FAILED this tick — not an answer (#48)
 
 
 # GitHub review states (as returned by the reviews API / pr view).
@@ -198,7 +184,6 @@ class WorldState:
 
 # Convenience re-export so callers can `from .world import replace`.
 __all__ = [
-    "CIState",
     "REVIEW_APPROVED",
     "REVIEW_CHANGES_REQUESTED",
     "Check",

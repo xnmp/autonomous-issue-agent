@@ -37,5 +37,3 @@ def test_refused_leg_completed_event_carries_the_missing_authority(tmp_path):
     (payload,) = _completed_payloads(tmp_path, refused)
 
     assert "PR repair purchase is held" in payload["summary"]
-
-

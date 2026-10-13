@@ -80,5 +80,3 @@ def test_reason_is_the_verdict_prose_with_the_keyword_removed():
         "2026-07-28 → #49",
         "n/a",
     ]
-
-

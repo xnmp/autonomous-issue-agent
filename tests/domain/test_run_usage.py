@@ -60,12 +60,10 @@ def test_large_trusted_values_preserve_exact_arithmetic():
     assert price_run_usage(observed, table).micros == 2 * 10**30
 
 
-
 def test_model_switches_within_the_session_bound_preserve_every_charge():
     samples = tuple(ModelUsage(f"session-{i // 2}", f"model-{i}", TokenUsage(1, 0)) for i in range(66))
     table = RateTable("card", "v1", "USD", {f"model-{i}": ModelRates(1_000_000, 1, 1, 1) for i in range(66)})
     assert price_run_usage(MeasuredRunUsage(samples), table) == Money("USD", 66)
-
 
 
 def test_reported_request_costs_and_frozen_token_prices_share_one_total():

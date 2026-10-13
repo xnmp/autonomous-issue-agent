@@ -176,4 +176,3 @@ def test_external_codex_home_links_login_without_copying_it_into_worktree(
 
     auth.write_text("rotated")
     assert open(linked).read() == "rotated"
-

@@ -74,5 +74,3 @@ def test_retained_branch_recovery_uses_the_shared_issue_policy(repo, prefix):
 
     assert Worktrees(str(repo)).branch_for_issue(703, "fix/703-fallback") == branch
     assert issue_from_branch(branch) == 703
-
-

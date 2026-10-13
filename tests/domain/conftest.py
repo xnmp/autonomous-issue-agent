@@ -1,4 +1,4 @@
-"""Make src/ importable for the domain tests (builders live in builders.py)."""
+"""Make src/ importable for the domain tests."""
 
 from __future__ import annotations
 

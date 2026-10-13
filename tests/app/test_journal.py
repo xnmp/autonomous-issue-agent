@@ -366,7 +366,6 @@ def test_passthrough_does_not_invent_attributes_neither_object_has(tmp_path):
         JournalingRuntime.__new__(JournalingRuntime).preflight  # half-built, no inner
 
 
-# ── Daemon: GhUnavailable is a countable event ────────────────────────────────
 # ── CLI status summary ────────────────────────────────────────────────────────
 def test_status_summary_is_silent_with_no_spend():
     from issue_agent.app.cli import spend_status_lines

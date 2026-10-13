@@ -126,5 +126,3 @@ def test_symlink_loop_in_pointer_degrades_to_stale(tmp_path):
 
     assert status.state == "stale"
     assert "pointer is invalid" in status.detail
-
-

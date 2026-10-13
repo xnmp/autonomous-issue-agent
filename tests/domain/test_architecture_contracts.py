@@ -425,5 +425,3 @@ def test_prompt_budget_evidence_matches_current_instruction_file() -> None:
     ).read_text()
     assert f"{len(prompt.encode()):,}" in evidence
     assert f"{len(prompt.split()):,}" in evidence
-
-

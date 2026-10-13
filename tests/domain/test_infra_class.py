@@ -131,5 +131,3 @@ def test_a_huge_negative_or_absent_num_turns_is_handled():
     assert no_session_evidence(num_turns=None)
     assert no_session_evidence(num_turns=-3)
     assert not no_session_evidence(num_turns=10**9)
-
-

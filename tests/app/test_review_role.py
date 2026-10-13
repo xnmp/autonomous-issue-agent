@@ -355,5 +355,3 @@ def test_a_machine_death_counts_no_attempt_and_backs_off(roles, later):
         assert dispatched(tick(review), AgentKind.REVIEW)
     assert not capped_for_a_human(gh, roles)
     assert Label.NEEDS_HUMAN not in gh.prs[100].labels
-
-

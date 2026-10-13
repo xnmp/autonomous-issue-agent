@@ -90,5 +90,3 @@ def test_make_requires_and_passes_explicit_snapshot(tmp_path, target, explicit_s
         assert "AGENT_ENV" in result.stderr
         assert "compose-env.sh" in result.stderr
         assert not called.exists()
-
-
