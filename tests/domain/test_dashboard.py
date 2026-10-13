@@ -165,6 +165,8 @@ def test_waits_name_what_they_wait_on():
     assert status(Wait(WaitReason.HEADROOM)).on == "headroom"
     assert status(Wait(WaitReason.HUMAN_CHANGES_REQUESTED)).on == "human-review"
     assert status(Wait(WaitReason.CI_UNKNOWN)).on == "github"
+    base_red = status(Wait(WaitReason.BASE_RED))
+    assert isinstance(base_red, dash.Waiting) and base_red.headline == "Base branch red"
     backoff = status(Backoff(AgentKind.RESOLVE, at(30)))
     assert isinstance(backoff, dash.Waiting) and (backoff.on, backoff.until_ts) == ("backoff", stamp(30))
 

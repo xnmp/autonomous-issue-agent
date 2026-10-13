@@ -20,13 +20,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from ..domain.checks import Unavailable
+from ..domain.checks import BaseTip, Unavailable
 from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
 from ..domain.world import Branch, Comment, IssueView, PRView, PullRequestDiff, Push, Review, WorldState
-from .github_ci import observe_checks
+from .github_ci import base_reports, observe_checks
 
 # Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
 # fields (mergeable / mergeStateStatus) once hung ~14 min on a just-merged PR
@@ -257,7 +257,7 @@ def format_pr_discussion(
 
 
 _FIX_MAX_PAGES = {"issues": 10, "pullRequests": 10, "refs": 10}
-_FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500}
+_FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500, "contexts": 1000}
 _HARNESS_BRANCH_PREFIX = "fix/"
 _COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt}}}}"
 _LABELS = "labels(first:100){totalCount nodes{name}}"
@@ -296,6 +296,15 @@ _FIX_REFS = ("refs(refPrefix:\"refs/heads/\",query:\"" + _HARNESS_BRANCH_PREFIX 
              "nodes{{name associatedPullRequests(last:1,orderBy:{{field:CREATED_AT,direction:ASC}})"
              "{{totalCount nodes{{state closedAt}}}} target{{... on Commit{{committedDate}}}} "
              "compare(headRef:$base){{behindBy}}}}}}")
+# The base tip's checks, in the first page (#313): a PR check red here too is
+# the base's, not the PR's. GitHub's rollup lists a rerun job's latest attempt.
+_BASE_CONTEXTS = ("contexts(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{__typename "
+                  "... on CheckRun{{id databaseId name status conclusion startedAt detailsUrl checkSuite{{app{{databaseId}}}}}} "
+                  "... on StatusContext{{id createdAt context state targetUrl}}}}}}")
+_BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid statusCheckRollup{id "
+             + _BASE_CONTEXTS.format(after="") + "}}}}")
+
+
 def _escaped(fields: str) -> str:
     return fields.replace("{", "{{").replace("}", "}}")
 
@@ -612,7 +621,8 @@ class GitHubGateway:
         incomplete top-level reads propagate: the daemon skips the tick."""
         # The domain reads no clock: one stamp per build, so every gate in a tick judges one instant.
         now = datetime.now(timezone.utc).isoformat()
-        first = self._repository_page(" ".join(t.format(after="") for t in _FIX_CONNECTIONS.values()), base=base)
+        first = self._repository_page(
+            " ".join([*(t.format(after="") for t in _FIX_CONNECTIONS.values()), _BASE_TIP]), base=base)
         collected: dict[str, list] = {}
         for name, template in _FIX_CONNECTIONS.items():
             nodes, info = _connection(first, name)
@@ -664,7 +674,24 @@ class GitHubGateway:
         for number, why in sorted(unknown.items()):
             self._skip_item("issue", number, FixObservationIncomplete(why))
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches)
+                          branches=branches, base=self._base_tip(first.get("baseTip"), base))
+
+    def _base_tip(self, raw: object, base: str) -> BaseTip | None:
+        """The base tip and its checks, or None when unreadable: a red PR check
+        is then the PR's, as before #313 (never a silent wait)."""
+        try:
+            if not isinstance(raw, dict) or raw.get("name") != base or not isinstance(raw.get("target"), dict):
+                raise FixObservationIncomplete("base ref is absent or not the configured base")
+            rollup = raw["target"].get("statusCheckRollup")
+            nodes = [] if rollup is None else self._nested(
+                rollup, "contexts", _BASE_CONTEXTS, on="StatusCheckRollup", backward=False)
+            if nodes is None:
+                raise FixObservationIncomplete("base checks exceed their bound")
+            return BaseTip(base, raw["target"].get("oid"), base_reports(nodes))
+        except (ValueError, KeyError, TypeError) as exc:
+            sys.stderr.write(f"base tip unread this poll ({type(exc).__name__}: {str(exc)[:120]}) "
+                             "— red PR checks are charged to the PR\n")
+            return None
 
     def pull_request_for_branch(self, branch: str) -> int | None:
         """The open PR whose head is `branch` in this repository. A closed one

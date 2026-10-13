@@ -443,3 +443,99 @@ def test_a_merged_pr_on_a_later_cross_reference_page_still_retires_its_issue():
 def test_cross_references_past_their_bound_skip_the_issue_rather_than_read_as_unmerged():
     world = GitHubGateway("o/r", runner=PagedGitHub(timeline_pages=50)).build_world("dev")
     assert world.issues == () and not any(p.state == "MERGED" for p in world.prs)
+
+
+# ── #313: the base tip's checks ride the first read ─────────────────────────
+
+
+def run_node(name, conclusion="FAILURE", status="COMPLETED", app=15368, n=1) -> dict:
+    return {
+        "__typename": "CheckRun",
+        "id": f"CR{name}{n}",
+        "databaseId": n,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "startedAt": "2026-10-12T00:00:00Z",
+        "detailsUrl": f"https://github.com/o/r/actions/runs/{n}/job/1",
+        "checkSuite": {"app": {"databaseId": app}},
+    }
+
+
+def status_node(context, state="FAILURE") -> dict:
+    return {
+        "__typename": "StatusContext",
+        "id": f"SC{context}",
+        "createdAt": "2026-10-12T00:00:00Z",
+        "context": context,
+        "state": state,
+        "targetUrl": None,
+    }
+
+
+def base_tip(nodes, name="dev", more=None, total=None) -> dict:
+    contexts = {
+        "totalCount": len(nodes) if total is None else total,
+        "pageInfo": {"hasNextPage": more is not None, "endCursor": more},
+        "nodes": nodes,
+    }
+    return {"name": name, "target": {"oid": "b9", "statusCheckRollup": {"id": "SCR1", "contexts": contexts}}}
+
+
+def world_with(tip, *more):
+    first = {"issues": page([]), "pullRequests": page([]), "refs": page([]), "baseTip": tip}
+    runner = GraphQL(first)
+    runner.answers += [json.dumps({"data": {"node": m}}) for m in more]
+    return GitHubGateway("o/r", runner=runner).build_world("dev"), runner
+
+
+def test_313_the_base_tips_checks_come_with_the_one_query():
+    world, runner = world_with(base_tip([run_node("frontend"), run_node("rust", "SUCCESS", n=2), status_node("ci/x")]))
+    assert world.base is not None and (world.base.ref, world.base.oid) == ("dev", "b9")
+    assert [(c.name, c.bucket, c.kind, c.app_id) for c in world.base.reports] == [
+        ("frontend", "fail", "check", 15368),
+        ("rust", "pass", "check", 15368),
+        ("ci/x", "fail", "status", None),
+    ]
+    assert len(runner.queries) == 1 and "baseTip:ref(qualifiedName:$base)" in runner.queries[0]
+
+
+def test_313_a_base_tip_with_no_checks_is_an_empty_read_not_an_unread_one():
+    world, _ = world_with({"name": "dev", "target": {"oid": "b9", "statusCheckRollup": None}})
+    assert world.base is not None and world.base.reports == ()
+
+
+@pytest.mark.parametrize(
+    "tip",
+    [
+        None,  # the base ref does not exist
+        "x",
+        {"name": "main", "target": {"oid": "b9", "statusCheckRollup": None}},  # not the configured base
+        {"name": "dev", "target": None},
+        {"name": "dev", "target": {"statusCheckRollup": None}},  # no commit id
+        base_tip([run_node("frontend", status="EXPLODED")]),  # unknown status
+        base_tip([{"__typename": "CheckRun", "name": "x"}]),  # partial node
+        base_tip([None]),
+        base_tip([run_node("a")], total=2),  # count disagrees with the nodes
+        {"name": "dev", "target": {"oid": "b9", "statusCheckRollup": {"id": "SCR1", "contexts": None}}},
+    ],
+)
+def test_313_an_unreadable_base_tip_is_absent_and_the_tick_goes_on(tip):
+    world, _ = world_with(tip)
+    assert world.base is None
+
+
+def test_313_a_base_tip_past_one_page_is_read_in_full():
+    more = {"contexts": {"totalCount": 101, "pageInfo": {"hasNextPage": False, "endCursor": None},
+                         "nodes": [run_node("last", n=101)]}}
+    world, runner = world_with(base_tip([run_node(f"j{i}", n=i + 1) for i in range(100)], more="c1", total=101), more)
+    assert world.base is not None and len(world.base.reports) == 101
+    assert "on StatusCheckRollup{contexts(first:100,after:$cursor)" in runner.queries[1]
+
+
+def test_313_a_huge_base_check_list_past_its_bound_is_absent():
+    big = [run_node(f"j{i}", n=i + 1) for i in range(100)]
+    pages = [{"contexts": {"totalCount": 5000, "pageInfo": {"hasNextPage": True, "endCursor": f"c{k}"},
+                           "nodes": [run_node(f"p{k}-{i}", n=1000 * k + i) for i in range(100)]}} for k in range(2, 12)]
+    world, _ = world_with(base_tip(big, more="c1", total=5000), *pages)
+    assert world.base is None

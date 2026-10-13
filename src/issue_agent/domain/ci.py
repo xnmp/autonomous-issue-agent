@@ -49,6 +49,14 @@ class Failed:
             raise ValueError("failed CI requires nonempty failures")
 
 
+@dataclass(frozen=True)
+class BaseRed:
+    """Every failure on the PR is settled red on the base tip too: the base is
+    broken, not the PR (#313)."""
+
+    checks: tuple[Check, ...]
+
+
 def _gated_checks(observation: Observed) -> tuple[Check, ...]:
     return tuple(c for c in observation.reports if not observation.policy or c.required)
 
@@ -69,6 +77,34 @@ def reduce_ci(observation: CIObservation) -> Clear | Waiting | Failed | Unavaila
         return Waiting(Executing(pending) if any(c.state != "QUEUED" for c in pending) else Queued(pending))
     failures = tuple(c for c in eligible if c.bucket == "fail")
     return Failed(failures) if failures else Clear()
+
+
+def charge(failed: Failed, base: tuple[Check, ...] | None) -> Failed | Waiting | BaseRed:
+    """Attribute a PR's settled failures against the base tip's reports (#313).
+
+    A failure stays the PR's unless every base report of the same check is
+    red or still running: no base report, or any passing one (a green rerun, a
+    same-named job in another workflow), keeps it the PR's, and one PR-owned
+    failure owes FIX_CI. Otherwise a base report still running outranks the
+    failure (the #49 rule) and the PR waits for the base's answer. An unread
+    base is None and charges the PR, as before.
+    """
+    if base is None:
+        return failed
+    outcomes: dict[tuple[str, str, int | None], set[str]] = {}
+    for check in base:
+        outcomes.setdefault(_identity(check), set()).add("pending" if _is_pending(check) else check.bucket)
+    shared = {_identity(c) for c in failed.checks}
+    if any(not outcomes.get(key) or not outcomes[key] <= {"fail", "pending"} for key in shared):
+        return failed
+    running = tuple(c for c in base if _is_pending(c) and _identity(c) in shared)
+    return Waiting(Executing(running)) if running else BaseRed(failed.checks)
+
+
+def _identity(check: Check) -> tuple[str, str, int | None]:
+    # A check run is its app's; a commit status is matched by context alone,
+    # as branch protection does (a required status may carry a policy app id).
+    return (check.kind, check.name, check.app_id if check.kind == "check" else None)
 
 
 def _is_pending(check: Check) -> bool:

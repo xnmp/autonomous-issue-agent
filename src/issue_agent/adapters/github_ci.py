@@ -91,6 +91,14 @@ def _report(node):
                  node["isRequired"], app_id, "check" if kind == "CheckRun" else "status")
 
 
+def base_reports(nodes) -> tuple[Check, ...]:
+    """The base tip's reports. A branch commit has no PR to be required for:
+    the PR's own policy decides which of its failures matter (#313)."""
+    if not isinstance(nodes, list):
+        raise ValueError("base reports are malformed")
+    return tuple(_report({**node, "isRequired": False}) for node in nodes)
+
+
 def _checked_merge(selected):
     merge = selected["potentialMergeCommit"]
     if merge is None or merge["statusCheckRollup"] is None:

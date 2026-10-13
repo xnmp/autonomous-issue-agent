@@ -334,6 +334,9 @@ def _wait_status(reason: WaitReason, pr: PRView | None, last_end: datetime | Non
     since = _iso(last_end)
     if reason is WaitReason.CI_PENDING:
         return Working("ci", None, "CI running", "Required checks are still running on the head.", since)
+    if reason is WaitReason.BASE_RED:
+        return Waiting("github", "Base branch red",
+                       "Its failing checks fail on the base tip too; it resumes when the base is fixed.", since)
     if reason is WaitReason.HEADROOM:
         return Waiting("headroom", "Daily cap reached", "The daily or global spend cap leaves no room for a leg.",
                        since)
@@ -438,7 +441,8 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
             return Stage.MERGE
         if state.reason is WaitReason.HUMAN_CHANGES_REQUESTED:
             return Stage.REVIEW
-        if state.reason in (WaitReason.CI_PENDING, WaitReason.CI_UNKNOWN, WaitReason.HEAD_UNKNOWN):
+        if state.reason in (WaitReason.CI_PENDING, WaitReason.CI_UNKNOWN, WaitReason.HEAD_UNKNOWN,
+                            WaitReason.BASE_RED):
             return Stage.CI
     return fallback
 
