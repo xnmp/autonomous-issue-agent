@@ -52,6 +52,8 @@ class DashboardCommands(Protocol):
 
     def resolve_command(self, name: str, number: int, body: ResolveCommand) -> CommandResult: ...
 
+    def unblock(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]: ...
+
 
 class DashboardBackend(
     RepositoryQueries, IssueQueries, OperatorQueries, DashboardCommands, Protocol

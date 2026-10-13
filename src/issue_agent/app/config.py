@@ -26,7 +26,6 @@ from ..domain.agent_task import RuntimeName
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
-from ..domain.identity import IdentityMode
 from ..domain.repository import (
     canonical_repository,
     repository_validation_error,
@@ -41,7 +40,6 @@ def fix_runtime_names_from_env(env: dict) -> frozenset[str]:
     primary = str(env.get("FIXER_RUNTIME") or "").strip().strip("\"'").lower()
     return frozenset({primary} if primary else set())
 
-SHELL_CMD_LOG_LIMIT = 120
 REPOINT_HISTORY_ENV = "REPOINTED_FROM_DEPLOYMENTS"
 MAX_REPOINT_HISTORY = 32
 
@@ -136,33 +134,11 @@ def parse_repoint_history(raw: str) -> tuple[tuple[str, str], ...]:
     return tuple(result)
 
 
-def describe_command(value: str | None, *, empty: str = "EMPTY",
-                     limit: int = SHELL_CMD_LOG_LIMIT) -> str:
-    """Render a shell command for a boot log line: quoted, and truncated
-    DELIBERATELY rather than by accident.
-
-    The boot log used to print `TEST_CMD=set` — the literal word "set",
-    reporting presence only. For a real value like
-    `TEST_CMD='set -e; cargo test …'` that output is indistinguishable from a
-    value truncated at the first space (#35), and this is the one line an
-    operator reads to confirm which command arms the gate. So: print the value,
-    repr-quoted (whitespace and shell punctuation stay visible inside the
-    quotes), cut at `limit` with an explicit ellipsis, and always state the full
-    length so a truncation can never be mistaken for the whole command.
-    """
-    text = value or ""
-    if not text:
-        return empty
-    shown = text if len(text) <= limit else text[:limit] + "…"
-    return f"{shown!r} (len={len(text)})"
-
-
 @dataclass(frozen=True)
 class RepositoryConfig:
     repo: str
     base_branch: str
     target_dir: str
-    identity_mode: IdentityMode
 
 
 @dataclass(frozen=True)
@@ -251,7 +227,6 @@ class HarnessConfig:
     repo_input: str = field(default="", repr=False, compare=False)
     base_branch: str = "dev"
     target_dir: str = ""
-    identity_mode: IdentityMode = IdentityMode.THREE
     fix_bot: str = ""
     review_bot: str = "my-reviewer-bot[bot]"
     state_dir: str = ""
@@ -450,9 +425,6 @@ class HarnessConfig:
     issue_spend_cap_usd: float = 25.0
     daily_spend_cap_usd: float = 700.0
     global_daily_spend_cap_usd: float = 0.0
-    # Shell command fed each spend_block / escalation event as JSON on stdin.
-    # Blank = no alerting (the events are still journalled).
-    alert_cmd: str = ""
     # Malformed-numeric fallbacks recorded by from_env (review M2): a bad
     # POLL_SECONDS/MAX_BUDGET_USD/etc must not traceback at startup — from_env
     # substitutes the field default and records what it did here, so
@@ -484,7 +456,6 @@ class HarnessConfig:
             repo=self.repo,
             base_branch=self.base_branch,
             target_dir=self.target_dir,
-            identity_mode=self.identity_mode,
         )
 
     @property
@@ -582,15 +553,13 @@ class HarnessConfig:
                 "PRs/reviews can never be identified, and (pre-P1R-7) let an "
                 "unresolvable PR author read as the fixer's own"
             )
-        if self.identity_mode == IdentityMode.THREE and normalize_login(self.fix_bot) == normalize_login(
-            self.review_bot
-        ):
+        if normalize_login(self.fix_bot) == normalize_login(self.review_bot):
             # review C1/D1 belt-and-braces: a raw string compare would miss
             # `fix-bot` vs `fix-bot[bot]` and let a self-approving identity
             # pair through — GitHub then 422s every approval, forever.
             errors.append(
-                "FIX_BOT and REVIEW_BOT normalize to the same identity under "
-                "IDENTITY_MODE=three (GitHub rejects self-approval with a 422)"
+                "FIX_BOT and REVIEW_BOT normalize to the same identity "
+                "(GitHub rejects self-approval with a 422)"
             )
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
@@ -700,9 +669,6 @@ class HarnessConfig:
 
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
-            # getattr, not IdentityMode(...): describe() is the startup diagnostic
-            # and must print whatever it was handed rather than raise on it.
-            f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
             f"{cadence}",
             f"fixer={self.fixer_runtime.value} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
@@ -716,7 +682,6 @@ class HarnessConfig:
             f"daily/{self.repo or 'repo'}=${self.daily_spend_cap_usd:.2f} "
             f"daily/global="
             f"{f'${self.global_daily_spend_cap_usd:.2f}' if self.global_daily_spend_cap_usd > 0 else 'off'} "
-            f"alert={describe_command(self.alert_cmd, empty='none')}",
             f"state={self.state_dir or '(unset)'} "
             f"control={self.control_authority_root or '(deployment state parent)'} "
             f"target={self.target_dir or '(cwd)'} "
@@ -855,7 +820,6 @@ _ENV_NAME_OVERRIDES = {
     "codex_max_rate_limit_wait": "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS",
 }
 _COERCE_OVERRIDES: dict[str, str] = {
-    "identity_mode": "identity_mode",
     "state_dir": "state_dir",
     "review_state_dir": "state_dir",
     "fix_effort": "effort",
@@ -866,7 +830,6 @@ _COERCE_OVERRIDES: dict[str, str] = {
     "codex_cost_per_mtok": "rate_table",
 }
 _CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
-    "identity_mode": tuple(item.value for item in IdentityMode),
     "fix_effort": tuple(item.value for item in EFFORT_LADDER),
     "fixer_runtime": tuple(item.value for item in RuntimeName),
     "reviewer_runtime": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
@@ -1003,8 +966,6 @@ def _metadata_value(
         return _coerce_float(env, env_name, float(fallback), errors)
     if coercion == "choice":
         return _metadata_choice(env, field_name, errors)
-    if coercion == "identity_mode":
-        return _coerce_identity_mode(env, errors)
     if coercion == "effort":
         return _effort(env, env_name, fallback, errors)
     if coercion == "runtime":
@@ -1078,33 +1039,6 @@ def _coerce_rate_tables(
     table, cached, parse_errors = parse_model_rate_table(env.get(key, ""))
     errors.extend(f"{key} {error} — ignoring it" for error in parse_errors)
     return table, cached
-
-
-def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
-    """IDENTITY_MODE → `IdentityMode`, with the same contract as `_coerce_int`:
-    empty/absent = unset (the field default), malformed = the default PLUS a
-    readable entry in validation_errors() (review M16).
-
-    `IDENTITY_MODE=Three` used to pass straight through as a string and land
-    BETWEEN the two guards that read it — `!= "three"` disabled auto-merge while
-    `== "solo"` left the reviewer enabled, so the harness reviewed, approved and
-    then never merged anything, with no log line naming the cause. There is no
-    safe silent fallback for this knob, so the value has to be named as wrong at
-    startup where `validate()` can refuse to run on it."""
-    raw = env.get("IDENTITY_MODE")
-    default: IdentityMode = _dc_default("identity_mode")
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return IdentityMode.from_env(raw)
-    except ValueError:
-        allowed = "|".join(m.value for m in IdentityMode)
-        errors.append(
-            f"IDENTITY_MODE must be exactly one of {allowed}, got {raw!r} "
-            f"(case-sensitive — the bash half compares it literally) — "
-            f"using default {default.value}"
-        )
-        return default
 
 
 def _repo_slug(repo: str) -> str:

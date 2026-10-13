@@ -163,39 +163,7 @@ sources therefore extend one decision table rather than adding recovery loops.
 V20 indexes the workflow episode on existing admitted runs. Adjudication allowance
 reads are bounded and episode-scoped; generation changes do not renew them. A
 strict never-launched release carries a distinct terminal proof, while ambiguous
-execution continues counting. A launched PR repair (REBASE, ADDRESS_REVIEW,
-FIX_CI, linked reply) that ends without a captured `pr-repair-result` is
-acknowledged by `reconcile_pr_repair_returns` only once its run is terminal,
-lease- and claim-free, has no unresolved publication command, and its money is
-accounted for: the reservation is released or settled. Recovery settles old
-accounting holds before this check. There is no retained-money exception or
-`unreturned_acknowledged_money_retained` event; acknowledgments use
-`unreturned_acknowledged` and follow the ordinary settled-money rule.
-The acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
-or settlement), charges no attempt (a launched repair that never returned is a
-machine failure, spaced by the per-issue backoff), and changes only the exact
-current admissions.
-The acknowledgment preserves existing session/model provenance. A late real
-result is captured and corrects any estimated charge through the shared settlement
-path, while the acknowledgment continues to prevent replayed workflow effects and
-changes to newer workflow state. Recovery shares the
-existing ceiling of 32 completions per reconciliation pass.
-
-PR-repair acknowledgment crash/concurrency matrix (ADR 0003, ADR 0016):
-selection is read-only and releases its transaction before acknowledgment.
-The mutation transaction re-proves eligibility; SQLite's writer serialization
-orders competing capture against that recheck and the paired state/receipt
-writes. No process or network operation runs inside either transaction.
-
-| Interruption or competing writer | Durable outcome and retry | Behavioral test in `tests/app/` |
-|---|---|---|
-| After candidate selection, before mutation | No state changed; the next reconciliation reselects and acknowledges once. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-selection]` |
-| During paired state/receipt writes | The transaction/savepoint rolls back both components and receipts; retry completes once. | `test_pr_repair_terminal_recovery_guards.py::test_acknowledgment_rolls_back_both_components_and_receipts_on_write_failure` |
-| Commit succeeds but the caller never receives the return | Both components and the distinct acknowledgment remain committed; retry adds no debt or receipt. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-commit]` |
-| Normal result captured after selection, before acknowledgment's recheck | Capture wins; acknowledgment returns false without mutation. The next ordinary pass applies the real result/session exactly once. | `test_pr_repair_recovery_interleavings.py::test_capture_between_selection_and_acknowledgment_wins` |
-| Acknowledgment commits before normal capture | The real result is captured, money is corrected, and acknowledged workflow effects remain consumed. | `test_pr_repair_terminal_recovery.py::test_late_real_repair_return_corrects_recovery_even_after_unreturned_ack`; `test_pr_repair_terminal_recovery_guards.py::test_settled_recovery_preserves_prior_session_and_money_and_accepts_late_capture` |
-| Retained (unknown-cost) run acknowledged, then later released or settled | Money is untouched by the acknowledgment; the later disposition finds the existing receipt and neither re-acknowledges nor re-holds the PR. | `test_pr_repair_retained_money_proceeds.py::test_later_release_of_retained_run_keeps_pr_consistent` |
-| Newer generation or admission supersedes the selected run | Exact admission guards preserve the newer components. | `test_pr_repair_terminal_recovery.py::test_stale_unreturned_repair_cannot_rewrite_a_newer_generation`; `test_pr_repair_terminal_recovery_guards.py::test_recovered_run_cannot_clear_newer_pending_admission` |
+execution continues counting.
 
 Migration validates immutable run/admission/budget
 provenance atomically before deriving the index; it does not activate a workflow

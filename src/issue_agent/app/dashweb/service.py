@@ -163,7 +163,7 @@ def _detail_limits(name: str, repo: str) -> dict[str, float]:
     }
 
 
-_AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE", "IDENTITY_MODE")
+_AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE",)
 
 
 def _harness_merges(name: str, repo: str) -> Callable[[str], bool]:
@@ -187,7 +187,6 @@ def _harness_merges(name: str, repo: str) -> Callable[[str], bool]:
     return partial(
         harness_merges_branch,
         auto_merge=cfg.auto_merge,
-        identity_mode=cfg.identity_mode,
     )
 
 
@@ -636,7 +635,8 @@ class Backend:
                 candidate_pr = pr
                 hold_role = self._pr_hold_role(row, pr)
                 if Label.NEEDS_HUMAN_REVIEW.value in labels and hold_role != "fix":
-                    reason = ("review_migration_required; activate review control before re-arming review holds"
+                    reason = ("review_hold_unsupported; review control was deleted in slice 5c, so remove "
+                              "needs-human-review on GitHub to release this hold"
                               if hold_role == "review" else "hold source is unknown; cannot authorize a legacy release")
                     return False, f"pr #{pr}: {reason}"
                 pr_changes[pr] = actions.pr_unblock_change(

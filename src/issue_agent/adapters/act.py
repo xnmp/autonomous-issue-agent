@@ -28,14 +28,29 @@ from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict
 
-_COMMENT_NAMESPACE = "fix-comment"  # 5b's name; renaming would orphan stored keys
-_REVIEW_NAMESPACE = "review-submission"
+# A stored-key namespace is never renamed: a rename orphans the keys already
+# claimed under the old name, and a claimed key decides whether to post.
+_COMMENT_NAMESPACE = "fix-comment"
 _PR_BODY_LIMIT = 60000
 
 
+def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bool:
+    """One review on exactly `head` under `bot`, the identity the review
+    gateway acts as (checked at boot). GitHub's read-back is the idempotency:
+    a standing bot verdict on `head` means it landed (a crash after the POST,
+    or a racing leg), so nothing is posted twice. False is GitHub's refusal (a
+    4xx), which no retry changes; no answer or no confirmation raises."""
+    if gateway.reviewed_on(pr, head, bot):
+        return True
+    if not gateway.submit_review(pr, verdict.event, verdict.body, head):
+        return False
+    if not gateway.reviewed_on(pr, head, bot):
+        raise RuntimeError(f"PR #{pr}: review of {head[:12]} not confirmed")
+    return True
+
+
 class GitHubAct:
-    """Executes a role's Actions; `RunAgent` goes to `dispatch`. The review
-    role's legs submit their verdicts through `submit_review`.
+    """Executes the fix role's Actions; `RunAgent` goes to `dispatch`.
     `replay_pending` is trivially clean: nothing is queued."""
 
     def __init__(
@@ -48,9 +63,8 @@ class GitHubAct:
         merge_method: str,
         close_issue_on_merge: bool,
         marker: str,
-        review_bot: str,
         dispatch: Callable[[RunAgent], None],
-        remove_worktree: Callable[[int], None] | None = None,
+        remove_worktree: Callable[[int], None],
         log: Callable[[str], None],
     ) -> None:
         self.gateway = gateway
@@ -60,7 +74,6 @@ class GitHubAct:
         self.merge_method = merge_method
         self.close_issue_on_merge = close_issue_on_merge
         self.marker = marker
-        self.review_bot = review_bot
         self.dispatch = dispatch
         self.remove_worktree = remove_worktree
         self.log = log
@@ -97,8 +110,6 @@ class GitHubAct:
         if self.close_issue_on_merge and not self.gateway.is_issue_closed(issue):
             # A non-default base does not close the issue through `Fixes #N`.
             self.gateway.close_issue(issue, "completed", f"{self.marker}\nResolved by #{action.pr}.")
-        if self.remove_worktree is None:
-            return  # only the fix role's dispatches own worktrees
         try:
             self.remove_worktree(issue)
         except Exception as exc:  # noqa: BLE001 - a stale worktree is disk, not state
@@ -146,22 +157,6 @@ class GitHubAct:
             raise RuntimeError(f"issue #{action.issue}: PR for {action.branch} not confirmed")
         self.log(f"issue #{action.issue}: opened PR for {action.branch}")
 
-    def submit_review(self, pr: int, head: str, verdict: Verdict) -> None:
-        """One review on exactly `head`, under this gateway's (the review
-        bot's) identity. GitHub's read-back decides: a standing bot verdict on
-        `head` means it landed (a crash after the POST, or a racing leg), so
-        nothing is posted twice. The key records each submission; it is not
-        consulted to skip one, because a human may dismiss the bot's verdict
-        and derive then owes a new review of the same head."""
-        key = f"review:{pr}:{head}"
-        self.control.claim_key(_REVIEW_NAMESPACE, self.repository, key)
-        if not self.gateway.reviewed_on(pr, head, self.review_bot):
-            self.gateway.submit_review(pr, verdict.event, verdict.body, head)
-            if not self.gateway.reviewed_on(pr, head, self.review_bot):
-                raise RuntimeError(f"PR #{pr}: review of {head[:12]} not confirmed")
-            self.log(f"PR #{pr}: submitted {verdict.event} on {head[:12]}")
-        self.control.confirm_key(_REVIEW_NAMESPACE, self.repository, key)
-
     def latest_resolve_summary(self, issue: int) -> str:
         """The agent's summary from the issue's latest returned resolve leg:
         an untrusted claim, used only as the PR description."""
@@ -173,4 +168,4 @@ class GitHubAct:
         return str(latest.receipt["summary"]) if latest is not None and latest.receipt is not None else ""
 
 
-__all__ = ["GitHubAct"]
+__all__ = ["GitHubAct", "submit_review"]

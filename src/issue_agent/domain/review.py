@@ -11,6 +11,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+# UTF-8 bytes, not characters: the body travels as one argv element to `gh`,
+# and Linux caps one at 128 KiB (MAX_ARG_STRLEN), which 60000 three-byte
+# characters exceed, so a character bound let a review fail to post forever.
 REVIEW_BODY_LIMIT = 60000
 _VERDICT_EVENTS = ("APPROVE", "REQUEST_CHANGES")
 
@@ -23,7 +26,7 @@ class Verdict:
     body: str
 
     def __post_init__(self) -> None:
-        if self.event not in _VERDICT_EVENTS or not isinstance(self.body, str) or len(self.body) > REVIEW_BODY_LIMIT:
+        if self.event not in _VERDICT_EVENTS or not isinstance(self.body, str) or _utf8_len(self.body) > REVIEW_BODY_LIMIT:
             raise ValueError("a verdict is APPROVE or REQUEST_CHANGES with a bounded body")
         if self.event == "REQUEST_CHANGES" and not self.body.strip():
             raise ValueError("a change request needs a body")
@@ -39,7 +42,11 @@ def parse_verdict(structured: object) -> Verdict | None:
     event, body = structured.get("decision"), structured.get("body")
     if event not in _VERDICT_EVENTS or not isinstance(body, str):
         return None
-    body = body.strip()[:REVIEW_BODY_LIMIT].strip()
+    body = body.strip().encode("utf-8", "ignore")[:REVIEW_BODY_LIMIT].decode("utf-8", "ignore").strip()
     if event == "REQUEST_CHANGES" and not body:
         return None
     return Verdict(event, body)
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))

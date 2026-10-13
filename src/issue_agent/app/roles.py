@@ -50,6 +50,7 @@ from ..domain.pricing import (
     default_cache_write_rate,
 )
 from ..domain.state import Harness
+from ..domain.identity import login_eq
 from .config import (
     CodexRuntimeConfig,
     HarnessConfig,
@@ -63,7 +64,7 @@ from .fix import FixLegs, FixSettings, fix_choose
 from .loop import Daemon
 from .planners.tasks import FixTaskConfig, ReviewTaskConfig
 from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
-from .review import ReviewLegs, ReviewSettings, review_choose
+from .review import ReviewAct, ReviewLegs, ReviewSettings, review_choose
 from .tick import Facts, decide_with, dispatch_item, lease_slots
 
 def _spend_evidence_dirs(cfg: HarnessConfig) -> tuple[str, ...]:
@@ -775,7 +776,6 @@ if frozenset(_FIX_RUNTIME_REGISTRY) != frozenset(RuntimeName):
 @dataclass(frozen=True)
 class _ReviewRuntimeBinding:
     runner: AgentRuntime
-    execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
 
 
@@ -786,13 +786,7 @@ def _bind_claude_review_runtime(
 ) -> _ReviewRuntimeBinding:
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
 
-    # execution_cwd is what arms the pinned per-PR review checkout (roles
-    # builds ReviewCheckouts off it) — without it Claude review legs read
-    # whatever the operator's live checkout happens to contain (0d2e295 M1).
-    return _ReviewRuntimeBinding(
-        RepositoryGuidanceRuntime(runner, log=_log("review")),
-        execution_cwd=cfg.target_dir,
-    )
+    return _ReviewRuntimeBinding(RepositoryGuidanceRuntime(runner, log=_log("review")))
 
 
 def _bind_codex_review_runtime(
@@ -819,23 +813,12 @@ def _bind_codex_review_runtime(
         if reason is not None
         else "codex: runtime ready (bin + key present)"
     )
-    execution_cwd = cfg.target_dir
-    if not execution_cwd:
-        log(
-            "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
-            "TARGET_DIR so its read-only leg has an explicit checkout"
-        )
-        return _ReviewRuntimeBinding(runner)
     prepare_cwd = partial(
         write_codex_home,
         state_dir=cfg.review_state_dir,
         auth_file=runner.oauth_auth_file(),
     )
-    return _ReviewRuntimeBinding(
-        CodexHomeRuntime(runner, prepare_cwd),
-        execution_cwd,
-        prepare_cwd,
-    )
+    return _ReviewRuntimeBinding(CodexHomeRuntime(runner, prepare_cwd), prepare_cwd)
 
 
 _REVIEW_RUNTIME_REGISTRY: Mapping[
@@ -870,7 +853,7 @@ def _lifetime_capped(cfg: HarnessConfig, control: SQLiteControlStore) -> Callabl
     def capped(issue: int) -> bool:
         snapshot = control.snapshot(issue_budget_scope(cfg.repo, issue, "USD"))
         if snapshot.disposition.value != "available":
-            # FixFacts reads a failed read as no headroom: paid legs wait, free work goes on.
+            # `Facts` reads a failed read as no headroom: paid legs wait, free work goes on.
             raise ControlStoreError(f"issue #{issue} spend is unreadable: {snapshot.detail}")
         return snapshot.committed.micros + leg.micros > cap.micros
 
@@ -979,7 +962,6 @@ def compose_fix_daemon(
         merge_method=cfg.merge_method,
         close_issue_on_merge=cfg.close_issue_on_merge,
         marker=settings.harness.marker,
-        review_bot=cfg.review_bot,
         dispatch=dispatch, remove_worktree=worktrees.remove, log=log,
     )
     facts = Facts(
@@ -1029,7 +1011,7 @@ class ReviewDaemonComposition:
     daemon: Daemon
     control: SQLiteControlStore
     journal: Journal
-    act: GitHubAct
+    act: ReviewAct
     legs: ReviewLegs
     recovery: _RecoveryHooks
     owner_id: str
@@ -1049,13 +1031,27 @@ def compose_review_daemon(
 
     `checkouts` pins each leg to its head; by default a detached per-PR
     worktree of TARGET_DIR (keifu #165: reviews of the operator's live
-    checkout produced phantom change requests under fresh SHAs)."""
+    checkout produced phantom change requests under fresh SHAs).
+
+    Two misconfigurations no retry can fix refuse to start (ValueError, so
+    `main` exits INVALID_CONFIG): no TARGET_DIR to pin reviews to, and a
+    review credential that is not REVIEW_BOT. The latter posted a duplicate
+    review on every retry, since the read-back looked for the wrong login."""
     log = log or _log("review")
     review_runtime = cfg.review_runtime
+    if checkouts is None:
+        if not cfg.target_dir:
+            raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
+        checkouts = ReviewCheckouts(cfg.target_dir, worktree_root=cfg.worktree_root)
+    acting_as = gateway.viewer_login()
+    if not login_eq(acting_as, review_runtime.bot):
+        raise ValueError(
+            f"REVIEW_BOT is {review_runtime.bot!r} but the review credential acts as "
+            f"{acting_as or 'nobody GitHub would name'!r}: set REVIEW_BOT to the "
+            "credential's login, or give the review role REVIEW_BOT's credential"
+        )
     journal = _journal(store)
     binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](cfg, review_runtime, runner)
-    if checkouts is None and binding.execution_cwd:
-        checkouts = ReviewCheckouts(binding.execution_cwd, worktree_root=cfg.worktree_root)
     control = _control_store(cfg, cfg.review_state_dir, "review")
     owner_id = _owner_identity(cfg, "review")
     settings = ReviewSettings(
@@ -1071,31 +1067,19 @@ def compose_review_daemon(
         runtime=review_runtime.runtime.value, state_dir=cfg.review_state_dir,
     )
     daemon_ref: dict[str, Daemon] = {}
-    acts: list[GitHubAct] = []
     legs = ReviewLegs(
         gateway, control, settings,
         runtime=runtime,
         accounting=accounting,
         checkouts=checkouts,
         prepare_cwd=binding.prepare_cwd,
-        submit=lambda pr, head, verdict: acts[0].submit_review(pr, head, verdict),
         task_config=ReviewTaskConfig(
             cfg.repo, cfg.base_branch, review_runtime.prompt, review_runtime.budget_usd, review_runtime.model,
         ),
         log=log,
     )
     dispatch = CancellableAsyncDispatch(legs.run)
-    act = GitHubAct(
-        gateway, control,
-        repository=cfg.repo,
-        base_branch=cfg.base_branch,
-        merge_method=cfg.merge_method,
-        close_issue_on_merge=cfg.close_issue_on_merge,
-        marker=settings.harness.marker,
-        review_bot=review_runtime.bot,
-        dispatch=dispatch, log=log,
-    )
-    acts.append(act)
+    act = ReviewAct(dispatch)
     facts = Facts(
         control, cfg.repo,
         active=lambda: daemon_ref["daemon"].active_dispatches if "daemon" in daemon_ref else (),

@@ -190,7 +190,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     compose_env_sh = _install_compose_env(tmp_path)
     (tmp_path / "config").mkdir(exist_ok=True)
     (tmp_path / "config" / "shared.env").write_text(
-        'IDENTITY_MODE="three"\nFIX_BOT="fix-bot"\n'
+        'FIX_BOT="fix-bot"\n'
     )
     repos_dir = tmp_path / "config" / "repos"
     repos_dir.mkdir()
@@ -758,7 +758,7 @@ def test_doctor_skips_state_dir_check_with_no_overlays(tmp_path):
 
 
 # ── D7 + C1: doctor identity-distinctness normalization ────────────────────────
-def test_doctor_rejects_bot_suffix_mismatch_under_identity_mode_three(tmp_path):
+def test_doctor_rejects_bot_suffix_mismatch(tmp_path):
     # review C1: acme-fixer and acme-fixer[bot] are the SAME GitHub identity in
     # two
     # API surface forms — a raw string compare (the old check) passed this,
@@ -766,21 +766,19 @@ def test_doctor_rejects_bot_suffix_mismatch_under_identity_mode_three(tmp_path):
     fake_bin = _fake_tool_path(tmp_path)
     result = _run_doctor({
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "IDENTITY_MODE": "three",
         "FIX_BOT": "acme-fixer",
         "REVIEW_BOT": "acme-fixer[bot]",
         "REPO": "o/r",
     })
     assert result.returncode != 0
-    assert "IDENTITY_MODE=three needs" in result.stdout
+    assert "FIX_BOT distinct from it" in result.stdout
 
 
-def test_doctor_accepts_distinct_identities_under_identity_mode_three(tmp_path):
+def test_doctor_accepts_distinct_identities(tmp_path):
     # Anti-vacuity twin: genuinely distinct identities must still pass.
     fake_bin = _fake_tool_path(tmp_path)
     result = _run_doctor({
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "IDENTITY_MODE": "three",
         "FIX_BOT": "acme-fixer",
         "REVIEW_BOT": "acme-reviewer",
         "REPO": "o/r",
@@ -794,13 +792,12 @@ def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
     fake_bin = _fake_tool_path(tmp_path)
     result = _run_doctor({
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-        "IDENTITY_MODE": "three",
         "FIX_BOT": "Acme-Fixer",
         "REVIEW_BOT": "acme-fixer[BOT]",
         "REPO": "o/r",
     })
     assert result.returncode != 0
-    assert "IDENTITY_MODE=three needs" in result.stdout
+    assert "FIX_BOT distinct from it" in result.stdout
 
 
 def test_two_deployments_compose_to_separate_files(tmp_path):
@@ -908,7 +905,7 @@ def _ci_doctor(tmp_path: Path, extra_env: dict, **fixture) -> subprocess.Complet
 
 def test_doctor_checks_explicit_composed_snapshot(tmp_path):
     active = _compose(
-        tmp_path, 'IDENTITY_MODE=solo\nFIX_BOT=acme-fixer\n',
+        tmp_path, 'FIX_BOT=acme-fixer\n',
         'REPO=acme/widget\nBASE_BRANCH=trunk\nTEST_CMD="uv run pytest -q"\n',
     )
     result = _ci_doctor(tmp_path, {"AGENT_ENV": str(active)}, workflows=0)

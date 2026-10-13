@@ -1,4 +1,4 @@
-"""Event journal, cost ledger, spend circuit breakers, alert hook.
+"""Event journal, cost ledger, spend circuit breakers.
 
 Two properties dominate here and both are about NOT making things worse:
 observability never raises (a read-only state dir must not kill a daemon), and
@@ -21,7 +21,6 @@ import pytest
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import (
     JournalingRuntime,
-    alert,
     default_ledger_path,
     read_events,
 )
@@ -639,25 +638,6 @@ def test_the_wrappers_own_attributes_win_over_the_inners(tmp_path):
     journal = Journal(str(tmp_path / "j.jsonl"))
     rt = JournalingRuntime(Shadowing(), journal, repo="o/r", role="fix")
     assert rt.role == "fix" and rt.journal is journal
-
-
-# ── alert hook ────────────────────────────────────────────────────────────────
-def test_alert_pipes_the_event_json_to_the_shell_command(tmp_path):
-    sink = tmp_path / "alerts.txt"
-    alert(f"cat >> {sink}", '{"event": "escalation"}')
-    assert json.loads(sink.read_text())["event"] == "escalation"
-
-
-def test_alert_is_a_noop_when_unset(tmp_path):
-    sink = tmp_path / "never.txt"
-    alert("", f"echo written > {sink}")
-    alert("   ", "{}")
-    assert not sink.exists()
-
-
-def test_alert_swallows_a_failing_command(tmp_path):
-    alert("exit 7", "{}")  # must not raise — a dead pager can't wedge the loop
-
 
 
 # ── Daemon: GhUnavailable is a countable event ────────────────────────────────

@@ -475,6 +475,9 @@ class _BuildableGateway(FakeGateway):
     def build_world(self):  # pragma: no cover - never ticked in these tests
         raise AssertionError("these tests build the daemon, they do not tick it")
 
+    def viewer_login(self) -> str:
+        return REVIEW_BOT  # the review role's boot check: its credential is REVIEW_BOT
+
 def _glm_profile(tmp_path, settings: str) -> str:
     d = tmp_path / ".cc-glm"
     d.mkdir()
@@ -591,7 +594,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     cfg = replace(
         from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "REVIEWER_RUNTIME": "codex",
             "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
             **_role_state_env(tmp_path),
             "TARGET_DIR": str(tmp_path),
@@ -636,7 +639,7 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     )
     cfg = replace(
         from_env({
-            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "REVIEWER_RUNTIME": "codex",
             **_role_state_env(tmp_path),
             "TARGET_DIR": str(tmp_path / "target"),
         }),

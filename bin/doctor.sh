@@ -188,7 +188,7 @@ else
   ok "no config/repos/*.env overlays found — nothing to check (single-repo layout)"
 fi
 
-: "${REPO:=}"; : "${IDENTITY_MODE:=three}"; : "${FIX_BOT:=}"
+: "${REPO:=}"; : "${FIX_BOT:=}"
 _reported_bad=""   # vars already failed by the placeholder/example scan below
 _is_bad_var() { case " $_reported_bad " in *" $1 "*) return 0 ;; esac; return 1; }
 # P1R-6: check the NORMALIZED value, not the raw one — a whitespace-only
@@ -204,15 +204,12 @@ _is_bad_var() { case " $_reported_bad " in *" $1 "*) return 0 ;; esac; return 1;
 _placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
 # Scope the identity fields to the path actually in use, or doctor fails over
 # fields the operator is CORRECT to leave untouched:
-#   solo                     → no second identity at all; none of these are read
-#   three + REVIEW_BOT_TOKEN → static-token path; the GH_APP_* block is unused
-#   three, no token          → GitHub App path; the App fields are required
+#   REVIEW_BOT_TOKEN set → static-token path; the GH_APP_* block is unused
+#   no token             → GitHub App path; the App fields are required
 # (app/main.py `_app_identity` resolves App token → static token → ambient.)
-if [ "${IDENTITY_MODE:-three}" = "three" ]; then
-  _placeholder_vars="$_placeholder_vars REVIEW_BOT"
-  if [ -z "${REVIEW_BOT_TOKEN:-}" ]; then
-    _placeholder_vars="$_placeholder_vars GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
-  fi
+_placeholder_vars="$_placeholder_vars REVIEW_BOT"
+if [ -z "${REVIEW_BOT_TOKEN:-}" ]; then
+  _placeholder_vars="$_placeholder_vars GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
 fi
 for _var in $_placeholder_vars; do
   case "${!_var:-}" in
@@ -241,26 +238,21 @@ if _is_bad_var FIX_BOT; then :
 elif [ -n "$(_normalize_login "$FIX_BOT")" ]; then ok "FIX_BOT=$FIX_BOT"
 else bad "FIX_BOT unset"; fi
 
-if [ "$IDENTITY_MODE" = "three" ]; then
-  : "${REVIEW_BOT:=}"
-  # FIX must differ from REVIEW (GitHub 422 self-approval). Compared NORMALIZED
-  # (review C1) — a raw `!=` would let fix-bot vs fix-bot[bot] (the SAME
-  # identity) through.
-  _nfix="$(_normalize_login "$FIX_BOT")"
-  _nreview="$(_normalize_login "$REVIEW_BOT")"
-  # Distinctness is meaningless if the logins are unedited examples — two
-  # DIFFERENT fake names are still "distinct". Suppress the ✓ so the scan's ✗
-  # is the only verdict on this line.
-  if _is_bad_var FIX_BOT || _is_bad_var REVIEW_BOT; then
-    :
-  elif [ -n "$REVIEW_BOT" ] && [ "$_nfix" != "$_nreview" ]; then
-    ok "two distinct identities (fix=$FIX_BOT, review=$REVIEW_BOT)"
-  else
-    bad "IDENTITY_MODE=three needs REVIEW_BOT set and FIX_BOT distinct from it after normalizing ([bot]-suffix-insensitive, case-insensitive)"
-  fi
+: "${REVIEW_BOT:=}"
+# FIX must differ from REVIEW (GitHub 422 self-approval). Compared NORMALIZED
+# (review C1) — a raw `!=` would let fix-bot vs fix-bot[bot] (the SAME
+# identity) through.
+_nfix="$(_normalize_login "$FIX_BOT")"
+_nreview="$(_normalize_login "$REVIEW_BOT")"
+# Distinctness is meaningless if the logins are unedited examples — two
+# DIFFERENT fake names are still "distinct". Suppress the ✓ so the scan's ✗
+# is the only verdict on this line.
+if _is_bad_var FIX_BOT || _is_bad_var REVIEW_BOT; then
+  :
+elif [ -n "$REVIEW_BOT" ] && [ "$_nfix" != "$_nreview" ]; then
+  ok "two distinct identities (fix=$FIX_BOT, review=$REVIEW_BOT)"
 else
-  ok "solo identity mode (human reviews; auto-merge stays human)"
-  [ "${AUTO_MERGE:-1}" = "1" ] && warn "AUTO_MERGE=1 has no effect in solo mode (no second approver) — merges stay human"
+  bad "REVIEW_BOT must be set and FIX_BOT distinct from it after normalizing ([bot]-suffix-insensitive, case-insensitive)"
 fi
 
 echo "== github access =="

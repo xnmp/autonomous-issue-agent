@@ -11,7 +11,9 @@ base...head diff), runs the configured review model once, and the harness
 submits the parsed verdict as one GitHub review on that commit under the
 review bot's identity. The verdict is the agent's claim: anything but an
 exact APPROVE or REQUEST_CHANGES with a body is no verdict, and the leg
-counts as an attempt (derive caps REVIEW attempts per head).
+counts as an attempt (derive caps REVIEW attempts per head). So does an end
+retrying cannot change: GitHub refusing the submission (a 4xx) or a head with
+nothing to review. A transport failure is a machine end and backs off.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 
+from ..adapters.act import submit_review
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.identity import login_eq
@@ -29,7 +32,7 @@ from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
 from ..domain.state import DerivedState, Harness, ItemKey, pr_key
 from ..domain.trust import as_untrusted
-from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, PRView, WorldState
+from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
 from .planners import tasks
 from .tick import Choose, leg_class, run_item
@@ -66,19 +69,29 @@ def stored_verdict(runs: Iterable[LegRun], pr: int, head: str) -> Verdict | None
     return parse_verdict({"decision": raw.get("event"), "body": raw.get("body")})
 
 
-def wall_capped_before(runs: Iterable[LegRun], pr: int, head: str) -> bool:
-    """Whether this head's newest REVIEW leg since its last agent leg is a
-    machine end that left a session (a wall cap): the review was retried once,
-    so a second wall cap counts as an attempt (`classify_leg`'s `resumed`)."""
-    mine = sorted((r for r in runs if r.kind == AgentKind.REVIEW.name and run_item(r) == pr_key(pr)
-                   and r.head == head), key=lambda r: r.completed_at)
-    since = []
-    for run in reversed(mine):
-        if leg_class(run) is not LegClass.MACHINE:
-            break
-        since.append(run)
-    return any(isinstance((r.receipt or {}).get("session"), str) and (r.receipt or {}).get("session")
-               for r in since)
+@dataclass(frozen=True)
+class ReviewAct:
+    """The review role's act step: it only dispatches REVIEW legs, which
+    submit their own verdicts. Nothing is queued, so nothing replays."""
+
+    dispatch: Callable[[RunAgent], None]
+
+    def replay_pending(self) -> bool:
+        return True
+
+    def execute(self, action: Action) -> None:
+        if not isinstance(action, RunAgent):
+            raise TypeError(f"the review role does not execute {action!r}")
+        self.dispatch(action)
+
+
+class _NothingToReview(Exception):
+    """The head's base...head diff is empty: an end retrying cannot change."""
+
+
+# The prior review rides along whole up to this size; it is the bot's own
+# body, already bounded by REVIEW_BODY_LIMIT, so this only trims the extreme.
+_PRIOR_REVIEW_BYTES = 20_000
 
 
 @dataclass(frozen=True)
@@ -89,10 +102,11 @@ class ReviewSettings:
 
 
 class ReviewLegs:
-    """Runs one REVIEW leg and submits its verdict. A preparation failure (no
-    pinned checkout, no revision-bound diff) or a submission GitHub refused is
-    recorded as a refused (machine) leg, so the PR backs off instead of
-    retrying hot; neither ever counts as an attempt."""
+    """Runs one REVIEW leg and submits its verdict. A preparation or transport
+    failure is recorded as a refused (machine) leg, so the PR backs off instead
+    of retrying hot. GitHub refusing the submission, or an empty diff, is
+    recorded as an attempt, so the REVIEW attempt cap stops the PR at
+    `needs-human` (written by the fix role)."""
 
     def __init__(
         self,
@@ -104,7 +118,6 @@ class ReviewLegs:
         accounting,
         checkouts,
         prepare_cwd: Callable[[str], None] | None,
-        submit: Callable[[int, str, Verdict], None],
         task_config: tasks.ReviewTaskConfig,
         log: Callable[[str], None],
     ) -> None:
@@ -115,7 +128,6 @@ class ReviewLegs:
         self.accounting = accounting
         self.checkouts = checkouts
         self.prepare_cwd = prepare_cwd
-        self.submit = submit
         self.task_config = task_config
         self.log = log
 
@@ -135,11 +147,10 @@ class ReviewLegs:
             await self._run_claimed(action, issue, pr)
         finally:
             self.control.release_dispatch_claim(repo, "review", issue, owner)
-            if self.checkouts is not None:
-                try:
-                    self.checkouts.remove(action.number)
-                except Exception as exc:  # noqa: BLE001 - a stale checkout is disk, not state
-                    self.log(f"REVIEW PR #{action.number}: pinned checkout not removed: {exc}")
+            try:
+                self.checkouts.remove(action.number)
+            except Exception as exc:  # noqa: BLE001 - a stale checkout is disk, not state
+                self.log(f"REVIEW PR #{action.number}: pinned checkout not removed: {exc}")
 
     async def _run_claimed(self, action: RunAgent, issue: int, pr: PRView) -> None:
         bot = self.settings.harness.review_bot
@@ -148,8 +159,9 @@ class ReviewLegs:
             self.log(f"REVIEW PR #{action.number}: skipped — already reviewed at {action.head[:12]}")
             return
         runs = self.control.leg_runs(self.settings.repository, (issue,))
+        # A REVIEW leg never resumes a session, so a wall cap is an attempt.
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
-                                 head=action.head, resumed=wall_capped_before(runs, action.number, action.head))
+                                 head=action.head, resumed=True)
         verdict = stored_verdict(runs, action.number, action.head)
         if verdict is not None and not on_head:
             # A paid verdict whose submission never landed (a crash, or GitHub
@@ -158,6 +170,11 @@ class ReviewLegs:
             return
         try:
             task = self._task(action, pr)
+        except _NothingToReview:
+            self.log(f"REVIEW PR #{action.number}: base...head is empty at {action.head[:12]}; "
+                     "nothing to review (counted as an attempt)")
+            self.accounting.record_refused_leg(attempt={"summary": "nothing to review"})
+            return
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"REVIEW PR #{action.number}: preparation failed: {exc}")
             self.accounting.record_refused_leg()
@@ -174,27 +191,48 @@ class ReviewLegs:
         self._submit(action, verdict)
 
     def _submit(self, action: RunAgent, verdict: Verdict) -> None:
+        pr, head = action.number, action.head
         try:
-            self.submit(action.number, action.head, verdict)
-        except Exception as exc:  # noqa: BLE001 - GitHub refused or did not confirm: a machine end
-            self.log(f"REVIEW PR #{action.number}: submission failed, retried after backoff: {exc}")
+            landed = submit_review(self.gateway, pr, head, verdict, self.settings.harness.review_bot)
+        except Exception as exc:  # noqa: BLE001 - GitHub did not answer or confirm: a machine end
+            self.log(f"REVIEW PR #{pr}: submission failed, retried after backoff: {exc}")
             self.accounting.record_refused_leg()
+            return
+        if landed:
+            self.log(f"PR #{pr}: {verdict.event} stands on {head[:12]}")
+            return
+        self.log(f"REVIEW PR #{pr}: GitHub refused the {verdict.event} on {head[:12]} (counted as an attempt)")
+        self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
 
     def _task(self, action: RunAgent, pr: PRView):
-        if self.checkouts is None:
-            raise RuntimeError("no checkout to pin the review to: set TARGET_DIR")
         cwd = self.checkouts.ensure(action.number, action.head)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
         diff = self.gateway.pr_diff(action.number, pr.base_ref_oid, action.head)
-        if diff.head_oid != action.head or diff.base_oid != pr.base_ref_oid or not diff.text.strip():
+        if diff.head_oid != action.head or diff.base_oid != pr.base_ref_oid:
             raise RuntimeError("the revision-bound diff does not match the reviewed head")
+        if not diff.text.strip():
+            raise _NothingToReview
         discussion = format_pr_discussion(pr.comments)
+        prior = _prior_review(pr, self.settings.harness.review_bot)
         task = tasks.build_review_task(
             action.number, as_untrusted(pr.title), as_untrusted(pr.body), as_untrusted(diff.text),
             self.task_config, discussion=as_untrusted(discussion) if discussion else None,
+            prior_review=as_untrusted(prior) if prior else None,
         )
         return replace(task, cwd=cwd)
 
 
-__all__ = ["ReviewLegs", "ReviewSettings", "review_actions", "review_choose", "stored_verdict", "wall_capped_before"]
+def _prior_review(pr: PRView, bot: str) -> str:
+    """The review bot's latest review body on this PR, bounded and marked like
+    the discussion: what the reviewer asked for last round, so it can judge
+    whether the new commits answer it rather than re-judge from scratch."""
+    mine = [r for r in pr.reviews if login_eq(r.author, bot) and r.body.strip()]
+    latest = max(mine, key=lambda r: r.submitted_at, default=None)
+    if latest is None:
+        return ""
+    return format_pr_discussion((Comment(latest.author, latest.body),),
+                                body_bytes=_PRIOR_REVIEW_BYTES, total_bytes=_PRIOR_REVIEW_BYTES)
+
+
+__all__ = ["ReviewAct", "ReviewLegs", "ReviewSettings", "review_actions", "review_choose", "stored_verdict"]

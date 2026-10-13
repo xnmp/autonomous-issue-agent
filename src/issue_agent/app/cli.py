@@ -2428,10 +2428,6 @@ def cmd_init(args) -> int:
         return value
 
     fields: list[tuple[str, str]] = []
-    # Normalized once, here: every downstream comparison (and the reviewer-token
-    # prompt that hangs off it) must see the same value, whatever case was typed.
-    identity_mode = ask("Identity mode (three|solo)", "three").lower()
-    fields.append(("IDENTITY_MODE", identity_mode))
     gh_login = detect_fixer_login()
     if gh_login:
         ok(f"gh is authenticated as '{gh_login}'")
@@ -2452,7 +2448,7 @@ def cmd_init(args) -> int:
         fields.append(("GH_APP_ID", ask("GH App ID", "")))
         fields.append(("GH_APP_INSTALL_ID", ask("GH App installation ID", "")))
         fields.append(("GH_APP_KEY_FILE", ask("GH App private-key .pem path", "")))
-    elif identity_mode == "three":
+    else:
         # Without an App, approvals are posted with this PAT. Validating it here
         # (rather than only in doctor) is the difference between a wizard that
         # cannot produce a doctor-red config and one that reliably does.
@@ -2463,19 +2459,18 @@ def cmd_init(args) -> int:
         else:
             warn("no REVIEW_BOT_TOKEN set — the reviewer will act as the ambient gh "
                  "account and GitHub will 422 its approvals.")
-    if identity_mode == "three":
-        # Asked regardless of the App answer: the App covers review only,
-        # and the fixer's credential is FIX_BOT_TOKEN or nothing. Skipping this
-        # is what put keifu's fixer on a human account and its personal quota.
-        print()
-        print("  The fixer needs its OWN token too. Without FIX_BOT_TOKEN the fix")
-        print("  daemon falls through to the ambient `gh auth` credential: its")
-        print("  branches, comments and PRs are attributed to that human account,")
-        print("  and its GraphQL calls come out of that account's personal")
-        print("  5,000-point/hour pool.")
-        fix_token = prompt_fix_bot_token()
-        if fix_token:
-            fields.append(("FIX_BOT_TOKEN", fix_token))
+    # Asked regardless of the App answer: the App covers review only,
+    # and the fixer's credential is FIX_BOT_TOKEN or nothing. Skipping this
+    # is what put keifu's fixer on a human account and its personal quota.
+    print()
+    print("  The fixer needs its OWN token too. Without FIX_BOT_TOKEN the fix")
+    print("  daemon falls through to the ambient `gh auth` credential: its")
+    print("  branches, comments and PRs are attributed to that human account,")
+    print("  and its GraphQL calls come out of that account's personal")
+    print("  5,000-point/hour pool.")
+    fix_token = prompt_fix_bot_token()
+    if fix_token:
+        fields.append(("FIX_BOT_TOKEN", fix_token))
     _wizard_pool_summary(fields)
     print()
     claude_ready = detect_claude_auth()

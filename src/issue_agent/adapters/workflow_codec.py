@@ -138,7 +138,7 @@ class WorkflowEncodingError(ValueError):
 def _encode(value: object, depth: int = 0) -> object:
     if depth > MAX_WORKFLOW_PAYLOAD_DEPTH:
         raise WorkflowEncodingError("workflow payload nesting is excessive")
-    if type(value) in _ENUM_TYPES:
+    if isinstance(value, Enum) and type(value) in _ENUM_TYPES:
         return {"type": type(value).__name__, "value": value.value}
     if type(value) in _VALUE_FIELDS and is_dataclass(value):
         return {

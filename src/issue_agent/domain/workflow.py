@@ -913,24 +913,6 @@ class ConsumedRetryAuthorization:
         _count(self.command_attempt, "command attempt", minimum=1)
 
 
-@dataclass(frozen=True)
-class RetryBegan:
-    consumed: ConsumedRetryAuthorization
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.consumed, ConsumedRetryAuthorization):
-            raise ValueError("new retry requires committed consumption")
-
-
-@dataclass(frozen=True)
-class RetryAlreadyConsumed:
-    consumed: ConsumedRetryAuthorization
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.consumed, ConsumedRetryAuthorization):
-            raise ValueError("retry replay requires prior consumption")
-
-
 class RetryDisposition(str, Enum):
     """How an operator grant ended without buying an attempt."""
     NOT_NEEDED = "not_needed"
@@ -955,20 +937,6 @@ class ClosedRetryAuthorization:
         if not isinstance(self.disposition, RetryDisposition):
             raise ValueError("a closed grant requires a typed disposition")
         _text(self.reason, "grant disposition reason", limit=MAX_DETAIL_CHARS)
-
-
-@dataclass(frozen=True)
-class RetryDeclined:
-    closed: ClosedRetryAuthorization
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.closed, ClosedRetryAuthorization):
-            raise ValueError("a declined retry requires its terminal grant")
-
-
-@dataclass(frozen=True)
-class RetryStale:
-    """The command's reconciliation moved after the executor's read; nothing was spent."""
 
 
 @dataclass(frozen=True)

@@ -18,12 +18,12 @@
 
 **Goal:** run agent legs on
 **GPT-5.5 via the OpenAI Codex CLI** instead of the Claude Agent SDK, to cut cost,
-**without touching the domain model**. `REVIEWER_RUNTIME=codex` runs review and
-re-review legs through the same runner; the steward remains on Claude.
+**without touching the domain model**. `REVIEWER_RUNTIME=codex` runs REVIEW
+legs through the same runner; the steward remains on Claude.
 
 ## Reviewer runtime
 
-`REVIEWER_RUNTIME` defaults to `codex`, with `REVIEW_MODEL=gpt-5.6-terra`.
+`REVIEWER_RUNTIME` defaults to `codex`, with `REVIEW_MODEL=gpt-6.1-sol`.
 `REVIEWER_RUNTIME=claude` is the explicit opt-in for Claude. For self-hosting,
 mixed fixer/reviewer runtimes remain recommended: they preserve the diversity
 guard that prevents one runtime regression from both creating and approving a

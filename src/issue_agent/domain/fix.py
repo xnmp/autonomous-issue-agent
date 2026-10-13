@@ -3,12 +3,11 @@ the fix decision itself; the fix role now runs on `state`/`policy`)."""
 
 from __future__ import annotations
 
-from .identity import IdentityMode
 from .refs import is_governed_branch
 
 
 def harness_merges_branch(
-    head_ref_name: str, *, auto_merge: bool, identity_mode: IdentityMode,
+    head_ref_name: str, *, auto_merge: bool,
 ) -> bool:
     """Whether the fixer, not an operator, merges a PR on this branch.
 
@@ -16,10 +15,6 @@ def harness_merges_branch(
     widens what we REVIEW, never what we MERGE. Keyed on the branch, which only
     the fixer creates, not on closing references a stranger can write.
     """
-    return (
-        auto_merge
-        and identity_mode == IdentityMode.THREE
-        and is_governed_branch(head_ref_name)
-    )
+    return auto_merge and is_governed_branch(head_ref_name)
 
 

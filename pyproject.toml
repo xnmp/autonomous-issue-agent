@@ -76,7 +76,10 @@ ignore-missing-imports = ["fastapi", "fastapi.*", "uvicorn"]
 # `make typecheck` re-enables seam-sensitive rules for the explicit authority
 # port conformance module while this migration backlog is retired.
 bad-argument-type = "ignore"
-missing-attribute = "ignore"
+# On everywhere: off, it hid `EvidenceUnavailable.source` (the field is
+# `required_fact`), which made every projection of that gate raise, and
+# per-file re-enables went stale as files were deleted (slice 5c).
+missing-attribute = "error"
 bad-index = "ignore"
 unsupported-operation = "ignore"
 bad-assignment = "ignore"
@@ -87,75 +90,13 @@ bad-return = "ignore"
 unsafe-overlap = "ignore"
 no-matching-overload = "ignore"
 
-# ADR 0015 resolve slice: attribute typos on authority/wire projections are
-# re-enabled here while the project-wide backlog above is retired. A disabled
-# missing-attribute rule once hid `EvidenceUnavailable.source` (the field is
-# `required_fact`), which made every projection of that gate raise.
+# Tests stay at "ignore" for now: fakes and probes reach into attributes the
+# declared types do not carry (~350 sites); the rule binds on src.
 [[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/app/dashweb/resolve_*.py"
+matches = "tests/**"
 
 [tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/app/resolve_control.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/app/workflows/resolve_rearm.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/domain/workflow*.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/domain/resolve_rearm.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/adapters/workflow_control.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/app/dashweb/review_*.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/app/review_control.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/domain/review_control.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/domain/review_rearm.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
-
-[[tool.pyrefly.sub-config]]
-matches = "src/issue_agent/domain/review_dispatch_record.py"
-
-[tool.pyrefly.sub-config.errors]
-missing-attribute = "error"
+missing-attribute = "ignore"
 
 # ── Architectural linting (import-linter) ─────────────────────────────────────
 # Enforces the hexagonal layering the design depends on: the domain is pure

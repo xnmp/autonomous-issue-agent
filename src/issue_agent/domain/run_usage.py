@@ -85,11 +85,12 @@ def price_run_usage(observed: RunUsage, table: RateTable | None) -> Money:
     currency = table.currency if table is not None else "USD"
     if any(s.reported_cost is not None and s.reported_cost.currency != currency for s in observed.samples):
         raise ValueError("reported request cost currency differs from the rate card")
-    return Money(currency, sum(
-        (s.reported_cost if s.reported_cost is not None else
-         price(s.usage, table.rates_for(s.model), currency)).micros
-        for s in observed.samples if s.reported_cost is not None or table is not None and table.priceable(s.model)
-    ))
+    reported = tuple(s.reported_cost for s in observed.samples if s.reported_cost is not None)
+    priced = () if table is None else tuple(
+        price(s.usage, table.rates_for(s.model), currency)
+        for s in observed.samples if s.reported_cost is None and table.priceable(s.model)
+    )
+    return Money(currency, sum(m.micros for m in (*reported, *priced)))
 
 
 def usage_lower_bound(first: TokenUsage, second: TokenUsage) -> TokenUsage:

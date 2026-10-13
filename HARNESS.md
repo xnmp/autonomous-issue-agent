@@ -63,7 +63,7 @@ Important fields:
   process that survived discovery loses all write authority, and an old service
   started after reboot exits cleanly instead of reacquiring work. Use a
   different `--name` for another repository; do not hand-author the lineage.
-- `FIX_BOT` must differ from `REVIEW_BOT` in three-identity mode.
+- `FIX_BOT` must differ from `REVIEW_BOT`.
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
 - `FIXER_RUNTIME=claude|codex|glm`;
@@ -373,14 +373,17 @@ The review role has no operator API since slice 5c; the review rejection
 family, its ceiling gates, re-arm, retry grants and dashboard review panel are
 deleted. The role owes one REVIEW leg when CI is green on a harness PR's head
 and the review bot has no standing verdict on that head. It submits the parsed
-verdict as one review on that commit; a verdict whose submission failed is
-resubmitted after the machine backoff without buying the review again.
-Everything else is the fix role's: a bot change request is answered by an
-`ADDRESS_REVIEW` leg, and three unusable verdicts on one head, or repeated bot
+verdict as one review on that commit, with the bot's previous review of the
+pull request in the prompt. A submission GitHub did not answer is resubmitted
+after the machine backoff without buying the review again; one GitHub refused
+(a 4xx, such as a token without pull-request write) counts as an attempt, as
+does a head whose diff is empty. Everything else is the fix role's: a bot
+change request is answered by an `ADDRESS_REVIEW` leg, and three attempts on
+one head (unusable verdicts, refusals, empty diffs), or repeated bot
 change-request rounds, stop the pull request at `needs-human`. To buy a fresh
-review of the same head, dismiss the bot's review on GitHub. Under
-`IDENTITY_MODE=solo` the review bot cannot approve its own pull request, so
-GitHub refuses the submission and the review retries on the machine backoff.
+review of the same head, dismiss the bot's review on GitHub. The role refuses
+to start without `TARGET_DIR`, or when its credential's login is not
+`REVIEW_BOT`.
 
 ### Family activation (deleted)
 

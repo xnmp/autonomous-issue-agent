@@ -1198,6 +1198,9 @@ class GitHubGateway:
     def pr_diff(
         self, pr: int, base_oid: str, head_oid: str
     ) -> PullRequestDiff:
+        """base...head as GitHub compares it. Empty text is GitHub's answer
+        (no change between the commits, or a compare it refused); an outage
+        raises `GhUnavailable`. The review role refuses to review an empty diff."""
         if not base_oid or not head_oid:
             raise ValueError("pull-request diff revisions are required")
         text = self._gh(
@@ -1208,8 +1211,6 @@ class GitHubGateway:
                 f"repos/{self.repo}/compare/{base_oid}...{head_oid}",
             ]
         )
-        if not text.strip():
-            raise RuntimeError("immutable pull-request diff is unavailable")
         return PullRequestDiff(base_oid, head_oid, text)
 
     # ── prompt inputs for the two repair legs (review M13 / D6) ──
@@ -1288,15 +1289,22 @@ class GitHubGateway:
             return ""
 
 
+    def viewer_login(self) -> str:
+        """The login this gateway's credential acts as, or "" when GitHub
+        refused to say. GraphQL `viewer`, not REST `/user`: an App installation
+        token answers it (as `slug[bot]`) and is refused by `/user`."""
+        return self._gh(
+            ["api", "graphql", "-f", "query=query{viewer{login}}", "--jq", ".data.viewer.login"]
+        ).strip()
+
     def submit_review(
         self, pr: int, event: str, body: str, head: str
     ) -> bool:
-        """POST a review. Returns True iff gh succeeded. A failed submit (e.g. 422
-        'can't approve your own PR' when the identity collides with the author, or a
-        403 from a misconfigured App) returns False so the caller does NOT record a
-        phantom 'reviewed' state — the daemon retries the same PR next poll. The
-        underlying gh failure is surfaced on stderr by `_subprocess_runner`. gh's
-        `api ... POST` prints the created-review JSON on success (non-empty)."""
+        """POST a review. True iff GitHub created it. False is GitHub's refusal
+        (a 4xx: 422 'can't approve your own PR', a 403 from a token without
+        pull-request write), which retrying cannot change; an outage raises
+        `GhUnavailable` instead. gh's `api ... POST` prints the created-review
+        JSON on success (non-empty)."""
         out = self._gh(
             build_submit_review_args(self.repo, pr, event, body, head)
         )

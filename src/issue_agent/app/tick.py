@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 
 from ..adapters.control_store import LegRun
+from ..adapters.accounting_runtime import LEG_ROLES
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.outcome import LegClass
@@ -24,8 +25,6 @@ from ..domain.policy import question_text
 from ..domain.refs import harness_branch_issue
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, pr_key
 from ..domain.world import WorldState
-
-ROLES = ("fix", "review")
 
 
 def run_item(run: LegRun) -> ItemKey | None:
@@ -115,13 +114,13 @@ class Facts:
 
     def held_issues(self) -> set[int]:
         repo = self.repository
-        held = {c.target_key for role in ROLES for c in self.control.active_dispatch_claims(repo, role)}
+        held = {c.target_key for role in LEG_ROLES for c in self.control.active_dispatch_claims(repo, role)}
         for lease in self.control.leases():
             try:
                 dispatch = json.loads(lease.dispatch_id)
             except (TypeError, ValueError):
                 continue
-            if isinstance(dispatch, dict) and dispatch.get("role") in ROLES and dispatch.get("repository") == repo:
+            if isinstance(dispatch, dict) and dispatch.get("role") in LEG_ROLES and dispatch.get("repository") == repo:
                 held.add(dispatch.get("issue"))
         return held
 
@@ -176,6 +175,6 @@ def lease_slots(daemon_ref: Mapping[str, object]) -> Callable[[], int]:
 
 
 __all__ = [
-    "ROLES", "Choose", "Facts", "decide_with", "dispatch_item", "item_issues", "lease_slots", "leased_items",
+    "Choose", "Facts", "decide_with", "dispatch_item", "item_issues", "lease_slots", "leased_items",
     "leg_class", "leg_end", "local_legs", "run_item",
 ]

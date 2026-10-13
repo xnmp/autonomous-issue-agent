@@ -2521,9 +2521,8 @@ def test_a_re_armed_row_with_a_lifetime_escalation_does_not_alarm():
 
 def _harness_merges_governed(branch: str) -> bool:
     from issue_agent.domain.fix import harness_merges_branch
-    from issue_agent.domain.identity import IdentityMode
 
-    return harness_merges_branch(branch, auto_merge=True, identity_mode=IdentityMode.THREE)
+    return harness_merges_branch(branch, auto_merge=True)
 
 
 def _approved_row(*later):

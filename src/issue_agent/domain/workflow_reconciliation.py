@@ -6,8 +6,7 @@ import hashlib
 
 from .contracts import CommandId
 from .workflow import (
-    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, EvidenceUnavailable,
-    NoAuthorizedRemediation, OpenGate, ReconciliationOnly,
+    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, OpenGate, ReconciliationOnly,
     ReconciliationPolicy, RemediationAttempted, RemediationOperation,
     RemediationOutcome, RemoteOutcomeUncertain, RetiredSettledCommand,
     RetiredUncertainCommand, RetryAuthorizationRequired,
@@ -172,42 +171,3 @@ def prewrite_evidence_gate_id(command_id: CommandId) -> str:
     return _PREWRITE_GATE_PREFIX + hashlib.sha256(str(command_id).encode()).hexdigest()
 
 
-def unavailable_prewrite_read(
-    binding: WorkflowBinding,
-    command_id: CommandId,
-    prior: ActiveReconciliation | None,
-    *,
-    now: datetime,
-    error: str,
-    policy: ReconciliationPolicy = ReconciliationPolicy(),
-) -> ReconciliationProgress:
-    """Schedule the next guard read of a command that has not written (ADR 0012).
-
-    No write happened, so nothing is uncertain; the command simply cannot
-    decide yet. Reads back off exponentially and, at the age/read ceiling,
-    an `EvidenceUnavailable` gate makes the stall visible. Reads continue at
-    the maximum delay; the first complete read ends the schedule and closes
-    the gate when the command begins.
-    """
-    validate_workflow_identifier(command_id, "command")
-    if not isinstance(binding, WorkflowBinding) or not isinstance(policy, ReconciliationPolicy):
-        raise ValueError("pre-write scheduling requires validated authority and policy")
-    if prior is not None and not isinstance(prior, ActiveReconciliation):
-        raise ValueError("pre-write history must be a validated schedule")
-    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError("pre-write scheduling requires a timezone-aware clock")
-    if not isinstance(error, str) or not error:
-        raise ValueError("an unavailable pre-write read records why")
-    since = prior.unresolved_since if prior is not None else now
-    if now < since:
-        raise ValueError("pre-write read precedes its unresolved history")
-    reads = min(prior.failed_reads + 1, 2**63 - 1) if prior is not None else 1
-    delay = min(policy.maximum_delay_seconds, policy.initial_delay_seconds * 2 ** min(reads - 1, 17))
-    history = ActiveReconciliation(since, now + timedelta(seconds=delay), reads)
-    if reads < policy.maximum_reads and (now - since).total_seconds() < policy.maximum_age_seconds:
-        return ReconciliationProgress(history, None)
-    return ReconciliationProgress(history, OpenGate(
-        prewrite_evidence_gate_id(command_id), binding.fence.generation,
-        EvidenceUnavailable(f"pre-write guard read for command {command_id}", since, reads, error),
-        NoAuthorizedRemediation("a complete harness read of the guarded target is required before the write"),
-    ))

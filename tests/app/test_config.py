@@ -13,7 +13,6 @@ from issue_agent.app.config import (
     render_agent_md,
 )
 from issue_agent.app.main import _load_agent_env
-from issue_agent.domain.identity import IdentityMode
 
 
 def test_metadata_backed_choices_drive_parsing_and_the_example():
@@ -112,7 +111,6 @@ def test_defaults():
     c = from_env({"REPO": "o/r"})
     assert c.repo == "o/r"
     assert c.base_branch == "dev"
-    assert c.identity_mode == "three"
     assert c.auto_merge is True
     assert c.poll_seconds == 20
 
@@ -227,44 +225,6 @@ def test_validate_fails_loud_on_empty_repo():
 def test_validate_rejects_repository_alias_and_url_shapes(repository):
     with pytest.raises(ValueError, match="REPO"):
         from_env({"REPO": repository}).validate()
-
-
-def test_a_shell_command_is_logged_quoted_and_whole_when_it_fits():
-    """#35: the boot line used to print the literal word `set` for a present
-    TEST_CMD, which for `TEST_CMD='set -e; cargo test …'` is indistinguishable
-    from a value truncated at the first space. It must show the command."""
-    from issue_agent.app.config import describe_command
-
-    out = describe_command("set -e; cargo test --quiet && cargo fmt --check")
-
-    assert "set -e; cargo test --quiet && cargo fmt --check" in out
-    assert out.startswith("'") or out.startswith('"')   # quoted, so spaces read
-    assert "…" not in out
-
-
-def test_a_long_shell_command_is_truncated_visibly_with_its_true_length():
-    from issue_agent.app.config import describe_command
-
-    out = describe_command("x" * 500, limit=10)
-
-    assert "…" in out                 # the cut is announced, never silent
-    assert "(len=500)" in out         # and the real size is always stated
-    assert len(out) < 60
-
-
-def test_an_unset_shell_command_is_reported_as_empty_not_as_quotes():
-    from issue_agent.app.config import describe_command
-
-    assert describe_command("") == "EMPTY"
-    assert describe_command(None) == "EMPTY"
-    assert describe_command("", empty="none") == "none"
-
-
-def test_describe_shows_the_real_alert_command():
-    c = from_env({"REPO": "o/r", "ALERT_CMD": "notify-send 'harness capped'"})
-    d = c.describe()
-
-    assert "notify-send 'harness capped'" in d or 'notify-send' in d
 
 
 def test_describe_reports_effective_values_and_no_secrets():
@@ -654,12 +614,12 @@ def test_empty_repo_falls_back_to_a_fixed_slug_not_a_shared_default():
     assert c.state_dir.endswith("issue-agent/unknown")
 
 
-def test_identity_cross_check_fires_on_normalized_equal_bots_under_three_mode():
+def test_identity_cross_check_fires_on_normalized_equal_bots():
     # review C1/D1 belt-and-braces: a raw string compare would miss
     # `fix-bot` vs `fix-bot[bot]` and let a self-approving pair through,
     # which GitHub rejects with a 422 on every approval, forever.
     c = from_env({
-        "REPO": "x", "IDENTITY_MODE": "three",
+        "REPO": "x",
         "FIX_BOT": "fix-bot", "REVIEW_BOT": "fix-bot[bot]",
     })
     errors = c.validation_errors()
@@ -669,58 +629,8 @@ def test_identity_cross_check_fires_on_normalized_equal_bots_under_three_mode():
 def test_identity_cross_check_does_not_fire_on_distinct_bots():
     # Anti-vacuity twin: genuinely distinct identities must not be flagged.
     c = from_env({
-        "REPO": "x", "IDENTITY_MODE": "three",
+        "REPO": "x",
         "FIX_BOT": "fix-bot", "REVIEW_BOT": "review-bot",
-    })
-    assert c.validation_errors() == ()
-
-
-# ── M16: IDENTITY_MODE is an enum with a validation entry, not a bare string ──
-# `IDENTITY_MODE=Three` used to sail through as a string and land BETWEEN the two
-# guards that read it, which have OPPOSITE polarity: `!= "three"` disabled
-# auto-merge while `== "solo"` left the reviewer enabled. The harness reviewed,
-# approved, and never merged anything — with nothing in the log naming the cause.
-def test_identity_mode_parses_to_the_enum():
-    assert from_env({"REPO": "x", "IDENTITY_MODE": "solo"}).identity_mode is IdentityMode.SOLO
-    assert from_env({"REPO": "x", "IDENTITY_MODE": "three"}).identity_mode is IdentityMode.THREE
-    assert from_env({"REPO": "x"}).identity_mode is IdentityMode.THREE  # unset → default
-
-
-def test_identity_mode_casing_typo_is_a_validation_error_not_a_silent_mode():
-    c = from_env({"REPO": "x", "IDENTITY_MODE": "Three", "FIX_BOT": "f", "REVIEW_BOT": "r"})
-    assert any("IDENTITY_MODE" in e and "Three" in e for e in c.validation_errors())
-    # …and the value the daemons would run on is the SAFE default, not the typo:
-    # nothing downstream may see a mode that matches neither guard.
-    assert c.identity_mode is IdentityMode.THREE
-
-
-def test_identity_mode_misspelling_is_a_validation_error_too():
-    c = from_env({"REPO": "x", "IDENTITY_MODE": "thre", "FIX_BOT": "f", "REVIEW_BOT": "r"})
-    assert any("IDENTITY_MODE" in e for e in c.validation_errors())
-
-
-def test_identity_mode_whitespace_is_tolerated_not_flagged():
-    # Anti-vacuity twin: a value that only differs by the whitespace a shell heredoc
-    # or `export IDENTITY_MODE="solo "` leaves behind is NOT a misconfiguration.
-    c = from_env({"REPO": "x", "IDENTITY_MODE": " solo "})
-    assert c.identity_mode is IdentityMode.SOLO
-    assert not any("IDENTITY_MODE" in e for e in c.validation_errors())
-
-
-def test_identity_mode_bad_value_refuses_to_start():
-    # validate() is what main.py calls: a mode nothing can act on must stop the
-    # daemon at startup rather than produce a half-working harness.
-    with pytest.raises(ValueError, match="IDENTITY_MODE"):
-        from_env({"REPO": "x", "IDENTITY_MODE": "THREE"}).validate()
-
-
-def test_identity_cross_check_does_not_fire_outside_three_mode():
-    # Same normalized-equal bots, but not in three-identity mode — the
-    # self-approval trap only applies when review is expected to be a
-    # distinct identity from the fixer.
-    c = from_env({
-        "REPO": "x", "IDENTITY_MODE": "solo",
-        "FIX_BOT": "fix-bot", "REVIEW_BOT": "fix-bot[bot]",
     })
     assert c.validation_errors() == ()
 
@@ -741,7 +651,7 @@ def test_identity_cross_check_fires_despite_trailing_whitespace_on_fix_bot():
     # normalized to itself while "fix-bot[bot]" normalized to "fix-bot", and
     # the (unequal-looking) strings never tripped the self-approval guard.
     c = from_env({
-        "REPO": "x", "IDENTITY_MODE": "three",
+        "REPO": "x",
         "FIX_BOT": "fix-bot ", "REVIEW_BOT": "fix-bot[bot]",
     })
     errors = c.validation_errors()
@@ -752,7 +662,7 @@ def test_identity_cross_check_whitespace_does_not_flag_genuinely_distinct_bots()
     # Anti-vacuity twin: the whitespace-tolerant normalization must not start
     # flagging genuinely distinct identities just because one has padding.
     c = from_env({
-        "REPO": "x", "IDENTITY_MODE": "three",
+        "REPO": "x",
         "FIX_BOT": " fix-bot ", "REVIEW_BOT": "review-bot",
     })
     assert c.validation_errors() == ()
@@ -1053,19 +963,19 @@ def test_file_value_wins_over_inherited_value(tmp_path):
 
 
 def test_shell_escaped_values_survive_the_file_read(tmp_path):
-    # compose-env.sh writes `printf '%s=%q'`, so a real command value such as
-    # ALERT_CMD lands backslash-escaped.
+    # compose-env.sh writes `printf '%s=%q'`, so a value with shell syntax
+    # lands backslash-escaped.
     env_file = tmp_path / "active.env"
     cmd = "set -e; (cd backend && uv run pytest) && pnpm exec tsc -b"
     quoted = subprocess.run(
-        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "ALERT_CMD", cmd],
+        ["bash", "-c", 'printf "%s=%q" "$1" "$2"', "_", "REVIEW_PROMPT", cmd],
         capture_output=True, text=True, check=True,
     ).stdout
     env_file.write_text(f"REPO=o/r\n{quoted}\n")
 
     c = from_env({"AGENT_ENV": str(env_file)})
 
-    assert c.alert_cmd == cmd
+    assert c.review_prompt == cmd
 
 
 def test_unparseable_agent_env_file_falls_back_to_process_env(tmp_path):

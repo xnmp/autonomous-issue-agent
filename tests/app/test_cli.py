@@ -1890,7 +1890,7 @@ def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None
 
 def _wizard_answers(**over) -> list[str]:
     base = {
-        "mode": "three", "fix": "fix-bot", "review": "review-bot",
+        "fix": "fix-bot", "review": "review-bot",
         "app": "N",
         "fixer_runtime": "claude", "reviewer_runtime": "claude",
     }
@@ -1934,7 +1934,7 @@ def test_cmd_init_reprompts_when_reviewer_is_the_fixer(tmp_path, monkeypatch, ca
     differ only by case or a [bot] suffix."""
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "Fix-Bot[bot]", "review-bot",
+        answers=["fix-bot", "Fix-Bot[bot]", "review-bot",
                  "N", "claude", "claude"],
         secrets=["", ""],
     )
@@ -1950,7 +1950,7 @@ def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(
     """A stubborn operator must not be able to hold the wizard open forever."""
     shared, asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "fix-bot", "fix-bot", "fix-bot",
+        answers=["fix-bot", "fix-bot", "fix-bot", "fix-bot",
                  "N", "claude", "claude"],
         secrets=["", ""],
     )
@@ -2152,19 +2152,6 @@ def test_cmd_init_names_the_consequence_when_the_fixer_token_is_skipped(
     assert "FIX_BOT_TOKEN is not set" in stderr  # the doctor finding, at config time
 
 
-def test_cmd_init_does_not_ask_for_a_fixer_token_in_solo_mode(tmp_path, monkeypatch):
-    """solo mode has no bot identities: the human IS the reviewer and ambient is
-    the documented arrangement, so there is nothing to attribute away."""
-    shared, _asked, secrets = _init_env(
-        tmp_path, monkeypatch,
-        answers=_wizard_answers(mode="solo"), secrets=["never-read"],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "FIX_BOT_TOKEN" not in _shared_values(shared.read_text())
-    assert secrets.prompts == []
-
-
 def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configured(
     tmp_path, monkeypatch
 ):
@@ -2175,7 +2162,7 @@ def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configure
     ambient credential)."""
     shared, _asked, secrets = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "y",
+        answers=["fix-bot", "review-bot", "y",
                  "123", "456", "/keys/app.pem", "claude", "claude"],
         secrets=["fixer-pat"],
         gh=_gh_stub(token_logins={"fixer-pat": "fix-bot"}),
@@ -2202,7 +2189,7 @@ def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
     )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "N",
+        answers=["fix-bot", "review-bot", "N",
                  "claude", "codex"],
         secrets=["", ""], codex=shadowed,
     )
@@ -2216,7 +2203,7 @@ def test_cmd_init_leaves_codex_bin_unpinned_when_resolution_is_clean(
 ):
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "N",
+        answers=["fix-bot", "review-bot", "N",
                  "claude", "codex", "https://api.openai.com/v1"],
         secrets=["", ""],
         codex=_codex_report(path="/opt/codex", version="0.147.0"),
@@ -2256,7 +2243,7 @@ def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
     )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "N",
+        answers=["fix-bot", "review-bot", "N",
                  "claude", "codex", "n", "https://api.openai.com/v1"],
         secrets=["", ""], codex=shadowed,
     )
@@ -2282,13 +2269,12 @@ def test_cmd_init_survives_eof_midway_and_still_writes_a_config(
 ):
     """Ctrl-D partway through takes the remaining defaults instead of exploding."""
     shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=["three", "fix-bot"], secrets=[],
+        tmp_path, monkeypatch, answers=["fix-bot"], secrets=[],
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     values = _shared_values(shared.read_text())
     assert values["FIX_BOT"] == "fix-bot"
-    assert values["IDENTITY_MODE"] == "three"
     assert "REVIEW_BOT_TOKEN" not in values
 
 
@@ -2815,21 +2801,6 @@ def test_cmd_init_tightens_an_existing_shared_env_before_writing_secrets(
     assert modes == ["0o600"]  # already private when the descriptor was taken
     assert oct(shared.stat().st_mode & 0o777) == "0o600"
     assert "good" in shared.read_text()
-
-
-def test_cmd_init_identity_mode_is_case_insensitive(tmp_path, monkeypatch):
-    """`Three` must take the same path as `three` — the reviewer-token prompt
-    hangs off this comparison."""
-    shared, _asked, secrets = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(mode="THREE"),
-        secrets=["good"], gh=_gh_stub(token_logins={"good": "review-bot"}),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    values = _shared_values(shared.read_text())
-    assert values["IDENTITY_MODE"] == "three"
-    assert values["REVIEW_BOT_TOKEN"] == "good"
-    assert secrets.prompts  # the token prompt DID fire
 
 
 def test_main_exits_130_on_keyboard_interrupt(monkeypatch, capsys):

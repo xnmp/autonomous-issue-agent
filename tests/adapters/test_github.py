@@ -397,6 +397,19 @@ def test_submit_review_returns_true_on_success():
     assert argv[1] == "api" and "--method" in argv and "POST" in argv
 
 
+def test_viewer_login_names_the_identity_the_credential_acts_as():
+    fr = FakeRunner({"api graphql": "review-app[bot]\n"})
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.viewer_login() == "review-app[bot]"
+    argv, _ = fr.calls[0]
+    assert "query=query{viewer{login}}" in argv
+
+
+def test_viewer_login_is_empty_when_github_refuses_to_answer():
+    assert GitHubGateway("o/r", runner=FakeRunner()).viewer_login() == ""
+
+
 def test_submit_review_returns_false_on_failure():
     # a failed POST (422/403) → runner returns "" (and logs stderr) → False.
     fr = FakeRunner()  # no canned response → "" for every call
@@ -418,11 +431,10 @@ def test_pr_diff_is_fetched_for_exact_observed_revisions():
     assert "repos/o/r/compare/base-sha...head-sha" in argv
 
 
-def test_pr_diff_empty_read_is_unavailable_not_approvable():
+def test_pr_diff_empty_answer_is_returned_empty_not_invented():
     gw = GitHubGateway("o/r", runner=FakeRunner())
 
-    with pytest.raises(RuntimeError, match="diff is unavailable"):
-        gw.pr_diff(100, "base-sha", "head-sha")
+    assert gw.pr_diff(100, "base-sha", "head-sha").text == ""
 
 
 def test_get_issue_parses_response():

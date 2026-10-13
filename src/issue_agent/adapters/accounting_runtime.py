@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import uuid
 import contextvars
 import json
@@ -50,7 +51,7 @@ from .control_store import (
     SettlementRequest,
 )
 
-_LEG_ROLES = frozenset({"fix", "review"})
+LEG_ROLES = frozenset({"fix", "review"})
 _UNLIMITED_ACCOUNTING_MICROS = 9_000_000_000_000_000_000
 _SUMMARY_LIMIT = 20000
 
@@ -143,16 +144,21 @@ class AccountingRuntime(AgentRuntime):
         self.record_refused_leg()
         return _return_refused(detail)
 
-    def record_refused_leg(self) -> None:
+    def record_refused_leg(self, attempt: Mapping[str, object] | None = None) -> None:
         """Record a refusal before admission as an ordinary zero-cost run.
 
         A refusal buys nothing and mints no paid run, so without this row the
         backoff never saw it and the item re-dispatched every poll (#262,
         tauri PR #1019). Cancelled, released and receipt-less, the row reads
         as a machine end and nothing else counts it.
+
+        `attempt` is for an end that retrying cannot change (GitHub refused
+        the review a leg produced; the head has nothing to review): it is
+        written as an agent leg's receipt, so the item's attempt cap stops it
+        at `needs-human` instead of a free retry looping forever.
         """
         issue, kind, number, *_, head, _resumed = self._context.get()
-        if self.role not in _LEG_ROLES or issue is None or not kind:
+        if self.role not in LEG_ROLES or issue is None or not kind:
             return
         run_id = RunId(uuid.uuid4().hex)
         dispatch_id = json.dumps({"repository": self.repository, "role": self.role, "kind": kind, "issue": issue,
@@ -161,6 +167,10 @@ class AccountingRuntime(AgentRuntime):
         try:
             self.store.start_run(run_id, dispatch_id, kind, self.owner_id or f"{self.repository}:{self.role}",
                                  self.config_version)
+            if attempt is not None:
+                self.store.receipt(LEG_NAMESPACE, self.repository, str(run_id), {
+                    **attempt, "leg": LegClass.AGENT.value, "runtime": self.runtime_name,
+                })
             self.store.complete_run(run_id, state="cancelled", outcome="admission_refused")
         except Exception:  # noqa: BLE001 - the refusal itself must still return
             pass
@@ -170,7 +180,7 @@ class AccountingRuntime(AgentRuntime):
             return self._refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
         issue, kind, number, claim_target, workflow, head, resumed = self._context.get()
-        if self.role in _LEG_ROLES and workflow is not None:
+        if self.role in LEG_ROLES and workflow is not None:
             return self._refused("a role's leg is a plain leg: no workflow binding")
         # ADR 0008: paid admission binds the decision-side target unchanged.
         target = (
@@ -312,7 +322,7 @@ class AccountingRuntime(AgentRuntime):
         except BaseException:
             self._recover_or_release(run_id)
             raise
-        if self.role in _LEG_ROLES:
+        if self.role in LEG_ROLES:
             # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
             leg = classify_leg(result, resumed=resumed)

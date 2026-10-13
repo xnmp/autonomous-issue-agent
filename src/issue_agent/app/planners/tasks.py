@@ -560,6 +560,22 @@ _DISCUSSION_NOTE = (
 )
 
 
+# The deleted re-review task carried the bot's prior review; without it the
+# reviewer re-judged every round from scratch and re-raised answered points
+# (the #613/#614 class) while REVIEW_PROMPT told it not to.
+_PRIOR_REVIEW_NOTE = (
+    "Your latest earlier review of this PR is below, as you posted it. Judge "
+    "whether the new commits answer it: do not re-raise a point they resolve, "
+    "and say so plainly if one is still open."
+)
+
+
+def _prior_review_section(prior_review: Untrusted | None) -> str:
+    if prior_review is None or not prior_review.value.strip():
+        return ""
+    return f"{_PRIOR_REVIEW_NOTE}\n{_fenced('prior review', prior_review)}"
+
+
 def _discussion_section(discussion: Untrusted | None) -> str:
     """The PR thread as a fenced DATA section, or "" when there is none.
 
@@ -577,6 +593,7 @@ def build_review_task(
     diff: Untrusted,
     cfg: ReviewTaskConfig,
     discussion: Untrusted | None = None,
+    prior_review: Untrusted | None = None,
 ) -> PlannedRun:
     """One REVIEW leg on one exact head. The untrusted conversation comes last,
     nearest the diff it comments on and after every harness-voice section."""
@@ -586,6 +603,7 @@ def build_review_task(
         _VISUAL_REVIEW_NOTE,
         _CHECKOUT_NOTE,
         _fenced("diff", diff),
+        _prior_review_section(prior_review),
         _discussion_section(discussion),
     )
     return PlannedRun(
