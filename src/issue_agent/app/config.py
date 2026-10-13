@@ -85,15 +85,6 @@ def prior_deployment_identities(
     )
 
 
-def configured_prior_owner_ids(cfg: HarnessConfig, role: str) -> tuple[str, ...]:
-    """Owner predecessors passed to daemon boot's adoption operation."""
-    return tuple(
-        owner
-        for repository, deployment in prior_deployment_identities(cfg, role)
-        for owner in (f"{repository}:{role}", f"{repository}:{role}:{deployment}")
-    )
-
-
 def parse_repoint_history(raw: str) -> tuple[tuple[str, str], ...]:
     """Decode the explicit repository/checkout lineage written by the CLI."""
 

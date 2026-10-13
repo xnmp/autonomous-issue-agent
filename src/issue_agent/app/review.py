@@ -137,13 +137,13 @@ class ReviewLegs:
             self.log(f"REVIEW PR #{action.number}: skipped — PR closed or head moved")
             return
         repo, owner = self.settings.repository, self.settings.owner_id
-        if not self.control.claim_dispatch(repo, "review", issue, action.kind.name, owner):
+        if not self.control.lease(repo, "review", issue, owner):
             self.log(f"REVIEW PR #{action.number}: skipped — issue #{issue} already has a review leg in flight")
             return
         try:
             await self._run_claimed(action, issue, pr)
         finally:
-            self.control.release_dispatch_claim(repo, "review", issue, owner)
+            self.control.unlease(repo, "review", issue, owner)
             try:
                 self.checkouts.remove(action.number)
             except Exception as exc:  # noqa: BLE001 - a stale checkout is disk, not state

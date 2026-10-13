@@ -32,7 +32,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
 
-from ..adapters.accounting_runtime import LEG_ROLES
 from ..adapters.control_store import LegRun
 from ..adapters.github import GhUnavailable
 from ..adapters.runtime_plan import AgentRuntime
@@ -145,17 +144,8 @@ class Facts:
         self.log = log
         self.now = now
 
-    def held_issues(self) -> set[int]:
-        repo = self.repository
-        held = {c.target_key for role in LEG_ROLES for c in self.control.active_dispatch_claims(repo, role)}
-        for lease in self.control.leases():
-            try:
-                dispatch = json.loads(lease.dispatch_id)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(dispatch, dict) and dispatch.get("role") in LEG_ROLES and dispatch.get("repository") == repo:
-                held.add(dispatch.get("issue"))
-        return held
+    def held_issues(self) -> frozenset[int]:
+        return self.control.held_targets(self.repository)
 
     def __call__(self, world: WorldState) -> Local:
         # `active` is sampled before the run read, so a leg ending between the

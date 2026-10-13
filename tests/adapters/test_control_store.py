@@ -1,35 +1,28 @@
+"""The 3-table control store: money, leases, idempotency, and the one-way cutover."""
+
 from __future__ import annotations
 
-import dataclasses
 import hashlib
-import json
 import multiprocessing
 import os
 import sqlite3
-import subprocess
-import signal
-import sys
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from issue_agent.adapters.control_path import control_store_path
-from issue_agent.adapters.codex_child_usage import NativeFailure
+from issue_agent.adapters import control_store
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     BudgetLimit,
     ControlStoreError,
     CorruptControlStore,
+    CutoverRefused,
     IncompatibleSchema,
-    LEGACY_V8_SCHEMA_DIGEST,
-    LegacySpendMigrationError,
-    Lease,
     ReservationRequest,
-    RetiredOwnerError,
     SQLiteControlStore,
     SettlementRequest,
     read_settled_spend,
@@ -37,2389 +30,682 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.domain.contracts import (
     BudgetScope,
-    Money,
-    PriceQuote,
-    PricingBasis,
     ChargeOrigin,
-    ReservationId,
+    Money,
+    PricingBasis,
     RunId,
     TokenUsage,
+    daily_budget_scope,
 )
 
-
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 47))
+REPO = "o/r"
+OWNER = "o/r:fix:deployment"
+LEGACY_SCHEMA = Path(__file__).parent / "fixtures" / "legacy_control_v46.sql"
 
 
-def _store(tmp_path: Path) -> SQLiteControlStore:
-    store = SQLiteControlStore(str(tmp_path / "state" / "control.db"), now=lambda: NOW)
+def _store(tmp_path: Path, now=lambda: NOW) -> SQLiteControlStore:
+    store = SQLiteControlStore(str(tmp_path / "state" / "control.db"), now=now)
     store.initialize()
     return store
 
 
-def _scope() -> BudgetScope:
+def _daily(repository: str = REPO, dimension: str = "repository") -> BudgetScope:
+    return daily_budget_scope(repository, dimension, "USD", NOW, ZoneInfo("UTC"))
+
+
+def _issue_scope(issue: int) -> BudgetScope:
     return BudgetScope(
-        "o/r",
-        "daily",
-        "USD",
-        "2026-07-30",
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
+        REPO, f"issue:{issue}", "USD", f"lifetime:{issue}",
+        datetime(1970, 1, 1, tzinfo=timezone.utc), datetime.max.replace(tzinfo=timezone.utc), ZoneInfo("UTC"),
     )
 
 
-def _request(index: int, maximum: int = 60, cap: int = 100) -> ReservationRequest:
+def _request(
+    index: int, maximum: int = 60, cap: int = 100, *, issue: int | None = None,
+    lease_target: int | None = None, limits: tuple[BudgetLimit, ...] | None = None,
+    owner: str = OWNER, repository: str = REPO,
+) -> ReservationRequest:
     return ReservationRequest(
-        ReservationId(f"reservation-{index}"),
-        RunId(f"run-{index}"),
-        f"dispatch-{index}",
-        _scope(),
-        PriceQuote("gpt", "card", "v1", NOW, Money("USD", maximum)),
-        Money("USD", cap),
-        "config-v1",
-        "o/r",
+        RunId(f"run-{index}"), repository, "fix", "RESOLVE", owner, Money("USD", maximum),
+        limits or (BudgetLimit(_daily(repository), Money("USD", cap)),),
+        lease_target, issue=issue if issue is not None else index, number=index, runtime="claude",
     )
 
 
-def _reserve_in_process(path: str, index: int, start, results) -> None:
-    store = SQLiteControlStore(path)
-    store.initialize()
-    start.wait(timeout=5)
-    results.put(store.reserve(_request(index)).disposition.value)
+def _settlement(run: str, micros: int, receipt: str | None = None, **changes) -> SettlementRequest:
+    return SettlementRequest(
+        RunId(run), Money("USD", micros), changes.pop("basis", PricingBasis.PROVIDER_REPORTED),
+        receipt or f"receipt-{run}", changes.pop("usage", None), None, None, **changes,
+    )
+
+
+def _leg(store: SQLiteControlStore, run: str) -> sqlite3.Row:
+    with closing(sqlite3.connect(store.path)) as db:
+        db.row_factory = sqlite3.Row
+        return db.execute("SELECT * FROM legs WHERE leg_id=?", (run,)).fetchone()
+
+
+def _alive(_pid: int, _ticks: int) -> bool:
+    return True
+
+
+def _dead(_pid: int, _ticks: int) -> bool:
+    return False
+
+
+def _launch(store: SQLiteControlStore, index: int, *, issue: int | None = None) -> RunId:
+    """Lease, reserve and register one leg's process: a running paid leg."""
+    target = issue if issue is not None else index
+    assert store.lease(REPO, "fix", target, OWNER)
+    assert store.reserve(_request(index, cap=10_000, issue=target, lease_target=target)).admitted
+    run = RunId(f"run-{index}")
+    store.register_process_lease(run, expected_owner_id=OWNER, pid=4242, pgid=4242, process_start_ticks=7)
+    return run
+
+
+# -- opening -------------------------------------------------------------------
+
+
+def test_a_fresh_store_has_three_tables_a_schema_version_and_owner_only_permissions(tmp_path):
+    store = _store(tmp_path)
+
+    with closing(sqlite3.connect(store.path)) as db:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert tables == {"legs", "leases", "idempotency"}
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert os.stat(store.path).st_mode & 0o777 == 0o600
+    assert os.stat(os.path.dirname(store.path)).st_mode & 0o777 == 0o700
+    store.initialize()  # reopening an existing store is idempotent
+
+
+@pytest.mark.parametrize("contents", [b"", b"not a database at all, just bytes" * 200])
+def test_an_empty_or_damaged_file_is_refused_rather_than_replaced(tmp_path, contents):
+    path = tmp_path / "control.db"
+    path.write_bytes(contents)
+
+    with pytest.raises(CorruptControlStore):
+        SQLiteControlStore(str(path)).initialize()
+    assert path.read_bytes() == contents
+
+
+def test_a_newer_or_foreign_schema_is_refused(tmp_path):
+    newer = tmp_path / "newer.db"
+    with closing(sqlite3.connect(newer)) as db:
+        db.execute("CREATE TABLE legs (leg_id TEXT)")
+        db.execute("PRAGMA user_version=2")
+    foreign = tmp_path / "foreign.db"
+    with closing(sqlite3.connect(foreign)) as db:
+        db.execute("CREATE TABLE something_else (x)")
+
+    for path in (newer, foreign):
+        with pytest.raises(IncompatibleSchema):
+            SQLiteControlStore(str(path)).initialize()
 
 
 def _initialize_in_process(path: str, start, results) -> None:
     start.wait(timeout=5)
     try:
         SQLiteControlStore(path).initialize()
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
         results.put(f"{type(exc).__name__}: {exc}")
     else:
         results.put("ok")
 
 
-def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
-    # This constructs test fixtures, not a production downgrade: migrations
-    # which rewrite rows need their historical inputs seeded by the caller.
-    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
-
-    removals = {
-        # Recreate the telemetry tables migration 46 retired, only to construct
-        # the old fixture schema.
-        46: tuple(statement for migration in _SCHEMA_MIGRATIONS if migration.version in (9, 40)
-                  for statement in _sql_statements(migration.source)
-                  if statement.lstrip().startswith("CREATE")
-                  and any(table in statement for table in ("event_outbox", "world_observations", "level_state"))),
-        45: ("CREATE INDEX runs_adjudication_episode ON runs(workflow_episode_key) WHERE kind='ADJUDICATE' "
-             "AND NOT(state='cancelled' AND outcome IS 'unlaunched_released' AND provider_receipt_id IS NULL)",),
-        43: ("CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target) "
-             "WHERE state IN ('pending','executing','retryable_failure','unknown_outcome') "
-             "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text'",),
-        44: (),
-        42: (),
-        41: ("ALTER TABLE charges DROP COLUMN origin",),
-        40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
-             "DROP INDEX lifecycle_review_generation_candidates"),
-        39: ("DROP INDEX workflow_repair_owed", "DROP INDEX continuation_pr_admission_identity",
-             "DROP INDEX reservations_active_workload"),
-        38: ("DROP INDEX lifecycle_self_clear_pending",),
-        37: ("DROP INDEX runs_fix_issue_dispatch",),
-        36: (
-            "DROP TRIGGER runs_continuation_selections_update",
-            "DROP TRIGGER runs_continuation_identity_update",
-            "ALTER TABLE runs DROP COLUMN continuations_json",
-            next(statement for migration in _SCHEMA_MIGRATIONS if migration.version == 25
-                 for statement in _sql_statements(migration.source) if statement.startswith("CREATE TABLE workflow_components "))
-            .replace("CREATE TABLE workflow_components (", "CREATE TABLE workflow_components_before36 ("),
-            "INSERT INTO workflow_components_before36 SELECT * FROM workflow_components",
-            "DROP TABLE workflow_components",
-            "ALTER TABLE workflow_components_before36 RENAME TO workflow_components",
-            "CREATE INDEX workflow_components_family ON workflow_components(repository,family)",
-        ),
-        35: ("DROP INDEX workflow_gates_current",),
-        # Recreate retired projections only to construct the old fixture schema.
-        34: tuple(statement for migration in _SCHEMA_MIGRATIONS if 27 <= migration.version <= 32
-                  for statement in _sql_statements(migration.source)),
-        33: ("DROP INDEX review_execution_rounds_generation_pending",),
-        32: ("DROP TABLE review_archive_identity_members",
-             "DROP TABLE review_archive_identity_certifications",
-             "DELETE FROM review_archive_source_versions WHERE source='identity_members' AND scope=X''") + tuple(
-            f"DROP TRIGGER review_lineage_{table}_{event}"
-            for table in (
-                "dedupe_keys", "dispatch_claims", "runs", "leases", "budget_reservations",
-                "reservation_recovery", "charges", "workflow_evidence", "reservation_limits",
-                "quota_debits", "run_cancellation_intents",
-            ) for event in ("insert", "update", "delete")
-        ),
-        31: (
-            "DROP TRIGGER review_archive_source_version_overflow",
-            "DROP TRIGGER review_lifecycle_command_source_insert",
-            "DROP TRIGGER review_lifecycle_command_source_update",
-            "DROP TRIGGER review_lifecycle_command_source_delete",
-            "DROP TRIGGER review_lifecycle_effect_source_insert",
-            "DROP TRIGGER review_lifecycle_effect_source_update",
-            "DROP TRIGGER review_lifecycle_effect_source_delete",
-            "DELETE FROM review_archive_source_versions WHERE source='lifecycle_rows' AND scope=X''",
-        ),
-        30: (
-            "DROP TRIGGER review_checkpoint_source_no_replace_insert",
-            "DROP TRIGGER review_checkpoint_source_minus_one_insert",
-            "DROP TRIGGER review_checkpoint_source_no_replace_update",
-            "DROP TRIGGER review_checkpoint_source_insert",
-            "DROP TRIGGER review_checkpoint_source_update",
-            "DROP TRIGGER review_checkpoint_source_delete",
-            "DROP TRIGGER review_workflow_source_insert",
-            "DROP TRIGGER review_workflow_source_update",
-            "DROP TRIGGER review_workflow_source_delete",
-            "DROP TRIGGER review_component_source_insert",
-            "DROP TRIGGER review_component_source_update",
-            "DROP TRIGGER review_component_source_delete",
-            "DELETE FROM review_archive_source_versions WHERE source='checkpoint_sources' AND scope=X''",
-            "DELETE FROM review_archive_source_versions WHERE source='workflow_rows' AND scope=X''",
-        ),
-        29: (
-            "DROP TRIGGER review_archive_dedupe_no_replace_insert",
-            "DROP TRIGGER review_archive_dedupe_minus_one_insert",
-            "DROP TRIGGER review_archive_dedupe_no_replace_update",
-            "DROP TRIGGER review_generation_source_insert",
-            "DROP TRIGGER review_generation_source_update",
-            "DROP TRIGGER review_generation_source_delete",
-            "DELETE FROM review_archive_source_versions WHERE source='generation_sources' AND scope=X''",
-        ),
-        28: (
-            "DROP TRIGGER review_all_round_source_insert",
-            "DROP TRIGGER review_all_round_source_update",
-            "DROP TRIGGER review_all_round_source_delete",
-            "DELETE FROM review_archive_source_versions WHERE source='all_round_rows' AND scope=X''",
-        ),
-        27: (
-            "DROP TRIGGER review_workflow_round_source_insert",
-            "DROP TRIGGER review_round_source_no_replace_insert",
-            "DROP TRIGGER review_round_source_no_replace_update",
-            "DROP TRIGGER review_round_source_insert",
-            "DROP TRIGGER review_round_source_update",
-            "DROP TRIGGER review_round_source_delete",
-            "DROP TRIGGER review_receipt_source_insert",
-            "DROP TRIGGER review_receipt_source_update",
-            "DROP TRIGGER review_receipt_source_delete",
-            "DROP TABLE review_archive_source_versions",
-        ),
-        26: ("DROP INDEX review_execution_rounds_repository",),
-        25: (
-            "DROP TRIGGER runs_review_attachment_insert", "DROP TRIGGER runs_review_attachment_update",
-            "DROP INDEX runs_review_child",
-            "ALTER TABLE runs DROP COLUMN review_child_id", "ALTER TABLE runs DROP COLUMN review_round_id",
-            "DROP TABLE review_execution_rounds", "DROP TABLE workflow_components",
-            "DROP TRIGGER dispatch_claims_occurrence_insert", "DROP TRIGGER dispatch_claims_occurrence_update",
-            "DROP INDEX dispatch_claims_occurrence", "ALTER TABLE dispatch_claims DROP COLUMN occurrence_id",
-        ),
-        24: (
-            "DROP INDEX effect_receipts_remote_object",
-            "ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json",
-        ),
-        23: (
-            "DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
-            "DROP INDEX workflow_retry_open_grant",
-            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition",
-            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at",
-            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition_reason",
-            "ALTER TABLE workflow_retry_authorizations DROP COLUMN accepted_at",
-            "ALTER TABLE workflow_retry_authorizations DROP COLUMN first_visit_at",
-            "ALTER TABLE workflow_retry_authorizations DROP COLUMN unavailable_reads",
-        ),
-        22: ("DROP TABLE workflow_activation_evidence", "DROP TABLE workflow_activation_imports"),
-        21: ("DROP INDEX runs_workflow_scope", "DROP INDEX lifecycle_publication_runs"),
-        20: (
-            "DROP TRIGGER runs_require_workflow_episode_insert",
-            "DROP TRIGGER runs_require_workflow_episode_update",
-            "DROP INDEX runs_adjudication_episode",
-            "ALTER TABLE runs DROP COLUMN workflow_episode_key",
-            "UPDATE runs SET outcome='released' WHERE outcome='unlaunched_released'",
-        ),
-        19: (
-            "DROP TABLE workflow_retry_authorizations",
-            "DROP TABLE workflow_evidence",
-            "DROP TABLE workflow_rearm_commands",
-            "DROP TABLE workflow_rearms",
-            "DROP TABLE workflow_gates",
-            "DROP TABLE workflows",
-            "DROP TABLE workflow_authority_epochs",
-            "ALTER TABLE runs DROP COLUMN workflow_binding_json",
-            "ALTER TABLE lifecycle_commands DROP COLUMN workflow_binding_json",
-            "ALTER TABLE lifecycle_commands DROP COLUMN workflow_reconciliation_json",
-            "ALTER TABLE lifecycle_commands DROP COLUMN attempt_owner",
-        ),
-        18: ("ALTER TABLE lifecycle_commands DROP COLUMN refusals",),
-        17: ("ALTER TABLE budget_reservations DROP COLUMN workload_repository",),
-        16: ("DROP TABLE reservation_recovery",),
-        15: ("DROP TABLE retired_owners",),
-        14: ("DROP TABLE dispatch_claim_runs",),
-        13: (),
-        12: (
-            "CREATE UNIQUE INDEX runs_active_dispatch_unique ON runs(dispatch_id) "
-            "WHERE state IN ('reserved', 'starting', 'running')",
-        ),
-        11: ("DROP INDEX runs_active_dispatch_unique", "DROP TABLE dispatch_claims"),
-        10: ("DROP TABLE run_cancellation_intents",),
-    }
-    assert version == 8 or version in EXPECTED_SCHEMA_VERSIONS
-    history = tuple(row[0] for row in db.execute(
-        "SELECT version FROM schema_migrations ORDER BY version"
-    ))
-    assert history == EXPECTED_SCHEMA_VERSIONS
-    assert set(removals) == set(EXPECTED_SCHEMA_VERSIONS[1:])
-    for applied in reversed(history):
-        if applied <= max(version, 9):
-            break
-        for statement in removals[applied]:
-            db.execute(statement)
-        db.execute("DELETE FROM schema_migrations WHERE version=?", (applied,))
-    if version == 8:
-        db.execute("DROP TABLE level_state")
-        db.execute("DELETE FROM schema_migrations")
-        db.execute(
-            "INSERT INTO schema_migrations(version, applied_at, source_digest) "
-            "VALUES (8, ?, ?)",
-            (NOW.isoformat(), LEGACY_V8_SCHEMA_DIGEST),
-        )
-
-
-def test_control_store_initializes_with_restrictive_permissions_and_integrity(tmp_path):
-    store = _store(tmp_path)
-    assert Path(store.path).stat().st_mode & 0o777 == 0o600
-    assert Path(store.authority_witness_path).read_text().strip() == (
-        "issue-agent-control-authority-v1"
-    )
-    store.integrity_check()
-    with sqlite3.connect(store.path) as db:
-        history = db.execute(
-            "SELECT version, length(source_digest) FROM schema_migrations "
-            "ORDER BY version"
-        ).fetchall()
-    assert history == [(version, 64) for version in EXPECTED_SCHEMA_VERSIONS]
-
-
-def test_established_control_store_disappearance_is_not_fresh_initialized(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    assert store.reserve(_request(1)).admitted
-    Path(store.path).unlink()
-
-    with pytest.raises(CorruptControlStore, match="disappeared"):
-        SQLiteControlStore(store.path).initialize()
-
-    assert not Path(store.path).exists()
-
-
-def test_established_control_store_read_does_not_recreate_deleted_authority(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    assert store.reserve(_request(1)).admitted
-    Path(store.path).unlink()
-
-    with pytest.raises(CorruptControlStore, match="disappeared"):
-        store.snapshot(_scope())
-
-    assert not Path(store.path).exists()
-
-
-def test_repository_alias_claim_collision_fails_as_permanent_schema_error(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    with store._connect() as db:
-        _historical_fixture(db, 12)
-        claim = (
-            "fix",
-            "issue:7",
-            "RESOLVE",
-            "owner",
-            123,
-            10,
-            "[]",
-            NOW.isoformat(),
-        )
-        db.execute(
-            "INSERT INTO dispatch_claims("
-            "repository, role, target, leg, owner_id, owner_pid, "
-            "owner_start_ticks, paths_json, claimed_at"
-            ") VALUES ('Acme/App', ?, ?, ?, ?, ?, ?, ?, ?)",
-            claim,
-        )
-        db.execute(
-            "INSERT INTO dispatch_claims("
-            "repository, role, target, leg, owner_id, owner_pid, "
-            "owner_start_ticks, paths_json, claimed_at"
-            ") VALUES ('acme/app', ?, ?, ?, ?, ?, ?, ?, ?)",
-            claim,
-        )
-
-    with pytest.raises(
-        IncompatibleSchema,
-        match="conflicting authority rows; operator repair is required",
-    ):
-        SQLiteControlStore(store.path).initialize()
-
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 12
-
-
-def test_valid_pre_witness_database_is_adopted_once(tmp_path):
-    store = _store(tmp_path)
-    Path(store.authority_witness_path).unlink()
-
-    SQLiteControlStore(store.path).initialize()
-
-    assert Path(store.authority_witness_path).read_text().strip() == (
-        "issue-agent-control-authority-v1"
-    )
-
-
-def test_empty_interrupted_first_initialization_can_resume(tmp_path):
-    path = tmp_path / "state" / "control.db"
-    path.parent.mkdir()
-    path.touch()
-
-    SQLiteControlStore(str(path)).initialize()
-
-    assert path.stat().st_size > 0
-
-
-def test_historyless_nonempty_database_is_rejected_without_adoption(tmp_path):
-    path = tmp_path / "state" / "control.db"
-    path.parent.mkdir()
-    with sqlite3.connect(path) as db:
-        db.execute("CREATE TABLE unrelated_authority(value TEXT)")
-
-    with pytest.raises(IncompatibleSchema, match="historyless nonempty"):
-        SQLiteControlStore(str(path)).initialize()
-
-    with sqlite3.connect(path) as db:
-        assert db.execute(
-            "SELECT name FROM sqlite_master WHERE name='unrelated_authority'"
-        ).fetchone() == ("unrelated_authority",)
-        assert db.execute(
-            "SELECT name FROM sqlite_master WHERE name='schema_migrations'"
-        ).fetchone() is None
-
-
-def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    request = _request(1)
-    assert store.reserve(request).admitted
-    with sqlite3.connect(store.path) as db:
-        _historical_fixture(db, 8)
-        db.commit()
-
-    SQLiteControlStore(store.path).initialize()
-
-    with sqlite3.connect(store.path) as db:
-        history = db.execute(
-            "SELECT version, source_digest FROM schema_migrations "
-            "ORDER BY version"
-        ).fetchall()
-        reserved = db.execute(
-            "SELECT state FROM budget_reservations WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()
-        workflow_binding = db.execute(
-            "SELECT workflow_binding_json FROM runs WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()
-        workflow_count = db.execute("SELECT COUNT(*) FROM workflows").fetchone()[0]
-        level_state = db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='level_state'"
-        ).fetchone()
-    assert tuple(version for version, _digest in history) == (8, *EXPECTED_SCHEMA_VERSIONS)
-    assert history[0][1] == (
-        "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
-    )
-    assert reserved == ("active",)
-    assert workflow_binding == (None,)
-    assert workflow_count == 0
-    assert level_state is None
-
-
-@pytest.mark.parametrize(
-    ("launched", "expected_policy"),
-    ((False, "spawn_pending"), (True, "reconcile_only")),
-)
-def test_v17_recovers_pre_v16_launch_proof(
-    tmp_path,
-    launched,
-    expected_policy,
-) -> None:
-    store = _store(tmp_path)
-    request = dataclasses.replace(
-        _request(1),
-        dispatch_id=json.dumps(
-            {} if launched else {"repository": "o/r"}
-        ),
-        scope=dataclasses.replace(
-            _scope(),
-            repository="*",
-            dimension="global",
-        ),
-        workload_repository="o/r",
-        additional_limits=(
-            (BudgetLimit(_scope(), Money("USD", 100)),)
-            if launched
-            else ()
-        ),
-    )
-    lease = (
-        Lease(
-            request.run_id,
-            request.dispatch_id,
-            request.owner_id,
-            123,
-            123,
-            NOW,
-            99,
-        )
-        if launched
-        else None
-    )
-    assert store.reserve(request, lease=lease).admitted
-    with sqlite3.connect(store.path) as db:
-        _historical_fixture(db, 15)
-
-    reopened = SQLiteControlStore(store.path, now=lambda: NOW)
-    reopened.initialize()
-
-    with sqlite3.connect(store.path) as db:
-        policy, workload_repository = db.execute(
-            "SELECT rr.policy, r.workload_repository "
-            "FROM reservation_recovery rr "
-            "JOIN budget_reservations r ON r.run_id=rr.run_id "
-            "WHERE rr.run_id=?",
-            (str(request.run_id),),
-        ).fetchone()
-    assert policy == expected_policy
-    assert workload_repository == "o/r"
-
-
-@pytest.mark.parametrize("starting_version", ("fresh", "v8", "v9"))
-def test_concurrent_role_boot_serializes_schema_migrations(
-    tmp_path,
-    starting_version,
-):
-    path = tmp_path / f"concurrent-{starting_version}.db"
-    if starting_version != "fresh":
-        store = SQLiteControlStore(str(path))
-        store.initialize()
-        with sqlite3.connect(path) as db:
-            _historical_fixture(db, int(starting_version[1:]))
-            db.commit()
+def test_both_role_daemons_booting_at_once_create_one_store(tmp_path):
     context = multiprocessing.get_context("spawn")
-    start = context.Event()
-    results = context.Queue()
-    processes = tuple(
-        context.Process(
-            target=_initialize_in_process,
-            args=(str(path), start, results),
-        )
-        for _index in range(3)
-    )
-    for process in processes:
-        process.start()
+    start, results = context.Event(), context.Queue()
+    path = str(tmp_path / "control.db")
+    workers = [context.Process(target=_initialize_in_process, args=(path, start, results)) for _ in range(4)]
+    for worker in workers:
+        worker.start()
     start.set()
-    observed = tuple(results.get(timeout=10) for _process in processes)
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
+    for worker in workers:
+        worker.join(timeout=30)
 
-    assert observed == ("ok", "ok", "ok")
-    with sqlite3.connect(path) as db:
-        assert tuple(
-            row[0]
-            for row in db.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
-        ) == (
-            (8, *EXPECTED_SCHEMA_VERSIONS)
-            if starting_version == "v8"
-            else EXPECTED_SCHEMA_VERSIONS
-        )
+    assert sorted(results.get(timeout=5) for _ in workers) == ["ok"] * 4
+    assert not list(tmp_path.glob("control.db.new-*"))
 
 
-def test_dispatch_claims_serialize_one_target_and_admit_others_concurrently(
-    tmp_path,
-) -> None:
+# -- money -------------------------------------------------------------------
+
+
+def test_reservations_admit_until_the_cap_and_name_the_limit_that_tripped(tmp_path):
+    store = _store(tmp_path)
+    issue_limit = BudgetLimit(_issue_scope(7), Money("USD", 100))
+    limits = (BudgetLimit(_daily(), Money("USD", 1_000)), issue_limit)
+
+    first = store.reserve(_request(1, issue=7, limits=limits))
+    second = store.reserve(_request(2, issue=7, limits=limits))
+
+    assert first.admitted
+    assert second.disposition is AccountingDisposition.EXHAUSTED
+    assert second.tripped_dimension == "issue:7"
+    assert store.snapshot(_issue_scope(7)).reserved == Money("USD", 60)
+
+
+def test_the_global_cap_sums_every_repository_and_the_daily_cap_only_its_own(tmp_path):
+    store = _store(tmp_path)
+    global_limit = BudgetLimit(_daily("*", "global"), Money("USD", 100))
+
+    assert store.reserve(_request(1, limits=(BudgetLimit(_daily("a/one"), Money("USD", 60)), global_limit),
+                                  repository="a/one", owner="a/one:fix:d")).admitted
+    blocked = store.reserve(_request(2, limits=(BudgetLimit(_daily("b/two"), Money("USD", 60)), global_limit),
+                                     repository="b/two", owner="b/two:fix:d"))
+
+    assert blocked.tripped_dimension == "global"
+    assert store.snapshot(_daily("a/one")).committed == Money("USD", 60)
+    assert store.snapshot(_daily("b/two")).committed == Money("USD", 0)
+
+
+def test_yesterdays_spend_does_not_count_against_todays_cap(tmp_path):
+    clock = [NOW - timedelta(days=1)]
+    store = _store(tmp_path, now=lambda: clock[0])
+    assert store.reserve(_request(1, cap=100)).admitted
+    assert store.settle(_settlement("run-1", 90)).disposition is AccountingDisposition.AVAILABLE
+    clock[0] = NOW
+
+    assert store.reserve(_request(2, cap=100)).admitted
+    assert store.snapshot(_daily()).committed == Money("USD", 60)
+
+
+def test_concurrent_reservations_admit_exactly_one_for_the_final_capacity(tmp_path):
     store = _store(tmp_path)
 
-    assert store.claim_dispatch("o/r", "fix", 7, "RESOLVE", "deployment-a")
-    assert not store.claim_dispatch("o/r", "fix", 7, "RESUME", "deployment-b")
-    # Another target runs alongside: only the target conflicts (Q13).
-    assert store.claim_dispatch("o/r", "fix", 8, "RESOLVE", "deployment-b")
-    assert not store.claim_dispatch("o/r", "fix", 8, "RESOLVE", "deployment-a")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda index: store.reserve(_request(index)).disposition, range(1, 9)))
 
-    assert not store.release_dispatch_claim(
-        "o/r", "fix", 7, "deployment-b"
-    )
-    assert store.release_dispatch_claim(
-        "o/r", "fix", 7, "deployment-a"
-    )
-    assert store.claim_dispatch(
-        "o/r",
-        "fix",
-        7,
-        "RESUME",
-        "deployment-b",
-    )
+    assert results.count(AccountingDisposition.AVAILABLE) == 1
+    assert results.count(AccountingDisposition.EXHAUSTED) == 7
 
 
-def test_dispatch_claim_process_probe_runs_outside_write_transaction(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    store = _store(tmp_path)
-    assert store.claim_dispatch(
-        "o/r", "fix", 1, "RESOLVE", "owner-a"
-    )
-    transaction_open = False
-    original_transaction = store.transaction
-    original_matches = ProcessSupervisor.matches_identity
-
-    @contextmanager
-    def observed_transaction():
-        nonlocal transaction_open
-        with original_transaction() as db:
-            transaction_open = True
-            try:
-                yield db
-            finally:
-                transaction_open = False
-
-    def observed_matches(pid: int, start_ticks: int) -> bool:
-        assert not transaction_open
-        return original_matches(pid, start_ticks)
-
-    monkeypatch.setattr(store, "transaction", observed_transaction)
-    monkeypatch.setattr(
-        ProcessSupervisor,
-        "matches_identity",
-        staticmethod(observed_matches),
-    )
-
-    assert store.claim_dispatch(
-        "o/r", "fix", 2, "RESOLVE", "owner-b"
-    )
-
-
-def test_dispatch_claim_survives_dead_daemon_while_bound_child_is_live(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    owner = "o/r:fix:checkout-a"
-    run_id = RunId("bound-child")
-    request = dataclasses.replace(
-        _request(1),
-        run_id=run_id,
-        reservation_id=ReservationId("bound-child-reservation"),
-        owner_id=owner,
-        kind="RESOLVE",
-    )
-    assert store.claim_dispatch(
-        "o/r", "fix", 42, "RESOLVE", owner
-    )
-    assert store.reserve(request).admitted
-    assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
-
-    process = subprocess.Popen(
-        ["sleep", "30"],
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-    )
-    try:
-        identity = ProcessSupervisor.process_identity(process.pid)
-        assert identity is not None
-        store.register_lease(
-            Lease(
-                run_id,
-                request.dispatch_id,
-                owner,
-                process.pid,
-                os.getpgid(process.pid),
-                NOW,
-                identity.start_ticks,
-            )
-        )
-        with store._connect() as db:
-            db.execute(
-                "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=? "
-                "WHERE repository='o/r' AND role='fix' AND target='issue:42'",
-                (2_000_000_000, 1),
-            )
-
-        assert not store.claim_dispatch(
-            "o/r",
-            "fix",
-            42,
-            "RESOLVE",
-            "o/r:fix:checkout-b",
-        )
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
-
-    assert store.reclaim_dead_leases(
-        owner, lambda _pid, _start: False
-    ) == (run_id,)
-    assert store.release(run_id, "spend_unknown").disposition.value == (
-        "available"
-    )
-    assert store.claim_dispatch(
-        "o/r",
-        "fix",
-        42,
-        "RESOLVE",
-        "o/r:fix:checkout-b",
-    )
-
-
-def test_legacy_owner_adoption_preserves_active_runs_and_leases(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    legacy = "o/r:fix"
-    current = "o/r:fix:deployment-2"
-    request = dataclasses.replace(_request(1), owner_id=legacy)
-    assert store.reserve(request).disposition is AccountingDisposition.AVAILABLE
-    identity = ProcessSupervisor.process_identity(os.getpid())
-    assert identity is not None
-    store.register_lease(
-        Lease(
-            request.run_id,
-            request.dispatch_id,
-            legacy,
-            identity.pid,
-            os.getpgid(identity.pid),
-            NOW,
-            identity.start_ticks,
-        )
-    )
-
-    assert store.adopt_legacy_owner("o/r", "fix", current) == 1
-
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT owner_id FROM runs WHERE run_id=?",
-            (request.run_id,),
-        ).fetchone()[0] == current
-        assert db.execute(
-            "SELECT owner_id FROM leases WHERE run_id=?",
-            (request.run_id,),
-        ).fetchone()[0] == current
-    assert store.active_reservation_runs(current) == (request.run_id,)
-
-
-def test_repoint_leaves_continuation_bound_runs_with_the_retired_owner(
-    tmp_path,
-) -> None:
-    # A live store held 143 continuation-bound runs under the prior owner; the
-    # identity trigger aborted the whole adoption and the repoint crashed boot.
-    store = _store(tmp_path)
-    old_owner = "o/r:fix:deployment-1"
-    current = "o/r:fix:deployment-2"
-    bound = dataclasses.replace(_request(1, maximum=10), owner_id=old_owner)
-    plain = dataclasses.replace(_request(2, maximum=10), owner_id=old_owner)
-    assert store.reserve(bound).admitted
-    assert store.reserve(plain).admitted
-    with store._connect() as db:
-        (trigger_sql,) = db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' "
-            "AND name='runs_continuation_selections_update'"
-        ).fetchone()
-        db.execute("DROP TRIGGER runs_continuation_selections_update")
-        db.execute(
-            "UPDATE runs SET continuations_json=? WHERE run_id=?",
-            ('{"format":1,"value":[{"legacy":true}]}', bound.run_id),
-        )
-        db.execute(trigger_sql)
-
-    assert store.adopt_legacy_owner(
-        "o/r", "fix", current, prior_owner_ids=(old_owner,)
-    ) == 1
-
-    with store._connect() as db:
-        owners = dict(db.execute("SELECT run_id, owner_id FROM runs").fetchall())
-    assert owners == {bound.run_id: old_owner, plain.run_id: current}
-
-
-def test_case_alias_owner_is_adopted_by_canonical_deployment(tmp_path) -> None:
-    store = _store(tmp_path)
-    prior = "Acme/App:fix:old-deployment"
-    prior_legacy = "Acme/App:fix"
-    current = "acme/app:fix:new-deployment"
-    request = dataclasses.replace(_request(1), owner_id=prior)
-    assert store.reserve(request).admitted
-
-    assert store.adopt_legacy_owner(
-        "acme/app",
-        "fix",
-        current,
-        prior_owner_ids=(prior_legacy, prior),
-    ) == 1
-
-    assert store.active_reservation_runs(current) == (request.run_id,)
-
-
-def test_repoint_permanently_fences_the_prior_owner_from_authority(
-    tmp_path,
-) -> None:
-    current_store = _store(tmp_path)
-    old_owner = "o/r:fix:deployment-1"
-    current_owner = "o/r:fix:deployment-2"
-    old_store = SQLiteControlStore(current_store.path, now=lambda: NOW)
-    old_store.initialize()
-    old_store.bind_active_owner(old_owner)
-
-    assert current_store.adopt_legacy_owner(
-        "o/r",
-        "fix",
-        current_owner,
-        prior_owner_ids=(old_owner,),
-    ) == 0
-
-    with pytest.raises(RetiredOwnerError, match="deployment-2"):
-        old_store.assert_owner_active(old_owner)
-    assert not old_store.claim_dispatch(
-        "o/r",
-        "fix",
-        91,
-        "RESOLVE",
-        old_owner,
-    )
-    refused = old_store.reserve(
-        dataclasses.replace(
-            _request(91),
-            owner_id=old_owner,
-        )
-    )
-    assert refused.disposition is AccountingDisposition.UNAVAILABLE
-    assert "retired" in refused.detail
-
-    current_store.bind_active_owner(current_owner)
-    assert current_store.claim_dispatch(
-        "o/r",
-        "fix",
-        91,
-        "RESOLVE",
-        current_owner,
-    )
-
-
-def test_repoint_fences_delayed_pre_spawn_child_on_fresh_store(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    old_owner = "o/r:fix:deployment-1"
-    current_owner = "o/r:fix:deployment-2"
-    request = dataclasses.replace(_request(1), owner_id=old_owner)
-    assert store.reserve(request).admitted
-    assert store.adopt_legacy_owner(
-        "o/r",
-        "fix",
-        current_owner,
-        prior_owner_ids=(old_owner,),
-    ) == 1
-
-    delayed_child_store = SQLiteControlStore(store.path, now=lambda: NOW)
-    delayed_child_store.initialize()
-    with pytest.raises(RetiredOwnerError, match="deployment-2"):
-        delayed_child_store.register_process_lease(
-            request.run_id,
-            expected_owner_id=old_owner,
-            pid=123,
-            pgid=123,
-            process_start_ticks=99,
-        )
-
-    assert delayed_child_store.leases() == ()
-
-
-def test_repoint_retirement_is_transitive_and_cannot_be_reversed(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    first = "o/r:fix:deployment-1"
-    second = "o/r:fix:deployment-2"
-    third = "o/r:fix:deployment-3"
-
-    store.adopt_legacy_owner(
-        "o/r",
-        "fix",
-        second,
-        prior_owner_ids=(first,),
-    )
-    store.adopt_legacy_owner(
-        "o/r",
-        "fix",
-        third,
-        prior_owner_ids=(first, second),
-    )
-
-    with store._connect() as db:
-        retired = dict(
-            db.execute(
-                "SELECT owner_id, successor_owner_id FROM retired_owners "
-                "WHERE owner_id IN (?, ?)",
-                (first, second),
-            ).fetchall()
-        )
-    assert retired == {first: third, second: third}
-    with pytest.raises(RetiredOwnerError, match="deployment-3"):
-        store.adopt_legacy_owner(
-            "o/r",
-            "fix",
-            second,
-            prior_owner_ids=(first,),
-        )
-    store.assert_owner_active(third)
-
-
-def test_concurrent_sublegs_may_share_a_dispatch_context(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    first = _request(1, maximum=40, cap=100)
-    second = dataclasses.replace(
-        _request(2, maximum=40, cap=100),
-        dispatch_id=first.dispatch_id,
-    )
-
-    assert store.reserve(first).disposition is AccountingDisposition.AVAILABLE
-    assert store.reserve(second).disposition is AccountingDisposition.AVAILABLE
-
-
-@pytest.mark.parametrize("version", EXPECTED_SCHEMA_VERSIONS)
-@pytest.mark.parametrize("stage", ("before_commit", "committed"))
-def test_schema_migration_restart_is_atomic_at_every_boundary(
-    tmp_path,
-    version,
-    stage,
-):
-    path = tmp_path / f"control-{version}-{stage}.db"
-    tripped = False
-
-    def interrupt(observed_version, observed_stage):
-        nonlocal tripped
-        if (
-            not tripped
-            and observed_version == version
-            and observed_stage == stage
-        ):
-            tripped = True
-            raise RuntimeError("simulated process death")
-
-    with pytest.raises(RuntimeError, match="simulated process death"):
-        SQLiteControlStore(
-            str(path),
-            migration_observer=interrupt,
-        ).initialize()
-
-    reopened = SQLiteControlStore(str(path))
-    reopened.initialize()
-    reopened.integrity_check()
-    with sqlite3.connect(path) as db:
-        versions = tuple(
-            row[0]
-            for row in db.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
-        )
-        cancellation_table = db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='run_cancellation_intents'"
-        ).fetchone()
-        tables = {row[0] for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )}
-        run_columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
-        command_columns = {row[1] for row in db.execute("PRAGMA table_info(lifecycle_commands)")}
-    assert versions == EXPECTED_SCHEMA_VERSIONS
-    assert cancellation_table == ("run_cancellation_intents",)
-    assert {
-        "workflow_authority_epochs", "workflows", "workflow_gates",
-        "workflow_rearms", "workflow_rearm_commands", "workflow_evidence",
-        "workflow_retry_authorizations",
-    } <= tables
-    assert "workflow_binding_json" in run_columns
-    assert {"workflow_binding_json", "workflow_reconciliation_json", "attempt_owner"} <= command_columns
-
-
-def test_schema_migration_digest_and_contiguity_are_validated(tmp_path):
-    store = _store(tmp_path)
-    with sqlite3.connect(store.path) as db:
-        db.execute(
-            "UPDATE schema_migrations SET source_digest='tampered' "
-            "WHERE version=9"
-        )
-        db.commit()
-
-    with pytest.raises(IncompatibleSchema, match="digest mismatch"):
-        SQLiteControlStore(store.path).initialize()
-
-    other = SQLiteControlStore(str(tmp_path / "other.db"))
-    other.initialize()
-    with sqlite3.connect(other.path) as db:
-        db.execute("DELETE FROM schema_migrations WHERE version=9")
-        db.commit()
-    with pytest.raises(IncompatibleSchema, match="not contiguous"):
-        SQLiteControlStore(other.path).initialize()
-
-
-def test_corrupt_database_is_rejected_before_migration_or_admission(tmp_path):
-    path = tmp_path / "state" / "control.db"
-    path.parent.mkdir()
-    path.write_bytes(b"not a sqlite database")
-
-    with pytest.raises(CorruptControlStore, match="integrity check failed"):
-        SQLiteControlStore(str(path)).initialize()
-
-
-def test_semantically_corrupt_accounting_is_rejected_before_admission(tmp_path):
+def test_a_replayed_reservation_is_idempotent_and_a_different_one_conflicts(tmp_path):
     store = _store(tmp_path)
     assert store.reserve(_request(1)).admitted
-    with sqlite3.connect(store.path) as db:
-        db.execute(
-            "UPDATE reservation_limits SET cap_micros=cap_micros+1 "
-            "WHERE run_id='run-1' AND dimension='daily'"
-        )
-        db.commit()
 
-    reopened = SQLiteControlStore(store.path)
-    with pytest.raises(CorruptControlStore, match="primary limit"):
-        reopened.initialize()
-    result = reopened.reserve(_request(2))
-    assert result.disposition is AccountingDisposition.CORRUPT
-    assert "primary limit" in result.detail
+    assert store.reserve(_request(1)).disposition is AccountingDisposition.AVAILABLE
+    assert store.reserve(_request(1, maximum=50)).disposition is AccountingDisposition.CONFLICT
+    assert store.snapshot(_daily()).reserved == Money("USD", 60)
 
 
-def test_active_reservation_requires_recovery_classification(tmp_path):
-    store = _store(tmp_path)
-    assert store.reserve(_request(1)).admitted
-    with sqlite3.connect(store.path) as db:
-        db.execute(
-            "DELETE FROM reservation_recovery WHERE run_id='run-1'"
-        )
-
-    with pytest.raises(CorruptControlStore, match="classification is absent"):
-        SQLiteControlStore(store.path).initialize()
-
-
-def test_semantically_corrupt_dispatch_binding_is_rejected(tmp_path):
-    store = _store(tmp_path)
-    owner = "o/r:fix:deployment"
-    request = dataclasses.replace(_request(1), owner_id=owner)
-    assert store.claim_dispatch(
-        "o/r", "fix", 1, "RESOLVE", owner
-    )
-    assert store.reserve(request).admitted
-    assert store.bind_dispatch_claim(
-        "o/r", "fix", 1, owner, request.run_id
-    )
-    with sqlite3.connect(store.path) as db:
-        db.execute(
-            "UPDATE runs SET owner_id='other-owner' WHERE run_id='run-1'"
-        )
-
-    with pytest.raises(CorruptControlStore, match="bound run owners"):
-        SQLiteControlStore(store.path).initialize()
-
-
-@pytest.mark.parametrize(
-    "message",
-    ["database or disk is full", "attempt to write a readonly database"],
-)
-def test_storage_write_faults_fail_paid_admission_closed(
-    tmp_path, monkeypatch, message
-):
-    store = _store(tmp_path)
-
-    @contextmanager
-    def unavailable_transaction():
-        raise sqlite3.OperationalError(message)
-        yield
-
-    monkeypatch.setattr(store, "transaction", unavailable_transaction)
-
-    result = store.reserve(_request(1))
-
-    assert result.disposition is AccountingDisposition.UNAVAILABLE
-    assert message in result.detail
-
-
-def test_shutdown_intent_preserves_active_spend_for_recovery(tmp_path):
-    store = _store(tmp_path)
-    request = dataclasses.replace(
-        _request(1),
-        dispatch_id=json.dumps(
-            {
-                "kind": "RESOLVE",
-                "number": 42,
-                "issue": 42,
-                "breaker_key": 42,
-            }
-        ),
-        kind="RESOLVE",
-        owner_id="o/r:fix",
-    )
-    assert store.reserve(request).admitted
-    store.register_process_lease(
-        request.run_id,
-        expected_owner_id=request.owner_id,
-        pid=123,
-        pgid=123,
-        process_start_ticks=99,
-    )
-
-    intents = store.record_owned_cancellation_intents(
-        "o/r:fix",
-        "shutdown_deadline_spend_unknown",
-    )
-
-    assert len(intents) == 1
-    assert intents[0].issue_number == 42
-    assert store.active_reservation_runs("o/r:fix") == (request.run_id,)
-    assert tuple(lease.run_id for lease in store.leases("o/r:fix")) == (
-        request.run_id,
-    )
-    assert store.pending_cancellation_intents("o/r:fix") == intents
-    with sqlite3.connect(store.path) as db:
-        run = db.execute(
-            "SELECT state, outcome FROM runs WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()
-        reservation = db.execute(
-            "SELECT state, release_reason FROM budget_reservations "
-            "WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()
-    assert run == ("running", None)
-    assert reservation == ("active", None)
-
-    store.mark_cancellation_handover_written(request.run_id)
-    assert store.pending_cancellation_intents("o/r:fix") == ()
-
-
-def test_transactional_reservations_admit_only_one_racer_for_final_capacity(tmp_path):
-    store = _store(tmp_path)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = tuple(pool.map(store.reserve, (_request(1), _request(2))))
-    assert sorted(result.disposition.value for result in results) == [
-        "available",
-        "exhausted",
-    ]
-    assert store.snapshot(_scope()).reserved == Money("USD", 60)
-
-
-def test_reservation_replay_requires_the_complete_same_paid_authority(tmp_path):
-    store = _store(tmp_path)
-    original = _request(1)
-    assert store.reserve(original).admitted
-    assert store.reserve(original).detail == "idempotent reservation"
-
-    other_scope = dataclasses.replace(
-        original.scope,
-        repository="other/repo",
-        dimension="weekly",
-        period_id="2026-W31",
-        period_end=original.scope.period_end + timedelta(days=6),
-    )
-    global_scope = dataclasses.replace(
-        original.scope,
-        repository="*",
-        dimension="global",
-    )
-    conflicting = dataclasses.replace(
-        original,
-        dispatch_id="other-dispatch",
-        scope=other_scope,
-        quote=dataclasses.replace(
-            original.quote,
-            model="other-model",
-            effective_at=NOW + timedelta(seconds=1),
-        ),
-        cap=Money("USD", 1),
-        config_version="config-v2",
-        additional_limits=(BudgetLimit(global_scope, Money("USD", 1)),),
-        kind="REVIEW",
-        owner_id="other-owner",
-    )
-
-    result = store.reserve(conflicting)
-
-    assert result.disposition is AccountingDisposition.CONFLICT
-    with store._connect() as db:
-        persisted = db.execute(
-            "SELECT b.repository, b.cap_micros, r.dispatch_id, r.owner_id "
-            "FROM budget_reservations b JOIN runs r ON r.run_id=b.run_id "
-            "WHERE b.run_id=?",
-            (str(original.run_id),),
-        ).fetchone()
-        limit_count = db.execute(
-            "SELECT COUNT(*) FROM reservation_limits WHERE run_id=?",
-            (str(original.run_id),),
-        ).fetchone()[0]
-    assert tuple(persisted) == ("o/r", 100, "dispatch-1", "reservation")
-    assert limit_count == 1
-
-
-@pytest.mark.parametrize("terminal", ("settled", "released"))
-def test_terminal_reservation_is_not_a_new_paid_admission(tmp_path, terminal):
-    store = _store(tmp_path)
-    request = _request(1)
-    assert store.reserve(request).admitted
-    if terminal == "settled":
-        store.settle(
-            SettlementRequest(
-                request.run_id,
-                Money("USD", 1),
-                PricingBasis.PROVIDER_REPORTED,
-                "terminal-receipt",
-                None,
-                None,
-                None,
-            )
-        )
-    else:
-        store.release(request.run_id, "cancelled")
-
-    assert (
-        store.reserve(request).disposition
-        is AccountingDisposition.CONFLICT
-    )
-
-
-def test_two_processes_racing_final_capacity_admit_exactly_one(tmp_path):
-    path = str(tmp_path / "state" / "control.db")
-    _store(tmp_path)
-    context = multiprocessing.get_context("spawn")
-    start = context.Event()
-    results = context.Queue()
-    processes = [
-        context.Process(
-            target=_reserve_in_process,
-            args=(path, index, start, results),
-        )
-        for index in (1, 2)
-    ]
-    for process in processes:
-        process.start()
-    start.set()
-    values = sorted(results.get(timeout=10) for _ in processes)
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
-
-    assert values == ["available", "exhausted"]
-
-
-def test_hundreds_of_concurrent_reservations_all_reach_one_terminal_state(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    requests = tuple(
-        _request(index, maximum=1, cap=200) for index in range(200)
-    )
-    with ThreadPoolExecutor(max_workers=32) as pool:
-        admissions = tuple(pool.map(store.reserve, requests))
-    assert all(result.admitted for result in admissions)
-
-    def finalize(request: ReservationRequest):
-        if int(str(request.run_id).split("-")[-1]) % 2:
-            return store.release(request.run_id, "stress")
-        return store.settle(
-            SettlementRequest(
-                request.run_id,
-                Money("USD", 1),
-                PricingBasis.PROVIDER_REPORTED,
-                f"receipt-{request.run_id}",
-                None,
-                None,
-                None,
-            )
-        )
-
-    with ThreadPoolExecutor(max_workers=32) as pool:
-        tuple(pool.map(finalize, requests))
-
-    snapshot = store.snapshot(_scope())
-    assert snapshot.reserved == Money("USD", 0)
-    assert snapshot.committed == Money("USD", 100)
-    assert store.active_reservation_runs() == ()
-
-
-def test_reservation_and_owner_lease_commit_atomically(tmp_path):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="owner")
-    lease = Lease(
-        request.run_id,
-        request.dispatch_id,
-        "owner",
-        123,
-        123,
-        NOW,
-    )
-
-    assert store.reserve(request, lease=lease).admitted
-    assert store.reserve(request, lease=lease).detail == "idempotent reservation"
-
-    assert store.leases() == (lease,)
-    assert store.active_reservation_runs() == (request.run_id,)
-
-
-def test_spawned_process_lease_binds_to_reserved_run_identity(tmp_path):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="owner")
-    assert store.reserve(request).admitted
-
-    lease = store.register_process_lease(
-        request.run_id,
-        expected_owner_id=request.owner_id,
-        pid=123,
-        pgid=124,
-        process_start_ticks=99,
-    )
-
-    assert lease == Lease(
-        request.run_id,
-        request.dispatch_id,
-        "owner",
-        123,
-        124,
-        NOW,
-        99,
-    )
-    assert store.register_process_lease(
-        request.run_id,
-        expected_owner_id=request.owner_id,
-        pid=123,
-        pgid=124,
-        process_start_ticks=99,
-    ) == lease
-    with pytest.raises(ControlStoreError, match="conflicting"):
-        store.register_process_lease(
-            request.run_id,
-            expected_owner_id=request.owner_id,
-            pid=125,
-            pgid=125,
-            process_start_ticks=100,
-        )
-
-
-@pytest.mark.parametrize("prior", ["leader-live", "worker-live", "reaped"])
-def test_same_run_transport_retry_replaces_only_a_fully_reaped_owned_process_group(tmp_path, monkeypatch, prior):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="owner")
-    assert store.reserve(request).admitted
-    script = "import subprocess,sys; child=subprocess.Popen([sys.executable,'-S','-c','import time; time.sleep(30)']); print(child.pid,flush=True); command=sys.stdin.readline(); child.terminate(); child.wait()"
-    old = subprocess.Popen([sys.executable, "-S", "-u", "-c", script], start_new_session=True,
-                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    new = subprocess.Popen([sys.executable, "-S", "-c", "import time; time.sleep(30)"], start_new_session=True)
-    try:
-        assert old.stdout is not None
-        assert int(old.stdout.readline()) > 0
-        old_identity, new_identity = ProcessSupervisor.process_identity(old.pid), ProcessSupervisor.process_identity(new.pid)
-        assert old_identity is not None and new_identity is not None
-        original = store.register_process_lease(request.run_id, expected_owner_id="owner", pid=old.pid,
-                                                pgid=old.pid, process_start_ticks=old_identity.start_ticks)
-        if prior == "worker-live":
-            old.terminate()
-            old.wait(timeout=5)
-            monkeypatch.setattr(ProcessSupervisor, "live_group_identities", lambda _pgid: ())
-        if prior == "reaped":
-            assert old.stdin is not None
-            old.stdin.write(b"reap\n")
-            old.stdin.flush()
-            old.wait(timeout=5)
-            assert ProcessSupervisor.group_is_absent(old.pid)
-            replacement = store.register_process_lease(request.run_id, expected_owner_id="owner", pid=new.pid,
-                                                       pgid=new.pid, process_start_ticks=new_identity.start_ticks)
-            assert replacement.run_id == original.run_id
-            assert replacement.dispatch_id == original.dispatch_id
-            assert store.leases() == (replacement,)
-        else:
-            with pytest.raises(ControlStoreError, match="conflicting"):
-                store.register_process_lease(request.run_id, expected_owner_id="owner", pid=new.pid,
-                                             pgid=new.pid, process_start_ticks=new_identity.start_ticks)
-            assert store.leases() == (original,)
-        assert store.active_reservation_runs() == (request.run_id,)
-    finally:
-        for process in (old, new):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.communicate(timeout=5)
-
-
-def test_pid_reuse_does_not_keep_a_dead_lease(tmp_path):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="owner")
-    lease = Lease(
-        request.run_id,
-        request.dispatch_id,
-        "owner",
-        123,
-        123,
-        NOW,
-        10,
-    )
-    assert store.reserve(request, lease=lease).admitted
-
-    assert store.reclaim_dead_leases(
-        "owner", lambda pid, start: pid == 123 and start == 11
-    ) == (request.run_id,)
-
-
-def test_dead_lease_liveness_probe_does_not_hold_sqlite_write_lock(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="owner")
-    lease = Lease(
-        request.run_id,
-        request.dispatch_id,
-        "owner",
-        123,
-        123,
-        NOW,
-        10,
-    )
-    assert store.reserve(request, lease=lease).admitted
-    competing = SQLiteControlStore(store.path, busy_timeout_ms=50)
-    probe_wrote = False
-
-    def alive(_pid, _start):
-        nonlocal probe_wrote
-        competing.start_run(
-            RunId("probe-write"),
-            "probe-dispatch",
-            "RESOLVE",
-            "other-owner",
-            "cfg",
-        )
-        probe_wrote = True
-        return True
-
-    assert store.reclaim_dead_leases("owner", alive) == ()
-    assert probe_wrote
-
-
-def test_one_transaction_enforces_shared_global_limit_across_repositories(tmp_path):
-    authority = tmp_path / "machine-state"
-    paths = (
-        control_store_path(
-            (str(tmp_path / "repo-a" / "fix"),),
-            authority_root=str(authority),
-        ),
-        control_store_path(
-            (str(tmp_path / "repo-b" / "fix"),),
-            authority_root=str(authority),
-        ),
-    )
-    assert paths[0] == paths[1]
-    stores = tuple(SQLiteControlStore(path, now=lambda: NOW) for path in paths)
-    for store in stores:
-        store.initialize()
-    global_scope = BudgetScope(
-        "*",
-        "global",
-        "USD",
-        "2026-07-30",
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-
-    def request(repository: str, index: int) -> ReservationRequest:
-        scope = dataclasses.replace(_scope(), repository=repository)
-        return dataclasses.replace(
-            _request(index, maximum=60, cap=1_000),
-            scope=scope,
-            workload_repository=repository,
-            additional_limits=(BudgetLimit(global_scope, Money("USD", 100)),),
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = tuple(
-            pool.map(
-                lambda pair: pair[0].reserve(pair[1]),
-                (
-                    (stores[0], request("o/one", 1)),
-                    (stores[1], request("o/two", 2)),
-                ),
-            )
-        )
-
-    assert sorted(result.disposition.value for result in results) == [
-        "available",
-        "exhausted",
-    ]
-    assert stores[0].snapshot(global_scope).reserved == Money("USD", 60)
-
-
-def test_settled_spend_read_model_uses_authoritative_charges(tmp_path) -> None:
-    store = _store(tmp_path)
-    first = _request(1)
-    second = dataclasses.replace(
-        _request(2),
-        scope=dataclasses.replace(_scope(), repository="o/other"),
-        workload_repository="o/other",
-    )
-    assert store.reserve(first).admitted
-    assert store.reserve(second).admitted
-    assert store.settle(
-        SettlementRequest(
-            first.run_id,
-            Money("USD", 25),
-            PricingBasis.PROVIDER_REPORTED,
-            "receipt-1",
-            None,
-            None,
-            None,
-        )
-    ).disposition is AccountingDisposition.AVAILABLE
-    assert store.settle(
-        SettlementRequest(
-            second.run_id,
-            Money("USD", 40),
-            PricingBasis.PROVIDER_REPORTED,
-            "receipt-2",
-            None,
-            None,
-            None,
-        )
-    ).disposition is AccountingDisposition.AVAILABLE
-
-    summary = read_settled_spend(
-        store.path,
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-    )
-
-    assert summary.disposition is AccountingDisposition.AVAILABLE
-    assert summary.total == Money("USD", 65)
-    assert summary.for_repository("O/R") == Money("USD", 25)
-    assert summary.for_repository("o/other") == Money("USD", 40)
-    assert summary.for_repository("o/absent") == Money.zero("USD")
-
-
-def test_global_only_reservation_keeps_workload_repository_attribution(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    request = dataclasses.replace(
-        _request(1),
-        scope=dataclasses.replace(
-            _scope(),
-            repository="*",
-            dimension="global",
-        ),
-        workload_repository="o/r",
-    )
-    assert store.reserve(request).admitted
-    assert store.settle(
-        SettlementRequest(
-            request.run_id,
-            Money("USD", 50),
-            PricingBasis.PROVIDER_REPORTED,
-            "global-only-receipt",
-            None,
-            None,
-            None,
-        )
-    ).disposition is AccountingDisposition.AVAILABLE
-
-    summary = read_settled_spend(
-        store.path,
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-    )
-
-    assert summary.total == Money("USD", 50)
-    assert summary.for_repository("o/r") == Money("USD", 50)
-    assert summary.for_repository("*") == Money.zero("USD")
-
-
-def test_missing_control_store_is_unknown_without_creating_it(tmp_path) -> None:
-    path = tmp_path / "absent" / "control.db"
-
-    summary = read_settled_spend(
-        str(path),
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-    )
-
-    assert summary.disposition is AccountingDisposition.UNAVAILABLE
-    assert summary.total is None
-    assert summary.for_repository("o/r") is None
-    assert summary.by_repository == {}
-    assert "does not exist" in summary.detail
-    assert not path.exists()
-
-
-def test_invalid_control_store_is_unknown_without_mutating_it(tmp_path) -> None:
-    path = tmp_path / "control.db"
-    original = b"not a SQLite database"
-    path.write_bytes(original)
-
-    summary = read_settled_spend(
-        str(path),
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-    )
-
-    assert summary.disposition is AccountingDisposition.UNAVAILABLE
-    assert summary.total is None
-    assert summary.for_repository("o/r") is None
-    assert summary.detail
-    assert path.read_bytes() == original
-
-
-def test_semantically_corrupt_control_store_spend_is_unknown(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    request = _request(1)
-    assert store.reserve(request).admitted
-    assert store.settle(
-        SettlementRequest(
-            request.run_id,
-            Money("USD", 50),
-            PricingBasis.PROVIDER_REPORTED,
-            "receipt",
-            None,
-            None,
-            None,
-        )
-    ).disposition is AccountingDisposition.AVAILABLE
-    with sqlite3.connect(store.path) as db:
-        db.execute(
-            "DELETE FROM reservation_limits WHERE run_id=?",
-            (str(request.run_id),),
-        )
-
-    summary = read_settled_spend(
-        store.path,
-        NOW.replace(hour=0),
-        NOW.replace(hour=0) + timedelta(days=1),
-    )
-
-    assert summary.disposition is AccountingDisposition.UNAVAILABLE
-    assert summary.total is None
-    assert "semantic integrity failed" in summary.detail
-
-
-def test_settle_is_idempotent_and_conflicting_receipt_is_rejected(tmp_path):
-    store = _store(tmp_path)
-    assert store.reserve(_request(1)).admitted
-    request = SettlementRequest(
-        RunId("run-1"),
-        Money("USD", 50),
-        PricingBasis.CONFIGURED_RATE_CARD,
-        "provider-1",
-        TokenUsage(1, 2),
-        "card",
-        "v1",
-    )
-    assert store.settle(request).disposition is AccountingDisposition.AVAILABLE
-    assert store.settle(request).idempotent
-    conflict = SettlementRequest(
-        RunId("run-1"),
-        Money("USD", 51),
-        PricingBasis.CONFIGURED_RATE_CARD,
-        "provider-1",
-        TokenUsage(1, 2),
-        "card",
-        "v1",
-    )
-    assert store.settle(conflict).disposition is AccountingDisposition.CONFLICT
-    assert store.snapshot(_scope()).settled == Money("USD", 50)
-    assert store.snapshot(_scope()).reserved == Money("USD", 0)
-
-
-@pytest.mark.parametrize("recovery_settles_first", (False, True))
-@pytest.mark.parametrize("recovery_basis", [PricingBasis.RECONCILED, PricingBasis.ESTIMATE])
-def test_normal_settlement_converges_with_dead_lease_recovery(
-    tmp_path, recovery_basis,
-    recovery_settles_first,
-) -> None:
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="o/r:fix")
-    assert store.reserve(
-        request,
-        lease=Lease(
-            request.run_id,
-            request.dispatch_id,
-            request.owner_id,
-            123,
-            123,
-            NOW,
-            99,
-        ),
-    ).admitted
-    assert store.reclaim_dead_leases(
-        request.owner_id, lambda _pid, _start: False
-    ) == (request.run_id,)
-    recovered = SettlementRequest(
-        request.run_id,
-        Money("USD", 50),
-        recovery_basis,
-        "codex-recovered:session:run-1",
-        TokenUsage(1, 2),
-        "card",
-        "v1",
-        origin=ChargeOrigin.RECOVERY_ESTIMATE,
-    )
-    normal = SettlementRequest(
-        request.run_id,
-        Money("USD", 50),
-        PricingBasis.CONFIGURED_RATE_CARD,
-        "codex:session:run-1",
-        TokenUsage(1, 2),
-        "card",
-        "v1",
-    )
-    if recovery_settles_first:
-        assert (
-            store.settle(recovered).disposition
-            is AccountingDisposition.AVAILABLE
-        )
-
-    normal_result = store.settle(normal)
-
-    assert normal_result.disposition is AccountingDisposition.AVAILABLE
-    assert store.settle(normal).disposition is AccountingDisposition.AVAILABLE
-    with sqlite3.connect(store.path) as db:
-        state = db.execute(
-            "SELECT state, outcome FROM runs WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()
-        reservation_state = db.execute(
-            "SELECT state FROM budget_reservations WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()[0]
-        charges = db.execute(
-            "SELECT COUNT(*) FROM charges WHERE run_id=?",
-            (str(request.run_id),),
-        ).fetchone()[0]
-    assert state == ("completed", "settled")
-    assert reservation_state == "settled"
-    assert charges == 1
-
-
-def test_dead_lease_cannot_use_completed_unmeasured_release_path(
-    tmp_path,
-) -> None:
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="o/r:fix")
-    assert store.reserve(
-        request,
-        lease=Lease(
-            request.run_id,
-            request.dispatch_id,
-            request.owner_id,
-            123,
-            123,
-            NOW,
-            99,
-        ),
-    ).admitted
-    assert store.reclaim_dead_leases(
-        request.owner_id, lambda _pid, _start: False
-    ) == (request.run_id,)
-
-    released = store.release_retained(
-        request.run_id,
-        "unmeasured_completed_reservation",
-        NOW + timedelta(minutes=3),
-    )
-
-    assert released.disposition is AccountingDisposition.CONFLICT
-    assert store.active_reservation_runs(request.owner_id) == (
-        request.run_id,
-    )
-
-
-def test_release_is_terminal_idempotent_and_returns_capacity(tmp_path):
+def test_settlement_is_once_idempotent_and_a_conflicting_receipt_is_refused(tmp_path):
     store = _store(tmp_path)
     store.reserve(_request(1))
-    released = store.release(RunId("run-1"), "cancelled")
+    store.reserve(_request(2, cap=1_000))
+    usage = TokenUsage(10, 5, 0, 0)
+
+    first = store.settle(_settlement("run-1", 75, usage=usage))
+    replay = store.settle(_settlement("run-1", 75, usage=usage))
+    changed = store.settle(_settlement("run-1", 10))
+    stolen = store.settle(_settlement("run-2", 10, receipt="receipt-run-1"))
+
+    assert first.disposition is AccountingDisposition.AVAILABLE
+    assert first.variance == Money("USD", 15)
+    assert replay.idempotent
+    assert changed.disposition is AccountingDisposition.CONFLICT
+    assert stolen.disposition is AccountingDisposition.CONFLICT
+    snapshot = store.snapshot(_daily())
+    assert (snapshot.settled, snapshot.reserved) == (Money("USD", 75), Money("USD", 60))
+
+
+def test_a_normal_return_corrects_a_recovery_estimate_but_not_the_reverse(tmp_path):
+    store = _store(tmp_path)
+    store.reserve(_request(1, cap=1_000))
+    store.reserve(_request(2, cap=1_000))
+    estimate = dict(basis=PricingBasis.ESTIMATE, origin=ChargeOrigin.RECOVERY_ESTIMATE)
+
+    assert store.settle(_settlement("run-1", 0, "estimate-1", **estimate)).disposition.value == "available"
+    assert store.settle(_settlement("run-1", 40)).disposition.value == "available"
+    assert store.settle(_settlement("run-2", 30)).disposition.value == "available"
+    late = store.settle(_settlement("run-2", 0, "estimate-2", **estimate))
+
+    assert late.disposition is AccountingDisposition.CONFLICT
+    assert store.snapshot(_daily()).settled == Money("USD", 70)
+
+
+def test_release_returns_capacity_charges_nothing_and_is_idempotent(tmp_path):
+    store = _store(tmp_path)
+    store.reserve(_request(1))
+
+    released = store.release(RunId("run-1"), "operator")
+    replay = store.release(RunId("run-1"), "operator")
+    other_reason = store.release(RunId("run-1"), "different")
+
     assert released.disposition is AccountingDisposition.AVAILABLE
-    assert store.release(RunId("run-1"), "cancelled").idempotent
-    assert (
-        store.release(RunId("run-1"), "different").disposition
-        is AccountingDisposition.CONFLICT
-    )
+    assert replay.idempotent
+    assert other_reason.disposition is AccountingDisposition.CONFLICT
+    assert store.snapshot(_daily()).committed == Money("USD", 0)
+    assert store.settle(_settlement("run-1", 5)).disposition is AccountingDisposition.CONFLICT
     assert store.reserve(_request(2)).admitted
 
 
-def test_idempotency_key_survives_reopen_and_receipt_detects_conflict(tmp_path):
+def test_only_a_never_launched_leg_is_released_as_unlaunched(tmp_path):
     store = _store(tmp_path)
-    assert store.claim_key("comment", "o/r", "same") == "new"
-    # A claim never confirmed (crash mid-write) must be read back, not redone.
-    assert store.claim_key("comment", "o/r", "same") == "claimed"
-    store.confirm_key("comment", "o/r", "same")
-    reopened = SQLiteControlStore(store.path, now=lambda: NOW)
-    reopened.initialize()
-    assert reopened.claim_key("comment", "o/r", "same") == "done"
-    assert reopened.claim_key("comment", "o/r", "other") == "new"
-    assert reopened.receipt("effect", "repo:o/r", "key", {"id": 1})
-    assert reopened.receipt("effect", "repo:o/r", "key", {"id": 1})
-    assert not reopened.receipt("effect", "repo:o/r", "key", {"id": 2})
+    store.reserve(_request(1))
+    running = _launch(store, 2)
+
+    assert store.release_unlaunched(RunId("run-1"), "unlaunched").disposition is AccountingDisposition.AVAILABLE
+    refused = store.release_unlaunched(running, "unlaunched")
+
+    assert refused.disposition is AccountingDisposition.CONFLICT
+    assert _leg(store, "run-2")["state"] == "running"
 
 
-def test_leases_are_durable_and_terminal_run_releases_them(tmp_path):
+def test_an_interrupted_leg_is_settled_at_zero_only_once_its_process_is_gone(tmp_path):
     store = _store(tmp_path)
-    store.start_run(RunId("run"), "dispatch", "resolve", "owner", "cfg")
-    store.register_lease(
-        Lease(RunId("run"), "dispatch", "owner", 123, 124, NOW)
+    run = _launch(store, 1)
+
+    assert not store.settle_terminal_estimate(run, "no evidence")  # live lease, no end
+    assert store.reclaim_dead_leases(OWNER, _dead) == (run,)
+    assert store.settle_terminal_estimate(run, "no evidence")
+
+    leg = _leg(store, "run-1")
+    assert (leg["state"], leg["charged_micros"], leg["basis"], leg["origin"]) == (
+        "ended", 0, "estimate", "recovery_estimate",
     )
-    assert store.leases()[0].pgid == 124
-    assert store.complete_run(RunId("run"), state="cancelled", outcome="signal")
+    assert store.snapshot(_daily()).committed == Money("USD", 0)
+
+
+def test_retained_spend_stays_reserved_until_recovery_and_reports_its_end(tmp_path):
+    store = _store(tmp_path)
+    run = _launch(store, 1)
+
+    assert store.record_reservation_retained(run, "runtime failed after launch")
+    assert store.stale_active_reservation_runs(OWNER, NOW - timedelta(hours=1)) == (run,)
+    assert store.run_completed_at(run) == NOW.timestamp()
+    assert store.snapshot(_daily()).reserved == Money("USD", 60)
     assert store.leases() == ()
+    assert store.release_retained(run, "unmeasured", NOW).disposition is AccountingDisposition.AVAILABLE
+    assert store.snapshot(_daily()).committed == Money("USD", 0)
 
 
-def test_legacy_spend_import_preserves_all_live_cap_dimensions(tmp_path):
+def test_shutdown_marks_this_deployments_unsettled_legs_without_releasing_them(tmp_path):
     store = _store(tmp_path)
-    ledger = tmp_path / "spend.jsonl"
-    first = {
-        "event": "spend",
-        "ts": NOW.isoformat(),
-        "repo": "o/r",
-        "issue": 42,
-        "cost_usd": 1.25,
-        "model": "legacy",
-    }
-    second = {**first, "cost_usd": 0.75, "model": "legacy-2"}
-    ledger.write_text(
-        "\n".join(json.dumps(row) for row in (first, second)) + "\n"
-    )
+    run = _launch(store, 1, issue=9)
+    store.reserve(_request(2, cap=1_000, owner="o/r:fix:other"))
 
-    report = store.import_legacy_spend(str(ledger))
-    assert report.imported == 2
-    assert report.amount == Money("USD", 2_000_000)
-    assert store.import_legacy_spend(str(ledger)).idempotent
+    intents = store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")
 
-    daily = _scope()
-    repository = dataclasses.replace(daily, dimension="repository")
-    global_scope = dataclasses.replace(
-        daily, repository="*", dimension="global"
-    )
-    issue_scope = BudgetScope(
-        "o/r",
-        "issue:42",
-        "USD",
-        "lifetime:42",
-        datetime(1970, 1, 1, tzinfo=timezone.utc),
-        datetime.max.replace(tzinfo=timezone.utc),
-        ZoneInfo("UTC"),
-    )
-    assert store.snapshot(repository).settled == Money("USD", 2_000_000)
-    assert store.snapshot(global_scope).settled == Money("USD", 2_000_000)
-    assert store.snapshot(issue_scope).settled == Money("USD", 2_000_000)
-
-    third = {**first, "cost_usd": 0.5, "model": "legacy-3"}
-    ledger.write_text(
-        "\n".join(json.dumps(row) for row in (third, first, second)) + "\n"
-    )
-    appended = store.import_legacy_spend(str(ledger))
-    assert appended.imported == 1
-    assert store.snapshot(repository).settled == Money("USD", 2_500_000)
-
-
-def test_legacy_spend_import_uses_canonical_repository_scope(tmp_path):
-    store = _store(tmp_path)
-    ledger = tmp_path / "spend.jsonl"
-    ledger.write_text(
-        json.dumps(
-            {
-                "event": "spend",
-                "ts": NOW.isoformat(),
-                "repo": " Acme/App ",
-                "issue": 7,
-                "cost_usd": 49,
-                "model": "legacy",
-            }
-        )
-        + "\n"
-    )
-
-    assert store.import_legacy_spend(str(ledger)).imported == 1
-
-    scope = dataclasses.replace(
-        _scope(), repository="acme/app", dimension="repository"
-    )
-    assert store.snapshot(scope).settled == Money("USD", 49_000_000)
-
-
-def test_distinct_rotated_ledgers_keep_identical_semantic_spend_rows(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    common = {
-        "event": "spend",
-        "ts": NOW.isoformat(),
-        "repo": "o/r",
-        "issue": 7,
-        "cost_usd": 1.25,
-        "model": "legacy",
-    }
-    first = tmp_path / "spend.1.jsonl"
-    second = tmp_path / "spend.2.jsonl"
-    first.write_text(
-        "\n".join(
-            json.dumps(row)
-            for row in (dict(common, issue=8), common)
-        )
-        + "\n"
-    )
-    second.write_text(
-        "\n".join(
-            json.dumps(row)
-            for row in (common, dict(common, issue=9))
-        )
-        + "\n"
-    )
-
-    assert store.import_legacy_spend(str(first)).imported == 2
-    assert store.import_legacy_spend(str(second)).imported == 2
-
-    scope = dataclasses.replace(_scope(), dimension="repository")
-    assert store.snapshot(scope).settled == Money("USD", 5_000_000)
-
-
-def test_byte_identical_rotated_ledgers_are_distinct_sources(tmp_path):
-    store = _store(tmp_path)
-    row = {
-        "event": "spend",
-        "ts": NOW.isoformat(),
-        "repo": "o/r",
-        "issue": 7,
-        "cost_usd": 1.25,
-        "model": "legacy",
-    }
-    first = tmp_path / "spend.1.jsonl"
-    second = tmp_path / "spend.2.jsonl"
-    content = json.dumps(row) + "\n"
-    first.write_text(content)
-    second.write_text(content)
-
-    assert store.import_legacy_spend(str(first)).imported == 1
-    assert store.import_legacy_spend(str(second)).imported == 1
-    assert store.import_legacy_spend(str(first)).idempotent
-    assert store.import_legacy_spend(str(second)).idempotent
-
-    scope = dataclasses.replace(_scope(), dimension="repository")
-    assert store.snapshot(scope).settled == Money("USD", 2_500_000)
-
-
-def test_legacy_digest_only_receipt_remains_idempotent_for_same_source(
-    tmp_path,
-):
-    store = _store(tmp_path)
-    ledger = tmp_path / "spend.jsonl"
-    ledger.write_text(
-        json.dumps(
-            {
-                "event": "spend",
-                "ts": NOW.isoformat(),
-                "repo": "o/r",
-                "issue": 7,
-                "cost_usd": 1.25,
-            }
-        )
-        + "\n"
-    )
-    store.import_legacy_spend(str(ledger))
-    legacy_id = "legacy-spend:" + hashlib.sha256(
-        ledger.read_bytes()
-    ).hexdigest()
-    with store._connect() as db:
-        db.execute(
-            "UPDATE migration_imports SET migration_id=?",
-            (legacy_id,),
-        )
-
-    repeated = store.import_legacy_spend(str(ledger))
-
-    assert repeated.idempotent
-    assert repeated.migration_id == legacy_id
-    with store._connect() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM migration_imports"
-        ).fetchone()[0] == 1
-
-
-def test_legacy_spend_import_rejects_unattributed_rows(tmp_path):
-    store = _store(tmp_path)
-    ledger = tmp_path / "spend.jsonl"
-    ledger.write_text(
-        json.dumps(
-            {
-                "event": "spend",
-                "ts": NOW.isoformat(),
-                "repo": "o/r",
-                "issue": None,
-                "cost_usd": 1,
-            }
-        )
-        + "\n"
-    )
-
-    with pytest.raises(LegacySpendMigrationError, match="no rows were imported"):
-        store.import_legacy_spend(str(ledger))
-
-    with sqlite3.connect(store.path) as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM migration_imports"
-        ).fetchone() == (0,)
-        assert db.execute(
-            "SELECT COUNT(*) FROM runs WHERE kind='legacy-import'"
-        ).fetchone() == (0,)
-
-
-@pytest.mark.parametrize(
-    ("timestamp", "amount"),
-    (
-        (NOW.replace(tzinfo=None).isoformat(), "1"),
-        (NOW.isoformat(), "-0.0000001"),
-        (NOW.isoformat(), "NaN"),
-        (NOW.isoformat(), "Infinity"),
-    ),
-)
-def test_legacy_spend_import_rejects_invalid_authority_rows_atomically(
-    tmp_path,
-    timestamp,
-    amount,
-):
-    store = _store(tmp_path)
-    ledger = tmp_path / "spend.jsonl"
-    valid = {
-        "event": "spend",
-        "ts": NOW.isoformat(),
-        "repo": "o/r",
-        "issue": 42,
-        "cost_usd": 1,
-    }
-    invalid = {**valid, "ts": timestamp, "cost_usd": amount}
-    ledger.write_text(
-        "\n".join(json.dumps(row) for row in (valid, invalid)) + "\n"
-    )
-
-    with pytest.raises(LegacySpendMigrationError, match="no rows were imported"):
-        store.import_legacy_spend(str(ledger))
-
-    with sqlite3.connect(store.path) as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM runs WHERE kind='legacy-import'"
-        ).fetchone() == (0,)
-
-
-# ── cross-role observation of live claims (#176) ──────────────────────────────
-def test_active_dispatch_claims_report_live_fix_targets(tmp_path) -> None:
-    store = _store(tmp_path)
-    assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a"
-    )
-    assert store.claim_dispatch(
-        "o/r", "fix", -7, "FIX_CI", "owner-a"
-    )
-    assert store.claim_dispatch(
-        "o/r", "review", 99, "REVIEW", "owner-a"
-    )
-
-    claims = store.active_dispatch_claims("o/r", "fix")
-
-    assert {claim.target_key: claim.leg for claim in claims} == {
-        42: "ADDRESS_REVIEW",
-        -7: "FIX_CI",
-    }
-    assert all(claim.claimed_at == NOW for claim in claims)
-
-
-def test_released_and_dead_claims_are_not_reported_as_active(tmp_path) -> None:
-    store = _store(tmp_path)
-    assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a"
-    )
-    assert store.claim_dispatch(
-        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a"
-    )
-    assert store.release_dispatch_claim("o/r", "fix", 42, "owner-a")
-    # A leaked row whose owner process is gone and which never bound a run: the
-    # claim is dead, so review must not wait on it.
-    with store._connect() as db:
-        db.execute(
-            "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=? "
-            "WHERE target='issue:43'",
-            (2_000_000_000, 1),
-        )
-
-    assert store.active_dispatch_claims("o/r", "fix") == ()
-
-
-def test_a_claim_with_an_unreadable_row_is_skipped(tmp_path) -> None:
-    """Fail open: this reader only withholds paid work, so one corrupt row must
-    not be able to starve review."""
-    store = _store(tmp_path)
-    assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a"
-    )
-    assert store.claim_dispatch(
-        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a"
-    )
-    with store._connect() as db:
-        db.execute(
-            "UPDATE dispatch_claims SET target='not-a-target' "
-            "WHERE target='issue:42'"
-        )
-        db.execute(
-            "UPDATE dispatch_claims SET claimed_at='whenever' "
-            "WHERE target='issue:43'"
-        )
-
-    assert store.active_dispatch_claims("o/r", "fix") == ()
-
-
-def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> None:
-    """A claim is taken at decision time and bound to a run later. Keying the
-    observation on the run id changed it mid-hold, which double-journalled one
-    deferral (#176); the key must survive binding."""
-    store = _store(tmp_path)
-    owner = "o/r:fix:checkout-a"
-    run_id = RunId("bound-child")
-    request = dataclasses.replace(
-        _request(1),
-        run_id=run_id,
-        reservation_id=ReservationId("bound-child-reservation"),
-        owner_id=owner,
-        kind="ADDRESS_REVIEW",
-    )
-    assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", owner
-    )
-    before = store.active_dispatch_claims("o/r", "fix")
-
-    assert store.reserve(request).admitted
-    assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
-    after = store.active_dispatch_claims("o/r", "fix")
-
-    assert [claim.claim_key for claim in before] == [
-        claim.claim_key for claim in after
+    assert [(i.run_id, i.kind, i.issue_number, i.reason) for i in intents] == [
+        (run, "RESOLVE", 9, "shutdown_deadline_spend_unknown"),
     ]
+    assert store.has_cancellation_intent(run)
+    assert not store.has_cancellation_intent(RunId("run-2"))
+    assert store.snapshot(_daily()).reserved == Money("USD", 120)
 
 
-def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
-    tmp_path,
-) -> None:
-    """The cross-deployment case: the claiming daemon is gone but its child leg
-    is still running and still pushing, so review must still wait on it."""
+@pytest.mark.parametrize("damage", ["garbage", "deleted"])
+def test_an_unreadable_authority_refuses_paid_admission(tmp_path, damage):
     store = _store(tmp_path)
-    owner = "o/r:fix:checkout-a"
-    run_id = RunId("bound-child")
-    request = dataclasses.replace(
-        _request(1),
-        run_id=run_id,
-        reservation_id=ReservationId("bound-child-reservation"),
-        owner_id=owner,
-        kind="ADDRESS_REVIEW",
-    )
-    assert store.claim_dispatch(
-        "o/r", "fix", 42, "ADDRESS_REVIEW", owner
-    )
-    assert store.reserve(request).admitted
-    assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
-    with store._connect() as db:
+    if damage == "garbage":
+        Path(store.path).write_bytes(b"\0garbage" * 4096)
+    else:
+        os.unlink(store.path)
+
+    result = store.reserve(_request(1))
+
+    assert not result.admitted
+    assert result.disposition in (AccountingDisposition.CORRUPT, AccountingDisposition.UNAVAILABLE)
+    assert not os.path.exists(store.path) or damage == "garbage"
+
+
+# -- legs ----------------------------------------------------------------------
+
+
+def test_ended_legs_carry_their_returned_class_session_and_result(tmp_path):
+    store = _store(tmp_path)
+    run = _launch(store, 1, issue=5)
+    assert store.leg_runs(REPO, (5,)) == ()  # not ended yet
+
+    assert store.record_result(run, "asked", session="s-1", result={"question": "which?"})
+    assert not store.record_result(run, "agent")
+    store.settle(_settlement("run-1", 10))
+    store.record_unpaid_leg(RunId("refused"), repository=REPO, role="fix", kind="FIX_CI", owner_id=OWNER,
+                            issue=5, number=12, head="abc", runtime="claude")
+
+    runs = sorted(store.leg_runs(REPO, (5, 6, -1)), key=lambda run: run.kind)
+    assert [(r.kind, r.number, r.issue, r.head) for r in runs] == [("FIX_CI", 12, 5, "abc"), ("RESOLVE", 1, 5, "")]
+    assert runs[0].receipt is None
+    assert runs[1].receipt == {"question": "which?", "leg": "asked", "session": "s-1", "runtime": "claude"}
+    assert runs[1].started_at is not None
+
+
+def test_leg_reads_are_bounded_for_huge_issue_lists(tmp_path):
+    store = _store(tmp_path)
+    store.record_unpaid_leg(RunId("r"), repository=REPO, role="review", kind="REVIEW", owner_id=OWNER,
+                            issue=1_999, number=3, head="h", runtime="codex")
+
+    assert [run.issue for run in store.leg_runs(REPO, range(1, 3_000))] == [1_999]
+
+
+# -- leases ----------------------------------------------------------------------
+
+
+def test_one_role_holds_one_item_and_the_other_role_may_hold_it_too(tmp_path):
+    store = _store(tmp_path)
+
+    assert store.lease(REPO, "fix", 7, OWNER)
+    assert not store.lease(REPO, "fix", 7, "o/r:fix:other")
+    assert store.lease(REPO, "review", 7, "o/r:review:d")
+    assert store.lease(REPO, "fix", 8, OWNER)
+    assert store.held_targets(REPO) == frozenset({7, 8})
+    assert store.unlease(REPO, "fix", 7, OWNER)
+    assert store.lease(REPO, "fix", 7, "o/r:fix:other")
+
+
+def test_a_paid_leg_must_bind_a_lease_its_owner_holds(tmp_path):
+    store = _store(tmp_path)
+
+    unleased = store.reserve(_request(1, lease_target=1))
+    assert store.lease(REPO, "fix", 1, "o/r:fix:other")
+    someone_elses = store.reserve(_request(1, lease_target=1))
+
+    assert unleased.disposition is AccountingDisposition.CONFLICT
+    assert someone_elses.disposition is AccountingDisposition.CONFLICT
+    assert store.snapshot(_daily()).committed == Money("USD", 0)
+
+
+def test_a_dead_holders_lease_is_taken_over_unless_its_leg_still_runs(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    assert store.lease(REPO, "fix", 1, OWNER)
+    run = _launch(store, 2)
+    monkeypatch.setattr(ProcessSupervisor, "matches_identity", classmethod(lambda cls, pid, ticks: False))
+
+    assert store.lease(REPO, "fix", 1, "o/r:fix:other")  # holder gone, nothing bound
+    assert not store.lease(REPO, "fix", 2, "o/r:fix:other")  # its running leg holds it
+    assert store.held_targets(REPO) == frozenset({2})  # every holder process reads as gone
+    assert _leg(store, str(run))["state"] == "running"
+
+
+def test_a_spawned_process_takes_over_its_legs_lease(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    run = _launch(store, 1)
+    lease = store.leases(OWNER)[0]
+    assert (lease.run_id, lease.pid, lease.pgid, lease.process_start_ticks) == (run, 4242, 4242, 7)
+    assert _leg(store, "run-1")["state"] == "running"
+
+    store.register_process_lease(run, expected_owner_id=OWNER, pid=4242, pgid=4242, process_start_ticks=7)
+    with pytest.raises(ControlStoreError):
+        store.register_process_lease(run, expected_owner_id="o/r:fix:other", pid=5, pgid=5, process_start_ticks=1)
+    monkeypatch.setattr(ProcessSupervisor, "matches_identity", classmethod(lambda cls, pid, ticks: True))
+    with pytest.raises(ControlStoreError, match="conflicting"):
+        store.register_process_lease(run, expected_owner_id=OWNER, pid=5, pgid=5, process_start_ticks=1)
+    monkeypatch.setattr(ProcessSupervisor, "matches_identity", classmethod(lambda cls, pid, ticks: False))
+    monkeypatch.setattr(ProcessSupervisor, "group_is_absent", staticmethod(lambda pgid: True))
+    store.register_process_lease(run, expected_owner_id=OWNER, pid=5, pgid=5, process_start_ticks=1)
+    assert store.leases()[0].pid == 5
+
+
+def test_a_process_cannot_register_for_an_unleased_or_finished_leg(tmp_path):
+    store = _store(tmp_path)
+    store.reserve(_request(1))
+    run = _launch(store, 2)
+    store.settle(_settlement(str(run), 1))
+
+    for leg in (RunId("run-1"), run, RunId("missing")):
+        with pytest.raises(ControlStoreError):
+            store.register_process_lease(leg, expected_owner_id=OWNER, pid=9, pgid=9, process_start_ticks=9)
+
+
+def test_a_dead_process_lease_is_reclaimed_and_its_leg_awaits_settlement(tmp_path):
+    store = _store(tmp_path)
+    run = _launch(store, 1)
+    _launch(store, 2)  # alive below
+    store.lease("x/y", "fix", 3, "x/y:fix:d")  # another repository: out of scope
+
+    assert store.reclaim_dead_leases(OWNER, _alive) == ()
+    reclaimed = store.reclaim_dead_leases(OWNER, _dead)
+    assert set(reclaimed) == {run, RunId("run-2")}
+    assert [lease.repository for lease in store.leases()] == ["x/y"]
+    leg = _leg(store, "run-1")
+    assert (leg["state"], leg["end_reason"]) == ("running", "dead_lease")
+    assert set(store.stale_active_reservation_runs(OWNER, NOW - timedelta(hours=1))) == {run, RunId("run-2")}
+
+
+def test_reclaim_probes_liveness_outside_the_write_transaction(tmp_path):
+    store = _store(tmp_path)
+    _launch(store, 1)
+
+    def probe(_pid: int, _ticks: int) -> bool:
+        with closing(sqlite3.connect(store.path, timeout=0)) as other:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+        return True
+
+    assert store.reclaim_dead_leases(OWNER, probe) == ()
+
+
+def test_releasing_a_lease_ends_its_unsettled_leg_for_recovery(tmp_path):
+    store = _store(tmp_path)
+    run = _launch(store, 1)
+
+    assert store.unlease(REPO, "fix", 1, OWNER)
+    assert not store.unlease(REPO, "fix", 1, OWNER)
+
+    leg = _leg(store, str(run))
+    assert (leg["state"], leg["end_reason"]) == ("running", "lease released before settlement")
+    assert store.settle_terminal_estimate(run, "no evidence")
+
+
+# -- idempotency -------------------------------------------------------------------
+
+
+def test_a_claimed_comment_key_survives_a_crash_and_is_read_back(tmp_path):
+    store = _store(tmp_path)
+    assert store.claim_key("fix-comment:o/r:needs-human:7") == "new"
+
+    reopened = SQLiteControlStore(store.path)  # the process died before confirming
+    reopened.initialize()
+    assert reopened.claim_key("fix-comment:o/r:needs-human:7") == "claimed"
+    reopened.confirm_key("fix-comment:o/r:needs-human:7")
+    assert SQLiteControlStore(store.path).claim_key("fix-comment:o/r:needs-human:7") == "done"
+
+
+# -- read model ----------------------------------------------------------------------
+
+
+def test_the_settled_spend_read_model_groups_charges_by_repository(tmp_path):
+    store = _store(tmp_path)
+    store.reserve(_request(1))
+    store.reserve(_request(2, repository="a/b", owner="a/b:fix:d"))
+    store.reserve(_request(3, cap=1_000))
+    store.settle(_settlement("run-1", 40))
+    store.settle(_settlement("run-2", 25))
+    start = NOW.replace(hour=0)
+
+    spend = read_settled_spend(store.path, start, start + timedelta(days=1))
+
+    assert spend.total == Money("USD", 65)
+    assert spend.for_repository("O/R") == Money("USD", 40)
+    assert spend.for_repository("never/ran") == Money("USD", 0)
+
+
+def test_the_read_model_never_creates_or_cuts_over_a_store(tmp_path):
+    start = NOW.replace(hour=0)
+    missing = tmp_path / "missing.db"
+    legacy = _legacy(tmp_path / "legacy.db")
+    before = legacy.read_bytes()
+
+    assert read_settled_spend(str(missing), start, start + timedelta(days=1)).total is None
+    assert read_settled_spend(str(legacy), start, start + timedelta(days=1)).total is None
+    assert not missing.exists()
+    assert legacy.read_bytes() == before
+
+
+# -- cutover -------------------------------------------------------------------------
+
+
+def _legacy(path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, ...] = ()) -> Path:
+    """A legacy v46 store. Each run: (run_id, run_state, reservation_state,
+    charged_micros | None, issue, created_at, lease?)."""
+    with closing(sqlite3.connect(path)) as db:
+        db.executescript(LEGACY_SCHEMA.read_text())
+        db.execute("PRAGMA journal_mode=WAL")
+        for run_id, run_state, reservation_state, charged, issue, created_at, lease in runs:
+            dispatch = (
+                f'{{"issue":{issue},"kind":"RESOLVE","number":{issue},"repository":"{REPO}",'
+                '"role":"fix","runtime":"codex"}'
+            )
+            db.execute(
+                "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, config_version, started_at, "
+                "completed_at, outcome, provider_receipt_id) VALUES (?, ?, 'RESOLVE', ?, ?, 'v', ?, ?, ?, ?)",
+                (run_id, dispatch, OWNER, run_state, created_at,
+                 created_at if run_state == "completed" else None,
+                 "settled" if charged is not None else None,
+                 f"receipt-{run_id}" if charged is not None else None),
+            )
+            day = created_at[:10]
+            db.execute(
+                "INSERT INTO budget_reservations(reservation_id, run_id, repository, workload_repository, "
+                "dimension, period_id, period_start, period_end, period_timezone, currency, maximum_micros, "
+                "cap_micros, model, rate_card_id, rate_card_version, quote_effective_at, config_version, "
+                "state, created_at, updated_at) VALUES (?, ?, ?, ?, 'repository', ?, ?, ?, 'UTC', 'USD', 500, "
+                "1000, 'gpt', 'card', 'v', ?, 'v', ?, ?, ?)",
+                (f"res-{run_id}", run_id, REPO, REPO, day, f"{day}T00:00:00.000Z", f"{day}T23:59:59.999Z",
+                 created_at, reservation_state, created_at, created_at),
+            )
+            db.execute(
+                "INSERT INTO reservation_recovery(run_id, policy, updated_at) VALUES (?, 'running', ?)",
+                (run_id, created_at),
+            )
+            if charged is not None:
+                db.execute(
+                    "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, currency, basis, settled_at, "
+                    "origin) VALUES (?, ?, ?, 'USD', 'provider_reported', ?, 'normal_return')",
+                    (run_id, f"receipt-{run_id}", charged, created_at),
+                )
+            if lease:
+                db.execute(
+                    "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, process_start_ticks, started_at) "
+                    "VALUES (?, ?, ?, 1, 1, 1, ?)", (run_id, dispatch, OWNER, created_at),
+                )
+        for scope, key, payload in comments:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) "
+                "VALUES (?, ?, ?, '2026-07-01T00:00:00.000Z', ?)",
+                ("fix-comment", scope, key, payload),
+            )
         db.execute(
-            "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=?",
-            (2_000_000_000, 1),
+            "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) "
+            "VALUES ('workflow-admission', 'o/r', 'k', '2026-07-01T00:00:00.000Z', '{}')"
         )
-
-    assert [
-        claim.target_key for claim in store.active_dispatch_claims("o/r", "fix")
-    ] == [42]
-
-    # Once that run reaches a terminal state nothing keeps the claim alive.
-    assert store.release(run_id, "spend_unknown").disposition.value == "available"
-    assert store.active_dispatch_claims("o/r", "fix") == ()
+        db.commit()
+    return path
 
 
-def _claim_rows(store):
-    with sqlite3.connect(store.path) as db:
-        db.row_factory = sqlite3.Row
-        return tuple(dict(row) for row in db.execute("SELECT * FROM dispatch_claims ORDER BY repository,role,target"))
+TODAY = "2026-07-30T09:00:00.000Z"
+SETTLED = (
+    ("today", "completed", "settled", 300, 7, TODAY, False),
+    ("earlier", "completed", "settled", 200, 7, "2026-07-01T09:00:00.000Z", False),
+    ("other-issue", "completed", "settled", 50, 8, TODAY, False),
+    ("released", "cancelled", "released", None, 7, TODAY, False),
+)
 
 
-def _claim_receipts(store):
-    with sqlite3.connect(store.path) as db:
-        return {key: json.loads(payload) for key, payload in db.execute(
-            "SELECT key,payload_json FROM dedupe_keys WHERE namespace='dispatch-claim-lifecycle' AND scope='o/r'")}
+def test_cutover_carries_settled_spend_into_the_caps_and_retires_the_legacy_file(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED,
+                   comments=(("o/r", "needs-human:7", '"done"'), ("o/r", "needs-human:8", '"claimed"')))
+    legacy_bytes_digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
-
-def test_dispatch_claim_occurrence_retains_create_and_normal_release_provenance_once(tmp_path):
-    store = _store(tmp_path)
-    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
-    claim, = _claim_rows(store)
-    occurrence = claim["occurrence_id"]
-    created = _claim_receipts(store)[f"{occurrence}:created"]
-    for field in ("role", "target", "leg", "owner_id", "owner_pid", "owner_start_ticks", "claimed_at"):
-        assert created[field] == claim[field]
-    assert created["source"] == "admission"
-    assert store.active_dispatch_claims("o/r", "fix")[0].claim_key == occurrence
-    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
-    assert _claim_rows(store) == (claim,)
-    assert len(_claim_receipts(store)) == 1
-    assert store.release_dispatch_claim("o/r", "fix", 42, "owner")
-    assert _claim_rows(store) == ()
-    retained = _claim_receipts(store)
-    released = retained[f"{occurrence}:released"]
-    assert released == {key: created[key] for key in created if key != "source"}
-    assert not store.release_dispatch_claim("o/r", "fix", 42, "owner")
-    assert _claim_receipts(store) == retained
-
-
-def test_stale_dispatch_reclaim_retains_exact_old_occurrence_and_mints_new_one(tmp_path, monkeypatch):
-    store = _store(tmp_path)
-    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
-    old, = _claim_rows(store)
-    monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(lambda _pid, _ticks: False))
-    assert store.claim_dispatch("o/r", "fix", 42, "RESUME", "successor")
-    new, = _claim_rows(store)
-    assert old["occurrence_id"] != new["occurrence_id"]
-    receipts = _claim_receipts(store)
-    reclaimed = receipts[f"{old['occurrence_id']}:reclaimed"]
-    for field in ("role", "target", "leg", "owner_id", "owner_pid", "owner_start_ticks", "claimed_at"):
-        assert reclaimed[field] == old[field]
-    assert receipts[f"{new['occurrence_id']}:created"]["owner_id"] == "successor"
-    assert len(receipts) == 3
-
-
-def test_same_owner_pid_and_timestamp_replacement_is_not_reclaimed_from_an_old_probe(tmp_path, monkeypatch):
-    store = _store(tmp_path)
-    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
-    old, = _claim_rows(store)
-    replacements = []
-
-    def replace_during_probe(pid, start_ticks):
-        assert not replacements
-        assert (pid, start_ticks) == (old["owner_pid"], old["owner_start_ticks"])
-        assert store.release_dispatch_claim("o/r", "fix", 42, "owner")
-        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
-        replacements.extend(_claim_rows(store))
-        return False
-
-    monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(replace_during_probe))
-    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "competitor")
-    replacement, = replacements
-    assert replacement["occurrence_id"] != old["occurrence_id"]
-    assert {key: value for key, value in replacement.items() if key != "occurrence_id"} == {
-        key: value for key, value in old.items() if key != "occurrence_id"}
-    assert _claim_rows(store) == (replacement,)
-    receipts = _claim_receipts(store)
-    assert set(receipts) == {f"{old['occurrence_id']}:created", f"{old['occurrence_id']}:released",
-                             f"{replacement['occurrence_id']}:created"}
-
-
-@pytest.mark.parametrize("event", ["created", "released", "reclaimed"])
-def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change(tmp_path, monkeypatch, event):
-    import uuid
-    import issue_agent.adapters.control_store as control_module
-
-    store = _store(tmp_path)
-    if event == "created":
-        identity = uuid.UUID("00000000-0000-0000-0000-000000000001")
-        monkeypatch.setattr(control_module.uuid, "uuid4", lambda: identity)
-        occurrence = identity.hex
-    else:
-        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner")
-        occurrence = _claim_rows(store)[0]["occurrence_id"]
-    assert store.receipt("dispatch-claim-lifecycle", "o/r", f"{occurrence}:{event}", {"conflicting": "accepted fact"})
-    with sqlite3.connect(store.path) as db:
-        before = tuple(db.iterdump())
-    if event == "reclaimed":
-        monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(lambda _pid, _ticks: False))
-    with pytest.raises(sqlite3.IntegrityError):
-        if event == "released":
-            store.release_dispatch_claim("o/r", "fix", 42, "owner")
-        else:
-            store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "successor")
-    with sqlite3.connect(store.path) as db:
-        assert tuple(db.iterdump()) == before
-
-
-def test_v34_preserves_predecessor_migration_sources_and_digests():
-    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS
-
-    # Pinned at accepted S4/S5 d7ef565 before the forward-only retirement.
-    encoded = json.dumps(tuple((migration.version, migration.source, migration.transform_spec, migration.digest)
-                               for migration in _SCHEMA_MIGRATIONS if migration.version <= 33),
-                         ensure_ascii=True, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == '03bf29fd7238a15690a0ef185adcff55b4d2ec81104cc6eb999ecd90a93201a0'
-
-
-def test_v33_binary_refuses_new_schema_without_mutating_authority(tmp_path, monkeypatch):
-    import issue_agent.adapters.control_store as control_module
-
-    store = _store(tmp_path)
-    with store.transaction() as db:
-        before = tuple(db.iterdump())
-    monkeypatch.setattr(control_module, 'SCHEMA_VERSION', 33)
-    with pytest.raises(IncompatibleSchema, match='newer than 33'):
-        SQLiteControlStore(store.path, now=lambda: NOW).initialize()
-    with store.transaction() as db:
-        assert tuple(db.iterdump()) == before
-
-
-def test_v34_unrelated_writes_need_no_retired_projection_witness(tmp_path):
-    store = _store(tmp_path)
-    with store.transaction() as db:
-        remaining = tuple(row[0] for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
-        ))
-        assert remaining == ('dispatch_claims_occurrence_insert', 'dispatch_claims_occurrence_update',
-                             'runs_continuation_identity_update', 'runs_continuation_selections_update',
-                             'runs_require_workflow_episode_insert', 'runs_require_workflow_episode_update',
-                             'runs_review_attachment_insert', 'runs_review_attachment_update',
-                             'workflow_retry_grant_insert', 'workflow_retry_grant_update')
-    assert store.claim_dispatch('o/r', 'review', -9, 'REVIEW', 's6-owner')
-    with pytest.raises(sqlite3.IntegrityError, match='occurrence is immutable'):
-        with store.transaction() as db:
-            db.execute("UPDATE dispatch_claims SET occurrence_id='changed' WHERE repository='o/r'")
-    assert store.reserve(_request(1)).admitted
-    assert store.claim_key('unrelated', 'other/repository', 'key') == 'new'
-    assert store.release(RunId('run-1'), 'cancelled').disposition is AccountingDisposition.AVAILABLE
-    store.integrity_check()
-
-
-@pytest.mark.parametrize("earlier_receipt", ["codex-recovered:session:run-1", "earlier-estimate:run-1", "claude:session:run-1"])
-@pytest.mark.parametrize("recovered,actual", [(0, 0), (0, 1_250_000), (1_000_000, 1_250_000), (1_250_000, 50)])
-def test_normal_return_corrects_terminal_recovery_idempotently(tmp_path, recovered, actual, earlier_receipt):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="o/r:fix")
-    assert store.reserve(request, lease=Lease(request.run_id, request.dispatch_id, request.owner_id,
-                                             123, 123, NOW, 99)).admitted
-    assert store.reclaim_dead_leases(request.owner_id, lambda _pid, _start: False) == (request.run_id,)
-    if recovered:
-        assert store.settle(SettlementRequest(request.run_id, Money("USD", recovered), PricingBasis.ESTIMATE,
-                            earlier_receipt, None, "card", "v1", origin=ChargeOrigin.RECOVERY_ESTIMATE)).disposition is AccountingDisposition.AVAILABLE
-    else:
-        assert store.settle_terminal_estimate(request.run_id, "no request evidence")
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("abandoned", "dead_lease")
-    normal = SettlementRequest(request.run_id, Money("USD", actual), PricingBasis.PROVIDER_REPORTED,
-                               "claude:session:run-1", None, None, None)
-    assert store.settle(normal).disposition is AccountingDisposition.AVAILABLE
-    restarted = SQLiteControlStore(store.path, now=lambda: NOW)
-    restarted.initialize()
-    assert restarted.settle(normal).idempotent
-    assert restarted.settle(dataclasses.replace(normal, amount=Money("USD", actual + 1))).disposition is AccountingDisposition.CONFLICT
-    assert restarted.snapshot(_scope()).settled == Money("USD", actual)
-    with store.transaction() as db:
-        assert [tuple(row) for row in db.execute("SELECT amount_micros,basis FROM charges WHERE run_id='run-1'")] == [
-            (actual, "provider_reported")]
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("completed", "settled")
-        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
-        assert db.execute("SELECT provider_receipt_id FROM runs").fetchone()[0] == normal.provider_receipt_id
-
-
-def test_measured_remeter_cannot_claim_an_estimated_charge(tmp_path):
-    store = _store(tmp_path)
-    assert store.reserve(_request(1)).admitted
-    request = SettlementRequest(RunId("run-1"), Money("USD", 50), PricingBasis.ESTIMATE,
-                                "codex-recovered:session:run-1", None, "card", "v1", origin=ChargeOrigin.RECOVERY_ESTIMATE)
-    with pytest.raises(ValueError, match="measured recovery"):
-        store.settle_remetered(request, NativeFailure.AMBIGUOUS_TOKEN_COUNTS)
-    assert store.snapshot(_scope()).reserved == Money("USD", 60)
-    measured = dataclasses.replace(request, basis=PricingBasis.RECONCILED)
-    assert store.settle_remetered(measured, NativeFailure.AMBIGUOUS_TOKEN_COUNTS).disposition is AccountingDisposition.AVAILABLE
-    assert store.snapshot(_scope()).settled == Money("USD", 50)
-
-
-@pytest.mark.parametrize("receipt_id,origin", [
-    ("codex-recovered:session:run-1", ChargeOrigin.RECOVERY_ESTIMATE),
-    ("terminal-estimate:run-1", ChargeOrigin.RECOVERY_ESTIMATE),
-    ("earlier-estimate:run-1", ChargeOrigin.NORMAL_RETURN),
-    ("codex:session:run-1", ChargeOrigin.NORMAL_RETURN),
-    ("codex-recovered:session:other", ChargeOrigin.NORMAL_RETURN),
-])
-def test_v41_preserves_existing_money_and_only_marks_identifiable_legacy_recovery(tmp_path, receipt_id, origin):
-    store = _store(tmp_path)
-    request = _request(1)
-    assert store.reserve(request).admitted
-    earlier = SettlementRequest(request.run_id, Money("USD", 50), PricingBasis.ESTIMATE,
-                                receipt_id, None, None, None, origin=origin)
-    assert store.settle(earlier).disposition is AccountingDisposition.AVAILABLE
-    with sqlite3.connect(store.path) as db:
-        _historical_fixture(db, 40)
-    restarted = SQLiteControlStore(store.path, now=lambda: NOW)
-    restarted.initialize()
-    assert restarted.snapshot(_scope()).settled == Money("USD", 50)
-    assert restarted.settle(earlier).idempotent
-    normal = dataclasses.replace(earlier, amount=Money("USD", 51), provider_receipt_id="new-normal",
-                                 origin=ChargeOrigin.NORMAL_RETURN)
-    result = restarted.settle(normal)
-    assert result.disposition is (AccountingDisposition.AVAILABLE if origin is ChargeOrigin.RECOVERY_ESTIMATE
-                                  else AccountingDisposition.CONFLICT)
-    assert restarted.snapshot(_scope()).settled == Money("USD", 51 if origin is ChargeOrigin.RECOVERY_ESTIMATE else 50)
-
-
-def test_migration_44_releases_unstarted_and_unreconciled_steward_runs(tmp_path):
-    store = _store(tmp_path)
-    steward = "o/r:steward:x"
-    for index, cap in ((1, 100), (2, 200)):
-        assert store.reserve(dataclasses.replace(_request(index, cap=cap), owner_id=steward)).admitted
-    with sqlite3.connect(store.path) as db:
-        _historical_fixture(db, 43)
-        db.execute("UPDATE runs SET state='completed', outcome='spend_unreconciled', started_at=?, completed_at=? "
-                   "WHERE run_id='run-2'", (NOW.isoformat(), NOW.isoformat()))
-        db.execute("UPDATE reservation_recovery SET policy='reconcile_only' WHERE run_id='run-2'")
+    store = SQLiteControlStore(str(path), now=lambda: NOW)
     store.initialize()
-    with sqlite3.connect(store.path) as db:
-        assert sorted(db.execute("SELECT r.run_id,r.state,r.outcome,b.state FROM runs r "
-                                 "JOIN budget_reservations b USING(run_id)")) == [
-            ("run-1", "cancelled", "unlaunched_released", "released"),
-            ("run-2", "completed", "spend_unmeasured_released", "released")]
-    store.integrity_check()
-    SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+
+    retired = list(tmp_path.glob("control.db.retired-v46-*"))
+    assert [p.name for p in retired] == ["control.db.retired-v46-20260730T120000Z"]
+    with closing(sqlite3.connect(retired[0])) as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 3
+    assert hashlib.sha256(path.read_bytes()).hexdigest() != legacy_bytes_digest
+    assert store.snapshot(_daily()).settled == Money("USD", 350)
+    assert store.snapshot(_daily("*", "global")).settled == Money("USD", 350)
+    assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
+    capped = store.reserve(_request(1, maximum=60, issue=7,
+                                    limits=(BudgetLimit(_issue_scope(7), Money("USD", 520)),)))
+    assert capped.tripped_dimension == "issue:7"
+    # Money only: attempts restart, so carried legs are no legs to derive.
+    assert store.leg_runs(REPO, (7, 8)) == ()
+    assert store.claim_key("fix-comment:o/r:needs-human:7") == "done"
+    assert store.claim_key("fix-comment:o/r:needs-human:8") == "claimed"
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0] == 2
+    store.initialize()  # the cutover runs once
+    assert len(list(tmp_path.glob("control.db.retired-*"))) == 1
 
 
-def test_cross_scope_adoption_refuses_without_mutation(tmp_path):
-    store = _store(tmp_path)
-    assert store.reserve(dataclasses.replace(_request(1), owner_id="o/r:fix:old")).admitted
-    with store.transaction() as db:
-        before = tuple(db.iterdump())
-    for wrong_owner in ("elsewhere/repo:fix:old", "o/r:review:old"):
-        with pytest.raises(ValueError):
-            store.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=(wrong_owner,))
-    with store.transaction() as db:
-        assert tuple(db.iterdump()) == before
+@pytest.mark.parametrize("unsettled", [
+    ("live", "running", "active", None, 7, TODAY, True),
+    ("reserved", "reserved", "active", None, 7, TODAY, False),
+    ("unswept", "abandoned", "active", None, 7, TODAY, False),
+])
+def test_cutover_is_refused_while_legacy_money_is_unsettled(tmp_path, unsettled):
+    path = _legacy(tmp_path / "control.db", runs=(*SETTLED, unsettled))
+    before = path.read_bytes()
+
+    with pytest.raises(CutoverRefused, match=r"1 unsettled legacy run\(s\) \(" + unsettled[0]):
+        SQLiteControlStore(str(path)).initialize()
+
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("control.db.retired-*"))
+    assert not list(tmp_path.glob("control.db.cutover-*"))
 
 
-def test_adopted_existing_process_lease_retry_is_inert(tmp_path):
-    store = _store(tmp_path)
-    request = dataclasses.replace(_request(1), owner_id="o/r:fix:old")
-    assert store.reserve(request).admitted
-    store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
-                                 pid=123, pgid=123, process_start_ticks=456)
-    store.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=("o/r:fix:old",))
-    with store.transaction() as db:
-        before = tuple(db.iterdump())
-    lease = store.register_process_lease(request.run_id, expected_owner_id="o/r:fix:new",
-                                         pid=123, pgid=123, process_start_ticks=456)
-    assert lease.owner_id == "o/r:fix:new"
-    with store.transaction() as db:
-        assert tuple(db.iterdump()) == before
+def test_cutover_is_refused_while_the_previous_release_holds_the_store_open(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED)
+    with closing(sqlite3.connect(path)) as holder:
+        holder.execute("SELECT COUNT(*) FROM runs").fetchone()
+        with pytest.raises(CutoverRefused, match="holds"):
+            SQLiteControlStore(str(path), busy_timeout_ms=100).initialize()
+    assert not list(tmp_path.glob("control.db.retired-*"))
+
+
+def _assert_legacy_intact(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT COUNT(*), SUM(amount_micros) FROM charges").fetchone() == (3, 550)
+
+
+def _crash(*_args, **_kwargs):
+    raise OSError("simulated crash")
+
+
+@pytest.mark.parametrize("step", ["copy", "verify", "retire", "swap"])
+def test_a_crash_at_any_cutover_step_leaves_the_legacy_store_and_a_retry_completes(tmp_path, monkeypatch, step):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED)
+    if step == "copy":
+        def partial_copy(new, _legacy):
+            new.execute("INSERT INTO idempotency(key, state, claimed_at) VALUES ('half', 'done', 'x')")
+            raise OSError("simulated crash")
+        monkeypatch.setattr(control_store, "_carry", partial_copy)
+    elif step == "verify":
+        original = control_store._carry
+        def short_copy(new, legacy):
+            original(new, legacy)
+            new.execute("DELETE FROM legs WHERE leg_id='earlier'")
+        monkeypatch.setattr(control_store, "_carry", short_copy)
+    elif step == "retire":
+        monkeypatch.setattr(control_store.os, "link", _crash)
+    else:
+        monkeypatch.setattr(control_store.os, "replace", _crash)
+
+    with pytest.raises((OSError, CorruptControlStore)):
+        SQLiteControlStore(str(path), now=lambda: NOW).initialize()
+
+    _assert_legacy_intact(path)
+    assert not list(tmp_path.glob("control.db.cutover-*"))
+    monkeypatch.undo()
+    store = SQLiteControlStore(str(path), now=lambda: NOW)
+    store.initialize()
+    assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
+    retired = list(tmp_path.glob("control.db.retired-*"))
+    assert len(retired) == 1
+    _assert_legacy_intact(retired[0])
+
+
+def test_a_hard_kill_mid_copy_leaves_a_stray_file_the_retry_removes(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED)
+    stray = tmp_path / "control.db.cutover-deadbeef"
+    stray.write_bytes(b"half a database")
+
+    SQLiteControlStore(str(path), now=lambda: NOW).initialize()
+
+    assert not stray.exists()
+    assert len(list(tmp_path.glob("control.db.retired-*"))) == 1

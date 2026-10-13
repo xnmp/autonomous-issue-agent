@@ -397,8 +397,10 @@ def test_a_review_leg_and_a_fix_leg_on_different_items_run_concurrently(roles):
     open_pr(gh, issue=5, head="h1", ci="pass")
     both = threading.Barrier(2, timeout=10)
     release = threading.Event()
+    review_in_flight = threading.Event()
 
     def reviewing(_task):
+        review_in_flight.set()
         both.wait()
         assert release.wait(timeout=10)
         return AgentResult(False, structured={"decision": "APPROVE", "body": "ok"}, cost_usd=0.2)
@@ -411,6 +413,9 @@ def test_a_review_leg_and_a_fix_leg_on_different_items_run_concurrently(roles):
     review = roles.review(gh, Agent(reviewing))
     fix = roles.fix(gh, Agent(resolving))
     assert dispatched(review.daemon.tick(), AgentKind.REVIEW)
+    # The review worker leases its item before the provider runs; tick the
+    # fix role only once it does, or the test races the worker thread.
+    assert review_in_flight.wait(timeout=10)
     gh.prs[100] = replace(gh.prs[100], ci=_ci("h1", "fail"))  # while the review runs, CI goes red
     taken = fix.daemon.tick()
     assert dispatched(taken, AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 6, head="")]

@@ -8,14 +8,16 @@ reconciliation pass released every one of those reservations.
 """
 
 import asyncio
+from contextlib import closing
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.control_store import (
-    Lease,
+    BudgetLimit,
     ReservationRequest,
     SettlementRequest,
     SQLiteControlStore,
@@ -29,9 +31,7 @@ from issue_agent.app.roles import (
 )
 from issue_agent.domain.contracts import (
     Money,
-    PriceQuote,
     PricingBasis,
-    ReservationId,
     RunId,
 )
 from issue_agent.domain.outcome import (
@@ -139,30 +139,28 @@ def _scope(now: datetime):
     return accounting_runtime.issue_budget_scope(REPOSITORY, ISSUE, "USD")
 
 
-def _reserve(store, scope, run_id: str, cap: Money, at: datetime, lease=None):
+def _reserve(store, scope, run_id: str, cap: Money, target: int):
+    """Plant one leg on ISSUE under its own item lease ``target``; the
+    admission under test leases ISSUE itself."""
     identifier = RunId(run_id)
+    assert store.lease(REPOSITORY, "fix", target, OWNER)
     result = store.reserve(
         ReservationRequest(
-            ReservationId(f"{run_id}-reservation"),
-            identifier,
-            f"dispatch-{run_id}",
-            scope,
-            PriceQuote("gpt", "card", "v1", at, LEG_MAXIMUM),
-            cap,
-            "config",
-            REPOSITORY,
-            owner_id=OWNER,
-        ),
-        lease=lease,
+            identifier, REPOSITORY, "fix", "RESOLVE", OWNER, LEG_MAXIMUM,
+            (BudgetLimit(scope, cap),), target, issue=ISSUE,
+        )
     )
     assert result.admitted, result.detail
     return identifier
 
 
+_targets = iter(range(1000, 10**6))
+
+
 def _dead_leg(store, scope, run_id: str, cap: Money, at: datetime) -> RunId:
     """A leg that died usage-blind and retained its reservation."""
 
-    identifier = _reserve(store, scope, run_id, cap, at)
+    identifier = _reserve(store, scope, run_id, cap, next(_targets))
     assert store.record_reservation_retained(
         identifier, "trusted usage and provider charge unavailable"
     )
@@ -174,22 +172,12 @@ def _live_leg(store, scope, run_id: str, cap: Money, at: datetime) -> RunId:
 
     identity = ProcessSupervisor.process_identity(os.getpid())
     assert identity is not None
-    return _reserve(
-        store,
-        scope,
-        run_id,
-        cap,
-        at,
-        lease=Lease(
-            RunId(run_id),
-            f"dispatch-{run_id}",
-            OWNER,
-            identity.pid,
-            os.getpgid(identity.pid),
-            at,
-            identity.start_ticks,
-        ),
+    identifier = _reserve(store, scope, run_id, cap, next(_targets))
+    store.register_process_lease(
+        identifier, expected_owner_id=OWNER, pid=identity.pid,
+        pgid=os.getpgid(identity.pid), process_start_ticks=identity.start_ticks,
     )
+    return identifier
 
 
 def _sweeper(store, now: datetime):
@@ -231,6 +219,7 @@ def _admission(store, runtime, cap: Money, reconciler):
 
 
 def _resolve(wrapper):
+    wrapper.store.lease(REPOSITORY, "fix", ISSUE, OWNER)
     return asyncio.run(
         wrapper.run(
             RuntimePlan("resolve", model="gpt-test", max_budget_usd=2)
@@ -446,6 +435,6 @@ def test_recent_completed_accounting_gap_settles_before_admission_without_grace(
     assert result.status == "ok"
     assert runtime.calls == 1
     assert store.active_reservation_runs(OWNER) == ()
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges WHERE run_id=?",
+    with closing(sqlite3.connect(store.path)) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE leg_id=?",
                                 (str(dead),)).fetchone()) == (0, "estimate")

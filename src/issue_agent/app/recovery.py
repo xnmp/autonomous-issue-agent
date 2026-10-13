@@ -92,7 +92,7 @@ class RecoveryCoordinator:
     ) -> tuple[tuple[RunId, ...], tuple[RunId, ...]]:
         reclaimed = reclaimed_leases
         live_runs = {
-            lease.run_id for lease in self.control.leases(self.owner_id)
+            lease.run_id for lease in self.control.leases() if lease.run_id is not None
         }
         cutoff = self.now() - grace
         candidates = self.control.stale_active_reservation_runs(

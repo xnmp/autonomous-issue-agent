@@ -1,5 +1,7 @@
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -8,6 +10,7 @@ from issue_agent.adapters.codex_runner import write_spend_evidence
 from issue_agent.adapters.codex_child_usage import rate_table_evidence
 from issue_agent.domain.pricing import ModelRates, RateTable
 from issue_agent.adapters.control_store import (
+    BudgetLimit,
     ReservationRequest,
     SQLiteControlStore,
     AccountingDisposition,
@@ -18,8 +21,6 @@ from issue_agent.domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, pr
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
-    PriceQuote,
-    ReservationId,
     RunId,
 )
 
@@ -27,7 +28,10 @@ from issue_agent.domain.contracts import (
 NOW = datetime.now(timezone.utc)
 
 
-def _reserved_store(tmp_path, *, runtime=None):
+OWNER = "o/r:fix"
+
+
+def _reserved_store(tmp_path, *, runtime="codex"):
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     scope = BudgetScope(
@@ -40,15 +44,10 @@ def _reserved_store(tmp_path, *, runtime=None):
         ZoneInfo("UTC"),
     )
     run_id = RunId("crashed-run")
+    assert store.lease("o/r", "fix", 7, OWNER)
     request = ReservationRequest(
-        ReservationId("reservation"),
-        run_id,
-        json.dumps({"runtime": runtime}) if runtime else "dispatch",
-        scope,
-        PriceQuote("gpt", "card", "v1", NOW, Money("USD", 1_000_000)),
-        Money("USD", 2_000_000),
-        "cfg",
-        "o/r",
+        run_id, "o/r", "fix", "RESOLVE", OWNER, Money("USD", 1_000_000),
+        (BudgetLimit(scope, Money("USD", 2_000_000)),), 7, issue=7, runtime=runtime,
     )
     assert store.reserve(request).admitted
     return store, scope, run_id
@@ -105,7 +104,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
     _end_run_at(store, run_id, END)
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).settled == Money("USD", 10_400)
     assert (settlements[0].rate_card_id, settlements[0].rate_card_version) == expected
     assert not any(evidence_dir.iterdir())
@@ -131,7 +130,7 @@ def test_missing_rollout_does_not_fabricate_recovered_spend(tmp_path):
     assert not CodexSpendReconciler(
         store, (str(evidence_dir),)
     ).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert store.active_reservation_runs(OWNER) == (run_id,)
 
 
 def test_legacy_receipt_without_native_invocation_contract_settles_estimate(tmp_path):
@@ -144,7 +143,7 @@ def test_legacy_receipt_without_native_invocation_contract_settles_estimate(tmp_
     })
     store.record_reservation_retained(run_id, "prior completed unmeasured run")
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 def test_unavailable_recovery_preserves_proven_unlaunched_release(tmp_path):
@@ -152,7 +151,7 @@ def test_unavailable_recovery_preserves_proven_unlaunched_release(tmp_path):
     assert not CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)).reconcile(run_id)
     result = store.release_unlaunched(run_id, "provider was never launched")
     assert result.disposition is AccountingDisposition.AVAILABLE
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 @pytest.mark.parametrize("runtime", ["claude", "glm"])
@@ -160,19 +159,18 @@ def test_codex_recovery_does_not_change_other_providers_unmeasured_policy(tmp_pa
     store, _scope, run_id = _reserved_store(tmp_path, runtime=runtime)
     store.record_reservation_retained(run_id, "provider return is unmeasured")
     assert not CodexSpendReconciler(store, (str(tmp_path / "missing-codex-evidence"),)).reconcile(run_id)
-    assert store.release_retained(run_id, "existing completed unmeasured grace elapsed",
-                                  NOW + timedelta(days=365)).disposition is AccountingDisposition.AVAILABLE
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == (run_id,)
+    assert store.settle_terminal_estimate(run_id, "existing completed unmeasured grace elapsed")
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 def test_running_codex_uncertainty_survives_generic_completion_and_grace(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET state='running' WHERE run_id=?", (str(run_id),))
+    store.register_process_lease(run_id, expected_owner_id=OWNER, pid=4242, pgid=4242, process_start_ticks=7)
     assert not CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)).reconcile(run_id)
     store.record_reservation_retained(run_id, "generic post-run retention")
     assert store.settle_terminal_estimate(run_id, "process returned without evidence")
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 ROOT = "019fa244-0000-7de0-8e18-e56f423bbbcc"
@@ -241,9 +239,12 @@ def _frozen_evidence(tmp_path, home, failure):
 
 
 def _end_run_at(store, run_id, at):
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET state='completed', completed_at=? WHERE run_id=?",
+    """The leg's process ended at ``at`` and gave up its lease, unsettled."""
+    with closing(sqlite3.connect(store.path)) as db:
+        db.execute("UPDATE legs SET ended_at=? WHERE leg_id=?",
                    (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)))
+        db.execute("DELETE FROM leases WHERE leg_id=?", (str(run_id),))
+        db.commit()
 
 
 def _later(seconds):
@@ -264,7 +265,7 @@ def test_recovery_with_2000_unrelated_rollouts_settles_owned_usage(tmp_path):
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).settled == Money("USD", 12_500)
     assert not any(evidence_dir.iterdir())
 
@@ -272,14 +273,12 @@ def test_recovery_with_2000_unrelated_rollouts_settles_owned_usage(tmp_path):
 def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settles(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
     # root 500 uncached in/10 out/500 cached + child 600/20/400 counted once.
     assert store.snapshot(scope).settled == Money("USD", 12_500)
     assert not any(evidence_dir.iterdir())
@@ -292,7 +291,7 @@ def test_other_frozen_failures_are_final_without_reading_rollouts(tmp_path, fail
     evidence_dir = _frozen_evidence(tmp_path, home, failure)
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert store.active_reservation_runs(OWNER) == (run_id,)
 
 
 @pytest.mark.parametrize("damage", ["missing_home", "missing_child_rollout", "malformed_rollout"])
@@ -309,7 +308,7 @@ def test_frozen_failure_with_unusable_rollouts_settles_remaining_evidence(tmp_pa
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 def _append(path, records):
@@ -366,7 +365,7 @@ def test_root_token_count_one_millisecond_after_the_end_is_not_charged(tmp_path)
     evidence_dir = _root_count_at(tmp_path, store, run_id, END + timedelta(milliseconds=1))
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
@@ -376,7 +375,7 @@ def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert store.active_reservation_runs(OWNER) == (run_id,)
 
 
 def test_untimestamped_root_usage_does_not_prevent_estimated_settlement(tmp_path):
@@ -390,7 +389,7 @@ def test_untimestamped_root_usage_does_not_prevent_estimated_settlement(tmp_path
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 # Each session uses the per-category maximum of cumulative usage and receipt totals.
@@ -604,8 +603,6 @@ def test_a_truncated_trailing_record_is_the_killed_write_and_an_invalid_one_is_n
 def test_recovery_of_an_unfinished_turns_run_settles_the_receipts_inside_the_run_window(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     home = _killed_child_home(tmp_path, responses=2, late_response=True)
     evidence_dir = _frozen_evidence(tmp_path, home, UNFINISHED)
     reconciler = CodexSpendReconciler(store, (str(evidence_dir),))
@@ -613,7 +610,7 @@ def test_recovery_of_an_unfinished_turns_run_settles_the_receipts_inside_the_run
     assert reconciler.reconcile(run_id)
     reconciler.reconcile(run_id)  # a second sweep changes nothing
 
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).settled == Money("USD", ROOT_ONLY_MICROS + 2 * CHILD_RESPONSE_MICROS)
 
 
@@ -622,7 +619,7 @@ def test_unfinished_turns_remeter_requires_the_runs_recorded_end(tmp_path):
     evidence_dir = _frozen_evidence(tmp_path, _killed_child_home(tmp_path), UNFINISHED)
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == (run_id,)
+    assert store.active_reservation_runs(OWNER) == (run_id,)
 
 
 def test_other_frozen_classes_stay_final_even_when_rollouts_would_meter(tmp_path):
@@ -631,7 +628,7 @@ def test_other_frozen_classes_stay_final_even_when_rollouts_would_meter(tmp_path
     evidence_dir = _frozen_evidence(tmp_path, _killed_child_home(tmp_path), "native child has no corroborating rollout")
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 @pytest.mark.parametrize("fault", ["absent", "later"])
@@ -646,7 +643,7 @@ def test_recovery_settles_a_receipted_root_without_a_usable_counter(tmp_path, fa
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).settled == Money("USD", CHILD_RESPONSE_MICROS)
 
 
@@ -662,7 +659,7 @@ def test_completed_root_turn_without_a_receipt_is_not_settled_from_the_others(tm
     assert isinstance(_root_sample(tmp_path, home, _counter(2)), EstimatedRunUsage)
     evidence_dir = _frozen_evidence(tmp_path, home, "")
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 def test_malformed_tail_does_not_prevent_estimated_settlement(tmp_path):
@@ -674,7 +671,7 @@ def test_malformed_tail_does_not_prevent_estimated_settlement(tmp_path):
     evidence_dir = _frozen_evidence(tmp_path, home, UNFINISHED)
 
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
 
 
 def test_a_valid_prefix_ending_in_a_cut_multibyte_character_is_the_killed_write(tmp_path):
@@ -700,5 +697,5 @@ def test_recovery_never_settles_a_receipt_window_without_the_runs_end(tmp_path, 
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
-    assert store.active_reservation_runs() == (run_id,)
+    assert store.active_reservation_runs(OWNER) == (run_id,)
     assert store.snapshot(scope).settled == Money("USD", 0)

@@ -44,7 +44,7 @@ import pytest
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
-    Lease,
+    BudgetLimit,
     ReservationRequest,
     SQLiteControlStore,
     SettlementRequest,
@@ -52,16 +52,14 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.store import Store
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.app.main import _recover_pre_adapter_processes
-from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_spend_gate, _control_store, _headroom, _control_store_path, _owner_identity, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
+from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_spend_gate, _control_store, _headroom, _owner_identity, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
-    PriceQuote,
     PricingBasis,
-    ReservationId,
     RunId,
 )
 from issue_agent.domain.recovery import RecoveryTrigger
@@ -231,96 +229,40 @@ def test_boot_preflight_recovers_current_and_repointed_but_not_siblings(
             sibling_process.wait()
 
 
-def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
-    tmp_path,
-) -> None:
-    state_root = tmp_path / "state"
-    state = str(state_root / "fix")
-    review_state = str(state_root / "review")
-    prior_target = str(tmp_path / "prior")
-    current_target = str(tmp_path / "current")
-    old = HarnessConfig(
-        repo="o/r",
-        target_dir=prior_target,
-        state_dir=state,
-        review_state_dir=review_state,
+def _daily(now: datetime) -> BudgetScope:
+    return BudgetScope(
+        "o/r", "repository", "USD", now.date().isoformat(),
+        now.replace(hour=0), now.replace(hour=0) + timedelta(days=1), ZoneInfo("UTC"),
     )
-    current = replace(
-        old,
-        target_dir=current_target,
-        repointed_from_deployments=(("o/r", prior_target),),
-    )
-    store = SQLiteControlStore(_control_store_path(old, state))
-    store.initialize()
-    now = datetime.now(timezone.utc)
-    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    scope = BudgetScope(
-        "o/r",
-        "repository",
-        "USD",
-        now.date().isoformat(),
-        period_start,
-        period_start + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
+
+
+def test_a_repointed_deployment_recovers_its_predecessors_dead_leg(tmp_path) -> None:
+    # Recovery scopes by repository and role, not deployment: the leg a
+    # repointed checkout's predecessor left behind is reclaimed and settled
+    # by the new deployment, and the item is free for it again.
+    state = str(tmp_path / "state")
+    old = HarnessConfig(repo="o/r", target_dir=str(tmp_path / "old"), state_dir=state, review_state_dir=state)
+    current = replace(old, target_dir=str(tmp_path / "current"))
     old_owner = _owner_identity(old, "fix")
-    request = ReservationRequest(
-        ReservationId("repoint-old-reservation"),
-        RunId("repoint-old-run"),
-        "repoint-old-dispatch",
-        scope,
-        PriceQuote("model", "test", "1", now, Money("USD", 60)),
-        Money("USD", 100),
-        "cfg",
-        "o/r",
-        kind="RESOLVE",
-        owner_id=old_owner,
-    )
-    assert store.reserve(request).admitted
-    store.register_lease(
-        Lease(
-            request.run_id,
-            request.dispatch_id,
-            old_owner,
-            2_000_000_000,
-            2_000_000_000,
-            now,
-            1,
-        )
-    )
-    # A continuation-bound run (pre-5d schema) must not abort the boot adoption.
-    bound = replace(
-        request,
-        reservation_id=ReservationId("repoint-bound-reservation"),
-        run_id=RunId("repoint-bound-run"),
-        dispatch_id="repoint-bound-dispatch",
-        quote=replace(request.quote, maximum_charge=Money("USD", 10)),
-    )
-    assert store.reserve(bound).admitted
-    with store._connect() as db:
-        db.execute("DROP TRIGGER runs_continuation_selections_update")
-        db.execute(
-            "UPDATE runs SET continuations_json=? WHERE run_id=?",
-            ('{"format":1,"value":[{"legacy":true}]}', bound.run_id),
-        )
-
-    adopted = _control_store(current, state, "fix")
     current_owner = _owner_identity(current, "fix")
-    assert adopted.leases(current_owner)[0].run_id == request.run_id
-    assert adopted.reclaim_dead_leases(
-        current_owner, lambda _pid, _start: False
-    ) == (request.run_id,)
-    assert adopted.release(request.run_id, "spend_unknown").disposition.value == (
-        "available"
+    assert old_owner != current_owner
+    store = _control_store(old, state)
+    run_id = RunId("repoint-old-run")
+    assert store.lease("o/r", "fix", 7, old_owner)
+    assert store.reserve(ReservationRequest(
+        run_id, "o/r", "fix", "RESOLVE", old_owner, Money("USD", 1_000),
+        (BudgetLimit(_daily(datetime.now(timezone.utc)), Money("USD", 10_000)),), 7, issue=7,
+    )).admitted
+    store.register_process_lease(
+        run_id, expected_owner_id=old_owner, pid=999_999, pgid=999_999, process_start_ticks=1,
     )
 
-    next_request = replace(
-        request,
-        reservation_id=ReservationId("repoint-new-reservation"),
-        run_id=RunId("repoint-new-run"),
-        owner_id=current_owner,
-    )
-    assert adopted.reserve(next_request).admitted
+    adopted = _control_store(current, state)
+    assert adopted.path == store.path
+    assert adopted.reclaim_dead_leases(current_owner, lambda _pid, _ticks: False) == (run_id,)
+    assert adopted.active_reservation_runs(current_owner) == (run_id,)
+    assert adopted.release(run_id, "spend_unknown").disposition.value == "available"
+    assert adopted.lease("o/r", "fix", 7, current_owner)
 
 
 def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
@@ -341,24 +283,11 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
         ZoneInfo("UTC"),
     )
     run_id = RunId("shutdown-reconcile")
+    assert control.lease("o/r", "fix", 42, "o/r:fix")
     assert control.reserve(
         ReservationRequest(
-            ReservationId("shutdown-reservation"),
-            run_id,
-            json.dumps({"kind": "RESOLVE", "issue": 42}),
-            scope,
-            PriceQuote(
-                "model",
-                "card",
-                "v1",
-                now,
-                Money("USD", 1_000),
-            ),
-            Money("USD", 2_000),
-            "config-v1",
-            "o/r",
-            kind="RESOLVE",
-            owner_id="o/r:fix",
+            run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1_000),
+            (BudgetLimit(scope, Money("USD", 2_000)),), 42, issue=42, number=42,
         )
     ).admitted
     control.register_process_lease(
@@ -400,7 +329,7 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
     assert control.active_reservation_runs("o/r:fix") == ()
     assert control.leases("o/r:fix") == ()
     assert control.snapshot(scope).settled == Money("USD", 250)
-    assert control.pending_cancellation_intents("o/r:fix") == ()
+    assert not control.has_cancellation_intent(run_id)
     assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
 
 
