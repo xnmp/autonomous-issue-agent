@@ -130,10 +130,12 @@ def test_a_triage_with_no_criteria_posts_the_tier_without_an_acceptance_heading(
 
 
 def test_agent_text_in_the_triage_comment_cannot_mention_or_embed_an_image():
-    triage = Triage(Tier.LOW, ("Ping @acme/security ![x](https://evil.example/p.png)",), rationale="cc @owner")
+    triage = Triage(Tier.LOW, ("Ping @acme/security ![x](https://evil.example/p.png)",),
+                    rationale='cc @owner <img src="https://evil.example/t.png">')
     legs = {issue_key(3): (LegEnd(AgentKind.TRIAGE, at(0), False, triage=triage),)}
     (comment,) = actions(derive(WorldState(issues=(ready(),)), Local(now=NOW, legs=legs), H), H)
     assert "@acme" not in comment.body and "@owner" not in comment.body and "![" not in comment.body
+    assert "<img" not in comment.body
 
 
 def test_a_forged_triage_tag_from_a_human_does_not_count_as_the_comment():

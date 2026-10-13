@@ -75,9 +75,9 @@ def triage_comment(state: TriageNote, harness: Harness) -> str:
 
 
 def _inert(text: str) -> str:
-    # A zero-width space breaks an @mention and image syntax without changing
-    # what a reader sees.
-    return text.replace("@", "@\u200b").replace("![", "!\u200b[")
+    # A zero-width space breaks an @mention and Markdown image syntax, and an
+    # escaped `<` any raw HTML (an <img>), without changing what a reader sees.
+    return text.replace("<", "&lt;").replace("@", "@\u200b").replace("![", "!\u200b[")
 
 
 def _code_span(text: str) -> str:
