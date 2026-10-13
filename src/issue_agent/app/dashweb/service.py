@@ -27,7 +27,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.control_path import control_store_path
-from ...adapters.control_store import ControlStoreError
+from ...adapters.control_store import ControlStoreError, Lease
 from ...adapters.dashweb.readonly_store import ReadOnlyControlStore
 from ...adapters.dashweb import ghdata, system, usage, verification
 from ...adapters.dashweb.legs import read_legs
@@ -35,6 +35,8 @@ from ...adapters.github import GitHubGateway
 from ...adapters.operator_effects import GitHubOperatorEffects, build_operator_effects
 from ...domain import dashboard as dash
 from ...domain.backoff import LegEnd
+from ...domain.contracts import daily_budget_scope
+from ...domain.repository import canonical_repository
 from ...domain.labels import Label
 from ...domain.state import DerivedState, Harness, ItemKey, derive
 from ...domain.world import WorldState
@@ -87,14 +89,28 @@ class Deployment:
 
 
 @dataclass(frozen=True)
+class Caps:
+    """Today's committed spend (settled + reserved, by `reserved_at` in the
+    UTC day) for the repository and for every repository: the snapshots the
+    core's `tick.headroom` compares against the caps. `headroom` is whether
+    each role's next leg fits, as that role decides it. None is unreadable."""
+
+    repository_usd: float | None
+    global_usd: float | None
+    headroom: Mapping[str, bool]
+
+
+@dataclass(frozen=True)
 class StoreRead:
-    """One request's read of the control store: the repository's legs and,
-    when there is a world to derive over, each item's state as its role sees
-    it. `problem` set means nothing was read."""
+    """One request's read of the control store: the repository's legs, its
+    leases, its caps and, when there is a world to derive over, each item's
+    state as its role sees it. `problem` set means nothing was read."""
 
     legs: tuple[dash.LegRow, ...] = ()
     states: Mapping[ItemKey, DerivedState] | None = None
     item_legs: Mapping[ItemKey, tuple[LegEnd, ...]] = field(default_factory=dict)
+    leases: tuple[Lease, ...] = ()
+    caps: Caps | None = None
     problem: str = ""
 
 
@@ -229,21 +245,36 @@ class Backend:
 
     # ── reads ──
     def store(self, dep: Deployment, world: WorldState | None = None) -> StoreRead:
-        """One read-only connection: the legs, and with a world each item's
-        derived state. Any failure is "store unavailable", never a guess."""
+        """One read-only connection: the legs and leases, and with a world
+        each item's derived state and the caps. Any failure is "store
+        unavailable", never a guess."""
         if dep.store_problem:
             return StoreRead(problem=dep.store_problem)
         try:
             with ReadOnlyControlStore(dep.control_path) as store:
                 legs = read_legs(store, dep.cfg.repo)
+                repository = canonical_repository(dep.cfg.repo) if dep.cfg.repo else ""
+                leases = tuple(lease for lease in store.leases() if lease.repository == repository)
+                facts = {role: _role_facts(dep.cfg, store, usd, self.now_fn)
+                         for role, usd in (("fix", dep.cfg.fix_budget_usd), ("review", dep.cfg.review_budget_usd))}
+                caps = self._caps(dep.cfg, store, facts)
                 if world is None or dep.harness is None:
-                    return StoreRead(legs)
-                fix = _role_facts(dep.cfg, store, dep.cfg.fix_budget_usd, self.now_fn)(world)
-                review = _role_facts(dep.cfg, store, dep.cfg.review_budget_usd, self.now_fn)(world)
+                    return StoreRead(legs, leases=leases, caps=caps)
+                fix, review = facts["fix"](world), facts["review"](world)
                 states = dash.role_states(derive(world, fix, dep.harness), derive(world, review, dep.harness))
-                return StoreRead(legs, states, fix.legs)
+                return StoreRead(legs, states, fix.legs, leases, caps)
         except (ControlStoreError, sqlite3.Error, OSError) as exc:
             return StoreRead(problem=f"control store unavailable: {_detail(exc)}")
+
+    def _caps(self, cfg: HarnessConfig, store: ReadOnlyControlStore, facts: Mapping[str, Facts]) -> Caps:
+        now = self.now_fn()
+
+        def committed(repository: str, dimension: str) -> float | None:
+            snapshot = store.snapshot(daily_budget_scope(repository, dimension, "USD", now, ZoneInfo("UTC")))
+            return snapshot.committed.micros / 1e6 if snapshot.disposition.value == "available" else None
+
+        return Caps(committed(cfg.repo, "repository") if cfg.repo else None, committed("*", "global"),
+                    {role: role_facts.headroom() for role, role_facts in facts.items()})
 
     def legs(self, dep: Deployment) -> tuple[tuple[dash.LegRow, ...], list[str]]:
         read = self.store(dep)
@@ -306,7 +337,7 @@ class Backend:
             read = self.store(dep, obs.world if obs else None)
             stamps = [leg.at for leg in read.legs]
             merged = views.merged_harness_prs(obs.merged) if obs else ()
-            beats = system.role_heartbeats({"fix": dep.cfg.state_dir, "review": dep.cfg.review_state_dir})
+            beats = system.role_beats(_state_dirs(dep.cfg))
             roles = [self._role(role, beats.get(role), live.get(name, set()), scan_ok, now) for role in dash.ROLE_NAMES]
             # The board's own rows, so the sidebar and the board agree.
             open_items = (len(views.board_rows(obs.world, read.states))
@@ -330,13 +361,19 @@ class Backend:
         return {"repos": out, "warnings": warnings}
 
     @staticmethod
-    def _role(role: str, beat: datetime | None, live: set[str], scan_ok: bool, now: datetime) -> dict:
-        age = (now - beat).total_seconds() if beat is not None else None
+    def _role(role: str, beat: system.Beat | None, live: set[str], scan_ok: bool, now: datetime) -> dict:
+        """A role's health: its process (the process table) and its last
+        heartbeat. A heartbeat in a terminal state, or older than the bound,
+        is stale."""
+        age = (now - beat.at).total_seconds() if beat is not None else None
         return {
             "role": role,
             "alive": (role in live) if scan_ok else None,
-            "stale": age is None or not 0 <= age <= dash.STALE_AFTER_S,
-            "heartbeat_ts": beat.isoformat() if beat is not None else None,
+            "stale": beat is None or beat.state not in ("running", "draining")
+            or age is None or not 0 <= age <= dash.STALE_AFTER_S,
+            "heartbeat_ts": beat.at.isoformat() if beat is not None else None,
+            "state": beat.state if beat is not None else None,
+            "in_flight": [{"kind": kind, "number": number} for kind, number in beat.in_flight] if beat else [],
         }
 
     def usage(self) -> dict:
@@ -371,6 +408,7 @@ class Backend:
 
     def issue(self, name: str, number: int) -> dict | None:
         dep, obs, read, warnings = self._read(name)
+        models = system.leg_models(_state_dirs(dep.cfg))
         legs = read.legs
         found = self._items(dep, obs, read)
         item = next((i for i in found or () if i.issue == number), None)
@@ -379,7 +417,7 @@ class Backend:
         if obs is not None and item is None and gh_issue is None and not any(
                 leg.issue == number for leg in legs) and not any(m.issue == number for m in merged):
             return None
-        detail = views.issue_detail(number, dep.cfg.repo, item, legs, merged, gh_issue)
+        detail = views.issue_detail(number, dep.cfg.repo, item, legs, merged, gh_issue, models)
         detail["warnings"] = warnings
         detail["store_error"] = read.problem or None
         return detail
@@ -390,28 +428,32 @@ class Backend:
         found = self._items(dep, obs, read)
         live, scan_ok = self.proc_scan()
         now = self.now_fn()
-        beats = system.role_heartbeats({"fix": dep.cfg.state_dir, "review": dep.cfg.review_state_dir})
+        beats = system.role_beats(_state_dirs(dep.cfg))
         merged = views.merged_harness_prs(obs.merged) if obs else ()
         gh_issues = ghdata.index_by_number(obs.issues) if obs else {}
         needs = views.attention(found or (), gh_issues)
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)  # the caps' UTC day
         m = dash.metrics(
             legs, merged_prs=len({x.pr for x in merged}) if obs and obs.merged is not None else None,
             open_items=len(found) if found is not None else None,
-            needs_human=len(needs) if found is not None else None, today_start=today,
+            needs_human=len(needs) if found is not None else None,
             merged_prs_partial=bool(obs and obs.merged_partial),
         )
         cfg = dep.cfg
+        caps = read.caps
         return {
             "metrics": asdict(m),
             "caps": {
                 "issue_cap_usd": cfg.issue_spend_cap_usd or None,
                 "daily_cap_usd": cfg.daily_spend_cap_usd or None,
                 "global_daily_cap_usd": cfg.global_daily_spend_cap_usd or None,
-                "today_usd": m.today_usd,
+                "today_usd": _round(caps.repository_usd) if caps else None,
+                "global_today_usd": _round(caps.global_usd) if caps else None,
+                "headroom": [{"role": role, "leg_usd": usd, "fits": caps.headroom.get(role) if caps else None}
+                             for role, usd in (("fix", cfg.fix_budget_usd), ("review", cfg.review_budget_usd))],
             },
             "health": [self._role(role, beats.get(role), live.get(name, set()), scan_ok, now)
                        for role in dash.ROLE_NAMES],
+            "leases": views.lease_rows(read.leases, legs),
             "needs_attention": needs,
             "health_trend": views.health_trend(obs.issues, _local_timezone(timezone_name)) if obs else [],
             "spend_per_hour": [asdict(b) for b in dash.spend_per_hour(legs, now)],
@@ -443,6 +485,14 @@ class Backend:
         result = apply(self.effects_factory(repo, identity=f"{repo}:dashboard"))
         self._observations.invalidate(name)
         return result
+
+
+def _state_dirs(cfg: HarnessConfig) -> dict[str, str]:
+    return {"fix": cfg.state_dir, "review": cfg.review_state_dir}
+
+
+def _round(usd: float | None) -> float | None:
+    return round(usd, 6) if usd is not None else None
 
 
 def _local_timezone(name: str | None):

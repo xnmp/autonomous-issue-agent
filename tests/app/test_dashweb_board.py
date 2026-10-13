@@ -420,3 +420,109 @@ def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
 
     assert payload["gh_ok"] is True and any("limited to the newest 200" in w for w in payload["warnings"])
     assert metrics["merged_prs"] == 200 and metrics["merged_prs_partial"] is True
+
+
+def test_the_overview_shows_the_caps_the_core_reads_and_each_roles_headroom(deployment):
+    """Committed today is settled + reserved by `reserved_at` (the store's
+    snapshot `tick.headroom` compares), so a running leg's reservation counts."""
+    backend, *_ = deployment
+    caps = backend.overview("demo", "UTC")["caps"]
+
+    assert (caps["today_usd"], caps["global_today_usd"], caps["daily_cap_usd"]) == (15.0, 15.0, 700.0)
+    assert [(row["role"], row["fits"]) for row in caps["headroom"]] == [("fix", True), ("review", True)]
+
+
+def test_an_unreadable_store_has_no_caps_rather_than_zero(deployment, tmp_path):
+    backend, *_ = deployment
+    backend.control_path = lambda cfg: str(tmp_path / "absent.db")
+    backend._configs = type(backend._configs)(ttl_s=0)
+
+    caps = backend.overview("demo", "UTC")["caps"]
+
+    assert caps["today_usd"] is None and caps["global_today_usd"] is None
+    assert [row["fits"] for row in caps["headroom"]] == [None, None]
+
+
+def test_the_overview_lists_the_repositorys_leases_with_their_legs(deployment):
+    backend, _log, db, _gateway = deployment
+    other = sqlite3.connect(db)
+    other.execute(
+        "INSERT INTO leases(repository, role, target, owner, leg_id, pid, pgid, start_ticks, acquired_at) "
+        "VALUES ('x/other', 'fix', 4, 'x/other:fix', NULL, 7, 7, 1, ?)", (store_ts(-1),))
+    other.commit()
+    other.close()
+
+    leases = backend.overview("demo", "UTC")["leases"]
+
+    assert leases == [{
+        "role": "fix", "issue": 4, "pr": None, "leg_id": "L4", "kind": "RESOLVE", "leg_state": "running",
+        "pid": 999999, "acquired_ts": (NOW - timedelta(minutes=5)).isoformat(),
+    }]
+
+
+def test_role_health_reads_the_heartbeats_state_and_in_flight_dispatches(deployment, tmp_path):
+    backend, *_ = deployment
+    fix = tmp_path / "state" / "fix"
+    fix.mkdir(parents=True)
+    (fix / "heartbeat.json").write_text(json.dumps(
+        {"in_flight": [{"kind": "REBASE", "number": 30}, {"kind": 1, "number": "x"}], "pid": 1, "state": "running",
+         "updated_at": ts(-1)}))
+    review = tmp_path / "state" / "review"
+    review.mkdir(parents=True)
+    (review / "heartbeat.json").write_text(json.dumps({"in_flight": [], "state": "stopped", "updated_at": ts(-1)}))
+
+    health = {row["role"]: row for row in backend.overview("demo", "UTC")["health"]}
+
+    assert (health["fix"]["state"], health["fix"]["stale"]) == ("running", False)
+    assert health["fix"]["in_flight"] == [{"kind": "REBASE", "number": 30}]  # the malformed row is dropped
+    assert (health["review"]["state"], health["review"]["stale"]) == ("stopped", True)
+
+
+@pytest.mark.parametrize("body", ["", "{not json", '{"updated_at": "2026-10-13T12:00:00", "state": "running"}'])
+def test_a_missing_malformed_or_naive_heartbeat_is_stale(deployment, tmp_path, body):
+    backend, *_ = deployment
+    fix = tmp_path / "state" / "fix"
+    fix.mkdir(parents=True)
+    if body:
+        (fix / "heartbeat.json").write_text(body)
+
+    health = {row["role"]: row for row in backend.overview("demo", "UTC")["health"]}
+
+    assert health["fix"]["stale"] is True and health["fix"]["heartbeat_ts"] is None
+
+
+def test_issue_legs_carry_their_model_from_the_role_journal(deployment, tmp_path):
+    backend, *_ = deployment
+    fix = tmp_path / "state" / "fix"
+    fix.mkdir(parents=True)
+    (fix / "journal.jsonl").write_text("\n".join([
+        json.dumps({"event": "agent_run_start", "leg_id": "L2", "model": ""}),
+        "{torn",
+        json.dumps({"event": "agent_run", "leg_id": "L2", "model": "gpt-6.1-sol"}),
+    ]) + "\n")
+
+    steps = backend.issue("demo", 2)["steps"]
+
+    assert [(s["leg_id"], s["runtime"], s["model"], s["pricing_basis"]) for s in steps] == [
+        ("L2", "claude", "gpt-6.1-sol", "provider_reported")]
+    assert backend.issue("demo", 8)["steps"][0]["model"] is None  # no journal line: unknown, not guessed
+
+
+def test_carried_legs_are_one_pre_cutover_total_not_legacy_kind_rows(deployment):
+    backend, _log, db, _gateway = deployment
+    carried = sqlite3.connect(db)
+    carried.execute(
+        "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, reserved_at, "
+        "ended_at, currency, reserved_micros, charged_micros, basis, origin, settled_at, provider_receipt_id) VALUES "
+        "('C1', 'o/r', 'carried', 'ROUTE', 2, 0, '', 'legacy', 'codex', 'ended', ?, ?, 'USD', 0, 1500000, 'synthetic', "
+        "'normal_return', ?, 'rc1')",
+        (store_ts(-900), store_ts(-899), store_ts(-899)))
+    carried.commit()
+    carried.close()
+
+    detail = backend.issue("demo", 2)
+    kinds = {row["kind"] for row in backend.overview("demo", "UTC")["metrics"]["by_kind"]}
+
+    assert [s["kind"] for s in detail["steps"]] == ["RESOLVE"]
+    assert detail["carried"] == {"legs": 1, "cost_usd": 1.5} and detail["cost_usd"] == 3.5
+    assert "ROUTE" not in kinds and "carried" in kinds

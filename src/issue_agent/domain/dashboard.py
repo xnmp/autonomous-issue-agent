@@ -128,9 +128,7 @@ class LegRow:
 
     @property
     def outcome(self) -> str:
-        """running | passed | changes_requested | asked | failed | done | carried."""
-        if self.carried:
-            return "carried"
+        """running | passed | changes_requested | asked | failed | done."""
         if self.running:
             return "running"
         if self.verdict == "APPROVE":
@@ -514,7 +512,9 @@ class Metrics:
     rounds_per_pr: float | None
     legs: int
     machine_legs: int
-    today_usd: float
+
+
+CARRIED_KIND = "carried"
 
 
 def _usd(value: float) -> float:
@@ -527,15 +527,16 @@ def metrics(
     merged_prs: int | None,
     open_items: int | None,
     needs_human: int | None,
-    today_start: datetime,
     merged_prs_partial: bool = False,
 ) -> Metrics:
+    """`by_kind` keys a carried leg as `carried`: its legacy kind (ROUTE,
+    TRIAGE, RE_REVIEW, …) names no act of the design, only money history."""
     rows = [leg for leg in legs if leg.counted]
     total = sum(leg.cost_usd for leg in rows)
     by_kind: dict[str, list[float]] = {}
     by_basis: dict[str, float] = {}
     for leg in rows:
-        by_kind.setdefault(leg.kind, []).append(leg.cost_usd)
+        by_kind.setdefault(CARRIED_KIND if leg.carried else leg.kind, []).append(leg.cost_usd)
         basis = leg.basis or ("unsettled" if leg.running else "unpriced")
         by_basis[basis] = by_basis.get(basis, 0.0) + leg.cost_usd
     verdicts: dict[int, list[str]] = {}
@@ -559,7 +560,6 @@ def metrics(
         rounds_per_pr=sum(len(seen) for seen in verdicts.values()) / len(verdicts) if verdicts else None,
         legs=len(rows),
         machine_legs=sum(1 for leg in rows if leg.derived and leg.outcome == "failed"),
-        today_usd=_usd(sum(leg.cost_usd for leg in rows if leg.at >= today_start)),
     )
 
 
@@ -567,15 +567,7 @@ def metrics_line(m: Metrics) -> str:
     """One status line of the primary metrics."""
     per_pr = f"${m.cost_per_merged_pr_usd:.2f}/merged PR" if m.cost_per_merged_pr_usd is not None else "no merged PRs"
     merged = "?" if m.merged_prs is None else f"{'≥' if m.merged_prs_partial else ''}{m.merged_prs}"
-    return (f"spend ${m.total_cost_usd:.2f} over {m.legs} legs ({m.machine_legs} machine) · "
-            f"merged {merged} · {per_pr} · today ${m.today_usd:.2f}")
-
-
-def interventions_line(m: Metrics) -> str:
-    """`issue-agent status`'s summary line. The journal intervention fold it
-    once printed is gone; the CLI keeps the old name until it drops the
-    import, so it now prints the legs metrics."""
-    return metrics_line(m)
+    return f"spend ${m.total_cost_usd:.2f} over {m.legs} legs ({m.machine_legs} machine) · merged {merged} · {per_pr}"
 
 
 @dataclass(frozen=True)

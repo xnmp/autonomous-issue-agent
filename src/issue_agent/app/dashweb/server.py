@@ -25,7 +25,7 @@ import sys
 import threading
 from collections.abc import Callable
 
-from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
+from ...adapters.dashweb.bundle import bundle_snapshot
 from . import contracts
 from .ports import DashboardBackend
 from .service import HARNESS_ROOT, Backend
@@ -57,14 +57,6 @@ def same_origin(origin: str, host_header: str) -> bool:
         return True
     prefix = origin.split("://", 1)[-1] if "://" in origin else origin
     return prefix.strip().lower() == host_header.strip().lower()
-
-
-def dist_dir(harness_root: str | None = None) -> str:
-    return str(published_dist(harness_root or HARNESS_ROOT))
-
-
-def dist_ready(harness_root: str | None = None) -> bool:
-    return bundle_snapshot(harness_root or HARNESS_ROOT).status.ready
 
 
 def build_command(harness_root: str | None = None) -> str:

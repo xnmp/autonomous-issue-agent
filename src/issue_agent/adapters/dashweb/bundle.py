@@ -57,16 +57,22 @@ def _dashboard_root(harness_root: str | os.PathLike[str]) -> Path:
     return Path(harness_root) / "dashboard"
 
 
-def _legacy_dist(harness_root: str | os.PathLike[str]) -> Path:
+def _dist_root(harness_root: str | os.PathLike[str]) -> Path:
     return _dashboard_root(harness_root) / "dist"
 
 
+class Unpublished(FileNotFoundError):
+    """No build was ever published: ``dist/current.json`` is absent."""
+
+
 def published_dist(harness_root: str | os.PathLike[str]) -> Path:
-    """The immutable build selected by the atomic pointer, or legacy ``dist``."""
-    root = _legacy_dist(harness_root)
+    """The immutable build the atomic pointer selects. There is no fallback
+    to files at the top of ``dist``: a pre-pointer build left there is
+    months old and never matches the source (live 2026-10-13: Jul 30 files)."""
+    root = _dist_root(harness_root)
     pointer = root / POINTER_NAME
     if not pointer.is_file():
-        return root
+        raise Unpublished(f"dashboard/dist/{POINTER_NAME} is missing (no build published)")
     raw = json.loads(pointer.read_text(encoding="utf-8"))
     if (
         not isinstance(raw, dict)
@@ -86,7 +92,7 @@ def published_dist(harness_root: str | os.PathLike[str]) -> Path:
 
 
 def _lease_dist(harness_root: str | os.PathLike[str], dist: Path) -> BundleLease:
-    lease_dir = _legacy_dist(harness_root) / ".leases"
+    lease_dir = _dist_root(harness_root) / ".leases"
     lease_dir.mkdir(parents=True, exist_ok=True)
     handle = (lease_dir / f"{dist.name}.lock").open("a+b")
     fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
@@ -102,13 +108,7 @@ def _published_snapshot(
     with (dashboard_root / ".build.lock").open("a+b") as build_lock:
         fcntl.flock(build_lock.fileno(), fcntl.LOCK_SH)
         dist = published_dist(harness_root)
-        fallback_dist = _legacy_dist(harness_root).resolve()
-        lease = (
-            _lease_dist(harness_root, dist)
-            if pin and dist.parent == fallback_dist / "builds"
-            else None
-        )
-        return dist, lease
+        return dist, _lease_dist(harness_root, dist) if pin else None
 
 
 def _input_spec(dashboard_root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -183,9 +183,11 @@ def output_hashes(harness_root: str | os.PathLike[str]) -> dict[str, str]:
 def bundle_snapshot(
     harness_root: str | os.PathLike[str], *, pin: bool = False
 ) -> BundleSnapshot:
-    fallback_dist = _legacy_dist(harness_root)
+    fallback_dist = _dist_root(harness_root)
     try:
         dist, lease = _published_snapshot(harness_root, pin=pin)
+    except Unpublished as exc:
+        return BundleSnapshot(BundleStatus("missing", str(exc)), fallback_dist)
     except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return BundleSnapshot(
             BundleStatus("stale", f"dashboard bundle pointer is invalid ({exc})"),
