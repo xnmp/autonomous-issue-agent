@@ -645,6 +645,13 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   adopts only those exact prior deployments. The lineage survives repeated
   interrupted repoints, unrelated siblings remain isolated, and
   cross-repository overlay reuse is refused.
+  REVISED 2026-10-13 (slice 9): the lineage is deleted. Boot reaps every
+  registry beneath the overlay's name-derived state roots, killing groups whose
+  recorded launcher is dead (a launch intent is authoritative over a live
+  subreaper parent), so no repoint strands a process. Same-repository leases
+  and legs are recovered by repository/role scope; a cross-repository repoint
+  leaves the old repository's unsettled legs reserved in its own scopes until
+  it runs again. Regression: `test_boot_reaps_an_orphan_another_repository_left_on_the_shared_state_root`.
 
 **117. A dead daemon released a dispatch claim while its paid child was alive**
 - Global target/path claims were keyed to the daemon PID. After an abrupt daemon

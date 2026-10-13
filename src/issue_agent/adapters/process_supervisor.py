@@ -284,11 +284,13 @@ class ProcessSupervisor:
         return self._reap_registered(self.grace_seconds)
 
     def recover_abandoned_orphans(self) -> tuple[RunId, ...]:
-        """Safely drain a pre-deployment-scope registry during upgrade.
+        """Reap a registry another daemon may own: only groups whose launcher
+        is dead.
 
-        A legacy state root can be shared by sibling checkouts. A live launch
-        owner or live external parent therefore makes a receipt authoritative
-        for that sibling, not an orphan this process may terminate.
+        A receipt with a launch intent is decided by its launcher's identity
+        alone: once that daemon is dead its group is an orphan, whatever
+        subreaper adopted it. A legacy receipt without one falls back to its
+        leader's parent: a live external parent keeps it.
         """
 
         table = self._process_table()
@@ -305,17 +307,11 @@ class ProcessSupervisor:
             intent = self._read_intent(
                 self._intent_path(registration.run_id)
             )
-            if (
-                intent is not None
-                and self.matches_identity(
-                    intent.launcher.pid,
-                    intent.launcher.start_ticks,
-                )
-            ):
-                continue
-            leader = table.get(registration.leader.pid)
-            if (
-                leader is not None
+            if intent is not None:
+                if self.matches_identity(intent.launcher.pid, intent.launcher.start_ticks):
+                    continue
+            elif (
+                (leader := table.get(registration.leader.pid)) is not None
                 and leader[0] == registration.leader
                 and leader[1] > 1
                 and leader[1] in table

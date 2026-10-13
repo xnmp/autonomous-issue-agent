@@ -466,3 +466,71 @@ def test_generic_estimate_recovery_preserves_real_abandonment(tmp_path):
     assert _leg(store, run_id, "state, end_reason, charged_micros, basis") == (
         "ended", "dead_lease", 0, "estimate",
     )
+
+
+# ── boot reap across the store's registries (slice 9 review P2-2) ─────────────
+_LAUNCHER = """
+import os, subprocess, sys
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.domain.contracts import RunId
+supervisor = ProcessSupervisor(sys.argv[1])
+token = supervisor.prepare_launch(RunId(sys.argv[2]))
+child = subprocess.Popen(["sleep", "30"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+supervisor.register_prepared_launch(RunId(sys.argv[2]), token, os.getpgid(child.pid), leader_pid=child.pid)
+print(child.pid, flush=True)
+"""
+
+
+def _orphan(registry: str, run_id: str) -> int:
+    """A group registered by a launcher that has since died (the orphan a
+    daemon killed mid-leg leaves behind)."""
+    import subprocess
+    import sys
+
+    launched = subprocess.run([sys.executable, "-c", _LAUNCHER, registry, run_id],
+                              capture_output=True, text=True, check=True, timeout=30)
+    return int(launched.stdout.strip())
+
+
+def _gone(pid: int, start_ticks: int) -> bool:
+    import time
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not ProcessSupervisor.matches_identity(pid, start_ticks):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_boot_reaps_an_orphan_another_repository_left_on_the_shared_state_root(tmp_path):
+    """An overlay repointed from repository A to B shares A's state root: B's
+    boot kills A's orphaned group (its launcher is dead) but never a group
+    whose launching daemon is alive (the sibling role's live leg)."""
+    from issue_agent.app.config import HarnessConfig, deployment_identity_for_target
+    from issue_agent.app.main import _recover_pre_adapter_processes
+
+    state = tmp_path / "state"
+    cfg = HarnessConfig(repo="o/b", target_dir=str(tmp_path / "b"), state_dir=str(state),
+                        review_state_dir=str(state))
+    previous = state / "process-supervision" / deployment_identity_for_target("o/a", str(tmp_path / "a"), "fix")
+    orphan = _orphan(str(previous), "a-leg")
+    orphan_identity = ProcessSupervisor.process_identity(orphan)
+    assert orphan_identity is not None
+
+    import subprocess
+
+    sibling = ProcessSupervisor(str(state / "process-supervision" / "sibling-review"), grace_seconds=0.05)
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        token = sibling.prepare_launch(RunId("live-leg"))  # this process is the live launcher
+        sibling.register_prepared_launch(RunId("live-leg"), token, os.getpgid(live.pid), leader_pid=live.pid)
+
+        recovered = _recover_pre_adapter_processes(cfg, "fix")
+
+        assert RunId("a-leg") in recovered and RunId("live-leg") not in recovered
+        assert _gone(orphan, orphan_identity.start_ticks)
+        assert live.poll() is None
+    finally:
+        live.kill()
+        live.wait()

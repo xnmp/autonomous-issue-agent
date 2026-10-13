@@ -42,8 +42,9 @@ model and rollout usage, enabling cost-mix analysis by runtime/model.
 The reviewer runs in a detached checkout of `TARGET_DIR` pinned to the
 reviewed head, under Codex's read-only sandbox, which contains filesystem
 mutation. Because Codex's resume grammar cannot carry a sandbox setting, every
-Codex review and in-leg transport retry is intentionally a fresh session and
-cannot regain a writable resume mode. The CODEX_HOME is prepared only
+Codex review is intentionally a fresh session and cannot regain a writable
+resume mode. A leg is one `codex exec`: a gateway drop or a 429 ends it as a
+machine failure charged what its rollout measured. The CODEX_HOME is prepared only
 immediately before a review leg, in that pinned checkout; daemon construction
 never mutates the process cwd, and an unset target fails closed instead of
 using an implicit cwd.

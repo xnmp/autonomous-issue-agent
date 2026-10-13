@@ -203,17 +203,20 @@ Offline family activation and legacy import were deleted (slice 5a). A family
 epoch's plan evidence remains authority; a target's family state is initialized
 only by its live first observation.
 
-The supported exception is an explicit same-repository checkout repoint
-(`issue-agent start --write-config`): the predecessor's unsettled legs are
-recovered by repository/role-scoped recovery. Before the overlay changes, the CLI stops and verifies all foreground and
-service-owned processes carrying its stable name; failure preserves the old
-snapshot. Cross-repository overlay reuse is refused.
-Process-group, process-tree, and launch-intent receipts use the same stable
-checkout deployment identity beneath each role state root. Boot and shutdown
-therefore reap only that deployment's children even when sibling checkouts
-intentionally share the repo-level default state root. Upgrade recovery inspects
-the former unscoped registry conservatively: a live recorded launcher or live
-external parent remains authoritative and is never signalled.
+An overlay can be repointed (`issue-agent start --write-config`). Before the
+overlay changes, the CLI stops and verifies all foreground and service-owned
+processes carrying its stable name; failure preserves the old snapshot. For a
+new checkout of the same repository, repository/role-scoped recovery settles the
+predecessor's unsettled legs. After a repoint to another repository, the old
+repository's unsettled legs stay reserved in its own scopes, never blocking the
+new one, until a deployment of that repository recovers them.
+Process-group and launch-intent receipts use the stable checkout deployment
+identity beneath each role state root. Shutdown reaps only that deployment's
+children. Boot reaps its own registry, then every other registry beneath the
+deployment's state roots (a repointed predecessor, the sibling role, the former
+unscoped registry), signalling only groups whose recorded launcher is dead; a
+receipt without a launch intent falls back to its leader's parent, and a live
+one keeps it.
 
 The control database is rooted at the operating-system service account's
 `~/.local/state/issue-agent-control/control.db`, independently of every
@@ -300,10 +303,9 @@ command executes, its child wrapper verifies the launcher's PID/start identity,
 persists PID/PGID/start-ticks in the SQLite `leases` table, and verifies the
 launcher again. A launcher death before registration refuses `exec`; a death
 after registration is recoverable through the same authoritative run record.
-A transport retry can replace that run's process lease only under the same
-active owner and dispatch, after the kernel proves the prior process group is
-absent and the new identity is live. It revalidates continuation admission and
-journals the replacement.
+A leg is one launch: a running leg's process lease is never replaced, and a
+gateway failure ends the leg (the item's backoff retries in a new leg with its
+own reservation).
 
 Each deployment has a role/repository/checkout-scoped lock and a stable
 deployment identity. Locks live in a private per-user host runtime directory,

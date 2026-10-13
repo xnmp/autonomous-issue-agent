@@ -52,12 +52,22 @@ def _load_agent_env(env: dict) -> dict:
 
 
 def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId, ...]:
-    """Boot's pre-adapter phase (ADR 0006): reap every registered process
-    group, the pre-deployment-identity registry included."""
+    """Boot's pre-adapter phase (ADR 0006): reap this deployment's registered
+    process groups, then every other registry under the shared store's state
+    roots (an overlay's previous repository or checkout, the sibling role, the
+    pre-identity registry), killing only groups whose launching daemon is dead."""
+    from glob import glob
+
     from ..adapters.process_supervisor import ProcessSupervisor
 
-    legacy = ProcessSupervisor(cfg.state_dir_for(role)).recover_abandoned_orphans()
-    return (*legacy, *ProcessSupervisor(supervision_dir(cfg, role)).recover_orphans())
+    own = os.path.abspath(supervision_dir(cfg, role))
+    recovered = list(ProcessSupervisor(own).recover_orphans())
+    roots = dict.fromkeys(os.path.abspath(p) for p in (cfg.state_dir_for(role), cfg.state_dir, cfg.review_state_dir) if p)
+    for root in roots:
+        for registry in (root, *sorted(glob(os.path.join(root, "process-supervision", "*")))):
+            if os.path.abspath(registry) != own and os.path.isdir(registry):
+                recovered.extend(ProcessSupervisor(registry).recover_abandoned_orphans())
+    return tuple(recovered)
 
 
 def _validate_reload_candidate(env: dict[str, str]) -> None:

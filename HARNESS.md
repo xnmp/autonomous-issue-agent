@@ -53,12 +53,18 @@ version that created it.
 Important fields:
 
 - `REPO=owner/name` and `TARGET_DIR=/absolute/path` are required.
-- `issue-agent start --write-config` may repoint an existing overlay only to a
-  new checkout of the same repository. Before replacing the overlay, the CLI
-  stops and verifies every foreground or installed process carrying that
-  deployment name; a stop failure leaves the old overlay unchanged. The new
-  deployment's recovery (scoped by repository and role) settles any leg the
-  old one left unsettled. Use a different `--name` for another repository.
+- `issue-agent start --write-config` regenerates an existing overlay for the
+  checkout given. Before replacing the overlay, the CLI stops and verifies every
+  foreground or installed process carrying that deployment name; a stop failure
+  leaves the old overlay unchanged. The overlay keeps its name-derived state
+  roots, so the new deployment's boot kills any process group the old one left
+  behind whose launching daemon is dead, whatever its repository. Lease and
+  spend recovery is scoped by repository and role: for a new checkout of the
+  same repository it settles the old deployment's unsettled legs; after a
+  repoint to another repository, the old repository's unsettled legs stay
+  reserved in its own scopes (they never block the new one) until a deployment
+  of that repository runs again. Prefer a different `--name` for another
+  repository.
 - `FIX_BOT` must differ from `REVIEW_BOT`.
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
