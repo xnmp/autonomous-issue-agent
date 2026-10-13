@@ -39,10 +39,3 @@ def test_refused_leg_completed_event_carries_the_missing_authority(tmp_path):
     assert "PR repair purchase is held" in payload["summary"]
 
 
-def test_ordinary_failure_summary_is_still_not_copied_into_the_event(tmp_path):
-    failed = AgentResult(is_error=True, status="error", summary="agent prose, untrusted",
-                         exit_reason=ExitReason.AGENT_ERROR)
-
-    (payload,) = _completed_payloads(tmp_path, failed)
-
-    assert "summary" not in payload

@@ -14,6 +14,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _bash(env, script, *args):
+    return subprocess.run(["bash", str(script), *args], env=env, capture_output=True, text=True)
+
+
 def _executable(path: Path, body: str) -> None:
     path.write_text(f"#!/bin/sh\n{body}\n")
     path.chmod(0o755)
@@ -145,12 +149,7 @@ def test_service_installers_reject_noncanonical_deployment_identity(
     env["ISSUE_AGENT_DEPLOYMENT_ID"] = "Acme App"
     script = "install-systemd.sh" if systemd else "install-launchd.sh"
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin" / script)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin" / script))
 
     assert result.returncode == 2
     assert "non-canonical deployment identity" in result.stderr
@@ -194,12 +193,7 @@ def test_service_installers_refuse_an_existing_identity_alias(
         )
         script = "install-launchd.sh"
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin" / script)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin" / script))
 
     assert result.returncode == 2
     assert "deployment identity alias" in result.stderr
@@ -217,12 +211,7 @@ def test_service_uninstall_preserves_every_definition_when_stop_fails(
     target = tmp_path / "target-repo"
     config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
     script = "install-systemd.sh" if systemd else "install-launchd.sh"
-    install = subprocess.run(
-        ["bash", str(ROOT / "bin" / script)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    install = _bash(env, str(ROOT / "bin" / script))
     assert install.returncode == 0, install.stderr
     artifact_dir = (
         home / ".config/systemd/user"
@@ -233,17 +222,7 @@ def test_service_uninstall_preserves_every_definition_when_stop_fails(
     assert len(artifacts) == (3 if systemd else 2)
 
     env["FAIL_UNINSTALL_PATTERN"] = "review-watcher"
-    uninstall = subprocess.run(
-        [
-            "bash",
-            str(ROOT / "bin" / script),
-            "uninstall",
-            "acme-app",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    uninstall = _bash(env, str(ROOT / "bin" / script), "uninstall", "acme-app")
 
     assert uninstall.returncode != 0
     assert "REFUSING uninstall" in uninstall.stderr
@@ -254,12 +233,7 @@ def test_service_uninstall_preserves_every_definition_when_stop_fails(
 def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     env, home, uv = _environment(tmp_path, systemd=True)
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode == 0, result.stderr
     units = sorted((home / ".config/systemd/user").glob("*.service"))
@@ -295,9 +269,7 @@ def test_systemd_dashboard_install_is_singleton_and_latest_install_wins(tmp_path
     env, home, _first_uv = _environment(tmp_path, systemd=True)
     script = str(ROOT / "bin/install-systemd.sh")
 
-    first = subprocess.run(
-        ["bash", script], env=env, capture_output=True, text=True
-    )
+    first = _bash(env, script)
     assert first.returncode == 0, first.stderr
 
     latest_bin = tmp_path / "latest-bin"
@@ -309,9 +281,7 @@ def test_systemd_dashboard_install_is_singleton_and_latest_install_wins(tmp_path
         "ISSUE_AGENT_DEPLOYMENT_ID": "repo-b",
         "PATH": f"{latest_bin}:{env['PATH']}",
     }
-    second = subprocess.run(
-        ["bash", script], env=second_env, capture_output=True, text=True
-    )
+    second = _bash(second_env, script)
     assert second.returncode == 0, second.stderr
 
     unit_dir = home / ".config/systemd/user"
@@ -332,12 +302,7 @@ def test_systemd_dashboard_port_conflict_preserves_installed_roles(tmp_path):
     )
     env["ISSUE_AGENT_DASHBOARD_PORT_CHECK"] = str(port_check)
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode != 0
     assert "TCP 8321 is already bound" in result.stderr
@@ -353,12 +318,7 @@ def test_systemd_installer_rolls_back_if_unit_is_not_running(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=True)
     env["SUB_STATE"] = "failed"
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode != 0
     assert "activation check failed" in result.stderr
@@ -379,17 +339,7 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
     dashboard = unit_dir / "issue-agent-dashboard.service"
     dashboard.write_text("singleton")
 
-    result = subprocess.run(
-        [
-            "bash",
-            str(ROOT / "bin/install-systemd.sh"),
-            "uninstall",
-            "My App",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"), "uninstall", "My App")
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(unit_dir.glob("*.service"))
@@ -408,12 +358,7 @@ def test_systemd_refuses_live_current_unit_without_rollback_definition(
     unit = "issue-agent-fix-watcher-target-repo.service"
     env[state_var] = unit
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode == 2
     assert "active/enabled current unit" in result.stderr
@@ -445,12 +390,7 @@ def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
             "legacy-target-name"
         )
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode == 0, result.stderr
     assert sorted(path.name for path in unit_dir.glob("*.service")) == sorted([
@@ -481,12 +421,7 @@ def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
         "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app",
     }
 
-    first = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=first_env,
-        capture_output=True,
-        text=True,
-    )
+    first = _bash(first_env, str(ROOT / "bin/install-systemd.sh"))
     assert first.returncode == 0, first.stderr
 
     config.write_text(
@@ -496,27 +431,17 @@ def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
         **env,
         "ISSUE_AGENT_DEPLOYMENT_ID": "other-app",
     }
-    second = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=second_env,
-        capture_output=True,
-        text=True,
-    )
+    second = _bash(second_env, str(ROOT / "bin/install-systemd.sh"))
     assert second.returncode == 0, second.stderr
     units = tuple((home / ".config/systemd/user").glob("*.service"))
     assert len(units) == 5
     assert sum(path.name.endswith("-acme-app.service") for path in units) == 2
     assert sum(path.name.endswith("-other-app.service") for path in units) == 2
 
-    collision = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env={
+    collision = _bash({
             **env,
             "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app",
-        },
-        capture_output=True,
-        text=True,
-    )
+        }, str(ROOT / "bin/install-systemd.sh"))
     assert collision.returncode == 2
     assert "REFUSING deployment 'acme-app'" in collision.stderr
     snapshot = home / ".config/issue-agent/acme-app.env"
@@ -537,12 +462,7 @@ def test_systemd_same_name_repoint_replaces_all_units_atomically(
         f'REPO="acme/app"\nTARGET_DIR="{first_target}"\nKNOWN_GOOD=1\n'
     )
 
-    first = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    first = _bash(env, str(ROOT / "bin/install-systemd.sh"))
     assert first.returncode == 0, first.stderr
     service_log = Path(env["SERVICE_LOG"])
     first_call_count = len(service_log.read_text().splitlines())
@@ -553,12 +473,7 @@ def test_systemd_same_name_repoint_replaces_all_units_atomically(
     )
     env["REQUIRE_OLD_SNAPSHOT_DURING_STOP"] = "1"
     env["CUTOVER_SNAPSHOT"] = str(snapshot)
-    second = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    second = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert second.returncode == 0, second.stderr
     unit_dir = home / ".config/systemd/user"
@@ -605,12 +520,7 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     snapshot = config_dir / "target-repo.env"
     snapshot.write_text("KNOWN_GOOD=1\n")
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode != 0
     assert all(
@@ -624,12 +534,7 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
 def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     env, home, uv = _environment(tmp_path, systemd=False)
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
 
     assert result.returncode == 0, result.stderr
     plists = sorted((home / "Library/LaunchAgents").glob("*.plist"))
@@ -667,17 +572,7 @@ def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
             "other"
         )
 
-    result = subprocess.run(
-        [
-            "bash",
-            str(ROOT / "bin/install-launchd.sh"),
-            "uninstall",
-            "target-repo",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-launchd.sh"), "uninstall", "target-repo")
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(launch_agents.glob("*.plist"))
@@ -717,12 +612,7 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
         f'REPO=""\nTARGET_DIR="{target}"\nKNOWN_GOOD=1\n'
     )
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
 
     assert result.returncode != 0
     assert all(
@@ -771,12 +661,7 @@ def test_launchd_stops_every_current_writer_before_swapping_config(
     env["REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD"] = "1"
     env["CUTOVER_SNAPSHOT"] = str(snapshot)
 
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
 
     assert result.returncode == 0, result.stderr
     calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
@@ -828,12 +713,7 @@ def _install_with_port_owner(tmp_path, owner_pid, main_pid):
     _executable(port_check, f"printf '{owner_pid}\\tissue-agent\\tdashboard\\n'")
     env["ISSUE_AGENT_DASHBOARD_PORT_CHECK"] = str(port_check)
     env["MAIN_PID"] = str(main_pid)
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
     return result, unit
 
 

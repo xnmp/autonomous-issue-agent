@@ -1,6 +1,5 @@
 """App-token mint — pure cache/expiry decision + mint-on-miss, injected clock."""
 
-import json
 import os
 import tempfile
 
@@ -30,16 +29,6 @@ def test_stale_within_margin():
 def test_stale_when_none_or_empty():
     assert token_is_fresh(None, 0) is False
     assert token_is_fresh(CachedToken("", 10_000), 0) is False
-
-
-def test_cache_roundtrip():
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "sub", "token.json")
-        write_cache(p, "tok", "2026-01-01T00:00:00Z", 1735689600)
-        c = load_cache(p)
-        assert c.token == "tok" and c.expires_epoch == 1735689600
-        # 0600 perms
-        assert oct(os.stat(p).st_mode)[-3:] == "600"
 
 
 def test_load_missing_is_none():

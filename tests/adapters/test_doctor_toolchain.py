@@ -14,67 +14,20 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-DOCTOR_SH = ROOT / "bin" / "doctor.sh"
+from tests.app.test_compose_env import _fake_tool_path, _run_doctor
 
-
-def _run_doctor(env: dict, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    full_env = dict(os.environ)
-    full_env.update(env)
-    if "AGENT_ENV" not in env:
-        empty = Path(tempfile.mkdtemp(prefix="doctor-cfg-")) / "empty.env"
-        empty.write_text("")
-        full_env["AGENT_ENV"] = str(empty)
-    return subprocess.run(
-        ["bash", str(DOCTOR_SH)],
-        env=full_env,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-
-# Realistic REPO/FIX_BOT/REVIEW_BOT keep the unrelated identity checks quiet.
-def _fake_toolchain_bin(
-    tmp_path: Path,
-    *,
-    rustc: str | None = None,
-    node: str | None = None,
-    python3: str | None = None,
-) -> Path:
-    fake_bin = tmp_path / "fake_toolchain_bin"
-    fake_bin.mkdir()
-    scripts = {
-        "gh": (
-            '#!/usr/bin/env bash\n'
-            'if [ "$1" = "--version" ]; then echo "gh version 0.0.0-fake"; exit 0; fi\n'
-            'if [ "$1" = "api" ] && [ "$2" = "user" ]; then echo "fake-user"; exit 0; fi\n'
-            'if [ "$1" = "repo" ] && [ "$2" = "view" ]; then exit 0; fi\n'
-            'exit 0\n'
-        ),
-        "claude": '#!/usr/bin/env bash\necho "claude 0.0.0-fake"\n',
-        "jq": '#!/usr/bin/env bash\necho "jq-0.0.0-fake"\n',
-        "uv": (
-            '#!/usr/bin/env bash\n'
-            'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\n'
-            'exit 2\n'
-        ),
-    }
-    if rustc is not None:
-        scripts["rustc"] = f'#!/usr/bin/env bash\necho "rustc {rustc} (abcdef123 2026-01-01)"\n'
-    if node is not None:
-        scripts["node"] = f'#!/usr/bin/env bash\necho "v{node}"\n'
-    if python3 is not None:
-        scripts["python3"] = f'#!/usr/bin/env bash\necho "Python {python3}"\n'
-    for name, body in scripts.items():
+def _fake_toolchain_bin(tmp_path: Path, **versions: str) -> Path:
+    """test_compose_env's hermetic gh/claude/jq/uv stubs plus fake rustc/node/
+    python3 binaries that report a controlled version."""
+    fake_bin = _fake_tool_path(tmp_path)
+    lines = {"rustc": "rustc {} (abcdef123 2026-01-01)", "node": "v{}", "python3": "Python {}"}
+    for name, version in versions.items():
         p = fake_bin / name
-        p.write_text(body)
+        p.write_text(f'#!/usr/bin/env bash\necho "{lines[name].format(version)}"\n')
         p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return fake_bin
 

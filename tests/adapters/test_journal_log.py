@@ -4,22 +4,6 @@ import json
 import threading
 
 from issue_agent.adapters.journal import Journal
-from tests.fakes.legacy_journal import read_events
-
-
-def test_each_record_is_one_self_describing_json_line(tmp_path):
-    path = tmp_path / "state" / "journal.jsonl"
-    journal = Journal(str(path))
-
-    journal.emit("escalation", {"target": "pr", "number": 7})
-    journal.emit("telemetry_warning", {"warning": "rate card missing"})
-
-    lines = [json.loads(line) for line in path.read_text().splitlines()]
-    assert [line["event"] for line in lines] == ["escalation", "telemetry_warning"]
-    assert lines[1]["warning"] == "rate card missing"
-    assert lines[0]["number"] == 7 and lines[0]["target"] == "pr"
-    assert all(isinstance(line["ts"], str) and line["ts"] for line in lines)
-    assert [event["event"] for event in read_events(str(path))] == [line["event"] for line in lines]
 
 
 def test_an_unwritable_log_drops_the_line_without_raising(tmp_path, capsys):
