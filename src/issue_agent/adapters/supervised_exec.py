@@ -16,6 +16,7 @@ from .child_env import (
 )
 from .control_store import SQLiteControlStore
 from .process_supervisor import ProcessSupervisor
+from .signal_log import send_signal
 
 _STATE_ENV = "ISSUE_AGENT_SUPERVISOR_STATE_DIR"
 _RUN_ENV = "ISSUE_AGENT_SUPERVISOR_RUN_ID"
@@ -80,7 +81,7 @@ def _register(
     supervisor.require_registered_launch(run_id, token)
 
 
-def _wait_for_target(pid: int) -> None:
+def _wait_for_target(pid: int, run_id: str) -> None:
     """Retain ancestor authority until the provider exits, preserving status."""
 
     while True:
@@ -95,13 +96,13 @@ def _wait_for_target(pid: int) -> None:
         signum = os.WTERMSIG(status)
         if signum not in {signal.SIGKILL, signal.SIGSTOP}:
             signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        send_signal(signum, pid=os.getpid(), reason="relay_child_death_signal", run_id=run_id)
         raise SystemExit(128 + signum)
     raise SystemExit(1)
 
 
 def _carry_authority_and_exec(
-    command: list[str], environment: Mapping[str, str]
+    command: list[str], environment: Mapping[str, str], run_id: str
 ) -> None:
     """Apply ADR 0005: retain ancestor authority and scrub the provider."""
 
@@ -127,7 +128,7 @@ def _carry_authority_and_exec(
             signal.signal(forwarded, signal.SIG_IGN)
         pgid = os.getpgrp()
         try:
-            os.killpg(pgid, signum)
+            send_signal(signum, pgid=pgid, reason="forward_received_signal", run_id=run_id)
         except ProcessLookupError:
             pass
         deadline = time.monotonic() + _FORWARDED_SIGNAL_GRACE_SECONDS
@@ -145,7 +146,7 @@ def _carry_authority_and_exec(
             )
         if targets:
             try:
-                os.killpg(pgid, signal.SIGKILL)
+                send_signal(signal.SIGKILL, pgid=pgid, reason="forward_grace_expired", run_id=run_id)
             except ProcessLookupError:
                 pass
             os._exit(128 + signal.SIGKILL)
@@ -154,13 +155,13 @@ def _carry_authority_and_exec(
         except ChildProcessError:
             pass
         signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        send_signal(signum, pid=os.getpid(), reason="relay_received_signal", run_id=run_id)
         raise SystemExit(128 + signum)
 
     for signum in _FORWARDED_SIGNALS:
         signal.signal(signum, forward_to_group)
     signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
-    _wait_for_target(pid)
+    _wait_for_target(pid, run_id)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -177,7 +178,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(125) from error
     environment.pop(_PARENT_PID_ENV, None)
     environment.pop(_PARENT_START_ENV, None)
-    _carry_authority_and_exec(command, environment)
+    _carry_authority_and_exec(command, environment, raw_run_id)
 
 
 def supervised_cli_main() -> None:
@@ -206,7 +207,7 @@ def supervised_cli_main() -> None:
         token,
         registration_environment,
     )
-    _carry_authority_and_exec([target, *sys.argv[1:]], environment)
+    _carry_authority_and_exec([target, *sys.argv[1:]], environment, raw_run_id)
 
 
 if __name__ == "__main__":

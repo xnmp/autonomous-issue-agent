@@ -462,7 +462,7 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
 `adapters/repository_guidance.py`,
-`adapters/runtime_plan.py`, `adapters/single_instance.py`,
+`adapters/runtime_plan.py`, `adapters/signal_log.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 and `adapters/worktree.py`. Dashboard-specific read

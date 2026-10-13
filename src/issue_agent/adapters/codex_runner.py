@@ -22,12 +22,14 @@ import signal
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
 from .atomic_file import atomic_write
 from .child_env import child_process_env
+from .signal_log import send_signal
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
 from ..domain.pricing import ModelRates, RateTable, UnknownModelPolicy
@@ -847,22 +849,28 @@ class CodexRunner(AgentRuntime):
             stderr_pending = b""
             return prefix + raw
 
+        def _kill(reason: str) -> None:
+            _kill_quietly(proc, reason=reason, run_id=str(supervision_run_id), log=self._log)
+
         def _trip(now: float, idle: float | None) -> bool:
             """Check every armed cap once against one clock reading; kill on a trip."""
             nonlocal hung, wall_tripped, budget_stop
             if idle is not None and self.idle_timeout is not None and idle >= self.idle_timeout:
+                reason = "idle_timeout"
                 hung = True
                 self._log(f"codex: IDLE — no stderr event for {idle:.0f}s (>{self.idle_timeout:.0f}s); "
                           "killing subprocess")
             elif self.max_runtime is not None and now - started_at >= self.max_runtime:
+                reason = "wall_timeout"
                 hung = wall_tripped = True
                 self._log(f"codex: WALL — total runtime {now - started_at:.0f}s exceeded max "
                           f"{self.max_runtime:.0f}s; killing subprocess")
             elif _over_budget(now):
+                reason = "budget_stop"
                 budget_stop = True
             else:
                 return False
-            _kill_quietly(proc)
+            _kill(reason)
             return True
 
         armed = self.idle_timeout is not None or self.max_runtime is not None or budget_armed
@@ -916,20 +924,20 @@ class CodexRunner(AgentRuntime):
                     stdout_task, timeout=self.post_hang_drain_timeout if armed else None)
             except asyncio.TimeoutError:
                 hung = True
-                _kill_quietly(proc)
+                _kill("post_hang_drain_timeout")
                 await _cancel_quietly(stdout_task)
                 stdout = ""
             if not await _observe_exit(10):
                 hung = True
                 self._log("codex: process exit was not observed within 10s after stream teardown")
-                _kill_quietly(proc)
+                _kill("exit_unobserved_after_teardown")
         except asyncio.CancelledError:
             # Post-spawn ownership: terminate the group and drain local tasks
             # before the dispatch lease is released, or an orphan keeps editing.
-            _kill_quietly(proc)
+            _kill("cancelled")
             await _cancel_quietly(stdout_task)
             if not await _observe_exit(10):
-                _kill_quietly(proc)
+                _kill("cancelled:exit_unobserved")
             raise
         finally:
             if feeder is not None:
@@ -1061,15 +1069,15 @@ async def _cancel_quietly(task: asyncio.Future) -> None:
         pass
 
 
-def _kill_quietly(proc: Any) -> None:
+def _kill_quietly(proc: Any, *, reason: str, run_id: str, log: Callable[[str], None]) -> None:
     """SIGKILL the run's whole process group (it leads one: start_new_session),
     so no descendant keeps the pipes open. Never raises."""
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        send_signal(signal.SIGKILL, pgid=os.getpgid(proc.pid), reason=reason, run_id=run_id, log=log)
     except ProcessLookupError:
         return
     except Exception:  # noqa: BLE001
         try:
-            proc.kill()
+            send_signal(signal.SIGKILL, pid=proc.pid, reason=f"{reason}:no_group", run_id=run_id, log=log)
         except Exception:  # noqa: BLE001
             pass

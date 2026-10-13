@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .atomic_file import atomic_write
 from ..domain.contracts import RunId
+from .signal_log import send_signal
 
 
 @dataclass(frozen=True)
@@ -200,7 +201,13 @@ class ProcessSupervisor:
         except FileNotFoundError:
             pass
 
-    def kill_tree(self, run_id: RunId, grace_seconds: float | None = None) -> None:
+    def kill_tree(
+        self,
+        run_id: RunId,
+        grace_seconds: float | None = None,
+        *,
+        reason: str = "leg_end_cleanup",
+    ) -> None:
         with self._intent_lock():
             intent_path = self._intent_path(run_id)
             intent = self._read_intent(intent_path)
@@ -228,7 +235,7 @@ class ProcessSupervisor:
         if registration is None:
             return
         grace = self.grace_seconds if grace_seconds is None else grace_seconds
-        self._terminate(registration, grace)
+        self._terminate(registration, grace, reason, run_id)
         with self._intent_lock():
             current = self._read(self._path(run_id))
             if current == registration:
@@ -279,7 +286,7 @@ class ProcessSupervisor:
                 and leader[1] in table
             ):
                 continue
-            self.kill_tree(registration.run_id, self.grace_seconds)
+            self.kill_tree(registration.run_id, self.grace_seconds, reason="orphan_reclaim")
             recovered.append(registration.run_id)
 
         self._discard_dead_launcher_intents()
@@ -304,7 +311,11 @@ class ProcessSupervisor:
                 # Quarantine it instead of guessing a process id.
                 path.rename(path.with_suffix(".invalid"))
                 continue
-            self.kill_tree(registration.run_id, grace_seconds)
+            self.kill_tree(
+                registration.run_id,
+                grace_seconds,
+                reason="drain_deadline" if grace_seconds == 0.0 else "orphan_reclaim",
+            )
             recovered.append(registration.run_id)
         return tuple(recovered)
 
@@ -536,12 +547,16 @@ class ProcessSupervisor:
 
     @classmethod
     def _terminate_identities(
-        cls, identities: tuple[ProcessIdentity, ...], grace_seconds: float
+        cls,
+        identities: tuple[ProcessIdentity, ...],
+        grace_seconds: float,
+        reason: str,
+        run_id: RunId | None,
     ) -> None:
         live = tuple(identity for identity in identities if cls._same_process(identity))
         for identity in reversed(live):
             try:
-                os.kill(identity.pid, signal.SIGTERM)
+                send_signal(signal.SIGTERM, pid=identity.pid, reason=reason, run_id=run_id)
             except ProcessLookupError:
                 pass
         deadline = time.monotonic() + max(0.0, grace_seconds)
@@ -554,13 +569,17 @@ class ProcessSupervisor:
             if not cls._same_process(identity):
                 continue
             try:
-                os.kill(identity.pid, signal.SIGKILL)
+                send_signal(signal.SIGKILL, pid=identity.pid, reason=f"{reason}:grace_expired", run_id=run_id)
             except ProcessLookupError:
                 pass
 
     @classmethod
     def _terminate(
-        cls, registration: ProcessRegistration, grace_seconds: float
+        cls,
+        registration: ProcessRegistration,
+        grace_seconds: float,
+        reason: str,
+        run_id: RunId | None,
     ) -> None:
         current_leader = cls._identity_for_pid(registration.leader.pid)
         if current_leader is not None and current_leader != registration.leader:
@@ -569,7 +588,7 @@ class ProcessSupervisor:
             return
         if current_leader is None:
             members = cls._group_identities(registration.pgid)
-            cls._terminate_identities(members, grace_seconds)
+            cls._terminate_identities(members, grace_seconds, reason, run_id)
             return
         pgid = registration.pgid
         owned = {
@@ -577,7 +596,7 @@ class ProcessSupervisor:
             for identity in cls._group_identities(pgid)
         }
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            send_signal(signal.SIGTERM, pgid=pgid, reason=reason, run_id=run_id)
         except ProcessLookupError:
             return
         deadline = time.monotonic() + max(0.0, grace_seconds)
@@ -594,4 +613,4 @@ class ProcessSupervisor:
                 for identity in cls._group_identities(pgid)
             )
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        cls._terminate_identities(tuple(owned.values()), 0.0)
+        cls._terminate_identities(tuple(owned.values()), 0.0, reason, run_id)
