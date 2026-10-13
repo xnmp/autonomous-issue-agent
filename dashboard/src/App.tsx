@@ -49,7 +49,7 @@ function storedBoolean(
 }
 
 /** An open issue tab names the board group its issue is in. */
-const BOARD_TONE: Record<BoardGroup, Tone> = { needs_you: "fail", working: "ok", waiting: "neutral" };
+const BOARD_TONE: Record<BoardGroup, Tone> = { needs_you: "fail", agent: "ok", ci: "ok", slot: "running", waiting: "neutral" };
 
 interface OptimisticPromotion {
   card: BacklogCard;
@@ -281,10 +281,10 @@ export default function App() {
             <span className="mono">#{n}</span>
             {card?.board ? (
               <Chip
-                tone={BOARD_TONE[card.board.status]}
-                pulse={card.board.status === "working" && card.board.activity === "agent"}
+                tone={BOARD_TONE[card.board.group]}
+                pulse={card.board.group === "agent"}
               >
-                {GROUP_META[card.board.status].label}
+                {GROUP_META[card.board.group].label}
               </Chip>
             ) : done ? <Chip tone="ok">done</Chip> : null}
           </>

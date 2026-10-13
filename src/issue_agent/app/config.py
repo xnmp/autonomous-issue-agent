@@ -71,6 +71,9 @@ def _default_coercion(default) -> str:
 
 _RUNTIMES = tuple(item.value for item in RuntimeName)
 
+# The review role runs one slot-holding leg at a time (`compose_role` capacity).
+REVIEW_DISPATCH_CAPACITY = 1
+
 
 @dataclass(frozen=True)
 class HarnessConfig:
@@ -169,6 +172,11 @@ class HarnessConfig:
     def config_version(self) -> str:
         """Stable identity of the immutable snapshot used by one admission."""
         return hashlib.sha256(repr(self).encode()).hexdigest()[:16]
+
+    @property
+    def dispatch_slots(self) -> int:
+        """Heavy dispatch slots across both roles: what the board's agent lane fills."""
+        return self.fix_dispatch_concurrency + REVIEW_DISPATCH_CAPACITY
 
     def state_dir_for(self, role: str) -> str:
         return {"fix": self.state_dir, "review": self.review_state_dir}[role]

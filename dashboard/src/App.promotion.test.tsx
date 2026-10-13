@@ -32,6 +32,7 @@ const usage = {
 
 const issues = {
   in_flight: [],
+  slots: { capacity: 3, heavy: 0, light: 0 },
   done: [],
   backlog: [],
   gh_ok: true, merged_partial: false,
@@ -100,7 +101,7 @@ describe("backlog promotion", () => {
                 pr: null,
                 pr_url: null,
                 board: {
-                  status: "working", activity: "queued", act: "RESOLVE", headline: "Queued",
+                  status: "waiting", group: "slot", on: "slot", headline: "Queued",
                   reason: "Confirmed by the server.", since_ts: null,
                 },
                 rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },

@@ -33,12 +33,12 @@ function card(issue: number, board: BoardStatus, over: Partial<IssueCard> = {}):
 }
 
 const needs = (since: string | null, reason: "question" | "attempts" | "labelled" = "attempts", target: "issue" | "pr" = "issue"): BoardStatus =>
-  ({ status: "needs_you", reason, headline: "Attempts exhausted", hint: "Reply or unblock.", detail: "**stop** text", target, since_ts: since });
-const working: BoardStatus = { status: "working", activity: "agent", act: "RESOLVE", headline: "Resolving", reason: "An agent leg holds this item.", since_ts: null };
-const waiting: BoardStatus = { status: "waiting", on: "branch-protection", headline: "Waiting on branch protection", reason: "GitHub blocks the merge.", since_ts: null };
+  ({ status: "needs_you", group: "needs_you", reason, headline: "Attempts exhausted", hint: "Reply or unblock.", detail: "**stop** text", target, since_ts: since });
+const working: BoardStatus = { status: "working", group: "agent", activity: "agent", act: "RESOLVE", headline: "Resolving", reason: "An agent leg holds this item.", since_ts: null };
+const waiting: BoardStatus = { status: "waiting", group: "waiting", on: "branch-protection", headline: "Waiting on branch protection", reason: "GitHub blocks the merge.", since_ts: null };
 
 function payload(over: Partial<IssuesPayload>): IssuesPayload {
-  return { in_flight: [], done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: null, notifications: [], warnings: [], ...over };
+  return { in_flight: [], slots: { capacity: 3, heavy: 0, light: 0 }, done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: null, notifications: [], warnings: [], ...over };
 }
 
 describe("boardItems", () => {
@@ -64,7 +64,7 @@ describe("queuedCard", () => {
     };
     const queued = queuedCard(backlog);
 
-    expect(queued.board).toMatchObject({ status: "working", activity: "queued", headline: "Queued" });
+    expect(queued.board).toMatchObject({ status: "waiting", group: "slot", on: "slot", headline: "Queued" });
     expect(queued.labels).toEqual(["bug", "ai-ready"]);
     expect(queued.rail.current).toBe("resolve");
   });
@@ -92,9 +92,10 @@ describe("groupItems", () => {
 
     const sections = groupItems(items);
 
-    expect(sections.map(({ group }) => group)).toEqual(["needs_you", "working", "waiting"]);
+    expect(sections.map(({ group }) => group)).toEqual(["needs_you", "agent", "ci", "slot", "waiting"]);
     expect(sections[0]?.items.map((item) => item.issue)).toEqual([13, 11, 12, 14]);
-    expect(sections[2]?.items).toEqual([]);
+    expect(sections[1]?.items.map((item) => item.issue)).toEqual([10]);
+    expect(sections[4]?.items).toEqual([]);
   });
 });
 
@@ -114,7 +115,8 @@ describe("waitCell", () => {
   });
 
   it("says what an undated row is instead of a wait, and reads a future start as no wait", () => {
-    expect(waitCell({ ...working, since_ts: null }, NOW).text).toBe("queued");
+    expect(waitCell({ status: "waiting", group: "slot", on: "slot", headline: "h", reason: "r", since_ts: null }, NOW).text).toBe("queued");
+    expect(waitCell({ ...working, since_ts: null }, NOW).text).toBe("—");
     expect(waitCell(waiting, NOW).text).toBe("—");
     // A park has no stop comment to date it: it waits on you, it is not queued.
     expect(waitCell(needs(null), NOW).text).toBe("needs you");

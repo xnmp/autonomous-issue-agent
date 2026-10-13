@@ -41,6 +41,7 @@ export type StageId = StageRail["current"];
 export type TrackChip = Schema["TrackChip"];
 export type StageVisit = Schema["StageVisit"];
 export type IssueCard = Schema["IssueCard"];
+export type SlotUsage = Schema["SlotUsage"];
 export type DoneCard = Schema["DoneCard"];
 export type BacklogCard = Schema["BacklogCard"];
 export type ToastNotification = Schema["ToastNotification"];

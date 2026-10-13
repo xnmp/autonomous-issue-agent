@@ -228,6 +228,12 @@ export interface components {
         BoardNeedsYou: {
             /** Detail */
             detail: string | null;
+            /**
+             * Group
+             * @constant
+             * @enum {string}
+             */
+            group: "needs_you";
             /** Headline */
             headline: string;
             /** Hint */
@@ -254,6 +260,11 @@ export interface components {
         };
         /** BoardWaiting */
         BoardWaiting: {
+            /**
+             * Group
+             * @enum {string}
+             */
+            group: "slot" | "waiting";
             /** Headline */
             headline: string;
             /**
@@ -283,7 +294,12 @@ export interface components {
              * Activity
              * @enum {string}
              */
-            activity: "agent" | "queued" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "triage_note" | "release";
+            activity: "agent" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "triage_note" | "release";
+            /**
+             * Group
+             * @enum {string}
+             */
+            group: "agent" | "ci";
             /** Headline */
             headline: string;
             /** Reason */
@@ -632,6 +648,7 @@ export interface components {
             notifications: components["schemas"]["ToastNotification"][];
             /** Observed At */
             observed_at?: string | null;
+            slots: components["schemas"]["SlotUsage"];
             /** Store Error */
             store_error?: string | null;
             /** Warnings */
@@ -820,6 +837,21 @@ export interface components {
             stale: boolean;
             /** State */
             state?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * SlotUsage
+         * @description Dispatch slots against the agent lane. Light legs (steward, triage)
+         *     run outside `capacity`.
+         */
+        SlotUsage: {
+            /** Capacity */
+            capacity: number;
+            /** Heavy */
+            heavy: number;
+            /** Light */
+            light: number;
         } & {
             [key: string]: unknown;
         };

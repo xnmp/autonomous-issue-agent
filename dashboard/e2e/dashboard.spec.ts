@@ -71,7 +71,7 @@ const inFlightCard = {
   pr_url: "https://github.com/openai/autonomous-issue-agent/pull/74",
   pr_ci_state: "passing",
   board: {
-    status: "working", activity: "agent", act: "REVIEW", headline: "Review running",
+    status: "working", group: "agent", activity: "agent", act: "REVIEW", headline: "Review running",
     reason: "An agent leg holds this item.", since_ts: "2026-07-29T08:00:00Z",
   },
   action: null,
@@ -89,6 +89,7 @@ const inFlightCard = {
 };
 
 const issues = {
+  slots: { capacity: 3, heavy: 1, light: 0 },
   in_flight: [inFlightCard],
   done: [
     doneCard,
@@ -134,6 +135,7 @@ const question = "Harness issue: the required-test gate rejects diagnostic outpu
 
 const round3Issues = {
   ...issues,
+  slots: { capacity: 3, heavy: 0, light: 0 },
   in_flight: [{
     ...inFlightCard,
     issue: 457,
@@ -144,7 +146,7 @@ const round3Issues = {
     leg_running: false,
     action: "open",
     board: {
-      status: "needs_you", reason: "question", headline: "Answer the agent's question",
+      status: "needs_you", group: "needs_you", reason: "question", headline: "Answer the agent's question",
       hint: "Reply on GitHub with the answer; the agent resumes with it.",
       detail: question, target: "pr", since_ts: "2026-07-29T07:30:00Z",
     },
@@ -560,7 +562,7 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
 
   await page.getByRole("tab", { name: /In flight/ }).click();
-  await expect(page.getByRole("region", { name: "Working" }).locator(".board-row", { hasText: "#120" }))
+  await expect(page.getByRole("region", { name: "Waiting for a slot" }).locator(".board-row", { hasText: "#120" }))
     .toContainText("Queued");
   await page.locator(".board-row", { hasText: "Exercise model wrapping" }).click();
   await expect(page.locator("#board-drawer-49").getByText("$1.80 est.")).toBeVisible();

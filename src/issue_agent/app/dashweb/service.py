@@ -400,6 +400,7 @@ class Backend:
         models = system.leg_models(_state_dirs(dep.cfg))
         return {
             "in_flight": [views.issue_card(item, dep.cfg.repo, gh_issues.get(item.issue), models) for item in found or ()],
+            "slots": asdict(dash.slot_usage((item.status for item in found or ()), dep.cfg.dispatch_slots)),
             "done": views.done_cards(merged, legs, dep.cfg.repo, gh_issues),
             "backlog": views.backlog_cards(gh_issues, active, now) if obs and obs.issues is not None else [],
             "gh_ok": obs is None or not obs.failed,

@@ -15,7 +15,7 @@ const doneRows = (n: number) => Array.from({ length: n }, (_, i) => done(i + 1))
 
 function polled(data: Partial<IssuesPayload>): Polled<IssuesPayload> {
   return {
-    data: { in_flight: [], done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: "2026-07-29T09:00:00Z", notifications: [], warnings: [], ...data },
+    data: { in_flight: [], slots: { capacity: 3, heavy: 0, light: 0 }, done: [], backlog: [], gh_ok: true, merged_partial: false, observed_at: "2026-07-29T09:00:00Z", notifications: [], warnings: [], ...data },
     error: null, loading: false, updatedAt: 0, refresh: vi.fn(),
   };
 }

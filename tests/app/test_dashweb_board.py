@@ -210,6 +210,7 @@ def test_the_board_shows_each_items_derived_state(deployment):
     assert board[1]["board"]["status"] == "waiting" and board[1]["board"]["on"] == "slot"
     assert board[2]["board"] | {"detail": None} == {
         "status": "needs_you",
+        "group": "needs_you",
         "reason": "question",
         "headline": "Answer the agent's question",
         "detail": None,
@@ -228,6 +229,9 @@ def test_the_board_shows_each_items_derived_state(deployment):
     assert board[5]["board"]["reason"] == "labelled" and board[5]["action"] == "unblock"
     assert board[2]["cost_usd"] == 2.0 and board[2]["rail"]["resolve_attempts"] == 1
     assert payload["observed_at"] == NOW.isoformat() and payload["gh_ok"] is True
+    assert {n: c["board"]["group"] for n, c in board.items()} == {1: "slot", 2: "needs_you", 3: "ci", 4: "agent", 5: "needs_you"}
+    # Capacity is the deployment's own config (fix concurrency + the review role's slot), never a constant.
+    assert payload["slots"] == {"capacity": backend.deployment("demo").cfg.dispatch_slots, "heavy": 1, "light": 0}
 
 
 def test_the_issue_page_lists_legs_and_the_unblock_control(deployment):

@@ -16,7 +16,8 @@ from ..domain import dashboard as dash
 
 __all__ = ["DeploymentView", "collect", "render_html", "render_text"]
 
-_GROUPS = (("needs_you", "Needs you"), ("working", "Working"), ("waiting", "Waiting"))
+_GROUPS = (("needs_you", "Needs you"), ("agent", "Agent running"), ("ci", "CI & GitHub"),
+           ("slot", "Waiting for a slot"), ("waiting", "Waiting"))
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ def collect(name: str, repo: str = "", *, backend=None, observe: bool = False) -
 
 def _rows(view: DeploymentView) -> Iterable[tuple[str, str, list[dict]]]:
     for group, title in _GROUPS:
-        yield group, title, [card for card in view.board or () if card["board"]["status"] == group]
+        yield group, title, [card for card in view.board or () if card["board"]["group"] == group]
 
 
 def render_text(deployments: Iterable[DeploymentView], now_fn=None, details: bool = False) -> str:

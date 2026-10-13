@@ -63,6 +63,7 @@ const DoneCard = z
 const BoardNeedsYou = z
   .object({
     detail: z.union([z.string(), z.null()]),
+    group: z.literal("needs_you"),
     headline: z.string(),
     hint: z.string(),
     reason: z.enum([
@@ -84,7 +85,6 @@ const BoardWorking = z
     act: z.union([z.string(), z.null()]),
     activity: z.enum([
       "agent",
-      "queued",
       "ci",
       "ci_queued",
       "merge",
@@ -93,6 +93,7 @@ const BoardWorking = z
       "triage_note",
       "release",
     ]),
+    group: z.enum(["agent", "ci"]),
     headline: z.string(),
     reason: z.string(),
     since_ts: z.union([z.string(), z.null()]),
@@ -101,6 +102,7 @@ const BoardWorking = z
   .passthrough();
 const BoardWaiting = z
   .object({
+    group: z.enum(["slot", "waiting"]),
     headline: z.string(),
     on: z.enum([
       "branch-protection",
@@ -191,6 +193,13 @@ const ToastNotification = z
     ts: z.string(),
   })
   .passthrough();
+const SlotUsage = z
+  .object({
+    capacity: z.number().int(),
+    heavy: z.number().int(),
+    light: z.number().int(),
+  })
+  .passthrough();
 const IssuesPayload = z
   .object({
     backlog: z.array(BacklogCard),
@@ -200,6 +209,7 @@ const IssuesPayload = z
     merged_partial: z.boolean().optional().default(false),
     notifications: z.array(ToastNotification).optional().default([]),
     observed_at: z.union([z.string(), z.null()]).optional(),
+    slots: SlotUsage,
     store_error: z.union([z.string(), z.null()]).optional(),
     warnings: z.array(z.string()),
   })
@@ -489,6 +499,7 @@ export const schemas = {
   StageRail,
   IssueCard,
   ToastNotification,
+  SlotUsage,
   IssuesPayload,
   ValidationError,
   HTTPValidationError,
@@ -571,6 +582,7 @@ const endpoints = makeApi([
         merged_partial: z.boolean().optional().default(false),
         notifications: z.array(ToastNotification).optional().default([]),
         observed_at: z.union([z.string(), z.null()]).optional(),
+        slots: SlotUsage,
         store_error: z.union([z.string(), z.null()]).optional(),
         warnings: z.array(z.string()),
       })
