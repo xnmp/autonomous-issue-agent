@@ -520,8 +520,6 @@ def test_every_fixer_repair_builder_fences_its_untrusted_inputs():
 @pytest.mark.parametrize("task_env", [{}, {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"}])
 def test_claude_launch_options_disable_background_tasks(plan, task_env):
     from issue_agent.adapters.agent_runner import build_option_kwargs
-    from issue_agent.app.planners.run import compose_runtime_plan
-
-    runtime_plan = replace(compose_runtime_plan(plan), env=task_env)
+    runtime_plan = replace(plan, env=task_env)
     kwargs = build_option_kwargs(runtime_plan)
     assert kwargs["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"

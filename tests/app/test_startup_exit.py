@@ -159,6 +159,9 @@ def test_boot_recovery_is_explicitly_sequenced_before_readiness(
         def validate(self):
             events.append("validate")
 
+        def state_dir_for(self, role):
+            return {"fix": self.state_dir, "review": self.review_state_dir}[role]
+
     class Daemon:
         requires_hard_exit = False
 
@@ -185,7 +188,7 @@ def test_boot_recovery_is_explicitly_sequenced_before_readiness(
     monkeypatch.setattr(
         main_module,
         "_recover_pre_adapter_processes",
-        lambda trigger, *_args: events.append(("preflight", trigger)) or (),
+        lambda _cfg, role: events.append(("preflight", role)) or (),
     )
     monkeypatch.setattr(
         main_module,
@@ -198,7 +201,7 @@ def test_boot_recovery_is_explicitly_sequenced_before_readiness(
 
     assert events == [
         "validate",
-        ("preflight", RecoveryTrigger.BOOT),
+        ("preflight", "fix"),
         "build",
         ("reconcile", RecoveryTrigger.BOOT),
         "ready",
@@ -221,6 +224,9 @@ def test_missing_recovery_trigger_withholds_readiness(tmp_path, monkeypatch):
 
         def validate(self):
             return None
+
+        def state_dir_for(self, role):
+            return {"fix": self.state_dir, "review": self.review_state_dir}[role]
 
     class Daemon:
         reconcile = None
@@ -282,6 +288,9 @@ def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
 
         def validate(self):
             return None
+
+        def state_dir_for(self, role):
+            return {"fix": self.state_dir, "review": self.review_state_dir}[role]
 
     notifications = []
 

@@ -7,7 +7,7 @@ recovery all price with, so these assertions cover every money path.
 import pytest
 
 from issue_agent.app.config import from_env
-from issue_agent.app.roles import _rate_table
+from issue_agent.app.config import rate_table as _rate_table
 from issue_agent.domain import pricing
 from issue_agent.domain.contracts import TokenUsage
 from issue_agent.domain.pricing import price

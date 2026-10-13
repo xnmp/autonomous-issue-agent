@@ -32,7 +32,7 @@ def test_repository_guidance_is_encoded_only_in_the_user_task(tmp_path):
     assert result.status == "ok"
     assert inner.task is not None
     assert inner.task.append_system_prompt == "trusted harness policy"
-    prompt = inner.task.prompt
+    prompt = inner.task.rendered_prompt
     assert prompt.startswith("authoritative user task")
     encoded = prompt.split(
         "<untrusted_repository_guidance_json>\n", 1

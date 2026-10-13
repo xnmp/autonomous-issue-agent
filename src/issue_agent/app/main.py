@@ -23,18 +23,14 @@ from ..adapters.env_file import source_env_file
 from ..adapters.github import GitHubGateway, Identity
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from ..adapters.systemd_notify import SystemdNotifier
-from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
 from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
-from ..domain.recovery import RecoveryArm, RecoveryTrigger, recovery_plan
+from ..domain.recovery import RecoveryTrigger
 from ..domain.repository import canonical_repository
-from .config import HarnessConfig, from_env, render_agent_md
-from .roles import (
-    build_fix_daemon,
-    build_review_daemon,
-    process_supervision_state_dir,
-)
+from .config import HarnessConfig, from_env, render_agent_md, supervision_dir
+from .fix import compose_fix_daemon
+from .review import compose_review_daemon
 from .review_identity import review_identity as _app_identity
 
 
@@ -55,27 +51,13 @@ def _load_agent_env(env: dict) -> dict:
     return loaded
 
 
-def _recover_pre_adapter_processes(
-    trigger: RecoveryTrigger,
-    cfg: HarnessConfig,
-    role: str,
-    state_dir: str,
-) -> tuple[RunId, ...]:
-    """Run ADR 0006's pre-adapter process phase for every owned scope."""
-
-    if (
-        RecoveryArm.REAP_ALL_PROCESSES
-        not in recovery_plan(trigger).preflight_arms
-    ):
-        return ()
-
+def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId, ...]:
+    """Boot's pre-adapter phase (ADR 0006): reap every registered process
+    group, the pre-deployment-identity registry included."""
     from ..adapters.process_supervisor import ProcessSupervisor
 
-    legacy = ProcessSupervisor(state_dir).recover_abandoned_orphans()
-    current = ProcessSupervisor(
-        process_supervision_state_dir(cfg, role, state_dir)
-    ).recover_orphans()
-    return (*legacy, *current)
+    legacy = ProcessSupervisor(cfg.state_dir_for(role)).recover_abandoned_orphans()
+    return (*legacy, *ProcessSupervisor(supervision_dir(cfg, role)).recover_orphans())
 
 
 def _validate_reload_candidate(env: dict[str, str]) -> None:
@@ -98,121 +80,65 @@ class _TerminationHandler:
         raise SystemExit(ExitCode.CLEAN)
 
 
-def _agent_md(cfg: HarnessConfig) -> str:
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    path = os.path.join(here, "plugin", "AGENT.md")
-    try:
-        with open(path) as f:
-            return render_agent_md(f.read(), cfg)
-    except OSError:
-        return ""
+# …/src/issue_agent/app/main.py → the harness checkout.
+_HARNESS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
-def _review_prompt(cfg: HarnessConfig) -> str:
-    """Reviewer system prompt. An operator REVIEW_PROMPT (cfg.review_prompt, from
-    the env) wins wholesale; otherwise load the built-in dimension scaffold from
-    plugin/REVIEW_PROMPT.md. File I/O lives here (not in the pure from_env mapping),
-    mirroring _agent_md. `$ROUND_NUMBER` is substituted per round downstream."""
-    if cfg.review_prompt:
-        return cfg.review_prompt
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    path = os.path.join(here, "plugin", "REVIEW_PROMPT.md")
+def _plugin_text(name: str) -> str:
     try:
-        with open(path) as f:
+        with open(os.path.join(_HARNESS_ROOT, "plugin", name)) as f:
             return f.read()
     except OSError:
         return ""
 
 
-def build_role(
-    role: str,
-    env: dict | None = None,
-    scheduler_progress: Callable[[], None] | None = None,
-):
-    # review S7/D3: `main()` already loads AGENT_ENV once (via `_load_agent_env`,
-    # which shells out to `bash -c ... env -0`) and passes the merged dict here —
-    # only self-load when called standalone (env=None) so the documented
-    # entrypoint (`python -m issue_agent.app.main <role>`) never pays for that
-    # subprocess twice per boot.
+def _agent_md(cfg: HarnessConfig) -> str:
+    return render_agent_md(_plugin_text("AGENT.md"), cfg)
+
+
+def _review_prompt(cfg: HarnessConfig) -> str:
+    """An operator REVIEW_PROMPT wins wholesale; otherwise plugin/REVIEW_PROMPT.md."""
+    return cfg.review_prompt or _plugin_text("REVIEW_PROMPT.md")
+
+
+def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[[], None] | None = None):
+    # `main()` already loaded AGENT_ENV once (a `bash -c ... env -0` shell-out);
+    # only a standalone caller (env=None) pays for it here (review S7/D3).
     if env is None:
         env = _load_agent_env(dict(os.environ))
     cfg = from_env(env)
     cfg.validate()
     if cfg.target_dir and os.path.isdir(cfg.target_dir):
         os.chdir(cfg.target_dir)
-    # Harness root (…/src/issue_agent/app/main.py → repo root): resolves relative
-    # FIX_MCP_CONFIG paths. Honour an explicit HARNESS_ROOT_DIR override if set.
-    harness_root = cfg.harness_root or os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-    # review S7: was `HarnessConfig(**{**cfg.__dict__, ...})` — a manual rebuild
-    # of a frozen dataclass from its own __dict__. `dataclasses.replace` is the
-    # stdlib-blessed way to derive one frozen instance from another and, unlike
-    # the __dict__ spread, raises on a typo'd/renamed field instead of silently
-    # constructing a HarnessConfig with the wrong shape.
-    cfg = dataclasses.replace(
-        cfg,
-        agent_md=_agent_md(cfg),
-        review_prompt=_review_prompt(cfg),
-        harness_root=harness_root,
-    )
-
-    target_dir = cfg.target_dir or os.getcwd()
-    runner_state_dir = {
-        "fix": cfg.state_dir,
-        "review": cfg.review_state_dir,
-    }[role]
-
-    # Resolved-config print (lean P5.1): every daemon start states what it
-    # ACTUALLY loaded — the only structural defense against the silent-default
-    # class (#16/#49/#50/#78).
+    cfg = dataclasses.replace(cfg, agent_md=_agent_md(cfg), review_prompt=_review_prompt(cfg),
+                              harness_root=cfg.harness_root or _HARNESS_ROOT)
+    # Every daemon start states what it ACTUALLY loaded: the only structural
+    # defense against the silent-default class (#16/#49/#50/#78).
     for line in cfg.describe().splitlines():
         sys.stderr.write(f"{role}: config: {line}\n")
     sys.stderr.flush()
 
-    # Runner diagnostics, tagged with the role so they interleave with the
-    # daemon's own log lines.
-    def _commit_log(msg: str) -> None:
+    def log(msg: str) -> None:
         sys.stderr.write(f"{role}: {msg}\n")
         sys.stderr.flush()
 
-    # ISSUE_AGENT_DEBUG=1 turns on the deep trace: every SDK stream message
-    # (runner). This is the
-    # instrument for the "Stream closed" wedge — off by default (verbose), on when
-    # diagnosing. Boot logs whether it's active so the log is self-describing.
-    debug = env.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
-    _idle = cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None
-    # Two independent caps: silence (idle) and total elapsed (wall). The wall cap is
-    # what bounds a limping post-suspend stream, which never goes silent enough to
-    # trip the idle watchdog. 0 on either knob disables that one only.
-    _wall = cfg.agent_max_runtime if cfg.agent_max_runtime > 0 else None
     from ..adapters.process_supervisor import ProcessSupervisor
 
+    # Two independent caps: silence (idle) and total elapsed (wall); the wall
+    # cap bounds a limping post-suspend stream. 0 disables either one.
     runner = AgentRunner(
-        log=_commit_log, debug=debug,
-        idle_timeout=_idle, max_runtime=_wall,
-        process_supervisor=ProcessSupervisor(
-            process_supervision_state_dir(cfg, role, runner_state_dir)
-        ),
+        log=log, debug=env.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
+        idle_timeout=cfg.agent_idle_timeout or None, max_runtime=cfg.agent_max_runtime or None,
+        process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)),
     )
-    worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
-
     if role == "fix":
-        gw = GitHubGateway(
-            cfg.repo,
-            Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
-            progress=scheduler_progress,
-        )
-        store = Store(cfg.state_dir)
-        return build_fix_daemon(cfg, gw, store, worktrees, runner)
+        gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
+                           progress=scheduler_progress)
+        worktrees = Worktrees(cfg.target_dir or os.getcwd(), cfg.worktree_root, cfg.base_branch)
+        return compose_fix_daemon(cfg, gw, worktrees, runner).daemon
     if role == "review":
-        gw = GitHubGateway(
-            cfg.repo,
-            _app_identity(env, warn=_commit_log),
-            progress=scheduler_progress,
-        )
-        store = Store(cfg.review_state_dir)
-        return build_review_daemon(cfg, gw, store, runner)
+        gw = GitHubGateway(cfg.repo, _app_identity(env, warn=log), progress=scheduler_progress)
+        return compose_review_daemon(cfg, gw, runner).daemon
     raise SystemExit(f"unknown role: {role!r} (use fix|review)")
 
 
@@ -308,14 +234,8 @@ def _serve(role: str) -> None:
     try:
         cfg = from_env(env)
         cfg.validate()
-        state_dir = {
-            "fix": cfg.state_dir,
-            "review": cfg.review_state_dir,
-        }[role]
-        if state_dir:
-            recovered = _recover_pre_adapter_processes(
-                RecoveryTrigger.BOOT, cfg, role, state_dir
-            )
+        if cfg.state_dir_for(role):
+            recovered = _recover_pre_adapter_processes(cfg, role)
             if recovered:
                 sys.stderr.write(
                     f"{role}: recovered {len(recovered)} orphaned process "
@@ -358,11 +278,8 @@ def _serve(role: str) -> None:
     if os.environ.get("HOT_RELOAD", "1") != "0":
         from ..adapters.reload import ReloadWatch
 
-        harness_root = os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        )
         watch = ReloadWatch(
-            harness_root,
+            _HARNESS_ROOT,
             files=tuple(p for p in (os.environ.get("AGENT_ENV"),) if p),
             validate=lambda: _validate_reload_candidate(dict(os.environ)),
         )

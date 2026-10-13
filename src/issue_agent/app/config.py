@@ -15,7 +15,7 @@ import json
 import math
 import os
 import re
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from enum import Enum
 
 from ..adapters.control_path import machine_control_authority_root
@@ -23,7 +23,18 @@ from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
-from ..domain.pricing import parse_model_rate_table
+from ..domain.contracts import Money
+from ..domain.pricing import (
+    BudgetPolicy,
+    ModelRates,
+    RateTable,
+    UnknownModelPolicy,
+    default_cache_read_rate,
+    default_cache_write_rate,
+    parse_model_rate_table,
+    usd_per_million_to_micros,
+    with_default_model_rates,
+)
 from ..domain.repository import canonical_repository, repository_validation_error
 
 
@@ -221,6 +232,51 @@ class HarnessConfig:
 
 
 _FIELDS = {item.name: item for item in fields(HarnessConfig)}
+
+
+def budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
+    """The per-leg maximum each paid act reserves."""
+    fix = Money.from_major("USD", cfg.fix_budget_usd)
+    limits = {("fix", kind): fix for kind in ("RESOLVE", "ADDRESS_REVIEW", "FIX_CI", "REBASE")}
+    return BudgetPolicy({**limits, ("review", "REVIEW"): Money.from_major("USD", cfg.review_budget_usd)})
+
+
+def rate_table(cfg: HarnessConfig, runtime_name: str) -> RateTable | None:
+    """The one rate card the live budget kill, settlement and recovery price
+    with. Codex also carries the shipped per-model defaults; other runtimes
+    price synthetically from the configured rates alone."""
+    micros = usd_per_million_to_micros
+    try:
+        fallback = ModelRates(micros(cfg.codex_cost_per_mtok_in), micros(cfg.codex_cost_per_mtok_out),
+                              micros(cfg.codex_cost_per_mtok_in / 10), micros(cfg.codex_cost_per_mtok_in))
+        cached = dict(cfg.codex_cost_per_mtok_cached_in)
+        codex = runtime_name == RuntimeName.CODEX.value
+        rates = {
+            model: ModelRates(micros(rate_in), micros(rate_out),
+                              micros(cached.get(model, default_cache_read_rate(model, rate_in))),
+                              micros(default_cache_write_rate(model, rate_in)))
+            for model, rate_in, rate_out in (
+                with_default_model_rates(cfg.codex_cost_per_mtok) if codex else cfg.codex_cost_per_mtok)
+        }
+    except ValueError:
+        return None
+    # Shipped defaults change without an overlay edit, so a receipt names the
+    # effective prices, not just the operator's input snapshot.
+    version = hashlib.sha256(json.dumps({
+        "config": cfg.config_version,
+        "rates": {model.strip().casefold(): asdict(value) for model, value in rates.items()},
+        "fallback": asdict(fallback),
+    }, sort_keys=True).encode()).hexdigest()[:16]
+    card = "codex-config" if codex else f"{runtime_name}-synthetic-config"
+    return RateTable(card, version, "USD", rates, UnknownModelPolicy.USE_FALLBACK, fallback)
+
+
+def supervision_dir(cfg: HarnessConfig, role: str) -> str:
+    """Private process registry for one (repo, checkout, role) deployment."""
+    root = cfg.state_dir_for(role)
+    if not root:
+        raise ValueError("process supervisor state directory is required")
+    return os.path.join(root, "process-supervision", deployment_identity_for_target(cfg.repo, cfg.target_dir, role))
 
 
 def _env_name(name: str) -> str:

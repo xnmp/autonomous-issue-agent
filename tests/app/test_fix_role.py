@@ -15,9 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from issue_agent.adapters.store import Store
 from issue_agent.app.config import from_env
-from issue_agent.app.roles import compose_fix_daemon
+from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
@@ -235,7 +234,7 @@ def role(tmp_path):
             control_authority_root=str(tmp_path / "machine-state"),
         )
         worktrees = FakeWorktrees(tmp_path / "worktrees")
-        composed = compose_fix_daemon(cfg, gh, Store(cfg.state_dir), worktrees, agent, log=lambda _line: None)
+        composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=lambda _line: None)
         return composed, worktrees
     return compose
 
@@ -587,7 +586,7 @@ def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(tmp_
                             "STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "rs")}),
                   control_authority_root=str(tmp_path / "ms"))
     lines: list[str] = []
-    composed = compose_fix_daemon(cfg, gh, Store(cfg.state_dir), FakeWorktrees(tmp_path / "wt"), Agent(),
+    composed = compose_fix_daemon(cfg, gh, FakeWorktrees(tmp_path / "wt"), Agent(),
                                   log=lines.append)
     assert tick(composed) == [] and gh.merged == []
     assert any("PR #100 waits to merge" in line and "BLOCKED" in line for line in lines)

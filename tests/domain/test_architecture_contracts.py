@@ -400,7 +400,6 @@ def test_orchestration_cannot_read_telemetry_for_control_state() -> None:
         }
     )
     control_paths = (
-        APP / "roles.py",
         APP / "tick.py",
         APP / "fix.py",
         APP / "review.py",

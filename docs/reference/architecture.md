@@ -18,7 +18,9 @@ harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
 ## The shape
 
 Two role daemons — **fix** and **review** — reconcile GitHub and
-drive Claude or Codex sessions. Each is assembled in `app/roles.py` from:
+drive Claude or Codex sessions. Both assemble through one path,
+`tick.compose_role` (called by `fix.compose_fix_daemon` and
+`review.compose_review_daemon`), from:
 
 ```
 observe   gateway.build_world()      one bounded GitHub observation
@@ -161,11 +163,11 @@ Live work retains its reservation and stops its process group on a metering
 fault that prevents cap enforcement. See [ADR 0002](../adr/0002-money-and-accounting.md)
 for runtime provenance, Claude's remaining cumulative-cost gap, and deferred late
 corrections.
-The coordinator feeds lease, reconciliation, and compare-and-set results into
-the pure `domain/reservation_recovery.py` state machine. That model owns action
-ordering and terminal reporting; SQLite remains responsible for atomically
-proving that a requested release is still eligible. New runtimes or evidence
-sources therefore extend one decision table rather than adding recovery loops.
+The coordinator (`app/recovery.py`) walks each stale reservation in one fixed
+order: a live lease preserves it; otherwise surviving request evidence settles
+it, else an ended leg settles at a zero estimate, else a never-launched hold is
+released. SQLite remains responsible for atomically proving that a requested
+release is still eligible.
 Lease liveness is probed (OS process inspection) outside SQLite write
 transactions; the write transaction revalidates the complete lease row, so a
 lease replaced meanwhile survives. The pre-cutover migration and canary
@@ -432,7 +434,7 @@ legs),
 criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,
-`domain/recovery.py`, `domain/reservation_recovery.py`,
+`domain/recovery.py`,
 `domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
 minimal-harness design; the fix role runs on it since slice 5b and the review
 role since slice 5c),
@@ -460,7 +462,7 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/reload.py`,
 `adapters/repository_guidance.py`,
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
-`adapters/spend_recovery.py`, `adapters/store.py`,
+`adapters/spend_recovery.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 and `adapters/worktree.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
@@ -476,11 +478,13 @@ session),
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
 dispatches, runs one leg pinned to the head, and submits the parsed verdict
 once, resubmitting a stored verdict free when its submission never landed),
-`app/review_identity.py`, `app/roles.py`,
+`app/review_identity.py`,
 `app/tick.py` (the daemon both roles run: local facts from SQLite,
 derive → policy → choose, the action executor, bounded paid dispatch, the
-single `run_leg` path, and the SIGTERM drain).
-Provider-neutral task construction is isolated in `app/planners/`; the web
+single `run_leg` path, the SIGTERM drain, and `compose_role`: the one
+composition both roles share — control store, recovery coordinator,
+accounting and journal runtimes, runtime binding, shutdown hooks).
+Prompt assembly for the five acts is isolated in `app/planners/`; the web
 composition/read-model boundary is in `app/dashweb/`.
 
 ## Where the detail lives

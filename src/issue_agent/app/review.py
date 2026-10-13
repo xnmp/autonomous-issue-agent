@@ -34,9 +34,10 @@ from ..domain.state import DerivedState, Harness, ItemKey, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
+from ..adapters.worktree import ReviewCheckouts
+from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, leg_class, run_item
-from .tick import run_leg
+from .tick import Choose, Role, compose_role, leg_class, run_item, run_leg, stderr_log
 
 
 def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int) -> tuple[Action, ...]:
@@ -232,4 +233,44 @@ def _prior_review(pr: PRView, bot: str) -> str:
                                 body_bytes=_PRIOR_REVIEW_BYTES, total_bytes=_PRIOR_REVIEW_BYTES)
 
 
-__all__ = ["ReviewAct", "ReviewLegs", "ReviewSettings", "review_actions", "review_choose", "stored_verdict"]
+def compose_review_daemon(
+    cfg: HarnessConfig, gateway, runner, *, checkouts=None, log: Callable[[str], None] | None = None,
+) -> Role:
+    """The review role: REVIEW dispatches only, one at a time.
+
+    `checkouts` pins each leg to its head; by default a detached per-PR
+    worktree of TARGET_DIR (keifu #165: reviews of the operator's live
+    checkout produced phantom change requests under fresh SHAs). Two
+    misconfigurations no retry can fix refuse to start (ValueError, so `main`
+    exits INVALID_CONFIG): no TARGET_DIR, and a review credential that is not
+    REVIEW_BOT (it posted a duplicate review on every retry, since the
+    read-back looked for the wrong login)."""
+    log = log or stderr_log("review")
+    if checkouts is None:
+        if not cfg.target_dir:
+            raise ValueError("the review role needs TARGET_DIR: each review reads a checkout pinned to its head")
+        checkouts = ReviewCheckouts(cfg.target_dir, worktree_root=cfg.worktree_root)
+    acting_as = gateway.viewer_login()
+    if not login_eq(acting_as, cfg.review_bot):
+        raise ValueError(
+            f"REVIEW_BOT is {cfg.review_bot!r} but the review credential acts as "
+            f"{acting_as or 'nobody GitHub would name'!r}: set REVIEW_BOT to the "
+            "credential's login, or give the review role REVIEW_BOT's credential")
+    harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
+    task_config = tasks.ReviewTaskConfig(cfg.repo, cfg.base_branch, cfg.review_prompt, cfg.review_budget_usd,
+                                         cfg.review_model)
+
+    def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> ReviewLegs:
+        return ReviewLegs(gateway, control, ReviewSettings(cfg.repo, owner_id, harness), runtime=runtime,
+                          accounting=accounting, checkouts=checkouts, prepare_cwd=prepare_cwd,
+                          task_config=task_config, log=log)
+
+    role = compose_role(cfg, "review", gateway, runner, make_legs=make_legs,
+                        make_act=lambda dispatch, _control: ReviewAct(dispatch),
+                        choose=review_choose(harness), log=log)
+    log(f"review: capabilities: review=on runtime={cfg.reviewer_runtime.value}")
+    return role
+
+
+__all__ = ["ReviewAct", "ReviewLegs", "ReviewSettings", "compose_review_daemon", "review_actions",
+           "review_choose", "stored_verdict"]

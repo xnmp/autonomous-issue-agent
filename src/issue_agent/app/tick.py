@@ -19,22 +19,32 @@ without real time.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Protocol
+from datetime import datetime, timedelta, timezone
+from functools import partial
+from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
-from ..adapters.control_store import LegRun
+from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
+from ..adapters.control_path import control_store_path
+from ..adapters.control_store import ControlStoreError, LegRun, SQLiteControlStore
 from ..adapters.github import GhUnavailable
-from ..adapters.runtime_plan import AgentRuntime
+from ..adapters.journal import Journal, JournalingRuntime
+from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
+from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
+from ..domain.agent_task import RuntimeName
+from ..domain.contracts import BudgetScope, Money
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
 from ..domain.events import (
@@ -46,7 +56,7 @@ from ..domain.events import (
 from ..domain.leg import Leg
 from ..domain.outcome import AgentResult, LegClass, pre_admission_refusal
 from ..domain.policy import question_text
-from ..domain.ports import EventSink
+from ..domain.ports import EventSink, SpendReconciler
 from ..domain.recovery import RecoveryTrigger
 from ..domain.refs import harness_branch_issue
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, pr_key
@@ -57,7 +67,8 @@ from ..domain.supervision import (
     suspension_between,
 )
 from ..domain.world import WorldState
-from .planners.run import PlannedRun, compose_runtime_plan
+from .config import HarnessConfig, budget_policy, owner_identity_for_target, rate_table, supervision_dir
+from .recovery import RecoveryCoordinator
 
 def run_item(run: LegRun) -> ItemKey | None:
     """The item a recorded leg belongs to: its issue for RESOLVE, its PR for
@@ -188,13 +199,6 @@ def decide_with(
             log(f"{role}: {action!r}")
         return chosen
     return decide
-
-
-def lease_slots(daemon_ref: Mapping[str, object]) -> Callable[[], int]:
-    def slots() -> int:
-        daemon = daemon_ref.get("daemon")
-        return int(getattr(daemon, "available_dispatch_slots", 0)) if daemon is not None else 0
-    return slots
 
 
 def _ignore_log(_message: str) -> None:
@@ -859,7 +863,7 @@ async def run_leg(
     runner: AgentRuntime,
     log: Callable[[str], None],
     leg: Leg,
-    task: PlannedRun,
+    task: RuntimePlan,
     *,
     scope: AbstractContextManager[object] | None = None,
 ) -> AgentResult:
@@ -868,7 +872,7 @@ async def run_leg(
     label = leg.kind.casefold().replace("_", "-")
     log(f"agent #{target}: {label} — running")
     with scope or contextlib.nullcontext():
-        result = await runner.run(compose_runtime_plan(task))
+        result = await runner.run(task)
     status = result.status or ("error" if result.is_error else "ok")
     log(
         f"agent #{target}: {label} — done "
@@ -879,9 +883,300 @@ async def run_leg(
     return result
 
 
+# ── composition: both roles assemble through `compose_role` ─────────────────
 
-__all__ = [
-    "ActionExecutor", "Choose", "Daemon", "Facts", "decide_with", "dispatch_item", "item_issues",
-    "lease_slots", "leased_items", "leg_class", "leg_end", "local_legs", "order_for_execution",
-    "run_item", "run_leg",
-]
+
+def stderr_log(_role: str) -> Callable[[str], None]:
+    def log(msg: str) -> None:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()  # a crash right after must not eat the line
+    return log
+
+
+class CancellableAsyncDispatch:
+    """Run one dispatch coroutine per worker thread with cooperative shutdown.
+
+    Each worker owns its event loop; the daemon thread keeps a thread-safe
+    cancellation handle. Cancelling the root task propagates into the async
+    runner, whose subprocess cleanup ends its process group before the worker
+    exits.
+    """
+
+    def __init__(self, dispatch: Callable[[RunAgent], Awaitable[None]]) -> None:
+        self._dispatch = dispatch
+        self._lock = threading.Lock()
+        self._active: dict[int, tuple[asyncio.AbstractEventLoop, asyncio.Task[None], threading.Event]] = {}
+        # Sticky: cancellation may win the race before a submitted worker
+        # reaches __call__; every later registration observes it too.
+        self._shutdown = threading.Event()
+
+    def _new_cancel_event(self) -> threading.Event:
+        return threading.Event()
+
+    async def _run(self, action: RunAgent, cancel_requested: threading.Event) -> None:
+        task = asyncio.create_task(self._dispatch(action))
+        try:
+            while not task.done():
+                if cancel_requested.is_set():
+                    task.cancel()
+                # call_soon_threadsafe is the normal path; the bounded wait is a
+                # fallback for loops whose self-pipe wake is gone in teardown.
+                await asyncio.wait((task,), timeout=1.0)
+            await task
+        except asyncio.CancelledError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise
+
+    def __call__(self, action: RunAgent) -> None:
+        loop = asyncio.new_event_loop()
+        cancel_requested = self._new_cancel_event()
+        task = loop.create_task(self._run(action, cancel_requested))
+        token = id(task)
+        with self._lock:
+            self._active[token] = (loop, task, cancel_requested)
+            if self._shutdown.is_set():
+                cancel_requested.set()
+                task.cancel()
+        try:
+            loop.run_until_complete(task)
+        finally:
+            with self._lock:
+                self._active.pop(token, None)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            self._shutdown.set()
+            active = tuple(self._active.values())
+        for loop, task, cancel_requested in active:
+            cancel_requested.set()
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                continue  # the worker closed its loop after the snapshot
+
+
+def control_store(cfg: HarnessConfig, role: str) -> SQLiteControlStore:
+    """The one accounting/control authority shared by both roles. The first
+    open after the 3-table cutover retires a legacy store; `CutoverRefused`
+    stops the boot while that store still holds unsettled money."""
+    control = SQLiteControlStore(control_store_path(
+        (cfg.state_dir, cfg.review_state_dir), fallback_state_dir=cfg.state_dir_for(role),
+        authority_root=cfg.control_authority_root))
+    control.initialize()
+    return control
+
+
+def owner_identity(cfg: HarnessConfig, role: str) -> str:
+    return owner_identity_for_target(cfg.repo, cfg.target_dir, role)
+
+
+def spend_reconciler(cfg: HarnessConfig, control: SQLiteControlStore) -> CodexSpendReconciler:
+    dirs = dict.fromkeys(os.path.abspath(path) for path in (cfg.state_dir, cfg.review_state_dir) if path)
+    return CodexSpendReconciler(control, tuple(spend_evidence_dir(path) for path in dirs))
+
+
+def headroom(cfg: HarnessConfig, control, leg_usd: float) -> Callable[[], bool]:
+    """Daily repository/global headroom for one more leg, over the authority
+    reservation uses. A cap below one leg makes paid work wait here instead of
+    being refused at admission (decision #7); an unreadable ledger is no
+    headroom: free work goes on, paid work waits (Q7)."""
+    caps = tuple((repository, dimension, Money.from_major("USD", cap)) for repository, dimension, cap in (
+        (cfg.repo, "repository", cfg.daily_spend_cap_usd), ("*", "global", cfg.global_daily_spend_cap_usd))
+        if cap > 0)
+    leg = Money.from_major("USD", leg_usd)
+
+    def fits() -> bool:
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            for repository, dimension, cap in caps:
+                snapshot = control.snapshot(BudgetScope(
+                    repository, dimension, "USD", start.date().isoformat(), start,
+                    start + timedelta(days=1), ZoneInfo("UTC")))
+                if (snapshot.disposition.value != "available"
+                        or snapshot.committed.micros + leg.micros > cap.micros):
+                    return False
+        except Exception:  # noqa: BLE001 - see docstring
+            return False
+        return True
+
+    return fits
+
+
+def lifetime_capped(cfg: HarnessConfig, control) -> Callable[[int], bool]:
+    """Whether an issue can no longer afford one more leg under its lifetime
+    cap, priced at the dearer role's leg: fix alone writes the stop, so both
+    roles must agree or a review nobody can afford is stopped by nobody."""
+    if cfg.issue_spend_cap_usd <= 0:
+        return lambda _issue: False
+    cap = Money.from_major("USD", cfg.issue_spend_cap_usd)
+    leg = Money.from_major("USD", max(cfg.fix_budget_usd, cfg.review_budget_usd))
+
+    def capped(issue: int) -> bool:
+        snapshot = control.snapshot(issue_budget_scope(cfg.repo, issue, "USD"))
+        if snapshot.disposition.value != "available":
+            # `Facts` reads a failed read as no headroom: paid legs wait, free work goes on.
+            raise ControlStoreError(f"issue #{issue} spend is unreadable: {snapshot.detail}")
+        return snapshot.committed.micros + leg.micros > cap.micros
+
+    return capped
+
+
+def bind_runtime(
+    cfg: HarnessConfig, role: str, runner: AgentRuntime, log: Callable[[str], None],
+) -> tuple[AgentRuntime, Callable[[str], object] | None]:
+    """The role's runtime and the per-checkout preparation its legs run first.
+    Claude runs the passed SDK runner with repository guidance. Codex builds
+    its own runner: fixes get the git-capable sandbox and resume a dropped
+    transport, reviews are read-only and carry the system prompt inline."""
+    from ..adapters.repository_guidance import RepositoryGuidanceRuntime
+
+    runtime = cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime
+    if runtime is RuntimeName.CLAUDE:
+        return RepositoryGuidanceRuntime(runner, log=log), None
+    from ..adapters.codex_home import CodexHomeRuntime, write_codex_home
+    from ..adapters.codex_runner import CodexProvider, CodexRunner
+    from ..adapters.process_supervisor import ProcessSupervisor
+
+    fix = role == "fix"
+    state_dir = cfg.state_dir_for(role)
+    model = (cfg.codex_model if fix else cfg.review_model) or None
+    codex = CodexRunner(
+        codex_bin=cfg.codex_bin,
+        provider=CodexProvider(provider_id=cfg.codex_provider_id, name=cfg.codex_provider_name,
+                               base_url=cfg.codex_base_url, env_key=cfg.codex_env_key,
+                               wire_api=cfg.codex_wire_api),
+        sandbox=cfg.codex_sandbox if fix else "read-only",
+        resume_on_retry=fix,
+        reasoning_effort=cfg.codex_reasoning_effort,
+        inject_system_prompt=not fix,
+        log=log,
+        debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
+        idle_timeout=cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None,
+        max_runtime=cfg.agent_max_runtime if cfg.agent_max_runtime > 0 else None,
+        process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)) if state_dir else None,
+        spend_evidence_dir=spend_evidence_dir(state_dir),
+        rate_table=rate_table(cfg, RuntimeName.CODEX.value),
+        **({"default_model": model} if model else {}),
+    )
+    reason = codex.preflight()
+    log(f"codex: NOT READY at startup — {reason}" if reason is not None
+        else "codex: runtime ready (bin + key present)")
+    prepare = partial(write_codex_home, agents_md=cfg.agent_md if fix else "", state_dir=state_dir,
+                      auth_file=codex.oauth_auth_file())
+    return CodexHomeRuntime(codex, prepare), prepare
+
+
+@dataclass(frozen=True)
+class Role:
+    """A role's composed authorities. Acceptance tests drive this exact
+    production wiring instead of a hand-copied replica that can drift."""
+
+    daemon: Daemon
+    control: SQLiteControlStore
+    journal: Journal
+    act: ActionExecutor
+    legs: Any
+    recovery: RecoveryCoordinator
+    owner_id: str
+
+
+_SHUTDOWN_REASON = "shutdown_deadline_spend_unknown"
+
+
+def shutdown_hooks(
+    control: SQLiteControlStore, spend: SpendReconciler, *, owner_id: str, state_dir: str, role: str,
+) -> tuple[Callable[[], object], Callable[[], int]]:
+    """(prepare, terminalize): record cancellation intents before teardown;
+    after it, reconcile killed paid work and persist one handover per issue.
+    Recording an intent releases nothing: capacity stays reserved until the
+    killed run's spend is reconciled (or boot recovery settles it)."""
+    from ..adapters.handover import write_shutdown_handover
+
+    def prepare() -> object:
+        return control.record_owned_cancellation_intents(owner_id, _SHUTDOWN_REASON)
+
+    def terminalize() -> int:
+        written = 0
+        for intent in control.record_owned_cancellation_intents(owner_id, _SHUTDOWN_REASON):
+            spend.reconcile(intent.run_id)
+            # One file per issue: rewriting it at a later shutdown is idempotent.
+            written += write_shutdown_handover(
+                state_dir=state_dir, role=role, issue=intent.issue_number, run_id=str(intent.run_id),
+                kind=intent.kind, reason=intent.reason) is not None
+        return written
+
+    return prepare, terminalize
+
+
+def compose_role(
+    cfg: HarnessConfig,
+    role: str,
+    gateway,
+    runner: AgentRuntime,
+    *,
+    make_legs: Callable[..., Any],
+    make_act: Callable[[CancellableAsyncDispatch, SQLiteControlStore], ActionExecutor],
+    choose: Choose,
+    worktrees=None,
+    capacity: int = 1,
+    log: Callable[[str], None],
+) -> Role:
+    """observe -> derive -> policy -> act, with paid legs in a bounded pool.
+
+    Money order: the recovery coordinator exists before accounting, so an
+    admission that trips a cap can sweep stale reservations (keifu #34);
+    every leg reserves before spawn and settles once through the accounting
+    runtime; shutdown records cancellation intents, then reconciles killed
+    work and writes handovers."""
+    from ..adapters.process_supervisor import ProcessSupervisor
+
+    state_dir = cfg.state_dir_for(role)
+    runtime_name = (cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime).value
+    journal = Journal(os.path.join(state_dir, "journal.jsonl"))
+    bound, prepare_cwd = bind_runtime(cfg, role, runner, log)
+    control = control_store(cfg, role)
+    owner_id = owner_identity(cfg, role)
+    supervisor = ProcessSupervisor(supervision_dir(cfg, role))
+    spend = spend_reconciler(cfg, control)
+    recovery = RecoveryCoordinator(supervisor, control, worktrees, spend, owner_id)
+
+    def cap(value: float) -> Money | None:
+        return Money.from_major("USD", value) if value > 0 else None
+
+    accounting = AccountingRuntime(
+        bound, control, cfg.repo, role, cap(cfg.daily_spend_cap_usd), cap(cfg.global_daily_spend_cap_usd),
+        cap(cfg.issue_spend_cap_usd), cfg.config_version, runtime_name, budget_policy(cfg),
+        rate_table(cfg, runtime_name), spend_evidence_dir(state_dir), owner_id=owner_id,
+        reservation_reconciler=recovery,
+    )
+    runtime = JournalingRuntime(accounting, journal, repo=cfg.repo, role=role, runtime=runtime_name,
+                                state_dir=state_dir)
+    legs = make_legs(runtime=runtime, accounting=accounting, control=control, owner_id=owner_id,
+                     prepare_cwd=prepare_cwd)
+    dispatch = CancellableAsyncDispatch(legs.run)
+    act = make_act(dispatch, control)
+
+    prepare_shutdown, terminalize = shutdown_hooks(control, spend, owner_id=owner_id, state_dir=state_dir, role=role)
+
+    daemon = Daemon(
+        role, lambda: gateway.build_world(cfg.base_branch), lambda _world: [], act, cfg.poll_seconds, log,
+        journal=journal,
+        dispatch_capacity=capacity,
+        dispatch_key=dispatch_item,
+        cancel_active_dispatches=dispatch.cancel_all,
+        force_kill_dispatches=supervisor.force_kill_all,
+        heartbeat_path=os.path.join(state_dir, "heartbeat.json"),
+        reconcile=recovery.reconcile,
+        prepare_shutdown=prepare_shutdown,
+        terminalize=terminalize,
+    )
+    leg_usd = cfg.fix_budget_usd if role == "fix" else cfg.review_budget_usd
+    facts = Facts(control, cfg.repo, active=lambda: daemon.active_dispatches,
+                  headroom=headroom(cfg, control, leg_usd), lifetime_capped=lifetime_capped(cfg, control), log=log)
+    harness = Harness(fix_bot=cfg.fix_bot, review_bot=cfg.review_bot)
+    daemon.decide = decide_with(role, facts, harness, choose, lambda: daemon.available_dispatch_slots, log)
+    return Role(daemon, control, journal, act, legs, recovery, owner_id)

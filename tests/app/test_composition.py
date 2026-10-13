@@ -1,30 +1,5 @@
-"""app/roles.py — `_fix_state` round-trips (review C4).
-
-C4: `app/roles.py` had ZERO test references, and `_fix_state` is the READ half
-of EVERY circuit breaker `decide_fix` trips on. The review's mutation proved
-this: replacing all four `_fix_state` reads with empty dicts left 848/848
-tests green, because nothing drove a real counter through the write side, back
-through `_fix_state`, into `decide_fix`.
-
-Every test below does exactly that round trip against a REAL `Store(tmp_path)`:
-
-    real write side (AgentDispatcher → FixWorkflow, a scripted runner)
-        → roles._fix_state(store, world)
-        → domain.fix.decide_fix(world, cfg, state, fixer_busy=False)
-
-and asserts the breaker actually trips: the escalation Action appears and the
-corresponding `RunAgent` is withheld. Each is written as a two-phase
-(below-cap / at-cap) pair, which doubles as the anti-vacuity twin: phase one
-proves the breaker does NOT fire early (a `_fix_state` that always reads 0
-would pass phase one trivially but then also fail to trip in phase two).
-
-MUTATION CHECK (done by hand, see the final report): temporarily replacing
-every `_fix_state` read with `{}` was applied to `src/issue_agent/app/roles.py`,
-this whole module was run, all round-trip tests FAILED (the phase-two breaker
-never tripped, so `RunAgent` kept appearing where an escalation was expected),
-and the mutation was then reverted. See the agent's final message for the
-exact result.
-"""
+"""The shared role composition (`tick.compose_role`): headroom, process
+isolation, recovery scope, shutdown hooks, and runtime binding."""
 
 from __future__ import annotations
 
@@ -49,10 +24,9 @@ from issue_agent.adapters.control_store import (
     SQLiteControlStore,
     SettlementRequest,
 )
-from issue_agent.adapters.store import Store
 from issue_agent.app.config import HarnessConfig, from_env
-from issue_agent.app.main import _recover_pre_adapter_processes
-from issue_agent.app.roles import _FIX_RUNTIME_REGISTRY, _REVIEW_RUNTIME_REGISTRY, _control_spend_gate, _control_store, _headroom, _owner_identity, _shutdown_prepare, _shutdown_terminalize, process_supervision_state_dir
+from issue_agent.app.config import supervision_dir
+from issue_agent.app.tick import control_store, headroom, owner_identity, shutdown_hooks
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
@@ -76,20 +50,12 @@ def test_paid_headroom_follows_the_daily_cap_and_fails_closed_on_an_unreadable_l
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
 
-    assert _headroom(_control_spend_gate(cfg, store, 5.0))() is True
-    assert _headroom(_control_spend_gate(cfg, store, 11.0))() is False
-    assert _headroom(_control_spend_gate(cfg, _UnreadableLedger(), 5.0))() is False
+    assert headroom(cfg, store, 5.0)() is True
+    assert headroom(cfg, store, 11.0)() is False
+    assert headroom(cfg, _UnreadableLedger(), 5.0)() is False
     # No cap configured: nothing to read, nothing to wait on.
     uncapped = HarnessConfig(repo="o/r", daily_spend_cap_usd=0.0)
-    assert _headroom(_control_spend_gate(uncapped, _UnreadableLedger(), 5.0))() is True
-
-
-def test_runtime_wiring_registries_cover_every_supported_runtime():
-    assert frozenset(_FIX_RUNTIME_REGISTRY) == frozenset(RuntimeName)
-    assert frozenset(_REVIEW_RUNTIME_REGISTRY) == {
-        RuntimeName.CLAUDE,
-        RuntimeName.CODEX,
-    }
+    assert headroom(uncapped, _UnreadableLedger(), 5.0)() is True
 
 
 def test_process_supervision_isolated_between_checkouts_sharing_state(
@@ -107,11 +73,11 @@ def test_process_supervision_isolated_between_checkouts_sharing_state(
     cfg_a = from_env({**common, "TARGET_DIR": str(checkout_a)})
     cfg_b = from_env({**common, "TARGET_DIR": str(checkout_b)})
     supervisor_a = ProcessSupervisor(
-        process_supervision_state_dir(cfg_a, "fix"),
+        supervision_dir(cfg_a, "fix"),
         grace_seconds=0.05,
     )
     supervisor_b = ProcessSupervisor(
-        process_supervision_state_dir(cfg_b, "fix"),
+        supervision_dir(cfg_b, "fix"),
         grace_seconds=0.05,
     )
     assert supervisor_a.state_dir != supervisor_b.state_dir
@@ -153,10 +119,10 @@ def test_a_repointed_deployment_recovers_its_predecessors_dead_leg(tmp_path) -> 
     state = str(tmp_path / "state")
     old = HarnessConfig(repo="o/r", target_dir=str(tmp_path / "old"), state_dir=state, review_state_dir=state)
     current = replace(old, target_dir=str(tmp_path / "current"))
-    old_owner = _owner_identity(old, "fix")
-    current_owner = _owner_identity(current, "fix")
+    old_owner = owner_identity(old, "fix")
+    current_owner = owner_identity(current, "fix")
     assert old_owner != current_owner
-    store = _control_store(old, state)
+    store = control_store(old, "fix")
     run_id = RunId("repoint-old-run")
     assert store.lease("o/r", "fix", 7, old_owner)
     assert store.reserve(ReservationRequest(
@@ -167,7 +133,7 @@ def test_a_repointed_deployment_recovers_its_predecessors_dead_leg(tmp_path) -> 
         run_id, expected_owner_id=old_owner, pid=999_999, pgid=999_999, process_start_ticks=1,
     )
 
-    adopted = _control_store(current, state)
+    adopted = control_store(current, "fix")
     assert adopted.path == store.path
     assert adopted.reclaim_dead_leases(current_owner, lambda _pid, _ticks: False) == (run_id,)
     assert adopted.active_reservation_runs(current_owner) == (run_id,)
@@ -207,7 +173,8 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
         pgid=123,
         process_start_ticks=99,
     )
-    _shutdown_prepare(control, owner_id="o/r:fix")()
+    prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix", state_dir="", role="fix")  # type: ignore[arg-type]
+    prepare()
     assert control.has_cancellation_intent(run_id)
     # Recording the intent releases nothing: capacity stays reserved until
     # the killed run's spend is reconciled.
@@ -228,13 +195,7 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
             )
             return result.disposition is AccountingDisposition.AVAILABLE
 
-    _shutdown_terminalize(
-        control,
-        Spend(),
-        owner_id="o/r:fix",
-        state_dir=str(tmp_path / "state"),
-        role="fix",
-    )()
+    shutdown_hooks(control, Spend(), owner_id="o/r:fix", state_dir=str(tmp_path / "state"), role="fix")[1]()
 
     assert control.active_reservation_runs("o/r:fix") == ()
     assert control.leases() == ()
@@ -261,13 +222,14 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
     control.register_process_lease(
         run_id, expected_owner_id="o/r:fix", pid=999_999, pgid=999_999, process_start_ticks=1,
     )
-    _shutdown_prepare(control, owner_id="o/r:fix")()
+    prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix", state_dir="", role="fix")  # type: ignore[arg-type]
+    prepare()
     control.unlease("o/r", "fix", 42, "o/r:fix")  # the role's `finally` after the cancelled leg
 
-    _shutdown_terminalize(
+    shutdown_hooks(
         control, CodexSpendReconciler(control, (str(tmp_path / "unreadable-yet"),)),
         owner_id="o/r:fix", state_dir=str(tmp_path / "state"), role="fix",
-    )()
+    )[1]()
 
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
     assert [lease.run_id for lease in control.leases()] == [run_id]
@@ -396,7 +358,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     carries its own per-review cap and model into the review task."""
     from issue_agent.adapters import codex_runner
     from issue_agent.app.config import from_env
-    from issue_agent.app.roles import compose_review_daemon
+    from issue_agent.app.review import compose_review_daemon
 
     seen = {}
 
@@ -422,7 +384,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     )
 
     composed = compose_review_daemon(
-        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        cfg, _BuildableGateway(),
         FakeRunner(AgentResult(is_error=False)),
     )
 
@@ -438,7 +400,7 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     """Building a daemon must not prepare any checkout's CODEX_HOME."""
     from issue_agent.adapters import codex_home, codex_runner
     from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_review_daemon
+    from issue_agent.app.review import compose_review_daemon
 
     hook_calls = []
 
@@ -465,8 +427,8 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
         control_authority_root=str(tmp_path / "machine-state"),
     )
 
-    build_review_daemon(
-        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+    compose_review_daemon(
+        cfg, _BuildableGateway(),
         FakeRunner(AgentResult(is_error=False)),
     )
 
@@ -487,18 +449,3 @@ def _held_pr(number=581, issue=500):
     )
 
 
-@pytest.mark.parametrize("cap_usd, blocked", [(5.0, True), (10.0, False), (50.0, False)])
-def test_spend_gate_holds_paid_dispatch_when_one_leg_no_longer_fits_the_daily_cap(tmp_path, cap_usd, blocked):
-    # Decision #7: a daily cap smaller than one leg's reservation is a reported
-    # tick-gate wait, never a silent one and never an admission refusal label.
-    from issue_agent.app.roles import _control_spend_gate
-
-    control = SQLiteControlStore(str(tmp_path / "control.db"))
-    control.initialize()
-    cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), daily_spend_cap_usd=cap_usd)
-    gate = _control_spend_gate(cfg, control, 10.0)
-    assert gate is not None
-    reason = gate()
-    assert (reason is not None) is blocked
-    if blocked:
-        assert "repository daily spend cap reached" in reason and "$10.00 leg / $5.00" in reason

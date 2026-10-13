@@ -1,10 +1,10 @@
-"""Per-AgentKind PlannedRun builders — pure ports of the bash `claude -p` calls.
+"""Per-AgentKind RuntimePlan builders — pure ports of the bash `claude -p` calls.
 
 Each builder assembles the prompt + schema + tool policy + budget + model + resume
 for one agent action, exactly as the corresponding bash script did
 (resolve-issue.sh, resume-issue.sh, address-review.sh, fix-ci.sh, review-pr.sh). They are PURE: given the inputs (issue/PR text,
 review feedback, session id, the AGENT.md system prompt text, config), they return
-a frozen PlannedRun. The orchestration layer gathers the inputs (GitHub reads,
+a frozen RuntimePlan. The orchestration layer gathers the inputs (GitHub reads,
 session lookup, worktree path) and calls these.
 
 Tool policy: the fix agents keep the broad allow-list (bypassPermissions)
@@ -26,7 +26,7 @@ from ...domain.trust import Untrusted, untrusted_block
 from ...domain.agent_task import RuntimeName
 from ...domain.effort import Effort
 from .schemas import FIX_SCHEMA, REVIEW_SCHEMA
-from .run import PlannedRun
+from ...adapters.runtime_plan import RuntimePlan
 
 
 @dataclass(frozen=True)
@@ -181,11 +181,11 @@ def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     return base + _STANDING_POLICY_NOTICE + "\n" + _HUMAN_MESSAGES
 
 
-def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None = None) -> PlannedRun:
+def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None = None) -> RuntimePlan:
     """One fixer leg. Codex runs with native sub-agents disabled (refactor
     decision Q12), so only other runtimes carry the delegation grant."""
     grant = "" if cfg.runtime == RuntimeName.CODEX else _FIXER_REVIEW_AUTHORIZATION
-    return PlannedRun(
+    return RuntimePlan(
         prompt=grant + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, session_id),
@@ -207,7 +207,7 @@ def build_resolve_task(
     cwd: str,
     cfg: FixTaskConfig,
     branch: str,
-) -> PlannedRun:
+) -> RuntimePlan:
     """Initial resolution of an ai-ready issue on its prepared branch."""
     prompt = (
         f"Resolve issue #{issue_number} in {cfg.repo} on the prepared branch `{branch}` "
@@ -253,7 +253,7 @@ def build_resume_task(
     cwd: str,
     session_id: str,
     cfg: FixTaskConfig,
-) -> PlannedRun:
+) -> RuntimePlan:
     """resume-issue.sh: feed a human reply back into a blocked issue's session."""
     prompt = (
         "You blocked with a question in 'needs'; the harness routed back the "
@@ -273,7 +273,7 @@ def build_fresh_reply_task(
     human_reply: Untrusted,
     cwd: str,
     cfg: FixTaskConfig,
-) -> PlannedRun:
+) -> RuntimePlan:
     """Recover a blocked issue when its runtime session handle is unavailable."""
     prompt = (
         f"Continue resolving issue #{issue_number} in {cfg.repo} on the existing "
@@ -291,7 +291,7 @@ def build_fresh_reply_task(
     return _fix_run(cfg, prompt, cwd)
 
 
-def build_continue_task(cwd: str, session_id: str, cfg: FixTaskConfig) -> PlannedRun:
+def build_continue_task(cwd: str, session_id: str, cfg: FixTaskConfig) -> RuntimePlan:
     """Resume a leg the wall-clock cap cut off: the same session, once."""
     prompt = (
         "Your previous leg was stopped by the harness's wall-clock cap before it "
@@ -302,14 +302,14 @@ def build_continue_task(cwd: str, session_id: str, cfg: FixTaskConfig) -> Planne
     return _fix_run(cfg, prompt, cwd, session_id)
 
 
-def with_human_reply(task: PlannedRun, reply: Untrusted) -> PlannedRun:
+def with_human_reply(task: RuntimePlan, reply: Untrusted) -> RuntimePlan:
     """A PR-stage task after a released question: the act's own prompt plus
     the human's reply to the question the agent raised."""
     prompt = (
-        task.intent.prompt + "\n\nYou previously blocked with a question; the "
+        task.prompt + "\n\nYou previously blocked with a question; the "
         "reply posted after it:\n\n" + _fenced("human reply", reply) + "\n\n" + _REPLY_AUTHORITY
     )
-    return replace(task, intent=replace(task.intent, prompt=prompt))
+    return replace(task, prompt=prompt)
 
 
 _PR_BODY_EDIT = (
@@ -325,7 +325,7 @@ def build_address_review_task(
     cwd: str,
     session_id: str,
     cfg: FixTaskConfig,
-) -> PlannedRun:
+) -> RuntimePlan:
     """address-review.sh: address reviewer feedback, push.
 
     `inline` is FENCED with `_fenced` (review P1R-14, same helper the review
@@ -378,7 +378,7 @@ def build_fix_ci_task(
     cwd: str,
     session_id: str,
     cfg: FixTaskConfig,
-) -> PlannedRun:
+) -> RuntimePlan:
     """fix-ci.sh: repair failing CI on an open PR.
 
     `failed_log` is FENCED with `_fenced` (review P1R-14): a CI log echoes
@@ -408,7 +408,7 @@ def build_fix_ci_task(
 def build_rebase_task(
     pr_number: int, base_branch: str, cwd: str, session_id: str,
     cfg: FixTaskConfig,
-) -> PlannedRun:
+) -> RuntimePlan:
     """Wake the fixer to rebase a CONFLICTING PR branch onto the (advanced) base.
     Resumes the original session so the agent still has its own implementation
     context — it wrote this code, it's best placed to resolve the conflict. The
@@ -531,7 +531,7 @@ def build_review_task(
     cfg: ReviewTaskConfig,
     discussion: Untrusted | None = None,
     prior_review: Untrusted | None = None,
-) -> PlannedRun:
+) -> RuntimePlan:
     """One REVIEW leg on one exact head. The untrusted conversation comes last,
     nearest the diff it comments on and after every harness-voice section."""
     sections = (
@@ -543,7 +543,7 @@ def build_review_task(
         _prior_review_section(prior_review),
         _discussion_section(discussion),
     )
-    return PlannedRun(
+    return RuntimePlan(
         prompt="\n\n".join(s for s in sections if s),
         schema=REVIEW_SCHEMA,
         append_system_prompt=cfg.review_prompt,

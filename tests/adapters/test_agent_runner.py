@@ -15,7 +15,7 @@ from issue_agent.adapters.agent_runner import (
     resolve_claude_cli,
     result_to_agent_result,
 )
-from issue_agent.adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import ExitReason
 
 
@@ -44,33 +44,7 @@ def test_no_append_still_uses_preset():
     assert kw["system_prompt"] == {"type": "preset", "preset": "claude_code"}
 
 
-def test_subagents_map_to_agents_dict_and_add_task_tool():
-    task = RuntimePlan(
-        prompt="x",
-        allowed_tools=("Read",),
-        subagents=(
-            SubagentDef(
-                name="code-scout",
-                description="cheap scout",
-                prompt="search the code",
-                tools=("Read", "Grep"),
-                model="sonnet",
-            ),
-        ),
-    )
-    kw = build_option_kwargs(task)
-    # Task tool auto-added so the parent can spawn the subagent.
-    assert "Task" in kw["allowed_tools"]
-    # agents emitted as a plain dict spec (SDK-free; run() materialises it).
-    assert kw["agents"]["code-scout"] == {
-        "description": "cheap scout",
-        "prompt": "search the code",
-        "tools": ["Read", "Grep"],
-        "model": "sonnet",
-    }
-
-
-def test_no_subagents_means_no_agents_key_and_no_task_tool():
+def test_no_agents_key_and_no_task_tool():
     kw = build_option_kwargs(RuntimePlan(prompt="x", allowed_tools=("Read",)))
     assert "agents" not in kw
     assert "Task" not in kw.get("allowed_tools", [])
@@ -85,7 +59,6 @@ def test_tools_model_budget_cwd_resume_map():
         max_budget_usd=1.5,
         cwd="/wt/issue-5",
         resume="sess-123",
-        fork_session=True,
     )
     kw = build_option_kwargs(task)
     assert kw["allowed_tools"] == ["Read", "Bash(git *)"]
@@ -94,24 +67,13 @@ def test_tools_model_budget_cwd_resume_map():
     assert kw["max_budget_usd"] == 1.5
     assert kw["cwd"] == "/wt/issue-5"
     assert kw["resume"] == "sess-123"
-    assert kw["fork_session"] is True
+    assert "fork_session" not in kw
     assert kw["setting_sources"] == []
 
 
 def test_target_project_settings_are_never_loaded_as_provider_authority():
     kw = build_option_kwargs(RuntimePlan(prompt="x", cwd="/target"))
     assert kw["setting_sources"] == []
-
-
-def test_mcp_servers_and_tool_globs():
-    task = RuntimePlan(
-        prompt="x",
-        allowed_tools=("Read",),
-        mcp_servers=(McpServer("sonarqube", {"command": "npx"}, "mcp__sonarqube__*"),),
-    )
-    kw = build_option_kwargs(task)
-    assert kw["mcp_servers"] == {"sonarqube": {"command": "npx"}}
-    assert kw["allowed_tools"] == ["Read", "mcp__sonarqube__*"]
 
 
 def test_permission_mode_override():

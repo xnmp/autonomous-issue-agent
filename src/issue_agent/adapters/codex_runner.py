@@ -275,7 +275,7 @@ def build_codex_argv(
         argv += ["-o", output_path]
     # The fix contract rides CODEX_HOME's developer_instructions; without it
     # (inject_system_prompt) the system prompt is prepended to the task.
-    prompt = task.prompt
+    prompt = task.rendered_prompt
     if inject_system_prompt and task.append_system_prompt:
         prompt = f"{task.append_system_prompt}\n\n---\n\n{prompt}"
     argv.append(prompt)

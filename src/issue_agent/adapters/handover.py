@@ -259,7 +259,7 @@ def _render_handover(
     status = _git(repo, "status", "--short", "--branch")
     commits = _git(repo, "log", "--oneline", "--decorate", "-10")
     diff_stat = _git(repo, "diff", "--stat")
-    prompt = _bounded_text(_without_previous_handover(task.prompt), _MAX_TASK_BYTES)
+    prompt = _bounded_text(_without_previous_handover(task.rendered_prompt), _MAX_TASK_BYTES)
     summary = _bounded_text(
         (result.summary or "No terminal summary was reported.").strip(),
         _MAX_SUMMARY_BYTES,

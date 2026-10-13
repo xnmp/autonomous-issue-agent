@@ -1,4 +1,4 @@
-"""Idempotent boot, wake, and periodic recovery coordinator."""
+"""Idempotent boot, wake, and periodic recovery coordinator (ADR 0006)."""
 
 from __future__ import annotations
 
@@ -8,23 +8,8 @@ from datetime import datetime, timedelta, timezone
 
 from ..adapters.process_supervisor import ProcessSupervisor as DurableProcessSupervisor
 from ..domain.contracts import RunId
-from ..domain.recovery import (
-    RecoveryArm,
-    RecoveryGrace,
-    RecoveryTrigger,
-    recovery_plan,
-)
-from ..domain.reservation_recovery import (
-    ReservationRecoveryAction,
-    ReservationRecoveryState,
-    decide_reservation_recovery,
-)
-from ..domain.ports import (
-    ProcessSupervisor,
-    RecoveryControl,
-    SpendReconciler,
-    WorktreeRecovery,
-)
+from ..domain.ports import ProcessSupervisor, RecoveryControl, SpendReconciler, WorktreeRecovery
+from ..domain.recovery import RecoveryTrigger
 
 
 @dataclass(frozen=True)
@@ -40,104 +25,47 @@ class RecoveryReport:
 class RecoveryCoordinator:
     supervisor: ProcessSupervisor
     control: RecoveryControl
-    worktrees: WorktreeRecovery
+    worktrees: WorktreeRecovery | None
     spend: SpendReconciler
     owner_id: str
     reservation_grace: timedelta = timedelta(minutes=2)
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
     def reconcile(self, trigger: RecoveryTrigger) -> RecoveryReport:
-        """Execute the trigger-selected arm set from ADR 0006."""
+        """Fixed order: kill orphans, reclaim dead leases, validate worktrees,
+        then settle or release stale reservations."""
+        killed = self.supervisor.recover_abandoned_orphans() if trigger is RecoveryTrigger.WAKE else ()
+        reclaimed = self.control.reclaim_dead_leases(self.owner_id, _pid_alive)
+        validated = (self.worktrees.prune_validate()
+                     if self.worktrees is not None and trigger is not RecoveryTrigger.PERIODIC else 0)
+        grace = timedelta(0) if trigger is RecoveryTrigger.BOOT else self.reservation_grace
+        return RecoveryReport(trigger, killed, reclaimed, validated, self._sweep(grace))
 
-        plan = recovery_plan(trigger)
-        arms = plan.coordinator_arms
-        killed: tuple[RunId, ...] = ()
-        if RecoveryArm.REAP_ALL_PROCESSES in arms:
-            killed = self.supervisor.recover_orphans()
-        elif RecoveryArm.REAP_ABANDONED_PROCESSES in arms:
-            killed = self.supervisor.recover_abandoned_orphans()
+    def reconcile_stale_reservations(self) -> int:
+        """Admission's on-demand sweep (keifu #34): the periodic plan, which
+        never reaps processes, so it cannot disturb a live paid child. Counted
+        by differencing active reservations: an exact settlement frees
+        headroom too but reports nothing unknown."""
+        before = frozenset(self.control.active_reservation_runs(self.owner_id))
+        self.reconcile(RecoveryTrigger.PERIODIC)
+        return len(before - frozenset(self.control.active_reservation_runs(self.owner_id)))
 
-        reclaimed: tuple[RunId, ...] = ()
-        if RecoveryArm.RECLAIM_LEASES in arms:
-            reclaimed = self.control.reclaim_dead_leases(
-                self.owner_id, _pid_alive
-            )
-
-        validated_worktrees = (
-            self.worktrees.prune_validate()
-            if RecoveryArm.VALIDATE_WORKTREES in arms
-            else 0
-        )
-        spend_unknown: tuple[RunId, ...] = ()
-        if RecoveryArm.SWEEP_RESERVATIONS in arms:
-            grace = (
-                timedelta(0)
-                if plan.reservation_grace is RecoveryGrace.IMMEDIATE
-                else self.reservation_grace
-            )
-            reclaimed, spend_unknown = self._sweep(grace, reclaimed)
-
-        return RecoveryReport(
-            trigger,
-            killed,
-            reclaimed,
-            validated_worktrees,
-            spend_unknown,
-        )
-
-    def _sweep(
-        self,
-        grace: timedelta,
-        reclaimed_leases: tuple[RunId, ...],
-    ) -> tuple[tuple[RunId, ...], tuple[RunId, ...]]:
-        reclaimed = reclaimed_leases
-        live_runs = {
-            lease.run_id for lease in self.control.leases() if lease.run_id is not None
-        }
-        cutoff = self.now() - grace
-        candidates = self.control.stale_active_reservation_runs(
-            self.owner_id, cutoff
-        )
+    def _sweep(self, grace: timedelta) -> tuple[RunId, ...]:
+        """A reservation whose lease is live is preserved. Otherwise surviving
+        request evidence settles it, else an ended leg settles at a zero
+        estimate; only a reservation whose process never registered is
+        released (spend unknown). Anything else keeps its hold for next time."""
+        live = {lease.run_id for lease in self.control.leases() if lease.run_id is not None}
         unknown: list[RunId] = []
-        for run_id in candidates:
-            state = ReservationRecoveryState.observed(
-                live_lease=run_id in live_runs,
-                lease_reclaimed=run_id in reclaimed,
-            )
-            while True:
-                decision = decide_reservation_recovery(state)
-                if decision.action is ReservationRecoveryAction.PRESERVE:
-                    break
-                if decision.action is ReservationRecoveryAction.RECONCILE_SPEND:
-                    state = state.after_spend_reconciliation(
-                        settled=(self.spend.reconcile(run_id) or
-                                 self.control.settle_terminal_estimate(run_id, "terminal recovery has no usable request evidence"))
-                    )
-                    continue
-                if decision.action is ReservationRecoveryAction.RELEASE_UNLAUNCHED:
-                    result = self.control.release_unlaunched(
-                        run_id, "unlaunched_reservation"
-                    )
-                    state = state.after_unlaunched_release(
-                        released=result.disposition.value == "available"
-                    )
-                    continue
-                if decision.action is not ReservationRecoveryAction.COMPLETE:
-                    raise AssertionError(
-                        f"unsupported reservation recovery action: "
-                        f"{decision.action}"
-                    )
-                if decision.report_spend_unknown:
-                    unknown.append(run_id)
-                break
-        return reclaimed, tuple(unknown)
-
-
-class NoWorktreeRecovery:
-    """Null object for roles that never own issue worktrees."""
-
-    def prune_validate(self) -> int:
-        return 0
+        for run_id in self.control.stale_active_reservation_runs(self.owner_id, self.now() - grace):
+            if run_id in live:
+                continue
+            if self.spend.reconcile(run_id) or self.control.settle_terminal_estimate(
+                    run_id, "terminal recovery has no usable request evidence"):
+                continue
+            if self.control.release_unlaunched(run_id, "unlaunched_reservation").disposition.value == "available":
+                unknown.append(run_id)
+        return tuple(unknown)
 
 
 def _pid_alive(pid: int, start_ticks: int) -> bool:

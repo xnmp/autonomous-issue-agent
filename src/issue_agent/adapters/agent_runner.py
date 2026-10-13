@@ -117,9 +117,8 @@ def build_option_kwargs(
     if task.schema is not None:
         kwargs["output_format"] = {"type": "json_schema", "schema": task.schema}
 
-    allowed = task.all_allowed_tools()
-    if allowed:
-        kwargs["allowed_tools"] = allowed
+    if task.allowed_tools:
+        kwargs["allowed_tools"] = list(task.allowed_tools)
     if task.disallowed_tools:
         kwargs["disallowed_tools"] = list(task.disallowed_tools)
     if task.model:
@@ -134,8 +133,6 @@ def build_option_kwargs(
         kwargs["cwd"] = task.cwd
     if task.resume:
         kwargs["resume"] = task.resume
-    if task.fork_session:
-        kwargs["fork_session"] = True
     # Commit attribution: author/committer name carries the leg's model. Task
     # env still wins so an explicit override stays an override.
     # Background tasks are off for every role and cannot be overridden: a
@@ -146,22 +143,6 @@ def build_option_kwargs(
         **task.env,
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     }
-    if task.mcp_servers:
-        kwargs["mcp_servers"] = {m.name: m.config for m in task.mcp_servers}
-    if task.subagents:
-        # Emit a plain-dict spec here (SDK-free, so this stays unit-testable); run()
-        # converts each to the SDK's AgentDefinition before constructing options.
-        # `Task` is already in all_allowed_tools() so the parent can spawn them;
-        # each subagent carries its OWN tool allow-list + model.
-        kwargs["agents"] = {
-            s.name: {
-                "description": s.description,
-                "prompt": s.prompt,
-                "tools": list(s.tools) or None,
-                "model": s.model,
-            }
-            for s in task.subagents
-        }
     # Target project settings and CLAUDE.md are untrusted checkout data, so
     # none load (no target hooks either); repository guidance is appended to
     # the user task by RepositoryGuidanceRuntime.
@@ -591,17 +572,6 @@ class AgentRunner(AgentRuntime):
                 "sdk: installed claude-agent-sdk has no effort option — "
                 "reasoning-effort escalation is a no-op here (harness #16)"
             )
-        # Materialise the SDK-free `agents` dict-spec into AgentDefinition objects
-        # (build_option_kwargs stays SDK-free for unit tests; the SDK type is
-        # applied only here, at the edge that already imports the SDK). Imported
-        # inside the branch so a task with no subagents never needs the symbol —
-        # keeps the stubbed-SDK unit tests (which omit AgentDefinition) working.
-        if kwargs.get("agents"):
-            from claude_agent_sdk import AgentDefinition
-
-            kwargs["agents"] = {
-                name: AgentDefinition(**spec) for name, spec in kwargs["agents"].items()
-            }
         # Capture the bundled CLI's OWN stderr. The SDK otherwise swallows it, so a
         # gateway-side failure (an HTTP status, an SSE `response.failed`, a reconnect
         # loop) that kills the result-delivery turn is invisible — we see only the
@@ -655,7 +625,7 @@ class AgentRunner(AgentRuntime):
         # injectable and a spurious read would shift a test's fake sequence, and an
         # unarmed cap has no baseline to keep.
         started_at = self._wall_clock() if self._max_runtime is not None else 0.0
-        agen = query(prompt=task.prompt, options=options).__aiter__()
+        agen = query(prompt=task.rendered_prompt, options=options).__aiter__()
         receive_started = False
         pending: Any = None
         try:

@@ -243,7 +243,7 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
 
 
 def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
-    from issue_agent.app.roles import CancellableAsyncDispatch
+    from issue_agent.app.tick import CancellableAsyncDispatch
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     started = threading.Event()
@@ -538,7 +538,7 @@ def test_application_shutdown_deadline_fits_inside_every_systemd_hard_stop():
 
 
 def test_interrupt_before_worker_registration_is_sticky():
-    from issue_agent.app.roles import CancellableAsyncDispatch
+    from issue_agent.app.tick import CancellableAsyncDispatch
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     registering = threading.Event()
