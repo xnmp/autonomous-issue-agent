@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import json
 import re
 from pathlib import Path
 
@@ -13,7 +12,6 @@ APP = ROOT / "src" / "issue_agent" / "app"
 PLUGIN = ROOT / "plugin"
 PRIVILEGED_EFFECT_ADAPTERS = frozenset(
     {
-        Path("src/issue_agent/adapters/effects.py"),
         Path("src/issue_agent/adapters/github.py"),
         Path("src/issue_agent/adapters/operator_effects.py"),
     }
@@ -34,19 +32,6 @@ REMOTE_WRITES = frozenset(
         "submit_review",
         "update_branch",
     }
-)
-DURABLE_EFFECT_TRANSITIONS = frozenset(
-    {
-        "begin_command",
-        "enqueue_command",
-        "enqueue_command_occurrence",
-        "record_effect",
-        "resolve_unknown_effect",
-        "retry_reconciled_command",
-    }
-)
-MIGRATION_FLAGS = frozenset(
-    {"CONTROL_STORE_MODE", "TRUSTED_PUBLISH", "EVENT_FORMAT", "SUPERVISION_NOTIFY"}
 )
 
 
@@ -341,84 +326,6 @@ def test_app_has_no_lambda_noop_defaults() -> None:
     assert violations == []
 
 
-def test_app_cannot_construct_the_non_durable_effect_adapter() -> None:
-    """Compatibility effects are test tooling, never a production fallback."""
-
-    violations: list[str] = []
-    for path in _python_files(APP):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
-            imported: tuple[str, ...] = ()
-            if isinstance(node, ast.Import):
-                imported = tuple(alias.name for alias in node.names)
-            elif node.module:
-                imported = tuple(alias.name for alias in node.names)
-            if any(
-                name.endswith("ImmediateGitHubEffectExecutor")
-                for name in imported
-            ):
-                violations.append(f"{path.relative_to(ROOT)}:{node.lineno}")
-    assert violations == []
-
-
-def test_durable_effect_transitions_have_one_lifecycle_coordinator() -> None:
-    """Effect adapters cannot grow independent command state machines."""
-
-    coordinator = Path("src/issue_agent/adapters/durable_effects.py")
-    violations: list[str] = []
-    for root in (APP, ROOT / "src" / "issue_agent" / "adapters"):
-        for path in _python_files(root):
-            relative = path.relative_to(ROOT)
-            if relative == coordinator:
-                continue
-            tree = ast.parse(path.read_text(), filename=str(path))
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in DURABLE_EFFECT_TRANSITIONS
-                ):
-                    violations.append(
-                        f"{relative}:{node.lineno} {node.func.attr}"
-                    )
-    assert violations == []
-
-
-def test_orchestration_cannot_read_telemetry_for_control_state() -> None:
-    """JSONL readers are confined to presentation and migration adapters."""
-
-    reader_names = frozenset(
-        {
-            "read_events",
-            "read_events_tail",
-            "sum_today",
-            "ci_flake_keys",
-            "ci_pending_keys",
-            "duplicate_pr_keys",
-        }
-    )
-    control_paths = (
-        APP / "tick.py",
-        APP / "fix.py",
-        APP / "review.py",
-    )
-    violations: list[str] = []
-    for path in control_paths:
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom):
-                continue
-            imported = {alias.name for alias in node.names}
-            forbidden = sorted(imported & reader_names)
-            if forbidden:
-                violations.append(
-                    f"{path.relative_to(ROOT)}:{node.lineno} {forbidden}"
-                )
-    assert violations == []
-
-
 def test_application_event_producers_cannot_emit_free_form_names() -> None:
     violations: list[str] = []
     for path in _python_files(APP):
@@ -434,71 +341,6 @@ def test_application_event_producers_cannot_emit_free_form_names() -> None:
             ):
                 violations.append(f"{path.relative_to(ROOT)}:{node.lineno}")
     assert violations == []
-
-
-def test_legacy_json_lifecycle_queue_is_removed() -> None:
-    forbidden = ("pending-actions.json", "quarantined-actions.json")
-    violations = [
-        f"{path.relative_to(ROOT)}: {marker}"
-        for path in _python_files(ROOT / "src")
-        for marker in forbidden
-        if marker in path.read_text()
-    ]
-    assert violations == []
-
-
-def test_self_authored_markers_are_not_gate_evidence() -> None:
-    forbidden = ("ac-posted", "test-plan-posted", "adversarial-verdict")
-    checked = (
-        *_python_files(APP),
-        *_python_files(ROOT / "src" / "issue_agent" / "adapters"),
-        *(ROOT / "plugin" / "hooks" / "checks").glob("*.sh"),
-    )
-    violations = [
-        f"{path.relative_to(ROOT)}: {marker}"
-        for path in checked
-        for marker in forbidden
-        if marker in path.read_text()
-    ]
-    assert violations == []
-
-
-def test_workflows_use_the_single_run_leg_path() -> None:
-    violations: list[str] = []
-    workflow_root = APP / "workflows"
-    for path in _python_files(workflow_root):
-        if path.name == "base.py":
-            continue
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run"
-                and _receiver_name(node.func.value).endswith("runner")
-            ):
-                violations.append(f"{path.relative_to(ROOT)}:{node.lineno}")
-    assert violations == []
-
-
-def test_every_live_migration_flag_has_an_executioner() -> None:
-    manifest_path = ROOT / "docs" / "reference" / "migration-flags.json"
-    manifest = json.loads(manifest_path.read_text())
-    assert set(manifest) <= MIGRATION_FLAGS
-    for flag, record in manifest.items():
-        assert record["owner"]
-        assert int(record["removal_issue"]) > 0
-        assert record["target_date"]
-        assert record["promotion_metric"]
-        assert record["rollback"]
-
-    live = {
-        flag
-        for path in _python_files(ROOT / "src")
-        for flag in MIGRATION_FLAGS
-        if flag in path.read_text()
-    }
-    assert live == set(manifest)
 
 
 def test_architecture_docs_name_authoritative_subsystems() -> None:
@@ -552,8 +394,9 @@ def test_every_adr_is_referenced_by_a_governed_source_file() -> None:
         decision = adr.read_text()
         match = re.match(r"# ADR ([0-9]{4})\b", decision)
         assert match is not None, f"{adr.name} has no ADR id"
-        if re.search(r"^Status: Superseded\b", decision, re.MULTILINE):
-            continue  # retired authority has no live source obligation
+        assert not re.search(r"^Status: Superseded\b", decision, re.MULTILINE), (
+            f"{adr.name} is superseded: move it to docs/archive/adr/"
+        )
         marker = f"ADR {match.group(1)}"
         governs = next(
             (
@@ -583,17 +426,3 @@ def test_prompt_budget_evidence_matches_current_instruction_file() -> None:
     ).read_text()
     assert f"{len(prompt.encode()):,}" in evidence
     assert f"{len(prompt.split()):,}" in evidence
-
-
-
-def test_current_documentation_has_no_retired_test_grant_authority():
-    architecture = (ROOT / "docs/reference/architecture.md").read_text()
-    manual = (ROOT / "HARNESS.md").read_text()
-    assert "`domain/exemptions.py`" not in architecture
-    assert "`domain/review_exemptions.py`" not in architecture
-    assert "exemption-trailer" not in architecture
-    assert "counting and exemption evidence" not in manual
-    residuals = (ROOT / "docs/open/residuals.md").read_text()
-    assert "UNVERIFIABLE exemption verdict" not in residuals
-    assert "missing MAC key map to WITHHELD" not in residuals
-    assert "Increment 8 retains this fix-side collector residual" not in residuals

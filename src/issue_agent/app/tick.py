@@ -36,6 +36,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
+from ..adapters.atomic_file import atomic_write
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import ControlStoreError, LegRun, SQLiteControlStore
 from ..adapters.github import GhUnavailable
@@ -299,15 +300,10 @@ class Daemon:
         try:
             if parent := os.path.dirname(self.heartbeat_path):
                 os.makedirs(parent, mode=0o700, exist_ok=True)
-            temporary = f"{self.heartbeat_path}.{os.getpid()}.tmp"
             payload = {"pid": os.getpid(), "state": self._state.value,
                        "in_flight": [{"kind": a.kind.name, "number": a.number} for a in self.active_dispatches],
                        "updated_at": datetime.now(timezone.utc).isoformat()}
-            with open(temporary, "w", encoding="utf-8") as stream:
-                json.dump(payload, stream, sort_keys=True)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.heartbeat_path)
+            atomic_write(self.heartbeat_path, json.dumps(payload, sort_keys=True))
         except OSError as exc:
             self.log(f"{self.name}: heartbeat write failed: {exc}")
 

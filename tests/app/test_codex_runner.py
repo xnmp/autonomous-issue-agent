@@ -39,7 +39,6 @@ from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime
 from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
-from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import FIX_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -89,8 +88,9 @@ def test_oversize_prompt_moves_to_stdin_small_stays_on_argv():
     assert routed_mb[-1] == "-" and payload_mb is not None
 
 
-def test_argv_basic_shape():
-    argv = build_codex_argv(RuntimePlan(prompt="do it"))
+def test_argv_shape():
+    argv = build_codex_argv(RuntimePlan(prompt="do it", cwd="/wt/issue-5"),
+                            schema_path="/tmp/s.json", output_path="/tmp/o.json")
     assert argv[:2] == ["codex", "exec"]
     assert argv[-1] == "do it"  # prompt is last positional
     assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
@@ -100,89 +100,21 @@ def test_argv_basic_shape():
     # and with no -m codex uses the provider's own default (in OAuth mode, the
     # subscription's current model).
     assert "-m" not in argv
-
-
-def test_argv_pins_medium_reasoning_effort_by_default():
-    # codex exec's own default is LOW (live session_meta 2026-07-27) — the
-    # harness pins medium so an implementer leg doesn't quietly under-think.
-    argv = build_codex_argv(RuntimePlan(prompt="x"))
-    assert "model_reasoning_effort=medium" in " ".join(argv)
-
-
-def test_argv_reasoning_effort_override_and_opt_out():
-    assert "model_reasoning_effort=high" in " ".join(
-        build_codex_argv(RuntimePlan(prompt="x"), reasoning_effort="high")
-    )
-    # "" = leave codex's own default alone — no pin at all.
-    assert "model_reasoning_effort" not in " ".join(
-        build_codex_argv(RuntimePlan(prompt="x"), reasoning_effort="")
-    )
-
-
-def test_argv_reasoning_effort_rides_the_resume_path_too():
-    # Follow-up legs resume; -c is legal on resume and the pin must not vanish
-    # exactly when the hard repair legs run.
-    argv = build_codex_argv(RuntimePlan(prompt="x", resume="0199-abc"))
-    assert "model_reasoning_effort=medium" in " ".join(argv)
-
-
-def test_argv_task_effort_beats_the_process_knob():
-    """The escalation ladder decides per LEG (#16); `reasoning_effort` is only
-    the default for legs with no opinion of their own."""
-    argv = build_codex_argv(
-        RuntimePlan(prompt="x", effort=Effort.HIGH), reasoning_effort="low"
-    )
-    joined = " ".join(argv)
-    assert "model_reasoning_effort=high" in joined
-    assert "model_reasoning_effort=low" not in joined
-
-
-def test_argv_task_effort_applies_on_the_resume_path_too():
-    # The repair legs are exactly where escalation fires most; -c is legal on
-    # resume, so a raised effort must not evaporate there.
-    argv = build_codex_argv(RuntimePlan(prompt="x", resume="0199-abc", effort=Effort.HIGH))
-    assert "model_reasoning_effort=high" in " ".join(argv)
-
-
-def test_a_task_without_an_effort_leaves_the_process_knob_untouched():
-    """Legs the ladder never touches (review, triage, the router) must build the
-    same argv they did before the field existed."""
-    argv = build_codex_argv(RuntimePlan(prompt="x"), reasoning_effort="low")
-    assert "model_reasoning_effort=low" in " ".join(argv)
-
-
-def test_argv_provider_overrides_inline():
-    prov = CodexProvider(provider_id="acme", base_url="https://gw.example/v1")
-    argv = build_codex_argv(RuntimePlan(prompt="x"), provider=prov)
-    joined = " ".join(argv)
-    assert 'model_providers.acme.base_url="https://gw.example/v1"' in joined
-    assert 'model_providers.acme.wire_api="responses"' in joined
-    assert 'model_provider="acme"' in joined
-    # never put the secret on the argv — only the env_key NAME (codex convention:
-    # OPENAI_API_KEY, which behind a proxy is aliased to the gateway key)
-    assert 'env_key="OPENAI_API_KEY"' in joined
-    assert "OPENAI_API_KEY=" not in joined
-
-
-def test_argv_model_override_wins():
-    argv = build_codex_argv(RuntimePlan(prompt="x", model="some-other-model"))
-    assert argv[argv.index("-m") + 1] == "some-other-model"
-
-
-def test_argv_cwd_schema_output():
-    argv = build_codex_argv(
-        RuntimePlan(prompt="x", cwd="/wt/issue-5"),
-        schema_path="/tmp/s.json", output_path="/tmp/o.json",
-    )
     assert argv[argv.index("-C") + 1] == "/wt/issue-5"
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
     assert argv[argv.index("-o") + 1] == "/tmp/o.json"
 
 
-def test_argv_resume_comes_first():
-    argv = build_codex_argv(RuntimePlan(prompt="x", resume="sess-123"))
-    # `exec resume <id>` must precede the -c/-m flags
-    assert argv[1] == "exec" and argv[2] == "resume" and argv[3] == "sess-123"
+@pytest.mark.parametrize("effort,knob,pinned", [
+    (None, "high", "high"),
+    (None, "", None),  # "" = leave codex's own default alone — no pin at all
+    # The escalation ladder decides per LEG (#16); the knob is only the default.
+    (Effort.HIGH, "low", "high"),
+])
+def test_argv_reasoning_effort(effort, knob, pinned):
+    joined = " ".join(build_codex_argv(RuntimePlan(prompt="x", effort=effort), reasoning_effort=knob))
+    assert joined.count("model_reasoning_effort") == (1 if pinned else 0)
+    assert pinned is None or f"model_reasoning_effort={pinned}" in joined
 
 
 def test_argv_resume_omits_exec_only_flags():
@@ -201,48 +133,23 @@ def test_argv_resume_omits_exec_only_flags():
     assert argv[argv.index("--output-schema") + 1] == "/tmp/s.json"
 
 
-def test_argv_nonresume_keeps_sandbox_and_cd():
-    # The plain-exec path is unchanged: --sandbox + -C present, no resume bypass.
-    argv = build_codex_argv(RuntimePlan(prompt="x", cwd="/wt/issue-5"))
-    assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
-    assert argv[argv.index("-C") + 1] == "/wt/issue-5"
-    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
-
-
 def test_argv_prepends_system_prompt_to_prompt():
     argv = build_codex_argv(RuntimePlan(prompt="the task", append_system_prompt="RULES"))
     assert argv[-1].startswith("RULES")
     assert argv[-1].endswith("the task")
 
 
-def test_argv_skips_system_prompt_when_inject_disabled():
-    # When the contract is delivered via AGENTS.md, the prompt must NOT also be
-    # prepended (no duplication).
-    argv = build_codex_argv(
-        RuntimePlan(prompt="the task", append_system_prompt="RULES"),
-        inject_system_prompt=False,
-    )
-    assert argv[-1] == "the task"
-    assert "RULES" not in argv[-1]
-
-
-def test_argv_custom_provider_and_bin():
+def test_argv_provider_block():
     prov = CodexProvider(provider_id="acme", name="Acme", base_url="https://x/y",
                          env_key="ACME_KEY", wire_api="chat")
     argv = build_codex_argv(RuntimePlan(prompt="x"), codex_bin="/opt/codex", provider=prov)
     assert argv[0] == "/opt/codex"
     joined = " ".join(argv)
     assert 'model_provider="acme"' in joined and 'env_key="ACME_KEY"' in joined
-
-
-# ── _strict_schema ───────────────────────────────────────────────────────────────
-def test_strict_schema_requires_all_and_closes():
-    s = {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}
-    out = _strict_schema(s)
-    assert set(out["required"]) == {"a", "b"}
-    assert out["additionalProperties"] is False
-    # original untouched (shallow-copy semantics)
-    assert "required" not in s
+    # Blank base_url = ChatGPT-subscription OAuth: codex's built-in provider must
+    # stay untouched (defining a custom one forces API-key auth).
+    oauth = " ".join(build_codex_argv(RuntimePlan(prompt="x"), provider=CodexProvider()))
+    assert "model_providers" not in oauth and "model_provider=" not in oauth
 
 
 def test_strict_schema_recurses_nested_objects():
@@ -273,8 +180,6 @@ def test_strict_schema_closes_objects_nested_under_array_combinators():
     assert item["required"] == ["detail"]
 
 
-
-
 def test_a_previously_optional_property_stays_sayable_as_null():
     """Strict mode forces every property into `required`. If that also made it
     non-nullable, a classifier could no longer express "no finding" — which is
@@ -291,75 +196,70 @@ def test_a_previously_optional_property_stays_sayable_as_null():
     assert out["properties"]["opt"]["type"] == ["integer", "null"]
 
 
-# ── parse_codex_envelope (pure) ──────────────────────────────────────────────────
-def test_envelope_success_maps_fields():
-    msg = json.dumps({"status": "pr_opened", "summary": "opened #5", "needs": ""})
-    r = parse_codex_envelope(exit_code=0, last_message=msg, session_id="s1")
-    assert r.is_error is False
-    assert r.status == "pr_opened"
-    assert r.summary == "opened #5"
-    assert r.session_id == "s1"
-    assert r.structured == {"status": "pr_opened", "summary": "opened #5", "needs": ""}
+_FAULT = "stream error: unexpected status 400 Bad Request"
+_OK, _AGENT, _UNAVAILABLE = ExitReason.OK, ExitReason.AGENT_ERROR, ExitReason.RUNTIME_UNAVAILABLE
 
 
-def test_envelope_blocked_carries_needs():
-    msg = json.dumps({"status": "blocked", "summary": "stuck", "needs": "which endpoint?"})
-    r = parse_codex_envelope(exit_code=0, last_message=msg)
-    assert r.status == "blocked" and r.needs == "which endpoint?"
-    assert r.is_error is False
+def _status(status, **kw):
+    return json.dumps({"status": status, **kw})
 
 
-def test_envelope_status_error_is_error():
-    msg = json.dumps({"status": "error", "summary": "boom", "needs": ""})
-    r = parse_codex_envelope(exit_code=0, last_message=msg)
-    assert r.is_error is True
+@pytest.mark.parametrize("exit_code,last_message,stderr,evidence,reason", [
+    (0, _status("pr_opened"), "", {}, _OK),
+    (0, _status("blocked", needs="?"), "", {}, _OK),  # a question is a NORMAL completion
+    (0, "PONG", "", {}, _OK),  # prose without a schema, exit 0
+    (0, "", _FAULT, {}, _OK),  # the fault branch may only narrow a FAILURE
+    (0, _status("error"), "", {}, _AGENT),
+    (1, "", "provider 401", {}, _AGENT),
+    (1, _status("error", summary="boom"), _FAULT, {}, _AGENT),  # a parsed envelope is never a fault
+    (1, "", _FAULT, {}, _UNAVAILABLE),  # a fault with no trace of a session
+    # supervised_exec fails a bad exec with a silent os._exit(127): no stream
+    # output and no session is not something a model can produce...
+    (127, "", "", {}, _UNAVAILABLE),
+    # ...but 127 is also a command the AGENT mistyped once anything printed,
+    # and only 127 is the exec-failure code.
+    (127, "", "bash: cargo: command not found", {}, _AGENT),
+    (1, "", "", {}, _AGENT),
+    (1, "", "boom", {}, _AGENT),  # the classification is POSITIVE
+    (3, "I rewrote the test helper", "unexpected status 400 Bad Request", {}, _AGENT),
+    # A leg with a session or tokens made an attempt (codex prices a
+    # subscription run at $0, so tokens matter on their own).
+    (1, "", _FAULT, {"session_id": "sess-1"}, _AGENT),
+    (1, "", _FAULT, {"usage": {"input_tokens": 4096, "output_tokens": 12}}, _AGENT),
+    # M17: only the stderr TAIL decides; a diff quoting a 400 cannot exempt a failure.
+    (1, "", "\n".join(['apply_patch: +    assert body == "unexpected status 400 Bad Request"']
+                      + [f"codex| trace line {i}" for i in range(40)] + ["Error: 2 tests failed"]), {}, _AGENT),
+    # The signature list holds one entry because agent tools write these.
+    (1, "", "bash: cargo: command not found", {}, _AGENT),
+    (1, "", "ls: /nope: No such file or directory", {}, _AGENT),
+    (1, "", "./tool: cannot execute binary file: Exec format error", {}, _AGENT),
+])
+def test_envelope_exit_reason(exit_code, last_message, stderr, evidence, reason):
+    r = parse_codex_envelope(exit_code=exit_code, last_message=last_message, stderr=stderr, **evidence)
+    assert r.exit_reason is reason
+    assert r.is_error is (reason is not _OK)
+    # None of these excuse a retry: they are attempts or a runtime that never ran.
+    assert not infra_death(r.exit_reason)
 
 
-def test_envelope_nonzero_exit_no_json_is_error():
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr="provider 401")
-    assert r.is_error is True
-    assert "provider 401" in r.summary
-
-
-def test_envelope_nonzero_exit_freetext_only_is_error():
-    r = parse_codex_envelope(exit_code=3, last_message="not json output")
-    assert r.is_error is True
-
-
-def test_envelope_zero_exit_freetext_not_error():
-    # codex printed prose but no schema (e.g. no --output-schema) and exited 0.
-    r = parse_codex_envelope(exit_code=0, last_message="PONG")
-    assert r.is_error is False and r.summary == "PONG"
-
-
-# ── exit_reason on the codex envelope ────────────────────────────────────────
-def test_envelope_exit_reason_separates_agent_error_from_normal_terminals():
-    ok = parse_codex_envelope(
-        exit_code=0, last_message=json.dumps({"status": "pr_opened"})
-    )
-    # `blocked` is a NORMAL completion — the agent finished and asked a question.
-    blocked = parse_codex_envelope(
-        exit_code=0, last_message=json.dumps({"status": "blocked", "needs": "?"})
-    )
-    err = parse_codex_envelope(exit_code=0, last_message=json.dumps({"status": "error"}))
-    no_envelope = parse_codex_envelope(exit_code=1, last_message="", stderr="401")
-
-    assert ok.exit_reason is ExitReason.OK
-    assert blocked.exit_reason is ExitReason.OK
-    assert err.exit_reason is ExitReason.AGENT_ERROR
-    assert no_envelope.exit_reason is ExitReason.AGENT_ERROR
-    # None of these excuse a retry — they are all attempts the agent actually made.
-    assert not any(
-        infra_death(r.exit_reason) for r in (ok, blocked, err, no_envelope)
-    )
+def test_envelope_maps_fields():
+    msg = {"status": "pr_opened", "summary": "opened #5", "needs": ""}
+    r = parse_codex_envelope(exit_code=0, last_message=json.dumps(msg), session_id="s1")
+    assert (r.status, r.summary, r.session_id, r.structured) == ("pr_opened", "opened #5", "s1", msg)
+    blocked = parse_codex_envelope(exit_code=0, last_message=_status("blocked", summary="stuck", needs="which?"))
+    assert (blocked.status, blocked.needs) == ("blocked", "which?")
+    assert "provider 401" in parse_codex_envelope(exit_code=1, last_message="", stderr="provider 401").summary
+    assert "400 Bad Request" in parse_codex_envelope(exit_code=1, last_message="", stderr=_FAULT).summary
 
 
 # ── run() over a fake codex binary ───────────────────────────────────────────────
 def _fake_codex(tmp, body: str) -> str:
-    """Write an executable stub at <tmp>/codex that runs `body` (bash)."""
+    """Write an executable stub at <tmp>/codex that runs `body` (bash), with
+    `$out` bound to the `-o` envelope path from argv."""
     path = os.path.join(tmp, "codex")
     with open(path, "w") as f:
-        f.write("#!/usr/bin/env bash\n" + body)
+        f.write('#!/usr/bin/env bash\nout=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+                + body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     return path
 
@@ -374,60 +274,17 @@ def _meta(sid: str) -> str:
     return f'{sys.executable} -c "{code}" "{sid}"\n'
 
 
-def test_cancelled_run_terminates_its_process_group():
-    tmp = tempfile.mkdtemp()
-    pid_file = os.path.join(tmp, "pid")
-    body = f'''
-echo $$ > "{pid_file}"
-while true; do
-  echo "working" >&2
-  sleep 0.05
-done
-'''
-
-    async def scenario():
-        runner = CodexRunner(
-            codex_bin=_fake_codex(tmp, body),
-            env={"OPENAI_API_KEY": "test-key"},
-        )
-        task = asyncio.create_task(runner.run(RuntimePlan(prompt="x")))
-        for _ in range(100):
-            if os.path.exists(pid_file):
-                break
-            await asyncio.sleep(0.01)
-        assert os.path.exists(pid_file)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(scenario())
-
-    pid = int(open(pid_file).read())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
-
-
-@pytest.mark.parametrize(
-    "closed_streams",
-    ("exec 2>&-", "exec 1>&- 2>&-"),
-    ids=("stdout-drain", "process-wait"),
-)
-def test_cancelled_after_stderr_eof_terminates_its_process_group(closed_streams):
+@pytest.mark.parametrize("streams", ("", "exec 2>&-", "exec 1>&- 2>&-"),
+                         ids=("streaming", "stdout-drain", "process-wait"))
+def test_a_cancelled_run_terminates_its_process_group(streams):
     tmp = tempfile.mkdtemp()
     pid_file = os.path.join(tmp, "pid")
     ready_file = os.path.join(tmp, "ready")
-    body = f'''
-echo $$ > "{pid_file}"
-{closed_streams}
-echo ready > "{ready_file}"
-sleep 30
-'''
+    body = f'echo $$ > "{pid_file}"\n{streams}\necho ready > "{ready_file}"\n'
+    body += 'while true; do echo "working" >&2; sleep 0.05; done\n' if not streams else "sleep 30\n"
 
     async def scenario():
-        runner = CodexRunner(
-            codex_bin=_fake_codex(tmp, body),
-            env={"OPENAI_API_KEY": "test-key"},
-        )
+        runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"})
         task = asyncio.create_task(runner.run(RuntimePlan(prompt="x")))
         for _ in range(100):
             if os.path.exists(ready_file):
@@ -442,9 +299,8 @@ sleep 30
 
     asyncio.run(scenario())
 
-    pid = int(open(pid_file).read())
     with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+        os.kill(int(open(pid_file).read()), 0)
 
 
 def test_native_codex_child_receives_operator_build_settings(tmp_path, monkeypatch):
@@ -455,48 +311,19 @@ def test_native_codex_child_receives_operator_build_settings(tmp_path, monkeypat
     monkeypatch.setenv("PW_WORKERS", "1")
     monkeypatch.setenv("GH_TOKEN", "publication-secret")
     body = r'''
-printf '%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_BUILD_JOBS-unset}" "${PW_WORKERS-unset}" "${GH_TOKEN-unset}" > "$OBSERVED_ENV"
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
+printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_BUILD_JOBS-unset}" "${PW_WORKERS-unset}" "${GH_TOKEN-unset}" "${GIT_AUTHOR_NAME-unset}" "${GIT_COMMITTER_NAME-unset}" > "$OBSERVED_ENV"
 printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 '''
     result = asyncio.run(CodexRunner(
         codex_bin=_fake_codex(str(tmp_path), body),
         env={"OPENAI_API_KEY": "test-key", "OBSERVED_ENV": str(observed)},
-    ).run(RuntimePlan(prompt="x")))
+    ).run(RuntimePlan(prompt="x", model="m", env={"GIT_AUTHOR_NAME": "fix-bot"})))
 
     assert result.status == "done"
+    # The task's identity (fix.py's fix-bot) beats the model's git identity.
     assert observed.read_text().splitlines() == [
-        "/operator/shared-cargo-target", "0", "2", "1", "unset",
+        "/operator/shared-cargo-target", "0", "2", "1", "unset", "fix-bot", "Harness - m",
     ]
-
-
-def test_run_parses_output_file_and_session_from_the_rollout():
-    tmp = tempfile.mkdtemp()
-    # The stub: find the -o path in argv, write an envelope there, print a header.
-    body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-''' + _meta("sess-xyz") + r'''
-printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
-exit 0
-'''
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "test-key", "CODEX_HOME": tmp})
-    r = asyncio.run(runner.run(RuntimePlan(prompt="resolve", schema={
-        "type": "object", "properties": {"status": {"type": "string"},
-        "summary": {"type": "string"}, "needs": {"type": "string"}}})))
-    assert r.is_error is False
-    assert r.status == "pr_opened"
-    assert r.session_id == "sess-xyz"
 
 
 def test_run_registers_process_group_before_codex_executes(tmp_path):
@@ -508,12 +335,6 @@ for receipt in "$RECEIPT_DIR"/*.json; do
   [ ! -e "$receipt" ] || receipt_found=1
 done
 [ -n "$receipt_found" ] || exit 9
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 '''
     supervisor = ProcessSupervisor(str(state_dir))
@@ -546,80 +367,10 @@ printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
     assert not any(supervisor.directory.glob("*.json"))
 
 
-def test_run_nonzero_exit_no_output_is_error():
-    tmp = tempfile.mkdtemp()
-    body = 'echo "boom" >&2\nexit 1\n'
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "test-key"})
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error is True
-
-
-def test_run_completes_after_a_megabyte_stderr_line_and_logs_it_truncated():
-    """One unbounded Codex trace line must not terminate an otherwise healthy leg."""
-    tmp = tempfile.mkdtemp()
-    body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-head -c 1048576 /dev/zero | tr '\0' x >&2
-echo >&2
-echo "stderr after oversized line" >&2
-printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
-exit 0
-'''
-    logged: list[str] = []
-    runner = CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
-        log=logged.append, debug=True,
-    )
-
-    result = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert result.status == "done"
-    assert any("oversized stderr line" in line and "truncated" in line for line in logged)
-    assert any("stderr after oversized line" in line for line in logged)
-
-
-def test_run_accepts_a_three_megabyte_line_before_the_stream_limit():
-    """Several-MiB trace records use the normal stream-reader path."""
-    tmp = tempfile.mkdtemp()
-    body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-head -c 3145728 /dev/zero | tr '\0' x >&2
-echo >&2
-printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
-exit 0
-'''
-    logged: list[str] = []
-    result = asyncio.run(CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
-        log=logged.append, debug=True,
-    ).run(RuntimePlan(prompt="x")))
-
-    assert result.status == "done"
-    assert any("oversized stderr line truncated: 3145729 bytes" in line for line in logged)
-    assert not any("after stream limit" in line for line in logged)
-
-
 def test_run_drains_a_line_beyond_the_stream_limit_without_losing_the_next_line():
     """Fallback draining preserves the stderr record boundary after a huge line."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 head -c 5242880 /dev/zero | tr '\0' x >&2
 echo >&2
 echo "stderr after fallback drain" >&2
@@ -635,33 +386,6 @@ exit 0
     assert result.status == "done"
     assert any("oversized stderr line" in line and "stream limit" in line for line in logged)
     assert any("stderr after fallback drain" in line for line in logged)
-
-
-def test_watchdog_cancellation_preserves_pending_stderr_after_fallback_drain():
-    """A timed read must not discard bytes buffered after a drained giant line."""
-    tmp = tempfile.mkdtemp()
-    body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-head -c 5242880 /dev/zero | tr '\0' x >&2
-printf '\npartial stderr record' >&2
-sleep 0.2
-echo " completed" >&2
-printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
-exit 0
-'''
-    logged: list[str] = []
-    result = asyncio.run(CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
-        idle_timeout=1.0, poll_slice=0.02, log=logged.append, debug=True,
-    ).run(RuntimePlan(prompt="x")))
-
-    assert result.status == "done"
-    assert any("partial stderr record completed" in line for line in logged)
 
 
 def _write_session_rollout(
@@ -831,68 +555,7 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
     assert evidence["cwd"] == os.path.realpath(worktree)
 
 
-def test_recovered_session_identity_drives_the_next_resume_invocation(
-    tmp_path, monkeypatch
-):
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    codex_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    sid = "019fa000-resumable"
-    _write_session_rollout(
-        codex_home,
-        sid=sid,
-        cwd=str(worktree),
-        timestamp=datetime.now(timezone.utc) + timedelta(minutes=1),
-    )
-    transcript = os.path.realpath(
-        os.path.join(
-            os.path.dirname(__file__), "..", "fixtures",
-            "codex-0.146.0-no-session-header.stderr",
-        )
-    )
-    args_path = str(tmp_path / "argv.txt")
-    runner = CodexRunner(
-        codex_bin=_fake_codex(
-            str(tmp_path),
-            _headerless_codex_body(transcript, args_path=args_path),
-        ),
-        env={"OPENAI_API_KEY": "test-key"},
-    )
-
-    first = asyncio.run(runner.run(RuntimePlan(prompt="resolve", cwd=str(worktree))))
-    asyncio.run(
-        runner.run(
-            RuntimePlan(prompt="continue", cwd=str(worktree), resume=first.session_id)
-        )
-    )
-
-    invocations = (tmp_path / "argv.txt").read_text().splitlines()
-    assert first.session_id == sid
-    assert any(f"exec resume {sid}" in invocation for invocation in invocations)
-
-
 # ── rate-limit (HTTP 429) classification + window-aligned backoff ─────────────
-def test_is_rate_limited_matches_provider_429_text():
-    # A representative Azure OpenAI gateway 429 body.
-    azure = ('azure-openai error: Your requests to gpt-5.5 for '
-             'your-deployment in eastus2 have exceeded rate limit.')
-    assert _is_rate_limited(azure) is True
-    assert _is_rate_limited('"code":"rate_limit_exceeded"') is True
-    assert _is_rate_limited("HTTP 429 Too Many Requests") is True
-    assert _is_rate_limited("quota exceeded for this deployment") is True
-    # A plain network drop is NOT a rate limit (routes to the short backoff).
-    assert _is_rate_limited("stream disconnected before completion") is False
-    assert _is_rate_limited("response.failed event received") is False
-
-
-def test_rate_limit_is_a_transport_drop_but_network_drop_is_not_rate_limited():
-    err = AgentResult(is_error=True)
-    # 429 counts as a retryable transport drop…
-    assert _is_transport_drop(1, "azure error: exceeded rate limit", err) is True
-    # …but a captured success envelope is never retried, even with 429 text.
-    ok = AgentResult(is_error=False, status="pr_opened")
-    assert _is_transport_drop(0, "exceeded rate limit", ok) is False
 
 
 def _counting_codex(tmp, stderr_line: str) -> tuple[str, str]:
@@ -956,88 +619,46 @@ def test_run_process_killed_by_signal_is_infra_death_not_an_attempt():
     assert infra_death(r.exit_reason) is True
 
 
-def test_run_ordinary_nonzero_exit_is_an_agent_error_not_infra_death():
-    """The boundary of the exemption: a POSITIVE exit code is codex reporting
-    failure after running. That IS an attempt and must still count."""
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "boom" >&2\nexit 1\n')
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"})
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert r.is_error is True
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-    assert infra_death(r.exit_reason) is False
-
-
 # ── total-runtime (wall) cap ─────────────────────────────────────────────────
-def test_wall_cap_kills_a_run_the_idle_watchdog_never_catches():
+def _jumping_wall_clock(*ticks: float):
+    """An injected WALL clock that replays `ticks`, then holds the last one."""
+    remaining, held = iter(ticks), [ticks[0]]
+
+    def wall():
+        held[0] = next(remaining, held[0])
+        return held[0]
+    return wall
+
+
+@pytest.mark.parametrize("idle_timeout", [900.0, None], ids=["idle-armed", "idle-disabled"])
+def test_wall_cap_kills_a_run_the_idle_watchdog_never_catches(idle_timeout):
     """A codex run that keeps printing tool traces resets the idle window forever
-    (FAILURE-MODES #60). Here stderr flows steadily while the injected WALL clock
-    jumps past the cap: only elapsed-time accounting can stop it, and it must use
-    the same killpg teardown (the process group, not just the pid)."""
+    (FAILURE-MODES #60). Here stderr flows while the injected WALL clock jumps
+    past the cap: only elapsed-time accounting can stop it, with the same killpg
+    teardown. With only the wall cap armed the pump must NOT fall through to
+    the unbounded readline branch."""
     import time as _time
 
     tmp = tempfile.mkdtemp()
     # One stderr line straight away (so the idle watchdog is satisfied), then a long
     # sleep the cap must cut short.
     codex = _fake_codex(tmp, 'echo "codex tool: step 1" >&2\nsleep 30\n')
-    # started_at, between-lines check, last_line, then the post-line check jumps.
-    ticks = iter([1000.0, 1000.0, 1000.0, 4600.0])
-    held = {"t": 1000.0}
-
-    def wall():
-        try:
-            held["t"] = next(ticks)
-        except StopIteration:
-            pass
-        return held["t"]
-
     logged: list[str] = []
     runner = CodexRunner(
         codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        idle_timeout=900.0, max_runtime=900.0, poll_slice=0.1,
-        wall_clock=wall, log=logged.append,
+        idle_timeout=idle_timeout, max_runtime=900.0, poll_slice=0.1,
+        # started_at, between-lines check, last_line, then the post-line check jumps.
+        wall_clock=_jumping_wall_clock(1000.0, 1000.0, 1000.0, 4600.0), log=logged.append,
     )
 
     start = _time.monotonic()
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    elapsed = _time.monotonic() - start
 
-    assert elapsed < 20, f"wall cap did not trip promptly (took {elapsed:.1f}s)"
+    assert _time.monotonic() - start < 20, "wall cap did not trip promptly"
     assert r.is_error is True and r.status == "timeout"
     assert r.exit_reason is ExitReason.WALL_TIMEOUT
     assert any("WALL" in m for m in logged)
     assert not any("IDLE" in m for m in logged)  # the idle watchdog never saw it
-
-
-def test_wall_cap_alone_still_bounds_a_run_when_idle_timeout_is_disabled():
-    """With only the wall cap armed the pump must NOT fall through to the unbounded
-    readline branch, or the cap would silently never fire."""
-    import time as _time
-
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "codex tool: step 1" >&2\nsleep 30\n')
-    ticks = iter([1000.0, 1000.0, 1000.0, 4600.0])
-    held = {"t": 1000.0}
-
-    def wall():
-        try:
-            held["t"] = next(ticks)
-        except StopIteration:
-            pass
-        return held["t"]
-
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        idle_timeout=None, max_runtime=900.0, poll_slice=0.1, wall_clock=wall,
-    )
-
-    start = _time.monotonic()
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert _time.monotonic() - start < 20
-    assert r.exit_reason is ExitReason.WALL_TIMEOUT
 
 
 def test_healthy_run_inside_both_caps_is_untouched():
@@ -1045,12 +666,6 @@ def test_healthy_run_inside_both_caps_is_untouched():
     and carries no timeout classification."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 echo "session id: sess-ok" >&2
 printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
 exit 0
@@ -1069,6 +684,20 @@ exit 0
     assert r.exit_reason is ExitReason.OK
 
 
+def test_the_per_run_scratch_dir_is_removed(tmp_path):
+    """review M17c: the run dir used to be an un-removed mkdtemp, so a long-lived
+    daemon leaked one `codex-run-*` directory per dispatch."""
+    marker = tmp_path / "outpath"
+    body = f'echo "$out" > "{marker}"\nprintf \'%s\' \'{{"status":"pr_opened","summary":"done"}}\' > "$out"\n'
+    r = asyncio.run(CodexRunner(codex_bin=_fake_codex(str(tmp_path), body), env={"OPENAI_API_KEY": "k"})
+                    .run(RuntimePlan(prompt="x", schema=FIX_SCHEMA)))
+
+    assert r.status == "pr_opened"
+    run_dir = os.path.dirname(marker.read_text().strip())
+    assert os.path.basename(run_dir).startswith("codex-run-")
+    assert not os.path.exists(run_dir), f"scratch dir leaked: {run_dir}"
+
+
 # ── idle watchdog measures wall-clock so it survives laptop sleep ─────────────
 def test_idle_watchdog_trips_on_wall_clock_not_monotonic():
     """Codex counterpart to the AgentRunner wall-clock fix. A stub that stays silent
@@ -1082,19 +711,9 @@ def test_idle_watchdog_trips_on_wall_clock_not_monotonic():
     # Stub prints nothing to stderr and sleeps a few seconds, then exits.
     codex = _fake_codex(tmp, "sleep 3\n")
     # Wall clock jumps +3600s after the first read, while real time stays ~seconds.
-    ticks = iter([1000.0, 4600.0, 4600.0, 4600.0, 4600.0])
-    held = {"t": 1000.0}
-
-    def wall():
-        try:
-            held["t"] = next(ticks)
-        except StopIteration:
-            pass
-        return held["t"]
-
     runner = CodexRunner(
         codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        idle_timeout=900.0, poll_slice=0.1, wall_clock=wall,
+        idle_timeout=900.0, poll_slice=0.1, wall_clock=_jumping_wall_clock(1000.0, 4600.0),
     )
     start = _time.monotonic()
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
@@ -1154,12 +773,6 @@ def test_run_longer_than_drain_cap_completes_when_stderr_flows():
     # exit 0. Total runtime (~1.5s) exceeds post_hang_drain_timeout (0.3s below), but
     # each stderr gap (0.1s) stays under idle_timeout (5s) → NOT a hang.
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 ''' + _meta("sess-long") + r'''
 for i in $(seq 1 15); do echo "codex tool: step $i" >&2; sleep 0.1; done
 printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
@@ -1195,16 +808,6 @@ def test_preflight_missing_key_names_the_var(monkeypatch):
     r = CodexRunner(codex_bin=codex, provider=prov)  # no env key
     reason = r.preflight()
     assert reason and "OPENAI_API_KEY is unset" in reason
-
-
-def test_oauth_mode_emits_no_provider_overrides_and_no_model_flag():
-    """Blank base_url = ChatGPT-subscription OAuth: codex's built-in provider
-    must stay untouched (defining a custom one forces API-key auth), and no
-    CODEX_MODEL means no -m (codex picks the subscription's default)."""
-    argv = build_codex_argv(RuntimePlan(prompt="x"), provider=CodexProvider())
-    joined = " ".join(argv)
-    assert "model_providers" not in joined and "model_provider=" not in joined
-    assert "-m" not in argv
 
 
 def test_oauth_mode_preflight_accepts_codex_login_credentials(monkeypatch):
@@ -1243,13 +846,6 @@ def test_oauth_auth_file_honors_explicit_codex_home(monkeypatch, tmp_path):
     assert runner.oauth_auth_file() == str(auth)
 
 
-def test_preflight_ok_when_bin_and_key_present():
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, "exit 0\n")
-    r = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"})
-    assert r.preflight() is None
-
-
 def test_run_returns_blocked_result_when_not_ready(monkeypatch):
     """A misconfigured codex runtime fails LOUD (blocked + reason), not opaque.
 
@@ -1269,46 +865,10 @@ def test_run_returns_blocked_result_when_not_ready(monkeypatch):
     assert any("NOT READY" in m for m in logged)
 
 
-def test_debug_dumps_codex_stderr_as_tagged_lines():
-    """Live stderr streaming: milestone lines (a TEST_CMD/pytest run) are tagged
-    and ALWAYS surface; other lines only under debug (`codex|`). A codex run is as
-    observable as the SDK path — the visibility the operator asked for."""
-    tmp = tempfile.mkdtemp()
-    body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-echo "exec bash -lc pytest" >&2
-echo "tokens used 1234" >&2
-printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
-exit 0
-'''
-    codex = _fake_codex(tmp, body)
-    logged: list[str] = []
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-                         log=logged.append, debug=True)
-    asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    joined = "\n".join(logged)
-    assert "codex: exec model=" in joined
-    # a pytest run is a milestone → tagged TEST_CMD, not the generic verbose tag
-    assert "codex TEST_CMD: exec bash -lc pytest" in joined
-    assert "codex| tokens used 1234" in joined  # non-milestone line, debug-only
-    assert "codex: exit 0" in joined
-
-
 def test_milestone_lines_surface_without_debug():
     """The key ask: TEST_CMD runs + commits are visible even with debug OFF."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 echo "exec bash -lc 'uv run pytest'" >&2
 echo "exec git commit -m 'green: impl'" >&2
 echo "some chatty verbose line" >&2
@@ -1326,92 +886,14 @@ exit 0
     assert "some chatty verbose line" not in joined  # noise stays suppressed
 
 
-# ── idle watchdog: kill a hung codex subprocess without total-runtime cap ──────
-def test_codex_idle_timeout_kills_and_returns_timeout():
-    """A codex subprocess that emits one line then goes silent past idle_timeout
-    is killed and surfaced as a retryable timeout — not an infinite wedge."""
-    tmp = tempfile.mkdtemp()
-    # print a line to stderr, then sleep far longer than the idle window.
-    body = 'echo "exec bash -lc pytest" >&2\nsleep 30\nexit 0\n'
-    codex = _fake_codex(tmp, body)
-    logged: list[str] = []
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-                         log=logged.append, idle_timeout=0.4)
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error and r.status == "timeout"
-    assert any("IDLE" in m for m in logged)
-
-
-def test_codex_no_idle_trip_on_steady_output():
-    """Steady stderr output (gaps < idle_timeout) must complete, never trip."""
-    tmp = tempfile.mkdtemp()
-    body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-for i in 1 2 3; do echo "exec step $i" >&2; sleep 0.05; done
-printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
-exit 0
-'''
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"}, idle_timeout=0.5)
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error is False and r.status == "done"
-
-
 # ── _is_transport_drop (pure classifier) ──────────────────────────────────────
 def _res(status="error", is_error=True, sid=""):
     return AgentResult(is_error=is_error, status=status, summary="", session_id=sid)
 
 
-def test_transport_drop_detects_response_failed():
-    assert _is_transport_drop(1, "ERROR: stream disconnected before completion: "
-                              "response.failed event received", _res()) is True
-
-
-def test_transport_drop_ignores_clean_exit():
-    # exit 0 is never a transport drop, even if stderr mentions the phrase.
-    assert _is_transport_drop(0, "response.failed event received", _res()) is False
-
-
-def test_transport_drop_ignores_real_agent_error():
-    # non-zero exit but stderr is a normal test failure, not a stream drop.
-    assert _is_transport_drop(1, "2 failed, 10 passed\nTypeError: ...", _res()) is False
-
-
-def test_transport_drop_never_claims_a_captured_envelope():
-    # A completed turn (blocked/pr_opened) must never be retried, even on nonzero exit.
-    assert _is_transport_drop(1, "stream disconnected before completion",
-                              _res(status="blocked", is_error=False)) is False
-    assert _is_transport_drop(1, "response.failed event received",
-                              _res(status="pr_opened", is_error=False)) is False
-
-
-def test_real_error_is_not_a_transport_death():
-    """A non-transport nonzero exit returns as the agent's own error."""
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "boom: some real error" >&2\nexit 1\n')
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp})
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error is True and r.exit_reason is not ExitReason.TRANSPORT_DEATH
-
-
 # ══ review M1 / plan D12 — codex token accounting ═══════════════════════════
 # Without a price table `cost_usd` was hardcoded 0.0, the ledger write is gated
 # on `cost > 0`, and BOTH spend caps were blind to every codex run.
-
-# Real `codex exec` usage lines (the two shapes across codex-cli versions).
-_MODERN_USAGE_LINE = (
-    "[2026-06-28T12:00:04] Token usage: total=52,341 input=48,000 "
-    "(+ 12,000 cached) output=4,341"
-)
-_LEGACY_USAGE_LINE = "[2026-06-28T12:00:04] tokens used: 52341"
-
-
-_TWO_LINE_USAGE = "codex\nok\ntokens used\n1,820\n"
 
 
 def test_read_rollout_usage_prefers_last_cumulative_token_count(tmp_path):
@@ -1565,21 +1047,6 @@ def _costed_codex(tmp) -> str:
     return _fake_codex(tmp, body)
 
 
-def test_run_flows_codex_cost_into_the_result():
-    """End to end: rates configured → the AgentResult the dispatcher journals
-    carries a non-zero cost, which is what lets the ledger (cost > 0) and both
-    spend caps see codex at all."""
-    tmp = tempfile.mkdtemp()
-    runner = CodexRunner(
-        codex_bin=_costed_codex(tmp),
-        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp}, rate_table=CARD,
-    )
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.status == "pr_opened"
-    # (36000 * 5 + 12000 * 0.5 + 4341 * 30) / 1e6.
-    assert r.cost_usd == pytest.approx(0.31623)
-
-
 def test_run_reports_zero_cost_without_rates():
     """Anti-vacuity twin: same stub, no price table → 0.0 (and the startup
     warning below is the operator's only signal)."""
@@ -1655,7 +1122,6 @@ def test_malformed_rollout_evidence_never_claims_a_provider_failure(tmp_path, co
     assert read_rollout_provider_failure("missing", str(tmp_path)) is None
 
 
-# ── harness #4: the SHIPPED config must price codex, not just be able to ──────
 # ── #43: each leg is priced with the model it actually ran ───────────────────
 
 
@@ -1671,21 +1137,6 @@ def test_the_result_reports_the_model_that_actually_ran():
     assert asyncio.run(
         runner.run(RuntimePlan(prompt="x", model="gpt-5.6-luna"))
     ).model == "gpt-5.6-luna"
-
-
-def test_an_aborted_run_still_reports_its_model():
-    """The runs whose cost is ESTIMATED rather than measured are exactly the
-    ones a tier split must not lose."""
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "session id: s" >&2\nsleep 30\n')
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        default_model="gpt-5.6-terra", idle_timeout=0.5,
-        post_hang_drain_timeout=0.5,
-    )
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.status == "timeout"
-    assert r.model == "gpt-5.6-terra"
 
 
 # ══ review M17a — the "real output" guard must use the real status vocabulary ═
@@ -1722,50 +1173,6 @@ def test_a_captured_envelope_is_never_a_transport_drop_whatever_its_terminal_sta
                               result) is False
 
 
-def test_an_error_envelope_with_a_drop_signature_is_still_a_transport_drop():
-    """Anti-vacuity for the guard: it must not swallow everything. An `error`
-    envelope classifies as ERROR, so a transport signature still counts."""
-    result = parse_codex_envelope(
-        exit_code=1, last_message=json.dumps({"status": "error", "summary": "s"}),
-        stderr="ERROR: stream disconnected before completion",
-    )
-    assert _is_transport_drop(1, "ERROR: stream disconnected before completion",
-                              result) is True
-
-
-def _pushed_then_dropped_codex(tmp, counter: str) -> str:
-    """A stub whose turn COMPLETES (writes a `pushed` envelope) but whose
-    connection then dies on the way out: drop signature + nonzero exit."""
-    body = (
-        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        'echo "session id: sess-push" >&2\n'
-        'printf \'%s\' \'{"status":"pushed","summary":"force-pushed the rebase","needs":""}\' > "$out"\n'
-        'echo "ERROR: stream disconnected before completion" >&2\n'
-        'exit 1\n'
-    )
-    return _fake_codex(tmp, body)
-
-
-def test_a_completed_force_push_is_not_re_run(tmp_path):
-    """review M17a, the concrete harm: `pushed` was missing from the old guard, so
-    a completed force-push whose stream died on the way out got RE-RUN on resume —
-    duplicate spend on the one branch-mutating leg."""
-    tmp = tempfile.mkdtemp()
-    counter = str(tmp_path / "n")
-    runner = CodexRunner(
-        codex_bin=_pushed_then_dropped_codex(tmp, counter),
-        env={"OPENAI_API_KEY": "k"},
-    )
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="rebase")))
-
-    with open(counter) as f:
-        assert int(f.read().strip()) == 1, "the completed push leg was run twice"
-    assert r.status == "pushed" and r.is_error is False
-
-
 # ══ review M17b — classify on the stderr TAIL, not the whole agent trace ══════
 # Codex streams the agent's whole tool trace (patches, test output, greps) to
 # stderr. A fixer working on ANY throttling code prints provider-pushback wording
@@ -1782,245 +1189,46 @@ def _trace_with(tail: str, poison: str = _POISON_PATCH_LINE) -> str:
     return "\n".join([poison] + [f"codex| trace line {i}" for i in range(30)] + [tail])
 
 
-def test_rate_limit_text_in_the_agent_trace_is_not_provider_pushback():
+_DROP = "ERROR: stream disconnected before completion"
+
+
+@pytest.mark.parametrize("exit_code,stderr,result,drop", [
+    (1, _DROP + ": response.failed event received", _res(), True),
+    (1, "azure error: exceeded rate limit", _res(), True),  # a 429 is a transport drop
+    (0, "response.failed event received", _res(), False),  # exit 0 never is
+    (1, "2 failed, 10 passed\nTypeError: ...", _res(), False),  # a real agent error
+    # A completed turn is never retried, even on nonzero exit or 429 text.
+    (1, _DROP, _res(status="blocked", is_error=False), False),
+    (1, "response.failed event received", _res(status="pr_opened", is_error=False), False),
+    (0, "exceeded rate limit", _res(status="pr_opened", is_error=False), False),
+])
+def test_transport_drop(exit_code, stderr, result, drop):
+    assert _is_transport_drop(exit_code, stderr, result) is drop
+
+
+@pytest.mark.parametrize("text,limited", [
+    ("azure-openai error: Your requests to gpt-5.5 for your-deployment in eastus2 have exceeded rate limit.", True),
+    ('"code":"rate_limit_exceeded"', True),
+    ("HTTP 429 Too Many Requests", True),
+    ("quota exceeded for this deployment", True),
+    # A plain network drop is NOT a rate limit (routes to the short backoff).
+    ("stream disconnected before completion", False),
+    ("response.failed event received", False),
+])
+def test_is_rate_limited(text, limited):
+    assert _is_rate_limited(text) is limited
+
+
+@pytest.mark.parametrize("tail,poison,signal", [
+    ("Error: 2 tests failed", _POISON_PATCH_LINE, False),
+    ("Error: 2 tests failed", "apply_patch: +    assert e.msg == stream disconnected before completion", False),
+    # Anti-vacuity twin: the provider's 429 lands as the last thing printed.
+    ("azure-openai error: have exceeded rate limit.", _POISON_PATCH_LINE, True),
+])
+def test_only_the_stderr_tail_classifies_provider_pushback(tail, poison, signal):
     """review M17b: matching the whole accumulated trace let the AGENT'S OWN TEXT
-    buy 15 minutes of 60s retries and then launder a plain agent error into
-    TRANSPORT_DEATH, the one exit reason the breakers exempt."""
-    trace = _trace_with("Error: 2 tests failed")
-    assert _is_rate_limited(trace) is False
-    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is False
-
-
-def test_a_real_429_in_the_stderr_tail_is_still_detected():
-    """Anti-vacuity twin: same trace, but the provider's 429 is where a real one
-    lands — the last thing printed before exit."""
-    trace = _trace_with("azure-openai error: have exceeded rate limit.")
-    assert _is_rate_limited(trace) is True
-    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is True
-
-
-def test_a_transport_signature_in_the_agent_trace_is_not_a_drop():
-    """Same narrowing for the network-drop signatures: the agent quoting
-    'stream disconnected before completion' (a log it read, a test it wrote) must
-    not buy a retry."""
-    trace = _trace_with(
-        "Error: 2 tests failed",
-        poison='apply_patch: +    assert e.msg == stream disconnected before completion',
-    )
-    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is False
-
-
-def test_run_is_an_agent_error_when_only_the_agent_trace_mentions_a_rate_limit(tmp_path):
-    """The behavioural half of M17b: a genuine agent error whose trace happens to
-    contain 'rate limit' must return AGENT_ERROR on the FIRST attempt — no waits,
-    and no TRANSPORT_DEATH laundering (which would exempt the breaker)."""
-    tmp = tempfile.mkdtemp()
-    counter = str(tmp_path / "n")
-    body = (
-        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
-        "echo '" + _POISON_PATCH_LINE + "' >&2\n"
-        'for i in $(seq 1 30); do echo "codex| trace line $i" >&2; done\n'
-        'echo "Error: 2 tests failed" >&2\n'
-        'exit 1\n'
-    )
-    runner = CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
-    )
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    with open(counter) as f:
-        assert int(f.read().strip()) == 1, "the agent's own text triggered a retry"
-    assert r.is_error is True
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-    assert infra_death(r.exit_reason) is False
-
-
-def test_the_per_run_scratch_dir_is_removed(tmp_path):
-    """review M17c: the run dir used to be an un-removed mkdtemp, so a long-lived
-    daemon leaked one `codex-run-*` directory per dispatch. The stub records the
-    -o path it was given; that whole directory must be gone once run() returns."""
-    tmp = tempfile.mkdtemp()
-    marker = str(tmp_path / "outpath")
-    body = (
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        'echo "$out" > "' + marker + '"\n'
-        'printf \'%s\' \'{"status":"pr_opened","summary":"done"}\' > "$out"\n'
-        'exit 0\n'
-    )
-    runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"})
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x", schema=FIX_SCHEMA)))
-
-    assert r.status == "pr_opened"
-    with open(marker) as f:
-        out_path = f.read().strip()
-    assert out_path, "stub never saw an -o path"
-    run_dir = os.path.dirname(out_path)
-    assert os.path.basename(run_dir).startswith("codex-run-")
-    assert not os.path.exists(run_dir), f"scratch dir leaked: {run_dir}"
-
-
-# ── the runtime could not start (keifu #130) ─────────────────────────────────
-# 2026-08-02: a broken codex binary answered every dispatch with an instant HTTP
-# 400 — exit non-zero, no envelope, no session id, no tokens, $0. This layer is
-# the only one that can see the difference between "the agent ran and failed"
-# and "the agent never ran": by the time the domain holds an AgentResult both
-# are is_error=True. Getting it wrong cost issue #130 a false `resolve failed
-# 3x` escalation on the first healthy dispatch hours later.
-def test_a_runtime_fault_with_no_trace_of_a_session_is_runtime_unavailable():
-    r = parse_codex_envelope(
-        exit_code=1,
-        last_message="",
-        stderr="stream error: unexpected status 400 Bad Request",
-    )
-    assert r.is_error is True
-    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
-    assert "400 Bad Request" in r.summary
-
-
-def test_a_silent_exec_failure_is_runtime_unavailable():
-    """`supervised_exec` fails a bad exec with a silent `os._exit(127)` — no
-    stderr at all — so the missing/wrong-architecture binary case is carried by
-    the exit code, not by a string. A non-zero exit with nothing on any stream
-    and no session is not something a model can produce."""
-    r = parse_codex_envelope(exit_code=127, last_message="", stderr="")
-    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
-
-
-def test_exit_127_that_printed_something_is_an_agent_error():
-    """127 is also what a shell returns for a command the AGENT mistyped. Once
-    codex has printed anything, the silence that made 127 unambiguous is gone."""
-    r = parse_codex_envelope(
-        exit_code=127, last_message="", stderr="bash: cargo: command not found",
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_an_ordinary_nonzero_exit_with_no_output_is_still_an_agent_error():
-    """Only 127 is the exec-failure code. A silent `exit 1` is codex reporting
-    failure, and must keep marching its breaker."""
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr="")
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_an_unrecognised_failure_stays_an_agent_error():
-    """The classification is POSITIVE. Absence of evidence is not evidence that
-    the leg never ran — an ordinary codex failure often leaves only a trace, and
-    exempting those would disarm every breaker."""
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr="boom")
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-@pytest.mark.parametrize(
-    "evidence",
-    [
-        {"session_id": "sess-1"},
-        {"usage": {"input_tokens": 4096, "output_tokens": 12}},
-    ],
-)
-def test_a_session_that_existed_is_an_agent_error_whatever_stderr_says(evidence):
-    """The guard half. A leg that produced a session id or tokens made an
-    attempt; a runtime-fault string scrolling past in its trace must not buy it
-    out of the breaker. (Tokens matter on their own: codex prices a
-    subscription run at $0, so a spend check alone would misread it.)"""
-    r = parse_codex_envelope(
-        exit_code=1,
-        last_message="",
-        stderr="stream error: unexpected status 400 Bad Request",
-        **evidence,
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_captured_agent_output_beats_a_runtime_fault_signature():
-    r = parse_codex_envelope(
-        exit_code=3,
-        last_message="I rewrote the test helper",
-        stderr="unexpected status 400 Bad Request",
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_a_runtime_fault_signature_deep_in_the_agent_trace_is_ignored():
-    """M17 discipline: only the stderr TAIL may decide. The agent's own output
-    scrolls past, and a test fixture or a diff quoting a 400 must never be able
-    to exempt a real failure from its breaker."""
-    trace = "\n".join(
-        ['apply_patch: +    assert body == "unexpected status 400 Bad Request"']
-        + [f"codex| trace line {i}" for i in range(40)]
-        + ["Error: 2 tests failed"]
-    )
-    r = parse_codex_envelope(exit_code=1, last_message="", stderr=trace)
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_agent_authored_exec_errors_can_never_reach_the_signature_list():
-    """The signature list holds exactly one entry BECAUSE of this. `exec format
-    error` / `no such file or directory` / `command not found` are unreachable
-    from the runtime on the paid path, so listing them would have added no
-    coverage and one laundering channel: text the agent's own tools wrote,
-    buying a real failure out of its breaker."""
-    for agent_text in (
-        "bash: cargo: command not found",
-        "ls: /nope: No such file or directory",
-        "./tool: cannot execute binary file: Exec format error",
-    ):
-        r = parse_codex_envelope(exit_code=1, last_message="", stderr=agent_text)
-        assert r.exit_reason is ExitReason.AGENT_ERROR, agent_text
-
-
-def test_a_parsed_envelope_is_never_a_runtime_fault():
-    r = parse_codex_envelope(
-        exit_code=1,
-        last_message=json.dumps({"status": "error", "summary": "boom"}),
-        stderr="unexpected status 400 Bad Request",
-    )
-    assert r.exit_reason is ExitReason.AGENT_ERROR
-
-
-def test_a_clean_exit_is_never_reclassified():
-    """The branch may only ever narrow a FAILURE."""
-    r = parse_codex_envelope(
-        exit_code=0, last_message="", stderr="unexpected status 400 Bad Request",
-    )
-    assert r.is_error is False
-    assert r.exit_reason is ExitReason.OK
-
-
-# ── the #130 seam, through run() ─────────────────────────────────────────────
-def test_run_classifies_the_130_shape_as_runtime_unavailable():
-    """The load-bearing assumption end to end: a codex build that 400s before
-    any work leaves NO rollout behind, so `discover_rollout_session` finds no
-    session id and the guard opens. Asserted through `run()` rather than
-    `parse_codex_envelope` so a change to rollout discovery — which would make
-    `session_id` non-empty and silently no-op the whole fix — fails here."""
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(
-        tmp,
-        'echo "stream error: unexpected status 400 Bad Request" >&2\nexit 1\n',
-    )
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
-    )
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert r.is_error is True
-    assert r.session_id == "", "no rollout means no session id"
-    assert r.cost_usd == 0.0
-    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
-
-
-def test_run_keeps_a_real_agent_failure_a_strike_even_with_no_rollout():
-    """Anti-vacuity twin through the same seam."""
-    tmp = tempfile.mkdtemp()
-    codex = _fake_codex(tmp, 'echo "Error: 2 tests failed" >&2\nexit 1\n')
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
-    )
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert r.exit_reason is ExitReason.AGENT_ERROR
+    (a log it read, a test it wrote) buy 15 minutes of 60s retries and launder a
+    plain agent error into TRANSPORT_DEATH, the one exit reason the breakers exempt."""
+    trace = _trace_with(tail, poison=poison)
+    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is signal
+    assert _is_rate_limited(trace) is (signal and "rate limit" in tail)

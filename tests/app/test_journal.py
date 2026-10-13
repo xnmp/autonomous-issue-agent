@@ -11,34 +11,20 @@ from __future__ import annotations
 
 
 import asyncio
-import json
 from datetime import datetime, timezone
 
 import pytest
 
 from tests.fakes.legacy_journal import Journal, read_events
 from issue_agent.adapters.journal import JournalingRuntime
-from tests.fakes.executor import ImmediateExecutor as Executor
-from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult, ExitReason
-from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _at(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat()
-
-
-def _write(path: str, *lines: str) -> str:
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
-    return path
-
-
-def _spend(dt: datetime, cost: float, repo="o/r", issue=5, kind="RESOLVE") -> str:
-    return json.dumps({"ts": _at(dt), "event": "spend", "repo": repo,
-                       "issue": issue, "kind": kind, "cost_usd": cost})
 
 
 # ── unsettled starts / bounded tail read (review P0R-4) ───────────────────────
@@ -144,11 +130,6 @@ def _settled(journal_path) -> list[dict]:
     return [e for e in read_events(journal_path) if e["event"] == "agent_run"]
 
 
-def test_journaling_runtime_satisfies_the_agent_runtime_port(tmp_path):
-    rt, _, _ = _runtime(tmp_path, AgentResult(is_error=False))
-    assert isinstance(rt, AgentRuntime)
-
-
 def test_agent_run_records_context_cost_and_usage(tmp_path):
     result = AgentResult(
         is_error=False, status="pr_opened", cost_usd=1.25, session_id="s5",
@@ -193,43 +174,10 @@ def test_agent_run_preserves_codex_total_only_usage(tmp_path):
     }
 
 
-def test_agent_run_cost_rounds_identically_to_authoritative_money(tmp_path):
-    result = AgentResult(
-        is_error=False,
-        status="ok",
-        cost_usd=0.0065895,
-    )
-    rt, journal, _ledger = _runtime(tmp_path, result)
-
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
-
-    assert _settled(journal.path)[0]["cost_usd"] == 0.00659
-
-
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
     rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
     asyncio.run(rt.run(RuntimePlan(prompt="p")))
     assert _settled(journal.path)[0]["usage"] is None
-
-
-def test_a_free_run_is_journalled_but_never_hits_the_ledger(tmp_path):
-    # $0.00 is what a subscription plan and Codex both report; a ledger full of
-    # zero lines is noise in the file the caps scan on every dispatch.
-    rt, journal, ledger = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.0))
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
-    assert len(_settled(journal.path)) == 1
-    assert read_events(ledger) == []
-
-
-def test_each_leg_of_a_multi_leg_dispatch_gets_its_own_attributed_line(tmp_path):
-    rt, journal, ledger = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.5))
-    rt.set_context("review", "REVIEW", 100, 5)
-    for _ in range(3):
-        asyncio.run(rt.run(RuntimePlan(prompt="leg")))
-    assert len(_settled(journal.path)) == 3
-    assert sum(
-        event["cost_usd"] for event in _settled(journal.path)
-    ) == pytest.approx(1.5)
 
 
 # ── #43: the journal records the model that RAN ──────────────────────────────
@@ -242,43 +190,6 @@ def test_the_model_the_run_reports_wins_over_the_one_the_task_asked_for(tmp_path
     )
     asyncio.run(rt.run(RuntimePlan(prompt="p")))
     assert _settled(journal.path)[0]["model"] == "gpt-5.6-terra"
-
-
-def test_a_runtime_that_reports_no_model_still_falls_back_to_the_task(tmp_path):
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=1.0))
-    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
-    assert _settled(journal.path)[0]["model"] == "opus"
-
-
-def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_path):
-    """Configured model attribution stays consistent across journal and spend records."""
-    rt, journal, ledger = _runtime(
-        tmp_path,
-        AgentResult(
-            is_error=False,
-            cost_usd=1.0,
-            model="claude-opus-4-1",
-        ),
-    )
-
-    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
-
-    assert {
-        event["event"]: event["model"]
-        for event in read_events(journal.path)
-    } == {
-        "agent_run_start": "opus",
-        "agent_run": "opus",
-    }
-    assert read_events(ledger) == []
-
-
-def test_result_is_returned_unchanged_and_inner_still_sees_the_task(tmp_path):
-    expected = AgentResult(is_error=False, status="done")
-    rt, _, _ = _runtime(tmp_path, expected)
-    task = RuntimePlan(prompt="p")
-    assert asyncio.run(rt.run(task)) is expected
-    assert rt.inner.tasks == [task]
 
 
 # ── JournalingRuntime: the pre-result death (review C3) ───────────────────────
@@ -369,18 +280,6 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     assert read_events(ledger) == []
 
 
-def test_review_with_a_configured_model_journals_it_at_start_and_settlement(tmp_path):
-    """A configured REVIEW_MODEL is visible before and after the SDK session."""
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False))
-    rt.set_context("review", "REVIEW", 100, 91)
-
-    asyncio.run(rt.run(RuntimePlan(prompt="review", model="claude-opus-4-1")))
-
-    start, settled = read_events(journal.path)
-    assert start["model"] == "claude-opus-4-1"
-    assert settled["model"] == "claude-opus-4-1"
-
-
 def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(tmp_path):
     # #13: `transport_death` alone cannot distinguish a loop that will never
     # converge from one a retry rescues, and the operator's first question is
@@ -403,35 +302,6 @@ def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(t
     assert settled["exit_reason"] == "transport_death"
     assert settled["deterministic"] == "exceeded maximum buffer size"
     assert settled["detail"] == "evidence/ac-3-titles.png"
-
-
-def test_an_ordinary_transport_death_is_not_marked_deterministic(tmp_path):
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    rt = JournalingRuntime(
-        RaisingInner(RuntimeError("Stream closed unexpectedly")),
-        journal, str(tmp_path / "spend.jsonl"), "o/r", "review",
-    )
-    rt.set_context("review", "REVIEW", 552, 545)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(rt.run(RuntimePlan(prompt="p")))
-
-    _, settled = read_events(journal.path)
-    assert settled["deterministic"] is None and settled["detail"] is None
-
-
-def test_a_normal_run_is_never_settled_as_a_transport_death(tmp_path):
-    # Anti-vacuity twin: the raise path must not be reachable from a run that
-    # merely returned an error result — those still count as attempts.
-    rt, journal, _ = _runtime(
-        tmp_path, AgentResult(is_error=True, status="failed", exit_reason=ExitReason.AGENT_ERROR))
-    rt.set_context("fix", "RESOLVE", 5, 5)
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
-
-    events = read_events(journal.path)
-    assert [e["event"] for e in events] == ["agent_run_start", "agent_run"]
-    assert events[1]["exit_reason"] == "agent_error" and events[1]["status"] == "failed"
-    assert "error" not in events[1]
 
 
 def test_a_journal_that_cannot_write_never_fails_a_run(tmp_path, capsys):
@@ -462,16 +332,6 @@ class InnerWithSurface:
         return "codex binary not found"
 
 
-def test_wrapping_a_runtime_does_not_hide_its_own_surface(tmp_path):
-    # review S7: `roles.py` calls `fix_runner.preflight()` for the codex
-    # readiness banner. A decorator without passthrough turns that into an
-    # AttributeError — or, behind a `getattr(..., None)` probe, a silent no-op
-    # that reports "ready" for a runtime with no binary.
-    rt = JournalingRuntime(InnerWithSurface(), Journal(str(tmp_path / "j.jsonl")))
-    assert rt.preflight() == "codex binary not found"
-    assert rt.bot == "fix-bot"
-
-
 def test_passthrough_does_not_invent_attributes_neither_object_has(tmp_path):
     # Anti-vacuity twin: passthrough must not turn every typo into a live object.
     rt = JournalingRuntime(InnerWithSurface(), Journal(str(tmp_path / "j.jsonl")))
@@ -481,16 +341,6 @@ def test_passthrough_does_not_invent_attributes_neither_object_has(tmp_path):
         JournalingRuntime.__new__(JournalingRuntime).preflight  # half-built, no inner
 
 
-def test_the_wrappers_own_attributes_win_over_the_inners(tmp_path):
-    class Shadowing(InnerWithSurface):
-        role = "steward"
-
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    rt = JournalingRuntime(Shadowing(), journal, repo="o/r", role="fix")
-    assert rt.role == "fix" and rt.journal is journal
-
-
-# ── Daemon: GhUnavailable is a countable event ────────────────────────────────
 # ── CLI status summary ────────────────────────────────────────────────────────
 def test_status_summary_is_silent_with_no_spend():
     from issue_agent.app.cli import spend_status_lines

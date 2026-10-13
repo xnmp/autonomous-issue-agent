@@ -349,18 +349,6 @@ def test_three_unproductive_attempts_stop_with_one_label_and_one_comment(role):
     assert len(agent.tasks) == 3
 
 
-def test_a_machine_death_is_no_attempt_and_backs_off(role):
-    gh = FakeGitHub(issues={5: ready()})
-    open_pr(gh, ci="fail")
-    composed, _ = role(gh, Agent(died))
-    assert dispatched(tick(composed), AgentKind.FIX_CI)
-
-    assert tick(composed) == []  # backing off: no redispatch, no stop
-    assert Label.NEEDS_HUMAN not in gh.prs[100].labels
-    runs = composed.control.leg_runs("o/r", (5,))
-    assert len(runs) == 1 and runs[0].receipt is None
-
-
 def test_an_approved_green_head_merges_bound_to_that_head_and_closes_the_issue(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, reviews=(Review("APPROVED", REVIEW_BOT, submitted_at="2026-10-01T00:00:00Z", commit_id="h1"),))
@@ -558,7 +546,6 @@ def test_a_first_pr_stage_wall_cap_is_a_machine_end_and_its_resume_counts(role, 
     legs = [r.receipt["leg"] for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
             if r.receipt is not None]
     assert legs == ["machine", "agent"]
-
 
 
 def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(role, later):

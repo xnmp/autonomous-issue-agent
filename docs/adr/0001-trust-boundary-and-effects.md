@@ -41,8 +41,6 @@ decision Q19).
 
 - Application orchestration cannot invoke gateway write methods directly.
 - Agent-authored marker files are claims, not sufficient trusted evidence.
-- Screenshot reads are recorded in a harness-owned, worktree-keyed state
-  receipt; a `.harness/screenshots-read` file has no gate authority.
 - A later separate effect broker would wrap the act layer, not a command queue.
 
 Screenshot-read receipts and visual-evidence bookkeeping were superseded by #327

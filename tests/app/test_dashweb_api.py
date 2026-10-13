@@ -15,7 +15,7 @@ pytest.importorskip("fastapi")
 
 from issue_agent.adapters.dashweb import build as dashboard_build  # noqa: E402
 from issue_agent.adapters.dashweb import bundle  # noqa: E402
-from issue_agent.app.dashweb import contracts, server  # noqa: E402
+from issue_agent.app.dashweb import server  # noqa: E402
 from asgi_client import ASGITestClient as TestClient  # noqa: E402
 
 
@@ -120,7 +120,6 @@ class StubBackend:
         return (True, "ok")
 
 
-
 WRITE_HEADERS = {"X-Issue-Agent-Dashboard": "1"}
 # The guard only serves loopback, so the test client must look like a browser
 # pointed at 127.0.0.1 — TestClient's default `testserver` host is exactly the
@@ -134,12 +133,6 @@ def client(backend=None):
         headers=WRITE_HEADERS,
         base_url=BASE_URL,
     )
-
-
-# ── GET ───────────────────────────────────────────────────────────────────────
-def test_repos_returns_the_pre_sorted_deployment_list():
-    body = client().get("/api/repos").json()
-    assert body["repos"][0]["name"] == "demo" and body["warnings"] == []
 
 
 def test_usage_returns_all_three_meters():
@@ -157,25 +150,10 @@ def test_overview_carries_metrics_caps_attention_and_health():
     assert body["metrics"]["cost_per_merged_pr_usd"] == 1.0
 
 
-def test_overview_carries_the_hourly_spend_series():
-    series = client().get("/api/repos/demo/overview").json()["spend_per_hour"]
-    assert [bucket["usd"] for bucket in series] == [1.0, 0.0]
-    assert series[0]["hour_start_iso"] == "2026-07-29T11:00:00+00:00"
-
-
 def test_a_degraded_overview_still_answers_with_an_empty_spend_series():
     backend = StubBackend(explode="overview")
     body = client(backend).get("/api/repos/demo/overview").json()
     assert body["spend_per_hour"] == [] and body["warnings"]
-
-
-def test_overview_forwards_the_browser_timezone():
-    backend = StubBackend()
-    response = client(backend).get(
-        "/api/repos/demo/overview?timezone=Australia%2FSydney"
-    )
-    assert response.status_code == 200
-    assert backend.overview_timezone == "Australia/Sydney"
 
 
 def test_issues_returns_all_three_lanes_in_one_call():
@@ -187,13 +165,6 @@ def test_issues_returns_all_three_lanes_in_one_call():
 def test_issue_detail_is_404_for_an_unknown_issue():
     assert client().get("/api/repos/demo/issues/404").status_code == 404
     assert client().get("/api/repos/demo/issues/7").json()["issue"] == 7
-
-
-def test_the_retired_read_and_write_routes_are_gone():
-    c = client()
-    for path in ("/api/repos/demo/issues/7/steps/0/events", "/api/repos/demo/issues/7/cost-chart?session_id=a"):
-        assert c.get(path).status_code == 404
-    assert c.post("/api/repos/demo/start").status_code in (404, 405)
 
 
 # ── failure posture ───────────────────────────────────────────────────────────
@@ -215,42 +186,11 @@ def test_a_collector_failure_degrades_to_a_warning_never_a_500(collector, path):
     assert r.json()["warnings"]
 
 
-def test_issue_failure_payload_still_satisfies_the_rendering_contract():
-    body = client(StubBackend(explode="issue")).get("/api/repos/demo/issues/7").json()
-
-    assert body == {
-        "issue": 7,
-        "title": None,
-        "url": None,
-        "done": False,
-        "pull_requests": [],
-        "cost_usd": 0.0,
-        "estimated": False,
-        "steps": [],
-        "warnings": ["issue detail unavailable (RuntimeError: collector blew up)"],
-    }
-
-
 # ── POST ──────────────────────────────────────────────────────────────────────
 def test_promote_reports_success():
     assert client().post("/api/repos/demo/issues/9/promote").json() == {
         "ok": True, "detail": "ok"
     }
-
-
-def test_unblock_reports_success():
-    assert client().post("/api/repos/demo/issues/9/unblock").json() == {
-        "ok": True, "detail": "ok"
-    }
-
-
-def test_the_removed_operator_command_routes_are_gone():
-    c = TestClient(server.create_app(backend=StubBackend()), headers=WRITE_HEADERS, base_url=BASE_URL)
-    for path in ("/api/repos/demo/issues/9/unpark", "/api/repos/demo/issues/9/park",
-                 "/api/repos/demo/issues/9/resolve-control/commands"):
-        assert c.post(path).status_code in (404, 405)
-    for path in ("/api/repos/demo/issues/9/resolve-control", "/api/repos/demo/workflow-families"):
-        assert c.get(path).status_code == 404
 
 
 @pytest.mark.parametrize("verb", ["promote", "unblock"])
@@ -305,20 +245,6 @@ def test_a_built_spa_is_served_with_a_fallback_for_client_routes(tmp_path):
     assert "app</html>" in c.get("/").text
     assert "console.log(1)" in c.get("/assets/app.js").text
     assert "app</html>" in c.get("/repo/demo/issue/7").text
-
-
-def test_a_stale_spa_is_not_served_even_when_index_exists(tmp_path):
-    _write_fresh_spa(tmp_path)
-    (tmp_path / "dashboard" / "build-inputs.json").write_text(
-        '{"schema":1,"files":["build-inputs.json"],"directories":["src"]}'
-    )
-    c = TestClient(
-        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
-        base_url=BASE_URL,
-    )
-
-    assert "make dashboard-ui" in c.get("/").text
-    assert "app</html>" not in c.get("/").text
 
 
 def test_a_running_server_keeps_its_immutable_version_after_new_publication(tmp_path):

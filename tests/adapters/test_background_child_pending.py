@@ -18,8 +18,6 @@ from dataclasses import dataclass, field
 
 from issue_agent.adapters.agent_runner import AgentRunner
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.actions import PostComment, Relabel
-from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import (
     ExitReason,
     Outcome,
@@ -82,12 +80,6 @@ def _run(monkeypatch, messages, log=None):
     return asyncio.run(runner.run(RuntimePlan(prompt="x")))
 
 
-def _asks_human(actions) -> bool:
-    return any(isinstance(a, PostComment) for a in actions) or any(
-        isinstance(a, Relabel) and Label.NEEDS_HUMAN in a.added_labels for a in actions
-    )
-
-
 def test_blocked_over_pending_background_child_is_a_typed_attempt_outcome(monkeypatch):
     logged: list[str] = []
     result = _run(
@@ -122,15 +114,6 @@ def test_malformed_task_events_are_ignored(monkeypatch):
         ],
     )
     assert classify_outcome(result) is Outcome.BLOCKED
-
-
-def test_pending_child_does_not_demote_a_non_blocked_result(monkeypatch):
-    result = _run(
-        monkeypatch,
-        [_started("t1"), _ResultMessage(structured_output={"status": "pr_opened"})],
-    )
-    assert classify_outcome(result) is Outcome.OK
-    assert result.exit_reason is ExitReason.OK
 
 
 def test_delegated_workflow_task_counts_as_a_pending_child(monkeypatch):

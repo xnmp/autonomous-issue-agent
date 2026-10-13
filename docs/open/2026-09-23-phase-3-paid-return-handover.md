@@ -13,7 +13,7 @@ phases 4–6 have not started. This document supersedes the stop instruction in
 [the earlier checkpoint](2026-09-23-architecture-checkpoint-handover.md), not
 the protected live-deployment pause.
 
-Read `CLAUDE.md` and [proposed ADR 0015](../adr/0015-generation-fenced-gate-rearm.md)
+Read `CLAUDE.md` and [proposed ADR 0015](../archive/adr/0015-generation-fenced-gate-rearm.md)
 before continuing. Branch `dev`, implementation base `ee7de45`. Existing
 scheduler/continuation changes and this increment remain uncommitted; this
 checkpoint passed full verification and independent review. Preserve the entire

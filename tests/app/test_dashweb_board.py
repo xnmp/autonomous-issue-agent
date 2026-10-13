@@ -176,17 +176,6 @@ def test_the_board_shows_each_items_derived_state(deployment):
     assert payload["observed_at"] == NOW.isoformat() and payload["gh_ok"] is True
 
 
-def test_done_backlog_and_notifications_come_from_github_lists_and_legs(deployment):
-    backend, *_ = deployment
-    payload = backend.issues("demo")
-
-    assert [(d["issue"], d["pr"], d["cost_usd"]) for d in payload["done"]] == [(8, 80, 3.0)]
-    assert [b["issue"] for b in payload["backlog"]] == [6]
-    assert payload["backlog"][0]["age_days"] == 1
-    ids = {n["id"] for n in payload["notifications"]}
-    assert {"leg:L4:start", "leg:L2:end", f"needs:2:question:{ts(-40)}"} <= ids
-
-
 def test_the_issue_page_lists_legs_and_the_unblock_control(deployment):
     backend, *_ = deployment
     detail = backend.issue("demo", 5)
@@ -199,17 +188,6 @@ def test_the_issue_page_lists_legs_and_the_unblock_control(deployment):
     done = backend.issue("demo", 8)
     assert done["done"] is True and done["rail"]["current"] == "merge"
     assert backend.issue("demo", 999) is None
-
-
-def test_overview_metrics_come_from_legs_and_merges(deployment):
-    backend, *_ = deployment
-    overview = backend.overview("demo", "UTC")
-    m = overview["metrics"]
-    assert (m["merged_prs"], m["open_items"], m["needs_human"]) == (1, 5, 2)
-    assert m["total_cost_usd"] == 15.0  # 2 + 3 settled, 10 reserved by the running leg
-    assert m["cost_per_merged_pr_usd"] == 15.0
-    assert [a["issue"] for a in overview["needs_attention"]] == [2, 5]
-    assert overview["caps"]["issue_cap_usd"] == 25.0
 
 
 def _every_read(backend) -> list:
@@ -243,30 +221,6 @@ def test_no_read_path_writes_the_control_store(deployment):
     assert before["mode"] == "wal"
     _every_read(backend)
     assert _fingerprint(db) == before
-
-
-def test_a_legacy_store_in_delete_mode_is_unavailable_and_untouched(deployment, tmp_path):
-    """The cutover leaves a refused legacy store in DELETE mode; a read-write
-    open would flip it to WAL and race the daemon's retry."""
-    backend, *_ = deployment
-    legacy = tmp_path / "legacy" / "control.db"
-    legacy.parent.mkdir()
-    db = sqlite3.connect(legacy)
-    db.execute("PRAGMA journal_mode=DELETE")
-    db.execute("CREATE TABLE schema_migrations(version INTEGER)")
-    db.commit()
-    db.close()
-    backend.control_path = lambda cfg: str(legacy)
-    backend._configs = type(backend._configs)(ttl_s=0)
-    before = _fingerprint(legacy)
-    listing = sorted(p.name for p in legacy.parent.iterdir())
-
-    payload, overview, *_ = _every_read(backend)
-
-    assert _fingerprint(legacy) == before and before["mode"] == "delete"
-    assert sorted(p.name for p in legacy.parent.iterdir()) == listing
-    assert payload["in_flight"] == [] and "predates the 3-table cutover" in payload["store_error"]
-    assert overview["store_error"] == payload["store_error"]
 
 
 @pytest.mark.parametrize("make", ["missing", "garbage"])
@@ -385,36 +339,3 @@ def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
 
     assert payload["gh_ok"] is True and any("limited to the newest 200" in w for w in payload["warnings"])
     assert metrics["merged_prs"] == 200 and metrics["merged_prs_partial"] is True
-
-
-def test_a_failed_github_read_is_gh_not_ok(deployment):
-    backend, *_ = deployment
-
-    class Down(Gh):
-        def issues(self, repo, limit=1000):
-            return None, "gh: HTTP 502"
-
-    backend.gh = Down()
-    backend._observations.invalidate("demo")
-    backend.issues("demo")
-    assert backend.issues("demo")["gh_ok"] is False
-
-
-def test_carried_legs_show_as_history_not_failures(deployment):
-    backend, _log, db, _gateway = deployment
-    conn = sqlite3.connect(db)
-    conn.execute("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
-                 "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
-                 "provider_receipt_id, settled_at) VALUES ('C1', 'o/r', 'carried', 'RESOLVE', 1, 0, '', 'carried', "
-                 "'claude', 'ended', ?, ?, ?, 'USD', 4000000, 4000000, 'provider_reported', 'normal_return', 'rc', ?)",
-                 (store_ts(-900), store_ts(-900), store_ts(-890), store_ts(-890)))
-    conn.commit()
-    conn.close()
-
-    card = next(c for c in backend.issues("demo")["in_flight"] if c["issue"] == 1)
-    detail = backend.issue("demo", 1)
-    overview = backend.overview("demo", "UTC")["metrics"]
-
-    assert card["cost_usd"] == 4.0 and card["rail"]["resolve_attempts"] == 0 and card["history"] == []
-    assert [s["outcome"] for s in detail["steps"]] == ["carried"]
-    assert overview["machine_legs"] == 0

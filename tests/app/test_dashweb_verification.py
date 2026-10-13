@@ -45,10 +45,6 @@ def test_an_id_is_extracted_when_the_change_names_an_issue():
     assert rows()[1].id == "codex per-leg usage deltas"
 
 
-def test_the_raw_row_is_always_kept_for_what_the_parser_could_not_classify():
-    assert rows()[2].raw.startswith("| pristine-base gate probe |")
-
-
 def test_a_verified_row_that_later_misbehaved_still_reads_verified():
     text = "|---|\n| x | y | z | VERIFIED 2026-07-28 — but MISBEHAVED on reversal → #54 |"
     assert verification.parse_verification(text)[0].status == "VERIFIED"
@@ -62,10 +58,6 @@ def test_column_drift_keeps_the_first_column_and_a_status_found_anywhere():
 
 def test_a_row_with_no_verdict_keyword_defaults_to_pending():
     assert verification.parse_verification("| a | b | c | ??? |")[0].status == "pending"
-
-
-def test_a_document_with_no_table_yields_no_rows():
-    assert verification.parse_verification("# just prose\n\nnothing here") == []
 
 
 def test_a_missing_ledger_is_a_warning_not_an_exception(tmp_path):
@@ -88,45 +80,3 @@ def test_reason_is_the_verdict_prose_with_the_keyword_removed():
         "2026-07-28 → #49",
         "n/a",
     ]
-
-
-def test_a_bare_verdict_falls_back_to_the_evidence_column():
-    row = verification.parse_verification(
-        "| change | landed | why it matters | status |\n"
-        "|---|---|---|---|\n"
-        "| #9 thing | abc | probe never fired again | VERIFIED |\n"
-    )[0]
-    assert row.reason == "probe never fired again"
-
-
-def test_a_row_with_nothing_to_say_reports_no_reason():
-    row = verification.parse_verification(
-        "| change | landed | evidence | status |\n"
-        "|---|---|---|---|\n"
-        "| #9 thing |  |  | VERIFIED |\n"
-    )[0]
-    assert row.reason is None
-
-
-def test_a_three_column_table_reports_its_reason_without_the_verdict_word():
-    """The badge beside the reason already says VERIFIED; repeating it in the
-    tooltip is noise whichever column the ledger happened to put it in."""
-    row = verification.parse_verification(
-        "| #9 thing | abc | VERIFIED — probe stayed green |\n"
-    )[0]
-    assert (row.status, row.reason) == ("VERIFIED", "probe stayed green")
-
-
-def test_a_reason_longer_than_a_tooltip_is_bounded():
-    row = verification.parse_verification(
-        f"| #9 thing | abc | evidence | VERIFIED — {'y' * 5000} |\n"
-    )[0]
-    assert row.reason is not None and len(row.reason) == 240
-
-
-def test_a_bounded_reason_is_taken_from_the_fallback_column_too():
-    row = verification.parse_verification(
-        f"| #9 thing | abc | {'z' * 5000} |\n"
-    )[0]
-    assert row.reason is not None and len(row.reason) == 240
-

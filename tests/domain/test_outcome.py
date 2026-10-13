@@ -30,7 +30,6 @@ def test_unknown_status_defaults_ok():
     assert classify_outcome(_ok("")) is Outcome.OK
 
 
-# ── field_bool: structured boolean accessor + fail-safe default ───────────────
 # ── infra death: WHY the session ended, separate from WHAT it decided ─────────
 def test_infra_death_only_for_external_kill_and_transport_death():
     assert infra_death(ExitReason.KILLED_EXTERNALLY) is True

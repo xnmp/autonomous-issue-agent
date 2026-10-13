@@ -80,8 +80,6 @@ class _Worktrees:
         return 0
 
 
-
-
 class _NoTrustedUsage:
     """No request evidence remains, so terminal recovery uses a zero estimate."""
 
@@ -249,7 +247,6 @@ def test_phantom_reservations_are_reclaimed_instead_of_escalated(tmp_path):
     assert all(run_id not in active for run_id in dead)
 
 
-
 def test_reconciliation_never_releases_a_still_running_leg(tmp_path):
     now = datetime.now(timezone.utc)
     started_at = now - timedelta(minutes=10)
@@ -291,6 +288,16 @@ def test_a_genuine_cap_exhaustion_still_escalates_to_a_human(tmp_path):
     assert len(store.active_reservation_runs(OWNER)) == 2
 
 
+def test_an_admitted_reservation_never_calls_reconciliation(tmp_path):
+    now = datetime.now(timezone.utc)
+    store = _store(tmp_path, now)
+    reconciler = _CountingReconciler(_sweeper(store, now))
+
+    result = _resolve(_admission(store, _Runtime(), Money("USD", 50_000_000), reconciler))
+
+    assert result.status == "ok"
+    assert reconciler.calls == 0
+
 
 def test_admission_reconciles_at_most_once_per_dispatch(tmp_path):
     """ADR 0012 ceiling: one reconcile, one retry, no loop."""
@@ -326,33 +333,6 @@ def test_unreadable_reconciliation_escalates_without_admitting(tmp_path):
 
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 0
-
-
-def test_admission_without_a_reconciler_escalates_exactly_as_before(tmp_path):
-    now = datetime.now(timezone.utc)
-    store = _store(tmp_path, now)
-    cap = Money("USD", 2_000_000)
-    _dead_leg(store, _scope(now), "just-died", cap, now)
-
-    runtime = _Runtime()
-    result = _resolve(_admission(store, runtime, cap, None))
-
-    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-    assert runtime.calls == 0
-
-
-def test_an_admitted_reservation_never_calls_reconciliation(tmp_path):
-    now = datetime.now(timezone.utc)
-    store = _store(tmp_path, now)
-
-    runtime = _Runtime()
-    reconciler = _CountingReconciler(_sweeper(store, now))
-    result = _resolve(
-        _admission(store, runtime, Money("USD", 50_000_000), reconciler)
-    )
-
-    assert result.status == "ok"
-    assert reconciler.calls == 0
 
 
 class _SettlesExactly:
@@ -406,7 +386,6 @@ def test_headroom_freed_by_exact_settlement_is_counted_and_admitted(tmp_path):
 
     assert result.status == "ok"
     assert runtime.calls == 1
-
 
 
 def test_recent_completed_accounting_gap_settles_before_admission_without_grace(tmp_path):

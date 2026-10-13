@@ -28,9 +28,3 @@ def test_parse_effort_returns_the_default_on_anything_unrecognised(raw):
 
 def test_parse_effort_passes_an_effort_through():
     assert parse_effort(Effort.MEDIUM) is Effort.MEDIUM
-
-
-# ── the sensor behind `review_rounds` (#16 P1) ────────────────────────────────
-# The store's per-review attempt counter re-keys to zero on every new review, so
-# it could never answer "rounds on this PR are climbing". These assert the
-# GitHub-derived counter that replaced it, from the FIXER's point of view.

@@ -625,7 +625,6 @@ def test_many_items_derive_independently():
     assert states[issue_key(6)] == Dispatch(AgentKind.RESOLVE)
 
 
-
 # ── Agent questions (slice 5b) ───────────────────────────────────────────────
 
 def asked(kind: AgentKind, minute: float, question: str = "404 or 410?") -> LegEnd:
@@ -849,7 +848,6 @@ def test_a_blocked_approved_green_pr_waits_for_branch_protection():
     states = derive(WorldState(prs=(pr(merge_state="BLOCKED", reviews=(review("APPROVED", 1),)),)), local(), H)
     assert states == {pr_key(7): Wait(WaitReason.MERGEABILITY_UNKNOWN)}
     assert actions(states, H) == ()
-
 
 
 def test_an_old_released_stop_does_not_stand_in_for_this_episodes_failed_one():

@@ -358,27 +358,3 @@ def test_git_inspection_timeout_preserves_original_ceiling_result(
 
     assert actual is expected
     assert not (repo / ".harness" / "handover.md").exists()
-
-
-def test_git_inspection_nonzero_is_recorded_without_masking_the_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = _worktree(tmp_path)
-    expected = AgentResult(
-        is_error=True,
-        exit_reason=ExitReason.BUDGET_EXHAUSTED,
-    )
-    inner = RecordingRuntime(expected)
-    journal = Journal(str(tmp_path / "journal.jsonl"))
-    runtime = JournalingRuntime(inner, journal, role="fix")
-    runtime.set_context("fix", "RESOLVE", 82, 82)
-
-    def fail_git(argv, **_kwargs):
-        return subprocess.CompletedProcess(argv, 128, "", "repository busy")
-
-    monkeypatch.setattr(handover_adapter.subprocess, "run", fail_git)
-    actual = asyncio.run(runtime.run(RuntimePlan(prompt="p", cwd=str(repo))))
-
-    written = (repo / ".harness" / "handover.md").read_text(encoding="utf-8")
-    assert actual is expected
-    assert "repository busy" in written

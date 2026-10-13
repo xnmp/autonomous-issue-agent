@@ -1,13 +1,8 @@
-"""CI-state and review interpretation — pure ports of watcher-lib.sh.
+"""CI-state interpretation — pure ports of watcher-lib.sh.
 
-These functions carry hard-won lessons and are tested in isolation:
-  * `ci_state` — pending OUTRANKS failure (the #49 anti-loop rule), with
-    repository-required reports deciding eligibility.
-  * `pending_deadline_breached` — the BOUND on how long that pending state may
-    last (#30). It does not reorder the precedence above; it says when waiting
-    on it has stopped being waiting and become a deadlock.
-  * `latest_other_review` — the latest review by a DISTINCT actor (the
-    no-self-approval invariant: a fixer never reviews/merges its own PR).
+`reduce_ci`: pending OUTRANKS failure (the #49 anti-loop rule), with
+repository-required reports deciding eligibility; an unread checks fetch is
+Unavailable, never an answer (#48).
 """
 
 from __future__ import annotations
@@ -15,10 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .checks import CIObservation, Observed, RequiredCheck, Unavailable
-from collections.abc import Iterable
 from datetime import datetime, timezone
 
-from .world import Check, CIState
+from .world import Check
 
 
 @dataclass(frozen=True)
@@ -55,18 +49,14 @@ class Failed:
             raise ValueError("failed CI requires nonempty failures")
 
 
-def gated_checks(observation: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
-    if isinstance(observation, Unavailable):
-        return ()
-    if isinstance(observation, Observed):
-        return tuple(c for c in observation.reports if not observation.policy or c.required)
-    return tuple(observation)
+def _gated_checks(observation: Observed) -> tuple[Check, ...]:
+    return tuple(c for c in observation.reports if not observation.policy or c.required)
 
 
 def reduce_ci(observation: CIObservation) -> Clear | Waiting | Failed | Unavailable:
     if isinstance(observation, Unavailable):
         return observation
-    eligible = gated_checks(observation)
+    eligible = _gated_checks(observation)
     witnesses = {(c.name, c.app_id) for c in eligible if c.required}
     names = {name for name, _ in witnesses}
     missing = tuple(sorted((r for r in observation.policy
@@ -107,28 +97,8 @@ def parse_timestamp(raw: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def failed_checks(
-    checks: CIObservation | Iterable[Check]
-) -> tuple[Check, ...]:
+def failed_checks(checks: CIObservation) -> tuple[Check, ...]:
     """Settled failures covered by the repository CI policy."""
-
-    if isinstance(checks, (Observed, Unavailable)):
-        result = reduce_ci(checks)
-        return result.checks if isinstance(result, Failed) else ()
-    return tuple(c for c in checks if c.bucket == "fail")
-
-
-def ci_state(checks: CIObservation | Iterable[Check]) -> CIState:
-    """Compact telemetry vocabulary for the typed CI reduction."""
-    if not isinstance(checks, (Observed, Unavailable)):
-        checks = Observed("legacy", "legacy", frozenset(), tuple(checks))
     result = reduce_ci(checks)
-    if isinstance(result, Unavailable):
-        return CIState.UNKNOWN
-    if isinstance(result, Waiting):
-        return CIState.PENDING
-    if isinstance(result, Failed):
-        return CIState.FAILURE
-    return CIState.OK if isinstance(checks, Observed) and checks.reports else CIState.NONE
-
+    return result.checks if isinstance(result, Failed) else ()
 

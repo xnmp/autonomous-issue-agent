@@ -40,6 +40,13 @@ job someone still has to do; the same file in `history/` is a record.
 - [failure-modes.md](reference/failure-modes.md) — 110 recorded failure modes.
   Load-bearing: tests and comments cite these by number (`FAILURE-MODES #66`)
 
+## adr/
+
+[adr/](adr/README.md) holds the accepted decisions: trust boundary (0001), money
+(0002), control store (0003), supervision (0005), recovery triggers (0006),
+configuration snapshot (0007) and deployment fencing (0008). The design itself is
+[open/2026-10-12-minimal-harness-design.md](open/2026-10-12-minimal-harness-design.md).
+
 ## open/
 
 - [residuals.md](open/residuals.md) — everything deliberately still open, why,
@@ -112,7 +119,8 @@ changes; it never proves a guard exists for a path nobody wrote a test for.
 The original bash design (`v1-original-spec.md` and the numbered `01-`…`09-`
 specs), plus the SDK-port planning docs (`refactor-sdk.md`,
 `refactor-roadmap.md`, `architecture-status.md`) that describe a migration since
-completed.
+completed. `archive/adr/` holds the superseded ADRs (0004, 0009–0016); the
+subtractive refactor deleted the mechanisms they governed.
 
 The archived specs describe deleted bash watchers and are not accurate about
 the Python path. The `plugin/hooks/` gate stack was deleted in slice 6a.

@@ -34,5 +34,3 @@ def test_default_priced_config_reports_harness_enforcement():
 def test_incomplete_pricing_reports_unmeasurable_budget(env):
     description = _describe(**env)
     assert "NOT ENFORCED on codex" in description
-
-

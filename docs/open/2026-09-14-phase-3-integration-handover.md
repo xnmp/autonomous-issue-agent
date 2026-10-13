@@ -14,7 +14,7 @@ this explicit stop.
   helpers. No commit was made because a required crash-recovery contract is red.
 - Phases 1–2 are accepted; phase 3 is incomplete. Phases 4–6 have not started.
 - Full plan: [architecture implementation phases](2026-09-14-architecture-implementation.md).
-- Authority proposal: [ADR 0015](../adr/0015-generation-fenced-gate-rearm.md), still proposed.
+- Authority proposal: [ADR 0015](../archive/adr/0015-generation-fenced-gate-rearm.md), still proposed.
 - Original review: `/tmp/architecture-review-2026-09-14/report.md`.
 - Longer implementation history: `/tmp/architecture-phase3-checkpoint-2026-09-14.md`.
 - Phase agent handover: `/tmp/phase3-agent-checkpoint-2026-09-14.md`.

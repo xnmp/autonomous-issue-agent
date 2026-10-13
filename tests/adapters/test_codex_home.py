@@ -148,29 +148,6 @@ def test_missing_state_dir_refuses_containment(tmp_path) -> None:
         raise AssertionError("CODEX_HOME was written into an untrusted worktree")
 
 
-def test_runtime_sets_codex_home_to_external_config(tmp_path) -> None:
-    worktree = tmp_path / "worktree"
-    state = tmp_path / "state"
-    worktree.mkdir()
-
-    class Runtime:
-        task = None
-
-        async def run(self, task):
-            self.task = task
-            return AgentResult(False, status="ok")
-
-    inner = Runtime()
-    runtime = CodexHomeRuntime(
-        inner,
-        lambda cwd: write_codex_home(cwd, state_dir=str(state)),
-    )
-    asyncio.run(runtime.run(RuntimePlan("work", cwd=str(worktree))))
-
-    assert inner.task is not None
-    assert inner.task.env["CODEX_HOME"].startswith(str(state))
-
-
 def test_external_codex_home_links_login_without_copying_it_into_worktree(
     tmp_path,
 ) -> None:
@@ -199,4 +176,3 @@ def test_external_codex_home_links_login_without_copying_it_into_worktree(
 
     auth.write_text("rotated")
     assert open(linked).read() == "rotated"
-

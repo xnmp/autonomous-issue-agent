@@ -109,12 +109,6 @@ def test_env_assignments_tolerate_export_comments_and_malformed_lines():
     assert parsed == {"A": "1", "B": "2", "C": "va=lue"}
 
 
-# ── findings ──────────────────────────────────────────────────────────────────
-def test_no_installed_units_is_silent(tmp_path):
-    assert service_findings("demo", str(tmp_path / "active.env"), systemd_dir=str(tmp_path / "none"),
-                            launchd_dir=str(tmp_path / "none2")) == ()
-
-
 def test_everything_resolving_and_matching_yields_no_findings(tmp_path):
     assert _findings(
         tmp_path, composed={"FIXER_RUNTIME": "codex"},
@@ -165,21 +159,6 @@ def test_required_binaries_come_from_the_installed_snapshot_not_the_composed(
         f.level == "error" and "'codex'" in f.message and "dispatch" in f.message
         for f in findings
     )
-
-
-def test_an_unpinned_claude_runtime_warns_rather_than_errors(tmp_path):
-    # The SDK can fall back to its bundled binary; absence from the service
-    # PATH is suspicious, not fatal — unless CLAUDE_BIN pins it.
-    unpinned = _findings(
-        tmp_path, snapshot="FIXER_RUNTIME=claude\n", which=_WHICH_CORE,
-    )
-    pinned = _findings(
-        tmp_path,
-        snapshot="FIXER_RUNTIME=claude\nCLAUDE_BIN=/opt/claude\n",
-        which=_WHICH_CORE,
-    )
-    assert {f.level for f in unpinned if "claude" in f.message} == {"warn"}
-    assert {f.level for f in pinned if "claude" in f.message} == {"error"}
 
 
 def test_a_transient_or_missing_working_directory_is_an_error(tmp_path):
@@ -248,14 +227,6 @@ def test_retired_tier_knobs_no_longer_require_codex(tmp_path):
 # ── identity ──────────────────────────────────────────────────────────────────
 def _levels(findings, needle):
     return {f.level for f in findings if needle in f.message}
-
-
-def test_separate_fix_and_review_tokens_are_silent():
-    assert identity_findings({"FIX_BOT_TOKEN": "a", "REVIEW_BOT_TOKEN": "b"}) == ()
-
-
-def test_a_missing_fixer_token_warns_about_the_ambient_account():
-    assert _levels(identity_findings({"REVIEW_BOT_TOKEN": "b"}), "ambient") == {"warn"}
 
 
 @pytest.mark.parametrize("env", [

@@ -155,7 +155,7 @@ resolution of retained obligations; exceptional unknown-spend release was not
 included in that approval. No live activation,
 service restart, paid external experiment, push or
 remote issue closure is claimed. The sole approved Jira counter exception is
-explicit in [ADR 0016](../adr/0016-phase-4-current-state-authority.md).
+explicit in [ADR 0016](../archive/adr/0016-phase-4-current-state-authority.md).
 
 The approved live preflight exposed two startup gaps on retained data: unbound
 fix/steward execution history blocked the whole deployment, and truly new
@@ -654,7 +654,7 @@ replay, receipt provenance/history, retired-command recurrence and cross-target
 publication authority. Full log: `/tmp/phase3-foundation-full.log`; the re-review
 also ran 302 focused tests and an additional adopted-receipt rollback diagnostic.
 This accepts the foundations only, not the complete resolve slice. The superseding
-[ADR 0015](../adr/0015-generation-fenced-gate-rearm.md) remains proposed.
+[ADR 0015](../archive/adr/0015-generation-fenced-gate-rearm.md) remains proposed.
 Daemon/operator/dashboard wiring, explicit absence-authorized retry, activation
 import and full composed crash acceptance still remain. Focused tests passing
 do not establish phase acceptance or authorize a live migration/restart.

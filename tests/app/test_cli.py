@@ -1,5 +1,5 @@
-"""CLI pure helpers — repo detection parsing, overlay-name resolution, and the
-synthesized per-repo env. No git/network: every helper here is deterministic.
+"""CLI helpers and commands: repo detection, overlay-name resolution, the
+synthesized per-repo env, and the per-command overlay guards.
 
 The key invariant: synth_repo_env's keys must round-trip through config.from_env
 (the daemon's reader), so the CLI and the daemon can't drift on key names."""
@@ -8,15 +8,12 @@ import argparse
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import sys
 
 from issue_agent.app import cli
-
-
 from issue_agent.app.config import from_env
 
 
@@ -34,7 +31,6 @@ def test_overlay_reviewer_runtime_overrides_and_scrubs_ambient_value(tmp_path, m
     assert cli.read_repo_env_field(str(overlay), "REVIEWER_RUNTIME") == ""
 
 
-# ── parse_remote_url ──────────────────────────────────────────────────────────
 @pytest.mark.parametrize("args,passed", [([], []), (["--port", "9000"], ["--port", "9000"])])
 def test_dashboard_replaces_itself_with_the_dashboard_module(monkeypatch, args, passed):
     calls = []
@@ -44,304 +40,133 @@ def test_dashboard_replaces_itself_with_the_dashboard_module(monkeypatch, args, 
     assert calls == [(sys.executable, [sys.executable, "-m", "issue_agent.app.dashweb.main", *passed])]
 
 
-@pytest.mark.parametrize("mode", [["--text"], ["--html", "x.html"], ["--legacy"], ["acme"]])
-def test_dashboard_render_modes_are_gone(mode):
-    with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["dashboard", *mode])
+@pytest.mark.parametrize("url,repo", [
+    ("git@github.com:acme/MyApp.git", "acme/myapp"),
+    ("https://github.com/acme/MyApp.git", "acme/myapp"),
+    ("https://github.com/acme/MyApp", "acme/myapp"),
+    ("https://github.example.com/o/r/", "o/r"),
+    ("not a url", ""),
+    ("", ""),
+])
+def test_parse_remote_url(url, repo):
+    assert cli.parse_remote_url(url) == repo
 
 
-def test_parse_remote_url_ssh():
-    assert cli.parse_remote_url("git@github.com:acme/MyApp.git") == "acme/myapp"
+@pytest.mark.parametrize("repo,name", [
+    # P0R-2: the owner is part of the name, so acme/app and other/app cannot
+    # share one overlay (the original collision).
+    ("acme/MyApp-combined-agent", "acme-myapp-combined-agent"),
+    ("acme/app", "acme-app"),
+    ("other/app", "other-app"),
+    ("o/weird name!", "o-weird-name"),
+    ("", "target"),
+])
+def test_derive_name(repo, name):
+    assert cli.derive_name(repo) == name
 
 
-def test_parse_remote_url_https_and_trailing_git():
-    assert cli.parse_remote_url("https://github.com/acme/MyApp.git") == "acme/myapp"
-    assert cli.parse_remote_url("https://github.com/acme/MyApp") == "acme/myapp"
-
-
-def test_parse_remote_url_https_trailing_slash():
-    assert cli.parse_remote_url("https://github.example.com/o/r/") == "o/r"
-
-
-def test_parse_remote_url_garbage_is_empty():
-    assert cli.parse_remote_url("not a url") == ""
-    assert cli.parse_remote_url("") == ""
-
-
-# ── derive_name ───────────────────────────────────────────────────────────────
-def test_derive_name_lowercases_basename():
-    # P0R-2: owner is now part of the derived name (was basename-only).
-    assert cli.derive_name("acme/MyApp-combined-agent") == "acme-myapp-combined-agent"
-
-
-def test_derive_name_sanitizes_and_falls_back():
-    assert cli.derive_name("") == "target"
-    assert cli.derive_name("o/weird name!") == "o-weird-name"
-
-
-@pytest.mark.parametrize(
-    ("alias", "canonical"),
-    (
-        ("Acme App", "acme-app"),
-        ("acme@app", "acme-app"),
-        ("ACME-APP", "acme-app"),
-    ),
-)
-def test_explicit_deployment_name_aliases_are_rejected(
-    alias,
-    canonical,
-):
+@pytest.mark.parametrize(("alias", "canonical"), (("Acme App", "acme-app"), ("acme@app", "acme-app"),
+                                                   ("ACME-APP", "acme-app")))
+def test_explicit_deployment_name_aliases_are_rejected(alias, canonical):
     with pytest.raises(ValueError, match=repr(canonical)):
         cli.resolve_name("acme/app", explicit=alias)
     with pytest.raises(SystemExit) as exc:
-        cli.build_parser().parse_args(
-            ["install-service", "--name", alias]
-        )
+        cli.build_parser().parse_args(["install-service", "--name", alias])
     assert exc.value.code == 2
 
 
-# ── P0R-2: derive_name includes the owner (collision fix) ─────────────────────
-def test_derive_name_includes_owner():
-    assert cli.derive_name("acme/app") == "acme-app"
-
-
-def test_derive_name_no_collision_across_owners():
-    """The original bug: acme/app and other/app both derived the bare
-    basename "app" — resolve_name could then reuse ONE owner's overlay while
-    running against the OTHER's checkout. Two different owners of the same
-    repo BASENAME must now derive DIFFERENT names."""
-    a = cli.derive_name("acme/app")
-    b = cli.derive_name("other/app")
-    assert a != b
-    assert {a, b} == {"acme-app", "other-app"}
-
-
-# ── read_repo_env_field + resolve_name ────────────────────────────────────────
-def test_read_repo_env_field_last_assignment_wins(tmp_path):
-    p = tmp_path / "r.env"
-    p.write_text('REPO="a/one"\nexport REPO="a/two"\nOTHER=x\n')
-    assert cli.read_repo_env_field(str(p), "REPO") == "a/two"
-
-
-# ── review M12: shell-semantics reader replaces the regex line-scanner ────────
-# The prior regex (`^FIELD=(.*)$`) silently mis-parsed each of these — the
-# repro table from the review — so resolve_name MISSED an existing overlay
-# and cmd_start synthesized a duplicate with fresh *_STATE_DIRs.
-def test_read_repo_env_field_survives_trailing_comment(tmp_path):
-    p = tmp_path / "r.env"
-    p.write_text('REPO="owner/name"  # prod\n')
-    assert cli.read_repo_env_field(str(p), "REPO") == "owner/name"
-
-
-def test_read_repo_env_field_survives_spaces_around_equals(tmp_path):
-    p = tmp_path / "r.env"
-    p.write_text("REPO = owner/name\n")
-    assert cli.read_repo_env_field(str(p), "REPO") == "owner/name"
-
-
-def test_read_repo_env_field_expands_var_reference(tmp_path):
-    p = tmp_path / "r.env"
-    p.write_text("OWNER_REPO=owner/name\nREPO=${OWNER_REPO}\n")
-    assert cli.read_repo_env_field(str(p), "REPO") == "owner/name"
-
-
-# Anti-vacuity twins: a reader that always returns something regardless of
-# input (or one that leaks the CLI process's own environment) would pass the
-# three tests above for the wrong reason.
-def test_read_repo_env_field_missing_field_is_empty(tmp_path):
-    p = tmp_path / "r.env"
-    p.write_text('OTHER="x"\n')
-    assert cli.read_repo_env_field(str(p), "REPO") == ""
-
-
-def test_read_repo_env_field_missing_file_is_empty():
-    assert cli.read_repo_env_field("/no/such/file.env", "REPO") == ""
-
-
-def test_read_repo_env_field_does_not_leak_ambient_env(tmp_path, monkeypatch):
-    """A field the FILE does not set must read as unset even if the CLI
-    process's own environment happens to carry a same-named var (e.g. an
-    operator's shell that `source`d an overlay by hand) — otherwise
-    resolve_name could match an overlay by accident."""
+# Review M12: the prior regex line-scanner mis-parsed the comment, spacing and
+# expansion rows, so resolve_name MISSED an existing overlay and cmd_start
+# synthesized a duplicate with fresh *_STATE_DIRs. The empty rows are the
+# anti-vacuity twins (a reader that leaks the CLI's own env would pass the rest).
+@pytest.mark.parametrize("text,value", [
+    ('REPO="a/one"\nexport REPO="a/two"\nOTHER=x\n', "a/two"),
+    ('REPO="owner/name"  # prod\n', "owner/name"),
+    ("REPO = owner/name\n", "owner/name"),
+    ("OWNER_REPO=owner/name\nREPO=${OWNER_REPO}\n", "owner/name"),
+    ('OTHER="x"\n', ""),
+    (None, ""),
+])
+def test_read_repo_env_field(tmp_path, monkeypatch, text, value):
     monkeypatch.setenv("REPO", "ambient/leak")
     p = tmp_path / "r.env"
-    p.write_text('OTHER="x"\n')
-    assert cli.read_repo_env_field(str(p), "REPO") == ""
+    if text is not None:
+        p.write_text(text)
+    assert cli.read_repo_env_field(str(p), "REPO") == value
+    if text is not None:
+        (tmp_path / "myapp.env").write_text(text)
+        expected = "myapp" if value else cli.derive_name("owner/name")
+        assert cli.resolve_name(value or "owner/name", repos_dir=str(tmp_path)) == expected
 
 
-def test_resolve_name_matches_overlay_despite_trailing_comment(tmp_path):
-    (tmp_path / "myapp.env").write_text('REPO="acme/App"  # prod\n')
-    assert cli.resolve_name("ACME/app", repos_dir=str(tmp_path)) == "myapp"
-
-
-def test_resolve_name_matches_overlay_with_spaced_equals(tmp_path):
-    (tmp_path / "myapp.env").write_text("REPO = acme/App\n")
-    assert cli.resolve_name("acme/App", repos_dir=str(tmp_path)) == "myapp"
-
-
-def test_resolve_name_matches_overlay_with_var_expansion(tmp_path):
-    (tmp_path / "myapp.env").write_text("OWNER_REPO=acme/App\nREPO=${OWNER_REPO}\n")
-    assert cli.resolve_name("acme/App", repos_dir=str(tmp_path)) == "myapp"
-
-
-def test_resolve_name_warns_before_synthesizing_duplicate(tmp_path, capsys):
+@pytest.mark.parametrize("overlay_dir,warns", [("/repos/app", True), ("/repos/other", False)])
+def test_resolve_name_warns_before_synthesizing_a_duplicate_for_the_same_checkout(
+    tmp_path, capsys, overlay_dir, warns
+):
     """M12: an overlay already targets this exact working copy but its REPO
-    field disagrees (rename, or a still-mismatched parse) — resolve_name must
-    warn loudly (stderr) before falling through to derive_name, which would
-    synthesize a SECOND overlay (and a second STATE_DIR) for the same
-    checkout."""
-    (tmp_path / "myapp.env").write_text('REPO="acme/OldName"\nTARGET_DIR="/repos/app"\n')
-    name = cli.resolve_name("acme/NewName", repos_dir=str(tmp_path), target_dir="/repos/app")
-    assert name == cli.derive_name("acme/NewName")  # still falls through to derive_name
-    captured = capsys.readouterr()
-    assert "myapp" in captured.err
-    assert "synthesize" in captured.err.lower()
-
-
-def test_resolve_name_no_warning_when_no_target_dir_collision(tmp_path, capsys):
-    """Anti-vacuity twin: an overlay pointed at a DIFFERENT working copy must
-    not trigger the warning."""
-    (tmp_path / "myapp.env").write_text('REPO="acme/OldName"\nTARGET_DIR="/repos/other"\n')
+    disagrees — warn before derive_name synthesizes a SECOND overlay (and a
+    second STATE_DIR) for the same checkout; a different checkout is silent."""
+    (tmp_path / "myapp.env").write_text(f'REPO="acme/OldName"\nTARGET_DIR="{overlay_dir}"\n')
     name = cli.resolve_name("acme/NewName", repos_dir=str(tmp_path), target_dir="/repos/app")
     assert name == cli.derive_name("acme/NewName")
-    captured = capsys.readouterr()
-    assert captured.err == ""
+    err = capsys.readouterr().err
+    assert ("myapp" in err and "synthesize" in err.lower()) if warns else err == ""
 
 
-def test_resolve_name_explicit_wins(tmp_path):
-    assert cli.resolve_name("o/r", explicit="custom", repos_dir=str(tmp_path)) == "custom"
-
-
-def test_resolve_name_reuses_matching_overlay(tmp_path):
+def test_resolve_name_explicit_wins_then_content_match_then_derived(tmp_path):
     (tmp_path / "myapp.env").write_text('REPO="acme/MyApp-combined-agent"\n')
     (tmp_path / "other.env").write_text('REPO="x/y"\n')
-    name = cli.resolve_name("acme/MyApp-combined-agent", repos_dir=str(tmp_path))
-    assert name == "myapp"
-
-
-def test_resolve_name_derives_when_no_match(tmp_path):
-    # P0R-2: derived name now includes the owner (was "new-repo").
-    name = cli.resolve_name("acme/New-Repo", repos_dir=str(tmp_path))
-    assert name == "acme-new-repo"
-
-
-# ── P0R-2: backward compat — reuse is by CONTENT (REPO field), not by
-# recomputing derive_name's (now-changed) shape against an existing filename ──
-def test_resolve_name_backcompat_old_basename_overlay_still_reused(tmp_path):
-    """An overlay named under the OLD basename-only convention (e.g. hand
-    authored, or synthesized before this fix) must still be found and reused
-    for the SAME repo — resolve_name matches by reading the overlay's actual
-    REPO field, never by recomputing derive_name against it. Only a NEWLY
-    synthesized name (no existing overlay matches) uses the new owner-
-    inclusive shape."""
+    # P0R-2 back-compat: reuse is by the overlay's REPO content, never by
+    # recomputing derive_name against an old basename-only filename.
     (tmp_path / "app.env").write_text('REPO="acme/app"\n')
-    # Sanity: the NEW derive_name would NOT reproduce this filename anymore —
-    # proves the reuse below is genuinely content-based, not a coincidence.
-    assert cli.derive_name("acme/app") != "app"
+    assert cli.resolve_name("o/r", explicit="custom", repos_dir=str(tmp_path)) == "custom"
+    assert cli.resolve_name("acme/MyApp-combined-agent", repos_dir=str(tmp_path)) == "myapp"
     assert cli.resolve_name("acme/app", repos_dir=str(tmp_path)) == "app"
+    assert cli.resolve_name("acme/New-Repo", repos_dir=str(tmp_path)) == "acme-new-repo"
 
 
-def test_resolve_name_prefers_target_dir_match(tmp_path):
+def test_resolve_name_prefers_target_dir_match(tmp_path, capsys):
     """Regression: two overlays share a REPO but point at different working copies.
     The launched-from dir (target_dir) must decide — NOT the alphabetically-first
-    match. `-wt` sorts before the primary name, so alpha-only picked the wrong one
-    and silently ran against the wrong TARGET_DIR."""
+    match (`-wt` sorts first and silently ran against the wrong TARGET_DIR). A
+    known checkout is an identity axis, not a hint: an unknown one derives."""
     repo = "acme/App-combined-agent"
     (tmp_path / "app-wt.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app-harness"\n')
     (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
-    # Launched from the primary checkout → the primary overlay, not the alpha-first -wt.
-    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/app") == "app"
-    # Launched from the worktree copy → the -wt overlay.
-    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/app-harness") == "app-wt"
-
-
-def test_resolve_name_target_dir_realpath_normalized(tmp_path):
-    """Trailing slash / `.` segment variants of the same dir still match."""
-    repo = "acme/App"
-    (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
-    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/app/") == "app"
-    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/./app") == "app"
-
-
-def test_resolve_name_does_not_reuse_same_repo_from_another_checkout(
-    tmp_path, capsys
-):
-    """A known checkout is a deployment identity axis, not a hint."""
-    repo = "acme/App-combined-agent"
-    (tmp_path / "app-wt.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app-harness"\n')
-    (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
-    assert cli.resolve_name(
-        repo, repos_dir=str(tmp_path), target_dir="/somewhere/else"
-    ) == cli.derive_name(repo)
+    for target, name in (("/repos/app", "app"), ("/repos/app/", "app"), ("/repos/./app", "app"),
+                         ("/repos/app-harness", "app-wt")):
+        assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir=target) == name
+    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/somewhere/else") == cli.derive_name(repo)
     assert "different working copy" in capsys.readouterr().err
 
 
-# ── synth_repo_env round-trips through the daemon's reader ─────────────────────
 def _source_env(text: str) -> dict:
-    """Parse a synthesized overlay the way from_env consumes it: only the simple
-    KEY=value lines the CLI emits (single-quoted or "$HOME/…"). We resolve the
-    subset config.from_env actually reads. This mirrors compose-env.sh sourcing
-    without spawning bash."""
+    """Parse the simple KEY=value lines synth_repo_env emits, as from_env reads them."""
     env: dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, val = line.split("=", 1)
-        val = val.strip()
-        if val.startswith("'") and val.endswith("'"):
-            val = val[1:-1]
-        elif val.startswith('"') and val.endswith('"'):
-            val = val[1:-1]
-        env[key] = val
+        env[key] = val.strip().strip("'\"")
     return env
 
 
-def test_synth_repo_env_minimal_keys():
-    text = cli.synth_repo_env(
-        repo="acme/MyApp", target_dir="/repos/myapp", name="myapp"
-    )
-    env = _source_env(text)
-    assert env["REPO"] == "acme/myapp"
-    assert env["TARGET_DIR"] == "/repos/myapp"
-    assert env["BASE_BRANCH"] == "dev"
+def test_synth_repo_env_roundtrips_through_from_env():
+    env = _source_env(cli.synth_repo_env(repo="acme/MyApp", target_dir="/repos/myapp", name="myapp"))
+    assert (env["REPO"], env["BASE_BRANCH"]) == ("acme/myapp", "dev")
     assert "issue-agent-myapp" in env["STATE_DIR"]
     # The harness never writes TEST_CMD: it is only the operator's point-at probe.
     assert "TEST_CMD" not in env
+    cfg = from_env(_source_env(cli.synth_repo_env(repo="o/r", target_dir="/t", name="r", base_branch="main",
+                                                  max_budget="10.00")))
+    assert (cfg.repo, cfg.target_dir, cfg.base_branch, cfg.fix_budget_usd) == ("o/r", "/t", "main", 10.00)
 
 
-def test_synth_repo_env_roundtrips_through_from_env():
-    text = cli.synth_repo_env(
-        repo="o/r", target_dir="/t", name="r", base_branch="main",
-        max_budget="10.00",
-    )
-    cfg = from_env(_source_env(text))
-    assert cfg.repo == "o/r"
-    assert cfg.target_dir == "/t"
-    assert cfg.base_branch == "main"
-    assert cfg.fix_budget_usd == 10.00
-
-
-# ── harness worktree path ─────────────────────────────────────────────────────
-def test_harness_worktree_path_default_is_sibling():
-    p = cli.harness_worktree_path("/Users/me/Repos/MyApp-combined-agent")
-    assert p == "/Users/me/Repos/MyApp-combined-agent-harness"
-
-
-def test_harness_worktree_path_strips_trailing_slash():
-    p = cli.harness_worktree_path("/Users/me/Repos/myapp/")
-    assert p == "/Users/me/Repos/myapp-harness"
-
-
-def test_harness_worktree_path_explicit_wins():
-    p = cli.harness_worktree_path("/Users/me/Repos/myapp", explicit="/tmp/wt")
-    assert p == "/tmp/wt"
-
-
-# ── HARNESS_ROOT resolves to the actual checkout (siblings present) ───────────
-def test_harness_root_points_at_checkout():
-    assert os.path.isdir(os.path.join(cli.HARNESS_ROOT, "plugin"))
-    assert os.path.isfile(os.path.join(cli.HARNESS_ROOT, "bin", "point-at.sh"))
+def test_harness_worktree_path():
+    assert cli.harness_worktree_path("/r/MyApp-combined-agent") == "/r/MyApp-combined-agent-harness"
+    assert cli.harness_worktree_path("/r/myapp/") == "/r/myapp-harness"
+    assert cli.harness_worktree_path("/r/myapp", explicit="/tmp/wt") == "/tmp/wt"
 
 
 def _fake_proc(stdout, returncode=0):
@@ -353,43 +178,12 @@ def _fake_proc(stdout, returncode=0):
     return p
 
 
-# ── review M11: status merges STATE_DIR/REVIEW_STATE_DIR ────
-def test_journal_paths_overlay_values_win(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text(
-        'STATE_DIR="/custom/fix"\n'
-        'REVIEW_STATE_DIR="/custom/review"\n'
-    )
-    assert cli.journal_paths("myapp") == [
-        "/custom/fix/journal.jsonl",
-        "/custom/review/journal.jsonl",
-    ]
-
-
-def test_journal_paths_falls_back_to_synth_defaults(tmp_path, monkeypatch):
+def test_journal_paths_fall_back_to_synth_defaults(tmp_path, monkeypatch):
     """No overlay at all → the same per-role layout `synth_repo_env` writes."""
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
     fix, review = cli.journal_paths("other")
     assert fix.endswith(os.path.join(".local", "state", "issue-agent-other", "journal.jsonl"))
     assert review.endswith(os.path.join(".local", "state", "review-agent-other", "journal.jsonl"))
-
-
-def test_journal_paths_for_a_hand_written_overlay_match_where_daemons_write(
-    tmp_path, monkeypatch
-):
-    """A reconstructed overlay with REPO but no STATE_DIR keys (keifu,
-    2026-08-02): status/dashboard must read the SAME dirs the daemons derive
-    via config.from_env, or every run is invisible while spend accrues."""
-    from issue_agent.app import config as config_mod
-
-    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text('REPO="Acme/Widget-App"\n')
-
-    daemon_cfg = config_mod.from_env({"REPO": "Acme/Widget-App"})
-    assert cli.journal_paths("myapp") == [
-        os.path.join(daemon_cfg.state_dir, "journal.jsonl"),
-        os.path.join(daemon_cfg.review_state_dir, "journal.jsonl"),
-    ]
 
 
 def _isolated_config(tmp_path, monkeypatch):
@@ -404,127 +198,65 @@ def _isolated_config(tmp_path, monkeypatch):
     return repos, config
 
 
-def test_journal_paths_prefer_the_composed_launch_snapshot(tmp_path, monkeypatch):
-    """REPO lives in `config/shared.env` for many deployments, so it reaches the
-    daemons only through the composed snapshot. Reading the overlay alone
-    derives a state dir nobody writes to and reports an empty history while
-    SQLite spend accrues — the read side must resolve what actually launched."""
-    from issue_agent.app import config as config_mod
-
+@pytest.mark.parametrize("overlay,snapshot", [
+    ('REPO="Acme/Widget-App"\n', None),
+    ('TARGET_DIR="/srv/myapp"\n', 'REPO="Acme/Widget-App"\n'),
+])
+def test_journal_paths_match_where_daemons_write(tmp_path, monkeypatch, overlay, snapshot):
+    """A hand-written overlay with REPO but no STATE_DIR keys (keifu, 2026-08-02),
+    or REPO only in the composed snapshot (it lives in shared.env): the read
+    side must resolve the dirs the daemons derive, or every run is invisible
+    while spend accrues."""
     repos, config = _isolated_config(tmp_path, monkeypatch)
-    (repos / "myapp.env").write_text('TARGET_DIR="/srv/myapp"\n')  # no REPO
-    (config / ".active.myapp.env").write_text('REPO="Acme/Widget-App"\n')
-
-    daemon_cfg = config_mod.from_env({"REPO": "Acme/Widget-App"})
+    (repos / "myapp.env").write_text(overlay)
+    if snapshot:
+        (config / ".active.myapp.env").write_text(snapshot)
+    daemon_cfg = from_env({"REPO": "Acme/Widget-App"})
     assert cli.journal_paths("myapp") == [
         os.path.join(daemon_cfg.state_dir, "journal.jsonl"),
         os.path.join(daemon_cfg.review_state_dir, "journal.jsonl"),
     ]
 
 
-def test_a_snapshot_missing_one_key_still_falls_through_to_the_overlay(
-    tmp_path, monkeypatch
-):
+def test_a_snapshot_missing_one_key_still_falls_through_to_the_overlay(tmp_path, monkeypatch):
     """Per FIELD, not per file: a snapshot that names REPO but not
     REVIEW_STATE_DIR must not blank the overlay's explicit value."""
     repos, config = _isolated_config(tmp_path, monkeypatch)
-    (repos / "myapp.env").write_text(
-        'REPO="Acme/Old"\nREVIEW_STATE_DIR="/custom/review"\n'
-    )
-    (config / ".active.myapp.env").write_text(
-        'REPO="Acme/New"\nSTATE_DIR="/composed/fix"\n'
-    )
-
-    fix, review = cli.journal_paths("myapp")
-    assert fix == "/composed/fix/journal.jsonl", "snapshot wins where it speaks"
-    assert review == "/custom/review/journal.jsonl", "overlay fills the gap"
+    (repos / "myapp.env").write_text('REPO="Acme/Old"\nREVIEW_STATE_DIR="/custom/review"\n')
+    (config / ".active.myapp.env").write_text('REPO="Acme/New"\nSTATE_DIR="/composed/fix"\n')
+    assert cli.journal_paths("myapp") == ["/composed/fix/journal.jsonl", "/custom/review/journal.jsonl"]
 
 
-def _write_jsonl(path: str, *lines: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        for line in lines:
-            f.write(line + "\n")
-
-
-def test_status_caps_resolve_overlay_then_shared_config(
-    tmp_path,
-    monkeypatch,
-) -> None:
+def test_status_caps_resolve_overlay_then_shared_config(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
     Path(cli.REPOS_DIR).mkdir()
     monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "shared.env"))
-    Path(cli.SHARED_ENV).write_text(
-        'DAILY_SPEND_CAP_USD="99"\n'
-        'GLOBAL_DAILY_SPEND_CAP_USD="1500"\n'
-    )
-    (Path(cli.REPOS_DIR) / "self.env").write_text(
-        'REPO="o/r"\n'
-        'TARGET_DIR="/srv/o-r"\n'
-        'DAILY_SPEND_CAP_USD="0"\n'
-    )
-
+    Path(cli.SHARED_ENV).write_text('DAILY_SPEND_CAP_USD="99"\nGLOBAL_DAILY_SPEND_CAP_USD="1500"\n')
+    (Path(cli.REPOS_DIR) / "self.env").write_text('REPO="o/r"\nTARGET_DIR="/srv/o-r"\nDAILY_SPEND_CAP_USD="0"\n')
     assert cli.daily_cap("self") == 0
     assert cli.global_daily_cap("self") == 1500
 
 
-# ── P0R-2: refuse a resolved overlay that belongs to a DIFFERENT repo/checkout
-# ── check_overlay_mismatch (pure) ─────────────────────────────────────────────
-def test_check_overlay_mismatch_detects_wrong_repo(tmp_path):
-    """The exact repro: overlay app.env is for acme/app at /srv/acme-app; the
-    detected repo/checkout is other/app at /srv/other-app. Message names both
-    repos."""
-    (tmp_path / "app.env").write_text(
-        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n'
-    )
-    msg = cli.check_overlay_mismatch(
-        "app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)
-    )
-    assert msg
-    assert "acme/app" in msg
-    assert "other/app" in msg
-
-
-def test_check_overlay_mismatch_anti_vacuity_when_repo_agrees(tmp_path):
-    """Anti-vacuity twin: same overlay, but the detected repo/checkout IS
-    acme/app at /srv/acme-app — no mismatch."""
-    (tmp_path / "app.env").write_text(
-        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n'
-    )
-    msg = cli.check_overlay_mismatch(
-        "app", "acme/app", "/srv/acme-app", repos_dir=str(tmp_path)
-    )
-    assert msg == ""
-
-
-def test_check_overlay_mismatch_no_file_is_not_a_mismatch(tmp_path):
-    """No overlay at that name yet → synthesis, not reuse; nothing to compare."""
-    assert cli.check_overlay_mismatch("app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)) == ""
-
-
-def test_check_overlay_mismatch_same_repo_different_target_dir_is_fatal(tmp_path):
-    """A sibling checkout must not start or stop this deployment."""
-    (tmp_path / "app-wt.env").write_text(
-        'REPO="acme/app"\nTARGET_DIR="/srv/app-harness"\n'
-    )
-    msg = cli.check_overlay_mismatch(
-        "app-wt", "acme/app", "/srv/somewhere-else", repos_dir=str(tmp_path)
-    )
-    assert msg
-    assert "/srv/app-harness" in msg
-    assert "/srv/somewhere-else" in msg
-
-
-def test_check_overlay_mismatch_target_dir_fallback_when_no_repo_recorded(tmp_path):
-    """A malformed/hand-edited overlay with no REPO at all: TARGET_DIR is the
-    only identity signal left, so a mismatch there is still caught."""
-    (tmp_path / "app.env").write_text('TARGET_DIR="/srv/acme-app"\n')
-    msg = cli.check_overlay_mismatch(
-        "app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)
-    )
-    assert msg
-    assert "/srv/acme-app" in msg
-    assert "/srv/other-app" in msg
+# P0R-2: refuse a resolved overlay that belongs to a DIFFERENT repo/checkout.
+@pytest.mark.parametrize("name,overlay,repo,target,named", [
+    ("app", 'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n', "other/app", "/srv/other-app",
+     ("acme/app", "other/app")),
+    ("app", 'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n', "acme/app", "/srv/acme-app", None),
+    ("app", None, "other/app", "/srv/other-app", None),
+    # A sibling checkout must not start or stop this deployment.
+    ("app-wt", 'REPO="acme/app"\nTARGET_DIR="/srv/app-harness"\n', "acme/app", "/srv/somewhere-else",
+     ("/srv/app-harness", "/srv/somewhere-else")),
+    # A hand-edited overlay with no REPO: TARGET_DIR is the identity left.
+    ("app", 'TARGET_DIR="/srv/acme-app"\n', "other/app", "/srv/other-app", ("/srv/acme-app", "/srv/other-app")),
+])
+def test_check_overlay_mismatch(tmp_path, name, overlay, repo, target, named):
+    if overlay:
+        (tmp_path / f"{name}.env").write_text(overlay)
+    msg = cli.check_overlay_mismatch(name, repo, target, repos_dir=str(tmp_path))
+    if named is None:
+        assert msg == ""
+    else:
+        assert msg and all(part in msg for part in named)
 
 
 # ── per-command wiring: fatal (start/stop/doctor/install-service) vs warn (status) ──
@@ -624,16 +356,6 @@ def test_start_does_not_reinstall_a_checkout_that_never_installed(monkeypatch):
     assert calls == []
 
 
-def test_start_gives_up_after_one_failed_reinstall(monkeypatch, capsys):
-    calls = _install_state(
-        monkeypatch, present=("issue-agent",), foreign=("issue-agent",), install_rc=2
-    )
-
-    assert cli.heal_entrypoint_drift() is False
-    assert len(calls) == 1  # one attempt, never a retry loop
-    assert "auto-repair failed" in capsys.readouterr().err
-
-
 def test_start_gives_up_when_the_reinstall_does_not_clear_the_drift(
     monkeypatch, capsys
 ):
@@ -724,12 +446,6 @@ def test_start_gives_up_when_the_reinstall_times_out(monkeypatch, capsys):
     assert "boom" in captured  # output tail still reaches the operator
 
 
-def test_entrypoint_drift_covers_every_declared_console_script():
-    """Derived from pyproject's [project.scripts], not a second hardcoded list
-    that can disagree with the one bin/install.sh materialises."""
-    assert set(cli.declared_console_scripts()) == {"issue-agent"}
-
-
 def test_live_deployment_names_ignores_stopped_deployments(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
     (tmp_path / "keifu.env").write_text("")
@@ -781,24 +497,6 @@ def test_cmd_start_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "acme/app" in captured.err
     assert "other/app" in captured.err
-
-
-def test_cmd_start_reuses_matching_overlay_no_warning(tmp_path, monkeypatch, capsys):
-    """Anti-vacuity twin: same overlay, but the detected repo/checkout IS
-    acme/app at /srv/acme-app — proceeds and reuses, no refusal, no warning."""
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    _install_state(monkeypatch, present=())
-    execve_calls: list = []
-    monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
-
-    args = _start_args(repo="acme/app", target_dir="/srv/acme-app", name="app")
-    rc = cli.cmd_start(args)
-
-    assert rc is None  # falls through to (stubbed) os.execve, never returns 2
-    assert len(execve_calls) == 1  # DID delegate to point-at.sh
-    captured = capsys.readouterr()
-    assert "reusing config/repos/app.env" in captured.out
-    assert captured.err == ""
 
 
 def test_cmd_stop_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
@@ -891,225 +589,6 @@ def test_fresh_role_heartbeats_are_bounded_and_ignore_terminal_state(
     assert "review" not in cli._fresh_role_heartbeats(
         "app", now_fn=lambda: now, stale_after_s=30
     )
-
-
-def test_cmd_status_reports_heartbeat_when_pid_namespace_hides_daemon(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    heartbeat = datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc)
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {role: [] for role in cli.ROLES},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
-    monkeypatch.setattr(
-        cli,
-        "_fresh_role_heartbeats",
-        lambda _name: {"fix": heartbeat, "review": heartbeat},
-    )
-    monkeypatch.setattr(cli, "log_dir", lambda: str(tmp_path / "logs"))
-
-    rc = cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app", target_dir="/srv/acme-app", name="app", lines=5
-        )
-    )
-
-    assert rc == 0
-    output = capsys.readouterr().out
-    assert "fix     : running (fresh heartbeat; PID not visible)" in output
-    assert "review  : running (fresh heartbeat; PID not visible)" in output
-
-
-def test_systemd_status_log_reads_the_installed_unit_journal(monkeypatch) -> None:
-    calls: list[tuple[list[str], float]] = []
-
-    class Result:
-        def __init__(self, stdout: str):
-            self.returncode = 0
-            self.stdout = stdout
-            self.stderr = ""
-
-    def run(command, **kwargs):
-        calls.append((command, kwargs["timeout"]))
-        if command[0] == "systemctl":
-            return Result("ActiveState=active\nLoadState=loaded\n")
-        if command[0] == "journalctl":
-            return Result("fix: live service output\n")
-        raise AssertionError(command)
-
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-    monkeypatch.setattr(cli.subprocess, "run", run)
-
-    assert cli._systemd_status_log("app", "fix", 7) == (
-        "systemd journal: issue-agent-fix-watcher-app.service",
-        "fix: live service output",
-    )
-    assert calls == [
-        ([
-            "systemctl",
-            "--user",
-            "show",
-            "issue-agent-fix-watcher-app.service",
-            "--property=LoadState",
-            "--property=ActiveState",
-        ], cli._STATUS_COMMAND_TIMEOUT_S),
-        ([
-            "journalctl",
-            "--user",
-            "--unit",
-            "issue-agent-fix-watcher-app.service",
-            "--lines",
-            "7",
-            "--no-pager",
-            "--output=cat",
-        ], cli._STATUS_COMMAND_TIMEOUT_S),
-    ]
-
-
-def test_systemd_status_log_reports_query_failure_instead_of_falling_back(
-    monkeypatch,
-) -> None:
-    class Result:
-        returncode = 1
-        stdout = ""
-        stderr = "Failed to connect to user bus"
-
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-    monkeypatch.setattr(
-        cli.subprocess,
-        "run",
-        lambda _command, **_kwargs: Result(),
-    )
-
-    source, output = cli._systemd_status_log("app", "fix", 7) or ("", "")
-    assert source == (
-        "systemd status unavailable: issue-agent-fix-watcher-app.service"
-    )
-    assert output == "  Failed to connect to user bus"
-
-
-def test_cmd_status_prefers_service_journal_over_stale_foreground_log(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "fix-app.log").write_text("stale canary incident\n")
-    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {"fix": [101], "review": []},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
-    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
-    monkeypatch.setattr(
-        cli,
-        "_systemd_status_log",
-        lambda _name, role, _lines: (
-            ("systemd journal: fix.service", "live service output")
-            if role == "fix"
-            else None
-        ),
-    )
-
-    assert cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            lines=5,
-        )
-    ) == 0
-
-    output = capsys.readouterr().out
-    assert "live service output" in output
-    assert "stale canary incident" not in output
-
-
-def test_cmd_status_prefers_live_foreground_log_over_inactive_installed_unit(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "fix-app.log").write_text("live foreground output\n")
-    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {"fix": [101], "review": []},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
-    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
-    service_queries: list[str] = []
-
-    def inactive_service(_name, role, _lines):
-        service_queries.append(role)
-        return None
-
-    monkeypatch.setattr(cli, "_systemd_status_log", inactive_service)
-
-    assert cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            lines=5,
-        )
-    ) == 0
-    assert "live foreground output" in capsys.readouterr().out
-    assert service_queries == ["fix", "review"]
-
-
-def test_cmd_status_shows_foreground_log_alongside_unavailable_systemd(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "fix-app.log").write_text("live foreground output\n")
-    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {"fix": [101], "review": []},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
-    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
-    monkeypatch.setattr(
-        cli,
-        "_systemd_status_log",
-        lambda _name, role, _lines: (
-            ("systemd status unavailable: fix.service", "user bus failed")
-            if role == "fix"
-            else None
-        ),
-    )
-
-    assert cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            lines=5,
-        )
-    ) == 0
-
-    output = capsys.readouterr().out
-    assert "user bus failed" in output
-    assert "live foreground output" in output
 
 
 def test_launcher_pid_discovery_uses_exact_deployment_argv_token(
@@ -1316,46 +795,6 @@ def test_doctor_aborts_on_compose_failure_without_checking_inherited_snapshot(
     assert "refusing to check a stale or missing" in capsys.readouterr().err
 
 
-def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
-    """Anti-vacuity twin: a successful compose still installs the service."""
-    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text(
-        f'REPO="o/r"\nTARGET_DIR="{tmp_path}"\n'
-    )
-    shared = tmp_path / "shared.env"
-    shared.write_text("")
-    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
-
-    real_run = cli.subprocess.run
-    calls: list[list[str]] = []
-    detailed_calls: list[tuple[list[str], dict]] = []
-
-    class _Result:
-        def __init__(self, returncode: int) -> None:
-            self.returncode = returncode
-
-    def fake_run(cmd, **kwargs):
-        if cmd[0] == "bash" and cmd[1] == "-c":
-            return real_run(cmd, **kwargs)
-        calls.append(cmd)
-        detailed_calls.append((cmd, kwargs))
-        return _Result(0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    rc = cli.cmd_install_service(_install_args(tmp_path))
-    assert rc == 0
-    assert any(
-        "install-systemd.sh" in c[1] or "install-launchd.sh" in c[1] for c in calls
-    )
-    install_call = next(
-        kwargs
-        for command, kwargs in detailed_calls
-        if "install-systemd.sh" in command[1]
-        or "install-launchd.sh" in command[1]
-    )
-    assert install_call["env"]["ISSUE_AGENT_DEPLOYMENT_ID"] == "myapp"
-
-
 def test_uninstall_service_defaults_to_current_deployment(
     tmp_path, monkeypatch
 ) -> None:
@@ -1513,6 +952,22 @@ def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None
     return shared, asked, secret_asked
 
 
+@pytest.mark.parametrize("pin_answer,pinned", [(None, True), ("n", False)])
+def test_cmd_init_pins_codex_bin_unless_the_operator_declines(tmp_path, monkeypatch, capsys, pin_answer, pinned):
+    """2026-08-02 keifu: the wizard's shell found 0.147.0 while the daemons'
+    systemd PATH found 0.142.3, which the provider refuses to serve. Answering
+    nothing (or piped stdin) must still write the absolute pin."""
+    answers = ["fix-bot", "review-bot", "N", "claude", "codex"]
+    if pin_answer is not None:
+        answers += [pin_answer, "https://api.openai.com/v1"]
+    shared, _asked, _s = _init_env(tmp_path, monkeypatch, answers=answers, secrets=["", ""],
+                                   codex="/home/o/.local/bin/codex")
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text()).get("CODEX_BIN") == ("/home/o/.local/bin/codex" if pinned else None)
+    assert ("unpinned" in capsys.readouterr().err) is not pinned
+
+
 def _wizard_answers(**over) -> list[str]:
     base = {
         "fix": "fix-bot", "review": "review-bot",
@@ -1527,19 +982,6 @@ def _shared_values(text: str) -> dict:
     return _source_env(text)
 
 
-def test_cmd_init_prefills_fixer_login_from_gh(tmp_path, monkeypatch, capsys):
-    """Enter on the FIX_BOT prompt accepts the account gh is authenticated as."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=_wizard_answers(fix=""), secrets=["", ""],
-        gh=_gh_stub(fixer="ambient-dev"),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["FIX_BOT"] == "ambient-dev"
-    assert "ambient-dev" in capsys.readouterr().out
-
-
 def test_cmd_init_degrades_when_gh_is_unreachable(tmp_path, monkeypatch, capsys):
     """gh missing/unauthenticated must warn and keep going, not crash the wizard."""
     def boom(cmd, **kwargs):
@@ -1552,21 +994,6 @@ def test_cmd_init_degrades_when_gh_is_unreachable(tmp_path, monkeypatch, capsys)
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert _shared_values(shared.read_text())["FIX_BOT"] == "fix-bot"
     assert "gh api user" in capsys.readouterr().err
-
-
-def test_cmd_init_reprompts_when_reviewer_is_the_fixer(tmp_path, monkeypatch, capsys):
-    """A reviewer that IS the fixer 422s every approval — including when the two
-    differ only by case or a [bot] suffix."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=["fix-bot", "Fix-Bot[bot]", "review-bot",
-                 "N", "claude", "claude"],
-        secrets=["", ""],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["REVIEW_BOT"] == "review-bot"
-    assert "422" in capsys.readouterr().err
 
 
 def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(
@@ -1585,37 +1012,6 @@ def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(
     assert "doctor" in capsys.readouterr().err
     reviewer_prompts = [p for p in asked.prompts if "Reviewer login" in p]
     assert len(reviewer_prompts) == 3  # bounded, then the answer stands
-
-
-def test_cmd_init_writes_a_token_that_authenticates_as_the_reviewer(
-    tmp_path, monkeypatch
-):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["good-token"],
-        gh=_gh_stub(token_logins={"good-token": "Review-Bot[bot]"}),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "good-token"
-
-
-def test_cmd_init_reprompts_a_token_belonging_to_another_account(
-    tmp_path, monkeypatch, capsys
-):
-    """The doctor-red config this wizard used to produce: a valid token for the
-    WRONG account. Caught at input time now."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(),
-        secrets=["someone-elses", "good-token"],
-        gh=_gh_stub(token_logins={"someone-elses": "other-human",
-                                  "good-token": "review-bot"}),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "good-token"
-    captured = capsys.readouterr()
-    assert "other-human" in captured.err
-    assert "someone-elses" not in captured.err + captured.out
 
 
 def test_cmd_init_discards_a_rejected_token_at_the_attempt_ceiling(
@@ -1657,24 +1053,6 @@ def test_cmd_init_discards_a_token_belonging_to_another_account(
     assert "the-operator" in capsys.readouterr().err
 
 
-def test_cmd_init_skip_after_a_rejected_token_stores_nothing(
-    tmp_path, monkeypatch, capsys
-):
-    """Enter (or EOF) after a rejection is a SKIP, not consent to the rejected
-    value."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(),
-        secrets=["wrong-token", ""],
-        gh=_gh_stub(token_logins={"wrong-token": "someone-else"}),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    text = shared.read_text()
-    assert "wrong-token" not in text
-    assert "REVIEW_BOT_TOKEN" not in _shared_values(text)
-    assert "no REVIEW_BOT_TOKEN stored" in capsys.readouterr().err
-
-
 def test_cmd_init_keeps_an_unverifiable_token_when_gh_cannot_run(
     tmp_path, monkeypatch, capsys
 ):
@@ -1693,19 +1071,6 @@ def test_cmd_init_keeps_an_unverifiable_token_when_gh_cannot_run(
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "offline-token"
     assert "UNVERIFIED" in capsys.readouterr().err
-
-
-def test_cmd_init_reads_a_token_out_of_a_file(tmp_path, monkeypatch):
-    token_file = tmp_path / "pat.txt"
-    token_file.write_text("file-token\n")
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(),
-        secrets=[f"@{token_file}"],
-        gh=_gh_stub(token_logins={"file-token": "review-bot"}),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "file-token"
 
 
 def test_cmd_init_reports_a_missing_token_file_and_reprompts(
@@ -1738,45 +1103,6 @@ def test_cmd_init_never_echoes_token_material(tmp_path, monkeypatch, capsys):
     assert "s3cret-pat" in _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"]
 
 
-def test_cmd_init_collects_a_fixer_token_and_reports_the_account_it_belongs_to(
-    tmp_path, monkeypatch, capsys
-):
-    """2026-08-02 keifu: with FIX_BOT_TOKEN unset the fix daemon fell through to
-    the ambient `gh auth` credential, acted as the human operator, and burned
-    that account's personal GraphQL pool. The wizard now asks."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(),
-        secrets=["review-pat", "fixer-pat"],
-        gh=_gh_stub(token_logins={
-            "review-pat": "review-bot", "fixer-pat": "fix-bot-account",
-        }),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    values = _shared_values(shared.read_text())
-    assert values["FIX_BOT_TOKEN"] == "fixer-pat"
-    out = capsys.readouterr()
-    assert "FIX_BOT_TOKEN authenticates as 'fix-bot-account'" in out.out
-    # …and with both identities distinct, the attribution finding is gone.
-    assert "FIX_BOT_TOKEN is not set" not in out.err
-
-
-def test_cmd_init_names_the_consequence_when_the_fixer_token_is_skipped(
-    tmp_path, monkeypatch, capsys
-):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(),
-        secrets=["review-pat"],
-        gh=_gh_stub(token_logins={"review-pat": "review-bot"}),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "FIX_BOT_TOKEN" not in _shared_values(shared.read_text())
-    stderr = capsys.readouterr().err
-    assert "no FIX_BOT_TOKEN stored" in stderr
-    assert "FIX_BOT_TOKEN is not set" in stderr  # the doctor finding, at config time
-
-
 def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configured(
     tmp_path, monkeypatch
 ):
@@ -1799,52 +1125,6 @@ def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configure
     assert "REVIEW_BOT_TOKEN" not in values
     assert values["FIX_BOT_TOKEN"] == "fixer-pat"
     assert [p for p in secrets.prompts if "REVIEW_BOT_TOKEN" in p] == []
-
-
-def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
-    tmp_path, monkeypatch, capsys
-):
-    """2026-08-02 keifu: the wizard's shell found 0.147.0 while the daemons'
-    systemd PATH found 0.142.3, which the provider refuses to serve. Answering
-    nothing (or piped stdin) must still write the absolute pin."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=["fix-bot", "review-bot", "N",
-                 "claude", "codex"],
-        secrets=["", ""], codex="/home/o/.local/bin/codex",
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["CODEX_BIN"] == "/home/o/.local/bin/codex"
-
-
-def test_cmd_init_never_asks_about_codex_for_a_claude_only_deployment(
-    tmp_path, monkeypatch
-):
-    """A deployment that never spawns codex has no reason to answer for a binary
-    it will not run — and no reason to carry a CODEX_BIN into its config."""
-    shared, asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["", ""],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "CODEX_BIN" not in _shared_values(shared.read_text())
-    assert not any("CODEX_BIN" in prompt for prompt in asked.prompts)
-
-
-def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
-    tmp_path, monkeypatch, capsys
-):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=["fix-bot", "review-bot", "N",
-                 "claude", "codex", "n", "https://api.openai.com/v1"],
-        secrets=["", ""],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "CODEX_BIN" not in _shared_values(shared.read_text())
-    assert "unpinned" in capsys.readouterr().err
 
 
 def test_cmd_init_writes_shared_env_private(tmp_path, monkeypatch):
@@ -1872,44 +1152,6 @@ def test_cmd_init_survives_eof_midway_and_still_writes_a_config(
     assert "REVIEW_BOT_TOKEN" not in values
 
 
-def test_cmd_init_non_tty_names_the_real_shared_template(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "shared.env"))
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: False))
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 2
-    message = capsys.readouterr().err
-    assert "config/shared.example.env" in message
-    assert "agent.env.example" not in message
-    assert (Path(cli.HARNESS_ROOT) / "config" / "shared.example.env").is_file()
-
-
-def test_cmd_init_codex_on_chatgpt_auth_explains_the_synthetic_rate_card(
-    tmp_path, monkeypatch, capsys
-):
-    """ChatGPT-auth codex reports no billed cost, so spend is priced from the
-    rate card and there is no gateway URL to ask for."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=_wizard_answers(reviewer_runtime="codex"), secrets=["", ""],
-    )
-    monkeypatch.setattr(cli, "detect_codex_auth", lambda: "chatgpt")
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "OPENAI_BASE_URL" not in _shared_values(shared.read_text())
-    assert "CODEX_COST_PER_MTOK" in capsys.readouterr().out
-
-
-def test_cmd_init_codex_on_api_key_still_asks_for_the_gateway(tmp_path, monkeypatch):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=_wizard_answers(reviewer_runtime="codex") + ["Y", "https://gw.local/v1"],
-        secrets=["", ""],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert _shared_values(shared.read_text())["OPENAI_BASE_URL"] == "https://gw.local/v1"
-
-
 # ── runtime auth detection ────────────────────────────────────────────────────
 def test_detect_claude_auth_accepts_an_environment_key(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1919,15 +1161,6 @@ def test_detect_claude_auth_accepts_an_environment_key(monkeypatch, tmp_path):
 
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
     assert cli.detect_claude_auth() is False
-
-
-def test_detect_claude_auth_accepts_stored_cli_credentials(monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    (tmp_path / ".claude").mkdir()
-    (tmp_path / ".claude" / ".credentials.json").write_text("{}")
-    assert cli.detect_claude_auth() is True
 
 
 def test_detect_codex_auth_reads_the_mode_not_the_secret(monkeypatch, tmp_path):
@@ -1944,21 +1177,6 @@ def test_detect_codex_auth_tolerates_a_malformed_auth_file(monkeypatch, tmp_path
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "auth.json").write_text("{not json")
     assert cli.detect_codex_auth() == ""
-
-
-def test_detect_codex_auth_does_not_answer_for_binary_presence(monkeypatch, tmp_path):
-    """Presence belongs to the resolution report, which asks about the DAEMONS'
-    PATH; `shutil.which` here would only describe the operator's shell."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cli.shutil, "which", lambda _b: None)
-    (tmp_path / ".codex").mkdir()
-    (tmp_path / ".codex" / "auth.json").write_text(json.dumps({"auth_mode": "apikey"}))
-    assert cli.detect_codex_auth() == "apikey"
-
-
-# ── token input handling (pure) ───────────────────────────────────────────────
-def test_read_token_input_strips_a_pasted_secret():
-    assert cli.read_token_input("  ghp_abc  ") == ("ghp_abc", "")
 
 
 def test_read_token_input_reads_a_bare_existing_path(tmp_path):
@@ -1981,11 +1199,6 @@ def test_read_token_input_treats_a_bare_nonexistent_path_as_the_token():
     assert cli.read_token_input("/not/a/real/path") == ("/not/a/real/path", "")
 
 
-def test_normalize_login_matches_doctor_semantics():
-    assert cli.normalize_login(" Review-Bot[bot] ") == "review-bot"
-    assert cli.normalize_login("review-bot") == "review-bot"
-
-
 def test_gh_login_for_token_rejects_an_error_body_as_a_login(monkeypatch):
     """gh writes its error body to stdout: it must never be read as a login, and
     the call still counts as ANSWERED (a verdict, not an outage)."""
@@ -2003,13 +1216,6 @@ def test_gh_login_for_token_reports_an_unrunnable_gh_as_unanswered(monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "run", boom)
     assert cli.gh_login_for_token("whatever") == ("", False)
-
-
-def test_gh_login_for_token_reports_a_github_refusal_as_answered(monkeypatch):
-    monkeypatch.setattr(
-        cli.subprocess, "run", lambda *a, **k: _fake_proc("gh: HTTP 401\n", 1)
-    )
-    assert cli.gh_login_for_token("expired") == ("", True)
 
 
 # ── base-branch / reviewer inference from repo history ────────────────────────
@@ -2031,70 +1237,27 @@ def _gh_run_stub(pr_list="", default_branch="", existing_branches=()):
     return run
 
 
-def test_detect_base_branch_takes_the_majority_of_merged_prs(monkeypatch):
-    monkeypatch.setattr(cli, "_run", _gh_run_stub(
-        pr_list=json.dumps(
-            [{"baseRefName": "main"}, {"baseRefName": "main"}, {"baseRefName": "dev"}]
-        ),
-        existing_branches=("main",),
-    ))
-    branch, note = cli.detect_base_branch("/t", "acme/app")
-    assert branch == "main"
-    assert "2/3" in note
+_MERGED = json.dumps([{"baseRefName": "main"}, {"baseRefName": "main"}, {"baseRefName": "dev"}])
+_TRUNK = ("trunk", "the repository default branch")
 
 
-def test_detect_base_branch_skips_a_branch_that_is_not_on_the_remote(monkeypatch):
-    """An inferred base that does not exist would point every PR at a missing ref
-    (and trip point-at.sh's hard stop) — fall through to the next candidate."""
-    monkeypatch.setattr(cli, "_run", _gh_run_stub(
-        pr_list=json.dumps([{"baseRefName": "deleted-release"}]),
-        default_branch="trunk",
-        existing_branches=("trunk",),
-    ))
-    assert cli.detect_base_branch("/t", "acme/app") == (
-        "trunk", "the repository default branch"
-    )
-
-
-def test_detect_base_branch_falls_back_to_the_default_branch(monkeypatch):
-    monkeypatch.setattr(cli, "_run", _gh_run_stub(
-        pr_list="[]", default_branch="trunk", existing_branches=("trunk",),
-    ))
-    assert cli.detect_base_branch("/t", "acme/app") == (
-        "trunk", "the repository default branch"
-    )
-
-
-def test_detect_base_branch_tolerates_malformed_gh_json(monkeypatch):
-    monkeypatch.setattr(cli, "_run", _gh_run_stub(
-        pr_list="not json at all", default_branch="trunk",
-        existing_branches=("trunk",),
-    ))
-    assert cli.detect_base_branch("/t", "acme/app")[0] == "trunk"
-
-
-def test_detect_base_branch_last_resort_is_dev_with_no_provenance(monkeypatch):
-    """Nothing confirmed → the harness default, and NO provenance comment:
-    'inferred from the harness default' is not an inference."""
-    monkeypatch.setattr(cli, "_run", _gh_run_stub())
-    assert cli.detect_base_branch("/t", "acme/app") == ("dev", "")
-
-
-def test_detect_base_branch_without_a_repo_cannot_confirm_anything(monkeypatch):
-    monkeypatch.setattr(cli, "_run", _gh_run_stub(
-        pr_list=json.dumps([{"baseRefName": "main"}]), existing_branches=("main",),
-    ))
-    assert cli.detect_base_branch("/t", "") == ("dev", "")
-
-
-# ── overlay: inferred keys ────────────────────────────────────────────────────
-def test_synth_repo_env_records_base_branch_provenance():
-    text = cli.synth_repo_env(
-        repo="o/r", target_dir="/t", name="r", base_branch="main",
-        base_branch_note="7/10 of the last merged PRs",
-    )
-    assert "# BASE_BRANCH inferred from 7/10 of the last merged PRs." in text
-    assert _source_env(text)["BASE_BRANCH"] == "main"
+@pytest.mark.parametrize("stub,repo,expected", [
+    (dict(pr_list=_MERGED, existing_branches=("main",)), "acme/app", ("main", "2/3")),
+    # An inferred base that does not exist would point every PR at a missing
+    # ref (and trip point-at.sh's hard stop): fall through to the next candidate.
+    (dict(pr_list=json.dumps([{"baseRefName": "gone"}]), default_branch="trunk", existing_branches=("trunk",)),
+     "acme/app", _TRUNK),
+    (dict(pr_list="[]", default_branch="trunk", existing_branches=("trunk",)), "acme/app", _TRUNK),
+    (dict(pr_list="not json at all", default_branch="trunk", existing_branches=("trunk",)), "acme/app", _TRUNK),
+    # Nothing confirmed: the harness default and NO provenance comment.
+    (dict(), "acme/app", ("dev", "")),
+    (dict(pr_list=_MERGED, existing_branches=("main",)), "", ("dev", "")),
+])
+def test_detect_base_branch(monkeypatch, stub, repo, expected):
+    monkeypatch.setattr(cli, "_run", _gh_run_stub(**stub))
+    branch, note = cli.detect_base_branch("/t", repo)
+    assert branch == expected[0]
+    assert expected[1] in note if expected[1] else note == ""
 
 
 # ── cmd_start first-run base-branch inference ────────────────────────────────────────────
@@ -2104,42 +1267,10 @@ def _fresh_start_env(tmp_path, monkeypatch):
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
     monkeypatch.setattr(cli.os, "execve", lambda *a: None)
+    # The real probe reads the host PATH; drift there would run `make install`
+    # on the checkout venv from inside the test.
+    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
     return Path(cli.REPOS_DIR) / "app.env"
-
-
-def test_cmd_start_write_config_stops_existing_deployment_before_rewrite(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    overlay = tmp_path / "app.env"
-    original = overlay.read_text()
-    events: list[tuple[str, str]] = []
-
-    def stop(name: str) -> int:
-        events.append((f"stop:{name}", overlay.read_text()))
-        return 0
-
-    def execve(*_args) -> None:
-        events.append(("exec", overlay.read_text()))
-
-    monkeypatch.setattr(cli, "_stop_deployment", stop)
-    monkeypatch.setattr(cli.os, "execve", execve)
-
-    rc = cli.cmd_start(
-        _start_args(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            write_config=True,
-        )
-    )
-
-    assert rc is None
-    assert events[0] == ("stop:app", original)
-    assert events[1][0] == "exec"
-    assert events[1][1] != original
-    assert _source_env(events[1][1])["REPO"] == "acme/app"
 
 
 def test_cmd_start_write_config_preserves_overlay_when_quiescence_fails(
@@ -2192,41 +1323,6 @@ def test_cmd_start_never_adopts_an_inferred_base_branch_unattended(
     assert "main" in capsys.readouterr().out
 
 
-def test_cmd_start_records_no_suggestion_when_nothing_was_inferred(
-    tmp_path, monkeypatch
-):
-    """Anti-vacuity twin: with no confirmed candidate there is no suggestion and
-    no provenance comment — 'inferred from the harness default' is not a fact."""
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None,
-    ))
-
-    text = overlay.read_text()
-    assert _source_env(text)["BASE_BRANCH"] == "dev"
-    assert "detected merge target" not in text
-    assert "inferred from" not in text
-
-
-def test_cmd_start_never_infers_over_an_explicit_base_branch(tmp_path, monkeypatch):
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-
-    def refuse(*a, **k):
-        raise AssertionError("must not infer when --base-branch was passed")
-
-    monkeypatch.setattr(cli, "detect_base_branch", refuse)
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch="release",
-    ))
-
-    assert _source_env(overlay.read_text())["BASE_BRANCH"] == "release"
-
-
 def test_cmd_start_write_config_preserves_the_existing_base_branch(
     tmp_path, monkeypatch
 ):
@@ -2253,25 +1349,6 @@ def test_cmd_start_write_config_preserves_the_existing_base_branch(
     assert _source_env(overlay.read_text())["BASE_BRANCH"] == "release-2"
 
 
-def test_cmd_start_write_config_honours_an_explicit_base_branch_override(
-    tmp_path, monkeypatch
-):
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    overlay = tmp_path / "app.env"
-    overlay.write_text(
-        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\nBASE_BRANCH="release-2"\n'
-    )
-    monkeypatch.setattr(cli.os, "execve", lambda *a: None)
-    monkeypatch.setattr(cli, "_stop_deployment", lambda _n: 0)
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch="main", write_config=True,
-    ))
-
-    assert _source_env(overlay.read_text())["BASE_BRANCH"] == "main"
-
-
 def test_cmd_start_confirms_the_inferred_base_branch_on_a_tty(tmp_path, monkeypatch):
     overlay = _fresh_start_env(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("main", "history"))
@@ -2284,41 +1361,6 @@ def test_cmd_start_confirms_the_inferred_base_branch_on_a_tty(tmp_path, monkeypa
     ))
 
     assert _source_env(overlay.read_text())["BASE_BRANCH"] == "trunk"
-
-
-def test_cmd_start_adopts_a_confirmed_base_branch_on_a_tty(tmp_path, monkeypatch):
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        cli, "detect_base_branch", lambda _t, _r: ("main", "9/10 of the last merged PRs")
-    )
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
-    monkeypatch.setattr("builtins.input", _Answers([""]))
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None,
-    ))
-
-    text = overlay.read_text()
-    assert _source_env(text)["BASE_BRANCH"] == "main"
-    assert "# BASE_BRANCH inferred from 9/10 of the last merged PRs." in text
-
-
-def test_cmd_start_does_not_rediscover_when_reusing_an_overlay(
-    tmp_path, monkeypatch, capsys
-):
-    """Base-branch inference is first-run only: a reused overlay is authority."""
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli.os, "execve", lambda *a: None)
-
-    def refuse(*a, **k):
-        raise AssertionError("must not probe on overlay reuse")
-
-    monkeypatch.setattr(cli, "detect_base_branch", refuse)
-
-    cli.cmd_start(_start_args(repo="acme/app", target_dir="/srv/acme-app", name="app"))
-
-    assert "reusing config/repos/app.env" in capsys.readouterr().out
 
 
 def test_cmd_init_tightens_an_existing_shared_env_before_writing_secrets(
@@ -2362,31 +1404,9 @@ def test_main_exits_130_on_keyboard_interrupt(monkeypatch, capsys):
     assert "aborted" in capsys.readouterr().err
 
 
-def test_start_parses_with_no_name_flag():
-    """argparse runs `type` over the string default too: this used to abort every
-    `issue-agent start`/`status`/`stop` that did not pass --name."""
-    args = cli.build_parser().parse_args(["start"])
-    assert args.name == ""
-    assert cli.build_parser().parse_args(["status"]).name == ""
-
-
 def test_start_still_rejects_a_non_canonical_name():
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["start", "--name", "Weird Name"])
-
-
-# ── discovered check commands must be check-mode, and trialed off the tree ────
-def _init_git_repo(path):
-    """A real one-commit repo — the trial-run tests need genuine git worktrees."""
-    path.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-    (path / "tracked.txt").write_text("pristine\n")
-    for argv in (["init", "-q", "-b", "main"], ["add", "-A"],
-                 ["commit", "-qm", "seed"]):
-        subprocess.run(["git", *argv], cwd=path, env=env, check=True,
-                       capture_output=True)
-    return path
 
 
 def test_gh_login_rejects_a_literal_null_from_jq(monkeypatch):

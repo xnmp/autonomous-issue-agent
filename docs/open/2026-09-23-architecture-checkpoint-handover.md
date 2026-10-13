@@ -27,7 +27,7 @@ Read `CLAUDE.md` first. The [phase plan](2026-09-14-architecture-implementation.
 defines acceptance; [the September 14 handover](2026-09-14-phase-3-integration-handover.md)
 contains the full dirty-tree inventory and prior verification. This document
 supersedes that handover's operational status, not its implementation inventory.
-Authority design remains [proposed ADR 0015](../adr/0015-generation-fenced-gate-rearm.md).
+Authority design remains [proposed ADR 0015](../archive/adr/0015-generation-fenced-gate-rearm.md).
 
 ## Fresh verification
 

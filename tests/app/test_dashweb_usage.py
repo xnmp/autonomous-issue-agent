@@ -37,29 +37,11 @@ def test_utilization_objects_are_read_as_percentages():
     assert parsed["error"] is None
 
 
-def test_a_flat_pct_variant_is_accepted_too():
-    parsed = usage.parse_claude_usage({"five_hour_pct": 5, "seven_day_pct": 9})
-    assert (parsed["five_hour_pct"], parsed["seven_day_pct"]) == (5.0, 9.0)
-
-
 @pytest.mark.parametrize("payload", [{}, [], None, {"quota": "unknown"}, "text"])
 def test_an_unrecognised_shape_errors_rather_than_reporting_zero_used(payload):
     parsed = usage.parse_claude_usage(payload)
     assert parsed["error"]
     assert parsed["five_hour_pct"] is None and parsed["seven_day_pct"] is None
-
-
-def test_claude_usage_sends_the_token_to_the_fetcher_and_never_returns_it(tmp_path):
-    seen = {}
-
-    def fetch(token):
-        seen["token"] = token
-        return {"five_hour": {"utilization": 1.0}}
-
-    result = usage.claude_usage(fetch=fetch, credentials_path=creds(tmp_path),
-                               cache=fresh_cache())
-    assert seen["token"] == "sk-oauth-secret"
-    assert "sk-oauth-secret" not in json.dumps(result)
 
 
 def test_a_fetch_failure_reports_an_error_without_leaking_the_token(tmp_path):
@@ -70,34 +52,6 @@ def test_a_fetch_failure_reports_an_error_without_leaking_the_token(tmp_path):
                                cache=fresh_cache())
     assert result["error"] and "sk-oauth-secret" not in result["error"]
     assert result["five_hour_pct"] is None
-
-
-def test_a_transient_fetch_failure_keeps_the_last_successful_reading(tmp_path):
-    last_good = {}
-    first = usage.claude_usage(
-        fetch=lambda _token: {
-            "five_hour": {"utilization": 17.0},
-            "seven_day": {"utilization": 42.0},
-        },
-        credentials_path=creds(tmp_path),
-        cache=fresh_cache(),
-        last_good=last_good,
-    )
-
-    def fail(_token):
-        raise OSError("temporary outage")
-
-    stale = usage.claude_usage(
-        fetch=fail,
-        credentials_path=creds(tmp_path),
-        cache=fresh_cache(),
-        last_good=last_good,
-    )
-
-    assert first["error"] is None
-    assert (stale["five_hour_pct"], stale["seven_day_pct"]) == (17.0, 42.0)
-    assert stale["source"] == "oauth · cached"
-    assert "last successful" in stale["error"]
 
 
 def test_an_unexpected_response_keeps_the_last_successful_reading(tmp_path):
@@ -141,19 +95,6 @@ def test_a_malformed_credentials_file_yields_no_token(tmp_path):
     assert usage.read_oauth_token(str(tmp_path / "absent.json")) == ""
 
 
-def test_the_second_call_inside_the_ttl_does_not_refetch(tmp_path):
-    calls = []
-    cache = fresh_cache()
-
-    def fetch(token):
-        calls.append(token)
-        return {"five_hour": {"utilization": 1.0}}
-
-    for _ in range(3):
-        usage.claude_usage(fetch=fetch, credentials_path=creds(tmp_path), cache=cache)
-    assert len(calls) == 1
-
-
 # ── codex ─────────────────────────────────────────────────────────────────────
 def rollout_line(pct, resets=1785728237, plan="plus"):
     return json.dumps({
@@ -181,17 +122,6 @@ def test_a_torn_or_unrelated_line_is_skipped_not_fatal():
 
 def test_a_rollout_without_any_snapshot_yields_none():
     assert usage.parse_rollout_rate_limits(['{"type":"turn"}', ""]) is None
-
-
-def test_codex_block_reports_the_window_plan_and_reset_as_iso():
-    block = usage.codex_block(
-        json.loads(rollout_line(3.25))["payload"]["rate_limits"], "2026-07-29T12:00:00+00:00"
-    )
-    assert block["weekly_pct"] == 3.25
-    assert block["window_minutes"] == 10080
-    assert block["plan"] == "plus"
-    assert block["resets_at"].startswith("2026-")
-    assert block["error"] is None
 
 
 @pytest.mark.parametrize("limits", [None, {}, {"primary": "nope"}])

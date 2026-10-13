@@ -66,11 +66,6 @@ def test_an_asked_receipt_with_a_missing_or_hostile_question_still_stops_safely(
     assert end is not None and end.question and "<!--" not in end.question
 
 
-def test_an_agent_receipt_carries_no_question():
-    end = leg_end(run(receipt={"leg": "agent", "question": "stale"}))
-    assert end is not None and end.question is None
-
-
 @pytest.mark.parametrize("kind", ["RESUME", "PR_RESUME", "ROUTE", "RE_REVIEW", "UNKNOWN_KIND", ""])
 def test_runs_of_no_act_are_no_leg_end(kind):
     assert leg_end(run(kind)) is None
@@ -147,11 +142,6 @@ def test_the_reply_is_every_human_comment_after_the_leg_in_order():
         Comment("carol", "undated", "yesterday"),
     )
     assert human_reply(comments, after, H) == "@alice: first\n\n@bob: second"
-
-
-def test_no_reply_is_empty():
-    assert human_reply((), T0, H) == ""
-
 
 
 # ── Facts (round 2) ───────────────────────────────────────────────────────

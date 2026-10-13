@@ -74,8 +74,6 @@ class _Control:
         return False
 
 
-
-
 class _Spend:
     def __init__(self, settled=()):
         self.settled = frozenset(settled)
@@ -89,8 +87,6 @@ class _Spend:
 class _Worktrees:
     def prune_validate(self):
         return 2
-
-
 
 
 def test_recovery_reconciles_dead_reservation_before_unknown_release():
@@ -122,53 +118,6 @@ def test_recovery_never_releases_indeterminate_spend_after_execution():
     assert report.spend_unknown == ()
     assert control.released == []
     assert RunId("live") not in spend.seen
-
-
-def test_recovery_runs_the_fixed_crash_consistency_sequence():
-    calls = []
-
-    class Supervisor:
-        def recover_orphans(self):
-            calls.append("kill_orphans")
-            return ()
-
-        def recover_abandoned_orphans(self):
-            calls.append("kill_abandoned_orphans")
-            return ()
-
-    class Control(_Control):
-        def reclaim_dead_leases(self, _owner_id, _is_alive):
-            calls.append("reclaim_leases")
-            return ()
-
-        def active_reservation_runs(self, _owner_id):
-            calls.append("reconstruct_spend")
-            return ()
-
-        def stale_active_reservation_runs(self, _owner_id, _created_before):
-            calls.append("reconstruct_spend")
-            return ()
-
-
-    class Worktrees:
-        def prune_validate(self):
-            calls.append("validate_worktrees")
-            return 0
-
-
-    RecoveryCoordinator(
-        Supervisor(),
-        Control(),
-        Worktrees(),
-        _Spend(),
-        "o/r:fix",
-    ).reconcile(RecoveryTrigger.BOOT)
-
-    assert calls == [
-        "reclaim_leases",
-        "validate_worktrees",
-        "reconstruct_spend",
-    ]
 
 
 def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
@@ -227,6 +176,10 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
         "read_leases",
         "read_stale_reservations",
     ]
+
+    calls.clear()
+    coordinator.reconcile(RecoveryTrigger.BOOT)
+    assert calls == ["reclaim_leases", "validate_worktrees", "read_leases", "read_stale_reservations"]
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
@@ -292,53 +245,6 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
         "ended", "dead_lease", "provider-receipt", 7,
     )
     assert store.leases() == ()
-
-
-def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
-    tmp_path,
-):
-    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
-    store.initialize()
-    identity = ProcessSupervisor.process_identity(os.getpid())
-    assert identity is not None
-    run_id = RunId("live-owned")
-    _reserve(store, run_id)
-    store.register_process_lease(
-        run_id, expected_owner_id=OWNER, pid=identity.pid,
-        pgid=os.getpgid(identity.pid), process_start_ticks=identity.start_ticks,
-    )
-
-    class SafeSupervisor:
-        def recover_orphans(self):
-            raise AssertionError("suspend recovery used the destructive reaper")
-
-        def recover_abandoned_orphans(self):
-            return ()
-
-    report = RecoveryCoordinator(
-        SafeSupervisor(),
-        store,
-        _Worktrees(),
-        _Spend(),
-        OWNER,
-        now=lambda: NOW + timedelta(hours=1),
-    ).reconcile(RecoveryTrigger.WAKE)
-
-    assert report.reclaimed_leases == ()
-    assert store.active_reservation_runs(OWNER) == (run_id,)
-    assert tuple(lease.run_id for lease in store.leases()) == (run_id,)
-    settled = store.settle(
-        SettlementRequest(
-            run_id,
-            Money("USD", 7),
-            PricingBasis.RECONCILED,
-            "live-provider-receipt",
-            None,
-            None,
-            None,
-        )
-    )
-    assert settled.disposition is AccountingDisposition.AVAILABLE
 
 
 def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(

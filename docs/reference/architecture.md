@@ -8,7 +8,7 @@ document have been deleted. Slice 6a (2026-10) deleted the remaining
 The [minimal-harness design](../open/2026-10-12-minimal-harness-design.md)
 governs the current shape. Each tick, both roles derive every item's state from
 GitHub plus local leg facts; nothing persists a selected continuation. The
-phase-4 roadmap and [ADR 0016](../adr/0016-phase-4-current-state-authority.md)
+phase-4 roadmap and [ADR 0016](../archive/adr/0016-phase-4-current-state-authority.md)
 continuation authority are superseded (slices 5c and 5d-1 deleted the workflow
 model, the durable-command path and the continuation writers).
 
@@ -449,7 +449,7 @@ exact APPROVE or REQUEST_CHANGES with a bounded body, or nothing),
 `adapters/accounting_runtime.py`, `adapters/act.py` (both roles' `act` step:
 idempotent or keyed-and-read-back GitHub writes, including the review bot's
 one review per head, no command queue),
-`adapters/agent_runner.py`, `adapters/app_token.py`,
+`adapters/agent_runner.py`, `adapters/app_token.py`, `adapters/atomic_file.py`,
 `adapters/child_env.py`,
 `adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
 once per leg; native sub-agents disabled in the isolated profile),
