@@ -44,7 +44,7 @@ def test_the_tree_as_committed_keeps_it(contract):
     ("issue_agent.adapters.github", "issue_agent.adapters.dashweb.legs"),
     ("issue_agent.adapters.control_store", "issue_agent.domain.dashboard"),
     ("issue_agent.domain.state", "issue_agent.domain.dashboard"),
-    ("issue_agent.app.planners.run", "issue_agent.app.dashweb.views"),
+    ("issue_agent.app.planners.tasks", "issue_agent.app.dashweb.views"),
 ])
 def test_a_core_import_of_the_dashboard_breaks_it(contract, importer, imported):
     assert not contract((importer, imported))
