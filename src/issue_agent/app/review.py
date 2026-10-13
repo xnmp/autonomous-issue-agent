@@ -25,6 +25,7 @@ from ..adapters.act import submit_review
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, RunAgent
 from ..domain.agent_task import RuntimeName
+from ..domain.effort import Effort
 from ..domain.identity import login_eq
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
@@ -120,7 +121,7 @@ class ReviewLegs:
         checkouts,
         prepare_cwd: Callable[[str, RuntimeName | None], None] | None,
         task_config: tasks.ReviewTaskConfig,
-        route: Callable[[Tier | None], tuple[RuntimeName | None, str | None]] | None = None,
+        route: Callable[[Tier | None], tuple[RuntimeName | None, str | None, Effort | None]] | None = None,
         log: Callable[[str], None],
     ) -> None:
         self.gateway = gateway
@@ -132,7 +133,7 @@ class ReviewLegs:
         self.prepare_cwd = prepare_cwd
         self.task_config = task_config
         # None: the role's default runtime with the configured REVIEW_MODEL.
-        self.route = route or (lambda _tier: (None, task_config.model))
+        self.route = route or (lambda _tier: (None, task_config.model, None))
         self.log = log
 
     async def run(self, action: RunAgent) -> None:
@@ -210,9 +211,9 @@ class ReviewLegs:
         self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
 
     def _task(self, action: RunAgent, pr: PRView):
-        runtime, model = self.route(action.tier)
+        runtime, model, effort = self.route(action.tier)
         self.log(f"REVIEW PR #{action.number}: tier {getattr(action.tier, 'value', '(none)')} -> "
-                 f"{runtime.value if runtime else '(default runtime)'}:{model or '(default model)'}")
+                 f"{runtime.value if runtime else '(default runtime)'}:{model or '(default model)'}{':' + effort.value if effort else ''}")
         cwd = self.checkouts.ensure(action.number, action.head)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd, runtime)
@@ -228,7 +229,7 @@ class ReviewLegs:
             self.task_config, discussion=as_untrusted(discussion) if discussion else None,
             prior_review=as_untrusted(prior) if prior else None,
         )
-        return replace(task, cwd=cwd, runtime=runtime, model=model)
+        return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort or task.effort)
 
 
 def _prior_review(pr: PRView, bot: str) -> str:

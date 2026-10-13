@@ -285,6 +285,8 @@ class AccountingRuntime(AgentRuntime):
                 **({"triage": triage.record()} if triage is not None else {}),
                 # The routed tier the leg ran at: a REVIEW of the head it pushed runs at the same tier.
                 **({"tier": tier} if tier else {}),
+                # The effort the plan carried; absent when the runtime's global default applied.
+                **({"effort": task.effort.value} if task.effort is not None else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result)
 

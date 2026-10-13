@@ -22,9 +22,11 @@ from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.contracts import RunId
+from issue_agent.domain.effort import Effort
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Review, WorldState
@@ -948,3 +950,31 @@ def test_unset_tier_specs_keep_the_single_configured_fixer(role):
     composed, _ = role(gh, agent, FIX_MODEL="claude-sonnet-5-5")
     tick(composed)
     assert agent.tasks[0].model == "claude-sonnet-5-5"
+
+
+def test_a_routed_legs_task_carries_the_routes_effort_and_an_omitted_one_uses_the_global_knob(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(did_nothing(), did_nothing())
+    composed, _ = role(gh, agent, FIX_EFFORT="low", FIX_MODEL_MED="claude:claude-sonnet-5-5:high",
+                       FIX_MODEL_HIGH="claude:claude-opus-5-5")
+    tick(composed)
+    tick(composed)  # MED (route effort), then escalated to HIGH (no route effort)
+    assert [t.effort for t in agent.tasks] == [Effort.HIGH, Effort.LOW]
+
+
+def test_the_triage_legs_task_carries_the_triage_routes_effort(role):
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(triaged("high"))
+    composed, _ = role(gh, agent, triaged=False, TRIAGE_MODEL="claude:claude-haiku-5-5:low")
+    tick(composed)
+    assert agent.tasks[0].effort is Effort.LOW
+
+
+def test_the_recorded_leg_result_names_the_effort_it_ran_at(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    composed, _ = role(gh, Agent(did_nothing()), FIX_MODEL_MED="claude:claude-sonnet-5-5:high")
+    tick(composed)
+    (run,) = (r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "FIX_CI")
+    assert (run.receipt["tier"], run.receipt["effort"]) == ("med", "high")

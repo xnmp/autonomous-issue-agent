@@ -20,6 +20,10 @@ class Effort(Enum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    # Beyond EFFORT_LADDER (the FIX_EFFORT choices); reachable through a route
+    # spec. Claude SDK takes both; codex takes xhigh but not max.
+    XHIGH = "xhigh"
+    MAX = "max"
 
 
 # Weakest → strongest; the configurable choices.
