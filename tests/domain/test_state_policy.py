@@ -242,6 +242,28 @@ def test_non_qualifying_comments_do_not_release(comments):
     assert pr_state(labelled(comments)) == Wait(WaitReason.NEEDS_HUMAN)
 
 
+def test_a_reply_after_the_label_was_applied_releases():
+    view = labelled([stop(StopReason.ATTEMPTS, 10), human(20)], needs_human_labeled_at=iso(10))
+    assert pr_state(view) == Release()
+
+
+def test_an_operator_park_after_the_reply_is_not_undone():
+    # Stop at 10, reply at 20 (released), operator re-applies the label at 30
+    # before any leg ran: the old reply must not release the new park.
+    view = labelled([stop(StopReason.ATTEMPTS, 10), human(20)], needs_human_labeled_at=iso(30))
+    assert pr_state(view) == Wait(WaitReason.NEEDS_HUMAN)
+    replied = labelled([stop(StopReason.ATTEMPTS, 10), human(20), human(40)], needs_human_labeled_at=iso(30))
+    assert pr_state(replied) == Release()
+    parked = IssueView(3, labels=frozenset({Label.AI_READY, Label.NEEDS_HUMAN}),
+                       comments=(stop(StopReason.ATTEMPTS, 10), human(20)), needs_human_labeled_at=iso(30))
+    assert one(WorldState(issues=(parked,))) == Wait(WaitReason.NEEDS_HUMAN)
+
+
+def test_an_unparseable_label_time_never_releases():
+    view = labelled([stop(StopReason.ATTEMPTS, 10), human(20)], needs_human_labeled_at="yesterday")
+    assert pr_state(view) == Wait(WaitReason.NEEDS_HUMAN)
+
+
 def test_reply_must_postdate_the_last_leg_end():
     view = labelled([stop(StopReason.ATTEMPTS, 10), human(20)])
     assert pr_state(view, local(pr_legs(*legs(REVIEW, 30)))) == Wait(WaitReason.NEEDS_HUMAN)

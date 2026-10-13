@@ -109,6 +109,9 @@ class IssueView:
     updated_at: str = ""
     author: str = ""
     state: str = "open"  # open | closed
+    # When `needs-human` was last applied ("" = not observed). A reply older
+    # than that never releases: the operator parked the item after it.
+    needs_human_labeled_at: str = ""
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -155,6 +158,7 @@ class PRView:
     content_known: bool = True
     # Head-branch pushes, any order. Empty = none observed.
     pushes: tuple[Push, ...] = ()
+    needs_human_labeled_at: str = ""  # as on IssueView
 
     @property
     def checks(self) -> tuple[Check, ...]:

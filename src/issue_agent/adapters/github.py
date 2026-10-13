@@ -268,8 +268,11 @@ _LABELS = "labels(first:100){totalCount nodes{name}}"
 _TIMELINE = ("timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:100{before}){{pageInfo{{hasPreviousPage startCursor}} "
              "nodes{{... on CrossReferencedEvent{{source{{... on PullRequest{{number state headRefName "
              "repository{{nameWithOwner}}}}}}}}}}}}")
+# The newest label applications: when `needs-human` was last applied.
+_LABELED = ("labeled:timelineItems(itemTypes:[LABELED_EVENT],last:100){pageInfo{hasPreviousPage} "
+            "nodes{... on LabeledEvent{createdAt label{name}}}}")
 _FIX_ISSUE = (
-    "id number title state author{login} " + _LABELS + " "
+    "id number title state author{login} " + _LABELS + " " + _LABELED + " "
     + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="")
 )
 _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
@@ -277,7 +280,7 @@ _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage sta
 _FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
 _FIX_PR = (
     "id number state headRefName headRefOid baseRefName baseRefOid title author{login} "
-    "mergeable mergeStateStatus " + _LABELS + " " + _COMMENTS.format(before="") + " "
+    "mergeable mergeStateStatus " + _LABELS + " " + _LABELED + " " + _COMMENTS.format(before="") + " "
     + _REVIEWS.format(before="") + " " + _FILES.format(after="")
     + " commits(last:1){nodes{commit{oid committedDate author{user{login}}}}}"
 )
@@ -327,6 +330,22 @@ def _complete_labels(node: dict) -> frozenset[Label]:
     return _labels(nodes)
 
 
+def _needs_human_labeled_at(node: dict, labels: frozenset[Label]) -> str:
+    """When `needs-human` was last applied, for a labelled item ("" otherwise).
+    Not found among the newest 100 label events: unknown, so the item is
+    skipped rather than released on an older reply."""
+    if Label.NEEDS_HUMAN not in labels:
+        return ""
+    nodes, info = _connection(node, "labeled")
+    times = [n["createdAt"] for n in nodes if isinstance(n, dict) and isinstance(n.get("createdAt"), str)
+             and isinstance(n.get("label"), dict) and n["label"].get("name") == Label.NEEDS_HUMAN.value]
+    if times:
+        return times[-1]
+    if info.get("hasPreviousPage"):
+        raise FixObservationIncomplete("needs-human label event is past the newest 100")
+    return ""
+
+
 def parse_fix_issue(node: object, comments: list) -> IssueView:
     """One issue node (with its fully paged comments) → IssueView."""
     if not isinstance(node, dict) or type(node.get("number")) is not int or node["number"] <= 0:
@@ -334,9 +353,11 @@ def parse_fix_issue(node: object, comments: list) -> IssueView:
     state = node.get("state")
     if state not in ("OPEN", "CLOSED"):
         raise FixObservationIncomplete("issue state is malformed")
+    labels = _complete_labels(node)
     return IssueView(
-        number=node["number"], title=node.get("title") or "", labels=_complete_labels(node),
+        number=node["number"], title=node.get("title") or "", labels=labels,
         comments=_comments(comments), author=_login(node.get("author")), state=state.lower(),
+        needs_human_labeled_at=_needs_human_labeled_at(node, labels),
     )
 
 
@@ -377,8 +398,9 @@ def parse_fix_pr(node: object, comments: list, reviews: list, files: list) -> PR
     return PRView(
         number=node["number"], head_ref_name=node["headRefName"], head_ref_oid=head,
         base_ref_name=node.get("baseRefName") or "", base_ref_oid=node.get("baseRefOid") or "",
-        title=node.get("title") or "", labels=_complete_labels(node),
+        title=node.get("title") or "", labels=(labels := _complete_labels(node)),
         comments=_comments(comments), reviews=_reviews(reviews),
+        needs_human_labeled_at=_needs_human_labeled_at(node, labels),
         state=str(node.get("state") or ""), changed_files=_changed_files([{"path": f.get("path")} for f in files
                                                                          if isinstance(f, dict)]),
         mergeable=str(node.get("mergeable") or ""), merge_state=str(node.get("mergeStateStatus") or ""),

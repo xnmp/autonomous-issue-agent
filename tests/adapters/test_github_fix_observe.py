@@ -78,6 +78,30 @@ def test_a_malformed_or_partial_issue_node_is_incomplete_not_empty(node):
         parse_fix_issue(node, [])
 
 
+def labeled(*events: tuple[str, str], earlier: bool = False) -> dict:
+    return {"pageInfo": {"hasPreviousPage": earlier},
+            "nodes": [{"createdAt": t, "label": {"name": n}} for n, t in events]}
+
+
+def test_a_labelled_item_carries_when_needs_human_was_last_applied():
+    node = issue_node(labels=labels("ai-ready", "needs-human"), labeled=labeled(
+        ("needs-human", "2026-10-01T00:00:00Z"), ("ai-ready", "2026-10-01T01:00:00Z"),
+        ("needs-human", "2026-10-01T02:00:00Z")))
+    assert parse_fix_issue(node, []).needs_human_labeled_at == "2026-10-01T02:00:00Z"
+    pr = parse_fix_pr(pr_node(labels=labels("needs-human"), labeled=labeled(("needs-human", "2026-10-02T00:00:00Z"))),
+                      [], [], [])
+    assert pr.needs_human_labeled_at == "2026-10-02T00:00:00Z"
+    # An unlabelled item does not need (or read) the events.
+    assert parse_fix_issue(issue_node(), []).needs_human_labeled_at == ""
+
+
+@pytest.mark.parametrize("events", [None, {"nodes": "x"}, labeled(("ai-ready", "2026-10-01T00:00:00Z"), earlier=True)])
+def test_an_unreadable_or_truncated_label_history_is_incomplete_for_a_labelled_item(events):
+    node = issue_node(labels=labels("ai-ready", "needs-human"), labeled=events)
+    with pytest.raises(FixObservationIncomplete):
+        parse_fix_issue(node, [])
+
+
 def test_a_pr_node_records_its_head_push_and_files():
     view = parse_fix_pr(pr_node(), [], [], [{"path": ".github/workflows/ci.yml"}, {"path": "src/a.py"}])
     assert (view.number, view.head_ref_oid, view.merge_state) == (100, "h1", "CLEAN")
