@@ -163,7 +163,7 @@ def test_moving_states_are_working(state, activity):
     assert isinstance(board, dash.Working) and board.activity == activity
 
 
-@pytest.mark.parametrize("act", [AgentKind.TRIAGE, AgentKind.RESOLVE])
+@pytest.mark.parametrize("act", [AgentKind.STEWARD, AgentKind.TRIAGE, AgentKind.RESOLVE])
 def test_an_item_whose_resolve_has_not_started_waits_for_a_slot(act):
     for legs in ([], [leg("TRIAGE", 0, ended=2)], [replace(leg("RESOLVE", 0, state="released", ended=1), started_at=None)]):
         board = status(Dispatch(act), legs=legs)

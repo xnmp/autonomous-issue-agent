@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 
 from .actions import AgentKind
 from .routing import Tier
-from .triage import Triage
+from .triage import Steward, Triage
 
 BACKOFF_BASE = timedelta(seconds=60)
 BACKOFF_CAP = timedelta(hours=1)
@@ -57,6 +57,9 @@ class LegEnd:
     started_at: datetime | None = None
     # A TRIAGE agent end's laundered result; None when it returned nothing usable.
     triage: Triage | None = None
+    # A STEWARD agent end's laundered result, or the steward half of a legacy
+    # combined TRIAGE result; None when it returned nothing usable.
+    steward: Steward | None = None
     # The routed tier the leg ran at, when recorded (legs before routing have none).
     tier: Tier | None = None
 
@@ -80,6 +83,11 @@ class LegEnd:
             not isinstance(self.triage, Triage) or self.kind is not AgentKind.TRIAGE or self.machine
         ):
             raise ValueError("only a TRIAGE agent end carries a triage result")
+        if self.steward is not None and (
+            not isinstance(self.steward, Steward) or self.kind not in (AgentKind.STEWARD, AgentKind.TRIAGE)
+            or self.machine
+        ):
+            raise ValueError("only a STEWARD or TRIAGE agent end carries a steward result")
         if self.tier is not None and not isinstance(self.tier, Tier):
             raise ValueError("leg tier must be a Tier")
 

@@ -15,6 +15,8 @@ export type Tone = "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutr
 /* --------------------------------------------------------- leg kinds */
 
 const KIND_LABEL: Record<string, string> = {
+  STEWARD: "Steward",
+  TRIAGE: "Triage",
   RESOLVE: "Resolve",
   REVIEW: "Review",
   FIX_CI: "Fix CI",

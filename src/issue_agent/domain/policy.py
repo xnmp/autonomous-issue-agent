@@ -26,7 +26,7 @@ _WHY = {
     StopReason.ATTEMPTS: f"{{act}} ran {ATTEMPT_CAP} times without progress since the last human activity.",
     StopReason.REVIEW_ROUNDS: f"the reviewer requested changes {REVIEW_ROUND_CAP} times; the dispute needs a human.",
     StopReason.QUESTION: "the agent asked a question that needs a human's judgment:",
-    StopReason.DUPLICATE: "triage suspects this issue duplicates #{dup}:",
+    StopReason.DUPLICATE: "steward suspects this issue duplicates #{dup}:",
 }
 _HOW = {
     StopReason.LIFETIME_CAP: "Raise the per-issue budget, then reply here or remove the `needs-human` label.",
@@ -60,18 +60,20 @@ def needs_human_key(key: ItemKey, stop: NeedsHuman) -> str:
 
 
 def triage_comment(state: TriageNote, harness: Harness) -> str:
-    """The one triage comment: the tier, triage's rationale and the acceptance
-    criteria (a heading `pr_body.issue_acceptance_criteria` finds, so they
-    reach the PR body), never an implementation plan. An issue that states
-    its own criteria was asked for none (`triage.criteria_wanted`). Agent text
-    was neutralised and bounded by `triage.parse_triage`; here it is also made
-    inert to mentions and images under the harness's name."""
+    """The one triage comment: the tier, triage's rationale and the steward's
+    acceptance criteria (a heading `pr_body.issue_acceptance_criteria` finds,
+    so they reach the PR body), never an implementation plan. An issue that
+    states its own criteria was asked for none (`triage.criteria_wanted`).
+    Agent text was neutralised and bounded by `triage.parse_triage` /
+    `parse_steward`; here it is also made inert to mentions and images under
+    the harness's name."""
     triage = state.triage
+    criteria = state.steward.acceptance_criteria
     why = f" {_inert(triage.rationale)}" if triage.rationale else ""
     head = f"{harness.marker}\n{TRIAGE_TAG}\n**Triage**: difficulty tier `{triage.tier.value}`.{why}"
-    if not triage.acceptance_criteria:
+    if not criteria:
         return head
-    return head + "\n\n### Acceptance criteria\n" + "\n".join(f"- [ ] {_inert(c)}" for c in triage.acceptance_criteria)
+    return head + "\n\n### Acceptance criteria\n" + "\n".join(f"- [ ] {_inert(c)}" for c in criteria)
 
 
 def _inert(text: str) -> str:

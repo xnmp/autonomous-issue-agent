@@ -30,10 +30,13 @@ Precedence, the single place it is defined (first match wins, per item):
 6. Publication an issue with a pushed `fix/<issue>-` branch ahead of base and
                owed a PR -> OpenPR (free; the agent pushes, the harness
                opens, Q11).
-6a. Triage     an issue with no agent-ended TRIAGE leg -> TRIAGE (gated as
-               in step 8). Triaged: a laundered `duplicate_of` with no
-               released duplicate stop -> NeedsHuman(DUPLICATE); no harness
-               triage comment yet -> TriageNote (free); else step 7.
+6a. Stewardship an issue with no agent-ended STEWARD leg (a legacy combined
+               TRIAGE result counts as one) -> STEWARD (gated as in step 8).
+               Stewarded: a laundered `duplicate_of` with no released
+               duplicate stop -> NeedsHuman(DUPLICATE). Then no agent-ended
+               TRIAGE leg -> TRIAGE (gated likewise); then no harness triage
+               comment yet -> TriageNote (free; tier, rationale and criteria
+               in the one comment); else step 7.
 7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
                for another head -> Wait; red -> FIX_CI, unless every red
                check is red or rerunning on the base tip too -> Wait (#313);
@@ -88,13 +91,14 @@ from .identity import login_eq
 from .labels import Label
 from .refs import harness_branch_issue
 from .routing import DEFAULT_TIER, Tier, escalate
-from .triage import Triage
+from .triage import Steward, Triage
 from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Branch, Comment, PRView, WorldState
 
 ATTEMPT_CAP = 3
 REVIEW_ROUND_CAP = 3
 DISPATCHABLE = frozenset({
-    AgentKind.TRIAGE, AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.REVIEW, AgentKind.ADDRESS_REVIEW,
+    AgentKind.STEWARD, AgentKind.TRIAGE, AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.REVIEW,
+    AgentKind.ADDRESS_REVIEW,
 })
 _MAX_MARKER = 200
 _STANDING = frozenset({REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, "DISMISSED"})
@@ -218,7 +222,7 @@ def _need_head(head: object) -> None:
 @dataclass(frozen=True)
 class Dispatch:
     act: AgentKind
-    head: str = ""  # "" exactly for the issue acts (TRIAGE, RESOLVE): no PR yet
+    head: str = ""  # "" exactly for the issue acts (STEWARD, TRIAGE, RESOLVE): no PR yet
     # The leg's tier: see `actions.check_tier`.
     tier: Tier | None = None
 
@@ -265,14 +269,17 @@ class OpenPR:
 @dataclass(frozen=True)
 class TriageNote:
     """A triaged issue has no harness triage comment yet: post one (free).
-    `anchor` is the triage leg's end, keying the comment once per triage."""
+    `anchor` is the triage leg's end, keying the comment once per triage;
+    `steward` carries the criteria (empty when STEWARD returned nothing)."""
 
     triage: Triage
     anchor: str
+    steward: Steward = Steward()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.triage, Triage) or not isinstance(self.anchor, str) or not self.anchor:
-            raise ValueError("a triage note requires the triage and its anchor")
+        if (not isinstance(self.triage, Triage) or not isinstance(self.steward, Steward)
+                or not isinstance(self.anchor, str) or not self.anchor):
+            raise ValueError("a triage note requires the triage, the steward result and an anchor")
 
 
 @dataclass(frozen=True)
@@ -433,14 +440,24 @@ def _proceed(
         return OpenPR(max(item.branches, key=lambda b: (parse_timestamp(b.committed_at) is not None,
                                                         b.committed_at, b.name)).name)
 
-    triage = _latest_triage(local.legs.get(issue_key(item.issue), ()))
-    if pr is None and triage is None:
-        step = Dispatch(AgentKind.TRIAGE)
-    elif pr is None:
-        note = _triage_note(item, triage, stops, harness, anchor)
-        if note is not None:
-            return note
-        step = Dispatch(AgentKind.RESOLVE)
+    issue_legs = local.legs.get(issue_key(item.issue), ())
+    triage = _latest_triage(issue_legs)
+    if pr is None:
+        # STEWARD first: a duplicate stops before any grading is bought.
+        steward = latest_steward(issue_legs)
+        if steward is None:
+            step = Dispatch(AgentKind.STEWARD)
+        elif (stop := _duplicate_stop(steward, stops, anchor)) is not None:
+            return stop
+        elif triage is None:
+            step = Dispatch(AgentKind.TRIAGE)
+        else:
+            criteria = steward.steward or Steward()
+            # An unusable grade still posts the steward's criteria, at the tier it runs at.
+            graded = triage.triage or (Triage(DEFAULT_TIER) if criteria.acceptance_criteria else None)
+            if graded is not None and not any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
+                return TriageNote(graded, triage.ended_at.isoformat(), criteria)
+            step = Dispatch(AgentKind.RESOLVE)
     else:
         step = _pr_step(pr, harness, item.base)
     if not isinstance(step, Dispatch):
@@ -489,20 +506,21 @@ def _latest_triage(legs: tuple[LegEnd, ...]) -> LegEnd | None:
                  if leg.kind is AgentKind.TRIAGE and not leg.machine), None)
 
 
-def _triage_note(
-    item: _Item, leg: LegEnd, stops: list[tuple[datetime, str]], harness: Harness, anchor: str,
-) -> NeedsHuman | TriageNote | None:
-    """What a triaged issue owes before RESOLVE: the duplicate stop (until a
-    human released one), then the one triage comment."""
-    triage = leg.triage
-    if triage is None:
+def latest_steward(legs: tuple[LegEnd, ...]) -> LegEnd | None:
+    """The issue's newest agent-ended leg that did the steward's work: a
+    STEWARD leg, or a legacy combined TRIAGE leg whose result carries the
+    steward's fields. An agent end whose output did not parse still counts
+    (it ran; the issue proceeds with no criteria and no duplicate stop)."""
+    return next((leg for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at))
+                 if not leg.machine and (leg.kind is AgentKind.STEWARD or leg.steward is not None)), None)
+
+
+def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str) -> NeedsHuman | None:
+    """The duplicate stop a steward result owes, until a human released one."""
+    steward = leg.steward
+    if steward is None or steward.duplicate_of is None or any(code == StopReason.DUPLICATE.value for _, code in stops):
         return None
-    if triage.duplicate_of is not None and not any(code == StopReason.DUPLICATE.value for _, code in stops):
-        return NeedsHuman(StopReason.DUPLICATE, anchor, duplicate_of=triage.duplicate_of,
-                          detail=triage.duplicate_reason)
-    if any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
-        return None
-    return TriageNote(triage, leg.ended_at.isoformat())
+    return NeedsHuman(StopReason.DUPLICATE, anchor, duplicate_of=steward.duplicate_of, detail=steward.duplicate_reason)
 
 
 def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> DerivedState:
@@ -635,5 +653,5 @@ __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
     "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "TriageNote", "TRIAGE_TAG",
     "Release", "Wait", "NeedsHuman",
-    "Busy", "Backoff", "DerivedState", "derive", "human_comments", "touches_github",
+    "Busy", "Backoff", "DerivedState", "derive", "human_comments", "latest_steward", "touches_github",
 ]

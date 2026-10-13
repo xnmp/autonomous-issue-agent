@@ -478,7 +478,7 @@ def test_unset_routes_fall_back_to_todays_single_models():
 
 
 @pytest.mark.parametrize("env", [
-    {"FIX_MODEL_HIGH": "opus"}, {"TRIAGE_MODEL": "codex:claude-haiku-5-5"}, {"FIX_MODEL_LOW": "glm:glm-5"},
+    {"FIX_MODEL_HIGH": "opus"}, {"TRIAGE_MODEL": "codex:claude-haiku-5-5"}, {"STEWARD_MODEL": "sonnet"}, {"FIX_MODEL_LOW": "glm:glm-5"},
     {"TRIAGE_BUDGET_USD": "0"},
 ])
 def test_malformed_routing_knobs_are_reported_and_fall_back(env):
@@ -503,7 +503,32 @@ def test_route_effort_reaches_every_route_and_an_omitted_one_stays_unset():
     assert "low=claude:claude-haiku-5-5:low" in cfg.describe()
 
 
-@pytest.mark.parametrize("name", ["FIX_MODEL_LOW", "FIX_MODEL_XHIGH", "TRIAGE_MODEL"])
+def test_the_steward_route_falls_back_to_triage_then_to_the_low_route():
+    from issue_agent.domain.agent_task import RuntimeName
+
+    own = _routed(STEWARD_MODEL="claude:claude-sonnet-5-5:high", TRIAGE_MODEL="claude:claude-haiku-5-5:high")
+    assert own.validation_errors() == ()
+    assert own.steward_route() == (RuntimeName.CLAUDE, "claude-sonnet-5-5", Effort.HIGH)
+    assert own.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.HIGH)
+
+    assert _routed(TRIAGE_MODEL="claude:claude-haiku-5-5:low").steward_route() == (
+        RuntimeName.CLAUDE, "claude-haiku-5-5", Effort.LOW)
+    assert _routed(FIX_MODEL_LOW="claude:claude-haiku-5-5").steward_route() == (
+        RuntimeName.CLAUDE, "claude-haiku-5-5", None)
+    assert _routed(FIXER_RUNTIME="codex", STEWARD_MODEL="claude:claude-sonnet-5-5").runtimes("fix") == frozenset(
+        {RuntimeName.CODEX, RuntimeName.CLAUDE})
+    assert "steward=claude:claude-sonnet-5-5:high" in own.describe()
+
+
+def test_the_steward_reserves_the_shared_light_budget():
+    from issue_agent.app.config import budget_policy
+
+    cfg = _routed(TRIAGE_BUDGET_USD="1.5")
+    policy = budget_policy(cfg)
+    assert policy.maximum_for("fix", "STEWARD") == policy.maximum_for("fix", "TRIAGE") != policy.maximum_for("fix", "RESOLVE")
+
+
+@pytest.mark.parametrize("name", ["FIX_MODEL_LOW", "FIX_MODEL_XHIGH", "TRIAGE_MODEL", "STEWARD_MODEL"])
 def test_an_invalid_route_effort_fails_config_validation(name):
     cfg = _routed(**{name: "codex:gpt-6-luna:max"})
     assert any(name in e and "effort" in e for e in cfg.validation_errors())

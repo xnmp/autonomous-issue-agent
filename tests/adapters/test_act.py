@@ -71,9 +71,9 @@ def test_the_triage_comment_posts_once_however_often_derive_asks_for_it(tmp_path
     from issue_agent.domain.policy import triage_comment
     from issue_agent.domain.routing import Tier
     from issue_agent.domain.state import Harness, TriageNote
-    from issue_agent.domain.triage import Triage
+    from issue_agent.domain.triage import Steward, Triage
 
-    note = TriageNote(Triage(Tier.LOW, ("Esc closes it",)), "2026-10-01T12:00:00+00:00")
+    note = TriageNote(Triage(Tier.LOW), "2026-10-01T12:00:00+00:00", Steward(("Esc closes it",)))
     action = PostComment(Target.ISSUE, 5, triage_comment(note, Harness("fix-bot", "review-bot")),
                          key=f"triage:issue:5:{note.anchor}")
     gh = Gateway(lose_reply=True)

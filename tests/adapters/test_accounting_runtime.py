@@ -534,11 +534,11 @@ def test_a_leg_whose_counters_are_malformed_settles_its_reserved_maximum_and_the
 # ── TRIAGE results and routed tiers (owner, 2026-10-13) ─────────────────────
 
 
-def _triage_wrapper(tmp_path, result, **fields):
+def _light_wrapper(tmp_path, kind, result, **fields):
     from issue_agent.domain.contracts import Money as M
 
-    return _wrapper(tmp_path, Runtime(result), context=("fix", "TRIAGE", 3, 3),
-                    budget_policy=BudgetPolicy({("fix", "TRIAGE"): M("USD", 2_000_000)}), **fields)
+    return _wrapper(tmp_path, Runtime(result), context=("fix", kind, 3, 3),
+                    budget_policy=BudgetPolicy({("fix", kind): M("USD", 2_000_000)}), **fields)
 
 
 def _receipt(store):
@@ -546,29 +546,51 @@ def _receipt(store):
     return run.receipt
 
 
-def test_a_triage_result_is_recorded_laundered_against_the_issues_the_harness_offered(tmp_path) -> None:
-    from issue_agent.domain.triage import triage_schema
-
-    claim = {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": 9,
-             "duplicate_reason": "same", "rationale": "small"}
-    wrapper, store = _triage_wrapper(tmp_path, AgentResult(False, structured=claim, session_id="s"))
-    _work(wrapper, schema=triage_schema([2, 4]))  # 9 was never offered
-    receipt = _receipt(store)
-    assert receipt["leg"] == "agent"
-    assert receipt["triage"] == {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": None,
-                                 "duplicate_reason": "", "rationale": "small"}
-
-
-@pytest.mark.parametrize("structured", [None, {"tier": "enormous"}, {"tier": "low", "rationale": "x" * 100_000}])
-def test_a_malformed_or_huge_triage_result_records_an_agent_leg_with_no_triage(tmp_path, structured) -> None:
-    wrapper, store = _triage_wrapper(tmp_path, AgentResult(False, structured=structured, session_id="s"))
+def test_a_triage_result_records_the_tier_and_nothing_the_steward_owns(tmp_path) -> None:
+    claim = {"tier": "low", "rationale": "small", "acceptance_criteria": ["smuggled"], "duplicate_of": 2}
+    wrapper, store = _light_wrapper(tmp_path, "TRIAGE", AgentResult(False, structured=claim, session_id="s"))
     _work(wrapper)
     receipt = _receipt(store)
-    assert receipt["leg"] == "agent" and "triage" not in receipt
+    assert receipt["leg"] == "agent"
+    assert receipt["triage"] == {"tier": "low", "rationale": "small"} and "steward" not in receipt
 
 
-def test_a_triage_that_claims_blocked_is_not_a_question(tmp_path) -> None:
-    wrapper, store = _triage_wrapper(tmp_path, AgentResult(False, status="blocked", needs="?", session_id="s"))
+def test_a_steward_result_is_recorded_laundered_against_the_issues_the_harness_offered(tmp_path) -> None:
+    from issue_agent.domain.triage import steward_schema
+
+    claim = {"acceptance_criteria": ["Esc closes it"], "duplicate_of": 9, "duplicate_reason": "same"}
+    wrapper, store = _light_wrapper(tmp_path, "STEWARD", AgentResult(False, structured=claim, session_id="s"))
+    _work(wrapper, schema=steward_schema([2, 4]))  # 9 was never offered
+    receipt = _receipt(store)
+    assert receipt["leg"] == "agent"
+    assert receipt["steward"] == {"acceptance_criteria": ["Esc closes it"], "duplicate_of": None,
+                                  "duplicate_reason": ""} and "triage" not in receipt
+
+
+def test_steward_criteria_are_dropped_when_the_issue_states_its_own(tmp_path) -> None:
+    from issue_agent.domain.triage import steward_schema
+
+    claim = {"duplicate_of": None, "duplicate_reason": "", "acceptance_criteria": ["invented"]}
+    wrapper, store = _light_wrapper(tmp_path, "STEWARD", AgentResult(False, structured=claim, session_id="s"))
+    _work(wrapper, schema=steward_schema([], criteria_wanted=False))
+    assert _receipt(store)["steward"]["acceptance_criteria"] == []
+
+
+@pytest.mark.parametrize("kind", ["TRIAGE", "STEWARD"])
+@pytest.mark.parametrize("structured", [
+    None, {"tier": "enormous"}, {"tier": "low", "rationale": "x" * 100_000}, {"acceptance_criteria": "x"},
+    {"acceptance_criteria": ["x" * 100_000]},
+])
+def test_a_malformed_or_huge_light_result_records_an_agent_leg_with_no_result(tmp_path, kind, structured) -> None:
+    wrapper, store = _light_wrapper(tmp_path, kind, AgentResult(False, structured=structured, session_id="s"))
+    _work(wrapper)
+    receipt = _receipt(store)
+    assert receipt["leg"] == "agent" and "triage" not in receipt and "steward" not in receipt
+
+
+@pytest.mark.parametrize("kind", ["TRIAGE", "STEWARD"])
+def test_a_light_act_that_claims_blocked_is_not_a_question(tmp_path, kind) -> None:
+    wrapper, store = _light_wrapper(tmp_path, kind, AgentResult(False, status="blocked", needs="?", session_id="s"))
     _work(wrapper)
     assert _receipt(store)["leg"] == "agent" and "question" not in _receipt(store)
 

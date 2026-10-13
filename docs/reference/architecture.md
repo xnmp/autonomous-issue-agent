@@ -437,7 +437,7 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`,
 `domain/routing.py` (difficulty tiers, the derived per-attempt escalation and
-the `runtime:model` route spec), `domain/triage.py` (the TRIAGE act's result,
+the `runtime:model` route spec), `domain/triage.py` (the STEWARD and TRIAGE acts' results,
 parsed and laundered from the agent's claim),
 `domain/tool_policy.py` (the denied-tool table: each rule with the reason the
 PreToolUse hook returns; `FIXER_DENY` derives from it),

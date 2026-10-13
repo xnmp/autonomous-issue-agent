@@ -71,15 +71,17 @@ Important fields:
 - `FIXER_RUNTIME=claude|codex`;
   `REVIEWER_RUNTIME=claude|codex`.
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
-- Routing (refactor decision 15): a TRIAGE leg grades each admitted issue
-  `low|med|high|xhigh` and posts its acceptance criteria as one harness
-  comment. Fix legs run on `FIX_MODEL_<TIER>` (`runtime:model`, e.g.
-  `claude:claude-sonnet-5-5`), one tier stronger per earlier attempt in the
+- Routing (refactor decisions 15, 27): a STEWARD leg writes each admitted
+  issue's acceptance criteria and flags duplicates; a TRIAGE leg then grades it
+  `low|med|high|xhigh`; one harness comment posts the tier and criteria. Fix
+  legs run on `FIX_MODEL_<TIER>` (`runtime:model`, e.g. `claude:claude-sonnet-5-5`), one tier stronger per earlier attempt in the
   attempt run, capped at `xhigh`. Review legs run at the tier of the fix leg
   that produced the head, else the triaged tier, else `REVIEW_MODEL`. An unset
   tier spec falls back to `FIX_MODEL` on `FIXER_RUNTIME`. `TRIAGE_MODEL`
-  (blank: the `low` spec) and `TRIAGE_BUDGET_USD` bound the triage leg. A
-  suspected duplicate stops the issue with `needs-human`; a reply or label
+  (blank: the `low` spec) routes the tier-grading leg and `STEWARD_MODEL`
+  (blank: `TRIAGE_MODEL`'s route) the leg that runs first, writing the
+  acceptance criteria and flagging duplicates; `TRIAGE_BUDGET_USD` bounds each
+  of the two. A suspected duplicate stops the issue with `needs-human`; a reply or label
   removal releases it. Effort stays `FIX_EFFORT` / `CODEX_REASONING_EFFORT`.
 - Astra has built-in standard-context accounting estimates ($10/$50 per
   million input/output tokens, $1 cached input); existing configured model

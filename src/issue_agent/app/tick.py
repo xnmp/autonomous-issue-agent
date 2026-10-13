@@ -55,7 +55,7 @@ from ..domain.recovery import RecoveryTrigger
 from ..domain.refs import harness_branch_issue
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, pr_key
 from ..domain.routing import parse_tier
-from ..domain.triage import triage_from_record
+from ..domain.triage import parse_triage, steward_from_record
 from ..domain.supervision import (
     ClockSample,
     DaemonState,
@@ -67,7 +67,7 @@ from .config import HarnessConfig, budget_policy, owner_identity_for_target, rat
 from .recovery import RecoveryCoordinator
 
 def run_item(run: LegRun) -> ItemKey | None:
-    """The item a recorded leg belongs to: its issue for TRIAGE and RESOLVE,
+    """The item a recorded leg belongs to: its issue for STEWARD, TRIAGE and RESOLVE,
     its PR for PR-stage legs. Pre-5b kinds (RESUME, PR_RESUME, ROUTE) belong
     to no act: under the cutover rule those legs simply stop counting."""
     kind = dispatched_kind(run.kind)
@@ -95,10 +95,14 @@ def leg_end(run: LegRun) -> LegEnd | None:
     if started is not None and (started.utcoffset() is None or started > run.completed_at):
         started = None
     question = question_text((run.receipt or {}).get("question")) if leg is LegClass.ASKED else None
-    triage = (triage_from_record((run.receipt or {}).get("triage"))
-              if kind is AgentKind.TRIAGE and leg is not LegClass.MACHINE else None)
+    receipt = run.receipt or {}
+    ran = leg is not LegClass.MACHINE
+    triage = parse_triage(receipt.get("triage")) if kind is AgentKind.TRIAGE and ran else None
+    # A legacy combined TRIAGE record carries the steward's fields too.
+    steward = (steward_from_record(receipt.get("steward" if kind is AgentKind.STEWARD else "triage"))
+               if kind in (AgentKind.STEWARD, AgentKind.TRIAGE) and ran else None)
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
-                  triage=triage, tier=parse_tier((run.receipt or {}).get("tier")))
+                  triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")))
 
 
 def local_legs(runs: Iterable[LegRun]) -> dict[ItemKey, tuple[LegEnd, ...]]:
@@ -181,7 +185,7 @@ class Facts:
 
 class Slots(NamedTuple):
     """Free dispatch capacity: `heavy` for acts that hold a slot, `light` for
-    those that do not (TRIAGE), which have their own ceiling."""
+    those that do not (STEWARD, TRIAGE), which have their own ceiling."""
 
     heavy: int
     light: int
@@ -284,7 +288,7 @@ class Daemon:
     def __post_init__(self) -> None:
         if self.dispatch_capacity < 1:
             raise ValueError("dispatch_capacity must be >= 1")
-        # Heavy legs fill `dispatch_capacity`; light ones (TRIAGE) get as many
+        # Heavy legs fill `dispatch_capacity`; light ones (STEWARD, TRIAGE) get as many
         # more, their ceiling, so a queued light leg can never hide in the pool.
         self._dispatch_pool = ThreadPoolExecutor(max_workers=2 * self.dispatch_capacity,
                                                  thread_name_prefix=f"{self.name}-dispatch")
@@ -917,7 +921,7 @@ def compose_role(
 
     state_dir = cfg.state_dir_for(role)
     default = cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime
-    # Legs route across runtimes (FIX_MODEL_<TIER>, TRIAGE_MODEL).
+    # Legs route across runtimes (FIX_MODEL_<TIER>, TRIAGE_MODEL, STEWARD_MODEL).
     names = sorted(cfg.runtimes(role), key=lambda n: n.value)
     journal = Journal(os.path.join(state_dir, "journal.jsonl"))
     control = control_store(cfg, role)

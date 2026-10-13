@@ -245,6 +245,15 @@ def asked(needs: str, session: str = "s1"):
     return lambda _task: AgentResult(False, status="blocked", needs=needs, cost_usd=0.1, session_id=session)
 
 
+def seed_light_legs(composed, number: int, **results) -> None:
+    """Record a STEWARD and a TRIAGE agent end for `number`: `results` maps a
+    kind to its receipt entries (default: an unusable result)."""
+    for kind in ("STEWARD", "TRIAGE"):
+        composed.control.record_unpaid_leg(
+            RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind=kind, owner_id="seed",
+            issue=number, number=number, head="", runtime="claude", leg_class="agent", result=results.get(kind, {}))
+
+
 @pytest.fixture
 def role(tmp_path):
     def compose(gh: FakeGitHub, agent: Agent, log=lambda _line: None, *, triaged: bool = True, **env):
@@ -265,12 +274,10 @@ def role(tmp_path):
         worktrees = FakeWorktrees(tmp_path / "worktrees")
         composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log)
         if triaged:
-            # A triage that returned nothing usable: the issue resolves at the
-            # default tier with no triage comment (test_triage_routing covers triage).
+            # Light legs that returned nothing usable: the issue resolves at the
+            # default tier with no triage comment (test_triage_routing covers them).
             for number in gh.issues:
-                composed.control.record_unpaid_leg(
-                    RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
-                    issue=number, number=number, head="", runtime="claude", leg_class="agent", result={})
+                seed_light_legs(composed, number)
         return composed, worktrees
 
     return compose
@@ -711,7 +718,7 @@ def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session
     assert dispatched(tick(composed), AgentKind.RESOLVE)
 
     assert resumes == [None, "s-init"]
-    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind != "TRIAGE"),
+    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind not in ("STEWARD", "TRIAGE")),
                   key=lambda r: r.completed_at)
     assert [(r.receipt["leg"], r.receipt["session"]) for r in runs] == [("machine", "s-init"), ("agent", "s-init")]
 
@@ -725,50 +732,66 @@ def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(role
     assert any("PR #100 waits to merge" in line and "BLOCKED" in line for line in lines)
 
 
-# ── TRIAGE and routing (owner, 2026-10-13) ───────────────────────────────────
+# ── STEWARD, TRIAGE and routing (owner, 2026-10-13/14) ──────────────────────
 
 
 def triaged(tier: str = "high", duplicate_of: int | None = None, session: str = "t1"):
-    claim = {"tier": tier, "acceptance_criteria": ["A null token returns 401, not 500"],
-             "duplicate_of": duplicate_of, "duplicate_reason": "Same crash" if duplicate_of else "",
-             "rationale": "One handler."}
-    return lambda _task: AgentResult(False, structured=claim, cost_usd=0.01, session_id=session)
+    """One scripted light result for either act: the steward's claim for a
+    STEWARD task, the grader's for a TRIAGE task (told apart by their schemas)."""
+    steward = {"acceptance_criteria": ["A null token returns 401, not 500"],
+               "duplicate_of": duplicate_of, "duplicate_reason": "Same crash" if duplicate_of else ""}
+    triage = {"tier": tier, "rationale": "One handler."}
+
+    def run(task):
+        claim = triage if "tier" in task.schema["properties"] else steward
+        return AgentResult(False, structured=claim, cost_usd=0.01, session_id=session)
+    return run
 
 
-ROUTES = {"TRIAGE_MODEL": "claude:claude-haiku-5-5", "FIX_MODEL_HIGH": "claude:claude-opus-5-5",
-          "FIX_MODEL_XHIGH": "claude:claude-fable-5-1"}
+ROUTES = {"TRIAGE_MODEL": "claude:claude-haiku-5-5:high", "STEWARD_MODEL": "claude:claude-sonnet-5-5:high",
+          "FIX_MODEL_HIGH": "claude:claude-opus-5-5", "FIX_MODEL_XHIGH": "claude:claude-fable-5-1"}
 
 
-def test_triage_grades_posts_its_criteria_once_then_resolve_runs_on_the_tiers_model(role):
+def test_steward_then_triage_then_one_comment_then_resolve_each_on_its_own_route(role):
     gh = FakeGitHub(issues={5: ready(), 2: IssueView(2, title="Login is slow")})
-    agent = Agent(triaged("high"), pushed(gh, "fix/5-null-token-crashes", "h1", session="s-resolve"))
+    light = triaged("high")
+    agent = Agent(light, light, pushed(gh, "fix/5-null-token-crashes", "h1", session="s-resolve"))
     composed, _ = role(gh, agent, triaged=False, **ROUTES)
 
-    assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
-    triage_task = agent.tasks[0]
-    assert triage_task.model == "claude-haiku-5-5" and triage_task.max_budget_usd == 2.0
-    assert triage_task.schema["properties"]["duplicate_of"]["enum"] == [2, None]  # never itself
-    assert "Login is slow" in triage_task.prompt
+    assert dispatched(tick(composed), AgentKind.STEWARD) == [RunAgent(AgentKind.STEWARD, 5)]
+    steward = agent.tasks[0]
+    assert (steward.model, steward.effort, steward.max_budget_usd) == ("claude-sonnet-5-5", Effort.HIGH, 2.0)
+    assert steward.schema["properties"]["duplicate_of"]["enum"] == [2, None]  # never itself
+    assert "Login is slow" in steward.prompt
 
-    tick(composed)  # the triage comment
+    assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
+    grader = agent.tasks[1]
+    assert (grader.model, grader.effort, grader.max_budget_usd) == ("claude-haiku-5-5", Effort.HIGH, 2.0)
+    assert "A null token returns 401, not 500" in grader.prompt  # the steward's criteria reach the grader
+    assert "Login is slow" not in grader.prompt  # no duplicate hunt
+
+    tick(composed)  # the one comment
     tick(composed)  # nothing new to say: RESOLVE
     (comment,) = gh.comments_with("issue", 5, "Acceptance criteria")
     assert "A null token returns 401, not 500" in comment.body and "`high`" in comment.body
-    resolve = agent.tasks[1]
-    assert resolve.model == "claude-opus-5-5" and resolve.resume is None  # never the triage session
+    resolve = agent.tasks[2]
+    assert resolve.model == "claude-opus-5-5" and resolve.resume is None  # never a light session
     assert "A null token returns 401, not 500" in resolve.prompt
     assert tick(composed) == [OpenPullRequest(5, "fix/5-null-token-crashes")]
     assert "A null token returns 401, not 500" in gh.prs[100].body
     assert len(gh.comments_with("issue", 5, "Acceptance criteria")) == 1
+    assert len(gh.comments_with("issue", 5, "issue-agent:triage")) == 1
 
 
 def test_an_issue_with_its_own_criteria_keeps_them_as_the_contract(role):
     own = "Crash on null token.\n\n## Acceptance criteria\n- [ ] The API answers 401"
     gh = FakeGitHub(issues={5: replace(ready(), body=own)})
-    agent = Agent(triaged("high"), pushed(gh, "fix/5-null-token-crashes", "h1"))
+    light = triaged("high")
+    agent = Agent(light, light, pushed(gh, "fix/5-null-token-crashes", "h1"))
     composed, _ = role(gh, agent, triaged=False, **ROUTES)
-    tick(composed)
+    tick(composed)  # STEWARD
     assert "acceptance_criteria" not in agent.tasks[0].schema["properties"]
+    tick(composed)  # TRIAGE
     tick(composed)  # the triage comment: the tier only
     tick(composed)  # RESOLVE
     assert gh.comments_with("issue", 5, "Acceptance criteria") == []
@@ -776,39 +799,61 @@ def test_an_issue_with_its_own_criteria_keeps_them_as_the_contract(role):
     assert "The API answers 401" in gh.prs[100].body and "A null token returns 401" not in gh.prs[100].body
 
 
-def test_a_triage_cut_off_by_the_wall_cap_counts_once_and_the_issue_resolves_at_the_default_tier(role):
+def test_light_legs_cut_off_by_the_wall_cap_count_once_and_the_issue_resolves_at_the_default_tier(role):
     gh = FakeGitHub(issues={5: ready()})
-    agent = Agent(_capped, pushed(gh, "fix/5-null-token-crashes", "h1"))
+    agent = Agent(_capped, _capped, pushed(gh, "fix/5-null-token-crashes", "h1"))
     composed, _ = role(gh, agent, triaged=False, **ROUTES, FIX_MODEL_MED="claude:claude-sonnet-5-5")
-    assert dispatched(tick(composed), AgentKind.TRIAGE)
+    assert dispatched(tick(composed), AgentKind.STEWARD)
     # Not a machine end retried (and re-paid) every backoff window.
+    assert dispatched(tick(composed), AgentKind.TRIAGE)
     assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
-    assert agent.tasks[1].model == "claude-sonnet-5-5"
+    assert agent.tasks[2].model == "claude-sonnet-5-5"
+    assert gh.comments_with("issue", 5, "issue-agent:triage") == []
 
 
-def test_a_suspected_duplicate_waits_for_a_human_and_a_reply_lets_it_resolve(role):
+def test_a_suspected_duplicate_stops_before_triage_and_a_reply_lets_it_continue(role):
     gh = FakeGitHub(issues={5: ready(), 2: IssueView(2, title="Null token crash")})
-    agent = Agent(triaged("low", duplicate_of=2), pushed(gh, "fix/5-null-token-crashes", "h1"))
+    light = triaged("low", duplicate_of=2)
+    agent = Agent(light, light, pushed(gh, "fix/5-null-token-crashes", "h1"))
     composed, _ = role(gh, agent, triaged=False, **ROUTES)
-    tick(composed)
-    tick(composed)
+    tick(composed)  # STEWARD flags it
+    tick(composed)  # the stop
     assert Label.NEEDS_HUMAN in gh.issues[5].labels
     (stop,) = gh.comments_with("issue", 5, stop_tag(StopReason.DUPLICATE))
     assert "#2" in stop.body
     assert tick(composed) == []  # held
+    assert len(agent.tasks) == 1  # no triage leg was bought for a suspected duplicate
 
     gh.comment("issue", 5, "Not a duplicate: #2 is the web client.", author="alice")
     tick(composed)  # release
+    assert dispatched(tick(composed), AgentKind.TRIAGE)
     tick(composed)  # triage comment
     assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.LOW)]
     assert Label.NEEDS_HUMAN not in gh.issues[5].labels
 
 
-# ── TRIAGE holds no dispatch slot (owner, 2026-10-14) ───────────────────────
+def test_a_combined_result_recorded_before_the_split_is_not_stewarded_again(role):
+    gh = FakeGitHub(issues={5: ready()})
+    legacy = {"tier": "high", "acceptance_criteria": ["Legacy criterion"], "duplicate_of": None,
+              "duplicate_reason": "", "rationale": "Old combined act."}
+    agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent, triaged=False, **ROUTES)
+    composed.control.record_unpaid_leg(
+        RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
+        issue=5, number=5, head="", runtime="claude", leg_class="agent", result={"triage": legacy})
+    taken = tick(composed)
+    assert not dispatched(taken, AgentKind.STEWARD) and not dispatched(taken, AgentKind.TRIAGE)
+    (comment,) = gh.comments_with("issue", 5, "Acceptance criteria")
+    assert "Legacy criterion" in comment.body
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.HIGH)]
+    assert "Legacy criterion" in agent.tasks[0].prompt
+
+
+# ── The light acts hold no dispatch slot (owner, 2026-10-14) ───────────────────────
 
 
 class SplitAgent:
-    """Routes by act: a TRIAGE task (the only one with a schema) runs `light`,
+    """Routes by act: a STEWARD or TRIAGE task (the only ones with a schema) runs `light`,
     every other leg runs `heavy`. Each call is recorded with its kind."""
 
     def __init__(self, heavy, light):
@@ -822,7 +867,7 @@ class SplitAgent:
 def _blocked(gate: threading.Event, result):
     def step(task):
         assert gate.wait(timeout=10)
-        return result
+        return result(task) if callable(result) else result
     return step
 
 
@@ -830,33 +875,31 @@ _DONE = AgentResult(False, status="pushed", cost_usd=0.1, session_id="s")
 
 
 def _seed_triage(composed, number: int) -> None:
-    composed.control.record_unpaid_leg(
-        RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
-        issue=number, number=number, head="", runtime="claude", leg_class="agent", result={})
+    seed_light_legs(composed, number)
 
 
-def test_triage_dispatches_while_the_only_heavy_slot_is_busy(role):
+def test_the_light_acts_dispatch_while_the_only_heavy_slot_is_busy(role):
     gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Other bug")})
     gate = threading.Event()
     agent = SplitAgent(_blocked(gate, _DONE), triaged())
     composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
     _seed_triage(composed, 5)
     try:
-        taken = composed.daemon.tick()  # RESOLVE 5 holds the slot; TRIAGE 6 still starts
+        taken = composed.daemon.tick()  # RESOLVE 5 holds the slot; STEWARD 6 still starts
         assert dispatched(taken, AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
-        assert dispatched(taken, AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 6)]
+        assert dispatched(taken, AgentKind.STEWARD) == [RunAgent(AgentKind.STEWARD, 6)]
     finally:
         gate.set()
         composed.daemon.wait_for_dispatches()
 
 
-def test_a_running_triage_does_not_take_the_heavy_slot(role):
+def test_a_running_light_leg_does_not_take_the_heavy_slot(role):
     gh = FakeGitHub(issues={6: ready(6, "Other bug")})
     gate = threading.Event()
-    agent = SplitAgent(_blocked(gate, _DONE), _blocked(gate, triaged()(None)))
+    agent = SplitAgent(_blocked(gate, _DONE), _blocked(gate, triaged()))
     composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
     try:
-        assert dispatched(composed.daemon.tick(), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 6)]
+        assert dispatched(composed.daemon.tick(), AgentKind.STEWARD) == [RunAgent(AgentKind.STEWARD, 6)]
         gh.issues[5] = ready(5)
         _seed_triage(composed, 5)
         assert dispatched(composed.daemon.tick(), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
@@ -891,14 +934,14 @@ def test_heavy_acts_still_cap_at_the_concurrency(role):
         composed.daemon.wait_for_dispatches()
 
 
-def test_triage_keeps_its_per_issue_lease_and_the_spend_headroom(role):
+def test_the_light_acts_keep_their_per_issue_lease_and_the_spend_headroom(role):
     gh = FakeGitHub(issues={5: ready(5)})
     gate = threading.Event()
-    agent = SplitAgent(lambda _t: _DONE, _blocked(gate, triaged()(None)))
+    agent = SplitAgent(lambda _t: _DONE, _blocked(gate, triaged()))
     composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
     try:
-        assert dispatched(composed.daemon.tick(), AgentKind.TRIAGE)
-        assert not dispatched(composed.daemon.tick(), AgentKind.TRIAGE)  # one leg per issue
+        assert dispatched(composed.daemon.tick(), AgentKind.STEWARD)
+        assert not dispatched(composed.daemon.tick(), AgentKind.STEWARD)  # one leg per issue
     finally:
         gate.set()
         composed.daemon.wait_for_dispatches()
@@ -906,24 +949,24 @@ def test_triage_keeps_its_per_issue_lease_and_the_spend_headroom(role):
 
     broke, _ = role(FakeGitHub(issues={5: ready(5)}), SplitAgent(lambda _t: _DONE, triaged()), triaged=False,
                     DAILY_SPEND_CAP_USD="0.5")
-    assert not dispatched(tick(broke), AgentKind.TRIAGE)  # a 2.0 budget does not fit under a 0.5 cap
+    assert not dispatched(tick(broke), AgentKind.STEWARD)  # a 2.0 budget does not fit under a 0.5 cap
 
 
-def test_many_untriaged_issues_triage_up_to_the_concurrency_at_once_and_all_finish(role):
+def test_many_unstewarded_issues_run_light_legs_up_to_the_concurrency_at_once_and_all_finish(role):
     numbers = range(5, 11)
     gh = FakeGitHub(issues={n: ready(n, f"Bug {n}") for n in numbers})
     gate = threading.Event()
-    agent = SplitAgent(lambda _t: _DONE, _blocked(gate, triaged()(None)))
+    agent = SplitAgent(lambda _t: _DONE, _blocked(gate, triaged()))
     lines: list[str] = []
     composed, _ = role(gh, agent, lines.append, triaged=False, FIX_DISPATCH_CONCURRENCY="2")
     try:
-        assert len(dispatched(composed.daemon.tick(), AgentKind.TRIAGE)) == 2  # the ceiling is the concurrency
+        assert len(dispatched(composed.daemon.tick(), AgentKind.STEWARD)) == 2  # the ceiling is the concurrency
         composed.daemon.tick()
         assert not [line for line in lines if "not submitted" in line]  # decide never over-chooses
     finally:
         gate.set()
         composed.daemon.wait_for_dispatches()
-    for _ in range(12):
+    for _ in range(40):
         tick(composed)
     graded = [r for r in composed.control.leg_runs("o/r", tuple(numbers)) if r.kind == "TRIAGE"]
     assert {r.number for r in graded} == set(numbers)
@@ -963,12 +1006,26 @@ def test_a_routed_legs_task_carries_the_routes_effort_and_an_omitted_one_uses_th
     assert [t.effort for t in agent.tasks] == [Effort.HIGH, Effort.LOW]
 
 
-def test_the_triage_legs_task_carries_the_triage_routes_effort(role):
+def test_each_light_act_carries_its_own_routes_effort(role):
     gh = FakeGitHub(issues={5: ready()})
-    agent = Agent(triaged("high"))
+    light = triaged("high")
+    agent = Agent(light, light)
+    composed, _ = role(gh, agent, triaged=False, TRIAGE_MODEL="claude:claude-haiku-5-5:low",
+                       STEWARD_MODEL="claude:claude-sonnet-5-5:xhigh")
+    tick(composed)
+    tick(composed)
+    assert [(t.model, t.effort) for t in agent.tasks] == [
+        ("claude-sonnet-5-5", Effort.XHIGH), ("claude-haiku-5-5", Effort.LOW)]
+
+
+def test_an_unset_steward_route_runs_on_the_triage_route(role):
+    gh = FakeGitHub(issues={5: ready()})
+    light = triaged("high")
+    agent = Agent(light, light)
     composed, _ = role(gh, agent, triaged=False, TRIAGE_MODEL="claude:claude-haiku-5-5:low")
     tick(composed)
-    assert agent.tasks[0].effort is Effort.LOW
+    tick(composed)
+    assert [(t.model, t.effort) for t in agent.tasks] == [("claude-haiku-5-5", Effort.LOW)] * 2
 
 
 def test_the_recorded_leg_result_names_the_effort_it_ran_at(role):
