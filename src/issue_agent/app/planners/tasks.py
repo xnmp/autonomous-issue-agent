@@ -406,6 +406,11 @@ _FIX_CI_DIAGNOSE = """Diagnose by failure class:
   genuinely covered (ensure the new tests are under a path SonarQube ingests as
   tests), NOT add the file to sonar.coverage.exclusions.
 - Security scan (Wiz/Snyk): address the flagged finding if it is in your diff.
+- Intermittent failure outside your diff (a hang or timeout in a test your change
+  does not touch, or the same failure on the base branch): re-run only the failed
+  jobs yourself with `gh run rerun <run-id> --failed`, once per head, say so in
+  the PR body, and end the leg; CI reports again. Never return blocked to ask a
+  human for a re-run (#1117).
 
 Do NOT suppress a quality/security signal for the code THIS PR adds/modifies just
 to go green — default to fixing the cause. Suppression is legitimate ONLY in
