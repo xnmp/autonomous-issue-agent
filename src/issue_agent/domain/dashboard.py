@@ -1,1892 +1,657 @@
-"""Pure dashboard lifecycle, attribution, and metric model.
+"""The dashboard's read model, as pure functions. No I/O, no clock.
 
-The model consumes already-parsed journal events. It knows nothing about files,
-processes, HTTP, GitHub, or rendering.
+The dashboard is a separate, read-only consumer (docs/open/2026-10-12-minimal-
+harness-design.md): it shows what the core derives and what the `legs` table
+recorded, and keeps no state or lifecycle rules of its own.
+
+- **Board.** Each row is one harness item, mapped from the state
+  `domain.state.derive` gives it over the same observation the roles read.
+  `needs-human` is "Needs you", worded by its stop reason; everything else is
+  either working (an agent, CI, or a free action is moving it) or a wait on
+  something outside the harness (branch protection, a human reviewer, money
+  headroom, a machine backoff, an unreadable GitHub field).
+- **Legs.** The issue page, the rail, the history and every metric read the
+  `legs` rows (refactor decision Q15: metrics from legs plus GitHub).
+
+Inputs arrive as plain values: the adapter parses SQLite rows into `LegRow`,
+GitHub into `domain.world` views.
 """
 
 from __future__ import annotations
 
 import math
-import re
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
-from collections.abc import Callable
-from datetime import date, datetime, timedelta, timezone
-from typing import Iterable, Literal, Mapping
 
 from .actions import AgentKind
-from .events import JsonValue
-from .labels import Label
-from .outcome import ExitReason
-from .world import ReviewDecision
+from .checks import Observed
+from .ci import Clear, Failed, Waiting as CiWaiting, parse_timestamp, reduce_ci
+from .state import (
+    Backoff, Busy, DerivedState, Dispatch, Harness, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason, Wait,
+    WaitReason, stop_tag,
+)
+from .world import Comment, PRView
 
-
-def _utc_date(timestamp: float) -> date:
-    return datetime.fromtimestamp(timestamp, timezone.utc).date()
-
-
-# The three role daemons, in the order `journal_paths` returns their journals.
 ROLE_NAMES = ("fix", "review")
-
-# A daemon that has not journalled anything in this long is probably not
-# ticking. Generous relative to POLL_SECONDS=20 because a long resolve run emits
-# nothing between its start and settled lines, and a 15-minute session must not
-# read as a dead daemon.
+# A role heartbeat older than this reads as stale (the CLI's status uses it too).
 STALE_AFTER_S = 1800.0
+# Kept for adapters/journal.py, which imports it to tell issue-numbered leg
+# kinds from PR-numbered ones; that import is the core's to drop.
+ISSUE_NUMBERED = frozenset({AgentKind.RESOLVE.name})
 
-# Leg families, for the cost mix and the stage heuristic. Kinds outside these
-# sets still cost money and are still reported — they just fall into "other".
-RESOLVE_KINDS = frozenset({"RESOLVE", "RESUME", "ROUTE"})
-REVIEW_KINDS = frozenset({"REVIEW", "RE_REVIEW"})
-REPAIR_KINDS = frozenset({"FIX_CI", "ADDRESS_REVIEW", "REBASE"})
-# Kinds whose `number` is an ISSUE; everything else numbers a PR.
-ISSUE_NUMBERED = RESOLVE_KINDS
+MESSAGE_CHARS = 4000
+EXCERPT_CHARS = 500
+SPEND_WINDOW_HOURS = 48
+NOTIFICATION_LIMIT = 100
+_ESTIMATED_BASES = frozenset({"estimate", "learned_estimate", "synthetic"})
 
 
-# ── action-desc parsing ───────────────────────────────────────────────────────
-# `Executor` journals applied actions as a human one-liner (`{"event":"action",
-# "desc":"relabel issue #7: -ai-ready +ai-working"}`) — there are no structured
-# fields to read. Parsing the sentence back is the only way to attribute those
-# events to an issue, so the grammar lives here, in one place, table-tested.
-_RE_RELABEL = re.compile(r"^relabel (issue|pr) #(\d+): (.*)$")
-# The dashboard's journaled unblock is semantically a relabel (removal-only);
-# parsing it as one lets attention-stage/clock derivations see the clear.
-_RE_OPERATOR_UNBLOCK = re.compile(r"^operator unblock (issue|pr) #(\d+): (.*)$")
-_RE_DISPATCH = re.compile(r"^dispatch ([A-Z_]+) #(\d+)$")
-_RE_CLEAR = re.compile(
-    r"^clear state for pr #(\d+)(?:, issue #(\d+))? \((merged|closed-unmerged)\)$"
-)
-_RE_PR_VERB = re.compile(
-    r"^(enable auto-merge|update branch|re-run failed checks|comment pr) "
-    r"(?:PR )?#(\d+)"
-)
-_RE_ISSUE_VERB = re.compile(r"^(close issue|comment issue|remove worktree for) #?(\d+)")
-_RE_WORKTREE = re.compile(r"^remove worktree for #(\d+)$")
+def bounded(text: object, limit: int) -> str:
+    value = text.strip() if isinstance(text, str) else ""
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+# ── legs ─────────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
-class ActionFact:
-    """What one journalled `action` line was about."""
+class Tokens:
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
-    verb: str  # relabel | dispatch | clear | automerge | close | comment | worktree
-    target: str  # "issue" or "pr" — which number `number` is
+
+@dataclass(frozen=True)
+class LegRow:
+    """One `legs` row as the dashboard reads it. Money is in USD; an absent
+    charge means the leg has not settled (it is reserved, running or was
+    released without spending)."""
+
+    leg_id: str
+    role: str
+    kind: str
+    issue: int | None
     number: int
-    kind: str = ""  # dispatch: the AgentKind; clear: merged/closed-unmerged
-    added: tuple[str, ...] = ()
-    removed: tuple[str, ...] = ()
-    issue: int | None = None  # named explicitly by the desc, when it is
-    merged: bool = False
-
-
-def parse_action(desc: str) -> ActionFact | None:
-    """One `action` desc → the fact it records, or None if unrecognised.
-
-    Unrecognised is a normal outcome, not an error: a new action type adds a new
-    sentence and this returns None until the grammar learns it, which costs the
-    dashboard one unattributed event rather than a crash.
-    """
-    desc = (desc or "").strip()
-    m = _RE_RELABEL.match(desc) or _RE_OPERATOR_UNBLOCK.match(desc)
-    if m:
-        target, number, moves = m.group(1), int(m.group(2)), m.group(3)
-        added = tuple(t[1:] for t in moves.split() if t.startswith("+"))
-        removed = tuple(t[1:] for t in moves.split() if t.startswith("-"))
-        return ActionFact("relabel", target, number, added=added, removed=removed)
-    m = _RE_DISPATCH.match(desc)
-    if m:
-        kind = m.group(1)
-        target = "issue" if kind in ISSUE_NUMBERED else "pr"
-        return ActionFact("dispatch", target, int(m.group(2)), kind=kind)
-    m = _RE_CLEAR.match(desc)
-    if m:
-        issue = int(m.group(2)) if m.group(2) else None
-        return ActionFact(
-            "clear", "pr", int(m.group(1)), kind=m.group(3), issue=issue,
-            merged=(m.group(3) == "merged"),
-        )
-    m = _RE_WORKTREE.match(desc)
-    if m:
-        return ActionFact("worktree", "issue", int(m.group(1)))
-    m = _RE_PR_VERB.match(desc)
-    if m:
-        return ActionFact(m.group(1).split()[0], "pr", int(m.group(2)))
-    m = _RE_ISSUE_VERB.match(desc)
-    if m:
-        return ActionFact(m.group(1).split()[0], "issue", int(m.group(2)))
-    return None
-
-
-# ── issue attribution ─────────────────────────────────────────────────────────
-def pr_issue_map(events) -> dict[int, int]:
-    """PR number → the issue it closes, learned from the agent runs themselves.
-
-    A review leg journals `number` = the PR and `issue` = the issue it closes,
-    so the harness's own receipts carry the mapping; nothing has to be asked of
-    GitHub. Later events win, since a PR's closing-ref can be added after the
-    first run against it.
-    """
-    out: dict[int, int] = {}
-    for e in events:
-        if e.get("event") not in ("agent_run", "agent_run_start"):
-            continue
-        issue, number = _int(e.get("issue")), _int(e.get("number"))
-        if issue is not None and number is not None:
-            out[number] = issue
-    return out
-
-
-def event_issue(event: dict, pr_issue: dict[int, int]) -> int | None:
-    """The issue an event belongs to, or None when it names none (a `daily`
-    spend block, a `tick_gated`) — those are deployment-level facts."""
-    kind = str(event.get("kind") or "")
-    name = event.get("event")
-    if name in ("agent_run", "agent_run_start"):
-        issue = _int(event.get("issue"))
-        if issue is not None:
-            return issue
-        number = _int(event.get("number"))
-        if number is None:
-            return None
-        return number if kind in ISSUE_NUMBERED else pr_issue.get(number)
-    if name == "action":
-        fact = parse_action(str(event.get("desc") or ""))
-        if fact is None:
-            return None
-        if fact.issue is not None:
-            return fact.issue
-        return fact.number if fact.target == "issue" else pr_issue.get(fact.number)
-    if name == "escalation":
-        number = _int(event.get("number"))
-        if number is None:
-            return None
-        return number if event.get("target") == "issue" else pr_issue.get(number)
-    issue = _int(event.get("issue"))
-    if issue is not None:
-        return issue
-    pr = _int(event.get("pr"))
-    return pr_issue.get(pr) if pr is not None else None
-
-
-# ── rows ──────────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class RunSummary:
-    """One settled agent run — the unit both the cost mix and the rounds count
-    are computed over."""
-
-    ts: datetime | None
-    role: str
-    kind: str
-    number: int | None
-    issue: int | None
-    model: str
-    status: str
-    exit_reason: str
-    duration_s: float
-    cost_usd: float
-    estimated: bool
-    session_id: str
-    # The envelope's semantic error signal. Defaulted so pre-existing positional
-    # constructions keep working; every producer in this module sets it.
-    is_error: bool = False
-
-
-@dataclass(frozen=True)
-class OtherAgentKind:
-    """A legitimate extension/legacy kind outside the dispatch enum."""
-
-    value: str
-
-
-AgentRunKind = AgentKind | OtherAgentKind
-
-
-@dataclass(frozen=True)
-class FailedRun:
-    """An agent run whose envelope did not settle cleanly."""
-
-    kind: AgentRunKind
-    reason: ExitReason
-
-
-@dataclass(frozen=True)
-class BlockedRun:
-    """A clean agent response that explicitly needs human input."""
-
-    kind: AgentRunKind
-
-
-@dataclass(frozen=True)
-class ReviewVerdict:
-    """A clean reviewer decision. Failed runs cannot inhabit this variant."""
-
-    kind: Literal[AgentKind.REVIEW]
-    decision: ReviewDecision
-
-
-@dataclass(frozen=True)
-class CompletedRun:
-    """A clean run that is not a structured review verdict."""
-
-    kind: AgentKind
-
-
-@dataclass(frozen=True)
-class UnrecognizedRun:
-    """A legacy/corrupt kind retained for display but denied typed meaning."""
-
-    kind: str
-
-
-SettledRun = (
-    FailedRun | BlockedRun | ReviewVerdict | CompletedRun | UnrecognizedRun
-)
-
-
-# The two ways a leg can say "this run ended cleanly": claude settles the happy
-# path with no exit reason at all, codex settles it as `ok`. Keying failure on
-# "the field is non-empty" therefore rendered every healthy codex leg as "run
-# failed" (#158) — a claude-shaped default, not a real signal.
-_CLEAN_EXIT_REASONS = frozenset({"", ExitReason.OK.value})
-
-
-def leg_failed(is_error: bool, exit_reason: str) -> bool:
-    """Whether a settled leg should render as failed.
-
-    Keys on the semantic error signal: the envelope's `is_error`, or an exit
-    reason that is not one of the clean sentinels. An `is_error` leg with no
-    exit reason still fails; `ok` with `is_error=False` renders whatever
-    lifecycle state the leg would have had without the field.
-
-    An unrecognised reason (a legacy journal, a runtime the taxonomy has not
-    caught up with) counts as failed. Only a clean sentinel is evidence of a
-    clean finish, and a silently-swallowed death is the worse failure mode for
-    a dashboard whose job is showing which legs died.
-    """
-    if is_error:
-        return True
-    return exit_reason.strip().casefold() not in _CLEAN_EXIT_REASONS
-
-
-def _agent_kind(raw: str) -> AgentKind | None:
-    # Journals from before refactor slice 5c record a re-review as RE_REVIEW.
-    # It is the same act; the read model goes with the dashboard rebuild (slice 8).
-    if raw == "RE_REVIEW":
-        return AgentKind.REVIEW
-    try:
-        return AgentKind[raw]
-    except KeyError:
-        return None
-
-
-def _failure_reason(leg: RunSummary) -> ExitReason:
-    raw = leg.exit_reason.strip().casefold()
-    if raw in _CLEAN_EXIT_REASONS:
-        return ExitReason.AGENT_ERROR
-    try:
-        return ExitReason(raw)
-    except ValueError:
-        return ExitReason.AGENT_ERROR
-
-
-def settled_run(leg: RunSummary) -> SettledRun:
-    """Parse the permissive journal projection into a closed outcome union.
-
-    Failure is classified first. A runtime may preserve parsed structured
-    output beside ``is_error=True``; that raw contradiction becomes only a
-    ``FailedRun`` here, so no downstream typed value can expose its APPROVE as
-    a verdict.
-    """
-    if leg_failed(leg.is_error, leg.exit_reason):
-        kind = _agent_kind(leg.kind) or OtherAgentKind(leg.kind)
-        return FailedRun(kind, _failure_reason(leg))
-    kind = _agent_kind(leg.kind)
-    if leg.status.casefold() == "blocked":
-        return BlockedRun(kind or OtherAgentKind(leg.kind))
-    if kind is None:
-        return UnrecognizedRun(leg.kind)
-    if kind is AgentKind.REVIEW:
-        try:
-            return ReviewVerdict(AgentKind.REVIEW, ReviewDecision(leg.status))
-        except ValueError:
-            return CompletedRun(kind)
-    return CompletedRun(kind)
-
-
-def review_verdict(leg: RunSummary) -> ReviewVerdict | None:
-    if leg.kind not in REVIEW_KINDS:
-        return None
-    outcome = settled_run(leg)
-    return outcome if isinstance(outcome, ReviewVerdict) else None
-
-
-def _settled_leg_stage(leg: RunSummary) -> str:
-    outcome = settled_run(leg)
-    if isinstance(outcome, FailedRun):
-        return "run failed"
-    if isinstance(outcome, BlockedRun):
-        return "awaiting human reply"
-    if isinstance(outcome, ReviewVerdict):
-        if outcome.decision is ReviewDecision.APPROVE:
-            return "awaiting merge"
-        if outcome.decision is ReviewDecision.REQUEST_CHANGES:
-            return "changes requested"
-        return "reviewed"
-    if (
-        isinstance(outcome, CompletedRun)
-        and outcome.kind is AgentKind.REVIEW
-    ):
-        return "reviewed"
-    if leg.kind in RESOLVE_KINDS | REPAIR_KINDS:
-        return "awaiting review"
-    return ""
-
-
-def _review_verdict_legs(
-    legs: Iterable[RunSummary],
-) -> list[tuple[RunSummary, ReviewVerdict]]:
-    result = []
-    for leg in legs:
-        if (verdict := review_verdict(leg)) is not None:
-            result.append((leg, verdict))
-    return result
-
-
-@dataclass(frozen=True)
-class RunningLeg:
-    """An `agent_run_start` with no settlement: either a leg running right now
-    or a leg whose process died (the journal cannot tell them apart — a stale
-    `since` is the tell)."""
-
-    ts: datetime | None
-    role: str
-    kind: str
-    number: int | None
-    issue: int | None
-    model: str
-
-
-@dataclass(frozen=True)
-class IssueRow:
-    issue: int
-    stage: str
-    cost_usd: float
-    legs: tuple[RunSummary, ...]
-    running: tuple[RunningLeg, ...]
-    rounds: int  # review legs against this issue's PRs
-    approvals: int
-    changes_requested: int
-    escalations: int
-    recurrences: int
-    spend_blocks: int
-    prs: tuple[int, ...]
-    models: tuple[str, ...]
-    last_ts: datetime | None
-    done: bool
-    events: tuple[dict, ...]  # the drill-down, in global ts order
-    facts: Mapping[str, JsonValue] = field(default_factory=dict)
-    lane: str = "in_flight"
+    head: str
+    runtime: str
+    state: str  # reserved | running | ended | released
+    reserved_at: datetime
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    end_reason: str = ""
+    reserved_usd: float = 0.0
+    charged_usd: float | None = None
+    basis: str = ""
+    origin: str = ""
+    leg_class: str = ""  # agent | asked | machine | "" (never returned)
+    session_id: str = ""
+    tokens: Tokens | None = None
+    summary: str = ""
+    question: str = ""
+    verdict: str = ""  # the review verdict event (APPROVE / REQUEST_CHANGES), if any
+    verdict_body: str = ""
 
     @property
-    def kinds(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(leg.kind for leg in self.legs))
-
-
-@dataclass(frozen=True)
-class DaemonHealth:
-    role: str
-    journal_path: str
-    log_path: str
-    events: int
-    last_ts: datetime | None
-    last_event: str
-    stale: bool  # no events for STALE_AFTER_S — or never any at all
-
-
-@dataclass(frozen=True)
-class Metrics:
-    done_issues: int
-    in_flight_issues: int
-    total_cost_usd: float
-    cost_per_done_usd: float
-    by_kind: tuple[tuple[str, float, int], ...]  # (kind, $, runs), dearest first
-    first_pass_approvals: int
-    first_pass_changes: int
-    rounds_per_pr: float
-    escalations: int
-    recurrences: int
-    spend_blocks: int
-    today_usd: float | None  # settled SQLite spend, or unknown
-    # (class, count) for every class in INTERVENTION_CLASSES, always all three.
-    interventions_by_class: tuple[tuple[str, int], ...] = ()
-    # The same interventions, itemized and oldest first. `interventions_by_class`
-    # is a fold of this, so a tile that disagreed with the timeline would be a
-    # bug in one reading rather than two independent classifications.
-    interventions: tuple["InterventionItem", ...] = ()
+    def running(self) -> bool:
+        return self.state in ("reserved", "running")
 
     @property
-    def first_pass_rate(self) -> float | None:
-        total = self.first_pass_approvals + self.first_pass_changes
-        return (self.first_pass_approvals / total) if total else None
+    def counted(self) -> bool:
+        """A leg that ran or may still run. A released leg never launched
+        (an unlaunched reservation, or one refused before admission)."""
+        return self.state != "released"
 
     @property
-    def interventions_total(self) -> int:
-        return sum(count for _name, count in self.interventions_by_class)
+    def cost_usd(self) -> float:
+        """What the leg costs now: its charge once settled, its reserved
+        maximum while it may still spend, nothing once released."""
+        if self.charged_usd is not None:
+            return self.charged_usd
+        return self.reserved_usd if self.running else 0.0
 
     @property
-    def interventions_per_merged_pr(self) -> float | None:
-        """Rearm+other interventions per merged PR; None when nothing merged.
-
-        `policy` is excluded from the headline ratio on purpose: a hand promote
-        is a chosen gate, so charging it here would make a deliberate
-        configuration read as harness unreliability. It stays in
-        `interventions_by_class` so the choice remains visible.
-
-        None rather than 0.0 when `done_issues` is 0: "nobody intervened" and
-        "nothing merged to divide by" are opposite readings of the same day.
-        """
-        if not self.done_issues:
-            return None
-        charged = sum(
-            count
-            for name, count in self.interventions_by_class
-            if name != INTERVENTION_POLICY
-        )
-        return round(charged / self.done_issues, 2)
-
-
-@dataclass(frozen=True)
-class Deployment:
-    name: str
-    repo: str
-    health: tuple[DaemonHealth, ...]
-    issues: tuple[IssueRow, ...]  # newest activity first
-    metrics: Metrics
-    unattributed: tuple[dict, ...]  # events naming no issue (daily caps, ticks)
-    warnings: tuple[str, ...] = ()
-    # Every row the fold produced, including the ones the present/done filter
-    # keeps out of `issues` — a retired or no longer observable issue whose legs
-    # were still paid for. Metrics charge this set, so any second view of the
-    # same money (the hourly spend series above all) must read it too, or the
-    # chart and the headline total disagree about what the deployment spent.
-    historical_issues: tuple[IssueRow, ...] = ()
+    def estimated(self) -> bool:
+        return self.running or self.basis in _ESTIMATED_BASES or self.origin == "recovery_estimate"
 
     @property
-    def metrics_issues(self) -> tuple[IssueRow, ...]:
-        """The rows `build_metrics` charged. Falls back to the display rows for
-        a Deployment assembled without a separate historical set."""
-        return self.historical_issues or self.issues
-
-
-@dataclass(frozen=True)
-class Snapshot:
-    """A deployment aggregate with configuration context needed by views."""
-
-    name: str
-    repo: str
-    target_dir: str
-    deployment: Deployment
-    timestamps: tuple[datetime | None, ...]
+    def outcome(self) -> str:
+        """running | passed | changes_requested | asked | failed | done."""
+        if self.running:
+            return "running"
+        if self.verdict == "APPROVE":
+            return "passed"
+        if self.verdict == "REQUEST_CHANGES":
+            return "changes_requested"
+        if self.leg_class == "asked":
+            return "asked"
+        if self.leg_class == "agent":
+            return "done"
+        return "failed"
 
     @property
-    def last_activity(self) -> datetime | None:
-        stamps = [ts for ts in self.timestamps if ts]
-        return max(stamps) if stamps else None
+    def at(self) -> datetime:
+        return self.ended_at or self.started_at or self.reserved_at
 
 
+def issue_legs(legs: Iterable[LegRow], issue: int) -> tuple[LegRow, ...]:
+    return tuple(sorted((leg for leg in legs if leg.issue == issue), key=lambda leg: (leg.reserved_at, leg.leg_id)))
 
-# ── stage inference (HEURISTIC — see the table in the docstring) ──────────────
-# Ordered rules, applied to the issue's events NEWEST FIRST; the first match
-# wins. This is a best-effort read of "where is this issue", not a state
-# machine: the harness has no single place that writes a stage, so the stage is
-# reconstructed from the traces it does leave. Every rule is one journal fact.
-_STAGE_RUNNING = {
-    "RESOLVE": "resolving",
-    "RESUME": "resolving",
-    "ROUTE": "routing",
-    "REVIEW": "reviewing",
-    "RE_REVIEW": "reviewing",
-    "FIX_CI": "fixing CI",
-    "ADDRESS_REVIEW": "addressing review",
-    "REBASE": "rebasing",
-}
 
+# ── board ────────────────────────────────────────────────────────────────────
 
-def stage_for(events, running: tuple[RunningLeg, ...] = ()) -> str:
-    """Best-effort lifecycle stage for one issue.
 
-    Rules, in priority order:
-
-      1. an active human-attention lifecycle state → "blocked" / "escalated".
-         Human attention outranks process activity, which remains in drill-down.
-      2. a leg is running now → that leg's stage ("resolving", "reviewing",
-         "fixing CI", …).
-      3. otherwise the newest event that matches one of:
-         `+ai-done` / a merged `clear state`   → "done"
-         `escalation` / `+needs-human-review`  → "escalated"
-         `recurrence`                          → "recurred"
-         `spend_block`                         → "blocked (spend)"
-         `hold`                                → "held"
-         `+ai-blocked`                         → "blocked" (the web projection
-                                                  adds the recorded reason)
-         review run APPROVE                    → "awaiting merge"
-         review run REQUEST_CHANGES            → "changes requested"
-         errored run                           → "run failed"
-         resolve/repair run settled            → "awaiting review"
-         `+ai-working` / `+ai-pr-open`         → "working" / "pr open"
-         `+ai-ready`                           → "queued"
-      4. nothing matched → "unknown".
-    """
-    attention = _human_attention_stage(events)
-    if attention:
-        return attention
-    if running:
-        kind = running[-1].kind
-        return _STAGE_RUNNING.get(kind, f"running {kind or 'agent'}".strip())
-    for e in reversed(list(events)):
-        stage = _stage_of_event(e)
-        if stage:
-            return stage
-    return "unknown"
-
-
-def _human_attention_stage(events) -> str:
-    """Current attention state from its newest explicit transition."""
-    for event in reversed(list(events)):
-        if event.get("event") == "action":
-            fact = parse_action(str(event.get("desc") or ""))
-            if fact is None:
-                continue
-            if fact.verb == "clear":
-                return ""
-            if fact.verb != "relabel":
-                continue
-            if "needs-human-review" in fact.added:
-                return "escalated"
-            if "ai-blocked" in fact.added:
-                return "blocked"
-            if (
-                "needs-human-review" in fact.removed
-                or "ai-blocked" in fact.removed
-            ):
-                return ""
-        elif event.get("event") == "escalation":
-            return "escalated"
-    return ""
-
-
-def _stage_of_event(e: dict) -> str:
-    name = e.get("event")
-    if name == "action":
-        fact = parse_action(str(e.get("desc") or ""))
-        if fact is None:
-            return ""
-        if fact.verb == "clear":
-            return "done" if fact.merged else "closed unmerged"
-        if fact.verb == "relabel":
-            for label, stage in (
-                ("ai-done", "done"),
-                ("needs-human-review", "escalated"),
-                ("ai-blocked", "blocked"),
-                ("ai-pr-open", "pr open"),
-                ("ai-working", "working"),
-                ("ai-ready", "queued"),
-            ):
-                if label in fact.added:
-                    return stage
-        return ""
-    if name == "escalation":
-        return "escalated"
-    if name == "recurrence":
-        return "recurred"
-    if name == "spend_block":
-        return "blocked (spend)"
-    if name == "hold":
-        return "held"
-    if name == "agent_run":
-        return _settled_leg_stage(_leg(e))
-    return ""
-
-
-# ── aggregation ───────────────────────────────────────────────────────────────
-def build_issue_rows(events, running_starts) -> tuple[IssueRow, ...]:
-    """Group a deployment's merged event stream into one row per issue.
-
-    `events` must already be in global `ts` order across the three role journals
-    — every "latest event" read below depends on it.
-    """
-    pr_issue = pr_issue_map(events)
-    grouped: dict[int, list[dict]] = {}
-    for e in events:
-        issue = event_issue(e, pr_issue)
-        if issue is not None:
-            grouped.setdefault(issue, []).append(e)
-    running_by_issue: dict[int, list[RunningLeg]] = {}
-    for e in running_starts:
-        issue = event_issue(e, pr_issue)
-        if issue is not None:
-            running_by_issue.setdefault(issue, []).append(_running_leg(e))
-
-    rows = [
-        _issue_row(issue, evs, tuple(running_by_issue.get(issue, ())))
-        for issue, evs in grouped.items()
-    ]
-    return tuple(sorted(rows, key=_row_sort_key, reverse=True))
-
-
-def _row_sort_key(row: IssueRow):
-    return (row.last_ts or datetime.min.replace(tzinfo=timezone.utc), row.issue)
-
-
-def _done_state(events: list[dict]) -> bool:
-    """Fold lifecycle evidence so a reopened issue does not stay historically done."""
-    done = False
-    active_labels = {"ai-ready", "ai-working", "ai-blocked", "needs-human-review"}
-    for event in events:
-        event_name = event.get("event")
-        if event_name == "recurrence":
-            done = False
-        if event_name != "action":
-            continue
-        fact = parse_action(str(event.get("desc") or ""))
-        if fact is None:
-            continue
-        if fact.verb == "clear":
-            done = fact.merged
-        elif fact.verb == "relabel":
-            if "ai-done" in fact.added:
-                done = True
-            elif "ai-done" in fact.removed or active_labels.intersection(fact.added):
-                done = False
-    return done
-
-
-def _issue_row(issue: int, events: list[dict], running: tuple[RunningLeg, ...]) -> IssueRow:
-    legs = tuple(_leg(e) for e in events if e.get("event") == "agent_run")
-    reviews = _review_verdict_legs(legs)
-    facts = [
-        parse_action(str(e.get("desc") or ""))
-        for e in events
-        if e.get("event") == "action"
-    ]
-    prs = tuple(
-        dict.fromkeys(
-            [leg.number for leg in legs if leg.number and leg.kind not in ISSUE_NUMBERED]
-            + [f.number for f in facts if f is not None and f.target == "pr"]
-        )
-    )
-    done = _done_state(events)
-    timestamps = [ts for ts in (parse_ts(e.get("ts")) for e in events) if ts]
-    effective_running = () if done else running
-    return IssueRow(
-        issue=issue,
-        # Terminal lifecycle evidence is authoritative. A torn/stale start can
-        # remain unmatched in the journal after merge, but it must not make a
-        # completed issue appear to be running again.
-        stage="done" if done else stage_for(events, effective_running),
-        cost_usd=round(sum(leg.cost_usd for leg in legs), 4),
-        legs=legs,
-        running=effective_running,
-        rounds=len(reviews),
-        approvals=sum(
-            verdict.decision is ReviewDecision.APPROVE
-            for _leg, verdict in reviews
-        ),
-        changes_requested=sum(
-            verdict.decision is ReviewDecision.REQUEST_CHANGES
-            for _leg, verdict in reviews
-        ),
-        escalations=sum(1 for e in events if e.get("event") == "escalation"),
-        recurrences=sum(1 for e in events if e.get("event") == "recurrence"),
-        spend_blocks=sum(1 for e in events if e.get("event") == "spend_block"),
-        prs=prs,
-        # Starts carry the configured model before a task settles. Reading both
-        # event shapes keeps live tasks visible and recovers reviewer models
-        # from older settlements that omitted the model field.
-        models=tuple(
-            dict.fromkeys(
-                str(event.get("model"))
-                for event in events
-                if event.get("event") in ("agent_run_start", "agent_run")
-                and event.get("kind") != "ROUTE"
-                and event.get("model")
-            )
-        ),
-        last_ts=max(timestamps) if timestamps else None,
-        done=done,
-        events=tuple(events),
-    )
-
-
-def _leg(e: dict) -> RunSummary:
-    cost = _float(e.get("cost_usd"))
-    estimated = _float(e.get("cost_estimated_usd"))
-    return RunSummary(
-        ts=parse_ts(e.get("ts")),
-        role=str(e.get("role") or ""),
-        kind=str(e.get("kind") or "?"),
-        number=_int(e.get("number")),
-        issue=_int(e.get("issue")),
-        model=str(e.get("model") or ""),
-        status=str(e.get("status") or ""),
-        exit_reason=str(e.get("exit_reason") or ""),
-        is_error=bool(e.get("is_error")),
-        duration_s=_float(e.get("duration_s")),
-        # The BILLED figure, exactly as `JournalingRuntime` computes it for the
-        # ledger: the true cost when there is one, else the token estimate. A
-        # dashboard that showed $0.00 for every aborted run would understate the
-        # one leg family most worth watching.
-        cost_usd=cost if cost > 0 else estimated,
-        estimated=cost <= 0 and estimated > 0,
-        session_id=str(e.get("session_id") or ""),
-    )
-
-
-def settled_run_from_event(event: dict) -> SettledRun:
-    """Typed outcome at the legacy journal-dict boundary."""
-    return settled_run(_leg(event))
-
-
-def _running_leg(e: dict) -> RunningLeg:
-    return RunningLeg(
-        ts=parse_ts(e.get("ts")),
-        role=str(e.get("role") or ""),
-        kind=str(e.get("kind") or "?"),
-        number=_int(e.get("number")),
-        issue=_int(e.get("issue")),
-        model=str(e.get("model") or ""),
-    )
-
-
-def unattributed_legs(unattributed) -> list[RunSummary]:
-    """Deployment-level paid legs — the runs naming no issue.
-
-    Shared so that every view of this money reads the same billed figure:
-    `_leg` prefers the true cost and falls back to the token estimate, and a
-    caller that read `cost_usd` off the raw event would silently drop every
-    subscription-priced leg.
-    """
-    return [
-        _leg(e)
-        for e in unattributed
-        if isinstance(e, dict) and e.get("event") == "agent_run"
-    ]
-
-
-def first_pass_verdicts(rows) -> tuple[int, int]:
-    """(approvals, changes-requested) over the FIRST review verdict per PR.
-
-    Per PR, not per review: the named guardrail is "did the first review of this
-    PR approve it", so later rounds — which are the *consequence* of a first-pass
-    rejection — must not be counted again or a bad PR reviewed four times reads
-    as three-quarters healthy.
-    """
-    first: dict[tuple[int, int | None], ReviewDecision] = {}
-    for row in rows:
-        for leg in row.legs:
-            verdict = review_verdict(leg)
-            if verdict is None or verdict.decision is ReviewDecision.ESCALATE:
-                continue
-            first.setdefault((row.issue, leg.number), verdict.decision)
-    verdicts = list(first.values())
-    return (
-        verdicts.count(ReviewDecision.APPROVE),
-        verdicts.count(ReviewDecision.REQUEST_CHANGES),
-    )
-
-
-# ── operator interventions ────────────────────────────────────────────────────
-# "Interventions per merged PR" is the adjudicating metric for running the
-# harness without a manager, so it has to be a number rather than a feeling.
-#
-# The automated split is a PROXY and is named as one. The gap / config /
-# judgment causes an operator assigns in a session review need a human to say
-# WHY the harness stopped; ADR 0013's ledger is where those land. Nothing here
-# invents them. What the journal can answer on its own is what the operator had
-# to DO:
-#
-#   rearm  — the harness wedged and a human re-armed it (unblock, review
-#            dismissal, priority nudge). Closest available stand-in for the
-#            gap class until ADR 0013 lands causes.
-#   policy — a chosen gate rather than a defect: promoting an issue to ai-ready
-#            by hand is the operator's admission gate.
-#   other  — an operator event this grammar does not recognise. An unclassified
-#            intervention is still an intervention, so it is counted, never
-#            dropped; a growing `other` means the grammar owes a class.
-#
-# Manual gh-side work (closing an issue by hand)
-# reaches the harness as an observed world fact, not as an operator event, and
-# is therefore NOT in this count. The number is a floor on human involvement.
-INTERVENTION_REARM = "rearm"
-INTERVENTION_POLICY = "policy"
-INTERVENTION_OTHER = "other"
-INTERVENTION_CLASSES = (
-    INTERVENTION_REARM,
-    INTERVENTION_POLICY,
-    INTERVENTION_OTHER,
-)
-
-# Two further DISPLAY classes, for the itemized timeline only. Each refines one
-# metric class rather than competing with it (see `timeline_class`), so the
-# guardrail series keeps its three-class history while the timeline can say
-# which kind of re-arm or which kind of unrecognised action this row was.
-INTERVENTION_GUIDANCE = "guidance"   # a re-arm that also moved the scope note
-INTERVENTION_RELABEL = "relabel"     # an operator label move outside the grammar
-INTERVENTION_TIMELINE_CLASSES = (
-    INTERVENTION_REARM,
-    INTERVENTION_GUIDANCE,
-    INTERVENTION_RELABEL,
-    INTERVENTION_POLICY,
-    INTERVENTION_OTHER,
-)
-
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-
-@dataclass(frozen=True)
-class InterventionItem:
-    """One journalled operator action, retained rather than counted away.
-
-    `action` is the raw projected payload: the fold has no vocabulary for
-    operator prose, and the view tier already owns the one-line rendering of a
-    label move, a scope note, or a failed dismissal.
-    """
-
-    identity: str
-    ts: datetime | None
-    metric_class: str    # one of INTERVENTION_CLASSES — what the tile counts
-    action_class: str    # one of INTERVENTION_TIMELINE_CLASSES — what the row says
-    kind: str            # the endpoint's `ActionApplied.kind`, verbatim
-    issue: int | None
-    pr: int | None
-    action: Mapping[str, JsonValue]
-
-# `ActionApplied.kind` values and `command_id` prefixes minted by the
-# dashboard's operator endpoints (app/dashweb/service.py). The relabel path
-# routes through a durable command whose id is a content digest, so its class
-# is read off the labels it moved instead.
-_REARM_ACTION_KINDS = frozenset({"operator_unblock", "operator_dismiss_review"})
-_REARM_COMMAND_PREFIXES = ("operator-unblock:", "operator-dismiss-review:")
-_RELABEL_ACTION_KIND = "operator_relabel"
-# Hand-adding the promotion label is the operator's admission gate.
-# Deliberately narrow: some
-# other lifecycle label arriving from an operator endpoint is a new behaviour
-# nobody has classified, and `other` is where it should surface.
-_POLICY_ADD_LABELS = frozenset({Label.AI_READY.value})
-# The deleted dashboard priority action journalled these moves; past journals
-# still carry them and the intervention metric keeps counting them as re-arms.
-_PRIORITY_LABELS = frozenset({Label.P1.value, Label.P2.value, Label.P3.value})
-
-
-def _text(value) -> str:
-    return value.strip() if isinstance(value, str) else ""
-
-
-def _label_set(value) -> frozenset[str]:
-    """The labels in an action attribute, tolerating anything at all.
-
-    Operator payloads are JSON off disk: a torn writer, a hand-edited journal,
-    or a future field shape must cost this fold a mis-classification at worst,
-    never a traceback.
-    """
-    if isinstance(value, (list, tuple)):
-        return frozenset(_text(item) for item in value if _text(item))
-    return frozenset()
-
-
-def operator_action(event) -> Mapping | None:
-    """The operator-authored `action` payload of one projected event, or None.
-
-    Provenance: an intervention is an action the DASHBOARD's operator endpoints
-    journalled — they stamp `attributes.operator` with `<repo>:dashboard` and
-    mint `operator_*` kinds. A daemon's own relabel carries neither and is not
-    an intervention, however similar the sentence reads.
-    """
-    if not isinstance(event, Mapping) or event.get("event") != "action":
-        return None
-    action = event.get("action")
-    if not isinstance(action, Mapping):
-        return None
-    if (
-        _text(action.get("operator"))
-        or _text(action.get("type")).startswith("operator")
-        or _text(event.get("command_id")).startswith("operator-")
-    ):
-        return action
-    return None
-
-
-def classify_intervention(action, command_id="") -> str:
-    """One operator action → `rearm` | `policy` | `other`. Total, never raises."""
-    if not isinstance(action, Mapping):
-        return INTERVENTION_OTHER
-    kind = _text(action.get("type"))
-    if kind in _REARM_ACTION_KINDS or _text(command_id).startswith(
-        _REARM_COMMAND_PREFIXES
-    ):
-        return INTERVENTION_REARM
-    if kind == _RELABEL_ACTION_KIND:
-        added = _label_set(action.get("add"))
-        removed = _label_set(action.get("remove"))
-        if added & _POLICY_ADD_LABELS:
-            return INTERVENTION_POLICY
-        moved = added | removed
-        # A priority set/clear also removes the other two P labels, so the whole
-        # move stays inside the priority vocabulary.
-        if moved and moved <= _PRIORITY_LABELS:
-            return INTERVENTION_REARM
-    return INTERVENTION_OTHER
-
-
-def timeline_class(action, metric_class: str) -> str:
-    """The finer DISPLAY class for one operator action.
-
-    Strict refinement of `classify_intervention`, never a contradiction of it:
-    `guidance` is a `rearm` that also moved the stored scope note, `relabel` is
-    an `other` that came from the relabel endpoint. A timeline row and the
-    intervention tile therefore never disagree about what happened — the tile
-    just says less. The metric keeps the coarse three so the guardrail series
-    stays comparable across deployments that predate this view.
-    """
-    if not isinstance(action, Mapping):
-        return INTERVENTION_OTHER
-    if metric_class == INTERVENTION_REARM:
-        if _text(action.get("guidance")):
-            return INTERVENTION_GUIDANCE
-        return INTERVENTION_REARM
-    if metric_class == INTERVENTION_OTHER:
-        if _text(action.get("type")) == _RELABEL_ACTION_KIND:
-            return INTERVENTION_RELABEL
-        return INTERVENTION_OTHER
-    return metric_class
-
-
-def intervention_items(rows, unattributed=()) -> tuple[InterventionItem, ...]:
-    """Every journalled operator intervention, oldest first, deduplicated.
-
-    The counts below are a fold of this list, so the tile and the timeline
-    cannot drift: one classification pass, two readings of it.
-    """
-    events = [event for row in rows for event in row.events]
-    events.extend(unattributed)
-    items: list[InterventionItem] = []
-    seen: set[str] = set()
-    for index, event in enumerate(events):
-        action = operator_action(event)
-        if action is None:
-            continue
-        # An action correlated to both an issue and a PR can be projected onto
-        # more than one row; the event id is what makes it one intervention.
-        identity = _text(event.get("event_id")) or f"position:{index}"
-        if identity in seen:
-            continue
-        seen.add(identity)
-        metric_class = classify_intervention(action, event.get("command_id"))
-        items.append(
-            InterventionItem(
-                identity=identity,
-                ts=parse_ts(event.get("ts")),
-                metric_class=metric_class,
-                action_class=timeline_class(action, metric_class),
-                kind=_text(action.get("type")),
-                issue=_int(event.get("issue")),
-                pr=_int(event.get("pr")),
-                action=action,
-            )
-        )
-    # Chronological, with a stable tie-break for the several targets one
-    # endpoint journals in the same pass (an issue and each of its PRs).
-    items.sort(key=lambda item: (item.ts is not None, item.ts or _EPOCH))
-    return tuple(items)
-
-
-def intervention_counts(rows, unattributed=()) -> tuple[tuple[str, int], ...]:
-    """Operator interventions per class, in `INTERVENTION_CLASSES` order.
-
-    Every class is present with an explicit zero: a missing key and a real zero
-    read identically in a dashboard tile, and the difference matters when the
-    question is "did anyone touch this deployment".
-    """
-    counts = dict.fromkeys(INTERVENTION_CLASSES, 0)
-    for item in intervention_items(rows, unattributed):
-        counts[item.metric_class] += 1
-    return tuple((name, counts[name]) for name in INTERVENTION_CLASSES)
-
-
-def interventions_line(metrics: Metrics) -> str:
-    """The one-line CLI readout. Pure so `issue-agent status` and the dashboard
-    cannot drift on how the same numbers are worded."""
-    by_class = dict(metrics.interventions_by_class)
-    ratio = metrics.interventions_per_merged_pr
-    return (
-        f"interventions: {metrics.interventions_total} ("
-        + ", ".join(f"{name} {by_class.get(name, 0)}" for name in INTERVENTION_CLASSES)
-        + ") — "
-        + (
-            f"{ratio:.1f} per merged PR"
-            if ratio is not None
-            else "no merged PRs yet"
-        )
-    )
-
-
-def build_metrics(
-    rows,
-    unattributed,
-    today_usd: float | None,
-) -> Metrics:
-    legs = [leg for row in rows for leg in row.legs]
-    legs += unattributed_legs(unattributed)
-    by_kind: dict[str, tuple[float, int]] = {}
-    for leg in legs:
-        cost, n = by_kind.get(leg.kind, (0.0, 0))
-        by_kind[leg.kind] = (cost + leg.cost_usd, n + 1)
-    unattributed_cost: dict[str, float] = {}
-    for index, event in enumerate(unattributed):
-        event_name = event.get("event")
-        if event_name not in {"agent_run", "spend"}:
-            continue
-        identity = str(
-            event.get("run_id")
-            or event.get("event_id")
-            or f"unattributed:{index}"
-        )
-        if event_name == "spend" or identity not in unattributed_cost:
-            unattributed_cost[identity] = _float(event.get("cost_usd"))
-    total = sum(row.cost_usd for row in rows) + sum(
-        unattributed_cost.values()
-    )
-    done = [row for row in rows if row.done]
-    approvals, changes = first_pass_verdicts(rows)
-    reviewed = [row for row in rows if row.rounds]
-    interventions = intervention_items(rows, unattributed)
-    counts = dict.fromkeys(INTERVENTION_CLASSES, 0)
-    for item in interventions:
-        counts[item.metric_class] += 1
-    return Metrics(
-        done_issues=len(done),
-        in_flight_issues=sum(
-            1
-            for row in rows
-            if not row.done and row.lane == "in_flight"
-        ),
-        total_cost_usd=round(total, 4),
-        cost_per_done_usd=round(total / len(done), 4) if done else 0.0,
-        by_kind=tuple(
-            (kind, round(cost, 4), n)
-            for kind, (cost, n) in sorted(
-                by_kind.items(), key=lambda kv: (-kv[1][0], kv[0])
-            )
-        ),
-        first_pass_approvals=approvals,
-        first_pass_changes=changes,
-        rounds_per_pr=(
-            round(sum(r.rounds for r in reviewed) / len(reviewed), 2) if reviewed else 0.0
-        ),
-        escalations=sum(row.escalations for row in rows)
-        + sum(1 for e in unattributed if e.get("event") == "escalation"),
-        recurrences=sum(row.recurrences for row in rows),
-        spend_blocks=sum(row.spend_blocks for row in rows)
-        + sum(1 for e in unattributed if e.get("event") == "spend_block"),
-        today_usd=round(today_usd, 4) if today_usd is not None else None,
-        interventions_by_class=tuple(
-            (name, counts[name]) for name in INTERVENTION_CLASSES
-        ),
-        interventions=interventions,
-    )
-
-
-def build_deployment(
-    name: str,
-    repo: str,
-    feeds,
-    ledger_events=(),
-    now_fn=None,
-    stale_after_s: float = STALE_AFTER_S,
-    warnings: tuple[str, ...] = (),
-    settled_today_usd: float | None = None,
-    settled_today_unavailable: bool = False,
-    to_local_date: Callable[[float], date] = _utc_date,
-    heartbeats: Mapping[str, datetime | None] | None = None,
-) -> Deployment:
-    """Assemble one deployment's report. Pure: `feeds` is
-    `(role, journal_path, log_path, events)` tuples already read off disk;
-    `heartbeats` maps role to its daemon's last scheduler heartbeat.
-    """
-    if now_fn is None:
-        raise ValueError("build_deployment requires an injected clock")
-    now = now_fn()
-    health = tuple(
-        _health(
-            role, journal, log, events, now, stale_after_s,
-            (heartbeats or {}).get(role),
-        )
-        for role, journal, log, events in feeds
-    )
-    merged: list[dict] = []
-    for role, _journal, _log, events in feeds:
-        # The file itself is the role boundary. Persist that provenance into the
-        # read model so generic events such as "action: comment issue" answer
-        # who performed them.
-        merged.extend({**event, "role": event.get("role") or role} for event in events)
-    merged.sort(key=lambda e: parse_ts(e.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
-    running = unsettled_start_events(merged, 86400.0, now_fn)
-    rows = build_issue_rows(merged, running)
-    pr_issue = pr_issue_map(merged)
-    unattributed = tuple(e for e in merged if event_issue(e, pr_issue) is None)
-    today = to_local_date(now.timestamp()).isoformat()
-    today_usd = (
-        None
-        if settled_today_unavailable
-        else (
-            settled_today_usd
-            if settled_today_usd is not None
-            else sum(
-                _float(e.get("cost_usd"))
-                for e in ledger_events
-                if e.get("event") == "spend"
-                and (
-                    (stamp := parse_ts(e.get("ts"))) is not None
-                    and to_local_date(stamp.timestamp()).isoformat() == today
-                )
-                and (not repo or e.get("repo") == repo)
-            )
-        )
-    )
-    return Deployment(
-        name=name,
-        repo=repo,
-        health=health,
-        issues=rows,
-        metrics=build_metrics(rows, unattributed, today_usd),
-        unattributed=unattributed,
-        warnings=warnings,
-    )
-
-
-def _health(
-    role, journal_path, log_path, events, now, stale_after_s, heartbeat=None
-) -> DaemonHealth:
-    # An idle daemon journals only state changes, so a quiet poll loop is
-    # visible only through its heartbeat (docs/field-verification.md:52).
-    timestamps = [ts for ts in (parse_ts(e.get("ts")) for e in events) if ts]
-    if heartbeat is not None:
-        timestamps.append(heartbeat)
-    last = max(timestamps) if timestamps else None
-    last_event = ""
-    if events:
-        last_event = str(events[-1].get("event") or "")
-    return DaemonHealth(
-        role=role,
-        journal_path=journal_path,
-        log_path=log_path,
-        events=len(events),
-        last_ts=last,
-        last_event=last_event,
-        # Never having run is stale too: "this daemon has produced nothing" is
-        # exactly the condition an operator is scanning the column for.
-        stale=(last is None or (now - last).total_seconds() > stale_after_s),
-    )
-
-
-def _int(value) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _float(value) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def parse_ts(value) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def _events_within(events, seconds: float, now_fn) -> list[dict]:
-    cutoff = now_fn() - timedelta(seconds=seconds)
-    return [
-        event for event in events
-        if (stamp := parse_ts(event.get("ts"))) is not None and stamp >= cutoff
-    ]
-
-
-def unsettled_start_events(events, window_s: float, now_fn) -> list[dict]:
-    """Return agent starts still owed a settlement, grouped per dispatch."""
-    scoped = _events_within(events, window_s, now_fn) if window_s > 0 else list(events)
-    starts: dict[tuple, list[dict]] = {}
-    settled: dict[tuple, int] = {}
-    for event in scoped:
-        event_name = event.get("event")
-        if event_name not in ("agent_run_start", "agent_run"):
-            continue
-        dispatch = str(event.get("dispatch") or "")
-        key = (
-            ("dispatch", dispatch)
-            if dispatch
-            else ("context", str(event.get("kind", "")), _int(event.get("number")))
-        )
-        if event_name == "agent_run_start":
-            starts.setdefault(key, []).append(event)
-        else:
-            settled[key] = settled.get(key, 0) + 1
-    outstanding: list[dict] = []
-    for key, start_events in starts.items():
-        missing = (
-            1
-            if key[0] == "dispatch" and len(start_events) > settled.get(key, 0)
-            else len(start_events) - settled.get(key, 0)
-        )
-        if missing > 0:
-            outstanding.extend(start_events[-missing:])
-    return outstanding
-
-
-# ── issues board: stage track ─────────────────────────────────────────────────
-# The board shows where an issue is on a fixed five-stage track and how much it
-# churned there. One fold produces the ordered stage visits; the rail, its
-# counts and the drawer history all read that one sequence, so they can never
-# disagree about the same issue.
 class Stage(str, Enum):
-    TRIAGE = "triage"
     RESOLVE = "resolve"
-    REVIEW = "review"
     CI = "ci"
+    REVIEW = "review"
     MERGE = "merge"
 
 
 STAGE_ORDER: tuple[Stage, ...] = tuple(Stage)
-
-# Synthetic step kinds the projection adds for observations that are not legs:
-# one CI run per distinct PR head with observed checks, and the merge itself.
-CI_RUN_KIND = "CI"
-MERGE_KIND = "MERGE"
-
 _STAGE_OF_KIND: Mapping[str, Stage] = {
-    **{kind: Stage.RESOLVE for kind in ("RESOLVE", "RESUME", "ROUTE")},
-    **{kind: Stage.REVIEW for kind in ("REVIEW", "RE_REVIEW", "ADDRESS_REVIEW")},
-    MERGE_KIND: Stage.MERGE,
+    AgentKind.RESOLVE.name: Stage.RESOLVE,
+    AgentKind.REBASE.name: Stage.CI,
+    AgentKind.FIX_CI.name: Stage.CI,
+    AgentKind.REVIEW.name: Stage.REVIEW,
+    AgentKind.ADDRESS_REVIEW.name: Stage.REVIEW,
 }
-_RESOLVE_ATTEMPT_KINDS = frozenset({"RESOLVE", "RESUME"})
+_ACT_WORDS: Mapping[str, str] = {
+    "RESOLVE": "Resolve", "REBASE": "Rebase", "FIX_CI": "Fix CI", "REVIEW": "Review",
+    "ADDRESS_REVIEW": "Address review",
+}
 
 
 def stage_of_kind(kind: str) -> Stage | None:
-    """The stage a step kind belongs to, or None when it inherits one.
-
-    REBASE and PR_RESUME are repairs inside whatever stage is in progress, as
-    are operator interventions and any kind this build does not know. A rebase
-    is never a stage of its own: it adds a CI run (a new head), and it returns
-    the issue to Review only when a reviewer runs again on the changed patch.
-
-    CI runs and FIX_CI legs also inherit: CI fails and is fixed on every head,
-    approved or not, and only an approval enters the CI stage (`stage_track`).
-    """
-    return _STAGE_OF_KIND.get(kind.strip().upper())
-
-
-class StepOutcome(str, Enum):
-    PASSED = "passed"
-    FAILED = "failed"
-    CHANGES_REQUESTED = "changes_requested"
-    DONE = "done"
-    RUNNING = "running"
+    return _STAGE_OF_KIND.get(kind)
 
 
 @dataclass(frozen=True)
-class TrackStep:
-    """One thing that happened to an issue: a leg, an operator step, or an
-    observation. `verdict` marks a review decision, which is what one review
-    round means (a failed review run decides nothing)."""
+class NeedsYou:
+    """`needs-human`: nothing moves until a human acts. `reason` is the stop's
+    reason, or "labelled" when the label carries no stop comment of this
+    episode (an operator park, or a human who added it). `target` is where a
+    reply releases it."""
 
-    kind: str
-    outcome: StepOutcome
-    ts: datetime | None = None
-    verdict: bool = False
+    reason: str
+    headline: str
+    detail: str | None
+    target: str  # issue | pr
+    since_ts: str | None
+    status: str = "needs_you"
+
+
+@dataclass(frozen=True)
+class Working:
+    """Moving without a human: an agent leg is running or next, CI is
+    running, or a free action (merge, branch update, PR open, release) runs
+    next tick."""
+
+    activity: str  # agent | queued | ci | merge | update | open_pr | release
+    act: str | None
+    headline: str
+    reason: str
+    since_ts: str | None
+    status: str = "working"
+
+
+@dataclass(frozen=True)
+class Waiting:
+    """A wait on something outside the harness."""
+
+    on: str  # branch-protection | human-review | headroom | backoff | github
+    headline: str
+    reason: str
+    since_ts: str | None
+    until_ts: str | None = None
+    status: str = "waiting"
+
+
+BoardStatus = NeedsYou | Working | Waiting
+
+_STOP_HEADLINE: Mapping[str, str] = {
+    StopReason.QUESTION.value: "Answer the agent's question",
+    StopReason.ATTEMPTS.value: "Attempts exhausted",
+    StopReason.REVIEW_ROUNDS.value: "Review dispute",
+    StopReason.LIFETIME_CAP.value: "Lifetime budget spent",
+    StopReason.WORKFLOW_PATH.value: "Workflow change needs a human",
+    "labelled": "Parked",
+}
+_STOP_REASON: Mapping[str, str] = {
+    StopReason.QUESTION.value: "Reply on GitHub with the answer; the agent resumes with it.",
+    StopReason.ATTEMPTS.value: "The same act ran without progress; reply or unblock to let it try again.",
+    StopReason.REVIEW_ROUNDS.value: "The reviewer kept requesting changes; reply or unblock to continue.",
+    StopReason.LIFETIME_CAP.value: "Raise the per-issue budget, then reply or unblock.",
+    StopReason.WORKFLOW_PATH.value: "The PR changes files under .github/; reply or unblock once judged.",
+    "labelled": "Labelled needs-human with no stop comment; unblock to hand it back.",
+}
+
+
+@dataclass(frozen=True)
+class Stop:
+    """The newest harness stop comment on an item."""
+
+    reason: str
+    at: datetime
+    message: str
+
+
+def latest_stop(comments: Iterable[Comment], harness: Harness) -> Stop | None:
+    """The newest stop comment the harness wrote (marker and login, as derive
+    reads it), with its tags stripped for display."""
+    tags = {stop_tag(reason): reason.value for reason in StopReason}
+    best: Stop | None = None
+    for comment in comments:
+        at = parse_timestamp(comment.created_at)
+        if at is None or not harness.wrote(comment):
+            continue
+        reason = next((code for tag, code in tags.items() if tag in comment.body), None)
+        if reason is None or (best is not None and at <= best.at):
+            continue
+        text = comment.body.replace(harness.marker, "")
+        for tag in tags:
+            text = text.replace(tag, "")
+        best = Stop(reason, at, bounded(text, MESSAGE_CHARS))
+    return best
+
+
+def _iso(stamp: datetime | None) -> str | None:
+    return stamp.astimezone(timezone.utc).isoformat() if stamp is not None else None
+
+
+def _needs_you(reason: str, target: str, since: datetime | None, detail: str | None) -> NeedsYou:
+    return NeedsYou(reason, _STOP_HEADLINE.get(reason, "Needs a human"), detail or None, target, _iso(since))
+
+
+def board_status(
+    state: DerivedState,
+    *,
+    target: str,
+    comments: Iterable[Comment],
+    pr: PRView | None,
+    legs: tuple[LegRow, ...],
+    harness: Harness,
+) -> BoardStatus:
+    """One item's board status from its derived state. `legs` are the item's
+    issue's legs, oldest first; `comments` are the item's own (where its stop
+    comment is posted)."""
+    ended = [leg.ended_at for leg in legs if leg.ended_at is not None and not leg.running]
+    last_end = max(ended, default=None)
+    running = next((leg for leg in reversed(legs) if leg.running), None)
+    if isinstance(state, NeedsHuman):
+        # About to be stopped this tick: policy adds the label and the comment.
+        detail = state.question if state.reason is StopReason.QUESTION else None
+        return _needs_you(state.reason.value, target, last_end, detail)
+    if isinstance(state, Wait) and state.reason is WaitReason.NEEDS_HUMAN:
+        stop = latest_stop(comments, harness)
+        if stop is not None and (last_end is None or stop.at > last_end):
+            return _needs_you(stop.reason, target, stop.at, stop.message)
+        return _needs_you("labelled", target, None, None)
+    if isinstance(state, Busy):
+        act = running.kind if running is not None else None
+        since = (running.started_at or running.reserved_at) if running is not None else None
+        return Working("agent", act, f"{_ACT_WORDS.get(act or '', 'Agent')} running",
+                       "An agent leg holds this item.", _iso(since))
+    if isinstance(state, Dispatch):
+        act = state.act.name
+        return Working("queued", act, f"{_ACT_WORDS[act]} next", "Dispatches when a slot is free.", _iso(last_end))
+    if isinstance(state, Merge):
+        return Working("merge", None, "Merging", "Approved on its head with green CI.", _iso(last_end))
+    if isinstance(state, Refresh):
+        return Working("update", None, "Updating branch", "Behind its base; GitHub updates it next tick.",
+                       _iso(last_end))
+    if isinstance(state, OpenPR):
+        return Working("open_pr", None, "Opening PR", f"Branch {state.branch} is pushed without a PR.",
+                       _iso(last_end))
+    if isinstance(state, Release):
+        return Working("release", None, "Releasing", "A human replied; needs-human comes off next tick.",
+                       _iso(last_end))
+    if isinstance(state, Backoff):
+        act = state.act.name
+        return Waiting("backoff", f"{_ACT_WORDS[act]} backing off",
+                       "The last leg ended on a machine failure; it retries after the backoff.",
+                       _iso(last_end), _iso(state.until))
+    if isinstance(state, Wait):
+        return _wait_status(state.reason, pr, last_end)
+    raise TypeError(f"unknown derived state {state!r}")
+
+
+def _wait_status(reason: WaitReason, pr: PRView | None, last_end: datetime | None) -> BoardStatus:
+    since = _iso(last_end)
+    if reason is WaitReason.CI_PENDING:
+        return Working("ci", None, "CI running", "Required checks are still running on the head.", since)
+    if reason is WaitReason.HEADROOM:
+        return Waiting("headroom", "Daily cap reached", "The daily or global spend cap leaves no room for a leg.",
+                       since)
+    if reason is WaitReason.HUMAN_CHANGES_REQUESTED:
+        return Waiting("human-review", "Human review standing",
+                       "A human's change request stands on an older head; they re-review.", since)
+    if reason is WaitReason.MERGEABILITY_UNKNOWN and pr is not None and pr.merge_state.upper() == "BLOCKED":
+        return Waiting("branch-protection", "Branch protection",
+                       "Approved and green; GitHub waits on a required approval or check.", since)
+    detail = {
+        WaitReason.HEAD_UNKNOWN: "The PR could not be read in full this poll.",
+        WaitReason.CI_UNKNOWN: "Required checks could not be read for the current head.",
+        WaitReason.MERGEABILITY_UNKNOWN: "GitHub is still computing mergeability.",
+    }.get(reason, "Waiting on GitHub.")
+    return Waiting("github", "Reading GitHub", detail, since)
+
+
+def primary_action(status: BoardStatus) -> str | None:
+    """The one action a row offers: unblock a stop the label removal can
+    release; a question or a spent lifetime budget is answered elsewhere."""
+    if not isinstance(status, NeedsYou):
+        return None
+    if status.reason in (StopReason.QUESTION.value, StopReason.LIFETIME_CAP.value):
+        return "open"
+    return "unblock"
+
+
+def ci_display(pr: PRView | None) -> str | None:
+    """passing | failing | pending for the PR's current head, or None when
+    unread or for another head (no guessed green)."""
+    if pr is None or not isinstance(pr.ci, Observed) or pr.ci.head != pr.head_ref_oid:
+        return None
+    ci = reduce_ci(pr.ci)
+    if isinstance(ci, Failed):
+        return "failing"
+    if isinstance(ci, CiWaiting):
+        return "pending"
+    return "passing" if isinstance(ci, Clear) else None
+
+
+# ── rail and history ─────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Rail:
+    current: str
+    furthest: str
+    resolve_attempts: int
+    review_rounds: int
+    ci_runs: int
+    steps: int
+    live: bool
 
 
 @dataclass(frozen=True)
 class TrackChip:
-    """Consecutive identical steps (same kind, same result) folded into one."""
-
     kind: str
-    outcome: StepOutcome
+    outcome: str
     count: int
 
 
 @dataclass(frozen=True)
 class StageVisit:
-    stage: Stage
-    chips: tuple[TrackChip, ...]
-
-    @property
-    def steps(self) -> int:
-        return sum(chip.count for chip in self.chips)
+    stage: str
+    steps: tuple[TrackChip, ...]
 
 
-@dataclass(frozen=True)
-class StageTrack:
-    visits: tuple[StageVisit, ...]
-    current: Stage
-    furthest: Stage
-    resolve_attempts: int
-    review_rounds: int
-    ci_runs: int
+def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRow, ...]) -> Stage:
+    running = next((leg for leg in reversed(legs) if leg.running), None)
+    last = next((stage for leg in reversed(legs) if leg.counted and (stage := stage_of_kind(leg.kind))), None)
+    fallback = last or (Stage.CI if has_pr else Stage.RESOLVE)
+    if isinstance(state, (Dispatch, Backoff)):
+        return _STAGE_OF_KIND[state.act.name]
+    if isinstance(state, NeedsHuman) and state.act is not None:
+        return _STAGE_OF_KIND[state.act.name]
+    if isinstance(state, NeedsHuman) and state.reason is StopReason.REVIEW_ROUNDS:
+        return Stage.REVIEW
+    if isinstance(state, Merge):
+        return Stage.MERGE
+    if isinstance(state, Refresh):
+        return Stage.CI
+    if isinstance(state, OpenPR):
+        return Stage.RESOLVE
+    if isinstance(state, Busy) and running is not None:
+        return stage_of_kind(running.kind) or fallback
+    if isinstance(state, Wait):
+        if state.reason is WaitReason.MERGEABILITY_UNKNOWN:
+            return Stage.MERGE
+        if state.reason is WaitReason.HUMAN_CHANGES_REQUESTED:
+            return Stage.REVIEW
+        if state.reason in (WaitReason.CI_PENDING, WaitReason.CI_UNKNOWN, WaitReason.HEAD_UNKNOWN):
+            return Stage.CI
+    return fallback
 
-    @property
-    def steps(self) -> int:
-        return sum(visit.steps for visit in self.visits)
 
-
-_NEVER = datetime.max.replace(tzinfo=timezone.utc)
-
-
-def stage_track(steps: Iterable[TrackStep]) -> StageTrack:
-    """Fold an issue's steps into its ordered stage visits.
-
-    Steps are ordered by timestamp; a step with no usable timestamp sorts
-    after every stamped one and keeps its relative order. A step whose kind
-    names no stage inherits the stage in progress (Triage before anything
-    happened). A visit ends when the stage changes, so going back to an
-    earlier stage, e.g. a CI fix whose new patch is reviewed again, starts a
-    new visit rather than extending the old one.
-
-    CI runs alongside review on every head, but the CI stage is what follows
-    an approval: an approving review decision moves the stage in progress to
-    CI, and a CI run or CI fix before the patch is approved stays in the stage
-    in progress. Otherwise every PR whose checks fail before its first review
-    would read as having been sent back from CI.
-
-    Counts:
-      resolve attempts — RESOLVE and RESUME runs, whatever their outcome;
-      review rounds    — review decisions (`verdict` steps);
-      CI runs          — one per PR head on which CI was observed (the
-                         projection's CI steps). A journal with no head
-                         observations still has its FIX_CI legs: each answered
-                         a failed run, so they are counted instead.
-    """
-    ordered = sorted(
-        steps,
-        key=lambda step: _aware(step.ts) if isinstance(step.ts, datetime) else _NEVER,
+def rail(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRow, ...], done: bool = False) -> Rail:
+    counted = [leg for leg in legs if leg.counted]
+    current = Stage.MERGE if done else current_stage(state, has_pr=has_pr, legs=legs)
+    reached = [stage for leg in counted if (stage := stage_of_kind(leg.kind))] + [current]
+    furthest = max(reached, key=STAGE_ORDER.index)
+    return Rail(
+        current=current.value,
+        furthest=furthest.value,
+        resolve_attempts=sum(1 for leg in counted if leg.kind == AgentKind.RESOLVE.name),
+        review_rounds=sum(1 for leg in counted if leg.kind == AgentKind.REVIEW.name),
+        ci_runs=sum(1 for leg in counted if leg.kind in (AgentKind.FIX_CI.name, AgentKind.REBASE.name)),
+        steps=len(counted),
+        live=any(leg.running for leg in legs),
     )
+
+
+def history(legs: tuple[LegRow, ...]) -> tuple[StageVisit, ...]:
+    """One visit per run of consecutive legs in the same stage, oldest first;
+    identical consecutive legs fold into one chip."""
     visits: list[tuple[Stage, list[TrackChip]]] = []
-    in_progress = Stage.TRIAGE
-    reached = in_progress
-    for step in ordered:
-        kind = step.kind.strip().upper()
-        in_progress = stage_of_kind(kind) or in_progress
-        if not visits or visits[-1][0] is not in_progress:
-            visits.append((in_progress, []))
+    for leg in legs:
+        stage = stage_of_kind(leg.kind)
+        if stage is None or not leg.counted:
+            continue
+        if not visits or visits[-1][0] is not stage:
+            visits.append((stage, []))
         chips = visits[-1][1]
-        if chips and (chips[-1].kind, chips[-1].outcome) == (step.kind, step.outcome):
-            chips[-1] = TrackChip(step.kind, step.outcome, chips[-1].count + 1)
+        if chips and chips[-1].kind == leg.kind and chips[-1].outcome == leg.outcome:
+            chips[-1] = TrackChip(leg.kind, leg.outcome, chips[-1].count + 1)
         else:
-            chips.append(TrackChip(step.kind, step.outcome, 1))
-        if step.verdict and step.outcome is StepOutcome.PASSED and kind in REVIEW_KINDS:
-            in_progress = Stage.CI
-        # An approval reaches CI even when a later re-review returns to
-        # Review before any CI step lands there.
-        reached = max(reached, in_progress, key=STAGE_ORDER.index)
-    kinds = [step.kind.strip().upper() for step in ordered]
-    folded = tuple(StageVisit(stage, tuple(chips)) for stage, chips in visits)
-    return StageTrack(
-        visits=folded,
-        current=in_progress,
-        furthest=max(
-            (reached, *(visit.stage for visit in folded)),
-            key=STAGE_ORDER.index,
-        ),
-        resolve_attempts=sum(kind in _RESOLVE_ATTEMPT_KINDS for kind in kinds),
-        review_rounds=sum(step.verdict for step in ordered),
-        ci_runs=kinds.count(CI_RUN_KIND) or kinds.count("FIX_CI"),
+            chips.append(TrackChip(leg.kind, leg.outcome, 1))
+    return tuple(StageVisit(stage.value, tuple(chips)) for stage, chips in visits)
+
+
+# ── metrics ──────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class KindCost:
+    kind: str
+    usd: float
+    runs: int
+
+
+@dataclass(frozen=True)
+class BasisCost:
+    basis: str
+    usd: float
+
+
+@dataclass(frozen=True)
+class Metrics:
+    """The CLAUDE.md primary metrics and guardrails that legs plus GitHub
+    can answer. None means unknown (GitHub unread), never zero."""
+
+    merged_prs: int | None
+    open_items: int | None
+    needs_human: int | None
+    total_cost_usd: float
+    cost_per_merged_pr_usd: float | None
+    by_basis: tuple[BasisCost, ...]
+    by_kind: tuple[KindCost, ...]
+    first_pass_approvals: int
+    first_pass_changes: int
+    first_pass_rate: float | None
+    rounds_per_pr: float | None
+    legs: int
+    machine_legs: int
+    today_usd: float
+
+
+def _usd(value: float) -> float:
+    return round(value, 6) if math.isfinite(value) else 0.0
+
+
+def metrics(
+    legs: Iterable[LegRow],
+    *,
+    merged_prs: int | None,
+    open_items: int | None,
+    needs_human: int | None,
+    today_start: datetime,
+) -> Metrics:
+    rows = [leg for leg in legs if leg.counted]
+    total = sum(leg.cost_usd for leg in rows)
+    by_kind: dict[str, list[float]] = {}
+    by_basis: dict[str, float] = {}
+    for leg in rows:
+        by_kind.setdefault(leg.kind, []).append(leg.cost_usd)
+        basis = leg.basis or ("unsettled" if leg.running else "unpriced")
+        by_basis[basis] = by_basis.get(basis, 0.0) + leg.cost_usd
+    verdicts: dict[int, list[str]] = {}
+    for leg in sorted(rows, key=lambda leg: leg.at):
+        if leg.kind == AgentKind.REVIEW.name and leg.verdict in ("APPROVE", "REQUEST_CHANGES") and leg.number > 0:
+            verdicts.setdefault(leg.number, []).append(leg.verdict)
+    approvals = sum(1 for seen in verdicts.values() if seen[0] == "APPROVE")
+    changes = len(verdicts) - approvals
+    return Metrics(
+        merged_prs=merged_prs,
+        open_items=open_items,
+        needs_human=needs_human,
+        total_cost_usd=_usd(total),
+        cost_per_merged_pr_usd=_usd(total / merged_prs) if merged_prs else None,
+        by_basis=tuple(BasisCost(basis, _usd(usd)) for basis, usd in sorted(by_basis.items())),
+        by_kind=tuple(KindCost(kind, _usd(sum(costs)), len(costs)) for kind, costs in sorted(by_kind.items())),
+        first_pass_approvals=approvals,
+        first_pass_changes=changes,
+        first_pass_rate=approvals / len(verdicts) if verdicts else None,
+        rounds_per_pr=sum(len(seen) for seen in verdicts.values()) / len(verdicts) if verdicts else None,
+        legs=len(rows),
+        machine_legs=sum(1 for leg in rows if leg.outcome == "failed"),
+        today_usd=_usd(sum(leg.cost_usd for leg in rows if leg.at >= today_start)),
     )
 
 
-def _aware(stamp: datetime) -> datetime:
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+def metrics_line(m: Metrics) -> str:
+    """One status line of the primary metrics."""
+    per_pr = f"${m.cost_per_merged_pr_usd:.2f}/merged PR" if m.cost_per_merged_pr_usd is not None else "no merged PRs"
+    merged = "?" if m.merged_prs is None else str(m.merged_prs)
+    return (f"spend ${m.total_cost_usd:.2f} over {m.legs} legs ({m.machine_legs} machine) · "
+            f"merged {merged} · {per_pr} · today ${m.today_usd:.2f}")
 
 
-# ── issues board: status ──────────────────────────────────────────────────────
-# Every in-flight or queued issue is in exactly one of three groups. The
-# variants below are the only shapes a row can take, so "escalated and
-# working" or "blocked on nothing" cannot be expressed.
-class Ask(str, Enum):
-    REARM = "rearm"
-    ESCALATED = "escalated"
-    BUDGET = "budget"
-    AWAITING_REPLY = "awaiting_reply"
-    MERGE = "merge"
-    STALLED = "stalled"
-
-
-class Activity(str, Enum):
-    AGENT = "agent"
-    CI = "ci"
-    MERGE = "merge"
-    HANDOFF = "handoff"
+def interventions_line(m: Metrics) -> str:
+    """`issue-agent status`'s summary line. The journal intervention fold it
+    once printed is gone; the CLI keeps the old name until it drops the
+    import, so it now prints the legs metrics."""
+    return metrics_line(m)
 
 
 @dataclass(frozen=True)
-class OnIssue:
-    # None when GitHub reports an open dependency without naming it.
-    issue: int | None
+class SpendBucket:
+    hour_start_iso: str
+    usd: float
+
+
+def spend_per_hour(legs: Iterable[LegRow], now: datetime, hours: int = SPEND_WINDOW_HOURS) -> tuple[SpendBucket, ...]:
+    """Hourly USD over the trailing window, oldest first, empty hours as zero.
+    A leg outside the window (a skewed future stamp included) is dropped."""
+    if hours <= 0:
+        return ()
+    end = now.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    totals = {end - timedelta(hours=offset): 0.0 for offset in range(hours)}
+    for leg in legs:
+        if not leg.counted:
+            continue
+        bucket = leg.at.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        if bucket in totals:
+            totals[bucket] += leg.cost_usd
+    return tuple(SpendBucket(hour.isoformat(), _usd(usd)) for hour, usd in sorted(totals.items()))
 
 
 @dataclass(frozen=True)
-class OnPr:
-    pr: int
+class HealthDay:
+    day: str
+    opened: int
+    closed: int
+    net_open: int
+
+
+def health_trend(issues: Iterable[tuple[str, str]], local_tz: tzinfo) -> tuple[HealthDay, ...]:
+    """Issues opened and closed per local day from GitHub (created, closed) stamps."""
+    days: dict[str, list[int]] = {}
+    for created, closed in issues:
+        for index, raw in ((0, created), (1, closed)):
+            stamp = parse_timestamp(raw)
+            if stamp is not None:
+                days.setdefault(stamp.astimezone(local_tz).date().isoformat(), [0, 0])[index] += 1
+    return tuple(HealthDay(day, o, c, o - c) for day, (o, c) in sorted(days.items()))
+
+
+# ── notifications ────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
-class OnOverlap:
+class Notification:
+    id: str
+    ts: str
+    severity: str  # info | attention
+    title: str
+    detail: str | None = None
     issue: int | None = None
     pr: int | None = None
 
 
-TriageWhy = Literal["parked"]
-
-
-@dataclass(frozen=True)
-class OnTriage:
-    why: TriageWhy
-
-
-@dataclass(frozen=True)
-class OnQueue:
-    """On `ai-ready`, waiting for the fixer to pick it up."""
-
-
-BlockedOn = OnIssue | OnPr | OnOverlap | OnTriage | OnQueue
-
-
-@dataclass(frozen=True)
-class NeedsYou:
-    ask: Ask
-    headline: str
-    reason: str
-    since: datetime | None
-
-
-@dataclass(frozen=True)
-class Working:
-    activity: Activity
-    headline: str
-    reason: str
-    since: datetime | None
-
-
-@dataclass(frozen=True)
-class Blocked:
-    on: BlockedOn
-    headline: str
-    reason: str
-    since: datetime | None
-
-
-BoardStatus = NeedsYou | Working | Blocked
-
-
-# Facts the projection has already parsed and attributed. Each is a variant,
-# not a flag: the decision below matches on shape.
-@dataclass(frozen=True)
-class Escalated:
-    since: datetime | None
-    # The harness's own escalation comment (first line), when one was paired.
-    reason: str | None = None
-    # A circuit breaker tripped: only an explicit re-arm grants another try.
-    breaker: bool = False
-    # The cap decision (`needs-budget-review`) is what resumes it.
-    budget: bool = False
-
-
-@dataclass(frozen=True)
-class AwaitingReply:
-    since: datetime | None
-    question: str | None = None
-
-
-Attention = Escalated | AwaitingReply
-
-
-@dataclass(frozen=True)
-class MergeReady:
-    """GitHub would merge the open PR now: open, not a draft, mergeable,
-    clean, approved, CI green or absent, no auto-merge armed. The same rule
-    starts the human-wait clock, so the board and the clock agree."""
-
-    since: datetime | None
-
-
-# Who merges an approved, green PR: the fixer (`fix.harness_merges_branch`),
-# GitHub's own auto-merge armed by someone else, or the operator.
-MergeOwner = Literal["harness", "github", "operator"]
-
-
-@dataclass(frozen=True)
-class Hold:
-    on: OnIssue | OnPr | OnOverlap
-    since: datetime | None
-
-
-@dataclass(frozen=True)
-class TriageHold:
-    why: TriageWhy
-    since: datetime | None
-
-
-@dataclass(frozen=True)
-class StallObserved:
-    since: datetime | None
-    # The current deferral reason (#296) when a journalled defer gives one.
-    deferral: str | None = None
-
-
-@dataclass(frozen=True)
-class BoardFacts:
-    track: StageTrack
-    attention: Attention | None = None
-    triage: TriageHold | None = None
-    running_kind: str | None = None
-    hold: Hold | None = None
-    # Current-head CI rollup of the open PR, None when unknown or no PR.
-    ci: Literal["pending", "passing", "failing"] | None = None
-    stall: StallObserved | None = None
-    # An ai-ready issue with nothing in progress: it waits for the fixer.
-    queued: bool = False
-    merge_ready: MergeReady | None = None
-    merge_owner: MergeOwner = "operator"
-    # GitHub's review decision on the current head: False when it requires a
-    # review or asks for changes, None when unread.
-    github_approved: bool | None = None
-    # An approving review is bound to the current head commit. A step that
-    # can push (a rebase) does not always change the patch: the reviewer
-    # carries its approval onto an unchanged patch without a paid leg.
-    head_approved: bool = False
-    # GitHub refuses the merge right now: draft, conflicting, behind or
-    # blocked by a branch rule.
-    merge_refused: bool = False
-    last_activity: datetime | None = None
-
-
-_RUNNING_HEADLINE: Mapping[str, str] = {
-    "RESOLVE": "Resolving",
-    "RESUME": "Resolving",
-    "ROUTE": "Routing",
-    "REVIEW": "Reviewing",
-    "RE_REVIEW": "Reviewing",
-    "ADDRESS_REVIEW": "Addressing review",
-    "FIX_CI": "Fixing CI",
-    "REBASE": "Rebasing",
-    "PR_RESUME": "Resuming",
-}
-
-# Framing the harness puts around its own escalation comments
-# (domain/lifecycle.py PrEscalation/IssueEscalation, domain/outcome.py budget
-# review). The headline already says it, so the row's reason drops it.
-_BREAKER_PREFIX = "Circuit breaker:"
-_BREAKER_SUFFIX = "Escalating to a human."
-_BUDGET_PREFIX = "Budget review needed:"
-
-
-def _sentence(text: str) -> str:
-    text = text.strip()
-    if not text:
-        return text
-    text = text[0].upper() + text[1:]
-    return text if text.endswith((".", "?", "!")) else f"{text}."
-
-
-def _short_reason(reason: str | None, *prefixes: str) -> str | None:
-    """The harness message without the framing the headline already says."""
-    if not reason or not reason.strip():
-        return None
-    text = reason.strip()
-    for prefix in prefixes:
-        if text.casefold().startswith(prefix.casefold()):
-            text = text[len(prefix):].strip()
-    if text.endswith(_BREAKER_SUFFIX):
-        text = text[: -len(_BREAKER_SUFFIX)].strip()
-    return _sentence(text) or None
-
-
-# Steps that can push a new head: an approval before one of them was given to
-# a different patch.
-_PATCH_KINDS = RESOLVE_KINDS | REPAIR_KINDS | {"PR_RESUME"}
-
-
-ReviewState = Literal["approved", "changes", "patched", "none"]
-
-
-def _review_state(track: StageTrack) -> ReviewState:
-    """The harness's newest review decision, or "patched" when a step that
-    can push a new head ran after it: that decision was about a different
-    patch."""
-    patched = False
-    for visit in reversed(track.visits):
-        for chip in reversed(visit.chips):
-            kind = chip.kind.strip().upper()
-            if kind in _PATCH_KINDS:
-                patched = True
-            elif kind in REVIEW_KINDS and chip.outcome in {
-                StepOutcome.PASSED,
-                StepOutcome.CHANGES_REQUESTED,
-            }:
-                if patched:
-                    return "patched"
-                return "approved" if chip.outcome is StepOutcome.PASSED else "changes"
-    return "none"
-
-
-def _current_approval(facts: BoardFacts) -> bool:
-    """No step since the newest approval may have changed the patch, or an
-    approval is bound to the current head itself. The step kinds only say a
-    head may have moved; head-bound evidence says what it was approved on."""
-    state = _review_state(facts.track)
-    return state != "patched" or facts.head_approved
-
-
-def _approved(facts: BoardFacts) -> bool:
-    """Whether the current patch is approved.
-
-    A lifetime approval survives neither a CI fix's new head nor a rebase
-    unless an approval is bound to the new head, and GitHub saying the
-    current head still needs a review overrides it.
-    """
-    state = _review_state(facts.track)
-    return facts.github_approved is not False and (
-        state == "approved" or (state == "patched" and facts.head_approved)
-    )
-
-
-def _approved_line(track: StageTrack) -> str:
-    rounds = track.review_rounds
-    return f"Approved on review round {rounds}" if rounds > 0 else "Approved"
-
-
-# Who merges, (when GitHub would merge now, when it has not confirmed yet).
-_MERGER: Mapping[str, tuple[str, str]] = {
-    "harness": ("The harness merges it next.", "The harness merges it once GitHub allows."),
-    "github": ("GitHub merges it automatically.", "GitHub merges it automatically once its rules pass."),
-}
-
-
-def _merge_ready(facts: BoardFacts, ready: MergeReady) -> BoardStatus:
-    """GitHub would merge it now: whoever owns the merge acts."""
-    merger = _MERGER.get(facts.merge_owner)
-    if merger is None:
-        return NeedsYou(
-            Ask.MERGE,
-            "Merge the PR",
-            "Approved and green. The harness does not merge this PR.",
-            ready.since,
-        )
-    return Working(
-        Activity.MERGE,
-        "Ready to merge",
-        f"{_approved_line(facts.track)} and green. {merger[0]}",
-        ready.since,
-    )
-
-
-def _approved_waiting(facts: BoardFacts) -> Working:
-    """Approved, but GitHub has not confirmed it would merge. Unread GitHub
-    state never claims the operator's attention."""
-    approved, since = _approved_line(facts.track), facts.last_activity
-    if facts.merge_refused:
-        return Working(Activity.HANDOFF, "Approved", f"{approved}. GitHub does not allow the merge yet.", since)
-    if facts.ci == "failing":
-        return Working(Activity.HANDOFF, "Approved", f"{approved}. CI failed on the current head.", since)
-    merger = _MERGER.get(facts.merge_owner)
-    if facts.ci == "passing" and merger is not None:
-        return Working(Activity.MERGE, "Ready to merge", f"{approved} and green. {merger[1]}", since)
-    return Working(Activity.HANDOFF, "Approved", f"{approved}. GitHub has not confirmed it can merge.", since)
-
-
-def _needs_you(attention: Attention) -> NeedsYou:
-    if isinstance(attention, AwaitingReply):
-        return NeedsYou(
-            Ask.AWAITING_REPLY,
-            "Reply to the agent",
-            _short_reason(attention.question)
-            or "The agent asked a question. Reply on GitHub to unblock it.",
-            attention.since,
-        )
-    if attention.budget:
-        return NeedsYou(
-            Ask.BUDGET,
-            "Approve spend or close",
-            _short_reason(attention.reason, _BUDGET_PREFIX)
-            or "Spend reached its cap. Only a cap decision resumes it.",
-            attention.since,
-        )
-    if attention.breaker:
-        return NeedsYou(
-            Ask.REARM,
-            "Re-arm or close",
-            _short_reason(attention.reason, _BREAKER_PREFIX)
-            or "A circuit breaker holds it until you re-arm.",
-            attention.since,
-        )
-    return NeedsYou(
-        Ask.ESCALATED,
-        "Answer the agent",
-        _short_reason(attention.reason) or "Escalated. See the issue comments.",
-        attention.since,
-    )
-
-
-def _working_reason(track: StageTrack, kind: str) -> str:
-    if kind in REVIEW_KINDS:
-        return f"Review round {track.review_rounds + 1}."
-    if kind == "ADDRESS_REVIEW":
-        return f"Review round {max(track.review_rounds, 1)} asked for changes."
-    if kind == "FIX_CI":
-        return f"CI run {max(track.ci_runs, 1)} failed."
-    if kind in _RESOLVE_ATTEMPT_KINDS:
-        return f"Attempt {max(track.resolve_attempts, 1)}."
-    if kind == "REBASE":
-        return "Bringing the branch up to date with its base."
-    return "An agent is working on it."
-
-
-def _handoff(facts: BoardFacts) -> Working:
-    """Nothing is running, but the next move is the harness's."""
-    track, since = facts.track, facts.last_activity
-    last = track.visits[-1].chips[-1] if track.visits else None
-    kind = last.kind.strip().upper() if last is not None else ""
-    if last is not None and last.outcome is StepOutcome.FAILED:
-        name = kind.replace("_", " ").lower()
-        return Working(Activity.HANDOFF, "Retrying", f"The last step ({name}) failed; the harness tries again.", since)
-    if last is not None and last.outcome is StepOutcome.CHANGES_REQUESTED:
-        return Working(Activity.HANDOFF, "Changes requested", f"Review round {track.review_rounds} asked for changes.", since)
-    if facts.github_approved is False:
-        return Working(Activity.HANDOFF, "Awaiting review", "GitHub requires a review on the current head.", since)
-    if last is not None and _approved(facts):
-        return _approved_waiting(facts)
-    if last is not None and (kind in RESOLVE_KINDS | REPAIR_KINDS or kind == CI_RUN_KIND):
-        return Working(Activity.HANDOFF, "Awaiting review", "The reviewer picks it up next.", since)
-    return Working(Activity.HANDOFF, "Up next", "The harness picks it up on its next tick.", since)
-
-
-def _blocked_on(hold: Hold) -> Blocked:
-    on = hold.on
-    if isinstance(on, OnIssue) and on.issue is None:
-        return Blocked(on, "Waiting on a dependency", "Starts when its open dependency closes.", hold.since)
-    if isinstance(on, OnIssue):
-        return Blocked(on, f"Waiting for #{on.issue}", f"Starts when #{on.issue} merges.", hold.since)
-    if isinstance(on, OnPr):
-        return Blocked(on, f"Waiting for PR #{on.pr}", f"Starts when PR #{on.pr} merges.", hold.since)
-    target = (
-        f"#{on.issue}" if on.issue is not None
-        else f"PR #{on.pr}" if on.pr is not None
-        else None
-    )
-    if target is None:
-        return Blocked(on, "Waiting on an overlap", "Its files overlap work in flight. Starts when that merges.", hold.since)
-    return Blocked(on, f"Waiting for {target}", f"Its files overlap {target}. Starts when that merges.", hold.since)
-
-
-def board_status(facts: BoardFacts) -> BoardStatus:
-    """Which group a row belongs to, and the one line that says why.
-
-    Precedence, first match wins:
-      1. held for a human (`needs-human`): nothing moves until a person acts;
-      2. escalated or awaiting a reply: nothing moves until a person acts,
-         even while a leg is still running (that leg cannot clear the hold);
-      3. a leg is running: a reviewer re-reading a new head outranks the
-         approval it may withdraw;
-      4. GitHub would merge it now (`MergeReady`) and no patch step ran
-         since the harness's newest review: Needs you when the operator
-         merges, Working when the harness or GitHub's auto-merge does;
-      5. a hold on another issue or PR, or a file overlap;
-      6. CI is running on the current head;
-      7. stalled: no leg, hold or escalation, yet nothing changed for a whole
-         stall threshold, so the harness stopped without escalating;
-      8. queued for the fixer;
-      9. otherwise the harness owns the next move.
-    """
-    triage = facts.triage
-    if triage is not None:
-        return Blocked(
-            OnTriage("parked"),
-            "Waiting on triage",
-            "Held for a human (needs-human). Unblock removes the label.",
-            triage.since,
-        )
-    if facts.attention is not None:
-        return _needs_you(facts.attention)
-    if facts.running_kind is not None:
-        kind = facts.running_kind.strip().upper()
-        return Working(
-            Activity.AGENT,
-            _RUNNING_HEADLINE.get(kind, "Agent running"),
-            _working_reason(facts.track, kind),
-            facts.last_activity,
-        )
-    if facts.merge_ready is not None and _current_approval(facts):
-        return _merge_ready(facts, facts.merge_ready)
-    if facts.hold is not None:
-        return _blocked_on(facts.hold)
-    if facts.ci == "pending":
-        reason = (
-            f"{_approved_line(facts.track)}."
-            if _approved(facts)
-            else f"Run {max(facts.track.ci_runs, 1)} on the current head."
-        )
-        return Working(Activity.CI, "CI running", reason, facts.last_activity)
-    if facts.stall is not None:
-        deferral = (facts.stall.deferral or "").strip()
-        lead = f"Deferred: {deferral}. " if deferral else "Nothing is moving it. "
-        return NeedsYou(
-            Ask.STALLED,
-            "Investigate the stall",
-            lead + "The harness stopped without escalating.",
-            facts.stall.since,
-        )
-    if facts.queued:
-        return Blocked(
-            OnQueue(),
-            "Queued",
-            "Starts when the fixer picks it up.",
-            None,
-        )
-    return _handoff(facts)
-
-
-OVERSPEND_ALARM_RATIO = 2.0
-
-
-def overspend_ratio(cost_usd: object, budget_usd: object) -> float | None:
-    """Spend over the projected cost, only when it is a row-level alarm.
-
-    The threshold is deliberately 2x: at 1.5x it flagged most of a live board,
-    which is noise rather than a signal. Unknown, non-positive or non-finite
-    figures have no ratio.
-    """
-    cost, budget = _finite(cost_usd), _finite(budget_usd)
-    if cost is None or budget is None or budget <= 0:
-        return None
-    ratio = cost / budget
-    # An overflowing quotient is not a figure anyone can act on, and JSON
-    # cannot carry it.
-    if not math.isfinite(ratio) or ratio < OVERSPEND_ALARM_RATIO:
-        return None
-    return round(ratio, 2)
-
-
-def _finite(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        number = float(value)
-    except OverflowError:  # an int beyond float range is no usable figure
-        return None
-    return number if math.isfinite(number) else None
+def notifications(
+    legs: Iterable[LegRow], needs: Iterable[tuple[int, NeedsYou]], limit: int = NOTIFICATION_LIMIT,
+) -> tuple[Notification, ...]:
+    """Leg starts and ends, and items that need a human. Ids are stable, so a
+    client toasts each once."""
+    out: list[Notification] = []
+    for leg in legs:
+        if not leg.counted or leg.issue is None:
+            continue
+        pr = leg.number if leg.kind != AgentKind.RESOLVE.name and leg.number > 0 else None
+        word = _ACT_WORDS.get(leg.kind, leg.kind)
+        if leg.started_at is not None:
+            out.append(Notification(f"leg:{leg.leg_id}:start", leg.started_at.isoformat(), "info",
+                                    f"#{leg.issue} {word} started", None, leg.issue, pr))
+        if leg.ended_at is not None and not leg.running:
+            failed = leg.outcome == "failed"
+            out.append(Notification(
+                f"leg:{leg.leg_id}:end", leg.ended_at.isoformat(), "attention" if failed else "info",
+                f"#{leg.issue} {word} {leg.outcome.replace('_', ' ')}",
+                f"${leg.cost_usd:.2f}" + (" (estimated)" if leg.estimated else ""), leg.issue, pr,
+            ))
+    for issue, status in needs:
+        out.append(Notification(f"needs:{issue}:{status.reason}:{status.since_ts or '-'}", status.since_ts or "",
+                                "attention", f"#{issue} needs you: {status.headline}", status.reason, issue))
+    out.sort(key=lambda n: (parse_timestamp(n.ts) or datetime.min.replace(tzinfo=timezone.utc), n.id))
+    return tuple(out[-limit:]) if limit > 0 else ()
+
+
+# ── labels ───────────────────────────────────────────────────────────────────
+
+
+def label_value(labels: Iterable[str], prefixes: tuple[str, ...], exact: tuple[str, ...] = ()) -> str | None:
+    """One compact planning value from labels like `type:bug` or `impact:high`."""
+    lowered = [(label, label.lower()) for label in labels]
+    for expected in exact:
+        if any(value == expected for _, value in lowered):
+            return expected
+    for label, value in lowered:
+        for prefix in prefixes:
+            if value.startswith(prefix) and len(label) > len(prefix):
+                return label[len(prefix):]
+    return None
+
+
+def frecency(stamps: Iterable[datetime], now: datetime) -> float:
+    """Recent activity weighted by recency: a day counts 3, a week 1, a month 0.25."""
+    score = 0.0
+    for stamp in stamps:
+        age = (now - stamp).total_seconds()
+        if age < 0:
+            continue
+        score += 3.0 if age <= 86400 else 1.0 if age <= 7 * 86400 else 0.25 if age <= 30 * 86400 else 0.0
+    return score

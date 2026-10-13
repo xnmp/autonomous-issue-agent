@@ -1,17 +1,18 @@
 """FastAPI app factory, static SPA mount, and the loopback runner.
 
 The HTTP layer is deliberately thin: every route calls one collector and returns
-what it produced. `Backend` is the composition point (journal snapshots + cached
-gh + usage meters), and `create_app(backend=…)` takes any object with the same
+what it produced. `Backend` is the composition point (derived board, legs,
+usage meters), and `create_app(backend=…)` takes any object with the same
 methods, which is how the endpoint tests run without touching disk, `gh`, or the
 network.
 
-**Read-only failure posture.** No route raises for a collector failure. A
-missing journal, a dead `gh`, an uninstalled codex — each yields empty data and
+**Read-only failure posture.** No route raises for a collector failure. An
+unreadable store, a dead `gh`, an uninstalled codex — each yields empty data and
 a `warnings` entry, because a dashboard that 500s during an incident is a
 dashboard that is not there during incidents. The only non-200s are 404 (a
-deployment or issue that does not exist, a chart that cannot be generated) and
-400 (a malformed action body).
+deployment or issue that does not exist) and 400 (a refused label change).
+
+The only writes are the three label changes (promote, park, unblock).
 """
 
 from __future__ import annotations
@@ -19,23 +20,21 @@ from __future__ import annotations
 import html
 import mimetypes
 import os
+import shlex
 import sys
 import threading
 from collections.abc import Callable
 
-from ...adapters.dashweb import costchart
 from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
-from ...adapters.control_path import canonical_control_store_path
-from .. import cli
 from . import contracts
 from .ports import DashboardBackend
-from .service import Backend
+from .service import HARNESS_ROOT, Backend
 
 HOST = "127.0.0.1"
 # A cross-site form POST cannot set a custom header, and a cross-site fetch that
 # sets one is preflighted — with no CORS middleware the preflight fails. So
 # requiring this header on every write is what stops a page the operator merely
-# VISITS from launching daemons or relabelling issues.
+# VISITS from relabelling issues.
 CSRF_HEADER = "x-issue-agent-dashboard"
 GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
@@ -61,11 +60,17 @@ def same_origin(origin: str, host_header: str) -> bool:
 
 
 def dist_dir(harness_root: str | None = None) -> str:
-    return str(published_dist(harness_root or cli.HARNESS_ROOT))
+    return str(published_dist(harness_root or HARNESS_ROOT))
 
 
 def dist_ready(harness_root: str | None = None) -> bool:
-    return bundle_snapshot(harness_root or cli.HARNESS_ROOT).status.ready
+    return bundle_snapshot(harness_root or HARNESS_ROOT).status.ready
+
+
+def build_command(harness_root: str | None = None) -> str:
+    """The rebuild an operator runs when the SPA bundle is missing or stale."""
+    root = shlex.quote(harness_root or HARNESS_ROOT)
+    return f"cd {root} && uv sync --extra sdk --extra dash && make dashboard-ui"
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -80,12 +85,9 @@ def create_app(
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from starlette.concurrency import run_in_threadpool
 
-    backend = backend or Backend(
-        harness_root=harness_root,
-        control_db_path=canonical_control_store_path(),
-    )
+    backend = backend or Backend(harness_root=harness_root)
     should_offload = isinstance(backend, Backend) if offload_backend is None else offload_backend
-    root = harness_root or getattr(backend, "harness_root", cli.HARNESS_ROOT)
+    root = harness_root or getattr(backend, "harness_root", HARNESS_ROOT)
     assets = bundle_snapshot(root, pin=True)
     assets_ready = assets.status.ready
     dist = str(assets.dist) if assets_ready else os.path.join(root, "dashboard", "dist")
@@ -169,19 +171,7 @@ def create_app(
         try:
             return await invoke(backend.overview, name, timezone_name)
         except Exception as exc:  # noqa: BLE001
-            return degraded(
-                "overview",
-                exc,
-                metrics=None,
-                cost_mix=None,
-                caps=None,
-                health=[],
-                needs_attention=[],
-                escalation_reasons=[],
-                interventions=[],
-                unattributed_count=0,
-                health_trend=[],
-            )
+            return degraded("overview", exc, metrics=None, caps=None, health=[])
 
     @app.get("/api/repos/{name}/issues", response_model=contracts.IssuesPayload)
     async def api_issues(name: str):
@@ -189,9 +179,7 @@ def create_app(
         try:
             return await invoke(backend.issues, name)
         except Exception as exc:  # noqa: BLE001
-            return degraded(
-                "issues", exc, in_flight=[], pending=[], done=[], backlog=[], gh_ok=False
-            )
+            return degraded("issues", exc, in_flight=[], done=[], backlog=[], gh_ok=False)
 
     @app.get(
         "/api/repos/{name}/issues/{number}",
@@ -204,60 +192,12 @@ def create_app(
             detail = await invoke(backend.issue, name, number)
         except Exception as exc:  # noqa: BLE001
             return degraded(
-                "issue detail",
-                exc,
-                issue=number,
-                title=None,
-                url=None,
-                stage=None,
-                done=False,
-                prs=[],
-                pull_requests=[],
-                cost_usd=0.0,
-                elapsed_s=None,
-                working_s=None,
-                idle_s=None,
-                idle_active=False,
-                steps=[],
-                events=[],
+                "issue detail", exc, issue=number, title=None, url=None, done=False,
+                pull_requests=[], cost_usd=0.0, estimated=False, steps=[],
             )
         if detail is None:
-            raise HTTPException(404, f"issue #{number} has no journal history in '{name}'")
+            raise HTTPException(404, f"issue #{number} is unknown to '{name}'")
         return detail
-
-    @app.get(
-        "/api/repos/{name}/issues/{number}/steps/{idx}/events",
-        response_model=contracts.StepEventsPayload,
-    )
-    async def api_step_events(name: str, number: int, idx: int):
-        await require_known(name)
-        try:
-            payload = await invoke(backend.step_events, name, number, idx)
-        except Exception as exc:  # noqa: BLE001
-            return degraded("step events", exc, events=[])
-        if payload is None:
-            raise HTTPException(404, f"issue #{number} has no journal history in '{name}'")
-        return payload
-
-    @app.get("/api/repos/{name}/issues/{number}/cost-chart")
-    async def api_cost_chart(name: str, number: int, session_id: str = ""):
-        await require_known(name)
-        if not costchart.valid_session_id(session_id):
-            raise HTTPException(400, "session_id must match ^[A-Za-z0-9_-]+$")
-        chart, error = await invoke(backend.cost_chart, session_id)
-        if error:
-            raise HTTPException(404, error)
-        # The chart is generated from a transcript containing untrusted text
-        # (issue bodies, PR comments, fetched pages). `sandbox` drops it into an
-        # opaque origin, so script in it cannot reach the action endpoints.
-        return HTMLResponse(
-            chart, headers={"Content-Security-Policy": "sandbox; default-src 'none'"}
-        )
-
-    @app.post("/api/repos/{name}/start", response_model=contracts.ActionResult)
-    async def api_start(name: str):
-        ok, detail = await invoke(backend.start, name)
-        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
     @app.post(
         "/api/repos/{name}/issues/{number}/promote",
@@ -281,14 +221,11 @@ def create_app(
     ):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
-        # Which hand pulled the lever: the browser UI or a bare API caller
-        # (curl, an agent). A courtesy provenance stamp, not authentication —
-        # the drill-down badges API-channel unblocks so operator history and
-        # automation history stay tellable apart.
+        # Which hand pulled the lever (browser or bare API caller): a courtesy
+        # stamp `move_hold` takes, not authentication.
         channel = "ui" if user_agent.startswith("Mozilla") else "api"
-        # Unlike the other actions this one reads (snapshot + GitHub) before it
-        # writes, so it has collector failure modes: report them as a refused
-        # action, never as a 500 the operator cannot read.
+        # It reads GitHub before it writes, so it has collector failure
+        # modes: report them as a refused action, never as a 500.
         try:
             ok, detail = await invoke(
                 backend.unblock, name, number, channel
@@ -367,7 +304,7 @@ def instructions_page(harness_root: str | None = None) -> str:
         "code{background:#141a3d;padding:.15rem .35rem;border-radius:3px}</style>"
         "<h1>dashboard UI unavailable</h1>"
         "<p>The API is live; the single-page app is missing, stale, or invalid:</p>"
-        f"<pre><code>{html.escape(cli.dashboard_build_command(harness_root))}</code></pre>"
+        f"<pre><code>{html.escape(build_command(harness_root))}</code></pre>"
         "<p>Then reload this page. The JSON API is available under "
         "<code>/api/</code> in the meantime.</p>"
     )
@@ -428,7 +365,7 @@ def serve(
     port: int, host: str = HOST, backend: DashboardBackend | None = None
 ) -> int:
     """Run the dashboard on loopback. Loopback is not a default but a
-    constraint: the POST actions launch daemons and relabel issues."""
+    constraint: the POST actions relabel issues."""
     if host not in ("127.0.0.1", "::1"):
         raise ValueError("dashboard actions require a literal loopback listener")
     import uvicorn
@@ -437,7 +374,7 @@ def serve(
     if os.environ.get("HOT_RELOAD", "1") != "0":
         from ...adapters.reload import ReloadWatch
 
-        reload_check = ReloadWatch(cli.HARNESS_ROOT).changed
+        reload_check = ReloadWatch(HARNESS_ROOT).changed
     config = uvicorn.Config(
         create_app(backend=backend),
         host=host,

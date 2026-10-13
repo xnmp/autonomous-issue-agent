@@ -4,33 +4,13 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable
-from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from collections.abc import Mapping
+from datetime import datetime
 from glob import glob
 
-from ...adapters.control_store import read_settled_spend
-from ...adapters.heartbeat import read_heartbeat_time
-from ...adapters.journal import read_events, read_events_tail
-from ...domain import dashboard as dash
-
-
-def _system_local_date(timestamp: float) -> date:
-    return datetime.fromtimestamp(timestamp).date()
-
-
-def _system_local_midnight(day: date) -> float:
-    return datetime.combine(day, time.min).timestamp()
-
-
-def _local_time_functions(
-    local_tz: tzinfo | None,
-) -> tuple[Callable[[float], date], Callable[[date], float]]:
-    if local_tz is None:
-        return _system_local_date, _system_local_midnight
-    return (
-        lambda timestamp: datetime.fromtimestamp(timestamp, local_tz).date(),
-        lambda day: datetime.combine(day, time.min, local_tz).timestamp(),
-    )
+from ..env_file import source_env_file
+from ..heartbeat import read_heartbeat_time
+from ...domain.dashboard import ROLE_NAMES
 
 
 def deployment_names(repos_dir: str) -> tuple[str, ...]:
@@ -40,6 +20,33 @@ def deployment_names(repos_dir: str) -> tuple[str, ...]:
             for path in glob(os.path.join(repos_dir, "*.env"))
         )
     )
+
+
+def deployment_env(harness_root: str, name: str, inherited: Mapping[str, str]) -> dict[str, str]:
+    """The environment a deployment's daemons were configured from.
+
+    The launch snapshot `config/.active.<name>.env` is what the daemons loaded,
+    so it is named as AGENT_ENV and `config.from_env` reads it the daemons'
+    way (the file is authoritative). A deployment never launched has no
+    snapshot: shared.env then its overlay are sourced, as a launch would
+    compose them."""
+    config = os.path.join(harness_root, "config")
+    active = os.path.join(config, f".active.{name}.env")
+    if os.access(active, os.R_OK):
+        return {**inherited, "AGENT_ENV": active}
+    env = {key: value for key, value in inherited.items() if key != "AGENT_ENV"}
+    for path in (os.path.join(config, "shared.env"), os.path.join(config, "repos", f"{name}.env")):
+        if os.access(path, os.R_OK):
+            env.update(source_env_file(path, env, assigned_only=True))
+    return env
+
+
+def role_heartbeats(state_dirs: Mapping[str, str]) -> dict[str, datetime | None]:
+    """Each role's last scheduler heartbeat (None when absent or terminal)."""
+    return {
+        role: read_heartbeat_time(os.path.join(state_dirs[role], "heartbeat.json")) if state_dirs.get(role) else None
+        for role in ROLE_NAMES
+    }
 
 
 def _environ_agent_env(blob: bytes) -> str:
@@ -97,93 +104,8 @@ def scan_proc_daemons(proc_root: str = "/proc") -> tuple[dict[str, set[str]], bo
                 argv = handle.read().decode(errors="replace").split("\0")
         except OSError:
             continue
-        roles.update(argument for argument in argv if argument in dash.ROLE_NAMES)
+        roles.update(argument for argument in argv if argument in ROLE_NAMES)
     return found, read_foreign
-
-
-def collect_snapshot(
-    *,
-    name: str,
-    repo: str,
-    target_dir: str,
-    journal_paths: list[str],
-    log_dir: str,
-    ledger_path: str,
-    now_fn,
-    stale_after_s: float,
-    control_db_path: str | None = None,
-    local_tz: tzinfo | None = None,
-) -> dash.Snapshot:
-    now = now_fn()
-    to_local_date, local_midnight = _local_time_functions(local_tz)
-    settled_today_usd, settled_today_unavailable, spend_warnings = (
-        _settled_today_usd(
-            control_db_path, repo, now, to_local_date, local_midnight
-        )
-    )
-    feeds = tuple(
-        (
-            role,
-            path,
-            os.path.join(log_dir, f"{role}-{name}.log"),
-            tuple(read_events_tail(path)),
-        )
-        for role, path in zip(dash.ROLE_NAMES, journal_paths)
-    )
-    deployment = dash.build_deployment(
-        name,
-        repo,
-        feeds,
-        tuple(read_events(ledger_path)),
-        now_fn,
-        stale_after_s,
-        spend_warnings,
-        settled_today_usd,
-        settled_today_unavailable,
-        to_local_date,
-        heartbeats={
-            role: read_heartbeat_time(
-                os.path.join(os.path.dirname(path), "heartbeat.json")
-            )
-            for role, path in zip(dash.ROLE_NAMES, tuple(journal_paths))
-        },
-    )
-    timestamps = tuple(
-        stamp
-        for _role, _path, _log, events in feeds
-        for event in events
-        if (stamp := dash.parse_ts(event.get("ts"))) is not None
-    )
-    return dash.Snapshot(name, repo, target_dir, deployment, timestamps)
-
-
-def _settled_today_usd(
-    control_db_path,
-    repository,
-    now,
-    to_local_date: Callable[[float], date],
-    local_midnight: Callable[[date], float],
-):
-    if not control_db_path:
-        return None, False, ()
-    today = to_local_date(now.timestamp())
-    start = datetime.fromtimestamp(local_midnight(today), timezone.utc)
-    end = datetime.fromtimestamp(
-        local_midnight(today + timedelta(days=1)), timezone.utc
-    )
-    spend = read_settled_spend(
-        control_db_path,
-        start,
-        end,
-    )
-    amount = spend.for_repository(repository)
-    if amount is None:
-        return (
-            None,
-            True,
-            (f"settled SQLite spend unavailable: {spend.detail}",),
-        )
-    return amount.micros / 1_000_000, False, ()
 
 
 def remote_repo(root: str) -> str:

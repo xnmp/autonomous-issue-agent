@@ -13,7 +13,6 @@ from issue_agent.adapters.codex_runner import parse_codex_envelope
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.dashboard import build_issue_rows, first_pass_verdicts, stage_for
 
 
 class _StaticRuntime:
@@ -68,17 +67,3 @@ def test_review_journal_envelope_is_runtime_invariant(tmp_path, kind, verdict):
     for field in set(claude_event) - generated_identity:
         assert codex_event[field] == claude_event[field]
     assert codex_event["status"] == verdict
-
-
-def test_codex_review_status_drives_dashboard_stages_and_first_pass_metric(tmp_path):
-    changes_requested = _settled_review_event(
-        tmp_path / "changes", _codex_result({"decision": "REQUEST_CHANGES"}), "REVIEW",
-    )
-    approved = _settled_review_event(
-        tmp_path / "approved", _codex_result({"decision": "APPROVE"}), "REVIEW",
-    )
-    approved["number"] = approved["issue"] = 126
-
-    assert stage_for([changes_requested]) == "changes requested"
-    assert stage_for([approved]) == "awaiting merge"
-    assert first_pass_verdicts(build_issue_rows([changes_requested, approved], [])) == (1, 1)

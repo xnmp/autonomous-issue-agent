@@ -1,518 +1,399 @@
-"""Dashboard application service and composition façade."""
+"""Dashboard application service: read, derive, shape.
+
+Per deployment it reads the launch configuration the daemons loaded, the
+observation the roles read (`GitHubGateway.build_world`) plus the two GitHub
+lists that observation leaves out, and the control store's `legs` and
+`leases` read-only. It derives every item with `domain.state.derive` over the
+same local facts the roles build (`app.tick.Facts`), so the board shows what
+the daemons will do, not a reconstruction.
+
+The only writes are label changes through `operator_effects` (refactor
+decision Q19): promote adds `ai-ready`, park adds `needs-human`, unblock
+removes it.
+"""
 
 from __future__ import annotations
 
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from functools import partial
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
-from ...adapters.journal import Journal, default_ledger_path
-from ...adapters.operator_effects import build_operator_effects
+from ...adapters.control_path import control_store_path
+from ...adapters.control_store import SQLiteControlStore
+from ...adapters.dashweb import ghdata, system, usage, verification
+from ...adapters.dashweb.legs import LegsUnavailable, read_legs
+from ...adapters.github import GitHubGateway
+from ...adapters.operator_effects import GitHubOperatorEffects, build_operator_effects
 from ...domain import dashboard as dash
-from ...domain.fix import harness_merges_branch
-
-from .. import cli, config
-from . import snapshots
+from ...domain.labels import Label
+from ...domain.refs import harness_branch_issue
+from ...domain.state import Harness, Local, derive
+from ...domain.world import WorldState
+from .. import config
+from ..config import HarnessConfig
+from ..tick import Facts
+from . import views
 from .ports import GitHubQueries
+
+HARNESS_ROOT = str(Path(__file__).resolve().parents[4])
+OBSERVE_TTL_S = 20.0
+LEGS_TTL_S = 3.0
+CONFIG_TTL_S = 60.0
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-_DETAIL_CONFIG_FIELDS = (
-    "MAX_BUDGET_USD",
-    "ROUTER_BUDGET_USD",
-    "REVIEW_BUDGET_USD",
-)
-_FIX_BUDGET_KINDS = (
-    "RESOLVE", "ADDRESS_REVIEW", "FIX_CI", "REBASE",
-)
-
-_GH_ENRICHMENT_TTL_S = ghdata.DEFAULT_TTL_S
-_GHContext = tuple[dict[int, dict], dict[int, dict], list[str]]
-
-
-@dataclass
-class _DeferredGhEntry:
-    value: _GHContext | None
-    refreshed_at: float
-    future: Future[_GHContext] | None
-
-
-class _DeferredGhContexts:
-    """Non-blocking stale-while-revalidate store for optional GitHub fields.
-
-    Journal folds are the dashboard's first-paint contract. GitHub titles,
-    links, reviews and check state are enrichment, and a cold ``gh`` process
-    can take tens of seconds. The first read therefore schedules enrichment
-    and returns no optional fields; later polls atomically pick up the result.
-    Once populated, callers keep the last value while its refresh runs so data
-    never flashes back to absent at the TTL boundary.
-    """
-
-    def __init__(
-        self,
-        *,
-        ttl_s: float = _GH_ENRICHMENT_TTL_S,
-        clock=time.monotonic,
-        executor: ThreadPoolExecutor | None = None,
-    ) -> None:
-        self._ttl_s = ttl_s
-        self._clock = clock
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=4,
-            thread_name_prefix="dashboard-gh",
-        )
-        self._lock = threading.Lock()
-        self._entries: dict[tuple, _DeferredGhEntry] = {}
-
-    def get(self, key: tuple, load) -> tuple[_GHContext, bool]:
-        """Return ``(context, enriched)`` without waiting on ``load``."""
-        now = self._clock()
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                self._entries[key] = _DeferredGhEntry(
-                    value=None,
-                    refreshed_at=0.0,
-                    future=self._executor.submit(load),
-                )
-                return ({}, {}, []), False
-
-            if entry.future is not None and entry.future.done():
-                try:
-                    entry.value = entry.future.result()
-                except Exception as exc:  # noqa: BLE001 - enrichment degrades
-                    entry.value = (
-                        {},
-                        {},
-                        [f"GitHub enrichment unavailable ({_detail(exc)})"],
-                    )
-                entry.refreshed_at = now
-                entry.future = None
-
-            if entry.value is None:
-                return ({}, {}, []), False
-
-            if (
-                entry.future is None
-                and now - entry.refreshed_at >= self._ttl_s
-            ):
-                entry.future = self._executor.submit(load)
-            return entry.value, True
-
-
-def _detail_limits(name: str, repo: str) -> dict[str, float]:
-    configured = {
-        field: value
-        for field in _DETAIL_CONFIG_FIELDS
-        if (value := cli.deployment_env_field(name, field))
-    }
-    cfg = config.from_env({"REPO": repo, **configured})
-    return {
-        **{kind: max(0.0, cfg.fix_budget_usd) for kind in _FIX_BUDGET_KINDS},
-        "REVIEW": max(0.0, cfg.review_budget_usd),
-    }
-
-
-_AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE",)
-
-
-def _harness_merges(name: str, repo: str) -> Callable[[str], bool]:
-    """Which PR branches the fixer merges itself on this repo.
-
-    The fixer's own per-branch rule (`harness_merges_branch`, which
-    `automerge_in_scope` applies) bound to this deployment's knobs, so a
-    stranger's branch on an auto-merging repo still reads as the operator's.
-    An unreadable configuration merges nothing, which surfaces a merge-ready
-    PR to the operator rather than letting it sit in Working on a guess.
-    """
-    try:
-        configured = {
-            field: value
-            for field in _AUTOMERGE_CONFIG_FIELDS
-            if (value := cli.deployment_env_field(name, field))
-        }
-        cfg = config.from_env({"REPO": repo, **configured})
-    except Exception:  # noqa: BLE001 - a display hint never fails the board
-        return _merges_nothing
-    return partial(
-        harness_merges_branch,
-        auto_merge=cfg.auto_merge,
-    )
-
-
-def _merges_nothing(_branch: str) -> bool:
-    return False
-
-
 def _detail(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:400]
 
 
+def daemon_control_path(cfg: HarnessConfig) -> str:
+    """The control store the deployment's daemons share (as `roles` opens it)."""
+    return control_store_path((cfg.state_dir, cfg.review_state_dir), fallback_state_dir=cfg.state_dir,
+                              authority_root=cfg.control_authority_root)
+
+
+@dataclass(frozen=True)
+class Deployment:
+    name: str
+    cfg: HarnessConfig
+    harness: Harness | None
+    control_path: str
+    problem: str = ""
+
+
+@dataclass(frozen=True)
+class Observation:
+    world: WorldState | None
+    issues: object
+    merged: object
+    observed_at: datetime
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass
+class _Entry:
+    value: Observation | None = None
+    refreshed_at: float = 0.0
+    future: Future | None = None
+    stale: bool = False
+
+
+@dataclass
+class _Observations:
+    """Stale-while-revalidate per deployment: a GitHub observation can take
+    seconds, so a poll returns the last one (None before the first) and a
+    refresh runs in the background once it is older than the TTL."""
+
+    ttl_s: float = OBSERVE_TTL_S
+    clock: Callable[[], float] = time.monotonic
+    executor: ThreadPoolExecutor = field(
+        default_factory=lambda: ThreadPoolExecutor(max_workers=4, thread_name_prefix="dashboard-observe"))
+    _entries: dict[str, _Entry] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def get(self, key: str, load: Callable[[], Observation]) -> Observation | None:
+        now = self.clock()
+        with self._lock:
+            entry = self._entries.setdefault(key, _Entry())
+            if entry.future is not None and entry.future.done():
+                try:
+                    entry.value = entry.future.result()
+                except Exception as exc:  # noqa: BLE001 - a failed read degrades
+                    entry.value = Observation(None, None, None, _utcnow(), (f"GitHub unavailable ({_detail(exc)})",))
+                entry.refreshed_at, entry.future = now, None
+            due = entry.stale or entry.value is None or now - entry.refreshed_at >= self.ttl_s
+            if entry.future is None and due:
+                entry.future, entry.stale = self.executor.submit(load), False
+            return entry.value
+
+    def cached(self, key: str) -> Observation | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            return entry.value if entry else None
+
+    def invalidate(self, key: str) -> None:
+        with self._lock:
+            if key in self._entries:
+                self._entries[key].stale = True
+
+
 class Backend:
-    """Every collector the API exposes, over one cached `gh` reader."""
+    """Every collector the API exposes."""
 
     def __init__(
         self,
         harness_root: str | None = None,
         gh: GitHubQueries | None = None,
-        now_fn=None,
-        stale_after_s: float = dash.STALE_AFTER_S,
-        snapshot_ttl_s: float = 3.0,
-        detail_config_ttl_s: float = 60.0,
-        gh_enrichment_ttl_s: float = _GH_ENRICHMENT_TTL_S,
-        gh_enrichment_executor: ThreadPoolExecutor | None = None,
+        *,
+        gateway_factory: Callable[[str], object] = GitHubGateway,
+        now_fn: Callable[[], datetime] = _utcnow,
         effects_factory=build_operator_effects,
-        control_db_path: str = "",
+        environ: Mapping[str, str] | None = None,
+        observe_ttl_s: float = OBSERVE_TTL_S,
+        observe_executor: ThreadPoolExecutor | None = None,
+        proc_scan: Callable[[], tuple[dict[str, set[str]], bool]] = system.scan_proc_daemons,
+        control_path: Callable[[HarnessConfig], str] = daemon_control_path,
     ):
-        self.harness_root = harness_root or cli.HARNESS_ROOT
+        self.harness_root = harness_root or HARNESS_ROOT
         self.gh = gh or ghdata.GhReader()
-        self.now_fn = now_fn or _utcnow
-        self.stale_after_s = stale_after_s
-        # Building one snapshot re-reads three journals AND sources the overlay
-        # through bash (the CLI's shell-semantics read). At the UI's 5s poll,
-        # across three deployments and two views, that is a lot of forks for
-        # data that cannot have changed. A few seconds of staleness is free —
-        # the daemons themselves tick every 20s.
-        self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
-        self._detail_configs = ghdata.TtlCache(ttl_s=detail_config_ttl_s)
-        self._gh_enrichment = _DeferredGhContexts(
-            ttl_s=gh_enrichment_ttl_s,
-            executor=gh_enrichment_executor,
-        )
-        self._self_repo = system.remote_repo(self.harness_root)
+        self.gateway_factory = gateway_factory
+        self.now_fn = now_fn
         self.effects_factory = effects_factory
-        self.control_db_path = control_db_path
+        self.environ = dict(environ if environ is not None else os.environ)
+        self.proc_scan = proc_scan
+        self.control_path = control_path
+        self._observations = _Observations(ttl_s=observe_ttl_s, **(
+            {"executor": observe_executor} if observe_executor is not None else {}))
+        self._configs = ghdata.TtlCache(ttl_s=CONFIG_TTL_S)
+        self._legs = ghdata.TtlCache(ttl_s=LEGS_TTL_S)
+        self._self_repo = system.remote_repo(self.harness_root)
 
-    # ── journal side ──
+    # ── configuration ──
+    @property
+    def repos_dir(self) -> str:
+        return os.path.join(self.harness_root, "config", "repos")
+
     def names(self) -> tuple[str, ...]:
-        return system.deployment_names(cli.REPOS_DIR)
+        return system.deployment_names(self.repos_dir)
 
     def known(self, name: str) -> bool:
-        """A deployment the operator actually configured.
-
-        Every route gates on this. `name` reaches a subprocess argv and several
-        filesystem paths, so an unvalidated one is both an injection surface and
-        an unbounded-work surface (each miss forks bash to source an overlay
-        that does not exist, and pins a cache entry)."""
+        """A deployment the operator configured. Every route gates on this:
+        `name` reaches filesystem paths and a subprocess environment."""
         return name in self.names()
 
-    def snapshot(self, name: str, *, refresh: bool = False) -> dash.Snapshot:
-        if not refresh:
-            cached = self._snapshots.get(name)
-            if cached is not None:
-                return cached
-        return self._snapshots.put(
-            name,
-            self._deployment_snapshot(name, self.overlay_field(name, "REPO"),
-                                      self.overlay_field(name, "TARGET_DIR"),
-                                      tuple(cli.journal_paths(name)), self.control_db_path),
+    def deployment(self, name: str) -> Deployment:
+        return self._configs.get_or_load(name, lambda: self._load_deployment(name))
+
+    def _load_deployment(self, name: str) -> Deployment:
+        cfg = config.from_env(system.deployment_env(self.harness_root, name, self.environ))
+        problem = "" if cfg.repo else f"no REPO configured for deployment '{name}'"
+        try:
+            harness: Harness | None = Harness(fix_bot=cfg.fix_runtime.bot, review_bot=cfg.review_runtime.bot)
+        except ValueError as exc:
+            harness, problem = None, problem or f"harness identity incomplete: {exc}"
+        return Deployment(name, cfg, harness, self.control_path(cfg), problem)
+
+    # ── reads ──
+    def legs(self, dep: Deployment) -> tuple[tuple[dash.LegRow, ...], list[str]]:
+        try:
+            return self._legs.get_or_load((dep.control_path, dep.cfg.repo),
+                                          lambda: read_legs(dep.control_path, dep.cfg.repo)), []
+        except LegsUnavailable as exc:
+            return (), [str(exc)]
+
+    def _observe(self, dep: Deployment) -> Observation:
+        warnings: list[str] = []
+        world: WorldState | None
+        try:
+            world = self.gateway_factory(dep.cfg.repo).build_world(dep.cfg.base_branch)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - shown as a warning, retried next TTL
+            world = None
+            warnings.append(f"GitHub observation failed ({_detail(exc)})")
+        issues, issues_error = self.gh.issues(dep.cfg.repo)
+        merged, merged_error = self.gh.merged_prs(dep.cfg.repo)
+        warnings += [m for m in (issues_error, merged_error) if m]
+        if isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
+            warnings.append(f"issue history limited to {ghdata.ISSUE_HISTORY_LIMIT} records")
+        if isinstance(merged, list) and len(merged) >= ghdata.MERGED_PR_LIMIT:
+            warnings.append(f"merged PRs limited to the newest {ghdata.MERGED_PR_LIMIT}; totals undercount")
+        return Observation(world, issues, merged, self.now_fn(), tuple(warnings))
+
+    def observation(self, dep: Deployment) -> Observation | None:
+        if dep.problem:
+            return None
+        return self._observations.get(dep.name, lambda: self._observe(dep))
+
+    def _facts(self, dep: Deployment, warnings: list[str]) -> Callable[[WorldState], Local]:
+        """The roles' own local facts (`tick.Facts`) over the shared store,
+        with the fix role's headroom and lifetime-cap arithmetic. The store
+        is opened without `initialize()`: the dashboard never creates or cuts
+        over the authority."""
+        # Private to roles.py; reported to slice 9 as the seam to make public.
+        from ..roles import _control_spend_gate, _headroom, _lifetime_capped
+
+        control = SQLiteControlStore(dep.control_path)
+        return Facts(
+            control, dep.cfg.repo, active=tuple,
+            headroom=_headroom(_control_spend_gate(dep.cfg, control, dep.cfg.fix_budget_usd)),
+            lifetime_capped=_lifetime_capped(dep.cfg, control), log=warnings.append, now=self.now_fn,
         )
 
-    def _deployment_snapshot(
-        self, name: str, repo: str, target_dir: str, journal_paths: tuple[str, ...], control_db_path: str,
-    ) -> dash.Snapshot:
-        return system.collect_snapshot(
-            name=name, repo=repo, target_dir=target_dir, journal_paths=list(journal_paths),
-            log_dir=cli.log_dir(), ledger_path=default_ledger_path(), now_fn=self.now_fn,
-            stale_after_s=self.stale_after_s, control_db_path=control_db_path,
-        )
+    def _items(self, dep: Deployment, obs: Observation | None, legs, warnings: list[str]) -> tuple[views.Item, ...] | None:
+        if obs is None or obs.world is None or dep.harness is None:
+            return None
+        try:
+            local = self._facts(dep, warnings)(obs.world)
+        except Exception as exc:  # noqa: BLE001 - derive without local facts, loudly
+            warnings.append(f"control store unreadable; running legs and caps are not shown ({_detail(exc)})")
+            local = Local(now=self.now_fn())
+        return views.items(obs.world, derive(obs.world, local, dep.harness), legs, dep.harness)
 
+    def _read(self, name: str, wait: bool = False):
+        """The deployment, its legs and its observation. `wait` reads GitHub
+        now (the one-shot renders); polls take the cached observation."""
+        dep = self.deployment(name)
+        warnings = [dep.problem] if dep.problem else []
+        legs, legs_warnings = self.legs(dep)
+        obs = self._observe(dep) if wait and not dep.problem else self.observation(dep)
+        warnings += legs_warnings + list(obs.warnings if obs else ())
+        if obs is None and not dep.problem:
+            warnings.append("reading GitHub…")
+        return dep, legs, obs, warnings
+
+    # ── endpoints ──
     def repos(self) -> dict:
-        live, scan_ok = system.scan_proc_daemons()
-        snaps = [self.snapshot(name) for name in self.names()]
-        return snapshots.repos_payload(
-            snaps, live, scan_ok, self.now_fn(), self_repo=self._self_repo
-        )
+        live, scan_ok = self.proc_scan()
+        now = self.now_fn()
+        out, warnings = [], []
+        for name in self.names():
+            try:
+                dep = self.deployment(name)
+            except Exception as exc:  # noqa: BLE001 - one bad overlay must not hide the rest
+                warnings.append(f"{name}: configuration unreadable ({_detail(exc)})")
+                continue
+            legs, _ = self.legs(dep)
+            stamps = [leg.at for leg in legs]
+            obs = self._observations.cached(name)
+            merged = views.merged_harness_prs(obs.merged) if obs else ()
+            beats = system.role_heartbeats({"fix": dep.cfg.state_dir, "review": dep.cfg.review_state_dir})
+            roles = [self._role(role, beats.get(role), live.get(name, set()), scan_ok, now) for role in dash.ROLE_NAMES]
+            open_items = None
+            if obs is not None and obs.world is not None:
+                open_items = len({i.number for i in obs.world.issues if i.state == "open" and i.has(Label.AI_READY)} | {
+                    n for p in obs.world.prs if p.state == "OPEN" and (n := harness_branch_issue(p.head_ref_name))})
+            out.append({
+                "name": name,
+                "repo": dep.cfg.repo or None,
+                "target_dir": dep.cfg.target_dir or None,
+                "is_self": bool(self._self_repo) and dep.cfg.repo.casefold() == self._self_repo.casefold(),
+                "active": (name in live) if scan_ok else None,
+                "roles": roles,
+                "frecency": dash.frecency(stamps, now),
+                "last_activity_ts": max(stamps).isoformat() if stamps else None,
+                "in_flight": open_items,
+                "done": len({m.issue for m in merged}) if obs is not None and obs.merged is not None else None,
+            })
+        top = max((repo["frecency"] for repo in out), default=0.0)
+        for repo in out:
+            repo["frecency"] = round(repo["frecency"] / top, 4) if top > 0 else 0.0
+        out.sort(key=lambda repo: (-repo["frecency"], repo["name"]))
+        return {"repos": out, "warnings": warnings}
 
     @staticmethod
-    def overlay_field(name: str, field: str) -> str:
-        return cli.read_repo_env_field(
-            os.path.join(cli.REPOS_DIR, f"{name}.env"), field
-        )
+    def _role(role: str, beat: datetime | None, live: set[str], scan_ok: bool, now: datetime) -> dict:
+        age = (now - beat).total_seconds() if beat is not None else None
+        return {
+            "role": role,
+            "alive": (role in live) if scan_ok else None,
+            "stale": age is None or not 0 <= age <= dash.STALE_AFTER_S,
+            "heartbeat_ts": beat.isoformat() if beat is not None else None,
+        }
 
     def usage(self) -> dict:
         def config_for(name: str) -> tuple[str, float, float]:
-            repo = cli.read_repo_env_field(
-                os.path.join(cli.REPOS_DIR, f"{name}.env"), "REPO"
-            )
-            return repo, cli.daily_cap(name), cli.global_daily_cap(name)
+            cfg = self.deployment(name).cfg
+            return cfg.repo, cfg.daily_spend_cap_usd, cfg.global_daily_spend_cap_usd
 
         return usage.usage_payload(self.names(), config_for)
 
     def verification(self) -> dict:
-        return verification.verification_payload(
-            verification.default_path(self.harness_root)
-        )
+        return verification.verification_payload(verification.default_path(self.harness_root))
 
-    def overview(self, name: str, timezone_name: str | None = None) -> dict:
-        live, scan_ok = system.scan_proc_daemons()
-        snapshot = self.snapshot(name)
-        local_tz = _local_timezone(timezone_name)
-        first_observed_day = snapshots.first_observed_day(snapshot, local_tz)
-        issues, issue_error = self.gh.issues(snapshot.repo)
-        recurrence_events = [
-            event
-            for row in snapshot.deployment.issues
-            for event in row.events
-            if event.get("event") == "recurrence"
-        ]
-        payload = snapshots.overview_payload(
-            snapshot,
-            live,
-            scan_ok,
-            issue_cap_usd=cli._env_cap(name, "ISSUE_SPEND_CAP_USD", 0.0) or None,
-            daily_cap_usd=cli.daily_cap(name) or None,
-        )
-        payload["health_trend"] = snapshots.health_trend(
-            issues,
-            recurrence_events,
-            first_observed_day=first_observed_day,
-            local_tz=local_tz,
-        )
-        payload["first_observed_day"] = first_observed_day
-        payload["spend_per_hour"] = snapshots.spend_per_hour(
-            snapshot.deployment, self.now_fn()
-        )
-        if issue_error:
-            payload["warnings"].append(issue_error)
-        elif isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
-            payload["warnings"].append(
-                f"GitHub issue history may be incomplete (limited to "
-                f"{ghdata.ISSUE_HISTORY_LIMIT} records)"
-            )
-        return payload
-
-    # ── gh-augmented ──
-    def _gh_context(self, repo: str) -> tuple[dict, dict, list[str]]:
-        # These are independent network reads. On the measured cold path they
-        # took 15s and 9s respectively; running them side by side keeps the
-        # eventual enrichment latency at the slower call rather than their sum.
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            issues_future = executor.submit(self.gh.issues, repo)
-            prs_future = executor.submit(self.gh.prs, repo)
-            issues_payload, issues_error = issues_future.result()
-            prs_payload, prs_error = prs_future.result()
-        warnings = [m for m in (issues_error, prs_error) if m]
-        return (
-            ghdata.index_by_number(issues_payload),
-            ghdata.index_by_number(prs_payload),
-            warnings,
-        )
-
-    def _gh_issue_context(
-        self,
-        repo: str,
-        prs: tuple[int, ...],
-    ) -> _GHContext:
-        gh_issues, gh_prs, warnings = self._gh_context(repo)
-        if not prs:
-            return gh_issues, gh_prs, warnings
-        with ThreadPoolExecutor(max_workers=min(4, len(prs))) as executor:
-            details = {
-                number: executor.submit(self.gh.pr, repo, number)
-                for number in prs
-            }
-            for number, future in details.items():
-                payload, error = future.result()
-                if isinstance(payload, dict):
-                    gh_prs[number] = {**gh_prs.get(number, {}), **payload}
-                if error:
-                    warnings.append(f"PR #{number} change details: {error}")
-        return gh_issues, gh_prs, warnings
-
-    def _deferred_gh_context(
-        self,
-        key: tuple,
-        load,
-    ) -> tuple[_GHContext, bool]:
-        (issues, prs, warnings), enriched = self._gh_enrichment.get(key, load)
-        # Response-specific diagnostics are composed below. Never let a poll
-        # append into the cached enrichment value shared by every request.
-        return (issues, prs, list(warnings)), enriched
-
-    def _cached_detail_limits(
-        self, name: str, repo: str
-    ) -> dict[str, float]:
-        key = (name, repo)
-        return self._detail_configs.get_or_load(
-            key, lambda: _detail_limits(name, repo)
-        )
-
-    def _cached_harness_merges(self, name: str, repo: str) -> Callable[[str], bool]:
-        return self._detail_configs.get_or_load(
-            ("automerge", name, repo), lambda: _harness_merges(name, repo)
-        )
-
-    def issues(self, name: str) -> dict:
-        snap = self.snapshot(name)
+    def issues(self, name: str, wait: bool = False) -> dict:
+        dep, legs, obs, warnings = self._read(name, wait)
+        found = self._items(dep, obs, legs, warnings)
+        gh_issues = ghdata.index_by_number(obs.issues) if obs else {}
+        merged = views.merged_harness_prs(obs.merged) if obs else ()
+        active = {item.issue for item in found or ()}
         now = self.now_fn()
-        (gh_issues, gh_prs, warnings), enriched = self._deferred_gh_context(
-            ("issues", snap.repo),
-            lambda: self._gh_context(snap.repo),
-        )
-        rows = snap.deployment.issues
-        projected_by_model = snapshots.projected_cost_by_model(rows)
-        verification_payload = self.verification()
-        ledger_rows = verification_payload.get("rows", [])
-        issue_status, pr_status = verification.status_indexes(ledger_rows)
-        issue_reason, pr_reason = verification.reason_indexes(ledger_rows)
-        harness_merges = self._cached_harness_merges(name, snap.repo)
-
-        def card(row):
-            model = snapshots.projection_model(row)
-            pr = row.prs[-1] if row.prs else None
-            return snapshots.issue_card(
-                row,
-                now,
-                gh_issue=gh_issues.get(row.issue),
-                gh_prs=gh_prs,
-                projected_cost_usd=projected_by_model.get(model) if model else None,
-                projected_model=model,
-                issue_verification=issue_status.get(row.issue),
-                pr_verification=pr_status.get(pr) if pr is not None else None,
-                issue_verification_reason=issue_reason.get(row.issue),
-                pr_verification_reason=(
-                    pr_reason.get(pr) if pr is not None else None
-                ),
-                harness_merges=harness_merges,
-            )
-
-        row_by_issue = {row.issue: row for row in rows}
-        ready_numbers = {
-            number
-            for number, issue in gh_issues.items()
-            if ghdata.is_open(issue)
-            and "ai-ready" in snapshots.labels_of(issue)
-        }
-        in_flight_numbers = {
-            row.issue
-            for row in rows
-            if not row.done and row.issue not in ready_numbers
-        }
-        pending, backlog = [], []
-        for number, issue in sorted(gh_issues.items()):
-            if not ghdata.is_open(issue):
-                continue
-            labels = snapshots.labels_of(issue)
-            if "ai-ready" in labels:
-                pending.append(
-                    snapshots.pending_card(
-                        issue,
-                        row_by_issue.get(number),
-                        gh_prs=gh_prs,
-                        harness_merges=harness_merges,
-                    )
-                )
-            elif snapshots.is_backlog(issue):
-                backlog.append(
-                    snapshots.backlog_card(
-                        issue, now, row_by_issue.get(number)
-                    )
-                )
         return {
-            "in_flight": [
-                card(row) for row in rows
-                if row.issue in in_flight_numbers
-            ],
-            "pending": pending,
-            "done": [card(row) for row in rows if row.done],
-            "backlog": backlog,
-            # A pending background read is not a GitHub failure. Optional
-            # fields are absent until the next poll, while an actual completed
-            # failure still drives the existing degraded-state affordance.
-            "gh_ok": not warnings,
-            "notifications": snapshots.journal_notifications(rows),
+            "in_flight": [views.issue_card(item, dep.cfg.repo, gh_issues.get(item.issue)) for item in found or ()],
+            "done": views.done_cards(merged, legs, dep.cfg.repo, gh_issues),
+            "backlog": views.backlog_cards(gh_issues, active, now) if obs and obs.issues is not None else [],
+            "gh_ok": obs is not None and not obs.warnings and found is not None,
+            "observed_at": obs.observed_at.isoformat() if obs else None,
+            "notifications": [asdict(n) for n in dash.notifications(
+                legs, ((item.issue, item.status) for item in found or () if isinstance(item.status, dash.NeedsYou)))],
             "warnings": warnings,
         }
 
     def issue(self, name: str, number: int) -> dict | None:
-        snap = self.snapshot(name)
-        row = snapshots.find_row(snap, number)
-        if row is None:
+        dep, legs, obs, warnings = self._read(name)
+        found = self._items(dep, obs, legs, warnings)
+        item = next((i for i in found or () if i.issue == number), None)
+        merged = views.merged_harness_prs(obs.merged) if obs else ()
+        gh_issue = ghdata.index_by_number(obs.issues).get(number) if obs else None
+        if obs is not None and item is None and gh_issue is None and not any(
+                leg.issue == number for leg in legs) and not any(m.issue == number for m in merged):
             return None
-        (gh_issues, gh_prs, warnings), enriched = self._deferred_gh_context(
-            ("issue", snap.repo, row.issue, row.prs),
-            lambda: self._gh_issue_context(snap.repo, row.prs),
-        )
-        budget_caps = self._cached_detail_limits(name, snap.repo)
-        detail = snapshots.issue_detail(
-            row,
-            self.now_fn(),
-            gh_issues.get(number),
-            gh_prs,
-            budget_caps=budget_caps,
-        )
+        detail = views.issue_detail(number, dep.cfg.repo, item, legs, merged, gh_issue)
         detail["warnings"] = warnings
         return detail
 
-    def step_events(self, name: str, number: int, idx: int) -> dict | None:
-        row = snapshots.find_row(self.snapshot(name), number)
-        if row is None:
-            return None
-        return {"events": snapshots.step_window_events(row, idx), "warnings": []}
-
-    def cost_chart(self, session_id: str) -> tuple[str, str]:
-        return costchart.render_cost_chart(session_id)
-
-    # ── actions ──
-    def start(self, name: str) -> tuple[bool, str]:
-        if not self.known(name):
-            return False, f"unknown deployment '{name}'"
-        live, scan_ok = system.scan_proc_daemons()
-        if scan_ok and name in live:
-            return False, f"deployment '{name}' already has live daemons"
-        log_path = actions.start_log_path(cli.log_dir(), name)
-        return actions.launch_detached(
-            actions.start_command(self.harness_root, name), log_path
+    def overview(self, name: str, timezone_name: str | None = None) -> dict:
+        dep, legs, obs, warnings = self._read(name)
+        found = self._items(dep, obs, legs, warnings)
+        live, scan_ok = self.proc_scan()
+        now = self.now_fn()
+        beats = system.role_heartbeats({"fix": dep.cfg.state_dir, "review": dep.cfg.review_state_dir})
+        merged = views.merged_harness_prs(obs.merged) if obs else ()
+        gh_issues = ghdata.index_by_number(obs.issues) if obs else {}
+        needs = views.attention(found or (), gh_issues)
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)  # the caps' UTC day
+        m = dash.metrics(
+            legs, merged_prs=len({x.pr for x in merged}) if obs and obs.merged is not None else None,
+            open_items=len(found) if found is not None else None,
+            needs_human=len(needs) if found is not None else None, today_start=today,
         )
+        cfg = dep.cfg
+        return {
+            "metrics": asdict(m),
+            "caps": {
+                "issue_cap_usd": cfg.issue_spend_cap_usd or None,
+                "daily_cap_usd": cfg.daily_spend_cap_usd or None,
+                "global_daily_cap_usd": cfg.global_daily_spend_cap_usd or None,
+                "today_usd": m.today_usd,
+            },
+            "health": [self._role(role, beats.get(role), live.get(name, set()), scan_ok, now)
+                       for role in dash.ROLE_NAMES],
+            "needs_attention": needs,
+            "health_trend": views.health_trend(obs.issues, _local_timezone(timezone_name)) if obs else [],
+            "spend_per_hour": [asdict(b) for b in dash.spend_per_hour(legs, now)],
+            "warnings": warnings,
+        }
+
+    # ── label writes ──
     def promote(self, name: str, number: int) -> tuple[bool, str]:
-        if not self.known(name):
-            return False, f"unknown deployment '{name}'"
-        repo = self.overlay_field(name, "REPO")
-        if not repo:
-            return False, f"no REPO configured for deployment '{name}'"
-        effects = self._operator_effects(name, repo)
-        return effects.set_issue_labels(number, add=("ai-ready",))
+        return self._write(name, lambda effects: effects.set_issue_labels(number, add=("ai-ready",)))
 
     def park(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]:
-        """Hand an issue to a human: `needs-human` on the issue and on each open
-        harness PR for it (refactor decision Q19). The fix policy waits on
-        that label until it is removed or a human replies to the stop."""
-        return self._move_hold(name, number, channel, park=True)
+        """Hand an issue to a human: `needs-human` on the issue and its open
+        harness PRs. Derive waits on the label until it is removed or a human
+        replies to a stop."""
+        return self._write(name, lambda effects: effects.move_hold(number, park=True, channel=channel))
 
     def unblock(self, name: str, number: int, channel: str = "api") -> tuple[bool, str]:
-        """Release a held issue: remove `needs-human` from the issue and its open
-        harness PRs, and nothing else."""
-        return self._move_hold(name, number, channel, park=False)
+        """Remove `needs-human` from the issue and its open harness PRs."""
+        return self._write(name, lambda effects: effects.move_hold(number, park=False, channel=channel))
 
-    def _move_hold(self, name: str, number: int, channel: str, *, park: bool) -> tuple[bool, str]:
+    def _write(self, name: str, apply: Callable[[GitHubOperatorEffects], tuple[bool, str]]) -> tuple[bool, str]:
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
-        repo = self.overlay_field(name, "REPO")
+        repo = self.deployment(name).cfg.repo
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
-        return self._operator_effects(name, repo).move_hold(number, park=park, channel=channel)
-
-    def _operator_effects(self, name: str, repo: str):
-        journal = self._operator_journal(name, repo)
-        return self.effects_factory(repo, identity=f"{repo}:dashboard", journal=journal)
-
-    def _operator_journal(self, name: str, repo: str) -> Journal | None:
-        """The fix role's journal, where an operator intervention becomes
-        visible to the board; the dashboard holds no other record of it."""
-        if not repo:
-            return None
-        return Journal(cli.journal_paths(name)[0])
+        result = apply(self.effects_factory(repo, identity=f"{repo}:dashboard"))
+        self._observations.invalidate(name)
+        return result
 
 
 def _local_timezone(name: str | None):
