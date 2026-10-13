@@ -338,4 +338,25 @@ describe("issues board actions", () => {
     expect(calls.filter(({ method }) => method === "POST").map(({ url }) => url)).toEqual(["/api/repos/demo/issues/220/unblock"]);
     expect(refresh).toHaveBeenCalled();
   });
+
+  it("shows CI waiting on a runner in yellow, and CI executing in green", () => {
+    stubFetch();
+    const working = (activity: "ci" | "ci_queued", headline: string): BoardStatus => ({
+      status: "working", activity, act: null, headline, reason: "r", since_ts: null,
+    });
+    renderBoard({
+      in_flight: [
+        card(180, working("ci_queued", "CI queued"), { rail: rail({ current: "ci" }) }),
+        card(181, working("ci", "CI running"), { rail: rail({ current: "ci" }) }),
+      ],
+    });
+
+    const queued = row("Issue 180 title");
+    expect(queued.closest(".board-item")).toHaveClass("board-tone-warn");
+    expect(within(queued).getByText("CI queued")).toBeVisible();
+    expect(queued.querySelector(".lifecycle-rail")).toHaveClass("rail-tone-warn");
+    const running = row("Issue 181 title");
+    expect(running.closest(".board-item")).not.toHaveClass("board-tone-warn");
+    expect(running.querySelector(".lifecycle-rail")).toHaveClass("rail-tone-ok");
+  });
 });

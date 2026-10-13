@@ -21,7 +21,7 @@ export interface RailNode {
   hotTip: string | null;
 }
 
-export type RailTone = "fail" | "ok" | "muted";
+export type RailTone = "fail" | "ok" | "muted" | "warn";
 
 /** The rail in words: the current stage with its count, then every other count. */
 export function railSummary(nodes: readonly RailNode[]): string {

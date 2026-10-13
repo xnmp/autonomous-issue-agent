@@ -21,6 +21,7 @@ from issue_agent.domain.state import (
     WaitReason,
     stop_tag,
 )
+from issue_agent.domain.checks import Check, Observed
 from issue_agent.domain.world import Comment, PRView
 
 T0 = datetime(2026, 10, 13, 8, 0, tzinfo=timezone.utc)
@@ -155,6 +156,26 @@ def test_a_stop_about_to_be_posted_is_already_needs_you():
 def test_moving_states_are_working(state, activity):
     board = status(state)
     assert isinstance(board, dash.Working) and board.activity == activity
+
+
+def _ci_pr(*states):
+    checks = tuple(Check(f"c{i}", state, "pending", required=True) for i, state in enumerate(states))
+    return PRView(1, head_ref_oid="h", ci=Observed("h", "h", frozenset(), checks))
+
+
+@pytest.mark.parametrize(
+    "pr,activity,headline,reason",
+    [
+        (_ci_pr("QUEUED", "QUEUED"), "ci_queued", "CI queued", "2 queued, waiting for a runner."),
+        (_ci_pr("IN_PROGRESS", "IN_PROGRESS", "QUEUED"), "ci", "CI running", "2 running, 1 queued"),
+        (_ci_pr("IN_PROGRESS"), "ci", "CI running", "1 running"),
+        (None, "ci", "CI running", "Required checks are still running."),
+        (PRView(1), "ci", "CI running", "Required checks are still running."),
+    ],
+)
+def test_ci_pending_distinguishes_queued_from_running(pr, activity, headline, reason):
+    board = status(Wait(WaitReason.CI_PENDING), pr=pr)
+    assert (board.activity, board.headline, board.reason) == (activity, headline, reason)
 
 
 def test_waits_name_what_they_wait_on():
