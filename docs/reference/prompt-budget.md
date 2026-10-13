@@ -50,3 +50,6 @@ whitespace-delimited words.
 Re-measured 2026-10-13 after the slice 5d-1 fix round cited the minimal-harness
 design for the provenance rule and renamed the app/ map entry: 7,309 UTF-8
 bytes and 979 whitespace-delimited words.
+
+Re-measured 2026-10-13 after slice 9 dropped GLM from the runtime list: 7,303
+UTF-8 bytes and 978 whitespace-delimited words.
