@@ -4,6 +4,11 @@ Translates a `RuntimePlan` into `ClaudeAgentOptions`, runs `query()` to
 completion and maps the final `ResultMessage` into `AgentResult`, reading the
 decision from the envelope, never from prose or an exit code. The SDK import
 is lazy so the pure mappings test without it.
+
+The session id is kept from the first stream message that names one (the init
+SystemMessage), so every returned end, including a watchdog abort, and a
+transport death carry it (#340: read only from the final ResultMessage, a
+wall-capped leg could not resume).
 """
 
 from __future__ import annotations
@@ -113,6 +118,23 @@ def reported_model(msg: Any) -> str:
     return nested.strip() if isinstance(nested, str) and nested.strip() else ""
 
 
+# A session id is a UUID; anything longer is malformed (ModelUsage's bound in
+# domain/run_usage.py).
+_MAX_SESSION_ID = 256
+
+
+def reported_session(msg: Any) -> str:
+    """The session id a stream message names, from either SDK shape (the init
+    SystemMessage keeps it in `data`), or "" when absent or malformed."""
+    value = getattr(msg, "session_id", None)
+    if not isinstance(value, str) or not value.strip():
+        data = getattr(msg, "data", None)
+        value = data.get("session_id") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > _MAX_SESSION_ID:
+        return ""
+    return value.strip()
+
+
 def result_to_agent_result(msg: Any) -> AgentResult:
     """Pure: SDK ResultMessage → AgentResult (duck-typed). An errored envelope
     with no declared status reports its subtype ("error_max_turns", …), and
@@ -135,7 +157,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     return AgentResult(
         is_error=is_error, status=status, envelope_subtype=subtype, summary=summary, needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0), model=reported_model(msg),
-        session_id=getattr(msg, "session_id", "") or "",
+        session_id=reported_session(msg),
         structured=structured if isinstance(structured, dict) else None,
         exit_reason=exit_reason_from_envelope(subtype, is_error),
         usage=usage if isinstance(usage, dict) else None, num_turns=turns if isinstance(turns, int) else None,
@@ -336,14 +358,18 @@ class AgentRunner(AgentRuntime):
         final: Any = None
         last_trace = ""  # what the agent last did, for abort and death lines
         msg_count, last_kind, last_msg, terminal_seen, resolved_model = 0, "none", None, "", ""
+        resolved_session = ""  # the first id the stream names
         # Delegated children still running when OUR result arrived: a headless
         # leg can never consume their notification (#255).
         live_children: set[str] = set()
         children_at_result: frozenset[str] = frozenset()
 
-        def with_resolved_model(result: AgentResult) -> AgentResult:
-            # The init model is the only attribution a no-result/timeout leg has.
-            return dataclasses.replace(result, model=resolved_model) if resolved_model and not result.model else result
+        def with_stream_identity(result: AgentResult) -> AgentResult:
+            # The init model and session are the only attribution and resume
+            # handle a no-result/timeout leg has. Before the stream names a
+            # session, a resumed leg's is the one it resumed (codex's rule).
+            return dataclasses.replace(result, model=result.model or resolved_model,
+                                       session_id=result.session_id or resolved_session or task.resume or "")
 
         usage_acc: dict | None = None
         # The clock is injectable: read it only when a cap is armed.
@@ -359,7 +385,7 @@ class AgentRunner(AgentRuntime):
                     if elapsed >= self._max_runtime:
                         await _aclose_quietly(agen)
                         if final is None:
-                            return with_resolved_model(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
+                            return with_stream_identity(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
                         self._honour_captured(elapsed)
                         break
                 message: Any = _NO_MESSAGE
@@ -387,7 +413,7 @@ class AgentRunner(AgentRuntime):
                             await _cancel_task_quietly(pending)
                             await _aclose_quietly(agen)
                             if final is None:
-                                return with_resolved_model(AgentResult(
+                                return with_stream_identity(AgentResult(
                                     is_error=True, status="timeout", exit_reason=ExitReason.IDLE_TIMEOUT,
                                     summary=f"agent idle >{self._idle_timeout:.0f}s (no stream event)",
                                     usage=usage_acc, stream_usage=usage_acc))
@@ -398,7 +424,7 @@ class AgentRunner(AgentRuntime):
                             await _cancel_task_quietly(pending)
                             await _aclose_quietly(agen)
                             if final is None:
-                                return with_resolved_model(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
+                                return with_stream_identity(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
                             self._honour_captured(elapsed)
                             stream_ended = True
                             break
@@ -412,6 +438,7 @@ class AgentRunner(AgentRuntime):
                 msg_count += 1
                 last_kind, last_msg = type(message).__name__, message
                 resolved_model = reported_model(message) or resolved_model
+                resolved_session = resolved_session or reported_session(message)
                 usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
                 # A background-requested turn end carries terminal_reason on a
                 # non-Result message: the forensic for a no-result drop.
@@ -450,6 +477,7 @@ class AgentRunner(AgentRuntime):
                 try:
                     setattr(exc, "harness_last_trace", last_trace)
                     setattr(exc, "harness_resolved_model", resolved_model)
+                    setattr(exc, "harness_session_id", resolved_session or task.resume or "")
                 except Exception:
                     pass
                 raise
@@ -474,10 +502,10 @@ class AgentRunner(AgentRuntime):
                       f"last kind={last_kind}" + (f", terminal_reason={terminal_seen}" if terminal_seen else "")
                       + (f", last={last_trace}" if last_trace else "") + " — result-delivery drop (no exception raised)"
                       + (f"; last_msg_fields={fields}" if last_msg is not None else ""))
-            return with_resolved_model(AgentResult(is_error=True, summary="no ResultMessage from query()",
+            return with_stream_identity(AgentResult(is_error=True, summary="no ResultMessage from query()",
                                                    exit_reason=ExitReason.NO_RESULT, usage=usage_acc,
                                                    stream_usage=usage_acc))
-        result = with_resolved_model(result_to_agent_result(final))
+        result = with_stream_identity(result_to_agent_result(final))
         reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
             self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "

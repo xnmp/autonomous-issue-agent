@@ -55,6 +55,8 @@ Agents push and return; they never wait on CI. They ask a question only when the
 
 Kept, slimmed: money accounting, process supervision, the Claude/Codex runtime adapters, the domain/adapter split.
 
+Kept by owner decision 2026-10-13: hot reload (`adapters/reload.py`, exit-87 restart between ticks), so the daemons pick up merged harness fixes without a manual restart.
+
 **The dashboard is a separate component, outside the core budget** (12,249 src lines now, across `domain/dashboard.py`, `app/dashboard.py` and `app/dashweb/`). It is read-only: it consumes the derived state and the telemetry, and holds no authority. The core must not import it. It may only trigger the operations the design keeps, which means label changes on GitHub. Slice 8 trims it to match the core.
 
 **Target layout** (a guide, not a straitjacket):

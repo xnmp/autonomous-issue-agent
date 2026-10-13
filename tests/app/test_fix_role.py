@@ -624,6 +624,44 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
     assert agent.tasks[2].resume == "s-wall"
 
 
+def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session(role, later, monkeypatch):
+    # #340: the session id came only from the final ResultMessage, so a wall
+    # cap left nothing to resume. The real SDK runner, a scripted stream.
+    import sys
+    import types
+
+    from issue_agent.adapters.agent_runner import AgentRunner
+
+    class ResultMessage:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    resumes: list[str | None] = []
+
+    async def query(prompt, options):
+        resumes.append(options["resume"] if "resume" in options else None)
+        yield type("SystemMessage", (), {"subtype": "init", "data": {"session_id": "s-init"}})()
+        if len(resumes) == 1:
+            await asyncio.Event().wait()  # hangs past the wall cap
+        yield ResultMessage(subtype="success", is_error=False, session_id="s-init",
+                            structured_output={"status": "pushed", "summary": "Fixed."})
+
+    sdk = types.ModuleType("claude_agent_sdk")
+    sdk.ClaudeAgentOptions, sdk.ResultMessage, sdk.query = dict, ResultMessage, query
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    gh = FakeGitHub(issues={5: ready()})
+    composed, _ = role(gh, AgentRunner(idle_timeout=None, max_runtime=0.3, poll_slice=0.05))
+
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    assert tick(composed) == []  # a machine end: backing off, no attempt
+    later()
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+
+    assert resumes == [None, "s-init"]
+    runs = sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    assert [(r.receipt["leg"], r.receipt["session"]) for r in runs] == [("machine", "s-init"), ("agent", "s-init")]
+
+
 def test_an_approved_pr_that_branch_protection_blocks_waits_with_a_log_line(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, merge_state="BLOCKED", reviews=_APPROVED)

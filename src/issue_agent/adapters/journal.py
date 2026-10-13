@@ -138,6 +138,7 @@ class JournalingRuntime:
             terminal = AgentResult(
                 is_error=True, status="cancelled" if cancelled else "raised", cost_usd=0.0,
                 model=str(getattr(exc, "harness_resolved_model", "") or ""),
+                session_id=str(getattr(exc, "harness_session_id", "") or ""),
                 exit_reason=ExitReason.OPERATOR_CANCELLED if cancelled else ExitReason.TRANSPORT_DEATH)
             if cancelled:
                 write_exhaustion_handover(task, terminal, scope)
