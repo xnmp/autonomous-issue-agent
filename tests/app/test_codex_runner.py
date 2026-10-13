@@ -311,17 +311,18 @@ def test_native_codex_child_receives_operator_build_settings(tmp_path, monkeypat
     monkeypatch.setenv("PW_WORKERS", "1")
     monkeypatch.setenv("GH_TOKEN", "publication-secret")
     body = r'''
-printf '%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_BUILD_JOBS-unset}" "${PW_WORKERS-unset}" "${GH_TOKEN-unset}" > "$OBSERVED_ENV"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_BUILD_JOBS-unset}" "${PW_WORKERS-unset}" "${GH_TOKEN-unset}" "${GIT_AUTHOR_NAME-unset}" "${GIT_COMMITTER_NAME-unset}" > "$OBSERVED_ENV"
 printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 '''
     result = asyncio.run(CodexRunner(
         codex_bin=_fake_codex(str(tmp_path), body),
         env={"OPENAI_API_KEY": "test-key", "OBSERVED_ENV": str(observed)},
-    ).run(RuntimePlan(prompt="x")))
+    ).run(RuntimePlan(prompt="x", model="m", env={"GIT_AUTHOR_NAME": "fix-bot"})))
 
     assert result.status == "done"
+    # The task's identity (fix.py's fix-bot) beats the model's git identity.
     assert observed.read_text().splitlines() == [
-        "/operator/shared-cargo-target", "0", "2", "1", "unset",
+        "/operator/shared-cargo-target", "0", "2", "1", "unset", "fix-bot", "Harness - m",
     ]
 
 
@@ -681,6 +682,20 @@ exit 0
 
     assert r.is_error is False and r.status == "pr_opened"
     assert r.exit_reason is ExitReason.OK
+
+
+def test_the_per_run_scratch_dir_is_removed(tmp_path):
+    """review M17c: the run dir used to be an un-removed mkdtemp, so a long-lived
+    daemon leaked one `codex-run-*` directory per dispatch."""
+    marker = tmp_path / "outpath"
+    body = f'echo "$out" > "{marker}"\nprintf \'%s\' \'{{"status":"pr_opened","summary":"done"}}\' > "$out"\n'
+    r = asyncio.run(CodexRunner(codex_bin=_fake_codex(str(tmp_path), body), env={"OPENAI_API_KEY": "k"})
+                    .run(RuntimePlan(prompt="x", schema=FIX_SCHEMA)))
+
+    assert r.status == "pr_opened"
+    run_dir = os.path.dirname(marker.read_text().strip())
+    assert os.path.basename(run_dir).startswith("codex-run-")
+    assert not os.path.exists(run_dir), f"scratch dir leaked: {run_dir}"
 
 
 # ── idle watchdog measures wall-clock so it survives laptop sleep ─────────────

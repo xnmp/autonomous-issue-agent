@@ -131,32 +131,43 @@ _ROLLOUT = {"input_tokens": 100, "output_tokens": 10, "source": "rollout"}
 _STREAM = {"input_tokens": 100, "output_tokens": 10}
 
 
-@pytest.mark.parametrize("result,runtime_name,caps,charge", [
+_ARMED, _CAPS_OFF, _UNPRICED = "armed", "caps-off", "unpriced"
+
+
+@pytest.mark.parametrize("result,runtime_name,pricing,charge", [
     # An unpinned leg with no reported model is priced at the fallback rates.
-    (AgentResult(False, status="ok", cost_usd=1.25, session_id="r", usage=_ROLLOUT), "codex", True, (800, "estimate")),
+    (AgentResult(False, status="ok", cost_usd=1.25, session_id="r", usage=_ROLLOUT), "codex", _ARMED, (800, "estimate")),
     # Usage-blind, stderr-only or malformed usage is a marked zero estimate:
     # it settles (never stays reserved) without claiming a provider figure.
-    (AgentResult(False, status="pushed", cost_usd=0, session_id="blind", usage=None), "codex", True, (0, "estimate")),
+    (AgentResult(False, status="pushed", cost_usd=0, session_id="blind", usage=None), "codex", _ARMED, (0, "estimate")),
     (AgentResult(False, status="ok", cost_usd=1.25, session_id="s", usage={
-        "input_tokens": 0, "output_tokens": 0, "total_tokens": 125_000, "source": "stderr"}), "codex", True,
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 125_000, "source": "stderr"}), "codex", _ARMED,
      (0, "estimate")),
-    (AgentResult(False, status="blind", cost_usd=0, usage=None, stream_usage=None), "claude", True, (0, "estimate")),
-    (AgentResult(False, status="ok", usage={"input_tokens": "malformed"}), "codex", True, (0, "estimate")),
-    # Caps off and an explicit unpriced codex opt-out still reserve and settle.
-    (AgentResult(False, status="untracked", cost_usd=0, usage=None), "codex", False, (0, "estimate")),
-    (AgentResult(False, status="ok", cost_usd=0, session_id="subscription"), "claude", False, (0, "estimate")),
+    (AgentResult(False, status="blind", cost_usd=0, usage=None, stream_usage=None), "claude", _ARMED, (0, "estimate")),
+    (AgentResult(False, status="ok", usage={"input_tokens": "malformed"}), "codex", _ARMED, (0, "estimate")),
+    # Malformed, boundary and huge primary usage falls back to a valid stream estimate.
+    *((AgentResult(False, status="done", usage={"input_tokens": bad, "output_tokens": 1}, stream_usage=_STREAM),
+       "claude", _ARMED, (800, "estimate")) for bad in (None, True, -1, 1.5, "12", 10**100)),
+    # Caps off still prices observed stream usage at the configured rate card...
+    (AgentResult(False, status="stream-only", cost_usd=0, usage=None,
+                 stream_usage={"input_tokens": 1_000_000, "output_tokens": 100_000}), "claude", _CAPS_OFF,
+     (8_000_000, "estimate")),
+    # ...and an explicit unpriced opt-out (no rate card) still reserves and settles.
+    (AgentResult(False, status="untracked", cost_usd=0, usage=None), "codex", _UNPRICED, (0, "estimate")),
+    (AgentResult(False, status="ok", cost_usd=0, session_id="subscription"), "claude", _UNPRICED, (0, "estimate")),
     # Valid provider dollars survive malformed token telemetry; unusable ones
     # fall back to the stream estimate.
-    (AgentResult(False, status="done", cost_usd=1.25, usage={"input_tokens": "bad"}), "claude", True,
+    (AgentResult(False, status="done", cost_usd=1.25, usage={"input_tokens": "bad"}), "claude", _ARMED,
      (1_250_000, "provider_reported")),
-    *((AgentResult(False, status="done", cost_usd=bad, stream_usage=_STREAM), "claude", True, (800, "estimate"))
+    *((AgentResult(False, status="done", cost_usd=bad, stream_usage=_STREAM), "claude", _ARMED, (800, "estimate"))
       for bad in (float("nan"), float("inf"), -1, 10**100)),
 ])
-def test_a_completed_leg_settles_once_with_its_basis(tmp_path, result, runtime_name, caps, charge) -> None:
+def test_a_completed_leg_settles_once_with_its_basis(tmp_path, result, runtime_name, pricing, charge) -> None:
     runtime = Runtime(result)
     wrapper, store = _wrapper(tmp_path, runtime, runtime_name=runtime_name)
-    if not caps:
-        wrapper = dataclasses.replace(wrapper, repository_cap=None, rate_table=None)
+    if pricing != _ARMED:
+        rates = wrapper.rate_table if pricing == _CAPS_OFF else None
+        wrapper = dataclasses.replace(wrapper, repository_cap=None, rate_table=rates)
         wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     assert _run(wrapper, RuntimePlan("work", max_budget_usd=2)).status == result.status

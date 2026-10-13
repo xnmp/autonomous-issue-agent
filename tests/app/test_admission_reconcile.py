@@ -288,6 +288,17 @@ def test_a_genuine_cap_exhaustion_still_escalates_to_a_human(tmp_path):
     assert len(store.active_reservation_runs(OWNER)) == 2
 
 
+def test_an_admitted_reservation_never_calls_reconciliation(tmp_path):
+    now = datetime.now(timezone.utc)
+    store = _store(tmp_path, now)
+    reconciler = _CountingReconciler(_sweeper(store, now))
+
+    result = _resolve(_admission(store, _Runtime(), Money("USD", 50_000_000), reconciler))
+
+    assert result.status == "ok"
+    assert reconciler.calls == 0
+
+
 def test_admission_reconciles_at_most_once_per_dispatch(tmp_path):
     """ADR 0012 ceiling: one reconcile, one retry, no loop."""
 

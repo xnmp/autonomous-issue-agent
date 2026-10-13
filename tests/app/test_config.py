@@ -12,6 +12,7 @@ from issue_agent.app.config import (
     render_agent_md,
 )
 from issue_agent.app.main import _load_agent_env
+from issue_agent.domain.effort import Effort
 
 
 def test_metadata_backed_choices_drive_parsing_and_the_example():
@@ -105,6 +106,9 @@ _NON_FINITE = ("nan", "NaN", "inf", "-inf", "Infinity", "1e400")
     (None, None, "base_branch", "dev", False),
     ("FIX_MODEL", "opus", "fix_model", "opus", False),
     ("FIX_MODEL", "", "fix_model", None, False),
+    # #16 escalation ladder: a valid token parses to the domain enum.
+    ("FIX_EFFORT", "high", "fix_effort", Effort.HIGH, False),
+    ("FIX_EFFORT", " Low ", "fix_effort", Effort.LOW, False),
     ("CODEX_COST_PER_MTOK_OUT", "15.00", "codex_cost_per_mtok_out", 15.0, False),
     ("REVIEW_BUDGET_USD", "2.5", "review_budget_usd", 2.5, False),
     ("MERGE_METHOD", "merge", "merge_method", "merge", False),

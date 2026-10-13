@@ -504,3 +504,43 @@ def test_review_checkout_defers_when_a_refresh_step_fails():
     )
     with pytest.raises(WorktreeUnavailable):
         rc.ensure(165, SHA)
+
+
+def test_a_symlink_to_the_parent_repo_is_never_classified_as_the_worktree(tmp_path):
+    """Adversarial N1: a link pointing at the PARENT repo makes both realpaths
+    resolve to the parent, so the toplevel comparison alone would classify it
+    as a valid worktree and reset --hard the operator's live checkout. A link
+    must always take the unlink path, whatever it points at."""
+    repo = tmp_path / "repo"
+    wt_root = repo / ".claude" / "worktrees"
+    wt_root.mkdir(parents=True)
+    (repo / "precious.txt").write_text("operator work")
+    link = wt_root / "review-pr-165"
+    link.symlink_to(repo)
+
+    mutated: list[str] = []
+
+    def git(args, cwd):
+        if args == ["rev-parse", "--show-toplevel"]:
+            return GitResult(0, str(repo) + "\n")  # the parent answers
+        if args[0] in ("checkout", "reset", "clean"):
+            mutated.append(" ".join(args))
+            return GitResult(0, "")
+        if args[:2] == ["worktree", "add"]:
+            link.mkdir()
+            return GitResult(0, "")
+        if args == ["rev-parse", "HEAD"]:
+            return GitResult(0, SHA + "\n")
+        if args[:2] == ["cat-file", "-e"]:
+            return GitResult(0, "")
+        return GitResult(0, "")
+
+    rc = wt_mod.ReviewCheckouts(
+        str(repo), run=git, remove_tree=lambda p: None
+    )
+    rc.ensure(165, SHA)
+
+    assert mutated == []                       # nothing ran inside the link
+    assert not link.is_symlink()               # squatter replaced by a real dir
+    assert (repo / "precious.txt").read_text() == "operator work"
+

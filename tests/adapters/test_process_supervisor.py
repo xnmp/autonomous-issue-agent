@@ -39,7 +39,11 @@ def _wait_dead(process: subprocess.Popen[bytes]) -> None:
     assert process.poll() is not None
 
 
-@pytest.mark.parametrize("raw", [None, "malformed", "123 (short) R", "456 (replaced) R 1 123 " + "0 " * 16 + "9876"])
+@pytest.mark.parametrize("raw", [
+    None, "malformed", "123 (short) R", "456 (replaced) R 1 123 " + "0 " * 16 + "9876",
+    # An unreaped zombie or dead leader is not alive, so its lease can be reclaimed.
+    *(f"123 (leader with ) and ( spaces) {state} 1 123 " + "0 " * 16 + "9876" for state in ("Z", "X")),
+])
 def test_selected_process_identity_refuses_absent_or_malformed_stat(monkeypatch, raw):
     original_is_dir = Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: path == Path("/proc") or original_is_dir(path))

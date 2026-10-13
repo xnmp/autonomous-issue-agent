@@ -41,6 +41,13 @@ def test_a_plan_maps_onto_the_sdk_options():
     assert kw["env"]["GIT_AUTHOR_NAME"] == kw["env"]["GIT_COMMITTER_NAME"] == "Harness - opus"
 
 
+def test_task_env_overrides_the_model_git_identity():
+    # fix.py puts the fix-bot identity in task.env; were the model identity to
+    # win, derive would read the agent's push as a human reset (attempt caps).
+    kw = build_option_kwargs(RuntimePlan(prompt="p", model="m", env={"GIT_AUTHOR_NAME": "me"}))
+    assert (kw["env"]["GIT_AUTHOR_NAME"], kw["env"]["GIT_COMMITTER_NAME"]) == ("me", "Harness - m")
+
+
 # ── message buffer ceiling (#13) ──────────────────────────────────────────────
 def test_default_buffer_survives_a_five_megabyte_read():
     # The SDK's own default is 1MB and a tool result is base64'd (x4/3), so the

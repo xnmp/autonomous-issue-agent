@@ -351,17 +351,18 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
 
 
 @pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
-def test_systemd_refuses_live_current_unit_without_rollback_definition(
-    tmp_path, state_var
-):
+@pytest.mark.parametrize("unit,kind", [
+    ("issue-agent-fix-watcher-target-repo.service", "current"),
+    ("issue-agent-fix-watcher.service", "legacy"),
+])
+def test_systemd_refuses_a_live_unit_without_rollback_definition(tmp_path, state_var, unit, kind):
     env, home, _uv = _environment(tmp_path, systemd=True)
-    unit = "issue-agent-fix-watcher-target-repo.service"
     env[state_var] = unit
 
     result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
 
     assert result.returncode == 2
-    assert "active/enabled current unit" in result.stderr
+    assert f"active/enabled {kind} unit" in result.stderr
     assert "no recoverable definition" in result.stderr
     calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
     assert not any(
@@ -402,6 +403,22 @@ def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
         assert f"stop {service}.service" in calls
         assert f"stop {service}-target-repo.service" in calls
         assert f"stop {service}-stable-name.service" in calls
+
+
+def test_systemd_failed_cutover_restores_legacy_units(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=True, fail_pattern="review-watcher")
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
+    unit_dir = home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    services = ("issue-agent-fix-watcher", "issue-agent-review-watcher")
+    for service in services:
+        (unit_dir / f"{service}-target-repo.service").write_text(f"legacy-{service}")
+
+    result = _bash(env, str(ROOT / "bin/install-systemd.sh"))
+
+    assert result.returncode != 0
+    assert all((unit_dir / f"{s}-target-repo.service").read_text() == f"legacy-{s}" for s in services)
+    assert not any(unit_dir.glob("*-stable-name.service"))
 
 
 def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
@@ -549,6 +566,49 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
         ]
         for plist in plists
     )
+
+
+@pytest.mark.parametrize("selector", ("--fix", "--review"))
+def test_launchd_refuses_partial_migration_cutover(tmp_path, selector):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+
+    result = _bash(env, str(ROOT / "bin/install-launchd.sh"), selector)
+
+    assert result.returncode == 2
+    assert "every legacy writer stops" in result.stderr
+    assert tuple((home / "Library/LaunchAgents").glob("*.plist")) == ()
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["migrates", "rolls-back"])
+def test_launchd_stable_identity_cutover_of_checksum_predecessors(tmp_path, fails):
+    """Checksum-named jobs of this deployment are the old writers: a stable
+    install unloads and removes them (and only them); a failed one restores them."""
+    env, home, _uv = _environment(tmp_path, systemd=False, fail_pattern="review-watcher" if fails else "")
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    Path(env["AGENT_ENV"]).write_text(f'REPO="acme/app"\nTARGET_DIR="{tmp_path / "target-repo"}"\n')
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True)
+    units = ("fix-watcher", "review-watcher")
+    mine = tuple(agents / f"dev.issue-agent.{unit}.123456.plist" for unit in units)
+    other = tuple(agents / f"dev.issue-agent.{unit}.999999.plist" for unit in units)
+    for paths, owner in ((mine, "acme-app"), (other, "other-app")):
+        for path in paths:
+            path.write_text(f"<key>ISSUE_AGENT_DEPLOYMENT_ID</key><string>{owner}</string>\n")
+
+    result = _bash(env, str(ROOT / "bin/install-launchd.sh"))
+
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    assert all(path.exists() for path in other)
+    current = tuple(agents.glob("dev.issue-agent.*.acme-app.plist"))
+    if fails:
+        assert result.returncode != 0
+        assert all(path.exists() and calls.count(f"load {path}") == 1 for path in mine)
+        assert current == ()
+        assert not (home / "Library/Application Support/issue-agent/acme-app.env").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert len(current) == 2 and not any(path.exists() for path in mine)
+        assert all(f"unload {path}" in calls and f"remove {path.stem}" in calls for path in mine)
 
 
 def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):

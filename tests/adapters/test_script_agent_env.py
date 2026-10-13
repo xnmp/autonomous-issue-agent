@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
         ("install-systemd.sh", []),
         ("install-launchd.sh", []),
         ("install-launchd.sh", ["uninstall", "demo"]),
+        ("demo-gate.sh", []),
     ],
 )
 @pytest.mark.parametrize("agent_env", [None, ""])
@@ -31,7 +32,7 @@ def test_scripts_refuse_missing_agent_env_without_reading_legacy_file(
     marker = tmp_path / "legacy-read"
     legacy = tmp_path / "config" / "agent.env"
     legacy.write_text(f'touch "{marker}"\nexit 0\n')
-    env = {**os.environ, "HARNESS_ROOT": str(tmp_path), "HOME": str(tmp_path)}
+    env = {**os.environ, "HARNESS_ROOT": str(tmp_path), "HOME": str(tmp_path), "DEMO_REPO": "o/demo"}
     env.pop("AGENT_ENV", None)
     if agent_env is not None:
         env["AGENT_ENV"] = agent_env

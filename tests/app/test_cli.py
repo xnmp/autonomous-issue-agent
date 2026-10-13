@@ -952,6 +952,22 @@ def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None
     return shared, asked, secret_asked
 
 
+@pytest.mark.parametrize("pin_answer,pinned", [(None, True), ("n", False)])
+def test_cmd_init_pins_codex_bin_unless_the_operator_declines(tmp_path, monkeypatch, capsys, pin_answer, pinned):
+    """2026-08-02 keifu: the wizard's shell found 0.147.0 while the daemons'
+    systemd PATH found 0.142.3, which the provider refuses to serve. Answering
+    nothing (or piped stdin) must still write the absolute pin."""
+    answers = ["fix-bot", "review-bot", "N", "claude", "codex"]
+    if pin_answer is not None:
+        answers += [pin_answer, "https://api.openai.com/v1"]
+    shared, _asked, _s = _init_env(tmp_path, monkeypatch, answers=answers, secrets=["", ""],
+                                   codex="/home/o/.local/bin/codex")
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text()).get("CODEX_BIN") == ("/home/o/.local/bin/codex" if pinned else None)
+    assert ("unpinned" in capsys.readouterr().err) is not pinned
+
+
 def _wizard_answers(**over) -> list[str]:
     base = {
         "fix": "fix-bot", "review": "review-bot",
@@ -1251,6 +1267,9 @@ def _fresh_start_env(tmp_path, monkeypatch):
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
     monkeypatch.setattr(cli.os, "execve", lambda *a: None)
+    # The real probe reads the host PATH; drift there would run `make install`
+    # on the checkout venv from inside the test.
+    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
     return Path(cli.REPOS_DIR) / "app.env"
 
 

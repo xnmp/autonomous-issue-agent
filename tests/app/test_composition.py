@@ -154,6 +154,8 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
     )
     prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix", state_dir="", role="fix")  # type: ignore[arg-type]
     prepare()
+    # The forced-shutdown intent is durable before teardown starts.
+    assert control.has_cancellation_intent(run_id)
     control.unlease("o/r", "fix", 42, "o/r:fix")  # the role's `finally` after the cancelled leg
 
     shutdown_hooks(

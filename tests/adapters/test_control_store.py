@@ -341,9 +341,14 @@ def test_only_a_never_launched_leg_is_released_as_unlaunched(tmp_path):
 def test_an_interrupted_leg_is_settled_at_zero_only_once_its_process_is_gone(tmp_path):
     store = _store(tmp_path)
     run = _launch(store, 1)
+    # Out of scope: another repository's and another role's leases (whose pids
+    # this daemon may not even see in its PID namespace) are never reclaimed.
+    store.lease("x/y", "fix", 3, "x/y:fix:d")
+    store.lease(REPO, "review", 4, f"{REPO}:review:d")
 
     assert not store.settle_terminal_estimate(run, "no evidence")  # live lease, no end
     assert store.reclaim_dead_leases(OWNER, _dead) == (run,)
+    assert sorted((lease.repository, lease.role) for lease in store.leases()) == [(REPO, "review"), ("x/y", "fix")]
     assert store.settle_terminal_estimate(run, "no evidence")
 
     leg = _leg(store, "run-1")
