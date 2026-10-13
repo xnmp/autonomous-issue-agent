@@ -318,23 +318,25 @@ _FOREIGN = dict(present=("issue-agent",), foreign=("issue-agent",))
 _TRANSIENT = dict(present=("issue-agent",), harness_root="/home/u/repo/.claude/worktrees/agent-x")
 
 
+# `said` pins each message to its stream: refusals and failures are stderr, which
+# operators separate from the success line (`issue-agent start 2>…`).
 @pytest.mark.parametrize("state,healed,installs,said", [
     (dict(present=("issue-agent",)), True, 0, ()),
     # Neither script on PATH is a dev checkout, not drift — doctor stays quiet
     # there too, and `make install` must not run behind the operator's back.
     (dict(present=()), True, 0, ()),
-    (dict(_FOREIGN, after=("issue-agent",), after_foreign=("issue-agent",)), False, 1, ("still drifted",)),
+    (dict(_FOREIGN, after=("issue-agent",), after_foreign=("issue-agent",)), False, 1, (("err", "still drifted"),)),
     # `make install` runs `uv sync` on the ONE .venv every deployment's daemons
     # execute from; pruning it mid-tick breaks the running ones.
-    (dict(_FOREIGN, live=("keifu", "sol")), False, 0, ("keifu, sol", "uv sync")),
+    (dict(_FOREIGN, live=("keifu", "sol")), False, 0, (("err", "keifu, sol"), ("err", "uv sync"))),
     # Presence-only reads healthy while another checkout's shim shadows ours —
     # the daemon then execs a different tree's plugin/ and config/.
-    (dict(_FOREIGN, after=("issue-agent",)), True, 1, ("/opt/other-checkout",)),
+    (dict(_FOREIGN, after=("issue-agent",)), True, 1, (("out", "/opt/other-checkout"),)),
     # #187: reinstalling from the transient process would reinstall the
     # transient tree — the exact state being healed.
-    (_TRANSIENT, False, 0, ("canonical checkout",)),
+    (_TRANSIENT, False, 0, (("err", "canonical checkout"),)),
     # The output tail still reaches the operator.
-    (dict(_FOREIGN, timeout=True), False, 1, ("exceeded 300s", "boom")),
+    (dict(_FOREIGN, timeout=True), False, 1, (("err", "exceeded 300s"), ("err", "boom"))),
 ])
 def test_start_heals_entrypoint_drift_only_when_safe(monkeypatch, capsys, state, healed, installs, said):
     calls = _install_state(monkeypatch, **state)
@@ -342,7 +344,7 @@ def test_start_heals_entrypoint_drift_only_when_safe(monkeypatch, capsys, state,
     assert cli.heal_entrypoint_drift() is healed
     assert len(calls) == installs
     captured = capsys.readouterr()
-    assert all(text in captured.out + captured.err for text in said)
+    assert all(text in getattr(captured, stream) for stream, text in said)
 
 
 def test_drift_flags_an_install_resolving_into_a_transient_worktree(monkeypatch):
@@ -1021,6 +1023,30 @@ def test_main_exits_130_on_keyboard_interrupt(monkeypatch, capsys):
         cli.main(["status"])
     assert excinfo.value.code == 130
     assert "aborted" in capsys.readouterr().err
+
+
+def test_status_tails_only_a_live_units_journal_and_reports_a_failed_query(monkeypatch):
+    """`systemctl show` is parsed: a loaded, live unit's journal is the log;
+    an inactive one is not; a failed query is reported, not replaced."""
+    show = {"returncode": 0, "stdout": "LoadState=loaded\nActiveState=active\n", "stderr": ""}
+    calls: list = []
+
+    def run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd[0] == "systemctl":
+            return argparse.Namespace(**show)
+        return argparse.Namespace(returncode=0, stdout="line 1\nline 2\n", stderr="")
+
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    unit = "issue-agent-fix-watcher-app.service"
+    assert cli._systemd_status_log("app", "fix", 5) == (f"systemd journal: {unit}", "line 1\nline 2")
+    assert calls[-1][:6] == ["journalctl", "--user", "--unit", unit, "--lines", "5"]
+    show["stdout"] = "LoadState=loaded\nActiveState=inactive\n"
+    assert cli._systemd_status_log("app", "fix", 5) is None
+    show.update(returncode=1, stdout="", stderr="Failed to connect to bus\n")
+    assert cli._systemd_status_log("app", "fix", 5) == (f"systemd status unavailable: {unit}",
+                                                         "  Failed to connect to bus")
 
 
 def test_start_still_rejects_a_non_canonical_name():
