@@ -118,7 +118,7 @@ def _plan(tmp_path):
 
 def test_a_dropped_launch_is_one_leg_settled_at_its_rollout_and_its_evidence_removed(tmp_path):
     directory = tmp_path / "evidence"
-    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "retry", directory), evidence_dir=str(directory))
+    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "retry", directory), spend_evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
 
@@ -135,7 +135,7 @@ def test_a_dropped_launch_is_one_leg_settled_at_its_rollout_and_its_evidence_rem
 
 def test_cancellation_kills_owned_groups_and_recovery_settles_the_rollout(tmp_path):
     directory = tmp_path / "evidence"
-    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "hang", directory), evidence_dir=str(directory))
+    wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "hang", directory), spend_evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
     identities = []
