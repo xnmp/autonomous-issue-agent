@@ -8,8 +8,7 @@
  * cyan = links/models — holds everywhere by construction.
  */
 
-import type { CostMix, RoleHealth, StepState } from "../api/types";
-import { isElevatedEffort } from "./models";
+import type { IssueStep, KindCost, RoleHealth, TrackChip } from "../api/types";
 
 export type Tone =
   | "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral"
@@ -19,104 +18,28 @@ export type Tone =
 
 const KIND_LABEL: Record<string, string> = {
   RESOLVE: "Resolve",
-  RESUME: "Resume",
-  ROUTE: "Route",
   REVIEW: "Review",
-  RE_REVIEW: "Re-review",
   FIX_CI: "Fix CI",
   ADDRESS_REVIEW: "Address review",
   REBASE: "Rebase",
-  CI: "CI",
-  MERGE: "Merge",
 };
 
 export function kindLabel(kind: string): string {
   return KIND_LABEL[kind] ?? kind.replaceAll("_", " ").toLowerCase();
 }
 
-export const RESOLVE_KINDS = new Set(["RESOLVE", "RESUME", "ROUTE"]);
-export const REVIEW_KINDS = new Set(["REVIEW", "RE_REVIEW"]);
-export const REPAIR_KINDS = new Set(["FIX_CI", "ADDRESS_REVIEW", "REBASE"]);
-
 export type LegFamily = "resolve" | "review" | "repair" | "other";
 
 export function familyOf(kind: string): LegFamily {
-  if (RESOLVE_KINDS.has(kind)) return "resolve";
-  if (REVIEW_KINDS.has(kind)) return "review";
-  if (REPAIR_KINDS.has(kind)) return "repair";
+  if (kind === "RESOLVE") return "resolve";
+  if (kind === "REVIEW") return "review";
+  if (kind === "FIX_CI" || kind === "ADDRESS_REVIEW" || kind === "REBASE") return "repair";
   return "other";
 }
 
-/* ------------------------------------------------------------ states */
+/* ---------------------------------------------------------- outcomes */
 
-export function stateTone(state: StepState | null | undefined): Tone {
-  switch (state) {
-    case "ok":
-    case "done":
-      return "ok";
-    case "failed":
-    case "blocked":
-      return "fail";
-    case "running":
-    case "advisory":
-      return "running";
-    default:
-      return "neutral";
-  }
-}
-
-/**
- * Steps the operator performed, not the harness: they cost nothing and are
- * named in prose by the backend (`unblock`, `relabel (operator)`). They read as
- * `meta` — the same tone the contract already reserves for self work —
- * so a human intervention is never mistaken for an agent leg.
- */
-export const OPERATOR_STEP_KINDS = new Set([
-  "unblock",
-  "unblock (api)",
-  "relabel (operator)",
-  "review re-arm",
-  "review re-arm (api)",
-]);
-
-export function isOperatorStep(kind: string): boolean {
-  return OPERATOR_STEP_KINDS.has(kind.toLowerCase());
-}
-
-/** An operator action driven over the bare API (an agent, a script) rather
- * than a human in the UI. Badged distinctly so automation's hand on the
- * levers is never mistaken for the operator's judgement. */
-export function isApiOperatorStep(kind: string): boolean {
-  return isOperatorStep(kind) && kind.toLowerCase().endsWith("(api)");
-}
-
-/** A step's chip tone: who ran it first, then how it ended. */
-export function stepKindTone(
-  kind: string,
-  state: StepState | null | undefined,
-): Tone {
-  if (isApiOperatorStep(kind)) return "running";
-  return isOperatorStep(kind) ? "meta" : stateTone(state);
-}
-
-/**
- * A leg has two outcomes: process state and, for reviews, a verdict. The
- * verdict wins only when the process itself did not fail or remain active.
- * Keeping that precedence here prevents a successful review invocation that
- * requested changes from appearing green in one view and yellow in another.
- */
-export function stepOutcomeTone(
-  kind: string,
-  state: StepState | null | undefined,
-  status: string | null | undefined,
-): Tone {
-  const processTone = stateTone(state);
-  if (processTone === "fail" || processTone === "running") return processTone;
-  if (isApiOperatorStep(kind)) return "running";
-  if (isOperatorStep(kind)) return "meta";
-  const verdictTone = statusTone(status);
-  return verdictTone === "neutral" ? processTone : verdictTone;
-}
+export type Outcome = TrackChip["outcome"];
 
 export interface StatusMark {
   glyph: string;
@@ -124,51 +47,29 @@ export interface StatusMark {
   tone: Tone;
 }
 
-/** The shared icon + colour vocabulary for task outcomes and verdicts. */
-export function stepOutcomeMark(
-  kind: string,
-  state: StepState | null | undefined,
-  status: string | null | undefined,
-): StatusMark {
-  const tone = stepOutcomeTone(kind, state, status);
-  const verdict = status?.trim().toUpperCase();
-  if (tone === "fail") return { glyph: "×", label: "failed", tone };
-  if (verdict === "REQUEST_CHANGES" || verdict === "CHANGES_REQUESTED") {
-    return { glyph: "±", label: "changes requested", tone };
-  }
-  if (state === "running") return { glyph: "…", label: "running", tone };
-  if (state === "advisory") return { glyph: "±", label: "advisory", tone };
-  if (isOperatorStep(kind)) return { glyph: "◆", label: "operator action", tone };
-  if (tone === "ok") return { glyph: "✓", label: "completed", tone };
-  return { glyph: "•", label: "informational", tone };
+/**
+ * The shared icon + colour vocabulary for a leg's outcome. A review that
+ * requested changes did its job, but green would read as "converged": it is
+ * yellow, the loop still going. An agent's question is the operator's to
+ * answer, so it reads as an alarm.
+ */
+const OUTCOME_MARKS: Record<Outcome, StatusMark> = {
+  running: { glyph: "…", label: "running", tone: "running" },
+  passed: { glyph: "✓", label: "approved", tone: "ok" },
+  changes_requested: { glyph: "±", label: "changes requested", tone: "running" },
+  asked: { glyph: "?", label: "asked a question", tone: "fail" },
+  failed: { glyph: "×", label: "failed", tone: "fail" },
+  done: { glyph: "✓", label: "completed", tone: "ok" },
+};
+
+export function outcomeMark(outcome: Outcome): StatusMark {
+  return OUTCOME_MARKS[outcome];
 }
 
-/** `stage_for` is a heuristic string; classify it rather than enumerate it. */
-export function stageTone(stage: string | null | undefined): Tone {
-  if (!stage) return "neutral";
-  const s = stage.toLowerCase();
-  if (/(done|merged|approved|complete)/.test(s)) return "ok";
-  if (/(block|fail|escalat|error|dead|stuck|human)/.test(s)) return "fail";
-  if (/(queue|pending|ready|waiting)/.test(s)) return "info";
-  return "running";
-}
-
-/** Terminal statuses from a leg (`APPROVE`, `REQUEST_CHANGES`, …). */
-export function statusTone(status: string | null | undefined): Tone {
-  if (!status) return "neutral";
-  const s = status.toUpperCase();
-  if (s === "APPROVE" || s === "OK" || s === "SUCCESS" || s === "DONE") return "ok";
-  if (s === "REQUEST_CHANGES" || s === "CHANGES_REQUESTED") return "running";
-  if (/(FAIL|ERROR|BLOCK|ABORT|TIMEOUT|KILLED)/.test(s)) return "fail";
-  return "info";
-}
-
-/** Test-driven commit subjects use the harness's red/green vocabulary. */
-export function commitSubjectTone(subject: string): Tone {
-  const prefix = subject.trim().split(":", 1)[0]?.toLowerCase();
-  if (prefix === "red") return "fail";
-  if (prefix === "green") return "ok";
-  return "neutral";
+/** What a leg reported, as text: the agent's question, the review, or its summary. */
+export function legNote(step: Pick<IssueStep, "question" | "verdict_excerpt" | "summary">): string | null {
+  const text = step.question ?? step.verdict_excerpt ?? step.summary ?? null;
+  return text?.trim() ? text.trim() : null;
 }
 
 export function prStateTone(state: string | null | undefined): Tone {
@@ -176,68 +77,6 @@ export function prStateTone(state: string | null | undefined): Tone {
   if (state === "closed") return "fail";
   if (state === "open") return "info";
   return "neutral";
-}
-
-export interface ReviewMark {
-  glyph: string;
-  label: string;
-  tone: Tone;
-}
-
-/**
- * Merge readiness as one glyph beside a PR number.
- *
- * `null` — the contract's answer whenever the PAT lacks the scope, review has
- * not spoken, or mergeability is still computing — renders NOTHING. Claiming
- * either verdict on absent data is the one wrong answer, so absence must not
- * borrow the shape of a verdict.
- */
-export function prReviewMark(state: string | null | undefined): ReviewMark | null {
-  if (state === "mergeable") {
-    return { glyph: "✓", label: "approved and mergeable", tone: "ok" };
-  }
-  if (state === "changes_requested") {
-    return { glyph: "±", label: "review requested changes", tone: "running" };
-  }
-  return null;
-}
-
-const VERIFICATION_GLYPH: Record<string, string> = {
-  verified: "✓",
-  misbehaved: "×",
-  pending: "…",
-  retired: "⊘",
-};
-
-/** The icon-only form of a verification badge; the word stays in the title. */
-export function verificationGlyph(status: string | null | undefined): string {
-  return VERIFICATION_GLYPH[(status ?? "").toLowerCase()] ?? "•";
-}
-
-/**
- * The badge's hover text: both ledger verdicts and, when the ledger recorded
- * one, the prose that justifies each. A verdict with no reason still names
- * itself rather than reading as missing data.
- */
-export function verificationSummary(parts: {
-  issueStatus?: string | null;
-  issueReason?: string | null;
-  prStatus?: string | null;
-  prReason?: string | null;
-}): string {
-  const line = (
-    subject: string,
-    status: string | null | undefined,
-    reason: string | null | undefined,
-  ) => {
-    const verdict = status?.trim() || "unavailable";
-    const why = reason?.trim();
-    return why ? `${subject}: ${verdict} — ${why}` : `${subject}: ${verdict}`;
-  };
-  return [
-    line("Issue", parts.issueStatus, parts.issueReason),
-    line("PR", parts.prStatus, parts.prReason),
-  ].join("\n");
 }
 
 /* -------------------------------------------- backlog triage taxonomy ---
@@ -354,52 +193,6 @@ export function verificationTone(status: string | null | undefined): Tone {
   return "neutral";
 }
 
-export function combinedVerificationStatus(
-  issueStatus: string | null | undefined,
-  prStatus: string | null | undefined,
-): string | null {
-  const statuses = [issueStatus, prStatus].filter(
-    (status): status is string => Boolean(status),
-  );
-  if (statuses.length === 0) return null;
-  if (statuses.some((status) => status.toUpperCase().includes("MISBEHAVED"))) {
-    return "misbehaved";
-  }
-  if (statuses.some((status) => status.toUpperCase().includes("PENDING"))) {
-    return "pending";
-  }
-  if (
-    statuses.length === 2
-    && statuses.every((status) => status.toUpperCase().includes("VERIFIED"))
-  ) {
-    return "verified";
-  }
-  if (statuses.some((status) => status.toUpperCase().includes("RETIRED"))) {
-    return "retired";
-  }
-  return "pending";
-}
-
-/**
- * A model badge's tone: **effort first, capability tier second.**
- *
- * Effort is the lever that costs money on any model — a `high` stance burns
- * multiples of the tokens a `medium` one does whether it runs on haiku or on
- * opus — so `tier-high` (the red end of the tier ramp) tracks the stance alone
- * and is not gated on a premium name. Below `high`, the tone names the tier.
- */
-export function modelTone(model: string, effort?: string | null): Tone {
-  const name = model.toLowerCase();
-  if (isElevatedEffort(effort)) {
-    return "tier-high";
-  }
-  if (name.includes("fable") || name.includes("opus")) return "tier-sol";
-  if (name.includes("sol")) return "tier-sol";
-  if (name.includes("terra") || name.includes("sonnet")) return "tier-terra";
-  if (name.includes("luna") || name.includes("haiku")) return "tier-luna";
-  return "neutral";
-}
-
 /* ----------------------------------------------------- daemon health */
 
 export type HealthState = "ok" | "stale" | "dead" | "unknown";
@@ -445,15 +238,18 @@ export interface MixSlice {
 }
 
 /**
- * Fixed slot order, validated with the dataviz validator against --panel:
- * blue / bright-cyan / yellow pass CVD separation, the
- * normal-vision floor and 3:1 contrast. Never reorder by size.
+ * Spend by leg family, from the per-kind fold. Fixed slot order, validated
+ * with the dataviz validator against --panel: blue / bright-cyan / yellow
+ * pass CVD separation, the normal-vision floor and 3:1 contrast. Never
+ * reorder by size.
  */
-export function mixSlices(mix: CostMix | null): MixSlice[] {
-  const at = (v: number | null | undefined) => (Number.isFinite(v as number) ? (v as number) : 0);
+export function mixSlices(byKind: readonly KindCost[] | null | undefined): MixSlice[] {
+  const total = (family: LegFamily) => (byKind ?? [])
+    .filter((row) => familyOf(row.kind) === family && Number.isFinite(row.usd))
+    .reduce((sum, row) => sum + row.usd, 0);
   return [
-    { family: "resolve", label: "Resolve", usd: at(mix?.resolve_usd), varName: "--series-1" },
-    { family: "review", label: "Review", usd: at(mix?.review_usd), varName: "--series-2" },
-    { family: "repair", label: "Repair", usd: at(mix?.repair_usd), varName: "--series-3" },
+    { family: "resolve", label: "Resolve", usd: total("resolve"), varName: "--series-1" },
+    { family: "review", label: "Review", usd: total("review"), varName: "--series-2" },
+    { family: "repair", label: "Repair", usd: total("repair"), varName: "--series-3" },
   ];
 }

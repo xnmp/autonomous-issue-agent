@@ -9,39 +9,20 @@ from issue_agent.app.dashweb.server import create_app
 
 
 def role(name: str) -> dict:
-    return {
-        "role": name,
-        "alive": True,
-        "stale": False,
-        "last_event_ts": "2026-07-29T08:00:00Z",
-        "last_event": "tick",
-        "events": 4,
-        "log_path": f"/logs/{name}.log",
-    }
+    return {"role": name, "alive": True, "stale": False, "heartbeat_ts": "2026-07-29T08:00:00Z"}
 
 
-ISSUE_CARD = {
+DONE_CARD = {
     "issue": 50,
     "title": "Explain completed work",
     "url": "https://github.com/openai/autonomous-issue-agent/issues/50",
     "pr": 75,
     "pr_url": "https://github.com/openai/autonomous-issue-agent/pull/75",
-    "pr_state": "merged",
-    "stage": "done",
-    "done": True,
-    "cost_usd": 2,
-    "estimated": False,
-    "elapsed_s": 60,
-    "working_s": 45,
-    "idle_s": 15,
-    "idle_active": False,
-    "started_ts": "2026-07-29T07:00:00Z",
-    "last_ts": "2026-07-29T08:00:00Z",
     "merged_ts": "2026-07-29T08:00:00Z",
-    "projected_cost_usd": 2,
-    "rounds": 1,
-    "models": ["claude-sonnet-5"],
-    "steps": [{"kind": "RESOLVE", "state": "ok", "status": "done", "cost_usd": 2}],
+    "cost_usd": 2,
+    "legs": 1,
+    "review_rounds": 0,
+    "labels": [],
 }
 
 
@@ -99,28 +80,22 @@ class FixtureBackend:
     def overview(self, _name: str, _timezone_name: str | None = None) -> dict:
         return {
             "metrics": None,
-            "cost_mix": None,
-            "caps": {"issue_cap_usd": 5, "daily_cap_usd": 10, "today_usd": 2},
+            "caps": {"issue_cap_usd": 5, "daily_cap_usd": 10, "global_daily_cap_usd": 50, "today_usd": 2},
             "health": [],
-            "unattributed": [],
-            "health_trend": [{
-                "day": "2026-07-29",
-                "opened": 3,
-                "closed": 1,
-                "net_open": 2,
-                "recurrences": 0,
-                "first_observation": True,
-            }],
+            "needs_attention": [],
+            "health_trend": [{"day": "2026-07-29", "opened": 3, "closed": 1, "net_open": 2}],
+            "spend_per_hour": [],
             "warnings": [],
         }
 
     def issues(self, _name: str) -> dict:
         return {
             "in_flight": [],
-            "pending": [],
-            "done": [ISSUE_CARD],
+            "done": [DONE_CARD],
             "backlog": [],
             "gh_ok": True,
+            "observed_at": "2026-07-29T08:00:00Z",
+            "notifications": [],
             "warnings": [],
         }
 
@@ -131,53 +106,46 @@ class FixtureBackend:
             "issue": 50,
             "title": "Explain completed work",
             "url": "https://github.com/openai/autonomous-issue-agent/issues/50",
-            "stage": "done",
+            "labels": [],
+            "board": None,
+            "action": None,
             "done": True,
-            "prs": [75],
+            "held_for_human": False,
             "pull_requests": [{
                 "number": 75,
                 "url": "https://github.com/openai/autonomous-issue-agent/pull/75",
                 "state": "merged",
             }],
             "cost_usd": 2,
-            "elapsed_s": 60,
-            "working_s": 45,
-            "idle_s": 15,
-            "idle_active": False,
+            "estimated": False,
+            "rail": {
+                "current": "merge", "furthest": "merge", "resolve_attempts": 1, "review_rounds": 0,
+                "ci_runs": 0, "steps": 1, "live": False,
+            },
+            "history": [{"stage": "resolve", "steps": [{"kind": "RESOLVE", "outcome": "done", "count": 1}]}],
             "steps": [{
                 "idx": 0,
+                "leg_id": "leg-50-0",
                 "kind": "RESOLVE",
                 "role": "fix",
-                "state": "ok",
-                "model": "claude-sonnet-5",
-                "status": "done",
-                "exit_reason": "ok",
+                "runtime": "codex",
+                "state": "ended",
+                "outcome": "done",
+                "started_ts": "2026-07-29T07:59:00Z",
+                "ended_ts": "2026-07-29T08:00:00Z",
                 "duration_s": 60,
                 "cost_usd": 2,
                 "estimated": False,
+                "pricing_basis": "provider_reported",
+                "end_reason": "normal_return",
                 "session_id": "session-50",
-                "has_transcript": False,
-                "turns": 3,
                 "usage": None,
-                "ts": "2026-07-29T08:00:00Z",
-            }],
-            "events": [{
-                "ts": "2026-07-29T07:59:00Z",
-                "event": "action",
-                "role": "fix",
-                "desc": "comment issue #50: verification recorded",
+                "head": None,
+                "pr": None,
+                "summary": "Explained the completed work.",
             }],
             "warnings": [],
         }
-
-    def step_events(self, _name: str, _number: int, _idx: int) -> dict:
-        return {"events": [], "warnings": []}
-
-    def cost_chart(self, _session_id: str) -> tuple[str, str]:
-        return "<html></html>", ""
-
-    def start(self, _name: str) -> tuple[bool, str]:
-        return True, "started"
 
     def promote(self, _name: str, _number: int) -> tuple[bool, str]:
         return True, "promoted"

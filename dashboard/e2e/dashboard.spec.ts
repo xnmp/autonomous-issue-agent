@@ -1,14 +1,6 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
 
-const role = (name: string) => ({
-  role: name,
-  alive: true,
-  stale: false,
-  last_event_ts: "2026-07-29T08:00:00Z",
-  last_event: "tick",
-  events: 4,
-  log_path: `/logs/${name}.log`,
-});
+const role = (name: string) => ({ role: name, alive: true, stale: false, heartbeat_ts: "2026-07-29T08:00:00Z" });
 
 const repos = {
   repos: [
@@ -33,8 +25,8 @@ const repos = {
       roles: [],
       frecency: 0,
       last_activity_ts: null,
-      in_flight: 0,
-      done: 0,
+      in_flight: null,
+      done: null,
     },
   ],
   warnings: [],
@@ -53,67 +45,55 @@ const usage = {
   warnings: [],
 };
 
-const issueCard = {
+const doneCard = {
   issue: 50,
   title: "Explain completed work",
   url: "https://github.com/openai/autonomous-issue-agent/issues/50",
   pr: 75,
   pr_url: "https://github.com/openai/autonomous-issue-agent/pull/75",
-  pr_state: "merged",
-  stage: "done",
-  done: true,
+  merged_ts: "2026-07-29T08:00:00Z",
   cost_usd: 2,
-  estimated: false,
-  elapsed_s: 4700,
-  working_s: 4638,
-  idle_s: 62,
-  idle_active: false,
+  legs: 4,
+  review_rounds: 2,
+  labels: [],
+};
+
+const rail = (over: Record<string, unknown> = {}) => ({
+  current: "review", furthest: "review", resolve_attempts: 1, review_rounds: 1, ci_runs: 0, steps: 2, live: false, ...over,
+});
+
+const inFlightCard = {
+  issue: 49,
+  title: "Exercise model wrapping",
+  url: "https://github.com/openai/autonomous-issue-agent/issues/49",
+  labels: ["ai-ready"],
+  pr: 74,
+  pr_url: "https://github.com/openai/autonomous-issue-agent/pull/74",
+  pr_ci_state: "passing",
+  board: {
+    status: "working", activity: "agent", act: "REVIEW", headline: "Review running",
+    reason: "An agent leg holds this item.", since_ts: "2026-07-29T08:00:00Z",
+  },
+  action: null,
+  rail: rail({ live: true }),
+  history: [
+    { stage: "resolve", steps: [{ kind: "RESOLVE", outcome: "done", count: 1 }] },
+    { stage: "review", steps: [{ kind: "REVIEW", outcome: "running", count: 1 }] },
+  ],
+  cost_usd: 1.8,
+  estimated: true,
+  legs: 2,
   started_ts: "2026-07-29T07:00:00Z",
   last_ts: "2026-07-29T08:00:00Z",
-  merged_ts: "2026-07-29T08:00:00Z",
-  projected_cost_usd: 2,
-  projected_model: "gpt-5.6-terra",
-  rounds: 1,
-  models: ["gpt-5.6-terra"],
-  model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],
-  issue_verification: "VERIFIED",
-  pr_verification: "pending",
-  steps: [{ kind: "RESOLVE", state: "ok", status: "done", cost_usd: 2 }],
+  leg_running: true,
 };
 
 const issues = {
-  in_flight: [{
-    ...issueCard,
-    issue: 49,
-    title: "Exercise model wrapping",
-    url: "https://github.com/openai/autonomous-issue-agent/issues/49",
-    pr: 74,
-    pr_url: "https://github.com/openai/autonomous-issue-agent/pull/74",
-    pr_state: "open",
-    stage: "reviewing",
-    done: false,
-    merged_ts: null,
-    leg_running: true,
-    board: {
-      status: "working", activity: "agent", headline: "Reviewing",
-      reason: "The reviewer is reading the patch.", since_ts: "2026-07-29T08:00:00Z",
-    },
-    rail: {
-      current: "review", furthest: "review", resolve_attempts: 1, review_rounds: 1,
-      ci_runs: 0, steps: 2, live: true,
-    },
-    models: ["gpt-5.6-terra", "gpt-5.6-fable", "gpt-5.6-luna"],
-    model_badges: [
-      { model: "gpt-5.6-terra", effort: "medium" },
-      { model: "gpt-5.6-fable", effort: "high" },
-      { model: "gpt-5.6-luna", effort: "medium" },
-    ],
-  }],
-  pending: [],
+  in_flight: [inFlightCard],
   done: [
-    issueCard,
+    doneCard,
     ...Array.from({ length: 18 }, (_, index) => ({
-      ...issueCard,
+      ...doneCard,
       issue: 51 + index,
       title: `Completed issue ${51 + index}`,
       url: `https://github.com/openai/autonomous-issue-agent/issues/${51 + index}`,
@@ -127,8 +107,6 @@ const issues = {
     url: "https://github.com/openai/autonomous-issue-agent/issues/120",
     body: "## Problem\n\nImportant state changes arrive silently.",
     labels: ["feature", "effort:medium", "impact:high"],
-    recurrence: false,
-    recurrence_count: 0,
     age_days: 0,
     age_s: 1800,
     comments: 2,
@@ -137,64 +115,54 @@ const issues = {
     impact: "high",
   }],
   gh_ok: true,
+  observed_at: "2026-07-29T08:00:00Z",
   notifications: [],
   warnings: [],
 };
 
 const overview = {
   metrics: null,
-  cost_mix: null,
-  caps: { issue_cap_usd: 5, daily_cap_usd: 10, today_usd: 2 },
+  caps: { issue_cap_usd: 5, daily_cap_usd: 10, global_daily_cap_usd: 50, today_usd: 2 },
   health: [],
-  unattributed_count: 30,
   needs_attention: [],
-  interventions: [],
   spend_per_hour: [],
-  escalation_reasons: [],
-  health_trend: [{
-    day: "2026-07-29",
-    opened: 3,
-    closed: 1,
-    net_open: 2,
-    recurrences: 0,
-    first_observation: true,
-  }],
+  health_trend: [{ day: "2026-07-29", opened: 3, closed: 1, net_open: 2 }],
   warnings: [],
 };
+
+const question = "Harness issue: the required-test gate rejects diagnostic output after the full acceptance plan was supplied. Should the plan's diagnostics count as test output?";
 
 const round3Issues = {
   ...issues,
   in_flight: [{
-    ...issues.in_flight[0],
+    ...inFlightCard,
     issue: 457,
     title: "Required-test gate rejects diagnostic output",
     url: "https://github.com/openai/autonomous-issue-agent/issues/457",
     pr: 482,
     pr_url: "https://github.com/openai/autonomous-issue-agent/pull/482",
-    stage: "reviewing",
-    escalation_reason: "Harness issue: required-test gate rejects diagnostic output after the full acceptance plan was supplied; operator decision is required before another review round",
-    leg_running: true,
+    leg_running: false,
+    action: "open",
     board: {
-      status: "needs_you", ask: "escalated", headline: "Answer the agent",
-      reason: "Harness issue: required-test gate rejects diagnostic output after the full acceptance plan was supplied; operator decision is required before another review round",
-      since_ts: "2026-07-29T07:30:00Z",
+      status: "needs_you", reason: "question", headline: "Answer the agent's question",
+      hint: "Reply on GitHub with the answer; the agent resumes with it.",
+      detail: question, target: "pr", since_ts: "2026-07-29T07:30:00Z",
     },
-    rail: {
-      current: "review", furthest: "ci", resolve_attempts: 1, review_rounds: 4,
-      ci_runs: 1, steps: 10, live: true,
-    },
-    rounds: 3,
-    steps: [
-      { kind: "RESOLVE", state: "ok", status: "done", cost_usd: 1.22, count: 1 },
-      { kind: "REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.48, count: 2 },
-      { kind: "ADDRESS_REVIEW", state: "ok", status: "done", cost_usd: 0.31, count: 1 },
-      { kind: "RE_REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.36, count: 1 },
-      { kind: "ADDRESS_REVIEW", state: "ok", status: "done", cost_usd: 0.28, count: 1 },
-      { kind: "RE_REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.34, count: 1 },
-      { kind: "ADDRESS_REVIEW", state: "ok", status: "done", cost_usd: 0.27, count: 1 },
-      { kind: "RE_REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.33, count: 1 },
-      { kind: "FIX_CI", state: "ok", status: "done", cost_usd: 0.22, count: 1 },
-      { kind: "ADDRESS_REVIEW", state: "running", status: "running", cost_usd: 0.31, count: 1 },
+    rail: rail({ current: "review", furthest: "review", review_rounds: 4, ci_runs: 1, steps: 10 }),
+    history: [
+      { stage: "resolve", steps: [{ kind: "RESOLVE", outcome: "done", count: 1 }] },
+      { stage: "ci", steps: [{ kind: "FIX_CI", outcome: "done", count: 1 }] },
+      {
+        stage: "review",
+        steps: [
+          { kind: "REVIEW", outcome: "changes_requested", count: 2 },
+          { kind: "ADDRESS_REVIEW", outcome: "done", count: 1 },
+          { kind: "REVIEW", outcome: "changes_requested", count: 1 },
+          { kind: "ADDRESS_REVIEW", outcome: "done", count: 1 },
+          { kind: "REVIEW", outcome: "changes_requested", count: 1 },
+          { kind: "ADDRESS_REVIEW", outcome: "asked", count: 1 },
+        ],
+      },
     ],
   }],
   backlog: [
@@ -211,66 +179,48 @@ const round3Issues = {
 
 const round3Overview = {
   ...overview,
-  first_observed_day: "2026-07-22",
   metrics: {
-    by_kind: [],
-    cost_per_done_usd: 1.84,
-    done_issues: 19,
-    escalations: 2,
+    merged_prs: 19,
+    open_items: 2,
+    needs_human: 2,
+    total_cost_usd: 34.96,
+    cost_per_merged_pr_usd: 1.84,
+    by_basis: [{ basis: "provider_reported", usd: 30.1 }, { basis: "estimate", usd: 4.86 }],
+    by_kind: [
+      { kind: "RESOLVE", usd: 20.4, runs: 22 },
+      { kind: "REVIEW", usd: 9.2, runs: 31 },
+      { kind: "ADDRESS_REVIEW", usd: 4.1, runs: 9 },
+      { kind: "FIX_CI", usd: 1.26, runs: 4 },
+    ],
     first_pass_approvals: 8,
     first_pass_changes: 3,
     first_pass_rate: 8 / 11,
-    in_flight_issues: 2,
-    interventions_by_class: [
-      { name: "rearm", count: 1 },
-      { name: "policy", count: 1 },
-      { name: "other", count: 0 },
-    ],
-    interventions_per_merged_pr: 0.11,
-    interventions_total: 2,
-    recurrences: 0,
     rounds_per_pr: 1.32,
-    spend_blocks: 1,
+    legs: 66,
+    machine_legs: 1,
     today_usd: 6.42,
-    total_cost_usd: 34.96,
   },
-  caps: { issue_cap_usd: 10, daily_cap_usd: 25, today_usd: 6.42 },
+  caps: { issue_cap_usd: 10, daily_cap_usd: 25, global_daily_cap_usd: 60, today_usd: 6.42 },
   needs_attention: [
     {
       issue: 457,
-      kind: "escalated",
       title: "Required-test gate rejects diagnostic output",
-      detail: "operator decision required before another review round",
+      reason: "question",
+      headline: "Answer the agent's question",
+      detail: question,
     },
     {
       issue: 462,
-      kind: "blocked",
       title: "Choose the event retention boundary",
-      detail: "waiting for the retention window",
+      reason: "labelled",
+      headline: "Parked",
+      detail: null,
     },
   ],
   health: ["fix", "review"].map((name, index) => ({
     ...role(name),
-    last_event_ts: `2026-08-09T07:${55 + index}:00Z`,
+    heartbeat_ts: `2026-08-09T07:${55 + index}:00Z`,
   })),
-  interventions: [
-    {
-      ts: "2026-08-09T07:42:00Z",
-      action_class: "guidance",
-      issue: 457,
-      pr: 482,
-      kind: "rearm review",
-      detail: "supplied the required-test acceptance plan",
-    },
-    {
-      ts: "2026-08-09T06:18:00Z",
-      action_class: "policy",
-      issue: 462,
-      pr: null,
-      kind: "promote backlog issue",
-      detail: "acceptance criteria and test plan approved",
-    },
-  ],
   spend_per_hour: Array.from({ length: 24 }, (_, index) => ({
     hour_start_iso: `2026-08-${index < 16 ? "08" : "09"}T${String((index + 8) % 24).padStart(2, "0")}:00:00Z`,
     usd: [0, 0.12, 0.35, 0.08, 0, 0.61][index % 6] ?? 0,
@@ -280,19 +230,40 @@ const round3Overview = {
     opened: 2 + (index % 3),
     closed: 1 + (index % 2),
     net_open: 1,
-    recurrences: 0,
-    first_observation: index === 0,
   })),
-  unattributed_count: 3,
 };
+
+const leg = (idx: number, over: Record<string, unknown>) => ({
+  idx,
+  leg_id: `leg-50-${idx}`,
+  kind: "RESOLVE",
+  role: "fix",
+  runtime: "codex",
+  state: "ended",
+  outcome: "done",
+  started_ts: `2026-07-29T08:0${idx * 2}:00Z`,
+  ended_ts: null,
+  duration_s: 60,
+  cost_usd: 0.5,
+  estimated: false,
+  pricing_basis: "provider_reported",
+  end_reason: "normal_return",
+  session_id: `session-50-${idx}`,
+  usage: null,
+  head: null,
+  pr: null,
+  ...over,
+});
 
 const issue = {
   issue: 50,
   title: "Explain completed work",
   url: "https://github.com/openai/autonomous-issue-agent/issues/50",
-  stage: "done",
+  labels: [],
+  board: null,
+  action: null,
   done: true,
-  prs: [75],
+  held_for_human: false,
   pull_requests: [
     {
       number: 75,
@@ -301,137 +272,19 @@ const issue = {
     },
   ],
   cost_usd: 2,
-  elapsed_s: 4700,
-  working_s: 4638,
-  idle_s: 62,
-  idle_active: false,
+  estimated: true,
+  rail: rail({ current: "merge", furthest: "merge", review_rounds: 2, steps: 4 }),
+  history: [],
   steps: [
-    {
-      idx: 0,
-      kind: "RESOLVE",
-      role: "fix",
-      state: "ok",
-      model: "claude-sonnet-5",
-      effort: "medium",
-      runtime: "codex",
-      status: "done",
-      exit_reason: "ok",
-      duration_s: 4638,
-      cost_usd: 2,
-      estimated: false,
-      pricing_basis: "configured_rate_card",
-      budget_cap_usd: 10,
-      session_id: "session-50",
-      has_transcript: false,
-      turns: 3,
-      usage: null,
-      ts: "2026-07-29T08:00:00Z",
-      change: {
-        pr: 75,
-        branch: "feat/50-explain-work",
-        head_sha: "a123456",
-        commit_subjects: ["red: reproduce missing task narrative"],
-        files_changed_count: 6,
-      },
-    },
-    {
-      idx: 1,
-      kind: "REVIEW",
-      role: "review",
-      state: "ok",
-      model: "gpt-5.6-terra",
-      effort: "medium",
-      runtime: "codex",
-      status: "REQUEST_CHANGES",
-      exit_reason: "ok",
-      duration_s: 92,
-      cost_usd: 0.42,
-      estimated: true,
-      pricing_basis: "learned_estimate",
-      budget_cap_usd: 8,
-      session_id: "review-50-r2",
-      has_transcript: false,
-      turns: 7,
-      usage: null,
-      ts: "2026-07-29T08:02:00Z",
-      note: "REQUEST_CHANGES round 2",
-      review: {
-        verdict_excerpt: "The implementation still hides the actual review findings. Surface the requested-change body as untrusted text and preserve the rejection and spend context so an operator can decide whether another round is productive.",
-        rejection: 2,
-        unproductive_rounds: 0,
-        unproductive_cap: 5,
-      },
-    },
-    {
-      idx: 2,
-      kind: "ADDRESS_REVIEW",
-      role: "fix",
-      state: "ok",
-      model: "gpt-5.6-terra",
-      effort: "high",
-      runtime: "codex",
-      status: "done",
-      exit_reason: "ok",
-      duration_s: 186,
-      cost_usd: 0.88,
-      estimated: false,
-      pricing_basis: "configured_rate_card",
-      budget_cap_usd: 10,
-      session_id: "session-50-r2",
-      has_transcript: false,
-      turns: 11,
-      usage: null,
-      ts: "2026-07-29T08:06:00Z",
-      escalation: {
-        notches: 1,
-        from_effort: "medium",
-        to_effort: "high",
-        after_review_round: 2,
-      },
-      change: {
-        pr: 75,
-        branch: "feat/50-explain-work",
-        head_sha: "b123456",
-        commit_subjects: ["green: expose verdict and spend context"],
-        files_changed_count: 9,
-      },
-    },
-    {
-      idx: 3,
-      kind: "RE_REVIEW",
-      role: "review",
-      state: "ok",
-      model: "gpt-5.6-terra",
-      effort: "medium",
-      runtime: "codex",
-      status: "APPROVE",
-      exit_reason: "ok",
-      duration_s: 74,
-      cost_usd: 0.31,
-      estimated: false,
-      pricing_basis: "configured_rate_card",
-      budget_cap_usd: 8,
-      session_id: "review-50-r3",
-      has_transcript: false,
-      turns: 5,
-      usage: null,
-      ts: "2026-07-29T08:08:00Z",
-      note: "APPROVE round 3",
-      review: {
-        verdict_excerpt: null,
-        rejection: null,
-        unproductive_rounds: 0,
-        unproductive_cap: 5,
-      },
-    },
-  ],
-  events: [
-    {
-      ts: "2026-07-29T07:59:00Z",
-      event: "action",
-      role: "fix",
-      desc: "comment issue #50: verification recorded",
-    },
+    leg(0, { duration_s: 4638, cost_usd: 2, summary: "Added the task narrative to the issue page." }),
+    leg(1, {
+      kind: "REVIEW", role: "review", runtime: "claude", outcome: "changes_requested", duration_s: 92,
+      cost_usd: 0.42, estimated: true, pricing_basis: "estimate", pr: 75, head: "a1234567890",
+      verdict: "REQUEST_CHANGES",
+      verdict_excerpt: "The implementation still hides the actual review findings. Surface the requested-change body as untrusted text so an operator can decide whether another round is productive.",
+    }),
+    leg(2, { kind: "ADDRESS_REVIEW", duration_s: 186, cost_usd: 0.88, pr: 75, head: "b1234567890" }),
+    leg(3, { kind: "REVIEW", role: "review", runtime: "claude", outcome: "passed", duration_s: 74, cost_usd: 0.31, pr: 75, verdict: "APPROVE" }),
   ],
   warnings: [],
 };
@@ -466,7 +319,7 @@ async function mockApi(
       return json(route, {
         ...issuesPayload,
         notifications: issuePolls <= 2 ? [] : [{
-          id: "merge-50",
+          id: "leg:leg-50-3:end",
           ts: "2026-07-29T08:00:00Z",
           severity: "info",
           title: "Issue #50 completed",
@@ -477,41 +330,15 @@ async function mockApi(
       });
     }
     if (path === "/api/repos/self/issues/50") return json(route, issue);
-    if (path === "/api/repos/self/issues/49")
-      return json(route, {
-        ...issue,
-        issue: 49,
-        title: "Exercise model wrapping",
-        stage: "reviewing",
-        done: false,
-        prs: [74],
-        pull_requests: [{
-          number: 74,
-          url: "https://github.com/openai/autonomous-issue-agent/pull/74",
-          state: "open",
-        }],
-      });
     const detail = /^\/api\/repos\/self\/issues\/(\d+)$/.exec(path);
-    if (detail) return json(route, { ...issue, issue: Number(detail[1]), done: false, prs: [], pull_requests: [] });
-    if (path.startsWith("/api/repos/self/issues/50/steps/") && path.endsWith("/events"))
-      return json(route, {
-        events: [{
-          ts: "2026-07-29T07:59:30Z",
-          kind: "RESOLVE",
-          role: "fix",
-          status: "done",
-          model: "claude-sonnet-5",
-          issue: 50,
-        }],
-        warnings: [],
-      });
+    if (detail) return json(route, { ...issue, issue: Number(detail[1]), done: false, pull_requests: [] });
     if (path === "/api/verification")
       return json(route, {
         rows: [{ id: "V-1", change: "Dashboard", status: "verified", evidence: "E2E", shipped: "yes", raw: "" }],
         warnings: [],
       });
     if (path === "/api/repos/self/overview") return json(route, overviewPayload);
-    return json(route, { ok: true, detail: "started" });
+    return json(route, { ok: true, detail: "ok" });
   });
 }
 
@@ -522,7 +349,9 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
 
   await expect(page.locator(".chip strong", { hasText: "issue-agent" })).toBeVisible();
   await page.locator(".rail-past > summary").click();
-  await expect(page.getByRole("button", { name: "Start daemons for sleeping" })).toBeVisible();
+  await expect(page.locator(".rail-past .repo-name", { hasText: "sleeping" })).toBeVisible();
+  // Starting daemons is not the dashboard's job: the only writes are label changes.
+  await expect(page.getByRole("button", { name: /Start daemons/ })).toHaveCount(0);
   const sidebarBounds = await page.locator(".sidebar").boundingBox();
   const footerBounds = await page.locator(".sidebar-foot").boundingBox();
   expect(sidebarBounds).not.toBeNull();
@@ -566,7 +395,7 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByText("#/repo/self/issues/done")).toHaveCount(0);
   await expect(page.getByRole("columnheader", { name: /Since done/ })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: /^Date/ })).toHaveCount(0);
-  await expect(page.locator(".duration-breakdown").first()).toContainText("1:17:18");
+  await expect(page.getByRole("columnheader", { name: /Legs/ })).toBeVisible();
 
   const mainbody = page.locator(".mainbody");
   await mainbody.evaluate((element) => {
@@ -674,7 +503,6 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   });
   await page.getByLabel("Theme").selectOption("cosmic-dusk");
   await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.locator(".duration-breakdown").first()).toContainText("1:17");
   await page.getByRole("button", { name: "Quota", exact: true }).click();
   await page.screenshot({
     path: "../evidence/dashboard-issues-table.png",
@@ -693,11 +521,11 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.keyboard.press("Alt+ArrowRight");
   await expect(page.locator(".issue-list-table th").first()).toHaveAttribute("data-column-key", "issue");
 
-  const durationHeader = page.locator('th[data-column-key="duration"]');
-  const durationBefore = await durationHeader.boundingBox();
-  const durationHandle = page.getByRole("separator", { name: "Resize Duration column" });
-  const handleBox = await durationHandle.boundingBox();
-  expect(durationBefore).not.toBeNull();
+  const issueColumn = page.locator('th[data-column-key="issue"]');
+  const issueBefore = await issueColumn.boundingBox();
+  const issueHandle = page.getByRole("separator", { name: "Resize Issue / PR column" });
+  const handleBox = await issueHandle.boundingBox();
+  expect(issueBefore).not.toBeNull();
   expect(handleBox).not.toBeNull();
   const handleX = handleBox!.x + 1;
   const handleY = handleBox!.y + handleBox!.height / 2;
@@ -705,9 +533,9 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.mouse.down();
   await page.mouse.move(handleX - 36, handleY);
   await page.mouse.up();
-  const durationAfter = await durationHeader.boundingBox();
-  expect(durationAfter!.width).toBeLessThan(durationBefore!.width);
-  expect(durationAfter!.width).toBeGreaterThanOrEqual(112);
+  const issueAfter = await issueColumn.boundingBox();
+  expect(issueAfter!.width).toBeLessThan(issueBefore!.width);
+  expect(issueAfter!.width).toBeGreaterThanOrEqual(112);
 
   const issueHeader = page.locator('th[data-column-key="issue"]');
   await expect(issueHeader).toHaveAttribute("aria-sort", "none");
@@ -732,11 +560,11 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
 
   await page.getByRole("tab", { name: /In flight/ }).click();
-  await expect(page.getByRole("region", { name: "Blocked" }).locator(".board-row", { hasText: "#120" }))
+  await expect(page.getByRole("region", { name: "Working" }).locator(".board-row", { hasText: "#120" }))
     .toContainText("Queued");
   await page.locator(".board-row", { hasText: "Exercise model wrapping" }).click();
-  await expect(page.locator("#board-drawer-49").getByText("gpt-5.6-terra, gpt-5.6-fable, gpt-5.6-luna"))
-    .toBeVisible();
+  await expect(page.locator("#board-drawer-49").getByText("$1.80 est.")).toBeVisible();
+  await expect(page.locator("#board-drawer-49 .board-visit")).toHaveCount(2);
   await page.screenshot({
     path: "../evidence/dashboard-inflight-models.png",
     fullPage: true,
@@ -759,23 +587,23 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("link", { name: "#50" })).toHaveAttribute("target", "_blank");
   await expect(page.getByText(/issue on GitHub/i)).toHaveCount(0);
   await expect(page.locator(".step-disclosure").first()).toContainText("Resolve");
-  await expect(page.getByText("Luna", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("1:17", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("1:17", { exact: true })).toHaveCount(1);
 
   await page.locator('th[data-column-key="operation"]').click({ button: "right" });
-  await page.getByRole("checkbox", { name: "Model" }).check();
+  await page.getByRole("checkbox", { name: "Role" }).check();
   await page.keyboard.press("Escape");
-  for (const [name, minimum] of [
-    ["Model", 100],
-    ["Status", 96],
-    ["Duration", 84],
-    ["Cost", 76],
+  await expect(page.getByRole("columnheader", { name: /Role/ })).toBeVisible();
+  for (const [name, key, minimum] of [
+    ["Runtime", "runtime", 90],
+    ["Outcome", "status", 96],
+    ["Duration", "duration", 84],
+    ["Cost", "cost", 76],
   ] as const) {
     const separator = page.getByRole("separator", { name: `Resize ${name} column` });
     await separator.focus();
     for (let index = 0; index < 12; index += 1) await page.keyboard.press("ArrowLeft");
     await expect(separator).toHaveAttribute("aria-valuenow", String(minimum));
-    const header = page.locator(`th[data-column-key="${name.toLowerCase()}"]`);
+    const header = page.locator(`th[data-column-key="${key}"]`);
     const renderedWidth = (await header.boundingBox())!.width;
     expect(renderedWidth).toBeGreaterThanOrEqual(minimum);
     expect(renderedWidth).toBeLessThanOrEqual(minimum + 24);
@@ -790,11 +618,11 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(taskDetail).toBeVisible();
   const taskDetailBox = await taskDetail.boundingBox();
   expect(taskDetailBox?.width).toBeGreaterThan(700);
-  await expect(taskDetail.getByText("claude-sonnet-5")).toBeVisible();
+  await expect(taskDetail.getByText("session-50-0")).toBeVisible();
+  await expect(taskDetail.getByText("Added the task narrative to the issue page.")).toBeVisible();
 
-  await page.getByRole("tab", { name: /^Events ·/ }).click();
-  await expect(page.getByText("by fix")).toBeVisible();
-  await expect(page.getByText(/comment issue #50/)).toBeVisible();
+  await taskDetail.getByRole("tab", { name: "Raw" }).click();
+  await expect(taskDetail.getByText(/leg-50-0/)).toBeVisible();
 
   await page.getByRole("tab", { name: "Overview" }).click();
   await expect(page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ })).toBeVisible();
@@ -854,7 +682,7 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
   await page.getByRole("tab", { name: /In flight/ }).click();
   const needsYou = page.getByRole("region", { name: "Needs you" });
   const activeIssueRow = needsYou.locator(".board-row", { hasText: "Required-test gate rejects diagnostic output" });
-  await expect(activeIssueRow.locator(".board-headline")).toHaveText("Answer the agent");
+  await expect(activeIssueRow.locator(".board-headline")).toHaveText("Answer the agent's question");
   await expect(activeIssueRow.getByText("round 4")).toHaveAttribute("data-tip", "4 or more review rounds: above typical");
   await activeIssueRow.click();
   await expect(activeIssueRow.locator(".board-title-btn")).toHaveAttribute("aria-expanded", "true");
@@ -933,8 +761,7 @@ test("serves a validated operator workflow through FastAPI and the production bu
   await page.locator(".step-disclosure").click();
   await expect(page.locator(".stepdetail")).toBeVisible();
   expect((await page.locator(".stepdetail").boundingBox())?.width).toBeGreaterThan(700);
-  await page.getByRole("tab", { name: /^Events ·/ }).click();
-  await expect(page.getByText("by fix")).toBeVisible();
+  await expect(page.locator(".stepdetail").getByText("Explained the completed work.")).toBeVisible();
   await page.screenshot({
     path: "../evidence/dashboard-issue-tasks.png",
     fullPage: true,

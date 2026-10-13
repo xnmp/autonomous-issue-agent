@@ -34,10 +34,10 @@ const usage = {
 
 const issues = {
   in_flight: [],
-  pending: [],
   done: [],
   backlog: [],
   gh_ok: true,
+  observed_at: "2026-10-12T12:00:00Z",
   notifications: [],
   warnings: [],
 };
@@ -71,17 +71,13 @@ describe("App navigation", () => {
         }
         return json({
           metrics: null,
-          cost_mix: null,
           caps: null,
           health: [],
-          unattributed: [],
           health_trend: [{
             day: "2026-07-29",
             opened: 3,
             closed: 1,
             net_open: 2,
-            recurrences: 0,
-            first_observation: true,
           }],
           warnings: [],
         });
@@ -174,22 +170,16 @@ describe("App navigation", () => {
         if (path.endsWith("/issues")) return json(issues);
         return json({
           metrics: null,
-          cost_mix: null,
           caps: null,
           health: [{
             role: "fix",
             alive: true,
             stale: false,
-            last_event_ts: "2026-08-09T01:00:00Z",
-            last_event: "tick",
-            events: 1,
-            log_path: "/logs/fix.log",
+            heartbeat_ts: "2026-08-09T01:00:00Z",
           }],
           health_trend: [],
           needs_attention: [],
-          interventions: [],
           spend_per_hour: [],
-          unattributed: [],
           warnings: [],
         });
       }),
@@ -197,7 +187,7 @@ describe("App navigation", () => {
 
     const first = render(<App />);
 
-    expect(await screen.findByText("Done", { selector: ".tile-label" })).toBeVisible();
+    expect(await screen.findByText("Merged", { selector: ".tile-label" })).toBeVisible();
     expect(screen.queryByText("Daemon health", { selector: ".panel-title" }))
       .not.toBeInTheDocument();
     expect(screen.queryByText("Issue health trend", { selector: ".panel-title" }))
@@ -233,7 +223,6 @@ describe("App navigation", () => {
       JSON.stringify({
         showOverviewDaemonHealth: "false",
         showOverviewIssueHealthTrend: "true",
-        showProjectedCost: "true",
       }),
     );
     vi.stubGlobal(
@@ -245,14 +234,11 @@ describe("App navigation", () => {
         if (path.endsWith("/issues")) return json(issues);
         return json({
           metrics: null,
-          cost_mix: null,
           caps: null,
           health: [],
           health_trend: [],
           needs_attention: [],
-          interventions: [],
           spend_per_hour: [],
-          unattributed: [],
           warnings: [],
         });
       }),
@@ -260,11 +246,10 @@ describe("App navigation", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("Done", { selector: ".tile-label" })).toBeVisible();
+    expect(await screen.findByText("Merged", { selector: ".tile-label" })).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(screen.getByRole("checkbox", { name: "Daemon health" })).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Issue health trend" })).not.toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Show projected cost" })).not.toBeChecked();
   });
 
   it("optimistically removes a promoted backlog issue and updates its tab count", async () => {
@@ -289,8 +274,6 @@ describe("App navigation", () => {
               url: "https://github.com/o/r/issues/120",
               body: "Important state changes",
               labels: ["feature"],
-              recurrence: false,
-              recurrence_count: 0,
               age_days: 0,
               comments: 0,
               issue_type: "feature",

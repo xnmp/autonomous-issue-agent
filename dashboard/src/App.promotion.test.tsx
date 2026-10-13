@@ -32,10 +32,10 @@ const usage = {
 
 const issues = {
   in_flight: [],
-  pending: [],
   done: [],
   backlog: [],
   gh_ok: true,
+  observed_at: "2026-10-12T12:00:00Z",
   notifications: [],
   warnings: [],
 };
@@ -46,8 +46,6 @@ const backlogIssue = {
   url: "https://github.com/o/r/issues/120",
   body: "Important state changes",
   labels: ["feature"],
-  recurrence: false,
-  recurrence_count: 0,
   age_days: 0,
   comments: 0,
   issue_type: "feature",
@@ -59,28 +57,13 @@ const historicalDoneIssue = {
   issue: 120,
   title: "Previous completion",
   url: "https://github.com/o/r/issues/120",
-  pr: null,
+  pr: 9,
   pr_url: null,
-  pr_state: null,
-  stage: "done",
-  done: true,
-  steps: [],
-  cost_usd: null,
-  estimated: false,
-  projected_cost_usd: null,
-  projected_model: null,
-  started_ts: null,
-  last_ts: null,
-  elapsed_s: null,
-  working_s: null,
-  idle_s: null,
-  idle_active: false,
-  models: [],
-  model_badges: [],
-  rounds: null,
-  issue_verification: null,
-  pr_verification: null,
   merged_ts: null,
+  cost_usd: 0,
+  legs: 0,
+  review_rounds: 0,
+  labels: [],
 };
 
 function json(body: unknown): Response {
@@ -109,18 +92,24 @@ describe("backlog promotion", () => {
           if (serverPromoted) {
             return json({
               ...issues,
-              pending: [{
+              in_flight: [{
                 issue: 120,
                 title: "Toast notifications",
                 url: "https://github.com/o/r/issues/120",
                 labels: ["feature", "ai-ready"],
-                held: false,
-                hold_reason: null,
-                overlap: null,
+                pr: null,
+                pr_url: null,
                 board: {
-                  status: "blocked", on: { kind: "queue" }, headline: "Queued",
+                  status: "working", activity: "queued", act: "RESOLVE", headline: "Queued",
                   reason: "Confirmed by the server.", since_ts: null,
                 },
+                rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
+                cost_usd: 0,
+                estimated: false,
+                legs: 0,
+                started_ts: null,
+                last_ts: null,
+                leg_running: false,
               }],
             });
           }

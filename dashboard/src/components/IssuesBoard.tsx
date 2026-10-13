@@ -1,6 +1,4 @@
 import { useMemo, useState } from "react";
-import { api } from "../api/client";
-import { usePolled } from "../api/hooks";
 import type { IssueCard } from "../api/types";
 import {
   COLUMN_HEADINGS,
@@ -8,15 +6,13 @@ import {
   GROUP_ORDER,
   OUTCOME_MARK,
   STAGES,
-  TIERS,
   groupCounts,
   groupItems,
   historyView,
-  operatorOwned,
-  overspendOf,
   plainHarnessMessage,
   primaryAction,
   railNodes,
+  sayLine,
   stageLabel,
   waitCell,
   type BoardGroup,
@@ -24,24 +20,17 @@ import {
   type PrimaryAction,
   type StageId,
   type StageVisit,
-  type Tier,
 } from "../features/issues/board";
-import { ago, duration, usd } from "../lib/format";
-import { liveClocks, useNow, useSnapshotOffset } from "../lib/clock";
+import { ago, usd } from "../lib/format";
+import { useNow } from "../lib/clock";
 import { kindLabel } from "../lib/semantics";
 import { Chip } from "./ui/Chip";
 import { Icon } from "./ui/Icon";
 import { UnblockControl } from "./UnblockControl";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { tipProps } from "./ui/Tip";
-import { ErrorBanner, SkeletonRows } from "./ui/Feedback";
+import { SkeletonRows } from "./ui/Feedback";
 import "./issues-board.css";
-
-/** The reader's display options, from the options menu. */
-interface Display {
-  showProjectedCost: boolean;
-  showDurationSeconds: boolean;
-}
 
 /** A title this long is clamped on the row, so the drawer repeats it whole. */
 const CLAMPED_TITLE_CHARS = 70;
@@ -52,18 +41,13 @@ export function IssuesBoard({
   loading,
   onRefresh,
   onOpenIssue,
-  showProjectedCost = true,
-  showDurationSeconds = true,
 }: {
   repo: string;
   items: BoardItem[];
   loading: boolean;
   onRefresh: () => void;
   onOpenIssue: (issue: number) => void;
-  showProjectedCost?: boolean;
-  showDurationSeconds?: boolean;
 }) {
-  const display = { showProjectedCost, showDurationSeconds };
   const [filter, setFilter] = useState<BoardGroup | null>(null);
   const [open, setOpen] = useState<ReadonlySet<number>>(() => new Set());
   const counts = useMemo(() => groupCounts(items), [items]);
@@ -136,7 +120,6 @@ export function IssuesBoard({
                       onToggle={() => toggle(item.issue)}
                       onRefresh={onRefresh}
                       onOpenIssue={onOpenIssue}
-                      display={display}
                     />
                   ))}
                 </>
@@ -155,7 +138,6 @@ function BoardRow({
   onToggle,
   onRefresh,
   onOpenIssue,
-  display,
 }: {
   repo: string;
   item: BoardItem;
@@ -163,12 +145,10 @@ function BoardRow({
   onToggle: () => void;
   onRefresh: () => void;
   onOpenIssue: (issue: number) => void;
-  display: Display;
 }) {
   const { board } = item;
   const nowMs = useNow(30_000);
   const wait = waitCell(board, nowMs);
-  const overspend = overspendOf(item.card);
   const drawerId = `board-drawer-${item.issue}`;
   // The title button is described by what a sighted reader scans across the
   // row: the headline and reason, the rail (its label names every count) and
@@ -198,30 +178,20 @@ function BoardRow({
           <div className="board-refs">
             <IssueLink issue={item.issue} url={item.url} />
             {item.pr !== null ? <PrNumber pr={item.pr} url={item.prUrl} /> : null}
-            {overspend ? (
-              <span
-                className="board-overspend"
-                {...tipProps(`${usd(overspend.cost)} spent of a ${usd(overspend.budget)} projection`)}
-              >
-                {overspend.ratio.toFixed(1)}× budget
-              </span>
-            ) : null}
           </div>
         </div>
-        <div id={sayId} className={`board-say${operatorOwned(board) ? " board-say-owned" : ""}`}>
+        <div id={sayId} className={`board-say${board.status === "needs_you" ? " board-say-owned" : ""}`}>
           <span className="board-headline">{board.headline}</span>
-          <span className="board-reason">{board.reason}</span>
+          <span className="board-reason">{sayLine(board)}</span>
         </div>
         <div className="board-rail">
-          {item.rail ? (
-            <LifecycleStepper
-              rail={railNodes(item.rail)}
-              tone={GROUP_META[board.status].tone}
-              live={item.rail.live || live}
-              label={`Issue #${item.issue} stage`}
-              id={railId}
-            />
-          ) : <span className="faint">—</span>}
+          <LifecycleStepper
+            rail={railNodes(item.rail)}
+            tone={GROUP_META[board.status].tone}
+            live={item.rail.live || live}
+            label={`Issue #${item.issue} stage`}
+            id={railId}
+          />
         </div>
         <span
           id={waitId}
@@ -239,7 +209,6 @@ function BoardRow({
           item={item}
           onRefresh={onRefresh}
           onOpenIssue={onOpenIssue}
-          display={display}
         />
       ) : null}
     </div>
@@ -252,24 +221,15 @@ function BoardDrawer({
   item,
   onRefresh,
   onOpenIssue,
-  display,
 }: {
   id: string;
   repo: string;
   item: BoardItem;
   onRefresh: () => void;
   onOpenIssue: (issue: number) => void;
-  display: Display;
 }) {
   const { board, card } = item;
-  const hasHistory = (item.rail?.steps ?? 0) > 0;
-  const detail = usePolled(
-    hasHistory ? `issue:${repo}:${item.issue}` : null,
-    (signal) => api.issue(repo, item.issue, signal),
-    5_000,
-  );
-  const note = plainHarnessMessage(detail.data?.harness_message)
-    ?? (operatorOwned(board) ? board.reason : null);
+  const note = board.status === "needs_you" ? plainHarnessMessage(board.detail) : null;
   return (
     <div className="board-drawer" id={id}>
       {item.title && item.title.length > CLAMPED_TITLE_CHARS ? (
@@ -280,29 +240,19 @@ function BoardDrawer({
           <span className="board-note-label">Harness:</span> {note}
         </p>
       ) : null}
-      {/* #329: each counted infra death (time, leg, cause) is listed here,
-          under the harness message, once that projection exists. */}
       <div>
         <div className="board-klabel">
-          History{item.rail ? <> · <span className="num">{item.rail.steps}</span> steps</> : null}
+          History · <span className="num">{item.rail.steps}</span> steps
         </div>
-        {!hasHistory ? (
-          <span className="faint">No agent work yet.</span>
-        ) : detail.data ? (
-          <History visits={detail.data.history ?? []} />
-        ) : detail.error ? (
-          <ErrorBanner message={detail.error} onRetry={detail.refresh} />
-        ) : (
-          <span className="faint">loading history…</span>
-        )}
+        <History visits={card.history ?? []} />
       </div>
-      <Facts item={item} card={card} display={display} />
+      <Facts item={item} card={card} />
       {/* Navigation, not an action: the issue page keeps the step table and
           per-PR review controls the board leaves out. */}
       <button type="button" className="board-linkbtn board-openfull" onClick={() => onOpenIssue(item.issue)}>
         Open full issue
       </button>
-      <Action repo={repo} item={item} onRefresh={onRefresh} onDetailRefresh={detail.refresh} />
+      <Action repo={repo} item={item} onRefresh={onRefresh} />
     </div>
   );
 }
@@ -361,89 +311,43 @@ function MiniTrack({ stage }: { stage: StageId }) {
   );
 }
 
-function Facts({
-  item,
-  card,
-  display,
-}: {
-  item: BoardItem;
-  card: IssueCard | null;
-  display: Display;
-}) {
-  const offset = useSnapshotOffset();
+function Facts({ item, card }: { item: BoardItem; card: IssueCard }) {
   const nowMs = useNow(30_000);
-  const clocks = card ? liveClocks(card, offset) : null;
-  const models = card ? (card.model_badges?.map(({ model }) => model) ?? card.models) : [];
   return (
     <dl className="board-facts">
-      <div><dt>Difficulty</dt><dd><TierBadge tier={item.tier} /></dd></div>
-      {card && card.cost_usd !== null ? (
-        <div>
-          <dt>Cost</dt>
-          <dd className="num">
-            {usd(card.cost_usd)}
-            {display.showProjectedCost && card.projected_cost_usd !== null ? ` of ${usd(card.projected_cost_usd)}` : null}
-          </dd>
-        </div>
+      <div>
+        <dt>Cost</dt>
+        <dd className="num" {...(card.estimated ? tipProps("Includes estimated or still-reserved spend") : {})}>
+          {usd(card.cost_usd)}{card.estimated ? " est." : null}
+        </dd>
+      </div>
+      <div><dt>Legs</dt><dd className="num">{card.legs}</dd></div>
+      {card.started_ts ? (
+        <div><dt>Started</dt><dd className="num">{ago(card.started_ts, nowMs)}</dd></div>
       ) : null}
-      {clocks && clocks.working !== null ? (
-        <div><dt>Agent time</dt><dd className="num">{duration(clocks.working, display.showDurationSeconds)}</dd></div>
-      ) : null}
-      {clocks && clocks.idle !== null ? (
-        <div><dt>Time idle</dt><dd className="num">{duration(clocks.idle, display.showDurationSeconds)}</dd></div>
-      ) : null}
-      {card?.last_ts ? (
+      {card.last_ts ? (
         <div><dt>Last activity</dt><dd className="num">{ago(card.last_ts, nowMs)}</dd></div>
       ) : null}
-      {models.length > 0 ? <div><dt>Models</dt><dd className="num">{models.join(", ")}</dd></div> : null}
       {item.labels.length > 0 ? <div><dt>Labels</dt><dd className="num">{item.labels.join(", ")}</dd></div> : null}
     </dl>
   );
 }
 
-function TierBadge({ tier }: { tier: Tier | null }) {
-  const rung = tier === null ? -1 : TIERS.indexOf(tier);
-  if (rung < 0) {
-    return <span className="board-tier board-tier-none" {...tipProps("Not yet triaged")}>untriaged</span>;
-  }
-  return (
-    <span className="board-tier" {...tipProps(`Difficulty tier ${rung + 1} of ${TIERS.length}`)}>
-      <span className="board-tier-meter" aria-hidden="true">
-        {TIERS.map((name, index) => <b key={name} className={index <= rung ? "on" : undefined} />)}
-      </span>
-      {tier}
-    </span>
-  );
-}
-
-/**
- * The row's single action. Re-arm and budget approval reveal the unblock
- * control, which confirms before it moves any label.
- */
+/** The row's single action: open the issue or PR to reply, or Unblock. */
 function Action({
   repo,
   item,
   onRefresh,
-  onDetailRefresh,
 }: {
   repo: string;
   item: BoardItem;
   onRefresh: () => void;
-  onDetailRefresh: () => void;
 }) {
-  const action = primaryAction(item.board);
+  const action = primaryAction(item.board, item.card.action);
   if (action === null) return null;
   return (
     <div className="board-actions">
-      <ActionControl
-        repo={repo}
-        item={item}
-        action={action}
-        onChanged={() => {
-          onDetailRefresh();
-          onRefresh();
-        }}
-      />
+      <ActionControl repo={repo} item={item} action={action} onChanged={onRefresh} />
     </div>
   );
 }
@@ -459,7 +363,6 @@ function ActionControl({
   action: PrimaryAction;
   onChanged: () => void;
 }) {
-  const [revealed, setRevealed] = useState(false);
   switch (action.kind) {
     case "open_issue":
       return item.url ? (
@@ -471,33 +374,7 @@ function ActionControl({
       ) : null;
     case "unblock":
       return <UnblockControl deployment={repo} issue={item.issue} heldForHuman onChanged={onChanged} />;
-    case "rearm":
-    case "budget":
-      return revealed ? (
-        <HeldControls repo={repo} issue={item.issue} onChanged={onChanged} />
-      ) : (
-        <button type="button" className="btn btn-primary" onClick={() => setRevealed(true)}>
-          {action.label}
-        </button>
-      );
   }
-}
-
-/** The unblock control, for a row the harness holds for a person. */
-function HeldControls({
-  repo,
-  issue,
-  onChanged,
-}: {
-  repo: string;
-  issue: number;
-  onChanged: () => void;
-}) {
-  return (
-    <div className="board-held-controls">
-      <UnblockControl deployment={repo} issue={issue} heldForHuman onChanged={onChanged} />
-    </div>
-  );
 }
 
 function IssueLink({ issue, url }: { issue: number; url: string | null }) {

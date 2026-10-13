@@ -1,23 +1,10 @@
 /**
- * The board's one clock, and the pure rules that decide what it moves.
- *
- * Two separate concerns live here, deliberately:
- *
- *   - `useNow` — a single shared ticker per interval. Every live duration on
- *     screen reads the same `now`, so a hundred timers cost one interval and
- *     never disagree by a frame.
- *   - `liveClocks` / `tickingClock` — pure functions of (server anchors,
- *     offset). Nothing here reads the wall clock, so the tick rules are
- *     testable without rendering anything.
- *
- * Skew: the offset is measured from the instant the CLIENT received the
- * snapshot (`Polled.updatedAt`), never from a server-authored timestamp, so a
- * client whose clock disagrees with the daemon's still ticks from zero. The
- * payload carries no `generated_at`; if one is ever added, the receive instant
- * remains the correct anchor and it can only serve as a staleness display.
+ * The board's one clock: a single shared ticker per interval. Every live
+ * duration on screen reads the same `now`, so a hundred timers cost one
+ * interval and never disagree by a frame.
  */
 
-import { createContext, useContext, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 
 /* ------------------------------------------------------------ the ticker */
 
@@ -90,88 +77,4 @@ function subscriber(intervalMs: number) {
 export function useNow(intervalMs = 1000): number {
   const { subscribe, read } = bindingFor(intervalMs);
   return useSyncExternalStore(subscribe, read, read);
-}
-
-/* ------------------------------------------------- the snapshot's anchor */
-
-/**
- * Ms since epoch at which the currently rendered snapshot was RECEIVED.
- * `null` means "no snapshot yet" — every derived clock then stands still.
- */
-export const SnapshotAnchor = createContext<number | null>(null);
-
-/** Seconds elapsed since the rendered snapshot arrived. Never negative. */
-export function offsetSince(anchorMs: number | null, nowMs: number): number {
-  if (anchorMs === null || !Number.isFinite(anchorMs) || !Number.isFinite(nowMs)) {
-    return 0;
-  }
-  return Math.max(0, (nowMs - anchorMs) / 1000);
-}
-
-/** `offsetSince` bound to the surrounding snapshot and the shared ticker. */
-export function useSnapshotOffset(intervalMs = 1000): number {
-  return offsetSince(useContext(SnapshotAnchor), useNow(intervalMs));
-}
-
-/* ------------------------------------------------------ the tick predicate */
-
-/** The server-authored fields the tick rules are a function of. */
-export interface ClockAnchors {
-  elapsed_s?: number | null;
-  working_s?: number | null;
-  idle_s?: number | null;
-  idle_active?: boolean;
-  /** A paid leg is executing right now. */
-  leg_running?: boolean;
-  done?: boolean;
-}
-
-export interface LiveClocks {
-  elapsed: number | null;
-  working: number | null;
-  idle: number | null;
-}
-
-/**
- * Which of the two clocks is still moving.
- *
- * A running leg owns the work clock EVEN WHEN the row waits on a person: the
- * fold can believe a row is human-owned (a journalled hold nobody journalled
- * clearing) while the harness is demonstrably still spending on it, and
- * freezing both clocks there hid live work behind a dead row (keifu
- * #142/#181, 2026-08-03). A human-owned row with no leg running and no idle
- * accrual is genuine quiescence, and freezing is then correct.
- */
-export function tickingClock(anchors: ClockAnchors): "work" | "idle" | null {
-  if (anchors.done) return null;
-  if (anchors.leg_running) return "work";
-  if (anchors.idle_active) return "idle";
-  return null;
-}
-
-function finite(value: number | null | undefined): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function advance(base: number | null | undefined, by: number): number | null {
-  const value = finite(base);
-  return value === null ? null : value + by;
-}
-
-/**
- * The three durations a row displays, ticked forward from the server's values.
- *
- * Absent, null, or non-finite anchors stay absent — a missing work clock reads
- * as "—", never as NaN. Fractional server values are preserved; the formatter
- * owns rounding.
- */
-export function liveClocks(anchors: ClockAnchors, offsetS: number): LiveClocks {
-  const ticking = tickingClock(anchors);
-  const by = Number.isFinite(offsetS) ? Math.max(0, offsetS) : 0;
-  return {
-    // Wall time only advances while one of its two components does.
-    elapsed: advance(anchors.elapsed_s, ticking === null ? 0 : by),
-    working: advance(anchors.working_s, ticking === "work" ? by : 0),
-    idle: advance(anchors.idle_s, ticking === "idle" ? by : 0),
-  };
 }

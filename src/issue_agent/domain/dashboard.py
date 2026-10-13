@@ -180,6 +180,7 @@ class NeedsYou:
     detail: str | None
     target: str  # issue | pr
     since_ts: str | None
+    hint: str = ""  # what releases it, in one line
     status: str = "needs_you"
 
 
@@ -262,7 +263,8 @@ def _iso(stamp: datetime | None) -> str | None:
 
 
 def _needs_you(reason: str, target: str, since: datetime | None, detail: str | None) -> NeedsYou:
-    return NeedsYou(reason, _STOP_HEADLINE.get(reason, "Needs a human"), detail or None, target, _iso(since))
+    return NeedsYou(reason, _STOP_HEADLINE.get(reason, "Needs a human"), detail or None, target, _iso(since),
+                    _STOP_REASON.get(reason, "Reply on GitHub or unblock to hand it back."))
 
 
 def board_status(

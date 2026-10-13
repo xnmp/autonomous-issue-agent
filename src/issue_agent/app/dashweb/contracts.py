@@ -170,6 +170,8 @@ class BoardNeedsYou(Contract):
     status: Literal["needs_you"]
     reason: StopReasonId
     headline: str
+    # What releases the stop, in one line.
+    hint: str
     # The stop comment (or the agent's question). Agent prose: clients
     # render it as text, never as Markdown.
     detail: str | None

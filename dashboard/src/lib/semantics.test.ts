@@ -1,126 +1,24 @@
 import { describe, expect, it } from "vitest";
 import {
-  combinedVerificationStatus,
-  commitSubjectTone,
   difficultyTone,
+  familyOf,
   impactTone,
   issueTypeTone,
   kindLabel,
   labelTone,
-  modelTone,
-  prReviewMark,
+  legNote,
+  mixSlices,
   roleHealth,
-  stageTone,
-  stepKindTone,
-  stepOutcomeMark,
-  stepOutcomeTone,
-  verificationSummary,
 } from "./semantics";
 
 describe("dashboard semantics", () => {
   it.each([
     ["RESOLVE", "Resolve"],
-    ["ROUTE", "Route"],
     ["ADDRESS_REVIEW", "Address review"],
-    ["RE_REVIEW", "Re-review"],
+    ["FIX_CI", "Fix CI"],
+    ["SOMETHING_NEW", "something new"],
   ])("renders %s without an operator-only abbreviation", (kind, label) => {
     expect(kindLabel(kind)).toBe(label);
-  });
-
-  it("treats done as terminal success", () => {
-    expect(stageTone("done")).toBe("ok");
-  });
-
-  it.each([
-    ["red: reproduce the race", "fail"],
-    ["green: serialize watcher writes", "ok"],
-    ["docs: explain the invariant", "neutral"],
-  ])("maps commit subject %s into the shared status vocabulary", (subject, tone) => {
-    expect(commitSubjectTone(subject)).toBe(tone);
-  });
-
-  it.each([
-    ["VERIFIED", "VERIFIED", "verified"],
-    ["VERIFIED", "pending", "pending"],
-    ["VERIFIED", null, "pending"],
-    ["MISBEHAVED", "VERIFIED", "misbehaved"],
-    ["RETIRED", "RETIRED", "retired"],
-    ["VERIFIED", "RETIRED", "retired"],
-    ["RETIRED", null, "retired"],
-    ["RETIRED", "pending", "pending"],
-    ["RETIRED", "MISBEHAVED", "misbehaved"],
-    [null, null, null],
-  ])(
-    "combines issue %s and PR %s into one verification state",
-    (issue, pr, expected) => {
-      expect(combinedVerificationStatus(issue, pr)).toBe(expected);
-    },
-  );
-
-  it.each([
-    ["gpt-5.6-luna", null, "tier-luna"],
-    ["gpt-5.6-terra", "medium", "tier-terra"],
-    ["gpt-5.6-sol", "medium", "tier-sol"],
-    ["gpt-5.6-sol", "high", "tier-high"],
-    ["gpt-5.6-sol", "xhigh", "tier-high"],
-    ["fable", null, "tier-sol"],
-    ["claude-opus-5", null, "tier-sol"],
-    ["claude-opus-5", "high", "tier-high"],
-    ["claude-opus-5", "xhigh", "tier-high"],
-  ])("colors %s at %s by capability tier", (model, effort, tone) => {
-    expect(modelTone(model, effort)).toBe(tone);
-  });
-
-  it.each([
-    ["gpt-5.6-luna", "high"],
-    ["gpt-5.6-terra", "xhigh"],
-    ["claude-haiku-5", "HIGH"],
-    ["some-unknown-model", "max"],
-  ])("alarms %s at %s effort whatever tier it runs on", (model, effort) => {
-    expect(modelTone(model, effort)).toBe("tier-high");
-  });
-
-  it.each([
-    ["gpt-5.6-terra", "  medium  ", "tier-terra"],
-    ["gpt-5.6-luna", "hgih", "tier-luna"],
-    ["gpt-5.6-luna", "", "tier-luna"],
-    ["gpt-5.6-terra", undefined, "tier-terra"],
-  ])(
-    "keeps %s at %s off the alarm colour when the stance is not elevated",
-    (model, effort, tone) => {
-      expect(modelTone(model, effort)).toBe(tone);
-    },
-  );
-
-  it.each([
-    ["mergeable", "✓"],
-    ["changes_requested", "±"],
-  ])("marks a %s PR with %s", (state, glyph) => {
-    expect(prReviewMark(state)?.glyph).toBe(glyph);
-  });
-
-  it.each([[null], [undefined], ["MERGEABLE"], ["unknown"]])(
-    "shows no merge-readiness mark for %s, because absent data is not a verdict",
-    (state) => {
-      expect(prReviewMark(state)).toBeNull();
-    },
-  );
-
-  it("puts both verdicts and their reasons in one hover text", () => {
-    expect(
-      verificationSummary({
-        issueStatus: "VERIFIED",
-        issueReason: "probe stayed green",
-        prStatus: "MISBEHAVED",
-        prReason: "reverted next day",
-      }),
-    ).toBe("Issue: VERIFIED — probe stayed green\nPR: MISBEHAVED — reverted next day");
-  });
-
-  it("names a verdict that has no recorded reason instead of reading as missing", () => {
-    expect(verificationSummary({ issueStatus: "VERIFIED", issueReason: "  " })).toBe(
-      "Issue: VERIFIED\nPR: unavailable",
-    );
   });
 
   // Not the tables themselves — restating a lookup map asserts nothing. What is
@@ -167,41 +65,32 @@ describe("dashboard semantics", () => {
     expect(labelTone(label)).toBe(tone);
   });
 
-  it.each([
-    ["unblock", "done", "meta"],
-    ["relabel (operator)", "done", "meta"],
-    ["RESOLVE", "ok", "ok"],
-    ["FIX_CI", "failed", "fail"],
-    ["REVIEW", "running", "running"],
-  ])("tones %s (%s) by who ran it, then how it ended", (kind, state, tone) => {
-    expect(stepKindTone(kind, state)).toBe(tone);
+  it("folds per-kind spend into the three fixed families, ignoring unknown and non-finite rows", () => {
+    const slices = mixSlices([
+      { kind: "RESOLVE", usd: 4, runs: 2 },
+      { kind: "REVIEW", usd: 1.5, runs: 3 },
+      { kind: "FIX_CI", usd: 1, runs: 1 },
+      { kind: "REBASE", usd: 0.5, runs: 1 },
+      { kind: "ADDRESS_REVIEW", usd: Number.NaN, runs: 1 },
+      { kind: "MYSTERY", usd: 9, runs: 1 },
+    ]);
+    expect(slices.map((slice) => [slice.family, slice.usd])).toEqual([
+      ["resolve", 4], ["review", 1.5], ["repair", 1.5],
+    ]);
+    expect(familyOf("MYSTERY")).toBe("other");
+    expect(mixSlices(null).map((slice) => slice.usd)).toEqual([0, 0, 0]);
   });
 
-  it.each([
-    ["REVIEW", "ok", "REQUEST_CHANGES", "running", "±"],
-    ["RE_REVIEW", "ok", "APPROVE", "ok", "✓"],
-    ["RESOLVE", "failed", "SUCCESS", "fail", "×"],
-    ["RESOLVE", "running", null, "running", "…"],
-    ["unblock", "done", null, "meta", "◆"],
-  ])(
-    "marks %s with state %s and verdict %s as %s %s",
-    (kind, state, status, tone, glyph) => {
-      expect(stepOutcomeTone(kind, state, status)).toBe(tone);
-      expect(stepOutcomeMark(kind, state, status)).toMatchObject({ tone, glyph });
-    },
-  );
+  it("takes a leg's note from its question first, then the review, then its summary", () => {
+    expect(legNote({ question: "Which API?", verdict_excerpt: "fix it", summary: "did it" })).toBe("Which API?");
+    expect(legNote({ question: null, verdict_excerpt: "fix it", summary: "did it" })).toBe("fix it");
+    expect(legNote({ question: null, verdict_excerpt: null, summary: "  did it " })).toBe("did it");
+    expect(legNote({ question: "   ", verdict_excerpt: null, summary: null })).toBeNull();
+  });
 
   it("keeps unavailable process liveness distinct from dead", () => {
-    expect(
-      roleHealth({
-        role: "fix",
-        alive: null,
-        stale: false,
-        last_event_ts: null,
-        last_event: null,
-        events: 1,
-        log_path: null,
-      }),
-    ).toBe("unknown");
+    expect(roleHealth({ role: "fix", alive: null, stale: false, heartbeat_ts: null })).toBe("unknown");
+    expect(roleHealth({ role: "fix", alive: false, stale: true, heartbeat_ts: null })).toBe("dead");
+    expect(roleHealth({ role: "fix", alive: true, stale: true, heartbeat_ts: null })).toBe("stale");
   });
 });

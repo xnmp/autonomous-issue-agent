@@ -4,10 +4,7 @@ import { z } from "zod";
 const RoleHealth = z
   .object({
     alive: z.union([z.boolean(), z.null()]),
-    events: z.number().int(),
-    last_event: z.union([z.string(), z.null()]),
-    last_event_ts: z.union([z.string(), z.null()]),
-    log_path: z.union([z.string(), z.null()]),
+    heartbeat_ts: z.union([z.string(), z.null()]),
     role: z.string(),
     stale: z.boolean(),
   })
@@ -15,9 +12,9 @@ const RoleHealth = z
 const RepoSummary = z
   .object({
     active: z.union([z.boolean(), z.null()]),
-    done: z.number().int(),
+    done: z.union([z.number(), z.null()]),
     frecency: z.number(),
-    in_flight: z.number().int(),
+    in_flight: z.union([z.number(), z.null()]),
     is_self: z.boolean(),
     last_activity_ts: z.union([z.string(), z.null()]),
     name: z.string(),
@@ -40,147 +37,132 @@ const BacklogCard = z
     issue: z.number().int(),
     issue_type: z.union([z.string(), z.null()]).optional(),
     labels: z.array(z.string()),
-    recurrence: z.boolean(),
-    recurrence_count: z.number().int(),
+    title: z.union([z.string(), z.null()]),
+    url: z.union([z.string(), z.null()]),
+  })
+  .passthrough();
+const DoneCard = z
+  .object({
+    cost_usd: z.number(),
+    issue: z.number().int(),
+    labels: z.array(z.string()).optional().default([]),
+    legs: z.number().int(),
+    merged_ts: z.union([z.string(), z.null()]),
+    pr: z.number().int(),
+    pr_url: z.union([z.string(), z.null()]),
+    review_rounds: z.number().int(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
   })
   .passthrough();
 const BoardNeedsYou = z
   .object({
-    ask: z.enum([
-      "rearm",
-      "escalated",
-      "budget",
-      "awaiting_reply",
-      "merge",
-      "stalled",
-    ]),
+    detail: z.union([z.string(), z.null()]),
     headline: z.string(),
-    reason: z.string(),
+    hint: z.string(),
+    reason: z.enum([
+      "question",
+      "attempts",
+      "review-rounds",
+      "lifetime-cap",
+      "workflow-path",
+      "labelled",
+    ]),
     since_ts: z.union([z.string(), z.null()]),
     status: z.literal("needs_you"),
+    target: z.enum(["issue", "pr"]),
   })
   .passthrough();
 const BoardWorking = z
   .object({
-    activity: z.enum(["agent", "ci", "merge", "handoff"]),
+    act: z.union([z.string(), z.null()]),
+    activity: z.enum([
+      "agent",
+      "queued",
+      "ci",
+      "merge",
+      "update",
+      "open_pr",
+      "release",
+    ]),
     headline: z.string(),
     reason: z.string(),
     since_ts: z.union([z.string(), z.null()]),
     status: z.literal("working"),
   })
   .passthrough();
-const BlockedOnIssue = z
-  .object({ issue: z.union([z.number(), z.null()]), kind: z.literal("issue") })
-  .passthrough();
-const BlockedOnPr = z
-  .object({ kind: z.literal("pr"), pr: z.number().int() })
-  .passthrough();
-const BlockedOnOverlap = z
-  .object({
-    issue: z.union([z.number(), z.null()]),
-    kind: z.literal("overlap"),
-    pr: z.union([z.number(), z.null()]),
-  })
-  .passthrough();
-const BlockedOnTriage = z
-  .object({ kind: z.literal("triage"), why: z.literal("parked") })
-  .passthrough();
-const BlockedOnQueue = z.object({ kind: z.literal("queue") }).passthrough();
-const BoardBlocked = z
+const BoardWaiting = z
   .object({
     headline: z.string(),
-    on: z.discriminatedUnion("kind", [
-      BlockedOnIssue,
-      BlockedOnPr,
-      BlockedOnOverlap,
-      BlockedOnTriage,
-      BlockedOnQueue,
+    on: z.enum([
+      "branch-protection",
+      "human-review",
+      "headroom",
+      "backoff",
+      "github",
     ]),
     reason: z.string(),
     since_ts: z.union([z.string(), z.null()]),
-    status: z.literal("blocked"),
+    status: z.literal("waiting"),
+    until_ts: z.union([z.string(), z.null()]).optional(),
   })
   .passthrough();
-const ModelBadge = z
-  .object({ effort: z.union([z.string(), z.null()]), model: z.string() })
+const TrackChip = z
+  .object({
+    count: z.number().int(),
+    kind: z.string(),
+    outcome: z.enum([
+      "running",
+      "passed",
+      "changes_requested",
+      "asked",
+      "failed",
+      "done",
+    ]),
+  })
+  .passthrough();
+const StageVisit = z
+  .object({
+    stage: z.enum(["resolve", "ci", "review", "merge"]),
+    steps: z.array(TrackChip),
+  })
   .passthrough();
 const StageRail = z
   .object({
     ci_runs: z.number().int(),
-    current: z.enum(["triage", "resolve", "review", "ci", "merge"]),
-    furthest: z.enum(["triage", "resolve", "review", "ci", "merge"]),
+    current: z.enum(["resolve", "ci", "review", "merge"]),
+    furthest: z.enum(["resolve", "ci", "review", "merge"]),
     live: z.boolean(),
     resolve_attempts: z.number().int(),
     review_rounds: z.number().int(),
     steps: z.number().int(),
   })
   .passthrough();
-const CardStep = z
-  .object({
-    cost_usd: z.union([z.number(), z.null()]),
-    count: z.number().int().optional().default(1),
-    kind: z.string(),
-    state: z.string(),
-    status: z.union([z.string(), z.null()]),
-  })
-  .passthrough();
 const IssueCard = z
   .object({
-    board: z
-      .union([
-        z.discriminatedUnion("status", [
-          BoardNeedsYou,
-          BoardWorking,
-          BoardBlocked,
-        ]),
-        z.null(),
-      ])
-      .optional(),
-    cost_usd: z.union([z.number(), z.null()]),
-    done: z.boolean(),
-    elapsed_s: z.union([z.number(), z.null()]),
+    action: z.union([z.enum(["unblock", "open"]), z.null()]).optional(),
+    board: z.discriminatedUnion("status", [
+      BoardNeedsYou,
+      BoardWorking,
+      BoardWaiting,
+    ]),
+    cost_usd: z.number(),
     estimated: z.boolean(),
-    idle_active: z.boolean(),
-    idle_s: z.union([z.number(), z.null()]),
+    history: z.array(StageVisit).optional().default([]),
     issue: z.number().int(),
-    issue_verification: z.union([z.string(), z.null()]).optional(),
-    issue_verification_reason: z.union([z.string(), z.null()]).optional(),
     labels: z.array(z.string()).optional().default([]),
     last_ts: z.union([z.string(), z.null()]),
-    leg_running: z.boolean().optional().default(false),
-    merged_ts: z.union([z.string(), z.null()]).optional(),
-    model_badges: z.array(ModelBadge).optional().default([]),
-    models: z.array(z.string()),
-    overspend_ratio: z.union([z.number(), z.null()]).optional(),
+    leg_running: z.boolean(),
+    legs: z.number().int(),
     pr: z.union([z.number(), z.null()]),
     pr_ci_state: z
       .union([z.enum(["passing", "failing", "pending"]), z.null()])
       .optional(),
-    pr_review_state: z
-      .union([z.enum(["mergeable", "changes_requested"]), z.null()])
-      .optional(),
-    pr_state: z.union([z.string(), z.null()]),
     pr_url: z.union([z.string(), z.null()]),
-    pr_verification: z.union([z.string(), z.null()]).optional(),
-    pr_verification_reason: z.union([z.string(), z.null()]).optional(),
-    projected_cost_usd: z.union([z.number(), z.null()]),
-    projected_model: z.union([z.string(), z.null()]).optional(),
-    rail: z.union([StageRail, z.null()]).optional(),
-    rounds: z.union([z.number(), z.null()]),
-    stage: z.union([z.string(), z.null()]),
+    rail: StageRail,
     started_ts: z.union([z.string(), z.null()]),
-    steps: z.array(CardStep),
-    tier: z
-      .union([
-        z.enum(["trivial", "standard", "complex", "exceptional"]),
-        z.null(),
-      ])
-      .optional(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
-    working_s: z.union([z.number(), z.null()]),
   })
   .passthrough();
 const ToastNotification = z
@@ -194,43 +176,14 @@ const ToastNotification = z
     ts: z.string(),
   })
   .passthrough();
-const PendingCard = z
-  .object({
-    board: z
-      .union([
-        z.discriminatedUnion("status", [
-          BoardNeedsYou,
-          BoardWorking,
-          BoardBlocked,
-        ]),
-        z.null(),
-      ])
-      .optional(),
-    body: z.union([z.string(), z.null()]).optional(),
-    held: z.boolean(),
-    hold_reason: z.union([z.string(), z.null()]),
-    issue: z.number().int(),
-    labels: z.array(z.string()),
-    overlap: z.union([z.unknown(), z.null()]),
-    pr: z.union([z.number(), z.null()]).optional(),
-    pr_ci_state: z
-      .union([z.enum(["passing", "failing", "pending"]), z.null()])
-      .optional(),
-    pr_state: z.union([z.string(), z.null()]).optional(),
-    pr_url: z.union([z.string(), z.null()]).optional(),
-    rail: z.union([StageRail, z.null()]).optional(),
-    title: z.union([z.string(), z.null()]),
-    url: z.union([z.string(), z.null()]),
-  })
-  .passthrough();
 const IssuesPayload = z
   .object({
     backlog: z.array(BacklogCard),
-    done: z.array(IssueCard),
+    done: z.array(DoneCard),
     gh_ok: z.boolean(),
     in_flight: z.array(IssueCard),
     notifications: z.array(ToastNotification).optional().default([]),
-    pending: z.array(PendingCard),
+    observed_at: z.union([z.string(), z.null()]).optional(),
     warnings: z.array(z.string()),
   })
   .passthrough();
@@ -247,128 +200,87 @@ const HTTPValidationError = z
   .object({ detail: z.array(ValidationError) })
   .partial()
   .passthrough();
-const TrackChip = z
-  .object({
-    count: z.number().int(),
-    kind: z.string(),
-    outcome: z.enum([
-      "passed",
-      "failed",
-      "changes_requested",
-      "done",
-      "running",
-    ]),
-  })
-  .passthrough();
-const StageVisit = z
-  .object({
-    stage: z.enum(["triage", "resolve", "review", "ci", "merge"]),
-    steps: z.array(TrackChip),
-  })
-  .passthrough();
 const PullRequestLink = z
   .object({
+    ci_state: z
+      .union([z.enum(["passing", "failing", "pending"]), z.null()])
+      .optional(),
     number: z.number().int(),
-    state: z.union([z.string(), z.null()]),
+    state: z.enum(["open", "merged"]),
     url: z.union([z.string(), z.null()]),
   })
   .passthrough();
-const IssueStepChange = z
-  .object({
-    branch: z.union([z.string(), z.null()]).optional(),
-    commit_subjects: z.array(z.string()).optional(),
-    files_changed_count: z.union([z.number(), z.null()]).optional(),
-    head_sha: z.union([z.string(), z.null()]).optional(),
-    pr: z.number().int(),
-  })
-  .passthrough();
-const IssueStepEscalation = z
-  .object({
-    after_review_round: z.union([z.number(), z.null()]).optional(),
-    from_effort: z.union([z.string(), z.null()]).optional(),
-    notches: z.number().int(),
-    to_effort: z.union([z.string(), z.null()]).optional(),
-  })
-  .passthrough();
-const IssueStepReview = z
-  .object({
-    rejection: z.union([z.number(), z.null()]),
-    verdict_excerpt: z.union([z.string(), z.null()]),
-  })
-  .partial()
-  .passthrough();
 const TokenUsage = z
   .object({
-    cache_creation_input_tokens: z.union([z.number(), z.null()]),
-    cache_read_input_tokens: z.union([z.number(), z.null()]),
-    input_tokens: z.union([z.number(), z.null()]),
-    output_tokens: z.union([z.number(), z.null()]),
+    cache_read_tokens: z.number().int(),
+    cache_write_tokens: z.number().int(),
+    input_tokens: z.number().int(),
+    output_tokens: z.number().int(),
   })
   .passthrough();
 const IssueStep = z
   .object({
-    budget_cap_usd: z.union([z.number(), z.null()]).optional(),
-    change: z.union([IssueStepChange, z.null()]).optional(),
-    cost_usd: z.union([z.number(), z.null()]),
+    cost_usd: z.number(),
     duration_s: z.union([z.number(), z.null()]),
-    effort: z.union([z.string(), z.null()]).optional(),
-    escalation: z.union([IssueStepEscalation, z.null()]).optional(),
+    end_reason: z.union([z.string(), z.null()]),
+    ended_ts: z.union([z.string(), z.null()]),
     estimated: z.boolean(),
-    exit_reason: z.union([z.string(), z.null()]),
-    has_transcript: z.boolean(),
+    head: z.union([z.string(), z.null()]),
     idx: z.number().int(),
     kind: z.string(),
-    model: z.union([z.string(), z.null()]),
-    note: z.union([z.string(), z.null()]).optional(),
-    pricing_basis: z.union([z.string(), z.null()]).optional(),
-    review: z.union([IssueStepReview, z.null()]).optional(),
+    leg_id: z.string(),
+    outcome: z.enum([
+      "running",
+      "passed",
+      "changes_requested",
+      "asked",
+      "failed",
+      "done",
+    ]),
+    pr: z.union([z.number(), z.null()]),
+    pricing_basis: z.union([z.string(), z.null()]),
+    question: z.union([z.string(), z.null()]).optional(),
     role: z.union([z.string(), z.null()]),
-    runtime: z.union([z.string(), z.null()]).optional(),
+    runtime: z.union([z.string(), z.null()]),
     session_id: z.union([z.string(), z.null()]),
-    state: z.string(),
-    status: z.union([z.string(), z.null()]),
-    ts: z.union([z.string(), z.null()]),
-    turns: z.union([z.number(), z.null()]),
+    started_ts: z.union([z.string(), z.null()]),
+    state: z.enum(["reserved", "running", "ended", "released"]),
+    summary: z.union([z.string(), z.null()]).optional(),
     usage: z.union([TokenUsage, z.null()]),
+    verdict: z.union([z.string(), z.null()]).optional(),
+    verdict_excerpt: z.union([z.string(), z.null()]).optional(),
   })
   .passthrough();
 const IssueDetailPayload = z
   .object({
-    attention_reason: z.union([z.string(), z.null()]).optional(),
-    cost_usd: z.union([z.number(), z.null()]),
+    action: z.union([z.enum(["unblock", "open"]), z.null()]).optional(),
+    board: z
+      .union([
+        z.discriminatedUnion("status", [
+          BoardNeedsYou,
+          BoardWorking,
+          BoardWaiting,
+        ]),
+        z.null(),
+      ])
+      .optional(),
+    cost_usd: z.number(),
     done: z.boolean(),
-    elapsed_s: z.union([z.number(), z.null()]),
-    escalation_reason: z.union([z.string(), z.null()]).optional(),
-    events: z.array(z.object({}).partial().passthrough()),
-    harness_message: z.union([z.string(), z.null()]).optional(),
+    estimated: z.boolean(),
     held_for_human: z.boolean().optional().default(false),
     history: z.array(StageVisit).optional().default([]),
-    idle_active: z.boolean(),
-    idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
-    leg_running: z.boolean().optional().default(false),
-    pr_ci_state: z
-      .union([z.enum(["passing", "failing", "pending"]), z.null()])
-      .optional(),
-    prs: z.array(z.number().int()),
+    labels: z.array(z.string()).optional().default([]),
     pull_requests: z.array(PullRequestLink),
     rail: z.union([StageRail, z.null()]).optional(),
-    stage: z.union([z.string(), z.null()]),
     steps: z.array(IssueStep),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
     warnings: z.array(z.string()),
-    working_s: z.union([z.number(), z.null()]),
   })
   .passthrough();
 const ActionResult = z
   .object({ detail: z.string(), ok: z.boolean() })
-  .passthrough();
-const StepEventsPayload = z
-  .object({
-    events: z.array(z.object({}).partial().passthrough()),
-    warnings: z.array(z.string()),
-  })
   .passthrough();
 const UnblockRequest = z.object({}).partial();
 const api_unblock_api_repos__name__issues__number__unblock_post_Body = z.union([
@@ -379,74 +291,56 @@ const timezone = z.union([z.string(), z.null()]).optional();
 const Caps = z
   .object({
     daily_cap_usd: z.union([z.number(), z.null()]),
+    global_daily_cap_usd: z.union([z.number(), z.null()]),
     issue_cap_usd: z.union([z.number(), z.null()]),
     today_usd: z.union([z.number(), z.null()]),
-  })
-  .passthrough();
-const CostMix = z
-  .object({
-    repair_usd: z.union([z.number(), z.null()]),
-    resolve_usd: z.union([z.number(), z.null()]),
-    review_usd: z.union([z.number(), z.null()]),
-  })
-  .passthrough();
-const EscalationReason = z
-  .object({
-    issue: z.number().int(),
-    reason: z.union([z.string(), z.null()]).optional(),
   })
   .passthrough();
 const HealthTrendDay = z
   .object({
     closed: z.number().int(),
     day: z.string(),
-    first_observation: z.boolean(),
     net_open: z.number().int(),
     opened: z.number().int(),
-    recurrences: z.number().int(),
   })
   .passthrough();
-const InterventionEvent = z
-  .object({
-    action_class: z.string(),
-    detail: z.union([z.string(), z.null()]).optional(),
-    issue: z.union([z.number(), z.null()]).optional(),
-    kind: z.string(),
-    pr: z.union([z.number(), z.null()]).optional(),
-    ts: z.union([z.string(), z.null()]),
-  })
+const BasisCost = z
+  .object({ basis: z.string(), usd: z.number() })
   .passthrough();
 const KindCost = z
   .object({ kind: z.string(), runs: z.number().int(), usd: z.number() })
   .passthrough();
-const InterventionCount = z
-  .object({ count: z.number().int(), name: z.string() })
-  .passthrough();
 const Metrics = z
   .object({
+    by_basis: z.array(BasisCost),
     by_kind: z.array(KindCost),
-    cost_per_done_usd: z.union([z.number(), z.null()]),
-    done_issues: z.number().int(),
-    escalations: z.number().int(),
-    first_pass_approvals: z.union([z.number(), z.null()]),
-    first_pass_changes: z.union([z.number(), z.null()]),
+    cost_per_merged_pr_usd: z.union([z.number(), z.null()]),
+    first_pass_approvals: z.number().int(),
+    first_pass_changes: z.number().int(),
     first_pass_rate: z.union([z.number(), z.null()]),
-    in_flight_issues: z.number().int(),
-    interventions_by_class: z.array(InterventionCount).optional().default([]),
-    interventions_per_merged_pr: z.union([z.number(), z.null()]).optional(),
-    interventions_total: z.number().int().optional().default(0),
-    recurrences: z.number().int(),
+    legs: z.number().int(),
+    machine_legs: z.number().int(),
+    merged_prs: z.union([z.number(), z.null()]),
+    needs_human: z.union([z.number(), z.null()]),
+    open_items: z.union([z.number(), z.null()]),
     rounds_per_pr: z.union([z.number(), z.null()]),
-    spend_blocks: z.number().int(),
-    today_usd: z.union([z.number(), z.null()]),
-    total_cost_usd: z.union([z.number(), z.null()]),
+    today_usd: z.number(),
+    total_cost_usd: z.number(),
   })
   .passthrough();
 const AttentionItem = z
   .object({
     detail: z.union([z.string(), z.null()]).optional(),
+    headline: z.string(),
     issue: z.number().int(),
-    kind: z.string(),
+    reason: z.enum([
+      "question",
+      "attempts",
+      "review-rounds",
+      "lifetime-cap",
+      "workflow-path",
+      "labelled",
+    ]),
     title: z.union([z.string(), z.null()]).optional(),
   })
   .passthrough();
@@ -456,16 +350,11 @@ const SpendBucket = z
 const OverviewPayload = z
   .object({
     caps: z.union([Caps, z.null()]),
-    cost_mix: z.union([CostMix, z.null()]),
-    escalation_reasons: z.array(EscalationReason).optional().default([]),
-    first_observed_day: z.union([z.string(), z.null()]).optional(),
     health: z.array(RoleHealth),
-    health_trend: z.array(HealthTrendDay),
-    interventions: z.array(InterventionEvent).optional().default([]),
+    health_trend: z.array(HealthTrendDay).optional().default([]),
     metrics: z.union([Metrics, z.null()]),
     needs_attention: z.array(AttentionItem).optional().default([]),
     spend_per_hour: z.array(SpendBucket).optional().default([]),
-    unattributed_count: z.number().int().optional().default(0),
     warnings: z.array(z.string()),
   })
   .passthrough();
@@ -533,44 +422,30 @@ export const schemas = {
   RepoSummary,
   ReposPayload,
   BacklogCard,
+  DoneCard,
   BoardNeedsYou,
   BoardWorking,
-  BlockedOnIssue,
-  BlockedOnPr,
-  BlockedOnOverlap,
-  BlockedOnTriage,
-  BlockedOnQueue,
-  BoardBlocked,
-  ModelBadge,
+  BoardWaiting,
+  TrackChip,
+  StageVisit,
   StageRail,
-  CardStep,
   IssueCard,
   ToastNotification,
-  PendingCard,
   IssuesPayload,
   ValidationError,
   HTTPValidationError,
-  TrackChip,
-  StageVisit,
   PullRequestLink,
-  IssueStepChange,
-  IssueStepEscalation,
-  IssueStepReview,
   TokenUsage,
   IssueStep,
   IssueDetailPayload,
   ActionResult,
-  StepEventsPayload,
   UnblockRequest,
   api_unblock_api_repos__name__issues__number__unblock_post_Body,
   timezone,
   Caps,
-  CostMix,
-  EscalationReason,
   HealthTrendDay,
-  InterventionEvent,
+  BasisCost,
   KindCost,
-  InterventionCount,
   Metrics,
   AttentionItem,
   SpendBucket,
@@ -630,11 +505,11 @@ const endpoints = makeApi([
     response: z
       .object({
         backlog: z.array(BacklogCard),
-        done: z.array(IssueCard),
+        done: z.array(DoneCard),
         gh_ok: z.boolean(),
         in_flight: z.array(IssueCard),
         notifications: z.array(ToastNotification).optional().default([]),
-        pending: z.array(PendingCard),
+        observed_at: z.union([z.string(), z.null()]).optional(),
         warnings: z.array(z.string()),
       })
       .passthrough(),
@@ -665,64 +540,32 @@ const endpoints = makeApi([
     ],
     response: z
       .object({
-        attention_reason: z.union([z.string(), z.null()]).optional(),
-        cost_usd: z.union([z.number(), z.null()]),
+        action: z.union([z.enum(["unblock", "open"]), z.null()]).optional(),
+        board: z
+          .union([
+            z.discriminatedUnion("status", [
+              BoardNeedsYou,
+              BoardWorking,
+              BoardWaiting,
+            ]),
+            z.null(),
+          ])
+          .optional(),
+        cost_usd: z.number(),
         done: z.boolean(),
-        elapsed_s: z.union([z.number(), z.null()]),
-        escalation_reason: z.union([z.string(), z.null()]).optional(),
-        events: z.array(z.object({}).partial().passthrough()),
-        harness_message: z.union([z.string(), z.null()]).optional(),
+        estimated: z.boolean(),
         held_for_human: z.boolean().optional().default(false),
         history: z.array(StageVisit).optional().default([]),
-        idle_active: z.boolean(),
-        idle_s: z.union([z.number(), z.null()]),
         issue: z.number().int(),
-        leg_running: z.boolean().optional().default(false),
-        pr_ci_state: z
-          .union([z.enum(["passing", "failing", "pending"]), z.null()])
-          .optional(),
-        prs: z.array(z.number().int()),
+        labels: z.array(z.string()).optional().default([]),
         pull_requests: z.array(PullRequestLink),
         rail: z.union([StageRail, z.null()]).optional(),
-        stage: z.union([z.string(), z.null()]),
         steps: z.array(IssueStep),
         title: z.union([z.string(), z.null()]),
         url: z.union([z.string(), z.null()]),
         warnings: z.array(z.string()),
-        working_s: z.union([z.number(), z.null()]),
       })
       .passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "get",
-    path: "/api/repos/:name/issues/:number/cost-chart",
-    alias: "api_cost_chart_api_repos__name__issues__number__cost_chart_get",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-      {
-        name: "session_id",
-        type: "Query",
-        schema: z.string().optional().default(""),
-      },
-    ],
-    response: z.unknown(),
     errors: [
       {
         status: 422,
@@ -784,43 +627,6 @@ const endpoints = makeApi([
     ],
   },
   {
-    method: "get",
-    path: "/api/repos/:name/issues/:number/steps/:idx/events",
-    alias:
-      "api_step_events_api_repos__name__issues__number__steps__idx__events_get",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-      {
-        name: "number",
-        type: "Path",
-        schema: z.number().int(),
-      },
-      {
-        name: "idx",
-        type: "Path",
-        schema: z.number().int(),
-      },
-    ],
-    response: z
-      .object({
-        events: z.array(z.object({}).partial().passthrough()),
-        warnings: z.array(z.string()),
-      })
-      .passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
     method: "post",
     path: "/api/repos/:name/issues/:number/unblock",
     alias: "api_unblock_api_repos__name__issues__number__unblock_post",
@@ -871,40 +677,14 @@ const endpoints = makeApi([
     response: z
       .object({
         caps: z.union([Caps, z.null()]),
-        cost_mix: z.union([CostMix, z.null()]),
-        escalation_reasons: z.array(EscalationReason).optional().default([]),
-        first_observed_day: z.union([z.string(), z.null()]).optional(),
         health: z.array(RoleHealth),
-        health_trend: z.array(HealthTrendDay),
-        interventions: z.array(InterventionEvent).optional().default([]),
+        health_trend: z.array(HealthTrendDay).optional().default([]),
         metrics: z.union([Metrics, z.null()]),
         needs_attention: z.array(AttentionItem).optional().default([]),
         spend_per_hour: z.array(SpendBucket).optional().default([]),
-        unattributed_count: z.number().int().optional().default(0),
         warnings: z.array(z.string()),
       })
       .passthrough(),
-    errors: [
-      {
-        status: 422,
-        description: `Validation Error`,
-        schema: HTTPValidationError,
-      },
-    ],
-  },
-  {
-    method: "post",
-    path: "/api/repos/:name/start",
-    alias: "api_start_api_repos__name__start_post",
-    requestFormat: "json",
-    parameters: [
-      {
-        name: "name",
-        type: "Path",
-        schema: z.string(),
-      },
-    ],
-    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
     errors: [
       {
         status: 422,

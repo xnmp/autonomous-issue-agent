@@ -1,109 +1,85 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { Metrics, OverviewPayload } from "../api/types";
 import { OverviewTab } from "./OverviewTab";
 
-const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+const metrics: Metrics = {
+  merged_prs: 4, open_items: 3, needs_human: 1, total_cost_usd: 20, cost_per_merged_pr_usd: 5,
+  by_basis: [{ basis: "provider_reported", usd: 20 }],
+  by_kind: [{ kind: "RESOLVE", usd: 12, runs: 4 }, { kind: "REVIEW", usd: 5, runs: 5 }, { kind: "FIX_CI", usd: 3, runs: 2 }],
+  first_pass_approvals: 3, first_pass_changes: 1, first_pass_rate: 0.75, rounds_per_pr: 1.25,
+  legs: 11, machine_legs: 1, today_usd: 2,
+};
 
-afterEach(() => {
-  if (originalClipboard) {
-    Object.defineProperty(navigator, "clipboard", originalClipboard);
-  } else {
-    Reflect.deleteProperty(navigator, "clipboard");
-  }
-});
-
-function overview(interventionCount = 0) {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      metrics: null,
-      cost_mix: null,
-      caps: { issue_cap_usd: 5, daily_cap_usd: 10, today_usd: 2 },
-      health: [{
-        role: "fix",
-        alive: true,
-        stale: false,
-        last_event_ts: "2026-08-01T08:00:00Z",
-        last_event: "tick",
-        events: 4,
-        log_path: "/logs/fix.log",
-      }],
-      health_trend: [],
-      needs_attention: [{ issue: 50, kind: "blocked", title: "Needs a decision" }],
-      interventions: Array.from({ length: interventionCount }, (_, index) => ({
-        ts: `2026-08-01T08:${String(index).padStart(2, "0")}:00Z`,
-        action_class: index === 7 ? "policy" : "guidance",
-        issue: 50 + index,
-        kind: index === 7 ? "promote needle" : `rearm ${index}`,
-        detail: null,
-      })),
-      spend_per_hour: [],
-      warnings: [],
-    }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    })),
+function overview(over: Partial<OverviewPayload> = {}) {
+  const body: OverviewPayload = {
+    metrics,
+    caps: { issue_cap_usd: 5, daily_cap_usd: 10, global_daily_cap_usd: 40, today_usd: 2 },
+    health: [{ role: "fix", alive: true, stale: false, heartbeat_ts: "2026-08-01T08:00:00Z" }],
+    health_trend: [],
+    needs_attention: [{
+      issue: 50, title: "Needs a decision", reason: "question", headline: "Answer the agent's question",
+      detail: "Which endpoint should retries use?",
+    }],
+    spend_per_hour: [],
+    warnings: [],
+    ...over,
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
+    status: 200, headers: { "Content-Type": "application/json" },
+  })));
+  const onOpenIssues = vi.fn();
+  const view = render(
+    <OverviewTab repo="demo" onOpenIssues={onOpenIssues} showDaemonHealth showIssueHealthTrend />,
   );
-  return render(
-    <OverviewTab
-      repo="demo"
-      onOpenIssues={vi.fn()}
-      showDaemonHealth
-      showIssueHealthTrend
-    />,
-  );
+  return { ...view, onOpenIssues };
 }
 
-describe("OverviewTab hierarchy", () => {
-  it("leads with compact metrics and removes redundant page and attention headings", async () => {
+describe("OverviewTab", () => {
+  it("leads with the metrics folded from legs and merges, then the items waiting on a person", async () => {
     const { container } = overview();
 
     const health = (await screen.findByText("Daemon health")).closest("section");
-    const actions = screen.getByText("Operator actions").closest("section");
-    const metrics = container.querySelector(".overview-metrics");
-
-    expect(health).not.toBeNull();
-    expect(actions).not.toBeNull();
-    expect(metrics).not.toBeNull();
-    expect(metrics!.compareDocumentPosition(health!) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy();
-    expect(metrics!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy();
-    // No VISIBLE page heading — but screen-reader heading navigation keeps one.
+    const attention = screen.getByText("Needs you", { selector: ".panel-title" }).closest("section");
+    const tiles = container.querySelector(".overview-metrics");
+    expect(tiles!.compareDocumentPosition(health!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(tiles!.compareDocumentPosition(attention!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Overview" })).toHaveClass("sr-only");
-    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
-    expect(screen.queryByText(/Reconciles every/)).not.toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent(
-      "$2.00today / $10.00",
-    );
-    expect(screen.queryByText("$ today")).not.toBeInTheDocument();
-    expect(screen.queryByText("Active lifecycle")).not.toBeInTheDocument();
-    expect(screen.queryByText("Cost mix by task family")).not.toBeInTheDocument();
-    expect(screen.queryByText("Spend by task type")).not.toBeInTheDocument();
+
+    expect(screen.getByText("$ per merged PR").closest(".tile")).toHaveTextContent("$5");
+    expect(screen.getByText("$ per merged PR").closest(".tile")).toHaveTextContent("$20.00 total");
+    expect(screen.getByText("First-pass rate").closest(".tile")).toHaveTextContent("3 approve / 1 changes");
+    expect(screen.getByText("Legs").closest(".tile")).toHaveTextContent("resolve $12.00 · review $5.00 · repair $3.00");
+    expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent("$2.00today / $10.00");
+    expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent("All repos $40.00");
   });
 
-  it("shows the operator-action timeline without a filter control", async () => {
-    overview(12);
-
-    expect(await screen.findByText("promote needle")).toBeVisible();
-    expect(screen.getByText("rearm 0")).toBeVisible();
-    expect(screen.queryByRole("searchbox", { name: "Filter operator actions" }))
-      .not.toBeInTheDocument();
-  });
-
-  it("copies a daemon log path from its icon and confirms the action", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
+  it("lists each item stopped for a person with its stop, as text", async () => {
     overview();
 
-    await userEvent.click(await screen.findByRole("button", { name: "Copy fix log path" }));
+    expect(await screen.findByText("Answer the agent's question")).toBeVisible();
+    expect(screen.getByText(/Which endpoint should retries use\?/)).toBeVisible();
+    expect(screen.getByText("#50")).toBeVisible();
+  });
 
-    expect(writeText).toHaveBeenCalledWith("/logs/fix.log");
-    expect(screen.getByRole("status")).toHaveTextContent("Log path copied");
-    expect(document.querySelector(".health-row")).not.toHaveTextContent("/logs/fix.log");
+  it("says when nothing waits on a person, and reports unknown merges as unknown, not zero", async () => {
+    overview({ needs_attention: [], metrics: { ...metrics, merged_prs: null, cost_per_merged_pr_usd: null } });
+
+    expect(await screen.findByText(/nothing is waiting on you/)).toBeVisible();
+    expect(screen.getByText("Merged").closest(".tile")).toHaveTextContent("GitHub not read yet");
+    expect(screen.getByText("Merged").closest(".tile")).not.toHaveTextContent(/\b0\b/);
+  });
+
+  it("opens the in-flight board from the Needs-you tile", async () => {
+    const { onOpenIssues } = overview();
+
+    await userEvent.click((await screen.findByText("Needs you", { selector: ".tile-label" })).closest("button")!);
+    expect(onOpenIssues).toHaveBeenCalledWith("inflight");
+  });
+
+  it("shows each role's last heartbeat", async () => {
+    overview();
+    expect(await screen.findByText(/heartbeat/, { selector: ".health-row span" })).toBeVisible();
   });
 });

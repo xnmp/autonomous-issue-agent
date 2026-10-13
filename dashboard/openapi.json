@@ -34,12 +34,24 @@
             ],
             "title": "Detail"
           },
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
           "issue": {
             "title": "Issue",
             "type": "integer"
           },
-          "kind": {
-            "title": "Kind",
+          "reason": {
+            "enum": [
+              "question",
+              "attempts",
+              "review-rounds",
+              "lifetime-cap",
+              "workflow-path",
+              "labelled"
+            ],
+            "title": "Reason",
             "type": "string"
           },
           "title": {
@@ -56,7 +68,8 @@
         },
         "required": [
           "issue",
-          "kind"
+          "reason",
+          "headline"
         ],
         "title": "AttentionItem",
         "type": "object"
@@ -152,14 +165,6 @@
             "title": "Labels",
             "type": "array"
           },
-          "recurrence": {
-            "title": "Recurrence",
-            "type": "boolean"
-          },
-          "recurrence_count": {
-            "title": "Recurrence Count",
-            "type": "integer"
-          },
           "title": {
             "anyOf": [
               {
@@ -189,196 +194,35 @@
           "url",
           "body",
           "labels",
-          "recurrence",
-          "recurrence_count",
           "age_days",
           "comments"
         ],
         "title": "BacklogCard",
         "type": "object"
       },
-      "BlockedOnIssue": {
+      "BasisCost": {
         "additionalProperties": true,
         "properties": {
-          "issue": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Issue"
-          },
-          "kind": {
-            "const": "issue",
-            "enum": [
-              "issue"
-            ],
-            "title": "Kind",
+          "basis": {
+            "title": "Basis",
             "type": "string"
+          },
+          "usd": {
+            "title": "Usd",
+            "type": "number"
           }
         },
         "required": [
-          "kind",
-          "issue"
+          "basis",
+          "usd"
         ],
-        "title": "BlockedOnIssue",
+        "title": "BasisCost",
         "type": "object"
       },
-      "BlockedOnOverlap": {
+      "BoardNeedsYou": {
         "additionalProperties": true,
         "properties": {
-          "issue": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Issue"
-          },
-          "kind": {
-            "const": "overlap",
-            "enum": [
-              "overlap"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "pr": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr"
-          }
-        },
-        "required": [
-          "kind",
-          "issue",
-          "pr"
-        ],
-        "title": "BlockedOnOverlap",
-        "type": "object"
-      },
-      "BlockedOnPr": {
-        "additionalProperties": true,
-        "properties": {
-          "kind": {
-            "const": "pr",
-            "enum": [
-              "pr"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "pr": {
-            "title": "Pr",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "kind",
-          "pr"
-        ],
-        "title": "BlockedOnPr",
-        "type": "object"
-      },
-      "BlockedOnQueue": {
-        "additionalProperties": true,
-        "properties": {
-          "kind": {
-            "const": "queue",
-            "enum": [
-              "queue"
-            ],
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind"
-        ],
-        "title": "BlockedOnQueue",
-        "type": "object"
-      },
-      "BlockedOnTriage": {
-        "additionalProperties": true,
-        "properties": {
-          "kind": {
-            "const": "triage",
-            "enum": [
-              "triage"
-            ],
-            "title": "Kind",
-            "type": "string"
-          },
-          "why": {
-            "const": "parked",
-            "enum": [
-              "parked"
-            ],
-            "title": "Why",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "why"
-        ],
-        "title": "BlockedOnTriage",
-        "type": "object"
-      },
-      "BoardBlocked": {
-        "additionalProperties": true,
-        "properties": {
-          "headline": {
-            "title": "Headline",
-            "type": "string"
-          },
-          "on": {
-            "discriminator": {
-              "mapping": {
-                "issue": "#/components/schemas/BlockedOnIssue",
-                "overlap": "#/components/schemas/BlockedOnOverlap",
-                "pr": "#/components/schemas/BlockedOnPr",
-                "queue": "#/components/schemas/BlockedOnQueue",
-                "triage": "#/components/schemas/BlockedOnTriage"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/BlockedOnIssue"
-              },
-              {
-                "$ref": "#/components/schemas/BlockedOnPr"
-              },
-              {
-                "$ref": "#/components/schemas/BlockedOnOverlap"
-              },
-              {
-                "$ref": "#/components/schemas/BlockedOnTriage"
-              },
-              {
-                "$ref": "#/components/schemas/BlockedOnQueue"
-              }
-            ],
-            "title": "On"
-          },
-          "reason": {
-            "title": "Reason",
-            "type": "string"
-          },
-          "since_ts": {
+          "detail": {
             "anyOf": [
               {
                 "type": "string"
@@ -387,47 +231,25 @@
                 "type": "null"
               }
             ],
-            "title": "Since Ts"
-          },
-          "status": {
-            "const": "blocked",
-            "enum": [
-              "blocked"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "on",
-          "headline",
-          "reason",
-          "since_ts"
-        ],
-        "title": "BoardBlocked",
-        "type": "object"
-      },
-      "BoardNeedsYou": {
-        "additionalProperties": true,
-        "properties": {
-          "ask": {
-            "enum": [
-              "rearm",
-              "escalated",
-              "budget",
-              "awaiting_reply",
-              "merge",
-              "stalled"
-            ],
-            "title": "Ask",
-            "type": "string"
+            "title": "Detail"
           },
           "headline": {
             "title": "Headline",
             "type": "string"
           },
+          "hint": {
+            "title": "Hint",
+            "type": "string"
+          },
           "reason": {
+            "enum": [
+              "question",
+              "attempts",
+              "review-rounds",
+              "lifetime-cap",
+              "workflow-path",
+              "labelled"
+            ],
             "title": "Reason",
             "type": "string"
           },
@@ -449,27 +271,114 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "target": {
+            "enum": [
+              "issue",
+              "pr"
+            ],
+            "title": "Target",
+            "type": "string"
           }
         },
         "required": [
           "status",
-          "ask",
-          "headline",
           "reason",
+          "headline",
+          "hint",
+          "detail",
+          "target",
           "since_ts"
         ],
         "title": "BoardNeedsYou",
         "type": "object"
       },
+      "BoardWaiting": {
+        "additionalProperties": true,
+        "properties": {
+          "headline": {
+            "title": "Headline",
+            "type": "string"
+          },
+          "on": {
+            "enum": [
+              "branch-protection",
+              "human-review",
+              "headroom",
+              "backoff",
+              "github"
+            ],
+            "title": "On",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "since_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Since Ts"
+          },
+          "status": {
+            "const": "waiting",
+            "enum": [
+              "waiting"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "until_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until Ts"
+          }
+        },
+        "required": [
+          "status",
+          "on",
+          "headline",
+          "reason",
+          "since_ts"
+        ],
+        "title": "BoardWaiting",
+        "type": "object"
+      },
       "BoardWorking": {
         "additionalProperties": true,
         "properties": {
+          "act": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Act"
+          },
           "activity": {
             "enum": [
               "agent",
+              "queued",
               "ci",
               "merge",
-              "handoff"
+              "update",
+              "open_pr",
+              "release"
             ],
             "title": "Activity",
             "type": "string"
@@ -505,6 +414,7 @@
         "required": [
           "status",
           "activity",
+          "act",
           "headline",
           "reason",
           "since_ts"
@@ -525,6 +435,17 @@
               }
             ],
             "title": "Daily Cap Usd"
+          },
+          "global_daily_cap_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Global Daily Cap Usd"
           },
           "issue_cap_usd": {
             "anyOf": [
@@ -552,57 +473,10 @@
         "required": [
           "issue_cap_usd",
           "daily_cap_usd",
+          "global_daily_cap_usd",
           "today_usd"
         ],
         "title": "Caps",
-        "type": "object"
-      },
-      "CardStep": {
-        "additionalProperties": true,
-        "properties": {
-          "cost_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Cost Usd"
-          },
-          "count": {
-            "default": 1,
-            "title": "Count",
-            "type": "integer"
-          },
-          "kind": {
-            "title": "Kind",
-            "type": "string"
-          },
-          "state": {
-            "title": "State",
-            "type": "string"
-          },
-          "status": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Status"
-          }
-        },
-        "required": [
-          "kind",
-          "state",
-          "status",
-          "cost_usd"
-        ],
-        "title": "CardStep",
         "type": "object"
       },
       "ClaudeUsage": {
@@ -779,59 +653,31 @@
         "title": "CodexUsage",
         "type": "object"
       },
-      "CostMix": {
+      "DoneCard": {
         "additionalProperties": true,
+        "description": "A merged harness PR.",
         "properties": {
-          "repair_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repair Usd"
+          "cost_usd": {
+            "title": "Cost Usd",
+            "type": "number"
           },
-          "resolve_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Resolve Usd"
-          },
-          "review_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Review Usd"
-          }
-        },
-        "required": [
-          "resolve_usd",
-          "review_usd",
-          "repair_usd"
-        ],
-        "title": "CostMix",
-        "type": "object"
-      },
-      "EscalationReason": {
-        "additionalProperties": true,
-        "properties": {
           "issue": {
             "title": "Issue",
             "type": "integer"
           },
-          "reason": {
+          "labels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "array"
+          },
+          "legs": {
+            "title": "Legs",
+            "type": "integer"
+          },
+          "merged_ts": {
             "anyOf": [
               {
                 "type": "string"
@@ -840,13 +686,62 @@
                 "type": "null"
               }
             ],
-            "title": "Reason"
+            "title": "Merged Ts"
+          },
+          "pr": {
+            "title": "Pr",
+            "type": "integer"
+          },
+          "pr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Url"
+          },
+          "review_rounds": {
+            "title": "Review Rounds",
+            "type": "integer"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
           }
         },
         "required": [
-          "issue"
+          "issue",
+          "title",
+          "url",
+          "pr",
+          "pr_url",
+          "merged_ts",
+          "cost_usd",
+          "legs",
+          "review_rounds"
         ],
-        "title": "EscalationReason",
+        "title": "DoneCard",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -963,10 +858,6 @@
             "title": "Day",
             "type": "string"
           },
-          "first_observation": {
-            "title": "First Observation",
-            "type": "boolean"
-          },
           "net_open": {
             "title": "Net Open",
             "type": "integer"
@@ -974,208 +865,77 @@
           "opened": {
             "title": "Opened",
             "type": "integer"
-          },
-          "recurrences": {
-            "title": "Recurrences",
-            "type": "integer"
           }
         },
         "required": [
           "day",
           "opened",
           "closed",
-          "net_open",
-          "recurrences",
-          "first_observation"
+          "net_open"
         ],
         "title": "HealthTrendDay",
         "type": "object"
       },
-      "InterventionCount": {
-        "additionalProperties": true,
-        "properties": {
-          "count": {
-            "title": "Count",
-            "type": "integer"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "count"
-        ],
-        "title": "InterventionCount",
-        "type": "object"
-      },
-      "InterventionEvent": {
-        "additionalProperties": true,
-        "properties": {
-          "action_class": {
-            "title": "Action Class",
-            "type": "string"
-          },
-          "detail": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Detail"
-          },
-          "issue": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Issue"
-          },
-          "kind": {
-            "title": "Kind",
-            "type": "string"
-          },
-          "pr": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr"
-          },
-          "ts": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Ts"
-          }
-        },
-        "required": [
-          "ts",
-          "action_class",
-          "kind"
-        ],
-        "title": "InterventionEvent",
-        "type": "object"
-      },
       "IssueCard": {
         "additionalProperties": true,
+        "description": "One board row: a harness item, by its issue.",
         "properties": {
-          "board": {
+          "action": {
             "anyOf": [
               {
-                "discriminator": {
-                  "mapping": {
-                    "blocked": "#/components/schemas/BoardBlocked",
-                    "needs_you": "#/components/schemas/BoardNeedsYou",
-                    "working": "#/components/schemas/BoardWorking"
-                  },
-                  "propertyName": "status"
-                },
-                "oneOf": [
-                  {
-                    "$ref": "#/components/schemas/BoardNeedsYou"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BoardWorking"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BoardBlocked"
-                  }
-                ]
+                "enum": [
+                  "unblock",
+                  "open"
+                ],
+                "type": "string"
               },
               {
                 "type": "null"
+              }
+            ],
+            "title": "Action"
+          },
+          "board": {
+            "discriminator": {
+              "mapping": {
+                "needs_you": "#/components/schemas/BoardNeedsYou",
+                "waiting": "#/components/schemas/BoardWaiting",
+                "working": "#/components/schemas/BoardWorking"
+              },
+              "propertyName": "status"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BoardNeedsYou"
+              },
+              {
+                "$ref": "#/components/schemas/BoardWorking"
+              },
+              {
+                "$ref": "#/components/schemas/BoardWaiting"
               }
             ],
             "title": "Board"
           },
           "cost_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Cost Usd"
-          },
-          "done": {
-            "title": "Done",
-            "type": "boolean"
-          },
-          "elapsed_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Elapsed S"
+            "title": "Cost Usd",
+            "type": "number"
           },
           "estimated": {
             "title": "Estimated",
             "type": "boolean"
           },
-          "idle_active": {
-            "title": "Idle Active",
-            "type": "boolean"
-          },
-          "idle_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Idle S"
+          "history": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/StageVisit"
+            },
+            "title": "History",
+            "type": "array"
           },
           "issue": {
             "title": "Issue",
             "type": "integer"
-          },
-          "issue_verification": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Issue Verification"
-          },
-          "issue_verification_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Issue Verification Reason"
           },
           "labels": {
             "default": [],
@@ -1197,46 +957,12 @@
             "title": "Last Ts"
           },
           "leg_running": {
-            "default": false,
             "title": "Leg Running",
             "type": "boolean"
           },
-          "merged_ts": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Merged Ts"
-          },
-          "model_badges": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/ModelBadge"
-            },
-            "title": "Model Badges",
-            "type": "array"
-          },
-          "models": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Models",
-            "type": "array"
-          },
-          "overspend_ratio": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Overspend Ratio"
+          "legs": {
+            "title": "Legs",
+            "type": "integer"
           },
           "pr": {
             "anyOf": [
@@ -1265,32 +991,6 @@
             ],
             "title": "Pr Ci State"
           },
-          "pr_review_state": {
-            "anyOf": [
-              {
-                "enum": [
-                  "mergeable",
-                  "changes_requested"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr Review State"
-          },
-          "pr_state": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr State"
-          },
           "pr_url": {
             "anyOf": [
               {
@@ -1302,81 +1002,8 @@
             ],
             "title": "Pr Url"
           },
-          "pr_verification": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr Verification"
-          },
-          "pr_verification_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr Verification Reason"
-          },
-          "projected_cost_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Projected Cost Usd"
-          },
-          "projected_model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Projected Model"
-          },
           "rail": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/StageRail"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "rounds": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rounds"
-          },
-          "stage": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Stage"
+            "$ref": "#/components/schemas/StageRail"
           },
           "started_ts": {
             "anyOf": [
@@ -1388,30 +1015,6 @@
               }
             ],
             "title": "Started Ts"
-          },
-          "steps": {
-            "items": {
-              "$ref": "#/components/schemas/CardStep"
-            },
-            "title": "Steps",
-            "type": "array"
-          },
-          "tier": {
-            "anyOf": [
-              {
-                "enum": [
-                  "trivial",
-                  "standard",
-                  "complex",
-                  "exceptional"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Tier"
           },
           "title": {
             "anyOf": [
@@ -1434,17 +1037,6 @@
               }
             ],
             "title": "Url"
-          },
-          "working_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Working S"
           }
         },
         "required": [
@@ -1453,21 +1045,14 @@
           "url",
           "pr",
           "pr_url",
-          "pr_state",
-          "stage",
-          "done",
-          "steps",
+          "board",
+          "rail",
           "cost_usd",
           "estimated",
-          "projected_cost_usd",
+          "legs",
           "started_ts",
           "last_ts",
-          "elapsed_s",
-          "working_s",
-          "idle_s",
-          "idle_active",
-          "models",
-          "rounds"
+          "leg_running"
         ],
         "title": "IssueCard",
         "type": "object"
@@ -1475,72 +1060,61 @@
       "IssueDetailPayload": {
         "additionalProperties": true,
         "properties": {
-          "attention_reason": {
+          "action": {
             "anyOf": [
               {
+                "enum": [
+                  "unblock",
+                  "open"
+                ],
                 "type": "string"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Attention Reason"
+            "title": "Action"
           },
-          "cost_usd": {
+          "board": {
             "anyOf": [
               {
-                "type": "number"
+                "discriminator": {
+                  "mapping": {
+                    "needs_you": "#/components/schemas/BoardNeedsYou",
+                    "waiting": "#/components/schemas/BoardWaiting",
+                    "working": "#/components/schemas/BoardWorking"
+                  },
+                  "propertyName": "status"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/BoardNeedsYou"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardWorking"
+                  },
+                  {
+                    "$ref": "#/components/schemas/BoardWaiting"
+                  }
+                ]
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Cost Usd"
+            "title": "Board"
+          },
+          "cost_usd": {
+            "title": "Cost Usd",
+            "type": "number"
           },
           "done": {
             "title": "Done",
             "type": "boolean"
           },
-          "elapsed_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Elapsed S"
-          },
-          "escalation_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Escalation Reason"
-          },
-          "events": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Events",
-            "type": "array"
-          },
-          "harness_message": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Harness Message"
+          "estimated": {
+            "title": "Estimated",
+            "type": "boolean"
           },
           "held_for_human": {
             "default": false,
@@ -1555,51 +1129,16 @@
             "title": "History",
             "type": "array"
           },
-          "idle_active": {
-            "title": "Idle Active",
-            "type": "boolean"
-          },
-          "idle_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Idle S"
-          },
           "issue": {
             "title": "Issue",
             "type": "integer"
           },
-          "leg_running": {
-            "default": false,
-            "title": "Leg Running",
-            "type": "boolean"
-          },
-          "pr_ci_state": {
-            "anyOf": [
-              {
-                "enum": [
-                  "passing",
-                  "failing",
-                  "pending"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr Ci State"
-          },
-          "prs": {
+          "labels": {
+            "default": [],
             "items": {
-              "type": "integer"
+              "type": "string"
             },
-            "title": "Prs",
+            "title": "Labels",
             "type": "array"
           },
           "pull_requests": {
@@ -1618,17 +1157,6 @@
                 "type": "null"
               }
             ]
-          },
-          "stage": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Stage"
           },
           "steps": {
             "items": {
@@ -1665,17 +1193,6 @@
             },
             "title": "Warnings",
             "type": "array"
-          },
-          "working_s": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Working S"
           }
         },
         "required": [
@@ -1683,55 +1200,22 @@
           "issue",
           "title",
           "url",
-          "stage",
           "done",
-          "prs",
           "pull_requests",
           "cost_usd",
-          "elapsed_s",
-          "working_s",
-          "idle_s",
-          "idle_active",
-          "steps",
-          "events"
+          "estimated",
+          "steps"
         ],
         "title": "IssueDetailPayload",
         "type": "object"
       },
       "IssueStep": {
         "additionalProperties": true,
+        "description": "One leg.",
         "properties": {
-          "budget_cap_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Budget Cap Usd"
-          },
-          "change": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/IssueStepChange"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "cost_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Cost Usd"
+            "title": "Cost Usd",
+            "type": "number"
           },
           "duration_s": {
             "anyOf": [
@@ -1744,7 +1228,7 @@
             ],
             "title": "Duration S"
           },
-          "effort": {
+          "end_reason": {
             "anyOf": [
               {
                 "type": "string"
@@ -1753,23 +1237,24 @@
                 "type": "null"
               }
             ],
-            "title": "Effort"
+            "title": "End Reason"
           },
-          "escalation": {
+          "ended_ts": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/IssueStepEscalation"
+                "type": "string"
               },
               {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Ended Ts"
           },
           "estimated": {
             "title": "Estimated",
             "type": "boolean"
           },
-          "exit_reason": {
+          "head": {
             "anyOf": [
               {
                 "type": "string"
@@ -1778,11 +1263,7 @@
                 "type": "null"
               }
             ],
-            "title": "Exit Reason"
-          },
-          "has_transcript": {
-            "title": "Has Transcript",
-            "type": "boolean"
+            "title": "Head"
           },
           "idx": {
             "title": "Idx",
@@ -1792,27 +1273,32 @@
             "title": "Kind",
             "type": "string"
           },
-          "model": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Model"
+          "leg_id": {
+            "title": "Leg Id",
+            "type": "string"
           },
-          "note": {
+          "outcome": {
+            "enum": [
+              "running",
+              "passed",
+              "changes_requested",
+              "asked",
+              "failed",
+              "done"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "pr": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "integer"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Note"
+            "title": "Pr"
           },
           "pricing_basis": {
             "anyOf": [
@@ -1825,15 +1311,16 @@
             ],
             "title": "Pricing Basis"
           },
-          "review": {
+          "question": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/IssueStepReview"
+                "type": "string"
               },
               {
                 "type": "null"
               }
-            ]
+            ],
+            "title": "Question"
           },
           "role": {
             "anyOf": [
@@ -1868,11 +1355,28 @@
             ],
             "title": "Session Id"
           },
+          "started_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started Ts"
+          },
           "state": {
+            "enum": [
+              "reserved",
+              "running",
+              "ended",
+              "released"
+            ],
             "title": "State",
             "type": "string"
           },
-          "status": {
+          "summary": {
             "anyOf": [
               {
                 "type": "string"
@@ -1881,29 +1385,7 @@
                 "type": "null"
               }
             ],
-            "title": "Status"
-          },
-          "ts": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Ts"
-          },
-          "turns": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Turns"
+            "title": "Summary"
           },
           "usage": {
             "anyOf": [
@@ -1914,32 +1396,8 @@
                 "type": "null"
               }
             ]
-          }
-        },
-        "required": [
-          "idx",
-          "kind",
-          "role",
-          "ts",
-          "state",
-          "status",
-          "exit_reason",
-          "duration_s",
-          "cost_usd",
-          "estimated",
-          "model",
-          "session_id",
-          "turns",
-          "usage",
-          "has_transcript"
-        ],
-        "title": "IssueStep",
-        "type": "object"
-      },
-      "IssueStepChange": {
-        "additionalProperties": true,
-        "properties": {
-          "branch": {
+          },
+          "verdict": {
             "anyOf": [
               {
                 "type": "string"
@@ -1948,108 +1406,7 @@
                 "type": "null"
               }
             ],
-            "title": "Branch"
-          },
-          "commit_subjects": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Commit Subjects",
-            "type": "array"
-          },
-          "files_changed_count": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Files Changed Count"
-          },
-          "head_sha": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Head Sha"
-          },
-          "pr": {
-            "title": "Pr",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "pr"
-        ],
-        "title": "IssueStepChange",
-        "type": "object"
-      },
-      "IssueStepEscalation": {
-        "additionalProperties": true,
-        "properties": {
-          "after_review_round": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "After Review Round"
-          },
-          "from_effort": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "From Effort"
-          },
-          "notches": {
-            "title": "Notches",
-            "type": "integer"
-          },
-          "to_effort": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "To Effort"
-          }
-        },
-        "required": [
-          "notches"
-        ],
-        "title": "IssueStepEscalation",
-        "type": "object"
-      },
-      "IssueStepReview": {
-        "additionalProperties": true,
-        "properties": {
-          "rejection": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rejection"
+            "title": "Verdict"
           },
           "verdict_excerpt": {
             "anyOf": [
@@ -2063,7 +1420,27 @@
             "title": "Verdict Excerpt"
           }
         },
-        "title": "IssueStepReview",
+        "required": [
+          "idx",
+          "leg_id",
+          "kind",
+          "role",
+          "runtime",
+          "state",
+          "outcome",
+          "started_ts",
+          "ended_ts",
+          "duration_s",
+          "cost_usd",
+          "estimated",
+          "pricing_basis",
+          "end_reason",
+          "session_id",
+          "usage",
+          "head",
+          "pr"
+        ],
+        "title": "IssueStep",
         "type": "object"
       },
       "IssuesPayload": {
@@ -2078,7 +1455,7 @@
           },
           "done": {
             "items": {
-              "$ref": "#/components/schemas/IssueCard"
+              "$ref": "#/components/schemas/DoneCard"
             },
             "title": "Done",
             "type": "array"
@@ -2102,12 +1479,16 @@
             "title": "Notifications",
             "type": "array"
           },
-          "pending": {
-            "items": {
-              "$ref": "#/components/schemas/PendingCard"
-            },
-            "title": "Pending",
-            "type": "array"
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
           },
           "warnings": {
             "items": {
@@ -2120,7 +1501,6 @@
         "required": [
           "warnings",
           "in_flight",
-          "pending",
           "done",
           "backlog",
           "gh_ok"
@@ -2155,6 +1535,13 @@
       "Metrics": {
         "additionalProperties": true,
         "properties": {
+          "by_basis": {
+            "items": {
+              "$ref": "#/components/schemas/BasisCost"
+            },
+            "title": "By Basis",
+            "type": "array"
+          },
           "by_kind": {
             "items": {
               "$ref": "#/components/schemas/KindCost"
@@ -2162,7 +1549,7 @@
             "title": "By Kind",
             "type": "array"
           },
-          "cost_per_done_usd": {
+          "cost_per_merged_pr_usd": {
             "anyOf": [
               {
                 "type": "number"
@@ -2171,37 +1558,15 @@
                 "type": "null"
               }
             ],
-            "title": "Cost Per Done Usd"
-          },
-          "done_issues": {
-            "title": "Done Issues",
-            "type": "integer"
-          },
-          "escalations": {
-            "title": "Escalations",
-            "type": "integer"
+            "title": "Cost Per Merged Pr Usd"
           },
           "first_pass_approvals": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "First Pass Approvals"
+            "title": "First Pass Approvals",
+            "type": "integer"
           },
           "first_pass_changes": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "First Pass Changes"
+            "title": "First Pass Changes",
+            "type": "integer"
           },
           "first_pass_rate": {
             "anyOf": [
@@ -2214,37 +1579,46 @@
             ],
             "title": "First Pass Rate"
           },
-          "in_flight_issues": {
-            "title": "In Flight Issues",
+          "legs": {
+            "title": "Legs",
             "type": "integer"
           },
-          "interventions_by_class": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/InterventionCount"
-            },
-            "title": "Interventions By Class",
-            "type": "array"
+          "machine_legs": {
+            "title": "Machine Legs",
+            "type": "integer"
           },
-          "interventions_per_merged_pr": {
+          "merged_prs": {
             "anyOf": [
               {
-                "type": "number"
+                "type": "integer"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Interventions Per Merged Pr"
+            "title": "Merged Prs"
           },
-          "interventions_total": {
-            "default": 0,
-            "title": "Interventions Total",
-            "type": "integer"
+          "needs_human": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Needs Human"
           },
-          "recurrences": {
-            "title": "Recurrences",
-            "type": "integer"
+          "open_items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Items"
           },
           "rounds_per_pr": {
             "anyOf": [
@@ -2257,75 +1631,32 @@
             ],
             "title": "Rounds Per Pr"
           },
-          "spend_blocks": {
-            "title": "Spend Blocks",
-            "type": "integer"
-          },
           "today_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Today Usd"
+            "title": "Today Usd",
+            "type": "number"
           },
           "total_cost_usd": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Total Cost Usd"
+            "title": "Total Cost Usd",
+            "type": "number"
           }
         },
         "required": [
-          "done_issues",
-          "in_flight_issues",
+          "merged_prs",
+          "open_items",
+          "needs_human",
           "total_cost_usd",
-          "cost_per_done_usd",
+          "cost_per_merged_pr_usd",
+          "by_basis",
+          "by_kind",
           "first_pass_approvals",
           "first_pass_changes",
           "first_pass_rate",
           "rounds_per_pr",
-          "escalations",
-          "recurrences",
-          "spend_blocks",
-          "today_usd",
-          "by_kind"
+          "legs",
+          "machine_legs",
+          "today_usd"
         ],
         "title": "Metrics",
-        "type": "object"
-      },
-      "ModelBadge": {
-        "additionalProperties": true,
-        "properties": {
-          "effort": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Effort"
-          },
-          "model": {
-            "title": "Model",
-            "type": "string"
-          }
-        },
-        "required": [
-          "model",
-          "effort"
-        ],
-        "title": "ModelBadge",
         "type": "object"
       },
       "OverviewPayload": {
@@ -2341,35 +1672,6 @@
               }
             ]
           },
-          "cost_mix": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/CostMix"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "escalation_reasons": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/EscalationReason"
-            },
-            "title": "Escalation Reasons",
-            "type": "array"
-          },
-          "first_observed_day": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "First Observed Day"
-          },
           "health": {
             "items": {
               "$ref": "#/components/schemas/RoleHealth"
@@ -2378,18 +1680,11 @@
             "type": "array"
           },
           "health_trend": {
+            "default": [],
             "items": {
               "$ref": "#/components/schemas/HealthTrendDay"
             },
             "title": "Health Trend",
-            "type": "array"
-          },
-          "interventions": {
-            "default": [],
-            "items": {
-              "$ref": "#/components/schemas/InterventionEvent"
-            },
-            "title": "Interventions",
             "type": "array"
           },
           "metrics": {
@@ -2418,11 +1713,6 @@
             "title": "Spend Per Hour",
             "type": "array"
           },
-          "unattributed_count": {
-            "default": 0,
-            "title": "Unattributed Count",
-            "type": "integer"
-          },
           "warnings": {
             "items": {
               "type": "string"
@@ -2434,104 +1724,16 @@
         "required": [
           "warnings",
           "metrics",
-          "cost_mix",
           "caps",
-          "health",
-          "health_trend"
+          "health"
         ],
         "title": "OverviewPayload",
         "type": "object"
       },
-      "PendingCard": {
+      "PullRequestLink": {
         "additionalProperties": true,
         "properties": {
-          "board": {
-            "anyOf": [
-              {
-                "discriminator": {
-                  "mapping": {
-                    "blocked": "#/components/schemas/BoardBlocked",
-                    "needs_you": "#/components/schemas/BoardNeedsYou",
-                    "working": "#/components/schemas/BoardWorking"
-                  },
-                  "propertyName": "status"
-                },
-                "oneOf": [
-                  {
-                    "$ref": "#/components/schemas/BoardNeedsYou"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BoardWorking"
-                  },
-                  {
-                    "$ref": "#/components/schemas/BoardBlocked"
-                  }
-                ]
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Board"
-          },
-          "body": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Body"
-          },
-          "held": {
-            "title": "Held",
-            "type": "boolean"
-          },
-          "hold_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Hold Reason"
-          },
-          "issue": {
-            "title": "Issue",
-            "type": "integer"
-          },
-          "labels": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Labels",
-            "type": "array"
-          },
-          "overlap": {
-            "anyOf": [
-              {},
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Overlap"
-          },
-          "pr": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr"
-          },
-          "pr_ci_state": {
+          "ci_state": {
             "anyOf": [
               {
                 "enum": [
@@ -2545,92 +1747,19 @@
                 "type": "null"
               }
             ],
-            "title": "Pr Ci State"
+            "title": "Ci State"
           },
-          "pr_state": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr State"
-          },
-          "pr_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Pr Url"
-          },
-          "rail": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/StageRail"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
-          "url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Url"
-          }
-        },
-        "required": [
-          "issue",
-          "title",
-          "url",
-          "labels",
-          "held",
-          "hold_reason",
-          "overlap"
-        ],
-        "title": "PendingCard",
-        "type": "object"
-      },
-      "PullRequestLink": {
-        "additionalProperties": true,
-        "properties": {
           "number": {
             "title": "Number",
             "type": "integer"
           },
           "state": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
+            "enum": [
+              "open",
+              "merged"
             ],
-            "title": "State"
+            "title": "State",
+            "type": "string"
           },
           "url": {
             "anyOf": [
@@ -2667,16 +1796,30 @@
             "title": "Active"
           },
           "done": {
-            "title": "Done",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Done"
           },
           "frecency": {
             "title": "Frecency",
             "type": "number"
           },
           "in_flight": {
-            "title": "In Flight",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "In Flight"
           },
           "is_self": {
             "title": "Is Self",
@@ -2781,11 +1924,7 @@
             ],
             "title": "Alive"
           },
-          "events": {
-            "title": "Events",
-            "type": "integer"
-          },
-          "last_event": {
+          "heartbeat_ts": {
             "anyOf": [
               {
                 "type": "string"
@@ -2794,29 +1933,7 @@
                 "type": "null"
               }
             ],
-            "title": "Last Event"
-          },
-          "last_event_ts": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Event Ts"
-          },
-          "log_path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Log Path"
+            "title": "Heartbeat Ts"
           },
           "role": {
             "title": "Role",
@@ -2831,10 +1948,7 @@
           "role",
           "alive",
           "stale",
-          "last_event_ts",
-          "last_event",
-          "events",
-          "log_path"
+          "heartbeat_ts"
         ],
         "title": "RoleHealth",
         "type": "object"
@@ -2860,7 +1974,6 @@
       },
       "StageRail": {
         "additionalProperties": true,
-        "description": "Where the issue is on the five-stage track, from one stage-visit fold.",
         "properties": {
           "ci_runs": {
             "title": "Ci Runs",
@@ -2868,10 +1981,9 @@
           },
           "current": {
             "enum": [
-              "triage",
               "resolve",
-              "review",
               "ci",
+              "review",
               "merge"
             ],
             "title": "Current",
@@ -2879,10 +1991,9 @@
           },
           "furthest": {
             "enum": [
-              "triage",
               "resolve",
-              "review",
               "ci",
+              "review",
               "merge"
             ],
             "title": "Furthest",
@@ -2922,10 +2033,9 @@
         "properties": {
           "stage": {
             "enum": [
-              "triage",
               "resolve",
-              "review",
               "ci",
+              "review",
               "merge"
             ],
             "title": "Stage",
@@ -2944,32 +2054,6 @@
           "steps"
         ],
         "title": "StageVisit",
-        "type": "object"
-      },
-      "StepEventsPayload": {
-        "additionalProperties": true,
-        "properties": {
-          "events": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Events",
-            "type": "array"
-          },
-          "warnings": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Warnings",
-            "type": "array"
-          }
-        },
-        "required": [
-          "warnings",
-          "events"
-        ],
-        "title": "StepEventsPayload",
         "type": "object"
       },
       "ToastNotification": {
@@ -3041,56 +2125,28 @@
       "TokenUsage": {
         "additionalProperties": true,
         "properties": {
-          "cache_creation_input_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Cache Creation Input Tokens"
+          "cache_read_tokens": {
+            "title": "Cache Read Tokens",
+            "type": "integer"
           },
-          "cache_read_input_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Cache Read Input Tokens"
+          "cache_write_tokens": {
+            "title": "Cache Write Tokens",
+            "type": "integer"
           },
           "input_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Input Tokens"
+            "title": "Input Tokens",
+            "type": "integer"
           },
           "output_tokens": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Output Tokens"
+            "title": "Output Tokens",
+            "type": "integer"
           }
         },
         "required": [
           "input_tokens",
           "output_tokens",
-          "cache_read_input_tokens",
-          "cache_creation_input_tokens"
+          "cache_read_tokens",
+          "cache_write_tokens"
         ],
         "title": "TokenUsage",
         "type": "object"
@@ -3108,11 +2164,12 @@
           },
           "outcome": {
             "enum": [
+              "running",
               "passed",
-              "failed",
               "changes_requested",
-              "done",
-              "running"
+              "asked",
+              "failed",
+              "done"
             ],
             "title": "Outcome",
             "type": "string"
@@ -3446,62 +2503,6 @@
         "summary": "Api Issue"
       }
     },
-    "/api/repos/{name}/issues/{number}/cost-chart": {
-      "get": {
-        "operationId": "api_cost_chart_api_repos__name__issues__number__cost_chart_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "session_id",
-            "required": false,
-            "schema": {
-              "default": "",
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Cost Chart"
-      }
-    },
     "/api/repos/{name}/issues/{number}/park": {
       "post": {
         "operationId": "api_park_api_repos__name__issues__number__park_post",
@@ -3596,63 +2597,6 @@
           }
         },
         "summary": "Api Promote"
-      }
-    },
-    "/api/repos/{name}/issues/{number}/steps/{idx}/events": {
-      "get": {
-        "operationId": "api_step_events_api_repos__name__issues__number__steps__idx__events_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "number",
-            "required": true,
-            "schema": {
-              "title": "Number",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "path",
-            "name": "idx",
-            "required": true,
-            "schema": {
-              "title": "Idx",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StepEventsPayload"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Step Events"
       }
     },
     "/api/repos/{name}/issues/{number}/unblock": {
@@ -3774,45 +2718,6 @@
           }
         },
         "summary": "Api Overview"
-      }
-    },
-    "/api/repos/{name}/start": {
-      "post": {
-        "operationId": "api_start_api_repos__name__start_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "title": "Name",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ActionResult"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Api Start"
       }
     },
     "/api/usage": {

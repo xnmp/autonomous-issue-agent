@@ -58,11 +58,7 @@ describe("ToastStack", () => {
       role: "fix",
       alive: true,
       stale: false,
-      last_event_ts: null,
-      last_event: "",
-      events: 0,
-      journal_path: "",
-      log_path: "",
+      heartbeat_ts: null,
     };
     const { rerender } = render(
       <ToastStack repo="demo" notifications={[]} roles={[role]} />,

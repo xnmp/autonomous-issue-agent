@@ -16,7 +16,6 @@ export const DASHBOARD_THEMES = [
 export type DashboardTheme = typeof DASHBOARD_THEMES[number][0];
 
 export interface DashboardOptions {
-  showProjectedCost: boolean;
   showPerRepoQuotas: boolean;
   showDurationSeconds: boolean;
   showOverviewDaemonHealth: boolean;
@@ -99,14 +98,6 @@ export function OptionsMenu({
               <span>Issue health trend</span>
             </label>
           </fieldset>
-          <label className="column-menu-item">
-            <input
-              type="checkbox"
-              checked={options.showProjectedCost}
-              onChange={(event) => onChange({ ...options, showProjectedCost: event.target.checked })}
-            />
-            <span>Show projected cost</span>
-          </label>
           <label className="column-menu-item">
             <input
               type="checkbox"

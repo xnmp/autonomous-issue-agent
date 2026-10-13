@@ -50,34 +50,26 @@ describe("validated API client", () => {
     await expect(api.repos()).rejects.toThrow("the dashboard backend did not respond in time");
   });
 
-  it("keeps the issues payload usable when a card names an unknown review state", async () => {
-    // `pr_review_state` is a closed enum in the contract. A backend that grows a
-    // third value must cost one badge, not the whole Issues tab.
+  it("rejects an issues payload whose board status is not one the contract names", async () => {
+    // The board is the server's derived state; a status this client cannot
+    // place must fail loudly, never land in a guessed group.
     const card = {
-      issue: 7, title: "t", url: null, labels: [], pr: 9, pr_url: null,
-      pr_state: "open", pr_review_state: "conflicting", stage: "review",
-      done: false, steps: [], cost_usd: 1, estimated: false,
-      projected_cost_usd: null, started_ts: null, last_ts: null,
-      elapsed_s: null, working_s: null, idle_s: null, idle_active: false,
-      models: [], rounds: null,
+      issue: 7, title: "t", url: null, labels: [], pr: null, pr_url: null,
+      board: { status: "blocked", headline: "?", reason: "", since_ts: null },
+      rail: { current: "resolve", furthest: "resolve", resolve_attempts: 0, review_rounds: 0, ci_runs: 0, steps: 0, live: false },
+      cost_usd: 0, estimated: false, legs: 0, started_ts: null, last_ts: null, leg_running: false,
     };
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         new Response(
-          JSON.stringify({
-            in_flight: [card], pending: [], done: [], backlog: [],
-            gh_ok: true, notifications: [], warnings: [],
-          }),
+          JSON.stringify({ in_flight: [card], done: [], backlog: [], gh_ok: true, warnings: [] }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         ),
       ),
     );
 
-    const payload = await api.issues("demo");
-
-    expect(payload.in_flight).toHaveLength(1);
-    expect(payload.in_flight[0]!.issue).toBe(7);
-    expect(payload.in_flight[0]!.pr_review_state).toBeNull();
+    await expect(api.issues("demo")).rejects.toThrow("invalid response");
   });
+
 });

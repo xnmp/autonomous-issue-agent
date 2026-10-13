@@ -164,6 +164,7 @@ def test_the_board_shows_each_items_derived_state(deployment):
     assert board[2]["board"] | {"detail": None} == {
         "status": "needs_you", "reason": "question", "headline": "Answer the agent's question", "detail": None,
         "target": "issue", "since_ts": ts(-40),
+        "hint": "Reply on GitHub with the answer; the agent resumes with it.",
     }
     assert "Which API?" in board[2]["board"]["detail"] and board[2]["action"] == "open"
     assert (board[3]["board"]["activity"], board[3]["pr"], board[3]["pr_ci_state"]) == ("ci", 30, "pending")

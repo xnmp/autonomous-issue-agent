@@ -1,11 +1,9 @@
 import { useState, type KeyboardEvent, type PointerEvent } from "react";
-import { api } from "../api/client";
 import type { Polled } from "../api/hooks";
 import type { HarnessRepoSpend, RepoSummary, ReposPayload, UsagePayload } from "../api/types";
 import { HEALTH_LABEL, HEALTH_TONE, roleHealth, utilTone } from "../lib/semantics";
 import { ago, pct, usd } from "../lib/format";
 import { Chip, Dot } from "./ui/Chip";
-import { ConfirmModal } from "./ui/Modal";
 import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedback";
 import { UsageBlock } from "./UsageBlock";
 import { OptionsMenu, type DashboardOptions } from "./ui/OptionsMenu";
@@ -72,10 +70,6 @@ export function Sidebar({
   onSelectRepo,
   onOpenVerification,
 }: SidebarProps) {
-  const [confirmStart, setConfirmStart] = useState<RepoSummary | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem("issue-agent.dashboard.sidebar-collapsed") === "true";
@@ -131,22 +125,6 @@ export function Sidebar({
     rememberWidth(next);
   };
 
-  const doStart = async () => {
-    if (!confirmStart) return;
-    setBusy(true);
-    setActionError(null);
-    try {
-      const res = await api.startDaemons(confirmStart.name);
-      setConfirmStart(null);
-      setNotice(res.detail || `started ${confirmStart.name}`);
-      repos.refresh();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   // Fully out of the way when collapsed: no rail, no border — just a floating
   // settings button and the affordance to bring the sidebar back.
   if (collapsed) {
@@ -183,11 +161,6 @@ export function Sidebar({
         <Icon name="chevron-left" />
       </button>
       <div className="sidebar-scroll">
-        {repos.data?.liveness === "unknown" ? (
-          <Chip tone="neutral" title="/proc scan unavailable — daemon liveness is unknown">
-            liveness unknown
-          </Chip>
-        ) : null}
         {repos.error ? (
           <ErrorBanner message={repos.error} onRetry={repos.refresh} stale={!!repos.data} />
         ) : null}
@@ -243,10 +216,6 @@ export function Sidebar({
                   selected={r.name === activeRepo}
                   onSelect={() => onSelectRepo(r.name)}
                   quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
-                  onStart={() => {
-                    setActionError(null);
-                    setConfirmStart(r);
-                  }}
                 />
               ))}
             </div>
@@ -254,16 +223,6 @@ export function Sidebar({
         ) : null}
       </div>
       <div className="sidebar-foot">
-        {notice ? (
-          <div className="banner banner-ok" role="status">
-            <span className="banner-msg trunc" title={notice}>
-              {notice}
-            </span>
-            <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
-              <Icon name="close" size={13} />
-            </button>
-          </div>
-        ) : null}
         <UsageBlock usage={usage} />
         <OptionsMenu options={options} onChange={onOptionsChange} />
         <button
@@ -289,36 +248,6 @@ export function Sidebar({
         onKeyDown={resizeFromKeyboard}
       />
 
-      {confirmStart ? (
-        <ConfirmModal
-          title="Start daemons"
-          confirmLabel={`Start ${confirmStart.name}`}
-          busy={busy}
-          error={actionError}
-          onConfirm={() => void doStart()}
-          onCancel={() => setConfirmStart(null)}
-          body={
-            <>
-              <p>
-                Launch all three role daemons for{" "}
-                <strong className="mono">{confirmStart.name}</strong>
-                {confirmStart.repo ? (
-                  <>
-                    {" "}
-                    (<span className="mono">{confirmStart.repo}</span>)
-                  </>
-                ) : null}
-                ?
-              </p>
-              <p className="muted">
-                Runs <span className="mono">make point-at</span> detached. The fixer will begin
-                picking up <span className="mono">ai-ready</span> issues and spending against this
-                deployment&apos;s caps.
-              </p>
-            </>
-          }
-        />
-      ) : null}
     </aside>
   );
 }
@@ -327,13 +256,11 @@ function RepoRow({
   repo,
   selected,
   onSelect,
-  onStart,
   quota,
 }: {
   repo: RepoSummary;
   selected: boolean;
   onSelect: () => void;
-  onStart?: () => void;
   quota?: HarnessRepoSpend;
 }) {
   const cls = [
@@ -365,7 +292,7 @@ function RepoRow({
                   <Dot
                     key={role.role}
                     tone={HEALTH_TONE[h]}
-                    title={`${role.role}: ${HEALTH_LABEL[h]} · ${role.events} events · last ${ago(role.last_event_ts)}`}
+                    title={`${role.role}: ${HEALTH_LABEL[h]} · heartbeat ${ago(role.heartbeat_ts)}`}
                   />
                 );
               })}
@@ -375,9 +302,11 @@ function RepoRow({
           ) : (
             <span className="faint">idle</span>
           )}
-          <span className="repo-counts faint num">
-            {repo.in_flight} flying · {repo.done} done
-          </span>
+          {repo.in_flight !== null ? (
+            <span className="repo-counts faint num">
+              {repo.in_flight} flying · {repo.done ?? 0} done
+            </span>
+          ) : null}
           <span className="spacer" />
           <span className="faint num" title={repo.last_activity_ts ?? "no activity"}>
             {ago(repo.last_activity_ts)}
@@ -385,16 +314,6 @@ function RepoRow({
         </div>
         {quota ? <RepoQuota quota={quota} /> : null}
       </button>
-      {onStart ? (
-        <button
-          className="btn btn-xs repo-start"
-          onClick={onStart}
-          title="start daemons"
-          aria-label={`Start daemons for ${repo.name}`}
-        >
-          <Icon name="play" size={13} />
-        </button>
-      ) : null}
     </div>
   );
 }

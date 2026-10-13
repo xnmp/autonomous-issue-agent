@@ -14,7 +14,6 @@ import type {
   IssuesPayload,
   OverviewPayload,
   ReposPayload,
-  StepEventsPayload,
   UsagePayload,
   VerificationPayload,
 } from "./types";
@@ -65,45 +64,10 @@ function errorDetail(body: unknown): string | null {
 
 type ResponseOutcomes = Readonly<Record<number, z.ZodTypeAny>>;
 
-/**
- * A closed enum in the contract must not be able to blank a whole tab.
- *
- * `pr_review_state` is a narrow `Literal` on the backend, so the generated
- * schema rejects any third value — and one unknown string in one card would
- * fail the whole payload's `safeParse` and leave the Issues tab showing an
- * error instead of fifty perfectly readable rows. A value this client does not
- * understand means exactly what a missing one means: no merge-readiness mark.
- * Widening happens here rather than in the generated file, which is only ever
- * written by `npm run generate:api`.
- */
-const KNOWN_PR_REVIEW_STATES = new Set(["mergeable", "changes_requested"]);
-
-function normaliseIssueCard(card: unknown): unknown {
-  if (!card || typeof card !== "object") return card;
-  const state = (card as { pr_review_state?: unknown }).pr_review_state;
-  if (state === null || state === undefined || KNOWN_PR_REVIEW_STATES.has(state as string)) {
-    return card;
-  }
-  return { ...card, pr_review_state: null };
-}
-
-export function normaliseIssuesPayload(payload: unknown): unknown {
-  if (!payload || typeof payload !== "object") return payload;
-  const body = payload as Record<string, unknown>;
-  const lanes = ["in_flight", "done"] as const;
-  const patched = Object.fromEntries(
-    lanes
-      .filter((lane) => Array.isArray(body[lane]))
-      .map((lane) => [lane, (body[lane] as unknown[]).map(normaliseIssueCard)]),
-  );
-  return { ...body, ...patched };
-}
-
 async function request<T>(
   path: string,
   init: RequestInit & { signal?: AbortSignal },
   schema?: z.ZodTypeAny,
-  normalise?: (payload: unknown) => unknown,
   outcomes?: ResponseOutcomes,
 ): Promise<T> {
   let res: Response;
@@ -117,7 +81,7 @@ async function request<T>(
     // The backend is loopback-only; the overwhelmingly likely cause is "not
     // running", so say that instead of the browser's opaque "Failed to fetch".
     throw new ApiError(
-      "cannot reach the dashboard backend (is `issue-agent dashboard --serve` running?)",
+      "cannot reach the dashboard backend (is `python -m issue_agent.app.dashweb.main` running?)",
       0,
     );
   }
@@ -137,9 +101,8 @@ async function request<T>(
       res.status,
     );
   }
-  const payload = normalise ? normalise(body) : body;
-  if (!responseSchema) return payload as T;
-  const parsed = responseSchema.safeParse(payload);
+  if (!responseSchema) return body as T;
+  const parsed = responseSchema.safeParse(body);
   if (!parsed.success) {
     // A success body's `detail` is not an error message; only a failure
     // status may lend its detail to the error.
@@ -159,10 +122,9 @@ export function getJson<T>(
   path: string,
   schema: z.ZodTypeAny,
   signal?: AbortSignal,
-  normalise?: (payload: unknown) => unknown,
   outcomes?: ResponseOutcomes,
 ): Promise<T> {
-  return request<T>(path, { method: "GET", signal }, schema, normalise, outcomes);
+  return request<T>(path, { method: "GET", signal }, schema, outcomes);
 }
 
 export function postJson<T>(
@@ -179,7 +141,7 @@ export function postJson<T>(
     headers: { "Content-Type": "application/json", "X-Issue-Agent-Dashboard": "1" },
     body: JSON.stringify(body ?? {}),
     signal,
-  }, schema, undefined, outcomes);
+  }, schema, outcomes);
 }
 
 const enc = encodeURIComponent;
@@ -209,7 +171,6 @@ export const api = {
       `/api/repos/${enc(name)}/issues`,
       schemas.IssuesPayload,
       s,
-      normaliseIssuesPayload,
     ),
 
   issue: (name: string, n: number, s?: AbortSignal) =>
@@ -219,20 +180,6 @@ export const api = {
       s,
     ),
 
-  stepEvents: (name: string, n: number, idx: number, s?: AbortSignal) =>
-    getJson<StepEventsPayload>(
-      `/api/repos/${enc(name)}/issues/${n}/steps/${idx}/events`,
-      schemas.StepEventsPayload,
-      s,
-    ),
-
-  /** iframe src — the endpoint returns text/html, not JSON. */
-  costChartUrl: (name: string, n: number, sessionId: string) =>
-    `/api/repos/${enc(name)}/issues/${n}/cost-chart?session_id=${enc(sessionId)}`,
-
-  startDaemons: (name: string, s?: AbortSignal) =>
-    postJson<ActionResult>(`/api/repos/${enc(name)}/start`, {}, schemas.ActionResult, s),
-
   promote: (name: string, n: number, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/promote`,
@@ -241,7 +188,7 @@ export const api = {
       s,
     ),
 
-  /** Removes `needs-human` from the issue and its open harness PRs and puts the issue back on `ai-ready`. */
+  /** Removes `needs-human` from the issue and its open harness PRs. */
   unblock: (name: string, n: number, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/unblock`,
