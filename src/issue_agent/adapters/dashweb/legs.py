@@ -10,7 +10,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from ..control_store import ReadOnlyControlStore
+from .readonly_store import ReadOnlyControlStore
 from ...domain.dashboard import LegRow, Tokens
 from ...domain.repository import canonical_repository
 

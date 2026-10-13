@@ -7,7 +7,8 @@ import sqlite3
 
 import pytest
 
-from issue_agent.adapters.control_store import ControlStoreError, ReadOnlyControlStore, SQLiteControlStore
+from issue_agent.adapters.control_store import ControlStoreError, SQLiteControlStore
+from issue_agent.adapters.dashweb.readonly_store import ReadOnlyControlStore
 from issue_agent.adapters.dashweb import legs as legs_module
 
 _INSERT = ("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "

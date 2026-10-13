@@ -27,7 +27,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.control_path import control_store_path
-from ...adapters.control_store import ControlStoreError, ReadOnlyControlStore
+from ...adapters.control_store import ControlStoreError
+from ...adapters.dashweb.readonly_store import ReadOnlyControlStore
 from ...adapters.dashweb import ghdata, system, usage, verification
 from ...adapters.dashweb.legs import read_legs
 from ...adapters.github import GitHubGateway
