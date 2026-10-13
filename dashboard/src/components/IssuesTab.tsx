@@ -54,6 +54,7 @@ import {
   SkeletonRows,
   SectionTitle,
   StoreUnavailable,
+  ReadingGitHub,
   WarningList,
 } from "./ui/Feedback";
 import { IssuesBoard } from "./IssuesBoard";
@@ -208,7 +209,7 @@ export function IssuesTab({
         {{ inflight: "In-flight issues", done: "Done issues", backlog: "Backlog" }[sub]}
       </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
-      {data && !data.observed_at ? <div className="row faint">Reading GitHub…</div> : null}
+      <ReadingGitHub loaded={!!data} observedAt={data?.observed_at} />
       {table !== null ? (
         <ColumnMenu
           columns={COLUMN_CHOICES[table]}

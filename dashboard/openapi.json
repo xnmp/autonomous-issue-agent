@@ -1212,6 +1212,17 @@
             "title": "Labels",
             "type": "array"
           },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
           "pull_requests": {
             "items": {
               "$ref": "#/components/schemas/PullRequestLink"
@@ -1939,6 +1950,17 @@
             },
             "title": "Needs Attention",
             "type": "array"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
           },
           "spend_per_hour": {
             "default": [],

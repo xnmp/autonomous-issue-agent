@@ -323,8 +323,6 @@ class Backend:
         obs = self._observe(dep) if wait and not dep.problem else self.observation(dep)
         read = self.store(dep, obs.world if obs else None)
         warnings += list(obs.warnings if obs else ())
-        if obs is None and not dep.problem:
-            warnings.append("reading GitHub…")
         return dep, obs, read, warnings
 
     # ── endpoints ──
@@ -425,6 +423,7 @@ class Backend:
             return None
         detail = views.issue_detail(number, dep.cfg.repo, item, legs, merged, gh_issue, models)
         detail["warnings"] = warnings
+        detail["observed_at"] = obs.observed_at.isoformat() if obs else None
         detail["store_error"] = read.problem or None
         return detail
 
@@ -464,6 +463,7 @@ class Backend:
             "health_trend": views.health_trend(obs.issues, _local_timezone(timezone_name)) if obs else [],
             "spend_per_hour": [asdict(b) for b in dash.spend_per_hour(legs, now)],
             "warnings": warnings,
+            "observed_at": obs.observed_at.isoformat() if obs else None,
             "store_error": read.problem or None,
         }
 
