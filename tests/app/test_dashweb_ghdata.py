@@ -30,9 +30,25 @@ def reader(responses, clock=None, ttl_s=45.0):
 def test_repeated_reads_inside_the_ttl_shell_out_once():
     gh, calls = reader([(json.dumps([{"number": 1}]), "")])
     for _ in range(3):
-        payload, error = gh.issues("o/r")
+        payload, error = gh.merged_prs("o/r")
     assert len(calls) == 1
     assert error == "" and payload == [{"number": 1}]
+
+
+def test_only_open_issues_carry_body_and_comments():
+    # 2026-10-13: body+comments for 1000 issues took ~28s and hit the 30s gh timeout.
+    history = [{"number": 1, "state": "CLOSED"}, {"number": 2, "state": "OPEN"}]
+    gh, calls = reader([(json.dumps(history), ""), (json.dumps([{"number": 2, "state": "OPEN", "body": "b"}]), "")])
+    payload, error = gh.issues("o/r")
+    assert error == "" and payload == [{"number": 1, "state": "CLOSED"}, {"number": 2, "state": "OPEN", "body": "b"}]
+    fields = [argv[argv.index("--json") + 1].split(",") for argv in calls]
+    assert "body" not in fields[0] and "comments" not in fields[0]
+    assert {"body", "comments"} <= set(fields[1]) and "open" in calls[1]
+
+
+def test_a_failed_open_issue_read_fails_the_issue_read():
+    gh, _calls = reader([("[]", ""), ("", "gh timed out after 30s")])
+    assert gh.issues("o/r") == (None, "gh timed out after 30s")
 
 
 def test_concurrent_cold_misses_share_one_gh_invocation():
@@ -48,7 +64,7 @@ def test_concurrent_cold_misses_share_one_gh_invocation():
 
     gh = ghdata.GhReader(run=run, clock=Clock())
     with ThreadPoolExecutor(max_workers=12) as pool:
-        futures = [pool.submit(gh.issues, "o/r") for _ in range(12)]
+        futures = [pool.submit(gh.merged_prs, "o/r") for _ in range(12)]
         assert entered.wait(timeout=2)
         release.set()
         results = [future.result(timeout=2) for future in futures]

@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 DEFAULT_TTL_S = 45.0
 GH_TIMEOUT_S = 30.0
 
-ISSUE_FIELDS = "number,title,url,body,labels,state,createdAt,closedAt,comments"
+# Body and comments only for open issues (the backlog shows them): with them,
+# 1000 issues of history was ~2 MiB and ~28s, so the read hit GH_TIMEOUT_S
+# whenever GitHub was slow and the whole view lost its GitHub data (2026-10-13).
+ISSUE_FIELDS = "number,title,url,labels,state,createdAt,closedAt"
+OPEN_ISSUE_FIELDS = ISSUE_FIELDS + ",body,comments"
 # `gh issue list` paginates to this bound; reaching it is reported to callers.
 ISSUE_HISTORY_LIMIT = 1000
 MERGED_PR_FIELDS = "number,title,url,mergedAt,headRefName"
@@ -142,8 +146,19 @@ class GhReader:
         return self._cache.get_or_load((repo, tuple(args)), load)
 
     def issues(self, repo: str, limit: int = ISSUE_HISTORY_LIMIT) -> tuple[object | None, str]:
-        """Open and closed issues in one call."""
-        return self.json(repo, ["issue", "list", "--state", "all", "--limit", str(limit), "--json", ISSUE_FIELDS])
+        """Open and closed issues; open ones also carry body and comments."""
+        history, error = self.json(repo, ["issue", "list", "--state", "all", "--limit", str(limit),
+                                          "--json", ISSUE_FIELDS])
+        if error:
+            return None, error
+        open_, error = self.json(repo, ["issue", "list", "--state", "open", "--limit", str(limit),
+                                        "--json", OPEN_ISSUE_FIELDS])
+        if error:
+            return None, error
+        if not isinstance(history, list) or not isinstance(open_, list):
+            return history, ""
+        full = index_by_number(open_)
+        return [full.get(i.get("number"), i) if isinstance(i, dict) else i for i in history], ""
 
     def merged_prs(self, repo: str, limit: int = MERGED_PR_LIMIT) -> tuple[object | None, str]:
         return self.json(repo, ["pr", "list", "--state", "merged", "--limit", str(limit), "--json", MERGED_PR_FIELDS])
