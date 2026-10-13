@@ -509,3 +509,8 @@ def test_an_invalid_route_effort_fails_config_validation(name):
     assert any(name in e and "effort" in e for e in cfg.validation_errors())
     with pytest.raises(ValueError, match=name):
         cfg.validate()
+
+
+@pytest.mark.parametrize("value", ["xhigh", "max"])
+def test_fix_effort_knob_rejects_route_only_efforts(value):
+    assert any("FIX_EFFORT" in e for e in _routed(FIX_EFFORT=value).parse_errors)

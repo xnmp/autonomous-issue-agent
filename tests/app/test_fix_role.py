@@ -26,7 +26,6 @@ from issue_agent.domain.effort import Effort
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
-from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Review, WorldState

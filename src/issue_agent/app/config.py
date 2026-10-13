@@ -107,7 +107,7 @@ class HarnessConfig:
     fix_model_med: str = _knob("")
     fix_model_high: str = _knob("")
     fix_model_xhigh: str = _knob("")
-    # The TRIAGE leg's `runtime:model`. Blank runs it on FIX_MODEL_LOW's route.
+    # The TRIAGE leg's `runtime:model[:effort]`. Blank runs it on FIX_MODEL_LOW's route.
     triage_model: str = _knob("")
     # TRIAGE reserves this, not MAX_BUDGET_USD: a cheap classifier must not
     # hold a fix leg's reservation against the daily caps.
@@ -223,7 +223,8 @@ class HarnessConfig:
     def fix_route(self, tier: Tier) -> tuple[RuntimeName, str | None, Effort | None]:
         """(runtime, model, effort) for a fix leg at `tier`. An unset or
         invalid spec (validate() reports it) keeps today's single configured
-        fixer. No effort means the global knob (FIX_EFFORT / CODEX_REASONING_EFFORT)."""
+        fixer. No effort: fix legs use FIX_EFFORT when set; triage and review legs
+        leave the runtime's own default (CODEX_REASONING_EFFORT on codex)."""
         route = self._tier_route(tier)
         return (route.runtime, route.model, route.effort) if route is not None else (
             self.fixer_runtime, self.fix_model, None)
@@ -427,7 +428,9 @@ def _parse(raw: str, key: str, definition, errors: list[str]) -> object:
             return bad("a number")
         return value if math.isfinite(value) else bad("a finite number")
     if coercion == "effort":
-        return parse_effort(token, None) or bad(f"one of {list(choices)}")
+        # The Effort enum is wider than the knob (route specs): gate on choices.
+        effort = parse_effort(token, None)
+        return effort if effort is not None and effort.value in choices else bad(f"one of {list(choices)}")
     if coercion in ("choice", "runtime"):
         if token not in choices:
             return bad(f"one of {list(choices)}")
