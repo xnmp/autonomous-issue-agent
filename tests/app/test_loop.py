@@ -634,43 +634,41 @@ def test_after_github_refuses_a_tick_no_wake_shortens_the_back_off(retry_after, 
     assert slept == [back_off]  # the back-off in full; the second interval was woken
 
 
-def test_a_change_wait_keeps_the_watchdog_fed_and_ends_mid_interval():
-    # Production slices the interval at 30 s for the systemd watchdog; a wake
-    # in the second slice still ends the interval there.
+def test_one_change_wait_spans_the_whole_interval_under_a_watchdog():
+    # Slicing it would re-baseline the store at every slice and absorb a
+    # change that landed near a boundary; the wait feeds the watchdog itself.
     progress, waited, logs = [], [], []
 
     def wait(timeout):
         waited.append(timeout)
-        return "store changed" if len(waited) == 2 else None
+        return "store changed"
 
     d, _ = _daemon(lambda w: [], logs=logs)
     d.poll_seconds, d.wait_for_change = 90, wait
     d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=1,
                   scheduler_progress=lambda: progress.append(1))
-    assert waited == [30, 30]
-    assert len(progress) == 5  # three around the tick, then one per slice waited
+    assert waited == [90]
+    assert len(progress) == 4  # three around the tick, one as the wait returns
     assert "fix: woke: store changed" in logs
 
 
-_END_LEG_ELSEWHERE = """
+_FREE_ITEM_ELSEWHERE = """
 import sys
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.domain.contracts import RunId
-SQLiteControlStore(sys.argv[1]).record_unpaid_leg(
-    RunId("review-leg"), repository="o/r", role="review", kind="REVIEW", owner_id="o/r:review",
-    issue=7, number=7, head="", runtime="claude")
+assert SQLiteControlStore(sys.argv[1]).unlease("o/r", "review", 7, "o/r:review")
 """
 
 
-def test_a_leg_ending_in_another_process_starts_the_next_tick_before_the_poll(tmp_path):
+def test_an_item_freed_in_another_process_starts_the_next_tick_before_the_poll(tmp_path):
     store = SQLiteControlStore(str(tmp_path / "state" / "control.db"))
     store.initialize()
+    assert store.lease("o/r", "review", 7, "o/r:review")
     clock, observed, logs = ManualClock(), [], []
 
     def sleep(seconds):
         clock.advance(seconds)
         if clock() == 10:
-            subprocess.run([sys.executable, "-c", _END_LEG_ELSEWHERE, store.path], check=True, timeout=60)
+            subprocess.run([sys.executable, "-c", _FREE_ITEM_ELSEWHERE, store.path], check=True, timeout=60)
 
     daemon = Daemon(
         "fix",
@@ -685,5 +683,5 @@ def test_a_leg_ending_in_another_process_starts_the_next_tick_before_the_poll(tm
     daemon.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: int(clock()),
                        active_now=clock, max_ticks=2)
 
-    assert observed == [0, 11]  # one quiet check after the leg ended, not the 60 s poll
+    assert observed == [0, 11]  # one quiet check after the release, not the 60 s poll
     assert "fix: woke: store changed" in logs

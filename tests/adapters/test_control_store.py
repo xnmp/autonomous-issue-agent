@@ -585,6 +585,19 @@ def test_an_unsettled_leg_keeps_its_lease_until_its_process_is_gone(tmp_path):
     assert store.unlease(REPO, "fix", 1, OWNER) is False  # reclaim already dropped it
 
 
+def test_a_settled_legs_claim_waits_for_its_owner_to_hand_it_back(tmp_path):
+    # The owner's release, after the leg's GitHub effects, is the store's
+    # signal that the item is free (StoreWake); settling must not pre-empt it.
+    store = _store(tmp_path)
+    run = _launch(store, 1)
+    store.settle(_settlement(str(run), 1))
+
+    assert [lease.run_id for lease in store.leases()] == [run]
+    assert store.held_targets(REPO) == frozenset()  # ended, its process gone: no longer busy
+    assert store.unlease(REPO, "fix", 1, OWNER)
+    assert store.leases() == ()
+    assert store.lease(REPO, "fix", 1, OWNER)
+
 def test_unleasing_a_never_launched_leg_releases_its_reservation_with_the_lease(tmp_path):
     # The runtime's own release can fail on a transient SQLite error; the
     # claim's release must not then keep the reservation and the daemon-pid

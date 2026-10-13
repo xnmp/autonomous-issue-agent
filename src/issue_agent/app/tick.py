@@ -271,8 +271,9 @@ class Daemon:
     reconcile: Callable[[RecoveryTrigger], object] | None = None
     # Elapsed (monotonic) time in poll intervals: early wakes add ticks, not sweeps.
     reservation_sweep_polls: int = DEFAULT_RESERVATION_SWEEP_POLLS
-    # Waits up to its argument in seconds; returns the wake reason, or None
-    # on timeout. None here means the plain timed sleep.
+    # Waits up to its argument in seconds, feeding the scheduler watchdog
+    # itself; returns the wake reason, or None on timeout. One call spans the
+    # interval, so its baseline is the tick's. None means the timed sleep.
     wait_for_change: Callable[[float], str | None] | None = None
     prepare_shutdown: Callable[[], object] | None = None
     terminalize: Callable[[], object] | None = None
@@ -642,24 +643,26 @@ class Daemon:
 
     def _sleep_interval(self, sleep: Callable[[int], None],
                         scheduler_progress: Callable[[], None] | None = None) -> str | None:
-        """One poll interval, sliced to keep a systemd watchdog fed when a
-        notifier is present; returns the reason when `wait_for_change` ended it early.
+        """One poll interval, the timed sleep sliced to keep a systemd watchdog
+        fed when a notifier is present; returns the reason when
+        `wait_for_change` ended it early.
         After GitHub refused a tick the interval is never woken early: a wake
         must not turn its back-off into another request."""
         interval = max(self.poll_seconds, int(self._retry_after_seconds or 0))
         wake = None if self._retry_after_seconds is not None else self.wait_for_change
         self._retry_after_seconds = None
+        if wake is not None:
+            reason = wake(interval)
+            if scheduler_progress is not None:
+                scheduler_progress()
+            return reason
         remaining = interval
         while remaining > 0:
             step = remaining if scheduler_progress is None else min(30, remaining)
-            reason = None if wake is None else wake(step)
-            if wake is None:
-                sleep(step)
+            sleep(step)
             remaining -= step
             if scheduler_progress is not None:
                 scheduler_progress()
-            if reason:
-                return reason
         return None
 
 

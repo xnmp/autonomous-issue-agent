@@ -166,6 +166,23 @@ def capped_for_a_human(gh, roles) -> bool:
 # ── the design table's REVIEW row ────────────────────────────────────────────
 
 
+def test_the_review_claim_is_handed_back_only_after_the_leg_is_cleaned_up(roles, tmp_path):
+    # The claim's release is what wakes both roles (StoreWake): it must come
+    # after the verdict landed and the checkout is gone, so the woken tick
+    # sees the verdict and a free slot.
+    gh = green()
+    seen_at_remove = []
+
+    class Recording(FakeCheckouts):
+        def remove(self, pr: int) -> None:
+            seen_at_remove.append((list(gh.submitted), [lease.target for lease in review.control.leases()]))
+
+    review = roles.review(gh, Agent(verdict("APPROVE", "Correct.")), checkouts=Recording(tmp_path / "rec"))
+    tick(review)
+
+    assert seen_at_remove == [([(100, "APPROVE", "Correct.", "h1")], [5])]
+    assert review.control.leases() == ()
+
 def test_a_green_head_without_a_bot_review_gets_one_review_leg_and_one_review_on_that_commit(roles):
     gh = green()
     agent = Agent(verdict("APPROVE", "Correct and tested."))

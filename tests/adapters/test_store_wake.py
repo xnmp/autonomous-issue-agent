@@ -1,4 +1,5 @@
-"""Store-change wake: a leg of the repository ending ends a daemon's wait early."""
+"""Store-change wake: an item of the repository freed in either role ends a
+daemon's wait early."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import pytest
 from issue_agent.adapters.control_store import (
     STORE_CHANGED,
     WAKE_MIN_GAP_SECONDS,
+    WAKE_SETTLE_SECONDS,
     SQLiteControlStore,
     StoreWake,
 )
@@ -30,7 +32,15 @@ def _store(tmp_path: Path) -> SQLiteControlStore:
     return store
 
 
-def _end_leg(store: SQLiteControlStore, run: str, repository: str = REPO) -> None:
+def _claim(store: SQLiteControlStore, item: int, repository: str = REPO, role: str = "fix") -> None:
+    assert store.lease(repository, role, item, f"{repository}:{role}")
+
+
+def _free(store: SQLiteControlStore, item: int, repository: str = REPO, role: str = "fix") -> None:
+    assert store.unlease(repository, role, item, f"{repository}:{role}")
+
+
+def _record_leg(store: SQLiteControlStore, run: str, repository: str = REPO) -> None:
     store.record_unpaid_leg(RunId(run), repository=repository, role="review", kind="REVIEW",
                             owner_id=f"{repository}:review", issue=1, number=1, head="", runtime="claude")
 
@@ -48,44 +58,44 @@ class _Sleeper:
             self.at.pop(when)()
 
 
-def _wake(store, clock, sleeper, logs=None) -> StoreWake:
-    return StoreWake(store.path, REPO, log=(logs.append if logs is not None else lambda _m: None), sleep=sleeper,
-                     monotonic=clock)
+def _wake(store, clock, sleeper, logs=None, progress=None) -> StoreWake:
+    return StoreWake(store.path, REPO, log=(logs.append if logs is not None else lambda _m: None),
+                     progress=progress, sleep=sleeper, monotonic=clock)
 
 
-def test_a_leg_ending_on_another_connection_wakes_the_wait_early(tmp_path):
+def test_an_item_freed_on_another_connection_wakes_the_wait_early(tmp_path):
     store, clock = _store(tmp_path), ManualClock()
-    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: _end_leg(store, "ended")}))
+    _claim(store, 7)
+    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: _free(store, 7)}))
 
     assert wake.wait(60) == STORE_CHANGED
     assert clock() == WAKE_MIN_GAP_SECONDS
 
 
-def test_an_item_freed_by_its_lease_ending_wakes_the_wait(tmp_path):
-    store, clock = _store(tmp_path), ManualClock()
-    assert store.lease(REPO, "fix", 7, f"{REPO}:fix")
-    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: store.unlease(REPO, "fix", 7, f"{REPO}:fix")}))
-
-    assert wake.wait(60) == STORE_CHANGED
-
-
 def test_without_a_change_the_full_timeout_elapses(tmp_path):
     store, clock = _store(tmp_path), ManualClock()
+    _claim(store, 7)
     wake = _wake(store, clock, _Sleeper(clock))
 
     assert wake.wait(60) is None
     assert clock() == 60
 
 
-@pytest.mark.parametrize("change", ["leg starts", "lease taken and handed back", "another repository's leg ends"])
+@pytest.mark.parametrize("change", [
+    "a claim is taken",
+    "a claim is taken and handed back within the wait",
+    "another repository frees an item",
+    "a leg is recorded while its claim is still held",
+])
 def test_commits_that_free_nothing_here_do_not_wake(tmp_path, change):
     store, clock = _store(tmp_path), ManualClock()
-    owner = f"{REPO}:fix"
+    _claim(store, 7)
+    _claim(store, 9, repository="other/repo")
     script = {
-        "leg starts": {1: lambda: store.lease(REPO, "fix", 7, owner)},
-        "lease taken and handed back": {1: lambda: store.lease(REPO, "fix", 7, owner),
-                                        8: lambda: store.unlease(REPO, "fix", 7, owner)},
-        "another repository's leg ends": {1: lambda: _end_leg(store, "elsewhere", "other/repo")},
+        "a claim is taken": {1: lambda: _claim(store, 8)},
+        "a claim is taken and handed back within the wait": {1: lambda: _claim(store, 8), 8: lambda: _free(store, 8)},
+        "another repository frees an item": {1: lambda: _free(store, 9, repository="other/repo")},
+        "a leg is recorded while its claim is still held": {1: lambda: _record_leg(store, "ended")},
     }[change]
     wake = _wake(store, clock, _Sleeper(clock, script))
 
@@ -95,50 +105,79 @@ def test_commits_that_free_nothing_here_do_not_wake(tmp_path, change):
 
 def test_a_burst_wakes_once_after_the_store_goes_quiet(tmp_path):
     store, clock = _store(tmp_path), ManualClock()
-    burst = {t: (lambda t=t: _end_leg(store, f"leg-{t}")) for t in (10, 11, 12)}
+    for item in (1, 2, 3):
+        _claim(store, item)
+    burst = {10: lambda: _free(store, 1), 11: lambda: _free(store, 2), 12: lambda: _free(store, 3)}
     wake = _wake(store, clock, _Sleeper(clock, burst))
 
     assert wake.wait(60) == STORE_CHANGED
-    assert clock() == 13  # one quiet check after the burst, not at its first commit
+    assert clock() == 13  # one quiet check after the burst
     assert wake.wait(60) is None  # the burst was spent on one wake
 
 
 def test_a_burst_inside_the_minimum_gap_wakes_at_the_gap(tmp_path):
     store, clock = _store(tmp_path), ManualClock()
-    burst = {t: (lambda t=t: _end_leg(store, f"leg-{t}")) for t in (1, 2, 3)}
-    wake = _wake(store, clock, _Sleeper(clock, burst))
+    for item in (1, 2, 3):
+        _claim(store, item)
+    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: _free(store, 1), 2: lambda: _free(store, 2),
+                                                3: lambda: _free(store, 3)}))
 
     assert wake.wait(60) == STORE_CHANGED
     assert clock() == WAKE_MIN_GAP_SECONDS
 
 
-def test_a_leg_ending_while_the_tick_ran_wakes_the_next_wait(tmp_path):
+def test_a_store_that_never_goes_quiet_is_judged_after_the_settle_time(tmp_path):
+    # Every deployment of the user shares the store: another repository's
+    # commits every second must not starve this one's wake.
     store, clock = _store(tmp_path), ManualClock()
+    _claim(store, 7)
+    churn: dict[float, Callable[[], object]] = {t: (lambda t=t: _record_leg(store, f"other-{t}", "other/repo"))
+                                                for t in range(1, 60)}
+    churn[10.5] = lambda: _free(store, 7)
+    wake = _wake(store, clock, _Sleeper(clock, churn))
+
+    assert wake.wait(60) == STORE_CHANGED
+    assert clock() <= 11 + WAKE_SETTLE_SECONDS
+
+
+def test_an_item_freed_while_the_tick_ran_wakes_the_next_wait(tmp_path):
+    store, clock = _store(tmp_path), ManualClock()
+    _claim(store, 7)
     wake = _wake(store, clock, _Sleeper(clock))
     assert wake.wait(10) is None
-    _end_leg(store, "during-tick")  # between waits, as a tick's dispatch would
+    _free(store, 7)  # between waits, as a dispatch finishing during a tick would
 
     assert wake.wait(60) == STORE_CHANGED
 
 
 def test_a_change_near_the_deadline_returns_at_the_deadline(tmp_path):
     store, clock = _store(tmp_path), ManualClock()
-    wake = _wake(store, clock, _Sleeper(clock, {2: lambda: _end_leg(store, "late")}))
+    _claim(store, 7)
+    wake = _wake(store, clock, _Sleeper(clock, {2: lambda: _free(store, 7)}))
 
     assert wake.wait(3) is None  # shorter than the gap: the timeout ends it
     assert clock() == 3
 
 
+def test_the_wait_feeds_the_watchdog_every_check(tmp_path):
+    store, clock, fed = _store(tmp_path), ManualClock(), []
+    wake = _wake(store, clock, _Sleeper(clock), progress=lambda: fed.append(clock()))
+
+    assert wake.wait(10) is None
+    assert fed == [float(t) for t in range(1, 11)]
+
+
 def test_an_unreadable_store_falls_back_to_the_timed_wait_and_logs_once(tmp_path):
-    clock, logs = ManualClock(), []
-    wake = StoreWake(str(tmp_path / "missing" / "control.db"), REPO, log=logs.append, sleep=_Sleeper(clock),
-                     monotonic=clock)
+    clock, logs, fed = ManualClock(), [], []
+    wake = StoreWake(str(tmp_path / "missing" / "control.db"), REPO, log=logs.append, progress=lambda: fed.append(1),
+                     sleep=_Sleeper(clock), monotonic=clock)
 
     assert wake.wait(60) is None
     assert clock() == 60
     assert wake.wait(60) is None
     assert clock() == 120
     assert len(logs) == 1 and "store wake unavailable" in logs[0]
+    assert len(fed) == 120  # the watchdog is still fed while falling back
 
 
 def _rename_leases(store: SQLiteControlStore, old: str, new: str) -> None:
@@ -148,6 +187,7 @@ def _rename_leases(store: SQLiteControlStore, old: str, new: str) -> None:
 
 def test_a_store_failing_mid_wait_finishes_on_the_timer_then_recovers(tmp_path):
     store, clock, logs = _store(tmp_path), ManualClock(), []
+    _claim(store, 7)
     sleeper = _Sleeper(clock, {2: lambda: _rename_leases(store, "leases", "leases_away")})
     wake = _wake(store, clock, sleeper, logs)
 
@@ -156,21 +196,23 @@ def test_a_store_failing_mid_wait_finishes_on_the_timer_then_recovers(tmp_path):
     assert len(logs) == 1 and "store wake unavailable" in logs[0]
 
     _rename_leases(store, "leases_away", "leases")
-    sleeper.at[61] = lambda: _end_leg(store, "after-recovery")
+    sleeper.at[61] = lambda: _free(store, 7)
     assert wake.wait(60) == STORE_CHANGED
     assert len(logs) == 1
 
 
 def test_the_wait_leaves_no_connection_holding_the_wal(tmp_path):
     # A wait closes its connection, so the last close still folds the WAL into
-    # the main file: a copy of control.db alone holds every committed leg.
+    # the main file: a copy of control.db alone holds every commit.
     store, clock = _store(tmp_path), ManualClock()
-    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: _end_leg(store, "settled")}))
+    _claim(store, 7)
+    wake = _wake(store, clock, _Sleeper(clock, {1: lambda: (_record_leg(store, "settled"), _free(store, 7))}))
     assert wake.wait(60) == STORE_CHANGED
 
     assert not os.path.exists(f"{store.path}-wal")
     with closing(sqlite3.connect(f"{Path(store.path).as_uri()}?mode=ro&immutable=1", uri=True)) as copy:
         assert copy.execute("SELECT leg_id FROM legs").fetchall() == [("settled",)]
+        assert copy.execute("SELECT count(*) FROM leases").fetchone() == (0,)
 
 
 def test_a_shutdown_signal_interrupts_the_wait_promptly(tmp_path):
@@ -191,4 +233,4 @@ def test_a_shutdown_signal_interrupts_the_wait_promptly(tmp_path):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 5

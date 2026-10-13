@@ -151,11 +151,13 @@ class ReviewLegs:
         try:
             await self._run_claimed(action, issue, pr)
         finally:
-            self.control.unlease(repo, "review", issue, owner)
             try:
                 self.checkouts.remove(action.number)
             except Exception as exc:  # noqa: BLE001 - a stale checkout is disk, not state
                 self.log(f"REVIEW PR #{action.number}: pinned checkout not removed: {exc}")
+            # Last: the release wakes both roles (`StoreWake`), and this slot
+            # frees as `run` returns.
+            self.control.unlease(repo, "review", issue, owner)
 
     async def _run_claimed(self, action: RunAgent, issue: int, pr: PRView) -> None:
         bot = self.settings.harness.review_bot
