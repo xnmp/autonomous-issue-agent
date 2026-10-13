@@ -170,7 +170,18 @@ def test_the_reply_is_every_human_comment_after_the_leg_in_order():
         Comment("ci[bot]", "coverage", (T0 + timedelta(minutes=9)).isoformat()),
         Comment("carol", "undated", "yesterday"),
     )
-    assert human_reply(comments, after, H) == "@alice: first\n\n@bob: second"
+    assert human_reply(comments, after, H, ()) == "@alice: first\n\n@bob: second"
+
+
+def test_342_the_reply_skips_comments_inside_any_of_the_items_leg_windows():
+    after = T0 + timedelta(minutes=5)
+    capped = LegEnd(AgentKind.FIX_CI, T0 + timedelta(minutes=10), True, started_at=T0 + timedelta(minutes=6))
+    comments = (
+        Comment("fix-bot", "answer", (T0 + timedelta(minutes=5, seconds=30)).isoformat()),
+        Comment("fix-bot", "agent progress", (T0 + timedelta(minutes=8)).isoformat()),
+        Comment("fix-bot", "follow-up", (T0 + timedelta(minutes=11)).isoformat()),
+    )
+    assert human_reply(comments, after, H, (capped,)) == "@fix-bot: answer\n\n@fix-bot: follow-up"
 
 
 # ── Facts (round 2) ───────────────────────────────────────────────────────

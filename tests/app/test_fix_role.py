@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
+from issue_agent.domain.contracts import RunId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.state import StopReason, stop_tag
@@ -577,6 +580,41 @@ def test_a_machine_death_after_the_answer_keeps_the_answer(role, later):
     assert dispatched(tick(composed), AgentKind.RESOLVE)
     retried = agent.tasks[2]
     assert retried.resume == "s-q" and "410." in retried.prompt
+
+
+def test_342_the_agents_own_mid_leg_comment_is_not_the_reply_and_a_later_one_is(role, later):
+    # tauri #1102: FIX_BOT is the operator's login. A PR-stage leg posts
+    # progress unmarked, then wall-caps; its continuation must not be handed
+    # that comment as the human's answer. A comment after the leg ends is.
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+
+    def posts_then_caps(task):
+        # What supervised_exec does once the provider process exists: the leg
+        # is running and its start is stamped (the fake agent spawns nothing).
+        env = task.env
+        SQLiteControlStore(env["ISSUE_AGENT_CONTROL_DB"]).register_process_lease(
+            RunId(env["ISSUE_AGENT_RUN_ID"]), expected_owner_id=env["ISSUE_AGENT_OWNER_ID"],
+            pid=999_999, pgid=999_999, process_start_ticks=1,
+        )
+        gh.comment("pr", 100, "Progress report: still red after the retry.", author=FIX_BOT)
+        time.sleep(0.01)  # the leg's end is stamped in whole milliseconds
+        return _capped(task)
+
+    agent = Agent(asked("Mock the clock or the network?", session="s-q"), posts_then_caps, did_nothing("s-wall"))
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # asks
+    tick(composed)  # stops with the question
+    gh.comment("pr", 100, "Mock the clock.", author=FIX_BOT)
+    tick(composed)  # released
+    assert Label.NEEDS_HUMAN not in gh.prs[100].labels
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # posts, then the wall cap
+    gh.comment("pr", 100, "Also pin the timezone.", author=FIX_BOT)
+    later()
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    continued = agent.tasks[2].prompt
+    assert "Mock the clock." in continued and "Also pin the timezone." in continued
+    assert "Progress report" not in continued
 
 
 def test_a_human_closed_pr_is_reopened_once_the_agent_pushes_again(role):
