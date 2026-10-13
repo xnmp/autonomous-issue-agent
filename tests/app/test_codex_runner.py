@@ -267,10 +267,12 @@ def test_envelope_exit_reason_separates_agent_error_from_normal_terminals():
 
 # ── run() over a fake codex binary ───────────────────────────────────────────────
 def _fake_codex(tmp, body: str) -> str:
-    """Write an executable stub at <tmp>/codex that runs `body` (bash)."""
+    """Write an executable stub at <tmp>/codex that runs `body` (bash), with
+    `$out` bound to the `-o` envelope path from argv."""
     path = os.path.join(tmp, "codex")
     with open(path, "w") as f:
-        f.write("#!/usr/bin/env bash\n" + body)
+        f.write('#!/usr/bin/env bash\nout=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+                + body)
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     return path
 
@@ -367,12 +369,6 @@ def test_native_codex_child_receives_operator_build_settings(tmp_path, monkeypat
     monkeypatch.setenv("GH_TOKEN", "publication-secret")
     body = r'''
 printf '%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_BUILD_JOBS-unset}" "${PW_WORKERS-unset}" "${GH_TOKEN-unset}" > "$OBSERVED_ENV"
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 '''
     result = asyncio.run(CodexRunner(
@@ -390,12 +386,6 @@ def test_run_parses_output_file_and_session_from_the_rollout():
     tmp = tempfile.mkdtemp()
     # The stub: find the -o path in argv, write an envelope there, print a header.
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 ''' + _meta("sess-xyz") + r'''
 printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
 exit 0
@@ -419,12 +409,6 @@ for receipt in "$RECEIPT_DIR"/*.json; do
   [ ! -e "$receipt" ] || receipt_found=1
 done
 [ -n "$receipt_found" ] || exit 9
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 '''
     supervisor = ProcessSupervisor(str(state_dir))
@@ -461,12 +445,6 @@ def test_run_completes_after_a_megabyte_stderr_line_and_logs_it_truncated():
     """One unbounded Codex trace line must not terminate an otherwise healthy leg."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 head -c 1048576 /dev/zero | tr '\0' x >&2
 echo >&2
 echo "stderr after oversized line" >&2
@@ -490,12 +468,6 @@ def test_run_drains_a_line_beyond_the_stream_limit_without_losing_the_next_line(
     """Fallback draining preserves the stderr record boundary after a huge line."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 head -c 5242880 /dev/zero | tr '\0' x >&2
 echo >&2
 echo "stderr after fallback drain" >&2
@@ -833,12 +805,6 @@ def test_healthy_run_inside_both_caps_is_untouched():
     and carries no timeout classification."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 echo "session id: sess-ok" >&2
 printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
 exit 0
@@ -942,12 +908,6 @@ def test_run_longer_than_drain_cap_completes_when_stderr_flows():
     # exit 0. Total runtime (~1.5s) exceeds post_hang_drain_timeout (0.3s below), but
     # each stderr gap (0.1s) stays under idle_timeout (5s) → NOT a hang.
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 ''' + _meta("sess-long") + r'''
 for i in $(seq 1 15); do echo "codex tool: step $i" >&2; sleep 0.1; done
 printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
@@ -1054,12 +1014,6 @@ def test_milestone_lines_surface_without_debug():
     """The key ask: TEST_CMD runs + commits are visible even with debug OFF."""
     tmp = tempfile.mkdtemp()
     body = r'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
 echo "exec bash -lc 'uv run pytest'" >&2
 echo "exec git commit -m 'green: impl'" >&2
 echo "some chatty verbose line" >&2

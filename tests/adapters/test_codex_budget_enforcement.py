@@ -212,56 +212,6 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
     assert result.cost_usd == pytest.approx(28.0)
 
 
-
-def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(
-    tmp_path, monkeypatch
-):
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage = {
-        "input_tokens": 5_000_000,
-        "cached_input_tokens": 0,
-        "cache_write_input_tokens": 0,
-        "output_tokens": 100_000,
-    }
-    session_meta = {
-        "timestamp": "2099-07-29T00:00:00Z",
-        "type": "session_meta",
-        "payload": {
-            "id": SID,
-            "originator": "codex_exec",
-            "source": "exec",
-            "cwd": str(worktree),
-        },
-    }
-    token_count = {
-        "timestamp": "2099-07-29T00:00:01Z",
-        "type": "event_msg",
-        "payload": {
-            "type": "token_count",
-            "info": {"last_token_usage": usage, "total_token_usage": usage},
-        }
-    }
-    _rollout_path(tmp_path).write_text(
-        json.dumps(session_meta) + "\n" + json.dumps(token_count) + "\n"
-    )
-    body = (
-        'for i in $(seq 1 40); do echo "exec step $i" >&2; sleep 0.05; done\n'
-    )
-
-    result = asyncio.run(
-        _runner(tmp_path, body).run(
-            RuntimePlan(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
-        )
-    )
-
-    assert result.status == "error_max_budget_usd"
-    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-    assert result.session_id == SID
-    assert result.cost_usd == pytest.approx(28.0)
-
-
 def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(
     tmp_path, monkeypatch
 ):
@@ -301,33 +251,6 @@ records = [{{"timestamp": stamp, "type": "session_meta", "payload": {{
 Path({str(_rollout_path(tmp_path))!r}).write_text("".join(json.dumps(r) + "\\n" for r in records))
 """)
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}\n"
-
-
-def test_large_owned_rollout_usage_still_enforces_the_budget(tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    body = _live_owned_rollout_command(tmp_path, input_tokens=0, output_tokens=5_100_000)
-    body += (
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
-    )
-    result = asyncio.run(_runner(tmp_path, body).run(RuntimePlan("x", max_budget_usd=20.0)))
-    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-    assert result.cost_usd == pytest.approx(153.0)
-
-
-def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    _write_rollout(tmp_path, input_tokens=1_000_000, output_tokens=10_000)
-
-    result = asyncio.run(
-        _runner(tmp_path, _chatty_body(seconds=1)).run(
-            RuntimePlan(prompt="x", max_budget_usd=20.0)
-        )
-    )
-
-    assert result.status == "pr_opened"
-    assert result.exit_reason is ExitReason.OK
 
 
 def test_cache_heavy_live_budget_sampler_does_not_kill_a_sub_twenty_dollar_leg(

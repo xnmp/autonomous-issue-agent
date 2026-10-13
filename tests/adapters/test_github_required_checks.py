@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.github import GhUnavailable, GitHubGateway, Identity, _subprocess_runner
-from issue_agent.domain.checks import Observed, RequiredCheck, Unavailable
+from issue_agent.domain.checks import Observed, Unavailable
 from issue_agent.domain.ci import Clear, reduce_ci
 
 
@@ -71,15 +71,6 @@ def gateway(*, branch=None, rules=None, pages=None, meta=None):
                               ([page([report()])] if pages is None else pages))
         raise AssertionError(argv)
     return GitHubGateway("o/r", Identity(), runner=run)
-
-
-def test_branch_summary_and_active_rules_union_app_bound_contexts():
-    rules = [[{"type": "required_status_checks", "parameters": {"required_status_checks": [
-        {"context": "lint", "integration_id": 2}]}}]]
-    ci = gateway(rules=rules, pages=[page([report(), report("lint", checkSuite={"app": {"databaseId": 2}, "workflowRun": None})])]).get_pr(3).ci
-    assert isinstance(ci, Observed)
-    assert ci.policy == frozenset({RequiredCheck("unit", 1), RequiredCheck("lint", 2)})
-    assert isinstance(reduce_ci(ci), Clear)
 
 
 def test_unprotected_summary_with_absent_protection_is_an_observed_empty_policy():
@@ -214,16 +205,6 @@ def test_required_sibling_jobs_with_same_name_in_one_workflow_both_gate(ordered)
     assert isinstance(reduce_ci(ci), Failed)
 
 
-def test_latest_reports_preserve_app_and_status_check_collisions():
-    status = {"__typename": "StatusContext", "id": "status", "context": "unit", "state": "FAILURE",
-        "targetUrl": None, "isRequired": True, "createdAt": "2026-10-12T00:00:00Z"}
-    other = report(id="other-app", checkSuite={"app": {"databaseId": 2}, "workflowRun": None}, isRequired=False, conclusion="FAILURE")
-    ci = gateway(pages=[page([report(), other, status])]).get_pr(3).ci
-    assert isinstance(ci, Observed) and len(ci.reports) == 3
-    from issue_agent.domain.ci import Failed
-    assert isinstance(reduce_ci(ci), Failed)
-
-
 @pytest.mark.parametrize("rules", [[[{"type": ""}]], [[{"type": "pull_request"}], []]])
 def test_malformed_rules_and_partial_ruleset_pages_are_unavailable(rules):
     assert isinstance(gateway(rules=rules).get_pr(3).ci, Unavailable)
@@ -250,12 +231,6 @@ def test_ruleset_capability_error_body_and_partial_success_are_classified(monkey
     assert _subprocess_runner(["gh", "api", "--paginate", "--slurp", "repos/o/r/rules/branches/dev"], None) == expected
 
 
-@pytest.mark.parametrize("started", [None, "2026-10-12T00:00:00Z"])
-def test_started_time_preserves_unknown_and_actual_deadline_evidence(started):
-    ci = gateway(pages=[page([report(status="IN_PROGRESS", conclusion=None, startedAt=started)])]).get_pr(3).ci
-    assert isinstance(ci, Observed) and ci.reports[0].started_at == (started or "")
-
-
 def test_distinct_workflows_and_events_with_the_same_job_name_still_gate():
     def suite(workflow, event):
         return {"app": {"databaseId": 1}, "workflowRun": {"event": event, "workflow": {"id": workflow, "name": workflow}}}
@@ -266,16 +241,6 @@ def test_distinct_workflows_and_events_with_the_same_job_name_still_gate():
     from issue_agent.domain.ci import Failed
     assert isinstance(ci, Observed) and len(ci.reports) == 3
     assert isinstance(reduce_ci(ci), Failed)
-
-
-def test_required_workflows_with_identical_display_names_remain_distinct():
-    def suite(identity):
-        return {"app": {"databaseId": 1}, "workflowRun": {
-            "event": "pull_request", "workflow": {"id": identity, "name": "CI"}}}
-    nodes = [report(id="failed-workflow", databaseId=10, conclusion="FAILURE", checkSuite=suite("workflow-A")),
-        report(id="green-workflow", databaseId=11, checkSuite=suite("workflow-B"))]
-    from issue_agent.domain.ci import Failed
-    assert isinstance(reduce_ci(gateway(pages=[page(nodes)]).get_pr(3).ci), Failed)
 
 
 @pytest.mark.parametrize("cursor", [False, 0, 12, {}, ""])

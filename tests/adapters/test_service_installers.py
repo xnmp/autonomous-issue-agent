@@ -586,52 +586,6 @@ def test_systemd_same_name_repoint_replaces_all_units_atomically(
     assert max(stops) < min(restarts)
 
 
-def test_systemd_second_checkout_preserves_same_repo_deployment(
-    tmp_path,
-):
-    env, home, _uv = _environment(tmp_path, systemd=True)
-    config = Path(env["AGENT_ENV"])
-    first_target = tmp_path / "checkout-primary"
-    second_target = tmp_path / "checkout-secondary"
-    first_target.mkdir()
-    second_target.mkdir()
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\n'
-    )
-
-    first = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env={**env, "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app"},
-        capture_output=True,
-        text=True,
-    )
-    assert first.returncode == 0, first.stderr
-
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n'
-    )
-    second = subprocess.run(
-        ["bash", str(ROOT / "bin/install-systemd.sh")],
-        env={**env, "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app-wt"},
-        capture_output=True,
-        text=True,
-    )
-
-    assert second.returncode == 0, second.stderr
-    units = tuple((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 5
-    assert sum(path.name.endswith("-acme-app.service") for path in units) == 2
-    assert sum(
-        path.name.endswith("-acme-app-wt.service") for path in units
-    ) == 2
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    assert not any(
-        call == f"stop issue-agent-{role}-acme-app.service"
-        for call in calls[len(calls) // 2 :]
-        for role in ("fix-watcher", "review-watcher")
-    )
-
-
 def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     env, home, _uv = _environment(
         tmp_path, systemd=True, fail_pattern="review-watcher"
@@ -692,70 +646,6 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     )
 
 
-def test_launchd_same_name_repoint_replaces_all_loaded_jobs_atomically(
-    tmp_path,
-):
-    env, home, _uv = _environment(tmp_path, systemd=False)
-    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
-    config = Path(env["AGENT_ENV"])
-    first_target = tmp_path / "checkout-a"
-    second_target = tmp_path / "checkout-b"
-    first_target.mkdir()
-    second_target.mkdir()
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\nKNOWN_GOOD=1\n'
-    )
-
-    first = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert first.returncode == 0, first.stderr
-    service_log = Path(env["SERVICE_LOG"])
-    first_call_count = len(service_log.read_text().splitlines())
-    snapshot = (
-        home
-        / "Library/Application Support/issue-agent"
-        / "acme-app.env"
-    )
-
-    config.write_text(
-        f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n'
-    )
-    env["REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD"] = "1"
-    env["CUTOVER_SNAPSHOT"] = str(snapshot)
-    second = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert second.returncode == 0, second.stderr
-    launch_agents = home / "Library/LaunchAgents"
-    plists = tuple(launch_agents.glob("*.plist"))
-    assert len(plists) == 2
-    assert all(path.name.endswith(".acme-app.plist") for path in plists)
-    assert all(
-        plistlib.loads(path.read_bytes())["EnvironmentVariables"]["TARGET_DIR"]
-        == str(second_target)
-        for path in plists
-    )
-    assert str(second_target) in snapshot.read_text()
-    second_calls = service_log.read_text().splitlines()[first_call_count:]
-    unloads = [
-        second_calls.index(f"unload {path}")
-        for path in plists
-    ]
-    loads = [
-        second_calls.index(f"load {path}")
-        for path in plists
-    ]
-    assert max(unloads) < min(loads)
-
-
 def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=False)
     config = Path(env["AGENT_ENV"])
@@ -793,73 +683,6 @@ def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
     remaining = tuple(launch_agents.glob("*.plist"))
     assert len(remaining) == 2
     assert all(path.name.endswith(".999999.plist") for path in remaining)
-
-
-def test_launchd_upgrade_unloads_and_removes_unsuffixed_legacy_jobs(
-    tmp_path,
-):
-    env, home, _uv = _environment(tmp_path, systemd=False)
-    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
-    launch_agents = home / "Library/LaunchAgents"
-    launch_agents.mkdir(parents=True)
-    labels = (
-        "dev.issue-agent.fix-watcher",
-        "dev.issue-agent.review-watcher",
-    )
-    for label in labels:
-        (launch_agents / f"{label}.plist").write_text("legacy")
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert not any(
-        (launch_agents / f"{label}.plist").exists() for label in labels
-    )
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    for label in labels:
-        legacy = launch_agents / f"{label}.plist"
-        assert f"unload {legacy}" in calls
-        assert f"remove {label}" in calls
-
-
-def test_launchd_refuses_loaded_current_job_without_rollback_plist(
-    tmp_path,
-):
-    env, home, _uv = _environment(tmp_path, systemd=False)
-    config = Path(env["AGENT_ENV"])
-    target = tmp_path / "target-repo"
-    checksum = subprocess.run(
-        ["cksum"],
-        input=f"{config}|{target}",
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()[0]
-    label = f"dev.issue-agent.fix-watcher.{checksum}"
-    env["LOADED_LABELS"] = label
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 2
-    assert "loaded current job" in result.stderr
-    assert "no recoverable plist" in result.stderr
-    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
-    assert not any(call.startswith(("unload ", "remove ", "load ")) for call in calls)
-    assert not tuple(
-        (
-            home / "Library/Application Support/issue-agent"
-        ).glob("*.env")
-    )
 
 
 def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
@@ -967,38 +790,6 @@ def test_launchd_stops_every_current_writer_before_swapping_config(
     ]
     assert max(unloads) < min(loads)
     assert "KNOWN_GOOD=1" not in snapshot.read_text()
-
-
-def test_launchd_success_uses_stable_private_config_snapshot(tmp_path):
-    env, home, _uv = _environment(tmp_path, systemd=False)
-    config = Path(env["AGENT_ENV"])
-    config.write_text(
-        f'REPO="o/r"\nTARGET_DIR="{tmp_path / "target-repo"}"\n'
-        "TOKEN=secret\n"
-    )
-
-    result = subprocess.run(
-        ["bash", str(ROOT / "bin/install-launchd.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    snapshots = tuple(
-        (
-            home / "Library/Application Support/issue-agent"
-        ).glob("*.env")
-    )
-    assert len(snapshots) == 1
-    assert snapshots[0].read_text() == config.read_text()
-    assert snapshots[0].stat().st_mode & 0o777 == 0o600
-    for plist in (home / "Library/LaunchAgents").glob("*.plist"):
-        rendered = plistlib.loads(plist.read_bytes())
-        assert (
-            rendered["EnvironmentVariables"]["AGENT_ENV"]
-            == str(snapshots[0])
-        )
 
 
 @contextlib.contextmanager

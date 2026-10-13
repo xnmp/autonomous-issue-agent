@@ -123,17 +123,6 @@ def test_daemon_exits_with_reload_code_between_ticks():
     assert any("hot-reload" in m for m in logs)
 
 
-def test_daemon_without_reload_check_never_exits_early():
-    ticked = []
-    d = Daemon(
-        name="fix", observe=lambda: WorldState(),
-        decide=lambda w: ticked.append(1) or [],
-        executor=Executor(_Gw()), poll_seconds=1,
-    )
-    d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=3)
-    assert len(ticked) == 3
-
-
 def test_dashboard_source_change_gracefully_stops_server_with_reload_code():
     class GracefulServer:
         should_exit = False

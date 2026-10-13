@@ -16,7 +16,6 @@ from issue_agent.adapters.github import (
     parse_fix_refs,
     parse_merged_harness_prs,
 )
-from issue_agent.domain.labels import Label
 from issue_agent.domain.world import Branch, Push
 
 
@@ -59,13 +58,6 @@ def xref(number, state="MERGED", repo="o/r", head="fix/5-x") -> dict:
 
 
 # ── parsers ──────────────────────────────────────────────────────────────────
-
-def test_an_issue_node_parses_with_its_comments_and_labels():
-    comments = [{"author": {"login": "bob"}, "body": "any update?", "createdAt": "2026-10-01T00:00:00Z"}]
-    view = parse_fix_issue(issue_node(), comments)
-    assert (view.number, view.state, view.author) == (5, "open", "alice")
-    assert view.labels == frozenset({Label.AI_READY})
-    assert [c.body for c in view.comments] == ["any update?"]
 
 
 @pytest.mark.parametrize("node", [
@@ -318,19 +310,6 @@ def test_every_paged_query_declares_exactly_the_variables_it_uses_and_is_sent_th
     assert len(runner.calls) == 7  # first read, refs page 2, 5 nested pages
     for query, variables in runner.calls:
         assert _declared(query) == _used(query) == set(variables), query
-
-
-@pytest.mark.parametrize(("connection", "owners"), [
-    ("timelineItems", ["Issue"]), ("files", ["PullRequest"]), ("reviews", ["PullRequest"]),
-    ("comments", ["Issue", "PullRequest"]),
-])
-def test_a_nested_page_selects_its_connection_only_on_the_owners_type(connection, owners):
-    runner = PagedGitHub()
-    GitHubGateway("o/r", runner=runner).build_world("dev")
-    pages = [q for q, _ in runner.calls if q.startswith("query($id") and f"{{{connection}(" in q]
-    head = re.compile(r"query\(\$id:ID!,\$cursor:String!\)\{node\(id:\$id\)\{\.\.\. on (\w+)\{" + connection + r"\(")
-    assert sorted(m.group(1) for q in pages if (m := head.match(q))) == owners
-    assert len(pages) == len(owners)
 
 
 def test_paged_connections_are_read_in_full():

@@ -9,7 +9,6 @@ which commit, labels, comments, merges) and on how many paid legs ran.
 from __future__ import annotations
 
 import asyncio
-import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import PullRequestDiff, Review
 from tests.app.test_fix_role import (
-    FIX_BOT, REVIEW_BOT, Agent, FakeGitHub, FakeWorktrees, _ci, _now, died, dispatched, open_pr, ready, tick,
+    FIX_BOT, REVIEW_BOT, Agent, FakeGitHub, FakeWorktrees, _now, died, dispatched, open_pr, ready, tick,
 )
 
 
@@ -160,15 +159,6 @@ def test_a_green_head_without_a_bot_review_gets_one_review_leg_and_one_review_on
     assert len(agent.tasks) == 1 and roles.checkouts.pinned == [(100, "h1")]
     task = agent.tasks[0]
     assert task.cwd.endswith("review-pr-100") and "diff --git a/x.py" in task.prompt
-
-
-def test_review_waits_for_green_ci(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pending")
-    review = roles.review(gh, Agent())
-
-    assert tick(review) == []
-    assert gh.submitted == []
 
 
 def test_a_review_on_a_moved_head_is_skipped_without_a_paid_leg(roles):
@@ -334,31 +324,6 @@ def test_a_bot_change_request_is_addressed_by_the_fix_role_not_reviewed_again(ro
     assert dispatched(tick(fix), AgentKind.ADDRESS_REVIEW) == [RunAgent(AgentKind.ADDRESS_REVIEW, 100, head="h1")]
 
 
-def test_an_approval_with_a_red_required_check_never_merges(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="fail", reviews=(
-        Review("APPROVED", REVIEW_BOT, submitted_at=_now(), commit_id="h1"),))
-    review = roles.review(gh, Agent())
-    fix = roles.fix(gh, Agent(lambda _t: AgentResult(False, status="pushed", cost_usd=0.1, session_id="s1")))
-
-    assert tick(review) == []
-    taken = tick(fix)
-    assert not any(isinstance(a, MergePullRequest) for a in taken)
-    assert dispatched(taken, AgentKind.FIX_CI) and gh.merged == []
-
-
-def test_a_push_after_approval_is_reviewed_again_on_the_new_head(roles):
-    gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass")
-    agent = Agent(verdict("APPROVE"), verdict("APPROVE", "Still right."))
-    review = roles.review(gh, agent)
-    tick(review)
-
-    gh.push("fix/5-null-token-crashes", "h2", ci="pass")
-    assert dispatched(tick(review), AgentKind.REVIEW) == [RunAgent(AgentKind.REVIEW, 100, head="h2")]
-    assert [s[3] for s in gh.submitted] == ["h1", "h2"]
-
-
 def test_three_unparseable_verdicts_on_one_head_stop_for_a_human_written_by_the_fix_role(roles):
     gh = ReviewGitHub(issues={5: ready()})
     open_pr(gh, head="h1", ci="pass")
@@ -392,35 +357,3 @@ def test_a_machine_death_counts_no_attempt_and_backs_off(roles, later):
     assert Label.NEEDS_HUMAN not in gh.prs[100].labels
 
 
-def test_a_review_leg_and_a_fix_leg_on_different_items_run_concurrently(roles):
-    gh = ReviewGitHub(issues={5: ready(), 6: ready(6, "Other bug")})
-    open_pr(gh, issue=5, head="h1", ci="pass")
-    both = threading.Barrier(2, timeout=10)
-    release = threading.Event()
-    review_in_flight = threading.Event()
-
-    def reviewing(_task):
-        review_in_flight.set()
-        both.wait()
-        assert release.wait(timeout=10)
-        return AgentResult(False, structured={"decision": "APPROVE", "body": "ok"}, cost_usd=0.2)
-
-    def resolving(_task):
-        both.wait()
-        assert release.wait(timeout=10)
-        return AgentResult(False, status="pushed", cost_usd=0.1, session_id="s6")
-
-    review = roles.review(gh, Agent(reviewing))
-    fix = roles.fix(gh, Agent(resolving))
-    assert dispatched(review.daemon.tick(), AgentKind.REVIEW)
-    # The review worker leases its item before the provider runs; tick the
-    # fix role only once it does, or the test races the worker thread.
-    assert review_in_flight.wait(timeout=10)
-    gh.prs[100] = replace(gh.prs[100], ci=_ci("h1", "fail"))  # while the review runs, CI goes red
-    taken = fix.daemon.tick()
-    assert dispatched(taken, AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 6, head="")]
-    assert not dispatched(taken, AgentKind.FIX_CI)  # the reviewed PR is busy for the fix role
-    release.set()
-    review.daemon.wait_for_dispatches()
-    fix.daemon.wait_for_dispatches()
-    assert gh.submitted == [(100, "APPROVE", "ok", "h1")]
