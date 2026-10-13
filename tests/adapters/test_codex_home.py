@@ -30,6 +30,15 @@ def test_codex_home_lives_outside_worktree(tmp_path) -> None:
     assert 'developer_instructions = "contract' in text
 
 
+def test_every_native_sub_agent_feature_is_pinned_off(tmp_path) -> None:
+    """The leg is priced from its root session alone (Q12): a default flip of
+    either multi-agent generation must not silently re-enable child sessions."""
+    (tmp_path / "worktree").mkdir()
+    config = write_codex_home(str(tmp_path / "worktree"), state_dir=str(tmp_path / "state"))
+    features = tomllib.loads(open(config).read())["features"]
+    assert features["multi_agent"] is False and features["multi_agent_v2"] is False
+
+
 def test_rewrite_replaces_a_stale_governor_hook_config(tmp_path) -> None:
     # The home keeps its historical codex-hooks path, so a pre-6a config whose
     # hook runs the deleted governor must not survive the next leg's write.

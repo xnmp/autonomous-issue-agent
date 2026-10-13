@@ -46,6 +46,7 @@ project_doc_max_bytes = 0
 # counters alone, and independent review is its own leg (refactor decision Q12).
 [features]
 multi_agent = false
+multi_agent_v2 = false
 """
 
 

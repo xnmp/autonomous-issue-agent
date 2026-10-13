@@ -790,8 +790,8 @@ def bind_runtime(
 ) -> tuple[AgentRuntime, Callable[[str], object] | None]:
     """The role's runtime and the per-checkout preparation its legs run first.
     Claude runs the passed SDK runner with repository guidance. Codex builds
-    its own runner: fixes get the git-capable sandbox and resume a dropped
-    transport, reviews are read-only and carry the system prompt inline."""
+    its own runner: fixes get the git-capable sandbox, reviews are read-only
+    and carry the system prompt inline."""
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
 
     runtime = cfg.fixer_runtime if role == "fix" else cfg.reviewer_runtime
@@ -810,7 +810,6 @@ def bind_runtime(
                                base_url=cfg.codex_base_url, env_key=cfg.codex_env_key,
                                wire_api=cfg.codex_wire_api),
         sandbox=cfg.codex_sandbox if fix else "read-only",
-        resume_on_retry=fix,
         reasoning_effort=cfg.codex_reasoning_effort,
         inject_system_prompt=not fix,
         log=log,

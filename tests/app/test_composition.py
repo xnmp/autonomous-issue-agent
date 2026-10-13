@@ -391,7 +391,6 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["rate_table"] is not None
     assert seen["sandbox"] == "read-only"
-    assert seen["resume_on_retry"] is False
     assert composed.legs.task_config.model == "gpt-5.6-terra"
     assert composed.legs.task_config.max_budget_usd == 2.5
 

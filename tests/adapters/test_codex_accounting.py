@@ -105,7 +105,7 @@ pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text(json.dumps({{"status
 def _runner(tmp_path, mode, directory):
     return CodexRunner(
         codex_bin=str(_fake_codex(tmp_path, mode)), default_model="sol", rate_table=RATES,
-        env={"OPENAI_API_KEY": "test-key"}, poll_slice=.02, backoff_base=0,
+        env={"OPENAI_API_KEY": "test-key"}, poll_slice=.02,
         spend_evidence_dir=str(directory),
         process_supervisor=ProcessSupervisor(str(tmp_path / "supervision"), grace_seconds=.05),
     )
@@ -116,7 +116,7 @@ def _plan(tmp_path):
                        env={"CODEX_HOME": str(tmp_path / "codex")})
 
 
-def test_a_resumed_transport_retry_prices_the_session_once_under_one_admission(tmp_path):
+def test_a_dropped_launch_is_one_leg_settled_at_its_rollout_and_its_evidence_removed(tmp_path):
     directory = tmp_path / "evidence"
     wrapper, control = _wrapper(tmp_path, _runner(tmp_path, "retry", directory), evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
@@ -124,14 +124,12 @@ def test_a_resumed_transport_retry_prices_the_session_once_under_one_admission(t
 
     result = _run(wrapper, _plan(tmp_path))
 
-    assert (tmp_path / "attempts").read_text() == "2", (result.summary, result.exit_reason)
-    assert result.status == "pushed"
-    # The session's cumulative counter after both attempts, charged once.
-    assert result.cost_usd == pytest.approx(2 * ROOT_MICROS / 1e6)
+    assert (tmp_path / "attempts").read_text() == "1"
+    assert result.exit_reason is ExitReason.TRANSPORT_DEATH
     assert control.active_reservation_runs("o/r:fix") == ()
     with _db(control) as db:
         assert db.execute("SELECT count(*) FROM legs").fetchone()[0] == 1
-        assert db.execute("SELECT charged_micros FROM legs WHERE state='ended'").fetchone()[0] == 2 * ROOT_MICROS
+        assert db.execute("SELECT charged_micros FROM legs WHERE state='ended'").fetchone()[0] == ROOT_MICROS
     assert not any(directory.iterdir())
 
 

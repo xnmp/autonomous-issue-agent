@@ -18,9 +18,9 @@ from issue_agent.adapters.codex_runner import (
     DEFAULT_SANDBOX,
     CodexProvider,
     CodexRunner,
+    MalformedRolloutCounters,
     read_rollout_usage,
     usage_delta,
-    _extract_retry_after_seconds,
     _is_rate_limited,
     _is_transport_drop,
     _strict_schema,
@@ -30,7 +30,10 @@ from issue_agent.adapters.codex_runner import (
 )
 from issue_agent.domain.outcome import (
     Outcome,
+    LegClass,
+    classify_leg,
     classify_outcome,
+    resumable_session,
 )
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
@@ -891,96 +894,49 @@ def test_rate_limit_is_a_transport_drop_but_network_drop_is_not_rate_limited():
     assert _is_transport_drop(0, "exceeded rate limit", ok) is False
 
 
-def test_extract_retry_after_seconds_parses_common_shapes():
-    assert _extract_retry_after_seconds("retry-after: 23") == 23.0
-    assert _extract_retry_after_seconds("please retry in 12.5s") == 12.5
-    assert _extract_retry_after_seconds("x-ratelimit-reset-tokens: 19") == 19.0
-    assert _extract_retry_after_seconds("retry-after: 2000ms") == 2.0
-    # No hint → None (caller uses the window-aligned default).
-    assert _extract_retry_after_seconds("exceeded rate limit") is None
-    # Largest hint wins (the furthest-out reset is the safe wait).
-    assert _extract_retry_after_seconds("reset-requests: 0 reset-tokens: 47") == 47.0
-
-
-def test_run_retries_after_rate_limit_then_succeeds():
-    """A 429 on the first attempt must NOT be given up on: the runner waits (short,
-    in-test) and retries, then succeeds. Regression for the 345 rebase, where the
-    2s network backoff retried inside Azure's 60s window and burned all attempts.
-    A stub counts invocations via an appended marker file; attempt 1 emits the
-    provider 429 text + exits nonzero, attempt 2 writes a real envelope."""
-    tmp = tempfile.mkdtemp()
+def _counting_codex(tmp, stderr_line: str) -> tuple[str, str]:
+    """A stub that counts its launches and dies on the wire every time."""
     counter = os.path.join(tmp, "n")
-    # Bash stub: increment counter; first run -> 429 to stderr + exit 1; else ok.
     body = (
-        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        'echo "session id: sess-rl" >&2\n'
-        'if [ "$n" -eq 1 ]; then\n'
-        '  echo "azure-openai error: have exceeded rate limit. retry-after: 0" >&2\n'
-        '  exit 1\n'
-        'fi\n'
-        'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
-        'exit 0\n'
+        f'n=$(cat "{counter}" 2>/dev/null || echo 0); echo $((n+1)) > "{counter}"\n'
+        + _meta("sess-drop") + f'echo "{stderr_line}" >&2\nexit 1\n'
     )
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        rate_limit_backoff_base=0.05, max_retry_wait=0.1, transport_retries=3,
-    )
-    r = asyncio.run(runner.run(RuntimePlan(prompt="rebase", schema={
-        "type": "object", "properties": {"status": {"type": "string"},
-        "summary": {"type": "string"}, "needs": {"type": "string"}}})))
-    assert r.is_error is False, f"rate-limited run was not retried to success: {r.summary}"
-    assert r.status == "pr_opened"
+    return _fake_codex(tmp, body), counter
+
+
+@pytest.mark.parametrize("stderr_line", [
+    "azure-openai error: have exceeded rate limit. retry-after: 0",
+    "ERROR: stream disconnected before completion: response.failed event received",
+])
+def test_a_gateway_failure_ends_the_leg_after_one_launch(stderr_line):
+    """A leg is one launch: a 429 or a stream drop is a machine end the item's
+    backoff retries in a new leg with its own reservation. The in-leg retry
+    loop this replaces settled only its last attempt's session."""
+    tmp = tempfile.mkdtemp()
+    codex, counter = _counting_codex(tmp, stderr_line)
+    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp})
+
+    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+
     with open(counter) as f:
-        assert int(f.read().strip()) == 2, "expected exactly one retry after the 429"
-
-
-def test_run_gives_up_after_transport_retries():
-    """A sustained 429 (every attempt) is bounded by transport_retries and
-    surfaces a retryable timeout — the daemon re-dispatches cold rather than looping
-    forever. Uses a tiny backoff so the test is fast."""
-    tmp = tempfile.mkdtemp()
-    body = (
-        'echo "session id: sess-rl2" >&2\n'
-        'echo "azure-openai error: exceeded rate limit" >&2\n'
-        'exit 1\n'
-    )
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        rate_limit_backoff_base=0.02, max_retry_wait=0.05, transport_retries=2,
-    )
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+        assert f.read().strip() == "1"
     assert r.is_error is True
-    assert r.status == "timeout"
-    assert "rate limit" in r.summary.lower()
-    # Upstream never gave the agent a turn → infra death, so the daemon must not
-    # burn a breaker slot on it.
-    assert r.exit_reason is ExitReason.TRANSPORT_DEATH
+    assert r.exit_reason is ExitReason.TRANSPORT_DEATH and infra_death(r.exit_reason)
+    # The provider ended the turn: the session stays resumable for the next leg.
+    assert resumable_session(r) == "sess-drop"
 
 
-def test_run_exhausted_transport_retries_is_infra_death():
-    """Every attempt died on the wire before a turn completed. The agent made no
-    attempt, so the CI/review breakers must not advance (FAILURE-MODES #58/#65)."""
+def test_a_hung_run_whose_tail_reads_like_a_drop_keeps_its_timeout_class():
+    """An idle-tripped run must stay IDLE_TIMEOUT, never become a transport
+    death: the wall-cap resume-once rule counts reliably hanging tasks."""
     tmp = tempfile.mkdtemp()
-    body = (
-        'echo "session id: sess-drop" >&2\n'
-        'echo "stream disconnected before completion" >&2\n'
-        'exit 1\n'
-    )
-    codex = _fake_codex(tmp, body)
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-        transport_retries=1, backoff_base=0.01,
-    )
+    body = _meta("sess-hang") + 'echo "stream disconnected before completion" >&2\nsleep 30\n'
+    runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
+                         idle_timeout=0.3, poll_slice=0.05)
 
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
 
-    assert r.is_error is True and r.status == "timeout"
-    assert r.exit_reason is ExitReason.TRANSPORT_DEATH
-    assert infra_death(r.exit_reason) is True
+    assert r.exit_reason is ExitReason.IDLE_TIMEOUT
 
 
 def test_run_process_killed_by_signal_is_infra_death_not_an_attempt():
@@ -1425,7 +1381,7 @@ def test_transport_drop_ignores_real_agent_error():
     assert _is_transport_drop(1, "2 failed, 10 passed\nTypeError: ...", _res()) is False
 
 
-def test_transport_drop_never_retries_captured_envelope():
+def test_transport_drop_never_claims_a_captured_envelope():
     # A completed turn (blocked/pr_opened) must never be retried, even on nonzero exit.
     assert _is_transport_drop(1, "stream disconnected before completion",
                               _res(status="blocked", is_error=False)) is False
@@ -1433,103 +1389,13 @@ def test_transport_drop_never_retries_captured_envelope():
                               _res(status="pr_opened", is_error=False)) is False
 
 
-# ── gateway transport-drop retry loop (run over a fake codex) ─────────────────
-def _flaky_codex(tmp, fail_times: int) -> str:
-    """A codex stub that emits a gateway stream-drop + exits 1 for the first
-    `fail_times` invocations (tracked via a counter file), then succeeds. Also
-    prints a session id header so the retry can resume."""
-    counter = os.path.join(tmp, "count")
-    with open(counter, "w") as f:
-        f.write("0")
-    body = f'''
-out=""
-prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-n=$(cat "{counter}")
-{_meta("sess-$n")}if [ "$n" -lt "{fail_times}" ]; then
-  echo $((n+1)) > "{counter}"
-  echo "ERROR: stream disconnected before completion: response.failed event received" >&2
-  exit 1
-fi
-printf '%s' '{{"status":"pr_opened","summary":"done","needs":""}}' > "$out"
-exit 0
-'''
-    return _fake_codex(tmp, body)
-
-
-def test_transport_drop_retries_then_succeeds():
-    """Two gateway drops, then success → run() recovers via the retry loop."""
+def test_real_error_is_not_a_transport_death():
+    """A non-transport nonzero exit returns as the agent's own error."""
     tmp = tempfile.mkdtemp()
-    codex = _flaky_codex(tmp, fail_times=2)
-    logged: list[str] = []
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
-                         log=logged.append, transport_retries=4, backoff_base=0.01)
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x", schema={
-        "type": "object", "properties": {"status": {"type": "string"},
-        "summary": {"type": "string"}, "needs": {"type": "string"}}})))
-    assert r.is_error is False and r.status == "pr_opened"
-    joined = "\n".join(logged)
-    assert "gateway stream drop — attempt 1/4" in joined
-    assert "resuming sess-" in joined  # retried with resume, not cold
-
-
-def test_read_only_transport_retry_starts_a_fresh_sandboxed_session():
-    """`codex exec resume` cannot accept --sandbox, so a reviewer retry must
-    never take the fixer recovery path that bypasses sandboxing."""
-    tmp = tempfile.mkdtemp()
-    codex = _flaky_codex(tmp, fail_times=1)
-    logged: list[str] = []
-    runner = CodexRunner(
-        codex_bin=codex, env={"OPENAI_API_KEY": "k"}, log=logged.append,
-        transport_retries=2, backoff_base=0.01, resume_on_retry=False,
-    )
-
-    result = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert result.status == "pr_opened"
-    assert "restarting in" in "\n".join(logged)
-    assert not any("resuming sess-" in line for line in logged)
-
-
-def test_transport_drop_exhausts_to_timeout():
-    """Every attempt drops → run() gives up as a retryable timeout, not error."""
-    tmp = tempfile.mkdtemp()
-    codex = _flaky_codex(tmp, fail_times=99)  # never succeeds
-    logged: list[str] = []
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-                         log=logged.append, transport_retries=2, backoff_base=0.01)
+    codex = _fake_codex(tmp, 'echo "boom: some real error" >&2\nexit 1\n')
+    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp})
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error and r.status == "timeout"
-    assert "survived 3 attempts" in r.summary  # 1 + 2 retries
-    assert any("giving up" in m for m in logged)
-
-
-def test_real_error_is_not_retried():
-    """A non-transport nonzero exit (real failure) must NOT enter the retry loop —
-    it returns immediately as the parsed error envelope."""
-    tmp = tempfile.mkdtemp()
-    body = 'echo "boom: some real error" >&2\nexit 1\n'
-    codex = _fake_codex(tmp, body)
-    logged: list[str] = []
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
-                         log=logged.append, transport_retries=4, backoff_base=0.01)
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error is True
-    assert not any("gateway stream-drop" in m for m in logged)  # loop never engaged
-
-
-def test_transport_retries_zero_disables_loop():
-    """transport_retries=0 → a single drop returns timeout immediately (no retry)."""
-    tmp = tempfile.mkdtemp()
-    codex = _flaky_codex(tmp, fail_times=99)
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-                         transport_retries=0, backoff_base=0.01)
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-    assert r.is_error and r.status == "timeout"
-    assert "survived 1 attempts" in r.summary
+    assert r.is_error is True and r.exit_reason is not ExitReason.TRANSPORT_DEATH
 
 
 # ══ review M1 / plan D12 — codex token accounting ═══════════════════════════
@@ -1578,13 +1444,67 @@ def test_read_rollout_usage_prefers_last_cumulative_token_count(tmp_path):
 def test_read_rollout_usage_is_none_when_file_or_session_missing(tmp_path):
     assert read_rollout_usage("", codex_home=str(tmp_path)) is None
     assert read_rollout_usage("no-such-session", codex_home=str(tmp_path)) is None
-    # Corrupt rollout (unparseable lines, no token_count) reads as None, not a raise.
+    # Unparseable lines that carry no counters, and a counter record codex is
+    # still writing (no newline yet), are no evidence rather than a raise.
     day = tmp_path / "sessions" / "2026" / "07" / "27"
     day.mkdir(parents=True)
     (day / "rollout-2026-07-27T00-00-00-badf00d.jsonl").write_text(
-        '{"payload": {"type": "token_count"\nnot json at all\n'
+        'not json at all\n{"payload": {"type": "token_count"'
     )
     assert read_rollout_usage("badf00d", codex_home=str(tmp_path)) is None
+
+
+def _rollout_with(tmp_path, sid: str, *lines: str) -> None:
+    day = tmp_path / "sessions" / "2026" / "10" / "13"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / f"rollout-now-{sid}.jsonl").write_text("".join(line + "\n" for line in lines))
+
+
+def _token_count(info) -> str:
+    return json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(),
+                       "payload": {"type": "token_count", "info": info}})
+
+
+@pytest.mark.parametrize("record", [
+    '{"payload": {"type": "token_count"',
+    _token_count({"total_token_usage": {"input_tokens": "12", "output_tokens": 3}}),
+    _token_count({"total_token_usage": None}),
+    _token_count(["not", "a", "dict"]),
+], ids=["unparseable", "string-counter", "null-totals", "non-dict-info"])
+def test_a_complete_counter_record_that_does_not_parse_fails_closed(tmp_path, record):
+    _rollout_with(tmp_path, "bad", record)
+    with pytest.raises(MalformedRolloutCounters):
+        read_rollout_usage("bad", codex_home=str(tmp_path))
+
+
+def test_a_counter_record_without_counters_yet_is_skipped(tmp_path):
+    """codex emits `info: null` token_count records (rate-limit snapshots)."""
+    _rollout_with(tmp_path, "early", _token_count(None),
+                  _token_count({"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}), _token_count(None))
+    assert read_rollout_usage("early", codex_home=str(tmp_path))["input_tokens"] == 10
+
+
+def test_a_run_whose_counters_are_malformed_ends_as_an_agent_attempt():
+    """Nothing can price it, so the live budget cannot hold: the leg ends as an
+    agent attempt (bounded by the attempt cap), never a free machine retry."""
+    tmp = tempfile.mkdtemp()
+    bad = json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(),
+                      "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": "x"}}}})
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        + _meta("sess-bad")
+        + f"printf '%s\\n' '{bad}' >> \"$CODEX_HOME/sessions/2026/10/13/rollout-now-sess-bad.jsonl\"\n"
+        'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
+    )
+    runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
+                         rate_table=CARD)
+
+    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+
+    assert r.is_error is True and r.exit_reason is ExitReason.AGENT_ERROR
+    assert classify_leg(r, resumed=False) is LegClass.AGENT
+    assert "malformed" in r.summary
 
 
 def test_usage_delta_subtracts_the_already_ledgered_baseline():
@@ -1759,7 +1679,7 @@ def test_an_aborted_run_still_reports_its_model():
     runner = CodexRunner(
         codex_bin=codex, env={"OPENAI_API_KEY": "k"},
         default_model="gpt-5.6-terra", idle_timeout=0.5,
-        transport_retries=0, post_hang_drain_timeout=0.5,
+        post_hang_drain_timeout=0.5,
     )
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
     assert r.status == "timeout"
@@ -1786,7 +1706,7 @@ def test_fixer_status_vocabulary_is_exactly_the_schemas_union():
 
 
 @pytest.mark.parametrize("status", sorted(_FIXER_TERMINAL_STATUSES | _LEGACY_OK_ALIASES))
-def test_a_captured_envelope_is_never_retried_whatever_its_terminal_status(status):
+def test_a_captured_envelope_is_never_a_transport_drop_whatever_its_terminal_status(status):
     """review M17a: every terminal status in the schemas means the turn COMPLETED.
     Retrying over one re-runs paid, side-effecting work (`pushed` = a force-push
     that already landed on the branch)."""
@@ -1800,9 +1720,9 @@ def test_a_captured_envelope_is_never_retried_whatever_its_terminal_status(statu
                               result) is False
 
 
-def test_an_error_envelope_with_a_drop_signature_is_still_retried():
+def test_an_error_envelope_with_a_drop_signature_is_still_a_transport_drop():
     """Anti-vacuity for the guard: it must not swallow everything. An `error`
-    envelope classifies as ERROR, so a transport signature still buys a retry."""
+    envelope classifies as ERROR, so a transport signature still counts."""
     result = parse_codex_envelope(
         exit_code=1, last_message=json.dumps({"status": "error", "summary": "s"}),
         stderr="ERROR: stream disconnected before completion",
@@ -1834,7 +1754,7 @@ def test_a_completed_force_push_is_not_re_run(tmp_path):
     counter = str(tmp_path / "n")
     runner = CodexRunner(
         codex_bin=_pushed_then_dropped_codex(tmp, counter),
-        env={"OPENAI_API_KEY": "k"}, transport_retries=4, backoff_base=0.01,
+        env={"OPENAI_API_KEY": "k"},
     )
 
     r = asyncio.run(runner.run(RuntimePlan(prompt="rebase")))
@@ -1842,21 +1762,6 @@ def test_a_completed_force_push_is_not_re_run(tmp_path):
     with open(counter) as f:
         assert int(f.read().strip()) == 1, "the completed push leg was run twice"
     assert r.status == "pushed" and r.is_error is False
-
-
-def test_an_envelope_less_drop_still_retries(tmp_path):
-    """Anti-vacuity twin: the guard only suppresses retries over REAL output. A
-    drop that produced no envelope must still get its retry."""
-    tmp = tempfile.mkdtemp()
-    codex = _flaky_codex(tmp, fail_times=1)
-    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"},
-                         transport_retries=4, backoff_base=0.01)
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert r.is_error is False and r.status == "pr_opened"
-    with open(os.path.join(tmp, "count")) as f:
-        assert int(f.read().strip()) == 1  # one failure consumed → it retried
 
 
 # ══ review M17b — classify on the stderr TAIL, not the whole agent trace ══════
@@ -1903,18 +1808,7 @@ def test_a_transport_signature_in_the_agent_trace_is_not_a_drop():
     assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is False
 
 
-def test_retry_after_hint_is_read_from_the_tail_not_the_agent_trace():
-    """A number the AGENT printed must never decide how long we sleep (the
-    parser takes the LARGEST hint, so one bogus big number in the trace would
-    otherwise park the daemon)."""
-    trace = _trace_with(
-        "azure-openai error: exceeded rate limit. retry-after: 3",
-        poison="apply_patch: +    # honour Retry-After: 99999 from the provider",
-    )
-    assert _extract_retry_after_seconds(trace) == 3.0
-
-
-def test_run_does_not_retry_when_only_the_agent_trace_mentions_a_rate_limit(tmp_path):
+def test_run_is_an_agent_error_when_only_the_agent_trace_mentions_a_rate_limit(tmp_path):
     """The behavioural half of M17b: a genuine agent error whose trace happens to
     contain 'rate limit' must return AGENT_ERROR on the FIRST attempt — no waits,
     and no TRANSPORT_DEATH laundering (which would exempt the breaker)."""
@@ -1929,8 +1823,6 @@ def test_run_does_not_retry_when_only_the_agent_trace_mentions_a_rate_limit(tmp_
     )
     runner = CodexRunner(
         codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
-        rate_limit_backoff_base=0.01, max_retry_wait=0.02,
-        transport_retries=4, backoff_base=0.01,
     )
 
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
@@ -1940,71 +1832,6 @@ def test_run_does_not_retry_when_only_the_agent_trace_mentions_a_rate_limit(tmp_
     assert r.is_error is True
     assert r.exit_reason is ExitReason.AGENT_ERROR
     assert infra_death(r.exit_reason) is False
-
-
-def test_run_still_retries_a_real_429_in_the_tail(tmp_path):
-    """Anti-vacuity twin of the above, through run(): identical trace, but the
-    provider's 429 is the last line → the rate-limit path engages and recovers."""
-    tmp = tempfile.mkdtemp()
-    counter = str(tmp_path / "n")
-    body = (
-        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        'echo "session id: sess-rl3" >&2\n'
-        "echo '" + _POISON_PATCH_LINE + "' >&2\n"
-        'for i in $(seq 1 30); do echo "codex| trace line $i" >&2; done\n'
-        'if [ "$n" -eq 1 ]; then\n'
-        '  echo "azure-openai error: have exceeded rate limit. retry-after: 0" >&2\n'
-        '  exit 1\n'
-        'fi\n'
-        'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
-        'exit 0\n'
-    )
-    runner = CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
-        rate_limit_backoff_base=0.01, max_retry_wait=0.02, transport_retries=3,
-    )
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    assert r.is_error is False and r.status == "pr_opened"
-    with open(counter) as f:
-        assert int(f.read().strip()) == 2
-
-
-# ══ review M17c — per-run scratch dir is removed; last.json truncated per attempt ═
-def test_a_stale_envelope_is_not_attributed_to_the_next_attempt(tmp_path):
-    """review M17c: codex writes `-o` only when a turn completes, so a retry that
-    produced NOTHING used to re-read the previous attempt's envelope and report
-    it as its own result. Attempt 1 leaves an `error` envelope and drops; attempt 2
-    writes no envelope and exits 0 — its result must be attempt 2's."""
-    tmp = tempfile.mkdtemp()
-    counter = str(tmp_path / "n")
-    body = (
-        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
-        'out=""; prev=""\n'
-        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        'echo "session id: sess-stale" >&2\n'
-        'if [ "$n" -eq 1 ]; then\n'
-        '  printf \'%s\' \'{"status":"error","summary":"ATTEMPT ONE ENVELOPE"}\' > "$out"\n'
-        '  echo "ERROR: stream disconnected before completion" >&2\n'
-        '  exit 1\n'
-        'fi\n'
-        'echo "SECOND ATTEMPT PROSE"\n'
-        'exit 0\n'
-    )
-    runner = CodexRunner(
-        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
-        transport_retries=4, backoff_base=0.01,
-    )
-
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
-
-    with open(counter) as f:
-        assert int(f.read().strip()) == 2  # it did retry (guard: the test is live)
-    assert "ATTEMPT ONE ENVELOPE" not in r.summary
-    assert r.is_error is False and "SECOND ATTEMPT PROSE" in r.summary
 
 
 def test_the_per_run_scratch_dir_is_removed(tmp_path):

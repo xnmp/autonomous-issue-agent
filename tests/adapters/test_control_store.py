@@ -486,13 +486,13 @@ def test_a_spawned_process_takes_over_its_legs_lease(tmp_path, monkeypatch):
     store.register_process_lease(run, expected_owner_id=OWNER, pid=4242, pgid=4242, process_start_ticks=7)
     with pytest.raises(ControlStoreError):
         store.register_process_lease(run, expected_owner_id="o/r:fix:other", pid=5, pgid=5, process_start_ticks=1)
-    monkeypatch.setattr(ProcessSupervisor, "matches_identity", classmethod(lambda cls, pid, ticks: True))
-    with pytest.raises(ControlStoreError, match="conflicting"):
-        store.register_process_lease(run, expected_owner_id=OWNER, pid=5, pgid=5, process_start_ticks=1)
+    # A leg is one launch: a second process never takes over a running leg,
+    # even once the first group is gone.
     monkeypatch.setattr(ProcessSupervisor, "matches_identity", classmethod(lambda cls, pid, ticks: False))
     monkeypatch.setattr(ProcessSupervisor, "group_is_absent", staticmethod(lambda pgid: True))
-    store.register_process_lease(run, expected_owner_id=OWNER, pid=5, pgid=5, process_start_ticks=1)
-    assert store.leases()[0].pid == 5
+    with pytest.raises(ControlStoreError, match="conflicting"):
+        store.register_process_lease(run, expected_owner_id=OWNER, pid=5, pgid=5, process_start_ticks=1)
+    assert store.leases()[0].pid == 4242
 
 
 def test_a_process_cannot_register_for_an_unleased_or_finished_leg(tmp_path):

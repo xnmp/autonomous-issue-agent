@@ -18,7 +18,6 @@ import glob
 import hashlib
 import json
 import os
-import random
 import re
 import signal
 import tempfile
@@ -64,13 +63,6 @@ DEFAULT_REASONING_EFFORT = "medium"
 _STDERR_STREAM_LIMIT = 4 * 1024 * 1024
 _STDERR_RETAINED_LINE_BYTES = 16 * 1024
 _SPEND_EVIDENCE_VERSION = 3
-
-# Gateway retry: a stream drop or a 429 is upstream, not the agent. A fresh
-# `codex exec` (resumed) recovers it; codex's own in-TCP reconnects do not.
-_TRANSPORT_RETRIES = 4
-_BACKOFF_BASE = 2.0
-_RATE_LIMIT_BASE = 60.0
-_MAX_RETRY_WAIT = 180.0
 
 
 def spend_evidence_path(directory: str, run_id: str) -> str:
@@ -366,8 +358,14 @@ def _rollout_path(session_id: str, codex_home: str | None) -> str | None:
     return max(paths, key=os.path.getmtime) if paths else None
 
 
-def _rollout_events(session_id: str, codex_home: str | None, marker: str):
-    """Parsed rollout events whose line contains `marker`; unreadable lines skip."""
+class MalformedRolloutCounters(ValueError):
+    """A complete rollout record carries token counters that do not parse:
+    nothing can price the leg, so its live budget cannot hold."""
+
+
+def _rollout_events(session_id: str, codex_home: str | None, marker: str, *, strict: bool = False):
+    """Parsed rollout events whose line contains `marker`. An unparseable line
+    skips, or under `strict` raises once complete (codex may be mid-write)."""
     path = _rollout_path(session_id, codex_home)
     if path is None:
         return
@@ -378,6 +376,8 @@ def _rollout_events(session_id: str, codex_home: str | None, marker: str):
             try:
                 event = json.loads(line)
             except ValueError:
+                if strict and line.endswith("\n"):
+                    raise MalformedRolloutCounters(f"unparseable {marker} record") from None
                 continue
             payload = event.get("payload") if isinstance(event, dict) else None
             if isinstance(payload, dict):
@@ -420,20 +420,26 @@ def read_rollout_usage(
 
     The last valid timestamped `token_count` wins (the counter is cumulative).
     `until` excludes counters after the run's recorded end, which a later leg
-    resuming the same session may have written.
+    resuming the same session may have written. A counter record that does not
+    parse raises `MalformedRolloutCounters` (fail closed); a record without
+    counters yet (`info: null`) is skipped.
     """
     try:
         found: dict | None = None
-        for event, payload in _rollout_events(session_id, codex_home, '"token_count"'):
+        for event, payload in _rollout_events(session_id, codex_home, '"token_count"', strict=True):
             if payload.get("type") != "token_count":
                 continue
             stamp = _rollout_timestamp(event.get("timestamp"))
             if stamp is None or (until is not None and stamp > until):
                 continue
-            total = (payload.get("info") or {}).get("total_token_usage")
-            if (isinstance(total, dict) and type(total.get("input_tokens")) is int
+            info = payload.get("info")
+            if info is None:
+                continue
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if not (isinstance(total, dict) and type(total.get("input_tokens")) is int
                     and type(total.get("output_tokens")) is int):
-                found = total
+                raise MalformedRolloutCounters("token_count record without parseable totals")
+            found = total
         if found is None:
             return None
         return {
@@ -443,7 +449,9 @@ def read_rollout_usage(
             "cache_creation_input_tokens": found.get("cache_write_input_tokens", 0),
             "source": UsageSource.ROLLOUT.value,
         }
-    except Exception:  # noqa: BLE001 — losing precision must never lose the run
+    except MalformedRolloutCounters:
+        raise
+    except Exception:  # noqa: BLE001 — an unreadable rollout is no evidence yet
         return None
 
 
@@ -564,13 +572,6 @@ class CodexRunner(AgentRuntime):
     # Bounds only the residual stdout drain after stderr ends: a descendant that
     # survived the group kill may hold the pipe forever.
     post_hang_drain_timeout: float = 30.0
-    transport_retries: int = _TRANSPORT_RETRIES
-    # `codex exec resume` bypasses the sandbox (no --sandbox form), so only the
-    # fix worktree recovers by resume; the read-only reviewer restarts fresh.
-    resume_on_retry: bool = True
-    backoff_base: float = _BACKOFF_BASE
-    rate_limit_backoff_base: float = _RATE_LIMIT_BASE
-    max_retry_wait: float = _MAX_RETRY_WAIT
     process_supervisor: Any = None
     # Where the leg's rollout coordinates are persisted, so boot recovery can
     # settle measured usage after SIGKILL or machine loss.
@@ -668,7 +669,10 @@ class CodexRunner(AgentRuntime):
         return replace(result, model=result.model or self._resolved_model(task))
 
     async def _run_in(self, task: RuntimePlan, tmpdir: str) -> AgentResult:
-        """The gateway-retry loop around one priced invocation."""
+        """One priced `codex exec`. A leg is one launch: a gateway drop or a 429
+        ends it as a machine failure charged what it spent, and the item's
+        backoff retries in a new leg with its own reservation (an in-leg retry
+        loop once settled only its last attempt's session)."""
         schema_path = None
         if task.schema is not None:
             schema_path = os.path.join(tmpdir, "schema.json")
@@ -677,67 +681,39 @@ class CodexRunner(AgentRuntime):
         output_path = os.path.join(tmpdir, "last.json")
         model = self._resolved_model(task) or "<runtime-default>"
         codex_home = self._accounting_home(self._child_environment(task), task.cwd)
-        # Tokens the resumed session had already burned (and an earlier leg
-        # ledgered). Captured once: retries inside this run resume a session
-        # whose earlier attempts were never ledgered.
+        # Tokens the resumed session had already burned (and an earlier leg ledgered).
         baseline_sid = task.resume or ""
-        baseline = read_rollout_usage(baseline_sid, codex_home) if baseline_sid else None
-        resume_id = task.resume
-        attempt = 0
-        while True:
-            # Codex writes `-o` only at a completed turn; a retry must never
-            # re-read the previous attempt's envelope (review M17).
-            _unlink_quietly(output_path)
-            run_task = replace(task, resume=resume_id) if resume_id else task
-            argv, stdin_payload = route_oversize_prompt(build_codex_argv(
-                run_task, codex_bin=self.codex_bin, provider=self.provider, sandbox=self.sandbox,
-                default_model=self.default_model, schema_path=schema_path, output_path=output_path,
-                inject_system_prompt=self.inject_system_prompt, reasoning_effort=self.reasoning_effort,
-            ))
-            if stdin_payload is not None and len(stdin_payload) > _PROMPT_STDIN_HARD_LIMIT:
-                return AgentResult(
-                    is_error=True, status="prompt_oversize", exit_reason=ExitReason.AGENT_ERROR,
-                    summary=(f"prompt is {len(stdin_payload)} bytes (> {_PROMPT_STDIN_HARD_LIMIT}); refusing "
-                             "to dispatch a leg that cannot fit a model context"),
-                )
-            result, exit_code, stderr = await self._exec_once(
-                argv, run_task, output_path, model, codex_home,
-                (baseline_sid, baseline) if baseline else None, stdin_payload,
+        try:
+            baseline = read_rollout_usage(baseline_sid, codex_home) if baseline_sid else None
+        except MalformedRolloutCounters as exc:
+            return _malformed_counters(str(exc), baseline_sid, None)
+        argv, stdin_payload = route_oversize_prompt(build_codex_argv(
+            task, codex_bin=self.codex_bin, provider=self.provider, sandbox=self.sandbox,
+            default_model=self.default_model, schema_path=schema_path, output_path=output_path,
+            inject_system_prompt=self.inject_system_prompt, reasoning_effort=self.reasoning_effort,
+        ))
+        if stdin_payload is not None and len(stdin_payload) > _PROMPT_STDIN_HARD_LIMIT:
+            return AgentResult(
+                is_error=True, status="prompt_oversize", exit_reason=ExitReason.AGENT_ERROR,
+                summary=(f"prompt is {len(stdin_payload)} bytes (> {_PROMPT_STDIN_HARD_LIMIT}); refusing "
+                         "to dispatch a leg that cannot fit a model context"),
             )
-            observed = leg_usage(result.session_id, model, result.usage, self.rate_table)
-            amount = price_run_usage(observed, self.rate_table)
-            result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
-            if task.max_budget_usd > 0 and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros:
-                result = replace(result, is_error=True, status=MAX_BUDGET_STATUS,
-                                 envelope_subtype=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
-            # A budget kill can leave a truncated stream that looks like a drop;
-            # retrying it would spend the budget again.
-            if result.exit_reason is ExitReason.BUDGET_EXHAUSTED or not _is_transport_drop(exit_code, stderr, result):
-                return result
-            if self.resume_on_retry:
-                resume_id = result.session_id or resume_id
-            limited = _is_rate_limited(stderr)
-            if attempt >= self.transport_retries:
-                self._log(f"codex: gateway failure persisted after {attempt + 1} attempt(s) — giving up")
-                # Every attempt died upstream before a turn completed: no attempt.
-                return replace(result, is_error=True, status="timeout", exit_reason=ExitReason.TRANSPORT_DEATH,
-                               summary=(f"codex gateway {'rate limit (HTTP 429)' if limited else 'stream drop'} "
-                                        f"survived {attempt + 1} attempts; retryable"))
-            hinted = _extract_retry_after_seconds(stderr) if limited else None
-            delay = hinted if hinted is not None else (
-                self.rate_limit_backoff_base * (attempt + 1) if limited else self.backoff_base * 2 ** attempt)
-            delay = min(delay, self.max_retry_wait)
-            delay += random.uniform(0, delay / 4)
-            attempt += 1
-            self._log(f"codex: {'rate limited (429)' if limited else 'gateway stream drop'} — attempt "
-                      f"{attempt}/{self.transport_retries}; {'resuming ' + resume_id if resume_id else 'restarting'} "
-                      f"in {delay:.1f}s")
-            await asyncio.sleep(delay)
+        result = await self._exec_once(
+            argv, task, output_path, model, codex_home,
+            (baseline_sid, baseline) if baseline else None, stdin_payload,
+        )
+        observed = leg_usage(result.session_id, model, result.usage, self.rate_table)
+        amount = price_run_usage(observed, self.rate_table)
+        result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
+        if task.max_budget_usd > 0 and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros:
+            result = replace(result, is_error=True, status=MAX_BUDGET_STATUS,
+                             envelope_subtype=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
+        return result
 
     async def _exec_once(
         self, argv: list[str], task: RuntimePlan, output_path: str, model: str, codex_home: str,
         baseline: tuple[str, dict] | None, stdin_payload: bytes | None,
-    ) -> tuple[AgentResult, int, str]:
+    ) -> AgentResult:
         """One `codex exec`: spawn, pump stderr under the watchdogs and the
         budget, then read the envelope and this leg's rollout counters."""
         proc_env = self._child_environment(task)
@@ -794,6 +770,7 @@ class CodexRunner(AgentRuntime):
         hung = False
         wall_tripped = False
         budget_stop = False
+        malformed = ""
         budget_armed = task.max_budget_usd > 0 and self.rate_table is not None
         budget = Money.from_major("USD", task.max_budget_usd) if budget_armed else None
         started_at = self._wall_clock() if self.max_runtime is not None else 0.0
@@ -811,8 +788,13 @@ class CodexRunner(AgentRuntime):
             return session_id
 
         def _usage() -> dict | None:
+            nonlocal malformed
             sid = _session()
-            usage = read_rollout_usage(sid, codex_home) if sid else None
+            try:
+                usage = read_rollout_usage(sid, codex_home) if sid else None
+            except MalformedRolloutCounters as exc:
+                malformed = str(exc)
+                return None
             return usage_delta(usage, baseline[1]) if baseline is not None and sid == baseline[0] else usage
 
         def _over_budget(now: float) -> bool:
@@ -823,6 +805,9 @@ class CodexRunner(AgentRuntime):
                 return False
             last_budget_check = now
             spent = price_run_usage(leg_usage(_session(), model, _usage(), self.rate_table), self.rate_table)
+            if malformed:
+                self._log(f"codex: COUNTERS — {malformed}; the budget cannot hold, killing subprocess")
+                return True
             if spent.micros < budget.micros:
                 return False
             self._log(f"codex: BUDGET — this leg has spent ${spent.micros / 1e6:.2f}, crossing "
@@ -966,6 +951,9 @@ class CodexRunner(AgentRuntime):
             self._log(f"codex: stderr tail: {_stderr_tail(stderr, 3)[:500]}")
         sid = _session()
         usage = _usage()
+        if malformed:
+            # Checked first: a malformed-counter kill also sets `budget_stop`.
+            return _malformed_counters(malformed, sid, usage)
         if budget_stop:
             # Checked before `hung`: the residual drain may set it after our kill.
             return AgentResult(
@@ -973,7 +961,7 @@ class CodexRunner(AgentRuntime):
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
                 summary=f"codex spend crossed MAX_BUDGET_USD=${task.max_budget_usd:.2f} mid-run; killed",
                 usage=usage, session_id=sid,
-            ), exit_code, stderr
+            )
         if hung:
             limit = (f"exceeded max runtime {self.max_runtime:.0f}s" if wall_tripped
                      else f"idle >{self.idle_timeout or 0:.0f}s (no stderr event)")
@@ -981,7 +969,7 @@ class CodexRunner(AgentRuntime):
                 is_error=True, status="timeout", summary=f"codex {limit}; killed",
                 exit_reason=ExitReason.WALL_TIMEOUT if wall_tripped else ExitReason.IDLE_TIMEOUT,
                 session_id=sid, usage=usage,
-            ), exit_code, stderr
+            )
         try:
             with open(output_path) as f:
                 last_message = f.read()
@@ -993,19 +981,23 @@ class CodexRunner(AgentRuntime):
         provider_failure = (
             read_rollout_provider_failure(sid, codex_home, since=rollout_started_at) if result.is_error else None
         )
+        if provider_failure is None and _is_transport_drop(exit_code, stderr, result):
+            provider_failure = "HTTP 429 rate limit" if _is_rate_limited(stderr) else "gateway stream drop"
         if provider_failure is not None:
-            # The provider refused the turn (capacity or quota): a machine
-            # failure whose session stays resumable.
-            self._log(f"codex: provider refused the turn ({provider_failure}) — machine failure, not an attempt")
+            # The provider ended the turn (capacity, quota, a dropped stream):
+            # a machine failure whose session stays resumable. Reached only
+            # after the watchdog and budget returns above, so a hung run keeps
+            # its timeout class.
+            self._log(f"codex: provider ended the turn ({provider_failure}) — machine failure, not an attempt")
             result = replace(result, exit_reason=ExitReason.TRANSPORT_DEATH,
                              envelope_subtype=PROVIDER_REFUSED_SUBTYPE,
-                             summary=f"provider refused the turn: {provider_failure}")
+                             summary=f"provider ended the turn: {provider_failure}")
         if exit_code < 0:
             # A signal we did not send (our kills set `hung`/`budget_stop`):
             # OOM, an operator kill, a Ctrl-C to the group. Not an attempt.
             self._log(f"codex: killed by signal {-exit_code} (not by our watchdog) — infra death")
             result = replace(result, exit_reason=ExitReason.KILLED_EXTERNALLY)
-        return result, exit_code, stderr
+        return result
 
 
 # Gateway stream-drop signatures codex prints when the upstream connection
@@ -1015,20 +1007,14 @@ _TRANSPORT_DROP_SIGNATURES = (
     "response.failed event received",
 )
 
-# HTTP 429 arrives as `response.failed` too, but must wait out the provider's
-# throttle window (Azure: 60s), honouring Retry-After when present.
+# HTTP 429 arrives as `response.failed` too; the item's machine backoff waits
+# out the provider's throttle window.
 _RATE_LIMIT_SIGNATURES = (
     "rate limit", "too many requests", "rate_limit_exceeded", "too_many_requests",
     "usage limit", "quota exceeded", " 429", "status 429", "http 429",
 )
 
-_RETRY_AFTER_RE = re.compile(
-    r"(?:retry[\s_-]*after|retry[\s_-]*in|reset[\s_-]*(?:requests|tokens)?|try again in)"
-    r"[^0-9]{0,12}?(\d+(?:\.\d+)?)\s*(m?s|sec|secs|seconds|s)?\b",
-    re.IGNORECASE,
-)
-
-# Retry classification reads only the stderr TAIL (review M17): codex streams
+# Transport classification reads only the stderr TAIL (review M17): codex streams
 # the agent's whole tool output to stderr, and a test named
 # `test_rate_limit_backoff` scrolling past once bought 15 minutes of waits and
 # laundered an agent error into a transport death. A fatal transport error is
@@ -1055,19 +1041,12 @@ def _is_rate_limited(stderr: str) -> bool:
     return any(sig in low for sig in _RATE_LIMIT_SIGNATURES)
 
 
-def _extract_retry_after_seconds(stderr: str) -> float | None:
-    """The largest Retry-After/reset hint in the stderr tail, in seconds."""
-    best: float | None = None
-    for m in _RETRY_AFTER_RE.finditer(_stderr_tail(stderr)):
-        try:
-            val = float(m.group(1))
-        except (TypeError, ValueError):
-            continue
-        if (m.group(2) or "").lower() == "ms":
-            val /= 1000.0
-        if best is None or val > best:
-            best = val
-    return best
+def _malformed_counters(detail: str, session_id: str, usage: dict | None) -> AgentResult:
+    """Fail closed: an unpriceable leg ends as an agent attempt, so the item's
+    attempt cap bounds a session whose spend nothing can see."""
+    return AgentResult(is_error=True, status="error", exit_reason=ExitReason.AGENT_ERROR,
+                       summary=f"codex rollout counters are malformed ({detail}); the leg cannot be priced",
+                       session_id=session_id, usage=usage)
 
 
 def _unlink_quietly(path: str) -> None:
