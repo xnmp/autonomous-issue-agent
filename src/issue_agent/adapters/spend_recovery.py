@@ -7,11 +7,13 @@ import os
 from dataclasses import dataclass
 
 from .codex_runner import (
+    MalformedRolloutCounters,
     discover_rollout_session,
     leg_usage,
     read_rollout_usage,
     recovered_rate_table,
     remove_spend_evidence,
+    reserved_maximum_usage,
     spend_evidence_path,
     usage_delta,
 )
@@ -50,10 +52,15 @@ class CodexSpendReconciler:
                 session_id = evidence["session_id"] or discover_rollout_session(
                     evidence["cwd"], float(evidence["rollout_started_at"]), evidence["codex_home"] or None)
                 rates = recovered_rate_table(evidence.get("rate_table", evidence.get("native_rate_table")))
-                usage = read_rollout_usage(session_id, evidence["codex_home"] or None, until=ended_at) \
-                    if session_id else None
-                baseline = evidence["baseline_usage"] if session_id == evidence["baseline_session_id"] else None
-                observed = leg_usage(session_id, evidence["model"], usage_delta(usage, baseline), rates)
+                try:
+                    usage = read_rollout_usage(session_id, evidence["codex_home"] or None, until=ended_at) \
+                        if session_id else None
+                except MalformedRolloutCounters as exc:
+                    observed = reserved_maximum_usage(session_id, evidence["model"],
+                                                      float(evidence.get("max_budget_usd") or 0), str(exc))
+                else:
+                    baseline = evidence["baseline_usage"] if session_id == evidence["baseline_session_id"] else None
+                    observed = leg_usage(session_id, evidence["model"], usage_delta(usage, baseline), rates)
                 amount = price_run_usage(observed, rates)
                 if amount.micros > 2**63 - 1:
                     return self._unavailable(run_id, "request prices exceed SQLite's money bound; unusable requests charged zero")

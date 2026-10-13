@@ -99,6 +99,31 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
     assert not any(evidence_dir.iterdir())
 
 
+def test_a_recovered_leg_whose_counters_are_malformed_settles_its_reserved_maximum(tmp_path):
+    """Fail closed: unknown spend bounded by the reservation is charged at
+    that bound, never at zero."""
+    store, scope, run_id = _reserved_store(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    rollout_dir = codex_home / "sessions" / NOW.strftime("%Y/%m/%d")
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / "rollout-now-session-1.jsonl").write_text(
+        '{"timestamp":"' + NOW.isoformat() + '","type":"event_msg","payload":{"type":"token_count","info":'
+        '{"total_token_usage":{"input_tokens":"1000"}}}}\n'
+    )
+    evidence_dir = tmp_path / "state" / "spend-evidence"
+    write_spend_evidence(str(evidence_dir), str(run_id), {
+        "cwd": str(tmp_path), "rollout_started_at": NOW.timestamp(), "session_id": "session-1",
+        "baseline_session_id": "", "baseline_usage": None, "model": "gpt", "codex_home": str(codex_home),
+        "rate_table": None, "max_budget_usd": 1.0,
+    })
+
+    _end_run_at(store, run_id, END)
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.active_reservation_runs(OWNER) == ()
+    assert store.snapshot(scope).settled == Money("USD", 1_000_000)
+
+
 def test_missing_rollout_does_not_fabricate_recovered_spend(tmp_path):
     store, _scope, run_id = _reserved_store(tmp_path)
     evidence_dir = tmp_path / "state" / "spend-evidence"

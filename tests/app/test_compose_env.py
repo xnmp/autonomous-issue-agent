@@ -775,7 +775,7 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
 #
 #   * CI triggered on `main` while every PR targeted `chong-dev`, so no PR had
 #     ever received a check. `ci_state` returns CIState.NONE for a PR with no
-#     checks and domain/fix.py:315/:340 treat NONE identically to OK — approved
+#     checks and domain/ci.py (reduce_ci) treats NONE identically to OK — approved
 #     PRs would have auto-merged with zero CI verification, silently.
 #   * The repo's `Security Audit` job is `continue-on-error: true`. GitHub still
 #     reports its conclusion as FAILURE, and domain/ci.py:45 makes any fail

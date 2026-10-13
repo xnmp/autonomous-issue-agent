@@ -426,7 +426,6 @@ after same-head cancellation until the free rerun is spent. Unavailable reads
 leave durable escalations owed; settled Clear obsoletes other CI escalations),
 `domain/contracts.py`, `domain/dashboard.py`,
 `domain/effort.py`,
-`domain/events.py`, `domain/fix.py`,
 `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),

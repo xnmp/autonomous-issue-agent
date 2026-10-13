@@ -56,10 +56,8 @@ def login_eq(a: str, b: str) -> bool:
     an unset `FIX_BOT` ("") read as OURS, falsifying the fail-safe the
     authorship filter's own comment claimed. Unknown-vs-unknown must fail
     closed, not match — an absent identity must never accidentally "match" an
-    absent author. Some call sites (domain/fix.py's PR filter) already guard
-    both sides non-empty before calling this, so this reversal is defence in
-    depth there; other call sites (domain/ci.py, domain/review.py) call this
-    directly with no such guard, so the reversal is load-bearing there."""
+    absent author. Callers pass logins unguarded, so the reversal is
+    load-bearing."""
     na, nb = normalize_login(a), normalize_login(b)
     if not na or not nb:
         return False

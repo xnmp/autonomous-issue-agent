@@ -853,3 +853,37 @@ def test_a_launch_that_drops_mid_run_is_settled_at_its_real_cost_and_the_caps_se
         # 300k input at $5/M + 10k output at $30/M.
         assert [row[0] for row in db.execute("SELECT charged_micros FROM legs WHERE state='ended'")] == [1_800_000]
     assert refused.exit_reason is ExitReason.BUDGET_EXHAUSTED
+
+
+def test_a_leg_whose_counters_are_malformed_settles_its_reserved_maximum_and_the_caps_see_it(tmp_path) -> None:
+    """Unknown spend is charged at the reservation's bound, never at zero:
+    the daily cap then refuses the next leg."""
+    import stat
+    import sys
+
+    from issue_agent.adapters.codex_runner import CodexRunner
+
+    home = tmp_path / "codex-home"
+    rollout = (
+        "import json,os,datetime;d=os.path.join(os.environ['CODEX_HOME'],'sessions','2026','10','13');"
+        "os.makedirs(d,exist_ok=True);now=datetime.datetime.now(datetime.timezone.utc).isoformat();"
+        "open(os.path.join(d,'rollout-now-sess-bad.jsonl'),'w').write("
+        "json.dumps({'timestamp':now,'type':'session_meta','payload':{'id':'sess-bad','originator':'codex_exec',"
+        "'source':'exec','cwd':os.getcwd()}})+'\\n'+json.dumps({'timestamp':now,'type':'event_msg','payload':"
+        "{'type':'token_count','info':{'total_token_usage':{'input_tokens':'x'}}}})+'\\n')"
+    )
+    codex = tmp_path / "codex"
+    codex.write_text(f'#!/usr/bin/env bash\n{sys.executable} -c "{rollout}"\nexit 0\n')
+    codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
+    runner = CodexRunner(codex_bin=str(codex), env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(home)},
+                         rate_table=_rates())
+    wrapper, store = _wrapper(tmp_path, runner, cap=3_000_000)
+
+    malformed = _run(wrapper, RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    refused = _run(wrapper, RuntimePlan("again", model="gpt-test", max_budget_usd=2))
+
+    assert malformed.exit_reason is ExitReason.AGENT_ERROR
+    with _db(store) as db:
+        assert [tuple(row) for row in db.execute(
+            "SELECT charged_micros, basis FROM legs WHERE state='ended'")] == [(2_000_000, "estimate")]
+    assert refused.exit_reason is ExitReason.BUDGET_EXHAUSTED

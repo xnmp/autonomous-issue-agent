@@ -1501,11 +1501,12 @@ def test_a_run_whose_counters_are_malformed_ends_as_an_agent_attempt():
     runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
                          rate_table=CARD)
 
-    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+    r = asyncio.run(runner.run(RuntimePlan(prompt="x", max_budget_usd=3)))
 
     assert r.is_error is True and r.exit_reason is ExitReason.AGENT_ERROR
     assert classify_leg(r, resumed=False) is LegClass.AGENT
     assert "malformed" in r.summary
+    assert r.cost_usd == 3.0  # the reservation's maximum, never zero
 
 
 def test_usage_delta_subtracts_the_already_ledgered_baseline():

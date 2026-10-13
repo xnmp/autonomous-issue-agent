@@ -383,7 +383,7 @@ echo "== CI on the base branch =="
 # 2026-07-28, and none of them were visible to any existing check):
 #
 #   A. `ci_state` returns CIState.NONE when a PR has no checks, and
-#      domain/fix.py:315/:340 treat NONE EXACTLY like OK. So a repo whose
+#      domain/ci.py reduce_ci reads no checks as Clear (NONE == OK). So a repo whose
 #      workflows never trigger on the base branch gets fully autonomous merges
 #      with zero CI verification — only the reviewer is left,
 #      and nothing anywhere says so. keifu was in precisely this state: CI
@@ -427,7 +427,7 @@ else
   if [ -z "$_WF" ]; then
     warn "could not list Actions workflows for $REPO (Actions disabled, or the token lacks access) — the CI gate cannot be verified"
   elif [ "$_WF" = "0" ]; then
-    warn "$REPO has no active Actions workflows. ci_state() therefore returns NONE, and domain/fix.py treats NONE exactly like OK — so an approved PR auto-merges with NO CI verification, gated only by the reviewer and your TEST_CMD. That may be intended; it should not be a surprise."
+    warn "$REPO has no active Actions workflows. ci_state() therefore returns NONE, and domain/ci.py (reduce_ci) treats NONE exactly like OK — so an approved PR auto-merges with NO CI verification, gated only by the reviewer and your TEST_CMD. That may be intended; it should not be a surprise."
   else
     _ROLLUP="$(gh pr list -R "$REPO" --base "$_BASE" --state all --limit 10 \
                  --json number,statusCheckRollup 2>/dev/null)"
@@ -439,7 +439,7 @@ else
       _WITH="$(printf '%s' "$_ROLLUP" | jq '[.[]|select((.statusCheckRollup//[])|length > 0)]|length' 2>/dev/null || echo 0)"
       case "${_WITH:-}" in ''|*[!0-9]*) _WITH=0 ;; esac
       if [ "$_WITH" -eq 0 ]; then
-        bad "$REPO has $_WF active workflow(s), but NOT ONE of the last $_PRS PR(s) into '$_BASE' received a single check. Every PR the harness opens will read CIState.NONE, which domain/fix.py:315 treats identically to OK — approved PRs will auto-merge with zero CI verification. Almost always the workflow triggers on a different branch than '$_BASE': check on.pull_request.branches in .github/workflows/."
+        bad "$REPO has $_WF active workflow(s), but NOT ONE of the last $_PRS PR(s) into '$_BASE' received a single check. Every PR the harness opens will read CIState.NONE, which domain/ci.py (reduce_ci) treats identically to OK — approved PRs will auto-merge with zero CI verification. Almost always the workflow triggers on a different branch than '$_BASE': check on.pull_request.branches in .github/workflows/."
       else
         ok "PRs into '$_BASE' receive checks ($_WITH of the last $_PRS sampled)"
 

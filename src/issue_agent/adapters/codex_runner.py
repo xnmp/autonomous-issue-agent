@@ -702,6 +702,8 @@ class CodexRunner(AgentRuntime):
             argv, task, output_path, model, codex_home,
             (baseline_sid, baseline) if baseline else None, stdin_payload,
         )
+        if isinstance(result.run_usage, EstimatedRunUsage):  # malformed counters: priced at the maximum
+            return replace(result, cost_usd=price_run_usage(result.run_usage, None).micros / 1_000_000)
         observed = leg_usage(result.session_id, model, result.usage, self.rate_table)
         amount = price_run_usage(observed, self.rate_table)
         result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
@@ -730,6 +732,9 @@ class CodexRunner(AgentRuntime):
             "model": model,
             "codex_home": codex_home,
             "rate_table": rate_table_evidence(self.rate_table),
+            # The reservation's maximum (admission rejects a task budget that
+            # differs): what malformed counters settle at.
+            "max_budget_usd": task.max_budget_usd,
         }
         write_spend_evidence(self.spend_evidence_dir, accounting_run_id, evidence)
         supervision_run_id = RunId(accounting_run_id or f"codex-{uuid.uuid4().hex}")
@@ -953,7 +958,8 @@ class CodexRunner(AgentRuntime):
         usage = _usage()
         if malformed:
             # Checked first: a malformed-counter kill also sets `budget_stop`.
-            return _malformed_counters(malformed, sid, usage)
+            return replace(_malformed_counters(malformed, sid, usage),
+                           run_usage=reserved_maximum_usage(sid, model, task.max_budget_usd, malformed))
         if budget_stop:
             # Checked before `hung`: the residual drain may set it after our kill.
             return AgentResult(
@@ -1039,6 +1045,16 @@ def _is_transport_drop(exit_code: int, stderr: str, result: AgentResult) -> bool
 def _is_rate_limited(stderr: str) -> bool:
     low = _stderr_tail(stderr).lower()
     return any(sig in low for sig in _RATE_LIMIT_SIGNATURES)
+
+
+def reserved_maximum_usage(session_id: str, model: str, max_budget_usd: float, detail: str) -> EstimatedRunUsage:
+    """Malformed counters settle at the reservation's maximum: the leg's real
+    spend is unknown but bounded by it, so the caps never see less."""
+    charge = Money.from_major("USD", max_budget_usd)
+    sample = ModelUsage(session_id or "unknown-session", model.strip() or "<runtime-default>",
+                        TokenUsage(0, 0, source=UsageSource.ROLLOUT), reported_cost=charge)
+    return EstimatedRunUsage(f"rollout counters malformed ({detail[:200]}); charged the reserved maximum",
+                             (sample,))
 
 
 def _malformed_counters(detail: str, session_id: str, usage: dict | None) -> AgentResult:
