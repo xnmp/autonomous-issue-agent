@@ -46,6 +46,10 @@ typechecks and compiler suites sequentially; honor configured worker counts.
    Check for commitlint/commit-msg hooks before the first commit and follow them.
 6. For UI-facing changes, commit screenshots from the running app in `evidence/`,
    each at most 700KB; the reviewer judges whether they show the changed behavior.
+   `curl` and `wget` are denied by policy (the denial carries no reason): probe a
+   dev server's readiness and capture with `agent-browser`, or take the images as
+   Playwright test byproducts (`page.screenshot`). Allow a dev server well over
+   20s to come up. (#1078: a curl probe read as "dev server denied".)
 7. `docs:` update folder `CLAUDE.md` with non-obvious learnings.
 8. Adversarial review — if your runtime can spawn subagents, do it as below;
    otherwise review your own diff in one fresh pass against the same acceptance
