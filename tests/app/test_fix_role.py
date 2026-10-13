@@ -23,7 +23,6 @@ from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
-from issue_agent.domain.contracts import RunId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.routing import Tier
@@ -710,7 +709,8 @@ def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session
     assert dispatched(tick(composed), AgentKind.RESOLVE)
 
     assert resumes == [None, "s-init"]
-    runs = sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind != "TRIAGE"),
+                  key=lambda r: r.completed_at)
     assert [(r.receipt["leg"], r.receipt["session"]) for r in runs] == [("machine", "s-init"), ("agent", "s-init")]
 
 
