@@ -22,9 +22,9 @@ afterEach(() => {
   localStorage.clear();
 });
 
-type Props = { cards: DoneCard[] | undefined; viewing: boolean };
+type Props = { cards: DoneCard[] | undefined; viewing: boolean; updatedAt?: number | null };
 const setup = (initial: Props, repo = "r") =>
-  renderHook((p: Props) => useDoneUnread(repo, p.cards, p.viewing), { initialProps: initial });
+  renderHook((p: Props) => useDoneUnread(repo, p.cards, p.updatedAt === undefined ? Date.now() : p.updatedAt, p.viewing), { initialProps: initial });
 
 const OLD = card(1, "2026-07-29T00:00:00Z");
 const FRESH = card(2, "2026-07-30T08:00:00Z");
@@ -67,6 +67,19 @@ describe("useDoneUnread", () => {
     expect([...result.current.unread]).toEqual([2]);
     rerender({ cards: [arrival, OLD, FRESH], viewing: false });
     expect(result.current.count).toBe(0);
+  });
+
+  it("treats cached data from before the visit as provisional, so a later refresh still highlights new items", () => {
+    localStorage.setItem(KEY, at("2026-07-30T00:00:00Z"));
+    const cached = [OLD];
+    const { result, rerender } = setup({ cards: cached, viewing: false, updatedAt: NOW - 600_000 });
+    rerender({ cards: cached, viewing: true, updatedAt: NOW - 600_000 });
+    expect(result.current.unread.size).toBe(0);
+    expect(localStorage.getItem(KEY)).toBe(at("2026-07-30T00:00:00Z"));
+    vi.setSystemTime(NOW + 2000);
+    rerender({ cards: [FRESH, OLD], viewing: true, updatedAt: NOW + 2000 });
+    expect([...result.current.unread]).toEqual([2]);
+    expect(localStorage.getItem(KEY)).toBe(at("2026-07-30T08:00:00Z"));
   });
 
   it("waits for data before freezing the unread set", () => {

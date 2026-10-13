@@ -22,6 +22,8 @@ interface State {
   watermark: number;
   /** Issues unread on entry to the Done tab, frozen for the visit; null while away. */
   frozen: ReadonlySet<number> | null;
+  /** When the current Done visit began (ms); null while away. */
+  visitStart: number | null;
 }
 
 // First ever visit (nothing stored) starts at "now", so nothing is new.
@@ -29,6 +31,7 @@ const init = (repo: string): State => ({
   repo,
   watermark: readTimestamp(key(repo)) ?? Date.now(),
   frozen: null,
+  visitStart: null,
 });
 
 export interface DoneUnread {
@@ -46,13 +49,15 @@ const NONE: ReadonlySet<number> = new Set();
  * Opening the tab freezes the unread set (so the user sees what arrived) and
  * advances the watermark to the newest done time seen. Items that arrive while
  * the tab stays open are seen immediately: they advance the watermark but are
- * not added to the frozen set. On a repo switch the first render may use that
- * repo's cached poll; items the refresh then adds count as arrivals. Counts cover only the cards loaded (page 1 of
+ * not added to the frozen set. Cached data from before the visit is
+ * provisional: nothing freezes until a fetch completes after entry. Counts cover only the cards loaded (page 1 of
  * the server's newest-first list), which is where new items sort anyway.
  */
 export function useDoneUnread(
   repo: string | null,
   cards: readonly DoneCard[] | undefined,
+  /** When `cards` was last fetched (ms); cached data from before this visit is provisional. */
+  updatedAt: number | null,
   viewing: boolean,
 ): DoneUnread {
   const [state, setState] = useState<State | null>(() => (repo ? init(repo) : null));
@@ -61,8 +66,16 @@ export function useDoneUnread(
   else if (cur?.repo !== repo) cur = init(repo);
 
   // Derived-state transitions happen during render (no effect, no extra paint).
-  if (cur && !viewing && cur.frozen !== null) cur = { ...cur, frozen: null };
-  if (cur && viewing && cards) {
+  if (cur && !viewing && (cur.frozen !== null || cur.visitStart !== null)) {
+    cur = { ...cur, frozen: null, visitStart: null };
+  }
+  if (cur && viewing && cur.visitStart === null) cur = { ...cur, visitStart: Date.now() };
+  // A key change or a return from a hidden tab renders the last cached poll
+  // first. Freezing from it would let items that arrived while away look like
+  // arrivals-while-open and be marked seen unhighlighted, so only data fetched
+  // since this visit began may freeze the set.
+  const fresh = cur?.visitStart != null && updatedAt !== null && updatedAt >= cur.visitStart;
+  if (cur && viewing && cards && fresh) {
     // Clamped to now so a future-dated server timestamp cannot park the
     // watermark ahead of real time and hide later arrivals.
     const newest = Math.max(cur.watermark, Math.min(Date.now(), ...cards.map((c) => doneAt(c) ?? 0).sort((x, y) => y - x).slice(0, 1)));

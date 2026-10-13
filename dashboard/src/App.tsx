@@ -162,6 +162,7 @@ export default function App() {
   const doneUnread = useDoneUnread(
     selectedRepo,
     issues.data?.done,
+    issues.updatedAt,
     route.view === "issues" && route.sub === "done",
   );
   const [promotedBacklog, setPromotedBacklog] = useState<
