@@ -685,3 +685,113 @@ def test_an_item_freed_in_another_process_starts_the_next_tick_before_the_poll(t
 
     assert observed == [0, 11]  # one quiet check after the release, not the 60 s poll
     assert "fix: woke: store changed" in logs
+
+
+_CRITERIA = PostComment(Target.ISSUE, 1096, "Acceptance criteria: …", key="triage:1096")
+
+
+def test_a_tick_that_changed_github_observes_the_result_after_the_gap_not_the_poll():
+    # #1096: the triage-criteria comment made RESOLVE dispatchable, but the
+    # loop slept the full poll before observing it (83 s comment to dispatch).
+    clock, decided_at, logs = ManualClock(), [], []
+
+    def decide(_world):
+        decided_at.append(clock())
+        return [_CRITERIA] if len(decided_at) == 1 else [RunAgent(AgentKind.RESOLVE, 1096)]
+
+    d, gw = _daemon(decide, logs=logs)
+    d.run_forever(sleep=clock.advance, now=lambda: int(clock()), active_now=clock, max_ticks=2)
+    d.wait_for_dispatches()
+
+    assert decided_at == [0, 5]
+    assert "fix: woke: re-tick after a GitHub change" in logs
+
+
+def test_a_mutation_every_tick_repeats_costs_one_extra_observe_per_interval_never_a_loop():
+    # An idempotent re-post (or a merge GitHub has not taken yet) is decided
+    # on every tick: the re-tick that repeats it does not re-tick again.
+    slept = []
+    d, _ = _daemon(lambda _w: [_CRITERIA])
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=5)
+    assert slept == [5, 60, 5, 60, 5]
+
+
+def test_a_tick_that_only_dispatched_waits_for_the_leg_not_a_retick():
+    # A dispatch changes nothing on GitHub; its end wakes the loop (store wake).
+    slept = []
+    d = _paid(lambda _a: None, poll_seconds=60)
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    d.wait_for_dispatches()
+    assert slept == [60, 60]
+
+
+def test_the_retick_gap_goes_through_the_change_wait_and_github_back_off_wins():
+    waited, slept = [], []
+    d, _ = _daemon(lambda _w: [_CRITERIA])
+    d.wait_for_change = lambda timeout: waited.append(timeout)
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    assert waited == [5, 60] and slept == []
+
+    calls = []
+
+    def observe():
+        calls.append(1)
+        if len(calls) == 2:
+            raise GhUnavailable("rate-limit", "HTTP 429", retry_after_s=None)
+        return WorldState()
+
+    refused, _ = _daemon(lambda _w: [_CRITERIA], observe=observe)
+    slept = []
+    refused.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=3)
+    assert slept == [5, 60, 5]  # the refused re-tick waits the full poll before trying again
+
+
+def test_a_store_wake_ending_the_retick_gap_does_not_start_another_retick():
+    waited = []
+
+    def wait(timeout):
+        waited.append(timeout)
+        return "store changed"
+
+    d, _ = _daemon(lambda _w: [_CRITERIA])
+    d.wait_for_change = wait
+    d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=4)
+    assert waited == [5, 60, 5, 60]
+
+
+class _Refusing:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def execute(self, _action) -> None:
+        raise self.error
+
+
+@pytest.mark.parametrize(("error", "slept"), [
+    (GhUnavailable("rate-limit", "HTTP 403: secondary rate limit", retry_after_s=90), [90, 90]),
+    (GhUnavailable("rate-limit", "HTTP 403: secondary rate limit"), [60, 60]),
+    (RuntimeError("comment not confirmed"), [60, 60]),
+])
+def test_a_github_write_that_failed_backs_off_instead_of_reticking(error, slept):
+    waits = []
+    d = Daemon("fix", lambda: WorldState(), lambda _w: [_CRITERIA], _Refusing(error), poll_seconds=60)
+    d.run_forever(sleep=waits.append, now=lambda: 0, max_ticks=2)
+    assert waits == slept
+    assert d.tick() == []  # a failed write is not a change taken
+
+
+def test_the_retick_gap_never_exceeds_a_shorter_poll():
+    slept = []
+    d, _ = _daemon(lambda _w: [_CRITERIA])
+    d.poll_seconds = 2
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    assert slept == [2, 2]
+
+
+def test_a_mutation_beside_a_dispatch_still_reticks():
+    slept = []
+    d = _paid(lambda _a: None, poll_seconds=60)
+    d.decide = lambda _w: [_CRITERIA, RunAgent(AgentKind.RESOLVE, 7)]
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=1)
+    d.wait_for_dispatches()
+    assert slept == [5]
