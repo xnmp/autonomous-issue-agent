@@ -2,7 +2,7 @@
 
 Status: Superseded by the minimal-harness refactor (slice 5d-1, 2026-10-13): both roles run one tick, observe -> derive -> policy -> act, in `app/tick.py` (docs/open/2026-10-12-minimal-harness-design.md).
 Date: 2026-08-01
-Governs: src/issue_agent/app/loop.py src/issue_agent/adapters/github.py
+Governs: src/issue_agent/app/tick.py src/issue_agent/adapters/github.py
 
 ## Context
 

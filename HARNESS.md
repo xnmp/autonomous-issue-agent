@@ -276,9 +276,10 @@ The dashboard changes labels on GitHub and nothing else (refactor decision
 Q19). `POST /api/repos/{name}/issues/{number}/park` adds `needs-human` to the
 issue and to each open harness PR for it (head `fix/<issue>-…`); the fix
 policy then waits until the label is removed or a human replies to the stop.
-`POST …/unblock` removes `needs-human` from the issue and those PRs and puts
-the issue back on `ai-ready`. `POST …/promote` adds `ai-ready`, and
-`POST …/priority` sets one of P1–P3. Each write reads the label first, writes
+`POST …/unblock` removes `needs-human` from the issue and those PRs and
+changes nothing else. Park and unblock read the issue and its open PRs fresh
+from GitHub and refuse a closed issue. `POST …/promote` adds `ai-ready`. There
+is no priority action. Each write reads the label first, writes
 only what is missing, and reads it back; repeating a request moves nothing,
 and a write whose reply was lost is observed rather than repeated. There is no
 command queue, typed resolve command or retry grant (deleted in slice 5d-1).

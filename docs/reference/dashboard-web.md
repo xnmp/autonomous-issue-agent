@@ -249,8 +249,8 @@ remain visible while a task is live and when an older settlement omitted them.
 `PendingCard` (gh: open issues labeled `ai-ready`, minus in-flight ones):
 
 ```json
-{ "issue": 9, "title": "…", "url": "…", "priority": "P1|P2|P3|null",
-  "labels": ["ai-ready", "P2"], "held": false, "hold_reason": null,
+{ "issue": 9, "title": "…", "url": "…",
+  "labels": ["ai-ready"], "held": false, "hold_reason": null,
   "overlap": null }   // reserved: steward overlap prediction not built yet
 ```
 
@@ -332,10 +332,9 @@ action shells out as the operator; nothing writes harness state directly.
   launch-logic reimplementation.)
 - `POST /api/repos/{name}/issues/{n}/promote` — body `{}`. Runs
   `gh issue edit <n> -R <repo> --add-label ai-ready`.
-- `POST /api/repos/{name}/issues/{n}/priority` — body
-  `{ "priority": "P1"|"P2"|"P3"|null }`. Removes the other P-labels, adds the
-  requested one (null = remove all). Labels may not exist on the target repo:
-  create-on-miss with `gh label create` (idempotent, ignore exists-errors).
+- `POST /api/repos/{name}/issues/{n}/park` and `…/unblock` — body `{}`. Add
+  or remove `needs-human` on the issue and its open harness PRs, read fresh;
+  a closed issue is refused (see HARNESS.md "Operator writes").
 
 ### GET / and static
 

@@ -78,8 +78,9 @@ unchanged; name what it removes before writing it.
 - New gate/review verdict inputs state their provenance (who can write them,
   in which trust domain); below harness-owned means laundered through a
   harness-side mint or treated as an untrusted claim. Retry/defer/skip loops
-  carry a log line and a ceiling (or are spaced by the machine backoff). (ADR 0012; existing code migrates when
-  touched.)
+  carry a log line and a ceiling (or are spaced by the machine backoff).
+  ([minimal-harness design](docs/open/2026-10-12-minimal-harness-design.md);
+  existing code migrates when touched.)
 
 Import-linter and AST contracts enforce these boundaries in `make test`.
 
@@ -161,7 +162,7 @@ the complete diff in a subagent.
 
 - `src/issue_agent/domain/` — value objects, policies, events, ports.
 - `src/issue_agent/adapters/` — GitHub/runtime/process/store/event/dashboard I/O.
-- `src/issue_agent/app/` — config, roles, workflows, daemon loop, CLI.
+- `src/issue_agent/app/` — config, role wiring, the shared tick, CLI, dashboard.
 - `plugin/` — fixer (`AGENT.md`) and reviewer prompt guidance.
 - `ops/` / `bin/` — service templates/installers and launch tooling.
 - `tests/domain`, `tests/adapters`, `tests/app` — mirrored test tiers.

@@ -1,18 +1,16 @@
 # Architecture — how the harness works now
 
-Current as of 2026-10-06. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-13. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Slice 6a (2026-10) deleted the remaining
 `plugin/hooks/` gate stack, the governor and the fixer's publication gates.
 
-The [phase-4 simplification roadmap](../open/2026-09-30-phase-4-simplification-roadmap.md)
-and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern selected
-continuation authority. Current SQL state and a bounded unresolved suffix
-replace archive certification, lifetime verification and selected Store
-continuity writers. A2 whole-system acceptance and Phase 6's declared policy/
-independent-execution contracts are complete. Phase 5's offline contracts and
-live cutover are verified; actual unattended windows and readout remain pending.
-Current evidence is in the [execution record](../open/2026-10-05-phase-5-live-execution.md).
+The [minimal-harness design](../open/2026-10-12-minimal-harness-design.md)
+governs the current shape. Each tick, both roles derive every item's state from
+GitHub plus local leg facts; nothing persists a selected continuation. The
+phase-4 roadmap and [ADR 0016](../adr/0016-phase-4-current-state-authority.md)
+continuation authority are superseded (slices 5c and 5d-1 deleted the workflow
+model, the durable-command path and the continuation writers).
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
 harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
@@ -47,8 +45,8 @@ worktrees live below the hidden `.claude/worktrees` scratch path and that path i
 also excluded by the primary checkout's shared `.git/info/exclude`, but their type
 gate must be identical to the primary checkout's.
 
-Durable commands, captured-revision guards, SQLite ownership, and trusted
-readback are the publication authority.
+The idempotent act layer (read-back writes and SQLite idempotency keys,
+property 2) and SQLite ownership are the publication authority.
 
 ## The five properties worth preserving
 
@@ -69,7 +67,7 @@ tests pass.
    (`adapters/operator_effects.py`) are label moves through the same
    `act.relabel` plus the CLI's bootstrap steps; the dashboard changes labels
    only (refactor decision Q19: park adds `needs-human`, unblock removes it and
-   puts the issue back on `ai-ready`). No SQLite transaction spans network
+   changes nothing else, each on a fresh read that refuses a closed issue). No SQLite transaction spans network
    I/O. Fix agents push their own branch with git; the harness opens the PR
    from it, once. Credential isolation remains separately trigger-gated, so
    this is durability—not an untrusted-input security claim.
