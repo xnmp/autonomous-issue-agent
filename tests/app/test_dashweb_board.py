@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_agent.adapters.dashweb import ghdata
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.dashweb.service import Backend
 from issue_agent.domain.checks import Check, Observed
@@ -60,7 +61,7 @@ class Gh:
     def issues(self, repo, limit=1000):
         return self._issues, ""
 
-    def merged_prs(self, repo, limit=200):
+    def merged_prs(self, repo, limit=1000):
         return self._merged, ""
 
 
@@ -409,7 +410,7 @@ def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
     backend.gh = Gh(
         merged=[
             {"number": 1000 + n, "title": "t", "headRefName": f"fix/{2000 + n}-x", "mergedAt": ts(-n)}
-            for n in range(200)
+            for n in range(ghdata.MERGED_PR_LIMIT)
         ]
     )
     backend._observations.invalidate("demo")
@@ -418,8 +419,8 @@ def test_a_truncated_merged_list_is_not_a_github_failure(deployment):
     payload = backend.issues("demo")
     metrics = backend.overview("demo", "UTC")["metrics"]
 
-    assert payload["gh_ok"] is True and any("limited to the newest 200" in w for w in payload["warnings"])
-    assert metrics["merged_prs"] == 200 and metrics["merged_prs_partial"] is True
+    assert payload["gh_ok"] is True and any(f"limited to the newest {ghdata.MERGED_PR_LIMIT}" in w for w in payload["warnings"])
+    assert metrics["merged_prs"] == ghdata.MERGED_PR_LIMIT and metrics["merged_prs_partial"] is True
 
 
 def test_the_overview_shows_the_caps_the_core_reads_and_each_roles_headroom(deployment):

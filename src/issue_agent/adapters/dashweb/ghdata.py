@@ -28,7 +28,7 @@ OPEN_ISSUE_FIELDS = ISSUE_FIELDS + ",body,comments"
 # `gh issue list` paginates to this bound; reaching it is reported to callers.
 ISSUE_HISTORY_LIMIT = 1000
 MERGED_PR_FIELDS = "number,title,url,mergedAt,headRefName"
-MERGED_PR_LIMIT = 200
+MERGED_PR_LIMIT = 1000  # 200 truncated tauri-explorer (325 merged); 1000 reads in ~2.4s
 
 
 @dataclass
@@ -156,9 +156,13 @@ class GhReader:
         if error:
             return None, error
         if not isinstance(history, list) or not isinstance(open_, list):
-            return history, ""
+            return None, "gh returned a non-list issue payload"
+        # The open read is authoritative for which issues are open: the two
+        # cache entries can be up to a TTL apart, so an issue closed or opened
+        # between them takes the open read's word.
         full = index_by_number(open_)
-        return [full.get(i.get("number"), i) if isinstance(i, dict) else i for i in history], ""
+        closed = [i for i in history if isinstance(i, dict) and not is_open(i) and i.get("number") not in full]
+        return [*full.values(), *closed], ""
 
     def merged_prs(self, repo: str, limit: int = MERGED_PR_LIMIT) -> tuple[object | None, str]:
         return self.json(repo, ["pr", "list", "--state", "merged", "--limit", str(limit), "--json", MERGED_PR_FIELDS])

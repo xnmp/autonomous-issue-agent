@@ -40,10 +40,29 @@ def test_only_open_issues_carry_body_and_comments():
     history = [{"number": 1, "state": "CLOSED"}, {"number": 2, "state": "OPEN"}]
     gh, calls = reader([(json.dumps(history), ""), (json.dumps([{"number": 2, "state": "OPEN", "body": "b"}]), "")])
     payload, error = gh.issues("o/r")
-    assert error == "" and payload == [{"number": 1, "state": "CLOSED"}, {"number": 2, "state": "OPEN", "body": "b"}]
+    assert error == "" and sorted(payload, key=lambda i: i["number"]) == [
+        {"number": 1, "state": "CLOSED"}, {"number": 2, "state": "OPEN", "body": "b"}]
     fields = [argv[argv.index("--json") + 1].split(",") for argv in calls]
     assert "body" not in fields[0] and "comments" not in fields[0]
     assert {"body", "comments"} <= set(fields[1]) and "open" in calls[1]
+
+
+def test_the_open_read_decides_which_issues_are_open():
+    # The two reads are cached separately and can be a TTL apart.
+    history = [{"number": 1, "state": "OPEN"}, {"number": 2, "state": "CLOSED"}, {"number": 3, "state": "CLOSED"}]
+    now_open = [{"number": 3, "state": "OPEN", "body": "reopened"}, {"number": 4, "state": "OPEN", "body": "new"}]
+    gh, _calls = reader([(json.dumps(history), ""), (json.dumps(now_open), "")])
+    payload, error = gh.issues("o/r")
+    assert error == ""
+    assert sorted(payload, key=lambda i: i["number"]) == [
+        {"number": 2, "state": "CLOSED"}, {"number": 3, "state": "OPEN", "body": "reopened"},
+        {"number": 4, "state": "OPEN", "body": "new"}]
+
+
+def test_a_non_list_issue_payload_is_an_error():
+    gh, _calls = reader([("[]", ""), ('{"number": 1}', "")])
+    payload, error = gh.issues("o/r")
+    assert payload is None and error
 
 
 def test_a_failed_open_issue_read_fails_the_issue_read():
