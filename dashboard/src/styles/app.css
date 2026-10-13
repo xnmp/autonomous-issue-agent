@@ -2132,3 +2132,29 @@
 .triage-criteria-label {
   font-size: var(--text-xs);
 }
+
+/* ---------- pager ---------- */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: var(--s2) 0;
+  font-size: var(--fs-xs);
+  color: var(--ink-muted);
+}
+.pager-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+}
+.pager .seg-btn {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: var(--s1, 2px) var(--s3, 10px);
+}
+.pager .seg-btn[disabled] {
+  opacity: 0.4;
+  cursor: default;
+}
