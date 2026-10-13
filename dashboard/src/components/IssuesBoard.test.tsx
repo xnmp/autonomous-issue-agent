@@ -96,7 +96,7 @@ afterEach(() => {
 });
 
 describe("issues board groups", () => {
-  it("lists every item waiting for a dispatch slot, issue or PR stage, under Waiting for a slot", () => {
+  it("lists every item waiting for a dispatch slot under Waiting for a slot, and shows no section for an empty group", () => {
     stubFetch();
     renderBoard({
       in_flight: [
@@ -107,7 +107,7 @@ describe("issues board groups", () => {
 
     expect(within(section("Waiting for a slot")).getByText("Resolve next")).toBeVisible();
     expect(within(section("Waiting for a slot")).getByText("Fix CI next")).toBeVisible();
-    expect(within(section("Waiting")).getByText("Nothing here right now.")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Waiting" })).not.toBeInTheDocument();
   });
 
   it("puts each row in its server-derived group, in order, longest Needs-you wait first", () => {
@@ -122,7 +122,7 @@ describe("issues board groups", () => {
     });
 
     const groups = screen.getAllByRole("region").map((node) => node.getAttribute("aria-labelledby"));
-    expect(groups).toEqual(["needs_you", "agent", "ci", "slot", "waiting"].map((g) => `board-group-${g}`));
+    expect(groups).toEqual(["needs_you", "agent", "waiting"].map((g) => `board-group-${g}`));
     const needsRows = within(section("Needs you")).getAllByText(/title$/).map((node) => node.textContent);
     expect(needsRows).toEqual(["Issue 103 title", "Issue 102 title"]);
     expect(within(section("Agent running")).getByText("Resolve running")).toBeVisible();
@@ -174,8 +174,7 @@ describe("issues board groups", () => {
     expect(screen.queryByRole("region", { name: "Waiting" })).not.toBeInTheDocument();
 
     await userEvent.click(chip(/2 Needs you/));
-    expect(screen.getAllByRole("region")).toHaveLength(5);
-    expect(screen.getAllByText("Nothing here right now.")).toHaveLength(4);
+    expect(screen.getAllByRole("region").map((node) => node.getAttribute("aria-labelledby"))).toEqual(["board-group-needs_you"]);
   });
 });
 
