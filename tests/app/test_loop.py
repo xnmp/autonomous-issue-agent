@@ -581,7 +581,7 @@ def test_reservation_sweep_cadence_is_elapsed_time_not_tick_count():
         poll_seconds=10,
         reconcile=sweeps.append,
         reservation_sweep_polls=3,
-        wake=wake,
+        wait_for_change=wake,
     )
 
     daemon.run_forever(sleep=lambda _s: None, now=lambda: int(clock()), active_now=clock, max_ticks=13)
@@ -590,12 +590,12 @@ def test_reservation_sweep_cadence_is_elapsed_time_not_tick_count():
     assert sweeps == [RecoveryTrigger.PERIODIC] * 2
 
 
-def test_without_a_wake_the_full_interval_is_slept():
+def test_without_a_change_the_full_interval_is_waited():
     d, _ = _daemon(lambda w: [])
-    d.poll_seconds, d.wake = 5, lambda timeout: None
-    slept = []
-    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert slept == []  # the wake owned the whole interval
+    waited = []
+    d.poll_seconds, d.wait_for_change = 5, lambda timeout: waited.append(timeout)
+    d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=2)
+    assert waited == [5, 5]
     # Regression guard on the unwired path: no slicing, no extra sleep calls.
     unwired, _ = _daemon(lambda w: [])
     slept = []
@@ -611,26 +611,45 @@ def test_a_wake_starts_the_next_tick_and_logs_its_reason_once():
         return "store changed" if len(waits) == 1 else None
 
     d, _ = _daemon(lambda w: ticks.append(w) or [], logs=logs)
-    d.wake = wake
+    d.wait_for_change = wake
     d.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: 0, max_ticks=3)
     assert len(ticks) == 3
     assert waits == [60, 60, 60]
     assert [m for m in logs if "woke" in m] == ["fix: woke: store changed"]
 
 
-def test_after_a_retry_after_no_wake_shortens_the_back_off():
+@pytest.mark.parametrize(("retry_after", "back_off"), [(120, 120), (None, 60)])
+def test_after_github_refuses_a_tick_no_wake_shortens_the_back_off(retry_after, back_off):
     calls, slept = [], []
 
     def observe():
         calls.append("observe")
         if len(calls) == 1:
-            raise GhUnavailable("rate-limit", "HTTP 429", retry_after_s=120)
+            raise GhUnavailable("rate-limit", "HTTP 429", retry_after_s=retry_after)
         return WorldState()
 
     d, _ = _daemon(lambda w: [], observe=observe)
-    d.wake = lambda _timeout: "store changed"
+    d.wait_for_change = lambda _timeout: "store changed"
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
-    assert slept == [120]  # the back-off in full; the second interval was woken
+    assert slept == [back_off]  # the back-off in full; the second interval was woken
+
+
+def test_a_change_wait_keeps_the_watchdog_fed_and_ends_mid_interval():
+    # Production slices the interval at 30 s for the systemd watchdog; a wake
+    # in the second slice still ends the interval there.
+    progress, waited, logs = [], [], []
+
+    def wait(timeout):
+        waited.append(timeout)
+        return "store changed" if len(waited) == 2 else None
+
+    d, _ = _daemon(lambda w: [], logs=logs)
+    d.poll_seconds, d.wait_for_change = 90, wait
+    d.run_forever(sleep=lambda _s: pytest.fail("the change wait owns the interval"), now=lambda: 0, max_ticks=1,
+                  scheduler_progress=lambda: progress.append(1))
+    assert waited == [30, 30]
+    assert len(progress) == 5  # three around the tick, then one per slice waited
+    assert "fix: woke: store changed" in logs
 
 
 _END_LEG_ELSEWHERE = """
@@ -660,11 +679,11 @@ def test_a_leg_ending_in_another_process_starts_the_next_tick_before_the_poll(tm
         Executor(FakeGateway()),
         poll_seconds=60,
         log=logs.append,
-        wake=StoreWake(store.path, log=logs.append, sleep=sleep, monotonic=clock).wait,
+        wait_for_change=StoreWake(store.path, "o/r", log=logs.append, sleep=sleep, monotonic=clock).wait,
     )
 
     daemon.run_forever(sleep=lambda _s: pytest.fail("the wake owns the wait"), now=lambda: int(clock()),
                        active_now=clock, max_ticks=2)
 
-    assert observed == [0, 10]
+    assert observed == [0, 11]  # one quiet check after the leg ended, not the 60 s poll
     assert "fix: woke: store changed" in logs

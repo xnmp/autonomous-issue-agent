@@ -12,7 +12,7 @@ Draft, 2026-10-12. This is the yardstick for the subtractive refactor. Anything 
 ## Tick
 `observe` (one GraphQL query plus SQLite) → `derive` (a pure function, state never stored) → `act` (idempotent: label, comment, merge, dispatch a leg).
 
-Between ticks a daemon waits for a change, not just the clock. A commit to the shared control store (a leg reserved, started or ended by either role) wakes it, detected by `PRAGMA data_version` checked once a second (`adapters/control_store.py` `StoreWake`). A burst coalesces into one tick, and ticks stay at least 5 s apart, so a busy store can't turn the loop into a hot GitHub poller. `POLL_SECONDS` stays the ceiling that picks up GitHub-side events (CI, human comments). After a Retry-After the wait is never cut short. If the store can't be read, the wait falls back to the timer and logs once.
+Between ticks a daemon waits for a change, not just the clock. It wakes when a leg of its repository ends, in either role: the repository gains an ended leg or loses a lease in the shared control store. `PRAGMA data_version`, checked once a second, gates that read (`adapters/control_store.py` `StoreWake`). A change is judged once the store has been quiet for a second, so a leg's end burst is one tick. Ticks stay at least 5 s apart. Leg starts, a lease handed back unused, and other repositories' commits wake nothing, so a busy store can't turn the loop into a hot GitHub poller. `POLL_SECONDS` stays the ceiling that picks up GitHub-side events (CI, human comments). After GitHub refuses a tick the interval is never cut short. If the store can't be read, the wait falls back to the timer and logs once.
 
 | Derived state | Action |
 |---|---|

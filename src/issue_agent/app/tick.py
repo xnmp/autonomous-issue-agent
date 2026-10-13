@@ -13,10 +13,12 @@ other act's attempt run).
 drive. Cheap actions execute before it returns; paid dispatches continue in a
 bounded pool. `run_forever()` wraps it with the wait and heartbeat (a periodic
 alive line plus the suspend-stall warning when wall-clock elapsed far exceeds
-the interval). The wait ends early when an injected `wake` reports a change
-(the control store's, so a leg ending in either role starts the next tick);
-the poll interval stays the ceiling that picks up GitHub-side events. The
-clock, sleep and wake are injected so the loop is testable without real time.
+the interval). The wait ends early when an injected `wait_for_change` reports
+one (a leg of the repository ending in either role, read from the control
+store); the poll interval stays the ceiling that picks up GitHub-side events.
+The clock, sleep and wait are injected so the loop is testable without real
+time; with a `wait_for_change` it owns the whole interval and `sleep` serves
+only the back-off after GitHub refused a tick.
 """
 
 from __future__ import annotations
@@ -271,7 +273,7 @@ class Daemon:
     reservation_sweep_polls: int = DEFAULT_RESERVATION_SWEEP_POLLS
     # Waits up to its argument in seconds; returns the wake reason, or None
     # on timeout. None here means the plain timed sleep.
-    wake: Callable[[float], str | None] | None = None
+    wait_for_change: Callable[[float], str | None] | None = None
     prepare_shutdown: Callable[[], object] | None = None
     terminalize: Callable[[], object] | None = None
     _state: DaemonState = field(default=DaemonState.STARTING, init=False, repr=False)
@@ -530,7 +532,8 @@ class Daemon:
             progress()
             actions = self.decide(world)
         except GhUnavailable as exc:
-            self._retry_after_seconds = exc.retry_after_s
+            # Set even without a Retry-After: a back-off interval is never woken early.
+            self._retry_after_seconds = exc.retry_after_s or 0.0
             self.log(f"{self.name}: world build failed: GitHub {exc.headline} — skipping tick, no actions taken "
                      f"({exc.detail})")
             return []
@@ -640,11 +643,11 @@ class Daemon:
     def _sleep_interval(self, sleep: Callable[[int], None],
                         scheduler_progress: Callable[[], None] | None = None) -> str | None:
         """One poll interval, sliced to keep a systemd watchdog fed when a
-        notifier is present; returns the reason when `wake` ended it early.
-        After a Retry-After the interval is never woken early: a wake must
-        not turn GitHub's back-off into another request."""
+        notifier is present; returns the reason when `wait_for_change` ended it early.
+        After GitHub refused a tick the interval is never woken early: a wake
+        must not turn its back-off into another request."""
         interval = max(self.poll_seconds, int(self._retry_after_seconds or 0))
-        wake = None if self._retry_after_seconds else self.wake
+        wake = None if self._retry_after_seconds is not None else self.wait_for_change
         self._retry_after_seconds = None
         remaining = interval
         while remaining > 0:
