@@ -26,7 +26,8 @@ These answer the questions in `/tmp/refactor-audit.md` §5. Each answer is the m
     - Multi and delegated review.
     - External-PR review (`ai-review`, adoption).
     - P1–P3 ordering. Issues are taken FIFO by number.
-    - Webhook wake and hot reload. Deploys restart through systemd.
+    - Webhook wake.
+    - Hot reload (`adapters/reload.py`, exit-87 restart between ticks) is **kept**, by owner decision 2026-10-13: the daemons pick up merged harness fixes without a manual restart.
 14. **Slice order:** 2, 3, 7, 6, 8a, then 5a–5d (with the two-label contract built in), then the slice 4 residue, then 8b, then **9 (adapter trim, about −5.4k)** to reach 15k.
 15. **Metrics** are computed from `legs` plus GitHub. The schema-v2 events and outbox go; the journal remains for logs.
 16. **Systemic faults.** Per-item exponential backoff, derived from `legs`, plus the money caps. No global breaker.

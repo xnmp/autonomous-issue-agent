@@ -351,9 +351,9 @@ Fate is KEEP, SLIM (→ surviving lines) or DELETE. Slice 5 is split into 5a–5
 | 12 | Telemetry: `events` + `event_log` + `journal` →120 | −230 |
 | 13 | `agent_runner` →450 | −150 |
 | 14 | `handover` →0 (resume through session id) | −150 |
-| 15 | Drop GLM `claude_profile`, `runtime_selection`, `reload`, `launchd_main` (Q12) | −324 |
+| 15 | Drop GLM `claude_profile`, `runtime_selection`, `launchd_main` (Q12; `reload` kept by owner decision 2026-10-13: the daemons pick up merged harness fixes without a manual restart) | −225 |
 
-Result: about 14.6k.
+Result: about 14.7k.
 
 **Tests:** 149,557 lines now. Whole-file deletions are about 1.3k (slice 2), 1.3k (3), 0.6k (4), 75k (5), 9.8k (6), 4.1k (7) and 15k (8). Rewrites of `test_control_store`, `test_fix_workflow`, `test_roles` and `test_effects` are needed to reach 20k.
 
