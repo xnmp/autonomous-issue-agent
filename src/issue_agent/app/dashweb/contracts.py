@@ -299,6 +299,13 @@ class IssueCard(Contract):
     started_ts: str | None
     last_ts: str | None
     leg_running: bool
+    # The triaged tier (None: untriaged or malformed) and, when the latest routed
+    # leg ran at another tier, that tier (an escalation).
+    triage_tier: Literal["low", "med", "high", "xhigh"] | None = None
+    routed_tier: str | None = None
+    # Model and runtime of the running leg, else the latest leg.
+    model: str | None = None
+    runtime: str | None = None
 
 
 class DoneCard(Contract):

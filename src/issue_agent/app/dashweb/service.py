@@ -397,8 +397,9 @@ class Backend:
         merged = views.merged_harness_prs(obs.merged) if obs else ()
         active = {item.issue for item in found or ()}
         now = self.now_fn()
+        models = system.leg_models(_state_dirs(dep.cfg))
         return {
-            "in_flight": [views.issue_card(item, dep.cfg.repo, gh_issues.get(item.issue)) for item in found or ()],
+            "in_flight": [views.issue_card(item, dep.cfg.repo, gh_issues.get(item.issue), models) for item in found or ()],
             "done": views.done_cards(merged, legs, dep.cfg.repo, gh_issues),
             "backlog": views.backlog_cards(gh_issues, active, now) if obs and obs.issues is not None else [],
             "gh_ok": obs is None or not obs.failed,

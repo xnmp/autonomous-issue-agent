@@ -13,7 +13,7 @@ from datetime import datetime, timezone, tzinfo
 
 from ...adapters.control_store import Lease
 from ...domain import dashboard as dash
-from ...domain.actions import ISSUE_ACTS, Target
+from ...domain.actions import ISSUE_ACTS, AgentKind, Target
 from ...domain.backoff import LegEnd
 from ...domain.ci import parse_timestamp
 from ...domain.labels import Label
@@ -115,9 +115,14 @@ def _spend(legs: Iterable[dash.LegRow]) -> tuple[float, bool]:
     return round(sum(leg.cost_usd for leg in counted), 6), any(leg.estimated for leg in counted)
 
 
-def issue_card(item: Item, repo: str, gh_issue: Mapping | None) -> dict:
+def issue_card(item: Item, repo: str, gh_issue: Mapping | None, models: Mapping[str, str] | None = None) -> dict:
     cost, estimated = _spend(item.legs)
     counted = [leg for leg in item.legs if leg.counted]
+    triage = dash.issue_triage(item.legs)
+    # The running leg's model, else the latest leg's; the legs table has the runtime only.
+    shown = next((leg for leg in item.legs if leg.running), None) or max(counted, key=lambda leg: leg.at, default=None)
+    routed = max((leg for leg in counted if leg.kind != AgentKind.TRIAGE.name and leg.tier),
+                 key=lambda leg: leg.at, default=None)
     return {
         "issue": item.issue,
         "title": _title(item.issue, item.issue_view, gh_issue, item.pr),
@@ -136,6 +141,10 @@ def issue_card(item: Item, repo: str, gh_issue: Mapping | None) -> dict:
         "started_ts": _iso(counted[0].reserved_at) if counted else None,
         "last_ts": _iso(max(leg.at for leg in counted)) if counted else None,
         "leg_running": any(leg.running for leg in item.legs),
+        "triage_tier": triage.tier.value if triage else None,
+        "routed_tier": routed.tier if routed and (triage is None or routed.tier != triage.tier.value) else None,
+        "model": (models or {}).get(shown.leg_id) if shown else None,
+        "runtime": shown.runtime or None if shown else None,
     }
 
 
