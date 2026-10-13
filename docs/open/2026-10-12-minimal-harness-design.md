@@ -43,15 +43,15 @@ Agents push and return; they never wait on CI. They ask a question only when the
 
 ## Target
 
-| | Now | Target |
-|---|---|---|
-| core src lines (excludes dashboard) | 104,285 | **≤ 15,000** |
-| test lines | 148,404 | ≤ 20,000 |
-| stop states | 34 | **1** |
-| labels | 16 | **2** |
-| SQLite tables | many workflow tables | **3**: legs+money, leases, idempotency |
-| roles | fix, review, steward | fix, review |
-| ADRs | 17 | this page + money/supervision |
+| | Start (2026-10-12) | Target | Now (slice 10) |
+|---|---|---|---|
+| core src lines (excludes dashboard) | 104,285 | **≤ 15,000** | 14,989 |
+| test lines | 148,404 | ≤ 20,000 | 22,576 |
+| stop states | 34 | **1** | 1 (`NeedsHuman`, five reasons) |
+| labels | 16 | **2** | 2 (`ai-ready`, `needs-human`) |
+| SQLite tables | many workflow tables | **3**: legs+money, leases, idempotency | 3 |
+| roles | fix, review, steward | fix, review | fix, review |
+| ADRs | 17 | this page + money/supervision | this page + 7 (0001–0003, 0005–0008); 9 archived |
 
 Kept, slimmed: money accounting, process supervision, the Claude/Codex runtime adapters, the domain/adapter split.
 
