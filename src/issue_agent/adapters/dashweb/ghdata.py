@@ -17,7 +17,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-DEFAULT_TTL_S = 45.0
+# Freshness belongs to the observation refresh (service.OBSERVE_TTL_S); this
+# only de-duplicates concurrent calls and the two sub-reads of one refresh.
+DEFAULT_TTL_S = 2.0
 GH_TIMEOUT_S = 30.0
 
 # Body and comments only for open issues (the backlog shows them): with them,

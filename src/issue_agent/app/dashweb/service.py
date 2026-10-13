@@ -47,7 +47,7 @@ from . import views
 from .ports import GitHubQueries
 
 HARNESS_ROOT = str(Path(__file__).resolve().parents[4])
-OBSERVE_TTL_S = 20.0
+OBSERVE_TTL_S = 15.0
 CONFIG_TTL_S = 60.0
 
 
@@ -282,15 +282,22 @@ class Backend:
 
     def _observe(self, dep: Deployment) -> Observation:
         warnings: list[str] = []
-        world: WorldState | None
-        failed = False
-        try:
-            world = self.gateway_factory(dep.cfg.repo).build_world(dep.cfg.base_branch)  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001 - shown as a warning, retried next TTL
-            world, failed = None, True
-            warnings.append(f"GitHub observation failed ({_detail(exc)})")
-        issues, issues_error = self.gh.issues(dep.cfg.repo)
-        merged, merged_error = self.gh.merged_prs(dep.cfg.repo)
+        # The three reads are independent and ~24s end to end when serial; a
+        # per-refresh pool (not the observe executor, which is running this
+        # call) keeps the refresh at the slowest read.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dashboard-read") as pool:
+            world_f = pool.submit(self.gateway_factory(dep.cfg.repo).build_world, dep.cfg.base_branch)  # type: ignore[attr-defined]
+            issues_f = pool.submit(self.gh.issues, dep.cfg.repo)
+            merged_f = pool.submit(self.gh.merged_prs, dep.cfg.repo)
+            world: WorldState | None
+            failed = False
+            try:
+                world = world_f.result()
+            except Exception as exc:  # noqa: BLE001 - shown as a warning, retried next TTL
+                world, failed = None, True
+                warnings.append(f"GitHub observation failed ({_detail(exc)})")
+            issues, issues_error = issues_f.result()
+            merged, merged_error = merged_f.result()
         errors = [m for m in (issues_error, merged_error) if m]
         warnings += errors
         if isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:

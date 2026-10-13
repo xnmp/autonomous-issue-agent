@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -555,3 +556,33 @@ def test_a_journal_line_appended_after_a_read_is_seen_on_the_next(deployment, tm
         stream.write(json.dumps({"event": "agent_run", "run_id": "L2", "model": "gpt-6.1-sol"}) + "\n")
 
     assert backend.issue("demo", 2)["steps"][0]["model"] == "gpt-6.1-sol"
+
+
+def test_a_refresh_waits_for_the_slowest_github_read_not_the_sum(deployment):
+    """Serial reads were ~24s per refresh (world 13.5 + issues 8 + merged 2.4)."""
+    backend, *_ = deployment
+    # Each read blocks until all three are in flight; serial reads would time out.
+    barrier = threading.Barrier(3, timeout=5)
+
+    class Overlapping:
+        def build_world(self, _base):
+            barrier.wait()
+            return _world()
+
+    class Gh:
+        def issues(self, _repo):
+            barrier.wait()
+            return [], ""
+
+        def merged_prs(self, _repo):
+            barrier.wait()
+            return [], ""
+
+    backend.gateway_factory = lambda repo: Overlapping()
+    backend.gh = Gh()
+    backend._observations.invalidate("demo")
+
+    payload = backend.issues("demo", wait=True)
+
+    assert payload["gh_ok"] is True and payload["warnings"] == []
+
