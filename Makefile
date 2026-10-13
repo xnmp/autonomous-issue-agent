@@ -77,14 +77,14 @@ test-app:
 	@uv run --quiet --extra dev --extra sdk --extra dash pytest tests/app/ -n $(TEST_WORKERS) --dist load --maxschedchunk=1 $(PYTEST_TIMING)
 
 # Build the dashboard SPA into dashboard/dist (gitignored). Needed before
-# `issue-agent dashboard --serve` prefers the interactive UI over the v1 page.
+# `issue-agent dashboard` can serve the interactive UI.
 dashboard-ui:
 	@PYTHONPATH=src uv run --offline --no-sync python scripts/build_dashboard.py
 
 # Run the operator dashboard with its extras guaranteed present, whatever a
 # prior exact sync pruned. This is the supported way to (re)start it.
 dashboard:
-	@uv run --quiet --extra sdk --extra dash issue-agent dashboard
+	@uv run --quiet --extra sdk --extra dash python -m issue_agent.app.dashweb.main
 
 # Architectural lint: the hexagonal layering contracts in pyproject.toml
 # ([tool.importlinter]). Needs the SDK importable (adapters/app import it), so

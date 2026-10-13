@@ -27,13 +27,11 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ..adapters.env_file import source_env_file
 from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
-from ..domain.dashboard import STALE_AFTER_S
 from ..domain.deployment import canonical_deployment_name
 from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
@@ -46,10 +44,10 @@ HARNESS_ROOT = os.path.dirname(
 )
 REPOS_DIR = os.path.join(HARNESS_ROOT, "config", "repos")
 SHARED_ENV = os.path.join(HARNESS_ROOT, "config", "shared.env")
-# Fixed so the operator can bookmark it and dashboard/vite.config.ts's proxy
-# target matches without configuration.
-DASHBOARD_PORT = 8321
 ROLES = ("fix", "review")
+# A heartbeat older than this is a dead daemon. Generous: a long leg emits
+# nothing between its start and end lines.
+STALE_AFTER_S = 1800.0
 # NixOS has no /bin/bash.
 _BASH = shutil.which("bash") or "/bin/bash"
 
@@ -964,153 +962,20 @@ def cmd_status(args) -> int:
 
 
 # ── dashboard ────────────────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class DashwebPreparation:
-    ready: bool
-    detail: str
-    rebuild_attempted: bool = False
-
-
-DASHBOARD_REBUILD_TIMEOUT_S = 330.0
-
-
-def _run_dashboard_build() -> int:
-    process = subprocess.Popen(["make", "-C", HARNESS_ROOT, "dashboard-ui"], start_new_session=True)
-    try:
-        return process.wait(timeout=DASHBOARD_REBUILD_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        _terminate_dashboard_build(process)
-        return 124
-    except KeyboardInterrupt:
-        _terminate_dashboard_build(process)
-        raise
-
-
-def _terminate_dashboard_build(process) -> None:
-    if process.poll() is not None:
-        return
-    os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-
-
 def dashboard_build_command(harness_root: str | None = None) -> str:
-    """A shell-safe recovery command that works from any target checkout."""
+    """Kept for the pre-8b dashboard server's error page; removed with it."""
     root = shlex.quote(harness_root or HARNESS_ROOT)
     return f"cd {root} && uv sync --extra sdk --extra dash && make dashboard-ui"
 
 
-def dashboard_frontend_build_command(harness_root: str | None = None) -> str:
-    root = shlex.quote(os.path.join(harness_root or HARNESS_ROOT, "dashboard"))
-    return f"cd {root} && npm run build"
-
-
-def _dashboard_startup_error(detail: str) -> int:
-    err("interactive dashboard startup failed:")
-    err(f"  {detail}")
-    err("  install server dependencies: uv sync --extra dash (or make install)")
-    err(f"  build a missing frontend bundle: {dashboard_frontend_build_command()}")
-    err("  from the harness checkout, that build is: cd dashboard && npm run build")
-    return 2
-
-
-def _prepare_dashweb() -> DashwebPreparation:
-    """A missing server dependency stays an explicit install step; missing or
-    stale generated assets are rebuilt in the harness checkout and revalidated."""
-    import importlib.util
-
-    if importlib.util.find_spec("fastapi") is None:
-        return DashwebPreparation(False, "the optional dashboard server is not installed")
-    from ..adapters.dashweb.bundle import bundle_status
-
-    before = bundle_status(HARNESS_ROOT)
-    if before.ready:
-        return DashwebPreparation(True, before.detail)
-    info(f"dashboard frontend is {before.state} ({before.detail}); rebuilding…")
-    try:
-        returncode = _run_dashboard_build()
-    except OSError as exc:
-        return DashwebPreparation(False, f"automatic dashboard rebuild could not start ({exc})", True)
-    after = bundle_status(HARNESS_ROOT)
-    if returncode == 0 and after.ready:
-        return DashwebPreparation(True, "dashboard frontend rebuilt and validated", True)
-    detail = ("automatic dashboard rebuild timed out" if returncode == 124
-              else f"automatic dashboard rebuild failed with exit {returncode}" if returncode
-              else f"automatic dashboard rebuild produced an invalid bundle ({after.detail})")
-    return DashwebPreparation(False, detail, rebuild_attempted=True)
-
-
 def cmd_dashboard(args) -> int:
-    """Every deployment in one read-only view (app/dashboard.py). Serving is
-    the default; --text and --html are one-shot renders and take precedence."""
-    from ..adapters.journal import default_ledger_path
-    from ..adapters.control_path import canonical_control_store_path
-    from . import dashboard as dash
-
-    names = list(args.names) or list(dash.deployment_names(REPOS_DIR))
-    if not names:
-        err(f"no deployments found in {REPOS_DIR} — run `issue-agent start` in a "
-            "target repo first, or pass --name <overlay>.")
-        return 2
-    ledger, logs = default_ledger_path(), log_dir()
-
-    def build() -> list:
-        return [dash.collect(name, read_repo_env_field(os.path.join(REPOS_DIR, f"{name}.env"), "REPO"),
-                             journal_paths(name), logs, ledger, stale_after_s=args.stale_minutes * 60.0,
-                             control_db_path=canonical_control_store_path())
-                for name in names]
-
-    if args.html:
-        path = os.path.abspath(os.path.expanduser(args.html))
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(dash.render_html(build()))
-        ok(f"wrote {path}")
-        return 0
-    if args.text or not args.serve:
-        print(dash.render_text(build(), details=args.details))
-        return 0
-    url = f"http://127.0.0.1:{args.serve}/"
-    if getattr(args, "legacy", False):
-        info(f"serving the legacy dashboard at {url} (Ctrl-C to stop)")
-        reload_check = None
-        if os.environ.get("HOT_RELOAD", "1") != "0":
-            from ..adapters.reload import ReloadWatch
-
-            reload_check = ReloadWatch(HARNESS_ROOT).changed
-        try:
-            return dash.serve(args.serve, lambda: dash.render_html(build()), reload_check=reload_check)
-        except KeyboardInterrupt:
-            print()
-        return 0
-    try:
-        preparation = _prepare_dashweb()
-    except Exception as exc:
-        return _dashboard_startup_error(str(exc))
-    if not preparation.ready:
-        return _dashboard_startup_error(preparation.detail)
-    try:
-        from .dashweb.server import serve as dashweb_serve
-        from ..adapters.reload import RELOAD_EXIT_CODE
-
-        info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
-        result = dashweb_serve(args.serve)
-        if result in {0, RELOAD_EXIT_CODE}:
-            return result
-        return _dashboard_startup_error(f"dashboard server exited with status {result}")
-    except KeyboardInterrupt:
-        print()
-        return 0
-    except SystemExit as exc:
-        return _dashboard_startup_error(f"dashboard server exited during startup with status {exc.code}")
-    except Exception as exc:
-        return _dashboard_startup_error(str(exc))
+    """The dashboard is a separate component the core never imports: replace
+    this process with its module entry, passing the arguments through."""
+    argv = [sys.executable, "-m", "issue_agent.app.dashweb.main", *args.dashboard_args]
+    os.execv(sys.executable, argv)
+    return 0  # unreachable: execv replaces the process or raises
 
 
-# ── doctor ───────────────────────────────────────────────────────────────────
 def _composed_env(env: dict) -> dict:
     """The env the daemons will see: the snapshot AGENT_ENV names, else the
     inherited one (an unsourceable snapshot is doctor.sh's to report)."""
@@ -1285,18 +1150,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = command("status", cmd_status, "show watcher state + recent logs for this repo")
     sp.add_argument("-n", "--lines", type=int, default=15, help="log tail length (default: 15)")
 
-    sp = command("dashboard", cmd_dashboard, "all repos, all issues: done / in flight / daemon health (read-only)",
+    sp = command("dashboard", cmd_dashboard, "serve the operator dashboard (python -m issue_agent.app.dashweb.main)",
                  context=False)
-    sp.add_argument("--name", dest="names", action="append", default=[],
-                    help="restrict to this overlay (repeatable; default: every config/repos/*.env)")
-    sp.add_argument("--html", default="", help="write a self-contained HTML snapshot to PATH and exit")
-    sp.add_argument("--serve", type=int, nargs="?", default=DASHBOARD_PORT, const=DASHBOARD_PORT, metavar="PORT",
-                    help=f"serve on 127.0.0.1:PORT (default: {DASHBOARD_PORT}; the default mode)")
-    sp.add_argument("--text", action="store_true", help="print the text report and exit instead of serving")
-    sp.add_argument("--legacy", action="store_true", help="serve the legacy snapshot renderer instead of the SPA")
-    sp.add_argument("--details", action="store_true", help="text mode: also dump each issue's raw journal events")
-    sp.add_argument("--stale-minutes", type=int, default=30,
-                    help="flag a daemon STALE after this long with no journal event (default: 30)")
+    sp.add_argument("dashboard_args", nargs=argparse.REMAINDER,
+                    help="passed through: [names...] [--port PORT] [--text] [--html PATH]")
 
     command("doctor", cmd_doctor, "preflight checks (tooling, identities, repo access)")
     sp = command("ready", cmd_ready, "label issue(s) ai-ready (trigger the fixer)", context=False)
@@ -1318,7 +1175,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv if argv is not None else sys.argv[1:])
+    argv = list(argv if argv is not None else sys.argv[1:])
+    if argv[:1] == ["dashboard"]:  # every flag after it is the dashboard's own
+        raise SystemExit(cmd_dashboard(argparse.Namespace(dashboard_args=argv[1:])))
+    args = build_parser().parse_args(argv)
     try:
         raise SystemExit(args.func(args))
     except KeyboardInterrupt:
