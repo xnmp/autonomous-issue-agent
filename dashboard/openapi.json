@@ -1026,6 +1026,17 @@
             "title": "Legs",
             "type": "integer"
           },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "pr": {
             "anyOf": [
               {
@@ -1067,6 +1078,28 @@
           "rail": {
             "$ref": "#/components/schemas/StageRail"
           },
+          "routed_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routed Tier"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime"
+          },
           "started_ts": {
             "anyOf": [
               {
@@ -1088,6 +1121,23 @@
               }
             ],
             "title": "Title"
+          },
+          "triage_tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "low",
+                  "med",
+                  "high",
+                  "xhigh"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Triage Tier"
           },
           "url": {
             "anyOf": [

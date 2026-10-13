@@ -628,3 +628,41 @@ def test_loading_the_first_observation_is_not_a_warning(deployment):
     pages = [backend.issues("demo"), backend.issue("demo", 5), backend.overview("demo")]
 
     assert [(p["observed_at"], p["warnings"]) for p in pages] == [(None, [])] * 3
+
+
+def _triage_leg(db_path, leg_id, issue, result, tier_at=-30):
+    db = sqlite3.connect(db_path)
+    db.execute(
+        "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, reserved_at, "
+        "started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, provider_receipt_id, "
+        "settled_at, leg_class, session_id, result_json) VALUES (?, 'o/r', 'fix', 'TRIAGE', ?, ?, '', 'o/r:fix', "
+        "'claude', 'ended', ?, ?, ?, 'USD', 2000000, 10000, 'provider_reported', 'normal_return', ?, ?, 'agent', "
+        "'t', ?)",
+        (leg_id, issue, issue, store_ts(tier_at), store_ts(tier_at), store_ts(tier_at + 1), leg_id,
+         store_ts(tier_at + 1), result),
+    )
+    db.commit()
+    db.close()
+
+
+def test_board_cards_carry_the_triaged_tier_and_the_latest_legs_model(deployment, tmp_path):
+    backend, *_ = deployment
+    _triage_leg(tmp_path / "control.db", "T1", 2, json.dumps({"triage": {"tier": "high"}, "summary": ""}), -90)
+    fix = tmp_path / "state" / "fix"
+    fix.mkdir(parents=True)
+    (fix / "journal.jsonl").write_text(json.dumps({"event": "agent_run", "run_id": "L2", "model": "claude-haiku-5-5"}) + "\n")
+
+    card = next(c for c in backend.issues("demo")["in_flight"] if c["issue"] == 2)
+
+    assert (card["triage_tier"], card["model"], card["runtime"]) == ("high", "claude-haiku-5-5", "claude")
+
+
+def test_board_cards_without_a_usable_triage_have_no_tier_and_never_crash(deployment, tmp_path):
+    backend, *_ = deployment
+    _triage_leg(tmp_path / "control.db", "T1", 2, "{not json")
+    _triage_leg(tmp_path / "control.db", "T2", 3, json.dumps({"triage": {"tier": "gigantic"}}))
+
+    cards = {c["issue"]: c for c in backend.issues("demo")["in_flight"]}
+
+    assert cards[2]["triage_tier"] is None and cards[3]["triage_tier"] is None
+    assert cards[5]["triage_tier"] is None and cards[5]["model"] is None  # no journal line: unknown

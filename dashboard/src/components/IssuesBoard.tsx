@@ -324,6 +324,16 @@ function Facts({ item, card }: { item: BoardItem; card: IssueCard }) {
         </dd>
       </div>
       <div><dt>Legs</dt><dd className="num">{card.legs}</dd></div>
+      <div>
+        <dt>Complexity</dt>
+        <dd className="num">
+          {card.triage_tier ?? "—"}{card.routed_tier ? ` → ${card.routed_tier}` : null}
+        </dd>
+      </div>
+      <div>
+        <dt>Model</dt>
+        <dd className="num">{card.model ? `${card.runtime ? `${card.runtime}:` : ""}${card.model}` : "—"}</dd>
+      </div>
       {card.started_ts ? (
         <div><dt>Started</dt><dd className="num">{ago(card.started_ts, nowMs)}</dd></div>
       ) : null}

@@ -476,6 +476,8 @@ export interface components {
             leg_running: boolean;
             /** Legs */
             legs: number;
+            /** Model */
+            model?: string | null;
             /** Pr */
             pr: number | null;
             /** Pr Ci State */
@@ -483,10 +485,16 @@ export interface components {
             /** Pr Url */
             pr_url: string | null;
             rail: components["schemas"]["StageRail"];
+            /** Routed Tier */
+            routed_tier?: string | null;
+            /** Runtime */
+            runtime?: string | null;
             /** Started Ts */
             started_ts: string | null;
             /** Title */
             title: string | null;
+            /** Triage Tier */
+            triage_tier?: ("low" | "med" | "high" | "xhigh") | null;
             /** Url */
             url: string | null;
         } & {

@@ -163,14 +163,20 @@ const IssueCard = z
     last_ts: z.union([z.string(), z.null()]),
     leg_running: z.boolean(),
     legs: z.number().int(),
+    model: z.union([z.string(), z.null()]).optional(),
     pr: z.union([z.number(), z.null()]),
     pr_ci_state: z
       .union([z.enum(["passing", "failing", "pending"]), z.null()])
       .optional(),
     pr_url: z.union([z.string(), z.null()]),
     rail: StageRail,
+    routed_tier: z.union([z.string(), z.null()]).optional(),
+    runtime: z.union([z.string(), z.null()]).optional(),
     started_ts: z.union([z.string(), z.null()]),
     title: z.union([z.string(), z.null()]),
+    triage_tier: z
+      .union([z.enum(["low", "med", "high", "xhigh"]), z.null()])
+      .optional(),
     url: z.union([z.string(), z.null()]),
   })
   .passthrough();

@@ -205,6 +205,26 @@ describe("issues board row", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "false");
   });
 
+  it("shows the triaged complexity and the leg's model in the expanded row, and a dash when absent", async () => {
+    stubFetch();
+    renderBoard({
+      in_flight: [
+        card(1, needs("question", "2026-10-12T11:00:00Z", "Q"), { triage_tier: "low", routed_tier: "med", model: "claude-haiku-5-5", runtime: "claude" }),
+        card(2, needs("question", "2026-10-12T11:00:00Z", "Q")),
+      ],
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Issue 1 title" }));
+    const facts = within(document.getElementById("board-drawer-1") as HTMLElement);
+    expect(facts.getByText("Complexity").nextSibling).toHaveTextContent("low → med");
+    expect(facts.getByText("Model").nextSibling).toHaveTextContent("claude:claude-haiku-5-5");
+
+    await userEvent.click(screen.getByRole("button", { name: "Issue 2 title" }));
+    const bare = within(document.getElementById("board-drawer-2") as HTMLElement);
+    expect(bare.getByText("Complexity").nextSibling).toHaveTextContent("—");
+    expect(bare.getByText("Model").nextSibling).toHaveTextContent("—");
+  });
+
   it("links the issue and PR numbers and clamps the title with its full text as a tooltip", async () => {
     stubFetch();
     const long = "A".repeat(120);
