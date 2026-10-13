@@ -225,7 +225,7 @@ class Working:
 class Waiting:
     """A wait on something outside the harness."""
 
-    on: str  # branch-protection | human-review | headroom | backoff | github
+    on: str  # branch-protection | human-review | headroom | backoff | github | slot
     headline: str
     reason: str
     since_ts: str | None
@@ -233,6 +233,7 @@ class Waiting:
     status: str = "waiting"
 
 
+ISSUE_ACTS_NAMES = frozenset({AgentKind.TRIAGE.name, AgentKind.RESOLVE.name})
 BoardStatus = NeedsYou | Working | Waiting
 
 _STOP_HEADLINE: Mapping[str, str] = {
@@ -328,6 +329,12 @@ def board_status(
                        "An agent leg holds this item.", _iso(since))
     if isinstance(state, Dispatch):
         act = state.act.name
+        if act in ISSUE_ACTS_NAMES and not any(
+            leg.kind == AgentKind.RESOLVE.name and leg.started_at is not None for leg in legs
+        ):
+            # No resolve has begun: the item waits for a slot. A retried resolve has
+            # begun, so it stays Working like any PR-stage act.
+            return Waiting("slot", f"{_ACT_WORDS[act]} next", "Waiting for a free agent slot.", _iso(ended))
         return Working("queued", act, f"{_ACT_WORDS[act]} next", "Dispatches when a slot is free.", _iso(ended))
     if isinstance(state, Merge):
         return Working("merge", None, "Merging", "Approved on its head with green CI.", _iso(ended))

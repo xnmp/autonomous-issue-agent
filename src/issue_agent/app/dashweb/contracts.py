@@ -235,7 +235,7 @@ class BoardWorking(Contract):
 
 class BoardWaiting(Contract):
     status: Literal["waiting"]
-    on: Literal["branch-protection", "human-review", "headroom", "backoff", "github"]
+    on: Literal["branch-protection", "human-review", "headroom", "backoff", "github", "slot"]
     headline: str
     reason: str
     since_ts: str | None
