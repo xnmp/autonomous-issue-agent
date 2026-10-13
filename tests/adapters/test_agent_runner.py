@@ -102,21 +102,8 @@ def test_no_buffer_knob_leaves_the_sdk_default_alone():
 def test_a_runner_applies_the_default_buffer_to_every_session(monkeypatch):
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"max_buffer_size"}))
     asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     assert seen["options"]["max_buffer_size"] == DEFAULT_MAX_BUFFER_BYTES
-
-
-def test_buffer_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
-    # An older SDK rejects an unknown field at construction — a harness that
-    # cannot raise the ceiling must still run, loudly.
-    seen = {}
-    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
-    logged: list[str] = []
-    asyncio.run(AgentRunner(log=logged.append).run(RuntimePlan(prompt="x")))
-    assert "max_buffer_size" not in seen["options"]
-    assert any("no max_buffer_size" in m for m in logged)
 
 
 def test_the_installed_sdk_accepts_max_buffer_size():
@@ -165,26 +152,11 @@ def test_a_task_with_no_effort_says_nothing():
     assert "effort" not in build_option_kwargs(RuntimePlan(prompt="x"))
 
 
-def test_effort_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
-    # Losing the cheap lever beats failing the dispatch: the tier half of the
-    # ladder still applies.
-    from issue_agent.domain.effort import Effort
-
-    seen = {}
-    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
-    logged: list[str] = []
-    asyncio.run(AgentRunner(log=logged.append).run(RuntimePlan(prompt="x", effort=Effort.HIGH)))
-    assert "effort" not in seen["options"]
-    assert any("no effort option" in m for m in logged)
-
-
 def test_effort_survives_to_the_session_on_a_build_that_has_the_field(monkeypatch):
     from issue_agent.domain.effort import Effort
 
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
-    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"effort"}))
     asyncio.run(AgentRunner().run(RuntimePlan(prompt="x", effort=Effort.LOW)))
     assert seen["options"]["effort"] == "low"
 

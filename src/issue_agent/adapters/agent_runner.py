@@ -1,15 +1,9 @@
-"""AgentRunner — the ONLY module that imports the Claude Agent SDK.
+"""AgentRunner: the ONLY module that imports the Claude Agent SDK.
 
-Replaces the bash `run_claude` + `claude_outcome` + the per-script arg assembly.
-Translates a pure `RuntimePlan` into `ClaudeAgentOptions`, runs `query()` to
-completion, and normalises the final `ResultMessage` into the domain's
-`AgentResult` (decision read from the envelope, NEVER prose — same contract as
-agent/lib.sh:claude_outcome).
-
-The SDK import is lazy (inside methods) so importing this module — e.g. to unit
-test `build_option_kwargs` — does not require the SDK to be installed. The pure
-mapping is factored into `build_option_kwargs` and `result_to_agent_result` so
-both are tested with no live model call.
+Translates a `RuntimePlan` into `ClaudeAgentOptions`, runs `query()` to
+completion and maps the final `ResultMessage` into `AgentResult`, reading the
+decision from the envelope, never from prose or an exit code. The SDK import
+is lazy so the pure mappings test without it.
 """
 
 from __future__ import annotations
@@ -34,55 +28,18 @@ from ..domain.outcome import (
     reclassify_pending_background_block,
 )
 
-# Longest single slice we block waiting for the next stream event before we come
-# up for air to re-check the WALL clock. Small enough that a sleep-spanning gap is
-# noticed promptly on wake; large enough to add negligible overhead on a healthy
-# steadily-streaming run. Only relevant when idle_timeout or max_runtime is set.
+# Longest single wait on the stream before re-checking the WALL clock, so a
+# sleep-spanning gap is noticed promptly on wake.
 _WATCHDOG_POLL_SLICE = 30.0
-
-# Sentinel: "no event this iteration" (idle slice elapsed / stream ended). Distinct
-# from any real SDK message and from None (which could be a legitimate yielded value).
 _NO_MESSAGE = object()
-def _default_wall_clock() -> float:
-    return time.time()
 
-
-def _option_field_names() -> frozenset[str]:
-    """Names of ClaudeAgentOptions fields for the installed SDK build, cached.
-    Guards optional kwargs (e.g. `stderr`) so we only pass them when the build
-    accepts them — an older SDK would reject an unknown field at construction."""
-    global _OPTION_FIELDS
-    if _OPTION_FIELDS is None:
-        import dataclasses
-
-        try:
-            from claude_agent_sdk import ClaudeAgentOptions
-
-            _OPTION_FIELDS = frozenset(
-                f.name for f in dataclasses.fields(ClaudeAgentOptions)
-            )
-        except (ImportError, TypeError):
-            # Older SDK, or a stubbed test double that isn't a dataclass → treat as
-            # "no optional fields known"; callers fall back to the base kwargs.
-            _OPTION_FIELDS = frozenset()
-    return _OPTION_FIELDS
-
-
-_OPTION_FIELDS: frozenset[str] | None = None
-
-
-# Default permission posture: bypassPermissions, so the task's tool lists and
-# the trusted-inbound-content posture (see the capability matrix) are the
-# boundary, not the classifier. Override via AgentRunner(permission_mode=…) if
-# a target wants the classifier too.
+# bypassPermissions: the task's tool lists and the trusted-inbound-content
+# posture (capability matrix) are the boundary, not the classifier.
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
-# Ceiling on ONE decoded SDK stream message. The SDK's own default is 1MB, and a
-# tool result carries its payload base64'd (x4/3), so any Read of a file above
-# ~750KB kills the transport mid-session — deterministically, since the next
-# dispatch reads the same file (#13, observed on a 2.3MB evidence PNG). 16MB
-# survives a ~5MB read and costs nothing until a message actually needs it: the
-# buffer bounds a decode, it is not preallocated. Override: SDK_MAX_BUFFER_BYTES.
+# Ceiling on ONE decoded SDK stream message. The SDK default (1MB) kills the
+# transport on any Read above ~750KB once base64'd, deterministically, since
+# the next dispatch reads the same file (#13, a 2.3MB PNG). Not preallocated.
 DEFAULT_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 
 
@@ -91,79 +48,42 @@ def build_option_kwargs(
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     max_buffer_size: int | None = None,
 ) -> dict[str, Any]:
-    """Pure: RuntimePlan → kwargs for ClaudeAgentOptions. No SDK import, no I/O, so
-    it is unit-tested directly."""
-    kwargs: dict[str, Any] = {
-        "permission_mode": permission_mode,
-        "max_budget_usd": task.max_budget_usd,
-    }
-    # Emitted unconditionally when set; `run` drops it if the installed SDK build
-    # predates the field, the same guard `stderr` gets.
+    """Pure: RuntimePlan → kwargs for ClaudeAgentOptions."""
+    kwargs: dict[str, Any] = {"permission_mode": permission_mode, "max_budget_usd": task.max_budget_usd}
     if max_buffer_size:
         kwargs["max_buffer_size"] = int(max_buffer_size)
-
-    # System prompt: claude_code preset + append (matches --append-system-prompt,
-    # and crucially keeps the full Claude Code prompt the bash agents rely on —
-    # the SDK uses a MINIMAL prompt by default).
+    # The claude_code preset keeps the full Claude Code prompt (the SDK default
+    # is minimal); the task's system text is appended to it.
+    kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code"}
     if task.append_system_prompt:
-        kwargs["system_prompt"] = {
-            "type": "preset",
-            "preset": "claude_code",
-            "append": task.append_system_prompt,
-        }
-    else:
-        kwargs["system_prompt"] = {"type": "preset", "preset": "claude_code"}
-
+        kwargs["system_prompt"]["append"] = task.append_system_prompt
     if task.schema is not None:
         kwargs["output_format"] = {"type": "json_schema", "schema": task.schema}
-
     if task.allowed_tools:
         kwargs["allowed_tools"] = list(task.allowed_tools)
     if task.disallowed_tools:
         kwargs["disallowed_tools"] = list(task.disallowed_tools)
     if task.model:
         kwargs["model"] = task.model
-    # Reasoning effort (harness #16). Emitted only when the task actually has an
-    # opinion — a task with effort=None must construct the SAME options it did
-    # before the field existed. `run` drops it on an SDK build that predates the
-    # option, the same guard `max_buffer_size` and `stderr` get.
+    # Only when the task has an opinion: no effort keeps the SDK's default (#16).
     if task.effort is not None:
         kwargs["effort"] = task.effort.value
     if task.cwd:
         kwargs["cwd"] = task.cwd
     if task.resume:
         kwargs["resume"] = task.resume
-    # Commit attribution: author/committer name carries the leg's model. Task
-    # env still wins so an explicit override stays an override.
-    # Background tasks are off for every role and cannot be overridden: a
-    # backgrounded Bash/Task ends the stream with no terminal ResultMessage, a
-    # paid verdict-less leg (docs/open/issues/review-no-resultmessage-background-tasks.md).
-    kwargs["env"] = {
-        **git_identity_env(task.model),
-        **task.env,
-        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-    }
-    # Target project settings and CLAUDE.md are untrusted checkout data, so
-    # none load (no target hooks either); repository guidance is appended to
-    # the user task by RepositoryGuidanceRuntime.
+    # Background tasks are off and cannot be overridden: a backgrounded
+    # Bash/Task ends the stream with no ResultMessage, a paid verdict-less leg.
+    kwargs["env"] = {**git_identity_env(task.model), **task.env, "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+    # Target settings and CLAUDE.md are untrusted checkout data: none load.
     kwargs["setting_sources"] = []
     return kwargs
 
 
-def resolve_claude_cli(
-    pinned: str,
-    bundled: Path,
-    which: Callable[[str], str | None] = shutil.which,
-) -> str | None:
-    """The CLI the supervised runner will exec, or None when nothing resolves.
-
-    Order: CLAUDE_BIN pin → SDK-bundled binary → PATH. The pin exists because
-    the bundled path derives from `claude_agent_sdk.__file__`, which a live
-    daemon resolves into a venv tree that can be DELETED under it (a `uv sync`
-    rebuild across a Python minor, keifu 2026-08-03 — every review leg died
-    pre-launch with transport_death), and PATH lookup is only as good as the
-    unit's minimal PATH (the CODEX_BIN incident, same class). The pin is taken
-    as given, never validated here — that is the point of pinning."""
+def resolve_claude_cli(pinned: str, bundled: Path, which: Callable[[str], str | None] = shutil.which) -> str | None:
+    """CLAUDE_BIN pin → SDK-bundled binary → PATH. The pin exists because a
+    `uv sync` can delete the venv under a live daemon (keifu 2026-08-03: every
+    review leg died pre-launch); it is taken as given."""
     if pinned.strip():
         return pinned.strip()
     if bundled.is_file() and os.access(bundled, os.X_OK):
@@ -172,115 +92,68 @@ def resolve_claude_cli(
 
 
 def exit_reason_from_envelope(subtype: str, is_error: bool) -> ExitReason:
-    """Pure: SDK ResultMessage (subtype, is_error) → why the session ended.
-
-    Read off the ENVELOPE, like every other decision here — never from prose or an
-    exit code. The one case worth singling out is budget: the SDK reports it as
-    just another `is_error` subtype, but a spend ceiling is an operator-knob
-    outcome, not a failure of the agent's reasoning, and the cost ledger needs to
-    tell them apart. Everything else that errored is AGENT_ERROR: the agent was
-    alive and answering, so it made an attempt (contrast `infra_death`)."""
+    """Budget is singled out: a spend ceiling is an operator knob, not a failed
+    attempt. Any other error is AGENT_ERROR (the agent was alive)."""
     st = (subtype or "").lower()
     if st == "success" and not is_error:
         return ExitReason.OK
     if "budget" in st:
         return ExitReason.BUDGET_EXHAUSTED
-    if is_error:
-        return ExitReason.AGENT_ERROR
-    return ExitReason.OK
+    return ExitReason.AGENT_ERROR if is_error else ExitReason.OK
 
 
 def reported_model(msg: Any) -> str:
-    """Concrete model named by an SDK init or result message, if any.
-
-    A task may intentionally leave ``model`` unset and let the SDK choose its
-    deployable default. The SDK reports that choice in the init message's data;
-    newer result envelopes may report it directly. Keep this adapter boundary
-    tolerant of either append-only SDK shape.
-    """
+    """The concrete model an init or result message names (an unpinned task
+    lets the SDK choose), from either SDK shape."""
     direct = getattr(msg, "model", None)
     if isinstance(direct, str) and direct.strip():
         return direct.strip()
     data = getattr(msg, "data", None)
-    if isinstance(data, dict):
-        nested = data.get("model")
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip()
-    return ""
+    nested = data.get("model") if isinstance(data, dict) else None
+    return nested.strip() if isinstance(nested, str) and nested.strip() else ""
 
 
 def result_to_agent_result(msg: Any) -> AgentResult:
-    """Pure: SDK ResultMessage → domain AgentResult. Duck-typed (reads attrs) so
-    a test can pass a stand-in object. Mirrors claude_outcome / save_session:
-    is_error from the envelope, status/summary/needs from structured_output."""
+    """Pure: SDK ResultMessage → AgentResult (duck-typed). An errored envelope
+    with no declared status reports its subtype ("error_max_turns", …), and
+    the subtype is always kept (#501 was undiagnosable without it)."""
     structured = getattr(msg, "structured_output", None) or {}
     status = declared_status(structured)
-    # On an errored envelope with no structured status, surface the SDK's own error
-    # kind (subtype, e.g. "error_max_turns" / "error_during_execution") as the
-    # status so the daemon log distinguishes a turn-limit abort from a budget abort
-    # from a transport death — otherwise every failure reads as a bare "error".
+    subtype = str(getattr(msg, "subtype", "") or "")
     if not status and bool(getattr(msg, "is_error", True)):
-        status = str(getattr(msg, "subtype", "") or "error")
-    summary = ""
-    needs = ""
+        status = subtype or "error"
     if isinstance(structured, dict):
         summary = structured.get("summary", "") or (getattr(msg, "result", "") or "")
         needs = structured.get("needs") or ""
     else:
-        summary = getattr(msg, "result", "") or ""
+        summary, needs = getattr(msg, "result", "") or "", ""
     is_error = bool(getattr(msg, "is_error", True)) or status == "error"
-    # Raw usage block, verbatim: it carries cache_read/cache_creation token counts
-    # that no other field exposes, and a subscription-plan run reports
-    # total_cost_usd == 0.00 — tokens are the only cost substrate that survives.
+    # Raw usage, verbatim: cache counters live only here, and a subscription
+    # run reports total_cost_usd == 0.00.
     usage = getattr(msg, "usage", None)
+    turns = getattr(msg, "num_turns", None)
     return AgentResult(
-        is_error=is_error,
-        status=status,
-        # Captured unconditionally — NOT under `if not status` like the fallback
-        # above. When the agent declares its own status the envelope's error kind
-        # would otherwise be thrown away, which is exactly what made #501's
-        # is_error=True / status="success" run undiagnosable.
-        envelope_subtype=str(getattr(msg, "subtype", "") or ""),
-        summary=summary,
-        needs=needs,
-        cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0),
-        model=reported_model(msg),
+        is_error=is_error, status=status, envelope_subtype=subtype, summary=summary, needs=needs,
+        cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0), model=reported_model(msg),
         session_id=getattr(msg, "session_id", "") or "",
         structured=structured if isinstance(structured, dict) else None,
-        exit_reason=exit_reason_from_envelope(
-            str(getattr(msg, "subtype", "") or ""), is_error
-        ),
-        usage=usage if isinstance(usage, dict) else None,
-        num_turns=(
-            int(getattr(msg, "num_turns"))
-            if isinstance(getattr(msg, "num_turns", None), int)
-            else None
-        ),
+        exit_reason=exit_reason_from_envelope(subtype, is_error),
+        usage=usage if isinstance(usage, dict) else None, num_turns=turns if isinstance(turns, int) else None,
     )
 
 
 def _short(value: Any, limit: int = 200) -> str:
-    """One-line, length-bounded repr. A diagnostic that floods the log is a
-    diagnostic operators disable."""
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[:limit] + "…"
 
 
 def error_forensics(msg: Any) -> str:
-    """WHY an errored ResultMessage errored, as one grep-able line.
-
-    The SDK envelope carries far more than we map onto AgentResult:
-    `errors`, `permission_denials` (a tool policy blocking the agent in a loop —
-    invisible everywhere else), `num_turns` (a max-turns wall), `stop_reason`,
-    `terminal_reason`, `api_error_status`, and the model's own `result` text.
-    All of it was being discarded, so a failed run left `exit_reason=agent_error`
-    and nothing else. Duck-typed and exception-free: a diagnostic must never add
-    a failure mode to the path it is diagnosing.
-    """
+    """WHY an errored ResultMessage errored, as one grep-able line: the
+    envelope fields AgentResult drops (errors, permission denials, stop and
+    terminal reasons, the model's own text). Never raises."""
     parts: list[str] = []
     try:
-        for name in ("subtype", "stop_reason", "terminal_reason",
-                     "api_error_status", "num_turns", "duration_ms"):
+        for name in ("subtype", "stop_reason", "terminal_reason", "api_error_status", "num_turns", "duration_ms"):
             value = getattr(msg, name, None)
             if value not in (None, "", 0):
                 parts.append(f"{name}={_short(value, 80)}")
@@ -289,10 +162,9 @@ def error_forensics(msg: Any) -> str:
             parts.append(f"errors={_short(errors, 400)}")
         denials = getattr(msg, "permission_denials", None)
         if denials:
-            # The count matters as much as the content: one denial is a blocked
-            # command, forty is an agent wedged against a tool policy.
+            # One denial is a blocked command; forty is an agent wedged on policy.
             try:
-                count = len(denials)
+                count: object = len(denials)
             except TypeError:
                 count = "?"
             parts.append(f"permission_denials={count} {_short(denials, 400)}")
@@ -305,49 +177,23 @@ def error_forensics(msg: Any) -> str:
 
 
 def merge_usage(acc: dict | None, raw: Any) -> dict | None:
-    """Accumulate one SDK per-turn usage block into a running total.
-
-    `AssistantMessage.usage` is the underlying API call's OWN usage block
-    (SDK message_parser: `usage=data["message"].get("usage")`), i.e. per turn —
-    so summing across turns gives the run's BILLED totals, since every call bills
-    its full input including cache reads. That distinction matters: if the field
-    were cumulative, summing would overcount by roughly the turn count.
-
-    Exists so an ABORTED run still knows what it spent. Cost only ever arrives on
-    the final ResultMessage, so a wall-cap/idle/dropped-result abort used to
-    report cost_usd=0.0 AND usage=None — a 906s session with four commits
-    ledgered as $0.00, invisible to both spend caps. Tokens are the only substrate
-    that survives an abort.
-
-    Returns None until something is seen, keeping "no usage reported" distinct
-    from "zero tokens".
-    """
+    """Add one per-turn usage block (each API call's own, so the sum is the
+    billed total) to a running total, so an ABORTED run still knows what it
+    spent: dollars arrive only on the final ResultMessage (a 906s session once
+    ledgered $0.00). None until something is seen."""
     if not isinstance(raw, dict):
         return acc
     out = dict(acc or {})
     for k, v in raw.items():
-        # bool is an int subclass; a flag is not a token count.
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             continue
         out[k] = out.get(k, 0) + v
     return out
 
 
-def total_stream_tokens(usage: dict) -> int:
-    """Sum of every numeric counter in a usage block — same contract as
-    journal.total_tokens, local so the runner keeps its no-journal-import
-    layering. Used only by the calibration log line."""
-    return sum(
-        int(v) for v in usage.values()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-    )
-
-
 def _trace_message(msg: Any) -> str:
-    """One-line summary of an SDK stream message for debug tracing. Duck-typed so
-    a test can pass a stand-in; never raises (diagnostics must not add failure
-    modes). Surfaces tool_use blocks (name + a short command/path) so the LAST
-    action before a transport death is visible in the log."""
+    """One-line summary of a stream message, naming tool_use blocks so the
+    LAST action before a transport death is visible. Never raises."""
     try:
         kind = type(msg).__name__
         blocks = getattr(msg, "content", None)
@@ -355,12 +201,10 @@ def _trace_message(msg: Any) -> str:
             parts = []
             for b in blocks:
                 name = getattr(b, "name", None)
-                if name:  # a ToolUseBlock
+                if name:
                     ti = getattr(b, "input", None)
-                    hint = ""
-                    if isinstance(ti, dict):
-                        raw = str(ti.get("command") or ti.get("file_path") or "")
-                        hint = raw.strip().splitlines()[0][:80] if raw.strip() else ""
+                    raw = str(ti.get("command") or ti.get("file_path") or "") if isinstance(ti, dict) else ""
+                    hint = raw.strip().splitlines()[0][:80] if raw.strip() else ""
                     parts.append(f"{name}({hint})" if hint else name)
             if parts:
                 return f"{kind} → {', '.join(parts)}"
@@ -369,27 +213,15 @@ def _trace_message(msg: Any) -> str:
         return "??"
 
 
-# The CLI reports a killed task as `killed` on task_updated and `stopped` on
-# task_notification; both vocabularies end a task.
+# `killed` (task_updated) and `stopped` (task_notification) both end a task.
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
-# Delegated agent work, the only kind whose completion wakes the leg: the SDK's
-# own in-flight ledger tracks exactly these. A background shell or monitor may
-# never reach a terminal status, so its presence says nothing about whether a
-# human question is genuine.
+# Only delegated agent work wakes the leg; a background shell may never end.
 _DELEGATED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 
 
 def background_task_transition(msg: Any) -> tuple[str, bool] | None:
-    """Pure: SDK task-lifecycle system message → (task_id, still_pending).
-
-    Read from the base `subtype`/`data` fields every SDK build populates, so an
-    older SDK that yields a generic SystemMessage is tracked the same way as
-    the typed Task*Message subclasses. Only delegated agent work starts a
-    pending child; an untyped start is not evidence. A terminal state can arrive on EITHER a
-    task_notification or a task_updated patch (the SDK documents both), so
-    both clear the task. Anything else, or a malformed payload, is None —
-    never raises on a lifecycle event.
-    """
+    """Pure: task-lifecycle system message → (task_id, still_pending), read
+    from the base `subtype`/`data` every SDK build populates; None otherwise."""
     subtype = getattr(msg, "subtype", None)
     data = getattr(msg, "data", None)
     if not isinstance(data, dict):
@@ -398,23 +230,18 @@ def background_task_transition(msg: Any) -> tuple[str, bool] | None:
     if not isinstance(task_id, str) or not task_id:
         return None
     if subtype == "task_started":
-        if data.get("task_type") not in _DELEGATED_TASK_TYPES:
-            return None
-        return task_id, True
+        return (task_id, True) if data.get("task_type") in _DELEGATED_TASK_TYPES else None
     if subtype == "task_notification":
         return task_id, False
     if subtype == "task_updated":
         patch = data.get("patch")
-        status = patch.get("status") if isinstance(patch, dict) else None
-        if status in _TERMINAL_TASK_STATUSES:
+        if (patch.get("status") if isinstance(patch, dict) else None) in _TERMINAL_TASK_STATUSES:
             return task_id, False
     return None
 
 
 async def _aclose_quietly(agen: Any) -> None:
-    """Best-effort close of the SDK async generator after an idle-timeout abort —
-    tears down the underlying query subprocess. Never raises (we're already in an
-    error path; a close failure must not mask the timeout)."""
+    """Close the SDK generator (tears down the query subprocess); never raises."""
     try:
         aclose = getattr(agen, "aclose", None)
         if aclose is not None:
@@ -424,7 +251,6 @@ async def _aclose_quietly(agen: Any) -> None:
 
 
 async def _cancel_task_quietly(task: Any) -> None:
-    """Cancel and join a child receive task before closing its generator."""
     if task is None or task.done():
         return
     task.cancel()
@@ -435,10 +261,8 @@ async def _cancel_task_quietly(task: Any) -> None:
 
 
 class AgentRunner(AgentRuntime):
-    """Runs headless agent tasks over the SDK. One instance per process; safe to
-    call `run` concurrently for distinct `cwd`s (each query is its own SDK
-    subprocess — see REFACTOR-SDK.md §15). Implements the domain AgentRuntime
-    port (the Claude-SDK realisation; CodexRunner is the other)."""
+    """Runs headless agent tasks over the SDK; `run` is safe concurrently for
+    distinct `cwd`s (each query is its own SDK subprocess)."""
 
     def __init__(
         self,
@@ -453,354 +277,155 @@ class AgentRunner(AgentRuntime):
         process_supervisor: Any = None,
     ):
         self.permission_mode = permission_mode
-        # Diagnostics: `log` is a str->None sink (stderr in prod). `debug` turns on
-        # per-message tracing so a mid-session transport death ("Stream closed")
-        # shows the LAST tool the agent ran before it — the blind spot today.
         self._log = log or (lambda _m: None)
-        self._debug = debug
-        # Idle watchdog: max seconds BETWEEN stream events before we call it a hang
-        # (not a total-runtime cap — a hard task streams events steadily and keeps
-        # resetting the clock; only genuine silence trips it). None disables. See
-        # AGENT_IDLE_TIMEOUT_SECONDS; default derived from the healthy #56 run where
-        # the worst legit inter-event gap was ~124s.
+        self._debug = debug  # per-message tracing
+        # Max seconds BETWEEN stream events (a hang), not total runtime.
         self._idle_timeout = idle_timeout
-        # The idle window is measured against the WALL clock (time.time), NOT the
-        # asyncio/monotonic clock. On macOS the monotonic clock (mach_absolute_time)
-        # FREEZES during system sleep, so a single `wait_for(timeout=idle_timeout)`
-        # spanning a suspend does not count the suspended time — after the laptop
-        # wakes, a stream whose socket died during sleep would need a WHOLE fresh
-        # idle window (or hang forever on a half-open socket) before tripping. That
-        # was the observed post-sleep review wedge (Myapp #345). Polling the wall clock
-        # in short slices instead makes a sleep-spanning gap visible on the first
-        # slice after wake → prompt recovery, and lets the Mac sleep freely.
-        self._wall_clock = wall_clock or _default_wall_clock
+        # Both caps are measured on the WALL clock in short slices: macOS
+        # freezes the monotonic clock during sleep, so a one-shot wait spanning
+        # a suspend wedged a review after wake (Myapp #345).
+        self._wall_clock = wall_clock or time.time
         self._poll_slice = poll_slice
-        # Total-runtime ceiling — the cap the idle watchdog CANNOT provide. A stream
-        # left "limping" by a suspend/resume (FAILURE-MODES #60) emits an event every
-        # few minutes: each one resets the idle clock, so a session burned 58 minutes
-        # on 3.6s of CPU and never tripped. Only elapsed wall time bounds that shape.
-        # None disables. See AGENT_MAX_RUNTIME_SECONDS.
+        # Total runtime: a stream limping after a resume emits an event every
+        # few minutes and never trips the idle cap (58 minutes on 3.6s of CPU).
         self._max_runtime = max_runtime
-        # Per-message decode ceiling for every session this runner drives — the
-        # reviewer's big-file Read must degrade to token cost, not a dead
-        # transport (#13). None/0 leaves the SDK's own 1MB default in place.
         self._max_buffer_size = max_buffer_size
         self._process_supervisor = process_supervisor
 
     def _slice_timeout(self) -> float:
-        """How long to block on one observation slice. The poll slice, floored by
-        whichever caps are active so a cap SHORTER than the slice still trips on
-        time (a 0.2s cap must not wait 30s to notice)."""
-        caps = [self._poll_slice]
-        if self._idle_timeout is not None:
-            caps.append(self._idle_timeout)
-        if self._max_runtime is not None:
-            caps.append(self._max_runtime)
-        return min(caps)
+        """The poll slice, floored by any shorter armed cap."""
+        return min([self._poll_slice] + [c for c in (self._idle_timeout, self._max_runtime) if c is not None])
 
-    def _wall_timeout(
-        self, elapsed: float, last_trace: str, usage: dict | None = None,
-        msgs: int = 0,
-    ) -> AgentResult:
-        """Log + build the terminal result for a tripped total-runtime cap.
+    def _wall_timeout(self, elapsed: float, last_trace: str, usage: dict | None = None, msgs: int = 0) -> AgentResult:
+        """The tripped total-runtime cap, costed by the stream usage so far.
+        `msgs` tells "wedged early" from "ran out of road"."""
+        self._log(f"sdk: WALL — total runtime {elapsed:.0f}s exceeded max {self._max_runtime:.0f}s; aborting after "
+                  f"{msgs} stream messages (last: {last_trace or 'none'})")
+        return AgentResult(is_error=True, status="timeout", exit_reason=ExitReason.WALL_TIMEOUT,
+                           summary=f"agent exceeded max runtime {self._max_runtime:.0f}s",
+                           usage=usage, stream_usage=usage)
 
-        `usage` carries whatever the stream reported before the abort, so the run
-        is costed rather than ledgered as $0.00 (see `merge_usage`). `msgs` is how
-        many stream messages arrived first — it distinguishes "wedged early" from
-        "worked the whole time and ran out of road", which need opposite responses
-        (investigate vs. raise the cap / trim the task)."""
-        self._log(
-            f"sdk: WALL — total runtime {elapsed:.0f}s exceeded "
-            f"max {self._max_runtime:.0f}s; aborting after {msgs} stream "
-            f"messages (last: {last_trace or 'none'})"
-        )
-        return AgentResult(
-            is_error=True, status="timeout",
-            exit_reason=ExitReason.WALL_TIMEOUT,
-            summary=f"agent exceeded max runtime {self._max_runtime:.0f}s",
-            usage=usage,
-            stream_usage=usage,
-        )
+    def _honour_captured(self, elapsed: float) -> None:
+        self._log(f"sdk: WALL — {elapsed:.0f}s exceeded max {self._max_runtime:.0f}s, but a ResultMessage was "
+                  "already captured; honouring it")
 
     async def run(self, task: RuntimePlan) -> AgentResult:
-        # Lazy import: keeps the SDK out of domain-only / unit-test paths.
-        import asyncio
-
         import claude_agent_sdk
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
-        accounting_run_id = task.env.get("ISSUE_AGENT_RUN_ID", "")
-        supervised_run_id = RunId(accounting_run_id or uuid.uuid4().hex)
-        kwargs = build_option_kwargs(
-            task, self.permission_mode, self._max_buffer_size
-        )
+        supervised_run_id = RunId(task.env.get("ISSUE_AGENT_RUN_ID", "") or uuid.uuid4().hex)
+        kwargs = build_option_kwargs(task, self.permission_mode, self._max_buffer_size)
         if self._process_supervisor is not None:
-            executable = resolve_claude_cli(
-                os.environ.get("CLAUDE_BIN", ""),
-                Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude",
-            )
+            executable = resolve_claude_cli(os.environ.get("CLAUDE_BIN", ""),
+                                            Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")
             if executable is None:
-                raise FileNotFoundError(
-                    "Claude CLI executable is unavailable — set CLAUDE_BIN "
-                    "to an absolute path to pin it"
-                )
-            wrapper, supervisor_env = self._process_supervisor.supervised_cli(
-                supervised_run_id, executable
-            )
+                raise FileNotFoundError("Claude CLI executable is unavailable — set CLAUDE_BIN "
+                                        "to an absolute path to pin it")
+            wrapper, supervisor_env = self._process_supervisor.supervised_cli(supervised_run_id, executable)
             kwargs["cli_path"] = wrapper
-            kwargs["env"] = {
-                **kwargs.get("env", {}),
-                **supervisor_env,
-            }
-            kwargs["env"][CHILD_ENV_MANIFEST] = " ".join(
-                sorted(kwargs["env"])
-            )
-        # Older SDK builds have no such field and reject it at construction.
-        if "max_buffer_size" in kwargs and "max_buffer_size" not in _option_field_names():
-            kwargs.pop("max_buffer_size")
-            self._log(
-                "sdk: installed claude-agent-sdk has no max_buffer_size — "
-                "large file reads may kill the transport (harness #13)"
-            )
-        # Same guard for reasoning effort: an older build has no `effort` field and
-        # would reject it at construction. Dropping it costs the escalation ladder
-        # its cheap lever on this runtime (the tier half still applies), which is
-        # strictly better than failing the dispatch.
-        if "effort" in kwargs and "effort" not in _option_field_names():
-            kwargs.pop("effort")
-            self._log(
-                "sdk: installed claude-agent-sdk has no effort option — "
-                "reasoning-effort escalation is a no-op here (harness #16)"
-            )
-        # Capture the bundled CLI's OWN stderr. The SDK otherwise swallows it, so a
-        # gateway-side failure (an HTTP status, an SSE `response.failed`, a reconnect
-        # loop) that kills the result-delivery turn is invisible — we see only the
-        # symptom ("no ResultMessage"), never the cause. Route each stderr line into
-        # our log (tagged) so the real reason sits next to the $0.00 error. Only
-        # wired when the SDK build exposes the `stderr` option (older builds don't).
-        if "stderr" in _option_field_names():
-            def _cli_stderr(line: str) -> None:
-                s = (line or "").rstrip()
-                if s:
-                    self._log(f"sdk-stderr: {s[:500]}")
-            kwargs["stderr"] = _cli_stderr
+            kwargs["env"] = {**kwargs.get("env", {}), **supervisor_env}
+            kwargs["env"][CHILD_ENV_MANIFEST] = " ".join(sorted(kwargs["env"]))
+
+        # The CLI's own stderr names a gateway failure the SDK otherwise swallows.
+        def _cli_stderr(line: str) -> None:
+            if s := (line or "").rstrip():
+                self._log(f"sdk-stderr: {s[:500]}")
+        kwargs["stderr"] = _cli_stderr
 
         options = ClaudeAgentOptions(**kwargs)
         final: Any = None
-        last_trace = ""  # last thing we saw before a transport death (for the log)
-        # Diagnostics for the clean-end-no-result drop (gateway fails at result
-        # delivery): the stream ends via StopAsyncIteration WITHOUT ever yielding a
-        # ResultMessage, so the "transport died" exception branch never fires and
-        # nothing explains the $0.00 error. Track how far we got — total messages
-        # seen and the KIND of the last one — so the log distinguishes "died on the
-        # first event" (never started) from "died mid-task after N tool turns"
-        # (gateway dropped the final result turn). ALWAYS logged (not debug-gated).
-        msg_count = 0
-        last_kind = "none"
-        last_msg: Any = None  # the actual last message object (for drop-path forensics)
-        terminal_seen = ""    # any terminal_reason observed across the stream
-        resolved_model = ""   # the SDK init model for an intentionally unpinned task
-        # Background tasks started and not yet terminal, and the snapshot of them
-        # taken when OUR turn's result arrived: a headless leg that ends its turn
-        # over a pending child can never consume that child's notification (#255).
+        last_trace = ""  # what the agent last did, for abort and death lines
+        msg_count, last_kind, last_msg, terminal_seen, resolved_model = 0, "none", None, "", ""
+        # Delegated children still running when OUR result arrived: a headless
+        # leg can never consume their notification (#255).
         live_children: set[str] = set()
         children_at_result: frozenset[str] = frozenset()
 
         def with_resolved_model(result: AgentResult) -> AgentResult:
-            """Keep the init model on every returned terminal outcome.
+            # The init model is the only attribution a no-result/timeout leg has.
+            return dataclasses.replace(result, model=resolved_model) if resolved_model and not result.model else result
 
-            The SDK only supplies an init envelope before a no-result, idle, or
-            wall timeout outcome, so waiting for a ResultMessage loses the only
-            concrete model attribution for an otherwise settled journal receipt.
-            """
-            if resolved_model and not result.model:
-                return dataclasses.replace(result, model=resolved_model)
-            return result
-
-        # Running token total, so an abort still reports what it spent. Only the
-        # final ResultMessage carries dollars, so without this every wall-cap /
-        # idle / dropped-result run ledgers $0.00 no matter how long it ran.
         usage_acc: dict | None = None
-        # Wall-cap baseline. Read the clock ONLY when the cap is armed: the clock is
-        # injectable and a spurious read would shift a test's fake sequence, and an
-        # unarmed cap has no baseline to keep.
+        # The clock is injectable: read it only when a cap is armed.
         started_at = self._wall_clock() if self._max_runtime is not None else 0.0
         agen = query(prompt=task.rendered_prompt, options=options).__aiter__()
-        receive_started = False
         pending: Any = None
         try:
             while True:
-                # Total-runtime cap, checked BETWEEN receives as well as inside the
-                # slice loop below. A stream delivering events FASTER than one poll
-                # slice never expires a slice, so the in-slice check alone would
-                # leave a chatty runaway session unbounded — exactly the spend hole
-                # the cap exists to close. Between receives there is no in-flight
-                # task to cancel; just close the generator (tears down the query
-                # subprocess) and honour any result we already captured.
+                # Also checked between receives: a stream faster than one slice
+                # never expires a slice, so a chatty runaway would be unbounded.
                 if self._max_runtime is not None:
                     elapsed = self._wall_clock() - started_at
                     if elapsed >= self._max_runtime:
                         await _aclose_quietly(agen)
                         if final is None:
-                            return with_resolved_model(self._wall_timeout(
-                                elapsed, last_trace, usage_acc, msg_count
-                            ))
-                        self._log(
-                            f"sdk: WALL — {elapsed:.0f}s exceeded max "
-                            f"{self._max_runtime:.0f}s, but a ResultMessage was "
-                            "already captured; honouring it"
-                        )
+                            return with_resolved_model(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
+                        self._honour_captured(elapsed)
                         break
-                # Bound the wait for the NEXT event, not the whole run. A hard task
-                # emits messages continuously so the idle clock resets every few
-                # seconds; only a true hang (no event at all) exceeds the window.
-                #
-                # The window is measured against the WALL clock in short poll slices,
-                # not a single monotonic-clock wait_for: macOS freezes the monotonic
-                # clock during system sleep, so a one-shot wait spanning a suspend
-                # would not count the suspended time and the post-wake wedge (a review
-                # whose socket died mid-sleep) could hang for a full extra window. By
-                # re-checking wall-clock elapsed each slice, a sleep-spanning gap trips
-                # on the first slice after wake — and the laptop is free to sleep.
                 message: Any = _NO_MESSAGE
                 stream_ended = False
+                pending = asyncio.ensure_future(agen.__anext__())
                 if self._idle_timeout is not None or self._max_runtime is not None:
-                    # ONE observation loop serves BOTH caps. They are checked
-                    # independently (each only when armed) but share the slice
-                    # machinery — arming only the wall cap must not fall through to
-                    # the unbounded `await __anext__()` branch below, or the cap
-                    # would silently never fire.
-                    #
-                    # Poll the NEXT event without cancelling the in-flight receive.
-                    #
-                    # The previous form — asyncio.wait_for(agen.__anext__(), slice) —
-                    # cancelled the pending __anext__() on every slice timeout. The SDK
-                    # generator awaits its transport read inside __anext__(); cancelling
-                    # that mid-read closes the stream, so the NEXT __anext__() returns
-                    # StopAsyncIteration and the whole run ends with NO ResultMessage
-                    # ($0.00 "result-delivery drop"). Any run where the model pauses
-                    # longer than one slice between messages (routine for a reviewer
-                    # thinking over a large diff) hit this — the persistent ~all-review
-                    # failure. See the wait_for-cancel repro in the drop investigation.
-                    #
-                    # Fix: start the __anext__() ONCE as a task and OBSERVE it across
-                    # slices with asyncio.wait (which does NOT cancel on timeout). The
-                    # receive runs to completion regardless of how many slices elapse;
-                    # slices exist only to re-check the wall-clock idle budget (so a
-                    # true hang, or a sleep-spanning gap on macOS where the monotonic
-                    # clock freezes, still trips the idle timeout and frees the laptop).
+                    # OBSERVE the one receive across slices with asyncio.wait,
+                    # which never cancels it: cancelling __anext__ mid-read
+                    # closed the stream and dropped the ResultMessage of every
+                    # leg that paused longer than a slice.
                     last_event = self._wall_clock()
-                    if not receive_started:
-                        pending = asyncio.ensure_future(agen.__anext__())
-                        receive_started = True
-                    else:
-                        pending = asyncio.ensure_future(agen.__anext__())
                     while True:
-                        done, _ = await asyncio.wait(
-                            {pending}, timeout=self._slice_timeout()
-                        )
+                        done, _ = await asyncio.wait({pending}, timeout=self._slice_timeout())
                         if done:
                             try:
                                 message = pending.result()
                             except StopAsyncIteration:
                                 stream_ended = True
-                            break  # got an event (or the stream ended)
-                        # ONE clock read per slice, shared by both checks — the clock
-                        # is injectable and extra reads would advance a fake sequence.
-                        now = self._wall_clock()
+                            break
+                        now = self._wall_clock()  # one read per slice, shared by both caps
                         idle = now - last_event
                         if self._idle_timeout is not None and idle >= self._idle_timeout:
-                            self._log(
-                                f"sdk: IDLE — no stream event for {idle:.0f}s "
-                                f"(>{self._idle_timeout:.0f}s); treating as hung "
-                                f"(last: {last_trace or 'none'})"
-                            )
+                            self._log(f"sdk: IDLE — no stream event for {idle:.0f}s (>{self._idle_timeout:.0f}s); "
+                                      f"treating as hung (last: {last_trace or 'none'})")
                             await _cancel_task_quietly(pending)
                             await _aclose_quietly(agen)
                             if final is None:
                                 return with_resolved_model(AgentResult(
-                                    is_error=True, status="timeout",
-                                    exit_reason=ExitReason.IDLE_TIMEOUT,
-                                    summary=f"agent idle >{self._idle_timeout:.0f}s "
-                                            "(no stream event)",
-                                    usage=usage_acc,
-                                    stream_usage=usage_acc,
-                                ))
-                            stream_ended = True  # had a result; honour it below
+                                    is_error=True, status="timeout", exit_reason=ExitReason.IDLE_TIMEOUT,
+                                    summary=f"agent idle >{self._idle_timeout:.0f}s (no stream event)",
+                                    usage=usage_acc, stream_usage=usage_acc))
+                            stream_ended = True
                             break
                         elapsed = now - started_at
                         if self._max_runtime is not None and elapsed >= self._max_runtime:
-                            # The limping-stream cap: events keep arriving (so the idle
-                            # watchdog never fires) but the session has run past any
-                            # plausible task length. Tear down exactly like the idle
-                            # path — a capped session must not leak its subprocess.
                             await _cancel_task_quietly(pending)
                             await _aclose_quietly(agen)
                             if final is None:
-                                # usage_acc MUST ride along here exactly as on the
-                                # between-receives wall path above: this branch used
-                                # to omit it, so a limping-stream wall abort ledgered
-                                # $0.00 — the precise hole merge_usage exists to close.
-                                return with_resolved_model(self._wall_timeout(
-                                    elapsed, last_trace, usage_acc, msg_count
-                                ))
-                            self._log(
-                                f"sdk: WALL — {elapsed:.0f}s exceeded max "
-                                f"{self._max_runtime:.0f}s, but a ResultMessage was "
-                                "already captured; honouring it"
-                            )
-                            stream_ended = True  # had a result; honour it below
+                                return with_resolved_model(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
+                            self._honour_captured(elapsed)
+                            stream_ended = True
                             break
-                        # slice elapsed but still inside both windows — keep observing
-                        # the SAME pending receive (do NOT cancel/restart it)
                     if stream_ended:
                         break
                 else:
                     try:
-                        if not receive_started:
-                            pending = asyncio.ensure_future(agen.__anext__())
-                            receive_started = True
-                            message = await pending
-                        else:
-                            message = await agen.__anext__()
+                        message = await pending
                     except StopAsyncIteration:
                         break
                 msg_count += 1
-                last_kind = type(message).__name__
-                last_msg = message
+                last_kind, last_msg = type(message).__name__, message
                 resolved_model = reported_model(message) or resolved_model
                 usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
-                # Capture any terminal_reason the SDK attaches to ANY message — a
-                # background-requested turn end carries it on a non-Result message,
-                # so it never reaches the ResultMessage branch. This is the forensic
-                # for the persistent no-ResultMessage drop on subagent-spawning runs.
-                tr = getattr(message, "terminal_reason", None)
-                if tr:
+                # A background-requested turn end carries terminal_reason on a
+                # non-Result message: the forensic for a no-result drop.
+                if tr := getattr(message, "terminal_reason", None):
                     terminal_seen = str(tr)
-                transition = background_task_transition(message)
-                if transition is not None:
+                if (transition := background_task_transition(message)) is not None:
                     task_id, still_pending = transition
-                    if still_pending:
-                        live_children.add(task_id)
-                    else:
-                        live_children.discard(task_id)
-                # ALWAYS maintained, not debug-gated: this string is what the
-                # wall/idle abort lines print as "(last: …)". Gated behind
-                # _debug it was never assigned in production, so every abort
-                # reported "(last: none)" — at the exact moment "what was the
-                # agent doing?" is the question (observed: #506's wall abort,
-                # 2026-07-26). Only the per-message log line stays debug-only.
-                last_trace = _trace_message(message)
+                    (live_children.add if still_pending else live_children.discard)(task_id)
+                last_trace = _trace_message(message)  # always: abort lines print it
                 if self._debug:
                     self._log(f"sdk: {last_trace}")
                 if isinstance(message, ResultMessage):
-                    # Skip background-task follow-up results. When a background task
-                    # finishes, the SDK injects a synthetic follow-up turn whose
-                    # ResultMessage carries origin={"kind":"task-notification"} — it
-                    # does NOT answer our prompt, and letting it overwrite `final`
-                    # would clobber (or stand in for) the real verdict. Keep only the
-                    # result for our own turn. Duck-typed: older SDK
-                    # builds have no `origin` → getattr None → treated as ours.
+                    # A finished background task injects a follow-up turn whose
+                    # result does not answer our prompt; keep our own.
                     origin = getattr(message, "origin", None)
                     if isinstance(origin, dict) and origin.get("kind") == "task-notification":
                         if self._debug:
@@ -809,44 +434,19 @@ class AgentRunner(AgentRuntime):
                     final = message
                     children_at_result = frozenset(live_children)
         except asyncio.CancelledError:
-            # Daemon shutdown cancels the root dispatch task from another
-            # thread. Closing the SDK generator tears down its query subprocess;
-            # cancellation stays outside the infrastructure-death breaker.
+            # Daemon shutdown: closing the generator tears down the subprocess.
             await _cancel_task_quietly(pending)
             await _aclose_quietly(agen)
             raise
         except Exception as exc:
-            # The SDK raises the CLI's trailing ProcessError when Claude Code
-            # exits non-zero AFTER delivering its ResultMessage — e.g. an
-            # is_error result, or a benign post-`gh pr create` non-zero exit.
-            # That exit code is for shell consumers; we read the ENVELOPE, never
-            # the exit code (same contract as bash claude_outcome). So if we
-            # already captured a ResultMessage, honour it; only a crash BEFORE
-            # any result is a genuine transport failure.
+            # The CLI raises when it exits non-zero AFTER its ResultMessage (an
+            # is_error result, a benign post-`gh pr create` exit): the envelope
+            # wins. Only a crash before any result is a transport death, and
+            # it propagates (the caller's crash isolation), carrying the last
+            # trace for the deterministic-death signature (#13).
             if final is None:
-                # ALWAYS log a pre-result transport death (not just under debug):
-                # this is the "Stream closed" wedge, and without the exception
-                # type + last-seen message it was undiagnosable from the log.
-                self._log(
-                    f"sdk: transport died before any ResultMessage — "
-                    f"{type(exc).__name__}: {str(exc)[:200]}"
-                    + (f" (last: {last_trace})" if last_trace else "")
-                )
-                # This raise IS the TRANSPORT_DEATH path for the SDK runtime —
-                # deliberately NOT converted into an AgentResult(exit_reason=
-                # TRANSPORT_DEATH). Callers depend on the exception for crash
-                # isolation: Daemon.tick catches it, so the issue keeps ai-working
-                # and the reaper requeues it — precisely the settle path
-                # infra_death() produces for a returned result. Returning instead
-                # would run the follow-up tail on a session that never happened.
-                # The enum member exists for the runtimes that CAN'T raise
-                # (CodexRunner reads an exit code) and for future supervision.
-                #
-                # The last-seen trace rides on the exception OBJECT rather than
-                # in a wrapper type: the journal and the dispatcher both need it
-                # to name the file a deterministic death (#13) died on, and
-                # re-raising unchanged is the crash-isolation contract above.
-                # Best-effort — an exception with __slots__ refuses the write.
+                self._log(f"sdk: transport died before any ResultMessage — {type(exc).__name__}: {str(exc)[:200]}"
+                          + (f" (last: {last_trace})" if last_trace else ""))
                 try:
                     setattr(exc, "harness_last_trace", last_trace)
                     setattr(exc, "harness_resolved_model", resolved_model)
@@ -857,89 +457,37 @@ class AgentRunner(AgentRuntime):
             if self._process_supervisor is not None:
                 self._process_supervisor.kill_tree(supervised_run_id)
         if final is None:
-            # No ResultMessage emitted (transport died) → surface as an error,
-            # never silently as success. Matches the bash rc!=0 path.
-            #
-            # This is the clean-end drop (stream StopAsyncIteration without a
-            # ResultMessage), NOT the exception path above — so log WHY here or the
-            # $0.00 error is opaque. `msg_count`/`last_kind` distinguish a stream
-            # that never started (0 msgs → auth/launch/gateway-reject) from one that
-            # ran N turns then lost only the final result turn (mid-task gateway
-            # drop). ALWAYS logged (this is the diagnostic for the persistent
-            # result-delivery failure).
-            # Forensic dump of the LAST message: its public non-callable attrs, so a
-            # terminal_reason / subtype / num_turns / origin that explains the drop is
-            # captured instead of guessed. Truncated per-value to keep the log sane.
-            forensic = ""
-            if last_msg is not None:
-                fields = {}
-                for a in dir(last_msg):
-                    if a.startswith("_"):
-                        continue
-                    try:
-                        v = getattr(last_msg, a)
-                    except Exception:
-                        continue
-                    if callable(v):
-                        continue
+            # A clean end with no ResultMessage (result-delivery drop): the
+            # count and the last message's fields tell a stream that never
+            # started from one that lost only its final turn.
+            fields = {}
+            for a in dir(last_msg) if last_msg is not None else ():
+                if a.startswith("_"):
+                    continue
+                try:
+                    v = getattr(last_msg, a)
+                except Exception:
+                    continue
+                if not callable(v):
                     fields[a] = repr(v)[:120]
-                forensic = f"; last_msg_fields={fields}"
-            self._log(
-                f"sdk: stream ENDED cleanly with NO ResultMessage after "
-                f"{msg_count} message(s); last kind={last_kind}"
-                + (f", terminal_reason={terminal_seen}" if terminal_seen else "")
-                + (f", last={last_trace}" if last_trace else "")
-                + " — result-delivery drop (no exception raised)"
-                + forensic
-            )
-            return with_resolved_model(AgentResult(
-                is_error=True,
-                summary="no ResultMessage from query()",
-                exit_reason=ExitReason.NO_RESULT,
-                usage=usage_acc,
-                stream_usage=usage_acc,
-            ))
-        result = result_to_agent_result(final)
-        result = with_resolved_model(result)
-        reclassified = reclassify_pending_background_block(
-            result, len(children_at_result)
-        )
+            self._log(f"sdk: stream ENDED cleanly with NO ResultMessage after {msg_count} message(s); "
+                      f"last kind={last_kind}" + (f", terminal_reason={terminal_seen}" if terminal_seen else "")
+                      + (f", last={last_trace}" if last_trace else "") + " — result-delivery drop (no exception raised)"
+                      + (f"; last_msg_fields={fields}" if last_msg is not None else ""))
+            return with_resolved_model(AgentResult(is_error=True, summary="no ResultMessage from query()",
+                                                   exit_reason=ExitReason.NO_RESULT, usage=usage_acc,
+                                                   stream_usage=usage_acc))
+        result = with_resolved_model(result_to_agent_result(final))
+        reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
-            self._log(
-                "sdk: BACKGROUND CHILD PENDING — the leg declared "
-                f"{result.status!r} while its own background task(s) "
-                f"{sorted(children_at_result)} were still running; a headless "
-                "leg cannot receive their notification, so this is not a "
-                "human-input block"
-            )
+            self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "
+                      f"task(s) {sorted(children_at_result)} were still running; a headless leg cannot receive their "
+                      "notification, so this is not a human-input block")
             result = reclassified
-        # Attach the stream sum to the COMPLETED result too: journaled beside the
-        # ResultMessage total, each completed run becomes a calibration pair, and
-        # the estimator learns its $/token rate in stream units — the only units
-        # the accounting runtime can retain the provider evidence on abort.
+        # The stream sum beside the envelope total: a calibration pair.
         if usage_acc:
             result = dataclasses.replace(result, stream_usage=dict(usage_acc))
-        # Calibration line for the abort-cost estimator: on a COMPLETED run both
-        # totals exist — the ResultMessage's own cumulative usage (authoritative,
-        # what the ledger keeps) and merge_usage's stream-summed accumulator (all
-        # an ABORTED run ever has). Logging the pair is the diagnostic for how far
-        # estimates on aborted runs can be trusted, per counter. Suspected skew:
-        # per-message usage blocks appear to carry message_start-style output
-        # placeholders — #506's 2707s wall abort accumulated output_tokens=4764
-        # across ~15 commits of code, vs 55-66k on comparable completed runs.
-        if usage_acc and isinstance(result.usage, dict):
-            acc_t, res_t = total_stream_tokens(usage_acc), total_stream_tokens(result.usage)
-            self._log(
-                f"sdk: usage calibration — stream-accumulated {acc_t} tokens "
-                f"(out={usage_acc.get('output_tokens', 0)}) vs result "
-                f"{res_t} (out={result.usage.get('output_tokens', 0)})"
-            )
-        # An errored envelope gets its forensics logged AT THE MOMENT OF FAILURE,
-        # while the raw ResultMessage is still in hand. Everything below is
-        # dropped by the AgentResult mapping, so without this the daemon log says
-        # only "done (status=…)" and the journal only "exit_reason=agent_error" —
-        # which is what made #501's 290s / $1.93 / zero-commit failure impossible
-        # to diagnose after the fact.
+        # Logged while the raw envelope is in hand; AgentResult drops it.
         if result.is_error:
             self._log(f"sdk: ERRORED — {error_forensics(final)}")
         return result
