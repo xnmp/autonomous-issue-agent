@@ -252,7 +252,7 @@ class FakeWorktrees:
     def remove(self, issue):
         pass
 
-    def branch_for_issue(self, issue, fallback, *, preferred=""):
+    def branch_for_issue(self, issue, fallback):
         del issue
         return preferred or fallback
 
