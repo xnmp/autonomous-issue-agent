@@ -21,7 +21,7 @@ from issue_agent.app.dashweb.service import Backend
 from issue_agent.domain.checks import Check, Observed
 from issue_agent.domain.labels import Label
 from issue_agent.domain.state import Harness, StopReason, stop_tag
-from issue_agent.domain.world import Comment, IssueView, PRView, WorldState
+from issue_agent.domain.world import BlockerRef, Comment, IssueView, PRView, WorldState
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
 MARKER = Harness("fixbot", "reviewbot").marker
@@ -697,3 +697,26 @@ def test_board_cards_without_a_usable_triage_have_no_tier_and_never_crash(deploy
 
     assert cards[2]["triage_tier"] is None and cards[3]["triage_tier"] is None
     assert cards[5]["triage_tier"] is None and cards[5]["model"] is None  # no journal line: unknown
+
+
+def test_a_blocked_issue_waits_under_waiting_headlined_and_linked_to_its_blocker(deployment):
+    backend, *_ = deployment
+    ready = frozenset({Label.AI_READY})
+    backend.gateway_factory = lambda repo: Gateway(WorldState(
+        issues=(IssueView(1, "free", labels=ready), IssueView(7, "after #1", labels=ready, blocked_by=(BlockerRef(1),)),
+                IssueView(8, "after a library", labels=ready, blocked_by=(BlockerRef(3, "x/lib"),))),
+        now=ts(0),
+    ))
+    backend._observations = type(backend._observations)(executor=InlineExecutor())  # type: ignore[arg-type]
+    backend.issues("demo")
+
+    board = {card["issue"]: card["board"] for card in backend.issues("demo")["in_flight"]}
+
+    assert (board[1]["group"], board[1]["on"], board[1]["headline_url"]) == ("slot", "slot", None)
+    assert {k: board[7][k] for k in ("status", "group", "on", "headline", "headline_url")} == {
+        "status": "waiting", "group": "waiting", "on": "blocked", "headline": "Blocked by #1",
+        "headline_url": "https://github.com/o/r/issues/1",
+    }
+    assert (board[8]["headline"], board[8]["headline_url"]) == ("Blocked by x/lib#3", "https://github.com/x/lib/issues/3")
+    assert "blocker" not in board[7]
+    assert backend.issue("demo", 7)["board"]["headline_url"] == "https://github.com/o/r/issues/1"

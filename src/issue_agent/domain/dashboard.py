@@ -10,7 +10,7 @@ recorded, and keeps no state or lifecycle rules of its own.
   sits in one lane (`group`): a running agent leg, CI and the free GitHub
   actions, a wait for a dispatch slot, or a wait on something outside the
   harness (branch protection, a human reviewer, money headroom, a machine
-  backoff, an unreadable GitHub field).
+  backoff, an open "blocked by" issue, an unreadable GitHub field).
 - **Legs.** The issue page, the rail, the history and every metric read the
   `legs` rows (refactor decision Q15: metrics from legs plus GitHub).
 
@@ -34,7 +34,7 @@ from .state import (
     TriageNote, Wait, WaitReason, stop_tag,
 )
 from .triage import Steward, Triage
-from .world import Comment, PRView
+from .world import BlockerRef, Comment, PRView
 
 ROLE_NAMES = ("fix", "review")
 # A role heartbeat older than this reads as stale (the CLI's status uses it too).
@@ -240,13 +240,15 @@ class Working:
 
 @dataclass(frozen=True)
 class Waiting:
-    """A wait on something outside the harness."""
+    """A wait on something outside the harness. `blocker` is the issue a
+    blocked wait names in its headline."""
 
-    on: str  # branch-protection | human-review | headroom | backoff | github | slot
+    on: str  # branch-protection | human-review | headroom | backoff | blocked | github | slot
     headline: str
     reason: str
     since_ts: str | None
     until_ts: str | None = None
+    blocker: BlockerRef | None = None
     status: str = "waiting"
     group: str = field(init=False)
 
@@ -371,7 +373,7 @@ def board_status(
                        "The last leg ended on a machine failure; it retries after the backoff.",
                        _iso(last_end), _iso(state.until))
     if isinstance(state, Wait):
-        return _wait_status(state.reason, pr, last_end, ended, now)
+        return _wait_status(state, pr, last_end, ended, now)
     raise TypeError(f"unknown derived state {state!r}")
 
 
@@ -405,9 +407,15 @@ def _ci_start(pr: PRView | None, now: datetime) -> datetime | None:
 
 
 def _wait_status(
-    reason: WaitReason, pr: PRView | None, last_end: datetime | None, ended: datetime | None, now: datetime,
+    wait: Wait, pr: PRView | None, last_end: datetime | None, ended: datetime | None, now: datetime,
 ) -> BoardStatus:
-    since = _iso(last_end)
+    reason, since = wait.reason, _iso(last_end)
+    if reason is WaitReason.BLOCKED:
+        first = min(wait.blocked_by, key=lambda b: b.sort_key)
+        rest = len(wait.blocked_by) - 1
+        why = (f"Also blocked by {rest} more; it starts by itself when all close." if rest
+               else "It starts by itself when that issue closes.")
+        return Waiting("blocked", f"Blocked by {first}", why, since, blocker=first)
     if reason is WaitReason.CI_PENDING:
         return _ci_pending_status(pr, _iso(_ci_start(pr, now) or ended))
     if reason is WaitReason.BASE_RED:
@@ -531,6 +539,8 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
     if isinstance(state, Busy) and running is not None:
         return stage_of_kind(running.kind) or fallback
     if isinstance(state, Wait):
+        if state.reason is WaitReason.BLOCKED:
+            return last or Stage.TRIAGE  # held before its first act
         if state.reason is WaitReason.MERGEABILITY_UNKNOWN:
             return Stage.MERGE
         if state.reason is WaitReason.HUMAN_CHANGES_REQUESTED:

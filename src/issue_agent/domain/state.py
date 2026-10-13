@@ -49,8 +49,11 @@ Precedence, the single place it is defined (first match wins, per item):
                Issue: `ai-ready`, open, no open or merged harness PR,
                triaged -> RESOLVE.
 8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh/open are
-               free): bot review rounds >= cap (ADDRESS_REVIEW on a bot
-               verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
+               free): an issue act (no PR yet) whose issue GitHub marks
+               "blocked by" an open issue, in any repository -> Wait (BLOCKED;
+               the observation that shows every blocker closed lets it start;
+               an item with a PR is never gated); bot review rounds >= cap
+               (ADDRESS_REVIEW on a bot verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
                issue's lifetime cap cannot afford a leg -> NeedsHuman; machine
                backoff -> Backoff; daily or global headroom short -> Wait
                (silent, Q7).
@@ -92,7 +95,7 @@ from .labels import Label
 from .refs import harness_branch_issue
 from .routing import DEFAULT_TIER, Tier, escalate
 from .triage import Steward, Triage
-from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Branch, Comment, PRView, WorldState
+from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, BlockerRef, Branch, Comment, PRView, WorldState
 
 ATTEMPT_CAP = 3
 REVIEW_ROUND_CAP = 3
@@ -197,6 +200,7 @@ class WaitReason(str, Enum):
     MERGEABILITY_UNKNOWN = "mergeability-unknown"  # or reported BLOCKED
     HUMAN_CHANGES_REQUESTED = "human-changes-requested"
     HEADROOM = "headroom"
+    BLOCKED = "blocked"  # GitHub's "blocked by" names an open issue
 
 
 class StopReason(str, Enum):
@@ -290,7 +294,15 @@ class Release:
 
 @dataclass(frozen=True)
 class Wait:
+    """`blocked_by` names the open blockers, carried exactly by a BLOCKED wait."""
+
     reason: WaitReason
+    blocked_by: tuple[BlockerRef, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.blocked_by, tuple) or any(not isinstance(b, BlockerRef) for b in self.blocked_by)
+                or bool(self.blocked_by) != (self.reason is WaitReason.BLOCKED)):
+            raise ValueError("blockers are carried exactly by a blocked wait")
 
 
 @dataclass(frozen=True)
@@ -350,6 +362,7 @@ class _Item:
     branches: tuple[Branch, ...] = ()
     labeled_at: str = ""
     base: tuple[Check, ...] | None = None  # the PR base's tip reports; None = unread
+    blocked_by: tuple[BlockerRef, ...] = ()
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
@@ -371,7 +384,7 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
             pushed.setdefault(n, []).append(b)
     items = [
         _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
-              labeled_at=i.needs_human_labeled_at)
+              labeled_at=i.needs_human_labeled_at, blocked_by=i.blocked_by)
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
@@ -462,6 +475,9 @@ def _proceed(
         step = _pr_step(pr, harness, item.base)
     if not isinstance(step, Dispatch):
         return step
+    # Before the gates: nothing is spent, and a stop would ask a human to act on an issue that is only waiting.
+    if step.act in ISSUE_ACTS and item.blocked_by:
+        return Wait(WaitReason.BLOCKED, item.blocked_by)
     floor = _reset_floor(item, [at for at, _ in human], last_stop, harness)
     if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
             and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED

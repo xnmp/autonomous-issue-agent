@@ -170,6 +170,10 @@
   color: var(--board-tone);
   font-weight: var(--weight-semibold);
 }
+.board-headline-link {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
 .board-reason {
   color: var(--ink-muted);
   font-size: var(--text-sm);

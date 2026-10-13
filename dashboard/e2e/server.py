@@ -20,7 +20,7 @@ from issue_agent.app.dashweb.service import Backend
 from issue_agent.domain.checks import Check, Observed
 from issue_agent.domain.labels import Label
 from issue_agent.domain.state import Harness, StopReason, stop_tag
-from issue_agent.domain.world import Comment, IssueView, PRView, WorldState
+from issue_agent.domain.world import BlockerRef, Comment, IssueView, PRView, WorldState
 
 # Noon of the current UTC day: every fixture leg falls inside the day the caps
 # sum, whenever the suite runs.
@@ -47,6 +47,7 @@ def world() -> WorldState:
             IssueView(2, "Asked a question", labels=ready | {Label.NEEDS_HUMAN}, comments=(question,)),
             IssueView(3, "Has a PR", labels=ready),
             IssueView(4, "Running now", labels=ready),
+            IssueView(5, "Waits on a blocker", labels=ready, blocked_by=(BlockerRef(1),)),
         ),
         prs=(PRView(30, title="fix: has a PR", head_ref_name="fix/3-pr", head_ref_oid="h3", ci=pending,
                     mergeable="MERGEABLE", merge_state="CLEAN"),),

@@ -46,7 +46,7 @@ from issue_agent.domain.state import (
     stop_tag,
 )
 from issue_agent.domain.routing import Tier
-from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Push, Review, WorldState
+from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Push, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 NOW = T0 + timedelta(days=1)
@@ -1084,3 +1084,86 @@ def test_an_old_lifetime_stop_does_not_pin_a_different_current_stop():
     view = labelled([stop(StopReason.LIFETIME_CAP, 0.5), human(0.6)], ci=RED)
     loc = local(pr_legs(*legs(FIX, 1, 2, 3)), lifetime_capped=frozenset({3}))
     assert pr_state(view, loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)
+
+
+# ── "blocked by": an open blocker holds new work, never a PR ─────────────────
+
+
+@pytest.mark.parametrize(
+    ("legs_by", "act"),
+    [({}, AgentKind.STEWARD), ({issue_key(3): (STEWARD_END,)}, AgentKind.TRIAGE), (TRIAGED, AgentKind.RESOLVE)],
+)
+def test_an_open_blocker_holds_every_issue_act_with_no_action(legs_by, act):
+    world = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),))
+    assert one(WorldState(issues=(issue(3),)), local(legs_by)) == Dispatch(act)  # the act it would start
+    states = derive(world, local(legs_by), H)
+    assert states == {issue_key(3): Wait(WaitReason.BLOCKED, (BlockerRef(9),))}
+    assert actions(states, H) == ()
+
+
+def test_the_issue_starts_by_itself_once_the_observation_shows_its_blockers_closed():
+    # Closed blockers are dropped at the boundary: the next world carries none.
+    blocked = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),))
+    freed = WorldState(issues=(issue(3, blocked_by=()),))
+    assert one(blocked, local(TRIAGED)) == Wait(WaitReason.BLOCKED, (BlockerRef(9),))
+    assert actions(derive(freed, local(TRIAGED), H), H) == (RunAgent(AgentKind.RESOLVE, 3, head="", tier=Tier.MED),)
+
+
+def test_mixed_and_cross_repository_blockers_all_ride_on_the_wait():
+    refs = (BlockerRef(4), BlockerRef(12, "other/lib"))
+    assert one(WorldState(issues=(issue(3, blocked_by=refs),)), local(TRIAGED)) == Wait(WaitReason.BLOCKED, refs)
+
+
+def test_a_cross_repository_blocker_alone_still_blocks():
+    ref = (BlockerRef(1, "other/lib"),)
+    assert one(WorldState(issues=(issue(3, blocked_by=ref),)), local(TRIAGED)) == Wait(WaitReason.BLOCKED, ref)
+
+
+def test_an_issue_with_an_open_pr_keeps_flowing_whatever_its_blockers():
+    world = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),), prs=(pr(),))
+    assert derive(world, local(), H) == {pr_key(7): Dispatch(REVIEW, HEAD)}
+
+
+def test_a_pushed_branch_still_opens_its_pr_while_blocked():
+    world = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),), branches=(Branch("fix/3-x", iso(0)),))
+    assert one(world, local(TRIAGED)) == OpenPR("fix/3-x")
+
+
+def test_a_blocked_issue_waits_rather_than_tripping_a_dispatch_gate():
+    # Lifetime-capped and out of headroom: the blocker is the reason it waits; nothing asks a human.
+    world = WorldState(issues=(issue(3, blocked_by=(BlockerRef(9),)),))
+    loc = local(TRIAGED, headroom=False, lifetime_capped=frozenset({3}))
+    assert one(world, loc) == Wait(WaitReason.BLOCKED, (BlockerRef(9),))
+
+
+def test_a_needs_human_stop_still_wins_over_a_blocker():
+    world = WorldState(issues=(issue(3, Label.NEEDS_HUMAN, blocked_by=(BlockerRef(9),)),))
+    assert one(world, local(TRIAGED)) == Wait(WaitReason.NEEDS_HUMAN)
+
+
+def test_a_huge_blocker_list_is_one_wait():
+    refs = tuple(BlockerRef(n) for n in range(1, 10_001))
+    assert one(WorldState(issues=(issue(3, blocked_by=refs),)), local(TRIAGED)) == Wait(WaitReason.BLOCKED, refs)
+
+
+def test_no_blockers_is_unblocked():
+    assert one(WorldState(issues=(issue(3, blocked_by=()),)), local(TRIAGED)) == Dispatch(AgentKind.RESOLVE)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [(0,), (-1,), ("3",), (True,), (None,), (3, "not a repo"), (3, "a/b/c"), (3, None)],
+)
+def test_a_malformed_blocker_ref_is_unconstructible(args):
+    with pytest.raises(ValueError):
+        BlockerRef(*args)
+
+
+def test_blockers_ride_exactly_on_a_blocked_wait():
+    with pytest.raises(ValueError):
+        Wait(WaitReason.BLOCKED)
+    with pytest.raises(ValueError):
+        Wait(WaitReason.HEADROOM, (BlockerRef(1),))
+    with pytest.raises(ValueError):
+        Wait(WaitReason.BLOCKED, [BlockerRef(1)])  # type: ignore[arg-type]
+    assert str(BlockerRef(4)) == "#4" and str(BlockerRef(4, "o/lib")) == "o/lib#4"

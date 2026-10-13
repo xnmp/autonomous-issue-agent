@@ -15,9 +15,10 @@ from issue_agent.adapters.github import (
     parse_fix_issue,
     parse_fix_pr,
     parse_fix_refs,
+    parse_blockers,
     parse_merged_harness_prs,
 )
-from issue_agent.domain.world import Branch, Push
+from issue_agent.domain.world import BlockerRef, Branch, Push
 
 
 def labels(*names: str) -> dict:
@@ -539,3 +540,108 @@ def test_313_a_huge_base_check_list_past_its_bound_is_absent():
                            "nodes": [run_node(f"p{k}-{i}", n=1000 * k + i) for i in range(100)]}} for k in range(2, 12)]
     world, _ = world_with(base_tip(big, more="c1", total=5000), *pages)
     assert world.base is None
+
+
+# ── "blocked by" (GitHub issue dependencies) ─────────────────────────────────
+
+
+def blocker(number, state="OPEN", repo="o/r") -> dict:
+    """One `blockedBy` node as GitHub's GraphQL returns it (schema checked live
+    on xnmp/tauri-explorer, 2026-10-14: Issue.blockedBy is an IssueConnection)."""
+    return {"number": number, "state": state, "repository": {"nameWithOwner": repo}}
+
+
+def blocked_by(*nodes, total=None) -> dict:
+    return {"totalCount": len(nodes) if total is None else total, "nodes": list(nodes)}
+
+
+def test_the_issue_query_reads_blockers_in_the_same_round_trip():
+    assert "blockedBy(first:100){totalCount nodes{number state repository{nameWithOwner}}}" in gh._FIX_ISSUE
+
+
+def test_only_open_blockers_remain_and_closed_ones_are_resolved_whatever_the_reason():
+    raw = blocked_by(blocker(8), blocker(3, "CLOSED"), blocker(9, "CLOSED"), blocker(2))
+    assert parse_blockers(raw, "o/r") == ((BlockerRef(2), BlockerRef(8)), "")
+
+
+def test_every_closed_blocker_means_no_blockers():
+    assert parse_blockers(blocked_by(blocker(3, "CLOSED")), "o/r") == ((), "")
+    assert parse_blockers(blocked_by(), "o/r") == ((), "")
+
+
+def test_a_cross_repository_blocker_keeps_its_repository_and_the_own_repository_is_matched_case_blind():
+    raw = blocked_by(blocker(4, repo="other/lib"), blocker(7, repo="O/R"))
+    assert parse_blockers(raw, "o/r") == ((BlockerRef(7), BlockerRef(4, "other/lib")), "")
+
+
+@pytest.mark.parametrize("raw", [None, [], "x", {"nodes": None}, {"totalCount": 1}])
+def test_an_absent_or_malformed_connection_is_no_blockers_with_a_reason(raw):
+    refs, problem = parse_blockers(raw, "o/r")
+    assert refs == () and problem
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        {"number": 4, "state": "MERGED", "repository": {"nameWithOwner": "o/r"}},
+        {"number": "4", "state": "OPEN", "repository": {"nameWithOwner": "o/r"}},
+        {"number": True, "state": "OPEN", "repository": {"nameWithOwner": "o/r"}},
+        {"number": 0, "state": "OPEN", "repository": {"nameWithOwner": "o/r"}},
+        {"number": 4, "state": "OPEN", "repository": None},
+        {"number": 4, "state": "OPEN", "repository": {"nameWithOwner": "not a repo"}},
+    ],
+)
+def test_a_malformed_blocker_node_is_dropped_never_a_block_and_valid_peers_stay(bad):
+    refs, problem = parse_blockers(blocked_by(bad, blocker(6)), "o/r")
+    assert refs == (BlockerRef(6),) and "1 malformed" in problem
+
+
+def test_blockers_github_counts_but_does_not_list_are_unseen_not_blocking():
+    refs, problem = parse_blockers(blocked_by(blocker(3, "CLOSED"), total=250), "o/r")
+    assert refs == () and "249 blocker(s) unseen" in problem
+
+
+def test_a_huge_blocker_list_parses_every_open_node():
+    raw = blocked_by(*(blocker(n) for n in range(1, 5001)))
+    refs, problem = parse_blockers(raw, "o/r")
+    assert len(refs) == 5000 and refs[0] == BlockerRef(1) and problem == ""
+
+
+def test_the_world_carries_open_blockers_and_logs_an_unreadable_connection(capsys):
+    runner = GraphQL(
+        {
+            "issues": page([
+                issue_node(5, blockedBy=blocked_by(blocker(4), blocker(3, "CLOSED"), blocker(9, repo="x/y"))),
+                issue_node(6, blockedBy="garbage"),
+                issue_node(7, blockedBy=blocked_by(None, blocker(8), total=2)),
+            ]),
+            "pullRequests": page([]),
+            "refs": page([]),
+        }
+    )
+    world = GitHubGateway("o/r", runner=runner).build_world("dev")
+    assert {i.number: i.blocked_by for i in world.issues} == {
+        5: (BlockerRef(4), BlockerRef(9, "x/y")), 6: (), 7: (BlockerRef(8),)}
+    err = capsys.readouterr().err
+    assert "issue #6: blockedBy is absent or malformed; unreadable blockers never block" in err
+    assert "issue #5" not in err
+
+
+def test_an_error_inside_blocked_by_alone_never_skips_the_tick(capsys):
+    # A blocker GitHub will not show this token: it nulls the connection and
+    # reports an error on that path, with the rest of the data intact.
+    repository = {"issues": page([issue_node(5, blockedBy=None)]), "pullRequests": page([]), "refs": page([])}
+    error = {"message": "Resource not accessible", "path": ["repository", "issues", "nodes", 0, "blockedBy"]}
+    answers = [json.dumps({"data": {"repository": repository}, "errors": [error]})]
+    world = GitHubGateway("o/r", runner=lambda argv, _t: answers.pop(0)).build_world("dev")
+    assert [(i.number, i.blocked_by) for i in world.issues] == [(5, ())]
+    assert "issue #5: blockedBy is absent or malformed" in capsys.readouterr().err
+
+
+def test_any_other_graphql_error_still_fails_the_read():
+    repository = {"issues": page([issue_node(5)]), "pullRequests": page([]), "refs": page([])}
+    for errors in ([{"message": "x", "path": ["repository", "issues"]}], [{"message": "x"}], "boom"):
+        answers = [json.dumps({"data": {"repository": repository}, "errors": errors})]
+        with pytest.raises(FixObservationIncomplete):
+            GitHubGateway("o/r", runner=lambda argv, _t: answers.pop(0)).build_world("dev")

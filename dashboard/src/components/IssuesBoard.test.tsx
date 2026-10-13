@@ -235,6 +235,26 @@ describe("issues board row", () => {
     expect(screen.getByRole("button", { name: long })).toHaveAttribute("aria-expanded", "false");
   });
 
+  it("links a blocked row's headline to its blocker under Waiting, without toggling the row", async () => {
+    stubFetch();
+    const blocked: BoardStatus = {
+      status: "waiting", group: "waiting", on: "blocked", headline: "Blocked by #12",
+      reason: "It starts by itself when that issue closes.", since_ts: null,
+      headline_url: "https://github.com/o/r/issues/12",
+    };
+    const headroom: BoardStatus = {
+      status: "waiting", group: "waiting", on: "headroom", headline: "Daily cap reached", reason: "r", since_ts: null,
+    };
+    renderBoard({ in_flight: [card(170, blocked), card(171, headroom)] });
+
+    const link = within(section("Waiting")).getByRole("link", { name: "Blocked by #12" });
+    expect(link).toHaveAttribute("href", "https://github.com/o/r/issues/12");
+    await userEvent.click(link);
+    expect(screen.getByRole("button", { name: "Issue 170 title" })).toHaveAttribute("aria-expanded", "false");
+    expect(within(row("Issue 171 title")).queryByRole("link", { name: "Daily cap reached" })).toBeNull();
+    expect(within(row("Issue 171 title")).getByText("Daily cap reached")).toBeInTheDocument();
+  });
+
   it("draws the rail counts, amber thresholds and a rewound stage", () => {
     stubFetch();
     renderBoard({
