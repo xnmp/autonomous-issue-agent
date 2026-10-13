@@ -339,15 +339,16 @@ describe("issues board actions", () => {
     expect(refresh).toHaveBeenCalled();
   });
 
-  it("shows CI waiting on a runner in yellow, and CI executing in green", () => {
+  it("shows CI waiting on a runner or a leg waiting on a slot in yellow, and CI executing in green", () => {
     stubFetch();
-    const working = (activity: "ci" | "ci_queued", headline: string): BoardStatus => ({
+    const working = (activity: "ci" | "ci_queued" | "queued", headline: string): BoardStatus => ({
       status: "working", activity, act: null, headline, reason: "r", since_ts: null,
     });
     renderBoard({
       in_flight: [
         card(180, working("ci_queued", "CI queued"), { rail: rail({ current: "ci" }) }),
         card(181, working("ci", "CI running"), { rail: rail({ current: "ci" }) }),
+        card(182, working("queued", "Fix CI next"), { rail: rail({ current: "ci" }) }),
       ],
     });
 
@@ -358,5 +359,8 @@ describe("issues board actions", () => {
     const running = row("Issue 181 title");
     expect(running.closest(".board-item")).not.toHaveClass("board-tone-warn");
     expect(running.querySelector(".lifecycle-rail")).toHaveClass("rail-tone-ok");
+    const slot = row("Issue 182 title");
+    expect(slot.closest(".board-item")).toHaveClass("board-tone-warn");
+    expect(slot.querySelector(".lifecycle-rail")).toHaveClass("rail-tone-warn");
   });
 });

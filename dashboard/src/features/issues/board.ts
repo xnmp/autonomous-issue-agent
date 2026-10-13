@@ -43,10 +43,13 @@ export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone:
 
 export type BoardTone = "fail" | "ok" | "muted" | "warn";
 
-/** The group tone, except CI waiting on a runner: nothing is executing yet, so
- * it reads yellow rather than the green of work in progress. */
+/** Rows waiting for a turn (CI waiting on a runner, a leg waiting on a
+ * dispatch slot) read yellow: nothing is executing yet, unlike the green of
+ * work in progress. */
+const WAITING_TURN: ReadonlySet<string> = new Set(["ci_queued", "queued"]);
+
 export function boardTone(board: BoardStatus): BoardTone {
-  return board.status === "working" && board.activity === "ci_queued" ? "warn" : GROUP_META[board.status].tone;
+  return board.status === "working" && WAITING_TURN.has(board.activity) ? "warn" : GROUP_META[board.status].tone;
 }
 
 export const COLUMN_HEADINGS: Record<BoardGroup, { now: string; wait: string }> = {
