@@ -30,6 +30,10 @@ Precedence, the single place it is defined (first match wins, per item):
 6. Publication an issue with a pushed `fix/<issue>-` branch ahead of base and
                owed a PR -> OpenPR (free; the agent pushes, the harness
                opens, Q11).
+6a. Triage     an issue with no agent-ended TRIAGE leg -> TRIAGE (gated as
+               in step 8). Triaged: a laundered `duplicate_of` with no
+               released duplicate stop -> NeedsHuman(DUPLICATE); no harness
+               triage comment yet -> TriageNote (free); else step 7.
 7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
                for another head -> Wait; red -> FIX_CI, unless every red
                check is red or rerunning on the base tip too -> Wait (#313);
@@ -39,14 +43,21 @@ Precedence, the single place it is defined (first match wins, per item):
                Merge, unless a human's standing CHANGES_REQUESTED is on an
                older head (Wait) or GitHub does not report it mergeable and
                unblocked (Wait: branch protection waits on a human).
-               Issue: `ai-ready`, open, no open or merged harness PR ->
-               RESOLVE.
+               Issue: `ai-ready`, open, no open or merged harness PR,
+               triaged -> RESOLVE.
 8. Dispatch gates, for a Dispatch from step 7 only (merge/refresh/open are
                free): bot review rounds >= cap (ADDRESS_REVIEW on a bot
                verdict) -> NeedsHuman; attempts >= cap -> NeedsHuman; the
                issue's lifetime cap cannot afford a leg -> NeedsHuman; machine
                backoff -> Backoff; daily or global headroom short -> Wait
                (silent, Q7).
+
+Routing: a routed act (RESOLVE, FIX_CI, ADDRESS_REVIEW, REBASE) runs at the
+issue's tier from its latest agent-ended TRIAGE leg (DEFAULT_TIER without
+one, e.g. a pre-cutover issue or a malformed result), escalated one rung per
+earlier attempt in the act's attempt run (`routing.escalate`). REVIEW runs
+at the tier of the fix leg that pushed its head (`_review_tier`), else the
+issue's triaged tier, else None: the configured REVIEW_MODEL.
 
 Attempts for act A (Q21) are the tail run of A's agent legs after the reset
 floor: machine legs are skipped, any other act's agent leg ends the run, and
@@ -69,23 +80,28 @@ from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 
-from .actions import AgentKind, Target
+from .actions import ISSUE_ACTS, ROUTED_ACTS, AgentKind, Target, check_tier
 from .backoff import LegEnd, machine_backoff_until
 from .checks import Check, Observed
 from .ci import BaseRed, Clear, Failed, Waiting, charge, parse_timestamp, reduce_ci
 from .identity import login_eq
 from .labels import Label
+from .pr_body import has_acceptance_criteria
 from .refs import harness_branch_issue
+from .routing import DEFAULT_TIER, Tier, escalate
+from .triage import Triage
 from .world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Branch, Comment, PRView, WorldState
 
 ATTEMPT_CAP = 3
 REVIEW_ROUND_CAP = 3
 DISPATCHABLE = frozenset({
-    AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.REVIEW, AgentKind.ADDRESS_REVIEW,
+    AgentKind.TRIAGE, AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.REBASE, AgentKind.REVIEW, AgentKind.ADDRESS_REVIEW,
 })
 _MAX_MARKER = 200
 _STANDING = frozenset({REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, "DISMISSED"})
 _STOP_TAG_RE = re.compile(r"<!-- needs-human:([a-z-]+) -->")
+# Carried by the harness's one triage comment per issue; derive reads it back.
+TRIAGE_TAG = "<!-- issue-agent:triage -->"
 
 
 @dataclass(frozen=True)
@@ -186,6 +202,8 @@ class StopReason(str, Enum):
     ATTEMPTS = "attempts"
     REVIEW_ROUNDS = "review-rounds"
     QUESTION = "question"
+    # Triage flagged a suspected duplicate: a judgment, so a human decides.
+    DUPLICATE = "duplicate"
 
 
 def stop_tag(reason: StopReason) -> str:
@@ -201,16 +219,19 @@ def _need_head(head: object) -> None:
 @dataclass(frozen=True)
 class Dispatch:
     act: AgentKind
-    head: str = ""  # "" exactly for RESOLVE, which has no PR yet
+    head: str = ""  # "" exactly for the issue acts (TRIAGE, RESOLVE): no PR yet
+    # The leg's tier: see `actions.check_tier`.
+    tier: Tier | None = None
 
     def __post_init__(self) -> None:
         if self.act not in DISPATCHABLE:
             raise ValueError("not a dispatchable act")
-        if self.act is AgentKind.RESOLVE:
+        if self.act in ISSUE_ACTS:
             if self.head != "":
-                raise ValueError("RESOLVE has no head")
+                raise ValueError("an issue act has no head")
         else:
             _need_head(self.head)
+        object.__setattr__(self, "tier", check_tier(self.act, self.tier))
 
 
 @dataclass(frozen=True)
@@ -243,6 +264,22 @@ class OpenPR:
 
 
 @dataclass(frozen=True)
+class TriageNote:
+    """A triaged issue has no harness triage comment yet: post one (free).
+    `anchor` is the triage leg's end, keying the comment once per triage.
+    `has_section` is True when the issue body already states acceptance
+    criteria, which the comment then does not restate."""
+
+    triage: Triage
+    anchor: str
+    has_section: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.triage, Triage) or not isinstance(self.anchor, str) or not self.anchor:
+            raise ValueError("a triage note requires the triage and its anchor")
+
+
+@dataclass(frozen=True)
 class Release:
     """A qualifying reply released the stop: remove `needs-human`. The item
     proceeds next tick, with its counts reset past the released stop comment."""
@@ -257,12 +294,15 @@ class Wait:
 class NeedsHuman:
     """A judgment stop. `anchor` (the item's last leg end, or "-") makes the
     comment's idempotency key unique per episode and stable within one.
-    `question` is the agent's question, carried exactly by a QUESTION stop."""
+    `question` is the agent's question, carried exactly by a QUESTION stop;
+    `duplicate_of` (with triage's one-line `detail`) exactly by a DUPLICATE stop."""
 
     reason: StopReason
     anchor: str
     act: AgentKind | None = None
     question: str = ""
+    duplicate_of: int = 0
+    detail: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.reason, StopReason) or not isinstance(self.anchor, str) or not self.anchor:
@@ -273,6 +313,10 @@ class NeedsHuman:
             raise ValueError("an act is named exactly for an attempts stop")
         if not isinstance(self.question, str) or bool(self.question) != (self.reason is StopReason.QUESTION):
             raise ValueError("a question is carried exactly by a question stop")
+        if (type(self.duplicate_of) is not int or self.duplicate_of < 0
+                or (self.duplicate_of > 0) != (self.reason is StopReason.DUPLICATE)
+                or not isinstance(self.detail, str) or (self.detail and self.reason is not StopReason.DUPLICATE)):
+            raise ValueError("a duplicate target is carried exactly by a duplicate stop")
 
 
 @dataclass(frozen=True)
@@ -290,7 +334,7 @@ class Backoff:
             raise ValueError("backoff requires a dispatchable act and an aware time")
 
 
-DerivedState = Dispatch | Merge | Refresh | OpenPR | Release | Wait | NeedsHuman | Busy | Backoff
+DerivedState = Dispatch | Merge | Refresh | OpenPR | TriageNote | Release | Wait | NeedsHuman | Busy | Backoff
 
 
 @dataclass(frozen=True)
@@ -303,6 +347,7 @@ class _Item:
     branches: tuple[Branch, ...] = ()
     labeled_at: str = ""
     base: tuple[Check, ...] | None = None  # the PR base's tip reports; None = unread
+    body: str = ""
 
 
 def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey, DerivedState]:
@@ -324,7 +369,7 @@ def derive(world: WorldState, local: Local, harness: Harness) -> Mapping[ItemKey
             pushed.setdefault(n, []).append(b)
     items = [
         _Item(issue_key(i.number), i.number, i.labels, i.comments, branches=tuple(pushed.get(i.number, ())),
-              labeled_at=i.needs_human_labeled_at)
+              labeled_at=i.needs_human_labeled_at, body=i.body if isinstance(i.body, str) else "")
         for i in world.issues
         if i.state == "open" and i.has(Label.AI_READY) and i.number > 0 and i.number not in shadowed
     ] + [_Item(pr_key(p.number), n, p.labels, p.comments, p, labeled_at=p.needs_human_labeled_at,
@@ -393,7 +438,16 @@ def _proceed(
         return OpenPR(max(item.branches, key=lambda b: (parse_timestamp(b.committed_at) is not None,
                                                         b.committed_at, b.name)).name)
 
-    step = _pr_step(pr, harness, item.base) if pr is not None else Dispatch(AgentKind.RESOLVE)
+    triage = _latest_triage(local.legs.get(issue_key(item.issue), ()))
+    if pr is None and triage is None:
+        step = Dispatch(AgentKind.TRIAGE)
+    elif pr is None:
+        note = _triage_note(item, triage, stops, harness, anchor)
+        if note is not None:
+            return note
+        step = Dispatch(AgentKind.RESOLVE)
+    else:
+        step = _pr_step(pr, harness, item.base)
     if not isinstance(step, Dispatch):
         return step
     floor = _reset_floor(item, [at for at, _ in human], last_stop, harness)
@@ -401,7 +455,8 @@ def _proceed(
             and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
             and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
         return NeedsHuman(StopReason.REVIEW_ROUNDS, anchor)
-    if _attempts(legs, step, floor) >= ATTEMPT_CAP:
+    attempts = _attempts(legs, step, floor)
+    if attempts >= ATTEMPT_CAP:
         return NeedsHuman(StopReason.ATTEMPTS, anchor, step.act)
     if item.issue in local.lifetime_capped:
         return NeedsHuman(StopReason.LIFETIME_CAP, anchor)
@@ -410,7 +465,49 @@ def _proceed(
         return Backoff(step.act, until)
     if not local.headroom:
         return Wait(WaitReason.HEADROOM)
+    triaged = triage.triage.tier if triage is not None and triage.triage is not None else None
+    if step.act in ROUTED_ACTS:
+        return Dispatch(step.act, step.head, escalate(triaged or DEFAULT_TIER, attempts))
+    if step.act is AgentKind.REVIEW and pr is not None:
+        return Dispatch(step.act, step.head, _review_tier(pr, harness, legs, local, item.issue) or triaged)
     return step
+
+
+def _review_tier(pr: PRView, harness: Harness, legs: tuple[LegEnd, ...], local: Local, issue: int) -> Tier | None:
+    """The tier of the fix leg that pushed the head under review (owner,
+    2026-10-13: the reviewer runs at the fixer's tier, escalation included):
+    the issue's newest agent-ended routed leg. None when that leg cannot be
+    identified: a head a human pushed, or a newest leg that predates routing."""
+    if any(p.actor.strip() and not harness.owns_login(p.actor) for p in pr.pushes):
+        return None
+    fixes = [leg for leg in (*legs, *local.legs.get(issue_key(issue), ()))
+             if leg.kind in ROUTED_ACTS and not leg.machine]
+    producer = max(fixes, key=lambda leg: leg.ended_at, default=None)
+    return producer.tier if producer is not None else None
+
+
+def _latest_triage(legs: tuple[LegEnd, ...]) -> LegEnd | None:
+    """The issue's newest agent-ended TRIAGE leg. A machine end is no triage
+    (it retries under the machine backoff); an agent end whose output did not
+    parse still is one (triage ran; the issue proceeds at DEFAULT_TIER)."""
+    return next((leg for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at))
+                 if leg.kind is AgentKind.TRIAGE and not leg.machine), None)
+
+
+def _triage_note(
+    item: _Item, leg: LegEnd, stops: list[tuple[datetime, str]], harness: Harness, anchor: str,
+) -> NeedsHuman | TriageNote | None:
+    """What a triaged issue owes before RESOLVE: the duplicate stop (until a
+    human released one), then the one triage comment."""
+    triage = leg.triage
+    if triage is None:
+        return None
+    if triage.duplicate_of is not None and not any(code == StopReason.DUPLICATE.value for _, code in stops):
+        return NeedsHuman(StopReason.DUPLICATE, anchor, duplicate_of=triage.duplicate_of,
+                          detail=triage.duplicate_reason)
+    if any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
+        return None
+    return TriageNote(triage, leg.ended_at.isoformat(), has_acceptance_criteria(item.body))
 
 
 def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> DerivedState:
@@ -541,6 +638,7 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
 
 __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
-    "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "Release", "Wait", "NeedsHuman",
+    "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "TriageNote", "TRIAGE_TAG",
+    "Release", "Wait", "NeedsHuman",
     "Busy", "Backoff", "DerivedState", "derive", "human_comments", "touches_github",
 ]

@@ -61,6 +61,7 @@ class ContextualRuntime(AgentRuntime, Protocol):
         *,
         head: str = "",
         resumed: bool = False,
+        tier: str = "",
     ) -> None: ...
 
 

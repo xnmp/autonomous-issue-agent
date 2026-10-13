@@ -11,6 +11,7 @@ from enum import Enum, auto
 from typing import Union
 
 from .labels import Label
+from .routing import DEFAULT_TIER, Tier
 
 
 class Target(Enum):
@@ -19,8 +20,9 @@ class Target(Enum):
 
 
 class AgentKind(Enum):
-    """The paid acts. RESOLVE runs on an issue; the rest on a PR head."""
+    """The paid acts. TRIAGE and RESOLVE run on an issue; the rest on a PR head."""
 
+    TRIAGE = auto()
     RESOLVE = auto()
     ADDRESS_REVIEW = auto()
     FIX_CI = auto()
@@ -87,13 +89,37 @@ class UpdateBranch:
 
 @dataclass(frozen=True)
 class RunAgent:
-    """Dispatch one paid leg. `number` is the issue for RESOLVE, else the PR."""
+    """Dispatch one paid leg. `number` is the issue for TRIAGE and RESOLVE,
+    else the PR."""
 
     kind: AgentKind
     number: int = 0
     # The PR head the dispatch was decided on ("" for issue-stage legs), so the
     # leg and its idempotency key bind to the exact head (e.g. review:{pr}:{head}).
     head: str = ""
+    # The difficulty tier the leg runs at (a fix act's already escalated for
+    # this attempt); see `check_tier`.
+    tier: Tier | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tier", check_tier(self.kind, self.tier))
+
+
+ISSUE_ACTS = frozenset({AgentKind.TRIAGE, AgentKind.RESOLVE})
+ROUTED_ACTS = frozenset({AgentKind.RESOLVE, AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE})
+
+
+def check_tier(kind: AgentKind, tier: Tier | None) -> Tier | None:
+    """A routed fix act always has a tier (DEFAULT_TIER when none is given);
+    REVIEW may (the tier of the leg that pushed its head; None falls back to
+    REVIEW_MODEL); TRIAGE never does."""
+    if tier is not None and not isinstance(tier, Tier):
+        raise ValueError("tier must be a Tier")
+    if kind in ROUTED_ACTS:
+        return tier or DEFAULT_TIER
+    if tier is not None and kind is not AgentKind.REVIEW:
+        raise ValueError(f"{kind.name} carries no tier")
+    return tier
 
 
 Action = Union[
@@ -109,6 +135,9 @@ Action = Union[
 __all__ = [
     "Action",
     "AgentKind",
+    "ISSUE_ACTS",
+    "ROUTED_ACTS",
+    "check_tier",
     "MergePullRequest",
     "OpenPullRequest",
     "PostComment",

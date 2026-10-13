@@ -438,3 +438,52 @@ def test_an_unusable_agent_env_file_falls_back_to_process_env(tmp_path, content)
         env_file.write_text(content)
     c = from_env({"AGENT_ENV": str(env_file), "REPO": "o/inherited", "FIX_MODEL": "opus"})
     assert (c.repo, c.fix_model) == ("o/inherited", "opus")
+
+
+# ── routing knobs (owner, 2026-10-13) ────────────────────────────────────────
+
+
+def _routed(**env):
+    from issue_agent.app.config import from_env
+
+    return from_env({"REPO": "o/r", "FIX_BOT": "fix-bot", **env})
+
+
+def test_the_live_claude_routing_knobs_parse_into_per_tier_routes():
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import Tier
+
+    cfg = _routed(FIXER_RUNTIME="claude", FIX_MODEL="claude-sonnet-5-5", FIX_MODEL_LOW="claude:claude-haiku-5-5",
+                  FIX_MODEL_MED="claude:claude-sonnet-5-5", FIX_MODEL_HIGH="claude:claude-opus-5-5",
+                  FIX_MODEL_XHIGH="claude:claude-fable-5-1", TRIAGE_MODEL="claude:claude-haiku-5-5",
+                  REVIEWER_RUNTIME="claude", REVIEW_MODEL="claude-opus-5-5")
+    assert cfg.validation_errors() == ()
+    assert cfg.fix_route(Tier.XHIGH) == (RuntimeName.CLAUDE, "claude-fable-5-1")
+    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5")
+    assert cfg.review_route(Tier.HIGH) == (RuntimeName.CLAUDE, "claude-opus-5-5")
+    assert cfg.review_route(None) == (RuntimeName.CLAUDE, "claude-opus-5-5")
+    assert cfg.runtimes("fix") == cfg.runtimes("review") == frozenset({RuntimeName.CLAUDE})
+    assert cfg.triage_budget_usd == 2.0
+
+
+def test_unset_routes_fall_back_to_todays_single_models():
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.routing import Tier
+
+    cfg = _routed(FIXER_RUNTIME="codex", FIX_MODEL_LOW="claude:claude-haiku-5-5")
+    assert cfg.fix_route(Tier.MED) == (RuntimeName.CODEX, None)  # CODEX_MODEL applies in the runner
+    assert cfg.triage_route() == (RuntimeName.CLAUDE, "claude-haiku-5-5")  # TRIAGE_MODEL unset: LOW's route
+    assert cfg.review_route(Tier.MED) == (RuntimeName.CODEX, "gpt-6.1-sol")  # no MED spec: REVIEW_MODEL
+    assert cfg.runtimes("fix") == frozenset({RuntimeName.CODEX, RuntimeName.CLAUDE})
+
+
+@pytest.mark.parametrize("env", [
+    {"FIX_MODEL_HIGH": "opus"}, {"TRIAGE_MODEL": "codex:claude-haiku-5-5"}, {"FIX_MODEL_LOW": "glm:glm-5"},
+    {"TRIAGE_BUDGET_USD": "0"},
+])
+def test_malformed_routing_knobs_are_reported_and_fall_back(env):
+    from issue_agent.domain.routing import Tier
+
+    cfg = _routed(**env)
+    assert cfg.validation_errors()
+    assert cfg.fix_route(Tier.HIGH)[0] is cfg.fixer_runtime

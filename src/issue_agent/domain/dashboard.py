@@ -25,13 +25,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
 
-from .actions import AgentKind
+from .actions import ISSUE_ACTS, AgentKind
 from .checks import Observed
 from .ci import Clear, Executing, Failed, Queued, Waiting as CiWaiting, parse_timestamp, reduce_ci
 from .state import (
     Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason,
-    Wait, WaitReason, stop_tag,
+    TriageNote, Wait, WaitReason, stop_tag,
 )
+from .triage import Triage
 from .world import Comment, PRView
 
 ROLE_NAMES = ("fix", "review")
@@ -90,6 +91,8 @@ class LegRow:
     question: str = ""
     verdict: str = ""  # the review verdict event (APPROVE / REQUEST_CHANGES), if any
     verdict_body: str = ""
+    tier: str = ""  # the routed tier the leg ran at (a TRIAGE leg: the tier it graded)
+    triage: Triage | None = None  # a TRIAGE leg's laundered result
 
     @property
     def running(self) -> bool:
@@ -150,10 +153,19 @@ def issue_legs(legs: Iterable[LegRow], issue: int) -> tuple[LegRow, ...]:
     return tuple(sorted((leg for leg in legs if leg.issue == issue), key=lambda leg: (leg.reserved_at, leg.leg_id)))
 
 
+def issue_triage(legs: Iterable[LegRow]) -> Triage | None:
+    """The triage derive routes by: the newest agent-ended TRIAGE leg's result."""
+    triaged = [leg for leg in legs if leg.kind == AgentKind.TRIAGE.name and leg.derived
+               and leg.leg_class in ("agent", "asked")]
+    latest = max(triaged, key=lambda leg: leg.at, default=None)
+    return latest.triage if latest is not None else None
+
+
 # ── board ────────────────────────────────────────────────────────────────────
 
 
 class Stage(str, Enum):
+    TRIAGE = "triage"
     RESOLVE = "resolve"
     CI = "ci"
     REVIEW = "review"
@@ -162,6 +174,7 @@ class Stage(str, Enum):
 
 STAGE_ORDER: tuple[Stage, ...] = tuple(Stage)
 _STAGE_OF_KIND: Mapping[str, Stage] = {
+    AgentKind.TRIAGE.name: Stage.TRIAGE,
     AgentKind.RESOLVE.name: Stage.RESOLVE,
     AgentKind.REBASE.name: Stage.CI,
     AgentKind.FIX_CI.name: Stage.CI,
@@ -169,7 +182,7 @@ _STAGE_OF_KIND: Mapping[str, Stage] = {
     AgentKind.ADDRESS_REVIEW.name: Stage.REVIEW,
 }
 _ACT_WORDS: Mapping[str, str] = {
-    "RESOLVE": "Resolve", "REBASE": "Rebase", "FIX_CI": "Fix CI", "REVIEW": "Review",
+    "TRIAGE": "Triage", "RESOLVE": "Resolve", "REBASE": "Rebase", "FIX_CI": "Fix CI", "REVIEW": "Review",
     "ADDRESS_REVIEW": "Address review",
 }
 
@@ -200,7 +213,7 @@ class Working:
     running, or a free action (merge, branch update, PR open, release) runs
     next tick."""
 
-    activity: str  # agent | queued | ci | ci_queued | merge | update | open_pr | release
+    activity: str  # agent | queued | ci | ci_queued | merge | update | open_pr | triage_note | release
     act: str | None
     headline: str
     reason: str
@@ -228,6 +241,7 @@ _STOP_HEADLINE: Mapping[str, str] = {
     StopReason.REVIEW_ROUNDS.value: "Review dispute",
     StopReason.LIFETIME_CAP.value: "Lifetime budget spent",
     StopReason.WORKFLOW_PATH.value: "Workflow change needs a human",
+    StopReason.DUPLICATE.value: "Suspected duplicate",
     "labelled": "Parked",
 }
 _STOP_REASON: Mapping[str, str] = {
@@ -236,6 +250,7 @@ _STOP_REASON: Mapping[str, str] = {
     StopReason.REVIEW_ROUNDS.value: "The reviewer kept requesting changes; reply or unblock to continue.",
     StopReason.LIFETIME_CAP.value: "Raise the per-issue budget, then reply or unblock.",
     StopReason.WORKFLOW_PATH.value: "The PR changes files under .github/; reply or unblock once judged.",
+    StopReason.DUPLICATE.value: "Triage suspects a duplicate; close it, or reply or unblock to resolve it.",
     "labelled": "Labelled needs-human with no stop comment; unblock to hand it back.",
 }
 
@@ -294,7 +309,9 @@ def board_status(
     running = next((leg for leg in reversed(legs) if leg.running), None)
     if isinstance(state, NeedsHuman):
         # About to be stopped this tick: policy adds the label and the comment.
-        detail = state.question if state.reason is StopReason.QUESTION else None
+        detail = (state.question if state.reason is StopReason.QUESTION
+                  else f"Duplicate of #{state.duplicate_of}: {state.detail}".rstrip(": ")
+                  if state.reason is StopReason.DUPLICATE else None)
         return _needs_you(state.reason.value, target, last_end, detail)
     if isinstance(state, Wait) and state.reason is WaitReason.NEEDS_HUMAN:
         stop = latest_stop(comments, harness)
@@ -316,6 +333,9 @@ def board_status(
                        _iso(last_end))
     if isinstance(state, OpenPR):
         return Working("open_pr", None, "Opening PR", f"Branch {state.branch} is pushed without a PR.",
+                       _iso(last_end))
+    if isinstance(state, TriageNote):
+        return Working("triage_note", None, "Posting triage", "Triage graded it; its comment posts next tick.",
                        _iso(last_end))
     if isinstance(state, Release):
         return Working("release", None, "Releasing", "A human replied; needs-human comes off next tick.",
@@ -442,6 +462,8 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
         return _STAGE_OF_KIND[state.act.name]
     if isinstance(state, NeedsHuman) and state.reason is StopReason.REVIEW_ROUNDS:
         return Stage.REVIEW
+    if isinstance(state, TriageNote) or isinstance(state, NeedsHuman) and state.reason is StopReason.DUPLICATE:
+        return Stage.TRIAGE
     if isinstance(state, Merge):
         return Stage.MERGE
     if isinstance(state, Refresh):
@@ -652,7 +674,7 @@ def notifications(
     for leg in legs:
         if not leg.derived or leg.issue is None:
             continue
-        pr = leg.number if leg.kind != AgentKind.RESOLVE.name and leg.number > 0 else None
+        pr = leg.number if leg.kind not in {k.name for k in ISSUE_ACTS} and leg.number > 0 else None
         word = _ACT_WORDS.get(leg.kind, leg.kind)
         if leg.started_at is not None:
             out.append(Notification(f"leg:{leg.leg_id}:start", leg.started_at.isoformat(), "info",

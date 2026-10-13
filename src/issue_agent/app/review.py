@@ -24,12 +24,14 @@ from dataclasses import dataclass, replace
 from ..adapters.act import submit_review
 from ..adapters.control_store import LegRun
 from ..domain.actions import Action, AgentKind, RunAgent
+from ..domain.agent_task import RuntimeName
 from ..domain.identity import login_eq
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
+from ..domain.routing import Tier
 from ..domain.state import DerivedState, Harness, ItemKey, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
@@ -115,8 +117,9 @@ class ReviewLegs:
         runtime,
         accounting,
         checkouts,
-        prepare_cwd: Callable[[str], None] | None,
+        prepare_cwd: Callable[[str, RuntimeName | None], None] | None,
         task_config: tasks.ReviewTaskConfig,
+        route: Callable[[Tier | None], tuple[RuntimeName | None, str | None]] | None = None,
         log: Callable[[str], None],
     ) -> None:
         self.gateway = gateway
@@ -127,6 +130,8 @@ class ReviewLegs:
         self.checkouts = checkouts
         self.prepare_cwd = prepare_cwd
         self.task_config = task_config
+        # None: the role's default runtime with the configured REVIEW_MODEL.
+        self.route = route or (lambda _tier: (None, task_config.model))
         self.log = log
 
     async def run(self, action: RunAgent) -> None:
@@ -159,7 +164,8 @@ class ReviewLegs:
         runs = self.control.leg_runs(self.settings.repository, (issue,))
         # A REVIEW leg never resumes a session, so a wall cap is an attempt.
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
-                                 head=action.head, resumed=True)
+                                 head=action.head, resumed=True,
+                                 tier=action.tier.value if action.tier is not None else "")
         verdict = stored_verdict(runs, action.number, action.head)
         if verdict is not None and not on_head:
             # A paid verdict whose submission never landed (a crash, or GitHub
@@ -203,9 +209,12 @@ class ReviewLegs:
         self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
 
     def _task(self, action: RunAgent, pr: PRView):
+        runtime, model = self.route(action.tier)
+        self.log(f"REVIEW PR #{action.number}: tier {getattr(action.tier, 'value', '(none)')} -> "
+                 f"{runtime.value if runtime else '(default runtime)'}:{model or '(default model)'}")
         cwd = self.checkouts.ensure(action.number, action.head)
         if self.prepare_cwd is not None:
-            self.prepare_cwd(cwd)
+            self.prepare_cwd(cwd, runtime)
         diff = self.gateway.pr_diff(action.number, pr.base_ref_oid, action.head)
         if diff.head_oid != action.head or diff.base_oid != pr.base_ref_oid:
             raise RuntimeError("the revision-bound diff does not match the reviewed head")
@@ -218,7 +227,7 @@ class ReviewLegs:
             self.task_config, discussion=as_untrusted(discussion) if discussion else None,
             prior_review=as_untrusted(prior) if prior else None,
         )
-        return replace(task, cwd=cwd)
+        return replace(task, cwd=cwd, runtime=runtime, model=model)
 
 
 def _prior_review(pr: PRView, bot: str) -> str:
@@ -263,7 +272,7 @@ def compose_review_daemon(
     def make_legs(*, runtime, accounting, control, owner_id, prepare_cwd) -> ReviewLegs:
         return ReviewLegs(gateway, control, ReviewSettings(cfg.repo, owner_id, harness), runtime=runtime,
                           accounting=accounting, checkouts=checkouts, prepare_cwd=prepare_cwd,
-                          task_config=task_config, log=log)
+                          task_config=task_config, route=cfg.review_route, log=log)
 
     role = compose_role(cfg, "review", gateway, runner, make_legs=make_legs,
                         make_act=lambda dispatch, _control: ReviewAct(dispatch),

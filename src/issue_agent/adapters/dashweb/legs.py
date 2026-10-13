@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from .readonly_store import ReadOnlyControlStore
 from ...domain.dashboard import LegRow, Tokens
 from ...domain.repository import canonical_repository
+from ...domain.triage import triage_from_record
 
 _COLUMNS = (
     "leg_id, role, kind, issue, number, head, runtime, state, reserved_at, started_at, ended_at, "
@@ -36,6 +37,7 @@ def parse_leg(row: sqlite3.Row) -> LegRow | None:
     result = _object(row["result_json"])
     verdict = result.get("verdict") if isinstance(result.get("verdict"), dict) else {}
     issue = row["issue"]
+    triage = triage_from_record(result.get("triage")) if row["kind"] == "TRIAGE" else None
     return LegRow(
         leg_id=str(row["leg_id"]),
         role=str(row["role"] or ""),
@@ -60,6 +62,8 @@ def parse_leg(row: sqlite3.Row) -> LegRow | None:
         question=_text(result.get("question")),
         verdict=_text(verdict.get("event")).upper(),
         verdict_body=_text(verdict.get("body")),
+        tier=triage.tier.value if triage is not None else _text(result.get("tier")),
+        triage=triage,
     )
 
 

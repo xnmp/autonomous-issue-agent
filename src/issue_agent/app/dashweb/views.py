@@ -13,16 +13,18 @@ from datetime import datetime, timezone, tzinfo
 
 from ...adapters.control_store import Lease
 from ...domain import dashboard as dash
-from ...domain.actions import Target
+from ...domain.actions import ISSUE_ACTS, Target
 from ...domain.backoff import LegEnd
 from ...domain.ci import parse_timestamp
 from ...domain.labels import Label
 from ...domain.refs import harness_branch_issue
 from ...domain.state import DerivedState, Harness, ItemKey
+from ...domain.triage import Triage
 from ...domain.world import IssueView, PRView, WorldState
 from ...adapters.dashweb.ghdata import index_by_number, is_open, labels_of
 
 _EXCERPT = dash.EXCERPT_CHARS
+_ISSUE_KINDS = frozenset(kind.name for kind in ISSUE_ACTS)
 
 
 def issue_url(repo: str, number: int) -> str:
@@ -225,6 +227,7 @@ def step(idx: int, leg: dash.LegRow, model: str = "") -> dict:
         "role": leg.role or None,
         "runtime": leg.runtime or None,
         "model": model or None,
+        "tier": leg.tier or None,
         "state": leg.state,
         "outcome": leg.outcome,
         "started_ts": _iso(leg.started_at or leg.reserved_at),
@@ -237,7 +240,7 @@ def step(idx: int, leg: dash.LegRow, model: str = "") -> dict:
         "session_id": leg.session_id or None,
         "usage": asdict(leg.tokens) if leg.tokens else None,
         "head": leg.head or None,
-        "pr": leg.number if leg.kind != "RESOLVE" and leg.number > 0 else None,
+        "pr": leg.number if leg.kind not in _ISSUE_KINDS and leg.number > 0 else None,
         "summary": dash.bounded(leg.summary, _EXCERPT) or None,
         "question": dash.bounded(leg.question, dash.MESSAGE_CHARS) or None,
         "verdict": leg.verdict or None,
@@ -282,7 +285,16 @@ def issue_detail(
         "steps": [step(idx, leg, (models or {}).get(leg.leg_id, ""))
                   for idx, leg in enumerate(leg for leg in own if not leg.carried)],
         "carried": {"legs": len(carried), "cost_usd": _spend(carried)[0]} if carried else None,
+        "triage": _triage(dash.issue_triage(own)),
     }
+
+
+def _triage(triage: Triage | None) -> dict | None:
+    if triage is None:
+        return None
+    return {"tier": triage.tier.value, "acceptance_criteria": list(triage.acceptance_criteria),
+            "duplicate_of": triage.duplicate_of, "duplicate_reason": triage.duplicate_reason or None,
+            "rationale": triage.rationale or None}
 
 
 def lease_rows(leases: Iterable[Lease], legs: Iterable[dash.LegRow]) -> list[dict]:
@@ -295,7 +307,8 @@ def lease_rows(leases: Iterable[Lease], legs: Iterable[dash.LegRow]) -> list[dic
         rows.append({
             "role": lease.role,
             "issue": lease.target if lease.target > 0 else None,
-            "pr": -lease.target if lease.target < 0 else (leg.number if leg and leg.kind != "RESOLVE" and leg.number > 0
+            "pr": -lease.target if lease.target < 0 else (leg.number if leg and leg.kind not in _ISSUE_KINDS
+                                                         and leg.number > 0
                                                          else None),
             "leg_id": str(lease.run_id) if lease.run_id is not None else None,
             "kind": leg.kind if leg else None,

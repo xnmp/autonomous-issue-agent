@@ -36,6 +36,7 @@ from ..domain.pricing import (
     with_default_model_rates,
 )
 from ..domain.repository import canonical_repository, repository_validation_error
+from ..domain.routing import TIER_LADDER, ModelRoute, Tier, parse_model_route
 
 
 def deployment_identity_for_target(repository: str, target_dir: str, role: str) -> str:
@@ -96,6 +97,18 @@ class HarnessConfig:
     # The independent reviewer is at least the fixer's tier: a reviewer at the
     # fixer's own tier approved/cycled at parity. Claude reviewers default to opus.
     review_model: str | None = _knob("gpt-6.1-sol")
+    # Routing: the `runtime:model` each triage tier's fix legs run on, e.g.
+    # `codex:gpt-6-luna` or `claude:claude-haiku-5-5`. Blank keeps the fixer
+    # runtime with FIX_MODEL (codex: CODEX_MODEL) for that tier.
+    fix_model_low: str = _knob("")
+    fix_model_med: str = _knob("")
+    fix_model_high: str = _knob("")
+    fix_model_xhigh: str = _knob("")
+    # The TRIAGE leg's `runtime:model`. Blank runs it on FIX_MODEL_LOW's route.
+    triage_model: str = _knob("")
+    # TRIAGE reserves this, not MAX_BUDGET_USD: a cheap classifier must not
+    # hold a fix leg's reservation against the daily caps.
+    triage_budget_usd: float = _knob(2.0)
     fix_budget_usd: float = _knob(10.0, env="MAX_BUDGET_USD")
     # $15 since 2026-08-09: sol reviews at ~2.5x terra's token rates.
     review_budget_usd: float = _knob(15.0)
@@ -170,6 +183,7 @@ class HarnessConfig:
         for name, value in (("POLL_SECONDS", self.poll_seconds),
                             ("FIX_DISPATCH_CONCURRENCY", self.fix_dispatch_concurrency),
                             ("MAX_BUDGET_USD", self.fix_budget_usd),
+                            ("TRIAGE_BUDGET_USD", self.triage_budget_usd),
                             ("REVIEW_BUDGET_USD", self.review_budget_usd)):
             if value <= 0:
                 errors.append(f"{name} must be > 0")
@@ -182,11 +196,50 @@ class HarnessConfig:
                             ("GLOBAL_DAILY_SPEND_CAP_USD", self.global_daily_spend_cap_usd)):
             if value < 0:
                 errors.append(f"{name} must be >= 0")
+        for name, value in self._route_specs():
+            if value.strip():
+                try:
+                    parse_model_route(value)
+                except ValueError as exc:
+                    errors.append(f"{name} {value!r}: {exc}")
         caps = (self.issue_spend_cap_usd, self.daily_spend_cap_usd, self.global_daily_spend_cap_usd)
         if any(cap > 0 for cap in caps) and not self.codex_budget_priceable:
             errors.append("armed spend caps require positive input/output pricing; "
                           "set CODEX_COST_PER_MTOK_IN/OUT or disable every spend cap")
         return tuple(errors)
+
+    def _route_specs(self) -> tuple[tuple[str, str], ...]:
+        return (("FIX_MODEL_LOW", self.fix_model_low), ("FIX_MODEL_MED", self.fix_model_med),
+                ("FIX_MODEL_HIGH", self.fix_model_high), ("FIX_MODEL_XHIGH", self.fix_model_xhigh),
+                ("TRIAGE_MODEL", self.triage_model))
+
+    def _tier_route(self, tier: Tier) -> ModelRoute | None:
+        return _route(dict(zip(TIER_LADDER, (self.fix_model_low, self.fix_model_med, self.fix_model_high,
+                                             self.fix_model_xhigh)))[tier])
+
+    def fix_route(self, tier: Tier) -> tuple[RuntimeName, str | None]:
+        """(runtime, model) for a fix leg at `tier`. An unset or invalid spec
+        (validate() reports it) keeps today's single configured fixer."""
+        route = self._tier_route(tier)
+        return (route.runtime, route.model) if route is not None else (self.fixer_runtime, self.fix_model)
+
+    def review_route(self, tier: Tier | None) -> tuple[RuntimeName, str | None]:
+        """(runtime, model) for a REVIEW at the fixer's `tier` (owner,
+        2026-10-13: the reviewer matches the fixer's tier). No tier, or no
+        spec for it, keeps REVIEWER_RUNTIME with REVIEW_MODEL."""
+        route = self._tier_route(tier) if tier is not None else None
+        return (route.runtime, route.model) if route is not None else (self.reviewer_runtime, self.review_model)
+
+    def triage_route(self) -> tuple[RuntimeName, str | None]:
+        route = _route(self.triage_model)
+        return (route.runtime, route.model) if route is not None else self.fix_route(Tier.LOW)
+
+    def runtimes(self, role: str) -> frozenset[RuntimeName]:
+        """Every runtime a role may dispatch a leg on."""
+        if role == "fix":
+            return frozenset({self.fixer_runtime, self.triage_route()[0],
+                              *(self.fix_route(t)[0] for t in TIER_LADDER)})
+        return frozenset({self.reviewer_runtime, *(self.review_route(t)[0] for t in TIER_LADDER)})
 
     def validate(self) -> None:
         if errors := self.validation_errors():
@@ -220,6 +273,9 @@ class HarnessConfig:
             f"fixer={self.fixer_runtime.value} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} {fix_budget}",
+            "routes: " + " ".join(f"{name}={route[0].value}:{model(route[1])}" for name, route in (
+                *((t.value, self.fix_route(t)) for t in TIER_LADDER), ("triage", self.triage_route())))
+            + f" triage_budget=${self.triage_budget_usd:.2f}",
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"review_budget=${self.review_budget_usd:.2f}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s wall={self.agent_max_runtime:.0f}s",
@@ -238,7 +294,15 @@ def budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
     """The per-leg maximum each paid act reserves."""
     fix = Money.from_major("USD", cfg.fix_budget_usd)
     limits = {("fix", kind): fix for kind in ("RESOLVE", "ADDRESS_REVIEW", "FIX_CI", "REBASE")}
-    return BudgetPolicy({**limits, ("review", "REVIEW"): Money.from_major("USD", cfg.review_budget_usd)})
+    return BudgetPolicy({**limits, ("fix", "TRIAGE"): Money.from_major("USD", cfg.triage_budget_usd),
+                         ("review", "REVIEW"): Money.from_major("USD", cfg.review_budget_usd)})
+
+
+def _route(spec: str) -> ModelRoute | None:
+    try:
+        return parse_model_route(spec) if spec.strip() else None
+    except ValueError:
+        return None
 
 
 def rate_table(cfg: HarnessConfig, runtime_name: str) -> RateTable | None:

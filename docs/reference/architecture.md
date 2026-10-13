@@ -436,6 +436,9 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`,
+`domain/routing.py` (difficulty tiers, the derived per-attempt escalation and
+the `runtime:model` route spec), `domain/triage.py` (the TRIAGE act's result,
+parsed and laundered from the agent's claim),
 `domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
 minimal-harness design; the fix role runs on it since slice 5b and the review
 role since slice 5c),
@@ -462,7 +465,9 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
 `adapters/repository_guidance.py`,
-`adapters/runtime_plan.py`, `adapters/signal_log.py`, `adapters/single_instance.py`,
+`adapters/runtime_plan.py`, `adapters/runtime_switch.py` (one role's
+per-runtime journal/accounting chains behind one runtime, so legs route
+across Claude and Codex), `adapters/signal_log.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 and `adapters/worktree.py`. Dashboard-specific read

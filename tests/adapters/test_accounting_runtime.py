@@ -529,3 +529,62 @@ def test_a_leg_whose_counters_are_malformed_settles_its_reserved_maximum_and_the
     assert malformed.exit_reason is ExitReason.AGENT_ERROR
     assert _ended(store) == [(2_000_000, "estimate")]
     assert refused.exit_reason is ExitReason.BUDGET_EXHAUSTED
+
+
+# ── TRIAGE results and routed tiers (owner, 2026-10-13) ─────────────────────
+
+
+def _triage_wrapper(tmp_path, result, **fields):
+    from issue_agent.domain.contracts import Money as M
+
+    return _wrapper(tmp_path, Runtime(result), context=("fix", "TRIAGE", 3, 3),
+                    budget_policy=BudgetPolicy({("fix", "TRIAGE"): M("USD", 2_000_000)}), **fields)
+
+
+def _receipt(store):
+    (run,) = store.leg_runs("o/r", (3,))
+    return run.receipt
+
+
+def test_a_triage_result_is_recorded_laundered_against_the_issues_the_harness_offered(tmp_path) -> None:
+    from issue_agent.domain.triage import triage_schema
+
+    claim = {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": 9,
+             "duplicate_reason": "same", "rationale": "small"}
+    wrapper, store = _triage_wrapper(tmp_path, AgentResult(False, structured=claim, session_id="s"))
+    _work(wrapper, schema=triage_schema([2, 4]))  # 9 was never offered
+    receipt = _receipt(store)
+    assert receipt["leg"] == "agent"
+    assert receipt["triage"] == {"tier": "low", "acceptance_criteria": ["Esc closes it"], "duplicate_of": None,
+                                 "duplicate_reason": "", "rationale": "small"}
+
+
+@pytest.mark.parametrize("structured", [None, {"tier": "enormous"}, {"tier": "low", "rationale": "x" * 100_000}])
+def test_a_malformed_or_huge_triage_result_records_an_agent_leg_with_no_triage(tmp_path, structured) -> None:
+    wrapper, store = _triage_wrapper(tmp_path, AgentResult(False, structured=structured, session_id="s"))
+    _work(wrapper)
+    receipt = _receipt(store)
+    assert receipt["leg"] == "agent" and "triage" not in receipt
+
+
+def test_a_triage_that_claims_blocked_is_not_a_question(tmp_path) -> None:
+    wrapper, store = _triage_wrapper(tmp_path, AgentResult(False, status="blocked", needs="?", session_id="s"))
+    _work(wrapper)
+    assert _receipt(store)["leg"] == "agent" and "question" not in _receipt(store)
+
+
+def test_the_routed_tier_a_leg_ran_at_is_recorded_with_it(tmp_path) -> None:
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", session_id="s")),
+                              context=("fix", "RESOLVE", 3, 3))
+    wrapper.set_context("fix", "RESOLVE", 3, 3, tier="high")
+    _work(wrapper)
+    assert _receipt(store)["tier"] == "high"
+
+
+def test_a_leg_planned_for_another_runtime_is_refused_by_this_runtimes_accounting(tmp_path) -> None:
+    from issue_agent.domain.agent_task import RuntimeName
+
+    runtime = Runtime(AgentResult(False, status="pushed", session_id="s"))
+    wrapper, store = _wrapper(tmp_path, runtime, context=("fix", "RESOLVE", 3, 3))  # a codex chain
+    result = _work(wrapper, runtime=RuntimeName.CLAUDE)
+    assert result.is_error and runtime.calls == 0
