@@ -391,7 +391,8 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
 def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, tmp_path):
     """Default-model review receipts name the concrete SDK model."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     for role, kind in (("review", "REVIEW"),):
         init = type("InitMessage", (), {
@@ -416,7 +417,8 @@ def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, t
 def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_path):
     """Configured aliases remain the journal's model across the SDK session."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},
@@ -439,7 +441,8 @@ def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_p
 def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
     """A dropped terminal envelope retains the SDK model in its settled receipt."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},
@@ -460,7 +463,8 @@ def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypa
 def test_unpinned_sdk_timeout_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
     """An idle SDK leg keeps its init model when its timeout settles it."""
     from tests.fakes.legacy_journal import Journal
-    from issue_agent.adapters.journal import JournalingRuntime, read_events
+    from issue_agent.adapters.journal import JournalingRuntime
+    from tests.fakes.legacy_journal import read_events
 
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},

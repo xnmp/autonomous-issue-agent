@@ -12,17 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timezone
 
 import pytest
 
-from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import (
-    JournalingRuntime,
-    default_ledger_path,
-    read_events,
-)
+from tests.fakes.legacy_journal import Journal, read_events
+from issue_agent.adapters.journal import JournalingRuntime
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
 from issue_agent.domain.outcome import AgentResult, ExitReason
@@ -44,29 +39,6 @@ def _write(path: str, *lines: str) -> str:
 def _spend(dt: datetime, cost: float, repo="o/r", issue=5, kind="RESOLVE") -> str:
     return json.dumps({"ts": _at(dt), "event": "spend", "repo": repo,
                        "issue": issue, "kind": kind, "cost_usd": cost})
-
-
-# ── readers ───────────────────────────────────────────────────────────────────
-def test_read_events_skips_malformed_and_truncated_lines(tmp_path):
-    path = _write(
-        str(tmp_path / "j.jsonl"),
-        json.dumps({"event": "a"}),
-        "{not json at all",
-        "",
-        '{"event": "b", "cost_usd": 1.0',  # truncated by a crash mid-write
-        json.dumps({"event": "c"}),
-        json.dumps(["not", "an", "object"]),
-    )
-    assert [e["event"] for e in read_events(path)] == ["a", "c"]
-
-
-def test_read_events_of_a_missing_file_is_an_empty_history(tmp_path):
-    assert read_events(str(tmp_path / "nope.jsonl")) == []
-
-
-def test_default_ledger_path_is_global_and_honours_xdg(monkeypatch):
-    monkeypatch.setenv("XDG_STATE_HOME", "/xdg")
-    assert default_ledger_path() == "/xdg/issue-agent/spend.jsonl"
 
 
 # ── unsettled starts / bounded tail read (review P0R-4) ───────────────────────
@@ -143,12 +115,6 @@ def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
         for rows in by_number.values()
     )
     assert by_number[5][0]["dispatch"] != by_number[7][0]["dispatch"]
-
-
-# ── read_events_tail ──────────────────────────────────────────────────────────
-# The poll-loop reader must not grow with the age of the install; a byte window
-# means its first line is usually torn, and a parser handed half an object must
-# skip it exactly like a killed writer's tail.
 
 
 # ── JournalingRuntime ─────────────────────────────────────────────────────────
@@ -555,15 +521,3 @@ def test_status_summary_without_a_repo_pairs_the_cap_with_the_global_total():
     out = "\n".join(spend_status_lines(50.0, all_repositories_spent=12.5))
 
     assert "$12.50" in out and "$50.00 cap" in out
-
-
-def test_status_journal_path_prefers_the_overlay_state_dir(tmp_path, monkeypatch):
-    from issue_agent.app import cli
-
-    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text('STATE_DIR="/custom/state"\n')
-    assert cli.journal_path("myapp") == "/custom/state/journal.jsonl"
-    # No overlay → the layout `issue-agent start` writes.
-    assert cli.journal_path("other").endswith(
-        os.path.join(".local", "state", "issue-agent-other", "journal.jsonl")
-    )

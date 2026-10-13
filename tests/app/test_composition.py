@@ -443,7 +443,7 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
 def _held_pr(number=581, issue=500):
     return observed_pr(
         number, head_ref_name=f"fix/{issue}-x", closing_issue=issue,
-        head_ref_oid="abc", labels=frozenset({Label.AI_PR_OPEN}),
+        head_ref_oid="abc", labels=frozenset({Label.NEEDS_HUMAN}),
         author=FIX_BOT, state="OPEN",
     )
 

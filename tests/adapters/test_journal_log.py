@@ -3,7 +3,8 @@
 import json
 import threading
 
-from issue_agent.adapters.journal import Journal, read_events, read_events_tail
+from issue_agent.adapters.journal import Journal
+from tests.fakes.legacy_journal import read_events
 
 
 def test_each_record_is_one_self_describing_json_line(tmp_path):
@@ -69,17 +70,3 @@ def test_the_journal_is_private_to_the_operator(tmp_path):
 
     assert (path.stat().st_mode & 0o777) == 0o600
     assert (path.parent.stat().st_mode & 0o777) == 0o700
-
-
-def test_the_tail_reader_stops_at_its_bound_and_keeps_the_newest_lines(tmp_path):
-    path = tmp_path / "journal.jsonl"
-    path.write_text("".join(json.dumps({"event": "e", "n": n, "pad": "x" * 100}) + "\n" for n in range(1000)))
-    bound = path.stat().st_size // 4
-
-    tail = read_events_tail(str(path), max_bytes=bound)
-
-    assert 0 < len(tail) < 300
-    assert tail[-1]["n"] == 999
-    assert [e["n"] for e in tail] == list(range(1000 - len(tail), 1000))  # contiguous, no torn first line
-    assert len(read_events_tail(str(path))) == 1000
-    assert read_events_tail(str(tmp_path / "missing.jsonl")) == []

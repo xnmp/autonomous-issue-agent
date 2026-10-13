@@ -58,12 +58,6 @@ class Journal:
             sys.stderr.write(f"journal: dropped {event} ({exc})\n")
 
 
-def default_ledger_path() -> str:
-    """The machine-global spend ledger path (read by status and the dashboard)."""
-    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return os.path.join(base, "issue-agent", "spend.jsonl")
-
-
 @dataclass(frozen=True)
 class RunContext:
     """Which dispatch a leg belongs to, set once per dispatch. `dispatch_id`
@@ -202,58 +196,3 @@ def _usage(raw) -> dict | None:
     if "total_tokens" in raw:
         normalized["total_tokens"] = raw.get("total_tokens", 0)
     return normalized
-
-
-# ── readers (tolerate a truncated tail) ───────────────────────────────────────
-def _parse_lines(lines) -> list[dict]:
-    events: list[dict] = []
-    for line in lines:
-        try:
-            obj = json.loads(line) if line.strip() else None
-        except ValueError:
-            continue  # a truncated/garbled line never poisons the read
-        if isinstance(obj, dict):
-            events.append(obj)
-    return events
-
-
-def read_events(path: str) -> list[dict]:
-    """Every parseable object in `path`, oldest first; a missing file is empty."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return _parse_lines(fh.readlines())
-    except OSError:
-        return []
-
-
-# A per-poll reader must not re-parse the whole journal (keifu 2026-08-02:
-# one polling tab pinned a core). 1 MiB is days of a busy daemon.
-_TAIL_BYTES = 1 << 20
-
-
-def read_events_tail(path: str, max_bytes: int | None = None) -> list[dict]:
-    """`read_events` over the last `max_bytes`; a window not starting at byte 0
-    drops its first (possibly partial) line."""
-    window = _TAIL_BYTES if max_bytes is None else max_bytes
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            start = max(0, fh.tell() - max(0, window))
-            fh.seek(start)
-            text = fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return []
-    if start > 0:
-        _, _, text = text.partition("\n")
-    return _parse_lines(text.splitlines())
-
-
-def parse_ts(value) -> datetime | None:
-    """`ts` → aware UTC datetime, or None if missing/unparseable."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)

@@ -16,7 +16,8 @@ import pytest
 from issue_agent.adapters.codex_runner import CodexRunner
 from issue_agent.domain.pricing import ModelRates, RateTable, UnknownModelPolicy
 from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import JournalingRuntime, read_events
+from issue_agent.adapters.journal import JournalingRuntime
+from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import ExitReason, infra_death
 

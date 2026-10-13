@@ -19,7 +19,7 @@ def test_parse_issue_maps_fields():
         "number": 5,
         "title": "Null token",
         "body": "crashes",
-        "labels": [{"name": "ai-ready"}, {"name": "P1"}, {"name": "weird-unknown"}],
+        "labels": [{"name": "ai-ready"}, {"name": "needs-human"}, {"name": "weird-unknown"}],
         "comments": [{"author": {"login": "alice"}, "body": "hi", "createdAt": "t1"}],
         "updatedAt": "t9",
         "author": {"login": "bob"},
@@ -27,7 +27,7 @@ def test_parse_issue_maps_fields():
     }
     iss = parse_issue(d)
     assert iss.number == 5
-    assert iss.has(Label.AI_READY) and iss.has(Label.P1)
+    assert iss.has(Label.AI_READY) and iss.has(Label.NEEDS_HUMAN)
     assert iss.author == "bob"
     assert iss.state == "open"            # normalised lower-case
     assert iss.comments[0].author == "alice"
@@ -432,11 +432,10 @@ def test_get_issue_parses_response():
 
 
 # ── external-repo reviewer: build_review_world + ai-review parsing ────────────
-def test_parse_pr_round_trips_ai_review_label():
-    # the ai-review tag must survive parsing into PRView (it's an enum member now;
-    # _labels silently drops names that aren't in Label, so this proves the wiring).
-    pr = parse_pr({"number": 815, "labels": [{"name": "ai-review"}], "state": "OPEN"})
-    assert pr.has(Label.AI_REVIEW)
+def test_parse_pr_keeps_known_labels_and_drops_retired_ones():
+    # _labels silently drops names that aren't in Label, so this proves the wiring.
+    pr = parse_pr({"number": 815, "labels": [{"name": "needs-human"}, {"name": "ai-review"}], "state": "OPEN"})
+    assert pr.labels == frozenset({Label.NEEDS_HUMAN})
 
 
 # ── P0.7: loud warning when a world-building list hits the --limit cap ────────

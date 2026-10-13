@@ -9,7 +9,7 @@ import threading
 import pytest
 
 from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import read_events
+from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.github import GhUnavailable
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.tick import Daemon
@@ -44,10 +44,10 @@ def _daemon(decide, observe=None, logs=None):
 
 
 def test_tick_observes_decides_executes():
-    d, gw = _daemon(lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)])
+    d, gw = _daemon(lambda w: [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)])
     actions = d.tick()
     assert len(actions) == 1
-    assert gw.calls == [("relabel", "issue", 5, "ai-ready", "ai-working")]
+    assert gw.calls == [("relabel", "issue", 5, "needs-human", "ai-ready")]
 
 
 def test_tick_isolated_from_decide_crash():
@@ -85,7 +85,7 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
     d = Daemon(
         "fix", lambda: WorldState(),
         lambda w: [
-            Relabel(Target.ISSUE, 500, Label.AI_READY, Label.AI_WORKING),
+            Relabel(Target.ISSUE, 500, Label.NEEDS_HUMAN, Label.AI_READY),
             RunAgent(AgentKind.RESOLVE, 500),
             PostComment(Target.PR, 537, "done"),
             RunAgent(AgentKind.REBASE, 534),
@@ -600,7 +600,7 @@ def test_tick_skips_the_pass_when_github_is_unavailable():
     decided = []
     def decide(world):
         decided.append(world)
-        return [Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)]
+        return [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)]
 
     d, gw = _daemon(decide, observe=rate_limited, logs=logs)
     assert d.tick() == []

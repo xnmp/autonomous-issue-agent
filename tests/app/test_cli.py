@@ -440,15 +440,6 @@ def test_a_snapshot_missing_one_key_still_falls_through_to_the_overlay(
     assert review == "/custom/review/journal.jsonl", "overlay fills the gap"
 
 
-def test_journal_path_backcompat_is_the_fix_journal(tmp_path, monkeypatch):
-    """journal_path (singular, back-compat) stays the fix-only journal — same
-    contract tests/adapters/test_journal.py (outside this leg's ownership)
-    already relies on."""
-    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text('STATE_DIR="/custom/fix"\n')
-    assert cli.journal_path("myapp") == cli.journal_paths("myapp")[0] == "/custom/fix/journal.jsonl"
-
-
 def _write_jsonl(path: str, *lines: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:

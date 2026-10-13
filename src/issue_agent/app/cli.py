@@ -828,11 +828,6 @@ def journal_paths(name: str) -> list[str]:
     return paths
 
 
-def journal_path(name: str) -> str:
-    """The fix-role journal of `name`."""
-    return journal_paths(name)[0]
-
-
 def _env_cap(name: str, key: str, default: float) -> float:
     """A cap as status reports it: overlay over shared; garbled reads as 0."""
     for path in (os.path.join(REPOS_DIR, f"{name}.env"), SHARED_ENV):
@@ -962,12 +957,6 @@ def cmd_status(args) -> int:
 
 
 # ── dashboard ────────────────────────────────────────────────────────────────
-def dashboard_build_command(harness_root: str | None = None) -> str:
-    """Kept for the pre-8b dashboard server's error page; removed with it."""
-    root = shlex.quote(harness_root or HARNESS_ROOT)
-    return f"cd {root} && uv sync --extra sdk --extra dash && make dashboard-ui"
-
-
 def cmd_dashboard(args) -> int:
     """The dashboard is a separate component the core never imports: replace
     this process with its module entry."""

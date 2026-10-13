@@ -31,12 +31,6 @@ class CIState(str, Enum):
     UNKNOWN = "unknown"  # the checks read FAILED this tick — not an answer (#48)
 
 
-class ReviewDecision(str, Enum):
-    APPROVE = "APPROVE"
-    REQUEST_CHANGES = "REQUEST_CHANGES"
-    ESCALATE = "ESCALATE"
-
-
 # GitHub review states (as returned by the reviews API / pr view).
 REVIEW_APPROVED = "APPROVED"
 REVIEW_CHANGES_REQUESTED = "CHANGES_REQUESTED"
@@ -205,7 +199,6 @@ class WorldState:
 # Convenience re-export so callers can `from .world import replace`.
 __all__ = [
     "CIState",
-    "ReviewDecision",
     "REVIEW_APPROVED",
     "REVIEW_CHANGES_REQUESTED",
     "Check",

@@ -35,3 +35,22 @@ class Journal:
                 stream.write(line + "\n")
         except Exception as exc:  # telemetry fixtures preserve fail-soft behavior
             sys.stderr.write(f"journal: dropped {event!r} event ({exc})\n")
+
+
+def read_events(path: str) -> list[dict]:
+    """Every parseable JSON object line in `path`, oldest first; a missing
+    file is empty and a torn or garbled line is skipped."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        try:
+            obj = json.loads(line) if line.strip() else None
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    return events

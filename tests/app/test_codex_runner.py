@@ -36,7 +36,8 @@ from issue_agent.domain.outcome import (
     resumable_session,
 )
 from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.journal import JournalingRuntime, read_events
+from issue_agent.adapters.journal import JournalingRuntime
+from tests.fakes.legacy_journal import read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import FIX_SCHEMA
