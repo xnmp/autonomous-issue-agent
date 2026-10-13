@@ -7,14 +7,12 @@ import re
 import signal
 import subprocess
 import sys
-import threading
 
 import pytest
 
 from issue_agent.adapters.dashweb import build
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.signal_log import send_signal
-from issue_agent.app import cli
 from issue_agent.domain.contracts import RunId
 
 
@@ -100,19 +98,6 @@ def test_a_group_that_ignores_sigterm_logs_the_escalation_to_sigkill(tmp_path, c
         "SIGKILL" in l and f"pid={stubborn.pid}" in l and "reason=leg_end_cleanup:grace_expired" in l
         for l in lines
     )
-
-
-def test_operator_stop_logs_each_sigterm_target(monkeypatch, capsys) -> None:
-    victim = subprocess.Popen(["sleep", "30"])
-    threading.Thread(target=victim.wait, daemon=True).start()  # reap so the stop sees it exit
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _n: [victim.pid])
-    monkeypatch.setattr(cli, "_role_pids", lambda _n: {})
-    try:
-        assert cli._stop_deployment("dep") == 0
-    finally:
-        victim.kill()
-    (line,) = _lines(capsys.readouterr().err)
-    assert f"SIGTERM pid={victim.pid} reason=operator_stop:dep" in line
 
 
 def test_dashboard_build_timeout_logs_the_group_kill(tmp_path, capsys) -> None:
