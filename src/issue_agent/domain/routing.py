@@ -4,7 +4,8 @@ TRIAGE grades each admitted issue once; every routed fix act (RESOLVE, FIX_CI,
 ADDRESS_REVIEW, REBASE) runs on its tier's configured `runtime:model`. The
 k-th attempt of an act runs one rung stronger per earlier attempt in its
 attempt run (the run derive already counts), capped at XHIGH: escalation is
-derived, never stored. REVIEW is a quality guardrail and is never routed.
+derived, never stored. REVIEW runs at the tier of the fix leg that produced
+the head it reviews (owner, 2026-10-13: the reviewer matches the fixer).
 """
 
 from __future__ import annotations
