@@ -16,6 +16,7 @@ alive line plus the suspend-stall warning when wall-clock elapsed far exceeds
 the interval). The wait ends early when an injected `wait_for_change` reports
 one (a leg of the repository ending in either role, read from the control
 store); the poll interval stays the ceiling that picks up GitHub-side events.
+A tick that changed GitHub waits only the re-tick gap, to act on its result.
 The clock, sleep and wait are injected so the loop is testable without real
 time; with a `wait_for_change` it owns the whole interval and `sleep` serves
 only the back-off after GitHub refused a tick.
@@ -42,7 +43,7 @@ from zoneinfo import ZoneInfo
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
 from ..adapters.atomic_file import atomic_write
 from ..adapters.control_path import control_store_path
-from ..adapters.control_store import ControlStoreError, LegRun, SQLiteControlStore
+from ..adapters.control_store import WAKE_MIN_GAP_SECONDS, ControlStoreError, LegRun, SQLiteControlStore
 from ..adapters.github import GhUnavailable
 from ..adapters.journal import Journal, JournalingRuntime
 from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
@@ -228,6 +229,12 @@ class ActionExecutor(Protocol):
 
 
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
+# Requeue after mutation (controller-runtime): a tick that changed GitHub (a
+# comment, label, merge, PR) observes its own result after the store wake's
+# gap, not a full poll: the next act in the lifecycle (RESOLVE after the
+# triage comment) is waiting on it (#1096: 83 s from comment to dispatch).
+_RETICK_SECONDS = int(WAKE_MIN_GAP_SECONDS)
+RETICK = "re-tick after a GitHub change"
 DEFAULT_RESERVATION_SWEEP_POLLS = 30
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
 _SHUTDOWN_PREPARE_RESERVE_SECONDS = 2.0
@@ -519,7 +526,8 @@ class Daemon:
         self._wake_recovery_pending = False
 
     def tick(self, scheduler_progress: Callable[[], None] | None = None) -> list[Action]:
-        """One observe→decide→execute pass; returns the actions taken. Never
+        """One observe→decide→execute pass; returns the actions taken (a failed
+        GitHub write is not taken). Never
         raises: a failed pass logs and yields []. GitHub being unavailable is
         an operating condition, not a bug: nothing is decided, one loud line,
         and the next poll is the retry (spaced by any Retry-After)."""
@@ -545,13 +553,17 @@ class Daemon:
         for action in order_for_execution(actions):
             try:
                 if not isinstance(action, RunAgent):
-                    taken.append(action)
                     self.executor.execute(action)
+                    taken.append(action)
                 elif self._submit_dispatch(action):
                     taken.append(action)
                 else:
                     self.log(f"{self.name}: dispatch {action.kind.name} #{action.number} not submitted — slot "
                              "full, duplicate target, or recovery/reload draining")
+            except GhUnavailable as exc:
+                # A refused write backs off like a refused read: no re-tick, no early wake.
+                self._retry_after_seconds = exc.retry_after_s or 0.0
+                self.log(f"{self.name}: action {action!r} failed: {exc}")
             except Exception as exc:  # noqa: BLE001 - one bad action ≠ dead daemon
                 self.log(f"{self.name}: action {action!r} failed: {exc}")
             finally:
@@ -575,6 +587,7 @@ class Daemon:
         self._transition(DaemonState.RUNNING)
         last, last_active = now(), active_now()
         last_logged, last_swept, ticks, reload_pending = last, last_active, 0, False
+        retick = False
         try:
             while max_ticks is None or ticks < max_ticks:
                 cur, cur_active = now(), active_now()
@@ -594,7 +607,12 @@ class Daemon:
                 elif cur - last_logged >= heartbeat_seconds:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
                     last_logged = cur
-                self.tick(scheduler_progress)
+                # A tick after a re-tick gap never re-ticks, however that gap
+                # ended (a store wake too): a mutation every tick repeats (an
+                # idempotent re-post, a merge GitHub has not taken yet) costs
+                # at most one extra observe per interval, never a loop.
+                taken = self.tick(scheduler_progress)
+                retick = not retick and any(not isinstance(action, RunAgent) for action in taken)
                 self._write_heartbeat()
                 if scheduler_progress is not None:
                     scheduler_progress()
@@ -619,7 +637,8 @@ class Daemon:
 
                     self.log(f"{self.name}: hot-reload — harness source changed; restarting with no session in flight")
                     raise SystemExit(RELOAD_EXIT_CODE)
-                if reason := self._sleep_interval(sleep, scheduler_progress):
+                reason = self._sleep_interval(sleep, scheduler_progress, retick=retick)
+                if reason:
                     self.log(f"{self.name}: woke: {reason}")
             self._transition(DaemonState.DRAINING, "loop completed")
             clean = self.shutdown_dispatches(cancel=False)
@@ -641,29 +660,32 @@ class Daemon:
                 raise SystemExit(ExitCode.TRANSIENT) from exc
             raise
 
-    def _sleep_interval(self, sleep: Callable[[int], None],
-                        scheduler_progress: Callable[[], None] | None = None) -> str | None:
-        """One poll interval, the timed sleep sliced to keep a systemd watchdog
-        fed when a notifier is present; returns the reason when
-        `wait_for_change` ended it early.
-        After GitHub refused a tick the interval is never woken early: a wake
-        must not turn its back-off into another request."""
-        interval = max(self.poll_seconds, int(self._retry_after_seconds or 0))
+    def _sleep_interval(self, sleep: Callable[[int], None], scheduler_progress: Callable[[], None] | None = None,
+                        *, retick: bool = False) -> str | None:
+        """One poll interval, or the re-tick gap after a tick changed GitHub,
+        the timed sleep sliced to keep a systemd watchdog fed when a notifier
+        is present; returns why it ended early (`RETICK`, or the reason
+        `wait_for_change` gave). After GitHub refused a tick the interval is
+        never cut short: neither may turn its back-off into another request."""
+        retick = retick and self._retry_after_seconds is None
+        interval = (min(_RETICK_SECONDS, self.poll_seconds) if retick
+                    else max(self.poll_seconds, int(self._retry_after_seconds or 0)))
         wake = None if self._retry_after_seconds is not None else self.wait_for_change
         self._retry_after_seconds = None
+        reason = None
         if wake is not None:
             reason = wake(interval)
             if scheduler_progress is not None:
                 scheduler_progress()
-            return reason
-        remaining = interval
-        while remaining > 0:
-            step = remaining if scheduler_progress is None else min(30, remaining)
-            sleep(step)
-            remaining -= step
-            if scheduler_progress is not None:
-                scheduler_progress()
-        return None
+        else:
+            remaining = interval
+            while remaining > 0:
+                step = remaining if scheduler_progress is None else min(30, remaining)
+                sleep(step)
+                remaining -= step
+                if scheduler_progress is not None:
+                    scheduler_progress()
+        return reason or (RETICK if retick else None)
 
 
 async def run_leg(
