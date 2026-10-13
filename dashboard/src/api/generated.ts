@@ -522,6 +522,8 @@ export interface components {
              * @default []
              */
             labels: string[];
+            /** Observed At */
+            observed_at?: string | null;
             /** Pull Requests */
             pull_requests: components["schemas"]["PullRequestLink"][];
             rail?: components["schemas"]["StageRail"] | null;
@@ -718,6 +720,8 @@ export interface components {
              * @default []
              */
             needs_attention: components["schemas"]["AttentionItem"][];
+            /** Observed At */
+            observed_at?: string | null;
             /**
              * Spend Per Hour
              * @default []

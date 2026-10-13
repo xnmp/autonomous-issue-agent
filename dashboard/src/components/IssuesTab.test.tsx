@@ -113,7 +113,12 @@ describe("IssuesTab", () => {
 
   it("says while the first GitHub observation is still being read", () => {
     render(<IssuesTab repo="demo" sub="inflight" issues={polled({ observed_at: null })} onOpenIssue={vi.fn()} />);
-    expect(screen.getByText("Reading GitHub…")).toBeVisible();
+    expect(screen.getAllByText("Reading GitHub…").length).toBe(1);
+  });
+
+  it("does not say it once the observation has landed", () => {
+    render(<IssuesTab repo="demo" sub="inflight" issues={polled({})} onOpenIssue={vi.fn()} />);
+    expect(screen.queryByText("Reading GitHub…")).toBeNull();
   });
 
   it("expands formatted backlog context and keeps noisy columns disabled by default", async () => {

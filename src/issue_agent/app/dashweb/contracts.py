@@ -19,6 +19,12 @@ class Warned(Contract):
     warnings: list[str]
 
 
+class Observed(Warned):
+    # When the GitHub observation the page derives from was taken; None
+    # while the first one is still being read.
+    observed_at: str | None = None
+
+
 class Dispatch(Contract):
     kind: str
     number: int
@@ -192,7 +198,7 @@ class AttentionItem(Contract):
     detail: str | None = None
 
 
-class OverviewPayload(Warned):
+class OverviewPayload(Observed):
     metrics: Metrics | None
     caps: Caps | None
     health: list[RoleHealth]
@@ -334,14 +340,11 @@ class ToastNotification(Contract):
     pr: int | None = None
 
 
-class IssuesPayload(Warned):
+class IssuesPayload(Observed):
     in_flight: list[IssueCard]
     done: list[DoneCard]
     backlog: list[BacklogCard]
     gh_ok: bool
-    # When the GitHub observation the board derives from was taken; None
-    # while the first one is still being read.
-    observed_at: str | None = None
     notifications: list[ToastNotification] = []
     # Why the control store could not be read; no board is derived then.
     store_error: str | None = None
@@ -412,7 +415,7 @@ class PullRequestLink(Contract):
     ci_state: CiState | None = None
 
 
-class IssueDetailPayload(Warned):
+class IssueDetailPayload(Observed):
     issue: int
     title: str | None
     url: str | None

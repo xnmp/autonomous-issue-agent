@@ -612,3 +612,19 @@ def test_triage_is_the_first_stage_and_the_issue_page_shows_its_tier_criteria_an
                                 "duplicate_reason": "Same dialog", "rationale": "One handler."}
     assert [(s["kind"], s["tier"]) for s in detail["steps"]] == [("TRIAGE", "low")]
     assert [visit["stage"] for visit in detail["history"]] == ["triage"]
+
+
+def test_loading_the_first_observation_is_not_a_warning(deployment):
+    """The dashboard says "Reading GitHub…" from a null `observed_at`; a warning
+    chip for the same state double-reported loading as a fault."""
+    backend, *_ = deployment
+
+    class Pending:
+        def submit(self, fn, *args):
+            return Future()  # never resolves: the first observation has not landed
+
+    backend._observations = type(backend._observations)(ttl_s=60, executor=Pending())
+
+    pages = [backend.issues("demo"), backend.issue("demo", 5), backend.overview("demo")]
+
+    assert [(p["observed_at"], p["warnings"]) for p in pages] == [(None, [])] * 3

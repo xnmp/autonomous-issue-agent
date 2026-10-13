@@ -36,6 +36,17 @@ afterEach(() => {
 });
 
 describe("IssueTab", () => {
+  it("says once while the first GitHub observation is still being read, and not after", async () => {
+    serve(detail({ observed_at: null }));
+    const first = render(<IssueTab repo="demo" issue={50} />);
+    expect(await screen.findAllByText("Reading GitHub…")).toHaveLength(1);
+    first.unmount();
+    serve(detail({ observed_at: "2026-08-01T08:00:00Z" }));
+    render(<IssueTab repo="demo" issue={50} />);
+    await screen.findByText("An issue");
+    expect(screen.queryByText("Reading GitHub…")).toBeNull();
+  });
+
   it("shows CI activity on the open PR beside the issue's status", async () => {
     serve(detail({
       board: { status: "working", activity: "ci", act: null, headline: "CI running", reason: "Checks are running on the PR head.", since_ts: null },
