@@ -970,8 +970,9 @@ def dashboard_build_command(harness_root: str | None = None) -> str:
 
 def cmd_dashboard(args) -> int:
     """The dashboard is a separate component the core never imports: replace
-    this process with its module entry, passing the arguments through."""
-    argv = [sys.executable, "-m", "issue_agent.app.dashweb.main", *args.dashboard_args]
+    this process with its module entry."""
+    port = ["--port", str(args.port)] if args.port is not None else []
+    argv = [sys.executable, "-m", "issue_agent.app.dashweb.main", *port]
     os.execv(sys.executable, argv)
     return 0  # unreachable: execv replaces the process or raises
 
@@ -1152,8 +1153,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = command("dashboard", cmd_dashboard, "serve the operator dashboard (python -m issue_agent.app.dashweb.main)",
                  context=False)
-    sp.add_argument("dashboard_args", nargs=argparse.REMAINDER,
-                    help="passed through: [names...] [--port PORT] [--text] [--html PATH]")
+    sp.add_argument("--port", type=int, default=None, help="loopback port (default: the dashboard's own)")
 
     command("doctor", cmd_doctor, "preflight checks (tooling, identities, repo access)")
     sp = command("ready", cmd_ready, "label issue(s) ai-ready (trigger the fixer)", context=False)
@@ -1175,10 +1175,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    argv = list(argv if argv is not None else sys.argv[1:])
-    if argv[:1] == ["dashboard"]:  # every flag after it is the dashboard's own
-        raise SystemExit(cmd_dashboard(argparse.Namespace(dashboard_args=argv[1:])))
-    args = build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv if argv is not None else sys.argv[1:])
     try:
         raise SystemExit(args.func(args))
     except KeyboardInterrupt:

@@ -35,13 +35,19 @@ def test_overlay_reviewer_runtime_overrides_and_scrubs_ambient_value(tmp_path, m
 
 
 # ── parse_remote_url ──────────────────────────────────────────────────────────
-@pytest.mark.parametrize("args", [[], ["acme", "--port", "9000"], ["--port", "9000", "--text"], ["--html", "x.html"]])
-def test_dashboard_replaces_itself_with_the_dashboard_module_and_passes_every_flag(monkeypatch, args):
+@pytest.mark.parametrize("args,passed", [([], []), (["--port", "9000"], ["--port", "9000"])])
+def test_dashboard_replaces_itself_with_the_dashboard_module(monkeypatch, args, passed):
     calls = []
     monkeypatch.setattr(cli.os, "execv", lambda path, argv: calls.append((path, argv)))
     with pytest.raises(SystemExit):
         cli.main(["dashboard", *args])
-    assert calls == [(sys.executable, [sys.executable, "-m", "issue_agent.app.dashweb.main", *args])]
+    assert calls == [(sys.executable, [sys.executable, "-m", "issue_agent.app.dashweb.main", *passed])]
+
+
+@pytest.mark.parametrize("mode", [["--text"], ["--html", "x.html"], ["--legacy"], ["acme"]])
+def test_dashboard_render_modes_are_gone(mode):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["dashboard", *mode])
 
 
 def test_parse_remote_url_ssh():

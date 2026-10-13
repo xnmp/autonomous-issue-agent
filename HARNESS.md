@@ -278,9 +278,7 @@ from the SQLite `legs` table plus GitHub.
 ## Dashboard
 
 ```bash
-issue-agent dashboard                 # interactive server
-issue-agent dashboard --text
-issue-agent dashboard --html
+issue-agent dashboard [--port PORT]   # = python -m issue_agent.app.dashweb.main
 ```
 
 The Linux service installer keeps the interactive server running as the

@@ -920,15 +920,16 @@ def spend_reconciler(cfg: HarnessConfig, control: SQLiteControlStore) -> CodexSp
     return CodexSpendReconciler(control, tuple(spend_evidence_dir(path) for path in dirs))
 
 
-def headroom(cfg: HarnessConfig, control, leg_usd: float) -> Callable[[], bool]:
-    """Daily repository/global headroom for one more leg, over the authority
+def headroom(cfg: HarnessConfig, control, budget_usd: float) -> Callable[[], bool]:
+    """Daily repository/global headroom for one more leg of `budget_usd`
+    (public: the dashboard derives with it too), over the authority
     reservation uses. A cap below one leg makes paid work wait here instead of
     being refused at admission (decision #7); an unreadable ledger is no
     headroom: free work goes on, paid work waits (Q7)."""
     caps = tuple((repository, dimension, Money.from_major("USD", cap)) for repository, dimension, cap in (
         (cfg.repo, "repository", cfg.daily_spend_cap_usd), ("*", "global", cfg.global_daily_spend_cap_usd))
         if cap > 0)
-    leg = Money.from_major("USD", leg_usd)
+    leg = Money.from_major("USD", budget_usd)
 
     def fits() -> bool:
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
