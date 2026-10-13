@@ -1,6 +1,5 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
-
 import asyncio
 import json
 import re
@@ -32,15 +31,26 @@ _KILL_WINDOW = 7
 
 def _daemon(decide, observe=None, logs=None):
     gw = FakeGateway()
-    d = Daemon(name="fix", observe=observe or (lambda: WorldState()), decide=decide, executor=Executor(gw),
-               poll_seconds=60, log=(logs.append if logs is not None else (lambda m: None)))
+    d = Daemon(
+        name="fix",
+        observe=observe or (lambda: WorldState()),
+        decide=decide,
+        executor=Executor(gw),
+        poll_seconds=60,
+        log=(logs.append if logs is not None else (lambda m: None)),
+    )
     return d, gw
 
 
 def _paid(run_agent, name="fix", kind=AgentKind.RESOLVE, **daemon) -> Daemon:
     """A daemon whose every tick decides one paid leg on item 7."""
-    return Daemon(name, lambda: WorldState(), lambda _world: [RunAgent(kind, 7)],
-                  Executor(FakeGateway(), run_agent=run_agent), **{"poll_seconds": 1, "dispatch_capacity": 1, **daemon})
+    return Daemon(
+        name,
+        lambda: WorldState(),
+        lambda _world: [RunAgent(kind, 7)],
+        Executor(FakeGateway(), run_agent=run_agent),
+        **{"poll_seconds": 1, "dispatch_capacity": 1, **daemon},
+    )
 
 
 def _interrupt(_seconds):
@@ -49,10 +59,12 @@ def _interrupt(_seconds):
 
 def test_tick_isolated_from_decide_crash():
     logs = []
+
     def boom(world):
         raise RuntimeError("decide blew up")
+
     d, gw = _daemon(boom, logs=logs)
-    assert d.tick() == []                # swallowed
+    assert d.tick() == []  # swallowed
     assert any("poll pass failed" in m for m in logs)
     assert gw.calls == []
 
@@ -77,15 +89,23 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
             executed.append(("comment", number))
 
     ex = Executor(OrderGateway(), run_agent=lambda a: executed.append(("run", a.number)))
-    d = Daemon("fix", lambda: WorldState(), lambda w: [
-        Relabel(Target.ISSUE, 500, Label.NEEDS_HUMAN, Label.AI_READY), RunAgent(AgentKind.RESOLVE, 500),
-        PostComment(Target.PR, 537, "done"), RunAgent(AgentKind.REBASE, 534),
-    ], ex, dispatch_capacity=2)
+    d = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda w: [
+            Relabel(Target.ISSUE, 500, Label.NEEDS_HUMAN, Label.AI_READY),
+            RunAgent(AgentKind.RESOLVE, 500),
+            PostComment(Target.PR, 537, "done"),
+            RunAgent(AgentKind.REBASE, 534),
+        ],
+        ex,
+        dispatch_capacity=2,
+    )
     taken = d.tick()
     d.wait_for_dispatches()
     assert executed[:2] == [
-        ("relabel", 500),      # the dispatch's own label move still precedes it
-        ("comment", 537),      # finished work lands before any session starts
+        ("relabel", 500),  # the dispatch's own label move still precedes it
+        ("comment", 537),  # finished work lands before any session starts
     ]
     assert sorted(executed[2:]) == [("run", 500), ("run", 534)]
     # Dispatch order among dispatches is preserved at submission.
@@ -104,8 +124,13 @@ def test_background_dispatch_is_bounded_and_admits_independent_targets():
             started_two.set()
         assert release.wait(timeout=5)
 
-    daemon = Daemon("fix", lambda: WorldState(), lambda _world: [RunAgent(AgentKind.RESOLVE, next(next_issue))],
-                    Executor(FakeGateway(), run_agent=run_agent), dispatch_capacity=2)
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, next(next_issue))],
+        Executor(FakeGateway(), run_agent=run_agent),
+        dispatch_capacity=2,
+    )
 
     daemon.tick()
     daemon.tick()
@@ -143,10 +168,15 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
             assert finished.wait(timeout=1)
 
     daemon = Daemon(
-        "fix", lambda: observations.append(len(observations) + 1) or WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)] + (
-            [PostComment(Target.PR, 100, "rerun")] if len(observations) == 2 else []),
-        Executor(gateway, run_agent=run_agent), poll_seconds=1, dispatch_capacity=1,
+        "fix",
+        lambda: observations.append(len(observations) + 1) or WorldState(),
+        lambda _world: (
+            [RunAgent(AgentKind.RESOLVE, 7)]
+            + ([PostComment(Target.PR, 100, "rerun")] if len(observations) == 2 else [])
+        ),
+        Executor(gateway, run_agent=run_agent),
+        poll_seconds=1,
+        dispatch_capacity=1,
     )
 
     with pytest.raises(SystemExit) as stopped:
@@ -176,8 +206,9 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
         terminalized.set()
 
     runtime = CancellableAsyncDispatch(dispatch)
-    daemon = _paid(runtime, prepare_shutdown=prepared.set, cancel_active_dispatches=runtime.cancel_all,
-                   terminalize=terminalize)
+    daemon = _paid(
+        runtime, prepare_shutdown=prepared.set, cancel_active_dispatches=runtime.cancel_all, terminalize=terminalize
+    )
 
     def interrupt(_seconds):
         assert started.wait(timeout=1)
@@ -207,8 +238,15 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted
         forced.append(True)
         clock.advance(_KILL_WINDOW)
 
-    daemon = _paid(run_agent, "review", AgentKind.REVIEW, shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT, monotonic=clock,
-                   cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW), force_kill_dispatches=kill)
+    daemon = _paid(
+        run_agent,
+        "review",
+        AgentKind.REVIEW,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
+        force_kill_dispatches=kill,
+    )
 
     def before_shutdown(_seconds):
         assert started.wait(timeout=1)
@@ -250,9 +288,14 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
         assert worker_accounted.is_set()
         order.append("terminalize")
 
-    daemon = _paid(run_agent, shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT, monotonic=clock,
-                   cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW), force_kill_dispatches=kill,
-                   terminalize=terminalize)
+    daemon = _paid(
+        run_agent,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
+        force_kill_dispatches=kill,
+        terminalize=terminalize,
+    )
 
     with pytest.raises(KeyboardInterrupt):
         daemon.run_forever(sleep=_interrupt, now=lambda: 0, max_ticks=1)
@@ -278,10 +321,15 @@ def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
         # and the worker has not settled yet.
         clock.set(_SHUTDOWN_TIMEOUT - 3)
 
-    daemon = _paid(run_agent, poll_seconds=60, shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT, monotonic=clock,
-                   cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
-                   force_kill_dispatches=kill_without_worker_settling_in_window,
-                   terminalize=lambda: terminalized.append("terminalized"))
+    daemon = _paid(
+        run_agent,
+        poll_seconds=60,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        cancel_active_dispatches=lambda: clock.advance(_GRACEFUL_WINDOW),
+        force_kill_dispatches=kill_without_worker_settling_in_window,
+        terminalize=lambda: terminalized.append("terminalized"),
+    )
     daemon.tick()
     assert started.wait(timeout=1)
 
@@ -338,17 +386,20 @@ def test_tick_skips_the_pass_when_github_is_unavailable():
     decide, NO execute — not a pass over an empty world. Asserted on the observable
     outcome (zero side-effects on the gateway), not on how tick branches."""
     logs = []
+
     def rate_limited():
         raise GhUnavailable("rate-limit", "HTTP 403: API rate limit exceeded for user 42")
+
     decided = []
+
     def decide(world):
         decided.append(world)
         return [Relabel(Target.ISSUE, 5, Label.NEEDS_HUMAN, Label.AI_READY)]
 
     d, gw = _daemon(decide, observe=rate_limited, logs=logs)
     assert d.tick() == []
-    assert decided == []          # never asked the domain about a world we can't see
-    assert gw.calls == []         # and never touched the repo
+    assert decided == []  # never asked the domain about a world we can't see
+    assert gw.calls == []  # and never touched the repo
 
 
 def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
@@ -356,12 +407,18 @@ def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
     mid-execute. The executor's per-action isolation must absorb it: the action is
     logged as failed and the daemon keeps polling."""
     logs = []
+
     class ThrottledGateway:
         def relabel(self, *a):
             raise GhUnavailable("rate-limit", "HTTP 429: Too Many Requests")
-    d = Daemon("fix", lambda: WorldState(),
-               lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, None)],
-               Executor(ThrottledGateway()), log=logs.append)
+
+    d = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, None)],
+        Executor(ThrottledGateway()),
+        log=logs.append,
+    )
     d.tick()  # must not raise
     assert any("action" in m and "failed" in m and "rate-limited" in m for m in logs)
 
@@ -386,8 +443,9 @@ def test_scheduler_progress_covers_tick_and_quiet_wait():
         return WorldState()
 
     d, _ = _daemon(lambda _world: [], observe=observe)
-    d.run_forever(sleep=lambda _seconds: None, now=lambda: 0, max_ticks=1,
-                  scheduler_progress=lambda: progress.append("completed"))
+    d.run_forever(
+        sleep=lambda _seconds: None, now=lambda: 0, max_ticks=1, scheduler_progress=lambda: progress.append("completed")
+    )
 
     assert progress == ["completed"] * 5
 
@@ -442,8 +500,15 @@ def test_suspend_recovery_waits_for_active_dispatch_owner():
             assert settled.wait(timeout=1)
             daemon.wait_for_dispatches()
 
-    daemon = Daemon("fix", lambda: WorldState(), decide, Executor(FakeGateway(), run_agent=run_agent),
-                    poll_seconds=60, dispatch_capacity=1, log=log)
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        decide,
+        Executor(FakeGateway(), run_agent=run_agent),
+        poll_seconds=60,
+        dispatch_capacity=1,
+        log=log,
+    )
 
     def reconcile(trigger):
         assert daemon.active_dispatches == ()
@@ -452,8 +517,9 @@ def test_suspend_recovery_waits_for_active_dispatch_owner():
     daemon.reconcile = reconcile
     wall_times = iter([0, 0, 240, 300])
     active_times = iter([0, 0, 60, 120])
-    daemon.run_forever(sleep=lambda _seconds: None, now=lambda: next(wall_times),
-                       active_now=lambda: next(active_times), max_ticks=3)
+    daemon.run_forever(
+        sleep=lambda _seconds: None, now=lambda: next(wall_times), active_now=lambda: next(active_times), max_ticks=3
+    )
 
     assert started.is_set()
     assert started_actions == [7]
@@ -479,8 +545,14 @@ def test_a_second_dispatch_for_a_running_target_is_not_submitted():
         started.append(action.number)
         assert release.wait(timeout=5)
 
-    d = Daemon("fix", lambda: WorldState(), lambda _w: [RunAgent(AgentKind.RESOLVE, 7)] * 2,
-               Executor(FakeGateway(), run_agent=run_agent), poll_seconds=1, dispatch_capacity=2)
+    d = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _w: [RunAgent(AgentKind.RESOLVE, 7)] * 2,
+        Executor(FakeGateway(), run_agent=run_agent),
+        poll_seconds=1,
+        dispatch_capacity=2,
+    )
     try:
         assert d.tick() == [RunAgent(AgentKind.RESOLVE, 7)]
     finally:
@@ -491,8 +563,15 @@ def test_a_second_dispatch_for_a_running_target_is_not_submitted():
 
 def test_reservation_sweep_runs_on_bounded_tick_cadence():
     sweeps = []
-    daemon = Daemon("fix", lambda: WorldState(), lambda _world: [], Executor(FakeGateway()), poll_seconds=1,
-                    reconcile=sweeps.append, reservation_sweep_ticks=2)
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway()),
+        poll_seconds=1,
+        reconcile=sweeps.append,
+        reservation_sweep_ticks=2,
+    )
 
     daemon.run_forever(sleep=lambda _seconds: None, now=lambda: 0, max_ticks=2)
 

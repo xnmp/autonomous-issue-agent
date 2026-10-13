@@ -35,8 +35,17 @@ class Gateway:
 def _act(tmp_path, gateway) -> GitHubAct:
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    return GitHubAct(gateway, store, repository="o/r", base_branch="dev", merge_method="squash", marker="m",
-                     dispatch=lambda _a: None, remove_worktree=lambda _i: None, log=lambda _m: None)
+    return GitHubAct(
+        gateway,
+        store,
+        repository="o/r",
+        base_branch="dev",
+        merge_method="squash",
+        marker="m",
+        dispatch=lambda _a: None,
+        remove_worktree=lambda _i: None,
+        log=lambda _m: None,
+    )
 
 
 def test_a_keyed_comment_lands_once_across_a_lost_reply_and_later_replays(tmp_path):

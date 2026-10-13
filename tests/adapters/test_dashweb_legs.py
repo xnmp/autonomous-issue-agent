@@ -11,11 +11,13 @@ from issue_agent.adapters.control_store import ControlStoreError, SQLiteControlS
 from issue_agent.adapters.dashweb.readonly_store import ReadOnlyControlStore
 from issue_agent.adapters.dashweb import legs as legs_module
 
-_INSERT = ("INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
-           "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
-           "provider_receipt_id, settled_at, leg_class, session_id, usage_json, result_json) VALUES "
-           "(?, ?, 'review', 'REVIEW', 7, 70, 'h', 'o/r:review', 'codex', 'ended', ?, ?, ?, 'USD', 5000000, ?, "
-           "'estimate', 'normal_return', ?, ?, 'agent', 'sess', ?, ?)")
+_INSERT = (
+    "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, runtime, state, "
+    "reserved_at, started_at, ended_at, currency, reserved_micros, charged_micros, basis, origin, "
+    "provider_receipt_id, settled_at, leg_class, session_id, usage_json, result_json) VALUES "
+    "(?, ?, 'review', 'REVIEW', 7, 70, 'h', 'o/r:review', 'codex', 'ended', ?, ?, ?, 'USD', 5000000, ?, "
+    "'estimate', 'normal_return', ?, ?, 'agent', 'sess', ?, ?)"
+)
 
 
 @pytest.fixture
@@ -32,15 +34,33 @@ def read_legs(path, repository=None):
 
 def _add(path, leg_id, repository="o/r", reserved="2026-10-13T08:00:00.000Z", usage=None, result=None):
     db = sqlite3.connect(path)
-    db.execute(_INSERT, (leg_id, repository, reserved, reserved, "2026-10-13T08:05:00.000Z", 1_250_000,
-                         f"r-{leg_id}", "2026-10-13T08:05:00.000Z", usage, result))
+    db.execute(
+        _INSERT,
+        (
+            leg_id,
+            repository,
+            reserved,
+            reserved,
+            "2026-10-13T08:05:00.000Z",
+            1_250_000,
+            f"r-{leg_id}",
+            "2026-10-13T08:05:00.000Z",
+            usage,
+            result,
+        ),
+    )
     db.commit()
     db.close()
 
 
 def test_a_settled_review_leg_reads_with_its_money_tokens_and_verdict(store):
-    usage = {"input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 2, "cache_write_tokens": 1,
-             "source": "provider"}
+    usage = {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_tokens": 2,
+        "cache_write_tokens": 1,
+        "source": "provider",
+    }
     result = {"summary": "looks fine", "verdict": {"event": "request_changes", "body": "fix the test"}}
     _add(store, "a", usage=json.dumps(usage), result=json.dumps(result))
 
@@ -60,9 +80,10 @@ def test_other_repositories_are_filtered_and_order_is_by_reservation(store):
     assert len(read_legs(str(store))) == 3
 
 
-@pytest.mark.parametrize("usage,result", [
-    ("not json", "not json"), (json.dumps([1, 2]), json.dumps("text")), (json.dumps({"input_tokens": "9"}), None),
-])
+@pytest.mark.parametrize(
+    "usage,result",
+    [("not json", "not json"), (json.dumps([1, 2]), json.dumps("text")), (json.dumps({"input_tokens": "9"}), None)],
+)
 def test_malformed_receipts_degrade_to_absent_fields(store, usage, result):
     _add(store, "a", usage=usage, result=result)
     (leg,) = read_legs(str(store), "o/r")

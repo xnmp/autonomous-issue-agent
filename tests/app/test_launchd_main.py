@@ -18,9 +18,7 @@ def test_launchd_maps_permanent_failures_to_success(code):
     run(lambda: (_ for _ in ()).throw(SystemExit(code)))
 
 
-@pytest.mark.parametrize(
-    "code", (ExitCode.TRANSIENT, ExitCode.RELOAD)
-)
+@pytest.mark.parametrize("code", (ExitCode.TRANSIENT, ExitCode.RELOAD))
 def test_launchd_preserves_restartable_failures(code):
     with pytest.raises(SystemExit) as stopped:
         run(lambda: (_ for _ in ()).throw(SystemExit(code)))

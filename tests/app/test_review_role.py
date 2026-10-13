@@ -24,7 +24,17 @@ from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import PullRequestDiff, Review
 from tests.app.test_fix_role import (
-    FIX_BOT, REVIEW_BOT, Agent, FakeGitHub, FakeWorktrees, _now, died, dispatched, open_pr, ready, tick,
+    FIX_BOT,
+    REVIEW_BOT,
+    Agent,
+    FakeGitHub,
+    FakeWorktrees,
+    _now,
+    died,
+    dispatched,
+    open_pr,
+    ready,
+    tick,
 )
 from tests.app.test_fix_role import later  # noqa: F401 — the shared backoff-clock fixture
 
@@ -48,8 +58,10 @@ class ReviewGitHub(FakeGitHub):
         return PullRequestDiff(base_oid, head_oid, self.diff)
 
     def reviewed_on(self, pr: int, head: str, login: str) -> bool:
-        return any(r.author == login and r.commit_id == head and r.state in ("APPROVED", "CHANGES_REQUESTED")
-                   for r in self.prs[pr].reviews)
+        return any(
+            r.author == login and r.commit_id == head and r.state in ("APPROVED", "CHANGES_REQUESTED")
+            for r in self.prs[pr].reviews
+        )
 
     def submit_review(self, pr: int, event: str, body: str, head: str) -> bool:
         if self.fail_submit:
@@ -63,8 +75,9 @@ class ReviewGitHub(FakeGitHub):
             self.submitted.append((pr, event, body, head))
             state = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[event]
             p = self.prs[pr]
-            self.prs[pr] = replace(p, reviews=(*p.reviews, Review(state, REVIEW_BOT, submitted_at=_now(),
-                                                                  body=body, commit_id=head)))
+            self.prs[pr] = replace(
+                p, reviews=(*p.reviews, Review(state, REVIEW_BOT, submitted_at=_now(), body=body, commit_id=head))
+            )
         self._lossy("submit_review")
         return True
 
@@ -85,8 +98,7 @@ class FakeCheckouts:
 
 
 def verdict(event: str, body: str = "Looks right."):
-    return lambda _task: AgentResult(False, structured={"decision": event, "body": body}, cost_usd=0.2,
-                                     session_id="r1")
+    return lambda _task: AgentResult(False, structured={"decision": event, "body": body}, cost_usd=0.2, session_id="r1")
 
 
 def garbled(_task):
@@ -97,11 +109,18 @@ def garbled(_task):
 def roles(tmp_path):
     def cfg(**env):
         return replace(
-            from_env({
-                "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEW_BOT": REVIEW_BOT, "BASE_BRANCH": "dev",
-                "STATE_DIR": str(tmp_path / "state"), "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
-                "REVIEWER_RUNTIME": "claude", **env,
-            }),
+            from_env(
+                {
+                    "REPO": "o/r",
+                    "FIX_BOT": FIX_BOT,
+                    "REVIEW_BOT": REVIEW_BOT,
+                    "BASE_BRANCH": "dev",
+                    "STATE_DIR": str(tmp_path / "state"),
+                    "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+                    "REVIEWER_RUNTIME": "claude",
+                    **env,
+                }
+            ),
             control_authority_root=str(tmp_path / "machine-state"),
         )
 
@@ -109,12 +128,19 @@ def roles(tmp_path):
         checkouts = FakeCheckouts(tmp_path / "checkouts")
 
         def review(self, gh, agent, checkouts=..., **env):
-            return compose_review_daemon(cfg(**env), gh, agent, log=lambda _line: None,
-                                         checkouts=self.checkouts if checkouts is ... else checkouts)
+            return compose_review_daemon(
+                cfg(**env),
+                gh,
+                agent,
+                log=lambda _line: None,
+                checkouts=self.checkouts if checkouts is ... else checkouts,
+            )
 
         def fix(self, gh, agent, **env):
-            return compose_fix_daemon(cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent,
-                                      log=lambda _line: None)
+            return compose_fix_daemon(
+                cfg(**env), gh, FakeWorktrees(tmp_path / "worktrees"), agent, log=lambda _line: None
+            )
+
     return Roles()
 
 
@@ -135,6 +161,7 @@ def capped_for_a_human(gh, roles) -> bool:
 
 
 # ── the design table's REVIEW row ────────────────────────────────────────────
+
 
 def test_a_green_head_without_a_bot_review_gets_one_review_leg_and_one_review_on_that_commit(roles):
     gh = green()
@@ -167,6 +194,7 @@ def test_a_review_on_a_moved_head_is_skipped_without_a_paid_leg(roles):
 
 # ── idempotent submission ────────────────────────────────────────────────────
 
+
 def test_a_crash_after_the_review_lands_never_posts_a_second_review(roles):
     gh = green()
     gh.lose_reply.add("submit_review")  # GitHub records the review; the reply is lost
@@ -184,9 +212,7 @@ def test_a_crash_after_the_review_lands_never_posts_a_second_review(roles):
     assert len(agent.tasks) == 1
 
 
-def test_a_submission_github_fails_to_answer_is_resubmitted_after_backoff_without_buying_the_review_again(
-    roles, later,
-):
+def test_a_submission_github_fails_to_answer_is_resubmitted_after_backoff_without_buying_the_review_again(roles, later):
     gh = green(fail_submit=1)
     agent = Agent(verdict("APPROVE"))
     review = roles.review(gh, agent)
@@ -275,6 +301,7 @@ def test_a_push_during_the_review_leaves_the_verdict_on_the_old_head_and_never_m
 
 # ── boot checks: misconfigurations no retry can fix ──────────────────────────
 
+
 def test_a_review_credential_that_is_not_review_bot_refuses_to_start(roles):
     # It posted under the real login while the read-back looked for REVIEW_BOT:
     # one duplicate review per retry, forever.
@@ -294,10 +321,15 @@ def test_the_review_role_refuses_to_start_without_a_checkout_to_pin_reviews_to(r
 
 # ── the split of work between the two roles ──────────────────────────────────
 
+
 def test_a_bot_change_request_is_addressed_by_the_fix_role_not_reviewed_again(roles):
     gh = ReviewGitHub(issues={5: ready()})
-    open_pr(gh, head="h1", ci="pass", reviews=(
-        Review("CHANGES_REQUESTED", REVIEW_BOT, body="Handle None.", submitted_at=_now(), commit_id="h1"),))
+    open_pr(
+        gh,
+        head="h1",
+        ci="pass",
+        reviews=(Review("CHANGES_REQUESTED", REVIEW_BOT, body="Handle None.", submitted_at=_now(), commit_id="h1"),),
+    )
     review = roles.review(gh, Agent())
     fix = roles.fix(gh, Agent(lambda _t: AgentResult(False, status="pushed", cost_usd=0.1, session_id="s1")))
 

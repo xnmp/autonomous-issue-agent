@@ -10,7 +10,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.domain.actions import (
-    AgentKind, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent, Target, UpdateBranch,
+    AgentKind,
+    MergePullRequest,
+    OpenPullRequest,
+    PostComment,
+    Relabel,
+    RunAgent,
+    Target,
+    UpdateBranch,
 )
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck, Unavailable
@@ -18,8 +25,24 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import QUESTION_LIMIT, actions, question_text
 from issue_agent.domain.refs import harness_branch_issue
 from issue_agent.domain.state import (
-    Backoff, Busy, Dispatch, Harness, ItemKey, Local, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason, Wait,
-    WaitReason, derive, issue_key, pr_key, stop_tag,
+    Backoff,
+    Busy,
+    Dispatch,
+    Harness,
+    ItemKey,
+    Local,
+    Merge,
+    NeedsHuman,
+    OpenPR,
+    Refresh,
+    Release,
+    StopReason,
+    Wait,
+    WaitReason,
+    derive,
+    issue_key,
+    pr_key,
+    stop_tag,
 )
 from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Push, Review, WorldState
 
@@ -96,16 +119,20 @@ def pr_legs(*ends: LegEnd, number: int = 7) -> dict:
 
 # ── Item identity (Q1) ───────────────────────────────────────────────────────
 
+
 def test_ready_issue_without_a_harness_pr_dispatches_resolve():
     world = WorldState(issues=(issue(3),))
     assert derive(world, local(), H) == {issue_key(3): Dispatch(AgentKind.RESOLVE)}
     assert actions(derive(world, local(), H), H) == (RunAgent(AgentKind.RESOLVE, 3, head=""),)
 
 
-@pytest.mark.parametrize("view", [
-    IssueView(3),  # not admitted
-    IssueView(3, labels=frozenset({Label.AI_READY}), state="closed"),
-])
+@pytest.mark.parametrize(
+    "view",
+    [
+        IssueView(3),  # not admitted
+        IssueView(3, labels=frozenset({Label.AI_READY}), state="closed"),
+    ],
+)
 def test_unadmitted_or_closed_issues_are_not_items(view):
     assert derive(WorldState(issues=(view,)), local(), H) == {}
 
@@ -133,6 +160,7 @@ def test_harness_branch_parser_rejects_malformed_input(raw):
 
 # ── PR rows of the tick table ────────────────────────────────────────────────
 
+
 def test_red_required_check_on_head_dispatches_fix_ci():
     assert pr_state(pr(ci=RED)) == Dispatch(FIX, HEAD)
 
@@ -148,13 +176,16 @@ def test_behind_but_clean_green_pr_updates_its_branch_for_free():
     assert actions(states, H) == (UpdateBranch(7, HEAD),)
 
 
-@pytest.mark.parametrize("reviews", [
-    (),
-    (review("APPROVED", 1, head="old"),),
-    (review("COMMENTED", 1),),
-    (review("APPROVED", 1, author="alice"),),
-    (review("DISMISSED", 1),),
-])
+@pytest.mark.parametrize(
+    "reviews",
+    [
+        (),
+        (review("APPROVED", 1, head="old"),),
+        (review("COMMENTED", 1),),
+        (review("APPROVED", 1, author="alice"),),
+        (review("DISMISSED", 1),),
+    ],
+)
 def test_green_pr_without_a_bot_verdict_on_head_is_reviewed(reviews):
     assert pr_state(pr(reviews=reviews)) == Dispatch(REVIEW, HEAD)
 
@@ -182,18 +213,22 @@ def test_push_after_approval_needs_a_fresh_review():
     assert pr_state(pr(head_ref_oid="h2", ci=ci(head="h2"), reviews=(review("APPROVED", 1),))) == Dispatch(REVIEW, "h2")
 
 
-@pytest.mark.parametrize(("view", "reason"), [
-    (pr(ci=PENDING), WaitReason.CI_PENDING),
-    (pr(ci=Unavailable("read failed")), WaitReason.CI_UNKNOWN),
-    (pr(ci=ci(head="stale")), WaitReason.CI_UNKNOWN),
-    (pr(head_ref_oid=""), WaitReason.HEAD_UNKNOWN),
-    (pr(mergeable="UNKNOWN", reviews=(review("APPROVED", 1),)), WaitReason.MERGEABILITY_UNKNOWN),
-])
+@pytest.mark.parametrize(
+    ("view", "reason"),
+    [
+        (pr(ci=PENDING), WaitReason.CI_PENDING),
+        (pr(ci=Unavailable("read failed")), WaitReason.CI_UNKNOWN),
+        (pr(ci=ci(head="stale")), WaitReason.CI_UNKNOWN),
+        (pr(head_ref_oid=""), WaitReason.HEAD_UNKNOWN),
+        (pr(mergeable="UNKNOWN", reviews=(review("APPROVED", 1),)), WaitReason.MERGEABILITY_UNKNOWN),
+    ],
+)
 def test_unsettled_pr_waits(view, reason):
     assert pr_state(view) == Wait(reason)
 
 
 # ── Workflow paths ───────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize("path", [".github/workflows/ci.yml", "./.github/CODEOWNERS", ".github/actions/a/x.yml"])
 def test_pr_touching_github_paths_needs_a_human(path):
@@ -216,6 +251,7 @@ def test_released_workflow_stop_lets_the_pr_proceed():
 
 # ── needs-human and replies (Q8) ─────────────────────────────────────────────
 
+
 def labelled(comments=(), **kw) -> PRView:
     return pr(labels={Label.NEEDS_HUMAN}, comments=tuple(comments), **kw)
 
@@ -231,13 +267,16 @@ def test_reply_newer_than_stop_and_last_leg_releases_and_policy_removes_the_labe
     assert actions(states, H) == (Relabel(Target.PR, 7, remove=Label.NEEDS_HUMAN, add=None),)
 
 
-@pytest.mark.parametrize("comments", [
-    [human(5), stop(StopReason.ATTEMPTS, 10)],                                   # older than the stop
-    [stop(StopReason.ATTEMPTS, 10), Comment("fix-bot", f"{H.marker} note", iso(20))],  # harness-marked
-    [stop(StopReason.ATTEMPTS, 10), Comment("codecov[bot]", "report", iso(20))],  # a bot
-    [stop(StopReason.ATTEMPTS, 10), Comment("alice", "go", "yesterday")],          # unparseable time
-    [human(20)],                                                                  # no harness stop comment
-])
+@pytest.mark.parametrize(
+    "comments",
+    [
+        [human(5), stop(StopReason.ATTEMPTS, 10)],  # older than the stop
+        [stop(StopReason.ATTEMPTS, 10), Comment("fix-bot", f"{H.marker} note", iso(20))],  # harness-marked
+        [stop(StopReason.ATTEMPTS, 10), Comment("codecov[bot]", "report", iso(20))],  # a bot
+        [stop(StopReason.ATTEMPTS, 10), Comment("alice", "go", "yesterday")],  # unparseable time
+        [human(20)],  # no harness stop comment
+    ],
+)
 def test_non_qualifying_comments_do_not_release(comments):
     assert pr_state(labelled(comments)) == Wait(WaitReason.NEEDS_HUMAN)
 
@@ -254,8 +293,12 @@ def test_an_operator_park_after_the_reply_is_not_undone():
     assert pr_state(view) == Wait(WaitReason.NEEDS_HUMAN)
     replied = labelled([stop(StopReason.ATTEMPTS, 10), human(20), human(40)], needs_human_labeled_at=iso(30))
     assert pr_state(replied) == Release()
-    parked = IssueView(3, labels=frozenset({Label.AI_READY, Label.NEEDS_HUMAN}),
-                       comments=(stop(StopReason.ATTEMPTS, 10), human(20)), needs_human_labeled_at=iso(30))
+    parked = IssueView(
+        3,
+        labels=frozenset({Label.AI_READY, Label.NEEDS_HUMAN}),
+        comments=(stop(StopReason.ATTEMPTS, 10), human(20)),
+        needs_human_labeled_at=iso(30),
+    )
     assert one(WorldState(issues=(parked,))) == Wait(WaitReason.NEEDS_HUMAN)
 
 
@@ -289,6 +332,7 @@ def test_issue_stage_needs_human_uses_the_issue_thread():
 
 # ── Attempts (Q3) ────────────────────────────────────────────────────────────
 
+
 def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
     view = pr(ci=RED)
     assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2)))) == Dispatch(FIX, HEAD)
@@ -314,27 +358,33 @@ def test_attempts_are_per_action_and_per_item():
     assert pr_state(pr(7), local(history)) == Dispatch(REVIEW, HEAD)
 
 
-@pytest.mark.parametrize("change", [
-    {"comments": (human(10),)},
-    {"reviews": (review("COMMENTED", 10, author="alice"),)},
-    {"pushes": (Push("alice", iso(10)),)},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"comments": (human(10),)},
+        {"reviews": (review("COMMENTED", 10, author="alice"),)},
+        {"pushes": (Push("alice", iso(10)),)},
+    ],
+)
 def test_a_non_harness_comment_review_or_push_resets_attempts(change):
     loc = local(pr_legs(*legs(FIX, 1, 2, 3, 11)))
     assert pr_state(pr(ci=RED, **change), loc) == Dispatch(FIX, HEAD)
 
 
-@pytest.mark.parametrize("change", [
-    {"comments": (Comment("fix-bot", f"{H.marker} opened", iso(10)),)},
-    {"comments": (Comment("ci[bot]", "coverage", iso(10)),)},
-    {"comments": (Comment("alice", "hm", "not-a-time"),)},
-    {"reviews": (review("CHANGES_REQUESTED", 10, head="old"),)},
-    {"pushes": (Push("fix-bot", iso(10)),)},
-    {"pushes": (Push("Fix-Bot[bot] ", iso(10)),)},
-    {"pushes": (Push("alice", ""),)},
-    {"pushes": (Push("", iso(10)),)},     # GitHub could not attribute the commit
-    {"pushes": (Push("  ", iso(10)),)},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"comments": (Comment("fix-bot", f"{H.marker} opened", iso(10)),)},
+        {"comments": (Comment("ci[bot]", "coverage", iso(10)),)},
+        {"comments": (Comment("alice", "hm", "not-a-time"),)},
+        {"reviews": (review("CHANGES_REQUESTED", 10, head="old"),)},
+        {"pushes": (Push("fix-bot", iso(10)),)},
+        {"pushes": (Push("Fix-Bot[bot] ", iso(10)),)},
+        {"pushes": (Push("alice", ""),)},
+        {"pushes": (Push("", iso(10)),)},  # GitHub could not attribute the commit
+        {"pushes": (Push("  ", iso(10)),)},
+    ],
+)
 def test_harness_bot_or_untimed_events_do_not_reset(change):
     loc = local(pr_legs(*legs(FIX, 1, 2, 3)))
     assert pr_state(pr(ci=RED, **change), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)
@@ -346,6 +396,7 @@ def test_attempts_after_the_latest_reset_still_reach_the_cap():
 
 
 # ── Attempt runs (Q21) ───────────────────────────────────────────────────────
+
 
 def seq(*steps: tuple[AgentKind, str] | tuple[AgentKind, str, bool]) -> dict:
     """Legs one minute apart, oldest first: (kind, head[, machine])."""
@@ -398,7 +449,9 @@ APPROVED_BY_BOT = review("APPROVED", 5)
 
 def test_human_change_request_on_head_dispatches_address_review_before_bot_review():
     assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice"),))) == Dispatch(ADDR, HEAD)
-    assert pr_state(pr(reviews=(APPROVED_BY_BOT, review("CHANGES_REQUESTED", 6, author="alice")))) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=(APPROVED_BY_BOT, review("CHANGES_REQUESTED", 6, author="alice")))) == Dispatch(
+        ADDR, HEAD
+    )
 
 
 def test_human_change_request_driven_address_review_counts_attempts_not_bot_rounds():
@@ -421,14 +474,25 @@ def test_human_change_request_on_an_older_head_still_lets_the_bot_review_the_new
 
 @pytest.mark.parametrize("clearing", ["APPROVED", "DISMISSED"])
 def test_a_later_approval_or_dismissal_by_the_same_human_clears_it(clearing):
-    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice", head="old"),
-                       review(clearing, 2, author="Alice", head="old"), APPROVED_BY_BOT))
+    view = pr(
+        reviews=(
+            review("CHANGES_REQUESTED", 1, author="alice", head="old"),
+            review(clearing, 2, author="Alice", head="old"),
+            APPROVED_BY_BOT,
+        )
+    )
     assert pr_state(view) == Merge(HEAD)
 
 
 def test_another_humans_approval_or_a_comment_does_not_clear_it():
-    view = pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice", head="old"),
-                       review("APPROVED", 2, author="bob"), review("COMMENTED", 3, author="alice"), APPROVED_BY_BOT))
+    view = pr(
+        reviews=(
+            review("CHANGES_REQUESTED", 1, author="alice", head="old"),
+            review("APPROVED", 2, author="bob"),
+            review("COMMENTED", 3, author="alice"),
+            APPROVED_BY_BOT,
+        )
+    )
     assert pr_state(view) == Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
 
 
@@ -438,6 +502,7 @@ def test_harness_reviewers_are_not_humans():
 
 
 # ── Review rounds (Q2) ───────────────────────────────────────────────────────
+
 
 def test_third_bot_change_request_stops_instead_of_addressing():
     rounds = tuple(review("CHANGES_REQUESTED", m, head=h) for m, h in ((1, "a"), (2, "b"), (3, HEAD)))
@@ -461,6 +526,7 @@ def test_untimed_bot_change_requests_still_count_as_rounds():
 
 
 # ── Backoff (Q16), lease, caps (Q7) ──────────────────────────────────────────
+
 
 def test_machine_failure_backs_off_then_dispatches():
     history = pr_legs(*legs(FIX, 0, machine=True))
@@ -495,10 +561,13 @@ def test_a_reply_releases_a_lifetime_stop_once_the_cap_is_raised():
     assert pr_state(view, local()) == Release()
 
 
-@pytest.mark.parametrize(("view", "expected"), [
-    (pr(reviews=(review("APPROVED", 1),)), Merge(HEAD)),
-    (pr(merge_state="BEHIND", reviews=(review("APPROVED", 1),)), Refresh(HEAD)),
-])
+@pytest.mark.parametrize(
+    ("view", "expected"),
+    [
+        (pr(reviews=(review("APPROVED", 1),)), Merge(HEAD)),
+        (pr(merge_state="BEHIND", reviews=(review("APPROVED", 1),)), Refresh(HEAD)),
+    ],
+)
 def test_the_lifetime_cap_never_blocks_free_work(view, expected):
     assert pr_state(view, local(lifetime_capped=frozenset({3}))) == expected
 
@@ -513,32 +582,51 @@ def test_the_lifetime_cap_never_blocks_opening_a_pushed_branch():
 WF = frozenset({".github/workflows/ci.yml"})
 
 
-@pytest.mark.parametrize(("view", "loc", "expected"), [
-    (labelled(changed_files=WF), local(leases=frozenset({pr_key(7)}), lifetime_capped=frozenset({3})), Busy()),
-    (pr(changed_files=WF), local(lifetime_capped=frozenset({3})), NeedsHuman(StopReason.WORKFLOW_PATH, "-")),
-    (labelled([stop(StopReason.ATTEMPTS, 1)], changed_files=WF), local(), Wait(WaitReason.NEEDS_HUMAN)),
-    (pr(ci=RED), local(pr_legs(*legs(FIX, 1, 2, 3)), lifetime_capped=frozenset({3})),
-     NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)),
-    (pr(ci=RED), local(lifetime_capped=frozenset({3})), NeedsHuman(StopReason.LIFETIME_CAP, "-")),
-    (pr(ci=RED, changed_files=WF), local(pr_legs(*legs(FIX, 1, 2, 3))), NeedsHuman(StopReason.WORKFLOW_PATH, iso(3))),
-    (pr(ci=RED), local(pr_legs(*legs(FIX, 1, 2, 3) + legs(FIX, 4, machine=True)), now=at(4.5)),
-     NeedsHuman(StopReason.ATTEMPTS, iso(4), FIX)),
-    (pr(ci=RED), local(pr_legs(*legs(FIX, 1, 2, 3)), headroom=False), NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)),
-    (pr(ci=RED), local(pr_legs(*legs(FIX, 0, machine=True)), now=at(0.5), headroom=False), Backoff(FIX, at(1))),
-    (pr(ci=RED, mergeable="CONFLICTING", reviews=(review("APPROVED", 1),)), local(), Dispatch(AgentKind.REBASE, HEAD)),
-    (pr(ci=RED, merge_state="BEHIND"), local(), Dispatch(FIX, HEAD)),
-    (pr(merge_state="BEHIND", reviews=(review("APPROVED", 1),)), local(), Refresh(HEAD)),
-])
+@pytest.mark.parametrize(
+    ("view", "loc", "expected"),
+    [
+        (labelled(changed_files=WF), local(leases=frozenset({pr_key(7)}), lifetime_capped=frozenset({3})), Busy()),
+        (pr(changed_files=WF), local(lifetime_capped=frozenset({3})), NeedsHuman(StopReason.WORKFLOW_PATH, "-")),
+        (labelled([stop(StopReason.ATTEMPTS, 1)], changed_files=WF), local(), Wait(WaitReason.NEEDS_HUMAN)),
+        (
+            pr(ci=RED),
+            local(pr_legs(*legs(FIX, 1, 2, 3)), lifetime_capped=frozenset({3})),
+            NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX),
+        ),
+        (pr(ci=RED), local(lifetime_capped=frozenset({3})), NeedsHuman(StopReason.LIFETIME_CAP, "-")),
+        (
+            pr(ci=RED, changed_files=WF),
+            local(pr_legs(*legs(FIX, 1, 2, 3))),
+            NeedsHuman(StopReason.WORKFLOW_PATH, iso(3)),
+        ),
+        (
+            pr(ci=RED),
+            local(pr_legs(*legs(FIX, 1, 2, 3) + legs(FIX, 4, machine=True)), now=at(4.5)),
+            NeedsHuman(StopReason.ATTEMPTS, iso(4), FIX),
+        ),
+        (pr(ci=RED), local(pr_legs(*legs(FIX, 1, 2, 3)), headroom=False), NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)),
+        (pr(ci=RED), local(pr_legs(*legs(FIX, 0, machine=True)), now=at(0.5), headroom=False), Backoff(FIX, at(1))),
+        (
+            pr(ci=RED, mergeable="CONFLICTING", reviews=(review("APPROVED", 1),)),
+            local(),
+            Dispatch(AgentKind.REBASE, HEAD),
+        ),
+        (pr(ci=RED, merge_state="BEHIND"), local(), Dispatch(FIX, HEAD)),
+        (pr(merge_state="BEHIND", reviews=(review("APPROVED", 1),)), local(), Refresh(HEAD)),
+    ],
+)
 def test_precedence(view, loc, expected):
     assert pr_state(view, loc) == expected
 
 
 # ── Policy contract ──────────────────────────────────────────────────────────
 
+
 def test_stop_comment_key_is_stable_per_episode_and_new_per_leg_end():
     def key(*minutes):
         states = derive(WorldState(prs=(pr(ci=RED),)), local(pr_legs(*legs(FIX, *minutes))), H)
         return actions(states, H)[1].key
+
     assert key(1, 2, 3) == key(1, 2, 3)
     assert key(1, 2, 3) != key(1, 2, 4)
 
@@ -564,31 +652,35 @@ def test_policy_refuses_resolve_on_a_pr():
 
 # ── Malformed and huge inputs ────────────────────────────────────────────────
 
-@pytest.mark.parametrize("build", [
-    lambda: Harness("", "review-bot"),
-    lambda: Harness("fix-bot", "  "),
-    lambda: Harness("fix-bot", "review-bot", marker="issue-agent"),
-    lambda: Harness("fix-bot", "review-bot", marker="<!---->"),
-    lambda: Harness("fix-bot", "review-bot", marker="<!--" + "x" * 500 + "-->"),
-    lambda: Local(now=datetime(2026, 10, 1)),
-    lambda: Local(now=NOW, legs={7: ()}),
-    lambda: Local(now=NOW, legs={pr_key(7): [LegEnd(FIX, T0, False)]}),
-    lambda: Local(now=NOW, leases=frozenset({7})),
-    lambda: Local(now=NOW, headroom=1),
-    lambda: Local(now=NOW, lifetime_capped=frozenset({0})),
-    lambda: ItemKey(Target.PR, 0),
-    lambda: ItemKey(Target.PR, True),
-    lambda: Dispatch(AgentKind.RESOLVE, "h"),
-    lambda: Dispatch(FIX, ""),
-    lambda: Merge(""),
-    lambda: NeedsHuman(StopReason.ATTEMPTS, "-"),
-    lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", FIX),
-    lambda: NeedsHuman(StopReason.WORKFLOW_PATH, ""),
-    lambda: NeedsHuman(StopReason.QUESTION, "-"),
-    lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", question="why?"),
-    lambda: Backoff(FIX, datetime(2026, 10, 1)),
-    lambda: MergePullRequest(7, ""),
-])
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: Harness("", "review-bot"),
+        lambda: Harness("fix-bot", "  "),
+        lambda: Harness("fix-bot", "review-bot", marker="issue-agent"),
+        lambda: Harness("fix-bot", "review-bot", marker="<!---->"),
+        lambda: Harness("fix-bot", "review-bot", marker="<!--" + "x" * 500 + "-->"),
+        lambda: Local(now=datetime(2026, 10, 1)),
+        lambda: Local(now=NOW, legs={7: ()}),
+        lambda: Local(now=NOW, legs={pr_key(7): [LegEnd(FIX, T0, False)]}),
+        lambda: Local(now=NOW, leases=frozenset({7})),
+        lambda: Local(now=NOW, headroom=1),
+        lambda: Local(now=NOW, lifetime_capped=frozenset({0})),
+        lambda: ItemKey(Target.PR, 0),
+        lambda: ItemKey(Target.PR, True),
+        lambda: Dispatch(AgentKind.RESOLVE, "h"),
+        lambda: Dispatch(FIX, ""),
+        lambda: Merge(""),
+        lambda: NeedsHuman(StopReason.ATTEMPTS, "-"),
+        lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", FIX),
+        lambda: NeedsHuman(StopReason.WORKFLOW_PATH, ""),
+        lambda: NeedsHuman(StopReason.QUESTION, "-"),
+        lambda: NeedsHuman(StopReason.WORKFLOW_PATH, "-", question="why?"),
+        lambda: Backoff(FIX, datetime(2026, 10, 1)),
+        lambda: MergePullRequest(7, ""),
+    ],
+)
 def test_malformed_values_are_rejected(build):
     with pytest.raises(ValueError):
         build()
@@ -627,6 +719,7 @@ def test_many_items_derive_independently():
 
 # ── Agent questions (slice 5b) ───────────────────────────────────────────────
 
+
 def asked(kind: AgentKind, minute: float, question: str = "404 or 410?") -> LegEnd:
     return LegEnd(kind, at(minute), False, question=question)
 
@@ -661,9 +754,15 @@ def test_a_question_cannot_smuggle_a_stop_tag_or_the_marker_into_the_stop_commen
     assert pr_state(released, local(pr_legs(asked(FIX, 5, smuggled)))) == NeedsHuman(StopReason.WORKFLOW_PATH, iso(5))
 
 
-@pytest.mark.parametrize(("needs", "expected"), [
-    ("", "(no question text)"), ("   ", "(no question text)"), (None, "(no question text)"), (7, "(no question text)"),
-])
+@pytest.mark.parametrize(
+    ("needs", "expected"),
+    [
+        ("", "(no question text)"),
+        ("   ", "(no question text)"),
+        (None, "(no question text)"),
+        (7, "(no question text)"),
+    ],
+)
 def test_an_empty_or_malformed_question_still_says_so(needs, expected):
     assert question_text(needs) == expected
 
@@ -697,14 +796,17 @@ def test_a_machine_end_after_a_question_does_not_hide_it():
     assert pr_state(pr(ci=RED), loc) == NeedsHuman(StopReason.QUESTION, iso(2), question="404 or 410?")
 
 
-@pytest.mark.parametrize("bad", [
-    dict(machine=True, question="why?"),
-    dict(machine=False, question=""),
-    dict(machine=False, question=1),
-    dict(machine=False, started_at=at(10)),                              # after the end
-    dict(machine=False, started_at=datetime(2026, 10, 1, 11, 0)),        # naive
-    dict(machine=False, started_at="2026-10-01T11:00:00Z"),
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        dict(machine=True, question="why?"),
+        dict(machine=False, question=""),
+        dict(machine=False, question=1),
+        dict(machine=False, started_at=at(10)),  # after the end
+        dict(machine=False, started_at=datetime(2026, 10, 1, 11, 0)),  # naive
+        dict(machine=False, started_at="2026-10-01T11:00:00Z"),
+    ],
+)
 def test_leg_end_rejects_contradictory_question_or_window(bad):
     machine = bad.pop("machine")
     with pytest.raises(ValueError):
@@ -712,6 +814,7 @@ def test_leg_end_rejects_contradictory_question_or_window(bad):
 
 
 # ── Own comments inside a leg (slice 5b) ─────────────────────────────────────
+
 
 def windowed(kind: AgentKind, start: float, end: float) -> LegEnd:
     return LegEnd(kind, at(end), False, started_at=at(start))
@@ -737,6 +840,7 @@ def test_a_comment_at_the_leg_start_instant_is_outside_the_window():
 
 
 # ── Publication: the agent pushes, the harness opens (Q11, slice 5b) ─────────
+
 
 def test_a_pushed_branch_without_a_pr_opens_one_for_free():
     world = WorldState(issues=(issue(3),), branches=(Branch("fix/3-slug", iso(1)),))
@@ -786,6 +890,7 @@ def test_open_pull_request_action_is_validated():
 
 # ── Fix round (slice 5b review) ──────────────────────────────────────────────
 
+
 def test_a_leg_that_ended_after_the_observation_holds_its_item_busy():
     # P0-1: the world was read before the leg pushed; its end is already local.
     world = WorldState(issues=(issue(3),), now=iso(10))
@@ -809,10 +914,13 @@ def test_a_labelled_item_whose_stop_comment_never_landed_is_stopped_again():
     assert isinstance(label, Relabel) and stop_tag(StopReason.ATTEMPTS) in comment.body
 
 
-@pytest.mark.parametrize("view", [
-    labelled(ci=RED),                                      # dispatchable
-    labelled(reviews=(review("APPROVED", 1),)),            # mergeable
-])
+@pytest.mark.parametrize(
+    "view",
+    [
+        labelled(ci=RED),  # dispatchable
+        labelled(reviews=(review("APPROVED", 1),)),  # mergeable
+    ],
+)
 def test_a_label_a_human_added_without_a_stop_comment_holds_the_item(view):
     assert pr_state(view) == Wait(WaitReason.NEEDS_HUMAN)
 
@@ -832,11 +940,19 @@ def test_a_forged_stop_comment_on_a_labelled_item_is_a_human_reply_not_a_stop():
     assert pr_state(view) == Release()
 
 
-@pytest.mark.parametrize("view", [
-    PRView(number=7, head_ref_name="fix/3-slug", state="OPEN", content_known=False),
-    PRView(number=7, head_ref_name="fix/3-slug", state="OPEN", content_known=False,
-           labels=frozenset({Label.NEEDS_HUMAN})),
-])
+@pytest.mark.parametrize(
+    "view",
+    [
+        PRView(number=7, head_ref_name="fix/3-slug", state="OPEN", content_known=False),
+        PRView(
+            number=7,
+            head_ref_name="fix/3-slug",
+            state="OPEN",
+            content_known=False,
+            labels=frozenset({Label.NEEDS_HUMAN}),
+        ),
+    ],
+)
 def test_an_unread_pr_waits_before_any_stop_or_label_logic(view):
     # P2-2: a placeholder has no labels or comments to judge by.
     loc = local(pr_legs(asked(FIX, 1), *legs(FIX, 2, 3, 4)), lifetime_capped=frozenset({3}))

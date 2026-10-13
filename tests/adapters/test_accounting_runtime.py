@@ -22,8 +22,9 @@ def _policy(maximum=2_000_000):
 
 
 def _rates():
-    return RateTable("test", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
-                     ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000))
+    return RateTable(
+        "test", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK, ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000)
+    )
 
 
 class Runtime:
@@ -70,10 +71,22 @@ def _ended(store, columns="charged_micros, basis"):
 def _wrapper(tmp_path, runtime, cap=5_000_000, context=("fix", "RESOLVE", 1, 1), **fields):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    wrapper = AccountingRuntime(**{
-        "inner": runtime, "store": store, "repository": "o/r", "role": "fix", "repository_cap": Money("USD", cap),
-        "global_cap": None, "issue_cap": None, "config_version": "cfg", "runtime_name": "codex",
-        "budget_policy": _policy(), "rate_table": _rates(), **fields})
+    wrapper = AccountingRuntime(
+        **{
+            "inner": runtime,
+            "store": store,
+            "repository": "o/r",
+            "role": "fix",
+            "repository_cap": Money("USD", cap),
+            "global_cap": None,
+            "issue_cap": None,
+            "config_version": "cfg",
+            "runtime_name": "codex",
+            "budget_policy": _policy(),
+            "rate_table": _rates(),
+            **fields,
+        }
+    )
     wrapper.set_context(*context)
     return wrapper, store
 
@@ -99,34 +112,85 @@ _STREAM = {"input_tokens": 100, "output_tokens": 10}
 _ARMED, _CAPS_OFF, _UNPRICED = "armed", "caps-off", "unpriced"
 
 
-@pytest.mark.parametrize("result,runtime_name,pricing,charge", [
-    # An unpinned leg with no reported model is priced at the fallback rates.
-    (AgentResult(False, status="ok", cost_usd=1.25, session_id="r", usage=_ROLLOUT), "codex", _ARMED, (800, "estimate")),
-    # Usage-blind, stderr-only or malformed usage is a marked zero estimate:
-    # it settles (never stays reserved) without claiming a provider figure.
-    (AgentResult(False, status="pushed", cost_usd=0, session_id="blind", usage=None), "codex", _ARMED, (0, "estimate")),
-    (AgentResult(False, status="ok", cost_usd=1.25, session_id="s", usage={
-        "input_tokens": 0, "output_tokens": 0, "total_tokens": 125_000, "source": "stderr"}), "codex", _ARMED,
-     (0, "estimate")),
-    (AgentResult(False, status="blind", cost_usd=0, usage=None, stream_usage=None), "claude", _ARMED, (0, "estimate")),
-    (AgentResult(False, status="ok", usage={"input_tokens": "malformed"}), "codex", _ARMED, (0, "estimate")),
-    # Malformed, boundary and huge primary usage falls back to a valid stream estimate.
-    *((AgentResult(False, status="done", usage={"input_tokens": bad, "output_tokens": 1}, stream_usage=_STREAM),
-       "claude", _ARMED, (800, "estimate")) for bad in (None, True, -1, 1.5, "12", 10**100)),
-    # Caps off still prices observed stream usage at the configured rate card...
-    (AgentResult(False, status="stream-only", cost_usd=0, usage=None,
-                 stream_usage={"input_tokens": 1_000_000, "output_tokens": 100_000}), "claude", _CAPS_OFF,
-     (8_000_000, "estimate")),
-    # ...and an explicit unpriced opt-out (no rate card) still reserves and settles.
-    (AgentResult(False, status="untracked", cost_usd=0, usage=None), "codex", _UNPRICED, (0, "estimate")),
-    (AgentResult(False, status="ok", cost_usd=0, session_id="subscription"), "claude", _UNPRICED, (0, "estimate")),
-    # Valid provider dollars survive malformed token telemetry; unusable ones
-    # fall back to the stream estimate.
-    (AgentResult(False, status="done", cost_usd=1.25, usage={"input_tokens": "bad"}), "claude", _ARMED,
-     (1_250_000, "provider_reported")),
-    *((AgentResult(False, status="done", cost_usd=bad, stream_usage=_STREAM), "claude", _ARMED, (800, "estimate"))
-      for bad in (float("nan"), float("inf"), -1, 10**100)),
-])
+@pytest.mark.parametrize(
+    "result,runtime_name,pricing,charge",
+    [
+        # An unpinned leg with no reported model is priced at the fallback rates.
+        (
+            AgentResult(False, status="ok", cost_usd=1.25, session_id="r", usage=_ROLLOUT),
+            "codex",
+            _ARMED,
+            (800, "estimate"),
+        ),
+        # Usage-blind, stderr-only or malformed usage is a marked zero estimate:
+        # it settles (never stays reserved) without claiming a provider figure.
+        (
+            AgentResult(False, status="pushed", cost_usd=0, session_id="blind", usage=None),
+            "codex",
+            _ARMED,
+            (0, "estimate"),
+        ),
+        (
+            AgentResult(
+                False,
+                status="ok",
+                cost_usd=1.25,
+                session_id="s",
+                usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 125_000, "source": "stderr"},
+            ),
+            "codex",
+            _ARMED,
+            (0, "estimate"),
+        ),
+        (
+            AgentResult(False, status="blind", cost_usd=0, usage=None, stream_usage=None),
+            "claude",
+            _ARMED,
+            (0, "estimate"),
+        ),
+        (AgentResult(False, status="ok", usage={"input_tokens": "malformed"}), "codex", _ARMED, (0, "estimate")),
+        # Malformed, boundary and huge primary usage falls back to a valid stream estimate.
+        *(
+            (
+                AgentResult(
+                    False, status="done", usage={"input_tokens": bad, "output_tokens": 1}, stream_usage=_STREAM
+                ),
+                "claude",
+                _ARMED,
+                (800, "estimate"),
+            )
+            for bad in (None, True, -1, 1.5, "12", 10**100)
+        ),
+        # Caps off still prices observed stream usage at the configured rate card...
+        (
+            AgentResult(
+                False,
+                status="stream-only",
+                cost_usd=0,
+                usage=None,
+                stream_usage={"input_tokens": 1_000_000, "output_tokens": 100_000},
+            ),
+            "claude",
+            _CAPS_OFF,
+            (8_000_000, "estimate"),
+        ),
+        # ...and an explicit unpriced opt-out (no rate card) still reserves and settles.
+        (AgentResult(False, status="untracked", cost_usd=0, usage=None), "codex", _UNPRICED, (0, "estimate")),
+        (AgentResult(False, status="ok", cost_usd=0, session_id="subscription"), "claude", _UNPRICED, (0, "estimate")),
+        # Valid provider dollars survive malformed token telemetry; unusable ones
+        # fall back to the stream estimate.
+        (
+            AgentResult(False, status="done", cost_usd=1.25, usage={"input_tokens": "bad"}),
+            "claude",
+            _ARMED,
+            (1_250_000, "provider_reported"),
+        ),
+        *(
+            (AgentResult(False, status="done", cost_usd=bad, stream_usage=_STREAM), "claude", _ARMED, (800, "estimate"))
+            for bad in (float("nan"), float("inf"), -1, 10**100)
+        ),
+    ],
+)
 def test_a_completed_leg_settles_once_with_its_basis(tmp_path, result, runtime_name, pricing, charge) -> None:
     runtime = Runtime(result)
     rates = _rates() if pricing == _CAPS_OFF else None
@@ -174,8 +238,13 @@ def test_a_review_leg_leases_its_issue_and_records_its_pr(tmp_path) -> None:
 
     runtime = Inspecting(AgentResult(False, status="reviewed", usage={"input_tokens": 1, "output_tokens": 1}))
     wrapper, store = _wrapper(
-        tmp_path, runtime, context=("review", "REVIEW", 42, 9), role="review", owner_id="o/r:review:deployment",
-        budget_policy=BudgetPolicy({("review", "REVIEW"): Money("USD", 2_000_000)}))
+        tmp_path,
+        runtime,
+        context=("review", "REVIEW", 42, 9),
+        role="review",
+        owner_id="o/r:review:deployment",
+        budget_policy=BudgetPolicy({("review", "REVIEW"): Money("USD", 2_000_000)}),
+    )
     wrapper.set_context("review", "REVIEW", 42, 9, claim_target=9, head="abc")
 
     assert _run(wrapper, RuntimePlan("review", model="gpt-test", max_budget_usd=2)).status == "reviewed"
@@ -183,21 +252,28 @@ def test_a_review_leg_leases_its_issue_and_records_its_pr(tmp_path) -> None:
     assert seen == [("review", 9)]
     with store._read() as db:
         assert tuple(db.execute("SELECT role, kind, issue, number, head FROM legs").fetchone()) == (
-            "review", "REVIEW", 9, 42, "abc")
+            "review",
+            "REVIEW",
+            9,
+            42,
+            "abc",
+        )
 
 
 def test_missing_issue_still_blocks_issue_scoped_fix_work(tmp_path) -> None:
     runtime = Runtime(AgentResult(False, status="should-not-run"))
-    wrapper, _store = _wrapper(tmp_path, runtime, context=("fix", "RESOLVE", 1, None),
-                               issue_cap=Money("USD", 25_000_000))
+    wrapper, _store = _wrapper(
+        tmp_path, runtime, context=("fix", "RESOLVE", 1, None), issue_cap=Money("USD", 25_000_000)
+    )
 
     assert _work(wrapper).summary == "paid admission blocked: issue spend scope is unavailable"
     assert runtime.calls == 0
 
 
 def test_resumed_session_uses_distinct_per_leg_settlement_receipts(tmp_path) -> None:
-    runtime = Runtime(AgentResult(False, status="ok", cost_usd=0.1, session_id="resumed-session",
-                                  usage=_usage(source="rollout")))
+    runtime = Runtime(
+        AgentResult(False, status="ok", cost_usd=0.1, session_id="resumed-session", usage=_usage(source="rollout"))
+    )
     wrapper, store = _wrapper(tmp_path, runtime)
 
     _work(wrapper, "first", model="gpt-test")
@@ -227,8 +303,13 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(tmp_path) -
 
         async def run(self, _task):
             self.calls += 1
-            return AgentResult(False, status="ok", cost_usd=0, session_id=f"subscription-{self.calls}",
-                               usage={"input_tokens": 1_000_000, "output_tokens": 100_000})
+            return AgentResult(
+                False,
+                status="ok",
+                cost_usd=0,
+                session_id=f"subscription-{self.calls}",
+                usage={"input_tokens": 1_000_000, "output_tokens": 100_000},
+            )
 
     runtime = SubscriptionRuntime()
     wrapper, store = _wrapper(tmp_path, runtime, runtime_name="claude")
@@ -243,8 +324,16 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(tmp_path) -
 
 
 def test_armed_subscription_cap_prices_stream_usage_when_final_usage_is_missing(tmp_path) -> None:
-    runtime = Runtime(AgentResult(False, status="no-final-usage", cost_usd=0, session_id="stream-observed", usage=None,
-                                  stream_usage={"input_tokens": 1_100_000, "output_tokens": 0}))
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="no-final-usage",
+            cost_usd=0,
+            session_id="stream-observed",
+            usage=None,
+            stream_usage={"input_tokens": 1_100_000, "output_tokens": 0},
+        )
+    )
     wrapper, store = _wrapper(tmp_path, runtime, cap=2_000_000, runtime_name="claude")
 
     first = _work(wrapper, model="gpt-test")
@@ -269,7 +358,9 @@ def test_codex_runtime_exception_releases_after_completed_teardown(tmp_path) -> 
     assert store.active_reservation_runs("o/r:fix") == ()
     with store._read() as db:
         assert tuple(db.execute("SELECT state, end_reason FROM legs").fetchone()) == (
-            "released", "runtime_exception_before_launch")
+            "released",
+            "runtime_exception_before_launch",
+        )
 
     # A machine failure is no attempt: the ended run carries no leg receipt.
     assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
@@ -284,7 +375,8 @@ def test_forced_codex_shutdown_intent_preserves_reservation_for_recovery(tmp_pat
     runtime = Death()
     wrapper, store = _wrapper(tmp_path, runtime)
     runtime.prepare_shutdown = lambda: store.record_owned_cancellation_intents(
-        "o/r:fix", "shutdown_deadline_spend_unknown")
+        "o/r:fix", "shutdown_deadline_spend_unknown"
+    )
 
     with pytest.raises(RuntimeError, match="killed"):
         _work(wrapper)
@@ -301,8 +393,11 @@ def test_runtime_exception_after_child_registration_retains_reservation(tmp_path
         async def run(self, task):
             self.run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
             self.store.register_process_lease(
-                self.run_id, expected_owner_id=task.env["ISSUE_AGENT_OWNER_ID"],
-                pid=os.getpid(), pgid=os.getpgid(os.getpid()), process_start_ticks=1,
+                self.run_id,
+                expected_owner_id=task.env["ISSUE_AGENT_OWNER_ID"],
+                pid=os.getpid(),
+                pgid=os.getpgid(os.getpid()),
+                process_start_ticks=1,
             )
             raise RuntimeError("transport died after provider launch")
 
@@ -317,15 +412,20 @@ def test_runtime_exception_after_child_registration_retains_reservation(tmp_path
     with store._read() as db:
         state, ended_at, reason = db.execute("SELECT state, ended_at, end_reason FROM legs").fetchone()
     assert (state, ended_at is not None, reason) == (
-        "running", True, "runtime failed after paid execution may have started",
+        "running",
+        True,
+        "runtime failed after paid execution may have started",
     )
     assert store.leases() == ()
 
 
 def test_successful_settlement_removes_crash_recovery_evidence(tmp_path) -> None:
     evidence_dir = str(tmp_path / "spend-evidence")
-    wrapper, _store = _wrapper(tmp_path, Runtime(AgentResult(False, status="ok", cost_usd=1, session_id="receipt")),
-                               spend_evidence_dir=evidence_dir)
+    wrapper, _store = _wrapper(
+        tmp_path,
+        Runtime(AgentResult(False, status="ok", cost_usd=1, session_id="receipt")),
+        spend_evidence_dir=evidence_dir,
+    )
     wrapper.set_run_identity("known-run", "leg")
     write_spend_evidence(evidence_dir, "known-run", {"session_id": "receipt"})
 
@@ -334,14 +434,15 @@ def test_successful_settlement_removes_crash_recovery_evidence(tmp_path) -> None
     assert not os.path.exists(spend_evidence_path(evidence_dir, "known-run"))
 
 
-@pytest.mark.parametrize("cap_kind,status", [
-    ("repository", DAILY_HEADROOM_STATUS), ("global", DAILY_HEADROOM_STATUS), ("issue", MAX_BUDGET_STATUS),
-])
+@pytest.mark.parametrize(
+    "cap_kind,status",
+    [("repository", DAILY_HEADROOM_STATUS), ("global", DAILY_HEADROOM_STATUS), ("issue", MAX_BUDGET_STATUS)],
+)
 def test_fix_admission_refusal_is_a_daily_wait_only_for_daily_caps(tmp_path, cap_kind, status):
     # Decision #7: daily/global windows refill with time, so their refusal is a
     # label-free wait; the lifetime issue cap needs a human decision. Neither
     # opens a paid run; the zero-cost refused row spaces the retry (#262).
-    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=0.01))
     wrapper, store = _wrapper(tmp_path, runtime, **{"repository_cap": None, f"{cap_kind}_cap": Money("USD", 0)})
     result = _work(wrapper, model="gpt-test")
     assert result.is_error and result.exit_reason is ExitReason.BUDGET_EXHAUSTED
@@ -349,7 +450,8 @@ def test_fix_admission_refusal_is_a_daily_wait_only_for_daily_caps(tmp_path, cap
     assert runtime.calls == 0
     with store._read() as db:
         assert [tuple(row) for row in db.execute("SELECT state, end_reason, reserved_micros FROM legs")] == [
-            ("released", "admission_refused", 0)]
+            ("released", "admission_refused", 0)
+        ]
     assert [run.receipt for run in store.leg_runs("o/r", (1,))] == [None]
 
 
@@ -365,9 +467,10 @@ def test_a_completed_leg_settles_and_the_daily_cap_gates_with_no_event_log_or_ou
     assert runtime.calls == 1
     assert _ended(store, "charged_micros") == [(1_250_000,)]
     with store._read() as db:
-        assert db.execute(
-            "SELECT name FROM sqlite_master WHERE name IN ('event_outbox','world_observations')"
-        ).fetchall() == []
+        assert (
+            db.execute("SELECT name FROM sqlite_master WHERE name IN ('event_outbox','world_observations')").fetchall()
+            == []
+        )
     assert sorted(path.name for path in tmp_path.iterdir() if path.suffix == ".jsonl") == []
 
 
@@ -385,8 +488,11 @@ def _codex_rollout(tmp_path, session: str, info: str, tail: str) -> CodexRunner:
     codex = tmp_path / "codex"
     codex.write_text(f'#!/usr/bin/env bash\n{sys.executable} -c "{rollout}"\n{tail}')
     codex.chmod(codex.stat().st_mode | stat.S_IXUSR)
-    return CodexRunner(codex_bin=str(codex), env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(tmp_path / "codex-home")},
-                       rate_table=_rates())
+    return CodexRunner(
+        codex_bin=str(codex),
+        env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(tmp_path / "codex-home")},
+        rate_table=_rates(),
+    )
 
 
 def test_a_launch_that_drops_mid_run_is_settled_at_its_real_cost_and_the_caps_see_it(tmp_path) -> None:
@@ -394,8 +500,12 @@ def test_a_launch_that_drops_mid_run_is_settled_at_its_real_cost_and_the_caps_se
     then loses its stream settles what its rollout measured, so the daily
     cap refuses the next leg instead of seeing only a cheap last attempt."""
     usage = "{'input_tokens':300000,'cached_input_tokens':0,'cache_write_input_tokens':0,'output_tokens':10000}"
-    runner = _codex_rollout(tmp_path, "sess-dear", f"{{'total_token_usage':{usage},'last_token_usage':{usage}}}",
-                            'echo "stream disconnected before completion" >&2\nexit 1\n')
+    runner = _codex_rollout(
+        tmp_path,
+        "sess-dear",
+        f"{{'total_token_usage':{usage},'last_token_usage':{usage}}}",
+        'echo "stream disconnected before completion" >&2\nexit 1\n',
+    )
     wrapper, store = _wrapper(tmp_path, runner, cap=3_000_000)
 
     dropped = _work(wrapper, model="gpt-test")

@@ -74,9 +74,7 @@ def test_buffer_overflow_death_is_deterministic():
 def test_deterministic_death_names_the_file_the_session_died_on():
     # The operator's first question is "which file?" — the answer is the last
     # tool call the runtime traced before the transport went down.
-    d = deterministic_death(
-        _BUFFER_DEATH, "AssistantMessage → Read(evidence/ac-3-edge-case-titles.png)"
-    )
+    d = deterministic_death(_BUFFER_DEATH, "AssistantMessage → Read(evidence/ac-3-edge-case-titles.png)")
     assert d.path == "evidence/ac-3-edge-case-titles.png"
 
 
@@ -112,10 +110,15 @@ import pytest
 from issue_agent.domain.outcome import LegClass, classify_leg
 
 
-@pytest.mark.parametrize("reason", [
-    ExitReason.TRANSPORT_DEATH, ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
-    ExitReason.OPERATOR_CANCELLED,
-])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ExitReason.TRANSPORT_DEATH,
+        ExitReason.KILLED_EXTERNALLY,
+        ExitReason.RUNTIME_UNAVAILABLE,
+        ExitReason.OPERATOR_CANCELLED,
+    ],
+)
 @pytest.mark.parametrize("resumed", [False, True])
 def test_a_harness_or_provider_death_is_never_an_attempt(reason, resumed):
     result = AgentResult(is_error=True, status="", exit_reason=reason)

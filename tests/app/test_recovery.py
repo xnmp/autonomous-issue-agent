@@ -9,7 +9,11 @@ import time
 from zoneinfo import ZoneInfo
 
 from issue_agent.adapters.control_store import (
-    AccountingDisposition, BudgetLimit, ReservationRequest, SQLiteControlStore, SettlementRequest,
+    AccountingDisposition,
+    BudgetLimit,
+    ReservationRequest,
+    SQLiteControlStore,
+    SettlementRequest,
 )
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
@@ -176,14 +180,29 @@ def _dead_launchers(monkeypatch) -> None:
 def _reserve(store, run_id, *, now=NOW, runtime="", issue=1):
     """Lease an issue as the daemon and reserve one paid leg bound to it."""
     scope = BudgetScope(
-        "o/r", "repository", "USD", now.date().isoformat(),
-        now.replace(hour=0), now.replace(hour=0) + timedelta(days=1), ZoneInfo("UTC"),
+        "o/r",
+        "repository",
+        "USD",
+        now.date().isoformat(),
+        now.replace(hour=0),
+        now.replace(hour=0) + timedelta(days=1),
+        ZoneInfo("UTC"),
     )
     assert store.lease("o/r", "fix", issue, OWNER)
-    assert store.reserve(ReservationRequest(
-        run_id, "o/r", "fix", "RESOLVE", OWNER, Money("USD", 10),
-        (BudgetLimit(scope, Money("USD", 100)),), issue, issue=issue, runtime=runtime,
-    )).admitted
+    assert store.reserve(
+        ReservationRequest(
+            run_id,
+            "o/r",
+            "fix",
+            "RESOLVE",
+            OWNER,
+            Money("USD", 10),
+            (BudgetLimit(scope, Money("USD", 100)),),
+            issue,
+            issue=issue,
+            runtime=runtime,
+        )
+    ).admitted
     return scope
 
 
@@ -196,15 +215,22 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(tm
     store = _store(tmp_path)
     run_id = RunId("crashed")
     _reserve(store, run_id)
-    store.register_process_lease(
-        run_id, expected_owner_id=OWNER, pid=999_999, pgid=999_999, process_start_ticks=1,
-    )
+    store.register_process_lease(run_id, expected_owner_id=OWNER, pid=999_999, pgid=999_999, process_start_ticks=1)
 
     class Reconciler:
         def reconcile(self, recovered_run_id):
-            result = store.settle(SettlementRequest(recovered_run_id, Money("USD", 7), PricingBasis.RECONCILED,
-                                                    "provider-receipt", None, None, None,
-                                                    origin=ChargeOrigin.RECOVERY_ESTIMATE))
+            result = store.settle(
+                SettlementRequest(
+                    recovered_run_id,
+                    Money("USD", 7),
+                    PricingBasis.RECONCILED,
+                    "provider-receipt",
+                    None,
+                    None,
+                    None,
+                    origin=ChargeOrigin.RECOVERY_ESTIMATE,
+                )
+            )
             return result.disposition is AccountingDisposition.AVAILABLE
 
     _dead_launchers(monkeypatch)
@@ -212,7 +238,10 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(tm
 
     assert report.reclaimed_leases == (run_id,)
     assert _leg(store, run_id, "state, end_reason, provider_receipt_id, charged_micros") == (
-        "ended", "dead_lease", "provider-receipt", 7,
+        "ended",
+        "dead_lease",
+        "provider-receipt",
+        7,
     )
     assert store.leases() == ()
 
@@ -236,14 +265,17 @@ def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
     assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).reserved == Money.zero("USD")
     assert _leg(store, run_id, "state, end_reason, charged_micros") == (
-        "ended", "trusted usage and provider charge unavailable", 0,
+        "ended",
+        "trusted usage and provider charge unavailable",
+        0,
     )
 
 
 def _stale_sweep(store):
     """The periodic sweep, three minutes after the reservation, with a two-minute grace."""
-    return _coordinator(store, reservation_grace=timedelta(minutes=2),
-                        now=lambda: NOW + timedelta(minutes=3)).reconcile(RecoveryTrigger.PERIODIC)
+    return _coordinator(
+        store, reservation_grace=timedelta(minutes=2), now=lambda: NOW + timedelta(minutes=3)
+    ).reconcile(RecoveryTrigger.PERIODIC)
 
 
 def test_periodic_sweep_releases_only_stale_unlaunched_reservation(tmp_path, monkeypatch):
@@ -256,9 +288,7 @@ def test_periodic_sweep_releases_only_stale_unlaunched_reservation(tmp_path, mon
 
     assert report.spend_unknown == (run_id,)
     assert store.active_reservation_runs(OWNER) == ()
-    assert _leg(store, run_id, "state, end_reason, charged_micros") == (
-        "released", "unlaunched_reservation", None,
-    )
+    assert _leg(store, run_id, "state, end_reason, charged_micros") == ("released", "unlaunched_reservation", None)
 
 
 def test_a_stale_reserved_leg_holding_its_live_lease_is_never_released(tmp_path):
@@ -274,7 +304,10 @@ def test_a_stale_reserved_leg_holding_its_live_lease_is_never_released(tmp_path)
     assert store.active_reservation_runs(OWNER) == (run_id,)
     assert tuple(lease.run_id for lease in store.leases()) == (run_id,)
     store.register_process_lease(
-        run_id, expected_owner_id=OWNER, pid=os.getpid(), pgid=os.getpgid(0),
+        run_id,
+        expected_owner_id=OWNER,
+        pid=os.getpid(),
+        pgid=os.getpgid(0),
         process_start_ticks=ProcessSupervisor.process_identity(os.getpid()).start_ticks,
     )
     assert _leg(store, run_id, "state") == ("running",)
@@ -286,8 +319,9 @@ def test_boot_settles_an_unmeasured_codex_hold_once_and_preserves_money(tmp_path
     run_id = RunId("9fdbdc47801a41849dc212b941ef6b8f")
     scope = _reserve(store, run_id, now=now, runtime="codex")
     assert store.record_reservation_retained(run_id, "unfinished turns")
-    coordinator = _coordinator(store, CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)),
-                               now=lambda: now)
+    coordinator = _coordinator(
+        store, CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)), now=lambda: now
+    )
     assert coordinator.reconcile(RecoveryTrigger.BOOT).spend_unknown == ()
     assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).reserved == Money.zero()
@@ -305,9 +339,7 @@ def test_generic_estimate_recovery_preserves_real_abandonment(tmp_path):
         db.commit()
     assert store.settle_terminal_estimate(run_id, "provider evidence unavailable")
     assert store.active_reservation_runs(OWNER) == ()
-    assert _leg(store, run_id, "state, end_reason, charged_micros, basis") == (
-        "ended", "dead_lease", 0, "estimate",
-    )
+    assert _leg(store, run_id, "state, end_reason, charged_micros, basis") == ("ended", "dead_lease", 0, "estimate")
 
 
 # ── boot reap across the store's registries (slice 9 review P2-2) ─────────────
@@ -326,8 +358,9 @@ print(child.pid, flush=True)
 def _orphan(registry: str, run_id: str) -> int:
     """A group registered by a launcher that has since died (the orphan a
     daemon killed mid-leg leaves behind)."""
-    launched = subprocess.run([sys.executable, "-c", _LAUNCHER, registry, run_id],
-                              capture_output=True, text=True, check=True, timeout=30)
+    launched = subprocess.run(
+        [sys.executable, "-c", _LAUNCHER, registry, run_id], capture_output=True, text=True, check=True, timeout=30
+    )
     return int(launched.stdout.strip())
 
 
@@ -345,8 +378,7 @@ def test_boot_reaps_an_orphan_another_repository_left_on_the_shared_state_root(t
     boot kills A's orphaned group (its launcher is dead) but never a group
     whose launching daemon is alive (the sibling role's live leg)."""
     state = tmp_path / "state"
-    cfg = HarnessConfig(repo="o/b", target_dir=str(tmp_path / "b"), state_dir=str(state),
-                        review_state_dir=str(state))
+    cfg = HarnessConfig(repo="o/b", target_dir=str(tmp_path / "b"), state_dir=str(state), review_state_dir=str(state))
     previous = state / "process-supervision" / deployment_identity_for_target("o/a", str(tmp_path / "a"), "fix")
     orphan = _orphan(str(previous), "a-leg")
     orphan_identity = ProcessSupervisor.process_identity(orphan)

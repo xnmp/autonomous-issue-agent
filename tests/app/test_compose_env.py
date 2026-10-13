@@ -74,8 +74,14 @@ def _run_doctor(env: dict, cwd: Path | None = None) -> subprocess.CompletedProce
         empty = Path(tempfile.mkdtemp(prefix="doctor-cfg-")) / "empty.env"
         empty.write_text("")
         full_env["AGENT_ENV"] = str(empty)
-    return subprocess.run(["bash", str(DOCTOR_SH)], env=full_env, cwd=str(cwd) if cwd else None,
-                          capture_output=True, text=True, timeout=30)
+    return subprocess.run(
+        ["bash", str(DOCTOR_SH)],
+        env=full_env,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
 
 def _doctor_with(fake_bin: Path, **env: str) -> subprocess.CompletedProcess:
@@ -125,8 +131,11 @@ def _emitted(active: Path) -> dict[str, str]:
     (still shell-quoted) values. `printf %q` always emits a single line, so
     line-splitting is safe even for values containing newlines. Use
     `_load_agent_env` when the unquoted value matters."""
-    return dict(line.split("=", 1) for line in active.read_text().splitlines()
-                if line and not line.startswith("#") and "=" in line)
+    return dict(
+        line.split("=", 1)
+        for line in active.read_text().splitlines()
+        if line and not line.startswith("#") and "=" in line
+    )
 
 
 # `NAME=` / `export NAME=` at the start of a line — an INDEPENDENT restatement
@@ -139,9 +148,12 @@ _UNSET_RE = re.compile(r"^[ \t]*unset[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*$", re.
 def test_compose_env_emits_the_files_with_overlay_precedence_and_nothing_ambient(tmp_path):
     """The overlay wins over shared.env, and only what the two files define is
     emitted: no unrelated ambient var and none of the shell's own (PATH/PWD/...)."""
-    active = _compose(tmp_path, shared='MERGE_METHOD="merge"\nFIX_BOT="fix-bot"\n',
-                      overlay='REPO="acme/widget"\nMERGE_METHOD="squash"\n',
-                      ambient={"SOME_UNRELATED_AMBIENT_VAR": "should-not-leak"})
+    active = _compose(
+        tmp_path,
+        shared='MERGE_METHOD="merge"\nFIX_BOT="fix-bot"\n',
+        overlay='REPO="acme/widget"\nMERGE_METHOD="squash"\n',
+        ambient={"SOME_UNRELATED_AMBIENT_VAR": "should-not-leak"},
+    )
     text = active.read_text()
     assert "MERGE_METHOD=squash" in text and "MERGE_METHOD=merge" not in text
     assert "SOME_UNRELATED_AMBIENT_VAR" not in text
@@ -184,7 +196,7 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
         # assigned then unset: a name the scan sees but POST does not have, so
         # it must not be emitted as an empty string
         'GONE_LATER="temp"\n'
-        'unset GONE_LATER\n'
+        "unset GONE_LATER\n"
         # set INDIRECTLY, via a nested `source` (no assignment-shaped line in
         # either config file names it) — proves the PRE/POST diff arm of the
         # union is still load-bearing and was not replaced by the file scan.
@@ -194,14 +206,17 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "nested.env").write_text('INDIRECT_FROM_NESTED_SOURCE="via-nested"\n')
     active = _compose(
-        tmp_path, shared, overlay,
+        tmp_path,
+        shared,
+        overlay,
         ambient={
             "TEST_CMD": "uv run pytest -q",
             "ANTHROPIC_AUTH_TOKEN": "sk-ambient-real",
             "SOME_UNRELATED_AMBIENT_VAR": "should-not-leak",
             # Commented names exported ambiently: a scan that matched a comment
             # would emit them with these values.
-            "COMMENTED_KNOB": "leaked", "TIGHT_COMMENT": "leaked",
+            "COMMENTED_KNOB": "leaked",
+            "TIGHT_COMMENT": "leaked",
         },
     )
 
@@ -215,10 +230,24 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
     assert set(emitted) == expected
 
     env = _load_agent_env({"AGENT_ENV": str(active)})
-    assert {key: env[key] for key in ("TEST_CMD", "ANTHROPIC_AUTH_TOKEN", "MERGE_METHOD", "INDENTED_EXPORT",
-                                      "EMPTY_ON_PURPOSE", "INDIRECT_FROM_NESTED_SOURCE")} == {
-        "TEST_CMD": "uv run pytest -q", "ANTHROPIC_AUTH_TOKEN": "sk-ambient-real", "MERGE_METHOD": "squash",
-        "INDENTED_EXPORT": "yes", "EMPTY_ON_PURPOSE": "", "INDIRECT_FROM_NESTED_SOURCE": "via-nested"}
+    assert {
+        key: env[key]
+        for key in (
+            "TEST_CMD",
+            "ANTHROPIC_AUTH_TOKEN",
+            "MERGE_METHOD",
+            "INDENTED_EXPORT",
+            "EMPTY_ON_PURPOSE",
+            "INDIRECT_FROM_NESTED_SOURCE",
+        )
+    } == {
+        "TEST_CMD": "uv run pytest -q",
+        "ANTHROPIC_AUTH_TOKEN": "sk-ambient-real",
+        "MERGE_METHOD": "squash",
+        "INDENTED_EXPORT": "yes",
+        "EMPTY_ON_PURPOSE": "",
+        "INDIRECT_FROM_NESTED_SOURCE": "via-nested",
+    }
 
 
 def test_compose_env_emits_only_sourceable_identifier_names(tmp_path):
@@ -228,11 +257,13 @@ def test_compose_env_emits_only_sourceable_identifier_names(tmp_path):
     # ("BASH_FUNC_name%%=...: command not found"), which is exactly the file
     # both `_load_agent_env` and the bash tools `source`. Assert the composed
     # file is clean AND that sourcing it is silent.
-    active = _compose(tmp_path, shared='_helper() { HELPED="yes"; }\n_helper\nFIX_BOT="fix-bot"\n',
-                      overlay='REPO="acme/widget"\n')
+    active = _compose(
+        tmp_path, shared='_helper() { HELPED="yes"; }\n_helper\nFIX_BOT="fix-bot"\n', overlay='REPO="acme/widget"\n'
+    )
     assert not [k for k in _emitted(active) if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)]
-    proc = subprocess.run(["bash", "-c", 'set -a; source "$1"; set +a', "check", str(active)],
-                          capture_output=True, text=True)
+    proc = subprocess.run(
+        ["bash", "-c", 'set -a; source "$1"; set +a', "check", str(active)], capture_output=True, text=True
+    )
     assert (proc.returncode, proc.stderr) == (0, "")
     # The variable the function set is still config and still arrives.
     assert _load_agent_env({"AGENT_ENV": str(active)})["HELPED"] == "yes"
@@ -245,7 +276,7 @@ def test_compose_env_scans_a_final_line_with_no_trailing_newline(tmp_path):
     active = _compose(
         tmp_path,
         shared='A_KNOB="one"\nB_KNOB="two"',  # deliberately unterminated
-        overlay='REPO="acme/widget"',          # deliberately unterminated
+        overlay='REPO="acme/widget"',  # deliberately unterminated
         ambient={"A_KNOB": "one", "B_KNOB": "two", "REPO": "acme/widget"},
     )
     assert set(_emitted(active)) == {"A_KNOB", "B_KNOB", "REPO", "HARNESS_DEPLOY_KNOBS"}
@@ -255,8 +286,12 @@ def test_compose_env_omits_a_conditional_assignment_that_never_fired(tmp_path):
     # A name the file scan sees inside a branch that did not execute, and that
     # nothing else set, must NOT be emitted as an empty string — an empty
     # TEST_CMD reads as "no test command" and is as bad as a missing one.
-    active = _compose(tmp_path, shared='if [ -n "${TRIGGER:-}" ]; then\n  MAYBE_KNOB="fired"\nfi\n',
-                      overlay='REPO="acme/widget"\n', ambient={"MAYBE_KNOB": None, "TRIGGER": None})
+    active = _compose(
+        tmp_path,
+        shared='if [ -n "${TRIGGER:-}" ]; then\n  MAYBE_KNOB="fired"\nfi\n',
+        overlay='REPO="acme/widget"\n',
+        ambient={"MAYBE_KNOB": None, "TRIGGER": None},
+    )
     assert "MAYBE_KNOB" not in _emitted(active)
 
 
@@ -312,8 +347,9 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
 
 
 def _machine_state(monkeypatch, tmp_path) -> Path:
-    monkeypatch.setattr("issue_agent.app.config.machine_control_authority_root",
-                        lambda: str(tmp_path / "machine-state"))
+    monkeypatch.setattr(
+        "issue_agent.app.config.machine_control_authority_root", lambda: str(tmp_path / "machine-state")
+    )
     return tmp_path / "state"
 
 
@@ -332,8 +368,18 @@ def test_build_role_does_not_reload_env_when_already_provided(tmp_path, monkeypa
 
     # FIX_BOT is required as of review P1R-7 (an unset one made every
     # unresolvable PR author read as ours), so a config built here must carry it.
-    assert main_module.build_role("fix", {"REPO": "o/r", "FIX_BOT": "fix-bot", "STATE_DIR": str(state / "fix"),
-                                          "REVIEW_STATE_DIR": str(state / "review")}) is not None
+    assert (
+        main_module.build_role(
+            "fix",
+            {
+                "REPO": "o/r",
+                "FIX_BOT": "fix-bot",
+                "STATE_DIR": str(state / "fix"),
+                "REVIEW_STATE_DIR": str(state / "review"),
+            },
+        )
+        is not None
+    )
 
 
 def test_build_role_self_loads_env_when_called_standalone_without_one(tmp_path, monkeypatch):
@@ -369,9 +415,14 @@ def _overlays(tmp_path: Path, overlays: dict[str, str]) -> Path:
 
 
 def test_doctor_fails_on_two_overlays_sharing_a_state_dir(tmp_path):
-    harness = _overlays(tmp_path, {"repo-a": 'REPO="acme/widget"\n',
-                                   "repo-b": 'REPO="other/thing"\nSTATE_DIR="/custom/shared-state"\n',
-                                   "repo-c": 'REPO="third/repo"\nSTATE_DIR="/custom/shared-state"\n'})
+    harness = _overlays(
+        tmp_path,
+        {
+            "repo-a": 'REPO="acme/widget"\n',
+            "repo-b": 'REPO="other/thing"\nSTATE_DIR="/custom/shared-state"\n',
+            "repo-c": 'REPO="third/repo"\nSTATE_DIR="/custom/shared-state"\n',
+        },
+    )
 
     result = _doctor_with(_fake_tool_path(tmp_path), HARNESS_ROOT=str(harness))
     assert result.returncode != 0
@@ -391,8 +442,9 @@ def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
     deployment's exported values.
     """
     active = {"REPO": "other/thing", "STATE_DIR": "/active/fix", "REVIEW_STATE_DIR": "/active/review"}
-    harness = _overlays(tmp_path, {"older": 'REPO="acme/widget"\n',
-                                   "active": "".join(f'{k}="{v}"\n' for k, v in active.items())})
+    harness = _overlays(
+        tmp_path, {"older": 'REPO="acme/widget"\n', "active": "".join(f'{k}="{v}"\n' for k, v in active.items())}
+    )
 
     result = _doctor_with(_fake_tool_path(tmp_path), HARNESS_ROOT=str(harness), **active)
 
@@ -412,8 +464,9 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
     """Concurrent multi-repo deployments: composing repo B must not overwrite
     repo A's snapshot (the old fixed config/.active.env did exactly that, and
     the mtime hot-reload watch then re-pointed A's live daemons at B)."""
-    compose_env_sh = _install_compose_env(tmp_path, "SHARED_KNOB=x\n",
-                                          {"alpha": "REPO=acme/alpha\n", "beta": "REPO=acme/beta\n"})
+    compose_env_sh = _install_compose_env(
+        tmp_path, "SHARED_KNOB=x\n", {"alpha": "REPO=acme/alpha\n", "beta": "REPO=acme/beta\n"}
+    )
 
     for name in ("alpha", "beta"):
         subprocess.run(["bash", str(compose_env_sh), name], check=True, capture_output=True, text=True)
@@ -442,11 +495,14 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
 # the section makes. `jq` is deliberately NOT stubbed here (unlike
 # _fake_tool_path) — the section's detection lives in its jq programs, so a
 # stubbed jq would test nothing.
-def _ci_doctor(tmp_path: Path, extra_env: dict, *, workflows: int = 1, prs: list | None = None,
-               allow_squash: bool = True) -> subprocess.CompletedProcess:
+def _ci_doctor(
+    tmp_path: Path, extra_env: dict, *, workflows: int = 1, prs: list | None = None, allow_squash: bool = True
+) -> subprocess.CompletedProcess:
     """Run doctor with a `gh` that answers the CI section's three queries from
     fixture data; everything else behaves like _fake_tool_path's stubs."""
-    gh = _GH_BASE + f"""if [ "$1" = "pr" ] && [ "$2" = "list" ]; then cat <<'JSON'
+    gh = (
+        _GH_BASE
+        + f"""if [ "$1" = "pr" ] && [ "$2" = "list" ]; then cat <<'JSON'
 {json.dumps(prs if prs is not None else [])}
 JSON
 exit 0; fi
@@ -458,16 +514,27 @@ if [ "$1" = "api" ]; then
 fi
 exit 0
 """
+    )
     fake_bin = _tool_dir(tmp_path / "fake_ci_bin", {**_STUBS, "gh": gh})
     harness = tmp_path / "harness"
     (harness / "config" / "repos").mkdir(parents=True, exist_ok=True)
-    return _doctor_with(fake_bin, **{"HARNESS_ROOT": str(harness), "REPO": "acme/widget", "BASE_BRANCH": "trunk",
-                                     "FIX_BOT": "acme-fixer", "REVIEW_BOT": "acme-review", **extra_env})
+    return _doctor_with(
+        fake_bin,
+        **{
+            "HARNESS_ROOT": str(harness),
+            "REPO": "acme/widget",
+            "BASE_BRANCH": "trunk",
+            "FIX_BOT": "acme-fixer",
+            "REVIEW_BOT": "acme-review",
+            **extra_env,
+        },
+    )
 
 
 def test_doctor_checks_explicit_composed_snapshot(tmp_path):
-    active = _compose(tmp_path, 'FIX_BOT=acme-fixer\n',
-                      'REPO=acme/widget\nBASE_BRANCH=trunk\nTEST_CMD="uv run pytest -q"\n')
+    active = _compose(
+        tmp_path, "FIX_BOT=acme-fixer\n", 'REPO=acme/widget\nBASE_BRANCH=trunk\nTEST_CMD="uv run pytest -q"\n'
+    )
     result = _ci_doctor(tmp_path, {"AGENT_ENV": str(active)}, workflows=0)
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -494,8 +561,12 @@ def test_doctor_errors_when_no_pr_into_base_ever_got_a_check(tmp_path):
 
 
 def test_doctor_errors_when_the_repo_forbids_the_configured_merge_method(tmp_path):
-    result = _ci_doctor(tmp_path, {"MERGE_METHOD": "squash"}, prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
-                        allow_squash=False)
+    result = _ci_doctor(
+        tmp_path,
+        {"MERGE_METHOD": "squash"},
+        prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
+        allow_squash=False,
+    )
     assert result.returncode != 0
     assert "MERGE_METHOD=squash is DISABLED" in result.stdout
 

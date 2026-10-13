@@ -21,8 +21,11 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture(scope="module")
 def contract():
     configuration.configure()
-    spec = next(c for c in tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["importlinter"]["contracts"]
-                if c["name"] == NAME)
+    spec = next(
+        c
+        for c in tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["importlinter"]["contracts"]
+        if c["name"] == NAME
+    )
     options = {key: value for key, value in spec.items() if key not in ("name", "type")}
 
     def kept(*edges: tuple[str, str]) -> bool:
@@ -38,13 +41,16 @@ def test_the_tree_as_committed_keeps_it(contract):
     assert contract()
 
 
-@pytest.mark.parametrize("importer,imported", [
-    ("issue_agent.app.fix", "issue_agent.app.dashweb.service"),
-    ("issue_agent.app.tick", "issue_agent.app.dashboard"),
-    ("issue_agent.adapters.github", "issue_agent.adapters.dashweb.legs"),
-    ("issue_agent.adapters.control_store", "issue_agent.domain.dashboard"),
-    ("issue_agent.domain.state", "issue_agent.domain.dashboard"),
-    ("issue_agent.app.planners.tasks", "issue_agent.app.dashweb.views"),
-])
+@pytest.mark.parametrize(
+    "importer,imported",
+    [
+        ("issue_agent.app.fix", "issue_agent.app.dashweb.service"),
+        ("issue_agent.app.tick", "issue_agent.app.dashboard"),
+        ("issue_agent.adapters.github", "issue_agent.adapters.dashweb.legs"),
+        ("issue_agent.adapters.control_store", "issue_agent.domain.dashboard"),
+        ("issue_agent.domain.state", "issue_agent.domain.dashboard"),
+        ("issue_agent.app.planners.tasks", "issue_agent.app.dashweb.views"),
+    ],
+)
 def test_a_core_import_of_the_dashboard_breaks_it(contract, importer, imported):
     assert not contract((importer, imported))

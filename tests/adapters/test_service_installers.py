@@ -152,8 +152,9 @@ def _calls(env) -> list[str]:
 
 def _checksum(env, tmp_path: Path) -> str:
     """The launchd job suffix the installer derives from (config, target)."""
-    return subprocess.run(["cksum"], input=f"{env['AGENT_ENV']}|{tmp_path / 'target-repo'}",
-                          capture_output=True, text=True, check=True).stdout.split()[0]
+    return subprocess.run(
+        ["cksum"], input=f"{env['AGENT_ENV']}|{tmp_path / 'target-repo'}", capture_output=True, text=True, check=True
+    ).stdout.split()[0]
 
 
 def _launchd_snapshot(home: Path, checksum: str, target: Path) -> Path:
@@ -231,9 +232,15 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     assert terminal_hook.is_file()
     for unit in _role_units(units):
         text = unit.read_text()
-        for directive in ("NotifyAccess=all", "WatchdogSec=300", "KillMode=mixed", "TimeoutStopSec=90",
-                          "FinalKillSignal=SIGKILL", f'ExecStopPost=-/bin/sh "{terminal_hook}"\n',
-                          "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"):
+        for directive in (
+            "NotifyAccess=all",
+            "WatchdogSec=300",
+            "KillMode=mixed",
+            "TimeoutStopSec=90",
+            "FinalKillSignal=SIGKILL",
+            f'ExecStopPost=-/bin/sh "{terminal_hook}"\n',
+            "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo",
+        ):
             assert directive in text, (unit.name, directive)
     dashboard = _artifacts(home, True) / "issue-agent-dashboard.service"
     assert "Environment=AGENT_ENV=" not in dashboard.read_text()
@@ -309,10 +316,10 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
 
 
 @pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
-@pytest.mark.parametrize("unit,kind", [
-    ("issue-agent-fix-watcher-target-repo.service", "current"),
-    ("issue-agent-fix-watcher.service", "legacy"),
-])
+@pytest.mark.parametrize(
+    "unit,kind",
+    [("issue-agent-fix-watcher-target-repo.service", "current"), ("issue-agent-fix-watcher.service", "legacy")],
+)
 def test_systemd_refuses_a_live_unit_without_rollback_definition(tmp_path, state_var, unit, kind):
     env, home, _uv = _environment(tmp_path, systemd=True)
     env[state_var] = unit
@@ -341,8 +348,9 @@ def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(tmp_path):
     result = _install(env)
 
     assert result.returncode == 0, result.stderr
-    assert sorted(path.name for path in unit_dir.glob("*.service")) == sorted([
-        *(f"{service}-stable-name.service" for service in _SERVICES), "issue-agent-dashboard.service"])
+    assert sorted(path.name for path in unit_dir.glob("*.service")) == sorted(
+        [*(f"{service}-stable-name.service" for service in _SERVICES), "issue-agent-dashboard.service"]
+    )
     calls = _calls(env)
     for service in _SERVICES:
         for name in (service, f"{service}-target-repo", f"{service}-stable-name"):

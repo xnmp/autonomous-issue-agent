@@ -39,34 +39,65 @@ def _rollout_path(codex_home, sid: str = SID):
 
 def _session_meta(cwd: str | None = None, sid: str = SID) -> str:
     """The root session's identity record; dated ahead so it postdates the run."""
-    return json.dumps({"timestamp": "2099-07-29T00:00:00Z", "type": "session_meta", "payload": {
-        "id": sid, "originator": "codex_exec", "source": "exec", "cwd": cwd or os.getcwd()}}) + "\n"
+    return (
+        json.dumps(
+            {
+                "timestamp": "2099-07-29T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": sid, "originator": "codex_exec", "source": "exec", "cwd": cwd or os.getcwd()},
+            }
+        )
+        + "\n"
+    )
 
 
 def _usage(input_tokens: int, output_tokens: int, cached_input_tokens: int = 0) -> dict:
-    return {"input_tokens": input_tokens, "cached_input_tokens": cached_input_tokens, "cache_write_input_tokens": 0,
-            "output_tokens": output_tokens}
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": 0,
+        "output_tokens": output_tokens,
+    }
 
 
 def _token_event(total: dict, last: dict | None = None) -> str:
-    return json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "payload": {
-        "type": "token_count", "info": {"last_token_usage": last or total, "total_token_usage": total}}})
+    return json.dumps(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": {"type": "token_count", "info": {"last_token_usage": last or total, "total_token_usage": total}},
+        }
+    )
 
 
-def _write_rollout(codex_home, *, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0,
-                   sid: str = SID, cwd: str | None = None) -> None:
+def _write_rollout(
+    codex_home,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+    sid: str = SID,
+    cwd: str | None = None,
+) -> None:
     event = _token_event(_usage(input_tokens, output_tokens, cached_input_tokens))
     _rollout_path(codex_home, sid).write_text(_session_meta(cwd, sid) + event + "\n")
 
 
 # $5 in / $30 out / $0.50 cached per MTok, the shipped fallback shape.
-CARD = RateTable("card", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
-                 ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000))
+CARD = RateTable(
+    "card", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK, ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000)
+)
 
 
 def _runner(tmp_path, body: str, **overrides) -> CodexRunner:
-    return CodexRunner(**{"codex_bin": _fake_codex(tmp_path, body), "env": {"OPENAI_API_KEY": "k"},
-                          "rate_table": CARD, "poll_slice": 0.05, **overrides})
+    return CodexRunner(
+        **{
+            "codex_bin": _fake_codex(tmp_path, body),
+            "env": {"OPENAI_API_KEY": "k"},
+            "rate_table": CARD,
+            "poll_slice": 0.05,
+            **overrides,
+        }
+    )
 
 
 def _go(runner: CodexRunner, **plan):
@@ -75,20 +106,17 @@ def _go(runner: CodexRunner, **plan):
 
 # The fake codex finds its `-o` output path, and finishes by writing a clean verdict there.
 _OUT_ARG = 'out=""; prev=""\nfor a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-_VERDICT = "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
+_VERDICT = 'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
 
 
 def _chatty_body(sid: str = SID, seconds: int = 40) -> str:
     return _OUT_ARG + f'for i in $(seq 1 {seconds}); do echo "exec step $i" >&2; sleep 0.05; done\n' + _VERDICT
 
 
-@pytest.mark.parametrize("home_source", [
-    "inherited", "runner", "task", "empty_task", "relative_runner", "relative_task",
-    "symlink_parent",
-])
-def test_accounting_uses_the_launched_child_home_without_scanning_foreign_archive(
-    tmp_path, monkeypatch, home_source,
-):
+@pytest.mark.parametrize(
+    "home_source", ["inherited", "runner", "task", "empty_task", "relative_runner", "relative_task", "symlink_parent"]
+)
+def test_accounting_uses_the_launched_child_home_without_scanning_foreign_archive(tmp_path, monkeypatch, home_source):
     ambient = tmp_path / "ambient"
     monkeypatch.setenv("HOME", str(ambient))
     foreign = ambient / ".codex"
@@ -172,8 +200,10 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
 
 def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex-home"))
-    body = ("echo 'Token usage: total=5,100,000 input=0 (+ 0 cached) output=5,100,000' >&2\n"
-            'for i in $(seq 1 10); do echo "exec step $i" >&2; sleep 0.03; done\n' + _OUT_ARG + _VERDICT)
+    body = (
+        "echo 'Token usage: total=5,100,000 input=0 (+ 0 cached) output=5,100,000' >&2\n"
+        'for i in $(seq 1 10); do echo "exec step $i" >&2; sleep 0.03; done\n' + _OUT_ARG + _VERDICT
+    )
 
     result = _go(_runner(tmp_path, body, poll_slice=0.01))
 
@@ -228,7 +258,8 @@ def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monke
     _write_rollout(tmp_path, input_tokens=1_000_000, cached_input_tokens=800_000, output_tokens=10_000)
     grown = _token_event(_usage(2_000_000, 20_000, 1_700_000), last={"input_tokens": 1})
     body = _chatty_body(seconds=1).replace(
-        "printf '%s'", f"printf '%s\\n' '{grown}' >> '{_rollout_path(tmp_path)}'\nprintf '%s'")
+        "printf '%s'", f"printf '%s\\n' '{grown}' >> '{_rollout_path(tmp_path)}'\nprintf '%s'"
+    )
 
     result = _go(_runner(tmp_path, body), resume=SID)
 

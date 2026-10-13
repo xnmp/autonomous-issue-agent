@@ -19,21 +19,14 @@ from issue_agent.domain.outcome import Outcome, classify_outcome
 def _claude_result(*, structured, is_error=False, result="", session_id="s1"):
     return result_to_agent_result(
         SimpleNamespace(
-            structured_output=structured,
-            is_error=is_error,
-            result=result,
-            total_cost_usd=0.25,
-            session_id=session_id,
+            structured_output=structured, is_error=is_error, result=result, total_cost_usd=0.25, session_id=session_id
         )
     )
 
 
 def _codex_result(*, structured, exit_code=0, session_id="s1", stderr=""):
     return parse_codex_envelope(
-        exit_code=exit_code,
-        last_message=json.dumps(structured),
-        session_id=session_id,
-        stderr=stderr,
+        exit_code=exit_code, last_message=json.dumps(structured), session_id=session_id, stderr=stderr
     )
 
 
@@ -62,10 +55,7 @@ def test_transport_failure_without_envelope_is_error():
         )
     )
     codex = parse_codex_envelope(
-        exit_code=1,
-        last_message="",
-        session_id="s2",
-        stderr="stream disconnected before completion",
+        exit_code=1, last_message="", session_id="s2", stderr="stream disconnected before completion"
     )
 
     for result in (claude, codex):

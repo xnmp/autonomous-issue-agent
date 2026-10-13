@@ -14,8 +14,7 @@ from issue_agent.domain.outcome import (
 
 def _blocked() -> AgentResult:
     return AgentResult(
-        is_error=False, status="blocked", needs="wait for reviewer",
-        exit_reason=ExitReason.OK, session_id="s",
+        is_error=False, status="blocked", needs="wait for reviewer", exit_reason=ExitReason.OK, session_id="s"
     )
 
 

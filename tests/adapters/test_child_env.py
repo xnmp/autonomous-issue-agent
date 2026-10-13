@@ -1,7 +1,4 @@
-from issue_agent.adapters.child_env import (
-    child_process_env,
-    without_supervisor_authority,
-)
+from issue_agent.adapters.child_env import child_process_env, without_supervisor_authority
 
 
 def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
@@ -15,10 +12,7 @@ def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
         "UNRELATED": "ambient",
     }
 
-    selected = child_process_env(
-        inherited,
-        {"ISSUE_AGENT_RUN_ID": "run-1", "GH_TOKEN": "still-denied"},
-    )
+    selected = child_process_env(inherited, {"ISSUE_AGENT_RUN_ID": "run-1", "GH_TOKEN": "still-denied"})
 
     assert selected == {
         "PATH": "/bin",
@@ -30,8 +24,7 @@ def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
 
 def test_provider_specific_auth_key_can_be_admitted_explicitly():
     selected = child_process_env(
-        {"CUSTOM_PROVIDER_KEY": "secret", "NOPE": "discarded"},
-        additional_keys=("CUSTOM_PROVIDER_KEY",),
+        {"CUSTOM_PROVIDER_KEY": "secret", "NOPE": "discarded"}, additional_keys=("CUSTOM_PROVIDER_KEY",)
     )
 
     assert selected == {"CUSTOM_PROVIDER_KEY": "secret"}

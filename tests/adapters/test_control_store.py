@@ -59,21 +59,39 @@ def _daily(repository: str = REPO, dimension: str = "repository") -> BudgetScope
 
 def _issue_scope(issue: int) -> BudgetScope:
     return BudgetScope(
-        REPO, f"issue:{issue}", "USD", f"lifetime:{issue}",
-        datetime(1970, 1, 1, tzinfo=timezone.utc), datetime.max.replace(tzinfo=timezone.utc), ZoneInfo("UTC"),
+        REPO,
+        f"issue:{issue}",
+        "USD",
+        f"lifetime:{issue}",
+        datetime(1970, 1, 1, tzinfo=timezone.utc),
+        datetime.max.replace(tzinfo=timezone.utc),
+        ZoneInfo("UTC"),
     )
 
 
 def _request(
-    index: int, maximum: int = 60, cap: int = 100, *, issue: int | None = None,
-    lease_target: int | None = None, limits: tuple[BudgetLimit, ...] | None = None,
-    owner: str = OWNER, repository: str = REPO,
+    index: int,
+    maximum: int = 60,
+    cap: int = 100,
+    *,
+    issue: int | None = None,
+    lease_target: int | None = None,
+    limits: tuple[BudgetLimit, ...] | None = None,
+    owner: str = OWNER,
+    repository: str = REPO,
 ) -> ReservationRequest:
     return ReservationRequest(
-        RunId(f"run-{index}"), repository, "fix", "RESOLVE", owner, Money("USD", maximum),
+        RunId(f"run-{index}"),
+        repository,
+        "fix",
+        "RESOLVE",
+        owner,
+        Money("USD", maximum),
         limits or (BudgetLimit(_daily(repository), Money("USD", cap)),),
         lease_target if lease_target is not None else index,
-        issue=issue if issue is not None else index, number=index, runtime="claude",
+        issue=issue if issue is not None else index,
+        number=index,
+        runtime="claude",
     )
 
 
@@ -86,8 +104,14 @@ def _reserve(store: SQLiteControlStore, *args, **changes):
 
 def _settlement(run: str, micros: int, receipt: str | None = None, **changes) -> SettlementRequest:
     return SettlementRequest(
-        RunId(run), Money("USD", micros), changes.pop("basis", PricingBasis.PROVIDER_REPORTED),
-        receipt or f"receipt-{run}", changes.pop("usage", None), None, None, **changes,
+        RunId(run),
+        Money("USD", micros),
+        changes.pop("basis", PricingBasis.PROVIDER_REPORTED),
+        receipt or f"receipt-{run}",
+        changes.pop("usage", None),
+        None,
+        None,
+        **changes,
     )
 
 
@@ -236,10 +260,20 @@ def test_the_global_cap_sums_every_repository_and_the_daily_cap_only_its_own(tmp
     store = _store(tmp_path)
     global_limit = BudgetLimit(_daily("*", "global"), Money("USD", 100))
 
-    assert _reserve(store, 1, limits=(BudgetLimit(_daily("a/one"), Money("USD", 60)), global_limit),
-                                  repository="a/one", owner="a/one:fix:d").admitted
-    blocked = _reserve(store, 2, limits=(BudgetLimit(_daily("b/two"), Money("USD", 60)), global_limit),
-                                     repository="b/two", owner="b/two:fix:d")
+    assert _reserve(
+        store,
+        1,
+        limits=(BudgetLimit(_daily("a/one"), Money("USD", 60)), global_limit),
+        repository="a/one",
+        owner="a/one:fix:d",
+    ).admitted
+    blocked = _reserve(
+        store,
+        2,
+        limits=(BudgetLimit(_daily("b/two"), Money("USD", 60)), global_limit),
+        repository="b/two",
+        owner="b/two:fix:d",
+    )
 
     assert blocked.tripped_dimension == "global"
     assert store.snapshot(_daily("a/one")).committed == Money("USD", 60)
@@ -355,7 +389,10 @@ def test_an_interrupted_leg_is_settled_at_zero_only_once_its_process_is_gone(tmp
 
     leg = _leg(store, "run-1")
     assert (leg["state"], leg["charged_micros"], leg["basis"], leg["origin"]) == (
-        "ended", 0, "estimate", "recovery_estimate",
+        "ended",
+        0,
+        "estimate",
+        "recovery_estimate",
     )
     assert store.snapshot(_daily()).committed == Money("USD", 0)
 
@@ -384,7 +421,7 @@ def test_shutdown_marks_this_deployments_unsettled_legs_without_releasing_them(t
     intents = store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")
 
     assert [(i.run_id, i.kind, i.issue_number, i.reason) for i in intents] == [
-        (run, "RESOLVE", 9, "shutdown_deadline_spend_unknown"),
+        (run, "RESOLVE", 9, "shutdown_deadline_spend_unknown")
     ]
     assert store.has_cancellation_intent(run)
     assert not store.has_cancellation_intent(RunId("run-2"))
@@ -392,7 +429,9 @@ def test_shutdown_marks_this_deployments_unsettled_legs_without_releasing_them(t
     # Once the cancelled leg ends unsettled, it is still shutdown's to hand over.
     assert store.record_reservation_retained(run, "killed")
     assert not store.has_cancellation_intent(run)
-    assert [i.run_id for i in store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")] == [run]
+    assert [i.run_id for i in store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")] == [
+        run
+    ]
     assert store.snapshot(_daily()).reserved == Money("USD", 180)
 
 
@@ -422,8 +461,17 @@ def test_ended_legs_carry_their_returned_class_session_and_result(tmp_path):
     assert store.record_result(run, "asked", session="s-1", result={"question": "which?"})
     assert not store.record_result(run, "agent")
     store.settle(_settlement("run-1", 10))
-    store.record_unpaid_leg(RunId("refused"), repository=REPO, role="fix", kind="FIX_CI", owner_id=OWNER,
-                            issue=5, number=12, head="abc", runtime="claude")
+    store.record_unpaid_leg(
+        RunId("refused"),
+        repository=REPO,
+        role="fix",
+        kind="FIX_CI",
+        owner_id=OWNER,
+        issue=5,
+        number=12,
+        head="abc",
+        runtime="claude",
+    )
 
     runs = sorted(store.leg_runs(REPO, (5, 6, -1)), key=lambda run: run.kind)
     assert [(r.kind, r.number, r.issue, r.head) for r in runs] == [("FIX_CI", 12, 5, "abc"), ("RESOLVE", 1, 5, "")]
@@ -434,8 +482,17 @@ def test_ended_legs_carry_their_returned_class_session_and_result(tmp_path):
 
 def test_leg_reads_are_bounded_for_huge_issue_lists(tmp_path):
     store = _store(tmp_path)
-    store.record_unpaid_leg(RunId("r"), repository=REPO, role="review", kind="REVIEW", owner_id=OWNER,
-                            issue=1_999, number=3, head="h", runtime="codex")
+    store.record_unpaid_leg(
+        RunId("r"),
+        repository=REPO,
+        role="review",
+        kind="REVIEW",
+        owner_id=OWNER,
+        issue=1_999,
+        number=3,
+        head="h",
+        runtime="codex",
+    )
 
     assert [run.issue for run in store.leg_runs(REPO, range(1, 3_000))] == [1_999]
 
@@ -595,7 +652,7 @@ def test_the_read_model_never_creates_or_cuts_over_a_store(tmp_path):
 
 
 def _legacy(
-    path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, ...] = (), schema: Path = LEGACY_SCHEMA,
+    path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, ...] = (), schema: Path = LEGACY_SCHEMA
 ) -> Path:
     """A legacy store (v46 unless told otherwise). Each run: (run_id,
     run_state, reservation_state, charged_micros | None, issue, created_at, lease?)."""
@@ -611,10 +668,16 @@ def _legacy(
             db.execute(
                 "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, config_version, started_at, "
                 "completed_at, outcome, provider_receipt_id) VALUES (?, ?, 'RESOLVE', ?, ?, 'v', ?, ?, ?, ?)",
-                (run_id, dispatch, OWNER, run_state, created_at,
-                 created_at if run_state == "completed" else None,
-                 "settled" if charged is not None else None,
-                 f"receipt-{run_id}" if charged is not None else None),
+                (
+                    run_id,
+                    dispatch,
+                    OWNER,
+                    run_state,
+                    created_at,
+                    created_at if run_state == "completed" else None,
+                    "settled" if charged is not None else None,
+                    f"receipt-{run_id}" if charged is not None else None,
+                ),
             )
             day = created_at[:10]
             workload = "" if v41 else "workload_repository, "
@@ -624,14 +687,31 @@ def _legacy(
                 "cap_micros, model, rate_card_id, rate_card_version, quote_effective_at, config_version, "
                 f"state, created_at, updated_at) VALUES (?, ?, ?, {'' if v41 else '?, '}'repository', ?, ?, ?, "
                 "'UTC', 'USD', 500, 1000, 'gpt', 'card', 'v', ?, 'v', ?, ?, ?)",
-                (f"res-{run_id}", run_id, REPO, *(() if v41 else (REPO,)), day, f"{day}T00:00:00.000Z",
-                 f"{day}T23:59:59.999Z", created_at, reservation_state, created_at, created_at),
+                (
+                    f"res-{run_id}",
+                    run_id,
+                    REPO,
+                    *(() if v41 else (REPO,)),
+                    day,
+                    f"{day}T00:00:00.000Z",
+                    f"{day}T23:59:59.999Z",
+                    created_at,
+                    reservation_state,
+                    created_at,
+                    created_at,
+                ),
             )
             db.execute(
                 "INSERT INTO reservation_limits(run_id, repository, dimension, period_id, period_start, "
                 "period_end, period_timezone, currency, cap_micros) VALUES (?, ?, ?, ?, ?, ?, 'UTC', 'USD', 10000)",
-                (run_id, REPO, f"issue:{issue}", f"lifetime:{issue}", "1970-01-01T00:00:00.000Z",
-                 "9999-12-31T23:59:59.999Z"),
+                (
+                    run_id,
+                    REPO,
+                    f"issue:{issue}",
+                    f"lifetime:{issue}",
+                    "1970-01-01T00:00:00.000Z",
+                    "9999-12-31T23:59:59.999Z",
+                ),
             )
             db.execute(
                 "INSERT INTO reservation_recovery(run_id, policy, updated_at) VALUES (?, 'running', ?)",
@@ -647,7 +727,8 @@ def _legacy(
             if lease:
                 db.execute(
                     "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, process_start_ticks, started_at) "
-                    "VALUES (?, ?, ?, 1, 1, 1, ?)", (run_id, dispatch, OWNER, created_at),
+                    "VALUES (?, ?, ?, 1, 1, 1, ?)",
+                    (run_id, dispatch, OWNER, created_at),
                 )
         for scope, key, payload in comments:
             db.execute(
@@ -673,8 +754,11 @@ SETTLED = (
 
 
 def test_cutover_carries_settled_spend_into_the_caps_and_retires_the_legacy_file(tmp_path):
-    path = _legacy(tmp_path / "control.db", runs=SETTLED,
-                   comments=(("o/r", "needs-human:7", '"done"'), ("o/r", "needs-human:8", '"claimed"')))
+    path = _legacy(
+        tmp_path / "control.db",
+        runs=SETTLED,
+        comments=(("o/r", "needs-human:7", '"done"'), ("o/r", "needs-human:8", '"claimed"')),
+    )
     legacy_bytes_digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
     store = SQLiteControlStore(str(path), now=lambda: NOW)
@@ -688,8 +772,7 @@ def test_cutover_carries_settled_spend_into_the_caps_and_retires_the_legacy_file
     assert store.snapshot(_daily()).settled == Money("USD", 350)
     assert store.snapshot(_daily("*", "global")).settled == Money("USD", 350)
     assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
-    capped = store.reserve(_request(1, maximum=60, issue=7,
-                                    limits=(BudgetLimit(_issue_scope(7), Money("USD", 520)),)))
+    capped = store.reserve(_request(1, maximum=60, issue=7, limits=(BudgetLimit(_issue_scope(7), Money("USD", 520)),)))
     assert capped.tripped_dimension == "issue:7"
     # Money only: attempts restart, so carried legs are no legs to derive.
     assert store.leg_runs(REPO, (7, 8)) == ()
@@ -759,11 +842,14 @@ def test_a_legacy_store_without_a_recorded_version_is_refused_as_corrupt(tmp_pat
         SQLiteControlStore(str(path)).initialize()
 
 
-@pytest.mark.parametrize("unsettled", [
-    ("live", "running", "active", None, 7, TODAY, True),
-    ("reserved", "reserved", "active", None, 7, TODAY, False),
-    ("unswept", "abandoned", "active", None, 7, TODAY, False),
-])
+@pytest.mark.parametrize(
+    "unsettled",
+    [
+        ("live", "running", "active", None, 7, TODAY, True),
+        ("reserved", "reserved", "active", None, 7, TODAY, False),
+        ("unswept", "abandoned", "active", None, 7, TODAY, False),
+    ],
+)
 def test_cutover_is_refused_while_legacy_money_is_unsettled(tmp_path, unsettled):
     path = _legacy(tmp_path / "control.db", runs=(*SETTLED, unsettled))
     before = path.read_bytes()
@@ -798,15 +884,19 @@ def _crash(*_args, **_kwargs):
 def test_a_crash_at_any_cutover_step_leaves_the_legacy_store_and_a_retry_completes(tmp_path, monkeypatch, step):
     path = _legacy(tmp_path / "control.db", runs=SETTLED)
     if step == "copy":
+
         def partial_copy(new, _legacy):
             new.execute("INSERT INTO idempotency(key, state, claimed_at) VALUES ('half', 'done', 'x')")
             raise OSError("simulated crash")
+
         monkeypatch.setattr(control_store, "_carry", partial_copy)
     elif step == "verify":
         original = control_store._carry
+
         def short_copy(new, legacy):
             original(new, legacy)
             new.execute("DELETE FROM legs WHERE leg_id='earlier'")
+
         monkeypatch.setattr(control_store, "_carry", short_copy)
     elif step == "retire":
         monkeypatch.setattr(control_store.os, "link", _crash)

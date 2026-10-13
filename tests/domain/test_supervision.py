@@ -1,21 +1,11 @@
-from issue_agent.domain.supervision import (
-    ClockSample,
-    DaemonState,
-    ExitCode,
-    suspension_between,
-)
+from issue_agent.domain.supervision import ClockSample, DaemonState, ExitCode, suspension_between
 
 
 def test_exit_taxonomy_is_stable() -> None:
     assert ExitCode.CLEAN == 0
     assert ExitCode.DUPLICATE_INSTANCE == 3
     assert ExitCode.RELOAD == 87
-    assert tuple(DaemonState) == (
-        DaemonState.STARTING,
-        DaemonState.RUNNING,
-        DaemonState.DRAINING,
-        DaemonState.STOPPED,
-    )
+    assert tuple(DaemonState) == (DaemonState.STARTING, DaemonState.RUNNING, DaemonState.DRAINING, DaemonState.STOPPED)
 
 
 def test_suspension_is_wall_time_not_explained_by_active_time() -> None:

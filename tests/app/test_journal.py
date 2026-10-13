@@ -61,7 +61,9 @@ def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
     events = read_events(journal.path)
     by_number = {number: [event for event in events if event["number"] == number] for number in (5, 7)}
     assert {number: {(event["kind"], event["issue"]) for event in rows} for number, rows in by_number.items()} == {
-        5: {("RESOLVE", 5)}, 7: {("RESUME", 7)}}
+        5: {("RESOLVE", 5)},
+        7: {("RESUME", 7)},
+    }
     assert all(len({event["dispatch"] for event in rows}) == 1 for rows in by_number.values())
     assert by_number[5][0]["dispatch"] != by_number[7][0]["dispatch"]
 
@@ -92,10 +94,18 @@ def _settled(journal_path) -> list[dict]:
 
 def test_agent_run_records_context_cost_and_usage(tmp_path):
     result = AgentResult(
-        is_error=False, status="pr_opened", cost_usd=1.25, session_id="s5",
+        is_error=False,
+        status="pr_opened",
+        cost_usd=1.25,
+        session_id="s5",
         exit_reason=ExitReason.OK,
-        usage={"input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 30,
-               "cache_creation_input_tokens": 40, "ignored": "extra"},
+        usage={
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 40,
+            "ignored": "extra",
+        },
     )
     rt, journal = _runtime(tmp_path, result)
     rt.set_context("fix", "RESOLVE", 5, 5)
@@ -107,19 +117,29 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
     assert run["model"] == "opus" and run["cost_usd"] == 1.25
     assert run["status"] == "pr_opened" and run["is_error"] is False
     assert run["exit_reason"] == "ok" and run["session_id"] == "s5"
-    assert run["usage"] == {"input_tokens": 10, "output_tokens": 20,
-                            "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40}
+    assert run["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 30,
+        "cache_creation_input_tokens": 40,
+    }
     assert isinstance(run["duration_s"], float)
 
 
 def test_agent_run_preserves_codex_total_only_usage(tmp_path):
-    rt, journal = _runtime(tmp_path, AgentResult(is_error=False, status="pr_opened", cost_usd=0.5,
-                                                 usage={"total_tokens": 50_000}))
+    rt, journal = _runtime(
+        tmp_path, AgentResult(is_error=False, status="pr_opened", cost_usd=0.5, usage={"total_tokens": 50_000})
+    )
 
     _leg(rt)
 
-    assert _settled(journal.path)[0]["usage"] == {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
-                                                  "cache_creation_input_tokens": 0, "total_tokens": 50_000}
+    assert _settled(journal.path)[0]["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "total_tokens": 50_000,
+    }
 
 
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
@@ -192,7 +212,12 @@ def test_the_dispatch_is_journalled_before_the_await(tmp_path):
     assert [e["event"] for e in inner.seen] == ["agent_run_start"]
     start = inner.seen[0]
     assert (start["role"], start["kind"], start["number"], start["issue"], start["model"]) == (
-        "fix", "RESOLVE", 5, 5, "opus")
+        "fix",
+        "RESOLVE",
+        5,
+        5,
+        "opus",
+    )
 
 
 def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_path):
@@ -222,8 +247,10 @@ def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(t
     # #13: `transport_death` alone cannot distinguish a loop that will never
     # converge from one a retry rescues, and the operator's first question is
     # which file killed it.
-    boom = RuntimeError("Fatal error in message reader: Failed to decode JSON: JSON message "
-                        "exceeded maximum buffer size of 1048576 bytes")
+    boom = RuntimeError(
+        "Fatal error in message reader: Failed to decode JSON: JSON message "
+        "exceeded maximum buffer size of 1048576 bytes"
+    )
     boom.harness_last_trace = "AssistantMessage → Read(evidence/ac-3-titles.png)"
     rt, journal = _runtime(tmp_path, RaisingInner(boom), role="review")
     rt.set_context("review", "REVIEW", 552, 545)

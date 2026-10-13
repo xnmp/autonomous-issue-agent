@@ -40,8 +40,9 @@ class _Runtime:
 
     async def run(self, _task):
         self.calls += 1
-        return AgentResult(False, status="ok", cost_usd=1.0, session_id="receipt",
-                           usage={"input_tokens": 100, "output_tokens": 10})
+        return AgentResult(
+            False, status="ok", cost_usd=1.0, session_id="receipt", usage={"input_tokens": 100, "output_tokens": 10}
+        )
 
 
 class _Supervisor:
@@ -100,8 +101,19 @@ def _reserve(store, run_id: str, cap: Money) -> RunId:
     test leases ISSUE itself."""
     identifier, target = RunId(run_id), next(_targets)
     assert store.lease(REPOSITORY, "fix", target, OWNER)
-    result = store.reserve(ReservationRequest(identifier, REPOSITORY, "fix", "RESOLVE", OWNER, LEG_MAXIMUM,
-                                              (BudgetLimit(SCOPE, cap),), target, issue=ISSUE))
+    result = store.reserve(
+        ReservationRequest(
+            identifier,
+            REPOSITORY,
+            "fix",
+            "RESOLVE",
+            OWNER,
+            LEG_MAXIMUM,
+            (BudgetLimit(SCOPE, cap),),
+            target,
+            issue=ISSUE,
+        )
+    )
     assert result.admitted, result.detail
     return identifier
 
@@ -118,22 +130,41 @@ def _live_leg(store, run_id: str, cap: Money) -> RunId:
     identity = ProcessSupervisor.process_identity(os.getpid())
     assert identity is not None
     identifier = _reserve(store, run_id, cap)
-    store.register_process_lease(identifier, expected_owner_id=OWNER, pid=identity.pid,
-                                 pgid=os.getpgid(identity.pid), process_start_ticks=identity.start_ticks)
+    store.register_process_lease(
+        identifier,
+        expected_owner_id=OWNER,
+        pid=identity.pid,
+        pgid=os.getpgid(identity.pid),
+        process_start_ticks=identity.start_ticks,
+    )
     return identifier
 
 
 def _sweeper(store, now: datetime, spend=None):
-    return RecoveryCoordinator(_Supervisor(), store, _Worktrees(), spend or _NoTrustedUsage(), OWNER,
-                               reservation_grace=GRACE, now=lambda: now)
+    return RecoveryCoordinator(
+        _Supervisor(), store, _Worktrees(), spend or _NoTrustedUsage(), OWNER, reservation_grace=GRACE, now=lambda: now
+    )
 
 
 def _admission(store, runtime, cap: Money, reconciler):
-    rates = RateTable("test", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
-                      ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000))
-    wrapper = AccountingRuntime(runtime, store, REPOSITORY, "fix", None, None, cap, "cfg", "codex",
-                                BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}), rates, owner_id=OWNER,
-                                reservation_reconciler=reconciler)
+    rates = RateTable(
+        "test", "v1", "USD", {}, UnknownModelPolicy.USE_FALLBACK, ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000)
+    )
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        REPOSITORY,
+        "fix",
+        None,
+        None,
+        cap,
+        "cfg",
+        "codex",
+        BudgetPolicy({("fix", "RESOLVE"): LEG_MAXIMUM}),
+        rates,
+        owner_id=OWNER,
+        reservation_reconciler=reconciler,
+    )
     wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE)
     return wrapper
 
@@ -262,8 +293,9 @@ class _SettlesExactly:
         self.amount = amount
 
     def reconcile(self, run_id) -> bool:
-        self.store.settle(SettlementRequest(run_id, self.amount, PricingBasis.RECONCILED, f"recovered-{run_id}",
-                                            None, None, None))
+        self.store.settle(
+            SettlementRequest(run_id, self.amount, PricingBasis.RECONCILED, f"recovered-{run_id}", None, None, None)
+        )
         return True
 
 
@@ -299,5 +331,7 @@ def test_recent_completed_accounting_gap_settles_before_admission_without_grace(
     assert runtime.calls == 1
     assert store.active_reservation_runs(OWNER) == ()
     with closing(sqlite3.connect(store.path)) as db:
-        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE leg_id=?",
-                                (str(dead),)).fetchone()) == (0, "estimate")
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE leg_id=?", (str(dead),)).fetchone()) == (
+            0,
+            "estimate",
+        )

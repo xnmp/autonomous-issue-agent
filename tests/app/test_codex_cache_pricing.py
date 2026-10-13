@@ -26,10 +26,9 @@ def test_model_cache_rate_prices_the_issue_71_usage_under_budget():
     assert _cost(cfg, "gpt-5.6-sol", usage) == 3_176_500
 
 
-@pytest.mark.parametrize("configured,expected", [
-    ("gpt-5.6-sol=5/30", (10.0, 50.0, 1.0)),
-    ("gpt-6-astra=12/60/2", (12.0, 60.0, 2.0)),
-])
+@pytest.mark.parametrize(
+    "configured,expected", [("gpt-5.6-sol=5/30", (10.0, 50.0, 1.0)), ("gpt-6-astra=12/60/2", (12.0, 60.0, 2.0))]
+)
 def test_astra_uses_its_shipped_rates_unless_the_operator_names_it(configured, expected):
     cfg = from_env({"CODEX_COST_PER_MTOK": configured})
     charge = _cost(cfg, "gpt-6-astra", TokenUsage(1_000_000, 1_000_000, cache_read_tokens=1_000_000))
@@ -48,13 +47,16 @@ def test_rate_card_version_tracks_shipped_prices_without_an_overlay_edit(monkeyp
     assert current.rate_card_id == changed.rate_card_id
 
 
-@pytest.mark.parametrize("raw", [
-    "gpt-5.6-sol=5/30/0",       # cache reads would price free
-    "gpt-5.6-sol=5/30/-1",      # and negative would pay the leg back
-    "gpt-5.6-sol=5/30/abc",     # non-numeric third component
-    "gpt-5.6-sol=5//30",        # empty middle: OUT must not become CACHED_IN
-    "gpt-5.6-sol=5/30/1/2",     # four components
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "gpt-5.6-sol=5/30/0",  # cache reads would price free
+        "gpt-5.6-sol=5/30/-1",  # and negative would pay the leg back
+        "gpt-5.6-sol=5/30/abc",  # non-numeric third component
+        "gpt-5.6-sol=5//30",  # empty middle: OUT must not become CACHED_IN
+        "gpt-5.6-sol=5/30/1/2",  # four components
+    ],
+)
 def test_a_non_positive_or_malformed_cache_rate_never_reaches_the_card(raw):
     cfg = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "CODEX_COST_PER_MTOK": raw})
     assert cfg.codex_cost_per_mtok == ()
@@ -62,10 +64,7 @@ def test_a_non_positive_or_malformed_cache_rate_never_reaches_the_card(raw):
     assert any(raw in e for e in cfg.validation_errors()), cfg.validation_errors()
 
 
-@pytest.mark.parametrize("model,expected", [
-    ("gpt-6.1-sol", (2.0, 10.0, 0.1)),
-    ("gpt-6-luna", (0.1, 0.5, 0.01)),
-])
+@pytest.mark.parametrize("model,expected", [("gpt-6.1-sol", (2.0, 10.0, 0.1)), ("gpt-6-luna", (0.1, 0.5, 0.01))])
 def test_shipped_model_rates_apply_beside_configured_ones(model, expected):
     cfg = from_env({"CODEX_COST_PER_MTOK": "gpt-5.6-sol=5/30/0.5"})
     charge = _cost(cfg, model, TokenUsage(1_000_000, 1_000_000, cache_read_tokens=1_000_000))

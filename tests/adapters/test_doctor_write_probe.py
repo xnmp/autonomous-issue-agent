@@ -28,11 +28,7 @@ DOCTOR_SH = ROOT / "bin" / "doctor.sh"
 
 
 def _fake_bin(
-    tmp_path: Path,
-    *,
-    label_post: str,
-    label_delete_rc: int = 0,
-    repo_read: str = "echo widget; exit 0",
+    tmp_path: Path, *, label_post: str, label_delete_rc: int = 0, repo_read: str = "echo widget; exit 0"
 ) -> Path:
     """PATH dir whose `gh` answers every read the identity section makes as a
     healthy write-capable collaborator, and whose label POST is scripted by
@@ -76,11 +72,7 @@ exit 0
     for name, body in {
         "claude": '#!/usr/bin/env bash\necho "claude 0.0.0-fake"\n',
         "jq": '#!/usr/bin/env bash\necho "jq-0.0.0-fake"\n',
-        "uv": (
-            "#!/usr/bin/env bash\n"
-            'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\n'
-            "exit 2\n"
-        ),
+        "uv": ('#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\nexit 2\n'),
     }.items():
         (fake_bin / name).write_text(body)
     for p in fake_bin.iterdir():
@@ -111,13 +103,7 @@ def _doctor(tmp_path: Path, **fixture) -> tuple[str, str]:
             "REVIEW_BOT_TOKEN": "github_pat_fake",
         }
     )
-    result = subprocess.run(
-        ["bash", str(DOCTOR_SH)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    result = subprocess.run(["bash", str(DOCTOR_SH)], env=env, capture_output=True, text=True, timeout=60)
     return result.stdout, probe_log.read_text()
 
 
@@ -139,11 +125,7 @@ def test_successful_probe_passes_and_removes_the_label(tmp_path):
 
 def test_denied_write_is_an_error_naming_the_scopes_to_remint(tmp_path):
     out, _log = _doctor(
-        tmp_path,
-        label_post=(
-            'echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; '
-            "exit 1"
-        ),
+        tmp_path, label_post=('echo "gh: Resource not accessible by personal access token (HTTP 403)" >&2; exit 1')
     )
 
     assert "CANNOT write" in out
@@ -163,10 +145,7 @@ def test_network_failure_stays_a_warning_not_an_error(tmp_path):
     """A dead network says nothing about the token's scopes. Failing the
     preflight on it would make doctor unusable offline and would misattribute
     an outage to a permission problem."""
-    out, _log = _doctor(
-        tmp_path,
-        label_post='echo "error connecting to api.github.com" >&2; exit 1',
-    )
+    out, _log = _doctor(tmp_path, label_post='echo "error connecting to api.github.com" >&2; exit 1')
 
     assert "CANNOT write" not in out
     warning = next(line for line in out.splitlines() if "write probe" in line)
@@ -188,10 +167,7 @@ def test_probe_label_is_reported_when_cleanup_fails(tmp_path):
 def test_probe_does_not_delete_a_label_it_did_not_create(tmp_path):
     """A 422 means the name collided — permission was fine, but deleting that
     label would destroy a real one."""
-    out, log = _doctor(
-        tmp_path,
-        label_post='echo "already_exists (HTTP 422)" >&2; exit 1',
-    )
+    out, log = _doctor(tmp_path, label_post='echo "already_exists (HTTP 422)" >&2; exit 1')
 
     assert "live-probed" in out
     assert "CANNOT write" not in out
@@ -205,11 +181,7 @@ def test_a_rate_limited_bot_is_not_misdiagnosed_as_missing_access(tmp_path):
     access was fine. The read is REST now, and a rate-limited read must say
     RATE LIMITED — sending the operator to re-invite a collaborator during a
     quota exhaustion hides the actual incident."""
-    out, _log = _doctor(
-        tmp_path,
-        label_post="exit 0",
-        repo_read='echo "API rate limit exceeded for user ID 1"; exit 1',
-    )
+    out, _log = _doctor(tmp_path, label_post="exit 0", repo_read='echo "API rate limit exceeded for user ID 1"; exit 1')
     assert "RATE LIMITED" in out
     assert "do not re-invite" in out
     assert "invite it as a collaborator (write) and ACCEPT" not in out

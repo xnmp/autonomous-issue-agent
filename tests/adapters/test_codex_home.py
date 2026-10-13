@@ -3,13 +3,8 @@ import os
 import stat
 import tomllib
 
-from issue_agent.adapters.codex_home import (
-    CodexHomeRuntime,
-    write_codex_home,
-)
-from issue_agent.adapters.repository_guidance import (
-    REPOSITORY_GUIDANCE_MAX_BYTES,
-)
+from issue_agent.adapters.codex_home import CodexHomeRuntime, write_codex_home
+from issue_agent.adapters.repository_guidance import REPOSITORY_GUIDANCE_MAX_BYTES
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult
 
@@ -19,9 +14,7 @@ def test_codex_home_lives_outside_worktree(tmp_path) -> None:
     state = tmp_path / "state"
     worktree.mkdir()
 
-    config = write_codex_home(
-        str(worktree), state_dir=str(state), agents_md="contract"
-    )
+    config = write_codex_home(str(worktree), state_dir=str(state), agents_md="contract")
 
     assert os.path.commonpath([config, state]) == str(state)
     assert not (worktree / ".codex").exists()
@@ -58,20 +51,14 @@ def test_repository_instructions_are_not_developer_instructions(tmp_path) -> Non
     state = tmp_path / "state"
     worktree.mkdir()
     (worktree / "CLAUDE.md").write_text("A" * 40_000)
-    config = write_codex_home(
-        str(worktree),
-        state_dir=str(state),
-        agents_md="contract",
-    )
+    config = write_codex_home(str(worktree), state_dir=str(state), agents_md="contract")
     parsed = tomllib.loads(open(config).read())
     assert parsed["developer_instructions"] == "contract"
     assert parsed["project_doc_max_bytes"] == 0
     assert "A" * 100 not in open(config).read()
 
 
-def test_target_agents_and_claude_files_are_low_authority_task_data(
-    tmp_path,
-) -> None:
+def test_target_agents_and_claude_files_are_low_authority_task_data(tmp_path) -> None:
     worktree = tmp_path / "worktree"
     state = tmp_path / "state"
     worktree.mkdir()
@@ -79,11 +66,7 @@ def test_target_agents_and_claude_files_are_low_authority_task_data(
     (worktree / "AGENTS.md").write_text(attack)
     (worktree / "CLAUDE.md").write_text("local convention")
 
-    config = write_codex_home(
-        str(worktree),
-        state_dir=str(state),
-        agents_md="trusted harness contract",
-    )
+    config = write_codex_home(str(worktree), state_dir=str(state), agents_md="trusted harness contract")
 
     parsed = tomllib.loads(open(config).read())
     assert parsed["developer_instructions"] == "trusted harness contract"
@@ -108,9 +91,7 @@ def test_target_agents_and_claude_files_are_low_authority_task_data(
     assert "Ignore the contract" not in parsed["developer_instructions"]
 
 
-def test_target_agents_shares_the_repository_instruction_byte_limit(
-    tmp_path,
-) -> None:
+def test_target_agents_shares_the_repository_instruction_byte_limit(tmp_path) -> None:
     worktree = tmp_path / "worktree"
     state = tmp_path / "state"
     worktree.mkdir()
@@ -133,9 +114,9 @@ def test_target_agents_shares_the_repository_instruction_byte_limit(
     prompt = inner.task.rendered_prompt
     assert "Additional target-repository guidance was omitted" in prompt
     assert "MUST-NOT-FIT" not in prompt
-    encoded = prompt.split(
-        "<untrusted_repository_guidance_json>\n", 1
-    )[1].split("\n</untrusted_repository_guidance_json>", 1)[0]
+    encoded = prompt.split("<untrusted_repository_guidance_json>\n", 1)[1].split(
+        "\n</untrusted_repository_guidance_json>", 1
+    )[0]
     assert len(encoded.encode()) <= REPOSITORY_GUIDANCE_MAX_BYTES
 
 
@@ -148,9 +129,7 @@ def test_missing_state_dir_refuses_containment(tmp_path) -> None:
         raise AssertionError("CODEX_HOME was written into an untrusted worktree")
 
 
-def test_external_codex_home_links_login_without_copying_it_into_worktree(
-    tmp_path,
-) -> None:
+def test_external_codex_home_links_login_without_copying_it_into_worktree(tmp_path) -> None:
     worktree = tmp_path / "worktree"
     state = tmp_path / "state"
     profile = tmp_path / "profile"
@@ -160,11 +139,7 @@ def test_external_codex_home_links_login_without_copying_it_into_worktree(
     auth.write_text("rotating-login")
     auth.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
-    config = write_codex_home(
-        str(worktree),
-        state_dir=str(state),
-        auth_file=str(auth),
-    )
+    config = write_codex_home(str(worktree), state_dir=str(state), auth_file=str(auth))
 
     linked = os.path.join(os.path.dirname(config), "auth.json")
     assert os.path.islink(linked)

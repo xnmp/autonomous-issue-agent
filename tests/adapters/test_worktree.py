@@ -41,10 +41,12 @@ def _deleted_branch(git) -> bool:
 
 
 def test_ensure_reuses_existing_worktree():
-    fg = FakeGit({
-        "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-5\nbranch refs/heads/fix/5-x\n"),
-        "branch --show-current": GitResult(0, "fix/5-x\n"),
-    })
+    fg = FakeGit(
+        {
+            "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-5\nbranch refs/heads/fix/5-x\n"),
+            "branch --show-current": GitResult(0, "fix/5-x\n"),
+        }
+    )
     # /repo isn't a real directory in the test environment — the honesty check
     # (M20, below) is exercised separately; these git-wiring tests fake it away.
     assert Worktrees("/repo", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x").endswith("issue-5")
@@ -78,22 +80,26 @@ def test_concurrent_worktree_setup_serializes_shared_git_metadata():
 
 
 def test_ensure_does_not_reuse_issue_with_prefix_collision():
-    fg = FakeGit({
-        "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-50\n"),
-        "show-ref": GitResult(1, ""),
-        "branch --show-current": GitResult(0, "fix/5-x"),
-    })
+    fg = FakeGit(
+        {
+            "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-50\n"),
+            "show-ref": GitResult(1, ""),
+            "branch --show-current": GitResult(0, "fix/5-x"),
+        }
+    )
     Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x")
 
     assert _adds(fg)
 
 
 def test_ensure_creates_from_base_when_no_branch():
-    fg = FakeGit({
-        "worktree list": GitResult(0, ""),                 # none yet
-        "branch --show-current": GitResult(0, "fix/5-x"),
-        "show-ref": GitResult(1, ""),                       # branch doesn't exist
-    })
+    fg = FakeGit(
+        {
+            "worktree list": GitResult(0, ""),  # none yet
+            "branch --show-current": GitResult(0, "fix/5-x"),
+            "show-ref": GitResult(1, ""),  # branch doesn't exist
+        }
+    )
     Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x")
     add = _adds(fg)
     assert add and "-b" in add[0] and "origin/dev" in add[0]
@@ -106,11 +112,13 @@ def test_ensure_raises_when_every_worktree_add_attempt_fails():
     dispatched the agent into a directory that was never created. With the
     REAL default `path_exists` (os.path.isdir) and a repo dir that plainly
     doesn't exist on disk, `ensure` must raise rather than lie."""
-    fg = FakeGit({
-        "worktree list": GitResult(0, ""),                       # none yet
-        "show-ref": GitResult(1, ""),                             # branch doesn't exist
-        "worktree add": GitResult(1, "fatal: boom"),              # every add attempt fails
-    })
+    fg = FakeGit(
+        {
+            "worktree list": GitResult(0, ""),  # none yet
+            "show-ref": GitResult(1, ""),  # branch doesn't exist
+            "worktree add": GitResult(1, "fatal: boom"),  # every add attempt fails
+        }
+    )
     with pytest.raises(WorktreeUnavailable):
         Worktrees("/definitely/not/a/real/repo-dir", base_branch="dev", run=fg).ensure(5, "fix/5-x")
 
@@ -131,7 +139,7 @@ def test_default_git_runner_times_out_and_reports_rather_than_hanging(tmp_path, 
 
     result = wt_mod._subprocess_git(["status"], str(tmp_path))
 
-    assert result.code != 0            # reported as failure, never a silent pass
+    assert result.code != 0  # reported as failure, never a silent pass
     assert "timed out" in capsys.readouterr().err.lower()
 
 
@@ -220,11 +228,13 @@ def _joined(fg) -> list[str]:
 def _review_git(special):
     """A git whose ``special(args)`` answers first; otherwise the head is
     reachable and verifies as SHA, and every other command succeeds."""
+
     def git(args, cwd):
         answer = special(args)
         if answer is not None:
             return answer
         return GitResult(0, SHA + "\n" if args == ["rev-parse", "HEAD"] else "")
+
     return git
 
 
@@ -258,15 +268,18 @@ def test_review_checkout_refreshes_existing_worktree_and_verifies_head():
     assert not any(j.startswith(("fetch", "checkout", "reset", "clean", "worktree")) for j in _joined(fg)[n:])
 
 
-@pytest.mark.parametrize("table", [
-    # The head is unreachable.
-    {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(1, "")},
-    # The verified head differs.
-    {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, "deadbeef\n")},
-    # 0d2e295 H1 (exit codes): a failed checkout/reset must defer the round,
-    # never fall through to the rev-parse confirmation.
-    {**TOPLEVEL_OK, **HEAD_OK, f"checkout --detach {SHA}": GitResult(1, "index.lock held")},
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        # The head is unreachable.
+        {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(1, "")},
+        # The verified head differs.
+        {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, "deadbeef\n")},
+        # 0d2e295 H1 (exit codes): a failed checkout/reset must defer the round,
+        # never fall through to the rev-parse confirmation.
+        {**TOPLEVEL_OK, **HEAD_OK, f"checkout --detach {SHA}": GitResult(1, "index.lock held")},
+    ],
+)
 def test_review_checkout_defers_unless_the_pinned_head_is_checked_out(table):
     rc, _fg = _review_checkouts(table, exists=lambda p: True)
     with pytest.raises(WorktreeUnavailable):
@@ -292,8 +305,11 @@ def test_review_checkout_never_mutates_a_plain_dir_on_the_worktree_path():
     worktree recreated; no checkout/reset/clean may ever run inside it."""
     removed: list[str] = []
     # git inside the plain dir answers with the PARENT's toplevel.
-    rc, fg = _review_checkouts({"rev-parse --show-toplevel": GitResult(0, "/repo\n"), **HEAD_OK},
-                               exists=lambda p: True, remove_tree=removed.append)
+    rc, fg = _review_checkouts(
+        {"rev-parse --show-toplevel": GitResult(0, "/repo\n"), **HEAD_OK},
+        exists=lambda p: True,
+        remove_tree=removed.append,
+    )
     assert rc.ensure(165, SHA) == RC_PATH
     assert removed == [RC_PATH]
     joined = _joined(fg)
@@ -306,8 +322,9 @@ def test_review_checkout_defers_when_the_stale_dir_cannot_be_removed():
     def explode(_path):
         raise OSError("permission denied")
 
-    rc, _fg = _review_checkouts({"rev-parse --show-toplevel": GitResult(0, "/repo\n")},
-                                exists=lambda p: True, remove_tree=explode)
+    rc, _fg = _review_checkouts(
+        {"rev-parse --show-toplevel": GitResult(0, "/repo\n")}, exists=lambda p: True, remove_tree=explode
+    )
     with pytest.raises(WorktreeUnavailable):
         rc.ensure(165, SHA)
 
@@ -317,8 +334,9 @@ def test_review_checkout_defers_when_the_dir_cannot_be_classified():
     process pressure) means 'could not classify' — the dir must be left alone
     and the round deferred, never rmtree'd as garbage."""
     removed: list[str] = []
-    rc, _fg = _review_checkouts({"rev-parse --show-toplevel": GitResult(1, "")},
-                                exists=lambda p: True, remove_tree=removed.append)
+    rc, _fg = _review_checkouts(
+        {"rev-parse --show-toplevel": GitResult(1, "")}, exists=lambda p: True, remove_tree=removed.append
+    )
     with pytest.raises(WorktreeUnavailable):
         rc.ensure(165, SHA)
     assert removed == []
@@ -337,8 +355,9 @@ def test_review_checkout_reverifies_the_worktree_after_the_fetch():
             return GitResult(0, next(toplevels, "/repo") + "\n")
         return None
 
-    rc = wt_mod.ReviewCheckouts("/repo", run=_review_git(flapping), path_exists=lambda p: True,
-                                remove_tree=lambda p: None)
+    rc = wt_mod.ReviewCheckouts(
+        "/repo", run=_review_git(flapping), path_exists=lambda p: True, remove_tree=lambda p: None
+    )
     with pytest.raises(WorktreeUnavailable):
         rc.ensure(165, SHA)
 
@@ -403,8 +422,9 @@ def test_review_checkout_add_only_succeeds_because_prune_ran_first():
             state["added"] = True
         return None
 
-    rc = wt_mod.ReviewCheckouts("/repo", run=_review_git(git), path_exists=lambda p: state["added"],
-                                remove_tree=lambda p: None)
+    rc = wt_mod.ReviewCheckouts(
+        "/repo", run=_review_git(git), path_exists=lambda p: state["added"], remove_tree=lambda p: None
+    )
     assert rc.ensure(165, SHA) == RC_PATH
 
 
@@ -428,6 +448,6 @@ def test_a_symlink_to_the_parent_repo_is_never_classified_as_the_worktree(tmp_pa
 
     wt_mod.ReviewCheckouts(str(repo), run=_review_git(git), remove_tree=lambda p: None).ensure(165, SHA)
 
-    assert mutated == []                       # nothing ran inside the link
-    assert not link.is_symlink()               # squatter replaced by a real dir
+    assert mutated == []  # nothing ran inside the link
+    assert not link.is_symlink()  # squatter replaced by a real dir
     assert (repo / "precious.txt").read_text() == "operator work"

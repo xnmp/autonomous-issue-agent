@@ -10,7 +10,16 @@ import pytest
 from issue_agent.domain import dashboard as dash
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.state import (
-    Backoff, Dispatch, Harness, Merge, NeedsHuman, Release, StopReason, Wait, WaitReason, stop_tag,
+    Backoff,
+    Dispatch,
+    Harness,
+    Merge,
+    NeedsHuman,
+    Release,
+    StopReason,
+    Wait,
+    WaitReason,
+    stop_tag,
 )
 from issue_agent.domain.world import Comment, PRView
 
@@ -30,18 +39,40 @@ def stop(reason: StopReason, minutes: float, author: str = "fixbot", text: str =
     return Comment(author, f"{HARNESS.marker}\n{stop_tag(reason)}\n**needs-human**: {text}", stamp(minutes))
 
 
-def leg(kind: str = "RESOLVE", minutes: float = 0, *, ended: float | None = None, state: str = "ended",
-        cls: str = "agent", cost: float | None = 1.0, verdict: str = "", number: int = 0, issue: int = 7,
-        basis: str = "provider_reported", leg_id: str | None = None, role: str | None = None) -> dash.LegRow:
+def leg(
+    kind: str = "RESOLVE",
+    minutes: float = 0,
+    *,
+    ended: float | None = None,
+    state: str = "ended",
+    cls: str = "agent",
+    cost: float | None = 1.0,
+    verdict: str = "",
+    number: int = 0,
+    issue: int = 7,
+    basis: str = "provider_reported",
+    leg_id: str | None = None,
+    role: str | None = None,
+) -> dash.LegRow:
     running = state in ("reserved", "running")
     ended = minutes + 1 if ended is None else ended
     return dash.LegRow(
-        leg_id=leg_id or f"{kind}-{minutes}", role=role or ("review" if kind == "REVIEW" else "fix"), kind=kind,
-        issue=issue, number=number, head="h1", runtime="claude", state=state, reserved_at=at(minutes),
+        leg_id=leg_id or f"{kind}-{minutes}",
+        role=role or ("review" if kind == "REVIEW" else "fix"),
+        kind=kind,
+        issue=issue,
+        number=number,
+        head="h1",
+        runtime="claude",
+        state=state,
+        reserved_at=at(minutes),
         started_at=at(minutes) if state != "reserved" else None,
-        ended_at=None if running else at(ended), reserved_usd=10.0,
+        ended_at=None if running else at(ended),
+        reserved_usd=10.0,
         charged_usd=None if running or state == "released" else cost,
-        basis="" if running or state == "released" else basis, leg_class="" if running else cls, verdict=verdict,
+        basis="" if running or state == "released" else basis,
+        leg_class="" if running else cls,
+        verdict=verdict,
     )
 
 
@@ -49,8 +80,9 @@ def status(state, *, comments=(), pr=None, legs=(), target="issue", last_end=Non
     """`last_end` is derive's item boundary; by default the newest end of `legs`."""
     if last_end is None:
         last_end = max((x.ended_at for x in legs if x.ended_at is not None), default=None)
-    return dash.board_status(state, target=target, comments=comments, pr=pr, legs=tuple(legs), last_end=last_end,
-                             harness=HARNESS)
+    return dash.board_status(
+        state, target=target, comments=comments, pr=pr, legs=tuple(legs), last_end=last_end, harness=HARNESS
+    )
 
 
 # ── needs you ────────────────────────────────────────────────────────────────
@@ -76,11 +108,14 @@ def test_a_labelled_stop_names_its_reason_and_offers_unblock(reason):
     assert (board.reason, board.target, dash.primary_action(board, held=True)) == (reason.value, "pr", "unblock")
 
 
-@pytest.mark.parametrize("comment", [
-    stop(StopReason.ATTEMPTS, 5, author="mallory"),  # marker forged by a commenter
-    Comment("fixbot", f"{stop_tag(StopReason.ATTEMPTS)} without the marker", stamp(5)),
-    Comment("fixbot", f"{HARNESS.marker}\n{stop_tag(StopReason.ATTEMPTS)}", "not a time"),
-])
+@pytest.mark.parametrize(
+    "comment",
+    [
+        stop(StopReason.ATTEMPTS, 5, author="mallory"),  # marker forged by a commenter
+        Comment("fixbot", f"{stop_tag(StopReason.ATTEMPTS)} without the marker", stamp(5)),
+        Comment("fixbot", f"{HARNESS.marker}\n{stop_tag(StopReason.ATTEMPTS)}", "not a time"),
+    ],
+)
 def test_only_a_harness_written_dated_stop_names_the_reason(comment):
     assert status(Wait(WaitReason.NEEDS_HUMAN), comments=[comment]).reason == "labelled"
 
@@ -108,12 +143,15 @@ def test_a_stop_about_to_be_posted_is_already_needs_you():
 # ── working and waiting ──────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("state,activity", [
-    (Dispatch(AgentKind.FIX_CI, "h1"), "queued"),
-    (Merge("h1"), "merge"),
-    (Release(), "release"),
-    (Wait(WaitReason.CI_PENDING), "ci"),
-])
+@pytest.mark.parametrize(
+    "state,activity",
+    [
+        (Dispatch(AgentKind.FIX_CI, "h1"), "queued"),
+        (Merge("h1"), "merge"),
+        (Release(), "release"),
+        (Wait(WaitReason.CI_PENDING), "ci"),
+    ],
+)
 def test_moving_states_are_working(state, activity):
     board = status(state)
     assert isinstance(board, dash.Working) and board.activity == activity
@@ -135,8 +173,13 @@ def test_waits_name_what_they_wait_on():
 
 
 def test_the_rail_counts_legs_and_remembers_a_rewind():
-    legs = (leg("RESOLVE", 0), leg("REVIEW", 2, verdict="REQUEST_CHANGES", number=9),
-            leg("FIX_CI", 4, number=9), leg("REBASE", 6, number=9), leg("RESOLVE", 8, state="released"))
+    legs = (
+        leg("RESOLVE", 0),
+        leg("REVIEW", 2, verdict="REQUEST_CHANGES", number=9),
+        leg("FIX_CI", 4, number=9),
+        leg("REBASE", 6, number=9),
+        leg("RESOLVE", 8, state="released"),
+    )
     rail = dash.rail(Dispatch(AgentKind.FIX_CI, "h1"), has_pr=True, legs=legs)
     assert (rail.current, rail.furthest) == ("ci", "review")
     assert (rail.resolve_attempts, rail.review_rounds, rail.ci_runs, rail.steps) == (1, 1, 2, 4)
@@ -144,8 +187,13 @@ def test_the_rail_counts_legs_and_remembers_a_rewind():
 
 
 def test_history_folds_identical_consecutive_legs_per_stage_visit():
-    legs = (leg("RESOLVE", 0, cls="machine"), leg("RESOLVE", 1, cls="machine"), leg("RESOLVE", 2),
-            leg("REVIEW", 3, verdict="APPROVE"), leg("FIX_CI", 4, state="running"))
+    legs = (
+        leg("RESOLVE", 0, cls="machine"),
+        leg("RESOLVE", 1, cls="machine"),
+        leg("RESOLVE", 2),
+        leg("REVIEW", 3, verdict="APPROVE"),
+        leg("FIX_CI", 4, state="running"),
+    )
     visits = dash.history(legs)
     assert [(v.stage, [(c.kind, c.outcome, c.count) for c in v.steps]) for v in visits] == [
         ("resolve", [("RESOLVE", "failed", 2), ("RESOLVE", "done", 1)]),
@@ -155,8 +203,10 @@ def test_history_folds_identical_consecutive_legs_per_stage_visit():
 
 
 def test_carried_legs_are_money_history_not_attempts_failures_or_toasts():
-    carried = (leg("RESOLVE", 0, cls="", role="carried", leg_id="C1"),
-               leg("REVIEW", 1, cls="", role="carried", number=9, leg_id="C2"))
+    carried = (
+        leg("RESOLVE", 0, cls="", role="carried", leg_id="C1"),
+        leg("REVIEW", 1, cls="", role="carried", number=9, leg_id="C2"),
+    )
     live = (leg("RESOLVE", 5, leg_id="L1"),)
     legs = carried + live
     assert [x.outcome for x in carried] == ["carried", "carried"]
@@ -183,8 +233,10 @@ def test_a_leg_costs_its_charge_its_reservation_while_running_and_nothing_once_r
 
 def test_metrics_divide_spend_by_merges_and_count_first_pass_reviews():
     legs = [
-        leg("RESOLVE", 0, cost=3.0, issue=1), leg("REVIEW", 1, cost=1.0, verdict="APPROVE", number=11, issue=1),
-        leg("RESOLVE", 2, cost=2.0, issue=2), leg("REVIEW", 3, cost=1.0, verdict="REQUEST_CHANGES", number=12, issue=2),
+        leg("RESOLVE", 0, cost=3.0, issue=1),
+        leg("REVIEW", 1, cost=1.0, verdict="APPROVE", number=11, issue=1),
+        leg("RESOLVE", 2, cost=2.0, issue=2),
+        leg("REVIEW", 3, cost=1.0, verdict="REQUEST_CHANGES", number=12, issue=2),
         leg("REVIEW", 5, cost=1.0, verdict="APPROVE", number=12, issue=2),
         leg("FIX_CI", 6, cost=0.0, cls="machine", number=12, issue=2, basis="estimate"),
         leg("RESOLVE", 7, state="released", issue=3),
@@ -202,13 +254,16 @@ def test_metrics_divide_spend_by_merges_and_count_first_pass_reviews():
 def test_metrics_report_unknown_rather_than_zero():
     m = dash.metrics([], merged_prs=None, open_items=None, needs_human=None, today_start=T0)
     assert m.cost_per_merged_pr_usd is None and m.first_pass_rate is None and m.rounds_per_pr is None
-    assert dash.metrics([leg()], merged_prs=0, open_items=0, needs_human=0, today_start=T0).cost_per_merged_pr_usd is None
+    assert (
+        dash.metrics([leg()], merged_prs=0, open_items=0, needs_human=0, today_start=T0).cost_per_merged_pr_usd is None
+    )
     assert "merged ?" in dash.metrics_line(m) and "no merged PRs" in dash.metrics_line(m)
 
 
 def test_a_truncated_merged_list_marks_the_merge_metrics_as_bounds():
-    m = dash.metrics([leg(cost=4.0)], merged_prs=2, open_items=0, needs_human=0, today_start=T0,
-                     merged_prs_partial=True)
+    m = dash.metrics(
+        [leg(cost=4.0)], merged_prs=2, open_items=0, needs_human=0, today_start=T0, merged_prs_partial=True
+    )
     assert m.merged_prs_partial and "merged ≥2" in dash.metrics_line(m)
     assert not dash.metrics([], merged_prs=2, open_items=0, needs_human=0, today_start=T0).merged_prs_partial
 

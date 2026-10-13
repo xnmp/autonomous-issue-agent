@@ -17,23 +17,32 @@ def latest(history: tuple[LegEnd, ...]) -> datetime:
     return max(end.ended_at for end in history)
 
 
-@pytest.mark.parametrize(("streak", "wait"), [
-    (1, timedelta(seconds=60)),
-    (2, timedelta(seconds=120)),
-    (3, timedelta(seconds=240)),
-    (6, timedelta(seconds=1920)),
-    (7, timedelta(hours=1)),
-    (40, timedelta(hours=1)),
-])
+@pytest.mark.parametrize(
+    ("streak", "wait"),
+    [
+        (1, timedelta(seconds=60)),
+        (2, timedelta(seconds=120)),
+        (3, timedelta(seconds=240)),
+        (6, timedelta(seconds=1920)),
+        (7, timedelta(hours=1)),
+        (40, timedelta(hours=1)),
+    ],
+)
 def test_wait_doubles_per_consecutive_machine_end_up_to_an_hour(streak, wait):
     history = ends(*([True] * streak))
     assert machine_backoff_until(history, AgentKind.FIX_CI) == latest(history) + wait
 
 
-@pytest.mark.parametrize(("streak", "wait"), [
-    (-5, timedelta(seconds=60)), (0, timedelta(seconds=60)), (1, timedelta(seconds=60)),
-    (4, timedelta(seconds=480)), (2**62, timedelta(hours=1)),
-])
+@pytest.mark.parametrize(
+    ("streak", "wait"),
+    [
+        (-5, timedelta(seconds=60)),
+        (0, timedelta(seconds=60)),
+        (1, timedelta(seconds=60)),
+        (4, timedelta(seconds=480)),
+        (2**62, timedelta(hours=1)),
+    ],
+)
 def test_wait_for_a_stored_streak_count_is_clamped_to_base_and_cap(streak, wait):
     assert machine_backoff_wait(streak) == wait
 
@@ -77,13 +86,16 @@ def test_unknown_run_kinds_are_not_agent_kinds(run_kind):
     assert dispatched_kind(run_kind) is None
 
 
-@pytest.mark.parametrize(("kind", "ended_at", "machine"), [
-    ("FIX_CI", T, True),
-    (AgentKind.FIX_CI, datetime(2026, 10, 1), True),
-    (AgentKind.FIX_CI, "2026-10-01T00:00:00Z", True),
-    (AgentKind.FIX_CI, T, 1),
-    (AgentKind.FIX_CI, T, None),
-])
+@pytest.mark.parametrize(
+    ("kind", "ended_at", "machine"),
+    [
+        ("FIX_CI", T, True),
+        (AgentKind.FIX_CI, datetime(2026, 10, 1), True),
+        (AgentKind.FIX_CI, "2026-10-01T00:00:00Z", True),
+        (AgentKind.FIX_CI, T, 1),
+        (AgentKind.FIX_CI, T, None),
+    ],
+)
 def test_malformed_leg_end_is_rejected(kind, ended_at, machine):
     with pytest.raises(ValueError):
         LegEnd(kind, ended_at, machine)

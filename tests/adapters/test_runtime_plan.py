@@ -7,10 +7,7 @@ from issue_agent.adapters.runtime_plan import RuntimePlan, git_identity_env
 
 def test_identity_names_harness_and_model():
     env = git_identity_env("gpt-5.6-sol")
-    assert env == {
-        "GIT_AUTHOR_NAME": "Harness - gpt-5.6-sol",
-        "GIT_COMMITTER_NAME": "Harness - gpt-5.6-sol",
-    }
+    assert env == {"GIT_AUTHOR_NAME": "Harness - gpt-5.6-sol", "GIT_COMMITTER_NAME": "Harness - gpt-5.6-sol"}
 
 
 def test_no_model_says_nothing():
@@ -23,8 +20,9 @@ def test_emails_are_never_touched():
 
 
 def test_replace_changes_execution_plan_and_keeps_context():
-    original = RuntimePlan(prompt="work", cwd="/old", context_prefix="Prior scratch notes\n\n",
-                           context_suffix="\n\nRepository context")
+    original = RuntimePlan(
+        prompt="work", cwd="/old", context_prefix="Prior scratch notes\n\n", context_suffix="\n\nRepository context"
+    )
     changed = replace(original, cwd="/new", resume="session")
 
     assert (original.cwd, changed.cwd, changed.resume) == ("/old", "/new", "session")
@@ -32,8 +30,9 @@ def test_replace_changes_execution_plan_and_keeps_context():
 
 
 def test_replacing_the_task_preserves_scratch_context():
-    original = RuntimePlan(prompt="Old requirements", context_prefix="Scratch notes\n\n",
-                           context_suffix="\n\nTrailing context")
+    original = RuntimePlan(
+        prompt="Old requirements", context_prefix="Scratch notes\n\n", context_suffix="\n\nTrailing context"
+    )
     changed = replace(original, prompt="New requirements")
 
     assert changed.rendered_prompt == "Scratch notes\n\nNew requirements\n\nTrailing context"

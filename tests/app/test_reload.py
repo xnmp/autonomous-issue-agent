@@ -1,5 +1,6 @@
 """Hot reload — commit-gated (partial edits cannot load), fires only between
 units of work, and a broken watch costs hot reload, never the process."""
+
 from __future__ import annotations
 
 import os
@@ -22,9 +23,16 @@ from issue_agent.domain.world import WorldState
 
 def _git(repo, *args):
     subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True,
-        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
     )
 
 
@@ -52,7 +60,7 @@ def test_uncommitted_edits_do_not_trigger_but_a_commit_does(tmp_path):
     w = ReloadWatch(str(repo))
     assert w.changed() is False
 
-    (repo / "a.py").write_text("x = 2\n")          # dirty tree, no commit
+    (repo / "a.py").write_text("x = 2\n")  # dirty tree, no commit
     (repo / "b.py").write_text("y = 1\n")
     assert w.changed() is False
 
@@ -79,11 +87,7 @@ def test_invalid_candidate_config_does_not_reload(tmp_path):
     repo = _repo(tmp_path)
     env = tmp_path / "active.env"
     env.write_text("A=1\n")
-    w = ReloadWatch(
-        str(repo),
-        files=(str(env),),
-        validate=lambda: (_ for _ in ()).throw(ValueError("invalid")),
-    )
+    w = ReloadWatch(str(repo), files=(str(env),), validate=lambda: (_ for _ in ()).throw(ValueError("invalid")))
     env.write_text("A=bad\n")
     assert w.changed() is False
 
@@ -114,12 +118,9 @@ def test_daemon_exits_with_reload_code_between_ticks():
     logs = []
     d.log = logs.append
     with pytest.raises(SystemExit) as exc:
-        d.run_forever(
-            sleep=lambda s: None, now=lambda: 0,
-            max_ticks=5, reload_check=lambda: len(ticked) >= 2,
-        )
+        d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=5, reload_check=lambda: len(ticked) >= 2)
     assert exc.value.code == RELOAD_EXIT_CODE
-    assert len(ticked) == 2                       # ran ticks, then left between them
+    assert len(ticked) == 2  # ran ticks, then left between them
     assert any("hot-reload" in m for m in logs)
 
 
@@ -142,18 +143,14 @@ def test_dashboard_source_change_gracefully_stops_server_with_reload_code():
     logs = []
 
     code = _run_server_until_reload(
-        server,
-        lambda: server.request_started.is_set(),
-        poll_seconds=0.001,
-        log=logs.append,
+        server, lambda: server.request_started.is_set(), poll_seconds=0.001, log=logs.append
     )
 
     assert code == RELOAD_EXIT_CODE
     assert server.should_exit
     assert server.request_drained
     assert logs == [
-        "dashboard: source changed — exiting for supervisor restart; "
-        "re-run `issue-agent dashboard` if unsupervised"
+        "dashboard: source changed — exiting for supervisor restart; re-run `issue-agent dashboard` if unsupervised"
     ]
 
 
@@ -171,11 +168,7 @@ def test_dashboard_uvicorn_config_bounds_graceful_shutdown(monkeypatch):
         def run(self):
             return None
 
-    monkeypatch.setitem(
-        sys.modules,
-        "uvicorn",
-        SimpleNamespace(Config=Config, Server=Server),
-    )
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(Config=Config, Server=Server))
     monkeypatch.setenv("HOT_RELOAD", "0")
     monkeypatch.setattr(dashweb_server, "create_app", lambda backend=None: backend)
 
@@ -200,9 +193,5 @@ def test_fallback_dashboard_exits_for_supervisor_reload():
 
     server = Server()
 
-    assert dashboard._serve_until_reload(
-        server,
-        reload_check=lambda: True,
-        poll_seconds=0.001,
-    ) == RELOAD_EXIT_CODE
+    assert dashboard._serve_until_reload(server, reload_check=lambda: True, poll_seconds=0.001) == RELOAD_EXIT_CODE
     assert server.closed

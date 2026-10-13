@@ -22,11 +22,7 @@ class Journal:
 
     def emit(self, event: str, fields: dict | None = None, **extra: object) -> None:
         try:
-            line = json.dumps(
-                {"ts": _stamp(), "event": event, **(fields or {}), **extra},
-                default=str,
-                sort_keys=True,
-            )
+            line = json.dumps({"ts": _stamp(), "event": event, **(fields or {}), **extra}, default=str, sort_keys=True)
             parent = os.path.dirname(self.path)
             if parent:
                 os.makedirs(parent, exist_ok=True)

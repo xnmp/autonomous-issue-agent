@@ -36,11 +36,20 @@ def _run(**runner):
 
 def test_a_plan_maps_onto_the_sdk_options():
     schema = {"type": "object"}
-    kw = build_option_kwargs(RuntimePlan(
-        prompt="x", allowed_tools=("Read", "Bash(git *)"), disallowed_tools=("Edit", "Write"),
-        model="opus", max_budget_usd=1.5, cwd="/wt/issue-5", resume="sess-123",
-        schema=schema, append_system_prompt="rules", effort=Effort.HIGH,
-    ))
+    kw = build_option_kwargs(
+        RuntimePlan(
+            prompt="x",
+            allowed_tools=("Read", "Bash(git *)"),
+            disallowed_tools=("Edit", "Write"),
+            model="opus",
+            max_budget_usd=1.5,
+            cwd="/wt/issue-5",
+            resume="sess-123",
+            schema=schema,
+            append_system_prompt="rules",
+            effort=Effort.HIGH,
+        )
+    )
     assert kw["allowed_tools"] == ["Read", "Bash(git *)"]
     assert kw["disallowed_tools"] == ["Edit", "Write"]
     assert (kw["model"], kw["max_budget_usd"], kw["cwd"], kw["resume"]) == ("opus", 1.5, "/wt/issue-5", "sess-123")
@@ -93,8 +102,9 @@ def test_bundled_claude_cli_supports_configured_opus_55(tmp_path):
     # SDK releases can lag the CLI required by a configured model. Check the
     # executable we actually launch, without making a paid provider request.
     executable = Path(sdk.__file__).parent / "_bundled" / "claude"
-    completed = subprocess.run([str(executable), "--version"], cwd=tmp_path, capture_output=True,
-                               text=True, check=True, timeout=10)
+    completed = subprocess.run(
+        [str(executable), "--version"], cwd=tmp_path, capture_output=True, text=True, check=True, timeout=10
+    )
     version = tuple(int(part) for part in completed.stdout.split()[0].split("."))
     assert version >= (2, 1, 280), completed.stdout
 
@@ -112,27 +122,46 @@ class FakeResult:
 
 
 def test_result_reads_structured_output():
-    r = result_to_agent_result(FakeResult(structured_output={"status": "pr_opened", "summary": "opened", "needs": ""},
-                                          total_cost_usd=0.42, session_id="s9"))
+    r = result_to_agent_result(
+        FakeResult(
+            structured_output={"status": "pr_opened", "summary": "opened", "needs": ""},
+            total_cost_usd=0.42,
+            session_id="s9",
+        )
+    )
     assert (r.is_error, r.status, r.summary, r.cost_usd, r.session_id) == (False, "pr_opened", "opened", 0.42, "s9")
 
 
-@pytest.mark.parametrize("fake,status,reason", [
-    (FakeResult(is_error=True), "error", ExitReason.AGENT_ERROR),
-    # The review schema names its terminal `decision`, not `status`, so a clean
-    # review used to journal status="" and the verdict lived only on the PR.
-    (FakeResult(subtype="success", structured_output={"decision": "APPROVE", "body": "LGTM"}), "APPROVE", ExitReason.OK),
-    # A malformed envelope must not put a non-str into the str-typed field; on an
-    # errored run the subtype fallback still fills it.
-    (FakeResult(structured_output={"status": 7, "decision": None}), "", ExitReason.OK),
-    (FakeResult(is_error=True, subtype="error_during_execution", structured_output={"decision": ["APPROVE"]}),
-     "error_during_execution", ExitReason.AGENT_ERROR),
-    # A spend ceiling is an operator-knob outcome, not a failure of the agent's reasoning.
-    (FakeResult(is_error=True, subtype="error_max_budget_usd"), "error_max_budget_usd", ExitReason.BUDGET_EXHAUSTED),
-    (FakeResult(is_error=True, subtype="error_max_turns"), "error_max_turns", ExitReason.AGENT_ERROR),
-    # is_error false on the envelope but status=="error" inside it is the agent reporting failure.
-    (FakeResult(is_error=False, structured_output={"status": "error"}), "error", ExitReason.AGENT_ERROR),
-])
+@pytest.mark.parametrize(
+    "fake,status,reason",
+    [
+        (FakeResult(is_error=True), "error", ExitReason.AGENT_ERROR),
+        # The review schema names its terminal `decision`, not `status`, so a clean
+        # review used to journal status="" and the verdict lived only on the PR.
+        (
+            FakeResult(subtype="success", structured_output={"decision": "APPROVE", "body": "LGTM"}),
+            "APPROVE",
+            ExitReason.OK,
+        ),
+        # A malformed envelope must not put a non-str into the str-typed field; on an
+        # errored run the subtype fallback still fills it.
+        (FakeResult(structured_output={"status": 7, "decision": None}), "", ExitReason.OK),
+        (
+            FakeResult(is_error=True, subtype="error_during_execution", structured_output={"decision": ["APPROVE"]}),
+            "error_during_execution",
+            ExitReason.AGENT_ERROR,
+        ),
+        # A spend ceiling is an operator-knob outcome, not a failure of the agent's reasoning.
+        (
+            FakeResult(is_error=True, subtype="error_max_budget_usd"),
+            "error_max_budget_usd",
+            ExitReason.BUDGET_EXHAUSTED,
+        ),
+        (FakeResult(is_error=True, subtype="error_max_turns"), "error_max_turns", ExitReason.AGENT_ERROR),
+        # is_error false on the envelope but status=="error" inside it is the agent reporting failure.
+        (FakeResult(is_error=False, structured_output={"status": "error"}), "error", ExitReason.AGENT_ERROR),
+    ],
+)
 def test_result_envelope_classification(fake, status, reason):
     r = result_to_agent_result(fake)
     assert (r.status, r.exit_reason, r.is_error) == (status, reason, reason is not ExitReason.OK)
@@ -141,8 +170,7 @@ def test_result_envelope_classification(fake, status, reason):
 def test_usage_block_is_captured_verbatim_for_the_cost_ledger():
     # cost_usd is 0.00 on a subscription plan, so tokens (incl. the cache counters
     # nothing else exposes) are the only cost substrate that always exists.
-    usage = {"input_tokens": 12, "output_tokens": 3,
-             "cache_read_input_tokens": 900, "cache_creation_input_tokens": 40}
+    usage = {"input_tokens": 12, "output_tokens": 3, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 40}
     assert result_to_agent_result(FakeResult(subtype="success", total_cost_usd=0.0, usage=usage)).usage == usage
 
 
@@ -181,6 +209,7 @@ def _install_fake_sdk(monkeypatch, messages, raise_after=False, capture=None):
             yield m
         if raise_after:
             raise RuntimeError("Claude Code returned an error result: success")
+
     _install_sdk(monkeypatch, fake_query, capture)
 
 
@@ -258,11 +287,13 @@ def test_transport_death_is_logged_with_type_and_last_message(monkeypatch):
 def _install_hanging_sdk(monkeypatch, messages, hang_after=True):
     """Fake query that yields `messages` fast, then (hang_after) blocks forever —
     the silent-hang shape (no more events, never returns/raises)."""
+
     async def fake_query(prompt, options):
         for m in messages:
             yield m
         if hang_after:
             await asyncio.Event().wait()  # never set → hang
+
     _install_sdk(monkeypatch, fake_query)
 
 
@@ -340,11 +371,12 @@ def test_gap_longer_than_poll_slice_still_delivers_result(monkeypatch):
     ended with NO ResultMessage. The watchdog must instead keep observing the SAME
     receive across slices: a gap > poll_slice but < idle_timeout must NOT drop the
     stream, and the terminal ResultMessage must still arrive."""
+
     async def fake_query(prompt, options):
-        yield object()                    # early event
-        await asyncio.sleep(0.15)         # gap > poll_slice (0.05), < idle_timeout (5.0)
-        yield object()                    # event after a multi-slice pause
-        await asyncio.sleep(0.15)         # another long-ish pause before the result
+        yield object()  # early event
+        await asyncio.sleep(0.15)  # gap > poll_slice (0.05), < idle_timeout (5.0)
+        yield object()  # event after a multi-slice pause
+        await asyncio.sleep(0.15)  # another long-ish pause before the result
         yield _ResultMessage(structured_output={"status": "pr_opened"}, session_id="s")
 
     _install_sdk(monkeypatch, fake_query)
@@ -365,6 +397,7 @@ def _jumping_wall(ticks):
     def wall():
         held[0] = next(remaining, held[0])
         return held[0]
+
     return wall
 
 
@@ -392,6 +425,7 @@ def test_wall_cap_trips_on_a_limping_stream_the_idle_watchdog_never_catches(monk
     burned 58 minutes on 3.6s of CPU. Here events arrive faster than a poll slice
     (so no slice ever expires) while the wall clock advances past the cap: only a
     between-receives elapsed check can stop this."""
+
     async def fake_query(prompt, options):
         while True:
             yield object()  # always ready → asyncio.wait returns before any timeout
@@ -411,8 +445,9 @@ def test_wall_cap_honours_a_result_already_captured(monkeypatch):
     """The envelope always wins over a watchdog. If the agent delivered its verdict
     and only THEN the cap expires, the run must return that verdict — aborting it
     into a timeout would discard finished, paid-for work."""
-    msg = _ResultMessage(subtype="success", structured_output={"status": "pr_opened", "summary": "opened"},
-                         session_id="s1")
+    msg = _ResultMessage(
+        subtype="success", structured_output={"status": "pr_opened", "summary": "opened"}, session_id="s1"
+    )
     _install_fake_sdk(monkeypatch, [msg])
 
     r = _run(max_runtime=900.0, wall_clock=_jumping_wall([1000.0, 1000.0, 1000.0, 4600.0]))
@@ -435,6 +470,7 @@ def test_healthy_short_run_is_not_capped(monkeypatch):
 
 
 # ── debug tracing: make a mid-session "Stream closed" wedge diagnosable ────────
+
 
 @dataclass
 class _ToolUseBlock:
@@ -463,8 +499,8 @@ def test_merge_usage_sums_numeric_per_turn_blocks_and_keeps_absent_distinct():
     acc = merge_usage(None, {"input_tokens": 10, "output_tokens": 2})
     assert merge_usage(acc, {"input_tokens": 30, "output_tokens": 5}) == {"input_tokens": 40, "output_tokens": 7}
     assert merge_usage(None, {"input_tokens": 5, "cached": True, "model": "opus"}) == {"input_tokens": 5}
-    assert merge_usage(None, None) is None          # nothing ever reported
-    assert merge_usage(None, {}) == {}              # reported, and it was empty
+    assert merge_usage(None, None) is None  # nothing ever reported
+    assert merge_usage(None, {}) == {}  # reported, and it was empty
     assert merge_usage(None, "not-a-dict") is None
 
 

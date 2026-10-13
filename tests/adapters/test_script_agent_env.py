@@ -23,9 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
     ],
 )
 @pytest.mark.parametrize("agent_env", [None, ""])
-def test_scripts_refuse_missing_agent_env_without_reading_legacy_file(
-    tmp_path, script, args, agent_env
-):
+def test_scripts_refuse_missing_agent_env_without_reading_legacy_file(tmp_path, script, args, agent_env):
     (tmp_path / "bin").mkdir()
     (tmp_path / "config").mkdir()
     shutil.copy2(ROOT / "bin" / script, tmp_path / "bin" / script)
@@ -38,8 +36,7 @@ def test_scripts_refuse_missing_agent_env_without_reading_legacy_file(
         env["AGENT_ENV"] = agent_env
 
     result = subprocess.run(
-        ["bash", str(tmp_path / "bin" / script), *args],
-        env=env, capture_output=True, text=True, timeout=10,
+        ["bash", str(tmp_path / "bin" / script), *args], env=env, capture_output=True, text=True, timeout=10
     )
 
     assert result.returncode != 0
@@ -54,8 +51,7 @@ def test_uninstall_all_does_not_need_config(tmp_path, script):
     env = {**os.environ, "HOME": str(tmp_path)}
     env.pop("AGENT_ENV", None)
     result = subprocess.run(
-        ["bash", str(ROOT / "bin" / script), "uninstall"],
-        env=env, capture_output=True, text=True, timeout=10,
+        ["bash", str(ROOT / "bin" / script), "uninstall"], env=env, capture_output=True, text=True, timeout=10
     )
     assert result.returncode == 0, result.stderr
 
@@ -67,19 +63,22 @@ def test_make_requires_and_passes_explicit_snapshot(tmp_path, target, explicit_s
     (tmp_path / "bin").mkdir()
     (tmp_path / "config").mkdir()
     active = tmp_path / "config" / ".active.demo.env"
-    active.write_text('REPO=acme/demo\n')
-    (tmp_path / "config" / "agent.env").write_text('REPO=wrong/repo\n')
+    active.write_text("REPO=acme/demo\n")
+    (tmp_path / "config" / "agent.env").write_text("REPO=wrong/repo\n")
     called = tmp_path / "called"
     (tmp_path / "bin" / f"{target}.sh").write_text(
-        f'printf "%s\\n" "$AGENT_ENV" > "{called}"\n'
-        '. "$AGENT_ENV"\nprintf "%s\\n" "$REPO"\n'
+        f'printf "%s\\n" "$AGENT_ENV" > "{called}"\n. "$AGENT_ENV"\nprintf "%s\\n" "$REPO"\n'
     )
     env = dict(os.environ)
     env.pop("AGENT_ENV", None)
     snapshot_arg = [f"AGENT_ENV={active}"] if explicit_snapshot else []
     result = subprocess.run(
         ["make", target, "DEMO_REPO=acme/demo", *snapshot_arg],
-        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
 
     if explicit_snapshot:

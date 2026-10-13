@@ -49,11 +49,17 @@ def _touch(marker: Path) -> tuple[str, ...]:
     return _python(f"from pathlib import Path; Path({str(marker)!r}).write_text('bad')")
 
 
-@pytest.mark.parametrize("raw", [
-    None, "malformed", "123 (short) R", "456 (replaced) R 1 123 " + "0 " * 16 + "9876",
-    # An unreaped zombie or dead leader is not alive, so its lease can be reclaimed.
-    *(f"123 (leader with ) and ( spaces) {state} 1 123 " + "0 " * 16 + "9876" for state in ("Z", "X")),
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "malformed",
+        "123 (short) R",
+        "456 (replaced) R 1 123 " + "0 " * 16 + "9876",
+        # An unreaped zombie or dead leader is not alive, so its lease can be reclaimed.
+        *(f"123 (leader with ) and ( spaces) {state} 1 123 " + "0 " * 16 + "9876" for state in ("Z", "X")),
+    ],
+)
 def test_selected_process_identity_refuses_absent_or_malformed_stat(monkeypatch, raw):
     original_is_dir = Path.is_dir
     monkeypatch.setattr(Path, "is_dir", lambda path: path == Path("/proc") or original_is_dir(path))
@@ -77,13 +83,29 @@ def _paid_run(tmp_path, run_id: RunId):
     store.initialize()
     now = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    scope = BudgetScope("o/r", "repository", "USD", now.date().isoformat(), start, start + timedelta(days=1),
-                        ZoneInfo("UTC"))
+    scope = BudgetScope(
+        "o/r", "repository", "USD", now.date().isoformat(), start, start + timedelta(days=1), ZoneInfo("UTC")
+    )
     assert store.lease("o/r", "fix", 1, "o/r:fix")
-    assert store.reserve(ReservationRequest(run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1),
-                                            (BudgetLimit(scope, Money("USD", 10)),), 1, issue=1)).admitted
-    env = {**os.environ, "ISSUE_AGENT_CONTROL_DB": store.path, "ISSUE_AGENT_RUN_ID": str(run_id),
-           "ISSUE_AGENT_OWNER_ID": "o/r:fix"}
+    assert store.reserve(
+        ReservationRequest(
+            run_id,
+            "o/r",
+            "fix",
+            "RESOLVE",
+            "o/r:fix",
+            Money("USD", 1),
+            (BudgetLimit(scope, Money("USD", 10)),),
+            1,
+            issue=1,
+        )
+    ).admitted
+    env = {
+        **os.environ,
+        "ISSUE_AGENT_CONTROL_DB": store.path,
+        "ISSUE_AGENT_RUN_ID": str(run_id),
+        "ISSUE_AGENT_OWNER_ID": "o/r:fix",
+    }
     return supervisor, store, env
 
 
@@ -157,8 +179,11 @@ def test_stale_group_leader_identity_is_never_signalled(tmp_path, monkeypatch) -
 
 def test_group_descendant_is_killed_after_registered_leader_exits(tmp_path) -> None:
     child_pid_file = tmp_path / "child.pid"
-    process = subprocess.Popen(["/bin/sh", "-c", f"sleep 30 & echo $! > {child_pid_file}; sleep 0.2"],
-                               start_new_session=True, stdout=subprocess.DEVNULL)
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", f"sleep 30 & echo $! > {child_pid_file}; sleep 0.2"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
     supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
     run_id = RunId("leader-exited")
     supervisor.register(run_id, os.getpgid(process.pid))
@@ -175,9 +200,15 @@ def test_group_descendant_is_killed_after_registered_leader_exits(tmp_path) -> N
 def test_term_grace_kills_stubborn_descendant_after_leader_exits(tmp_path) -> None:
     child_pid_file = tmp_path / "stubborn-child.pid"
     process = subprocess.Popen(
-        ["/bin/sh", "-c", "trap 'exit 0' TERM; (trap '' TERM; while :; do sleep 1; done) & "
-                          f"echo $! > {child_pid_file}; while :; do sleep 1; done"],
-        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; (trap '' TERM; while :; do sleep 1; done) & "
+            f"echo $! > {child_pid_file}; while :; do sleep 1; done",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     _until(child_pid_file.exists)
     child_pid = int(child_pid_file.read_text().strip())
@@ -261,7 +292,12 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
 
     lease = store.leases()[0]
     assert (lease.run_id, lease.repository, lease.role, lease.target, lease.owner_id) == (
-        run_id, "o/r", "fix", 1, "o/r:fix")
+        run_id,
+        "o/r",
+        "fix",
+        1,
+        "o/r:fix",
+    )
     assert (lease.pid, lease.pgid) == (process.pid, process.pid)
     assert lease.process_start_ticks > 0
 
@@ -276,17 +312,30 @@ def test_supervised_paid_command_scrubs_authority_from_the_target_environment(tm
     run_id = RunId("authority-carrier")
     supervisor, store, env = _paid_run(tmp_path, run_id)
     observed = tmp_path / "observed.json"
-    command = supervisor.supervised_command(run_id, _python(
-        "import json, os; from pathlib import Path; "
-        f"Path({str(observed)!r}).write_text(json.dumps({{k: os.environ.get(k) for k in ("
-        "'ISSUE_AGENT_CONTROL_DB', 'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID')}))"))
+    command = supervisor.supervised_command(
+        run_id,
+        _python(
+            "import json, os; from pathlib import Path; "
+            f"Path({str(observed)!r}).write_text(json.dumps({{k: os.environ.get(k) for k in ("
+            "'ISSUE_AGENT_CONTROL_DB', 'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID')}))"
+        ),
+    )
 
-    completed = subprocess.run(command, start_new_session=True, env={**env, **supervisor.launch_guard_env()},
-                               check=False, capture_output=True, text=True)
+    completed = subprocess.run(
+        command,
+        start_new_session=True,
+        env={**env, **supervisor.launch_guard_env()},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(observed.read_text()) == {
-        "ISSUE_AGENT_CONTROL_DB": None, "ISSUE_AGENT_RUN_ID": None, "ISSUE_AGENT_OWNER_ID": None}
+        "ISSUE_AGENT_CONTROL_DB": None,
+        "ISSUE_AGENT_RUN_ID": None,
+        "ISSUE_AGENT_OWNER_ID": None,
+    }
 
     supervisor.kill_tree(run_id)
     assert store.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
@@ -298,9 +347,13 @@ def test_carrier_forwards_direct_termination_to_the_target_group(tmp_path) -> No
     supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
     run_id = RunId("carrier-signal")
     target_pid_file = tmp_path / "target.pid"
-    command = supervisor.supervised_command(run_id, _python(
-        "import os, signal, time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        f"Path({str(target_pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)"))
+    command = supervisor.supervised_command(
+        run_id,
+        _python(
+            "import os, signal, time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"Path({str(target_pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)"
+        ),
+    )
     process = subprocess.Popen(command, start_new_session=True)
     _until(target_pid_file.exists)
     assert target_pid_file.exists()
@@ -321,8 +374,13 @@ def test_supervised_paid_command_refuses_exec_after_launcher_death(tmp_path) -> 
     marker = tmp_path / "paid-command-started"
     command = supervisor.supervised_command(run_id, _touch(marker))
 
-    completed = subprocess.run(command, start_new_session=True, check=False, capture_output=True, env={
-        **env, "ISSUE_AGENT_SUPERVISOR_PARENT_PID": "99999999", "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": "1"})
+    completed = subprocess.run(
+        command,
+        start_new_session=True,
+        check=False,
+        capture_output=True,
+        env={**env, "ISSUE_AGENT_SUPERVISOR_PARENT_PID": "99999999", "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": "1"},
+    )
 
     assert completed.returncode != 0
     assert not marker.exists()
@@ -351,12 +409,21 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(tmp_path) -
     supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
     run_id = RunId("sdk-cli")
     wrapper, supervised_env = supervisor.supervised_cli(run_id, str(target))
-    process = subprocess.Popen([wrapper, "--sdk-argument"], env={
-        **os.environ, **supervised_env, "GH_TOKEN": "must-not-reach-child", "TEST_CMD": "uv run pytest",
-        "ISSUE_AGENT_AUTHORITY_BUNDLE": "must-stay-in-carrier", "CARGO_INCREMENTAL": "0",
-        "CARGO_TARGET_DIR": "/operator/shared-cargo-target", "CARGO_BUILD_JOBS": "2", "PW_WORKERS": "1",
-        CHILD_ENV_MANIFEST: "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE",
-    })
+    process = subprocess.Popen(
+        [wrapper, "--sdk-argument"],
+        env={
+            **os.environ,
+            **supervised_env,
+            "GH_TOKEN": "must-not-reach-child",
+            "TEST_CMD": "uv run pytest",
+            "ISSUE_AGENT_AUTHORITY_BUNDLE": "must-stay-in-carrier",
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_TARGET_DIR": "/operator/shared-cargo-target",
+            "CARGO_BUILD_JOBS": "2",
+            "PW_WORKERS": "1",
+            CHILD_ENV_MANIFEST: "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE",
+        },
+    )
     _until(marker.exists)
 
     assert marker.exists()

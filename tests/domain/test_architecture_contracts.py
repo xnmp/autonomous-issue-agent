@@ -11,15 +11,26 @@ ROOT = Path(__file__).parents[2]
 DOMAIN = ROOT / "src" / "issue_agent" / "domain"
 APP = ROOT / "src" / "issue_agent" / "app"
 PLUGIN = ROOT / "plugin"
-PRIVILEGED_EFFECT_ADAPTERS = frozenset({
-    Path("src/issue_agent/adapters/github.py"),
-    Path("src/issue_agent/adapters/operator_effects.py"),
-})
+PRIVILEGED_EFFECT_ADAPTERS = frozenset(
+    {Path("src/issue_agent/adapters/github.py"), Path("src/issue_agent/adapters/operator_effects.py")}
+)
 
-REMOTE_WRITES = frozenset({
-    "close_issue", "comment", "create_pr", "delete_branch", "enable_auto_merge", "merge_pr", "push", "relabel",
-    "cancel_workflow_runs", "rerun_failed_checks", "submit_review", "update_branch",
-})
+REMOTE_WRITES = frozenset(
+    {
+        "close_issue",
+        "comment",
+        "create_pr",
+        "delete_branch",
+        "enable_auto_merge",
+        "merge_pr",
+        "push",
+        "relabel",
+        "cancel_workflow_runs",
+        "rerun_failed_checks",
+        "submit_review",
+        "update_branch",
+    }
+)
 
 
 def _python_files(root: Path) -> tuple[Path, ...]:
@@ -88,15 +99,35 @@ def test_app_cannot_gate_mutating_port_calls_on_runtime_protocol_probes() -> Non
     """A structural runtime probe must never turn a durable write into a skip."""
 
     mutation_prefixes = (
-        "abandon_", "bump_", "claim", "clear_", "drain_", "enqueue_", "execute_", "flush_", "prune_", "receipt",
-        "record_", "recover_", "release", "remove", "replace_", "reserve", "retire_", "save_", "set_", "settle",
+        "abandon_",
+        "bump_",
+        "claim",
+        "clear_",
+        "drain_",
+        "enqueue_",
+        "execute_",
+        "flush_",
+        "prune_",
+        "receipt",
+        "record_",
+        "recover_",
+        "release",
+        "remove",
+        "replace_",
+        "reserve",
+        "retire_",
+        "save_",
+        "set_",
+        "settle",
     )
     mutating_ports = {
         node.name
         for node in _parse(DOMAIN / "ports.py").body
         if isinstance(node, ast.ClassDef)
-        and any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and member.name.startswith(mutation_prefixes) for member in node.body)
+        and any(
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name.startswith(mutation_prefixes)
+            for member in node.body
+        )
     }
 
     violations: list[str] = []
@@ -135,8 +166,11 @@ def test_every_domain_port_is_type_checked_or_explicitly_exempted() -> None:
                 and len(node.value.args) == 1
                 and isinstance(node.value.args[0], ast.Set)
             ):
-                return {item.value for item in node.value.args[0].elts
-                        if isinstance(item, ast.Constant) and isinstance(item.value, str)}
+                return {
+                    item.value
+                    for item in node.value.args[0].elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                }
         raise AssertionError(f"{name} must be one literal frozenset")
 
     covered = declared("COVERED_PORTS")
@@ -201,7 +235,7 @@ def test_remote_cli_mutations_live_only_in_privileged_effect_adapters() -> None:
                 if (
                     "harness:preflight-probe" in stripped
                     and path.name == "doctor.sh"
-                    and re.search(r'repos/\$REPO/labels', stripped)
+                    and re.search(r"repos/\$REPO/labels", stripped)
                 ):
                     continue
                 # It creates and immediately deletes a throwaway repo label to
@@ -219,7 +253,8 @@ def test_remote_cli_mutations_live_only_in_privileged_effect_adapters() -> None:
 
 def test_app_has_no_lambda_noop_defaults() -> None:
     violations = [
-        f"{path}:{node.lineno}" for path, node in _nodes(APP)
+        f"{path}:{node.lineno}"
+        for path, node in _nodes(APP)
         if isinstance(node, ast.Lambda) and isinstance(node.body, ast.Constant) and node.body.value is None
     ]
     assert violations == []
@@ -227,7 +262,8 @@ def test_app_has_no_lambda_noop_defaults() -> None:
 
 def test_application_event_producers_cannot_emit_free_form_names() -> None:
     violations = [
-        f"{path}:{node.lineno}" for path, node in _nodes(APP)
+        f"{path}:{node.lineno}"
+        for path, node in _nodes(APP)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "emit"
@@ -245,8 +281,14 @@ def test_architecture_docs_name_authoritative_subsystems() -> None:
         assert required in architecture
     for runtime in ("claude", "codex"):
         assert runtime in matrix
-    for authority in ("paid admission", "remote mutation", "run/process ownership", "deduplication",
-                      "gate evidence", "logs/dashboard"):
+    for authority in (
+        "paid admission",
+        "remote mutation",
+        "run/process ownership",
+        "deduplication",
+        "gate evidence",
+        "logs/dashboard",
+    ):
         assert authority in matrix
 
 
@@ -270,10 +312,12 @@ def test_every_adr_is_referenced_by_a_governed_source_file() -> None:
             f"{adr.name} is superseded: move it to docs/archive/adr/"
         )
         marker = f"ADR {match.group(1)}"
-        governs = next((line.removeprefix("Governs: ") for line in decision.splitlines()
-                        if line.startswith("Governs: ")), "")
-        source_files = tuple(ROOT / token for token in governs.split()
-                             if token.startswith("src/") and token.endswith(".py"))
+        governs = next(
+            (line.removeprefix("Governs: ") for line in decision.splitlines() if line.startswith("Governs: ")), ""
+        )
+        source_files = tuple(
+            ROOT / token for token in governs.split() if token.startswith("src/") and token.endswith(".py")
+        )
         assert source_files, f"{adr.name} governs no source file"
         assert all(path.is_file() for path in source_files), f"{adr.name} governs a missing source file"
         assert any(path.is_file() and marker in path.read_text() for path in source_files), (

@@ -30,16 +30,20 @@ def run(kind="RESOLVE", number=5, issue=5, head="", leg="agent", minute=1, start
 
 # ── recorded runs → leg ends ─────────────────────────────────────────────────
 
-@pytest.mark.parametrize("recorded,item", [
-    (run("RESOLVE"), issue_key(5)),
-    (run("RESUME"), None),               # pre-5b kinds stop counting at the cutover
-    (run("FIX_CI", number=100), pr_key(100)),
-    (run("PR_RESUME", number=100), None),
-    (run("ROUTE"), None),                # the deleted classifier leg belongs to no item
-    (run("RESOLVE", issue=0), None),
-    (run("REVIEW", number=100), pr_key(100)),  # both roles derive from every leg
-    (run("FIX_CI", number=0), None),
-])
+
+@pytest.mark.parametrize(
+    "recorded,item",
+    [
+        (run("RESOLVE"), issue_key(5)),
+        (run("RESUME"), None),  # pre-5b kinds stop counting at the cutover
+        (run("FIX_CI", number=100), pr_key(100)),
+        (run("PR_RESUME", number=100), None),
+        (run("ROUTE"), None),  # the deleted classifier leg belongs to no item
+        (run("RESOLVE", issue=0), None),
+        (run("REVIEW", number=100), pr_key(100)),  # both roles derive from every leg
+        (run("FIX_CI", number=0), None),
+    ],
+)
 def test_each_run_belongs_to_its_issue_or_pr_item(recorded, item):
     assert run_item(recorded) == item
 
@@ -77,30 +81,52 @@ def test_an_inconsistent_start_is_dropped_but_the_end_still_counts():
 
 
 def test_local_legs_group_both_roles_legs_by_item_in_end_order():
-    legs = local_legs([run("FIX_CI", number=100, minute=3), run("RESOLVE", minute=1),
-                       run("FIX_CI", number=100, minute=2), run("REVIEW", number=100, minute=4)])
+    legs = local_legs(
+        [
+            run("FIX_CI", number=100, minute=3),
+            run("RESOLVE", minute=1),
+            run("FIX_CI", number=100, minute=2),
+            run("REVIEW", number=100, minute=4),
+        ]
+    )
     assert set(legs) == {issue_key(5), pr_key(100)}
     assert [(e.kind, e.ended_at.minute) for e in legs[pr_key(100)]] == [
-        (AgentKind.FIX_CI, 2), (AgentKind.FIX_CI, 3), (AgentKind.REVIEW, 4)]
+        (AgentKind.FIX_CI, 2),
+        (AgentKind.FIX_CI, 3),
+        (AgentKind.REVIEW, 4),
+    ]
 
 
 def test_leases_cover_own_dispatches_and_other_holders_issues_only():
-    held = leased_items([RunAgent(AgentKind.RESOLVE, 5), RunAgent(AgentKind.FIX_CI, 100, head="h1")],
-                        [7, 0, -3, "8", True, None])
+    held = leased_items(
+        [RunAgent(AgentKind.RESOLVE, 5), RunAgent(AgentKind.FIX_CI, 100, head="h1")], [7, 0, -3, "8", True, None]
+    )
     assert held == frozenset({issue_key(5), pr_key(100), issue_key(7)})
 
 
 # ── the tick's actions ───────────────────────────────────────────────────────
 
+
 def ci(head="h1", bucket="pass"):
-    return Observed(head, head, frozenset({RequiredCheck("test")}),
-                    (Check("test", state="COMPLETED", bucket=bucket, required=True),))
+    return Observed(
+        head,
+        head,
+        frozenset({RequiredCheck("test")}),
+        (Check("test", state="COMPLETED", bucket=bucket, required=True),),
+    )
 
 
 def harness_pr(number=100, issue=5, **kw):
     kw.setdefault("ci", ci())
-    return PRView(number=number, head_ref_name=f"fix/{issue}-x", head_ref_oid="h1", state="OPEN",
-                  mergeable="MERGEABLE", merge_state="CLEAN", **kw)
+    return PRView(
+        number=number,
+        head_ref_name=f"fix/{issue}-x",
+        head_ref_oid="h1",
+        state="OPEN",
+        mergeable="MERGEABLE",
+        merge_state="CLEAN",
+        **kw,
+    )
 
 
 def local(**kw):
@@ -108,8 +134,10 @@ def local(**kw):
 
 
 def test_paid_dispatches_fit_the_free_slots_issues_first():
-    world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)),
-                       prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),))
+    world = WorldState(
+        issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)),
+        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),),
+    )
     chosen = fix_actions(derive(world, local(), H), H, slots=2)
     assert chosen == (RunAgent(AgentKind.RESOLVE, 1), RunAgent(AgentKind.RESOLVE, 2))
     assert fix_actions(derive(world, local(), H), H, slots=0) == ()
@@ -131,6 +159,7 @@ def test_no_slots_means_no_paid_dispatch(slots):
 
 # ── reply and question text ──────────────────────────────────────────────────
 
+
 def test_the_reply_is_every_human_comment_after_the_leg_in_order():
     after = T0 + timedelta(minutes=5)
     comments = (
@@ -146,6 +175,7 @@ def test_the_reply_is_every_human_comment_after_the_leg_in_order():
 
 # ── Facts (round 2) ───────────────────────────────────────────────────────
 
+
 class _Control:
     def leg_runs(self, repository, issues):
         return ()
@@ -159,8 +189,15 @@ def test_an_unreadable_lifetime_read_holds_paid_work_and_says_so():
         raise RuntimeError("spend snapshot unavailable")
 
     lines: list[str] = []
-    facts = Facts(_Control(), "o/r", active=lambda: (),
-                     headroom=lambda: True, lifetime_capped=unreadable, log=lines.append, now=lambda: T0)
+    facts = Facts(
+        _Control(),
+        "o/r",
+        active=lambda: (),
+        headroom=lambda: True,
+        lifetime_capped=unreadable,
+        log=lines.append,
+        now=lambda: T0,
+    )
     loc = facts(WorldState(issues=(IssueView(5, labels=frozenset({Label.AI_READY})),)))
     assert loc.headroom is False and loc.lifetime_capped == frozenset()
     assert len(lines) == 1 and "spend snapshot unavailable" in lines[0]

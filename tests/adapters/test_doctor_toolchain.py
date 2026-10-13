@@ -20,6 +20,7 @@ import pytest
 
 from tests.app.test_compose_env import _fake_tool_path, _run_doctor
 
+
 def _fake_toolchain_bin(tmp_path: Path, **versions: str) -> Path:
     """test_compose_env's hermetic gh/claude/jq/uv stubs plus fake rustc/node/
     python3 binaries that report a controlled version."""
@@ -42,9 +43,7 @@ def _target_dir(tmp_path: Path, files: dict[str, str]) -> Path:
     return target
 
 
-def _toolchain_doctor(
-    tmp_path: Path, files: dict[str, str], **tool_versions
-) -> subprocess.CompletedProcess:
+def _toolchain_doctor(tmp_path: Path, files: dict[str, str], **tool_versions) -> subprocess.CompletedProcess:
     fake_bin = _fake_toolchain_bin(tmp_path, **tool_versions)
     harness = tmp_path / "harness"
     (harness / "config" / "repos").mkdir(parents=True, exist_ok=True)
@@ -65,28 +64,56 @@ _PIN = {"rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n'}
 _PY = {"pyproject.toml": '[project]\nname = "x"\n'}
 
 
-@pytest.mark.parametrize("files,tools,present,absent", [
-    (_CARGO, {}, ["Cargo.toml present but no rust-toolchain.toml/rust-toolchain"], []),
-    # The keifu incident: both versions are named.
-    ({**_CARGO, **_PIN}, {"rustc": "1.93.0"}, ["rustc drift", "1.97.1", "1.93.0"], []),
-    ({**_CARGO, **_PIN}, {"rustc": "1.97.1"}, ["rustc matches rust-toolchain.toml (1.97.1)"], ["rustc drift"]),
-    # An unparseable pin stays silent rather than comparing nonsense.
-    ({**_CARGO, "rust-toolchain.toml": '[toolchain]\nchannel = "stable"\n'}, {"rustc": "1.97.1"}, [],
-     ["rustc drift", "rustc matches", "no rust-toolchain.toml/rust-toolchain"]),
-    ({"package.json": "{}\n"}, {}, ["package.json present but no .nvmrc/.node-version"], []),
-    ({"package.json": "{}\n", ".nvmrc": "18.17.0\n"}, {"node": "20.11.1"}, ["node drift", "18.17.0", "20.11.1"], []),
-    ({"package.json": "{}\n", ".nvmrc": "20.11.1\n"}, {"node": "20.11.1"}, ["node matches .nvmrc (20.11.1)"],
-     ["node drift"]),
-    # A loose .nvmrc must not shadow a parseable .node-version beside it.
-    ({"package.json": "{}\n", ".nvmrc": "lts/*\n", ".node-version": "20.11.1\n"}, {"node": "18.17.0"},
-     ["node drift", "20.11.1", "18.17.0"], []),
-    (_PY, {}, ["pyproject.toml/requirements.txt present but no .python-version"], []),
-    ({"requirements.txt": "flask\n", ".python-version": "3.11.4\n"}, {"python3": "3.12.2"},
-     ["python drift", "3.11.4", "3.12.2"], []),
-    ({**_PY, ".python-version": "3.12.2\n"}, {"python3": "3.12.2"}, ["python3 matches .python-version (3.12.2)"],
-     ["python drift"]),
-    ({"README.md": "hello\n"}, {}, [], ["rust-toolchain", ".nvmrc", ".python-version"]),
-])
+@pytest.mark.parametrize(
+    "files,tools,present,absent",
+    [
+        (_CARGO, {}, ["Cargo.toml present but no rust-toolchain.toml/rust-toolchain"], []),
+        # The keifu incident: both versions are named.
+        ({**_CARGO, **_PIN}, {"rustc": "1.93.0"}, ["rustc drift", "1.97.1", "1.93.0"], []),
+        ({**_CARGO, **_PIN}, {"rustc": "1.97.1"}, ["rustc matches rust-toolchain.toml (1.97.1)"], ["rustc drift"]),
+        # An unparseable pin stays silent rather than comparing nonsense.
+        (
+            {**_CARGO, "rust-toolchain.toml": '[toolchain]\nchannel = "stable"\n'},
+            {"rustc": "1.97.1"},
+            [],
+            ["rustc drift", "rustc matches", "no rust-toolchain.toml/rust-toolchain"],
+        ),
+        ({"package.json": "{}\n"}, {}, ["package.json present but no .nvmrc/.node-version"], []),
+        (
+            {"package.json": "{}\n", ".nvmrc": "18.17.0\n"},
+            {"node": "20.11.1"},
+            ["node drift", "18.17.0", "20.11.1"],
+            [],
+        ),
+        (
+            {"package.json": "{}\n", ".nvmrc": "20.11.1\n"},
+            {"node": "20.11.1"},
+            ["node matches .nvmrc (20.11.1)"],
+            ["node drift"],
+        ),
+        # A loose .nvmrc must not shadow a parseable .node-version beside it.
+        (
+            {"package.json": "{}\n", ".nvmrc": "lts/*\n", ".node-version": "20.11.1\n"},
+            {"node": "18.17.0"},
+            ["node drift", "20.11.1", "18.17.0"],
+            [],
+        ),
+        (_PY, {}, ["pyproject.toml/requirements.txt present but no .python-version"], []),
+        (
+            {"requirements.txt": "flask\n", ".python-version": "3.11.4\n"},
+            {"python3": "3.12.2"},
+            ["python drift", "3.11.4", "3.12.2"],
+            [],
+        ),
+        (
+            {**_PY, ".python-version": "3.12.2\n"},
+            {"python3": "3.12.2"},
+            ["python3 matches .python-version (3.12.2)"],
+            ["python drift"],
+        ),
+        ({"README.md": "hello\n"}, {}, [], ["rust-toolchain", ".nvmrc", ".python-version"]),
+    ],
+)
 def test_doctor_toolchain_pins(tmp_path, files, tools, present, absent):
     out = _toolchain_doctor(tmp_path, files, **tools).stdout
     assert all(text in out for text in present), out

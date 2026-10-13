@@ -40,33 +40,40 @@ def test_dashboard_replaces_itself_with_the_dashboard_module(monkeypatch, args, 
     assert calls == [(sys.executable, [sys.executable, "-m", "issue_agent.app.dashweb.main", *passed])]
 
 
-@pytest.mark.parametrize("url,repo", [
-    ("git@github.com:acme/MyApp.git", "acme/myapp"),
-    ("https://github.com/acme/MyApp.git", "acme/myapp"),
-    ("https://github.com/acme/MyApp", "acme/myapp"),
-    ("https://github.example.com/o/r/", "o/r"),
-    ("not a url", ""),
-    ("", ""),
-])
+@pytest.mark.parametrize(
+    "url,repo",
+    [
+        ("git@github.com:acme/MyApp.git", "acme/myapp"),
+        ("https://github.com/acme/MyApp.git", "acme/myapp"),
+        ("https://github.com/acme/MyApp", "acme/myapp"),
+        ("https://github.example.com/o/r/", "o/r"),
+        ("not a url", ""),
+        ("", ""),
+    ],
+)
 def test_parse_remote_url(url, repo):
     assert cli.parse_remote_url(url) == repo
 
 
-@pytest.mark.parametrize("repo,name", [
-    # P0R-2: the owner is part of the name, so acme/app and other/app cannot
-    # share one overlay (the original collision).
-    ("acme/MyApp-combined-agent", "acme-myapp-combined-agent"),
-    ("acme/app", "acme-app"),
-    ("other/app", "other-app"),
-    ("o/weird name!", "o-weird-name"),
-    ("", "target"),
-])
+@pytest.mark.parametrize(
+    "repo,name",
+    [
+        # P0R-2: the owner is part of the name, so acme/app and other/app cannot
+        # share one overlay (the original collision).
+        ("acme/MyApp-combined-agent", "acme-myapp-combined-agent"),
+        ("acme/app", "acme-app"),
+        ("other/app", "other-app"),
+        ("o/weird name!", "o-weird-name"),
+        ("", "target"),
+    ],
+)
 def test_derive_name(repo, name):
     assert cli.derive_name(repo) == name
 
 
-@pytest.mark.parametrize(("alias", "canonical"), (("Acme App", "acme-app"), ("acme@app", "acme-app"),
-                                                   ("ACME-APP", "acme-app")))
+@pytest.mark.parametrize(
+    ("alias", "canonical"), (("Acme App", "acme-app"), ("acme@app", "acme-app"), ("ACME-APP", "acme-app"))
+)
 def test_explicit_deployment_name_aliases_are_rejected(alias, canonical):
     with pytest.raises(ValueError, match=repr(canonical)):
         cli.resolve_name("acme/app", explicit=alias)
@@ -79,14 +86,17 @@ def test_explicit_deployment_name_aliases_are_rejected(alias, canonical):
 # expansion rows, so resolve_name MISSED an existing overlay and cmd_start
 # synthesized a duplicate with fresh *_STATE_DIRs. The empty rows are the
 # anti-vacuity twins (a reader that leaks the CLI's own env would pass the rest).
-@pytest.mark.parametrize("text,value", [
-    ('REPO="a/one"\nexport REPO="a/two"\nOTHER=x\n', "a/two"),
-    ('REPO="owner/name"  # prod\n', "owner/name"),
-    ("REPO = owner/name\n", "owner/name"),
-    ("OWNER_REPO=owner/name\nREPO=${OWNER_REPO}\n", "owner/name"),
-    ('OTHER="x"\n', ""),
-    (None, ""),
-])
+@pytest.mark.parametrize(
+    "text,value",
+    [
+        ('REPO="a/one"\nexport REPO="a/two"\nOTHER=x\n', "a/two"),
+        ('REPO="owner/name"  # prod\n', "owner/name"),
+        ("REPO = owner/name\n", "owner/name"),
+        ("OWNER_REPO=owner/name\nREPO=${OWNER_REPO}\n", "owner/name"),
+        ('OTHER="x"\n', ""),
+        (None, ""),
+    ],
+)
 def test_read_repo_env_field(tmp_path, monkeypatch, text, value):
     monkeypatch.setenv("REPO", "ambient/leak")
     p = tmp_path / "r.env"
@@ -100,9 +110,7 @@ def test_read_repo_env_field(tmp_path, monkeypatch, text, value):
 
 
 @pytest.mark.parametrize("overlay_dir,warns", [("/repos/app", True), ("/repos/other", False)])
-def test_resolve_name_warns_before_synthesizing_a_duplicate_for_the_same_checkout(
-    tmp_path, capsys, overlay_dir, warns
-):
+def test_resolve_name_warns_before_synthesizing_a_duplicate_for_the_same_checkout(tmp_path, capsys, overlay_dir, warns):
     """M12: an overlay already targets this exact working copy but its REPO
     disagrees — warn before derive_name synthesizes a SECOND overlay (and a
     second STATE_DIR) for the same checkout; a different checkout is silent."""
@@ -133,8 +141,12 @@ def test_resolve_name_prefers_target_dir_match(tmp_path, capsys):
     repo = "acme/App-combined-agent"
     (tmp_path / "app-wt.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app-harness"\n')
     (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
-    for target, name in (("/repos/app", "app"), ("/repos/app/", "app"), ("/repos/./app", "app"),
-                         ("/repos/app-harness", "app-wt")):
+    for target, name in (
+        ("/repos/app", "app"),
+        ("/repos/app/", "app"),
+        ("/repos/./app", "app"),
+        ("/repos/app-harness", "app-wt"),
+    ):
         assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir=target) == name
     assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/somewhere/else") == cli.derive_name(repo)
     assert "different working copy" in capsys.readouterr().err
@@ -158,8 +170,9 @@ def test_synth_repo_env_roundtrips_through_from_env():
     assert "issue-agent-myapp" in env["STATE_DIR"]
     # The harness never writes TEST_CMD: it is only the operator's point-at probe.
     assert "TEST_CMD" not in env
-    cfg = from_env(_source_env(cli.synth_repo_env(repo="o/r", target_dir="/t", name="r", base_branch="main",
-                                                  max_budget="10.00")))
+    cfg = from_env(
+        _source_env(cli.synth_repo_env(repo="o/r", target_dir="/t", name="r", base_branch="main", max_budget="10.00"))
+    )
     assert (cfg.repo, cfg.target_dir, cfg.base_branch, cfg.fix_budget_usd) == ("o/r", "/t", "main", 10.00)
 
 
@@ -192,10 +205,9 @@ def _isolated_config(tmp_path, monkeypatch):
     return repos, config
 
 
-@pytest.mark.parametrize("overlay,snapshot", [
-    ('REPO="Acme/Widget-App"\n', None),
-    ('TARGET_DIR="/srv/myapp"\n', 'REPO="Acme/Widget-App"\n'),
-])
+@pytest.mark.parametrize(
+    "overlay,snapshot", [('REPO="Acme/Widget-App"\n', None), ('TARGET_DIR="/srv/myapp"\n', 'REPO="Acme/Widget-App"\n')]
+)
 def test_journal_paths_match_where_daemons_write(tmp_path, monkeypatch, overlay, snapshot):
     """A hand-written overlay with REPO but no STATE_DIR keys (keifu, 2026-08-02),
     or REPO only in the composed snapshot (it lives in shared.env): the read
@@ -232,17 +244,30 @@ def test_status_caps_resolve_overlay_then_shared_config(tmp_path, monkeypatch) -
 
 
 # P0R-2: refuse a resolved overlay that belongs to a DIFFERENT repo/checkout.
-@pytest.mark.parametrize("name,overlay,repo,target,named", [
-    ("app", 'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n', "other/app", "/srv/other-app",
-     ("acme/app", "other/app")),
-    ("app", 'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n', "acme/app", "/srv/acme-app", None),
-    ("app", None, "other/app", "/srv/other-app", None),
-    # A sibling checkout must not start or stop this deployment.
-    ("app-wt", 'REPO="acme/app"\nTARGET_DIR="/srv/app-harness"\n', "acme/app", "/srv/somewhere-else",
-     ("/srv/app-harness", "/srv/somewhere-else")),
-    # A hand-edited overlay with no REPO: TARGET_DIR is the identity left.
-    ("app", 'TARGET_DIR="/srv/acme-app"\n', "other/app", "/srv/other-app", ("/srv/acme-app", "/srv/other-app")),
-])
+@pytest.mark.parametrize(
+    "name,overlay,repo,target,named",
+    [
+        (
+            "app",
+            'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n',
+            "other/app",
+            "/srv/other-app",
+            ("acme/app", "other/app"),
+        ),
+        ("app", 'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n', "acme/app", "/srv/acme-app", None),
+        ("app", None, "other/app", "/srv/other-app", None),
+        # A sibling checkout must not start or stop this deployment.
+        (
+            "app-wt",
+            'REPO="acme/app"\nTARGET_DIR="/srv/app-harness"\n',
+            "acme/app",
+            "/srv/somewhere-else",
+            ("/srv/app-harness", "/srv/somewhere-else"),
+        ),
+        # A hand-edited overlay with no REPO: TARGET_DIR is the identity left.
+        ("app", 'TARGET_DIR="/srv/acme-app"\n', "other/app", "/srv/other-app", ("/srv/acme-app", "/srv/other-app")),
+    ],
+)
 def test_check_overlay_mismatch(tmp_path, name, overlay, repo, target, named):
     if overlay:
         (tmp_path / f"{name}.env").write_text(overlay)
@@ -255,10 +280,23 @@ def test_check_overlay_mismatch(tmp_path, name, overlay, repo, target, named):
 
 # ── per-command wiring: fatal (start/stop/doctor/install-service) vs warn (status) ──
 def _start_args(**overrides) -> argparse.Namespace:
-    return argparse.Namespace(**{
-        "repo": "", "target_dir": "", "name": "", "roles": None, "base_branch": "dev", "no_init": True,
-        "max_budget": "", "review_budget": "", "max_ticks": None, "write_config": False, "worktree": False,
-        "worktree_path": "", **overrides})
+    return argparse.Namespace(
+        **{
+            "repo": "",
+            "target_dir": "",
+            "name": "",
+            "roles": None,
+            "base_branch": "dev",
+            "no_init": True,
+            "max_budget": "",
+            "review_budget": "",
+            "max_ticks": None,
+            "write_config": False,
+            "worktree": False,
+            "worktree_path": "",
+            **overrides,
+        }
+    )
 
 
 def _prep_mismatch_overlay(tmp_path, monkeypatch, *, isolate_entrypoint=True) -> None:
@@ -274,8 +312,17 @@ def _prep_mismatch_overlay(tmp_path, monkeypatch, *, isolate_entrypoint=True) ->
 
 
 # ── start self-heals a stale/partial install (#156 follow-up, 2026-08-08) ─────
-def _install_state(monkeypatch, present, install_rc=0, after=None, after_foreign=(), live=(), foreign=(),
-                   timeout=False, harness_root="/opt/test-harness"):
+def _install_state(
+    monkeypatch,
+    present,
+    install_rc=0,
+    after=None,
+    after_foreign=(),
+    live=(),
+    foreign=(),
+    timeout=False,
+    harness_root="/opt/test-harness",
+):
     """PATH resolution for the declared console scripts, plus a recording stub
     for `make install` that can flip what PATH resolves afterwards. `foreign`
     names scripts that resolve to ANOTHER checkout's shim; `live` is what the
@@ -320,24 +367,27 @@ _TRANSIENT = dict(present=("issue-agent",), harness_root="/home/u/repo/.claude/w
 
 # `said` pins each message to its stream: refusals and failures are stderr, which
 # operators separate from the success line (`issue-agent start 2>…`).
-@pytest.mark.parametrize("state,healed,installs,said", [
-    (dict(present=("issue-agent",)), True, 0, ()),
-    # Neither script on PATH is a dev checkout, not drift — doctor stays quiet
-    # there too, and `make install` must not run behind the operator's back.
-    (dict(present=()), True, 0, ()),
-    (dict(_FOREIGN, after=("issue-agent",), after_foreign=("issue-agent",)), False, 1, (("err", "still drifted"),)),
-    # `make install` runs `uv sync` on the ONE .venv every deployment's daemons
-    # execute from; pruning it mid-tick breaks the running ones.
-    (dict(_FOREIGN, live=("keifu", "sol")), False, 0, (("err", "keifu, sol"), ("err", "uv sync"))),
-    # Presence-only reads healthy while another checkout's shim shadows ours —
-    # the daemon then execs a different tree's plugin/ and config/.
-    (dict(_FOREIGN, after=("issue-agent",)), True, 1, (("out", "/opt/other-checkout"),)),
-    # #187: reinstalling from the transient process would reinstall the
-    # transient tree — the exact state being healed.
-    (_TRANSIENT, False, 0, (("err", "canonical checkout"),)),
-    # The output tail still reaches the operator.
-    (dict(_FOREIGN, timeout=True), False, 1, (("err", "exceeded 300s"), ("err", "boom"))),
-])
+@pytest.mark.parametrize(
+    "state,healed,installs,said",
+    [
+        (dict(present=("issue-agent",)), True, 0, ()),
+        # Neither script on PATH is a dev checkout, not drift — doctor stays quiet
+        # there too, and `make install` must not run behind the operator's back.
+        (dict(present=()), True, 0, ()),
+        (dict(_FOREIGN, after=("issue-agent",), after_foreign=("issue-agent",)), False, 1, (("err", "still drifted"),)),
+        # `make install` runs `uv sync` on the ONE .venv every deployment's daemons
+        # execute from; pruning it mid-tick breaks the running ones.
+        (dict(_FOREIGN, live=("keifu", "sol")), False, 0, (("err", "keifu, sol"), ("err", "uv sync"))),
+        # Presence-only reads healthy while another checkout's shim shadows ours —
+        # the daemon then execs a different tree's plugin/ and config/.
+        (dict(_FOREIGN, after=("issue-agent",)), True, 1, (("out", "/opt/other-checkout"),)),
+        # #187: reinstalling from the transient process would reinstall the
+        # transient tree — the exact state being healed.
+        (_TRANSIENT, False, 0, (("err", "canonical checkout"),)),
+        # The output tail still reaches the operator.
+        (dict(_FOREIGN, timeout=True), False, 1, (("err", "exceeded 300s"), ("err", "boom"))),
+    ],
+)
 def test_start_heals_entrypoint_drift_only_when_safe(monkeypatch, capsys, state, healed, installs, said):
     calls = _install_state(monkeypatch, **state)
 
@@ -423,15 +473,18 @@ def test_start_still_launches_the_preflight_after_a_failed_reinstall(tmp_path, m
 # PERSISTENT service relaunching against it, refused before compose-env.sh).
 # WARN for status: it is read-only, and refusing would prevent using `status`
 # to diagnose this exact collision.
-@pytest.mark.parametrize("command,rc", [("start", 2), ("stop", 2), ("doctor", 2), ("install_service", 2),
-                                        ("status", 0)])
+@pytest.mark.parametrize(
+    "command,rc", [("start", 2), ("stop", 2), ("doctor", 2), ("install_service", 2), ("status", 0)]
+)
 def test_a_wrong_repo_overlay_is_fatal_except_for_read_only_status(tmp_path, monkeypatch, capsys, command, rc):
     _prep_mismatch_overlay(tmp_path, monkeypatch)
     launched = _record_scripts(monkeypatch)
     monkeypatch.setattr(cli.os, "execve", lambda *a: launched.append(a))
 
-    assert getattr(cli, f"cmd_{command}")(_start_args(repo="other/app", target_dir="/srv/other-app", name="app",
-                                                      lines=5)) == rc
+    assert (
+        getattr(cli, f"cmd_{command}")(_start_args(repo="other/app", target_dir="/srv/other-app", name="app", lines=5))
+        == rc
+    )
 
     captured = capsys.readouterr()
     assert "acme/app" in captured.err and "other/app" in captured.err
@@ -443,8 +496,10 @@ def test_a_wrong_repo_overlay_is_fatal_except_for_read_only_status(tmp_path, mon
 
 def test_role_pid_discovery_is_scoped_to_requested_deployment(monkeypatch) -> None:
     by_pattern = {
-        "issue_agent.app.main fix": [101, 102], "issue_agent.app.launchd_main fix": [],
-        "issue_agent.app.main review": [201, 202], "issue_agent.app.launchd_main review": [],
+        "issue_agent.app.main fix": [101, 102],
+        "issue_agent.app.launchd_main fix": [],
+        "issue_agent.app.main review": [201, 202],
+        "issue_agent.app.launchd_main review": [],
     }
     owners = {101: "deployment-a", 102: "deployment-b", 201: "deployment-a", 202: "deployment-b"}
     monkeypatch.setattr(cli, "_pgrep", lambda pattern: by_pattern[pattern])
@@ -498,7 +553,9 @@ def test_linux_pid_deployment_identity_comes_from_process_environment():
         return
     process = subprocess.Popen(
         [cli.sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(5)"],
-        env={**os.environ, "ISSUE_AGENT_DEPLOYMENT_ID": "deployment-a"}, stdout=subprocess.PIPE, text=True,
+        env={**os.environ, "ISSUE_AGENT_DEPLOYMENT_ID": "deployment-a"},
+        stdout=subprocess.PIPE,
+        text=True,
     )
     try:
         assert process.stdout is not None
@@ -528,8 +585,7 @@ def test_explicit_target_dir_is_the_repository_detection_authority(tmp_path, mon
 def _install_args(tmp_path, **changes) -> argparse.Namespace:
     # Explicit repo/target_dir/name → _resolve_context never shells out to
     # git/gh; resolve_name(explicit=name) returns immediately.
-    return argparse.Namespace(**{"repo": "o/r", "target_dir": str(tmp_path), "name": "myapp", "roles": None,
-                                 **changes})
+    return argparse.Namespace(**{"repo": "o/r", "target_dir": str(tmp_path), "name": "myapp", "roles": None, **changes})
 
 
 def _myapp_overlay(tmp_path, monkeypatch, text: str | None = None) -> None:
@@ -585,9 +641,7 @@ def test_uninstall_service_all_is_explicit_and_unscoped(monkeypatch) -> None:
     assert [cmd for cmd, _kw in calls] == [[cli._BASH, cli._bin(script), "uninstall"]]
 
 
-def test_ready_routes_operator_label_through_operator_effects(
-    monkeypatch, capsys
-):
+def test_ready_routes_operator_label_through_operator_effects(monkeypatch, capsys):
     calls = []
 
     class Effects:
@@ -633,9 +687,7 @@ def _gh_stub(fixer: str = "fix-bot", token_logins: dict | None = None):
         token = (kwargs.get("env") or {}).get("GH_TOKEN", "")
         if token:
             login = tokens.get(token, "")
-            return _fake_proc(
-                (login or '{"message":"Bad credentials"}') + "\n", 0 if login else 1
-            )
+            return _fake_proc((login or '{"message":"Bad credentials"}') + "\n", 0 if login else 1)
         return _fake_proc(fixer + "\n", 0 if fixer else 1)
 
     return run
@@ -665,8 +717,9 @@ def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None
     monkeypatch.setattr(cli, "detect_codex_auth", lambda: "apikey")
     real_which = cli.shutil.which
     codex_path = "/usr/bin/codex" if codex is None else codex
-    monkeypatch.setattr(cli.shutil, "which",
-                        lambda name, *a, **k: codex_path if name == "codex" else real_which(name, *a, **k))
+    monkeypatch.setattr(
+        cli.shutil, "which", lambda name, *a, **k: codex_path if name == "codex" else real_which(name, *a, **k)
+    )
     asked = _Answers(answers)
     secret_asked = _Answers(secrets)
     monkeypatch.setattr("builtins.input", asked)
@@ -682,8 +735,9 @@ def test_cmd_init_pins_codex_bin_unless_the_operator_declines(tmp_path, monkeypa
     answers = ["fix-bot", "review-bot", "N", "claude", "codex"]
     if pin_answer is not None:
         answers += [pin_answer, "https://api.openai.com/v1"]
-    shared, _asked, _s = _init_env(tmp_path, monkeypatch, answers=answers, secrets=["", ""],
-                                   codex="/home/o/.local/bin/codex")
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=answers, secrets=["", ""], codex="/home/o/.local/bin/codex"
+    )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert _shared_values(shared.read_text()).get("CODEX_BIN") == ("/home/o/.local/bin/codex" if pinned else None)
@@ -691,8 +745,13 @@ def test_cmd_init_pins_codex_bin_unless_the_operator_declines(tmp_path, monkeypa
 
 
 def _wizard_answers(**over) -> list[str]:
-    base = {"fix": "fix-bot", "review": "review-bot", "app": "N", "fixer_runtime": "claude",
-            "reviewer_runtime": "claude"}
+    base = {
+        "fix": "fix-bot",
+        "review": "review-bot",
+        "app": "N",
+        "fixer_runtime": "claude",
+        "reviewer_runtime": "claude",
+    }
     base.update(over)
     return list(base.values())
 
@@ -704,13 +763,15 @@ def _shared_values(text: str) -> dict:
 def _init(tmp_path, monkeypatch, *, secrets, answers=None, gh=None, force=False):
     """Run the wizard to completion; returns (written text, prompts, secret prompts)."""
     shared, asked, secret_asked = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers() if answers is None else answers, secrets=secrets, gh=gh)
+        tmp_path, monkeypatch, answers=_wizard_answers() if answers is None else answers, secrets=secrets, gh=gh
+    )
     assert cli.cmd_init(argparse.Namespace(force=force)) == 0
     return shared.read_text(), asked, secret_asked
 
 
 def test_cmd_init_degrades_when_gh_is_unreachable(tmp_path, monkeypatch, capsys):
     """gh missing/unauthenticated must warn and keep going, not crash the wizard."""
+
     def boom(cmd, **kwargs):
         raise OSError("gh: not found")
 
@@ -722,8 +783,12 @@ def test_cmd_init_degrades_when_gh_is_unreachable(tmp_path, monkeypatch, capsys)
 
 def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(tmp_path, monkeypatch, capsys):
     """A stubborn operator must not be able to hold the wizard open forever."""
-    text, asked, _s = _init(tmp_path, monkeypatch, secrets=["", ""],
-                            answers=["fix-bot", "fix-bot", "fix-bot", "fix-bot", "N", "claude", "claude"])
+    text, asked, _s = _init(
+        tmp_path,
+        monkeypatch,
+        secrets=["", ""],
+        answers=["fix-bot", "fix-bot", "fix-bot", "fix-bot", "N", "claude", "claude"],
+    )
 
     assert _shared_values(text)["REVIEW_BOT"] == "fix-bot"
     assert "doctor" in capsys.readouterr().err
@@ -734,8 +799,7 @@ def test_cmd_init_discards_a_rejected_token_at_the_attempt_ceiling(tmp_path, mon
     """A token GitHub answered about and rejected is NEVER stored. Persisting one
     silently installs whatever account it belongs to (typically the operator's
     own PAT) as the reviewer identity, defeating three-identity mode."""
-    text, _asked, secrets = _init(tmp_path, monkeypatch, secrets=["t1", "t2", "t3", "t4"],
-                                  gh=_gh_stub(token_logins={}))
+    text, _asked, secrets = _init(tmp_path, monkeypatch, secrets=["t1", "t2", "t3", "t4"], gh=_gh_stub(token_logins={}))
 
     assert "REVIEW_BOT_TOKEN" not in _shared_values(text)
     assert "t3" not in text
@@ -750,8 +814,9 @@ def test_cmd_init_discards_a_rejected_token_at_the_attempt_ceiling(tmp_path, mon
 def test_cmd_init_discards_a_token_belonging_to_another_account(tmp_path, monkeypatch, capsys):
     """The review's scenario: an operator's personal PAT offered three times. It
     authenticates fine — for the WRONG identity — so it must not be written."""
-    text, _asked, _s = _init(tmp_path, monkeypatch, secrets=["personal-pat"] * 3,
-                             gh=_gh_stub(token_logins={"personal-pat": "the-operator"}))
+    text, _asked, _s = _init(
+        tmp_path, monkeypatch, secrets=["personal-pat"] * 3, gh=_gh_stub(token_logins={"personal-pat": "the-operator"})
+    )
 
     assert "personal-pat" not in text
     assert "the-operator" in capsys.readouterr().err
@@ -760,6 +825,7 @@ def test_cmd_init_discards_a_token_belonging_to_another_account(tmp_path, monkey
 def test_cmd_init_keeps_an_unverifiable_token_when_gh_cannot_run(tmp_path, monkeypatch, capsys):
     """gh absent is an outage, not a verdict: keep the token, loudly, and let
     doctor adjudicate. This is the ONLY path that stores an unproven token."""
+
     def unusable(cmd, **kwargs):
         if (kwargs.get("env") or {}).get("GH_TOKEN"):
             raise OSError("gh: not found")
@@ -774,8 +840,12 @@ def test_cmd_init_keeps_an_unverifiable_token_when_gh_cannot_run(tmp_path, monke
 def test_cmd_init_reports_a_missing_token_file_and_reprompts(tmp_path, monkeypatch, capsys):
     token_file = tmp_path / "pat.txt"
     token_file.write_text("file-token\n")
-    text, _asked, _s = _init(tmp_path, monkeypatch, secrets=[f"@{tmp_path / 'nope.txt'}", f"@{token_file}"],
-                             gh=_gh_stub(token_logins={"file-token": "review-bot"}))
+    text, _asked, _s = _init(
+        tmp_path,
+        monkeypatch,
+        secrets=[f"@{tmp_path / 'nope.txt'}", f"@{token_file}"],
+        gh=_gh_stub(token_logins={"file-token": "review-bot"}),
+    )
 
     assert _shared_values(text)["REVIEW_BOT_TOKEN"] == "file-token"
     message = capsys.readouterr().err
@@ -785,8 +855,9 @@ def test_cmd_init_reports_a_missing_token_file_and_reprompts(tmp_path, monkeypat
 
 def test_cmd_init_stores_a_verified_token_privately_and_never_echoes_it(tmp_path, monkeypatch, capsys):
     """shared.env can hold a long-lived PAT: it must never be group/world readable."""
-    text, _asked, _s = _init(tmp_path, monkeypatch, secrets=["s3cret-pat"],
-                             gh=_gh_stub(token_logins={"s3cret-pat": "review-bot"}))
+    text, _asked, _s = _init(
+        tmp_path, monkeypatch, secrets=["s3cret-pat"], gh=_gh_stub(token_logins={"s3cret-pat": "review-bot"})
+    )
 
     captured = capsys.readouterr()
     assert "s3cret-pat" not in captured.out + captured.err
@@ -801,8 +872,12 @@ def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configure
     keifu — an App-configured deployment still ran its fixer on the operator's
     ambient credential)."""
     text, _asked, secrets = _init(
-        tmp_path, monkeypatch, secrets=["fixer-pat"], gh=_gh_stub(token_logins={"fixer-pat": "fix-bot"}),
-        answers=["fix-bot", "review-bot", "y", "123", "456", "/keys/app.pem", "claude", "claude"])
+        tmp_path,
+        monkeypatch,
+        secrets=["fixer-pat"],
+        gh=_gh_stub(token_logins={"fixer-pat": "fix-bot"}),
+        answers=["fix-bot", "review-bot", "y", "123", "456", "/keys/app.pem", "claude", "claude"],
+    )
 
     values = _shared_values(text)
     assert values["GH_APP_ID"] == "123"
@@ -829,10 +904,16 @@ def test_detect_claude_auth_accepts_an_environment_key(monkeypatch, tmp_path):
     assert cli.detect_claude_auth() is False
 
 
-@pytest.mark.parametrize("content,mode", [
-    (json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}}), "chatgpt"),  # the mode, not the secret
-    ("{not json", ""),
-])
+@pytest.mark.parametrize(
+    "content,mode",
+    [
+        (
+            json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}}),
+            "chatgpt",
+        ),  # the mode, not the secret
+        ("{not json", ""),
+    ],
+)
 def test_detect_codex_auth_reads_the_mode_and_tolerates_a_malformed_file(monkeypatch, tmp_path, content, mode):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".codex").mkdir()
@@ -856,15 +937,18 @@ def _gh_raises(*_a, **_k):
     raise OSError("gh: not found")
 
 
-@pytest.mark.parametrize("run,answer", [
-    # gh writes its error body to stdout: never a login, yet ANSWERED (a verdict).
-    (lambda *a, **k: _fake_proc('{"message":"Bad credentials"}\n', 0), ("", True)),
-    # `gh api user --jq .login` prints `null` for an absent field, and `null`
-    # passes the login charset — it must not be compared as an account.
-    (lambda *a, **k: _fake_proc("null\n", 0), ("", True)),
-    # gh absent is an OUTAGE, not a verdict — the caller may keep the token.
-    (_gh_raises, ("", False)),
-])
+@pytest.mark.parametrize(
+    "run,answer",
+    [
+        # gh writes its error body to stdout: never a login, yet ANSWERED (a verdict).
+        (lambda *a, **k: _fake_proc('{"message":"Bad credentials"}\n', 0), ("", True)),
+        # `gh api user --jq .login` prints `null` for an absent field, and `null`
+        # passes the login charset — it must not be compared as an account.
+        (lambda *a, **k: _fake_proc("null\n", 0), ("", True)),
+        # gh absent is an OUTAGE, not a verdict — the caller may keep the token.
+        (_gh_raises, ("", False)),
+    ],
+)
 def test_gh_login_for_token_separates_a_verdict_from_an_outage(monkeypatch, run, answer):
     monkeypatch.setattr(cli.subprocess, "run", run)
     assert cli.gh_login_for_token("t") == answer
@@ -875,6 +959,7 @@ def test_gh_login_for_token_separates_a_verdict_from_an_outage(monkeypatch, run,
 def _gh_run_stub(pr_list="", default_branch="", existing_branches=()):
     """Stand in for the three gh reads base-branch inference makes, dispatching on
     the REAL argv so a renamed --json field cannot silently pass."""
+
     def run(cmd, cwd=None):
         if cmd[:4] == ["gh", "pr", "list", "--state"]:
             assert cmd[4] == "merged"
@@ -894,18 +979,24 @@ _MERGED = json.dumps([{"baseRefName": "main"}, {"baseRefName": "main"}, {"baseRe
 _TRUNK = ("trunk", "the repository default branch")
 
 
-@pytest.mark.parametrize("stub,repo,expected", [
-    (dict(pr_list=_MERGED, existing_branches=("main",)), "acme/app", ("main", "2/3")),
-    # An inferred base that does not exist would point every PR at a missing
-    # ref (and trip point-at.sh's hard stop): fall through to the next candidate.
-    (dict(pr_list=json.dumps([{"baseRefName": "gone"}]), default_branch="trunk", existing_branches=("trunk",)),
-     "acme/app", _TRUNK),
-    (dict(pr_list="[]", default_branch="trunk", existing_branches=("trunk",)), "acme/app", _TRUNK),
-    (dict(pr_list="not json at all", default_branch="trunk", existing_branches=("trunk",)), "acme/app", _TRUNK),
-    # Nothing confirmed: the harness default and NO provenance comment.
-    (dict(), "acme/app", ("dev", "")),
-    (dict(pr_list=_MERGED, existing_branches=("main",)), "", ("dev", "")),
-])
+@pytest.mark.parametrize(
+    "stub,repo,expected",
+    [
+        (dict(pr_list=_MERGED, existing_branches=("main",)), "acme/app", ("main", "2/3")),
+        # An inferred base that does not exist would point every PR at a missing
+        # ref (and trip point-at.sh's hard stop): fall through to the next candidate.
+        (
+            dict(pr_list=json.dumps([{"baseRefName": "gone"}]), default_branch="trunk", existing_branches=("trunk",)),
+            "acme/app",
+            _TRUNK,
+        ),
+        (dict(pr_list="[]", default_branch="trunk", existing_branches=("trunk",)), "acme/app", _TRUNK),
+        (dict(pr_list="not json at all", default_branch="trunk", existing_branches=("trunk",)), "acme/app", _TRUNK),
+        # Nothing confirmed: the harness default and NO provenance comment.
+        (dict(), "acme/app", ("dev", "")),
+        (dict(pr_list=_MERGED, existing_branches=("main",)), "", ("dev", "")),
+    ],
+)
 def test_detect_base_branch(monkeypatch, stub, repo, expected):
     monkeypatch.setattr(cli, "_run", _gh_run_stub(**stub))
     branch, note = cli.detect_base_branch("/t", repo)
@@ -992,8 +1083,13 @@ def test_cmd_init_tightens_an_existing_shared_env_before_writing_secrets(tmp_pat
     """--force over a 0644 file: O_CREAT's mode applies only to a NEW file, so
     without a chmod FIRST the PAT would land in a world-readable file and only be
     protected afterwards. Asserted at open time, not just at the end."""
-    shared, _asked, _s = _init_env(tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["good"],
-                                   gh=_gh_stub(token_logins={"good": "review-bot"}))
+    shared, _asked, _s = _init_env(
+        tmp_path,
+        monkeypatch,
+        answers=_wizard_answers(),
+        secrets=["good"],
+        gh=_gh_stub(token_logins={"good": "review-bot"}),
+    )
     shared.parent.mkdir(parents=True, exist_ok=True)
     shared.write_text("stale\n")
     os.chmod(shared, 0o644)
@@ -1015,6 +1111,7 @@ def test_cmd_init_tightens_an_existing_shared_env_before_writing_secrets(tmp_pat
 
 def test_main_exits_130_on_keyboard_interrupt(monkeypatch, capsys):
     """Ctrl-C at a wizard prompt is an ordinary exit, not a crash."""
+
     def interrupted(_args):
         raise KeyboardInterrupt
 
@@ -1045,8 +1142,10 @@ def test_status_tails_only_a_live_units_journal_and_reports_a_failed_query(monke
     show["stdout"] = "LoadState=loaded\nActiveState=inactive\n"
     assert cli._systemd_status_log("app", "fix", 5) is None
     show.update(returncode=1, stdout="", stderr="Failed to connect to bus\n")
-    assert cli._systemd_status_log("app", "fix", 5) == (f"systemd status unavailable: {unit}",
-                                                         "  Failed to connect to bus")
+    assert cli._systemd_status_log("app", "fix", 5) == (
+        f"systemd status unavailable: {unit}",
+        "  Failed to connect to bus",
+    )
 
 
 def test_start_still_rejects_a_non_canonical_name():
@@ -1068,12 +1167,15 @@ def _doctor_rc(tmp_path, monkeypatch, composed: dict, *, sh_rc: int) -> int:
 _SEPARATE = {"FIX_BOT_TOKEN": "fix", "REVIEW_BOT_TOKEN": "review"}
 
 
-@pytest.mark.parametrize("composed,sh_rc,rc", [
-    # doctor is a gate (point-at.sh, CI): a whitespace token 401s every call.
-    ({**_SEPARATE, "FIX_BOT_TOKEN": "   "}, 0, 1),
-    ({"REVIEW_BOT_TOKEN": "review"}, 0, 0),  # warning-level findings stay green
-    ({**_SEPARATE, "FIX_BOT_TOKEN": "   "}, 2, 2),  # a failing doctor.sh keeps its exit code
-])
+@pytest.mark.parametrize(
+    "composed,sh_rc,rc",
+    [
+        # doctor is a gate (point-at.sh, CI): a whitespace token 401s every call.
+        ({**_SEPARATE, "FIX_BOT_TOKEN": "   "}, 0, 1),
+        ({"REVIEW_BOT_TOKEN": "review"}, 0, 0),  # warning-level findings stay green
+        ({**_SEPARATE, "FIX_BOT_TOKEN": "   "}, 2, 2),  # a failing doctor.sh keeps its exit code
+    ],
+)
 def test_doctor_exit_code_gates_on_error_findings_and_doctor_sh(tmp_path, monkeypatch, capsys, composed, sh_rc, rc):
     assert _doctor_rc(tmp_path, monkeypatch, composed, sh_rc=sh_rc) == rc
     assert ("whitespace" in capsys.readouterr().err) is (rc == 1 or sh_rc == 2)

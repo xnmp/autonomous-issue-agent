@@ -8,9 +8,7 @@ import os
 
 from issue_agent.adapters.dashweb import verification
 
-HARNESS_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
+HARNESS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 LEDGER = """\
 # Field-verification ledger
@@ -74,9 +72,4 @@ def test_the_real_ledger_parses_with_verdicts_on_both_sides(tmp_path):
 
 
 def test_reason_is_the_verdict_prose_with_the_keyword_removed():
-    assert [r.reason for r in rows()] == [
-        "never fired",
-        "2026-07-27 (fifth)",
-        "2026-07-28 → #49",
-        "n/a",
-    ]
+    assert [r.reason for r in rows()] == ["never fired", "2026-07-27 (fifth)", "2026-07-28 → #49", "n/a"]

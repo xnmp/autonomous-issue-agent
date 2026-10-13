@@ -14,21 +14,24 @@ def test_an_approval_may_have_an_empty_body():
     assert parse_verdict({"decision": "APPROVE", "body": ""}) == Verdict("APPROVE", "")
 
 
-@pytest.mark.parametrize("structured", [
-    None,
-    "APPROVE",
-    ["APPROVE"],
-    {},
-    {"decision": "APPROVE"},
-    {"decision": "APPROVE", "body": None},
-    {"decision": "APPROVE", "body": 7},
-    {"decision": "approve", "body": "lower case is not the contract"},
-    {"decision": "ESCALATE", "body": "escalation is derive's, not the agent's"},
-    {"decision": "COMMENT", "body": "x"},
-    {"decision": ["APPROVE"], "body": "x"},
-    {"decision": "REQUEST_CHANGES", "body": ""},
-    {"decision": "REQUEST_CHANGES", "body": " \n\t "},
-])
+@pytest.mark.parametrize(
+    "structured",
+    [
+        None,
+        "APPROVE",
+        ["APPROVE"],
+        {},
+        {"decision": "APPROVE"},
+        {"decision": "APPROVE", "body": None},
+        {"decision": "APPROVE", "body": 7},
+        {"decision": "approve", "body": "lower case is not the contract"},
+        {"decision": "ESCALATE", "body": "escalation is derive's, not the agent's"},
+        {"decision": "COMMENT", "body": "x"},
+        {"decision": ["APPROVE"], "body": "x"},
+        {"decision": "REQUEST_CHANGES", "body": ""},
+        {"decision": "REQUEST_CHANGES", "body": " \n\t "},
+    ],
+)
 def test_anything_else_is_no_verdict(structured):
     assert parse_verdict(structured) is None
 
