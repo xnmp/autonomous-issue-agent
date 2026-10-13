@@ -16,9 +16,8 @@ from collections.abc import Callable
 from ..adapters.agent_runner import AgentRunner
 from ..adapters.control_store import (
     CorruptControlStore,
+    CutoverRefused,
     IncompatibleSchema,
-    LegacySpendMigrationError,
-    RetiredOwnerError,
 )
 from ..adapters.env_file import source_env_file
 from ..adapters.github import GitHubGateway, Identity
@@ -34,7 +33,6 @@ from .config import HarnessConfig, from_env, render_agent_md
 from .roles import (
     build_fix_daemon,
     build_review_daemon,
-    migrate_legacy_spend,
     prior_process_supervision_state_dirs,
     process_supervision_state_dir,
 )
@@ -333,12 +331,6 @@ def _serve(role: str) -> None:
                     "group(s) before adapter initialization\n"
                 )
         daemon = build_role(role, env, scheduler_progress)
-        imported = migrate_legacy_spend(cfg, state_dir)
-        if imported:
-            sys.stderr.write(
-                f"{role}: imported {imported} legacy spend row(s) "
-                "before paid admission\n"
-            )
         if daemon.reconcile is None:
             raise ValueError(
                 f"{role} daemon recovery trigger is not configured"
@@ -350,12 +342,9 @@ def _serve(role: str) -> None:
     except CorruptControlStore as exc:
         sys.stderr.write(f"{role}: corrupt control store — {exc}\n")
         raise SystemExit(ExitCode.STORE_CORRUPTION) from exc
-    except LegacySpendMigrationError as exc:
-        sys.stderr.write(f"{role}: operator repair required — {exc}\n")
+    except CutoverRefused as exc:
+        sys.stderr.write(f"{role}: control-store cutover refused — {exc}\n")
         raise SystemExit(ExitCode.OPERATOR_REPAIR_REQUIRED) from exc
-    except RetiredOwnerError as exc:
-        sys.stderr.write(f"{role}: deployment owner retired — {exc}\n")
-        raise SystemExit(ExitCode.CLEAN) from exc
     except ValueError as exc:
         sys.stderr.write(f"{role}: invalid configuration — {exc}\n")
         raise SystemExit(ExitCode.INVALID_CONFIG) from exc

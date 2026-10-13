@@ -55,14 +55,13 @@ Important fields:
 - `REPO=owner/name` and `TARGET_DIR=/absolute/path` are required.
 - `issue-agent start --write-config` may repoint an existing overlay only to a
   new checkout of the same repository. It preserves a bounded
-  `REPOINTED_FROM_DEPLOYMENTS` lineage so the first boot can reap and adopt
-  those exact old deployment identities. Before replacing the overlay, the CLI
+  `REPOINTED_FROM_DEPLOYMENTS` lineage so the first boot can reap those exact
+  old deployments' process registries. Before replacing the overlay, the CLI
   stops and verifies every foreground or installed process carrying that
-  deployment name; a stop failure leaves the old overlay unchanged. Schema v15
-  then retires every prior owner identity in the shared control store. An old
-  process that survived discovery loses all write authority, and an old service
-  started after reboot exits cleanly instead of reacquiring work. Use a
-  different `--name` for another repository; do not hand-author the lineage.
+  deployment name; a stop failure leaves the old overlay unchanged. The new
+  deployment's recovery (scoped by repository and role) settles any leg the
+  old one left unsettled. Use a different `--name` for another repository; do
+  not hand-author the lineage.
 - `FIX_BOT` must differ from `REVIEW_BOT`.
 - `TEST_CMD` (optional) is only `bin/point-at.sh`'s base-branch probe; no fixer
   gate runs it. It must terminate.
@@ -213,19 +212,13 @@ and the independent reviewer judge the pushed head.
 The per-account SQLite database at
 `~/.local/state/issue-agent-control/control.db` is authoritative for:
 
-- paid reservations and charges;
-- run/lease ownership and legs/attempts;
-- idempotency keys for GitHub writes.
+- paid reservations and charges, one `legs` row per leg;
+- item leases (which role holds which issue or PR, and its process);
+- idempotency keys for GitHub comments.
 
 Every paid leg reserves its maximum charge before the runtime starts, including
-when operator caps are disabled. Concurrent final-cap races are serialized.
-On first startup after upgrade, current and rotated legacy spend ledgers are
-imported into the live repository/global/issue scopes before admission. Any
-malformed or unattributed legacy row exits with operator-repair-required status
-instead of resetting a cap.
-Use `issue-agent install-service` for this cutover: the installers stop every
-legacy role before starting any SQLite-authoritative role, preventing a late
-legacy-ledger append from racing the import.
+when operator caps are disabled, and only while its role holds the item's
+lease. Concurrent final-cap races are serialized.
 Upgrading past the steward removal: before reinstalling, stop/disable/remove any
 `issue-agent-steward-<name>` systemd unit, or unload/remove the steward launchd plist;
 the installers no longer manage it.
@@ -234,21 +227,58 @@ usage provenance, and rate-card identity.
 
 At boot and after a suspension gap, recovery runs in a fixed order: kill known
 orphan groups, reclaim dead leases, reconcile unsettled spend, release only
-reservations durably proven never launched. A run that may have reached
-a paid provider remains fail-closed until positive settlement evidence exists.
-Completed runs that returned without trusted usage or a provider charge are a
-separate liveness case: recovery retries provider reconciliation through the
-reservation grace window, then atomically releases the retained maximum and
-records `spend_unmeasured_released`. This keeps repeated usage-blind results
-from permanently exhausting admission capacity while preserving an explicit
-operator-visible accounting gap.
-An explicit same-repository repoint first reaps the recorded prior checkout
-registries and atomically adopts their run and lease ownership; unrelated
-sibling checkouts remain isolated.
-Historical JSONL is never queried for these decisions.
+reservations whose process never registered. A leg that may have reached a
+paid provider keeps its reservation while its lease is live. Once its process
+is gone, recovery settles it from surviving request evidence (Codex rollouts),
+or else at a zero `estimate` charge, so usage-blind ends cannot exhaust
+admission capacity. An explicit same-repository repoint first reaps the
+recorded prior checkout registries; unrelated sibling checkouts remain
+isolated. Historical JSONL is never queried for these decisions.
+
+A missing `control.db` is recreated only on a machine that never had one. If
+its companions remain (`control.db.initialize.lock`, `-wal`, `-shm`,
+`.retired-v*`, `.authority`), startup refuses and names them rather than
+silently resetting every cap to zero. With every daemon stopped, restore the
+database from a backup. If a `control.db.retired-v*` file is listed and there
+is no backup, move any listed `-wal`/`-shm` aside (they belong to the lost
+store) and rename the retired file back to `control.db`: the next start cuts it
+over again and keeps the pre-cutover spend; only legs recorded since the
+cutover are lost. Do not delete a retired file. Only when none is listed may
+you delete the listed files to start deliberately with no spend history.
+
+### Upgrading to the 3-table store (slice 5d-2)
+
+The first role daemon to open a pre-5d-2 `control.db` converts it in place,
+once. Carried over: every settled charge (so today's repository/global spend
+and each issue's lifetime spend still count against the caps) and confirmed or
+pending comment keys. Dropped and re-derived from GitHub on the first tick:
+workflow rows, receipts, holds and attempt history (attempt counts restart).
+
+1. Stop every role daemon of every deployment and the dashboard
+   (`systemctl --user stop 'issue-agent-*'`, or unload the launchd plists).
+2. Start the new release (`issue-agent install-service` or `issue-agent start`).
+3. If it exits with `control-store cutover refused`, read the message:
+   - *holds N unsettled legacy run(s) … owned by …*: the old store still has
+     in-flight money. Check out the previous release, start each named owning
+     deployment once, let its boot recovery settle (its `issue-agent status`
+     shows no in-flight legs), stop it, and go back to step 2.
+   - *another process holds … open*: something had the database open at that
+     instant (a daemon or the dashboard); stop it and go back to step 2. The
+     check is point-in-time, so step 1 is what actually guarantees nothing of
+     the previous release is left running.
+4. On success the old file remains as
+   `control.db.retired-v<N>-<UTC stamp>` beside the new one. Nothing reads it,
+   but keep it: it is the only copy of the pre-cutover spend if `control.db`
+   is ever lost (see above). The old
+   `control.db.authority` witness file beside it is no longer used and may be
+   deleted too.
+
+The cutover is one-way: an older release refuses the new schema, so roll back
+by restoring the retired file (with every daemon stopped) under the
+`control.db` name, accepting that legs recorded since are lost.
 
 Each role's `journal.jsonl` is a plain JSON-lines log only. Metrics derive
-from the SQLite legs/money tables (runs, charges) plus GitHub.
+from the SQLite `legs` table plus GitHub.
 
 ## Dashboard
 
@@ -267,8 +297,7 @@ and prints the command to re-run when no supervisor is present.
 The board reads each role's `journal.jsonl` plus GitHub. GitHub calls may
 enrich links/titles but do not infer lifecycle state.
 CLI and dashboard quota totals are read-only projections of settled SQLite
-charges for the current budget period; the legacy spend ledger is migration
-input only.
+charges for the current budget period.
 
 ### Operator writes
 

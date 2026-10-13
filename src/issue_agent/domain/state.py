@@ -365,8 +365,8 @@ def _proceed(
     comments: list[tuple[datetime, Comment]], stops: list[tuple[datetime, str]], anchor: str,
 ) -> DerivedState:
     last_stop = max((at for at, _ in stops), default=None)
-    agent_legs = [leg for leg in legs if not leg.machine]
-    last_agent = max(agent_legs, key=lambda leg: leg.ended_at, default=None)
+    # Newest agent end; a tie goes to the later-recorded leg, as in _attempts.
+    last_agent = next((leg for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at)) if not leg.machine), None)
     if (last_agent is not None and last_agent.question is not None
             and not any(at > last_agent.ended_at for at, _ in stops)):
         return NeedsHuman(StopReason.QUESTION, anchor, question=last_agent.question)
@@ -462,7 +462,7 @@ def _human_change_requests(pr: PRView, harness: Harness) -> frozenset[str]:
 
 def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) -> int:
     run = 0
-    for leg in sorted(legs, key=lambda leg: leg.ended_at, reverse=True):
+    for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at)):  # ties: later-recorded is newer
         if floor is not None and leg.ended_at <= floor:
             break
         if leg.machine:

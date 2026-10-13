@@ -6,7 +6,7 @@ from itertools import permutations
 from datetime import timedelta
 import pytest
 from tests.adapters.test_codex_child_usage import ROOT, CHILD, START, RATES, event, metadata, spawn, write
-from tests.adapters.test_accounting_runtime import _wrapper, Runtime
+from tests.adapters.test_accounting_runtime import Runtime, _db, _lease, _run, _wrapper
 from tests.adapters import test_native_usage_accounting as native
 from issue_agent.adapters.codex_child_usage import CodexChildUsageMeter
 from issue_agent.adapters.codex_runner import read_rollout_usage
@@ -35,9 +35,9 @@ def test_delayed_linked_receipt_keeps_other_cumulative_spend_and_gap(tmp_path):
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status='pushed', run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context('fix', 'RESOLVE', 1, 1)
-    asyncio.run(wrapper.run(RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=2)))
-    with store.transaction() as db:
-        charge = tuple(db.execute('SELECT amount_micros,basis FROM charges').fetchone())
+    _run(wrapper, RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=2))
+    with _db(store) as db:
+        charge = tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone())
     assert charge == (400, 'estimate')
 
 @pytest.mark.parametrize('receipt_first', [False, True])
@@ -57,8 +57,8 @@ def test_cumulative_only_and_two_legacy_receipts_settle_once(tmp_path, receipt_f
     reconciler = native.CodexSpendReconciler(store, (str(tmp_path / 'evidence'),))
     assert reconciler.reconcile(run_id)
     reconciler.reconcile(run_id)
-    with store.transaction() as db:
-        assert db.execute('SELECT count(*) FROM charges').fetchone()[0] == 1
+    with _db(store) as db:
+        assert db.execute("SELECT count(*) FROM legs WHERE state='ended'").fetchone()[0] == 1
     assert store.snapshot(scope).settled == Money('USD', 400)
     assert price_run_usage(observed, RATES).micros == 400
 
@@ -82,9 +82,9 @@ def test_delayed_child_receipt_does_not_hide_live_cap_overrun(tmp_path, monkeypa
     wrapper, store = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES, budget_policy=BudgetPolicy({('fix', 'RESOLVE'): Money('USD', cap)}))
     wrapper.set_context('fix', 'RESOLVE', 1, 1)
-    result = asyncio.run(wrapper.run(RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=cap / 1_000_000, env={'CODEX_HOME': str(tmp_path / 'codex')})))
-    with store.transaction() as db:
-        assert tuple(db.execute('SELECT amount_micros,basis FROM charges').fetchone()) == (charge, 'estimate')
+    result = _run(wrapper, RuntimePlan('work', cwd=str(tmp_path), model='sol', max_budget_usd=cap / 1_000_000, env={'CODEX_HOME': str(tmp_path / 'codex')}))
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (charge, 'estimate')
     assert not (tmp_path / 'finished').exists()
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
 

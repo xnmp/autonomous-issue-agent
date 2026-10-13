@@ -20,16 +20,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ..adapters.act import GitHubAct
 from ..adapters.agent_runner import AgentRunner
 from ..adapters.accounting_runtime import AccountingRuntime, issue_budget_scope
 from ..adapters.control_path import control_store_path
-from ..adapters.control_store import ControlStoreError, LegacySpendMigrationError, SQLiteControlStore
+from ..adapters.control_store import ControlStoreError, SQLiteControlStore
 from ..adapters.github import GitHubGateway
-from ..adapters.journal import Journal, JournalingRuntime, default_ledger_path
+from ..adapters.journal import Journal, JournalingRuntime
 from ..adapters.runtime_plan import AgentRuntime
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..adapters.store import Store
@@ -58,7 +57,6 @@ from .config import (
     deployment_identity_for_target,
     owner_identity_for_target,
     prior_deployment_identities,
-    configured_prior_owner_ids,
 )
 from .fix import FixLegs, FixSettings, fix_choose
 from .tick import Daemon
@@ -143,56 +141,23 @@ def _owner_identity(cfg: HarnessConfig, role: str) -> str:
     return owner_identity_for_target(cfg.repo, cfg.target_dir, role)
 
 
-def _control_store(
-    cfg: HarnessConfig,
-    state_dir: str,
-    role: str,
-) -> SQLiteControlStore:
-    """Open the one accounting/control authority shared by all role daemons."""
+def _control_store(cfg: HarnessConfig, state_dir: str) -> SQLiteControlStore:
+    """Open the one accounting/control authority shared by all role daemons.
 
-    control = SQLiteControlStore(_control_store_path(cfg, state_dir))
-    control.initialize()
-    prior_owners = configured_prior_owner_ids(cfg, role)
-    control.adopt_legacy_owner(
-        cfg.repo,
-        role,
-        _owner_identity(cfg, role),
-        prior_owner_ids=prior_owners,
+    The first open after the 3-table cutover release retires a legacy store
+    (see `control_store._cut_over`); `CutoverRefused` stops the boot while
+    that store still holds unsettled money.
+    """
+
+    control = SQLiteControlStore(
+        control_store_path(
+            (cfg.state_dir, cfg.review_state_dir),
+            fallback_state_dir=state_dir,
+            authority_root=cfg.control_authority_root,
+        )
     )
-    control.bind_active_owner(_owner_identity(cfg, role))
+    control.initialize()
     return control
-
-
-def _control_store_path(cfg: HarnessConfig, state_dir: str) -> str:
-    return control_store_path(
-        (cfg.state_dir, cfg.review_state_dir),
-        fallback_state_dir=state_dir,
-        authority_root=cfg.control_authority_root,
-    )
-
-
-def migrate_legacy_spend(cfg: HarnessConfig, state_dir: str) -> int:
-    """Import all rotated legacy ledgers before the first paid admission."""
-
-    control = SQLiteControlStore(_control_store_path(cfg, state_dir))
-    control.initialize()
-    current = Path(default_ledger_path())
-    candidates = (
-        tuple(sorted(current.parent.glob(f"{current.stem}*{current.suffix}")))
-        if current.parent.is_dir()
-        else ()
-    )
-    imported = 0
-    for path in candidates:
-        report = control.import_legacy_spend(str(path))
-        if report.rejected:
-            raise LegacySpendMigrationError(
-                f"{path}: rejected {report.rejected} legacy spend row(s); "
-                "repair or quarantine the ledger before paid work can start"
-            )
-        if not report.idempotent:
-            imported += report.imported
-    return imported
 
 
 @dataclass
@@ -267,7 +232,6 @@ def _with_accounting(
         _rate_table(cfg, runtime_name),
         spend_evidence_dir(_role_state_dir(cfg, role)),
         owner_id=_owner_identity(cfg, role),
-        require_dispatch_claim=True,
         reservation_reconciler=reconciler,
     )
 
@@ -413,10 +377,10 @@ def _shutdown_terminalize(
 
     def terminalize() -> object:
         intents = control.record_owned_cancellation_intents(owner_id, reason)
+        written = 0
         for intent in intents:
             spend.reconcile(intent.run_id)
-        written = 0
-        for intent in control.pending_cancellation_intents(owner_id):
+            # One file per issue: rewriting it at a later shutdown is idempotent.
             receipt = write_shutdown_handover(
                 state_dir=state_dir,
                 role=role,
@@ -425,10 +389,7 @@ def _shutdown_terminalize(
                 kind=intent.kind,
                 reason=intent.reason,
             )
-            if receipt is None:
-                continue
-            control.mark_cancellation_handover_written(intent.run_id)
-            written += 1
+            written += receipt is not None
         return written
 
     return terminalize
@@ -897,7 +858,7 @@ def compose_fix_daemon(
     journal = _journal(store)
     fix_runtime = cfg.fix_runtime
     binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](cfg, cfg.codex_runtime, runner)
-    control = _control_store(cfg, cfg.state_dir, "fix")
+    control = _control_store(cfg, cfg.state_dir)
     owner_id = _owner_identity(cfg, "fix")
     settings = FixSettings(
         repository=cfg.repo,
@@ -1025,7 +986,7 @@ def compose_review_daemon(
         )
     journal = _journal(store)
     binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](cfg, review_runtime, runner)
-    control = _control_store(cfg, cfg.review_state_dir, "review")
+    control = _control_store(cfg, cfg.review_state_dir)
     owner_id = _owner_identity(cfg, "review")
     settings = ReviewSettings(
         repository=cfg.repo, owner_id=owner_id,

@@ -28,8 +28,9 @@ from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict
 
-# A stored-key namespace is never renamed: a rename orphans the keys already
-# claimed under the old name, and a claimed key decides whether to post.
+# A stored key's text is never changed: a rename orphans the keys already
+# claimed (the cutover carried them in this form), and a claimed key decides
+# whether to post.
 _COMMENT_NAMESPACE = "fix-comment"
 _PR_BODY_LIMIT = 60000
 
@@ -150,17 +151,18 @@ class GitHubAct:
         # it is posted only once its `needs-human` label is verified.
         if action.key.startswith("needs-human:") and not self.gateway.has_label(kind, action.number, Label.NEEDS_HUMAN.value):
             raise RuntimeError(f"{kind} #{action.number}: stop comment withheld until needs-human is applied")
-        state = self.control.claim_key(_COMMENT_NAMESPACE, self.repository, action.key) if action.key else "new"
+        key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
+        state = self.control.claim_key(key) if action.key else "new"
         if state == "done":
             return
         if state == "claimed" and self.gateway.has_comment(kind, action.number, action.body):
-            self.control.confirm_key(_COMMENT_NAMESPACE, self.repository, action.key)
+            self.control.confirm_key(key)
             return
         self.gateway.comment(kind, action.number, action.body)
         if action.key:
             if not self.gateway.has_comment(kind, action.number, action.body):
                 raise RuntimeError(f"{kind} #{action.number}: comment {action.key} not confirmed")
-            self.control.confirm_key(_COMMENT_NAMESPACE, self.repository, action.key)
+            self.control.confirm_key(key)
 
     def open_pr(self, action: OpenPullRequest) -> None:
         if self.gateway.pull_request_for_branch(action.branch) is not None:

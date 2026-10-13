@@ -15,7 +15,7 @@ from issue_agent.domain.contracts import Money, TokenUsage, UsageSource
 from issue_agent.domain.outcome import AgentResult, ExitReason, infra_class_failure
 from issue_agent.domain.pricing import BudgetPolicy, RateTable, ModelRates
 from issue_agent.domain.run_usage import ModelUsage, MeasuredRunUsage, EstimatedRunUsage
-from tests.adapters.test_accounting_runtime import Runtime, _wrapper
+from tests.adapters.test_accounting_runtime import Runtime, _db, _lease, _run, _wrapper
 from issue_agent.adapters.codex_child_usage import rate_table_evidence
 from issue_agent.adapters.codex_runner import CodexRunner, write_spend_evidence, spend_evidence_path
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
@@ -50,14 +50,13 @@ def test_same_admission_prices_each_native_model_and_emits_one_aggregate_charge(
     wrapper, control = _wrapper(tmp_path, Runtime(result))
     wrapper = replace(wrapper, rate_table=table())
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
-    with control.transaction() as db:
-        charges = db.execute("SELECT amount_micros,basis FROM charges").fetchall()
-        counts = {name: db.execute("SELECT count(*) FROM " + name).fetchone()[0]
-                  for name in ("runs", "budget_reservations", "charges")}
-    assert [(r["amount_micros"], r["basis"]) for r in charges] == [(1224, "configured_rate_card")]
-    assert counts == {"runs": 1, "budget_reservations": 1, "charges": 1}
-    assert control.active_reservation_runs() == ()
+    _run(wrapper, RuntimePlan("work", model="sol", max_budget_usd=2))
+    with _db(control) as db:
+        charges = db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchall()
+        legs = db.execute("SELECT count(*) FROM legs").fetchone()[0]
+    assert [(r["charged_micros"], r["basis"]) for r in charges] == [(1224, "configured_rate_card")]
+    assert legs == 1
+    assert control.active_reservation_runs("o/r:fix") == ()
 
 
 def test_missing_child_receipt_settles_known_parent_estimate_without_holding(tmp_path):
@@ -66,11 +65,11 @@ def test_missing_child_receipt_settles_known_parent_estimate_without_holding(tmp
     wrapper, control = _wrapper(tmp_path, Runtime(result))
     wrapper = replace(wrapper, rate_table=table())
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    returned = asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
+    returned = _run(wrapper, RuntimePlan("work", model="sol", max_budget_usd=2))
     assert returned.status == "pushed" and not infra_class_failure(returned)
-    assert control.active_reservation_runs() == ()
-    with control.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (1150, "estimate")
+    assert control.active_reservation_runs("o/r:fix") == ()
+    with _db(control) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (1150, "estimate")
 
 
 def test_interrupted_unusaged_native_request_settles_zero_without_the_reserved_maximum(tmp_path):
@@ -78,10 +77,10 @@ def test_interrupted_unusaged_native_request_settles_zero_without_the_reserved_m
                          run_usage=EstimatedRunUsage("interrupted request"))
     wrapper, control = _wrapper(tmp_path, Runtime(result))
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
-    assert control.active_reservation_runs() == ()
-    with control.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
+    _run(wrapper, RuntimePlan("work", model="sol", max_budget_usd=2))
+    assert control.active_reservation_runs("o/r:fix") == ()
+    with _db(control) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (0, "estimate")
 
 
 @pytest.mark.parametrize("crash_after_commit", [False, True])
@@ -106,11 +105,11 @@ def test_completed_request_without_evidence_journals_gap_in_actual_settlement(tm
 
         monkeypatch.setattr(control, "settle", committed_then_crash)
         with pytest.raises(OSError, match="caller disappeared"):
-            asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
+            _run(wrapper, RuntimePlan("work", model="sol", max_budget_usd=2))
     else:
-        asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
-    with control.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (200, "estimate")
+        _run(wrapper, RuntimePlan("work", model="sol", max_budget_usd=2))
+    with _db(control) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (200, "estimate")
 
 
 def test_recovery_excludes_copied_history_without_ordinal_boundary_and_replays_once(tmp_path):
@@ -126,10 +125,10 @@ def test_recovery_excludes_copied_history_without_ordinal_boundary_and_replays_o
     _end_run_at(store, run_id, ENDED)
     reconciler = CodexSpendReconciler(store, (str(directory),))
     assert reconciler.reconcile(run_id)
-    assert not reconciler.reconcile(run_id)
+    assert reconciler.reconcile(run_id)  # already settled: idempotent, never a second charge
     assert store.snapshot(scope).settled == Money("USD", 274)
-    with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+    with _db(store) as db:
+        assert db.execute("SELECT count(*) FROM legs WHERE state='ended'").fetchone()[0] == 1
 
 
 def recovery_files(tmp_path):
@@ -166,11 +165,11 @@ def test_native_recovery_settles_exact_frozen_mixed_price_once(tmp_path, fork):
     _end_run_at(store, run_id, ENDED)
     reconciler = CodexSpendReconciler(store, (str(directory),))
     assert reconciler.reconcile(run_id)
-    assert not reconciler.reconcile(run_id)
+    assert reconciler.reconcile(run_id)  # already settled: idempotent, never a second charge
     assert store.snapshot(scope).settled == Money("USD", 1224)
-    assert store.active_reservation_runs() == ()
-    with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+    assert store.active_reservation_runs("o/r:fix") == ()
+    with _db(store) as db:
+        assert db.execute("SELECT count(*) FROM legs WHERE state='ended'").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("fault", ["native_usage_started_at", "native_root_sessions", "native_rate_table",
@@ -206,7 +205,7 @@ def test_malformed_or_incomplete_native_recovery_never_downgrades_to_parent_only
     store.record_reservation_retained(run_id, control_reason)
     _end_run_at(store, run_id, ENDED)
     assert CodexSpendReconciler(store, (str(directory),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs("o/r:fix") == ()
     expected = 1224 if fault in ("unfinished-child", "sticky-failure") else 0
     assert store.snapshot(scope).settled == Money("USD", expected)
 
@@ -255,9 +254,9 @@ def test_recovery_price_exceeding_sqlite_bound_settles_zero_estimate(tmp_path):
     _end_run_at(store, run_id, ENDED)
     assert CodexSpendReconciler(store, (str(directory),)).reconcile(run_id)
     assert store.snapshot(scope).settled == Money.zero()
-    assert store.active_reservation_runs() == ()
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
+    assert store.active_reservation_runs("o/r:fix") == ()
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (0, "estimate")
 
 
 def native_executable(tmp_path, *, mode="chatty", complete=True):
@@ -346,15 +345,15 @@ def test_observer_limits_fail_closed(tmp_path, mode):
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 2000)}))
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.002,
-                                                env={"CODEX_HOME": str(tmp_path / "codex")})))
+    result = _run(wrapper, RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.002,
+                                                env={"CODEX_HOME": str(tmp_path / "codex")}))
     assert not (tmp_path / "finished").exists()
     assert result.exit_reason is ExitReason.ACCOUNTING_UNAVAILABLE
     assert any("ACCOUNTING" in line and "killing subprocess" in line for line in logs)
     assert isinstance(result.run_usage, EstimatedRunUsage)
-    assert control.active_reservation_runs() == ()
-    with control.transaction() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+    assert control.active_reservation_runs("o/r:fix") == ()
+    with _db(control) as db:
+        assert db.execute("SELECT count(*) FROM legs WHERE state='ended'").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("mode", ["chatty", "clean", "pre-final"])
@@ -391,6 +390,8 @@ def test_native_child_crossing_cap_stops_inflight_or_final_success_under_one_res
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 1200)}))
     wrapper.set_context("fix", "RESOLVE", 1, 1)
+    _lease(wrapper)
+
     async def run():
         # Bound failure cleanup if the watchdog stops enforcing the cap;
         # the process/stream events above determine the race ordering.
@@ -412,10 +413,10 @@ def test_native_child_crossing_cap_stops_inflight_or_final_success_under_one_res
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert result.cost_usd == pytest.approx(.001224)
     assert isinstance(result.run_usage, EstimatedRunUsage)
-    assert control.active_reservation_runs() == ()
-    with control.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
-        assert db.execute("SELECT amount_micros FROM charges").fetchone()[0] == 1224
+    assert control.active_reservation_runs("o/r:fix") == ()
+    with _db(control) as db:
+        assert db.execute("SELECT count(*) FROM legs").fetchone()[0] == 1
+        assert db.execute("SELECT charged_micros FROM legs WHERE state='ended'").fetchone()[0] == 1224
 
 
 def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for_recovery(tmp_path):
@@ -425,6 +426,7 @@ def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
     identities = []
+    _lease(wrapper)
 
     async def scenario():
         task = asyncio.create_task(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2,
@@ -447,12 +449,12 @@ def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for
     assert all(not ProcessSupervisor.matches_identity(i.pid, i.start_ticks) for i in identities)
     # Operator policy (2026-10-11): the interrupted request costs zero. Receipts are only priced
     # inside the run's recorded end, so the reservation waits for it and then settles at 1224.
-    run_id = control.active_reservation_runs()[0]
+    run_id = control.active_reservation_runs("o/r:fix")[0]
     _end_run_at(control, run_id, ENDED)
     assert CodexSpendReconciler(control, (str(directory),)).reconcile(run_id)
-    assert control.active_reservation_runs() == ()
-    with control.transaction() as db:
-        assert db.execute("SELECT amount_micros FROM charges").fetchall()[0][0] == 1224
+    assert control.active_reservation_runs("o/r:fix") == ()
+    with _db(control) as db:
+        assert db.execute("SELECT charged_micros FROM legs WHERE state='ended'").fetchall()[0][0] == 1224
 
 
 @pytest.mark.parametrize("resume", [True, False])
@@ -463,16 +465,16 @@ def test_transport_retry_prices_every_attempt_and_child_without_another_admissio
     wrapper, control = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2,
-                                                env={"CODEX_HOME": str(tmp_path / "codex")})))
+    result = _run(wrapper, RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2,
+                                                env={"CODEX_HOME": str(tmp_path / "codex")}))
     assert (tmp_path / "attempts").read_text() == "2", (result.summary, result.exit_reason)
     assert result.status == "pushed"
     assert result.cost_usd == pytest.approx(.002374)
-    assert control.active_reservation_runs() == ()
-    with control.transaction() as db:
-        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
-        assert db.execute("SELECT amount_micros FROM charges").fetchone()[0] == 2374
+    assert control.active_reservation_runs("o/r:fix") == ()
+    with _db(control) as db:
+        assert db.execute("SELECT count(*) FROM legs").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM legs WHERE state='ended'").fetchone()[0] == 1
+        assert db.execute("SELECT charged_micros FROM legs WHERE state='ended'").fetchone()[0] == 2374
 
 
 def test_clean_exit_uses_captured_card_even_when_legacy_scalar_would_cross_cap(tmp_path):
@@ -501,11 +503,11 @@ def test_malformed_optional_baseline_preserves_in_window_root_and_child_evidence
     write_spend_evidence(str(directory), str(run_id), evidence)
     _end_run_at(store, run_id, ENDED)
     assert CodexSpendReconciler(store, (str(directory),)).reconcile(run_id)
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs("o/r:fix") == ()
     assert store.snapshot(scope).settled == Money("USD", 1224)
 
-    with store.transaction() as db:
-        assert db.execute("SELECT basis FROM charges").fetchone()[0] == "estimate"
+    with _db(store) as db:
+        assert db.execute("SELECT basis FROM legs WHERE state='ended'").fetchone()[0] == "estimate"
 
 
 @pytest.mark.parametrize("reported_micros", [None, 900])
@@ -532,10 +534,10 @@ def test_v2_recovery_without_native_rates_keeps_frozen_scalar_request_pricing(tm
     assert store.snapshot(scope).settled == Money("USD", 200 if reported_micros is None else 1000)
     reconciler.reconcile(run_id)
     assert store.snapshot(scope).settled == Money("USD", 200 if reported_micros is None else 1000)
-    with store.transaction() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+    with _db(store) as db:
+        assert db.execute("SELECT count(*) FROM legs WHERE state='ended'").fetchone()[0] == 1
     assert not Path(spend_evidence_path(str(directory), str(run_id))).exists()
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs("o/r:fix") == ()
 
 
 @pytest.mark.parametrize("usage_kind,expected_basis", [
@@ -557,10 +559,11 @@ def test_journalled_run_cost_matches_the_committed_settlement(tmp_path, usage_ki
     journaled = JournalingRuntime(wrapper, Journal(str(tmp_path / "journal.jsonl")),
                                   repo="o/r", role="fix", runtime="codex")
     journaled.set_context("fix", "RESOLVE", 1, 1)
+    _lease(wrapper)
 
     asyncio.run(journaled.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
     completed = next(r for r in (json.loads(line) for line in (tmp_path / "journal.jsonl").read_text().splitlines())
                      if r["event"] == "agent_run" and "cost_usd" in r)
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (200, expected_basis)
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (200, expected_basis)
     assert completed["cost_usd"] == 0.0002

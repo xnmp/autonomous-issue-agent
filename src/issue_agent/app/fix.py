@@ -123,13 +123,13 @@ class FixLegs:
                 return
         owner = self.settings.owner_id
         repo = self.settings.repository
-        if not self.control.claim_dispatch(repo, "fix", issue, action.kind.name, owner):
+        if not self.control.lease(repo, "fix", issue, owner):
             self.log(f"{action.kind.name} #{action.number}: skipped — issue #{issue} already has a fix leg in flight")
             return
         try:
             await self._run_claimed(action, item, issue, subject)
         finally:
-            self.control.release_dispatch_claim(repo, "fix", issue, owner)
+            self.control.unlease(repo, "fix", issue, owner)
 
     async def _run_claimed(self, action: RunAgent, item: ItemKey, issue: int, subject) -> None:
         # The review role's legs are not this role's sessions to continue.

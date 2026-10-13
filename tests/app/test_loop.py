@@ -443,14 +443,13 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
     from zoneinfo import ZoneInfo
 
     from issue_agent.adapters.control_store import (
+        BudgetLimit,
         ReservationRequest,
         SQLiteControlStore,
     )
     from issue_agent.domain.actions import AgentKind, RunAgent
     from issue_agent.domain.contracts import (
         Money,
-        PriceQuote,
-        ReservationId,
         RunId,
         daily_budget_scope,
     )
@@ -459,30 +458,12 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
     control.initialize()
     now = datetime.now(timezone.utc)
     run_id = RunId("deadline-run")
+    assert control.lease("o/r", "fix", 7, "o/r:fix")
     request = ReservationRequest(
-        ReservationId("deadline-reservation"),
-        run_id,
-        json.dumps(
-            {
-                "kind": "RESOLVE",
-                "number": 7,
-                "issue": 7,
-                "breaker_key": 7,
-            }
-        ),
-        daily_budget_scope("o/r", "repository", "USD", now, ZoneInfo("UTC")),
-        PriceQuote(
-            "model",
-            "card",
-            "v1",
-            now,
-            Money("USD", 1_000_000),
-        ),
-        Money("USD", 2_000_000),
-        "config-v1",
-        "o/r",
-        kind="RESOLVE",
-        owner_id="o/r:fix",
+        run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1_000_000),
+        (BudgetLimit(daily_budget_scope("o/r", "repository", "USD", now, ZoneInfo("UTC")),
+                     Money("USD", 2_000_000)),),
+        7, issue=7, number=7,
     )
     assert control.reserve(request).admitted
     control.register_process_lease(
@@ -528,9 +509,9 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
     assert started.is_set()
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
     assert tuple(
-        lease.run_id for lease in control.leases("o/r:fix")
+        lease.run_id for lease in control.leases()
     ) == (run_id,)
-    assert control.pending_cancellation_intents("o/r:fix")[0].run_id == run_id
+    assert control.has_cancellation_intent(run_id)
     release.set()
     daemon.wait_for_dispatches()
 

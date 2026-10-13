@@ -160,11 +160,8 @@ class _Control:
     def leg_runs(self, repository, issues):
         return ()
 
-    def active_dispatch_claims(self, repository, role):
-        return ()
-
-    def leases(self):
-        return ()
+    def held_targets(self, repository):
+        return frozenset()
 
 
 def test_an_unreadable_lifetime_read_holds_paid_work_and_says_so():

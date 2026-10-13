@@ -8,10 +8,11 @@ import sqlite3
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.domain.contracts import RunId
 
 
-def _authority_bytes(store: SQLiteControlStore) -> tuple[bytes, bytes]:
-    return (Path(store.path).read_bytes(), Path(store.authority_witness_path).read_bytes())
+def _authority_bytes(store: SQLiteControlStore) -> bytes:
+    return Path(store.path).read_bytes()
 
 
 def _backup_and_collect(store: SQLiteControlStore, copy: Path) -> None:
@@ -21,6 +22,13 @@ def _backup_and_collect(store: SQLiteControlStore, copy: Path) -> None:
             source.backup(target)
     gc.collect()
     assert _authority_bytes(store) == before
+
+
+def _unpaid(store: SQLiteControlStore, run: str) -> None:
+    store.record_unpaid_leg(
+        RunId(run), repository="o/r", role="fix", kind="RESOLVE", owner_id="o/r:fix",
+        issue=1, number=1, head="", runtime="claude",
+    )
 
 
 def test_completed_control_operations_keep_original_bytes_stable(tmp_path: Path) -> None:
@@ -33,31 +41,16 @@ def test_completed_control_operations_keep_original_bytes_stable(tmp_path: Path)
         store.initialize()
         _backup_and_collect(store, tmp_path / "initialized-copy.db")
 
-        with store.transaction() as db:
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                "VALUES (?,?,?,?,?)",
-                ("connection-lifecycle", "test", "committed", "2026-09-30T00:00:00+00:00", "{}"),
-            )
+        _unpaid(store, "committed")
         _backup_and_collect(store, tmp_path / "committed-copy.db")
         with closing(sqlite3.connect(tmp_path / "committed-copy.db")) as copied:
-            assert copied.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='connection-lifecycle'"
-            ).fetchone() == ("{}",)
+            assert copied.execute("SELECT leg_id FROM legs").fetchall() == [("committed",)]
 
-        with pytest.raises(RuntimeError, match="rollback stimulus"):
-            with store.transaction() as db:
-                db.execute(
-                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                    "VALUES (?,?,?,?,?)",
-                    ("connection-lifecycle", "test", "rolled-back", "2026-09-30T00:00:00+00:00", "{}"),
-                )
-                raise RuntimeError("rollback stimulus")
+        with pytest.raises(sqlite3.IntegrityError):
+            _unpaid(store, "committed")  # a duplicate leg rolls its transaction back
         _backup_and_collect(store, tmp_path / "rolled-back-copy.db")
         with closing(sqlite3.connect(tmp_path / "rolled-back-copy.db")) as copied:
-            assert copied.execute(
-                "SELECT key FROM dedupe_keys WHERE namespace='connection-lifecycle'"
-            ).fetchall() == [("committed",)]
+            assert copied.execute("SELECT leg_id FROM legs").fetchall() == [("committed",)]
     finally:
         if automatic_gc:
             gc.enable()

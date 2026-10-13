@@ -1,3 +1,4 @@
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
@@ -6,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
-    Lease,
+    BudgetLimit,
     ReservationRequest,
     SQLiteControlStore,
     SettlementRequest,
@@ -17,9 +18,7 @@ from issue_agent.domain.contracts import (
     BudgetScope,
     ChargeOrigin,
     Money,
-    PriceQuote,
     PricingBasis,
-    ReservationId,
     RunId,
 )
 from issue_agent.domain.recovery import RecoveryTrigger
@@ -62,7 +61,7 @@ class _Control:
     def stale_active_reservation_runs(self, _owner_id, _created_before):
         return (RunId("recovered"), RunId("live"))
 
-    def leases(self, _owner_id):
+    def leases(self):
         return (_Lease(RunId("live")),)
 
     def release_unlaunched(self, run_id, reason):
@@ -74,8 +73,6 @@ class _Control:
     def settle_terminal_estimate(self, run_id, reason):
         return False
 
-    def release_retained(self, _run_id, _reason, _retained_before):
-        return _Release(_Disposition("conflict"))
 
 
 
@@ -191,7 +188,7 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
             calls.append("reclaim_leases")
             return ()
 
-        def leases(self, _owner_id):
+        def leases(self):
             calls.append("read_leases")
             return ()
 
@@ -232,38 +229,38 @@ def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
     ]
 
 
+NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+OWNER = "o/r:fix"
+
+
+def _reserve(store, run_id, *, now=NOW, runtime="", issue=1):
+    """Lease an issue as the daemon and reserve one paid leg bound to it."""
+    scope = BudgetScope(
+        "o/r", "repository", "USD", now.date().isoformat(),
+        now.replace(hour=0), now.replace(hour=0) + timedelta(days=1), ZoneInfo("UTC"),
+    )
+    assert store.lease("o/r", "fix", issue, OWNER)
+    assert store.reserve(ReservationRequest(
+        run_id, "o/r", "fix", "RESOLVE", OWNER, Money("USD", 10),
+        (BudgetLimit(scope, Money("USD", 100)),), issue, issue=issue, runtime=runtime,
+    )).admitted
+    return scope
+
+
+def _leg(store, run_id, columns):
+    with closing(sqlite3.connect(store.path)) as db:
+        return db.execute(f"SELECT {columns} FROM legs WHERE leg_id=?", (str(run_id),)).fetchone()
+
+
 def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
     tmp_path, monkeypatch
 ):
-    now = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-    store = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: now
-    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     run_id = RunId("crashed")
-    scope = BudgetScope(
-        "o/r",
-        "daily",
-        "USD",
-        "2026-07-30",
-        now.replace(hour=0),
-        now.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-    request = ReservationRequest(
-        ReservationId("reservation"),
-        run_id,
-        "dispatch",
-        scope,
-        PriceQuote("gpt", "card", "v1", now, Money("USD", 10)),
-        Money("USD", 100),
-        "config",
-        "o/r",
-        owner_id="o/r:fix",
-    )
-    store.reserve(
-        request,
-        lease=Lease(run_id, "dispatch", request.owner_id, 999_999, 999_999, now),
+    _reserve(store, run_id)
+    store.register_process_lease(
+        run_id, expected_owner_id=OWNER, pid=999_999, pgid=999_999, process_start_ticks=1,
     )
 
     class Reconciler:
@@ -287,64 +284,28 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
     )
     report = RecoveryCoordinator(
         _Supervisor(), store, _Worktrees(),
-        Reconciler(), "o/r:fix"
+        Reconciler(), OWNER
     ).reconcile(RecoveryTrigger.BOOT)
 
-    with sqlite3.connect(store.path) as db:
-        state, outcome, receipt = db.execute(
-            "SELECT state, outcome, provider_receipt_id FROM runs WHERE run_id=?",
-            (str(run_id),),
-        ).fetchone()
     assert report.reclaimed_leases == (run_id,)
-    assert (state, outcome, receipt) == (
-        "abandoned",
-        "dead_lease",
-        "provider-receipt",
+    assert _leg(store, run_id, "state, end_reason, provider_receipt_id, charged_micros") == (
+        "ended", "dead_lease", "provider-receipt", 7,
     )
+    assert store.leases() == ()
 
 
 def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
     tmp_path,
 ):
-    now = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-    store = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: now
-    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     identity = ProcessSupervisor.process_identity(os.getpid())
     assert identity is not None
     run_id = RunId("live-owned")
-    scope = BudgetScope(
-        "o/r",
-        "daily",
-        "USD",
-        "2026-07-30",
-        now.replace(hour=0),
-        now.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-    request = ReservationRequest(
-        ReservationId("live-reservation"),
-        run_id,
-        "dispatch",
-        scope,
-        PriceQuote("gpt", "card", "v1", now, Money("USD", 10)),
-        Money("USD", 100),
-        "config",
-        "o/r",
-        owner_id="o/r:fix",
-    )
-    store.reserve(
-        request,
-        lease=Lease(
-            run_id,
-            "dispatch",
-            "o/r:fix",
-            identity.pid,
-            os.getpgid(identity.pid),
-            now,
-            identity.start_ticks,
-        ),
+    _reserve(store, run_id)
+    store.register_process_lease(
+        run_id, expected_owner_id=OWNER, pid=identity.pid,
+        pgid=os.getpgid(identity.pid), process_start_ticks=identity.start_ticks,
     )
 
     class SafeSupervisor:
@@ -358,17 +319,14 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
         SafeSupervisor(),
         store,
         _Worktrees(),
-       
         _Spend(),
-        "o/r:fix",
-        now=lambda: now + timedelta(hours=1),
+        OWNER,
+        now=lambda: NOW + timedelta(hours=1),
     ).reconcile(RecoveryTrigger.WAKE)
 
     assert report.reclaimed_leases == ()
-    assert store.active_reservation_runs("o/r:fix") == (run_id,)
-    assert tuple(lease.run_id for lease in store.leases("o/r:fix")) == (
-        run_id,
-    )
+    assert store.active_reservation_runs(OWNER) == (run_id,)
+    assert tuple(lease.run_id for lease in store.leases()) == (run_id,)
     settled = store.settle(
         SettlementRequest(
             run_id,
@@ -386,37 +344,11 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
 def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
     tmp_path,
 ):
-    reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-    current = [reserved_at + timedelta(minutes=1)]
-    store = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: reserved_at
-    )
+    current = [NOW + timedelta(minutes=1)]
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     run_id = RunId("usage-blind")
-    scope = BudgetScope(
-        "o/r",
-        "daily",
-        "USD",
-        "2026-07-30",
-        reserved_at.replace(hour=0),
-        reserved_at.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-    store.reserve(
-        ReservationRequest(
-            ReservationId("usage-blind-reservation"),
-            run_id,
-            "dispatch",
-            scope,
-            PriceQuote(
-                "gpt", "card", "v1", reserved_at, Money("USD", 10)
-            ),
-            Money("USD", 100),
-            "config",
-            "o/r",
-            owner_id="o/r:fix",
-        )
-    )
+    scope = _reserve(store, run_id)
     assert store.record_reservation_retained(
         run_id, "trusted usage and provider charge unavailable"
     )
@@ -424,211 +356,113 @@ def test_periodic_sweep_settles_completed_usage_blind_reservation_without_grace(
         _Supervisor(),
         store,
         _Worktrees(),
-       
         _Spend(),
-        "o/r:fix",
+        OWNER,
         reservation_grace=timedelta(minutes=2),
         now=lambda: current[0],
     )
 
     assert coordinator.reconcile(RecoveryTrigger.PERIODIC).spend_unknown == ()
-    assert store.active_reservation_runs("o/r:fix") == ()
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges WHERE run_id=?",
-                                (str(run_id),)).fetchone()) == (0, "estimate")
+    assert store.active_reservation_runs(OWNER) == ()
+    assert _leg(store, run_id, "charged_micros, basis") == (0, "estimate")
 
-    current[0] = reserved_at + timedelta(minutes=3)
+    current[0] = NOW + timedelta(minutes=3)
     report = coordinator.reconcile(RecoveryTrigger.PERIODIC)
 
     assert report.spend_unknown == ()
-    assert store.active_reservation_runs("o/r:fix") == ()
+    assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).reserved == Money.zero("USD")
-    with sqlite3.connect(store.path) as db:
-        policy, reservation_state, reason, run_state, outcome = db.execute(
-            "SELECT rr.policy, b.state, b.release_reason, r.state, r.outcome "
-            "FROM reservation_recovery rr "
-            "JOIN budget_reservations b ON b.run_id=rr.run_id "
-            "JOIN runs r ON r.run_id=rr.run_id WHERE rr.run_id=?",
-            (str(run_id),),
-        ).fetchone()
-    assert (
-        policy,
-        reservation_state,
-        reason,
-        run_state,
-        outcome,
-    ) == (
-        "reconcile_only",
-        "settled",
-        None,
-        "completed",
-        "spend_unreconciled",
+    assert _leg(store, run_id, "state, end_reason, charged_micros") == (
+        "ended", "trusted usage and provider charge unavailable", 0,
     )
 
 
 def test_periodic_sweep_releases_only_stale_unlaunched_reservation(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
-    reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-    store = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: reserved_at
-    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     run_id = RunId("never-launched")
-    scope = BudgetScope(
-        "o/r",
-        "daily",
-        "USD",
-        "2026-07-30",
-        reserved_at.replace(hour=0),
-        reserved_at.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-    store.reserve(
-        ReservationRequest(
-            ReservationId("never-launched-reservation"),
-            run_id,
-            "dispatch",
-            scope,
-            PriceQuote(
-                "gpt", "card", "v1", reserved_at, Money("USD", 10)
-            ),
-            Money("USD", 100),
-            "config",
-            "o/r",
-            owner_id="o/r:fix",
-        )
+    _reserve(store, run_id)
+    # The daemon that reserved died before spawning: its claim is dead.
+    monkeypatch.setattr(
+        "issue_agent.app.recovery._pid_alive", lambda _pid, _start: False
     )
     report = RecoveryCoordinator(
         _Supervisor(),
         store,
         _Worktrees(),
-       
         _Spend(),
-        "o/r:fix",
+        OWNER,
         reservation_grace=timedelta(minutes=2),
-        now=lambda: reserved_at + timedelta(minutes=3),
+        now=lambda: NOW + timedelta(minutes=3),
     ).reconcile(RecoveryTrigger.PERIODIC)
 
     assert report.spend_unknown == (run_id,)
-    assert store.active_reservation_runs("o/r:fix") == ()
-    with sqlite3.connect(store.path) as db:
-        state, reason = db.execute(
-            "SELECT state, release_reason FROM budget_reservations "
-            "WHERE run_id=?",
-            (str(run_id),),
-        ).fetchone()
-    assert (state, reason) == ("released", "unlaunched_reservation")
-
-
-def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
-    reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-    store = SQLiteControlStore(
-        str(tmp_path / "control.db"), now=lambda: reserved_at
+    assert store.active_reservation_runs(OWNER) == ()
+    assert _leg(store, run_id, "state, end_reason, charged_micros") == (
+        "released", "unlaunched_reservation", None,
     )
+
+
+def test_a_stale_reserved_leg_holding_its_live_lease_is_never_released(tmp_path):
+    # A leg is reserved only under its lease, so a spawn that may still
+    # register is always visible to the sweep as live work.
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     run_id = RunId("spawn-race")
-    scope = BudgetScope(
-        "o/r",
-        "daily",
-        "USD",
-        "2026-07-30",
-        reserved_at.replace(hour=0),
-        reserved_at.replace(hour=0) + timedelta(days=1),
-        ZoneInfo("UTC"),
-    )
-    store.reserve(
-        ReservationRequest(
-            ReservationId("spawn-race-reservation"),
-            run_id,
-            "dispatch",
-            scope,
-            PriceQuote(
-                "gpt", "card", "v1", reserved_at, Money("USD", 10)
-            ),
-            Money("USD", 100),
-            "config",
-            "o/r",
-            owner_id="o/r:fix",
-        )
-    )
-
-    class RegisteringReconciler:
-        def reconcile(self, candidate):
-            store.register_lease(
-                Lease(
-                    candidate,
-                    "dispatch",
-                    "o/r:fix",
-                    123,
-                    123,
-                    reserved_at,
-                    1,
-                )
-            )
-            return False
+    _reserve(store, run_id)
 
     report = RecoveryCoordinator(
         _Supervisor(),
         store,
         _Worktrees(),
-       
-        RegisteringReconciler(),
-        "o/r:fix",
+        _Spend(),
+        OWNER,
         reservation_grace=timedelta(minutes=2),
-        now=lambda: reserved_at + timedelta(minutes=3),
+        now=lambda: NOW + timedelta(minutes=3),
     ).reconcile(RecoveryTrigger.PERIODIC)
 
     assert report.spend_unknown == ()
-    assert store.active_reservation_runs("o/r:fix") == (run_id,)
-    assert tuple(lease.run_id for lease in store.leases("o/r:fix")) == (
-        run_id,
+    assert store.active_reservation_runs(OWNER) == (run_id,)
+    assert tuple(lease.run_id for lease in store.leases()) == (run_id,)
+    store.register_process_lease(
+        run_id, expected_owner_id=OWNER, pid=os.getpid(), pgid=os.getpgid(0),
+        process_start_ticks=ProcessSupervisor.process_identity(os.getpid()).start_ticks,
     )
+    assert _leg(store, run_id, "state") == ("running",)
 
 
-def test_boot_settles_legacy_accounting_hold_once_and_preserves_money(tmp_path):
-    import json
+def test_boot_settles_an_unmeasured_codex_hold_once_and_preserves_money(tmp_path):
     from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 
     now = datetime.now(timezone.utc)
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: now)
     store.initialize()
-    scope = BudgetScope("o/r", "repository", "USD", now.date().isoformat(),
-                        now.replace(hour=0), now.replace(hour=0) + timedelta(days=1), ZoneInfo("UTC"))
     run_id = RunId("9fdbdc47801a41849dc212b941ef6b8f")
-    assert store.reserve(ReservationRequest(ReservationId("legacy"), run_id,
-        json.dumps({"runtime": "codex"}), scope,
-        PriceQuote("sol", "card", "v1", now, Money("USD", 50_000_000)), Money("USD", 100_000_000),
-        "cfg", "o/r", owner_id="o/r:fix")).admitted
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET state='completed',outcome='accounting_unavailable',"
-                   "started_at=?,completed_at=? WHERE run_id=?", (now.isoformat(), now.isoformat(), str(run_id)))
-        db.execute("UPDATE reservation_recovery SET policy='reconcile_only',reason='unfinished turns' WHERE run_id=?",
-                   (str(run_id),))
+    scope = _reserve(store, run_id, now=now, runtime="codex")
+    assert store.record_reservation_retained(run_id, "unfinished turns")
     coordinator = RecoveryCoordinator(_Supervisor(), store, _Worktrees(),
-        CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)), "o/r:fix",
+        CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)), OWNER,
         now=lambda: now)
     assert coordinator.reconcile(RecoveryTrigger.BOOT).spend_unknown == ()
-    assert store.active_reservation_runs() == ()
+    assert store.active_reservation_runs(OWNER) == ()
     assert store.snapshot(scope).reserved == Money.zero()
-    with store.transaction() as db:
-        ledger = db.execute("SELECT run_id,amount_micros,basis FROM charges").fetchall()
+    ledger = _leg(store, run_id, "leg_id, charged_micros, basis, settled_at")
     assert coordinator.reconcile(RecoveryTrigger.BOOT).spend_unknown == ()
-    with store.transaction() as db:
-        assert db.execute("SELECT run_id,amount_micros,basis FROM charges").fetchall() == ledger
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
-        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("completed", "settled")
+    assert _leg(store, run_id, "leg_id, charged_micros, basis, settled_at") == ledger
+    assert _leg(store, run_id, "state, charged_micros, basis") == ("ended", 0, "estimate")
 
 
 def test_generic_estimate_recovery_preserves_real_abandonment(tmp_path):
     from tests.adapters.test_spend_recovery import _reserved_store, _end_run_at, END
     store, _scope, run_id = _reserved_store(tmp_path, runtime="claude")
     _end_run_at(store, run_id, END)
-    with store.transaction() as db:
-        db.execute("UPDATE runs SET state='abandoned',outcome='dead_lease' WHERE run_id=?", (str(run_id),))
+    with closing(sqlite3.connect(store.path)) as db:
+        db.execute("UPDATE legs SET end_reason='dead_lease' WHERE leg_id=?", (str(run_id),))
+        db.commit()
     assert store.settle_terminal_estimate(run_id, "provider evidence unavailable")
-    assert store.active_reservation_runs() == ()
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("abandoned", "dead_lease")
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
+    assert store.active_reservation_runs(OWNER) == ()
+    assert _leg(store, run_id, "state, end_reason, charged_micros, basis") == (
+        "ended", "dead_lease", 0, "estimate",
+    )

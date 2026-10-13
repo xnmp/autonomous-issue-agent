@@ -18,7 +18,7 @@ from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.run_usage import price_run_usage
 from tests.adapters import test_native_usage_accounting as native
-from tests.adapters.test_accounting_runtime import Runtime, _wrapper
+from tests.adapters.test_accounting_runtime import Runtime, _db, _lease, _run, _wrapper
 from tests.adapters.test_codex_child_usage import ROOT, CHILD, START, RATES, event, metadata, path, write
 from tests.adapters.test_settlement_regressions import counter, receipt, child_rollout
 
@@ -52,9 +52,9 @@ def test_usable_provider_dollars_survive_an_unusaged_completed_request_and_journ
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=RATES)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (900, "estimate")
+    _run(wrapper, RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2))
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (900, "estimate")
 
 
 def test_mixed_request_evidence_stops_live_execution_at_the_same_settled_amount(tmp_path, monkeypatch):
@@ -66,13 +66,13 @@ def test_mixed_request_evidence_stops_live_execution_at_the_same_settled_amount(
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 2000)}))
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.002,
-                                                 env={"CODEX_HOME": str(tmp_path / "codex")})))
+    result = _run(wrapper, RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.002,
+                                                 env={"CODEX_HOME": str(tmp_path / "codex")}))
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert not (tmp_path / "finished").exists()
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (2250, "estimate")
-    assert store.active_reservation_runs() == ()
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (2250, "estimate")
+    assert store.active_reservation_runs("o/r:fix") == ()
 
 
 @pytest.mark.parametrize("normal_basis", [PricingBasis.ESTIMATE, PricingBasis.CONFIGURED_RATE_CARD, PricingBasis.PROVIDER_REPORTED])
@@ -189,10 +189,10 @@ def test_normal_return_keeps_provider_dollars_when_caps_and_token_card_are_absen
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=None, repository_cap=None, global_cap=None, issue_cap=None)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
+    result = _run(wrapper, RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2))
     assert result.status == "pushed", result.summary
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (900, "provider_reported")
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis FROM legs WHERE state='ended'").fetchone()) == (900, "provider_reported")
 
 
 def test_normal_return_uses_the_same_frozen_mixed_price_as_the_live_meter_without_wrapper_rates(tmp_path):
@@ -204,9 +204,9 @@ def test_normal_return_uses_the_same_frozen_mixed_price_as_the_live_meter_withou
     wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", run_usage=observed)))
     wrapper = replace(wrapper, rate_table=None, repository_cap=None, global_cap=None, issue_cap=None)
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2)))
-    with store.transaction() as db:
-        assert tuple(db.execute("SELECT amount_micros,basis,rate_card_id FROM charges").fetchone()) == (1100, "estimate", "card")
+    _run(wrapper, RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=2))
+    with _db(store) as db:
+        assert tuple(db.execute("SELECT charged_micros,basis,rate_card_id FROM legs WHERE state='ended'").fetchone()) == (1100, "estimate", "card")
 
 
 @pytest.mark.parametrize("cap,expected", [(.001, ExitReason.OK), (.0009001, ExitReason.BUDGET_EXHAUSTED)])

@@ -14,6 +14,7 @@ import pytest
 
 from issue_agent.adapters.child_env import CHILD_ENV_MANIFEST
 from issue_agent.adapters.control_store import (
+    BudgetLimit,
     ReservationRequest,
     SQLiteControlStore,
 )
@@ -21,8 +22,6 @@ from issue_agent.adapters.process_supervisor import ProcessIdentity, ProcessSupe
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
-    PriceQuote,
-    ReservationId,
     RunId,
 )
 
@@ -75,27 +74,16 @@ def _reserve_paid_run(
     store: SQLiteControlStore,
     run_id: RunId,
 ) -> ReservationRequest:
+    """Lease issue 1 as the daemon and reserve one paid leg bound to it."""
     now = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    scope = BudgetScope(
+        "o/r", "repository", "USD", now.date().isoformat(), start, start + timedelta(days=1), ZoneInfo("UTC"),
+    )
+    assert store.lease("o/r", "fix", 1, "o/r:fix")
     request = ReservationRequest(
-        ReservationId(f"reservation-{run_id}"),
-        run_id,
-        f"dispatch-{run_id}",
-        BudgetScope(
-            "o/r",
-            "repository",
-            "USD",
-            now.date().isoformat(),
-            start,
-            start + timedelta(days=1),
-            ZoneInfo("UTC"),
-        ),
-        PriceQuote("model", "test", "1", now, Money("USD", 1)),
-        Money("USD", 10),
-        "cfg",
-        "o/r",
-        kind="RESOLVE",
-        owner_id="o/r:fix",
+        run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1),
+        (BudgetLimit(scope, Money("USD", 10)),), 1, issue=1,
     )
     assert store.reserve(request).admitted
     return request
@@ -448,12 +436,13 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
         },
     )
     deadline = time.monotonic() + 3
-    while not store.leases() and time.monotonic() < deadline:
+    # The daemon's own lease is replaced by the child's process identity.
+    while store.leases()[0].pid != process.pid and time.monotonic() < deadline:
         time.sleep(0.02)
 
     lease = store.leases()[0]
     assert lease.run_id == run_id
-    assert lease.dispatch_id == request.dispatch_id
+    assert (lease.repository, lease.role, lease.target) == ("o/r", "fix", 1)
     assert lease.owner_id == request.owner_id
     assert lease.pid == process.pid
     assert lease.pgid == process.pid
@@ -461,7 +450,8 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
 
     supervisor.kill_tree(run_id)
     _wait_dead(process)
-    store.release(run_id, "test complete")
+    assert store.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
+    assert store.settle_terminal_estimate(run_id, "test complete")
     assert store.leases() == ()
 
 
@@ -511,7 +501,8 @@ def test_supervised_paid_command_scrubs_authority_from_the_target_environment(
     }
 
     supervisor.kill_tree(run_id)
-    store.release(run_id, "test complete")
+    assert store.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
+    assert store.settle_terminal_estimate(run_id, "test complete")
     assert store.leases() == ()
 
 
@@ -658,7 +649,8 @@ def test_supervised_paid_command_refuses_exec_after_launcher_death(
 
     assert completed.returncode != 0
     assert not marker.exists()
-    assert store.leases() == ()
+    # Only the daemon's claim remains: no child process was registered.
+    assert [lease.pid for lease in store.leases()] == [os.getpid()]
     assert supervisor.registrations() == ()
 
 

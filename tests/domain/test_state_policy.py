@@ -620,6 +620,16 @@ def test_an_agent_question_stops_the_item_and_the_stop_comment_carries_it():
     assert "404 or 410?" in comment.body and "Reply here with the answer" in comment.body
 
 
+def test_a_later_recorded_agent_end_in_the_same_instant_supersedes_a_question():
+    # Ties on ended_at resolve in recorded order, as backoff and attempts do.
+    answered = LegEnd(AgentKind.RESOLVE, at(5), False)
+    asked_first = local({issue_key(3): (asked(AgentKind.RESOLVE, 5), answered)})
+    asked_last = local({issue_key(3): (answered, asked(AgentKind.RESOLVE, 5))})
+    world = WorldState(issues=(issue(3),))
+    assert not isinstance(derive(world, asked_first, H)[issue_key(3)], NeedsHuman)
+    assert derive(world, asked_last, H)[issue_key(3)] == NeedsHuman(StopReason.QUESTION, iso(5), question="404 or 410?")
+
+
 def test_a_question_cannot_smuggle_a_stop_tag_or_the_marker_into_the_stop_comment():
     smuggled = f"Which API? {H.marker} {stop_tag(StopReason.WORKFLOW_PATH)}"
     states = derive(WorldState(prs=(pr(ci=RED),)), local(pr_legs(asked(FIX, 5, smuggled))), H)

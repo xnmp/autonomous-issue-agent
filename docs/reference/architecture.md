@@ -26,7 +26,7 @@ derive    state.derive (PURE)        world + local SQLite facts → per-item sta
 policy    policy.actions (PURE)      states → list[Action]; each role keeps its own
 act       GitHubAct.execute()        the ONE place writes happen (adapters/act.py)
 legs      FixLegs / ReviewLegs       RunAgent → an actual paid agent session
-control   SQLiteControlStore         leases, spend, dedup, runs, receipts
+control   SQLiteControlStore         legs (money + attempts), leases, idempotency keys
 ```
 
 The layering is hexagonal and **machine-enforced** (import-linter contracts
@@ -97,50 +97,62 @@ is judged by CI and the independent reviewer.
 
 ## Operational state, telemetry, and money
 
-SQLite is authoritative for money (reservations and charges), leases,
-legs/attempts (runs) and idempotency keys. Tables of the deleted workflow and
-durable-command model are no longer read or written and leave the schema in
-slice 5d-2. Recovery kills registered orphan trees, reclaims dead leases,
-settles killed Codex runs from persisted rollout coordinates and locked rates,
-and makes genuinely unrecoverable spend visible before capacity is released.
-At upgrade, current and rotated legacy ledgers are imported idempotently into
-repository-daily, global-daily, and issue-lifetime scopes before paid
-admission; malformed or unattributed rows require operator repair.
-The 2026-07-31 migration rehearsal replayed a 98.531-hour, 303-row historical
-window twice; matched source digest, per-scope balances, count, amount, and
-failure decisions; and exercised ordinary, exhausted, duplicate, and
-conflicting-receipt admissions on the pre-existing live primary database.
-Fresh databases use the v9 adoption baseline. The exact digest emitted by the
-previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14/v15/v16/v17
-without rewritten history. V13 canonicalizes GitHub's case-insensitive `owner/name`
-repository identity across commands, reservations, limits, and dispatch claims;
-startup also adopts both historical mixed-case owner formats so in-flight
-authority is not stranded by the cutover.
-V14 binds each coarse dispatch claim to every admitted run in that workflow.
-Claim reaping treats any bound nonterminal run as authoritative until its owner
-recovers and terminalizes it, closing the crash window where a sibling checkout
-could start duplicate paid work while the original child or descendant still
-ran.
-V15 records retired deployment owners and their successors. Repoint adoption
-transfers active ownership and retires the complete recorded lineage in one
-transaction. Every role store is then bound to its current owner: all later
-transactions recheck that durable fence, fresh claims and reservations from a
-retired owner fail closed, and a rebooted old service exits cleanly at startup.
-V16 classifies every active reservation as spawn-pending, running, or
-reconcile-only. Recovery can release only spawn-pending work while atomically
-rechecking that no lease registered and the run never started; any reservation
-that may still be running retains capacity until terminal recovery can settle it.
-V17 separates workload repository attribution from the budget scope that
-admitted a run, so global-only reservations still charge the correct
-repository. It also restores pre-v16 reserved/no-lease rows to spawn-pending
-when the old lease-before-exec contract proves they never launched. Paid child
-registration carries the launcher's immutable expected owner and checks it in
-the lease transaction, while a normal completion that races dead-lease spend
-recovery replaces its recovered charge with the normal return's evidence and
-corrects the false abandonment, atomically with output capture. Replay keeps one charge. Read-only spend projections validate the current migration
-history, SQLite quick check, foreign keys, and semantic invariants before
-showing authoritative current-day values.
+SQLite is authoritative for money, leases, legs (attempts) and idempotency
+keys, in three tables (`adapters/control_store.py`, `PRAGMA user_version` 1;
+no migration history and no digest pins):
+
+- `legs` — one row per leg, paid or refused: identity (repository, role, kind,
+  issue, item number, head, owner, runtime), lifecycle
+  `state ∈ reserved | running | ended | released` with `reserved_at`,
+  `started_at`, `ended_at` and `end_reason`, the money (reserved maximum,
+  charged micros, basis, origin, usage, rate card, `provider_receipt_id`
+  UNIQUE, `settled_at`) and the leg's result (`leg_class`, session, result
+  JSON). CHECK constraints make contradictions unrepresentable: an `ended`
+  leg has a charge and a `released` or unsettled leg has none, a charge's
+  fields are all set or all null, a `reserved` leg has not started, and an
+  ended or released leg has an end time. An unsettled leg with `ended_at`
+  set is ended work awaiting spend recovery.
+- `leases` — one claim per `(repository, role, target)`: owner, the bound
+  leg (set by `reserve` in the reservation's transaction), and the holding
+  process (pid, pgid, start ticks). The claiming daemon holds it until the
+  leg's child registers its own process group. A lease is live while its
+  bound leg is unsettled and not ended, or while its process is alive. A
+  role releasing its claim leaves a running leg's lease in place, so a leg
+  killed at shutdown is settled by boot recovery after the reap, from usage
+  that may only then be readable, never at a premature zero. A bound leg that
+  never launched is released with the claim, so a failed release on the
+  runtime's error path cannot hold its reservation until restart.
+- `idempotency` — keyed writes (`fix-comment:{repository}:{key}`), claimed
+  before the effect and confirmed after its read-back.
+
+Caps are sums over `legs` by scope dimension: a repository's day, every
+repository's day (`global`), or one issue's lifetime (`issue:<n>`), counting
+settled charges and the reserved maximum of unsettled legs. A missing store
+is recreated only where none was ever used (ADR 0003). Attempts and
+machine backoff derive from ended legs (`leg_runs`); ties on `ended_at`
+resolve in recorded order. Recovery kills registered orphan trees, reclaims
+dead leases of the daemon's repository and role (so a repointed checkout
+recovers its predecessor's legs), settles killed Codex runs from persisted
+rollout coordinates and locked rates, and settles genuinely unrecoverable
+ended work at a zero estimate before capacity is released.
+
+The first open of a pre-cutover database (one with the legacy
+`schema_migrations` table) performs a one-way cutover. It refuses with
+`CutoverRefused` (exit `OPERATOR_REPAIR_REQUIRED`) while the legacy store
+holds a reserved/starting/running run, an active reservation or a lease,
+naming each and its owner. Otherwise, under `BEGIN EXCLUSIVE` with rollback
+journaling, it writes a new file beside the old one carrying every settled
+charge as a `role='carried'` ended leg (repository, issue, reservation time,
+charge, basis, rate card, receipt) and the `fix-comment` idempotency keys,
+verifies the carried count and sum and that every charge each legacy cap
+scope counted is still counted by that scope, hard-links the old file to
+`control.db.retired-v<N>-<UTC stamp>` (never read again) and atomically
+renames the new file into place. A crash leaves either the old file intact
+(the next boot repeats the cutover) or the new file complete. Carried legs
+count toward daily and per-issue lifetime caps; they are not attempts, so
+derive restarts attempt counts from GitHub. A downgrade is refused: older
+binaries do not recognise the new schema.
+
 Completed legs settle from the sum of usable request receipts, otherwise streamed
 usage at the captured rate card, otherwise zero for interrupted/unusable requests.
 Partial evidence produces `basis=estimate`;
@@ -155,40 +167,22 @@ the pure `domain/reservation_recovery.py` state machine. That model owns action
 ordering and terminal reporting; SQLite remains responsible for atomically
 proving that a requested release is still eligible. New runtimes or evidence
 sources therefore extend one decision table rather than adding recovery loops.
-V20 indexes the workflow episode on existing admitted runs. Adjudication allowance
-reads are bounded and episode-scoped; generation changes do not renew them. A
-strict never-launched release carries a distinct terminal proof, while ambiguous
-execution continues counting.
-
-Migration validates immutable run/admission/budget
-provenance atomically before deriving the index; it does not activate a workflow
-family. This migration has been exercised only against isolated test databases.
-Every migration is digest-validated and individually transactional; restart
-and concurrent-role tests interrupt both sides of every migration commit
-boundary and serialize fresh/v8/v9 boot. Machine-readable
-evidence is in `control-store-migration-evidence.json`.
-V12 removes the run-level active-dispatch uniqueness constraint: one review
-workflow may legitimately run several validator sublegs concurrently. The
-coarser paid-dispatch authority is instead the durable target claim made
-before the workflow starts and released on every completion, rejection, or
-cancellation path. Process liveness is snapshotted before the claim
-transaction, so OS inspection never holds SQLite's cross-process write lock.
-The snapshot fingerprint includes bound run state and lease PID/start identity;
-a concurrent bind or lease transition is conservatively retained and retried.
-The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
-accounting run, cleanup receipt, and post-canary invariants are captured in
-`live-release-canary-evidence.json`.
+Lease liveness is probed (OS process inspection) outside SQLite write
+transactions; the write transaction revalidates the complete lease row, so a
+lease replaced meanwhile survives. The pre-cutover migration and canary
+records (`control-store-migration-evidence.json`,
+`live-release-canary-evidence.json`) describe the retired v8–v46 schema and
+are historical.
 JSONL is the per-role daemon log only; losing it cannot authorize a write,
 deduplicate work, or admit spend. Metrics derive from the SQLite legs/money
 tables plus GitHub.
-Every paid run is scoped to repository, role, and stable
-checkout deployment identity in the shared store. Cross-process dispatch
-claims remain repository/role-global, so two intentionally allowed checkouts
-cannot both admit the same target (targets are the only conflict; Q13 deleted
-the path-overlap holds). A daemon queries
-only its exact ownership scope, so sibling deployments and roles cannot cancel,
-recover, or receipt each other's work.
-The observed-world target used to acquire a dispatch claim is carried through
+Every paid leg records its repository, role, and stable checkout deployment
+owner in the shared store. Leases are repository/role-global, so two
+intentionally allowed checkouts cannot both admit the same target (targets are
+the only conflict; Q13 deleted the path-overlap holds). Shutdown cancels only
+the daemon's exact owner's legs; recovery is scoped by repository and role and
+never touches a leg whose lease is live.
+The observed-world target used to acquire a lease is carried through
 paid admission. A fresh PR read may validate that target
 but cannot replace it; changed linkage defers to a new observation. An issueless
 PR is claimed by negative PR number without manufacturing a per-issue spend
@@ -196,10 +190,10 @@ scope (ADR 0008).
 The review role (slice 5c) owes a REVIEW leg when CI is green on a harness PR's
 head and the review bot has no standing verdict on that head. The leg reads the
 exact head (a detached checkout and the revision-bound diff), and `GitHubAct`
-submits the parsed verdict as one review on that commit, keyed
-`review:{pr}:{head}` in the dedupe table and read back first, so a crash after
+submits the parsed verdict as one review on that commit, read back first
+(a standing bot verdict on the head means it landed), so a crash after
 submission never posts a second review. The verdict is also kept on the leg's
-run receipt: a verdict whose submission never landed is resubmitted without
+result: a verdict whose submission never landed is resubmitted without
 buying the review again. An unparseable verdict is an attempt, and derive caps
 attempts per head; everything else the review produces (labels, stop comments,
 merge) is the fix role's.
@@ -208,40 +202,19 @@ Offline family activation and legacy import were deleted (slice 5a). A family
 epoch's plan evidence remains authority; a target's family state is initialized
 only by its live first observation.
 
-Store continuity/session/model/reply/phase APIs are retired.
-Current selected issue/PR components retain exact paid admission and outcome
-sources, while free remediation holds the existing command identity until its
-exact head/run/base receipt settles. Machine and budget recoveries share one
-SQL count and retire only after verified projection. Current issue pending
-admissions recover classification even when monetary settlement and newer PR
-continuity have already committed. Schema39's fixed indexes select these owed
-sources independently of settled history. The copied rollback requires an
-explicit stopped index-only39→38 schema step before the archived F14 reader;
-later money/holds/replies survive, and forward migration restores39.
-Their raw files cannot regain runtime authority after restart or rollback; the
-existing schema fence refuses an older binary before it can mutate the current
-database.
-
 The supported exception is an explicit same-repository checkout repoint:
 `issue-agent start --write-config` records a bounded lineage of exact prior
-checkout identities. The first boot reaps only those process registries and
-adopts their run/lease/claim/command ownership. The marker
-persists across repeated repoints so an interrupted intermediate boot cannot
-strand an older reservation. Before the overlay changes, the CLI stops and
-verifies all foreground and service-owned processes carrying its stable name;
-failure preserves the old snapshot. Schema v15 permanently fences the adopted
-owners, covering processes missed by OS discovery and old service definitions
-started after reboot. Cross-repository overlay reuse is refused.
+checkout identities. The first boot reaps only those process registries; the
+predecessor's unsettled legs are recovered by repository/role-scoped recovery.
+Before the overlay changes, the CLI stops and verifies all foreground and
+service-owned processes carrying its stable name; failure preserves the old
+snapshot. Cross-repository overlay reuse is refused.
 Process-group, process-tree, and launch-intent receipts use the same stable
 checkout deployment identity beneath each role state root. Boot and shutdown
 therefore reap only that deployment's children even when sibling checkouts
 intentionally share the repo-level default state root. Upgrade recovery inspects
 the former unscoped registry conservatively: a live recorded launcher or live
 external parent remains authoritative and is never signalled.
-At the deployment-identity cutover, the first role deployment atomically adopts
-the former `<repository>:<role>` run, lease, and nonterminal command scope.
-Reconcile-before-write then prevents a changed owner identity from duplicating
-an ambiguous legacy effect.
 
 The control database is rooted at the operating-system service account's
 `~/.local/state/issue-agent-control/control.db`, independently of every
@@ -250,8 +223,8 @@ split the host-global reservation pool. Startup fails closed if it finds the
 former deployment-local database at a custom root; that authority must be
 migrated into the canonical database before the deployment can restart.
 CLI status and dashboard usage endpoints project current-period settled charges
-directly from this SQLite authority. The historical JSONL spend ledger is read
-only during idempotent migration and cannot make current spend appear as zero.
+directly from this SQLite authority (read-only; a missing or unreadable store is
+reported unavailable, never zero).
 
 The dashboard is a read-only consumer. Its board is built from each role's
 plain `journal.jsonl` log, SQLite settled spend, and GitHub reads; GitHub reads

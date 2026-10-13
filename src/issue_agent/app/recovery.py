@@ -92,7 +92,7 @@ class RecoveryCoordinator:
     ) -> tuple[tuple[RunId, ...], tuple[RunId, ...]]:
         reclaimed = reclaimed_leases
         live_runs = {
-            lease.run_id for lease in self.control.leases(self.owner_id)
+            lease.run_id for lease in self.control.leases() if lease.run_id is not None
         }
         cutoff = self.now() - grace
         candidates = self.control.stale_active_reservation_runs(
@@ -119,16 +119,6 @@ class RecoveryCoordinator:
                         run_id, "unlaunched_reservation"
                     )
                     state = state.after_unlaunched_release(
-                        released=result.disposition.value == "available"
-                    )
-                    continue
-                if decision.action is ReservationRecoveryAction.RELEASE_RETAINED:
-                    result = self.control.release_retained(
-                        run_id,
-                        "unmeasured_completed_reservation",
-                        cutoff,
-                    )
-                    state = state.after_retained_release(
                         released=result.disposition.value == "available"
                     )
                     continue

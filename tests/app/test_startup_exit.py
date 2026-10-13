@@ -6,8 +6,8 @@ import pytest
 
 from issue_agent.adapters.control_store import (
     CorruptControlStore,
+    CutoverRefused,
     IncompatibleSchema,
-    RetiredOwnerError,
 )
 from issue_agent.app import cli
 from issue_agent.app import main as main_module
@@ -39,6 +39,7 @@ def test_only_the_fix_and_review_roles_can_be_started(capsys):
         (ValueError("bad config"), ExitCode.INVALID_CONFIG),
         (IncompatibleSchema("future"), ExitCode.INCOMPATIBLE_SCHEMA),
         (CorruptControlStore("bad db"), ExitCode.STORE_CORRUPTION),
+        (CutoverRefused("legacy legs in flight"), ExitCode.OPERATOR_REPAIR_REQUIRED),
     ),
 )
 def test_startup_failures_map_to_permanent_exit_classes(
@@ -126,32 +127,6 @@ def test_reload_candidate_runs_full_config_validation(monkeypatch):
     assert validated == [True]
 
 
-def test_retired_deployment_owner_exits_cleanly_without_service_restart(
-    tmp_path,
-    monkeypatch,
-):
-    env_file = tmp_path / "agent.env"
-    env_file.write_text('REPO="o/r"\nFIX_BOT="fixer"\n')
-    monkeypatch.setenv("AGENT_ENV", str(env_file))
-    monkeypatch.setattr(
-        main_module, "acquire", lambda *_args, **_kwargs: object()
-    )
-    monkeypatch.setattr(
-        main_module,
-        "build_role",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RetiredOwnerError("old owner")
-        ),
-    )
-    monkeypatch.setattr(
-        main_module, "_recover_pre_adapter_processes", lambda *_args: ()
-    )
-
-    with pytest.raises(SystemExit) as stopped:
-        main_module.main(["fix"])
-    assert stopped.value.code is ExitCode.CLEAN
-
-
 def test_second_sigterm_escalates_to_transient_hard_exit():
     exits = []
     handler = main_module._TerminationHandler(exits.append)
@@ -217,11 +192,6 @@ def test_boot_recovery_is_explicitly_sequenced_before_readiness(
         "build_role",
         lambda *_args: events.append("build") or Daemon(),
     )
-    monkeypatch.setattr(
-        main_module,
-        "migrate_legacy_spend",
-        lambda *_args: events.append("migrate") or 0,
-    )
     monkeypatch.setattr(main_module, "SystemdNotifier", Notifier)
 
     main_module.main(["fix"])
@@ -230,7 +200,6 @@ def test_boot_recovery_is_explicitly_sequenced_before_readiness(
         "validate",
         ("preflight", RecoveryTrigger.BOOT),
         "build",
-        "migrate",
         ("reconcile", RecoveryTrigger.BOOT),
         "ready",
         "run",
@@ -273,9 +242,6 @@ def test_missing_recovery_trigger_withholds_readiness(tmp_path, monkeypatch):
         main_module, "_recover_pre_adapter_processes", lambda *_args: ()
     )
     monkeypatch.setattr(main_module, "build_role", lambda *_args: Daemon())
-    monkeypatch.setattr(
-        main_module, "migrate_legacy_spend", lambda *_args: 0
-    )
     monkeypatch.setattr(main_module, "SystemdNotifier", Notifier)
 
     with pytest.raises(SystemExit) as stopped:
@@ -330,9 +296,6 @@ def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
 
     monkeypatch.setattr(main_module, "build_role", lambda *_args: Daemon())
     monkeypatch.setattr(main_module, "from_env", lambda _env: Config())
-    monkeypatch.setattr(
-        main_module, "migrate_legacy_spend", lambda *_args: 0
-    )
     monkeypatch.setattr(main_module, "SystemdNotifier", Notifier)
     if failure_seam == "max_ticks":
         monkeypatch.setenv("ISSUE_AGENT_MAX_TICKS", "not-an-integer")

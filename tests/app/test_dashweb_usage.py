@@ -228,21 +228,37 @@ def test_codex_usage_reads_the_newest_rollout_end_to_end(tmp_path):
 # ── harness caps ──────────────────────────────────────────────────────────────
 def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
     from issue_agent.app import cli
-    from issue_agent.adapters.control_store import SQLiteControlStore
     from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from issue_agent.adapters.control_store import (
+        BudgetLimit, ReservationRequest, SQLiteControlStore, SettlementRequest,
+    )
+    from issue_agent.domain.contracts import BudgetScope, Money, PricingBasis, RunId
 
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
     (tmp_path / "repos").mkdir()
     (tmp_path / "repos" / "demo.env").write_text("REPO='o/r'\nDAILY_SPEND_CAP_USD=20\n")
-    ledger = tmp_path / "spend.jsonl"
-    ledger.write_text(
-        '{"ts": "2026-07-29T01:00:00+00:00", "event": "spend", "repo": "o/r", "issue": 1, "cost_usd": 1.5}\n'
-        '{"ts": "2026-07-29T02:00:00+00:00", "event": "spend", "repo": "o/other", "issue": 2, "cost_usd": 2.0}\n'
-        '{"ts": "2026-07-28T02:00:00+00:00", "event": "spend", "repo": "o/r", "issue": 1, "cost_usd": 9.0}\n'
-    )
-    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    clock = [datetime(2026, 7, 29, tzinfo=timezone.utc)]
+    control = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: clock[0])
     control.initialize()
-    control.import_legacy_spend(str(ledger))
+    settled = (("2026-07-29T01:00:00+00:00", "o/r", 1, 1_500_000),
+               ("2026-07-29T02:00:00+00:00", "o/other", 2, 2_000_000),
+               ("2026-07-28T02:00:00+00:00", "o/r", 1, 9_000_000))
+    for index, (stamp, repository, issue, micros) in enumerate(settled):
+        clock[0] = datetime.fromisoformat(stamp)
+        owner = f"{repository}:fix"
+        assert control.lease(repository, "fix", issue, owner)
+        scope = BudgetScope(repository, "repository", "USD", "all", datetime(2026, 1, 1, tzinfo=timezone.utc),
+                            datetime(2027, 1, 1, tzinfo=timezone.utc), ZoneInfo("UTC"))
+        run = RunId(f"leg-{index}")
+        assert control.reserve(ReservationRequest(
+            run, repository, "fix", "RESOLVE", owner, Money("USD", micros),
+            (BudgetLimit(scope, Money("USD", 10**9)),), issue, issue=issue,
+        )).admitted
+        assert control.settle(SettlementRequest(
+            run, Money("USD", micros), PricingBasis.PROVIDER_REPORTED, f"receipt-{index}", None, None, None,
+        )).disposition.value == "available"
     now = lambda: datetime(2026, 7, 29, 12, tzinfo=timezone.utc)  # noqa: E731
     def config_for(name):
         path = tmp_path / "repos" / f"{name}.env"

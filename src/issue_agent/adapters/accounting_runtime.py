@@ -15,9 +15,7 @@ from .runtime_plan import AgentRuntime, RuntimePlan
 from ..domain.contracts import (
     BudgetScope,
     Money,
-    PriceQuote,
     PricingBasis,
-    ReservationId,
     RunId,
     TokenUsage,
     UsageSource,
@@ -38,9 +36,7 @@ from ..domain.review import parse_verdict
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
-from ..domain.agent_task import run_input_fingerprint
 from .control_store import (
-    LEG_NAMESPACE,
     AccountingDisposition,
     BudgetLimit,
     ReservationRequest,
@@ -69,7 +65,6 @@ class AccountingRuntime(AgentRuntime):
     rate_table: RateTable | None = None
     spend_evidence_dir: str = ""
     owner_id: str = ""
-    require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, str, bool]
@@ -155,18 +150,12 @@ class AccountingRuntime(AgentRuntime):
         issue, kind, number, *_, head, _resumed = self._context.get()
         if self.role not in LEG_ROLES or issue is None or not kind:
             return
-        run_id = RunId(uuid.uuid4().hex)
-        dispatch_id = json.dumps({"repository": self.repository, "role": self.role, "kind": kind, "issue": issue,
-                                  "number": number, "head": head},
-                                 sort_keys=True, separators=(",", ":"))
         try:
-            self.store.start_run(run_id, dispatch_id, kind, self.owner_id or f"{self.repository}:{self.role}",
-                                 self.config_version)
-            if attempt is not None:
-                self.store.receipt(LEG_NAMESPACE, self.repository, str(run_id), {
-                    **attempt, "leg": LegClass.AGENT.value, "runtime": self.runtime_name,
-                })
-            self.store.complete_run(run_id, state="cancelled", outcome="admission_refused")
+            self.store.record_unpaid_leg(
+                RunId(uuid.uuid4().hex), repository=self.repository, role=self.role, kind=kind,
+                owner_id=self._owner(), issue=issue, number=number, head=head, runtime=self.runtime_name,
+                leg_class=LegClass.AGENT.value if attempt is not None else None, result=attempt,
+            )
         except Exception:  # noqa: BLE001 - the refusal itself must still return
             pass
 
@@ -190,7 +179,7 @@ class AccountingRuntime(AgentRuntime):
         if self.issue_cap is not None and issue is None:
             return self._blocked("issue spend scope is unavailable")
         limits = list(self._limits(now, issue))
-        primary, *additional = limits
+        primary = limits[0]
         budget_kind = kind or ""
         try:
             maximum = self.budget_policy.maximum_for(
@@ -206,54 +195,36 @@ class AccountingRuntime(AgentRuntime):
             )
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
-        dispatch_id = json.dumps(
-            {
-                "repository": self.repository,
-                "role": self.role,
-                "kind": kind or "unknown",
-                "leg_id": _leg_id or str(run_id),
-                "runtime": self.runtime_name,
-                "effort": task.effort.value if task.effort is not None else None,
-                "input_fingerprint": run_input_fingerprint(task.intent),
-                "number": number,
-                "issue": issue,
-                # The PR head the leg was decided on: attempt counting keys
-                # REVIEW legs to it (refactor decision Q21).
-                "head": head,
-                "claim_target": target,
-                "cwd": (
-                    str(Path(task.cwd).resolve())
-                    if task.cwd is not None
-                    else ""
-                ),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         reserved_model = task.model or "<runtime-default>"
         request = ReservationRequest(
-            ReservationId(uuid.uuid4().hex),
             run_id,
-            dispatch_id,
-            primary.scope,
-            PriceQuote(
-                reserved_model,
-                "task-budget",
-                self.config_version,
-                now,
-                maximum,
-            ),
-            primary.cap,
-            self.config_version,
             self.repository,
-            tuple(additional),
+            self.role,
             kind or "paid",
-            self.owner_id or f"{self.repository}:{self.role}",
+            self._owner(),
+            maximum,
+            tuple(limits),
+            lease_target=target,
+            issue=issue,
+            number=number,
+            # The PR head the leg was decided on: attempt counting keys REVIEW
+            # legs to it (refactor decision Q21).
+            head=head,
+            runtime=self.runtime_name,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
-        # The daemon itself must not be registered as the reservation lease:
+        # The daemon itself must not be registered as the leg's process:
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
+        if reservation.disposition is AccountingDisposition.CONFLICT:
+            self.record_refused_leg()
+            return AgentResult(
+                is_error=True,
+                status="dispatch_claim_unavailable",
+                envelope_subtype="dispatch_claim_unavailable",
+                summary=f"paid admission refused: {reservation.detail}",
+                exit_reason=ExitReason.AGENT_ERROR,
+            )
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             # A fix refusal buys nothing; its zero-cost row spaces the retry.
             self.record_refused_leg()
@@ -271,27 +242,6 @@ class AccountingRuntime(AgentRuntime):
                     f"{reservation.disposition.value} ({reservation.detail})"
                 ),
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
-            )
-        if self.require_dispatch_claim and not self.store.bind_dispatch_claim(
-            self.repository,
-            self.role,
-            target,
-            request.owner_id,
-            run_id,
-        ):
-            released = self.store.release(
-                run_id,
-                "dispatch_claim_binding_unavailable",
-            )
-            return AgentResult(
-                is_error=True,
-                status="dispatch_claim_unavailable",
-                envelope_subtype="dispatch_claim_unavailable",
-                summary=(
-                    "paid admission cancelled: its global target/path claim "
-                    f"could not be bound ({released.disposition.value})"
-                ),
-                exit_reason=ExitReason.AGENT_ERROR,
             )
         authority = {
             "ISSUE_AGENT_RUN_ID": str(run_id),
@@ -315,10 +265,7 @@ class AccountingRuntime(AgentRuntime):
             # without this receipt (died, reclaimed, refused) is a machine end.
             leg = classify_leg(result, resumed=resumed)
             verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
-            self.store.receipt(LEG_NAMESPACE, self.repository, str(run_id), {
-                "leg": leg.value,
-                "session": resumable_session(result),
-                "runtime": self.runtime_name,
+            self.store.record_result(run_id, leg.value, session=resumable_session(result) or "", result={
                 # The PR body the harness opens a RESOLVE's branch with (Q11).
                 "summary": (result.summary or "")[:_SUMMARY_LIMIT],
                 # The question the QUESTION stop comment embeds: recorded with
@@ -329,6 +276,9 @@ class AccountingRuntime(AgentRuntime):
                 **({"verdict": {"event": verdict.event, "body": verdict.body}} if verdict is not None else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result)
+
+    def _owner(self) -> str:
+        return self.owner_id or f"{self.repository}:{self.role}"
 
     def _blocked(self, detail: str) -> AgentResult:
         self.record_refused_leg()

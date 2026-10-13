@@ -54,7 +54,8 @@ class CodexSpendReconciler:
                 amount = price_run_usage(native, rates)
                 if amount.micros > 2**63 - 1:
                     return self._unavailable(run_id, "request prices exceed SQLite's money bound; unusable requests charged zero")
-                remetered = NativeFailure.parse(evidence.get("native_usage_failure")) if isinstance(native, MeasuredRunUsage) else None
+                if isinstance(native, MeasuredRunUsage):
+                    NativeFailure.parse(evidence.get("native_usage_failure"))
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 return self._unavailable(run_id, "Codex recovery evidence is malformed or unpriceable")
             request = SettlementRequest(
@@ -68,8 +69,7 @@ class CodexSpendReconciler:
                 native.detail if isinstance(native, EstimatedRunUsage) else "",
                 ChargeOrigin.RECOVERY_ESTIMATE,
             )
-            result = (self.store.settle(request) if remetered is None
-                      else self.store.settle_remetered(request, remetered))
+            result = self.store.settle(request)
             if result.disposition is not AccountingDisposition.AVAILABLE:
                 return self._unavailable(run_id, "Codex measured recovery settlement was refused")
             remove_spend_evidence(directory, run_id)
@@ -80,21 +80,7 @@ class CodexSpendReconciler:
         return self.store.settle_terminal_estimate(run_id, reason)
 
     def _belongs_to_codex(self, run_id: RunId) -> bool:
-        with self.store.transaction() as db:
-            row = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
-        if row is None:
-            return False
-        try:
-            metadata = json.loads(row["dispatch_id"])
-        except (TypeError, ValueError):
-            metadata = None
-        runtime = metadata.get("runtime") if isinstance(metadata, dict) else None
-        if runtime in ("claude", "glm", "codex"):
-            return runtime == "codex"
-        # Older runs lack structured dispatch metadata. A per-run file in
-        # this harness-owned Codex directory establishes only its provider,
-        # never usable counters from malformed content.
-        return any(os.path.isfile(spend_evidence_path(directory, str(run_id))) for directory in self.evidence_dirs if directory)
+        return self.store.leg_runtime(run_id) == "codex"
 
     def _read(self, directory: str, run_id: RunId) -> dict | None:
         if not directory:

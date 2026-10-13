@@ -49,7 +49,7 @@ class ProcessSupervisor(Protocol):
 
 class RecoveryLease(Protocol):
     @property
-    def run_id(self) -> RunId: ...
+    def run_id(self) -> RunId | None: ...
 
 
 class RecoveryDisposition(Protocol):
@@ -78,15 +78,9 @@ class RecoveryControl(Protocol):
     def stale_active_reservation_runs(
         self, owner_id: str, created_before: datetime
     ) -> tuple[RunId, ...]: ...
-    def leases(self, owner_id: str) -> tuple[RecoveryLease, ...]: ...
+    def leases(self) -> tuple[RecoveryLease, ...]: ...
     def release_unlaunched(
         self, run_id: RunId, reason: str
-    ) -> RecoveryRelease: ...
-    def release_retained(
-        self,
-        run_id: RunId,
-        reason: str,
-        retained_before: datetime,
     ) -> RecoveryRelease: ...
 
 
