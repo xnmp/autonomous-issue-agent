@@ -55,7 +55,6 @@ import {
   ErrorBanner,
   GhUnavailableChip,
   SkeletonRows,
-  SectionTitle,
   StoreUnavailable,
   ReadingGitHub,
   WarningList,
@@ -262,7 +261,6 @@ export function IssuesTab({
 
       {sub === "done" && hasMatches ? (
         <>
-          <SectionTitle>Done</SectionTitle>
           {data?.merged_partial ? (
             <p className="muted">Showing only the newest merged PRs; older merges are not counted.</p>
           ) : null}
