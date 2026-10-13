@@ -273,6 +273,8 @@ def test_a_replayed_reservation_is_idempotent_and_a_different_one_conflicts(tmp_
 
     assert _reserve(store, 1).disposition is AccountingDisposition.AVAILABLE
     assert _reserve(store, 1, maximum=50).disposition is AccountingDisposition.CONFLICT
+    # One held item lease carries one leg: a second leg on the same item is refused.
+    assert _reserve(store, 2, lease_target=1, cap=1_000).disposition is AccountingDisposition.CONFLICT
     assert store.snapshot(_daily()).reserved == Money("USD", 60)
 
 

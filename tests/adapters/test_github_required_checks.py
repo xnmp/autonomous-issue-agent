@@ -78,6 +78,15 @@ def test_unprotected_summary_with_absent_protection_is_an_observed_empty_policy(
     assert isinstance(ci, Observed) and not ci.policy
 
 
+def test_same_named_checks_from_different_apps_are_kept_as_distinct_reports():
+    # One app's newer success must not shadow another app's failure of the same name.
+    failing = report(id="b", databaseId=2, conclusion="FAILURE", isRequired=False,
+                     checkSuite={"app": {"databaseId": 2}, "workflowRun": None})
+    ci = gateway(branch={"protected": False}, pages=[page([report(isRequired=False), failing])]).get_pr(3).ci
+    assert isinstance(ci, Observed)
+    assert sorted(check.app_id for check in ci.reports) == [1, 2]
+
+
 @pytest.mark.parametrize("pages", [[], None, [{}], [page([None])], [page([report(isRequired=None)])],
     [page([report()], more=True, cursor="next", total=2)], [page([report()], total=2)],
     [page([report()], head="changed")], [page([report()], revision="other")],

@@ -94,3 +94,14 @@ def test_the_read_only_view_refuses_every_write_path(store):
             view.lease("o/r", "fix", 1, "o/r:fix")
         with pytest.raises(sqlite3.OperationalError):
             view.query("DELETE FROM legs")
+
+
+def test_the_read_only_view_refuses_writes_through_each_of_its_two_guards(store):
+    with ReadOnlyControlStore(str(store)) as view:
+        # query_only: even the private temp schema, which a mode=ro file allows, is refused.
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            view.query("CREATE TEMP TABLE scratch(x)")
+        # mode=ro: with query_only lifted, the file itself still cannot be written.
+        view.query("PRAGMA query_only=OFF")
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            view.query("DELETE FROM legs")

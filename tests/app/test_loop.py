@@ -460,6 +460,35 @@ def test_suspend_recovery_waits_for_active_dispatch_owner():
     assert recoveries == [RecoveryTrigger.WAKE]
 
 
+def test_a_late_tick_without_suspension_is_productive_not_a_wake():
+    # A long synchronous leg outruns the poll interval on both clocks: no
+    # wall time went unexplained, so nothing was suspended.
+    recoveries, logs = [], []
+    d, _ = _daemon(lambda w: [], logs=logs)
+    d.reconcile = recoveries.append
+    wall, active = iter([0, 0, 240, 300]), iter([0, 0, 240, 300])
+    d.run_forever(sleep=lambda _s: None, now=lambda: next(wall), active_now=lambda: next(active), max_ticks=3)
+    assert RecoveryTrigger.WAKE not in recoveries
+    assert not any("woke" in m for m in logs)
+
+
+def test_a_second_dispatch_for_a_running_target_is_not_submitted():
+    release, started = threading.Event(), []
+
+    def run_agent(action):
+        started.append(action.number)
+        assert release.wait(timeout=5)
+
+    d = Daemon("fix", lambda: WorldState(), lambda _w: [RunAgent(AgentKind.RESOLVE, 7)] * 2,
+               Executor(FakeGateway(), run_agent=run_agent), poll_seconds=1, dispatch_capacity=2)
+    try:
+        assert d.tick() == [RunAgent(AgentKind.RESOLVE, 7)]
+    finally:
+        release.set()
+        d.wait_for_dispatches()
+    assert started == [7]
+
+
 def test_reservation_sweep_runs_on_bounded_tick_cadence():
     sweeps = []
     daemon = Daemon("fix", lambda: WorldState(), lambda _world: [], Executor(FakeGateway()), poll_seconds=1,
