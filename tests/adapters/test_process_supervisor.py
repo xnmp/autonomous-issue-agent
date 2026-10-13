@@ -450,7 +450,8 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
 
     supervisor.kill_tree(run_id)
     _wait_dead(process)
-    store.release(run_id, "test complete")
+    assert store.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
+    assert store.settle_terminal_estimate(run_id, "test complete")
     assert store.leases() == ()
 
 
@@ -500,7 +501,8 @@ def test_supervised_paid_command_scrubs_authority_from_the_target_environment(
     }
 
     supervisor.kill_tree(run_id)
-    store.release(run_id, "test complete")
+    assert store.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
+    assert store.settle_terminal_estimate(run_id, "test complete")
     assert store.leases() == ()
 
 

@@ -82,12 +82,6 @@ class RecoveryControl(Protocol):
     def release_unlaunched(
         self, run_id: RunId, reason: str
     ) -> RecoveryRelease: ...
-    def release_retained(
-        self,
-        run_id: RunId,
-        reason: str,
-        retained_before: datetime,
-    ) -> RecoveryRelease: ...
 
 
 class SpendReconciler(Protocol):

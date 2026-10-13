@@ -28,7 +28,6 @@ class ReservationRecoveryAction(str, Enum):
     PRESERVE = "preserve"
     RECONCILE_SPEND = "reconcile_spend"
     RELEASE_UNLAUNCHED = "release_unlaunched"
-    RELEASE_RETAINED = "release_retained"
     COMPLETE = "complete"
 
 
@@ -39,20 +38,15 @@ class ReservationRecoveryState:
     lease: LeaseEvidence
     spend: SpendEvidence = SpendEvidence.UNCHECKED
     unlaunched_release: ReleaseEvidence = ReleaseEvidence.UNCHECKED
-    retained_release: ReleaseEvidence = ReleaseEvidence.UNCHECKED
 
     def __post_init__(self) -> None:
         if (
             not isinstance(self.lease, LeaseEvidence)
             or not isinstance(self.spend, SpendEvidence)
             or not isinstance(self.unlaunched_release, ReleaseEvidence)
-            or not isinstance(self.retained_release, ReleaseEvidence)
         ):
             raise TypeError("reservation recovery evidence must use enums")
-        releases_unchecked = (
-            self.unlaunched_release is ReleaseEvidence.UNCHECKED
-            and self.retained_release is ReleaseEvidence.UNCHECKED
-        )
+        releases_unchecked = self.unlaunched_release is ReleaseEvidence.UNCHECKED
         if self.lease is LeaseEvidence.LIVE and (
             self.spend is not SpendEvidence.UNCHECKED
             or not releases_unchecked
@@ -65,13 +59,6 @@ class ReservationRecoveryState:
             and not releases_unchecked
         ):
             raise ValueError("release evidence requires indeterminate spend")
-        if (
-            self.retained_release is not ReleaseEvidence.UNCHECKED
-            and self.unlaunched_release is not ReleaseEvidence.INELIGIBLE
-        ):
-            raise ValueError(
-                "retained release requires an ineligible unlaunched release"
-            )
 
     @classmethod
     def observed(
@@ -126,25 +113,6 @@ class ReservationRecoveryState:
             ),
         )
 
-    def after_retained_release(
-        self,
-        *,
-        released: bool,
-    ) -> ReservationRecoveryState:
-        if (
-            self.unlaunched_release is not ReleaseEvidence.INELIGIBLE
-            or self.retained_release is not ReleaseEvidence.UNCHECKED
-        ):
-            raise ValueError("retained release is out of recovery order")
-        return replace(
-            self,
-            retained_release=(
-                ReleaseEvidence.RELEASED
-                if released
-                else ReleaseEvidence.INELIGIBLE
-            ),
-        )
-
 
 @dataclass(frozen=True)
 class ReservationRecoveryDecision:
@@ -169,18 +137,10 @@ def decide_reservation_recovery(
         return ReservationRecoveryDecision(
             ReservationRecoveryAction.RELEASE_UNLAUNCHED
         )
-    if state.unlaunched_release is ReleaseEvidence.RELEASED:
-        return ReservationRecoveryDecision(
-            ReservationRecoveryAction.COMPLETE,
-            report_spend_unknown=True,
-        )
-    if state.retained_release is ReleaseEvidence.UNCHECKED:
-        return ReservationRecoveryDecision(
-            ReservationRecoveryAction.RELEASE_RETAINED
-        )
+    # An ended, lease-free leg settles (at a zero estimate if nothing else)
+    # inside RECONCILE_SPEND, so a leg still indeterminate here is one whose
+    # release proof failed: it keeps its reservation for the next sweep.
     return ReservationRecoveryDecision(
         ReservationRecoveryAction.COMPLETE,
-        report_spend_unknown=(
-            state.retained_release is ReleaseEvidence.RELEASED
-        ),
+        report_spend_unknown=state.unlaunched_release is ReleaseEvidence.RELEASED,
     )

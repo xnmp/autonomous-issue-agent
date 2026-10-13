@@ -58,6 +58,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.contracts import (
     BudgetScope,
+    ChargeOrigin,
     Money,
     PricingBasis,
     RunId,
@@ -261,7 +262,7 @@ def test_a_repointed_deployment_recovers_its_predecessors_dead_leg(tmp_path) -> 
     assert adopted.path == store.path
     assert adopted.reclaim_dead_leases(current_owner, lambda _pid, _ticks: False) == (run_id,)
     assert adopted.active_reservation_runs(current_owner) == (run_id,)
-    assert adopted.release(run_id, "spend_unknown").disposition.value == "available"
+    assert adopted.settle_terminal_estimate(run_id, "spend_unknown")
     assert adopted.lease("o/r", "fix", 7, current_owner)
 
 
@@ -327,10 +328,50 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
     )()
 
     assert control.active_reservation_runs("o/r:fix") == ()
-    assert control.leases("o/r:fix") == ()
+    assert control.leases() == ()
     assert control.snapshot(scope).settled == Money("USD", 250)
     assert not control.has_cancellation_intent(run_id)
     assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
+
+
+def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(tmp_path):
+    # Its rollout may become readable only after the process group is
+    # reaped: settling it at a zero estimate during shutdown could never be
+    # corrected by the measured recovery that follows.
+    from issue_agent.adapters.spend_recovery import CodexSpendReconciler
+
+    now = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+    control = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: now)
+    control.initialize()
+    run_id = RunId("killed-at-shutdown")
+    assert control.lease("o/r", "fix", 42, "o/r:fix")
+    assert control.reserve(ReservationRequest(
+        run_id, "o/r", "fix", "RESOLVE", "o/r:fix", Money("USD", 1_000),
+        (BudgetLimit(_daily(now), Money("USD", 2_000)),), 42, issue=42, runtime="codex",
+    )).admitted
+    control.register_process_lease(
+        run_id, expected_owner_id="o/r:fix", pid=999_999, pgid=999_999, process_start_ticks=1,
+    )
+    _shutdown_prepare(control, owner_id="o/r:fix")()
+    control.unlease("o/r", "fix", 42, "o/r:fix")  # the role's `finally` after the cancelled leg
+
+    _shutdown_terminalize(
+        control, CodexSpendReconciler(control, (str(tmp_path / "unreadable-yet"),)),
+        owner_id="o/r:fix", state_dir=str(tmp_path / "state"), role="fix",
+    )()
+
+    assert control.active_reservation_runs("o/r:fix") == (run_id,)
+    assert [lease.run_id for lease in control.leases()] == [run_id]
+    assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
+    # Boot: the group is reaped, its lease reclaimed, and the measured
+    # rollout settles the leg.
+    assert control.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)
+    measured = control.settle(SettlementRequest(
+        run_id, Money("USD", 250), PricingBasis.RECONCILED, "codex-recovered:s:killed", None, None, None,
+        origin=ChargeOrigin.RECOVERY_ESTIMATE,
+    ))
+    assert measured.disposition is AccountingDisposition.AVAILABLE
+    assert control.snapshot(_daily(now)).settled == Money("USD", 250)
 
 
 class FakeWorktrees:

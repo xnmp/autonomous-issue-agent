@@ -211,7 +211,6 @@ class AccountingRuntime(AgentRuntime):
             # legs to it (refactor decision Q21).
             head=head,
             runtime=self.runtime_name,
-            model=reserved_model,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the leg's process:

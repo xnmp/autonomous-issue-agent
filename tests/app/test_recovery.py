@@ -73,8 +73,6 @@ class _Control:
     def settle_terminal_estimate(self, run_id, reason):
         return False
 
-    def release_retained(self, _run_id, _reason, _retained_before):
-        return _Release(_Disposition("conflict"))
 
 
 
@@ -328,7 +326,7 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
 
     assert report.reclaimed_leases == ()
     assert store.active_reservation_runs(OWNER) == (run_id,)
-    assert tuple(lease.run_id for lease in store.leases(OWNER)) == (run_id,)
+    assert tuple(lease.run_id for lease in store.leases()) == (run_id,)
     settled = store.settle(
         SettlementRequest(
             run_id,
@@ -427,7 +425,7 @@ def test_a_stale_reserved_leg_holding_its_live_lease_is_never_released(tmp_path)
 
     assert report.spend_unknown == ()
     assert store.active_reservation_runs(OWNER) == (run_id,)
-    assert tuple(lease.run_id for lease in store.leases(OWNER)) == (run_id,)
+    assert tuple(lease.run_id for lease in store.leases()) == (run_id,)
     store.register_process_lease(
         run_id, expected_owner_id=OWNER, pid=os.getpid(), pgid=os.getpgid(0),
         process_start_ticks=ProcessSupervisor.process_identity(os.getpid()).start_ticks,

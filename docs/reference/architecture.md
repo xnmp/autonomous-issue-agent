@@ -102,7 +102,7 @@ keys, in three tables (`adapters/control_store.py`, `PRAGMA user_version` 1;
 no migration history and no digest pins):
 
 - `legs` — one row per leg, paid or refused: identity (repository, role, kind,
-  issue, item number, head, owner, runtime, model), lifecycle
+  issue, item number, head, owner, runtime), lifecycle
   `state ∈ reserved | running | ended | released` with `reserved_at`,
   `started_at`, `ended_at` and `end_reason`, the money (reserved maximum,
   charged micros, basis, origin, usage, rate card, `provider_receipt_id`
@@ -116,13 +116,17 @@ no migration history and no digest pins):
   leg (set by `reserve` in the reservation's transaction), and the holding
   process (pid, pgid, start ticks). The claiming daemon holds it until the
   leg's child registers its own process group. A lease is live while its
-  bound leg is unsettled and not ended, or while its process is alive.
+  bound leg is unsettled and not ended, or while its process is alive. A
+  role releasing its claim leaves a still-unsettled leg's lease in place, so
+  a leg killed at shutdown is settled by boot recovery after the reap, from
+  usage that may only then be readable, never at a premature zero.
 - `idempotency` — keyed writes (`fix-comment:{repository}:{key}`), claimed
   before the effect and confirmed after its read-back.
 
 Caps are sums over `legs` by scope dimension: a repository's day, every
 repository's day (`global`), or one issue's lifetime (`issue:<n>`), counting
-settled charges and the reserved maximum of unsettled legs. Attempts and
+settled charges and the reserved maximum of unsettled legs. A missing store
+is recreated only where none was ever used (ADR 0003). Attempts and
 machine backoff derive from ended legs (`leg_runs`); ties on `ended_at`
 resolve in recorded order. Recovery kills registered orphan trees, reclaims
 dead leases of the daemon's repository and role (so a repointed checkout
@@ -138,7 +142,8 @@ naming each and its owner. Otherwise, under `BEGIN EXCLUSIVE` with rollback
 journaling, it writes a new file beside the old one carrying every settled
 charge as a `role='carried'` ended leg (repository, issue, reservation time,
 charge, basis, rate card, receipt) and the `fix-comment` idempotency keys,
-verifies the carried count and sum, hard-links the old file to
+verifies the carried count and sum and that every charge each legacy cap
+scope counted is still counted by that scope, hard-links the old file to
 `control.db.retired-v<N>-<UTC stamp>` (never read again) and atomically
 renames the new file into place. A crash leaves either the old file intact
 (the next boot repeats the cutover) or the new file complete. Carried legs

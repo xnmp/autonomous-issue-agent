@@ -46,20 +46,16 @@ def test_unlaunched_release_reports_unknown_spend_and_abandonment() -> None:
     assert decision.report_spend_unknown is True
 
 
-def test_retained_release_is_tried_only_after_unlaunched_conflict() -> None:
+def test_an_unreleasable_indeterminate_leg_keeps_its_reservation_without_reporting() -> None:
     state = ReservationRecoveryState.observed(
         live_lease=False,
         lease_reclaimed=False,
     ).after_spend_reconciliation(settled=False)
-    state = state.after_unlaunched_release(released=False)
 
-    assert _action(state) is ReservationRecoveryAction.RELEASE_RETAINED
+    decision = decide_reservation_recovery(state.after_unlaunched_release(released=False))
 
-    decision = decide_reservation_recovery(
-        state.after_retained_release(released=True)
-    )
     assert decision.action is ReservationRecoveryAction.COMPLETE
-    assert decision.report_spend_unknown is True
+    assert decision.report_spend_unknown is False
 
 
 def test_reclaimed_settled_run_records_only_abandonment() -> None:
@@ -86,7 +82,7 @@ def test_impossible_evidence_order_is_rejected() -> None:
         lease_reclaimed=False,
     )
     with pytest.raises(ValueError, match="out of recovery order"):
-        state.after_retained_release(released=True)
+        state.after_unlaunched_release(released=True)
 
     with pytest.raises(TypeError, match="evidence must use enums"):
         ReservationRecoveryState(cast(Any, "live"))

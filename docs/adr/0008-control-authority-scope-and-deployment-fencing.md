@@ -16,10 +16,12 @@ remote target concurrently.
 The operating-system account has one canonical SQLite control authority at
 `~/.local/state/issue-agent-control/control.db`, independent of repository
 `STATE_DIR` paths. A discovered legacy deployment-local database is a startup
-conflict, not an empty replacement authority. (The authority witness that
-made a deleted database fail closed was retired with the 3-table store in
-slice 5d-2: a missing store is created empty, so its loss is an operator
-restore, not a fenced state.)
+conflict, not an empty replacement authority. A missing canonical store is
+recreated only where none was ever used; the files a prior store leaves beside
+it (its `.initialize.lock`, `-wal`/`-shm`, `.retired-v*`, the previous
+release's `.authority` witness) make its loss a startup refusal naming them,
+so caps never silently reset (ADR 0003). The dedicated witness file was
+retired with the 3-table store in slice 5d-2.
 
 Repository names are canonicalized and every role/check-out has a stable
 deployment owner identity, recorded on each leg and lease. Shutdown cancels

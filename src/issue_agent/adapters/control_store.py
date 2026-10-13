@@ -51,8 +51,6 @@ DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _PAID_ROLES = ("fix", "review")
 # Legs copied from the legacy store at cutover: money only, never a leg derive
 # counts (attempts restart at the cutover; GitHub carries the rest).
-CARRIED_ROLE = "carried"
-_LEASE_RELEASED = "lease released before settlement"
 
 
 class ControlStoreError(RuntimeError):
@@ -148,12 +146,11 @@ class ReservationRequest:
     owner_id: str
     maximum: Money
     limits: tuple[BudgetLimit, ...]
-    lease_target: int | None
+    lease_target: int
     issue: int | None = None
     number: int = 0
     head: str = ""
     runtime: str = ""
-    model: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "repository", canonical_repository(self.repository))
@@ -165,6 +162,8 @@ class ReservationRequest:
             raise ValueError("a reservation needs at least one limit")
         if any(limit.scope.currency != self.maximum.currency for limit in self.limits):
             raise ValueError("all reservation limits must use the reservation's currency")
+        if type(self.lease_target) is not int or self.lease_target == 0:
+            raise ValueError("a paid leg binds to a held item lease")
         if self.issue is not None and (type(self.issue) is not int or self.issue <= 0):
             raise ValueError("a leg's issue is a positive number")
         if type(self.number) is not int or self.number < 0:
@@ -192,7 +191,6 @@ class SettlementResult:
     disposition: AccountingDisposition
     amount: Money
     idempotent: bool = False
-    variance: Money | None = None
     detail: str = ""
 
 
@@ -239,7 +237,6 @@ _DDL = (
     head TEXT NOT NULL DEFAULT '',
     owner TEXT NOT NULL CHECK (owner <> ''),
     runtime TEXT NOT NULL DEFAULT '',
-    model TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL CHECK (state IN ('reserved', 'running', 'ended', 'released')),
     reserved_at TEXT NOT NULL,
     started_at TEXT,
@@ -372,10 +369,13 @@ class SQLiteControlStore:
         parent = os.path.dirname(self.path)
         os.makedirs(parent, mode=0o700, exist_ok=True)
         os.chmod(parent, stat.S_IRWXU)
+        # Probed before the lock is taken (taking it creates the file).
+        opened_before = os.path.lexists(f"{self.path}.initialize.lock")
         with self._initialization_lock():
             try:
                 metadata = os.stat(self.path, follow_symlinks=False)
             except FileNotFoundError:
+                _refuse_prior_use(self.path, opened_before)
                 _create(self.path)
             else:
                 if not stat.S_ISREG(metadata.st_mode):
@@ -502,29 +502,26 @@ class SQLiteControlStore:
                             f"exceeds {limit.scope.dimension} cap",
                             limit.cap, limit.scope.dimension,
                         )
-                if request.lease_target is not None:
-                    lease = db.execute(
-                        "SELECT leg_id FROM leases WHERE repository=? AND role=? AND target=? AND owner=?",
-                        (request.repository, request.role, request.lease_target, request.owner_id),
-                    ).fetchone()
-                    if lease is None or lease["leg_id"] is not None:
-                        return result(AccountingDisposition.CONFLICT, committed,
-                                      "the leg's item lease is not held")
+                lease = db.execute(
+                    "SELECT leg_id FROM leases WHERE repository=? AND role=? AND target=? AND owner=?",
+                    (request.repository, request.role, request.lease_target, request.owner_id),
+                ).fetchone()
+                if lease is None or lease["leg_id"] is not None:
+                    return result(AccountingDisposition.CONFLICT, committed,
+                                  "the leg's item lease is not held")
                 db.execute(
                     "INSERT INTO legs(leg_id, repository, role, kind, issue, number, head, owner, "
-                    "runtime, model, state, reserved_at, currency, reserved_micros) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)",
+                    "runtime, state, reserved_at, currency, reserved_micros) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)",
                     (str(request.run_id), request.repository, request.role, request.kind,
                      request.issue, request.number, request.head, request.owner_id,
-                     request.runtime, request.model, self._stamp_now(), requested.currency,
-                     requested.micros),
+                     request.runtime, self._stamp_now(), requested.currency, requested.micros),
                 )
-                if request.lease_target is not None:
-                    db.execute(
-                        "UPDATE leases SET leg_id=? WHERE repository=? AND role=? AND target=? AND owner=?",
-                        (str(request.run_id), request.repository, request.role,
-                         request.lease_target, request.owner_id),
-                    )
+                db.execute(
+                    "UPDATE leases SET leg_id=? WHERE repository=? AND role=? AND target=? AND owner=?",
+                    (str(request.run_id), request.repository, request.role,
+                     request.lease_target, request.owner_id),
+                )
                 return result(AccountingDisposition.AVAILABLE, committed + requested)
         except CorruptControlStore as exc:
             return result(AccountingDisposition.CORRUPT, zero, str(exc))
@@ -573,14 +570,9 @@ class SQLiteControlStore:
             if leg["origin"] != ChargeOrigin.RECOVERY_ESTIMATE.value or recovery:
                 return SettlementResult(AccountingDisposition.CONFLICT, request.amount,
                                         detail="conflicting settlement receipt")
-        elif leg["state"] == "released" and (leg["started_at"] is None or recovery):
+        elif leg["state"] == "released":
             return SettlementResult(AccountingDisposition.CONFLICT, request.amount,
                                     detail="reservation is already released")
-        maximum = int(leg["reserved_micros"])
-        variance = (
-            Money(request.amount.currency, request.amount.micros - maximum)
-            if request.amount.micros > maximum else None
-        )
         settled_at = self._stamp_now()
         db.execute(
             "UPDATE legs SET state='ended', charged_micros=?, basis=?, origin=?, usage_json=?, "
@@ -591,7 +583,7 @@ class SQLiteControlStore:
              settled_at, settled_at, str(request.run_id)),
         )
         db.execute("DELETE FROM leases WHERE leg_id=?", (str(request.run_id),))
-        return SettlementResult(AccountingDisposition.AVAILABLE, request.amount, variance=variance)
+        return SettlementResult(AccountingDisposition.AVAILABLE, request.amount)
 
     def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool:
         """Settle an ended, unsettled leg at zero (ESTIMATE): its process is
@@ -614,58 +606,31 @@ class SQLiteControlStore:
             ))
             return result.disposition is AccountingDisposition.AVAILABLE
 
-    def release(self, run_id: RunId, reason: str) -> ReleaseResult:
-        """Return an unsettled leg's reservation: it charges nothing."""
-        if not reason:
-            raise ValueError("reservation release reason is required")
-        with self._transaction() as db:
-            return self._release(db, run_id, reason, _UNSETTLED)
-
     def release_unlaunched(self, run_id: RunId, reason: str) -> ReleaseResult:
-        """Release only a leg whose process never registered (still `reserved`)."""
+        """Return the reservation of a leg whose process never registered
+        (still `reserved`): it charges nothing. Running work is never
+        released; it settles from evidence or a zero estimate once ended."""
         if not reason:
             raise ValueError("reservation release reason is required")
         with self._transaction() as db:
-            return self._release(db, run_id, reason, "state='reserved'")
-
-    def release_retained(self, run_id: RunId, reason: str, retained_before: datetime) -> ReleaseResult:
-        """Release an ended, unmeasured leg once its reconciliation grace passed."""
-        if not reason:
-            raise ValueError("retained reservation release reason is required")
-        with self._transaction() as db:
-            return self._release(
-                db, run_id, reason,
-                "state='running' AND ended_at IS NOT NULL AND ended_at<=? "
-                "AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.leg_id=legs.leg_id)",
-                (_stamp(retained_before),),
+            row = db.execute("SELECT state, end_reason FROM legs WHERE leg_id=?", (str(run_id),)).fetchone()
+            if row is None:
+                return ReleaseResult(AccountingDisposition.CONFLICT, run_id, detail="leg has no reservation")
+            if row["state"] == "released":
+                identical = row["end_reason"] == reason
+                return ReleaseResult(
+                    AccountingDisposition.AVAILABLE if identical else AccountingDisposition.CONFLICT,
+                    run_id, idempotent=identical, detail="" if identical else "conflicting release reason",
+                )
+            if row["state"] != "reserved":
+                return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
+                                     detail=f"a {row['state']} leg is not eligible for this release")
+            db.execute(
+                "UPDATE legs SET state='released', end_reason=?, ended_at=COALESCE(ended_at, ?) WHERE leg_id=?",
+                (reason, self._stamp_now(), str(run_id)),
             )
-
-    def _release(
-        self, db: sqlite3.Connection, run_id: RunId, reason: str, eligible: str,
-        parameters: tuple[object, ...] = (),
-    ) -> ReleaseResult:
-        row = db.execute(
-            f"SELECT state, end_reason, ({eligible}) AS eligible FROM legs WHERE leg_id=?",
-            (*parameters, str(run_id)),
-        ).fetchone()
-        if row is None:
-            return ReleaseResult(AccountingDisposition.CONFLICT, run_id, detail="leg has no reservation")
-        if row["state"] == "released":
-            identical = row["end_reason"] == reason
-            return ReleaseResult(
-                AccountingDisposition.AVAILABLE if identical else AccountingDisposition.CONFLICT,
-                run_id, idempotent=identical, detail="" if identical else "conflicting release reason",
-            )
-        if not row["eligible"]:
-            return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
-                                 detail=f"a {row['state']} leg is not eligible for this release")
-        now = self._stamp_now()
-        db.execute(
-            "UPDATE legs SET state='released', end_reason=?, ended_at=COALESCE(ended_at, ?) WHERE leg_id=?",
-            (reason, now, str(run_id)),
-        )
-        db.execute("DELETE FROM leases WHERE leg_id=?", (str(run_id),))
-        return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
+            db.execute("DELETE FROM leases WHERE leg_id=?", (str(run_id),))
+            return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def record_reservation_retained(self, run_id: RunId, reason: str) -> bool:
         """End a leg whose spend is uncertain, keeping its reservation for recovery."""
@@ -717,22 +682,29 @@ class SQLiteControlStore:
         return str(row["runtime"]) if row is not None else None
 
     def record_owned_cancellation_intents(self, owner_id: str, reason: str) -> tuple[RunCancellationIntent, ...]:
-        """Mark this deployment's unsettled legs as stopped by shutdown.
+        """Mark this deployment's in-flight legs as stopped by shutdown, and
+        return every unsettled leg shutdown stopped (including ones that have
+        ended since).
 
         A killed provider process can leave usage that becomes readable only
         after it is reaped, so the reservation stays until post-kill or boot
         recovery settles that evidence.
+
+        The intent is `end_reason` set while `ended_at` is not: every other
+        writer of `end_reason` (retention, reclaim, release) sets `ended_at` in
+        the same statement, so the two states cannot be confused.
         """
         if not owner_id or not reason:
             raise ValueError("run owner and cancellation reason are required")
         with self._transaction() as db:
             db.execute(
-                f"UPDATE legs SET end_reason=? WHERE owner=? AND {_UNSETTLED} AND end_reason IS NULL",
+                f"UPDATE legs SET end_reason=? WHERE owner=? AND {_UNSETTLED} "
+                "AND ended_at IS NULL AND end_reason IS NULL",
                 (reason, owner_id),
             )
             rows = db.execute(
                 f"SELECT leg_id, kind, issue, end_reason FROM legs WHERE owner=? AND {_UNSETTLED} "
-                "ORDER BY reserved_at", (owner_id,),
+                "AND end_reason=? ORDER BY reserved_at", (owner_id, reason),
             ).fetchall()
         return tuple(
             RunCancellationIntent(RunId(row["leg_id"]), row["kind"], row["issue"], row["end_reason"])
@@ -740,9 +712,11 @@ class SQLiteControlStore:
         )
 
     def has_cancellation_intent(self, run_id: RunId) -> bool:
+        """Shutdown asked this leg to stop while it was still in flight."""
         with self._read() as db:
             return db.execute(
-                f"SELECT 1 FROM legs WHERE leg_id=? AND {_UNSETTLED} AND end_reason IS NOT NULL",
+                f"SELECT 1 FROM legs WHERE leg_id=? AND {_UNSETTLED} "
+                "AND ended_at IS NULL AND end_reason IS NOT NULL",
                 (str(run_id),),
             ).fetchone() is not None
 
@@ -836,24 +810,20 @@ class SQLiteControlStore:
             return True
 
     def unlease(self, repository: str, role: str, target: int, owner_id: str) -> bool:
-        """Release a claim. A bound leg not yet settled has ended: recovery
-        settles it from whatever evidence survived."""
+        """Release a claim whose leg settled, was released, or never reserved.
+
+        A bound leg still unsettled keeps the lease: its process (killed at
+        shutdown, or crashed) may have left usage that only becomes readable
+        once it is reaped, and settling it at a zero estimate now could not be
+        corrected later. Liveness and dead-lease recovery govern it instead.
+        """
         key = (canonical_repository(repository), role, target)
         with self._transaction() as db:
-            row = db.execute(
-                "SELECT leg_id FROM leases WHERE repository=? AND role=? AND target=? AND owner=?",
+            return bool(db.execute(
+                "DELETE FROM leases WHERE repository=? AND role=? AND target=? AND owner=? "
+                f"AND (leg_id IS NULL OR leg_id NOT IN (SELECT leg_id FROM legs WHERE {_UNSETTLED}))",
                 (*key, owner_id),
-            ).fetchone()
-            if row is None:
-                return False
-            db.execute("DELETE FROM leases WHERE repository=? AND role=? AND target=?", key)
-            if row["leg_id"] is not None:
-                db.execute(
-                    "UPDATE legs SET ended_at=COALESCE(ended_at, ?), end_reason=COALESCE(end_reason, ?) "
-                    f"WHERE leg_id=? AND {_UNSETTLED}",
-                    (self._stamp_now(), _LEASE_RELEASED, row["leg_id"]),
-                )
-            return True
+            ).rowcount)
 
     def register_process_lease(
         self, run_id: RunId, *, expected_owner_id: str, pid: int, pgid: int, process_start_ticks: int,
@@ -898,13 +868,9 @@ class SQLiteControlStore:
                 (now, str(run_id)),
             )
 
-    def leases(self, owner_id: str | None = None) -> tuple[Lease, ...]:
+    def leases(self) -> tuple[Lease, ...]:
         with self._read() as db:
-            rows = db.execute(
-                "SELECT * FROM leases" + (" WHERE owner=?" if owner_id is not None else "")
-                + " ORDER BY acquired_at",
-                (owner_id,) if owner_id is not None else (),
-            ).fetchall()
+            rows = db.execute("SELECT * FROM leases ORDER BY acquired_at").fetchall()
         return tuple(
             Lease(
                 row["repository"], row["role"], int(row["target"]), row["owner"],
@@ -982,6 +948,37 @@ class SQLiteControlStore:
     def confirm_key(self, key: str) -> None:
         with self._transaction() as db:
             db.execute("UPDATE idempotency SET state='done' WHERE key=?", (key,))
+
+
+def _refuse_prior_use(path: str, opened_before: bool) -> None:
+    """A missing store is created only where none ever was.
+
+    Recreating it over a lost one would silently reopen every daily and
+    lifetime cap at zero, and a leftover -wal would be replayed into the
+    "fresh" file. The evidence needs no marker of its own: every open by this
+    release or the previous one leaves `<path>.initialize.lock` (never
+    removed), SQLite leaves -wal/-shm beside a store it had open, the cutover
+    leaves `.retired-v*`, and the previous release left its `.authority`
+    witness. A concurrent first open is not prior use: it holds the lock until
+    the store exists, so this check never sees the store missing then.
+    """
+    directory, name = os.path.split(path)
+    evidence = sorted(
+        str(candidate) for candidate in (
+            *(Path(path + suffix) for suffix in ("-wal", "-shm", ".authority")),
+            *Path(directory).glob(f"{name}.retired-v*"),
+        )
+        if os.path.lexists(candidate)
+    )
+    if opened_before:
+        evidence.insert(0, f"{path}.initialize.lock")
+    if evidence:
+        raise CorruptControlStore(
+            f"control store {path} is missing but was used before ({', '.join(evidence)}); "
+            "refusing to recreate it empty, which would reset spend and caps to zero. "
+            "Stop every role daemon and restore control.db (with its -wal, if any) from a backup, "
+            "or, to deliberately start with no spend history, delete the listed files and start again."
+        )
 
 
 def _create(path: str) -> None:
@@ -1159,9 +1156,13 @@ def _cut_over(path: str, now: datetime) -> None:
         # Refused before anything is written, so a refusal leaves the file as
         # the previous release expects it.
         _refuse_unsettled(legacy, path)
-        # Leaving WAL needs every other connection gone: the check that no
-        # daemon of the previous release still has the store open. It also
-        # folds the -wal into the file the retired name keeps.
+        # Leaving WAL needs every other connection gone at this instant, so a
+        # daemon or dashboard of the previous release caught mid-operation
+        # refuses the cutover. It is point-in-time only: the previous release
+        # opens a connection per operation, so an idle one passes and its next
+        # operation meets the new schema and fails closed. Stopping every
+        # daemon first (HARNESS.md) is the real guard. It also folds the -wal
+        # into the file the retired name keeps.
         try:
             mode = legacy.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         except sqlite3.OperationalError:
@@ -1173,7 +1174,10 @@ def _cut_over(path: str, now: datetime) -> None:
         legacy.execute("BEGIN EXCLUSIVE")
         try:
             _refuse_unsettled(legacy, path)
-            version = int(legacy.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
+            recorded = legacy.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            if type(recorded) is not int:
+                raise CorruptControlStore(f"legacy control store records no schema version: {path}")
+            version = recorded
             expected = legacy.execute(
                 "SELECT COUNT(*), COALESCE(SUM(amount_micros), 0) FROM charges"
             ).fetchone()
@@ -1188,6 +1192,7 @@ def _cut_over(path: str, now: datetime) -> None:
                     raise CorruptControlStore(
                         f"cutover carried {tuple(carried)} legs/micros, the legacy ledger holds {tuple(expected)}"
                     )
+                _verify_scopes(legacy, temporary)
                 _retire(path, version, now)
                 # The legacy -wal was folded in when it left WAL; a stale
                 # -wal or -shm must not be read as the new file's.
@@ -1229,7 +1234,7 @@ def _carry(new: sqlite3.Connection, legacy: sqlite3.Connection) -> None:
     origin = "c.origin" if "origin" in columns["charges"] else "'normal_return'"
     rows = legacy.execute(
         f"SELECT r.run_id, r.kind, r.owner_id, r.dispatch_id, r.started_at, r.completed_at, r.outcome, "
-        f"b.repository, {workload} AS workload, b.model, b.created_at, b.maximum_micros, "
+        f"b.repository, {workload} AS workload, b.created_at, b.maximum_micros, "
         f"c.amount_micros, c.currency, c.basis, {origin} AS origin, c.usage_json, c.rate_card_id, "
         "c.rate_card_version, c.provider_receipt_id, c.settled_at, "
         "(SELECT MIN(l.dimension) FROM reservation_limits l WHERE l.run_id=r.run_id "
@@ -1239,11 +1244,11 @@ def _carry(new: sqlite3.Connection, legacy: sqlite3.Connection) -> None:
     )
     for row in rows:
         new.execute(
-            "INSERT INTO legs(leg_id, repository, role, kind, issue, number, owner, runtime, model, "
+            "INSERT INTO legs(leg_id, repository, role, kind, issue, number, owner, runtime, "
             "state, reserved_at, started_at, ended_at, end_reason, currency, reserved_micros, "
             "charged_micros, basis, origin, usage_json, rate_card_id, rate_card_version, "
             "provider_receipt_id, settled_at) "
-            "VALUES (?, ?, 'carried', ?, ?, ?, ?, ?, ?, 'ended', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, 'carried', ?, ?, ?, ?, ?, 'ended', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             _carried_leg(row),
         )
     new.executemany(
@@ -1284,12 +1289,50 @@ def _carried_leg(row: sqlite3.Row) -> tuple[object, ...]:
     return (
         row["run_id"], repository, row["kind"] or "carried", issue,
         positive(dispatch.get("number")) or 0, row["owner_id"] or "carried",
-        runtime if isinstance(runtime, str) else "", row["model"] or "",
+        runtime if isinstance(runtime, str) else "",
         row["created_at"], row["started_at"], row["completed_at"] or row["settled_at"],
         row["outcome"], row["currency"], max(int(row["maximum_micros"]), 0),
         int(row["amount_micros"]), row["basis"], row["origin"], row["usage_json"],
         row["rate_card_id"], row["rate_card_version"], row["provider_receipt_id"], row["settled_at"],
     )
+
+
+def _verify_scopes(legacy: sqlite3.Connection, carried_path: str) -> None:
+    """Every charge a legacy cap scope counted is counted by the same scope
+    in the new file, so no repository day, global day or issue lifetime loses
+    spend. A carried leg may also count toward a scope its reservation did not
+    arm (the new caps count every matching leg): that only makes a historic
+    total higher, never lower.
+    """
+    with closing(sqlite3.connect(f"{Path(carried_path).as_uri()}?mode=ro", uri=True)) as new:
+        legs = {
+            row[0]: row[1:]
+            for row in new.execute("SELECT leg_id, repository, issue, reserved_at, currency FROM legs")
+        }
+    scopes = legacy.execute(
+        "SELECT run_id, repository, dimension, period_start, period_end, currency FROM budget_reservations "
+        "WHERE run_id IN (SELECT run_id FROM charges) UNION "
+        "SELECT run_id, repository, dimension, period_start, period_end, currency FROM reservation_limits "
+        "WHERE run_id IN (SELECT run_id FROM charges)"
+    ).fetchall()
+    lost: list[str] = []
+    for run_id, repository, dimension, start, end, currency in scopes:
+        kind, _, issue = str(dimension).partition(":")
+        if kind not in ("repository", "global", "issue"):
+            continue  # no current cap reads it
+        leg = legs.get(run_id)
+        counted = leg is not None and leg[3] == currency and (
+            _parse_stamp(start) <= _parse_stamp(leg[2]) < _parse_stamp(end)
+        ) and (kind == "global" or leg[0] == canonical_repository(repository)) and (
+            kind != "issue" or (issue.isdigit() and leg[1] == int(issue))
+        )
+        if not counted:
+            lost.append(f"{run_id} from {repository} {dimension} {start}")
+    if lost:
+        raise CorruptControlStore(
+            f"cutover would drop {len(lost)} charge(s) from the cap scopes that counted them: "
+            + "; ".join(lost[:5])
+        )
 
 
 def _retire(path: str, version: int, now: datetime) -> str:

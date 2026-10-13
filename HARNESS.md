@@ -235,6 +235,13 @@ admission capacity. An explicit same-repository repoint first reaps the
 recorded prior checkout registries; unrelated sibling checkouts remain
 isolated. Historical JSONL is never queried for these decisions.
 
+A missing `control.db` is recreated only on a machine that never had one. If
+its companions remain (`control.db.initialize.lock`, `-wal`, `-shm`,
+`.retired-v*`, `.authority`), startup refuses and names them rather than
+silently resetting every cap to zero: restore the database from a backup with
+every daemon stopped, or delete the listed files to start deliberately with no
+spend history.
+
 ### Upgrading to the 3-table store (slice 5d-2)
 
 The first role daemon to open a pre-5d-2 `control.db` converts it in place,
@@ -251,8 +258,10 @@ workflow rows, receipts, holds and attempt history (attempt counts restart).
      in-flight money. Check out the previous release, start each named owning
      deployment once, let its boot recovery settle (its `issue-agent status`
      shows no in-flight legs), stop it, and go back to step 2.
-   - *another process holds … open*: something still has the database open
-     (a daemon or the dashboard); stop it and go back to step 2.
+   - *another process holds … open*: something had the database open at that
+     instant (a daemon or the dashboard); stop it and go back to step 2. The
+     check is point-in-time, so step 1 is what actually guarantees nothing of
+     the previous release is left running.
 4. On success the old file remains as
    `control.db.retired-v<N>-<UTC stamp>` beside the new one. Nothing reads it;
    keep it as evidence or delete it once the new store has run. The old

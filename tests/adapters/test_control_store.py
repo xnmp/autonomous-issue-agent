@@ -42,6 +42,9 @@ NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
 REPO = "o/r"
 OWNER = "o/r:fix:deployment"
 LEGACY_SCHEMA = Path(__file__).parent / "fixtures" / "legacy_control_v46.sql"
+# The live store's version at the cutover: no workload_repository column on
+# reservations and no charge origin yet.
+LEGACY_V41_SCHEMA = Path(__file__).parent / "fixtures" / "legacy_control_v41.sql"
 
 
 def _store(tmp_path: Path, now=lambda: NOW) -> SQLiteControlStore:
@@ -69,8 +72,16 @@ def _request(
     return ReservationRequest(
         RunId(f"run-{index}"), repository, "fix", "RESOLVE", owner, Money("USD", maximum),
         limits or (BudgetLimit(_daily(repository), Money("USD", cap)),),
-        lease_target, issue=issue if issue is not None else index, number=index, runtime="claude",
+        lease_target if lease_target is not None else index,
+        issue=issue if issue is not None else index, number=index, runtime="claude",
     )
+
+
+def _reserve(store: SQLiteControlStore, *args, **changes):
+    """Lease the request's item as its owner, then reserve: a paid leg's path."""
+    request = _request(*args, **changes)
+    store.lease(request.repository, request.role, request.lease_target, request.owner_id)
+    return store.reserve(request)
 
 
 def _settlement(run: str, micros: int, receipt: str | None = None, **changes) -> SettlementRequest:
@@ -117,6 +128,40 @@ def test_a_fresh_store_has_three_tables_a_schema_version_and_owner_only_permissi
     assert os.stat(store.path).st_mode & 0o777 == 0o600
     assert os.stat(os.path.dirname(store.path)).st_mode & 0o777 == 0o700
     store.initialize()  # reopening an existing store is idempotent
+
+
+@pytest.mark.parametrize("evidence", ["opened", "-wal", "-shm", ".authority", ".retired-v41-20261013T000000Z"])
+def test_a_missing_store_with_evidence_of_prior_use_is_refused_not_recreated(tmp_path, evidence):
+    # Recreating it would reset every daily and lifetime cap to zero, and a
+    # leftover -wal would be replayed into the "fresh" file.
+    path = tmp_path / "state" / "control.db"
+    if evidence == "opened":
+        _store(tmp_path)
+        path.unlink()
+    else:
+        path.parent.mkdir(mode=0o700)
+        Path(f"{path}{evidence}").write_bytes(b"left behind")
+
+    with pytest.raises(CorruptControlStore, match="missing but was used before") as refused:
+        SQLiteControlStore(str(path)).initialize()
+
+    assert str(refused.value).count(".initialize.lock" if evidence == "opened" else evidence) >= 1
+    assert "restore control.db" in str(refused.value)
+    assert not path.exists()
+
+
+def test_a_stale_wal_is_never_replayed_into_a_recreated_store(tmp_path):
+    store = _store(tmp_path)
+    assert store.claim_key("fix-comment:o/r:needs-human:7") == "new"
+    with closing(sqlite3.connect(store.path)) as holder:  # keep the -wal alive past the delete
+        holder.execute("PRAGMA journal_mode=WAL").fetchone()
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("INSERT INTO idempotency(key, state, claimed_at) VALUES ('only-in-wal', 'done', 'x')")
+        holder.commit()
+        os.unlink(store.path)
+        with pytest.raises(CorruptControlStore, match="-wal"):
+            SQLiteControlStore(store.path).initialize()
+    assert not os.path.exists(store.path)
 
 
 @pytest.mark.parametrize("contents", [b"", b"not a database at all, just bytes" * 200])
@@ -176,8 +221,8 @@ def test_reservations_admit_until_the_cap_and_name_the_limit_that_tripped(tmp_pa
     issue_limit = BudgetLimit(_issue_scope(7), Money("USD", 100))
     limits = (BudgetLimit(_daily(), Money("USD", 1_000)), issue_limit)
 
-    first = store.reserve(_request(1, issue=7, limits=limits))
-    second = store.reserve(_request(2, issue=7, limits=limits))
+    first = _reserve(store, 1, issue=7, limits=limits)
+    second = _reserve(store, 2, issue=7, limits=limits)
 
     assert first.admitted
     assert second.disposition is AccountingDisposition.EXHAUSTED
@@ -189,10 +234,10 @@ def test_the_global_cap_sums_every_repository_and_the_daily_cap_only_its_own(tmp
     store = _store(tmp_path)
     global_limit = BudgetLimit(_daily("*", "global"), Money("USD", 100))
 
-    assert store.reserve(_request(1, limits=(BudgetLimit(_daily("a/one"), Money("USD", 60)), global_limit),
-                                  repository="a/one", owner="a/one:fix:d")).admitted
-    blocked = store.reserve(_request(2, limits=(BudgetLimit(_daily("b/two"), Money("USD", 60)), global_limit),
-                                     repository="b/two", owner="b/two:fix:d"))
+    assert _reserve(store, 1, limits=(BudgetLimit(_daily("a/one"), Money("USD", 60)), global_limit),
+                                  repository="a/one", owner="a/one:fix:d").admitted
+    blocked = _reserve(store, 2, limits=(BudgetLimit(_daily("b/two"), Money("USD", 60)), global_limit),
+                                     repository="b/two", owner="b/two:fix:d")
 
     assert blocked.tripped_dimension == "global"
     assert store.snapshot(_daily("a/one")).committed == Money("USD", 60)
@@ -202,11 +247,11 @@ def test_the_global_cap_sums_every_repository_and_the_daily_cap_only_its_own(tmp
 def test_yesterdays_spend_does_not_count_against_todays_cap(tmp_path):
     clock = [NOW - timedelta(days=1)]
     store = _store(tmp_path, now=lambda: clock[0])
-    assert store.reserve(_request(1, cap=100)).admitted
+    assert _reserve(store, 1, cap=100).admitted
     assert store.settle(_settlement("run-1", 90)).disposition is AccountingDisposition.AVAILABLE
     clock[0] = NOW
 
-    assert store.reserve(_request(2, cap=100)).admitted
+    assert _reserve(store, 2, cap=100).admitted
     assert store.snapshot(_daily()).committed == Money("USD", 60)
 
 
@@ -214,7 +259,7 @@ def test_concurrent_reservations_admit_exactly_one_for_the_final_capacity(tmp_pa
     store = _store(tmp_path)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda index: store.reserve(_request(index)).disposition, range(1, 9)))
+        results = list(pool.map(lambda index: _reserve(store, index).disposition, range(1, 9)))
 
     assert results.count(AccountingDisposition.AVAILABLE) == 1
     assert results.count(AccountingDisposition.EXHAUSTED) == 7
@@ -222,17 +267,17 @@ def test_concurrent_reservations_admit_exactly_one_for_the_final_capacity(tmp_pa
 
 def test_a_replayed_reservation_is_idempotent_and_a_different_one_conflicts(tmp_path):
     store = _store(tmp_path)
-    assert store.reserve(_request(1)).admitted
+    assert _reserve(store, 1).admitted
 
-    assert store.reserve(_request(1)).disposition is AccountingDisposition.AVAILABLE
-    assert store.reserve(_request(1, maximum=50)).disposition is AccountingDisposition.CONFLICT
+    assert _reserve(store, 1).disposition is AccountingDisposition.AVAILABLE
+    assert _reserve(store, 1, maximum=50).disposition is AccountingDisposition.CONFLICT
     assert store.snapshot(_daily()).reserved == Money("USD", 60)
 
 
 def test_settlement_is_once_idempotent_and_a_conflicting_receipt_is_refused(tmp_path):
     store = _store(tmp_path)
-    store.reserve(_request(1))
-    store.reserve(_request(2, cap=1_000))
+    _reserve(store, 1)
+    _reserve(store, 2, cap=1_000)
     usage = TokenUsage(10, 5, 0, 0)
 
     first = store.settle(_settlement("run-1", 75, usage=usage))
@@ -241,7 +286,6 @@ def test_settlement_is_once_idempotent_and_a_conflicting_receipt_is_refused(tmp_
     stolen = store.settle(_settlement("run-2", 10, receipt="receipt-run-1"))
 
     assert first.disposition is AccountingDisposition.AVAILABLE
-    assert first.variance == Money("USD", 15)
     assert replay.idempotent
     assert changed.disposition is AccountingDisposition.CONFLICT
     assert stolen.disposition is AccountingDisposition.CONFLICT
@@ -251,8 +295,8 @@ def test_settlement_is_once_idempotent_and_a_conflicting_receipt_is_refused(tmp_
 
 def test_a_normal_return_corrects_a_recovery_estimate_but_not_the_reverse(tmp_path):
     store = _store(tmp_path)
-    store.reserve(_request(1, cap=1_000))
-    store.reserve(_request(2, cap=1_000))
+    _reserve(store, 1, cap=1_000)
+    _reserve(store, 2, cap=1_000)
     estimate = dict(basis=PricingBasis.ESTIMATE, origin=ChargeOrigin.RECOVERY_ESTIMATE)
 
     assert store.settle(_settlement("run-1", 0, "estimate-1", **estimate)).disposition.value == "available"
@@ -266,23 +310,23 @@ def test_a_normal_return_corrects_a_recovery_estimate_but_not_the_reverse(tmp_pa
 
 def test_release_returns_capacity_charges_nothing_and_is_idempotent(tmp_path):
     store = _store(tmp_path)
-    store.reserve(_request(1))
+    _reserve(store, 1)
 
-    released = store.release(RunId("run-1"), "operator")
-    replay = store.release(RunId("run-1"), "operator")
-    other_reason = store.release(RunId("run-1"), "different")
+    released = store.release_unlaunched(RunId("run-1"), "unlaunched")
+    replay = store.release_unlaunched(RunId("run-1"), "unlaunched")
+    other_reason = store.release_unlaunched(RunId("run-1"), "different")
 
     assert released.disposition is AccountingDisposition.AVAILABLE
     assert replay.idempotent
     assert other_reason.disposition is AccountingDisposition.CONFLICT
     assert store.snapshot(_daily()).committed == Money("USD", 0)
     assert store.settle(_settlement("run-1", 5)).disposition is AccountingDisposition.CONFLICT
-    assert store.reserve(_request(2)).admitted
+    assert _reserve(store, 2).admitted
 
 
 def test_only_a_never_launched_leg_is_released_as_unlaunched(tmp_path):
     store = _store(tmp_path)
-    store.reserve(_request(1))
+    _reserve(store, 1)
     running = _launch(store, 2)
 
     assert store.release_unlaunched(RunId("run-1"), "unlaunched").disposition is AccountingDisposition.AVAILABLE
@@ -316,14 +360,17 @@ def test_retained_spend_stays_reserved_until_recovery_and_reports_its_end(tmp_pa
     assert store.run_completed_at(run) == NOW.timestamp()
     assert store.snapshot(_daily()).reserved == Money("USD", 60)
     assert store.leases() == ()
-    assert store.release_retained(run, "unmeasured", NOW).disposition is AccountingDisposition.AVAILABLE
+    assert store.release_unlaunched(run, "unmeasured").disposition is AccountingDisposition.CONFLICT
+    assert store.settle_terminal_estimate(run, "unmeasured")
     assert store.snapshot(_daily()).committed == Money("USD", 0)
 
 
 def test_shutdown_marks_this_deployments_unsettled_legs_without_releasing_them(tmp_path):
     store = _store(tmp_path)
     run = _launch(store, 1, issue=9)
-    store.reserve(_request(2, cap=1_000, owner="o/r:fix:other"))
+    _reserve(store, 2, cap=1_000, owner="o/r:fix:other")
+    ended = _launch(store, 3)
+    assert store.record_reservation_retained(ended, "runtime failed after launch")  # ended before shutdown
 
     intents = store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")
 
@@ -332,7 +379,12 @@ def test_shutdown_marks_this_deployments_unsettled_legs_without_releasing_them(t
     ]
     assert store.has_cancellation_intent(run)
     assert not store.has_cancellation_intent(RunId("run-2"))
-    assert store.snapshot(_daily()).reserved == Money("USD", 120)
+    assert not store.has_cancellation_intent(ended)
+    # Once the cancelled leg ends unsettled, it is still shutdown's to hand over.
+    assert store.record_reservation_retained(run, "killed")
+    assert not store.has_cancellation_intent(run)
+    assert [i.run_id for i in store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")] == [run]
+    assert store.snapshot(_daily()).reserved == Money("USD", 180)
 
 
 @pytest.mark.parametrize("damage", ["garbage", "deleted"])
@@ -421,7 +473,7 @@ def test_a_dead_holders_lease_is_taken_over_unless_its_leg_still_runs(tmp_path, 
 def test_a_spawned_process_takes_over_its_legs_lease(tmp_path, monkeypatch):
     store = _store(tmp_path)
     run = _launch(store, 1)
-    lease = store.leases(OWNER)[0]
+    lease = store.leases()[0]
     assert (lease.run_id, lease.pid, lease.pgid, lease.process_start_ticks) == (run, 4242, 4242, 7)
     assert _leg(store, "run-1")["state"] == "running"
 
@@ -439,7 +491,8 @@ def test_a_spawned_process_takes_over_its_legs_lease(tmp_path, monkeypatch):
 
 def test_a_process_cannot_register_for_an_unleased_or_finished_leg(tmp_path):
     store = _store(tmp_path)
-    store.reserve(_request(1))
+    _reserve(store, 1)
+    assert store.reclaim_dead_leases(OWNER, _dead) == ()  # its daemon died: run-1 holds no lease
     run = _launch(store, 2)
     store.settle(_settlement(str(run), 1))
 
@@ -476,16 +529,22 @@ def test_reclaim_probes_liveness_outside_the_write_transaction(tmp_path):
     assert store.reclaim_dead_leases(OWNER, probe) == ()
 
 
-def test_releasing_a_lease_ends_its_unsettled_leg_for_recovery(tmp_path):
+def test_an_unsettled_leg_keeps_its_lease_until_its_process_is_gone(tmp_path):
+    # A leg killed at shutdown may leave usage readable only after it is
+    # reaped: unleasing it must not open the way to a zero settlement.
     store = _store(tmp_path)
     run = _launch(store, 1)
+    assert store.lease(REPO, "fix", 2, OWNER)
 
-    assert store.unlease(REPO, "fix", 1, OWNER)
     assert not store.unlease(REPO, "fix", 1, OWNER)
+    assert store.unlease(REPO, "fix", 2, OWNER)  # nothing bound: released
 
-    leg = _leg(store, str(run))
-    assert (leg["state"], leg["end_reason"]) == ("running", "lease released before settlement")
+    assert [lease.run_id for lease in store.leases()] == [run]
+    assert _leg(store, str(run))["ended_at"] is None
+    assert not store.settle_terminal_estimate(run, "no evidence")
+    assert store.reclaim_dead_leases(OWNER, _dead) == (run,)
     assert store.settle_terminal_estimate(run, "no evidence")
+    assert store.unlease(REPO, "fix", 1, OWNER) is False  # reclaim already dropped it
 
 
 # -- idempotency -------------------------------------------------------------------
@@ -507,9 +566,9 @@ def test_a_claimed_comment_key_survives_a_crash_and_is_read_back(tmp_path):
 
 def test_the_settled_spend_read_model_groups_charges_by_repository(tmp_path):
     store = _store(tmp_path)
-    store.reserve(_request(1))
-    store.reserve(_request(2, repository="a/b", owner="a/b:fix:d"))
-    store.reserve(_request(3, cap=1_000))
+    _reserve(store, 1)
+    _reserve(store, 2, repository="a/b", owner="a/b:fix:d")
+    _reserve(store, 3, cap=1_000)
     store.settle(_settlement("run-1", 40))
     store.settle(_settlement("run-2", 25))
     start = NOW.replace(hour=0)
@@ -536,11 +595,14 @@ def test_the_read_model_never_creates_or_cuts_over_a_store(tmp_path):
 # -- cutover -------------------------------------------------------------------------
 
 
-def _legacy(path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, ...] = ()) -> Path:
-    """A legacy v46 store. Each run: (run_id, run_state, reservation_state,
-    charged_micros | None, issue, created_at, lease?)."""
+def _legacy(
+    path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, ...] = (), schema: Path = LEGACY_SCHEMA,
+) -> Path:
+    """A legacy store (v46 unless told otherwise). Each run: (run_id,
+    run_state, reservation_state, charged_micros | None, issue, created_at, lease?)."""
+    v41 = schema == LEGACY_V41_SCHEMA
     with closing(sqlite3.connect(path)) as db:
-        db.executescript(LEGACY_SCHEMA.read_text())
+        db.executescript(schema.read_text())
         db.execute("PRAGMA journal_mode=WAL")
         for run_id, run_state, reservation_state, charged, issue, created_at, lease in runs:
             dispatch = (
@@ -556,14 +618,21 @@ def _legacy(path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, 
                  f"receipt-{run_id}" if charged is not None else None),
             )
             day = created_at[:10]
+            workload = "" if v41 else "workload_repository, "
             db.execute(
-                "INSERT INTO budget_reservations(reservation_id, run_id, repository, workload_repository, "
+                f"INSERT INTO budget_reservations(reservation_id, run_id, repository, {workload}"
                 "dimension, period_id, period_start, period_end, period_timezone, currency, maximum_micros, "
                 "cap_micros, model, rate_card_id, rate_card_version, quote_effective_at, config_version, "
-                "state, created_at, updated_at) VALUES (?, ?, ?, ?, 'repository', ?, ?, ?, 'UTC', 'USD', 500, "
-                "1000, 'gpt', 'card', 'v', ?, 'v', ?, ?, ?)",
-                (f"res-{run_id}", run_id, REPO, REPO, day, f"{day}T00:00:00.000Z", f"{day}T23:59:59.999Z",
-                 created_at, reservation_state, created_at, created_at),
+                f"state, created_at, updated_at) VALUES (?, ?, ?, {'' if v41 else '?, '}'repository', ?, ?, ?, "
+                "'UTC', 'USD', 500, 1000, 'gpt', 'card', 'v', ?, 'v', ?, ?, ?)",
+                (f"res-{run_id}", run_id, REPO, *(() if v41 else (REPO,)), day, f"{day}T00:00:00.000Z",
+                 f"{day}T23:59:59.999Z", created_at, reservation_state, created_at, created_at),
+            )
+            db.execute(
+                "INSERT INTO reservation_limits(run_id, repository, dimension, period_id, period_start, "
+                "period_end, period_timezone, currency, cap_micros) VALUES (?, ?, ?, ?, ?, ?, 'UTC', 'USD', 10000)",
+                (run_id, REPO, f"issue:{issue}", f"lifetime:{issue}", "1970-01-01T00:00:00.000Z",
+                 "9999-12-31T23:59:59.999Z"),
             )
             db.execute(
                 "INSERT INTO reservation_recovery(run_id, policy, updated_at) VALUES (?, 'running', ?)",
@@ -571,8 +640,9 @@ def _legacy(path: Path, *, runs: tuple[tuple, ...] = (), comments: tuple[tuple, 
             )
             if charged is not None:
                 db.execute(
-                    "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, currency, basis, settled_at, "
-                    "origin) VALUES (?, ?, ?, 'USD', 'provider_reported', ?, 'normal_return')",
+                    "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, currency, basis, settled_at"
+                    f"{'' if v41 else ', origin'}) VALUES (?, ?, ?, 'USD', 'provider_reported', ?"
+                    f"{'' if v41 else ", 'normal_return'"})",
                     (run_id, f"receipt-{run_id}", charged, created_at),
                 )
             if lease:
@@ -630,6 +700,45 @@ def test_cutover_carries_settled_spend_into_the_caps_and_retires_the_legacy_file
         assert db.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0] == 2
     store.initialize()  # the cutover runs once
     assert len(list(tmp_path.glob("control.db.retired-*"))) == 1
+
+
+def test_a_v41_store_cuts_over_with_its_spend_in_the_caps(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED, schema=LEGACY_V41_SCHEMA)
+
+    store = SQLiteControlStore(str(path), now=lambda: NOW)
+    store.initialize()
+
+    assert [p.name for p in tmp_path.glob("control.db.retired-*")] == ["control.db.retired-v41-20260730T120000Z"]
+    assert store.snapshot(_daily()).settled == Money("USD", 350)
+    assert store.snapshot(_daily("*", "global")).settled == Money("USD", 350)
+    assert store.snapshot(_issue_scope(7)).settled == Money("USD", 500)
+    with closing(sqlite3.connect(path)) as db:
+        assert set(db.execute("SELECT repository, origin FROM legs")) == {(REPO, "normal_return")}
+
+
+def test_a_cutover_that_would_move_a_charge_out_of_a_cap_scope_is_refused(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED)
+    with closing(sqlite3.connect(path)) as db:  # the leg's dispatch says issue 7, its lifetime cap was issue 9
+        db.execute("UPDATE reservation_limits SET dimension='issue:9' WHERE run_id='earlier'")
+        db.commit()
+
+    with pytest.raises(CorruptControlStore, match=r"drop 1 charge\(s\).*earlier from o/r issue:9"):
+        SQLiteControlStore(str(path)).initialize()
+
+    # Only the journal mode changed (the previous release turns WAL back on).
+    _assert_legacy_intact(path)
+    assert not list(tmp_path.glob("control.db.retired-*"))
+    assert not list(tmp_path.glob("control.db.cutover-*"))
+
+
+def test_a_legacy_store_without_a_recorded_version_is_refused_as_corrupt(tmp_path):
+    path = _legacy(tmp_path / "control.db", runs=SETTLED)
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("DELETE FROM schema_migrations")
+        db.commit()
+
+    with pytest.raises(CorruptControlStore, match="no schema version"):
+        SQLiteControlStore(str(path)).initialize()
 
 
 @pytest.mark.parametrize("unsettled", [

@@ -122,16 +122,6 @@ class RecoveryCoordinator:
                         released=result.disposition.value == "available"
                     )
                     continue
-                if decision.action is ReservationRecoveryAction.RELEASE_RETAINED:
-                    result = self.control.release_retained(
-                        run_id,
-                        "unmeasured_completed_reservation",
-                        cutoff,
-                    )
-                    state = state.after_retained_release(
-                        released=result.disposition.value == "available"
-                    )
-                    continue
                 if decision.action is not ReservationRecoveryAction.COMPLETE:
                     raise AssertionError(
                         f"unsupported reservation recovery action: "

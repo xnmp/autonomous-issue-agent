@@ -144,11 +144,8 @@ def test_unpinned_codex_run_without_reported_model_uses_reserved_fallback(
 
     assert result.status == "ok"
     assert store.active_reservation_runs("o/r:fix") == ()
-    with store._read() as db:
-        reservation_model, amount, basis = db.execute(
-            "SELECT model, charged_micros, basis FROM legs"
-        ).fetchone()
-    assert reservation_model == "<runtime-default>"
+    with _db(store) as db:
+        amount, basis = db.execute("SELECT charged_micros, basis FROM legs").fetchone()
     assert (amount, basis) == (800, "estimate")
 
 

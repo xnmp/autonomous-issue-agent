@@ -509,7 +509,7 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
     assert started.is_set()
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
     assert tuple(
-        lease.run_id for lease in control.leases("o/r:fix")
+        lease.run_id for lease in control.leases()
     ) == (run_id,)
     assert control.has_cancellation_intent(run_id)
     release.set()

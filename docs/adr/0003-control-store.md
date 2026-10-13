@@ -17,15 +17,21 @@ WAL where supported, a busy timeout, restrictive permissions (`0600` file,
 `0700` directory), short `BEGIN IMMEDIATE` transactions, CHECK constraints
 that make contradictory leg states unrepresentable, and a `quick_check` at
 open and before every reservation. An absent file is created atomically
-(written beside the path, then renamed); an empty or unreadable file is
-`CorruptControlStore`, never replaced.
+(written beside the path, then renamed) only where no store was ever used:
+evidence of a prior one — the `.initialize.lock` every open leaves, a
+`-wal`/`-shm`, a `.retired-v*` file, or the previous release's `.authority`
+witness — makes a missing store `CorruptControlStore`, never an empty
+replacement. An empty or unreadable file is `CorruptControlStore` too.
 
 A pre-5d-2 database (legacy `schema_migrations` table) is cut over once, at
 open, to a new file carrying every settled charge as a `carried` ended leg and
 the `fix-comment` keys; everything else is dropped and re-derived from GitHub.
 The cutover refuses (`CutoverRefused`) while the legacy store holds unsettled
-runs, active reservations or leases, or while another process holds it open.
-It verifies the carried count and sum, keeps the old file under
+runs, active reservations or leases, or while another process has it open at
+that instant (a point-in-time check; stopping every daemon first is the guard).
+It verifies the carried count and sum and that every charge a legacy cap scope
+(repository day, global day, issue lifetime) counted is counted by the same
+scope in the new file, keeps the old file under
 `control.db.retired-v<N>-<stamp>`, and swaps the new file in with one atomic
 rename; a crash leaves the old file intact or the new one complete.
 
