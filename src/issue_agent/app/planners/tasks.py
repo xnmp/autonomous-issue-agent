@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from ...domain.tool_policy import FIXER_DENY  # noqa: F401  (re-export)
 from ...domain.trust import Untrusted, untrusted_block
 from ...domain.agent_task import RuntimeName
 from ...domain.effort import Effort
@@ -35,25 +36,8 @@ class FixTaskConfig:
 # honours (deny beats bypass), so the deny list lives here. Outbound fetches,
 # credential commands, raw `gh api` (an authenticated-mutation escape hatch no
 # fixer flow needs) and secret files are denied; `Task` (the pre-PR review
-# subagent) and `Bash` (git/test/gh work) are deliberately not.
-FIXER_DENY: tuple[str, ...] = (
-    # Outbound network (exfiltration + prompt-injection fetch surface).
-    "WebFetch",
-    "WebSearch",
-    "Bash(curl:*)",
-    "Bash(wget:*)",
-    # Credential and raw-API escape hatches around the gh guardrails.
-    "Bash(gh auth:*)",
-    "Bash(gh secret:*)",
-    "Bash(gh api:*)",
-    # Secrets on disk: never readable, at any depth.
-    "Read(.env)",
-    "Read(.env.*)",
-    "Read(**/.env)",
-    "Read(**/.env.*)",
-    "Read(**/*.pem)",
-    "Read(**/id_rsa*)",
-)
+# subagent) and `Bash` (git/test/gh work) are deliberately not. The rules and
+# their reasons live in domain/tool_policy.py (re-exported here).
 
 
 # A resumed session gets this pointer instead of re-paying ~2.9k tokens of

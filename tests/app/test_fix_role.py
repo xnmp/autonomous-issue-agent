@@ -700,6 +700,7 @@ def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session
 
     sdk = types.ModuleType("claude_agent_sdk")
     sdk.ClaudeAgentOptions, sdk.ResultMessage, sdk.query = dict, ResultMessage, query
+    sdk.HookMatcher = dict
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
     gh = FakeGitHub(issues={5: ready()})
     composed, _ = role(gh, AgentRunner(idle_timeout=None, max_runtime=0.3, poll_slice=0.05))

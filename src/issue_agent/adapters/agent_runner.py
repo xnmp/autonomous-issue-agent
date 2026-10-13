@@ -26,6 +26,7 @@ from typing import Any
 from .child_env import CHILD_ENV_MANIFEST
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import RunId
+from ..domain.tool_policy import denial_reason, has_reasons
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
@@ -83,6 +84,19 @@ def build_option_kwargs(
     # Target settings and CLAUDE.md are untrusted checkout data: none load.
     kwargs["setting_sources"] = []
     return kwargs
+
+
+def deny_reason_hook(rules: tuple[str, ...]) -> Callable[..., Any]:
+    """PreToolUse hook that denies calls matching `rules` WITH the table's reason.
+    `disallowed_tools` stays the enforcement; the hook only makes the agent see why."""
+    async def hook(input_data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        data = input_data if isinstance(input_data, dict) else {}
+        reason = denial_reason(data.get("tool_name"), data.get("tool_input"), rules)
+        if reason is None:
+            return {}
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": reason}}
+    return hook
 
 
 def resolve_claude_cli(pinned: str, bundled: Path, which: Callable[[str], str | None] = shutil.which) -> str | None:
@@ -354,6 +368,9 @@ class AgentRunner(AgentRuntime):
                 self._log(f"sdk-stderr: {s[:500]}")
         kwargs["stderr"] = _cli_stderr
 
+        if has_reasons(task.disallowed_tools):  # a hook keeps stdin open: only where it can speak
+            from claude_agent_sdk import HookMatcher
+            kwargs["hooks"] = {"PreToolUse": [HookMatcher(hooks=[deny_reason_hook(task.disallowed_tools)])]}
         options = ClaudeAgentOptions(**kwargs)
         final: Any = None
         last_trace = ""  # what the agent last did, for abort and death lines
