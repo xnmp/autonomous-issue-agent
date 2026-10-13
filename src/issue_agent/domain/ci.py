@@ -51,10 +51,7 @@ class Failed:
 
 @dataclass(frozen=True)
 class BaseRed:
-    """Every failure on the PR is settled red on the base tip too: the base is
-    broken, not the PR (#313)."""
-
-    checks: tuple[Check, ...]
+    """Every failure on the PR is red on the base tip too: the base is broken, not the PR (#313)."""
 
 
 def _gated_checks(observation: Observed) -> tuple[Check, ...]:
@@ -82,23 +79,24 @@ def reduce_ci(observation: CIObservation) -> Clear | Waiting | Failed | Unavaila
 def charge(failed: Failed, base: tuple[Check, ...] | None) -> Failed | Waiting | BaseRed:
     """Attribute a PR's settled failures against the base tip's reports (#313).
 
-    A failure stays the PR's unless every base report of the same check is
-    red or still running: no base report, or any passing one (a green rerun, a
-    same-named job in another workflow), keeps it the PR's, and one PR-owned
-    failure owes FIX_CI. Otherwise a base report still running outranks the
-    failure (the #49 rule) and the PR waits for the base's answer. An unread
-    base is None and charges the PR, as before.
+    A failure is the base's only if every base report of the same check is a
+    plain FAILURE/ERROR or still running; no report, a pass, or any other
+    conclusion (CANCELLED, TIMED_OUT, STALE: nothing ever re-reads those)
+    keeps it the PR's, and one PR-owned failure owes FIX_CI. A running base
+    twin outranks failure (#49) but only while IN_PROGRESS, which a job
+    timeout bounds; QUEUED or WAITING can sit forever, so it charges the PR.
+    An unread base is None and charges the PR, as before.
     """
     if base is None:
         return failed
     outcomes: dict[tuple[str, str, int | None], set[str]] = {}
     for check in base:
-        outcomes.setdefault(_identity(check), set()).add("pending" if _is_pending(check) else check.bucket)
+        outcomes.setdefault(_identity(check), set()).add(check.state)
     shared = {_identity(c) for c in failed.checks}
-    if any(not outcomes.get(key) or not outcomes[key] <= {"fail", "pending"} for key in shared):
+    if any(not outcomes.get(key) or not outcomes[key] <= {"FAILURE", "ERROR", "IN_PROGRESS"} for key in shared):
         return failed
-    running = tuple(c for c in base if _is_pending(c) and _identity(c) in shared)
-    return Waiting(Executing(running)) if running else BaseRed(failed.checks)
+    running = tuple(c for c in base if c.state == "IN_PROGRESS" and _identity(c) in shared)
+    return Waiting(Executing(running)) if running else BaseRed()
 
 
 def _identity(check: Check) -> tuple[str, str, int | None]:

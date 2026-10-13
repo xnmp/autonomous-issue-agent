@@ -427,8 +427,8 @@ def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> De
         ci = charge(ci, base)
     if isinstance(ci, Failed):
         return Dispatch(AgentKind.FIX_CI, head)
-    # The base is the repo's to fix (Q13): the PR waits, uncharged, and
-    # resumes when the base tip goes green.
+    # The base is the repo's to fix (Q13: flakes are the repo's). The PR
+    # waits uncharged and resumes when the base tip stops failing.
     if isinstance(ci, BaseRed):
         return Wait(WaitReason.BASE_RED)
     if isinstance(ci, Waiting):

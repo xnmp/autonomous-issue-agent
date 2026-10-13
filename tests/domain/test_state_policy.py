@@ -199,6 +199,11 @@ def test_313_the_pr_resumes_when_the_base_goes_green():
     assert pr_state_in(pr(ci=RED, base_ref_name="dev"), green) == Dispatch(FIX, HEAD)
 
 
+def test_313_a_base_twin_still_running_is_waited_for():
+    running = BaseTip("dev", "b10", (Check("test", "FAILURE", "fail"), Check("test", "IN_PROGRESS", "pending")))
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), running) == Wait(WaitReason.CI_PENDING)
+
+
 def pr_state_in(p: PRView, base: BaseTip | None):
     return one(WorldState(prs=(p,), base=base))
 

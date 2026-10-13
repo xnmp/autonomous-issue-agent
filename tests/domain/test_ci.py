@@ -49,8 +49,9 @@ def _on_base(name: str, bucket: str, *, state: str = "", kind: str = "check", ap
 
 
 def test_313_a_check_red_on_the_head_and_the_base_tip_is_the_bases():
-    assert charge(_red("frontend"), (_on_base("frontend", "fail"), _on_base("rust", "pass"))) == BaseRed(
-        _red("frontend").checks)
+    assert charge(_red("frontend"), (_on_base("frontend", "fail"), _on_base("rust", "pass"))) == BaseRed()
+    assert isinstance(charge(_red("ci/x", kind="status"), (_on_base("ci/x", "fail", state="ERROR", kind="status"),)),
+                      BaseRed)
 
 
 def test_313_a_check_red_only_on_the_head_is_the_prs():
@@ -75,8 +76,20 @@ def test_313_a_base_check_still_running_is_waited_for_not_charged():
     running = _on_base("frontend", "pending")
     result = charge(_red("frontend"), (_on_base("frontend", "fail"), running))
     assert result == Waiting(Executing((running,)))
-    queued = _on_base("frontend", "pending", state="QUEUED")
-    assert isinstance(charge(_red("frontend"), (queued,)), Waiting)
+
+
+@pytest.mark.parametrize("state", ["QUEUED", "WAITING", "PENDING", "EXPECTED"])
+def test_313_a_base_twin_that_may_never_start_charges_the_pr(state):
+    # Only IN_PROGRESS is bounded (a job timeout); a queued or gated job can sit forever.
+    failed = _red("frontend")
+    assert charge(failed, (_on_base("frontend", "pending", state=state),)) is failed
+
+
+@pytest.mark.parametrize("conclusion", ["CANCELLED", "TIMED_OUT", "STALE", "ACTION_REQUIRED", "STARTUP_FAILURE"])
+def test_313_a_base_twin_that_did_not_plainly_fail_charges_the_pr(conclusion):
+    # Nothing re-reads a cancelled or timed-out base run: waiting on it would never end.
+    failed = _red("frontend")
+    assert charge(failed, (_on_base("frontend", "fail", state=conclusion),)) is failed
 
 
 def test_313_any_green_base_report_of_the_same_check_keeps_the_failure_the_prs():

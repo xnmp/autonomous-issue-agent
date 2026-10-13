@@ -333,7 +333,7 @@ def board_status(
 def _wait_status(reason: WaitReason, pr: PRView | None, last_end: datetime | None) -> BoardStatus:
     since = _iso(last_end)
     if reason is WaitReason.CI_PENDING:
-        return Working("ci", None, "CI running", "Required checks are still running on the head.", since)
+        return Working("ci", None, "CI running", "Required checks are still running.", since)
     if reason is WaitReason.BASE_RED:
         return Waiting("github", "Base branch red",
                        "Its failing checks fail on the base tip too; it resumes when the base is fixed.", since)
