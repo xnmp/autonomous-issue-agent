@@ -162,19 +162,6 @@ class GitHubOperatorEffects:
         except Exception as exc:  # noqa: BLE001 - operator-facing result
             return False, _detail(exc)
 
-    def set_repository_auto_merge(self, enabled: bool) -> tuple[bool, str]:
-        try:
-            if self._repository_auto_merge() is not enabled:
-                self._mutate([
-                    "gh", "api", "-X", "PATCH", f"repos/{self.repository}",
-                    "-F", f"allow_auto_merge={'true' if enabled else 'false'}",
-                ])
-                if self._repository_auto_merge() is not enabled:
-                    raise OperatorEffectError("repository auto-merge setting did not change")
-            return True, "ok"
-        except Exception as exc:  # noqa: BLE001 - operator-facing result
-            return False, _detail(exc)
-
     def publish_base_branch(self, cwd: str, branch: str) -> tuple[bool, str]:
         """Create one missing remote base branch from a verified local head."""
         try:
@@ -227,12 +214,6 @@ class GitHubOperatorEffects:
     def _label_exists(self, label: str) -> bool:
         rows = self._json(["gh", "label", "list", "-R", self.repository, "--json", "name", "--limit", "1000"])
         return isinstance(rows, list) and any(isinstance(row, dict) and row.get("name") == label for row in rows)
-
-    def _repository_auto_merge(self) -> bool:
-        row = self._json(["gh", "api", f"repos/{self.repository}", "--jq", "{allow_auto_merge}"])
-        if not isinstance(row, dict):
-            raise OperatorEffectError("repository settings could not be read")
-        return bool(row.get("allow_auto_merge"))
 
     def _remote_branch(self, cwd: str, branch: str) -> str:
         output = self._text(["git", "-C", cwd, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"]).strip()

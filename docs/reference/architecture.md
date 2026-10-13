@@ -468,9 +468,11 @@ and `adapters/worktree.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
-`app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
+`app/cli.py`, `app/config.py`, `app/dashboard.py`,
+`app/doctor.py` (offline doctor checks: one credential per role, the codex
+binary the daemons exec, the installed services' PATH and snapshot),
 `app/fix.py` (the fix role: one paid leg per dispatch, resuming the right
-session), `app/identity_pools.py`,
+session),
 `app/launchd_main.py`,
 `app/main.py`,
 `app/recovery.py`, `app/review.py` (the review role: keeps only REVIEW
@@ -479,8 +481,7 @@ once, resubmitting a stored verdict free when its submission never landed),
 `app/review_identity.py`, `app/roles.py`,
 `app/tick.py` (the daemon both roles run: local facts from SQLite,
 derive → policy → choose, the action executor, bounded paid dispatch, the
-single `run_leg` path, and the SIGTERM drain),
-and `app/service_doctor.py`.
+single `run_leg` path, and the SIGTERM drain).
 Provider-neutral task construction is isolated in `app/planners/`; the web
 composition/read-model boundary is in `app/dashweb/`.
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_agent.app import cli, codex_resolution
+from issue_agent.app import cli
 
 
 from issue_agent.app.config import from_env
@@ -373,29 +373,6 @@ def test_read_repo_env_field_does_not_leak_ambient_env(tmp_path, monkeypatch):
     assert cli.read_repo_env_field(str(p), "REPO") == ""
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("REVIEW_BOT_TOKEN", "review-secret"),
-        ("GH_APP_ID", "123"),
-        ("GH_APP_INSTALL_ID", "456"),
-        ("GH_APP_KEY_FILE", "/keys/review.pem"),
-        ("GH_APP_TOKEN_CACHE", "/state/app-token.json"),
-    ],
-)
-def test_rearm_identity_fields_are_read_from_the_composed_file_only(
-    tmp_path, monkeypatch, field, value
-):
-    overlay = tmp_path / "r.env"
-    overlay.write_text(f'{field}="{value}"\n')
-    monkeypatch.setenv(field, "ambient-secret-must-not-win")
-
-    assert cli.read_repo_env_field(str(overlay), field) == value
-
-    overlay.write_text('OTHER="x"\n')
-    assert cli.read_repo_env_field(str(overlay), field) == ""
-
-
 def test_resolve_name_matches_overlay_despite_trailing_comment(tmp_path):
     (tmp_path / "myapp.env").write_text('REPO="acme/App"  # prod\n')
     assert cli.resolve_name("ACME/app", repos_dir=str(tmp_path)) == "myapp"
@@ -549,75 +526,6 @@ def test_synth_repo_env_roundtrips_through_from_env():
     assert cfg.fix_budget_usd == 10.00
 
 
-def test_synth_repo_env_records_exact_repoint_lineage():
-    text = cli.synth_repo_env(
-        repo="o/r",
-        target_dir="/srv/current",
-        name="r",
-        repointed_from_deployments=(
-            ("o/r", "/srv/old"),
-            ("o/r", "/srv/older"),
-        ),
-    )
-
-    assert json.loads(
-        _source_env(text)["REPOINTED_FROM_DEPLOYMENTS"]
-    ) == [
-        {"repository": "o/r", "target_dir": "/srv/old"},
-        {"repository": "o/r", "target_dir": "/srv/older"},
-    ]
-
-
-def test_repoint_history_preserves_unstarted_and_started_ancestors(tmp_path):
-    overlay = tmp_path / "app.env"
-    overlay.write_text(
-        "REPO='o/r'\n"
-        "TARGET_DIR='/srv/second'\n"
-        "REPOINTED_FROM_DEPLOYMENTS='"
-        '[{"repository":"o/r","target_dir":"/srv/first"}]'
-        "'\n"
-    )
-
-    history = cli.repoint_history_for_overlay(
-        str(overlay),
-        repository="o/r",
-        target_dir="/srv/third",
-    )
-
-    assert history == (
-        ("o/r", "/srv/second"),
-        ("o/r", "/srv/first"),
-    )
-
-
-def test_repoint_history_refuses_to_discard_malformed_lineage(tmp_path):
-    overlay = tmp_path / "app.env"
-    overlay.write_text(
-        "REPO='o/r'\n"
-        "TARGET_DIR='/srv/old'\n"
-        "REPOINTED_FROM_DEPLOYMENTS='not-json'\n"
-    )
-
-    with pytest.raises(ValueError, match="valid JSON"):
-        cli.repoint_history_for_overlay(
-            str(overlay),
-            repository="o/r",
-            target_dir="/srv/new",
-        )
-
-
-def test_repoint_history_rejects_cross_repository_overlay_reuse(tmp_path):
-    overlay = tmp_path / "app.env"
-    overlay.write_text("REPO='old/repo'\nTARGET_DIR='/srv/old'\n")
-
-    with pytest.raises(ValueError, match="different --name"):
-        cli.repoint_history_for_overlay(
-            str(overlay),
-            repository="new/repo",
-            target_dir="/srv/new",
-        )
-
-
 # ── harness worktree path ─────────────────────────────────────────────────────
 def test_harness_worktree_path_default_is_sibling():
     p = cli.harness_worktree_path("/Users/me/Repos/MyApp-combined-agent")
@@ -750,18 +658,6 @@ def _write_jsonl(path: str, *lines: str) -> None:
     with open(path, "w") as f:
         for line in lines:
             f.write(line + "\n")
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def test_status_caps_resolve_overlay_then_shared_config(
@@ -1229,11 +1125,6 @@ def test_cmd_status_reports_heartbeat_when_pid_namespace_hides_daemon(
         lambda _name: {"fix": heartbeat, "review": heartbeat},
     )
     monkeypatch.setattr(cli, "log_dir", lambda: str(tmp_path / "logs"))
-    monkeypatch.setattr(
-        cli,
-        "interventions_status_line",
-        lambda _name, _repo: "  interventions: 0",
-    )
 
     rc = cli.cmd_status(
         argparse.Namespace(
@@ -1341,11 +1232,6 @@ def test_cmd_status_prefers_service_journal_over_stale_foreground_log(
             else None
         ),
     )
-    monkeypatch.setattr(
-        cli,
-        "interventions_status_line",
-        lambda _name, _repo: "  interventions: 0",
-    )
 
     assert cli.cmd_status(
         argparse.Namespace(
@@ -1385,11 +1271,6 @@ def test_cmd_status_prefers_live_foreground_log_over_inactive_installed_unit(
         return None
 
     monkeypatch.setattr(cli, "_systemd_status_log", inactive_service)
-    monkeypatch.setattr(
-        cli,
-        "interventions_status_line",
-        lambda _name, _repo: "  interventions: 0",
-    )
 
     assert cli.cmd_status(
         argparse.Namespace(
@@ -1428,11 +1309,6 @@ def test_cmd_status_shows_foreground_log_alongside_unavailable_systemd(
             if role == "fix"
             else None
         ),
-    )
-    monkeypatch.setattr(
-        cli,
-        "interventions_status_line",
-        lambda _name, _repo: "  interventions: 0",
     )
 
     assert cli.cmd_status(
@@ -1693,25 +1569,6 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     assert install_call["env"]["ISSUE_AGENT_DEPLOYMENT_ID"] == "myapp"
 
 
-def test_install_service_rejects_partial_role_cutover(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text(
-        f'REPO="o/r"\nTARGET_DIR="{tmp_path}"\n'
-    )
-    shared = tmp_path / "shared.env"
-    shared.write_text("")
-    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
-    args = _install_args(tmp_path)
-    args.roles = ["fix"]
-
-    assert cli.cmd_install_service(args) == 2
-    assert "every legacy writer stops" in capsys.readouterr().err
-
-
 def test_uninstall_service_defaults_to_current_deployment(
     tmp_path, monkeypatch
 ) -> None:
@@ -1800,32 +1657,19 @@ def test_ready_routes_operator_label_through_operator_effects(
     assert "#9" in capsys.readouterr().out
 
 
-def test_remote_bootstrap_uses_effect_commands_for_every_requested_write(
-    monkeypatch,
-):
+def test_remote_bootstrap_ensures_exactly_the_two_lifecycle_labels(monkeypatch, capsys):
     labels = []
-    auto_merge = []
 
     class Effects:
         def ensure_label(self, label, **_kwargs):
             labels.append(label)
-            return True, "ok"
-
-        def set_repository_auto_merge(self, enabled):
-            auto_merge.append(enabled)
-            return True, "ok"
+            return (label != "needs-human"), "forbidden"
 
     monkeypatch.setattr(cli, "_operator_effects", lambda *_args: Effects())
-    args = argparse.Namespace(
-        repo="o/r",
-        name="demo",
-        skip_labels=False,
-        ensure_auto_merge=True,
-    )
 
-    assert cli.cmd_prepare_remote(args) == 0
+    assert cli.cmd_prepare_remote(argparse.Namespace(repo="o/r")) == 1
     assert labels == ["ai-ready", "needs-human"]
-    assert auto_merge == [True]
+    assert "label needs-human: forbidden" in capsys.readouterr().err
 
 
 # ── setup wizard: identity detection + first-line token validation ────────────
@@ -1864,14 +1708,6 @@ class _Answers:
         return self.items.pop(0)
 
 
-def _codex_report(*, path="/usr/bin/codex", version="0.147.0", findings=()):
-    return codex_resolution.analyse_codex_resolution(
-        path if path.startswith("/") else "codex",
-        path, version,
-        tuple(codex_resolution.CodexCandidate(p, v) for p, v in findings),
-    )
-
-
 def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None):
     shared = tmp_path / "config" / "shared.env"
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
@@ -1879,8 +1715,10 @@ def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None
     monkeypatch.setattr(cli.subprocess, "run", gh or _gh_stub())
     monkeypatch.setattr(cli, "detect_claude_auth", lambda: True)
     monkeypatch.setattr(cli, "detect_codex_auth", lambda: "apikey")
-    report = codex if codex is not None else _codex_report()
-    monkeypatch.setattr(cli, "report_codex_resolution", lambda _bin: report)
+    real_which = cli.shutil.which
+    codex_path = "/usr/bin/codex" if codex is None else codex
+    monkeypatch.setattr(cli.shutil, "which",
+                        lambda name, *a, **k: codex_path if name == "codex" else real_which(name, *a, **k))
     asked = _Answers(answers)
     secret_asked = _Answers(secrets)
     monkeypatch.setattr("builtins.input", asked)
@@ -2131,7 +1969,7 @@ def test_cmd_init_collects_a_fixer_token_and_reports_the_account_it_belongs_to(
     values = _shared_values(shared.read_text())
     assert values["FIX_BOT_TOKEN"] == "fixer-pat"
     out = capsys.readouterr()
-    assert "fixer token authenticates as 'fix-bot-account'" in out.out
+    assert "FIX_BOT_TOKEN authenticates as 'fix-bot-account'" in out.out
     # …and with both identities distinct, the attribution finding is gone.
     assert "FIX_BOT_TOKEN is not set" not in out.err
 
@@ -2182,35 +2020,15 @@ def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
     """2026-08-02 keifu: the wizard's shell found 0.147.0 while the daemons'
     systemd PATH found 0.142.3, which the provider refuses to serve. Answering
     nothing (or piped stdin) must still write the absolute pin."""
-    shadowed = codex_resolution.analyse_codex_resolution(
-        "codex", "/run/current-system/sw/bin/codex", "0.142.3",
-        (codex_resolution.CodexCandidate("/run/current-system/sw/bin/codex", "0.142.3"),
-         codex_resolution.CodexCandidate("/home/o/.local/bin/codex", "0.147.0")),
-    )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
         answers=["fix-bot", "review-bot", "N",
                  "claude", "codex"],
-        secrets=["", ""], codex=shadowed,
+        secrets=["", ""], codex="/home/o/.local/bin/codex",
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert _shared_values(shared.read_text())["CODEX_BIN"] == "/home/o/.local/bin/codex"
-
-
-def test_cmd_init_leaves_codex_bin_unpinned_when_resolution_is_clean(
-    tmp_path, monkeypatch
-):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=["fix-bot", "review-bot", "N",
-                 "claude", "codex", "https://api.openai.com/v1"],
-        secrets=["", ""],
-        codex=_codex_report(path="/opt/codex", version="0.147.0"),
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "CODEX_BIN" not in _shared_values(shared.read_text())
 
 
 def test_cmd_init_never_asks_about_codex_for_a_claude_only_deployment(
@@ -2218,14 +2036,8 @@ def test_cmd_init_never_asks_about_codex_for_a_claude_only_deployment(
 ):
     """A deployment that never spawns codex has no reason to answer for a binary
     it will not run — and no reason to carry a CODEX_BIN into its config."""
-    shadowed = codex_resolution.analyse_codex_resolution(
-        "codex", "/usr/bin/codex", "0.142.3",
-        (codex_resolution.CodexCandidate("/usr/bin/codex", "0.142.3"),
-         codex_resolution.CodexCandidate("/opt/codex", "0.147.0")),
-    )
     shared, asked, _s = _init_env(
         tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["", ""],
-        codex=shadowed,
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
@@ -2236,16 +2048,11 @@ def test_cmd_init_never_asks_about_codex_for_a_claude_only_deployment(
 def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
     tmp_path, monkeypatch, capsys
 ):
-    shadowed = codex_resolution.analyse_codex_resolution(
-        "codex", "/usr/bin/codex", "0.142.3",
-        (codex_resolution.CodexCandidate("/usr/bin/codex", "0.142.3"),
-         codex_resolution.CodexCandidate("/opt/codex", "0.147.0")),
-    )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
         answers=["fix-bot", "review-bot", "N",
                  "claude", "codex", "n", "https://api.openai.com/v1"],
-        secrets=["", ""], codex=shadowed,
+        secrets=["", ""],
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
@@ -2308,25 +2115,12 @@ def test_cmd_init_codex_on_chatgpt_auth_explains_the_synthetic_rate_card(
 def test_cmd_init_codex_on_api_key_still_asks_for_the_gateway(tmp_path, monkeypatch):
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=_wizard_answers(reviewer_runtime="codex") + ["https://gw.local/v1"],
+        answers=_wizard_answers(reviewer_runtime="codex") + ["Y", "https://gw.local/v1"],
         secrets=["", ""],
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert _shared_values(shared.read_text())["OPENAI_BASE_URL"] == "https://gw.local/v1"
-
-
-def test_cmd_init_uses_the_suggested_reviewer_login_as_the_default(
-    tmp_path, monkeypatch
-):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(review=""), secrets=["", ""],
-    )
-
-    assert cli.cmd_init(
-        argparse.Namespace(force=False, review_bot_default="suggested-bot")
-    ) == 0
-    assert _shared_values(shared.read_text())["REVIEW_BOT"] == "suggested-bot"
 
 
 # ── runtime auth detection ────────────────────────────────────────────────────
@@ -2504,40 +2298,6 @@ def test_detect_base_branch_without_a_repo_cannot_confirm_anything(monkeypatch):
         pr_list=json.dumps([{"baseRefName": "main"}]), existing_branches=("main",),
     ))
     assert cli.detect_base_branch("/t", "") == ("dev", "")
-
-
-def test_detect_review_bot_picks_the_most_frequent_non_fixer_reviewer(monkeypatch):
-    payload = json.dumps([
-        {"reviews": [{"author": {"login": "fix-bot"}},
-                     {"author": {"login": "review-bot"}}]},
-        {"reviews": [{"author": {"login": "review-bot"}}]},
-        {"reviews": [{"author": {"login": "someone"}}]},
-    ])
-    seen: list[list[str]] = []
-
-    def run(cmd, cwd=None):
-        seen.append(cmd)
-        return payload
-
-    monkeypatch.setattr(cli, "_run", run)
-    assert cli.detect_review_bot("/t", "Fix-Bot") == "review-bot"
-    # Real argv: a renamed field would return nothing and silently no-op.
-    assert seen[0][:4] == ["gh", "pr", "list", "--state"]
-    assert seen[0][4] == "merged"
-    assert seen[0][seen[0].index("--json") + 1] == "reviews"
-
-
-def test_detect_review_bot_is_empty_when_only_the_fixer_reviews(monkeypatch):
-    payload = json.dumps([{"reviews": [{"author": {"login": "fix-bot"}}]}])
-    monkeypatch.setattr(cli, "_run", lambda cmd, cwd=None: payload)
-    assert cli.detect_review_bot("/t", "fix-bot") == ""
-
-
-def test_detect_review_bot_tolerates_gh_failure_and_malformed_json(monkeypatch):
-    monkeypatch.setattr(cli, "_run", lambda cmd, cwd=None: "")
-    assert cli.detect_review_bot("/t", "fix-bot") == ""
-    monkeypatch.setattr(cli, "_run", lambda cmd, cwd=None: "{oops")
-    assert cli.detect_review_bot("/t", "fix-bot") == ""
 
 
 # ── overlay: inferred keys ────────────────────────────────────────────────────
@@ -2848,3 +2608,42 @@ def test_gh_login_rejects_a_literal_null_from_jq(monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_proc("null\n", 0))
     assert cli.gh_login_for_token("t") == ("", True)
     assert cli.detect_fixer_login() == ""
+
+# ── doctor: the offline checks gate the exit code ─────────────────────────────
+def _doctor_rc(tmp_path, monkeypatch, composed: dict, *, sh_rc: int) -> int:
+    monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "absent.env"))
+    for independent_check in ("entrypoint_drift", "check_overlay_mismatch"):
+        monkeypatch.setattr(cli, independent_check, lambda *a, **k: "")
+    monkeypatch.setattr(cli, "_resolve_context", lambda _a: ("o/r", str(tmp_path), "r"))
+    monkeypatch.setattr(cli, "_composed_env", lambda _env: dict(composed))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: argparse.Namespace(returncode=sh_rc))
+    return cli.cmd_doctor(argparse.Namespace(name=None, repo=None))
+
+
+_SEPARATE = {"FIX_BOT_TOKEN": "fix", "REVIEW_BOT_TOKEN": "review"}
+
+
+def test_doctor_exits_nonzero_on_an_error_finding_even_when_doctor_sh_is_green(tmp_path, monkeypatch, capsys):
+    """doctor is a gate (point-at.sh, CI): a whitespace token 401s every call."""
+    assert _doctor_rc(tmp_path, monkeypatch, {**_SEPARATE, "FIX_BOT_TOKEN": "   "}, sh_rc=0) == 1
+    assert "whitespace" in capsys.readouterr().err
+
+
+def test_doctor_stays_green_for_warning_level_findings(tmp_path, monkeypatch):
+    assert _doctor_rc(tmp_path, monkeypatch, {"REVIEW_BOT_TOKEN": "review"}, sh_rc=0) == 0
+
+
+def test_doctor_preserves_a_failing_doctor_sh_exit_code(tmp_path, monkeypatch):
+    assert _doctor_rc(tmp_path, monkeypatch, {**_SEPARATE, "FIX_BOT_TOKEN": "   "}, sh_rc=2) == 2
+
+
+def test_doctor_reads_the_composed_snapshot_the_daemons_will_see(tmp_path):
+    snapshot = tmp_path / "active.env"
+    snapshot.write_text('FIX_BOT="from-snapshot"\n')
+    composed = cli._composed_env({"AGENT_ENV": str(snapshot), "FIX_BOT": "from-shell"})
+    assert composed["FIX_BOT"] == "from-snapshot"
+
+
+def test_an_unsourceable_snapshot_falls_back_to_the_inherited_environment():
+    env = {"AGENT_ENV": "/nonexistent/active.env", "FIX_BOT": "f"}
+    assert cli._composed_env(env) == env

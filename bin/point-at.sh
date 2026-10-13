@@ -252,22 +252,6 @@ if ! run_harness_issue_agent prepare-remote --repo "$REPO"; then
 fi
 grn "  ✓ labels ensured"
 
-# Enable GitHub native auto-merge on the target so an approved+green PR merges
-# itself (the harness's merge leg uses `gh pr merge --auto`, which the repo must
-# permit — otherwise it loops "Auto merge is not allowed"). Default on; set
-# ENSURE_AUTO_MERGE=0 to skip (e.g. a repo whose policy forbids it). Idempotent;
-# needs admin on the repo — a non-admin failure is a warning, not fatal.
-if [ "${ENSURE_AUTO_MERGE:-1}" != "0" ]; then
-  info "ensuring GitHub auto-merge is enabled on $REPO"
-  if run_harness_issue_agent prepare-remote --repo "$REPO" \
-      --skip-labels --ensure-auto-merge; then
-    grn "  ✓ allow_auto_merge=true"
-  else
-    red "  ⚠ could not enable allow_auto_merge (need admin on $REPO?) — approved PRs"
-    red "    won't auto-merge; enable it in repo Settings → General, or merge by hand."
-  fi
-fi
-
 # Resolve info/exclude via git (NOT $TARGET_DIR/.git/… — a linked worktree's .git
 # is a file, and excludes live in the SHARED primary .git anyway). One exclude
 # file per repo, applied to every worktree.
