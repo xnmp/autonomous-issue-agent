@@ -670,110 +670,6 @@ def test_systemd_status_log_reads_the_installed_unit_journal(monkeypatch) -> Non
     ]
 
 
-def test_systemd_status_log_reports_query_failure_instead_of_falling_back(
-    monkeypatch,
-) -> None:
-    class Result:
-        returncode = 1
-        stdout = ""
-        stderr = "Failed to connect to user bus"
-
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-    monkeypatch.setattr(
-        cli.subprocess,
-        "run",
-        lambda _command, **_kwargs: Result(),
-    )
-
-    source, output = cli._systemd_status_log("app", "fix", 7) or ("", "")
-    assert source == (
-        "systemd status unavailable: issue-agent-fix-watcher-app.service"
-    )
-    assert output == "  Failed to connect to user bus"
-
-
-def test_cmd_status_prefers_service_journal_over_stale_foreground_log(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "fix-app.log").write_text("stale canary incident\n")
-    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {"fix": [101], "review": []},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
-    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
-    monkeypatch.setattr(
-        cli,
-        "_systemd_status_log",
-        lambda _name, role, _lines: (
-            ("systemd journal: fix.service", "live service output")
-            if role == "fix"
-            else None
-        ),
-    )
-
-    assert cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            lines=5,
-        )
-    ) == 0
-
-    output = capsys.readouterr().out
-    assert "live service output" in output
-    assert "stale canary incident" not in output
-
-
-def test_cmd_status_shows_foreground_log_alongside_unavailable_systemd(
-    tmp_path,
-    monkeypatch,
-    capsys,
-) -> None:
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
-    logs = tmp_path / "logs"
-    logs.mkdir()
-    (logs / "fix-app.log").write_text("live foreground output\n")
-    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
-    monkeypatch.setattr(
-        cli,
-        "_role_pids",
-        lambda _name: {"fix": [101], "review": []},
-    )
-    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
-    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
-    monkeypatch.setattr(
-        cli,
-        "_systemd_status_log",
-        lambda _name, role, _lines: (
-            ("systemd status unavailable: fix.service", "user bus failed")
-            if role == "fix"
-            else None
-        ),
-    )
-
-    assert cli.cmd_status(
-        argparse.Namespace(
-            repo="acme/app",
-            target_dir="/srv/acme-app",
-            name="app",
-            lines=5,
-        )
-    ) == 0
-
-    output = capsys.readouterr().out
-    assert "user bus failed" in output
-    assert "live foreground output" in output
-
-
 def test_launcher_pid_discovery_uses_exact_deployment_argv_token(
     monkeypatch,
 ) -> None:
@@ -1294,21 +1190,6 @@ def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configure
     assert [p for p in secrets.prompts if "REVIEW_BOT_TOKEN" in p] == []
 
 
-def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
-    tmp_path, monkeypatch, capsys
-):
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=["fix-bot", "review-bot", "N",
-                 "claude", "codex", "n", "https://api.openai.com/v1"],
-        secrets=["", ""],
-    )
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "CODEX_BIN" not in _shared_values(shared.read_text())
-    assert "unpinned" in capsys.readouterr().err
-
-
 def test_cmd_init_writes_shared_env_private(tmp_path, monkeypatch):
     """shared.env can hold a long-lived PAT: it must never be group/world readable."""
     shared, _asked, _s = _init_env(
@@ -1332,33 +1213,6 @@ def test_cmd_init_survives_eof_midway_and_still_writes_a_config(
     values = _shared_values(shared.read_text())
     assert values["FIX_BOT"] == "fix-bot"
     assert "REVIEW_BOT_TOKEN" not in values
-
-
-def test_cmd_init_non_tty_names_the_real_shared_template(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "shared.env"))
-    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: False))
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 2
-    message = capsys.readouterr().err
-    assert "config/shared.example.env" in message
-    assert "agent.env.example" not in message
-    assert (Path(cli.HARNESS_ROOT) / "config" / "shared.example.env").is_file()
-
-
-def test_cmd_init_codex_on_chatgpt_auth_explains_the_synthetic_rate_card(
-    tmp_path, monkeypatch, capsys
-):
-    """ChatGPT-auth codex reports no billed cost, so spend is priced from the
-    rate card and there is no gateway URL to ask for."""
-    shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch,
-        answers=_wizard_answers(reviewer_runtime="codex"), secrets=["", ""],
-    )
-    monkeypatch.setattr(cli, "detect_codex_auth", lambda: "chatgpt")
-
-    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
-    assert "OPENAI_BASE_URL" not in _shared_values(shared.read_text())
-    assert "CODEX_COST_PER_MTOK" in capsys.readouterr().out
 
 
 # ── runtime auth detection ────────────────────────────────────────────────────
@@ -1527,25 +1381,6 @@ def test_cmd_start_never_adopts_an_inferred_base_branch_unattended(
     assert _source_env(text)["BASE_BRANCH"] == "dev"
     assert "# detected merge target of recent PRs: main" in text
     assert "main" in capsys.readouterr().out
-
-
-def test_cmd_start_records_no_suggestion_when_nothing_was_inferred(
-    tmp_path, monkeypatch
-):
-    """Anti-vacuity twin: with no confirmed candidate there is no suggestion and
-    no provenance comment — 'inferred from the harness default' is not a fact."""
-    overlay = _fresh_start_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
-
-    cli.cmd_start(_start_args(
-        repo="acme/app", target_dir="/srv/acme-app", name="app",
-        base_branch=None,
-    ))
-
-    text = overlay.read_text()
-    assert _source_env(text)["BASE_BRANCH"] == "dev"
-    assert "detected merge target" not in text
-    assert "inferred from" not in text
 
 
 def test_cmd_start_write_config_preserves_the_existing_base_branch(

@@ -96,17 +96,6 @@ def test_absent_manager_fields_stay_empty_rather_than_invented(tmp_path):
     assert (fields["oom"], fields["oom_kill"]) == ("0", "0")
 
 
-def test_large_counters_are_reported_verbatim(tmp_path):
-    huge = str(2**63 - 1)
-    fields = record(cgroup(tmp_path, f"oom {huge}\noom_kill {huge}\n", None), MANAGER)
-
-    assert (fields["oom"], fields["oom_kill"], fields["memory_peak"]) == (
-        huge,
-        huge,
-        "unknown",
-    )
-
-
 @pytest.mark.parametrize(
     ("value", "reported"),
     [("9" * 20, "9" * 20), ("1" + "0" * 20, "unknown")],

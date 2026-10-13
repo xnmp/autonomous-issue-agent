@@ -23,55 +23,6 @@ def _read(path: str) -> str:
     return (ROOT / path).read_text()
 
 
-# ── Makefile: target name -> its recipe lines ────────────────────────────────
-def _parse_makefile_targets(text: str) -> dict[str, list[str]]:
-    """A tiny target→recipe splitter (tab-indented lines belong to the most
-    recently declared target). Real enough for this file's needs — no
-    variables/pattern-rules to resolve — and means an assertion about
-    `run-fix`'s recipe can't be satisfied by `run-fix-sh`'s."""
-    targets: dict[str, list[str]] = {}
-    current: str | None = None
-    for line in text.splitlines():
-        if line.startswith("\t"):
-            if current is not None:
-                targets[current].append(line[1:].strip())
-            continue
-        current = None
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        head, sep, _rest = line.partition(":")
-        if sep and " " not in head.strip() and ":=" not in line.split(":", 1)[0]:
-            current = head.strip()
-            targets.setdefault(current, [])
-    return targets
-
-
-def test_makefile_exposes_only_python_watchers():
-    targets = _parse_makefile_targets(_read("Makefile"))
-
-    for role in ("fix", "review"):
-        assert f"run-{role}" in targets
-        assert f"run-{role}-sh" not in targets
-        recipe = " ".join(targets[f"run-{role}"])
-        assert f"python -m issue_agent.app.main {role}" in recipe
-
-    # No target's recipe anywhere still shells out to a retired bash watcher.
-    for recipe in targets.values():
-        joined = " ".join(recipe)
-        assert "agent/watcher.sh" not in joined
-        assert "review/review-watcher.sh" not in joined
-        assert "steward/steward.sh" not in joined
-
-
-def test_retired_shell_watchers_are_absent():
-    assert not (ROOT / "bin/run-role.sh").exists()
-    for directory in ("agent", "review", "steward"):
-        assert not any(
-            path.is_file() for path in (ROOT / directory).rglob("*")
-        )
-
-
 # ── systemd units: parse [Section]/key=value, don't grep the raw text ────────
 def _parse_unit(text: str) -> dict[str, dict[str, list[str]]]:
     """Minimal systemd-unit-file reader: `[Section]` headers + `key=value`

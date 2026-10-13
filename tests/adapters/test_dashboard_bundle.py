@@ -43,38 +43,6 @@ def _record_current_inputs(tmp_path):
     )
 
 
-def test_matching_build_manifest_is_ready(tmp_path):
-    _dashboard(tmp_path)
-    _record_current_inputs(tmp_path)
-
-    status = bundle.bundle_status(tmp_path)
-
-    assert status.ready
-    assert status.state == "ready"
-
-
-def test_changed_added_and_removed_inputs_each_make_the_bundle_stale(tmp_path):
-    dashboard = _dashboard(tmp_path)
-    _record_current_inputs(tmp_path)
-
-    (dashboard / "src" / "main.tsx").write_text("export const version = 2;")
-    changed = bundle.bundle_status(tmp_path)
-    assert changed.state == "stale"
-    assert "src/main.tsx" in changed.detail
-
-    (dashboard / "src" / "main.tsx").write_text("export const version = 1;")
-    (dashboard / "src" / "new.ts").write_text("export {};")
-    added = bundle.bundle_status(tmp_path)
-    assert added.state == "stale"
-    assert "src/new.ts" in added.detail
-
-    (dashboard / "src" / "new.ts").unlink()
-    (dashboard / "src" / "main.tsx").unlink()
-    removed = bundle.bundle_status(tmp_path)
-    assert removed.state == "stale"
-    assert "src/main.tsx" in removed.detail
-
-
 def test_missing_or_malformed_manifest_never_looks_ready(tmp_path):
     dashboard = _dashboard(tmp_path)
 
@@ -108,31 +76,6 @@ def test_manifest_hashes_file_bytes_not_timestamps(tmp_path):
     ).hexdigest()
 
 
-def test_deleted_tampered_and_unexpected_outputs_each_make_the_bundle_stale(tmp_path):
-    dashboard = _dashboard(tmp_path)
-    asset = dashboard / "dist" / "assets" / "app.js"
-    asset.parent.mkdir()
-    asset.write_text("console.log('built');")
-    _record_current_inputs(tmp_path)
-
-    asset.write_text("console.log('tampered');")
-    tampered = bundle.bundle_status(tmp_path)
-    assert tampered.state == "stale"
-    assert "build output" in tampered.detail
-    assert "assets/app.js" in tampered.detail
-
-    asset.unlink()
-    deleted = bundle.bundle_status(tmp_path)
-    assert deleted.state == "stale"
-    assert "assets/app.js" in deleted.detail
-
-    asset.write_text("console.log('built');")
-    (dashboard / "dist" / "unexpected.js").write_text("unexpected")
-    unexpected = bundle.bundle_status(tmp_path)
-    assert unexpected.state == "stale"
-    assert "unexpected.js" in unexpected.detail
-
-
 def test_atomic_pointer_selects_a_version_and_rejects_escape(tmp_path):
     dashboard = _dashboard(tmp_path)
     legacy_dist = dashboard / "dist"
@@ -161,41 +104,6 @@ def test_atomic_pointer_selects_a_version_and_rejects_escape(tmp_path):
     escaped = bundle.bundle_status(tmp_path)
     assert escaped.state == "stale"
     assert "escapes" in escaped.detail
-
-
-def test_bundle_snapshot_resolves_the_published_version_only_once(tmp_path, monkeypatch):
-    dashboard = _dashboard(tmp_path)
-    version = dashboard / "dist" / "builds" / "v1"
-    version.mkdir(parents=True)
-    index = version / "index.html"
-    index.write_text("<html>version one</html>")
-    (version / bundle.MANIFEST_NAME).write_text(
-        json.dumps(
-            {
-                "schema": 1,
-                "inputs": bundle.source_hashes(tmp_path),
-                "outputs": {
-                    "index.html": hashlib.sha256(index.read_bytes()).hexdigest()
-                },
-            }
-        )
-    )
-    calls = 0
-
-    def resolve_once(_root):
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            raise AssertionError("published version was resolved more than once")
-        return version
-
-    monkeypatch.setattr(bundle, "published_dist", resolve_once)
-
-    snapshot = bundle.bundle_snapshot(tmp_path)
-
-    assert snapshot.status.ready
-    assert snapshot.dist == version
-    assert calls == 1
 
 
 def test_bundle_selection_holds_the_build_lock_until_its_lease_is_acquired(

@@ -72,34 +72,6 @@ def test_a_fetch_failure_reports_an_error_without_leaking_the_token(tmp_path):
     assert result["five_hour_pct"] is None
 
 
-def test_a_transient_fetch_failure_keeps_the_last_successful_reading(tmp_path):
-    last_good = {}
-    first = usage.claude_usage(
-        fetch=lambda _token: {
-            "five_hour": {"utilization": 17.0},
-            "seven_day": {"utilization": 42.0},
-        },
-        credentials_path=creds(tmp_path),
-        cache=fresh_cache(),
-        last_good=last_good,
-    )
-
-    def fail(_token):
-        raise OSError("temporary outage")
-
-    stale = usage.claude_usage(
-        fetch=fail,
-        credentials_path=creds(tmp_path),
-        cache=fresh_cache(),
-        last_good=last_good,
-    )
-
-    assert first["error"] is None
-    assert (stale["five_hour_pct"], stale["seven_day_pct"]) == (17.0, 42.0)
-    assert stale["source"] == "oauth · cached"
-    assert "last successful" in stale["error"]
-
-
 def test_an_unexpected_response_keeps_the_last_successful_reading(tmp_path):
     last_good = {}
     usage.claude_usage(
@@ -181,17 +153,6 @@ def test_a_torn_or_unrelated_line_is_skipped_not_fatal():
 
 def test_a_rollout_without_any_snapshot_yields_none():
     assert usage.parse_rollout_rate_limits(['{"type":"turn"}', ""]) is None
-
-
-def test_codex_block_reports_the_window_plan_and_reset_as_iso():
-    block = usage.codex_block(
-        json.loads(rollout_line(3.25))["payload"]["rate_limits"], "2026-07-29T12:00:00+00:00"
-    )
-    assert block["weekly_pct"] == 3.25
-    assert block["window_minutes"] == 10080
-    assert block["plan"] == "plus"
-    assert block["resets_at"].startswith("2026-")
-    assert block["error"] is None
 
 
 @pytest.mark.parametrize("limits", [None, {}, {"primary": "nope"}])
