@@ -217,7 +217,7 @@ class Working:
     act: str | None
     headline: str
     reason: str
-    since_ts: str | None
+    since_ts: str | None  # when this step began (`board_status`; CI uses `_ci_start`), not the last activity
     status: str = "working"
 
 
@@ -301,11 +301,14 @@ def board_status(
     legs: tuple[LegRow, ...],
     last_end: datetime | None,
     harness: Harness,
+    now: datetime,
 ) -> BoardStatus:
     """One item's board status from its derived state. `legs` are the item's
     issue's legs, oldest first; `comments` are the item's own (where its stop
     comment is posted); `last_end` is the newest end among the legs derive
-    keyed to this item (its episode boundary, `state._decide`)."""
+    keyed to this item (its episode boundary, `state._decide`). `now` bounds
+    step start times: a Working row's `since_ts` is when its step began."""
+    ended = last_end if last_end is not None else max((x.ended_at for x in legs if x.ended_at), default=None)
     running = next((leg for leg in reversed(legs) if leg.running), None)
     if isinstance(state, NeedsHuman):
         # About to be stopped this tick: policy adds the label and the comment.
@@ -325,28 +328,28 @@ def board_status(
                        "An agent leg holds this item.", _iso(since))
     if isinstance(state, Dispatch):
         act = state.act.name
-        return Working("queued", act, f"{_ACT_WORDS[act]} next", "Dispatches when a slot is free.", _iso(last_end))
+        return Working("queued", act, f"{_ACT_WORDS[act]} next", "Dispatches when a slot is free.", _iso(ended))
     if isinstance(state, Merge):
-        return Working("merge", None, "Merging", "Approved on its head with green CI.", _iso(last_end))
+        return Working("merge", None, "Merging", "Approved on its head with green CI.", _iso(ended))
     if isinstance(state, Refresh):
         return Working("update", None, "Updating branch", "Behind its base; GitHub updates it next tick.",
-                       _iso(last_end))
+                       _iso(ended))
     if isinstance(state, OpenPR):
         return Working("open_pr", None, "Opening PR", f"Branch {state.branch} is pushed without a PR.",
-                       _iso(last_end))
+                       _iso(ended))
     if isinstance(state, TriageNote):
         return Working("triage_note", None, "Posting triage", "Triage graded it; its comment posts next tick.",
-                       _iso(last_end))
+                       _iso(ended))
     if isinstance(state, Release):
         return Working("release", None, "Releasing", "A human replied; needs-human comes off next tick.",
-                       _iso(last_end))
+                       _iso(ended))
     if isinstance(state, Backoff):
         act = state.act.name
         return Waiting("backoff", f"{_ACT_WORDS[act]} backing off",
                        "The last leg ended on a machine failure; it retries after the backoff.",
                        _iso(last_end), _iso(state.until))
     if isinstance(state, Wait):
-        return _wait_status(state.reason, pr, last_end)
+        return _wait_status(state.reason, pr, last_end, ended, now)
     raise TypeError(f"unknown derived state {state!r}")
 
 
@@ -364,10 +367,27 @@ def _ci_pending_status(pr: PRView | None, since: str | None) -> Working:
     return Working("ci", None, "CI running", "Required checks are still running.", since)
 
 
-def _wait_status(reason: WaitReason, pr: PRView | None, last_end: datetime | None) -> BoardStatus:
+def _ci_start(pr: PRView | None, now: datetime) -> datetime | None:
+    """When CI began on the PR's current head: the earliest check start, else
+    the head commit's push time. Unparseable or future stamps are absent."""
+    def valid(raw: str) -> datetime | None:
+        at = parse_timestamp(raw)
+        return at if at is not None and at <= now else None
+
+    if pr is None:
+        return None
+    checks = pr.ci.reports if isinstance(pr.ci, Observed) and pr.ci.head == pr.head_ref_oid else ()
+    starts = [at for c in checks if (at := valid(c.started_at))]
+    pushes = [at for p in pr.pushes if (at := valid(p.pushed_at))]
+    return min(starts) if starts else max(pushes, default=None)
+
+
+def _wait_status(
+    reason: WaitReason, pr: PRView | None, last_end: datetime | None, ended: datetime | None, now: datetime,
+) -> BoardStatus:
     since = _iso(last_end)
     if reason is WaitReason.CI_PENDING:
-        return _ci_pending_status(pr, since)
+        return _ci_pending_status(pr, _iso(_ci_start(pr, now) or ended))
     if reason is WaitReason.BASE_RED:
         return Waiting("github", "Base branch red",
                        "Its failing checks fail on the base tip too; it resumes when the base is fixed.", since)

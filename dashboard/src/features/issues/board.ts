@@ -51,7 +51,7 @@ export function boardTone(board: BoardStatus): BoardTone {
 
 export const COLUMN_HEADINGS: Record<BoardGroup, { now: string; wait: string }> = {
   needs_you: { now: "What to do", wait: "Waiting" },
-  working: { now: "Now", wait: "Last activity" },
+  working: { now: "Now", wait: "In step" },
   waiting: { now: "Waiting for", wait: "Waiting" },
 };
 
@@ -201,12 +201,15 @@ export interface WaitCell {
 
 /**
  * The fourth column. Needs you and Waiting count how long the row has waited
- * on the operator or its blocker; Working says how long ago something last
- * happened. A row with no start says what it is instead: a working row is
+ * on the operator or its blocker; Working says how long the current step has run. A row with no start says what it is instead: a working row is
  * queued, a needs-you row (a park, say, which has no stop comment to date it)
  * waits on you.
  */
 const UNDATED: Record<BoardStatus["status"], string> = { working: "queued", needs_you: "needs you", waiting: "—" };
+
+function stepName(board: BoardStatus): string {
+  return board.status === "working" ? board.headline.toLowerCase() : "step";
+}
 
 export function waitCell(board: BoardStatus, nowMs: number): WaitCell {
   const since = parseTs(board.since_ts);
@@ -214,7 +217,7 @@ export function waitCell(board: BoardStatus, nowMs: number): WaitCell {
   const seconds = Math.max(0, (nowMs - since) / 1000);
   const text = waitCompact(seconds);
   if (board.status === "working") {
-    return { text: `${text} ago`, stale: seconds >= DAY_S, title: `Last activity ${text} ago` };
+    return { text, stale: seconds >= DAY_S, title: `In ${stepName(board)} for ${text}` };
   }
   return {
     text,

@@ -114,14 +114,14 @@
   --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas,
     "Liberation Mono", monospace;
   /* Body 14, secondary 13, labels and counts 12 (#330). */
-  --text-2xs: 10px;
-  --text-xs: 12px;
-  --text-sm: 13px;
-  --text-base: 14px;
-  --text-lg: 15px;
-  --text-xl: 18px;
-  --text-2xl: 24px;
-  --text-3xl: 32px;
+  --text-2xs: 11px;
+  --text-xs: 13px;
+  --text-sm: 14px;
+  --text-base: 15px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 26px;
+  --text-3xl: 34px;
   --fs-base: var(--text-base);
   --fs-sm: var(--text-sm);
   --fs-xs: var(--text-xs);

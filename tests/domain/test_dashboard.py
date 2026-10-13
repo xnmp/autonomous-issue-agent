@@ -15,6 +15,7 @@ from issue_agent.domain.state import (
     Harness,
     Merge,
     NeedsHuman,
+    Refresh,
     Release,
     StopReason,
     Wait,
@@ -22,7 +23,7 @@ from issue_agent.domain.state import (
     stop_tag,
 )
 from issue_agent.domain.checks import Check, Observed
-from issue_agent.domain.world import Comment, PRView
+from issue_agent.domain.world import Comment, PRView, Push
 
 T0 = datetime(2026, 10, 13, 8, 0, tzinfo=timezone.utc)
 HARNESS = Harness(fix_bot="fixbot", review_bot="reviewbot")
@@ -77,12 +78,15 @@ def leg(
     )
 
 
-def status(state, *, comments=(), pr=None, legs=(), target="issue", last_end=None):
+_AUTO = object()
+
+
+def status(state, *, comments=(), pr=None, legs=(), target="issue", last_end=_AUTO, now=None):
     """`last_end` is derive's item boundary; by default the newest end of `legs`."""
-    if last_end is None:
+    if last_end is _AUTO:
         last_end = max((x.ended_at for x in legs if x.ended_at is not None), default=None)
     return dash.board_status(
-        state, target=target, comments=comments, pr=pr, legs=tuple(legs), last_end=last_end, harness=HARNESS
+        state, target=target, comments=comments, pr=pr, legs=tuple(legs), last_end=last_end, harness=HARNESS, now=now or at(600),
     )
 
 
@@ -190,6 +194,59 @@ def test_waits_name_what_they_wait_on():
     assert isinstance(base_red, dash.Waiting) and base_red.headline == "Base branch red"
     backoff = status(Backoff(AgentKind.RESOLVE, at(30)))
     assert isinstance(backoff, dash.Waiting) and (backoff.on, backoff.until_ts) == ("backoff", stamp(30))
+
+
+def _ci_pr_at(checks=(), pushes=()):
+    return PRView(1, head_ref_oid="h", pushes=tuple(Push("bot", p) for p in pushes),
+                  ci=Observed("h", "h", frozenset(), tuple(Check(f"c{i}", "IN_PROGRESS", "pending", started_at=s)
+                                                           for i, s in enumerate(checks))))
+
+
+def _ci_since(pr, *, legs=(), last_end=None, now=None):
+    board = status(Wait(WaitReason.CI_PENDING), pr=pr, legs=legs, last_end=last_end, now=now)
+    assert isinstance(board, dash.Working) and board.activity == "ci"
+    return board.since_ts
+
+
+def test_ci_step_starts_at_the_earliest_check_start():
+    pr = _ci_pr_at(checks=(stamp(9), stamp(7), ""), pushes=(stamp(5),))
+    assert _ci_since(pr, last_end=at(3)) == stamp(7)
+
+
+def test_ci_step_without_check_starts_falls_back_to_the_newest_push_then_last_end():
+    assert _ci_since(_ci_pr_at(pushes=(stamp(4), stamp(6))), last_end=at(3)) == stamp(6)
+    assert _ci_since(_ci_pr_at(), last_end=at(3)) == stamp(3)
+
+
+def test_a_pr_row_in_ci_with_no_pr_keyed_leg_still_has_a_step_start():
+    # Live bug: the only leg (RESOLVE) is keyed to the issue, so derive's last_end is None.
+    board = status(Wait(WaitReason.CI_PENDING), pr=_ci_pr_at(), legs=[leg("RESOLVE", 2)], last_end=None, target="pr")
+    assert isinstance(board, dash.Working) and board.since_ts == stamp(3)
+
+
+@pytest.mark.parametrize("bad", ["garbage", "", "2026-13-45T99:00:00Z"])
+def test_malformed_ci_timestamps_are_absent(bad):
+    pr = _ci_pr_at(checks=(bad,), pushes=(bad,))
+    assert _ci_since(pr, last_end=at(3)) == stamp(3)
+
+
+def test_future_ci_timestamps_are_absent_not_clamped():
+    pr = _ci_pr_at(checks=(stamp(700),), pushes=(stamp(8), stamp(800)))
+    assert _ci_since(pr, last_end=at(3), now=at(10)) == stamp(8)
+    assert _ci_since(_ci_pr_at(checks=(stamp(700),)), last_end=at(3), now=at(10)) == stamp(3)
+
+
+def test_checks_of_another_head_do_not_date_the_step():
+    pr = PRView(1, head_ref_oid="new", ci=Observed("old", "old", frozenset(), (Check("c", "IN_PROGRESS", started_at=stamp(1)),)))
+    assert _ci_since(pr, last_end=at(3)) == stamp(3)
+
+
+def test_free_action_steps_start_when_the_previous_step_ended_falling_back_to_issue_legs():
+    legs = [leg("RESOLVE", 2), leg("REVIEW", 5)]
+    for state in (Merge("h"), Refresh("h"), Release()):
+        assert status(state, legs=legs, last_end=None).since_ts == stamp(6)
+    assert status(Merge("h"), legs=legs, last_end=at(1)).since_ts == stamp(1)
+    assert status(Merge("h"), last_end=None).since_ts is None
 
 
 # ── rail and history ─────────────────────────────────────────────────────────

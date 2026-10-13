@@ -77,7 +77,7 @@ def board_rows(world: WorldState, keys: Iterable[ItemKey]) -> dict[int, tuple[It
 
 def items(
     world: WorldState, states: Mapping[ItemKey, DerivedState], legs: Iterable[dash.LegRow], harness: Harness,
-    item_legs: Mapping[ItemKey, tuple[LegEnd, ...]],
+    item_legs: Mapping[ItemKey, tuple[LegEnd, ...]], now: datetime,
 ) -> tuple[Item, ...]:
     """One `Item` per board row. `item_legs` are the legs derive keyed to
     each item (`Local.legs`), whose newest end bounds the item's episode."""
@@ -90,7 +90,7 @@ def items(
         comments = pr.comments if pr is not None else (view.comments if view else ())
         last_end = max((leg.ended_at for leg in item_legs.get(key, ())), default=None)
         status = dash.board_status(states[key], target="pr" if pr is not None else "issue", comments=comments,
-                                   pr=pr, legs=own, last_end=last_end, harness=harness)
+                                   pr=pr, legs=own, last_end=last_end, harness=harness, now=now)
         out.append(Item(issue, key, states[key], view, pr, status, own))
     return tuple(out)
 

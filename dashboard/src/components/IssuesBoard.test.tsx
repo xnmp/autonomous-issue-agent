@@ -136,9 +136,9 @@ describe("issues board groups", () => {
 
     const headings = (label: string) => Array.from(section(label).querySelectorAll(".board-cols span")).map((node) => node.textContent);
     expect(headings("Needs you")).toEqual(["Issue", "What to do", "Stage", "Waiting", ""]);
-    expect(headings("Working")).toEqual(["Issue", "Now", "Stage", "Last activity", ""]);
+    expect(headings("Working")).toEqual(["Issue", "Now", "Stage", "In step", ""]);
     expect(headings("Waiting")).toEqual(["Issue", "Waiting for", "Stage", "Waiting", ""]);
-    expect(within(row("Issue 121 title")).getByText("12m ago")).toBeVisible();
+    expect(within(row("Issue 121 title")).getByText("12m")).toBeVisible();
     expect(within(row("Issue 120 title")).getByText("2h")).toBeVisible();
   });
 

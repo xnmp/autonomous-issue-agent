@@ -394,7 +394,7 @@
   border-radius: var(--radius-sm);
   background: var(--meter-track);
   color: var(--ink);
-  font-size: 10px;
+  font-size: 11px;
   text-align: center;
   line-height: 16px;
 }
@@ -671,7 +671,7 @@
   align-items: center;
   padding: 0 var(--space-4) 0 0;
   color: var(--ink-faint);
-  font-size: 10px;
+  font-size: 11px;
   transition: color var(--t);
 }
 .tab-close:hover {
@@ -926,7 +926,7 @@
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 .stack-seg-label {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   /* inside a filled segment, ink is chosen for contrast against the fill */
   color: var(--ink-on-fill);
@@ -1296,7 +1296,7 @@
 }
 .sort-mark {
   color: var(--ink-faint);
-  font-size: 10px;
+  font-size: 11px;
   flex: none;
 }
 .column-resizer {
