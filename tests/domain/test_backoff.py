@@ -54,6 +54,14 @@ def test_order_of_input_does_not_matter():
     assert machine_backoff_until(tuple(reversed(history)), AgentKind.FIX_CI) == latest(history) + timedelta(seconds=120)
 
 
+def test_ends_sharing_a_timestamp_count_the_later_recorded_one_as_newest():
+    # A refused submission can be recorded in the same millisecond as the paid
+    # leg it follows; the recorded order, not chance, decides which is newest.
+    paid, refused = LegEnd(AgentKind.REVIEW, T, False), LegEnd(AgentKind.REVIEW, T, True)
+    assert machine_backoff_until((paid, refused), AgentKind.REVIEW) == T + timedelta(seconds=60)
+    assert machine_backoff_until((refused, paid), AgentKind.REVIEW) is None
+
+
 def test_other_kinds_neither_wait_nor_reset():
     history = ends(True, True) + ends(False, kind=AgentKind.REBASE)
     assert machine_backoff_until(history, AgentKind.FIX_CI) == latest(ends(True, True)) + timedelta(seconds=120)

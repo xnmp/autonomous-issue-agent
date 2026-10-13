@@ -80,7 +80,10 @@ def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime |
     """
     streak = 0
     latest: datetime | None = None
-    for end in sorted((end for end in ends if end.kind is kind), key=lambda end: end.ended_at, reverse=True):
+    # Newest first; ends sharing a timestamp keep their recorded order, so the
+    # later-recorded one counts as newer (a refused submission can land in
+    # the same millisecond as the paid leg it follows).
+    for end in reversed(sorted((end for end in ends if end.kind is kind), key=lambda end: end.ended_at)):
         if not end.machine:
             break
         streak += 1

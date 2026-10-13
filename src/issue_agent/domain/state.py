@@ -462,7 +462,7 @@ def _human_change_requests(pr: PRView, harness: Harness) -> frozenset[str]:
 
 def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) -> int:
     run = 0
-    for leg in sorted(legs, key=lambda leg: leg.ended_at, reverse=True):
+    for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at)):  # ties: later-recorded is newer
         if floor is not None and leg.ended_at <= floor:
             break
         if leg.machine:
