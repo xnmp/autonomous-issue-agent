@@ -46,7 +46,7 @@ Agents push and return; they never wait on CI. They ask a question only when the
 | | Start (2026-10-12) | Target | Now (slice 10) |
 |---|---|---|---|
 | core src lines (excludes dashboard) | 104,285 | **≤ 15,000** | 14,989 |
-| test lines | 148,404 | ≤ 20,000 | 22,790 (over target: coverage the review restored outranks the line budget) |
+| test lines | 148,404 | ≤ 20,000 | 19,882 ✓ (slice 11 compacted without losing a covered line or branch) |
 | stop states | 34 | **1** | 1 (`NeedsHuman`, five reasons) |
 | labels | 16 | **2** | 2 (`ai-ready`, `needs-human`) |
 | SQLite tables | many workflow tables | **3**: legs+money, leases, idempotency | 3 |
