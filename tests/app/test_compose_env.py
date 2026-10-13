@@ -180,40 +180,9 @@ def test_compose_env_missing_overlay_fails_loud(tmp_path):
     assert "nonexistent.env" in result.stderr
 
 
-# ── P0R-1: a var the files assign must be emitted even when it is unchanged ───
-def test_compose_env_emits_assigned_var_whose_value_equals_the_ambient_shells(tmp_path):
-    # THE regression test. shared.env assigns TEST_CMD; the launching shell
-    # already exports the byte-identical value, so the PRE/POST diff sees no
-    # change and (pre-fix) omitted it. Under systemd — units pass only
-    # AGENT_ENV + TARGET_DIR — the daemon then read TEST_CMD=None, the bash
-    # gate checkers failed closed, and every push / `gh pr create` was denied
-    # forever. Asserted end-to-end through the real loader, because "present in
-    # the file text" is not the property that matters; "reaches the daemon" is.
-    active = _compose(
-        tmp_path,
-        shared='TEST_CMD="uv run pytest -q"\n',
-        overlay='REPO="acme/widget"\n',
-        ambient={"TEST_CMD": "uv run pytest -q"},
-    )
-    assert "TEST_CMD" in _emitted(active)
-    assert _load_agent_env({"AGENT_ENV": str(active)})["TEST_CMD"] == "uv run pytest -q"
-
-
-def test_compose_env_emits_parameter_expansion_default_with_the_ambient_value(tmp_path):
-    # The `${VAR:-default}` idiom main.py's `_load_agent_env` docstring names as
-    # the reason these files are shell syntax. With the var already exported the
-    # assignment is a no-op — but the var IS config and must be emitted, with
-    # the ambient value (not the fallback).
-    active = _compose(
-        tmp_path,
-        shared='ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-fallback}"\n',
-        overlay='REPO="acme/widget"\n',
-        ambient={"ANTHROPIC_AUTH_TOKEN": "sk-ambient-real"},
-    )
-    env = _load_agent_env({"AGENT_ENV": str(active)})
-    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ambient-real"
-
-
+# P0R-1: a var the files assign must be emitted even when its value equals the
+# launching shell's. Pre-fix, a PRE/POST diff saw no change and omitted it; under
+# systemd the daemon then read TEST_CMD=None and every gate failed closed.
 def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path):
     # review §5's structural lesson: for anything that emits a SET, assert set
     # equality against an independently-derived expectation, never membership
@@ -256,6 +225,9 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
             "TEST_CMD": "uv run pytest -q",
             "ANTHROPIC_AUTH_TOKEN": "sk-ambient-real",
             "SOME_UNRELATED_AMBIENT_VAR": "should-not-leak",
+            # Commented names exported ambiently: a scan that matched a comment
+            # would emit them with these values.
+            "COMMENTED_KNOB": "leaked", "TIGHT_COMMENT": "leaked",
         },
     )
 
@@ -263,8 +235,10 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
     expected -= set(_UNSET_RE.findall(shared)) | set(_UNSET_RE.findall(overlay))
     expected |= {"INDIRECT_FROM_NESTED_SOURCE"}
     # compose-env appends the #63 scrub manifest naming every emitted knob.
-    expected |= {"HARNESS_DEPLOY_KNOBS"}
-    assert set(_emitted(active)) == expected
+    emitted = _emitted(active)
+    # raw _emitted values keep %q escaping (backslash-space) — unescape first
+    assert set(emitted.pop("HARNESS_DEPLOY_KNOBS").replace("\\", "").split()) == expected
+    assert set(emitted) == expected
 
     env = _load_agent_env({"AGENT_ENV": str(active)})
     assert env["TEST_CMD"] == "uv run pytest -q"
@@ -296,35 +270,6 @@ def test_compose_env_emits_only_sourceable_identifier_names(tmp_path):
     assert proc.stderr == ""
     # The variable the function set is still config and still arrives.
     assert _load_agent_env({"AGENT_ENV": str(active)})["HELPED"] == "yes"
-
-
-def test_compose_env_skips_commented_assignments_and_names_unset_after_assignment(tmp_path):
-    # Focused twin of the set-equality test's negative half, so a failure here
-    # points straight at the file-scan's anchor rather than at the whole set.
-    active = _compose(
-        tmp_path,
-        shared=(
-            '# COMMENTED_KNOB="nope"\n'
-            '#TIGHT_COMMENT="nope"\n'
-            '  # INDENTED_COMMENT="nope"\n'
-            'GONE_LATER="temp"\n'
-            'unset GONE_LATER\n'
-            '  export INDENTED_EXPORT="yes"\n'
-        ),
-        overlay='REPO="acme/widget"\n',
-        # The commented names are ALSO exported ambiently: if the scan ever
-        # matched a comment, they would be emitted with these values, which is
-        # the leak this asserts against.
-        ambient={"COMMENTED_KNOB": "leaked", "TIGHT_COMMENT": "leaked"},
-    )
-    emitted = _emitted(active)
-    assert "COMMENTED_KNOB" not in emitted
-    assert "TIGHT_COMMENT" not in emitted
-    assert "INDENTED_COMMENT" not in emitted
-    assert "GONE_LATER" not in emitted
-    assert emitted.keys() == {"INDENTED_EXPORT", "REPO", "HARNESS_DEPLOY_KNOBS"}
-    # raw _emitted values keep %q escaping (backslash-space) — unescape first
-    assert set(emitted["HARNESS_DEPLOY_KNOBS"].replace("\\", "").split()) == {"INDENTED_EXPORT", "REPO"}
 
 
 def test_compose_env_scans_a_final_line_with_no_trailing_newline(tmp_path):
