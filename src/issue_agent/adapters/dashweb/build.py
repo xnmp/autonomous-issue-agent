@@ -11,16 +11,18 @@ import signal
 import subprocess
 import time
 
+from ..signal_log import send_signal
+
 BUILD_TIMEOUT_S = 300.0
 TIMEOUT_EXIT = 124
 
 
-def _terminate_process_group(process: subprocess.Popen) -> None:
-    os.killpg(process.pid, signal.SIGTERM)
+def _terminate_process_group(process: subprocess.Popen, reason: str) -> None:
+    send_signal(signal.SIGTERM, pgid=process.pid, reason=reason)
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
+        send_signal(signal.SIGKILL, pgid=process.pid, reason=f"{reason}:grace_expired")
         process.wait()
 
 
@@ -29,17 +31,17 @@ def run_process(argv: list[str], cwd: Path, timeout: float) -> int:
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def terminate_child_group(signum, _frame) -> None:
-        _terminate_process_group(process)
+        _terminate_process_group(process, "build_sigterm")
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate_child_group)
     try:
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _terminate_process_group(process)
+        _terminate_process_group(process, "build_timeout")
         return TIMEOUT_EXIT
     except KeyboardInterrupt:
-        _terminate_process_group(process)
+        _terminate_process_group(process, "build_interrupt")
         raise
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)

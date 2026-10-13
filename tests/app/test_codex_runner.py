@@ -4,6 +4,7 @@ pure, and run() is exercised against a tiny shell stub that mimics `codex exec`
 (writes the -o file and a rollout `session_meta`).
 """
 
+import re
 import asyncio
 import json
 import os
@@ -1139,3 +1140,29 @@ def test_only_the_stderr_tail_classifies_provider_pushback(tail, poison, signal)
     trace = _trace_with(tail, poison=poison)
     assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is signal
     assert _is_rate_limited(trace) is (signal and "rate limit" in tail)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        (dict(idle_timeout=0.3, poll_slice=0.05), "idle_timeout"),
+        (
+            dict(
+                idle_timeout=900.0,
+                max_runtime=900.0,
+                poll_slice=0.1,
+                wall_clock=_jumping_wall_clock(1000.0, 1000.0, 1000.0, 4600.0),
+            ),
+            "wall_timeout",
+        ),
+    ],
+)
+def test_270_watchdog_kill_logs_signal_target_reason_and_run(tmp_path, kwargs, reason):
+    """#270: the harness's own SIGKILL of a codex group must be attributable."""
+    logged: list[str] = []
+
+    _run(tmp_path, 'echo "codex tool: step 1" >&2\nsleep 30\n', log=logged.append, **kwargs)
+
+    (line,) = [m for m in logged if m.startswith("signal-send:")]
+    assert "SIGKILL" in line and f"reason={reason}" in line
+    assert re.search(r"pgid=\d+", line) and "run_id=" in line

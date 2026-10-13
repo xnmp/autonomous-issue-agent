@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from ..adapters.env_file import source_env_file
 from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
+from ..adapters.signal_log import send_signal
 from ..domain.deployment import canonical_deployment_name
 from ..domain.labels import Label
 from ..domain.repository import canonical_repository, repository_equal
@@ -606,7 +607,7 @@ def _stop_deployment(name: str) -> int:
     info(f"stopping watchers for '{name}' (pids: {' '.join(map(str, pids))})")
     for pid in pids:
         try:
-            os.kill(pid, signal.SIGTERM)
+            send_signal(signal.SIGTERM, pid=pid, reason=f"operator_stop:{name}")
         except ProcessLookupError:
             pass
     deadline, remaining = time.monotonic() + 90, set(pids)
