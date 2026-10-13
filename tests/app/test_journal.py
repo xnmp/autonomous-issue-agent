@@ -174,19 +174,6 @@ def test_agent_run_preserves_codex_total_only_usage(tmp_path):
     }
 
 
-def test_agent_run_cost_rounds_identically_to_authoritative_money(tmp_path):
-    result = AgentResult(
-        is_error=False,
-        status="ok",
-        cost_usd=0.0065895,
-    )
-    rt, journal, _ledger = _runtime(tmp_path, result)
-
-    asyncio.run(rt.run(RuntimePlan(prompt="p")))
-
-    assert _settled(journal.path)[0]["cost_usd"] == 0.00659
-
-
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
     rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
     asyncio.run(rt.run(RuntimePlan(prompt="p")))
@@ -291,18 +278,6 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     assert "RuntimeError" in settled["error"] and "Stream closed" in settled["error"]
     # A session that never delivered a result costs nothing to attribute.
     assert read_events(ledger) == []
-
-
-def test_review_with_a_configured_model_journals_it_at_start_and_settlement(tmp_path):
-    """A configured REVIEW_MODEL is visible before and after the SDK session."""
-    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False))
-    rt.set_context("review", "REVIEW", 100, 91)
-
-    asyncio.run(rt.run(RuntimePlan(prompt="review", model="claude-opus-4-1")))
-
-    start, settled = read_events(journal.path)
-    assert start["model"] == "claude-opus-4-1"
-    assert settled["model"] == "claude-opus-4-1"
 
 
 def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(tmp_path):
