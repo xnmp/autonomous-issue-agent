@@ -130,17 +130,18 @@ def harness_pr(number=100, issue=5, **kw):
 
 
 def local(**kw):
-    return Local(now=T0 + timedelta(days=1), legs={}, **kw)
+    return Local(now=T0 + timedelta(days=1), **{"legs": {}, **kw})
 
 
-def test_paid_dispatches_fit_the_free_slots_issues_first():
+def test_heavy_dispatches_fit_the_free_slots_and_triage_needs_none():
+    triage = tuple(RunAgent(AgentKind.TRIAGE, n) for n in (1, 2, 3))
     world = WorldState(
         issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)),
-        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),),
+        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")), harness_pr(101, issue=8, ci=ci(bucket="fail"))),
     )
-    chosen = fix_actions(derive(world, local(), H), H, slots=2)
-    assert chosen == (RunAgent(AgentKind.TRIAGE, 1), RunAgent(AgentKind.TRIAGE, 2))
-    assert fix_actions(derive(world, local(), H), H, slots=0) == ()
+    chosen = fix_actions(derive(world, local(), H), H, slots=1)
+    assert chosen[:3] == triage and [a.kind for a in chosen[3:]] == [AgentKind.FIX_CI]
+    assert fix_actions(derive(world, local(), H), H, slots=0) == triage
 
 
 def test_free_actions_ignore_the_slot_budget_and_review_is_never_the_fix_roles():
@@ -151,9 +152,59 @@ def test_free_actions_ignore_the_slot_budget_and_review_is_never_the_fix_roles()
     assert fix_actions(derive(WorldState(prs=(approved, unreviewed)), local(), H), H, slots=5, merge=False) == ()
 
 
+def test_triage_is_bounded_by_the_light_ceiling_not_the_heavy_slots():
+    world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY})) for n in (3, 1, 2)))
+    chosen = fix_actions(derive(world, local(), H), H, slots=0, light=2)
+    assert chosen == (RunAgent(AgentKind.TRIAGE, 1), RunAgent(AgentKind.TRIAGE, 2))
+
+
+def _slot_world():
+    """Issue 5 awaits RESOLVE; PRs 100 and 101 await FIX_CI."""
+    return WorldState(
+        issues=(IssueView(5, labels=frozenset({Label.AI_READY})),),
+        prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")), harness_pr(101, issue=8, ci=ci(bucket="fail"))),
+    )
+
+
+def _heavy(states, **kw):
+    return [(a.kind, a.number) for a in fix_actions(states, H, **kw) if isinstance(a, RunAgent)]
+
+
+def test_a_pr_act_outranks_an_issue_resolve_for_the_one_slot():
+    triaged = {issue_key(5): (LegEnd(AgentKind.TRIAGE, T0, False),)}
+    states = derive(_slot_world(), local(legs=triaged), H)
+    assert _heavy(states, slots=3) == [(AgentKind.RESOLVE, 5), (AgentKind.FIX_CI, 100), (AgentKind.FIX_CI, 101)]
+    assert _heavy(states, slots=1) == [(AgentKind.FIX_CI, 100)]
+    assert _heavy(states, slots=2) == [(AgentKind.FIX_CI, 100), (AgentKind.FIX_CI, 101)]
+
+
+def test_the_longer_waiting_pr_beats_the_lower_numbered_one_and_absent_waits_sort_oldest_then_by_number():
+    states = derive(_slot_world(), local(), H)
+    one = lambda **kw: [n for k, n in _heavy(states, slots=1, **kw) if k is AgentKind.FIX_CI]
+    k = lambda n: pr_key(n)
+    assert one(waiting_since={k(100): T0 + timedelta(hours=2), k(101): T0}) == [101]
+    assert one(waiting_since={k(100): T0, k(101): T0}) == [100]  # tie: number
+    assert one(waiting_since={k(100): T0}) == [101]  # never served is oldest
+    assert one() == [100]  # nothing known: by number
+
+
+def test_1125_starved_behind_1039_1117_1122():
+    """Live incident: the high-numbered FIX_CI PR waited behind a newly admitted
+    issue's RESOLVE and behind lower-numbered PRs each time they cycled."""
+    world = WorldState(
+        issues=(IssueView(1039, labels=frozenset({Label.AI_READY})),),
+        prs=tuple(harness_pr(n, issue=n - 100, ci=ci(bucket="fail")) for n in (1117, 1122, 1125)),
+    )
+    states = derive(world, local(), H)
+    waiting = {pr_key(1117): T0 + timedelta(minutes=50), pr_key(1122): T0 + timedelta(minutes=40),
+               pr_key(1125): T0}
+    first = [(k, n) for k, n in _heavy(states, slots=1, waiting_since=waiting) if k is not AgentKind.TRIAGE]
+    assert first == [(AgentKind.FIX_CI, 1125)]
+
+
 @pytest.mark.parametrize("slots", [-1, 0])
-def test_no_slots_means_no_paid_dispatch(slots):
-    world = WorldState(issues=(IssueView(1, labels=frozenset({Label.AI_READY})),))
+def test_no_slots_means_no_heavy_dispatch(slots):
+    world = WorldState(prs=(harness_pr(100, issue=9, ci=ci(bucket="fail")),))
     assert fix_actions(derive(world, local(), H), H, slots=slots) == ()
 
 

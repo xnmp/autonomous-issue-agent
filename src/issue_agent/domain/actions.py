@@ -29,6 +29,12 @@ class AgentKind(Enum):
     REBASE = auto()
     REVIEW = auto()
 
+    @property
+    def holds_dispatch_slot(self) -> bool:
+        """Whether a leg of this act occupies and needs a dispatch slot. TRIAGE
+        is light (no workspace), so it neither waits behind nor crowds out one."""
+        return self is not AgentKind.TRIAGE
+
 
 @dataclass(frozen=True)
 class Relabel:
