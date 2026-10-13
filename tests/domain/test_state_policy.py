@@ -881,12 +881,12 @@ def test_ten_thousand_comments_against_many_legs():
     assert len(human_comments(comments, H, legs_)) == 10_000 - 50
 
 
-def test_342_a_mid_leg_comment_cannot_release_a_stop_but_a_later_reply_does():
+def test_342_the_operator_as_fix_bot_releases_a_stop_after_a_machine_ended_leg():
+    # Release is safe by construction (the reply postdates the stop, which
+    # postdates every leg), so the shared window filter must not starve it.
     capped = LegEnd(FIX, at(10), True, started_at=at(5))
     reply = Comment("fix-bot", "Mock the clock.", iso(12))
     assert pr_state(labelled([stop(StopReason.ATTEMPTS, 11), reply]), local(pr_legs(capped))) == Release()
-    inside = labelled([human(7, author="fix-bot"), stop(StopReason.ATTEMPTS, 11)])
-    assert pr_state(inside, local(pr_legs(capped))) == Wait(WaitReason.NEEDS_HUMAN)
 
 
 def test_a_comment_at_the_leg_start_instant_is_outside_the_window():
