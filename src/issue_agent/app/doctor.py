@@ -92,8 +92,8 @@ def identity_findings(env: dict) -> tuple[Finding, ...]:
             findings.append(Finding("error", f"{name} is whitespace: it is sent as a bearer token "
                                              "and GitHub 401s every call. Unset it or set a real token."))
     if not fix:
-        findings.append(Finding("warn", "FIX_BOT_TOKEN is not set: the fixer acts as the ambient "
-                                        "`gh auth` account and spends that person's rate-limit pool."))
+        findings.append(Finding("error", "FIX_BOT_TOKEN is not set: fix legs run sandboxed with no GitHub "
+                                         "credential and cannot push or read CI logs (#413)."))
     if any(app) and not all(app):
         findings.append(Finding("error", "GH_APP_ID, GH_APP_INSTALL_ID and GH_APP_KEY_FILE must be set together."))
     uses_app = all(app)
@@ -234,9 +234,24 @@ def service_findings(
     return tuple(findings)
 
 
+def sandbox_findings(probe: Callable[[], str | None] | None = None) -> tuple[Finding, ...]:
+    """Whether paid legs can run: every leg runs under bubblewrap, and with
+    none usable they are refused (no unsandboxed fallback, #413)."""
+    if probe is None:
+        from ..adapters.leg_sandbox import LegSandbox
+
+        probe = LegSandbox(home=os.path.expanduser("~"), repository=os.getcwd(), writable=False).preflight
+    reason = probe()
+    if reason is not None:
+        return (Finding("error", f"every paid leg is refused: {reason}"),)
+    return (Finding("info", "every leg runs under bubblewrap: private HOME, no harness checkout or "
+                            "state dirs, its checkout plus toolchains; network on"),)
+
+
 def doctor_findings(name: str, composed: dict, active_env_path: str) -> tuple[tuple[str, tuple[Finding, ...]], ...]:
     """The table of offline checks `issue-agent doctor` renders."""
     return (
+        ("leg sandbox", sandbox_findings()),
         ("identity", identity_findings(composed)),
         ("codex binary", codex_findings(composed)),
         ("installed services", service_findings(name, active_env_path)),

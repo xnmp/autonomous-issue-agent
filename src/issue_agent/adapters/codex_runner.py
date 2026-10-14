@@ -29,6 +29,7 @@ from typing import Any
 
 from .atomic_file import atomic_write
 from .child_env import child_process_env
+from .leg_sandbox import LegSandbox, SandboxRefused, codex_runtime_state
 from .signal_log import send_signal
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
@@ -571,6 +572,8 @@ class CodexRunner(AgentRuntime):
     spend_evidence_dir: str = ""
     # The rate card both the mid-run budget kill and settlement price with.
     rate_table: RateTable | None = None
+    # Every production leg runs inside it (#413); None only in unit tests.
+    leg_sandbox: LegSandbox | None = None
 
     def __post_init__(self) -> None:
         self._log = self.log or (lambda _m: None)
@@ -712,9 +715,22 @@ class CodexRunner(AgentRuntime):
         """One `codex exec`: spawn, pump stderr under the watchdogs and the
         budget, then read the envelope and this leg's rollout counters."""
         proc_env = self._child_environment(task)
+        execution_cwd = task.cwd or os.getcwd()
+        spawn_argv = tuple(argv)
+        if self.leg_sandbox is not None:
+            try:
+                launch = self.leg_sandbox.launch(argv, cwd=execution_cwd, env=proc_env,
+                                             runtime_state=codex_runtime_state(proc_env, execution_cwd),
+                                             scratch=(os.path.dirname(output_path),), read_only=task.read_only)
+            except SandboxRefused as exc:
+                self._log(f"codex: SANDBOX REFUSED — {exc}")
+                return AgentResult(is_error=True, status="blocked", summary=f"sandbox unavailable: {exc}",
+                                   exit_reason=ExitReason.RUNTIME_UNAVAILABLE)
+            self._log(f"codex: {launch.summary}")
+            spawn_argv = launch.argv
+            proc_env.update(launch.env)
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
         rollout_started_at = time.time()
-        execution_cwd = task.cwd or os.getcwd()
         accounting_run_id = proc_env.get("ISSUE_AGENT_RUN_ID", "")
         evidence = {
             "cwd": os.path.realpath(execution_cwd),
@@ -731,9 +747,8 @@ class CodexRunner(AgentRuntime):
         }
         write_spend_evidence(self.spend_evidence_dir, accounting_run_id, evidence)
         supervision_run_id = RunId(accounting_run_id or f"codex-{uuid.uuid4().hex}")
-        spawn_argv = tuple(argv)
         if self.process_supervisor is not None:
-            spawn_argv = self.process_supervisor.supervised_command(supervision_run_id, argv)
+            spawn_argv = self.process_supervisor.supervised_command(supervision_run_id, spawn_argv)
             proc_env.update(self.process_supervisor.launch_guard_env())
         # A new session puts codex and every descendant (the test servers it
         # spawns) in one process group the watchdogs kill whole; a leaked

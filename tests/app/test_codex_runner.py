@@ -1195,3 +1195,50 @@ def test_270_watchdog_kill_logs_signal_target_reason_and_run(tmp_path, kwargs, r
     (line,) = [m for m in logged if m.startswith("signal-send:")]
     assert "SIGKILL" in line and f"reason={reason}" in line
     assert re.search(r"pgid=\d+", line) and "run_id=" in line
+
+
+# ── #413: a codex leg runs inside the leg sandbox ───────────────────────────
+
+
+def _codex_sandbox(tmp_path, **kwargs):
+    from issue_agent.adapters.leg_sandbox import LegSandbox
+
+    (tmp_path / "home/.ssh").mkdir(parents=True)
+    (tmp_path / "home/.ssh/id_ed25519").write_text("planted-key\n")
+    return LegSandbox(home=str(tmp_path / "home"), repository=str(tmp_path / "target"), writable=True,
+                      credential="fake-leg-token", **kwargs)
+
+
+def test_a_sandboxed_codex_leg_runs_with_its_scratch_state_and_token_but_not_home(tmp_path):
+    from issue_agent.adapters.leg_sandbox import LegSandbox
+
+    if reason := LegSandbox(home="/x", repository="/x", writable=False).preflight():
+        pytest.skip(f"no usable bubblewrap: {reason}")
+    work, codex_home = tmp_path / "work", tmp_path / "state/codex-hooks/k"
+    work.mkdir()
+    codex_home.mkdir(parents=True)
+    body = ('cat "$HOME/.ssh/id_ed25519" > seen 2>/dev/null || echo hidden > seen\n'
+            'echo "${GH_TOKEN:-none}" >> seen; echo rollout > "$CODEX_HOME/marker"\n' + _DONE)
+    runner = CodexRunner(codex_bin=_fake_codex(tmp_path / "work", body),
+                         env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(codex_home), "HOME": str(tmp_path / "home")},
+                         process_supervisor=ProcessSupervisor(str(tmp_path / "sup")),
+                         leg_sandbox=_codex_sandbox(tmp_path))
+
+    result = asyncio.run(runner.run(RuntimePlan(prompt="x", schema=_STATUS_SCHEMA, cwd=str(work))))
+
+    assert result.status == "done", result.summary
+    assert (work / "seen").read_text().split() == ["hidden", "fake-leg-token"]
+    assert (codex_home / "marker").read_text() == "rollout\n"
+
+
+def test_a_codex_leg_the_sandbox_refuses_never_spawns(tmp_path):
+    marker = tmp_path / "spawned"
+    runner = CodexRunner(codex_bin=_fake_codex(tmp_path, f'touch "{marker}"\n' + _DONE),
+                         env={"OPENAI_API_KEY": "k", "CODEX_HOME": str(tmp_path)},
+                         leg_sandbox=_codex_sandbox(tmp_path, bwrap="definitely-not-bwrap"))
+
+    result = asyncio.run(runner.run(RuntimePlan(prompt="x", schema=_STATUS_SCHEMA, cwd=str(tmp_path))))
+
+    assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE and result.is_error
+    assert "not installed" in result.summary
+    assert not marker.exists()

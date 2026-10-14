@@ -6,7 +6,8 @@ operator reference.
 
 ## First run
 
-Prerequisites: `git`, `gh`, `jq`, `uv`, and at least one configured runtime
+Prerequisites: `git`, `gh`, `jq`, `uv`, `bwrap` (bubblewrap 0.10 or newer, with
+unprivileged user namespaces; Linux only), and at least one configured runtime
 (`claude` or `codex`).
 
 ```bash
@@ -212,10 +213,15 @@ together. The review role writes through the same `act` step: one GitHub
 review per head under the review bot, keyed in SQLite and read back before
 submission (slice 5c).
 
-There is no command governor and no fixer publication gate (slice 6a). Current
-runtime children still inherit publication capability, so use only trusted inbound
-issues/reviews/CI text. The credential-free artifact publisher is deliberately
-trigger-gated on untrusted-repo onboarding; see
+There is no command governor and no fixer publication gate (slice 6a). Every
+leg runs under bubblewrap (#413): it sees a private HOME, its own checkout, the
+toolchains and its runtime's session store, never `config/`, `~/.config/gh`,
+`~/.ssh`, the harness checkout, state dirs or other repositories. A fix leg's
+one GitHub credential is `FIX_BOT_TOKEN` (give it Contents and Pull requests
+write on the harness repos and nothing that bypasses branch protection); a
+review leg has none. Paid legs are refused when bwrap is missing or cannot
+create a user namespace, and `issue-agent doctor` reports the posture. What a
+sandboxed leg can still reach is listed in `docs/open/residuals.md` §1.1; see
 `docs/reference/capability-authority-matrix.md`.
 
 Agent-written files are claims. Remote facts are re-derived by trusted code; CI

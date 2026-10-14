@@ -7,7 +7,14 @@ import plistlib
 
 import pytest
 
-from issue_agent.app.doctor import codex_findings, env_assignments, identity_findings, parse_unit, service_findings
+from issue_agent.app.doctor import (
+    codex_findings,
+    env_assignments,
+    identity_findings,
+    parse_unit,
+    sandbox_findings,
+    service_findings,
+)
 
 ROLES = ("fix-watcher", "review-watcher")
 _WHICH_ALL = lambda binary, path=None: "/usr/bin/" + binary  # noqa: E731
@@ -233,6 +240,23 @@ def test_the_app_key_resolves_against_the_daemon_home(tmp_path):
 def test_identity_findings_never_carry_token_material():
     findings = identity_findings({"FIX_BOT_TOKEN": "ghp_secret", "REVIEW_BOT_TOKEN": "ghp_secret"})
     assert findings and not any("ghp_secret" in f.message for f in findings)
+
+
+def test_a_fixer_without_fix_bot_token_cannot_publish_from_its_sandbox():
+    # #413: the ambient `gh` login is hidden from legs; FIX_BOT_TOKEN is the only credential.
+    assert _levels(identity_findings({"REVIEW_BOT_TOKEN": "b"}), "FIX_BOT_TOKEN is not set") == {"error"}
+
+
+# ── leg sandbox ───────────────────────────────────────────────────────────────
+def test_an_unusable_sandbox_is_an_error_naming_the_reason():
+    findings = sandbox_findings(lambda: "bubblewrap (bwrap) is not installed")
+
+    assert [f.level for f in findings] == ["error"]
+    assert "refused" in findings[0].message and "not installed" in findings[0].message
+
+
+def test_a_usable_sandbox_reports_the_posture():
+    assert [f.level for f in sandbox_findings(lambda: None)] == ["info"]
 
 
 # ── codex binary ──────────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ from .config import HarnessConfig, from_env, rate_table, render_agent_md, superv
 from .fix import compose_fix_daemon
 from .review import compose_review_daemon
 from .review_identity import review_identity as _app_identity
-from .tick import Daemon, Role
+from .tick import Daemon, Role, leg_sandbox
 
 
 def _load_agent_env(env: dict) -> dict:
@@ -147,11 +147,15 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
 
     # Two independent caps: silence (idle) and total elapsed (wall); the wall
     # cap bounds a limping post-suspend stream. 0 disables either one.
+    sandbox = leg_sandbox(cfg, role, env)
+    credential = "FIX_BOT_TOKEN" if sandbox.has_credential else "none"
+    log(f"sandbox: every leg runs under {sandbox.posture()}; leg GitHub credential: {credential}")
     runner = AgentRunner(
         log=log, debug=env.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
         idle_timeout=cfg.agent_idle_timeout or None, max_runtime=cfg.agent_max_runtime or None,
         process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)),
         rate_table=rate_table(cfg, RuntimeName.CLAUDE.value),
+        leg_sandbox=sandbox,
     )
     if role == "fix":
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),

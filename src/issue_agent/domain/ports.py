@@ -9,7 +9,7 @@ Failure contracts are explicit:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Protocol
 
@@ -39,7 +39,7 @@ class ProcessSupervisor(Protocol):
         self, run_id: RunId, argv: tuple[str, ...] | list[str]
     ) -> tuple[str, ...]: ...
     def supervised_cli(
-        self, run_id: RunId, executable: str
+        self, run_id: RunId, command: Sequence[str]
     ) -> tuple[str, dict[str, str]]: ...
     def unregister(self, run_id: RunId) -> None: ...
     def kill_tree(self, run_id: RunId, grace_seconds: float = 10.0) -> None: ...

@@ -1161,6 +1161,9 @@ def _doctor_rc(tmp_path, monkeypatch, composed: dict, *, sh_rc: int) -> int:
     monkeypatch.setattr(cli, "_resolve_context", lambda _a: ("o/r", str(tmp_path), "r"))
     monkeypatch.setattr(cli, "_composed_env", lambda _env: dict(composed))
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: argparse.Namespace(returncode=sh_rc))
+    from issue_agent.app import doctor
+
+    monkeypatch.setattr(doctor, "sandbox_findings", lambda: ())  # the host's bwrap is not under test
     return cli.cmd_doctor(argparse.Namespace(name=None, repo=None))
 
 
@@ -1172,7 +1175,7 @@ _SEPARATE = {"FIX_BOT_TOKEN": "fix", "REVIEW_BOT_TOKEN": "review"}
     [
         # doctor is a gate (point-at.sh, CI): a whitespace token 401s every call.
         ({**_SEPARATE, "FIX_BOT_TOKEN": "   "}, 0, 1),
-        ({"REVIEW_BOT_TOKEN": "review"}, 0, 0),  # warning-level findings stay green
+        (dict(_SEPARATE), 0, 0),  # no error finding stays green
         ({**_SEPARATE, "FIX_BOT_TOKEN": "   "}, 2, 2),  # a failing doctor.sh keeps its exit code
     ],
 )

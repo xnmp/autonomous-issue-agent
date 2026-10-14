@@ -13,31 +13,29 @@ plan §6b, the lean-core handover §5, and the improvement plan's §4 backlog.
 ## 1. Blocking anything — before you point this at a repo you care about
 
 The control-plane correctness blockers are closed. The remaining restrictions
-are trust-boundary residuals: they matter whenever inbound repository content
-is not trusted. Every named residual below is executable in
-`tests/test_residuals.py`; the tests assert the desired closed behavior under
+are trust-boundary residuals: they bound what inbound repository content that
+hijacks a leg could do. Every residual with a code name (`GIT-OBJECTS`) is
+executable in `tests/test_residuals.py`; the tests assert the desired closed behavior under
 `xfail(strict=True)`, so fixing one requires removing or updating its registry
 entry.
 
-### 1.1 Publication credentials are still present in agent processes
+### 1.1 What a sandboxed leg can still reach
 
-SQLite reservations, commands, receipts, and process leases are authoritative.
-Supported agent push/PR flows go through `issue-agent-publish`, with durable
-commands, remote readback, and receipts. Publication environment variables are
-removed from supervised child commands, but the model still runs as the daemon
-OS account and inherits its home-directory surface. Environment scrubbing does
-not prevent recovery through filesystem or local-socket access
-(`CRED-HOME`). Slice 6a (2026-10) deleted the command governor and the
-agent-local hook stack outright, so there is no in-process command filter at
-all: the agent can run any command its OS account can. Until slice 6b, the PR
-base, the branch and `Fixes #N` therefore depend on the agent following
-`AGENT.md`: nothing forces it through `issue-agent-publish`, and merge does not
-check the PR base. Slices 6a and 6b deploy together.
+Every leg runs under bubblewrap (#413; `docs/reference/capability-authority-matrix.md`).
+The review bot's token, the GitHub App key, the operator's `gh` login, SSH
+keys, keyrings, the harness checkout and the control store are out of reach
+(`CRED-HOME` is closed). Slice 6a deleted the command governor, so inside the
+sandbox the agent can run any command. What remains:
 
-**Consequence:** do not point this at a repository whose inbound issue, PR,
-review, or CI text is supplied by people you do not trust. The trigger-gated
-end state is a credential-free agent plus a separately privileged artifact
-publisher; see ADR 0001 and the capability matrix.
+| Residual | Why it is accepted | Trigger / exit |
+|---|---|---|
+| A fix leg holds `FIX_BOT_TOKEN`: it can push any branch, open or edit PRs, comment and read Actions logs the token allows. A token that bypasses branch protection (an admin's PAT) lets a hijacked leg merge around review | The leg must publish; the token's scope is the bound. The owner chooses the account | the owner gives `FIX_BOT_TOKEN` a non-admin account with no protection bypass |
+| `GIT-OBJECTS`: a fix leg writes the repository's shared object store and refs; review checkouts read the same store, so a leg could rewrite an object a later review checks out (git does not re-hash on read) | Commits need a writable store; a separate store for review is a larger change | review checkouts from a separate clone, or verifying the reviewed tree against GitHub's; `tests/test_residuals.py` |
+| The network is on, so loopback services (`127.0.0.1`) and abstract-namespace unix sockets of the host are reachable | Owner decision: the sandbox isolates credentials and files, not egress | a host service that trusts any local connection; then `--unshare-net` plus a proxy |
+| `CARGO_TARGET_DIR` is mounted read-write when the leg's env names one outside the checkout; a target dir shared with the operator's own builds (ballast's) lets a leg plant build outputs those builds run | Shared incremental builds are why the knob exists | point it at a harness-only directory (tauri and keifu already do) |
+| Teardown inside the sandbox is SIGKILL: bwrap does not forward SIGTERM, so a runtime never sees a graceful stop | `--die-with-parent` and the PID namespace guarantee every sandboxed process dies; the runtimes' session files are written as they go | a runtime that loses resumable state on SIGKILL |
+| Claude's OAuth login file is mounted read-write (refresh writes it) but its lock is leg-private, so two legs refreshing at once are not serialized | Same race exists against the operator's own CLI | an auth failure traced to a concurrent refresh; then `CLAUDE_CODE_OAUTH_TOKEN` or an API key |
+| macOS (launchd) has no bubblewrap: paid legs are refused there | No silent unsandboxed fallback (#413) | a macOS deployment: sandbox-exec or a VM |
 
 ### 1.2 Agent-written claims are not authorization evidence
 
@@ -98,7 +96,7 @@ self-authored issue.
 | A refused harness re-run of a head's failed jobs (workflow disabled, run not re-runnable, token without `actions:write`) raises each poll with one log line and no ceiling (PR #403) | Owner decision: no logic for it, the same as a refused update-branch; a push or a human reply exits it | the fix journal repeats `re-run of run R was refused or did not land` and the board says "Re-running failed jobs" until someone acts |
 | A FIX_CI try begins with a CI run that began after the head's first leg began and no earlier leg was handed (PR #403), read from the time each failure key names. That time is GitHub's (an Actions run attempt's creation) compared with the harness's leg start (its wall clock when the process lease attaches). A status's time is its latest post and another app's check run's is its own start, because neither has a run start. An Actions job whose `workflowRun` is unreadable has no time. A head's first leg with no recorded start is measured from its end | The data has no run start for statuses or other apps' checks; a GitHub-sourced leg boundary would be another record; an unreadable time fails toward counting | a status or external check that fails after the first leg began counts as a try (a rung, or a stop sooner); harness clock skew behind GitHub by more than push-to-first-leg counts the push's own runs, and skew ahead lets a run caused within the skew resume; a token without Actions read counts every leg on the head; runs a leg sets off within the same second (GitHub's resolution) share a start and count as one try |
 | A later failure of a run that already existed resumes the newest try, at its tier: after a re-run (by the harness or a human), a failure of the push's other workflow runs one rung up | Tries are read per leg from its failure keys; tracking which try each run belongs to would need another record. The tier only ever goes up and the session still routes to the newest leg's runtime | one rung of extra spend on that leg |
-| Read-your-writes (`end_head`) trusts `git ls-remote origin` from the harness checkout; worktrees share its `.git/config`, so an agent that rewrites `origin` or adds `url.*.insteadOf` changes what the harness reads. An unread head records nothing and reads as "no push" | Under the trusted-inbound posture (§1.1) the agent can already do worse; reading the ref through the API would add a second remote read path. "No push" is the old behaviour (decide on what GitHub shows) | a false "no push" can re-run or stop the old head while GitHub lags the push; a false "pushed" waits until a push, a human reply or a human push |
+| Read-your-writes (`end_head`) trusts `git ls-remote origin` from the harness checkout. Since #413 a leg cannot rewrite `origin` or add `url.*.insteadOf` (the repository config is read-only in its sandbox). An unread head records nothing and reads as "no push" | Reading the ref through the API would add a second remote read path. "No push" is the old behaviour (decide on what GitHub shows) | a false "no push" can re-run or stop the old head while GitHub lags the push; a false "pushed" waits until a push, a human reply or a human push |
 | CI observation of a run past attempt 1 reads `actions/runs/<run>/jobs?filter=all`; an unreadable or malformed answer (a deleted run whose check runs persist, a token without Actions read) makes the whole CI observation unavailable each poll; and in the moment the latest attempt's jobs are all finished but the rollup still lists the old check runs, the run's checks drop out (with a required-check policy this reads as missing, i.e. pending) | Unreadable stays fail-closed (no decision on CI that could not be read); the drop-out window is one poll and only matters for a repository without required checks | CI_UNKNOWN on that PR until a push; on an unprotected repository a REVIEW may dispatch one poll early. A re-run attempt that never gets jobs (a startup failure) keeps the old checks pending until a push; a human comment in the seconds GitHub lags a push ends the read-your-writes wait early (a stale-head dispatch is then refused by the worktree sync, a machine end) |
 | Dashboard board-stage inaccuracies after telemetry removal: an `escalated` stage persists while a re-review runs (relabel commands no longer journal an `action` line); runs killed by SIGKILL/crash show as running for up to 24 h (abandonment is no longer journaled); the escalation log line is not transactional with its SQLite claim, so a crash between them loses the line | The board still folds the plain role journal; the authority is SQLite and GitHub labels, which are correct. Slice 8b rebuilds the board over derived state | an operator reads the stage text and `running` marker as hints and checks GitHub labels / `runs`; accepted until slice 8b |
 

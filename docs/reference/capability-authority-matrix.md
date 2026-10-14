@@ -2,36 +2,55 @@
 
 This is the deployment truth, not a security claim inferred from hooks.
 
+Every leg of either runtime runs under bubblewrap (#413, ADR 0001): the
+filesystem, not the environment allowlist or a tool deny list, is the
+credential boundary.
+
 | Runtime | Sandbox/tool surface | Resume | Budget evidence | Command governor | Agent publication credentials | Supported inbound trust |
 |---|---|---|---|---|---|---|
-| Claude | SDK tool allow/deny; worktree cwd; broad fixer Bash | yes; sandbox preserved | provider result/usage; native limit | none (deleted in slice 6a) | publication env keys are scrubbed from supervised commands; same-account home/filesystem access remains | trusted inbound only |
-| Codex | `workspace-write`/`read-only` selection; child process group | supported, but resume cannot preserve every exec-only sandbox flag | rollout counters priced by configured card | none (deleted in slice 6a) | publication env keys are scrubbed; operator HOME and same-account filesystem access remain | trusted inbound only |
+| Claude | bwrap leg sandbox; fix legs write their checkout, review legs read it; SDK tool allow/deny for light legs | yes: the session store for the checkout is mounted read-write | provider result/usage; native limit | none (deleted in slice 6a) | fix legs: `FIX_BOT_TOKEN` in env (GH_TOKEN/GITHUB_TOKEN, git helper); review and light legs: none | see residuals §1.1 |
+| Codex | bwrap leg sandbox around codex's own `workspace-write`/`read-only` mode; child process group | yes: the harness CODEX_HOME is mounted read-write | rollout counters priced by configured card | none (deleted in slice 6a) | as Claude | see residuals §1.1 |
+
+What a leg sees (`domain/sandbox.py`):
+
+| Visible | Access |
+|---|---|
+| its checkout; for a fix leg also the repository's `objects/`, `refs/`, `logs/` and its own `worktrees/<name>/` | fix: read-write; review/light: read-only |
+| the repository's `.git` (config, hooks, other checkouts' links), the checkout's `.git` link | read-only |
+| the runtime binary; `/usr`, `/etc`, `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |
+| `~/.cargo/registry`, `~/.cargo/git`, `~/.cache/uv`, `~/.bun/install/cache`, `~/.npm` | per-leg overlay (writes discarded) |
+| the runtime session store and login (`~/.claude/projects/<checkout>`, `.credentials.json`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write |
+| HOME, `/tmp`, `/var/tmp` | empty, leg-private |
+| network | on (no egress filter) |
+
+Not visible: `config/` and the rest of the harness checkout, the operator's
+HOME (`~/.config/gh`, `~/.ssh`, keyrings, `~/.claude.json`, settings, other
+sessions), state and control dirs (SQLite), other checkouts' files, other
+repositories, `/run` (D-Bus, agent sockets), and host processes
+(`--unshare-pid`, so no `/proc/<daemon>/environ`).
 
 | Concern | Authority | Failure posture |
 |---|---|---|
 | Paid admission | SQLite reservations and charges | unavailable/corrupt/unpriceable with an armed cap blocks new paid work |
 | Remote mutation | idempotent act layer: naturally idempotent write plus read-back, or a SQLite idempotency key claimed before the write and confirmed after read-back | unknown outcome is read back, never blindly repeated |
-| Run/process ownership | SQLite lease plus PID/PGID/start-identity receipts | boot recovery kills/reclaims before admission |
+| Leg sandbox | a bwrap probe before every launch; the mount plan from harness-held facts | missing/unusable bwrap or an unsafe mount refuses the leg before spawn (`RUNTIME_UNAVAILABLE`, a $0 machine end under the backoff) |
+| Run/process ownership | SQLite lease plus PID/PGID/start-identity receipts; bwrap inside the registered group | boot recovery kills/reclaims before admission; killing bwrap collapses the sandbox's PID namespace |
 | Deduplication | namespaced SQLite idempotency keys | conflicts are loud; journal tails are never authority |
 | Gate evidence | GitHub state, operator config | indeterminate is deny; worktree marker forgery has no authority |
 | Logs/dashboard | plain per-role JSONL log, SQLite legs/money tables, GitHub | may be incomplete; never changes control decisions |
 
 Fix agents push their own branch with plain `git push` (refactor decision
-Q11); the publish broker and `issue-agent-publish` were deleted in slice 5b.
-The harness opens the PR from a pushed `fix/<issue>-` branch owed one (ahead of base, no open PR),
-once, through `adapters/act.py`. Nothing stops an agent from running
-`gh pr create` or `gh pr edit` itself (it holds the daemon account's
-credentials); a PR the agent opened is simply observed and the harness opens
-no second one.
+Q11), authenticated by `FIX_BOT_TOKEN` through an environment-config git
+helper; nothing is written to the checkout's git config. The harness opens the
+PR from a pushed `fix/<issue>-` branch owed one (ahead of base, no open PR),
+once, through `adapters/act.py`. A fix leg can still run `gh pr create` or
+`gh pr edit` with its token; a PR the agent opened is simply observed and the
+harness opens no second one. `FIX_BOT_TOKEN`'s scope is therefore what a
+hijacked fix leg can do: it must not carry Administration or a branch
+protection bypass.
 A registered supervisor ancestor keeps the run's accounting identity while
-provider and target-command environments omit it.
-Because the model still runs as
-the daemon's OS account, filesystem or local-socket access may recover
-publication authority despite environment scrubbing. With no command filter,
-this keeps every runtime in the trusted-inbound posture.
+provider and target-command environments omit it. The review bot's token and
+GitHub App key stay with the act layer, outside every sandbox.
 
-The trigger-gated end state for untrusted inbound repositories removes
-publication credentials from agent children and publishes verified artifacts
-through a separately privileged effect process. Environment scrubbing alone is
-not sufficient isolation because filesystem and local-socket access may recover
-credentials.
+Without bubblewrap (macOS, or a host that forbids unprivileged user
+namespaces) paid legs are refused; there is no unsandboxed mode.

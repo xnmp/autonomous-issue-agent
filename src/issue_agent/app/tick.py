@@ -46,6 +46,7 @@ from ..adapters.control_path import control_store_path
 from ..adapters.control_store import WAKE_MIN_GAP_SECONDS, ControlStoreError, LegRun, SQLiteControlStore
 from ..adapters.github import GhUnavailable
 from ..adapters.journal import Journal, JournalingRuntime
+from ..adapters.leg_sandbox import LegSandbox
 from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..domain.agent_task import RuntimeName
@@ -886,6 +887,26 @@ def lifetime_capped(cfg: HarnessConfig, control) -> Callable[[int], bool]:
     return capped
 
 
+# The checkout this code runs from: never visible to a leg (config/ holds the bot tokens).
+_THIS_CHECKOUT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def leg_sandbox(cfg: HarnessConfig, role: str, env: Mapping[str, str] | None = None) -> LegSandbox:
+    """The role's leg sandbox (#413). A fix leg writes its checkout and holds
+    FIX_BOT_TOKEN, whatever account owns it; a review leg reads and holds no
+    credential: the act layer keeps the bot tokens."""
+    env = os.environ if env is None else env
+    fix = role == "fix"
+    return LegSandbox(
+        home=env.get("HOME") or os.path.expanduser("~"),
+        repository=cfg.target_dir or os.getcwd(),
+        writable=fix,
+        credential=env.get("FIX_BOT_TOKEN") if fix else None,
+        protected=(_THIS_CHECKOUT, cfg.harness_root, cfg.state_dir, cfg.review_state_dir,
+                   cfg.control_authority_root),
+    )
+
+
 def bind_runtime(
     cfg: HarnessConfig, role: str, runtime: RuntimeName, runner: AgentRuntime, log: Callable[[str], None],
 ) -> tuple[AgentRuntime, Callable[[str], object] | None]:
@@ -919,6 +940,7 @@ def bind_runtime(
         process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)) if state_dir else None,
         spend_evidence_dir=spend_evidence_dir(state_dir),
         rate_table=rate_table(cfg, RuntimeName.CODEX.value),
+        leg_sandbox=leg_sandbox(cfg, role),
         **({"default_model": model} if model else {}),
     )
     reason = codex.preflight()
@@ -1003,6 +1025,7 @@ def compose_role(
     def cap(value: float) -> Money | None:
         return Money.from_major("USD", value) if value > 0 else None
 
+    posture = leg_sandbox(cfg, role).posture
     chains: dict[RuntimeName, AgentRuntime] = {}
     accountings: dict[RuntimeName, AccountingRuntime] = {}
     prepares: dict[RuntimeName, Callable[[str], object] | None] = {}
@@ -1015,7 +1038,8 @@ def compose_role(
             reservation_reconciler=recovery,
             remote_head=worktrees.remote_head if worktrees is not None else None,
         )
-        chains[name] = JournalingRuntime(accountings[name], journal, repo=cfg.repo, role=role, runtime=name.value)
+        chains[name] = JournalingRuntime(accountings[name], journal, repo=cfg.repo, role=role, runtime=name.value,
+                                         sandbox=posture)
 
     def prepare_cwd(cwd: str, runtime: RuntimeName | None = None) -> None:
         if (prepare := prepares.get(runtime or default)) is not None:

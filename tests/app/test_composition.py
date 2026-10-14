@@ -297,6 +297,8 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["rate_table"] is not None
     assert seen["sandbox"] == "read-only"
+    # #413: the review leg runs in the leg sandbox, read-only, with no GitHub credential.
+    assert not seen["leg_sandbox"].writable and not seen["leg_sandbox"].has_credential
     assert composed.legs.task_config.model == "gpt-5.6-terra"
     assert composed.legs.task_config.max_budget_usd == 2.5
 
@@ -338,3 +340,24 @@ def test_codex_reviewer_defers_codex_home_preparation_until_dispatch(tmp_path, m
     compose_review_daemon(cfg, _BuildableGateway(), FakeRunner(AgentResult(is_error=False)))
 
     assert hook_calls == []
+
+
+def test_a_fix_role_leg_sandbox_carries_fix_bot_token_and_hides_the_harness(tmp_path):
+    """#413: a fix leg writes and holds FIX_BOT_TOKEN, whichever account owns
+    it; a review leg holds none; neither can mount the harness, state or
+    control directories."""
+    from issue_agent.app.config import from_env
+    from issue_agent.app.tick import leg_sandbox
+
+    cfg = replace(from_env({"REPO": "o/r", **_role_state_env(tmp_path), "TARGET_DIR": str(tmp_path / "t")}),
+                  control_authority_root=str(tmp_path / "machine-state"))
+    env = {"HOME": str(tmp_path / "home"), "FIX_BOT_TOKEN": "fix-token", "REVIEW_BOT_TOKEN": "review-token"}
+
+    fix, review = leg_sandbox(cfg, "fix", env), leg_sandbox(cfg, "review", env)
+
+    assert fix.writable and fix.has_credential
+    assert not review.writable and not review.has_credential
+    assert "fix-token" not in repr(fix) and "review-token" not in repr(review)
+    for path in (cfg.state_dir, cfg.review_state_dir, str(tmp_path / "machine-state")):
+        assert os.path.realpath(path) in fix.protected
+    assert not leg_sandbox(cfg, "fix", {"HOME": str(tmp_path), "FIX_BOT_TOKEN": "  "}).has_credential

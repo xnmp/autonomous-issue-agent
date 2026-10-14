@@ -56,18 +56,6 @@ _RUNTIME_AUTH_KEYS = frozenset(
     }
 )
 
-_PUBLICATION_CREDENTIAL_KEYS = frozenset(
-    {
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GIT_ASKPASS",
-        "SSH_AGENT_PID",
-        "SSH_ASKPASS",
-        "SSH_AUTH_SOCK",
-    }
-)
-
 # ADR 0005: the supervised launcher retains ISSUE_AGENT_* control-plane values;
 # provider processes receive none of them.
 
@@ -88,21 +76,13 @@ def child_process_env(
     *,
     additional_keys: Iterable[str] = (),
 ) -> dict[str, str]:
-    """Select child variables and exclude publication credentials."""
+    """Select child variables: the allowlist from the daemon's environment,
+    plus what the harness names explicitly. Nothing inherited carries a
+    publication credential; a fix leg's one token is explicit, and the leg
+    sandbox unsets every GitHub token for a leg that does not publish (#413)."""
 
     configured = dict(explicit or {})
-    allowed = (
-        _BASE_KEYS
-        | _RUNTIME_AUTH_KEYS
-        | frozenset(additional_keys)
-        | frozenset(configured)
-    ) - _PUBLICATION_CREDENTIAL_KEYS
+    allowed = _BASE_KEYS | _RUNTIME_AUTH_KEYS | frozenset(additional_keys) | frozenset(configured)
     selected = {key: value for key, value in inherited.items() if key in allowed}
-    selected.update(
-        {
-            key: value
-            for key, value in configured.items()
-            if key not in _PUBLICATION_CREDENTIAL_KEYS
-        }
-    )
+    selected.update(configured)
     return selected

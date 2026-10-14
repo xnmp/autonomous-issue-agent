@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -92,14 +92,17 @@ class ProcessSupervisor:
         }
 
     def supervised_cli(
-        self, run_id: RunId, executable: str
+        self, run_id: RunId, command: Sequence[str]
     ) -> tuple[str, dict[str, str]]:
-        """Return an SDK-compatible CLI path that registers before exec."""
+        """Return an SDK-compatible CLI path that registers, then execs
+        `command` (the CLI, or the sandbox wrapping it) with the SDK's
+        arguments appended."""
 
+        if not command:
+            raise ValueError("supervised CLI command cannot be empty")
+        if not os.path.isfile(command[0]) or not os.access(command[0], os.X_OK):
+            raise ValueError(f"supervised CLI is not executable: {command[0]}")
         token = self.prepare_launch(run_id)
-        target = os.path.realpath(executable)
-        if not os.path.isfile(target) or not os.access(target, os.X_OK):
-            raise ValueError(f"supervised CLI is not executable: {target}")
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         wrapper = self.state_dir / "supervised-cli"
         content = (
@@ -113,7 +116,7 @@ class ProcessSupervisor:
             "ISSUE_AGENT_SUPERVISOR_STATE_DIR": str(self.state_dir),
             "ISSUE_AGENT_SUPERVISOR_RUN_ID": str(run_id),
             "ISSUE_AGENT_SUPERVISOR_LAUNCH_TOKEN": token,
-            "ISSUE_AGENT_SUPERVISED_TARGET": target,
+            "ISSUE_AGENT_SUPERVISED_TARGET": json.dumps(list(command)),
             **self.launch_guard_env(),
         }
 

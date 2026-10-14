@@ -64,3 +64,7 @@ whitespace-delimited words.
 Re-measured 2026-10-14 after the governing-ADR and crash-analysis review rule
 moved here from the generic reviewer prompt: 8,078 UTF-8 bytes and 1,090
 whitespace-delimited words.
+
+Re-measured 2026-10-14 after the leg sandbox (#413) replaced the
+"trusted inbound content only" paragraph with the sandbox posture: 8,316 UTF-8
+bytes and 1,131 whitespace-delimited words.

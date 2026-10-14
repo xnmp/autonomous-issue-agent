@@ -5,6 +5,8 @@ result mapping is duck-typed so a stand-in object stands in for ResultMessage.
 """
 
 import asyncio
+import re
+import os
 import dataclasses
 from dataclasses import dataclass
 import subprocess
@@ -612,3 +614,78 @@ def test_a_transport_death_after_init_journals_the_session(monkeypatch):
 
     settled = [f for e, f in sink.events if e == "agent_run"]
     assert [(f["exit_reason"], f["session_id"]) for f in settled] == [("transport_death", "s-died")]
+
+
+# ── #413: every leg launches inside the leg sandbox ─────────────────────────
+
+
+class _Sandbox:
+    """Records the launch; `refuse` makes it refuse like a host without bwrap."""
+
+    def __init__(self, refuse: str = ""):
+        self.refuse, self.launches = refuse, []
+
+    def launch(self, command, *, cwd, env, runtime_state=(), scratch=(), read_only=False):
+        from issue_agent.adapters.leg_sandbox import Launch, SandboxRefused
+
+        if self.refuse:
+            raise SandboxRefused(self.refuse)
+        self.launches.append({"command": tuple(command), "cwd": cwd, "runtime_state": tuple(runtime_state),
+                              "read_only": read_only})
+        return Launch(("/usr/bin/bwrap", "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
+
+
+def _supervised_cli_runner(tmp_path, monkeypatch, sandbox):
+    from issue_agent.adapters.process_supervisor import ProcessSupervisor
+
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_BIN", str(cli))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(sys.modules["claude_agent_sdk"], "__file__", str(tmp_path / "sdk" / "__init__.py"),
+                        raising=False)
+    return AgentRunner(process_supervisor=ProcessSupervisor(str(tmp_path / "sup")), leg_sandbox=sandbox), cli
+
+
+def test_a_claude_leg_execs_its_cli_through_the_sandbox_with_its_credential(tmp_path, monkeypatch):
+    import json
+
+    capture: dict = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(structured_output={"status": "done"}, session_id="s1")],
+                      capture=capture)
+    sandbox = _Sandbox()
+    runner, cli = _supervised_cli_runner(tmp_path, monkeypatch, sandbox)
+
+    result = asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
+
+    assert result.status == "done"
+    env = capture["options"]["env"]
+    assert json.loads(env["ISSUE_AGENT_SUPERVISED_TARGET"]) == ["/usr/bin/bwrap", "--sandboxed", "--",
+                                                                os.path.realpath(cli)]
+    assert env["GH_TOKEN"] == "leg-token" and "GH_TOKEN" in env["ISSUE_AGENT_CHILD_ENV_KEYS"].split()
+    # The session store `--resume` needs is the CLI's own, for this checkout.
+    store = sandbox.launches[0]["runtime_state"][0]
+    assert store.endswith("/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(tmp_path)))
+
+
+def test_a_claude_leg_the_sandbox_refuses_never_starts(tmp_path, monkeypatch):
+    started = []
+
+    async def fake_query(prompt, options):
+        started.append(True)
+        yield  # pragma: no cover
+
+    _install_sdk(monkeypatch, fake_query)
+    runner, _ = _supervised_cli_runner(tmp_path, monkeypatch, _Sandbox(refuse="bwrap is not installed"))
+
+    result = asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
+
+    assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE and result.is_error
+    assert "bwrap is not installed" in result.summary
+    assert started == []
+
+
+def test_a_sandbox_without_a_process_supervisor_is_a_wiring_error():
+    with pytest.raises(ValueError):
+        AgentRunner(leg_sandbox=_Sandbox())

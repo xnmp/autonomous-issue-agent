@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
@@ -190,9 +191,13 @@ def supervised_cli_main() -> None:
         state_dir = environment.pop(_STATE_ENV)
         raw_run_id = environment.pop(_RUN_ENV)
         token = environment.pop(_TOKEN_ENV)
-        target = environment.pop(_TARGET_ENV)
+        target = json.loads(environment.pop(_TARGET_ENV))
     except KeyError as exc:
         raise SystemExit(f"missing supervised CLI environment: {exc}") from exc
+    except ValueError as exc:
+        raise SystemExit("supervised CLI target is not a JSON command") from exc
+    if not isinstance(target, list) or not target or not all(isinstance(part, str) and part for part in target):
+        raise SystemExit("supervised CLI target is not a command")
     explicit_keys = environment.pop(CHILD_ENV_MANIFEST, "").split()
     environment.pop(_PARENT_PID_ENV, None)
     environment.pop(_PARENT_START_ENV, None)
@@ -207,7 +212,7 @@ def supervised_cli_main() -> None:
         token,
         registration_environment,
     )
-    _carry_authority_and_exec([target, *sys.argv[1:]], environment, raw_run_id)
+    _carry_authority_and_exec([*target, *sys.argv[1:]], environment, raw_run_id)
 
 
 if __name__ == "__main__":

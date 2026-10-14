@@ -428,11 +428,12 @@ starts; no `ISSUE_AGENT_*` variable reaches the provider. The authority is carri
 ancestor check works through `/proc` on Linux and `ps` on macOS; its
 GitHub host is captured by the daemon, and both push remotes and `gh --repo`
 scope are pinned to that host rather than child-controlled `GH_HOST`.
-Publication credentials are nevertheless still
-recoverable in the child process/filesystem topology; the broker does not
-constitute credential isolation. All runtimes therefore remain
-trusted-inbound-only until the trigger-gated separately privileged artifact
-publisher is deployed.
+Since #413 the filesystem is the credential boundary: every leg runs under
+bubblewrap with a private HOME, a private PID namespace and only the mounts
+`domain/sandbox.py` plans, so neither the harness's `config/` nor the
+operator's `gh`/SSH credentials nor `/proc/<daemon>/environ` is reachable. A
+fix leg holds exactly `FIX_BOT_TOKEN` in its environment; a review leg holds
+none. Residual exposure is in `docs/open/residuals.md` §1.1.
 
 Visual screenshot evidence is judged by the independent reviewer (#327); image
 size remains capped at 700KB. The harness opens a PR with the agent's own
@@ -490,8 +491,8 @@ legs),
 `domain/routing.py` (difficulty tiers, the derived per-attempt escalation and
 the `runtime:model` route spec), `domain/triage.py` (the STEWARD and TRIAGE acts' results,
 parsed and laundered from the agent's claim),
-`domain/tool_policy.py` (`FIXER_DENY`, the fixer's credential denies passed
-as the SDK's `disallowed_tools`),
+`domain/sandbox.py` (the leg mount plan: what a paid leg sees under
+bubblewrap, #413),
 `domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
 minimal-harness design; the fix role runs on it since slice 5b and the review
 role since slice 5c),
@@ -514,6 +515,8 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
 `adapters/heartbeat.py`, `adapters/journal.py`,
+`adapters/leg_sandbox.py` (renders the mount plan as a `bwrap` launch, carries
+a fix leg's one GitHub token in its environment),
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
 `adapters/repository_guidance.py`,
