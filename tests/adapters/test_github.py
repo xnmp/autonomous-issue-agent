@@ -280,6 +280,16 @@ def test_the_issue_index_carries_only_harness_labels_and_tolerates_a_missing_lis
                      (4, "open", "", frozenset()))
 
 
+def test_the_issue_index_lists_one_authors_issues_when_asked():
+    runner = FakeRunner({"issue list": []})
+    gateway = GitHubGateway("o/r", runner=runner)
+    gateway.issue_index()
+    gateway.issue_index(1000, author="@me")
+    assert "--author" not in runner.calls[0][0]
+    argv = runner.calls[1][0]
+    assert argv[argv.index("--author") + 1] == "@me" and argv[argv.index("--limit") + 1] == "1000"
+
+
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
 def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
     fr = FakeRunner(

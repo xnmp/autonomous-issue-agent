@@ -24,7 +24,7 @@ from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
 from issue_agent.domain.contracts import RunId
 from issue_agent.domain.effort import Effort
-from issue_agent.domain.checks import Check, Observed, RequiredCheck
+from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun, Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.routing import Tier
@@ -61,17 +61,34 @@ class FakeGitHub:
     closed: list[int] = field(default_factory=list)
     lose_reply: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # The base branch's completed push runs, when each issue was last closed,
+    # and the issues GitHub's search has not indexed yet.
+    base_runs: list[BaseRun] = field(default_factory=list)
+    unindexed: set[int] = field(default_factory=set)
+    closed_times: dict[int, tuple[str, str]] = field(default_factory=dict)  # issue -> (when, by whom)
+    observed_by: list[str] = field(default_factory=list)
 
     # ── observation ──
-    def build_world(self, base: str) -> WorldState:
+    def build_world(self, base: str, *, filed_by: str = "") -> WorldState:
         with self.lock:
             now = _now()
+            self.observed_by.append(filed_by)
             return WorldState(
                 issues=tuple(self._open_blockers(i) for i in self.issues.values() if i.state == "open"),
                 prs=tuple(self.prs.values()),
                 branches=tuple(Branch(b, self.pushed_at.get(b, now)) for b in self.branches if self._owed(b)),
                 now=now,
+                base_ci=self._base_ci(filed_by) if filed_by else None,
             )
+
+    def _base_ci(self, filer: str) -> BaseCI:
+        """What the gateway reads: the runs and the fixer's issues titled
+        "… failing on dev", open and closed."""
+        issues = tuple(BaseIssue(n, i.title, *(("", False) if i.state == "open" else
+                                               (self.closed_times[n][0], self.closed_times[n][1] == filer)))
+                       for n, i in sorted(self.issues.items())
+                       if i.author == filer and "failing on dev" in i.title and n not in self.unindexed)
+        return BaseCI(tuple(self.base_runs), issues)
 
     def _open_blockers(self, issue: IssueView) -> IssueView:
         """GitHub lists only a blocker that is still open (a closed one is resolved)."""
@@ -105,8 +122,10 @@ class FakeGitHub:
     def get_issue(self, number: int) -> IssueView:
         return self.issues[number]
 
-    def issue_index(self) -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
-        return tuple((n, i.state, i.title, i.labels) for n, i in sorted(self.issues.items()))
+    def issue_index(self, limit: int = 300, author: str = "") -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
+        mine = {"": None, "@me": FIX_BOT}.get(author, author)
+        return tuple((n, i.state, i.title, i.labels) for n, i in sorted(self.issues.items())
+                     if mine is None or i.author == mine)[:limit]
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         return self.prs[number]
@@ -186,9 +205,23 @@ class FakeGitHub:
     def cancel_run(self, run_id: int) -> None:
         self.cancelled.append(run_id)
 
-    def close_issue(self, number: int, reason: str, comment: str) -> None:
+    def close_issue(self, number: int, reason: str, comment: str, *, author: str = FIX_BOT) -> None:
         self.closed.append(number)
-        self.issues[number] = replace(self.issues[number], state="closed")
+        self.closed_times[number] = (_now(), author)
+        current = self.issues[number]
+        comments = (*current.comments, Comment(author, comment, _now())) if comment else current.comments
+        self.issues[number] = replace(current, state="closed", comments=comments)
+
+    def reopen_issue(self, number: int, comment: str) -> None:
+        current = self.issues[number]
+        comments = (*current.comments, Comment(FIX_BOT, comment, _now()))
+        self.issues[number] = replace(current, state="open", comments=comments)
+
+    def create_issue(self, title: str, body: str) -> int:
+        number = max((*self.issues, *self.prs, 0)) + 1
+        self.issues[number] = IssueView(number=number, title=title, body=body, author=FIX_BOT, updated_at=_now())
+        self._lossy("create_issue")
+        return number
 
     # ── test helpers ──
     def push(self, branch: str, head: str, ci: str = "pending") -> None:
@@ -1169,3 +1202,155 @@ def test_merging_cancels_every_unfinished_run_on_the_merged_branch_only(role):
 
     assert MergePullRequest(100, "h1") in tick(composed)
     assert gh.cancelled == [1, 2]
+
+
+# ── gap 22: one issue per workflow red on the base branch ────────────────────
+
+
+def base_run(workflow: str, run: int, conclusion: str, minutes: float) -> BaseRun:
+    """A completed push run on dev that finished `minutes` from now (a later run: more minutes)."""
+    at = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+    return BaseRun(workflow, run, f"https://github.com/o/r/actions/runs/{run}", f"sha{run}", conclusion, at, at)
+
+
+def base_issues(gh: FakeGitHub) -> dict[str, IssueView]:
+    found = [i for i in gh.issues.values() if i.title.startswith("CI: ")]
+    assert len({i.title for i in found}) == len(found), "two issues for one workflow"
+    return {i.title: i for i in found}
+
+
+def test_a_base_failure_files_one_unlabelled_issue_naming_the_run_and_head(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 1, "success", -30),
+                               base_run("macOS Smoke", 2, "failure", -20), base_run("macOS Smoke", 3, "failure", -10)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+
+    (issue,) = base_issues(gh).values()
+    assert issue.title == "CI: macOS Smoke failing on dev" and issue.labels == frozenset() and issue.state == "open"
+    assert "https://github.com/o/r/actions/runs/2 (head `sha2`)" in issue.body  # the streak's first failing run
+    assert gh.observed_by[-1] == FIX_BOT
+
+
+def test_repeated_ticks_on_a_still_red_workflow_file_nothing_more(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -20)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    gh.base_runs.append(base_run("macOS Smoke", 3, "failure", -10))
+    tick(composed)
+    tick(composed)
+    assert len(base_issues(gh)) == 1
+
+
+def test_a_flaky_suite_keeps_one_issue_closed_on_green_and_reopened_on_red(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -20)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    (issue,) = base_issues(gh).values()
+
+    gh.base_runs.append(base_run("macOS Smoke", 4, "success", -5))
+    tick(composed)
+    assert gh.issues[issue.number].state == "closed"
+    (note,) = gh.comments_with("issue", issue.number, "passes on `dev` again")
+    assert "actions/runs/4 (head `sha4`)" in note.body
+    tick(composed)
+    assert gh.closed == [issue.number]  # closed once
+
+    gh.base_runs.append(base_run("macOS Smoke", 5, "failure", 5))  # finished after the close
+    tick(composed)
+    assert list(base_issues(gh).values()) == [gh.issues[issue.number]] and gh.issues[issue.number].state == "open"
+    (again,) = gh.comments_with("issue", issue.number, "failing on `dev` again")
+    assert "actions/runs/5 (head `sha5`)" in again.body
+
+    gh.base_runs.append(base_run("macOS Smoke", 6, "success", 6))
+    tick(composed)
+    assert gh.issues[issue.number].state == "closed"
+    gh.base_runs.append(base_run("macOS Smoke", 7, "failure", 30))
+    tick(composed)
+    assert len(base_issues(gh)) == 1 and gh.issues[issue.number].state == "open"  # never a second issue
+
+
+def test_a_harness_close_reopens_on_the_next_red_even_once_the_green_has_left_the_listing(role):
+    gh = FakeGitHub(base_runs=[base_run("Docs", 2, "failure", -20)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    (issue,) = base_issues(gh).values()
+    gh.base_runs.append(base_run("Docs", 3, "success", -10))
+    tick(composed)
+    assert gh.issues[issue.number].state == "closed"
+    gh.base_runs[:] = [base_run("Docs", 4, "failure", 5)]  # the earlier runs slid off the one listed page
+    tick(composed)
+    assert gh.issues[issue.number].state == "open" and len(base_issues(gh)) == 1
+
+
+def test_a_human_close_during_the_red_streak_holds_until_it_passes_and_fails_again(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -20)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    (issue,) = base_issues(gh).values()
+    gh.close_issue(issue.number, "not planned", "", author="alice")  # still red
+    gh.base_runs.append(base_run("macOS Smoke", 3, "failure", 5))
+    tick(composed)
+    assert gh.issues[issue.number].state == "closed"
+
+    gh.base_runs += [base_run("macOS Smoke", 4, "success", 6), base_run("macOS Smoke", 5, "failure", 10)]
+    tick(composed)
+    assert gh.issues[issue.number].state == "open" and len(base_issues(gh)) == 1
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped"])
+def test_cancelled_or_skipped_runs_neither_file_nor_close(role, conclusion):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "success", -30),
+                               base_run("macOS Smoke", 3, conclusion, -25)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    assert base_issues(gh) == {}  # green under a cancelled run is still green
+
+    gh.base_runs.append(base_run("macOS Smoke", 4, "failure", -20))
+    tick(composed)
+    (issue,) = base_issues(gh).values()
+    gh.base_runs.append(base_run("macOS Smoke", 5, conclusion, -10))
+    tick(composed)
+    assert gh.issues[issue.number].state == "open" and gh.closed == []  # red under a cancelled run is still red
+
+
+def test_two_failing_workflows_file_two_issues(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -5),
+                               base_run("Windows smoke", 3, "timed_out", -5), base_run("CI", 4, "success", -5)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    tick(composed)
+    assert sorted(base_issues(gh)) == ["CI: Windows smoke failing on dev", "CI: macOS Smoke failing on dev"]
+
+
+def test_a_lost_reply_on_filing_files_exactly_one_issue(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -5)])
+    gh.lose_reply.add("create_issue")
+    composed, _ = role(gh, Agent())
+    tick(composed)  # the issue landed; act raised and the tick logged it
+    gh.unindexed = {i.number for i in base_issues(gh).values()}  # the search lags the filing
+    tick(composed)
+    gh.unindexed = set()
+    tick(composed)
+    assert len(base_issues(gh)) == 1
+
+
+def test_a_deleted_issue_of_a_still_red_workflow_is_filed_again_once_then_quiet(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -5)])
+    composed, _ = role(gh, Agent())
+    tick(composed)
+    (issue,) = base_issues(gh).values()
+    del gh.issues[issue.number]  # a human deleted it
+    tick(composed)
+    (again,) = base_issues(gh).values()
+    gh.unindexed = {again.number}  # the search lags the new filing
+    tick(composed)
+    gh.unindexed = set()
+    assert list(base_issues(gh).values()) == [again] and again.state == "open"  # filed again, once
+
+
+def test_an_unread_base_files_and_closes_nothing(role):
+    gh = FakeGitHub(base_runs=[base_run("macOS Smoke", 2, "failure", -5)])
+    composed, _ = role(gh, Agent())
+    gh.build_world = lambda base, **_: WorldState(now=_now())  # type: ignore[method-assign]
+    tick(composed)
+    assert base_issues(gh) == {}

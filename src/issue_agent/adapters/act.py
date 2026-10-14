@@ -16,12 +16,14 @@ from datetime import datetime, timezone
 
 from ..domain.actions import (
     Action,
+    FileIssue,
     LinkBlockedBy,
     MergePullRequest,
     OpenPullRequest,
     PostComment,
     Relabel,
     RunAgent,
+    SetIssueState,
     Target,
     UpdateBranch,
 )
@@ -37,6 +39,7 @@ from .github import FixObservationIncomplete, GhUnavailable
 # claimed (the cutover carried them in this form), and a claimed key decides
 # whether to post.
 _COMMENT_NAMESPACE = "fix-comment"
+_ISSUE_NAMESPACE = "fix-issue"
 _PR_BODY_LIMIT = 60000
 # Stable across retries: the comment's read-back matches its exact body.
 _GITHUB_REFUSED = "GitHub would not read or write the link"
@@ -125,6 +128,10 @@ class GitHubAct:
             self.open_pr(action)
         elif isinstance(action, LinkBlockedBy):
             self.link_blocker(action)
+        elif isinstance(action, FileIssue):
+            self.file_issue(action)
+        elif isinstance(action, SetIssueState):
+            self.set_issue_state(action)
         else:
             raise TypeError(f"act does not execute {action!r}")
 
@@ -211,6 +218,38 @@ class GitHubAct:
             if not self.gateway.has_comment(kind, action.number, action.body):
                 raise RuntimeError(f"{kind} #{action.number}: comment {action.key} not confirmed")
             self.control.confirm_key(key)
+
+    def file_issue(self, action: FileIssue) -> None:
+        """Claimed before the write, confirmed once the issue reads back. As
+        `post`: the listing of this token's own issues (complete, and not the
+        search index), not the key, says whether the issue is there. Derive's
+        issue search can lag a filing, and an unconfirmed claim may have
+        landed; a confirmed key whose exact title the listing lacks was deleted
+        or retitled, and derive asks again (#395)."""
+        key = f"{_ISSUE_NAMESPACE}:{self.repository}:{action.key}"
+        if (state := self.control.claim_key(key)) != "new":
+            if action.title in {title for _, _, title, _ in self.gateway.issue_index(1000, author="@me")}:
+                self.control.confirm_key(key)
+                return
+            if state == "done":
+                self.log(f"issue for {action.title!r} was deleted or retitled; filing again")
+        number = self.gateway.create_issue(action.title, action.body)
+        if self.gateway.get_issue(number).title.strip() != action.title.strip():
+            raise RuntimeError(f"issue #{number}: filed issue {action.key} not confirmed")
+        self.control.confirm_key(key)
+        self.log(f"issue #{number}: filed {action.title!r}")
+
+    def set_issue_state(self, action: SetIssueState) -> None:
+        if self.gateway.is_issue_closed(action.number) != action.open:
+            return
+        if action.open:
+            self.gateway.reopen_issue(action.number, action.comment)
+        else:
+            self.gateway.close_issue(action.number, "completed", action.comment)
+        if self.gateway.is_issue_closed(action.number) == action.open:
+            raise RuntimeError(f"issue #{action.number}: {'reopen' if action.open else 'close'} not confirmed")
+        self.log(f"issue #{action.number}: {'reopened' if action.open else 'closed'}: "
+                 f"{' '.join(action.comment.split())[:300]}")
 
     def link_blocker(self, action: LinkBlockedBy) -> None:
         """A steward's "blocked by" claim, rechecked on fresh reads

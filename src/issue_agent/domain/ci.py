@@ -7,9 +7,11 @@ Unavailable, never an answer (#48).
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
-from .checks import CIObservation, Observed, RequiredCheck, Unavailable
+from .checks import BaseRun, CIObservation, Observed, RequiredCheck, Unavailable
+from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from .world import Check
@@ -129,6 +131,31 @@ def parse_timestamp(raw: str) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# A base run's verdict. Cancelled, skipped and every other conclusion count
+# neither way: with `cancel-in-progress` on base pushes most runs are cancelled.
+RED_CONCLUSIONS = frozenset({"failure", "timed_out"})
+GREEN_CONCLUSIONS = frozenset({"success", "neutral"})
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def base_verdicts(runs: Iterable[BaseRun]) -> tuple[tuple[BaseRun, BaseRun, bool], ...]:
+    """Per workflow name: its latest verdict run (by creation, then run id; a
+    re-run keeps its run), the first run of the streak of that verdict ending
+    at it as far back as `runs` reach, and whether an opposite verdict bounds
+    that streak (else it may have begun before the earliest listed run)."""
+    by_workflow: dict[str, list[BaseRun]] = {}
+    for run in sorted(runs, key=lambda r: (parse_timestamp(r.created_at) or _EPOCH, r.run_id), reverse=True):
+        if run.conclusion in RED_CONCLUSIONS | GREEN_CONCLUSIONS:
+            by_workflow.setdefault(run.workflow, []).append(run)
+    out = []
+    for name in sorted(by_workflow):
+        latest, *older = by_workflow[name]
+        red = latest.conclusion in RED_CONCLUSIONS
+        streak = [latest, *itertools.takewhile(lambda r: (r.conclusion in RED_CONCLUSIONS) == red, older)]
+        out.append((latest, streak[-1], len(streak) <= len(older)))
+    return tuple(out)
 
 
 def failed_checks(checks: CIObservation) -> tuple[Check, ...]:

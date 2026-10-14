@@ -215,6 +215,23 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * BaseCIFailure
+         * @description A workflow red on the base branch; `since_ts` is its red streak's first
+         *     run as far back as listed.
+         */
+        BaseCIFailure: {
+            /** Issue Url */
+            issue_url?: string | null;
+            /** Run Url */
+            run_url: string;
+            /** Since Ts */
+            since_ts: string;
+            /** Workflow */
+            workflow: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** BasisCost */
         BasisCost: {
             /** Basis */
@@ -728,6 +745,8 @@ export interface components {
         };
         /** OverviewPayload */
         OverviewPayload: {
+            /** Base Failures */
+            base_failures?: components["schemas"]["BaseCIFailure"][] | null;
             caps: components["schemas"]["Caps"] | null;
             /** Health */
             health: components["schemas"]["RoleHealth"][];

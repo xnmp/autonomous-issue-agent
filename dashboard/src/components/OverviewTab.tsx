@@ -3,6 +3,7 @@ import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import type {
   AttentionItem,
+  BaseCIFailure,
   Caps,
   HealthTrendDay,
   LeaseRow,
@@ -128,7 +129,7 @@ export function OverviewTab({
       <section className="overview-health panel">
         <div className="panel-hd">
           <span className="panel-title">Daemon health</span>
-          <span className="faint">role heartbeats</span>
+          <span className="faint">role heartbeats · base branch CI</span>
         </div>
         <div className="panel-bd health-list">
           {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
@@ -136,6 +137,9 @@ export function OverviewTab({
           ) : null}
           {(ov.data?.health ?? []).map((h) => (
             <HealthRow key={h.role} health={h} />
+          ))}
+          {(ov.data?.base_failures ?? []).map((f) => (
+            <BaseFailureRow key={f.run_url} failure={f} />
           ))}
         </div>
       </section>
@@ -374,6 +378,29 @@ function HealthRow({ health }: { health: RoleHealth }) {
       <span className="faint num" title={health.heartbeat_ts ?? undefined}>
         {health.heartbeat_ts ? `heartbeat ${ago(health.heartbeat_ts)}` : "no heartbeat"}
       </span>
+    </div>
+  );
+}
+
+/**
+ * A workflow failing on the base branch (a push-only one shows on no PR). The
+ * fix role keeps one
+ * unlabelled issue per workflow: closed when it passes, reopened when it fails again.
+ */
+function BaseFailureRow({ failure }: { failure: BaseCIFailure }) {
+  return (
+    <div className="health-row tone-border-fail">
+      <span className="dot dot-fail" aria-hidden="true" />
+      <span className="health-role">{failure.workflow}</span>
+      <Chip tone="fail">failing on base</Chip>
+      <a className="faint" href={failure.run_url} target="_blank" rel="noreferrer">latest run</a>
+      {failure.issue_url ? (
+        <a className="faint" href={failure.issue_url} target="_blank" rel="noreferrer">issue</a>
+      ) : (
+        <span className="faint">no open issue</span>
+      )}
+      <span className="spacer" />
+      <span className="faint num" title={failure.since_ts}>first failed {ago(failure.since_ts)}</span>
     </div>
   );
 }

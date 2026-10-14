@@ -16,7 +16,9 @@ from ...adapters.control_store import Lease
 from ...domain import dashboard as dash
 from ...domain.actions import ISSUE_ACTS, AgentKind, Target
 from ...domain.backoff import LegEnd
-from ...domain.ci import parse_timestamp
+from ...domain.checks import BaseCI
+from ...domain.ci import RED_CONCLUSIONS, base_verdicts, parse_timestamp
+from ...domain.policy import base_title
 from ...domain.labels import Label
 from ...domain.refs import harness_branch_issue
 from ...domain.state import DerivedState, Harness, ItemKey
@@ -355,6 +357,17 @@ def attention(item_list: Iterable[Item], gh_issues: Mapping[int, Mapping]) -> li
         "headline": status.headline,
         "detail": status.detail,
     } for item, status in rows]
+
+
+def base_failures(base_ci: BaseCI | None, base: str, repo: str) -> list[dict] | None:
+    """The fix role's red base workflows, longest red first; None: unread."""
+    if base_ci is None:
+        return None
+    return [{"workflow": latest.workflow, "since_ts": since.created_at, "run_url": latest.url,
+             "issue_url": issue_url(repo, issue.number) if issue and not issue.closed_at else None}
+            for latest, since, _ in sorted(base_verdicts(base_ci.runs), key=lambda v: v[1].created_at)
+            if latest.conclusion in RED_CONCLUSIONS
+            for issue in [base_ci.issue(base_title(latest.workflow, base))]]
 
 
 def health_trend(issues_payload: object, local_tz: tzinfo) -> list[dict]:

@@ -5,7 +5,8 @@ from dataclasses import replace
 
 from ..domain.ci import parse_timestamp
 
-from ..domain.checks import Check, CIObservation, Observed, RequiredCheck, Unavailable
+from ..domain.checks import BaseIssue, BaseRun, Check, CIObservation, Observed, RequiredCheck, Unavailable
+from ..domain.identity import login_eq
 
 _METADATA = """query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){
  pullRequest(number:$number){id headRefOid baseRefName
@@ -97,6 +98,40 @@ def base_reports(nodes) -> tuple[Check, ...]:
     if not isinstance(nodes, list):
         raise ValueError("base reports are malformed")
     return tuple(_report({**node, "isRequired": False}) for node in nodes)
+
+
+def base_runs(payload, base: str) -> tuple[BaseRun, ...]:
+    """One page of the base branch's completed push runs. A malformed row
+    makes the page unread: dropping it could make an older run the latest."""
+    rows = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise ValueError("base run listing is absent or malformed")
+    rows = [r for r in rows if (r.get("head_branch"), r.get("event"), r.get("status")) == (base, "push", "completed")]
+    if any(parse_timestamp(str(r.get("created_at"))) is None or parse_timestamp(str(r.get("updated_at"))) is None
+           or not isinstance(r.get("conclusion") or "", str) for r in rows):
+        raise ValueError("base run conclusion or times are malformed")
+    return tuple(BaseRun(r.get("name"), r.get("id"), r.get("html_url"), r.get("head_sha"),
+                         (r.get("conclusion") or "unknown").lower(), r["created_at"], r["updated_at"]) for r in rows)
+
+
+def base_issues(search, filer: str) -> tuple[BaseIssue, ...]:
+    """The issues `filer` opened in one complete page of issue-search results."""
+    nodes = search.get("nodes") if isinstance(search, dict) else None
+    if (not isinstance(nodes, list) or search.get("issueCount") != len(nodes)
+            or any(not isinstance(n, dict) or type(n.get("number")) is not int or not isinstance(n.get("title"), str)
+                   or n.get("state") not in ("OPEN", "CLOSED") or n["state"] == "CLOSED" and not n.get("closedAt")
+                   for n in nodes)):
+        raise ValueError("issue search is absent, malformed or past one page")
+    return tuple(BaseIssue(n["number"], n["title"], "" if n["state"] == "OPEN" else n["closedAt"],
+                           n["state"] == "CLOSED" and _closed_by(n, filer))
+                 for n in nodes if login_eq(str((n.get("author") or {}).get("login") or ""), filer))
+
+
+def _closed_by(node: dict, filer: str) -> bool:
+    """Whether `filer` itself closed the issue last (not a merged PR it authored or merged)."""
+    events = (node.get("timelineItems") or {}).get("nodes") or [{}]
+    last = events[-1] if isinstance(events, list) and isinstance(events[-1], dict) else {}
+    return last.get("closer") is None and login_eq(str((last.get("actor") or {}).get("login") or ""), filer)
 
 
 def _checked_merge(selected):

@@ -142,4 +142,33 @@ describe("OverviewTab", () => {
     expect(row).toHaveTextContent("running");
     expect(row).toHaveTextContent("Rebase #999");
   });
+
+  it("lists each workflow failing on the base branch with its run and issue in the health panel", async () => {
+    overview({
+      base_failures: [
+        {
+          workflow: "Windows smoke", since_ts: "2026-08-01T07:00:00Z",
+          run_url: "https://github.com/o/r/actions/runs/81", issue_url: "https://github.com/o/r/issues/41",
+        },
+        { workflow: "macOS Smoke", since_ts: "2026-08-01T08:00:00Z", run_url: "https://github.com/o/r/actions/runs/71" },
+      ],
+    });
+
+    const health = (await screen.findByText("Daemon health")).closest("section")!;
+    const windows = (await screen.findByText("Windows smoke")).closest(".health-row")!;
+    expect(health).toContainElement(windows as HTMLElement);
+    expect(windows).toHaveTextContent("failing on base");
+    expect(windows).toHaveTextContent("first failed");
+    expect(screen.getAllByRole("link", { name: "latest run" }).map((a) => a.getAttribute("href"))).toEqual([
+      "https://github.com/o/r/actions/runs/81", "https://github.com/o/r/actions/runs/71",
+    ]);
+    expect(screen.getByRole("link", { name: "issue" })).toHaveAttribute("href", "https://github.com/o/r/issues/41");
+    expect(screen.getByText("macOS Smoke").closest(".health-row")).toHaveTextContent("no open issue");
+  });
+
+  it("shows no base-CI row when the base branch is green or unread", async () => {
+    overview({ base_failures: null });
+    await screen.findByText("Daemon health");
+    expect(screen.queryByText("failing on base")).toBeNull();
+  });
 });

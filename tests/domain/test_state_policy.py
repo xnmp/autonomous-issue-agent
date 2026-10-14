@@ -1310,3 +1310,98 @@ def test_ordering_never_drops_or_duplicates_a_key():
     touches = {n: ("src",) if n % 2 else ("docs",) for n in range(1, 200)}
     order = dispatch_order(keys, {}, touches, {"src/x.py"}, NOW)
     assert sorted(order, key=lambda k: k.sort_key) == sorted(keys, key=lambda k: k.sort_key)
+
+
+# ── gap 22: one base-CI issue per workflow ───────────────────────────────────
+
+from issue_agent.domain.actions import FileIssue, SetIssueState  # noqa: E402
+from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun  # noqa: E402
+from issue_agent.domain.policy import base_ci_actions  # noqa: E402
+
+TITLE = "CI: macOS Smoke failing on dev"
+
+
+def _br(run: int, conclusion: str, name: str = "macOS Smoke", finished: str | None = None) -> BaseRun:
+    return BaseRun(name, run, f"https://x/runs/{run}", f"sha{run}", conclusion, f"2026-10-14T00:00:{run:02d}Z",
+                   finished or f"2026-10-14T01:00:{run:02d}Z")
+
+
+def _act(*runs, issues=()):
+    return base_ci_actions(BaseCI(tuple(runs), tuple(issues)), "dev", "<!-- m -->")
+
+
+def test_an_unread_base_acts_on_nothing():
+    assert base_ci_actions(None, "dev", "<!-- m -->") == ()
+
+
+def test_a_first_red_verdict_files_one_issue_keyed_by_workflow_naming_the_streaks_first_run():
+    (filed,) = _act(_br(1, "success"), _br(2, "failure"), _br(3, "failure"))
+    assert isinstance(filed, FileIssue) and filed.title == TITLE and filed.key == f"base-ci:dev:{TITLE}"
+    assert filed.body.startswith("<!-- m -->\n") and "https://x/runs/2 (head `sha2`)" in filed.body
+
+
+def test_a_red_workflow_with_its_issue_open_files_nothing():
+    assert _act(_br(2, "failure"), issues=[BaseIssue(40, TITLE)]) == ()
+
+
+def test_green_closes_the_open_issue_naming_the_green_run_and_leaves_a_closed_one():
+    (closed,) = _act(_br(9, "success"), issues=[BaseIssue(40, TITLE)])
+    assert closed == SetIssueState(40, False, "<!-- m -->\n**macOS Smoke** passes on `dev` again: "
+                                              "https://x/runs/9 (head `sha9`).")
+    assert _act(_br(9, "success"), issues=[BaseIssue(40, TITLE, "2026-10-14T02:00:00Z")]) == ()
+
+
+def test_a_red_streak_that_began_after_the_close_reopens_the_issue():
+    (reopened,) = _act(_br(1, "success"), _br(2, "failure", finished="2026-10-14T03:00:00Z"),
+                       issues=[BaseIssue(40, TITLE, "2026-10-14T02:00:00Z")])
+    assert reopened.number == 40 and reopened.open and "https://x/runs/2" in reopened.comment
+
+
+def test_a_red_streak_whose_start_is_past_the_listing_reopens_nothing_and_says_so_when_filing():
+    # A human closed the issue at 02:00 mid-streak; the streak's 01:00 run has slid off the one listed page.
+    assert _act(_br(4, "failure", finished="2026-10-14T04:00:00Z"), issues=[BaseIssue(40, TITLE,
+                                                                                    "2026-10-14T02:00:00Z")]) == ()
+    (filed,) = _act(_br(4, "failure"))
+    assert "Earliest listed failing run: https://x/runs/4" in filed.body
+
+
+def test_a_duplicate_title_always_means_the_oldest_issue():
+    issues = [BaseIssue(41, TITLE), BaseIssue(40, TITLE, "2026-10-14T00:00:00Z")]
+    (reopened,) = _act(_br(1, "success"), _br(2, "failure", finished="2026-10-14T03:00:00Z"), issues=issues)
+    assert reopened.number == 40
+    assert _act(_br(1, "success"), _br(2, "failure"), issues=issues[::-1]) == _act(_br(1, "success"), _br(2, "failure"),
+                                                                                  issues=issues)
+
+
+def test_a_title_stays_within_githubs_limit_whatever_the_base_branch():
+    base = "release/" + "b" * 222
+    (filed,) = base_ci_actions(BaseCI((_br(2, "failure", name="w" * 300),), ()), base, "<!-- m -->")
+    assert len(filed.title) <= 256 and filed.title.endswith(f" failing on {base}")  # what the issue search finds
+
+
+def test_a_harness_close_reopens_on_a_later_red_whatever_the_listing_reaches():
+    # Only the red run is listed: the green the harness closed on has left the page.
+    (reopened,) = _act(_br(4, "failure", finished="2026-10-14T04:00:00Z"),
+                       issues=[BaseIssue(40, TITLE, "2026-10-14T02:00:00Z", harness_closed=True)])
+    assert reopened == SetIssueState(40, True, reopened.comment) and "runs/4" in reopened.comment
+    assert _act(_br(4, "failure", finished="2026-10-14T01:00:00Z"),  # red before the harness's close: a race, held
+                issues=[BaseIssue(40, TITLE, "2026-10-14T02:00:00Z", harness_closed=True)]) == ()
+
+
+def test_a_close_during_the_red_streak_holds():
+    # The streak's first run finished before a human closed the issue; later red runs change nothing.
+    assert _act(_br(1, "success"), _br(2, "failure", finished="2026-10-14T01:00:00Z"),
+                _br(3, "failure", finished="2026-10-14T05:00:00Z"),
+                issues=[BaseIssue(40, TITLE, "2026-10-14T02:00:00Z")]) == ()
+
+
+def test_another_bases_issue_or_an_unparseable_close_time_is_not_acted_on():
+    assert _act(_br(2, "failure"), issues=[BaseIssue(40, "CI: macOS Smoke failing on main")])[0].title == TITLE
+    assert _act(_br(2, "failure"), issues=[BaseIssue(40, TITLE, "whenever")]) == ()
+
+
+def test_a_hostile_or_huge_workflow_name_is_bounded_in_the_title_and_inert_in_the_body():
+    name = "@owner <img src=x>\n![p](http://x) " + "w" * 5000
+    (filed,) = _act(_br(2, "failure", name=name))
+    assert len(filed.title) <= 256 and "\n" not in filed.title and len(filed.body) < 1000
+    assert "@owner" not in filed.body and "<img" not in filed.body and "![p]" not in filed.body

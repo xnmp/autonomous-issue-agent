@@ -198,12 +198,23 @@ class AttentionItem(Contract):
     detail: str | None = None
 
 
+class BaseCIFailure(Contract):
+    """A workflow red on the base branch; `since_ts` is its red streak's first
+    run as far back as listed."""
+
+    workflow: str
+    since_ts: str
+    run_url: str
+    issue_url: str | None = None
+
+
 class OverviewPayload(Observed):
     metrics: Metrics | None
     caps: Caps | None
     health: list[RoleHealth]
     leases: list[LeaseRow] = []
     needs_attention: list[AttentionItem] = []
+    base_failures: list[BaseCIFailure] | None = None  # None: unread
     health_trend: list[HealthTrendDay] = []
     spend_per_hour: list[SpendBucket] = []
     # Why the control store could not be read; no board is derived then.
