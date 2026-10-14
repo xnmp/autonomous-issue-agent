@@ -751,12 +751,15 @@ TIERS = {"FIX_MODEL_MED": "claude:claude-sonnet-5-5", "FIX_MODEL_HIGH": "claude:
 
 
 def _cap_hit(cap: str, session: str, cost: float = 1.05):
-    """A leg the harness ended at a per-leg cap with its session intact."""
+    """A leg the harness ended at a per-leg cap with its session intact.
+
+    Settlement prices tokens, not the CLI's dollars (#389): `cost` is spent as
+    output tokens at claude-sonnet-5-5's $10/MTok."""
     spent = cap == "budget"
     return lambda _task: AgentResult(
         True, status=MAX_BUDGET_STATUS if spent else "", envelope_subtype=MAX_BUDGET_STATUS if spent else "",
         exit_reason=ExitReason.BUDGET_EXHAUSTED if spent else ExitReason.WALL_TIMEOUT, cost_usd=cost,
-        session_id=session)
+        usage={"input_tokens": 0, "output_tokens": round(cost * 100_000)}, session_id=session)
 
 
 def _resolve_legs(composed) -> list[str | None]:
@@ -803,7 +806,8 @@ def test_a_budget_hit_never_buys_past_the_issues_lifetime_cap(role, later):
     # The lifetime cap is the human's grant: a machine end does not route around it.
     gh = FakeGitHub(issues={5: ready()})
     agent = Agent(_cap_hit("budget", "s-1", cost=0.6))
-    composed, _ = role(gh, agent, ISSUE_SPEND_CAP_USD="1", MAX_BUDGET_USD="0.6", REVIEW_BUDGET_USD="0.6")
+    composed, _ = role(gh, agent, ISSUE_SPEND_CAP_USD="1", MAX_BUDGET_USD="0.6", REVIEW_BUDGET_USD="0.6",
+                       FIX_MODEL="claude-sonnet-5-5")
     assert dispatched(tick(composed), AgentKind.RESOLVE)
     later()
     tick(composed)
