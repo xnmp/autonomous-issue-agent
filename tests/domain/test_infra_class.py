@@ -37,7 +37,7 @@ def test_harness_side_endings_are_infra_class(reason):
         (dict(exit_reason=ExitReason.TRANSPORT_DEATH, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s"), "s"),
         (dict(exit_reason=ExitReason.AGENT_ERROR, session_id="s"), "s"),
         (dict(exit_reason=ExitReason.TRANSPORT_DEATH, session_id="s"), ""),
-        (dict(exit_reason=ExitReason.BUDGET_EXHAUSTED, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s"), ""),
+        (dict(exit_reason=ExitReason.BUDGET_EXHAUSTED, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s"), "s"),
         (dict(exit_reason=ExitReason.TRANSPORT_DEATH, envelope_subtype=PROVIDER_REFUSED_SUBTYPE), ""),
     ],
 )

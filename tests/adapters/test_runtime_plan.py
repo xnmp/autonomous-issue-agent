@@ -21,20 +21,20 @@ def test_emails_are_never_touched():
 
 def test_replace_changes_execution_plan_and_keeps_context():
     original = RuntimePlan(
-        prompt="work", cwd="/old", context_prefix="Prior scratch notes\n\n", context_suffix="\n\nRepository context"
+        prompt="work", cwd="/old", context_suffix="\n\nRepository context"
     )
     changed = replace(original, cwd="/new", resume="session")
 
     assert (original.cwd, changed.cwd, changed.resume) == ("/old", "/new", "session")
-    assert changed.rendered_prompt == original.rendered_prompt == "Prior scratch notes\n\nwork\n\nRepository context"
+    assert changed.rendered_prompt == original.rendered_prompt == "work\n\nRepository context"
 
 
-def test_replacing_the_task_preserves_scratch_context():
+def test_replacing_the_task_preserves_repository_context():
     original = RuntimePlan(
-        prompt="Old requirements", context_prefix="Scratch notes\n\n", context_suffix="\n\nTrailing context"
+        prompt="Old requirements", context_suffix="\n\nTrailing context"
     )
     changed = replace(original, prompt="New requirements")
 
-    assert changed.rendered_prompt == "Scratch notes\n\nNew requirements\n\nTrailing context"
-    assert original.rendered_prompt == "Scratch notes\n\nOld requirements\n\nTrailing context"
+    assert changed.rendered_prompt == "New requirements\n\nTrailing context"
+    assert original.rendered_prompt == "Old requirements\n\nTrailing context"
     assert RuntimePlan(prompt="bare").rendered_prompt == "bare"

@@ -357,10 +357,11 @@ def build_fresh_reply_task(
 
 
 def build_continue_task(cwd: str, session_id: str, cfg: FixTaskConfig) -> RuntimePlan:
-    """Resume a leg the wall-clock cap cut off: the same session, once."""
+    """Resume a leg a per-leg cap (wall clock or spend) cut off: the same
+    session, once."""
     prompt = (
-        "Your previous leg was stopped by the harness's wall-clock cap before it "
-        "returned. Continue from where you stopped; do not restart the work. "
+        "Your previous leg was stopped by the harness's per-leg time or spend cap "
+        "before it returned. Continue from where you stopped; do not restart the work. "
         "Push your branch with `git push` when done (the harness opens the pull "
         "request), or return status=blocked with 'needs'."
     )

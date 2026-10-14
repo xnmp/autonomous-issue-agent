@@ -254,6 +254,12 @@ that matters is not "wrong answer" but "loop that bills forever":
   harness prices the root rollout counters with the captured rate card and
   kills the process group on crossing
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
+- the two per-leg caps share one rule (`outcome.leg_cap`): a first hit on a
+  fresh session is a machine end, and the next leg resumes that session at
+  the same tier; a hit on the resumed leg is an attempt. A resume is bought
+  only while the issue cap still affords a leg at the dearer role's budget
+  (`ISSUE_SPEND_CAP_USD` ≥ committed + max(`MAX_BUDGET_USD`,
+  `REVIEW_BUDGET_USD`)); a budget hit spends at least `MAX_BUDGET_USD`
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
 
@@ -345,12 +351,14 @@ startup. Network fail-soft behavior and operation-local reconcile-first effects
 are not recovery triggers.
 `SIGTERM` moves the daemon through `RUNNING → DRAINING → STOPPED`: paid
 admission stops first, active work receives a bounded cancellation window,
-handover and receipts are persisted, and remaining
+receipts are persisted, and remaining
 groups are killed. Before cancellation, owned active runs receive a durable
 cancellation intent. Forced teardown then reconciles measured rollout usage; a
 still-indeterminate paid run retains its reservation and evidence for boot
 recovery instead of manufacturing a zero charge or releasing unknown capacity.
-State-owned handovers are then written.
+No handover file is written. A leg cancelled at shutdown records no
+receipt and no session, so the next leg starts a fresh session in the
+preserved worktree and branch, which hold its work.
 Missing the shutdown deadline changes a clean request to a transient exit. Exit codes
 distinguish clean/operator stops, transient
 failures, invalid configuration, duplicate instances, incompatible schemas,
@@ -463,7 +471,6 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/env_file.py`,
 `adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),
-`adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,

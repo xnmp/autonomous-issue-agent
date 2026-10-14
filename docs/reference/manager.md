@@ -118,11 +118,7 @@ about paid runners, not a harness fix).
   daemon), **write the manager handover and commit it directly to `dev`** —
   `docs/open/<date>-handover-<batch>.md`, the operator-facing batch record,
   together with the ledger verdicts ticked during the batch, in one docs-only
-  commit. (Not to be confused with the FIXER's exhausted-leg handover —
-  `.harness/handover.md` in worktree scratch, written by
-  `adapters/handover.py` for the next leg of the same issue to consume,
-  excluded from git and never committed. The two share a name and nothing
-  else.) Don't sit on it: a manager session can die at any point and an
+  commit. Don't sit on it: a manager session can die at any point and an
   uncommitted handover dies with it (batch 3, 2026-07-29, took two takeover
   sessions to reconstruct). Mid-batch the rule stays the opposite — never
   move `dev` while ai PRs are open; it forces rebases on all of them.

@@ -31,14 +31,13 @@ class RuntimePlan:
     # read-only outside any git repository, with the task's own system prompt
     # instead of the fix contract; Claude closes its tools by disallowed_tools.
     read_only: bool = False
-    # Scratch history and repository guidance: execution context around the
-    # task, never authoritative task input.
-    context_prefix: str = ""
+    # Repository guidance: execution context after the task, never
+    # authoritative task input.
     context_suffix: str = ""
 
     @property
     def rendered_prompt(self) -> str:
-        return self.context_prefix + self.prompt + self.context_suffix
+        return self.prompt + self.context_suffix
 
 
 def git_identity_env(model: str | None) -> dict[str, str]:

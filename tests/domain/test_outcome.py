@@ -107,7 +107,9 @@ def test_offending_path_takes_the_last_tool_call_and_never_raises():
 # ── classify_leg: what one returned fix leg counts as (slice 5b) ────────────
 import pytest
 
-from issue_agent.domain.outcome import LegClass, classify_leg
+from dataclasses import replace
+
+from issue_agent.domain.outcome import LegClass, classify_leg, resumable_session
 
 
 @pytest.mark.parametrize(
@@ -125,10 +127,22 @@ def test_a_harness_or_provider_death_is_never_an_attempt(reason, resumed):
     assert classify_leg(result, resumed=resumed) is LegClass.MACHINE
 
 
-def test_a_wall_cap_is_a_machine_end_once_then_an_attempt_on_the_resume():
-    capped = AgentResult(is_error=True, status="", exit_reason=ExitReason.WALL_TIMEOUT)
+_WALL = AgentResult(is_error=True, status="", exit_reason=ExitReason.WALL_TIMEOUT, session_id="s-wall")
+_SPENT = AgentResult(is_error=True, status=MAX_BUDGET_STATUS, envelope_subtype=MAX_BUDGET_STATUS,
+                     exit_reason=ExitReason.BUDGET_EXHAUSTED, session_id="s-spent")
+
+
+@pytest.mark.parametrize("capped", [_WALL, _SPENT], ids=["wall", "budget"])
+def test_a_leg_cap_is_a_machine_end_once_then_an_attempt_on_the_resume(capped):
+    # Owner, 2026-10-14: a per-leg budget hit is a wall timeout, one rule.
     assert classify_leg(capped, resumed=False) is LegClass.MACHINE
     assert classify_leg(capped, resumed=True) is LegClass.AGENT
+
+
+@pytest.mark.parametrize("capped", [_WALL, _SPENT], ids=["wall", "budget"])
+def test_a_leg_cap_leaves_its_session_resumable(capped):
+    assert resumable_session(capped) == capped.session_id
+    assert resumable_session(replace(capped, session_id="")) == ""
 
 
 def test_a_blocked_return_is_a_question_and_an_error_is_agent_work():
@@ -136,11 +150,6 @@ def test_a_blocked_return_is_a_question_and_an_error_is_agent_work():
     assert classify_leg(AgentResult(is_error=True, status="blocked"), resumed=False) is LegClass.AGENT
     assert classify_leg(_ok("pushed"), resumed=False) is LegClass.AGENT
     assert classify_leg(_ok("failed"), resumed=True) is LegClass.AGENT
-
-
-def test_a_per_leg_budget_hit_is_agent_work():
-    spent = AgentResult(is_error=True, status=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
-    assert classify_leg(spent, resumed=False) is LegClass.AGENT
 
 
 def test_unknown_or_garbage_status_counts_as_agent_work():

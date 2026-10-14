@@ -925,26 +925,21 @@ _SHUTDOWN_REASON = "shutdown_deadline_spend_unknown"
 
 
 def shutdown_hooks(
-    control: SQLiteControlStore, spend: SpendReconciler, *, owner_id: str, state_dir: str, role: str,
+    control: SQLiteControlStore, spend: SpendReconciler, *, owner_id: str,
 ) -> tuple[Callable[[], object], Callable[[], int]]:
     """(prepare, terminalize): record cancellation intents before teardown;
-    after it, reconcile killed paid work and persist one handover per issue.
-    Recording an intent releases nothing: capacity stays reserved until the
-    killed run's spend is reconciled (or boot recovery settles it)."""
-    from ..adapters.handover import write_shutdown_handover
+    after it, reconcile killed paid work. The intents in SQLite are the
+    receipts. Recording an intent releases nothing: capacity stays reserved
+    until the killed run's spend is reconciled (or boot recovery settles it)."""
 
     def prepare() -> object:
         return control.record_owned_cancellation_intents(owner_id, _SHUTDOWN_REASON)
 
     def terminalize() -> int:
-        written = 0
-        for intent in control.record_owned_cancellation_intents(owner_id, _SHUTDOWN_REASON):
+        intents = control.record_owned_cancellation_intents(owner_id, _SHUTDOWN_REASON)
+        for intent in intents:
             spend.reconcile(intent.run_id)
-            # One file per issue: rewriting it at a later shutdown is idempotent.
-            written += write_shutdown_handover(
-                state_dir=state_dir, role=role, issue=intent.issue_number, run_id=str(intent.run_id),
-                kind=intent.kind, reason=intent.reason) is not None
-        return written
+        return len(intents)
 
     return prepare, terminalize
 
@@ -968,7 +963,7 @@ def compose_role(
     admission that trips a cap can sweep stale reservations (keifu #34);
     every leg reserves before spawn and settles once through the accounting
     runtime; shutdown records cancellation intents, then reconciles killed
-    work and writes handovers."""
+    work."""
     from ..adapters.process_supervisor import ProcessSupervisor
     from ..adapters.runtime_switch import RuntimeSwitch
 
@@ -997,8 +992,7 @@ def compose_role(
             rate_table(cfg, name.value), spend_evidence_dir(state_dir), owner_id=owner_id,
             reservation_reconciler=recovery,
         )
-        chains[name] = JournalingRuntime(accountings[name], journal, repo=cfg.repo, role=role, runtime=name.value,
-                                         state_dir=state_dir)
+        chains[name] = JournalingRuntime(accountings[name], journal, repo=cfg.repo, role=role, runtime=name.value)
 
     def prepare_cwd(cwd: str, runtime: RuntimeName | None = None) -> None:
         if (prepare := prepares.get(runtime or default)) is not None:
@@ -1009,7 +1003,7 @@ def compose_role(
     dispatch = CancellableAsyncDispatch(legs.run)
     act = make_act(dispatch, control)
 
-    prepare_shutdown, terminalize = shutdown_hooks(control, spend, owner_id=owner_id, state_dir=state_dir, role=role)
+    prepare_shutdown, terminalize = shutdown_hooks(control, spend, owner_id=owner_id)
 
     # Only the fix role files base-CI issues, so only it reads base CI; the
     # review role's token pool is the rate-limited one.

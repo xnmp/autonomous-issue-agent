@@ -80,10 +80,11 @@ def infra_death(reason: ExitReason | None) -> bool:
     return reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.TRANSPORT_DEATH)
 
 
-def budget_exhausted(reason: ExitReason | None) -> bool:
-    """The harness ended the leg at its spend ceiling (a non-strike with its
-    own operator surface, unlike `infra_death`)."""
-    return reason is ExitReason.BUDGET_EXHAUSTED
+def leg_cap(reason: ExitReason | None) -> bool:
+    """The harness ended a live session at a per-leg resource cap: its wall
+    clock or its spend ceiling (owner, 2026-10-14: a budget hit is a wall
+    timeout). The session is intact, so the work continues by resuming it."""
+    return reason in (ExitReason.WALL_TIMEOUT, ExitReason.BUDGET_EXHAUSTED)
 
 
 def runtime_unavailable(reason: ExitReason | None) -> bool:
@@ -177,14 +178,16 @@ class LegClass(str, Enum):
 
 
 def classify_leg(result: "AgentResult", *, resumed: bool) -> LegClass:
-    """Classify a returned leg. A wall-cap hit is a machine failure on a fresh
-    session and an attempt on a resumed one: the item resumes once (the leg
-    runner resumes the latest machine end's session) and a second wall-cap on
-    that resume counts. A per-leg budget hit mid-run is agent work, and an
-    orderly harness teardown never is."""
+    """Classify a returned leg. A per-leg cap hit (`leg_cap`: wall clock or
+    spend) is a machine failure on a fresh session and an attempt on a resumed
+    one: the item resumes once at the same tier (the leg runner resumes the
+    latest machine end's session) and a second cap hit on that resume counts,
+    whichever cap it is. An orderly harness teardown is never an attempt. The
+    per-issue lifetime cap is not a leg cap: it refuses admission and stops
+    for a human."""
     if infra_class_failure(result) or result.exit_reason is ExitReason.OPERATOR_CANCELLED:
         return LegClass.MACHINE
-    if result.exit_reason is ExitReason.WALL_TIMEOUT:
+    if leg_cap(result.exit_reason):
         return LegClass.AGENT if resumed else LegClass.MACHINE
     if not result.is_error and result.status == "blocked":
         return LegClass.ASKED
@@ -193,8 +196,7 @@ def classify_leg(result: "AgentResult", *, resumed: bool) -> LegClass:
 
 def resumable_session(result: AgentResult) -> str:
     """The session a later leg may resume, or "" when this end left none usable."""
-    if budget_exhausted(result.exit_reason) or (
-            infra_class_failure(result) and result.envelope_subtype != PROVIDER_REFUSED_SUBTYPE):
+    if infra_class_failure(result) and result.envelope_subtype != PROVIDER_REFUSED_SUBTYPE:
         return ""
     return result.session_id or ""
 

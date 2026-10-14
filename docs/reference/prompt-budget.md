@@ -56,3 +56,7 @@ UTF-8 bytes and 978 whitespace-delimited words.
 
 Re-measured 2026-10-14 after adding the owner rule "the agent does more; the
 harness controls less": 7,743 UTF-8 bytes and 1,046 whitespace-delimited words.
+
+Re-measured 2026-10-14 after the SIGTERM line dropped the deleted handover
+file (agent-autonomy audit PR A): 7,748 UTF-8 bytes and 1,047
+whitespace-delimited words.
