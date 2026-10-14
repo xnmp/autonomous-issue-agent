@@ -51,9 +51,11 @@ _KEY_AUTH = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOK
 # config vanishes with it, so `git push -u` cannot record an upstream for the
 # next leg. No auto-maintenance: it would repack and prune the object store
 # other checkouts share; the harness's own git, outside the sandbox, keeps it.
-# No pruning fetch: a remote-tracking ref is usually packed, and a leg cannot
+# No pruning fetch (origin's own setting wins over fetch.prune): a
+# remote-tracking ref is usually packed, and a leg cannot
 # rewrite packed-refs (`domain.sandbox`), so the prune would fail the fetch.
-_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"), ("fetch.prune", "false"))
+_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"), ("fetch.prune", "false"),
+               ("remote.origin.prune", "false"))
 _PUBLISH_GIT_CONFIG = (
     ("credential.https://github.com.helper",
      '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'),
@@ -213,15 +215,25 @@ _LOOSE_REFS = (("gc.packRefs", "false"), ("maintenance.pack-refs.enabled", "fals
 
 
 def _keep_refs_loose(common: str, run: Callable[..., subprocess.CompletedProcess]) -> None:
+    """Set each key in the repository config, then check the value git
+    actually uses (an include or the main checkout's config.worktree can
+    override the file); a leg does not start on a repository that may pack."""
     config = os.path.join(common, "config")
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return run(["git", *args], capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+
     try:
         for key, value in _LOOSE_REFS:
-            current = run(["git", "config", "--file", config, "--get", key], capture_output=True, text=True,
-                          timeout=_PROBE_TIMEOUT_S)
-            if (current.stdout or "").strip() != value and run(
-                    ["git", "config", "--file", config, key, value], capture_output=True, text=True,
-                    timeout=_PROBE_TIMEOUT_S).returncode != 0:
-                raise SandboxRefused(f"cannot set {key}={value} in {config}")
+            if (git("config", "--file", config, "--get", key).stdout or "").strip() != value:
+                done = git("config", "--file", config, key, value)
+                if done.returncode != 0:
+                    raise SandboxRefused(f"cannot set {key}={value} in {config}: "
+                                         f"{(done.stderr or '').strip()[:200]}")
+            effective = (git("--git-dir", common, "config", "--get", key).stdout or "").strip()
+            if effective != value:
+                raise SandboxRefused(f"{key} is {effective!r} for {common} despite its config (an include or "
+                                     f"config.worktree overrides it); a fix leg needs {value}")
     except (OSError, subprocess.SubprocessError) as exc:
         raise SandboxRefused(f"cannot read {config} ({type(exc).__name__})") from exc
 
@@ -350,11 +362,13 @@ class LegSandbox:
 
     def _empty_file(self) -> str:
         """An empty, read-only regular file in this user's private directory
-        under the temp dir, shared by every sandbox and made again if a temp
-        cleaner removed it."""
+        (the runtime dir where there is one, which no other user can claim),
+        shared by every sandbox and made again if a cleaner removed it."""
         if self._empty and os.path.isfile(self._empty) and os.path.getsize(self._empty) == 0:
             return self._empty
-        directory = os.path.join(tempfile.gettempdir(), f"issue-agent-sandbox-{os.getuid()}")
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        base = runtime if os.path.isabs(runtime) and os.path.isdir(runtime) else tempfile.gettempdir()
+        directory = os.path.join(base, f"issue-agent-sandbox-{os.getuid()}")
         try:
             os.mkdir(directory, 0o700)
         except FileExistsError:

@@ -223,7 +223,7 @@ def login_mounts(login: LoginDir) -> tuple[Mount, ...]:
     path = _normal(login.path)
 
     def shared(name: str) -> bool:
-        return any(name == s or name.startswith(s + ".") for s in login.shared)
+        return any(name == s or name.startswith(s + ".tmp.") for s in login.shared)
 
     return (Mount(path, Access.READ_WRITE),
             *(Mount(posixpath.join(path, name), Access.HIDDEN) for name in dict.fromkeys(login.entries)

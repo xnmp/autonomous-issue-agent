@@ -553,10 +553,22 @@ def test_a_symlinked_config_name_claude_obeys_refuses_the_leg(host):
 @needs_bwrap
 def test_a_fix_leg_never_prunes_on_fetch(host):
     _git("config", "fetch.prune", "true", cwd=host["target"])
+    _git("config", "remote.origin.prune", "true", cwd=host["target"])
 
-    out, err = _fix_leg(host, "git config fetch.prune").communicate(timeout=30)
+    out, err = _fix_leg(host, "git config fetch.prune; git config remote.origin.prune").communicate(timeout=30)
 
-    assert out.strip() == "false", err
+    assert out.split() == ["false", "false"], err
+
+
+@needs_bwrap
+def test_a_repository_whose_include_would_pack_refs_again_refuses_the_fix_leg(host):
+    (host["tmp"] / "packs.gitconfig").write_text("[gc]\n\tpackRefs = true\n")
+    _fix_leg(host, "true").communicate(timeout=30)  # the launch writes the keys first
+    with open(host["target"] / ".git/config", "a") as config:
+        config.write(f"[include]\n\tpath = {host['tmp'] / 'packs.gitconfig'}\n")
+
+    with pytest.raises(SandboxRefused, match="gc.packRefs"):
+        _fix_leg(host, "true")
 
 
 def test_a_leg_with_its_own_key_or_token_mounts_none_of_the_operators_claude_state(host):
