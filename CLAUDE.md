@@ -56,6 +56,21 @@ unchanged; name what it removes before writing it.
   added; reviewers reject unjustified additions. Incident history:
   [manager reference](docs/reference/manager.md) surface-area test.
 
+## The agent does more; the harness controls less
+
+Agents are capable, flexible and robust; harness control of workflow and data
+flow is brittle and is surface. Before adding a harness step, ask whether the
+agent can just do it: fetch its own evidence (CI logs, review comments), read
+what it needs, decide how to work. Do not pre-digest inputs, restrict reads
+without a security reason, script the agent's steps, or add prompt rules for
+things it handles fine. Incident: tauri #1078, where a harness-fetched CI log
+was swallowed to "" and the agent waited on CI instead.
+
+The harness keeps only what it alone can own: when and on what to dispatch
+(which failures are new, caps), money, leases and idempotency, lifecycle
+mutations through the act layer, trust provenance for verdicts, and the
+waiting between legs. Reviewers reject control the agent does not need.
+
 ## Architecture rules
 
 - `domain/` is pure: no I/O, ambient environment, wall clock, or adapter/app
