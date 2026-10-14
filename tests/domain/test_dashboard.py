@@ -160,11 +160,72 @@ def test_moving_states_are_working(state, activity):
 
 @pytest.mark.parametrize("act", list(AgentKind))
 @pytest.mark.parametrize("legs", [[], [leg("RESOLVE", 0, ended=2)]])
-def test_every_dispatch_waits_for_a_slot_whatever_the_leg_history(act, legs):
+def test_every_dispatch_waits_in_the_slot_lane_whatever_the_leg_history(act, legs):
     board = status(Dispatch(act, "" if act in ISSUE_ACTS else "h1"), legs=legs)
     assert isinstance(board, dash.Waiting)
-    assert (board.on, board.headline, board.reason) == ("slot", f"{dash._ACT_WORDS[act.name]} next",
-                                                        "Waiting for a free agent slot.")
+    # #1105: a light act (STEWARD, TRIAGE) never waits for an agent slot.
+    reason = "Waiting for a free agent slot." if act.holds_dispatch_slot else (
+        "Needs no agent slot; starts on the next tick unless every light slot is busy.")
+    assert (board.on, board.headline, board.reason) == ("slot", f"{dash._ACT_WORDS[act.name]} next", reason)
+
+
+def _reloading(state, held, **kw):
+    return dash.board_status(state, target="issue", comments=(), pr=None, legs=(), last_end=None, harness=HARNESS,
+                             now=at(600), reload_held=held, **kw)
+
+
+@pytest.mark.parametrize(("held", "reason"), [
+    ((1078,), "Restarts when #1078's leg ends."),
+    ((7, 1078), "Restarts when the legs of #7, #1078 end."),
+    ((), "Starts after the harness restarts, once its running light legs end."),
+])
+def test_heavy_work_held_by_a_reload_drain_says_so_instead_of_a_slot_wait(held, reason):
+    board = _reloading(Dispatch(AgentKind.RESOLVE), {"fix": held})
+    assert (board.on, board.group, board.headline, board.reason) == (
+        "reload", "waiting", "Paused for a harness reload", reason)
+
+
+def test_a_reload_drain_pauses_only_its_own_roles_heavy_work():
+    assert _reloading(Dispatch(AgentKind.STEWARD), {"fix": (1078,)}).on == "slot"  # light legs keep starting
+    assert _reloading(Dispatch(AgentKind.REVIEW, "h1"), {"fix": (1078,)}).on == "slot"
+    assert _reloading(Dispatch(AgentKind.REVIEW, "h1"), {"review": (30,)}).on == "reload"
+    assert _reloading(Dispatch(AgentKind.RESOLVE), {}).on == "slot"
+
+
+def test_light_work_is_paused_too_once_no_heavy_leg_drains():
+    # Light admission closes with the last heavy leg (no livelock), so the row must not promise "next tick".
+    board = _reloading(Dispatch(AgentKind.TRIAGE), {"fix": ()})
+    assert (board.on, board.reason) == ("reload", "Starts after the harness restarts, once its running light legs end.")
+
+
+@pytest.mark.parametrize(("state", "age", "pending", "expected"), [
+    ("running", 10.0, True, (7, 1078)),
+    ("draining", 10.0, True, (7, 1078)),
+    ("running", 10.0, False, None),
+    ("stopped", 10.0, True, None),
+    ("running", dash.STALE_AFTER_S + 1, True, None),
+    ("running", -5.0, True, None),
+    ("running", None, True, None),
+])
+def test_reload_held_trusts_only_a_live_heartbeat_and_counts_only_heavy_legs(state, age, pending, expected):
+    flight = [("FIX_CI", 1078), ("TRIAGE", 1105), ("RESOLVE", 7), ("STEWARD", 1106)]
+    assert dash.reload_held(state=state, age_s=age, reload_pending=pending, in_flight=flight) == expected
+
+
+def test_a_queued_wait_counts_from_when_the_issue_became_ready_not_an_earlier_episode():
+    # #1105 read "1d": its only legs were pre-cutover TRIAGE/GROOM rows from two days before.
+    old = [leg("TRIAGE", 0, ended=3)]
+    board = dash.board_status(Dispatch(AgentKind.STEWARD), target="issue", comments=(), pr=None, legs=tuple(old),
+                              last_end=at(3), harness=HARNESS, now=at(600), ready_at=at(500))
+    assert board.since_ts == stamp(500)
+    later_end = dash.board_status(Dispatch(AgentKind.RESOLVE), target="issue", comments=(), pr=None, legs=(),
+                                  last_end=at(550), harness=HARNESS, now=at(600), ready_at=at(500))
+    assert later_end.since_ts == stamp(550)
+    future = dash.board_status(Dispatch(AgentKind.RESOLVE), target="issue", comments=(), pr=None, legs=(),
+                               last_end=None, harness=HARNESS, now=at(600), ready_at=at(700))
+    assert future.since_ts is None
+    unrelated = status(Dispatch(AgentKind.STEWARD), legs=old, last_end=None)
+    assert unrelated.since_ts is None  # an earlier episode's leg never dates the wait
 
 
 def test_a_slot_wait_is_dated_from_the_last_leg_end():

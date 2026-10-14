@@ -123,6 +123,9 @@ class IssueView:
     needs_human_labeled_at: str = ""
     # Its still-open blockers; closed ones (completed or not planned) are gone.
     blocked_by: tuple[BlockerRef, ...] = ()
+    # When `ai-ready` was last applied ("" = not observed): display only, the
+    # board dates a queued item's wait from it.
+    ai_ready_labeled_at: str = ""
 
     def has(self, label: Label) -> bool:
         return label in self.labels

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 import os
 import sqlite3
 import threading
@@ -20,7 +21,8 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.dashweb.service import Backend
 from issue_agent.domain.checks import Check, Observed
 from issue_agent.domain.labels import Label
-from issue_agent.domain.state import Harness, StopReason, stop_tag
+from issue_agent.domain.actions import AgentKind
+from issue_agent.domain.state import Dispatch, Harness, StopReason, stop_tag
 from issue_agent.domain.world import BlockerRef, Comment, IssueView, PRView, WorldState
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
@@ -720,3 +722,43 @@ def test_a_blocked_issue_waits_under_waiting_headlined_and_linked_to_its_blocker
     assert (board[8]["headline"], board[8]["headline_url"]) == ("Blocked by x/lib#3", "https://github.com/x/lib/issues/3")
     assert "blocker" not in board[7]
     assert backend.issue("demo", 7)["board"]["headline_url"] == "https://github.com/o/r/issues/1"
+
+
+def _fix_beat(tmp_path, **fields):
+    fix = tmp_path / "state" / "fix"
+    fix.mkdir(parents=True, exist_ok=True)
+    (fix / "heartbeat.json").write_text(json.dumps(
+        {"in_flight": [{"kind": "FIX_CI", "number": 30}], "pid": 1, "state": "running", "updated_at": ts(-1)} | fields))
+
+
+def test_during_a_reload_drain_light_work_still_reads_as_starting_not_as_a_slot_wait(deployment, tmp_path):
+    # #1105: "why is triage waiting for a free agent slot?" It is not; light legs start during a drain.
+    backend, *_ = deployment
+    _fix_beat(tmp_path, reload_pending=True)
+    board = {card["issue"]: card["board"] for card in backend.issues("demo")["in_flight"]}
+    assert (board[1]["on"], board[1]["headline"], board[1]["reason"]) == (
+        "slot", "Steward next", "Needs no agent slot; starts on the next tick unless every light slot is busy.")
+
+
+def test_heavy_work_reads_as_paused_for_the_reload_only_while_a_live_heartbeat_reports_it(deployment, tmp_path, monkeypatch):
+    # Issue 1 is made heavy (RESOLVE next) at the store read, where the board's states are derived.
+    backend, *_ = deployment
+    _fix_beat(tmp_path, reload_pending=True)
+    original = backend.store
+
+    def store(dep, world=None):
+        read = original(dep, world)
+        if read.states is not None:
+            read = replace(read, states={k: (Dispatch(AgentKind.RESOLVE) if k.number == 1 else v)
+                                         for k, v in read.states.items()})
+        return read
+
+    monkeypatch.setattr(backend, "store", store)
+    board = {card["issue"]: card["board"] for card in backend.issues("demo")["in_flight"]}
+    assert (board[1]["on"], board[1]["headline"], board[1]["reason"]) == (
+        "reload", "Paused for a harness reload", "Restarts when #30's leg ends.")
+
+    _fix_beat(tmp_path, reload_pending=True, updated_at=ts(-60 * 24))  # stale: the daemon is gone
+    assert {c["issue"]: c["board"] for c in backend.issues("demo")["in_flight"]}[1]["on"] == "slot"
+    _fix_beat(tmp_path, reload_pending="yes")  # malformed
+    assert {c["issue"]: c["board"] for c in backend.issues("demo")["in_flight"]}[1]["on"] == "slot"

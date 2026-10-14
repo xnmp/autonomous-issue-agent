@@ -138,6 +138,20 @@ def test_a_labelled_item_carries_when_needs_human_was_last_applied():
     assert parse_fix_issue(issue_node(), []).needs_human_labeled_at == ""
 
 
+def test_a_ready_issue_carries_when_ai_ready_was_last_applied():
+    node = issue_node(labeled=labeled(("ai-ready", "2026-10-01T00:00:00Z"), ("ai-ready", "2026-10-03T00:00:00Z")))
+    assert parse_fix_issue(node, []).ai_ready_labeled_at == "2026-10-03T00:00:00Z"
+    unready = issue_node(labels=labels(), labeled=labeled(("ai-ready", "2026-10-01T00:00:00Z")))
+    assert parse_fix_issue(unready, []).ai_ready_labeled_at == ""
+
+
+@pytest.mark.parametrize("events", [None, {"nodes": "x"}, labeled(earlier=True), labeled(("bug", "2026-10-01T00:00:00Z"))])
+def test_an_unknown_ready_time_is_blank_and_never_fails_the_observation(events):
+    # Display only: unlike needs-human's, a missing ai-ready event cannot mis-release anything.
+    node = issue_node(labeled=events) if events is not None else issue_node()
+    assert parse_fix_issue(node, []).ai_ready_labeled_at == ""
+
+
 @pytest.mark.parametrize("events", [None, {"nodes": "x"}, labeled(("ai-ready", "2026-10-01T00:00:00Z"), earlier=True)])
 def test_an_unreadable_or_truncated_label_history_is_incomplete_for_a_labelled_item(events):
     node = issue_node(labels=labels("ai-ready", "needs-human"), labeled=events)

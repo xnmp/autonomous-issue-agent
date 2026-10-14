@@ -313,7 +313,12 @@ class Backend:
     def _items(self, dep: Deployment, obs: Observation | None, read: StoreRead) -> tuple[views.Item, ...] | None:
         if obs is None or obs.world is None or dep.harness is None or read.states is None:
             return None
-        return views.items(obs.world, read.states, read.legs, dep.harness, read.item_legs, obs.observed_at)
+        now = self.now_fn()
+        held = {role: found for role, beat in system.role_beats(_state_dirs(dep.cfg)).items() if beat is not None
+                and (found := dash.reload_held(state=beat.state, age_s=(now - beat.at).total_seconds(),
+                                               reload_pending=beat.reload_pending, in_flight=beat.in_flight))
+                is not None}
+        return views.items(obs.world, read.states, read.legs, dep.harness, read.item_legs, obs.observed_at, held)
 
     def _read(self, name: str, wait: bool = False):
         """The deployment, its observation and one store read. `wait` reads
@@ -372,8 +377,7 @@ class Backend:
         return {
             "role": role,
             "alive": (role in live) if scan_ok else None,
-            "stale": beat is None or beat.state not in ("running", "draining")
-            or age is None or not 0 <= age <= dash.STALE_AFTER_S,
+            "stale": beat is None or not dash.beat_live(beat.state, age),
             "heartbeat_ts": beat.at.isoformat() if beat is not None else None,
             "state": beat.state if beat is not None else None,
             "in_flight": [{"kind": kind, "number": number} for kind, number in beat.in_flight] if beat else [],

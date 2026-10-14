@@ -47,7 +47,7 @@ export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone:
   },
   waiting: {
     label: "Waiting",
-    hint: "Held by something outside the harness: branch protection, a human review, spend headroom, a retry backoff, an open blocking issue or GitHub. Nothing for you to do.",
+    hint: "Held by branch protection, a human review, spend headroom, a retry backoff, an open blocking issue, GitHub or a pending harness reload. Nothing for you to do.",
     tone: "muted",
   },
 };

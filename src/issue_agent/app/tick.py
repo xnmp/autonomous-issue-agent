@@ -291,7 +291,8 @@ class Daemon:
     _dispatch_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _shutdown_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _dispatches: dict[Future[None], tuple[RunAgent, Hashable]] = field(default_factory=dict, init=False, repr=False)
-    _accept_dispatches: bool = field(default=True, init=False, repr=False)
+    # A hot reload waits for paid work to drain (`_admitting`).
+    _reload_pending: bool = field(default=False, init=False, repr=False)
     _dispatch_closed: bool = field(default=False, init=False, repr=False)
     _retry_after_seconds: float | None = field(default=None, init=False, repr=False)
     _shutdown_deadline: float | None = field(default=None, init=False, repr=False)
@@ -338,7 +339,7 @@ class Daemon:
         try:
             if parent := os.path.dirname(self.heartbeat_path):
                 os.makedirs(parent, mode=0o700, exist_ok=True)
-            payload = {"pid": os.getpid(), "state": self._state.value,
+            payload = {"pid": os.getpid(), "state": self._state.value, "reload_pending": self._reload_pending,
                        "in_flight": [{"kind": a.kind.name, "number": a.number} for a in self.active_dispatches],
                        "updated_at": datetime.now(timezone.utc).isoformat()}
             atomic_write(self.heartbeat_path, json.dumps(payload, sort_keys=True))
@@ -354,17 +355,24 @@ class Daemon:
         with self._dispatch_lock:
             return tuple(self._dispatches.values())
 
-    def _admitting(self) -> bool:
-        # Caller holds _dispatch_lock. Pending recovery or a hot reload closes
-        # admission while existing work drains.
-        return self._accept_dispatches and not self._dispatch_closed and not self._wake_recovery_pending
+    def _admitting(self, *, heavy: bool) -> bool:
+        # Caller holds _dispatch_lock. Shutdown or pending recovery closes
+        # admission. A pending hot reload holds heavy legs while they drain;
+        # light ones (STEWARD, TRIAGE: their own small budget and timeout)
+        # start only while a heavy leg is still in flight, so the reload
+        # waits at most one light-leg timeout past the last heavy one (the
+        # light lane runs in parallel), never a stream of them (#1105 sat
+        # 45 min behind #1078's FIX_CI).
+        if self._dispatch_closed or self._wake_recovery_pending:
+            return False
+        return not self._reload_pending or (not heavy and self._in_flight(heavy=True) > 0)
 
     @property
     def available_dispatch_slots(self) -> int:
         """Capacity visible to decide, so it never chooses work this process
         will not start."""
         with self._dispatch_lock:
-            return max(0, self.dispatch_capacity - self._in_flight(heavy=True)) if self._admitting() else 0
+            return max(0, self.dispatch_capacity - self._in_flight(heavy=True)) if self._admitting(heavy=True) else 0
 
     def _in_flight(self, *, heavy: bool) -> int:
         # Caller holds _dispatch_lock.
@@ -373,7 +381,7 @@ class Daemon:
     @property
     def available_light_slots(self) -> int:
         with self._dispatch_lock:
-            return max(0, self.dispatch_capacity - self._in_flight(heavy=False)) if self._admitting() else 0
+            return max(0, self.dispatch_capacity - self._in_flight(heavy=False)) if self._admitting(heavy=False) else 0
 
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
@@ -388,7 +396,7 @@ class Daemon:
     def _submit_dispatch(self, action: RunAgent) -> bool:
         key = self.dispatch_key(action)
         with self._dispatch_lock:
-            if (not self._admitting()
+            if (not self._admitting(heavy=action.kind.holds_dispatch_slot)
                     or self._in_flight(heavy=action.kind.holds_dispatch_slot) >= self.dispatch_capacity
                     or key in {k for _a, k in self._dispatches.values()}):
                 return False
@@ -422,7 +430,6 @@ class Daemon:
             if self._dispatch_closed:
                 return False if self._dispatches else self._finish_shutdown()
             self._dispatch_closed = True
-            self._accept_dispatches = False
         if cancel:
             self._prepare_shutdown()
             if self.cancel_active_dispatches is not None:
@@ -588,7 +595,7 @@ class Daemon:
         self.log(f"{self.name}: watching (poll {self.poll_seconds}s)")
         self._transition(DaemonState.RUNNING)
         last, last_active = now(), active_now()
-        last_logged, last_swept, ticks, reload_pending = last, last_active, 0, False
+        last_logged, last_swept, ticks = last, last_active, 0
         retick = False
         try:
             while max_ticks is None or ticks < max_ticks:
@@ -627,14 +634,14 @@ class Daemon:
                     except Exception as exc:
                         self.log(f"{self.name}: reservation sweep failed (continuing): {exc}")
                 reload_requested = reload_check is not None and reload_check()
-                if reload_requested and self.active_dispatches:
-                    if not reload_pending:
-                        self.log(f"{self.name}: hot-reload requested — draining {len(self.active_dispatches)} paid "
-                                 "dispatch(es) while observation continues")
-                    reload_pending = True
+                if reload_requested and self.active_dispatches and not self._reload_pending:
+                    self.log(f"{self.name}: hot-reload requested — draining {len(self.active_dispatches)} paid "
+                             "dispatch(es) while observation continues; light legs start only while a heavy one "
+                             "drains")
                     with self._dispatch_lock:
-                        self._accept_dispatches = False
-                if (reload_requested or reload_pending) and not self.active_dispatches:
+                        self._reload_pending = True
+                    self._write_heartbeat()
+                if (reload_requested or self._reload_pending) and not self.active_dispatches:
                     from ..adapters.reload import RELOAD_EXIT_CODE
 
                     self.log(f"{self.name}: hot-reload — harness source changed; restarting with no session in flight")

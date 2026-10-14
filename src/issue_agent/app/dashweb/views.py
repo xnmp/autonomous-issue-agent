@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone, tzinfo
+from types import MappingProxyType
 
 from ...adapters.control_store import Lease
 from ...domain import dashboard as dash
@@ -88,9 +89,11 @@ def board_rows(world: WorldState, keys: Iterable[ItemKey]) -> dict[int, tuple[It
 def items(
     world: WorldState, states: Mapping[ItemKey, DerivedState], legs: Iterable[dash.LegRow], harness: Harness,
     item_legs: Mapping[ItemKey, tuple[LegEnd, ...]], now: datetime,
+    reload_held: Mapping[str, tuple[int, ...]] = MappingProxyType({}),
 ) -> tuple[Item, ...]:
     """One `Item` per board row. `item_legs` are the legs derive keyed to
-    each item (`Local.legs`), whose newest end bounds the item's episode."""
+    each item (`Local.legs`), whose newest end bounds the item's episode;
+    `reload_held` is `dash.board_status`'s."""
     issues = {i.number: i for i in world.issues}
     rows = tuple(legs)
     out = []
@@ -100,7 +103,9 @@ def items(
         comments = pr.comments if pr is not None else (view.comments if view else ())
         last_end = max((leg.ended_at for leg in item_legs.get(key, ())), default=None)
         status = dash.board_status(states[key], target="pr" if pr is not None else "issue", comments=comments,
-                                   pr=pr, legs=own, last_end=last_end, harness=harness, now=now)
+                                   pr=pr, legs=own, last_end=last_end, harness=harness, now=now,
+                                   reload_held=reload_held,
+                                   ready_at=parse_timestamp(view.ai_ready_labeled_at) if view else None)
         out.append(Item(issue, key, states[key], view, pr, status, own))
     return tuple(out)
 

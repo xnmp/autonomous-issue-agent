@@ -363,20 +363,37 @@ def _complete_labels(node: dict) -> frozenset[Label]:
     return _labels(nodes)
 
 
+def _last_labeled(node: dict, label: Label) -> tuple[str, bool]:
+    """When `label` was last applied among the newest 100 label events ("" if
+    not among them), and whether older events were cut off."""
+    nodes, info = _connection(node, "labeled")
+    times = [n["createdAt"] for n in nodes if isinstance(n, dict) and isinstance(n.get("createdAt"), str)
+             and isinstance(n.get("label"), dict) and n["label"].get("name") == label.value]
+    return (times[-1] if times else ""), bool(info.get("hasPreviousPage"))
+
+
 def _needs_human_labeled_at(node: dict, labels: frozenset[Label]) -> str:
     """When `needs-human` was last applied, for a labelled item ("" otherwise).
     Not found among the newest 100 label events: unknown, so the item is
     skipped rather than released on an older reply."""
     if Label.NEEDS_HUMAN not in labels:
         return ""
-    nodes, info = _connection(node, "labeled")
-    times = [n["createdAt"] for n in nodes if isinstance(n, dict) and isinstance(n.get("createdAt"), str)
-             and isinstance(n.get("label"), dict) and n["label"].get("name") == Label.NEEDS_HUMAN.value]
-    if times:
-        return times[-1]
-    if info.get("hasPreviousPage"):
+    at, cut = _last_labeled(node, Label.NEEDS_HUMAN)
+    if not at and cut:
         raise FixObservationIncomplete("needs-human label event is past the newest 100")
-    return ""
+    return at
+
+
+def _ai_ready_labeled_at(node: dict, labels: frozenset[Label]) -> str:
+    """When `ai-ready` was last applied, for a ready issue; "" when unknown.
+    Display only (the board dates a queued wait from it), so it never fails
+    the observation."""
+    if Label.AI_READY not in labels:
+        return ""
+    try:
+        return _last_labeled(node, Label.AI_READY)[0]
+    except FixObservationIncomplete:
+        return ""
 
 
 def parse_blockers(raw: object, repository: str) -> tuple[tuple[BlockerRef, ...], str]:
@@ -471,6 +488,7 @@ def parse_fix_issue(node: object, comments: list, blocked_by: tuple[BlockerRef, 
         number=node["number"], title=node.get("title") or "", labels=labels,
         comments=_comments(comments), author=_login(node.get("author")), state=state.lower(),
         needs_human_labeled_at=_needs_human_labeled_at(node, labels), blocked_by=blocked_by,
+        ai_ready_labeled_at=_ai_ready_labeled_at(node, labels),
     )
 
 
