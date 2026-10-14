@@ -111,11 +111,9 @@ def append_repository_guidance(
     *,
     log: Callable[[str], None] | None = None,
 ) -> RuntimePlan:
-    """Append target files to the user task, never to provider instructions.
-    A session's first leg only: a resumed transcript already holds them, and
-    re-sending up to 32 KB every round only grows the context."""
+    """Append target files to the user task, never to provider instructions."""
 
-    if not task.cwd or task.resume:
+    if not task.cwd:
         return task
     guidance, truncated = load_repository_guidance(task.cwd)
     if truncated:

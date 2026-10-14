@@ -474,7 +474,7 @@ once per leg; native sub-agents disabled in the isolated profile),
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
-`adapters/repository_guidance.py` (target CLAUDE.md/AGENTS.md as untrusted task data, sent on a session's first leg only),
+`adapters/repository_guidance.py`,
 `adapters/runtime_plan.py`, `adapters/runtime_switch.py` (one role's
 per-runtime journal/accounting chains behind one runtime, so legs route
 across Claude and Codex), `adapters/signal_log.py`, `adapters/single_instance.py`,

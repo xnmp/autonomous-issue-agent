@@ -61,10 +61,11 @@ def _codex(inner, tmp_path):
 
 
 @pytest.mark.parametrize("boundary", [_claude, _codex], ids=["claude", "codex"])
-@pytest.mark.parametrize(("resume", "sent"), [(None, True), ("", True), ("session-1", False)])
-def test_guidance_reaches_a_sessions_first_leg_and_never_its_resumes(tmp_path, boundary, resume, sent):
-    # A resumed transcript already holds the guidance its first leg was sent;
-    # re-sending up to 32 KB every round only grew the context (audit item 2).
+@pytest.mark.parametrize("resume", [None, "", "session-1"])
+def test_every_leg_carries_the_guidance_resumes_included(tmp_path, boundary, resume):
+    # A resume must re-send it: an auto-compaction can summarise the first
+    # leg's copy away (tauri issue-1039, 2026-10-13), and only the next leg's
+    # injection restores it (owner, 2026-10-14).
     worktree = tmp_path / "wt"
     worktree.mkdir()
     (worktree / "CLAUDE.md").write_text("use local naming")
@@ -73,5 +74,6 @@ def test_guidance_reaches_a_sessions_first_leg_and_never_its_resumes(tmp_path, b
     asyncio.run(boundary(inner, tmp_path).run(RuntimePlan("the task", cwd=str(worktree), resume=resume)))
 
     assert inner.task is not None and inner.task.prompt == "the task"
-    assert ("use local naming" in inner.task.rendered_prompt) is sent
-    assert ("<untrusted_repository_guidance_json>" in inner.task.rendered_prompt) is sent
+    assert inner.task.resume == resume
+    assert "use local naming" in inner.task.rendered_prompt
+    assert "<untrusted_repository_guidance_json>" in inner.task.rendered_prompt
