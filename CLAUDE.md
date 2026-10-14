@@ -89,6 +89,12 @@ between legs. Reviewers reject control the agent does not need (tauri #1078).
   carry a log line and a ceiling (or are spaced by the machine backoff).
   ([minimal-harness design](docs/open/2026-10-12-minimal-harness-design.md);
   existing code migrates when touched.)
+- Read the `docs/adr/` index before changing a path an ADR's `Governs:` line
+  names, and cite `ADR <id>` in the PR body. A change to trust boundaries,
+  money/accounting, durable operational state, privileged effects, or process
+  lifecycle cites its governing ADR or adds one; reviewers request changes
+  otherwise. Control-store, ledger, reservation, lease, or idempotency-key
+  changes also map each crash point to a behavioral test.
 
 Import-linter and AST contracts enforce these boundaries in `make test`.
 

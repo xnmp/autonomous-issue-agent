@@ -402,14 +402,9 @@ def _env_name(name: str) -> str:
 
 
 def render_agent_md(text: str, cfg: HarnessConfig) -> str:
-    """Expand the AGENT.md template's config $VARs (GPT models take a literal
-    `$DIAGNOSE_RULES` at face value) and strip the optional rule blocks.
-    $ISSUE_NUMBER stays literal: the prompt fills it per issue."""
-    repl = {"$BASE_BRANCH": cfg.base_branch, "$HARNESS_REPO": cfg.repo,
-            "$DIAGNOSE_RULES": "", "$LOGGING_RULES": "", "$DOC_RULES": "", "$TEST_RULES": ""}
-    for k, v in repl.items():
-        text = text.replace(k, v)
-    return text
+    """Expand the AGENT.md template's one config variable: GPT models take a
+    literal `$VAR` at face value (failure-modes #7)."""
+    return text.replace("$BASE_BRANCH", cfg.base_branch)
 
 
 def generated_env_reference() -> str:

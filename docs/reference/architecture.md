@@ -448,8 +448,8 @@ criteria and closing link when absent, instead of denying the publication),
 `domain/routing.py` (difficulty tiers, the derived per-attempt escalation and
 the `runtime:model` route spec), `domain/triage.py` (the STEWARD and TRIAGE acts' results,
 parsed and laundered from the agent's claim),
-`domain/tool_policy.py` (the denied-tool table: each rule with the reason the
-PreToolUse hook returns; `FIXER_DENY` derives from it),
+`domain/tool_policy.py` (`FIXER_DENY`, the fixer's credential denies passed
+as the SDK's `disallowed_tools`),
 `domain/state.py` and `domain/policy.py` (the pure derive → actions core of the
 minimal-harness design; the fix role runs on it since slice 5b and the review
 role since slice 5c),

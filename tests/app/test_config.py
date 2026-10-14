@@ -1,5 +1,6 @@
 """Config-from-env mapping."""
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -49,17 +50,12 @@ def test_checked_in_env_example_is_generated_from_metadata():
     assert path.read_text() == generated_env_reference()
 
 
-def test_render_agent_md_expands_and_strips():
+def test_rendered_agent_contract_leaves_no_placeholder_for_the_model():
+    # failure-modes #7: a GPT fixer took a literal `$DIAGNOSE_RULES` as a skill
+    # to find and spent 448k tokens hunting it.
     cfg = HarnessConfig(repo="o/harness", base_branch="dev")
-    md = (
-        "branch off $BASE_BRANCH, file on $HARNESS_REPO, issue $ISSUE_NUMBER\n"
-        "$DIAGNOSE_RULES\n$LOGGING_RULES\n$DOC_RULES\n$TEST_RULES"
-    )
-    out = render_agent_md(md, cfg)
-    assert "$BASE_BRANCH" not in out and "dev" in out
-    assert "$HARNESS_REPO" not in out and "o/harness" in out
-    assert "$DIAGNOSE_RULES" not in out  # optional rule blocks stripped
-    assert "$ISSUE_NUMBER" in out  # left literal — agent fills it per-issue
+    rendered = render_agent_md((Path(__file__).parents[2] / "plugin" / "AGENT.md").read_text(), cfg)
+    assert re.search(r"\$[A-Z][A-Z_]+", rendered) is None
 
 
 def test_rendered_agent_contract_names_the_configured_non_default_base():

@@ -14,12 +14,6 @@ the diff, the PR and the code on disk.
 6 Proof of work is real  7 Docs (folder CLAUDE.md for non-obvious changes)  8 Logging at boundaries
 9 Maintainability (VERY IMPORTANT — weight this heavily)
 
-For changes touching trust boundaries, money/accounting, durable operational
-state, privileged effects, or process lifecycle, REQUEST_CHANGES unless the PR
-cites the governing ADR or adds one. For control-store, ledger, reservation,
-lease, or idempotency-key changes, also require a concrete crash/concurrency analysis
-that maps each crash point to a behavioral test.
-
 ## Dimension 2 — Test integrity (this is where weak PRs slip through; scrutinise it)
 Do not just check a test FILE exists or that the PR description claims coverage. Verify
 the test would actually FAIL if the change were reverted. REQUEST_CHANGES if:
