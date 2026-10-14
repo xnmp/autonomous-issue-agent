@@ -525,7 +525,7 @@ def test_the_operators_claude_state_is_hidden_and_cannot_be_replaced(host):
 def test_a_leg_cannot_create_config_the_operators_claude_would_obey(host):
     config = _plant_claude_config(host)
     (config / "settings.json").unlink()
-    names = ("settings.json", "settings.local.json", ".config.json", "keybindings.json", "commands/x.md",
+    names = ("settings.json", "settings.local.json", "keybindings.json", "commands/x.md",
              "output-styles/x.md", "agents/x.md", "skills/x/SKILL.md", "rules/x.md", "plugins/x")
     script = "".join(f'mkdir -p "$(dirname "{config}/{n}")" 2>/dev/null; echo evil > "{config}/{n}" 2>/dev/null; '
                      for n in names) + "echo done"
@@ -536,9 +536,18 @@ def test_a_leg_cannot_create_config_the_operators_claude_would_obey(host):
     for name in names:
         path = config / name
         assert not path.exists() or path.read_bytes() == b"", name
-    # Absent names were made empty and inert; the global config stays ~/.claude.json.
-    assert (config / ".config.json").stat().st_mode & 0o222 == 0
+    # Absent names were made empty and inert.
     assert (config / "settings.json").read_bytes() == b""
+
+
+def test_shielding_the_config_dir_never_creates_a_global_config_file(host):
+    # The CLI parses `.config.json` whenever it exists; an empty placeholder
+    # killed every Claude process on the host (incident 2026-10-15).
+    config = _plant_claude_config(host)
+
+    claude_login({"HOME": str(host["home"])})
+
+    assert not (config / ".config.json").exists()
 
 
 def test_a_symlinked_config_name_claude_obeys_refuses_the_leg(host):

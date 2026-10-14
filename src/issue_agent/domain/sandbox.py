@@ -168,9 +168,11 @@ CLAUDE_LOGIN_SHARED = (".credentials.json", ".oauth_refresh.lock", ".oauth_refre
 # What the operator's own Claude reads from its config dir as settings, memory
 # or extensions (CLI 2.1.299). A leg shares that dir read-write, so each is
 # hidden even where the operator has none: one a leg created would run in the
-# operator's sessions (hooks, mcpServers) or prompt them. `.config.json`
-# replaces `~/.claude.json` as global config only when non-empty or writable.
-CLAUDE_CONFIG_FILES = ("settings.json", "settings.local.json", "CLAUDE.md", ".config.json", "keybindings.json")
+# operator's sessions (hooks, mcpServers) or prompt them. `.config.json` is
+# not on this list: the CLI parses it whenever it exists, and an empty
+# placeholder is fatal to every Claude process, the operator's included
+# (incident 2026-10-15). A leg can still create it (residuals §1.1).
+CLAUDE_CONFIG_FILES = ("settings.json", "settings.local.json", "CLAUDE.md", "keybindings.json")
 CLAUDE_CONFIG_DIRS = ("agents", "commands", "skills", "hooks", "plugins", "rules", "output-styles")
 
 # Claude Code's project-directory name limit; longer paths get a hash suffix
