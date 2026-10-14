@@ -201,6 +201,42 @@
         "title": "BacklogCard",
         "type": "object"
       },
+      "BaseCIFailure": {
+        "additionalProperties": true,
+        "description": "A workflow red on the base branch; `since_ts` is its red streak's first\nrun as far back as listed.",
+        "properties": {
+          "issue_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Url"
+          },
+          "run_url": {
+            "title": "Run Url",
+            "type": "string"
+          },
+          "since_ts": {
+            "title": "Since Ts",
+            "type": "string"
+          },
+          "workflow": {
+            "title": "Workflow",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow",
+          "since_ts",
+          "run_url"
+        ],
+        "title": "BaseCIFailure",
+        "type": "object"
+      },
       "BasisCost": {
         "additionalProperties": true,
         "properties": {
@@ -1995,6 +2031,20 @@
       "OverviewPayload": {
         "additionalProperties": true,
         "properties": {
+          "base_failures": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/BaseCIFailure"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Failures"
+          },
           "caps": {
             "anyOf": [
               {

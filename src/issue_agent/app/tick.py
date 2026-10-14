@@ -1011,8 +1011,11 @@ def compose_role(
 
     prepare_shutdown, terminalize = shutdown_hooks(control, spend, owner_id=owner_id, state_dir=state_dir, role=role)
 
+    # Only the fix role files base-CI issues, so only it reads base CI; the
+    # review role's token pool is the rate-limited one.
+    observed = {"filed_by": cfg.fix_bot} if role == "fix" else {}
     daemon = Daemon(
-        role, lambda: gateway.build_world(cfg.base_branch), lambda _world: [], act, cfg.poll_seconds, log,
+        role, lambda: gateway.build_world(cfg.base_branch, **observed), lambda _world: [], act, cfg.poll_seconds, log,
         dispatch_capacity=capacity,
         dispatch_key=dispatch_item,
         cancel_active_dispatches=dispatch.cancel_all,

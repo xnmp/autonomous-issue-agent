@@ -117,3 +117,61 @@ def test_313_huge_check_lists_attribute_by_identity():
     odd = _red(*(f"job {i}" for i in range(1, 5000, 2)))
     assert isinstance(charge(odd, base), BaseRed)
     assert charge(_red("job 1", "job 4998"), base).__class__ is Failed
+
+
+# ── gap 22: the base branch's workflows by their latest verdict ──────────────
+
+from issue_agent.domain.checks import BaseRun  # noqa: E402
+from issue_agent.domain.ci import base_verdicts  # noqa: E402
+
+
+def _run(workflow: str, run: int, conclusion: str, at: str | None = None) -> BaseRun:
+    stamp = at or f"2026-10-14T00:{run // 60 % 60:02d}:{run % 60:02d}Z"
+    return BaseRun(workflow, run, f"https://x/runs/{run}", f"sha{run}", conclusion, stamp, stamp)
+
+
+def test_the_latest_verdict_decides_and_its_streak_runs_back_to_the_last_other_verdict():
+    runs = [_run("a", 1, "failure"), _run("a", 2, "success"), _run("a", 3, "failure"), _run("a", 4, "cancelled"),
+            _run("a", 5, "timed_out"), _run("a", 6, "skipped")]
+    ((latest, since, bounded),) = base_verdicts(reversed(runs))  # the listing's order does not matter
+    assert (latest.run_id, since.run_id, bounded) == (5, 3, True)
+
+
+def test_a_streak_that_reaches_the_earliest_listed_run_is_unbounded():
+    ((_, since, bounded),) = base_verdicts([_run("a", 1, "failure"), _run("a", 2, "cancelled"), _run("a", 3, "failure")])
+    assert (since.run_id, bounded) == (1, False)
+
+
+def test_a_green_latest_verdict_is_green_and_cancelled_or_skipped_runs_count_neither_way():
+    verdicts = base_verdicts([_run("a", 1, "failure"), _run("a", 2, "neutral"), _run("a", 3, "cancelled"),
+                              _run("b", 4, "skipped"), _run("b", 5, "action_required"), _run("b", 6, "unknown")])
+    assert [(latest.workflow, latest.conclusion, since.run_id) for latest, since, _ in verdicts] == [("a", "neutral", 2)]
+
+
+def test_creation_time_orders_runs_before_the_run_id():
+    # A run created later is newer even with a smaller id; a re-run keeps its run.
+    ((latest, _, _),) = base_verdicts([_run("a", 9, "failure", "2026-10-14T00:00:00Z"),
+                                    _run("a", 2, "success", "2026-10-14T01:00:00Z")])
+    assert latest.run_id == 2
+
+
+def test_a_huge_run_list_reduces_to_one_verdict_per_workflow():
+    same = "2026-10-14T00:00:00Z"  # equal times: the run id orders them
+    runs = [_run(f"w{w}", w * 100_000 + n, "failure" if n % 3 else "success", same)
+            for w in range(1, 21) for n in range(1, 2001)]
+    verdicts = base_verdicts(runs)
+    assert len(verdicts) == 20
+    assert all(latest.run_id % 100_000 == 2000 and since.run_id % 100_000 == 1999 for latest, since, _ in verdicts)
+
+
+def test_no_runs_is_no_verdicts():
+    assert base_verdicts([]) == ()
+
+
+@pytest.mark.parametrize("bad", [dict(run_id=0), dict(run_id=True), dict(url=""), dict(conclusion=None),
+                                 dict(workflow="")])
+def test_a_malformed_base_run_is_refused(bad):
+    fields = dict(workflow="wf", run_id=2, url="u", head_sha="s", conclusion="failure",
+                  created_at="2026-10-14T00:00:00Z", completed_at="2026-10-14T00:10:00Z")
+    with pytest.raises(ValueError):
+        BaseRun(**{**fields, **bad})

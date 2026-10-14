@@ -13,9 +13,11 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 
 from .actions import (
-    ISSUE_ACTS, Action, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent, Target,
-    UpdateBranch,
+    ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent,
+    SetIssueState, Target, UpdateBranch,
 )
+from .checks import BaseCI
+from .ci import GREEN_CONCLUSIONS, base_verdicts, parse_timestamp
 from .labels import Label
 from .triage import normalise_guess, normalise_path
 from .state import (
@@ -162,6 +164,41 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
             "the harness will not write that link again.")
 
 
+def base_title(workflow: str, base: str) -> str:
+    """A workflow's one base-CI issue is known by this title: the name is cut
+    so the title keeps its searched suffix within GitHub's 256 characters."""
+    return f"CI: {' '.join(workflow.split())[:max(1, min(200, 240 - len(base)))]} failing on {base}"
+
+
+def base_ci_actions(base_ci: BaseCI | None, base: str, marker: str) -> tuple[Action, ...]:
+    """One issue per workflow on the base branch, for life, required or not
+    (#402 plans to fix forward through it). A red verdict files it (once:
+    keyed) or reopens it if the red streak began after it was closed; green
+    closes it. Unless the harness closed it, a streak whose start is past the
+    listed runs reopens nothing, so a human's close during a red streak holds
+    until the workflow passes and fails again."""
+    if base_ci is None:
+        return ()
+    out: list[Action] = []
+    for latest, since, bounded in base_verdicts(base_ci.runs):
+        title = base_title(latest.workflow, base)
+        issue, name = base_ci.issue(title), _inert(" ".join(latest.workflow.split())[:200])
+        run = f"{since.url} (head `{since.head_sha}`)"
+        if latest.conclusion in GREEN_CONCLUSIONS:
+            if issue is not None and not issue.closed_at:
+                out.append(SetIssueState(issue.number, False, f"{marker}\n**{name}** passes on `{base}` again: "
+                                                              f"{latest.url} (head `{latest.head_sha}`)."))
+        elif issue is None:
+            out.append(FileIssue(title, f"{marker}\n**{name}** is failing on `{base}`. {'First' if bounded else 'Earliest listed'} failing run: {run}.\n\n"
+                                        "The harness closes this issue when it passes, and reopens it when it fails "
+                                        "again.", f"base-ci:{base}:{title}"))
+        elif (bounded or issue.harness_closed) and (finished := parse_timestamp(since.completed_at)) \
+                and (closed := parse_timestamp(issue.closed_at)) and finished > closed:
+            out.append(SetIssueState(issue.number, True, f"{marker}\n**{name}** is failing on `{base}` again. "
+                                                         f"First failing run: {run}."))
+    return tuple(out)
+
+
 def _inert(text: str) -> str:
     # A zero-width space breaks an @mention and Markdown image syntax, and an
     # escaped `<` any raw HTML (an <img>), without changing what a reader sees.
@@ -213,5 +250,6 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     raise TypeError(f"unknown derived state {state!r}")
 
 
-__all__ = ["OVERLAP_DEFER_CEILING", "QUESTION_LIMIT", "actions", "blocker_closed_comment", "blocker_comment",
-           "dispatch_order", "needs_human_key", "overlaps", "path_index", "question_text", "triage_comment"]
+__all__ = ["OVERLAP_DEFER_CEILING", "QUESTION_LIMIT", "actions", "base_ci_actions", "base_title",
+           "blocker_closed_comment", "blocker_comment", "dispatch_order", "needs_human_key", "overlaps", "path_index",
+           "question_text", "triage_comment"]

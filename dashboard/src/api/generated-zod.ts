@@ -334,6 +334,14 @@ const ActionResult = z
   .object({ detail: z.string(), ok: z.boolean() })
   .passthrough();
 const timezone = z.union([z.string(), z.null()]).optional();
+const BaseCIFailure = z
+  .object({
+    issue_url: z.union([z.string(), z.null()]).optional(),
+    run_url: z.string(),
+    since_ts: z.string(),
+    workflow: z.string(),
+  })
+  .passthrough();
 const RoleHeadroom = z
   .object({
     fits: z.union([z.boolean(), z.null()]),
@@ -417,6 +425,7 @@ const SpendBucket = z
   .passthrough();
 const OverviewPayload = z
   .object({
+    base_failures: z.union([z.array(BaseCIFailure), z.null()]).optional(),
     caps: z.union([Caps, z.null()]),
     health: z.array(RoleHealth),
     health_trend: z.array(HealthTrendDay).optional().default([]),
@@ -515,6 +524,7 @@ export const schemas = {
   IssueDetailPayload,
   ActionResult,
   timezone,
+  BaseCIFailure,
   RoleHeadroom,
   Caps,
   HealthTrendDay,
@@ -727,6 +737,7 @@ const endpoints = makeApi([
     ],
     response: z
       .object({
+        base_failures: z.union([z.array(BaseCIFailure), z.null()]).optional(),
         caps: z.union([Caps, z.null()]),
         health: z.array(RoleHealth),
         health_trend: z.array(HealthTrendDay).optional().default([]),

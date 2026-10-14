@@ -377,3 +377,117 @@ def test_an_unreachable_github_cancels_nothing_and_does_not_raise(tmp_path):
 
     lines = _cancel(tmp_path, down)
     assert len(lines) == 1 and "unavailable" in lines[0]
+
+
+# ── gap 22: base-CI issues ───────────────────────────────────────────────────
+
+from issue_agent.domain.actions import FileIssue, SetIssueState  # noqa: E402
+from issue_agent.domain.world import IssueView  # noqa: E402
+
+FILE = FileIssue("CI: macOS Smoke failing on dev", "m\nbody", key="base-ci:dev:CI: macOS Smoke failing on dev")
+
+
+class IssueGateway(Gateway):
+    """GitHub's issues as act writes them: created open and unlabelled, reopened and closed on request."""
+
+    def __init__(self, *, lose_reply=False, ignore=False, **kw):
+        super().__init__(**kw)
+        self.issues: dict[int, IssueView] = {}
+        self.lose_reply, self.ignore = lose_reply, ignore
+        self.writes: list[tuple[str, int, str]] = []
+
+    def create_issue(self, title, body):
+        number = 100 + len(self.issues)
+        self.issues[number] = IssueView(number, title, body, author="fix-bot")
+        if self.lose_reply:
+            raise GhUnavailable("timeout", "gh timed out", argv=["gh", "issue", "create"])
+        return number
+
+    def issue_index(self, limit=300, author=""):
+        assert author == "@me"  # only the token's own issues can be the harness's
+        return tuple((n, i.state, i.title, i.labels) for n, i in self.issues.items() if i.author == "fix-bot")
+
+    def get_issue(self, number):
+        return self.issues[number]
+
+    def is_issue_closed(self, number):
+        return self.issues[number].state == "closed"
+
+    def _set(self, verb, number, comment, state):
+        self.writes.append((verb, number, comment))
+        if not self.ignore:
+            self.issues[number] = IssueView(number, self.issues[number].title, state=state)
+
+    def close_issue(self, number, reason, comment):
+        self._set("close", number, comment, "closed")
+
+    def reopen_issue(self, number, comment):
+        self._set("reopen", number, comment, "open")
+
+
+def test_a_filed_issue_is_confirmed_once_and_a_lagging_search_never_files_it_again(tmp_path):
+    gh = IssueGateway()
+    act = _act(tmp_path, gh)
+    act.execute(FILE)
+    act.execute(FILE)  # an issue search that lags the filing asks again
+    assert [(i.title, i.body, i.labels) for i in gh.issues.values()] == [(FILE.title, FILE.body, frozenset())]
+
+
+def test_a_filed_issue_a_human_deleted_or_retitled_is_filed_again_once_and_logged(tmp_path):
+    for gone in ("deleted", "retitled"):
+        gh, logs = IssueGateway(), []
+        act = _act(tmp_path / gone, gh)
+        act.log = logs.append
+        act.execute(FILE)
+        (number,) = gh.issues
+        if gone == "deleted":
+            del gh.issues[number]
+        else:
+            gh.issues[number] = IssueView(number, "flaky macOS smoke, ignore", author="fix-bot")
+        gh.issues[7] = IssueView(7, FILE.title, author="alice")  # a human's issue of that title is not the harness's
+        act.execute(FILE)  # derive no longer finds the issue under its title and asks again
+        act.execute(FILE)  # its search lags the new filing
+        assert [i.author for i in gh.issues.values() if i.title == FILE.title] == ["alice", "fix-bot"]
+        assert [m for m in logs if "filing again" in m] == [
+            f"issue for {FILE.title!r} was deleted or retitled; filing again"]
+
+
+def test_a_filing_whose_reply_was_lost_is_found_in_the_issue_listing_not_filed_again(tmp_path):
+    gh = IssueGateway(lose_reply=True)
+    act = _act(tmp_path, gh)
+    with pytest.raises(GhUnavailable):
+        act.execute(FILE)
+    gh.lose_reply = False
+    act.execute(FILE)  # the issue search has not indexed it yet, so derive asked again
+    act.execute(FILE)
+    assert [i.title for i in gh.issues.values()] == [FILE.title]
+
+
+def test_a_claimed_filing_that_never_landed_is_filed(tmp_path):
+    gh = IssueGateway(lose_reply=True)
+    act = _act(tmp_path, gh)
+    with pytest.raises(GhUnavailable):
+        act.execute(FILE)
+    gh.issues.clear()  # the create never reached GitHub
+    gh.lose_reply = False
+    act.execute(FILE)
+    assert [i.title for i in gh.issues.values()] == [FILE.title]
+
+
+def test_close_then_reopen_each_write_once_and_a_replay_in_the_same_state_writes_nothing(tmp_path):
+    gh = IssueGateway()
+    gh.issues[40] = IssueView(40, "CI: x failing on dev")
+    act = _act(tmp_path, gh)
+    for action in (SetIssueState(40, False, "m\ngreen"), SetIssueState(40, False, "m\ngreen"),
+                   SetIssueState(40, True, "m\nred again"), SetIssueState(40, True, "m\nred again")):
+        act.execute(action)
+    assert gh.writes == [("close", 40, "m\ngreen"), ("reopen", 40, "m\nred again")]
+
+
+@pytest.mark.parametrize("action", [SetIssueState(40, False, "m\ngreen"), SetIssueState(41, True, "m\nred")])
+def test_a_state_change_that_does_not_read_back_raises(tmp_path, action):
+    gh = IssueGateway(ignore=True)
+    gh.issues[40] = IssueView(40, "CI: x failing on dev")
+    gh.issues[41] = IssueView(41, "CI: y failing on dev", state="closed")
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        _act(tmp_path, gh).execute(action)

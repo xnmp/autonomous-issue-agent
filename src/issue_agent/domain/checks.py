@@ -74,3 +74,46 @@ class BaseTip:
         if (any(not isinstance(v, str) or not v for v in (self.ref, self.oid))
                 or not isinstance(self.reports, tuple) or any(not isinstance(c, Check) for c in self.reports)):
             raise ValueError("base tip requires a ref, a commit and typed reports")
+
+
+@dataclass(frozen=True)
+class BaseRun:
+    """A completed push run on the base branch. `completed_at` is the run's
+    last update, which a completed run makes when it finishes."""
+
+    workflow: str
+    run_id: int
+    url: str
+    head_sha: str
+    conclusion: str  # GitHub's, lowercased
+    created_at: str
+    completed_at: str
+
+    def __post_init__(self) -> None:
+        if type(self.run_id) is not int or self.run_id <= 0 or any(
+                not isinstance(v, str) or not v for v in (self.workflow, self.url, self.head_sha, self.conclusion)):
+            raise ValueError("base run is malformed")
+
+
+@dataclass(frozen=True)
+class BaseIssue:
+    """A base-CI issue the fixer opened, known by its title. `harness_closed`:
+    its last close was the fixer's own, not a human's or a merged PR's."""
+
+    number: int
+    title: str
+    closed_at: str = ""  # "" while open
+    harness_closed: bool = False
+
+
+@dataclass(frozen=True)
+class BaseCI:
+    """Base runs and the fixer's base-CI issues, open and closed. Only a
+    complete read constructs one; an unread base is absent, never empty."""
+
+    runs: tuple[BaseRun, ...]
+    issues: tuple[BaseIssue, ...]
+
+    def issue(self, title: str) -> BaseIssue | None:
+        """The oldest issue with `title`: a duplicate never changes which one is meant."""
+        return next(iter(sorted((i for i in self.issues if i.title == title), key=lambda i: i.number)), None)

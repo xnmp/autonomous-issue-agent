@@ -30,6 +30,7 @@ export type LeaseRow = Schema["LeaseRow"];
 export type HealthTrendDay = Schema["HealthTrendDay"];
 export type SpendBucket = Schema["SpendBucket"];
 export type AttentionItem = Schema["AttentionItem"];
+export type BaseCIFailure = Schema["BaseCIFailure"];
 export type OverviewPayload = Schema["OverviewPayload"];
 export type BoardNeedsYou = Schema["BoardNeedsYou"];
 export type BoardWorking = Schema["BoardWorking"];

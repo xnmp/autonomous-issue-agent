@@ -115,6 +115,26 @@ class LinkBlockedBy:
 
 
 @dataclass(frozen=True)
+class FileIssue:
+    """Open one unlabelled issue (whether the harness works on it is the
+    owner's call), at most once per key, as PostComment."""
+
+    title: str
+    body: str
+    key: str
+
+
+@dataclass(frozen=True)
+class SetIssueState:
+    """Reopen or close an issue with one comment; act writes only when a fresh
+    read shows the other state, then reads it back."""
+
+    number: int
+    open: bool
+    comment: str
+
+
+@dataclass(frozen=True)
 class RunAgent:
     """Dispatch one paid leg. `number` is the issue for STEWARD, TRIAGE and RESOLVE,
     else the PR."""
@@ -156,6 +176,8 @@ Action = Union[
     OpenPullRequest,
     UpdateBranch,
     LinkBlockedBy,
+    FileIssue,
+    SetIssueState,
     RunAgent,
 ]
 
@@ -166,12 +188,14 @@ __all__ = [
     "ISSUE_ACTS",
     "ROUTED_ACTS",
     "check_tier",
+    "FileIssue",
     "LinkBlockedBy",
     "MergePullRequest",
     "OpenPullRequest",
     "PostComment",
     "Relabel",
     "RunAgent",
+    "SetIssueState",
     "Target",
     "UpdateBranch",
 ]

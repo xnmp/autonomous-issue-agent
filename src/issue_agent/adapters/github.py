@@ -20,13 +20,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from ..domain.checks import BaseTip, Unavailable
+from ..domain.checks import BaseCI, BaseTip, Unavailable
 from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
 from ..domain.world import BlockerRef, Branch, Comment, IssueView, PRView, PullRequestDiff, Push, Review, WorldState
-from .github_ci import base_reports, observe_checks
+from .github_ci import base_issues, base_reports, base_runs, observe_checks
 
 # Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
 # fields (mergeable / mergeStateStatus) once hung ~14 min on a just-merged PR
@@ -322,6 +322,10 @@ _BASE_CONTEXTS = ("contexts(first:100{after}){{totalCount pageInfo{{hasNextPage 
                   "... on StatusContext{{id createdAt context state targetUrl}}}}}}")
 _BASE_TIP = ("baseTip:ref(qualifiedName:$base){name target{... on Commit{oid statusCheckRollup{id "
              + _BASE_CONTEXTS.format(after="") + "}}}}")
+
+_BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCount "
+                "nodes{... on Issue{number title state closedAt author{login} "
+                "timelineItems(itemTypes:[CLOSED_EVENT],last:1){nodes{... on ClosedEvent{actor{login} closer{__typename}}}}}}}}")
 
 
 def _escaped(fields: str) -> str:
@@ -730,12 +734,13 @@ class GitHubGateway:
             return None
         return nodes
 
-    def build_world(self, base: str) -> WorldState:
+    def build_world(self, base: str, *, filed_by: str = "") -> WorldState:
         """The fix role's observation: open `ai-ready`/`needs-human` issues,
         open harness PRs (`fix/<issue>-`) with head, mergeability, required
         checks, reviews, comments, every changed file and the head push, and
-        harness branches owed a PR against `base`. `GhUnavailable` and
-        incomplete top-level reads propagate: the daemon skips the tick."""
+        harness branches owed a PR against `base`; with `filed_by` (the fixer's
+        login), also `base_ci`. `GhUnavailable` and incomplete
+        top-level reads propagate: the daemon skips the tick."""
         # The domain reads no clock: one stamp per build, so every gate in a tick judges one instant.
         now = datetime.now(timezone.utc).isoformat()
         first = self._repository_page(
@@ -794,7 +799,8 @@ class GitHubGateway:
         for number, why in sorted(unknown.items()):
             self._skip_item("issue", number, FixObservationIncomplete(why))
         return WorldState(issues=tuple(i for i in issues if i.number not in unknown), prs=tuple(prs), now=now,
-                          branches=branches, base=self._base_tip(first.get("baseTip"), base))
+                          branches=branches, base=self._base_tip(first.get("baseTip"), base),
+                          base_ci=self._base_ci(base, filed_by) if filed_by else None)
 
     def _base_tip(self, raw: object, base: str) -> BaseTip | None:
         """The base tip and its checks, or None when unreadable: a red PR check
@@ -813,13 +819,41 @@ class GitHubGateway:
                              "— red PR checks are charged to the PR\n")
             return None
 
-    def issue_index(self, limit: int = 300) -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
+    def _base_ci(self, base: str, filer: str) -> BaseCI | None:
+        """Base runs and the base-CI issues `filer` opened, open and closed; None
+        when either read is unusable (nothing is then filed or changed)."""
+        try:
+            runs = base_runs(self._gh_json([
+                "api", f"repos/{self.repo}/actions/runs?branch={quote(base, safe='')}&event=push&status=completed"
+                       f"&exclude_pull_requests=true&per_page=100"]), base)
+            issues = base_issues(self._graphql(_BASE_ISSUES, q=(
+                f'repo:{self.repo} is:issue author:{filer} in:title "failing on {base}"')).get("search"), filer)
+            return BaseCI(runs, issues)
+        except (ValueError, KeyError, TypeError, GhUnavailable) as exc:
+            # An optional read: GitHub not answering it must not cost the tick its merges and dispatches.
+            sys.stderr.write(f"base CI unread this poll ({type(exc).__name__}: {str(exc)[:120]})\n")
+            return None
+
+    def create_issue(self, title: str, body: str) -> int:
+        """Open an unlabelled issue; its number, from the link gh prints."""
+        found = re.search(r"/issues/([0-9]+)$", self._gh(["issue", "create", "--repo", self.repo, "--title", title,
+                                                          "--body", body]).strip())
+        if found is None:
+            raise FixObservationIncomplete("issue creation answered no issue link")
+        return int(found[1])
+
+    def reopen_issue(self, number: int, comment: str) -> None:
+        self._gh(["issue", "reopen", str(number), "--repo", self.repo, "--comment", comment])
+
+    def issue_index(self, limit: int = 300, author: str = "") -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
         """(number, state, title, harness labels) of the repository's most
-        recent issues, open and closed: the candidates a STEWARD leg may name
-        as a duplicate or a blocker. An unreadable listing raises; the leg then
-        offers none."""
+        recent issues, open and closed (by `author`, `@me` for this token's
+        login, if given; gh reads it as `createdBy`, not the search index):
+        the candidates a STEWARD leg may name as a duplicate or a blocker. An
+        unreadable listing raises; the leg then offers none."""
         data = self._gh_json(["issue", "list", "--repo", self.repo, "--state", "all", "--json",
-                              "number,state,title,labels", "--limit", str(limit)])
+                              "number,state,title,labels", "--limit", str(limit),
+                              *(["--author", author] if author else [])])
         if not isinstance(data, list):
             raise FixObservationIncomplete("issue listing is unreadable")
         return tuple((row["number"], str(row.get("state") or "").lower(), str(row.get("title") or ""),

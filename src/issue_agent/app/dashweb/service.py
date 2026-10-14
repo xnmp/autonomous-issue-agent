@@ -286,7 +286,8 @@ class Backend:
         # per-refresh pool (not the observe executor, which is running this
         # call) keeps the refresh at the slowest read.
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dashboard-read") as pool:
-            world_f = pool.submit(self.gateway_factory(dep.cfg.repo).build_world, dep.cfg.base_branch)  # type: ignore[attr-defined]
+            world_f = pool.submit(self.gateway_factory(dep.cfg.repo).build_world,  # type: ignore[attr-defined]
+                                  dep.cfg.base_branch, filed_by=dep.cfg.fix_bot)
             issues_f = pool.submit(self.gh.issues, dep.cfg.repo)
             merged_f = pool.submit(self.gh.merged_prs, dep.cfg.repo)
             world: WorldState | None
@@ -466,6 +467,8 @@ class Backend:
                        for role in dash.ROLE_NAMES],
             "leases": views.lease_rows(read.leases, legs),
             "needs_attention": needs,
+            "base_failures": (views.base_failures(obs.world.base_ci, dep.cfg.base_branch, dep.cfg.repo)
+                              if obs and obs.world else None),
             "health_trend": views.health_trend(obs.issues, _local_timezone(timezone_name)) if obs else [],
             "spend_per_hour": [asdict(b) for b in dash.spend_per_hour(legs, now)],
             "warnings": warnings,

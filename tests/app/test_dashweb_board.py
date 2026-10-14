@@ -52,8 +52,9 @@ class Gateway:
         self.world = world
         self.reads = 0
 
-    def build_world(self, base):
+    def build_world(self, base, **observe):
         self.reads += 1
+        self.observe = observe
         return self.world
 
 
@@ -571,7 +572,7 @@ def test_a_refresh_waits_for_the_slowest_github_read_not_the_sum(deployment):
     barrier = threading.Barrier(3, timeout=5)
 
     class Overlapping:
-        def build_world(self, _base):
+        def build_world(self, _base, **_observe):
             barrier.wait()
             return _world()
 
@@ -762,3 +763,33 @@ def test_heavy_work_reads_as_paused_for_the_reload_only_while_a_live_heartbeat_r
     assert {c["issue"]: c["board"] for c in backend.issues("demo")["in_flight"]}[1]["on"] == "slot"
     _fix_beat(tmp_path, reload_pending="yes")  # malformed
     assert {c["issue"]: c["board"] for c in backend.issues("demo")["in_flight"]}[1]["on"] == "slot"
+
+
+def test_the_overview_lists_red_base_workflows_longest_red_first_with_their_open_issue(deployment):
+    from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun
+
+    def run(name, number, conclusion, at):
+        return BaseRun(name, number, f"https://github.com/o/r/actions/runs/{number}", f"s{number}", conclusion, at, at)
+
+    backend, *_ = deployment
+    gateway = Gateway(WorldState(now=ts(0), base_ci=BaseCI(
+        (run("macOS Smoke", 70, "failure", "2026-10-14T03:00:00Z"), run("macOS Smoke", 71, "failure", "2026-10-14T05:00:00Z"),
+         run("Windows smoke", 80, "failure", "2026-10-13T22:00:00Z"), run("CI", 90, "success", "2026-10-12T00:00:00Z"),
+         run("Lint", 60, "success", "2026-10-14T05:00:00Z")),
+        (BaseIssue(41, "CI: Windows smoke failing on dev"), BaseIssue(42, "CI: macOS Smoke failing on dev", "2026-10-01")))))
+    backend.gateway_factory = lambda repo: gateway
+    backend._observations = type(backend._observations)(executor=InlineExecutor())  # type: ignore[arg-type]
+    backend.overview("demo")
+
+    assert backend.overview("demo")["base_failures"] == [
+        {"workflow": "Windows smoke", "since_ts": "2026-10-13T22:00:00Z",
+         "run_url": "https://github.com/o/r/actions/runs/80", "issue_url": "https://github.com/o/r/issues/41"},
+        {"workflow": "macOS Smoke", "since_ts": "2026-10-14T03:00:00Z",
+         "run_url": "https://github.com/o/r/actions/runs/71", "issue_url": None},  # its issue is closed
+    ]
+    assert gateway.observe == {"filed_by": "fixbot"}
+
+
+def test_an_unread_base_is_no_base_failure_list_not_an_empty_one(deployment):
+    backend, *_ = deployment
+    assert backend.overview("demo")["base_failures"] is None

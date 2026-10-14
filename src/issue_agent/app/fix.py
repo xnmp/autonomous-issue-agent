@@ -27,7 +27,7 @@ from ..domain.effort import Effort
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
-from ..domain.policy import actions as policy_actions, dispatch_order
+from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order
 from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
@@ -380,8 +380,10 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
                    and found.steward is not None}
         busy = frozenset(f for pr in world.prs if pr.state == "OPEN" and harness_branch_issue(pr.head_ref_name)
                          for f in pr.changed_files)
+        # The base branch's own CI is not an item: one issue per failing workflow, no lifecycle.
+        base = base_ci_actions(world.base_ci, settings.base_branch, settings.harness.marker)
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
-                           light=slots.light, waiting_since=waiting, touches=touches, busy=busy, now=local.now)
+                           light=slots.light, waiting_since=waiting, touches=touches, busy=busy, now=local.now) + base
     return choose
 
 
