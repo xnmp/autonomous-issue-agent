@@ -53,3 +53,6 @@ bytes and 979 whitespace-delimited words.
 
 Re-measured 2026-10-13 after slice 9 dropped GLM from the runtime list: 7,303
 UTF-8 bytes and 978 whitespace-delimited words.
+
+Re-measured 2026-10-14 after adding the owner rule "the agent does more; the
+harness controls less": 7,743 UTF-8 bytes and 1,046 whitespace-delimited words.

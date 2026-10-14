@@ -56,6 +56,14 @@ unchanged; name what it removes before writing it.
   added; reviewers reject unjustified additions. Incident history:
   [manager reference](docs/reference/manager.md) surface-area test.
 
+## The agent does more; the harness controls less
+
+Agents are capable and robust; harness control of workflow and data flow is
+brittle surface. A leg gets its task and trigger and fetches its own evidence
+(CI logs, review comments). The harness keeps only dispatch decisions, money,
+leases, idempotency, act-layer mutations, verdict provenance, and the waiting
+between legs. Reviewers reject control the agent does not need (tauri #1078).
+
 ## Architecture rules
 
 - `domain/` is pure: no I/O, ambient environment, wall clock, or adapter/app

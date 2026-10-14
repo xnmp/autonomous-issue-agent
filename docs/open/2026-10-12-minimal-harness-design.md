@@ -8,6 +8,7 @@ Draft, 2026-10-12. This is the yardstick for the subtractive refactor. Anything 
 3. **A machine failure never counts as an attempt.** Retry it with backoff; only money caps bound it.
 4. **Agent output is a claim, never authority.**
 5. **Only judgment stops work:** spend, access, policy, or a dispute.
+6. **The agent does more; the harness controls less.** A leg gets the task and the trigger (for example "fix CI on PR #N: these jobs failed") and fetches its own evidence. The harness owns dispatch, money, leases, idempotency, act-layer mutations, verdict provenance, and the waiting between legs; nothing else (2026-10-14, tauri #1078).
 
 ## Tick
 `observe` (one GraphQL query plus SQLite) → `derive` (a pure function, state never stored) → `act` (idempotent: label, comment, merge, dispatch a leg).
