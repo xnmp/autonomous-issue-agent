@@ -546,7 +546,7 @@ def test_failed_run_log_tails_only_the_observed_revision_bound_run():
     )
     out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (4242,))
     assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
-    view_argv = fr.calls[1][0]
+    view_argv = fr.calls[-1][0]
     assert view_argv[1:4] == ["run", "view", "4242"] and "--log-failed" in view_argv
 
 
@@ -615,3 +615,88 @@ def test_unread_checks_are_unknown_not_an_empty_world(checks):
     fr = FakeRunner({"pr view 100": {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=checks)  # the policy read is unmatched → unavailable
     assert pr.checks == () and isinstance(pr.ci, Unavailable)
+
+
+# ── per-job failed logs (tauri #1078: run-level --log-failed refuses mid-run) ──
+_RUN = {"id": 9, "head_sha": "head", "run_attempt": 2}
+
+
+def _job_runner(jobs, logs, run=None, run_level=""):
+    """A run whose jobs are `jobs`; `logs` maps job id -> text ("" = gh's 404/410 answer)."""
+    # FakeRunner answers the FIRST matching prefix, so the longer jobs key goes first.
+    responses = {"api repos/o/r/actions/runs/9/attempts/2/jobs": jobs}
+    responses.update({f"api repos/o/r/actions/jobs/{i}/logs": text for i, text in logs.items()})
+    responses.update({"api repos/o/r/actions/runs/9": run or _RUN, "run view 9": run_level})
+    return FakeRunner(responses)
+
+
+def _jobs(*rows):
+    return {"jobs": [{"id": i, "name": n, "conclusion": c} for i, n, c in rows]}
+
+
+def test_in_progress_run_still_yields_the_failed_jobs_log():
+    fr = _job_runner(_jobs((1, "smoke-ubuntu", "failure"), (2, "smoke-windows", None), (3, "lint", "success"), (4, "slow", "timed_out")),
+                     {1: "setup\n##[group]Run tests\nFAILED test_x\n##[error]exit 1\ncleanup", 2: "unfinished", 4: "timed out here"},
+                     run_level="")  # gh run view refuses while the run is in progress
+    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
+    assert "FAILED test_x" in out and "smoke-ubuntu" in out and "timed out here" in out
+    assert "unfinished" not in out and "setup" not in out and "cleanup" not in out
+    assert not any(c[0][1] == "run" for c in fr.calls)
+
+
+def test_multiple_failed_jobs_are_concatenated_and_bounded():
+    big = "\n".join(f"job1 line {i}" for i in range(5000))
+    fr = _job_runner(_jobs((1, "a", "failure"), (2, "b", "failure")), {1: big, 2: "b broke"})
+    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
+    assert out.endswith("b broke") and "== job: b ==" in out
+    assert len(out.encode()) <= _FAILED_LOG_BYTES and len(out.splitlines()) <= _FAILED_LOG_LINES
+
+
+def test_failed_jobs_across_runs_are_all_read():
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/9/attempts/1": _jobs((1, "a", "failure")),
+        "api repos/o/r/actions/runs/9": {**_RUN, "run_attempt": 1},
+        "api repos/o/r/actions/runs/8/attempts/1": _jobs((2, "b", "failure")),
+        "api repos/o/r/actions/runs/8": {"id": 8, "head_sha": "head", "run_attempt": 1},
+        "api repos/o/r/actions/jobs/1/logs": "boom A", "api repos/o/r/actions/jobs/2/logs": "boom B",
+    })
+    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9, 8))
+    assert "boom A" in out and "boom B" in out
+
+
+@pytest.mark.parametrize("run", [{**_RUN, "head_sha": "other"}, {**_RUN, "run_attempt": "x"}])
+def test_head_or_attempt_mismatch_reads_no_job_log(run):
+    fr = _job_runner(_jobs((1, "a", "failure")), {1: "boom"}, run=run)
+    assert GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,)) == ""
+    assert not any("jobs" in c[0][2] for c in fr.calls)
+
+
+def test_attempt_pins_the_job_listing():
+    fr = _job_runner(_jobs((1, "a", "failure")), {1: "boom"})
+    GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
+    assert any("runs/9/attempts/2/jobs" in c[0][2] for c in fr.calls)
+
+
+def test_expired_job_log_falls_back_to_run_level_then_empty():
+    jobs = _jobs((1, "a", "failure"))
+    assert GitHubGateway("o/r", runner=_job_runner(jobs, {1: ""}, run_level="run-level tail")).failed_run_log(
+        "head", (9,)) == "run-level tail"
+    assert GitHubGateway("o/r", runner=_job_runner(jobs, {1: ""})).failed_run_log("head", (9,)) == ""
+
+
+def test_empty_result_says_why_on_stderr(capsys):
+    GitHubGateway("o/r", runner=_job_runner(_jobs((1, "a", "failure")), {1: ""})).failed_run_log("head", (9,))
+    assert "failed-run log empty" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("jobs", ["not json{", {"jobs": "x"}, [], {"jobs": [None, 3, {"id": True, "conclusion": "failure"}]},
+                                  _jobs((1, "a", "success"), (2, "b", "cancelled"))])
+def test_malformed_or_failure_free_job_lists_fall_back_to_run_level(jobs):
+    fr = _job_runner(jobs, {1: "unused", 2: "unused"}, run_level="run-level tail")
+    assert GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,)) == "run-level tail"
+
+
+def test_huge_job_log_is_truncated_to_the_byte_bound():
+    fr = _job_runner(_jobs((1, "a", "failure")), {1: "x" * 5_000_000})
+    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
+    assert out and len(out.encode()) <= _FAILED_LOG_BYTES

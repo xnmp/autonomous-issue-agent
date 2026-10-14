@@ -54,6 +54,18 @@ def _tail(text: str, lines: int, max_bytes: int | None = None) -> str:
     return encoded[-max_bytes:].decode("utf-8", errors="ignore")
 
 
+def _failed_step_section(log: str) -> str:
+    """The failed step's section of a raw job log, as `--log-failed` shows it:
+    from the last `##[group]` opener before the first `##[error]`, through the
+    last `##[error]`. A log without markers is returned whole (the caller tails it)."""
+    rows = (log or "").splitlines()
+    errors = [i for i, row in enumerate(rows) if "##[error]" in row]
+    if not errors:
+        return log or ""
+    start = next((i for i in range(errors[0], -1, -1) if "##[group]" in rows[i]), 0)
+    return "\n".join(rows[start:errors[-1] + 1])
+
+
 def _cap_bytes(text: str, max_bytes: int) -> str:
     """The first `max_bytes` UTF-8 bytes (a comment states its point up front)."""
     encoded = text.encode("utf-8", errors="ignore")
@@ -859,12 +871,43 @@ class GitHubGateway:
             attempts = self.workflow_run_attempts(head, run_ids)
             if attempts is None:
                 return ""
-            logs = [_tail(self._gh(["run", "view", str(run_id), "--repo", self.repo, "--attempt", str(attempt),
-                                    "--log-failed"]), lines, max_bytes=_FAILED_LOG_BYTES)
-                    for run_id, attempt in attempts.items()]
-            return _tail("\n\n".join(logs), lines, max_bytes=_FAILED_LOG_BYTES)
-        except Exception:  # noqa: BLE001 — a missing log must not block the fix
+            logs = [self._run_failure_log(run_id, attempt, lines) for run_id, attempt in attempts.items()]
+            out = _tail("\n\n".join(log for log in logs if log), lines, max_bytes=_FAILED_LOG_BYTES)
+        except Exception as exc:  # noqa: BLE001 — a missing log must not block the fix
+            sys.stderr.write(f"failed-run log unavailable ({type(exc).__name__}: {str(exc)[:120]})\n")
             return ""
+        if not out:
+            sys.stderr.write(f"failed-run log empty for runs {list(run_ids)}: no failed job log was readable\n")
+        return out
+
+    def _run_failure_log(self, run_id: int, attempt: int, lines: int) -> str:
+        """Per-job REST logs first: `gh run view --log-failed` refuses while ANY
+        job of the run is still running (tauri #1078: the agent got an empty
+        log for ~50 min), but the job-logs endpoint serves each completed job.
+        Run-level `--log-failed` stays as the fallback (e.g. job list unreadable)."""
+        try:
+            log = self._failed_job_logs(run_id, attempt, lines)
+        except Exception:  # noqa: BLE001 — fall back to the run-level log
+            log = ""
+        return log or _tail(self._gh(["run", "view", str(run_id), "--repo", self.repo, "--attempt", str(attempt),
+                                      "--log-failed"]), lines, max_bytes=_FAILED_LOG_BYTES)
+
+    def _failed_job_logs(self, run_id: int, attempt: int, lines: int) -> str:
+        # One page: a >100-job matrix falls back to the run-level log.
+        raw = self._gh_json(["api", f"repos/{self.repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"])
+        jobs = raw.get("jobs") if isinstance(raw, dict) else None
+        if not isinstance(jobs, list):
+            return ""
+        parts = []
+        for job in jobs:
+            job_id = job.get("id") if isinstance(job, dict) else None
+            if not isinstance(job, dict) or job.get("conclusion") not in ("failure", "timed_out") or type(job_id) is not int or job_id <= 0:
+                continue
+            text = _failed_step_section(self._gh(["api", f"repos/{self.repo}/actions/jobs/{job_id}/logs"]))
+            if text.strip():
+                parts.append(f"== job: {_one_line(str(job.get('name') or job_id))} ==\n"
+                             + _tail(text, lines, max_bytes=_FAILED_LOG_BYTES))
+        return "\n\n".join(parts)
 
     def review_comments(self, pr: int, *, limit: int = _INLINE_COMMENT_LIMIT) -> str:
         """The newest inline review comments. `per_page=100`: the default page
