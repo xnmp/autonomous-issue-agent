@@ -190,10 +190,11 @@ Uninstall with `issue-agent uninstall-service`.
 
 ## Runtime and trust model
 
-Repository CI can use one native local GitHub Actions runner instead of paid
-GitHub-hosted minutes. See [native CI setup](docs/reference/self-hosted-ci.md)
-for the dedicated account, standard runner service, limits and installation.
-The runner retains all existing checks and reports genuine GitHub CI results.
+This repository is public, so its CI runs on GitHub-hosted runners only: a
+fork PR runs `make test` with its own code, and a runner on the operator's
+machine would expose the harness credentials to it. A private target repository
+can still use one native local runner instead of paid hosted minutes; see
+[native CI setup](docs/reference/self-hosted-ci.md).
 
 The daemon observes GitHub, derives each item's state with a pure function,
 and maps it to `Action` values. The fix role executes them directly
