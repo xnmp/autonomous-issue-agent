@@ -56,7 +56,9 @@ there, refuses a secret that also appears in the env file or that exists in the
 credstore yet never arrived (no fallback to the ambient login), and the credential
 directory never enters a leg's environment. Claude legs authenticate with their
 own `CLAUDE_CODE_OAUTH_TOKEN` (the one secret on both units, passed to Claude
-legs only), which leaves the operator's `~/.claude` unmounted. launchd and
+legs only) and is required: a Claude leg with no such credential (that or
+`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`) is refused, so the operator's
+`~/.claude` is never mounted beyond the leg's own session store. launchd and
 foreground runs keep env-file secrets.
 Paid legs are refused when bwrap is missing or cannot create a
 sandbox: there is no unsandboxed mode and no per-repo knob. The sandbox

@@ -30,10 +30,6 @@ class Access(Enum):
     PRIVATE = "tmpfs"
     # Host device nodes, usable as on the host.
     DEVICE = "dev"
-    # The host entry stays in place but its content is gone: a directory is an
-    # empty leg-private one, anything else reads empty. A mount point, so the
-    # leg cannot rename, remove or replace the host's entry either.
-    HIDDEN = "hidden"
 
 
 @dataclass(frozen=True)
@@ -56,23 +52,6 @@ class GitLink:
 
 
 @dataclass(frozen=True)
-class LoginDir:
-    """A runtime's login directory, shared read-write with the host.
-
-    The runtime replaces its login file by atomic rename and serializes refresh
-    with lock files beside it, so only the directory keeps the leg and the host
-    on one login. A bind of the file alone pinned the inode the host's refresh
-    renamed away: every running leg failed `OAuth session expired`, and a
-    leg's own refresh could not replace the mount point (incident 2026-10-15).
-    `shared` names stay visible; every other entry the directory held at
-    launch is hidden."""
-
-    path: str
-    shared: tuple[str, ...]
-    entries: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class LegFacts:
     home: str
     cwd: str
@@ -86,7 +65,6 @@ class LegFacts:
     runtime_support: tuple[str, ...] = ()
     # The runtime's session store, which `--resume` needs.
     runtime_state: tuple[str, ...] = ()
-    login: LoginDir | None = None
     search_path: tuple[str, ...] = ()
     # A build cache outside the checkout the leg's env names (CARGO_TARGET_DIR).
     build_cache: tuple[str, ...] = ()
@@ -158,23 +136,6 @@ PUBLICATION_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_EN
 
 _RENDER_NODE = re.compile(r"/dev/dri/renderD[0-9]+")
 
-# What a Claude leg shares in its config dir (CLI 2.1.299): the login, the
-# refresh lock and its owner record (a holder another process may take over),
-# and the secure-storage write lock. Everything else there is the operator's:
-# settings and hooks, other projects' transcripts, history.
-CLAUDE_LOGIN_SHARED = (".credentials.json", ".oauth_refresh.lock", ".oauth_refresh.lock.owner",
-                       ".storage-write.lock")
-
-# What the operator's own Claude reads from its config dir as settings, memory
-# or extensions (CLI 2.1.299). A leg shares that dir read-write, so each is
-# hidden even where the operator has none: one a leg created would run in the
-# operator's sessions (hooks, mcpServers) or prompt them. `.config.json` is
-# not on this list: the CLI parses it whenever it exists, and an empty
-# placeholder is fatal to every Claude process, the operator's included
-# (incident 2026-10-15). A leg can still create it (residuals §1.1).
-CLAUDE_CONFIG_FILES = ("settings.json", "settings.local.json", "CLAUDE.md", "keybindings.json")
-CLAUDE_CONFIG_DIRS = ("agents", "commands", "skills", "hooks", "plugins", "rules", "output-styles")
-
 # Claude Code's project-directory name limit; longer paths get a hash suffix
 # whose function the CLI does not publish (CLI 2.1.299).
 _CLAUDE_PROJECT_NAME_LIMIT = 200
@@ -213,25 +174,6 @@ def claude_session_store(config_dir: str, cwd: str) -> str:
     return posixpath.join(_normal(config_dir), "projects", name)
 
 
-def _entry_name(name: object) -> bool:
-    return isinstance(name, str) and name not in ("", ".", "..") and "/" not in name and "\0" not in name
-
-
-def login_mounts(login: LoginDir) -> tuple[Mount, ...]:
-    """The login directory read-write, each unshared entry hidden. A shared
-    name's staging files (`.credentials.json.tmp.<hex>`) stay visible: a mount
-    moves with its entry, so a hidden one the host then renamed onto the login
-    would hide the login itself from the leg."""
-    path = _normal(login.path)
-
-    def shared(name: str) -> bool:
-        return any(name == s or name.startswith(s + ".tmp.") for s in login.shared)
-
-    return (Mount(path, Access.READ_WRITE),
-            *(Mount(posixpath.join(path, name), Access.HIDDEN) for name in dict.fromkeys(login.entries)
-              if _entry_name(name) and not shared(name)))
-
-
 def leg_mount_plan(facts: LegFacts) -> MountPlan:
     """The mounts for one leg. Raises `UnsafeMount` when a required mount
     would expose a protected path; optional ones that would are dropped."""
@@ -243,8 +185,6 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     required: list[Mount] = [Mount(_normal(facts.runtime_binary), Access.READ_ONLY)]
     required += [Mount(_normal(p), Access.READ_WRITE) for p in (*facts.runtime_state, *facts.build_cache,
                                                                  *facts.scratch)]
-    if facts.login is not None:
-        required += login_mounts(facts.login)
     required.append(Mount(cwd, writable))
     if facts.git is not None:
         common, own = _normal(facts.git.common_dir), _normal(facts.git.worktree_dir)
@@ -307,8 +247,8 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
                                                      m.access is not Access.PRIVATE))
     # An optional mount adds nothing inside one with the same or write access
     # and could narrow it (a PATH entry inside the checkout would turn that
-    # directory read-only); inside a hidden entry it would re-expose what the
-    # plan hides. Only the nearest enclosing mount decides what a path shows.
+    # directory read-only). Only the nearest enclosing mount decides what a
+    # path shows.
     by_path = {m.path: m for m in ordered}
 
     def enclosing(path: str) -> list[Mount]:
@@ -323,8 +263,6 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
         if not m.optional:
             return False
         around = enclosing(m.path)
-        if any(p.access is Access.HIDDEN for p in around):
-            return True
         return bool(around) and around[0].access in (m.access, Access.READ_WRITE)
 
     ordered = [m for m in ordered if not dropped(m)]
@@ -334,6 +272,6 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
 
 
 __all__ = [
-    "CLAUDE_CONFIG_DIRS", "CLAUDE_CONFIG_FILES", "CLAUDE_LOGIN_SHARED", "Access", "GitLink", "LegFacts", "LoginDir", "Mount", "MountPlan", "UnsafeMount",
-    "claude_session_store", "exposes", "leg_mount_plan", "login_mounts", "protected_paths",
+    "Access", "GitLink", "LegFacts", "Mount", "MountPlan", "UnsafeMount",
+    "claude_session_store", "exposes", "leg_mount_plan", "protected_paths",
 ]
