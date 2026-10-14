@@ -43,8 +43,20 @@ PID namespace and only the mounts `domain/sandbox.py` plans from facts the
 harness holds (checkout, git metadata, runtime binary and session store,
 toolchains on PATH). The repository's config, hooks and checkout links never
 change on the host, because the harness runs git in every checkout outside the
-sandbox: a review leg sees them read-only, a fix leg through an overlay its
-writes vanish with.
+sandbox: a review leg sees them read-only, and a fix leg sees none of them.
+Per-leg fix clones (2026-10-15) amend #417/#419: a fix leg works in a clone of
+origin that borrows the repository's objects read-only (`clone --reference`)
+and keeps its own refs, packed-refs and new objects, so it cannot rewrite
+objects a review checks out (GIT-OBJECTS) and a host ref pack cannot hide its
+branch (tauri #1106). The overlay, the read-only packed-refs, the
+repository-config writes that stopped ref packing and their refusal are gone.
+The clone's `config`, `hooks/` and `commondir` (written `.` at each launch) are
+read-only to the leg and `.git` is a mount point, because the harness's git
+runs there. Crash points: a clone is built at `<path>.partial` and renamed
+into place, and removal renames it there before deleting, so a kill at any
+step leaves only scratch the next clone replaces; a restarted daemon reuses
+clones on disk at the same path, so Claude's cwd-keyed session store resumes
+(`tests/adapters/test_worktree_identity.py`).
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
 the act layer. Secrets reach the daemons as systemd encrypted

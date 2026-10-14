@@ -68,9 +68,9 @@ have one; keep your context for reasoning, design and code.
 
 ## Your sandbox
 You run under bubblewrap: HOME and `/tmp` are empty and private, there is no
-Docker socket, and writes to the repository's `.git` outside your branch's
-objects and refs (config, a scratch `git worktree add`) vanish when the leg
-ends. Other legs share the X abstract-socket namespace but not `/tmp`, so
+Docker socket, and your checkout is a clone of its own whose git config and
+hooks are read-only: `git push -u` still publishes (ignore its "could not
+write config" line), but `git config` and `git remote add` fail. Other legs share the X abstract-socket namespace but not `/tmp`, so
 `xvfb-run -a` can pick a display another leg holds: use `xvfb-run -d`, or give
 Xvfb `-nolisten local`.
 

@@ -14,10 +14,10 @@ plan §6b, the lean-core handover §5, and the improvement plan's §4 backlog.
 
 The control-plane correctness blockers are closed. The remaining restrictions
 are trust-boundary residuals: they bound what inbound repository content that
-hijacks a leg could do. Every residual with a code name (`GIT-OBJECTS`) is
-executable in `tests/test_residuals.py`; the tests assert the desired closed behavior under
-`xfail(strict=True)`, so fixing one requires removing or updating its registry
-entry.
+hijacks a leg could do. Every residual with a code name (`BORROWED-OBJECTS`,
+§2) is executable in `tests/test_residuals.py`; the tests assert the desired
+closed behavior under `xfail(strict=True)`, so fixing one requires removing or
+updating its registry entry.
 
 ### 1.1 What a sandboxed leg can still reach
 
@@ -25,13 +25,15 @@ Every leg runs under bubblewrap (#413; `docs/reference/capability-authority-matr
 The review bot's token, the GitHub App key, the operator's `gh` login, SSH
 keys, keyring files and `/run` sockets, the harness checkout and the control
 store are out of reach
-(`CRED-HOME` is closed). Slice 6a deleted the command governor, so inside the
+(`CRED-HOME` is closed). A fix leg works in a clone of its own that borrows
+the repository's objects read-only, so it cannot rewrite what review checkouts
+read, and no host ref pack can hide its branch (`GIT-OBJECTS` and tauri #1106
+are closed; ADR 0001). Slice 6a deleted the command governor, so inside the
 sandbox the agent can run any command. What remains:
 
 | Residual | Why it is accepted | Trigger / exit |
 |---|---|---|
 | A fix leg holds `FIX_BOT_TOKEN`, a non-admin account (`xnmp-fixer`, Write on the four target repos): it can push any unprotected branch, open, edit or comment on PRs and read the Actions logs Write allows. A direct push to a protected branch is refused ("Changes must be made through a pull request", probed 2026-10-14); it could still merge a PR whose protection requirements are already met | The leg must publish; Write is the smallest repository role that can push. Merging stays behind branch protection and the independent review | a protected branch that requires no approving review, or the account gaining Admin or a bypass; then tighten protection or the role |
-| `GIT-OBJECTS`: a fix leg writes the repository's shared object store and refs; review checkouts read the same store, so a leg could rewrite an object a later review checks out (git does not re-hash on read). Loose refs are as exposed. `packed-refs` is read-only as of the leg's launch, so a leg's `git pack-refs` fails rather than prune the host's loose refs, and a leg cannot delete or rename a packed ref (`branch -D`, `tag -d`, `branch -m`, `update-ref -d` fail; its fetch does not prune unless asked, and an explicit `--prune` of a packed tracking ref fails). A fix-leg launch sets the repository never to pack refs (`gc.packRefs=false`, `maintenance.pack-refs.enabled=false`), because a host pack (the auto-maintenance a fetch starts) moves a running leg's branch out of the live `refs/` and the leg loses it (tauri #1106, 2026-10-15). A launch whose effective config would still pack (an include or `config.worktree` overriding them) is refused. An explicit `git pack-refs` or `git maintenance run --task=pack-refs` on the host while a fix leg runs, or removing those keys, still does that | Commits need a writable store; a separate store for review is a larger change | review checkouts from a separate clone, or verifying the reviewed tree against GitHub's; a leg losing its branch to a host pack, or legs needing to delete packed refs (then per-leg clones); `tests/test_residuals.py` |
 | The network is on, so loopback services (`127.0.0.1`) and abstract-namespace unix sockets of the host are reachable, including a D-Bus session bus or secret service listening on an abstract socket (classic `dbus-daemon`; `/run/user` buses are not mounted) and an X server that listens on one and trusts the local user (Xorg with `xhost +si:localuser`). Legs share that namespace too, so `xvfb-run -a`, which sees only its own `/tmp`, can pick another leg's display; `plugin/AGENT.md` says to use `xvfb-run -d` | Owner decision: the sandbox isolates credentials and files, not egress | a host service that trusts any local connection; then `--unshare-net` plus a proxy |
 | `CARGO_TARGET_DIR` is mounted read-write when the leg's env names one outside the checkout; a target dir shared with the operator's own builds (ballast's) lets a leg plant build outputs those builds run | Shared incremental builds are why the knob exists | point it at a harness-only directory (tauri and keifu already do) |
 | Teardown inside the sandbox is SIGKILL: bwrap does not forward SIGTERM, so a runtime never sees a graceful stop | `--die-with-parent` and the PID namespace guarantee every sandboxed process dies; the runtimes' session files are written as they go | a runtime that loses resumable state on SIGKILL |
@@ -75,6 +77,8 @@ self-authored issue.
 
 | Item | Why it's accepted | Where it bites |
 |---|---|---|
+| `BORROWED-OBJECTS`: a fix clone borrows the repository's objects (`clone --reference`). Git deletes only what no ref of the repository holds, so the harness anchors what it hands a clone (`sync` fetches the head into the repository's `refs/remotes/origin/<branch>`), and a leg's fetch prunes tracking refs whose branch is gone (`fetch.prune=true`), which a merged branch's pruned objects would otherwise break. A leg's own mid-leg fetch can still adopt an object the repository holds under no ref (a head a review fetched), which the repository's gc deletes after `gc.pruneExpire` (two weeks) or at once on `gc --prune=now` | The window is a push by someone else during one leg, and the clone survives until the issue merges | a broken clone (`bad object` in a leg): remove `.claude/worktrees/issue-<n>` and the next leg reclones; if it recurs, give each clone its objects (`--dissociate`, ~360 MB per tauri clone); `tests/test_residuals.py` |
+| A fix clone's `.git/config` and `.git/hooks` are read-only to its leg: the harness runs git there outside the sandbox. `git push -u`, `branch -D` and tracking checkouts still succeed (their config write prints an error); `git config` and `git remote add` fail; hooks the operator installed in the repository's own config (husky's `core.hooksPath`) do not apply in the clone | Config a leg could write is code the harness's git would run | a target whose checks live in repository-installed hooks (none of the four do, 2026-10-15) |
 | Migration 44 deletes steward continuation admission/return receipts | The steward role is deleted; settled runs and charges stay, so ledger spend and caps are unaffected | historical measurement/cohort readouts lose steward spend attribution (more `run lacks authoritative admission binding` gaps); measurement is deleted in slice 8a |
 | Push gate: bash denies on an unreadable PR state, Python runs the state checks and allows a clean push | P1R-12 was decided for the Python path only; changing the codex path's fail-closed stance needs its own call | codex mode only; asserted in `tests/test_gate_parity.py` |
 | Commit-arm rule *order* differs between stacks (lint before ordering vs interleaved) | Verdicts are identical, only the reported reason differs | cosmetic; asserted as a parity divergence |
