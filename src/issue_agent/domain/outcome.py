@@ -179,11 +179,11 @@ class LegClass(str, Enum):
 
 def classify_leg(result: "AgentResult", *, resumed: bool) -> LegClass:
     """Classify a returned leg. A per-leg cap hit (`leg_cap`: wall clock or
-    spend) or a provider-refused end (api_error, quota; a permanent one such
-    as a 400 would otherwise loop free, #418) is a machine failure on a fresh
-    session and an attempt on a resumed one: the item resumes once at the same tier (the leg runner resumes the
-    latest machine end's session) and a second cap hit on that resume counts,
-    whichever cap it is. An orderly harness teardown is never an attempt. The
+    spend) or a provider-refused end is a machine failure on a fresh session
+    and an attempt on a resumed one: the item resumes once at the same tier
+    (the leg runner resumes the latest machine end's session) and a second
+    such end on that resume counts. A provider error can be permanent (a 400),
+    and without the second rule it would retry free forever (#418). An orderly harness teardown is never an attempt. The
     per-issue lifetime cap is not a leg cap: it refuses admission and stops
     for a human."""
     if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE or leg_cap(result.exit_reason):
