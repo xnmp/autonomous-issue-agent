@@ -21,7 +21,7 @@ from issue_agent.app.config import from_env, rate_table
 from issue_agent.domain.contracts import Money
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import BudgetPolicy, UnknownModelPolicy
-from issue_agent.domain.run_usage import EstimatedRunUsage, MeasuredRunUsage
+from issue_agent.domain.run_usage import EstimatedRunUsage, MeasuredRunUsage, parse_snapshot, snapshot_record
 
 CLAUDE = rate_table(from_env({}), "claude")
 SONNET, HAIKU = "claude-sonnet-5-5", "claude-haiku-5-5"
@@ -95,60 +95,43 @@ def test_a_multi_model_leg_prices_each_models_tokens_at_its_own_rate(monkeypatch
     assert {s.model for s in result.run_usage.samples} == {SONNET, HAIKU}
 
 
-def test_the_resumed_issue_1078_leg_settles_its_own_tokens_not_the_session_total(monkeypatch):
-    # FIX_CI on tauri #1078: the CLI reported $8.14, the session's running total;
-    # the leg's own usage was 4 in, 1,443 out, 284,614 read, 29,637 written.
-    envelope = _ResultMessage({SONNET: _model(60, 40_000, 4_000_000, 600_000)}, _usage(4, 1_443, 284_614, 29_637),
-                              total_cost_usd=8.14)
-    plan = RuntimePlan(prompt="x", model=SONNET, max_budget_usd=10, resume="46e64a48")
-
-    result, lines = _leg(monkeypatch, envelope, plan)
-
-    # 8 + 14430 + 28462 + 118548 micros.
-    assert result.cost_usd == 161_448 / 1e6
-    assert isinstance(result.run_usage, MeasuredRunUsage)
-    assert not any("CROSS-CHECK" in line for line in lines)  # a cumulative figure compares nothing
-
-
-def test_a_resumed_leg_that_delegated_is_bounded_by_the_session_cumulative_usage(monkeypatch):
+def test_a_resumed_leg_without_a_baseline_is_bounded_by_its_own_and_other_models_usage(monkeypatch):
     envelope = _ResultMessage(_FRESH, _usage(2, 7, 20_348, 438), total_cost_usd=0.058)
     plan = RuntimePlan(prompt="x", model=SONNET, max_budget_usd=10, resume="s1")
 
-    result, lines = _leg(monkeypatch, envelope, plan, before=(_subagent_started(),))
+    result, lines = _leg(monkeypatch, envelope, plan)
 
     # The main loop's own tokens (4 + 70 + 2035 + 1752 micros), not its session
-    # total; the Haiku subagent at its session-cumulative usage, an upper bound.
+    # total; the Haiku model at its session-cumulative usage, an upper bound.
     assert result.cost_usd == (3_861 + _HAIKU_MICROS) / 1e6
     assert isinstance(result.run_usage, EstimatedRunUsage)
-    assert any("PRICING" in line and "session-cumulative" in line for line in lines)
+    assert not any("CROSS-CHECK" in line for line in lines)  # a cumulative figure compares nothing
+
+
+def test_a_resumed_leg_that_delegated_is_bounded_by_all_session_cumulative_usage(monkeypatch):
+    # Its subagents may have run on the main model, which its own usage omits.
+    envelope = _ResultMessage(_FRESH, _usage(2, 7, 20_348, 438))
+    plan = RuntimePlan(prompt="x", model=SONNET, max_budget_usd=10, resume="s1")
+
+    result, _ = _leg(monkeypatch, envelope, plan, before=(_subagent_started(),))
+
+    assert result.cost_usd == (_SONNET_MICROS + _HAIKU_MICROS) / 1e6
+    assert isinstance(result.run_usage, EstimatedRunUsage)
 
 
 def test_a_resumed_alias_plan_never_charges_its_main_loop_twice(monkeypatch):
     envelope = _ResultMessage(_FRESH, _usage(2, 7, 20_348, 438))
     plan = RuntimePlan(prompt="x", model="sonnet", max_budget_usd=10, resume="s1")
 
-    result, _ = _leg(monkeypatch, envelope, plan, before=(_subagent_started(),))
+    result, _ = _leg(monkeypatch, envelope, plan)
 
     assert result.cost_usd == (3_861 + _HAIKU_MICROS) / 1e6
 
 
-def test_a_malformed_field_the_leg_does_not_price_from_is_ignored(monkeypatch):
+def test_a_malformed_top_level_usage_a_fresh_leg_does_not_price_from_is_ignored(monkeypatch):
     fresh, _ = _leg(monkeypatch, _ResultMessage({SONNET: _FRESH[SONNET]}, {"input_tokens": None}))
-    resumed, _ = _leg(monkeypatch, _ResultMessage("malformed", _usage(2, 7, 20_348, 438)),
-                      RuntimePlan(prompt="x", model=SONNET, max_budget_usd=10, resume="s1"))
 
-    assert (fresh.cost_usd, resumed.cost_usd) == (_SONNET_MICROS / 1e6, 3_861 / 1e6)
-
-
-def test_tokens_from_a_model_with_no_harness_rate_settle_the_reserved_maximum(monkeypatch):
-    # A stale CLI prices an unknown model at a fallback; the harness trusts neither.
-    envelope = _ResultMessage({SONNET: _FRESH[SONNET], "claude-haiku-6": _model(1, 1, 1, 1)}, total_cost_usd=0.06)
-
-    result, lines = _leg(monkeypatch, envelope)
-
-    assert result.cost_usd == 10.0
-    assert isinstance(result.run_usage, EstimatedRunUsage)
-    assert any("no harness rate for claude-haiku-6" in line for line in lines)
+    assert fresh.cost_usd == _SONNET_MICROS / 1e6
 
 
 def test_a_model_entry_with_no_tokens_needs_no_rate(monkeypatch):
@@ -278,19 +261,6 @@ def test_a_rated_model_or_cli_alias_is_admitted(tmp_path, model):
     assert inner.calls == 1
 
 
-def test_a_resumed_leg_prices_the_concrete_model_its_alias_resolved_to(monkeypatch):
-    # The init message names what the CLI resolved "sonnet" to; a model the
-    # card does not know is never priced at the alias's rate.
-    init = types.SimpleNamespace(subtype="init", data={"model": "claude-sonnet-6", "session_id": "s1"})
-    plan = RuntimePlan(prompt="x", model="sonnet", max_budget_usd=10, resume="s1")
-    envelope = _ResultMessage({"claude-sonnet-6": _model(1, 1, 1, 1)}, _usage(1, 1, 1, 1))
-
-    result, lines = _leg(monkeypatch, envelope, plan, before=(init,))
-
-    assert result.cost_usd == 10.0
-    assert any("no harness rate for claude-sonnet-6" in line for line in lines)
-
-
 def test_a_rated_leg_settles_its_token_price_on_the_rate_card(tmp_path, monkeypatch):
     priced, _ = _leg(monkeypatch, _ResultMessage(_FRESH, total_cost_usd=6.89))
     wrapper, store = _accounting(tmp_path, _Runtime(priced))
@@ -321,6 +291,139 @@ def test_an_interrupted_leg_on_a_model_with_no_rate_settles_the_reserved_maximum
     asyncio.run(wrapper.run(RuntimePlan(prompt="x", max_budget_usd=10)))
 
     assert _ended(store) == [(10_000_000, "estimate", "claude-list-rates")]
+
+
+# ── a session's legs priced by the delta of its cumulative usage ──────────────
+# Real envelopes from CLI 2.1.294: a fresh Sonnet leg whose Haiku subagent made
+# four requests (r6), then the same task on the resumed session (r7).
+_R6 = {SONNET: _model(4, 293, 32_374, 7_721), HAIKU: _model(8, 491, 42_580, 14_969)}
+_R7 = {SONNET: _model(8, 539, 73_696, 10_734), HAIKU: _model(16, 903, 98_247, 16_895)}
+# r6: Sonnet 8 + 2930 + 3238 + 30884, Haiku 4 + 1228 + 2129 + 14969 micros.
+_R6_MICROS = 55_390
+# r7 less r6: Sonnet 4/246/41,322/3,013 (= r7's own `usage`) at 8 + 2460 + 4133
+# + 12052; Haiku 8/412/55,667/1,926 at 4 + 1030 + 2784 + 1926 micros.
+_R7_OWN_MICROS = 24_397
+
+
+def _session(tmp_path, monkeypatch):
+    """Run legs of one session through accounting over a real AgentRunner."""
+    wrapper, store = _accounting(tmp_path, AgentRunner(rate_table=CLAUDE))
+
+    def leg(*messages, resume="s1"):
+        async def query(prompt, options):
+            for message in messages:
+                yield message
+
+        fake = types.ModuleType("claude_agent_sdk")
+        fake.ClaudeAgentOptions = lambda **_kw: object()
+        fake.ResultMessage = _ResultMessage
+        fake.query = query
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+        store.unlease("o/r", "fix", 1, wrapper._owner())
+        store.lease("o/r", "fix", 1, wrapper._owner())
+        return asyncio.run(wrapper.run(RuntimePlan(prompt="x", model=SONNET, max_budget_usd=10, resume=resume)))
+
+    return leg, store
+
+
+def _charges(store):
+    return [(micros, basis) for micros, basis, _card in _ended(store)]
+
+
+def test_a_resumed_leg_with_a_subagent_is_priced_exactly_by_the_session_delta(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    resumed = leg(_subagent_started(), _ResultMessage(_R7, _usage(4, 246, 41_322, 3_013), total_cost_usd=0.11))
+
+    assert _charges(store) == [(_R6_MICROS, "configured_rate_card"), (_R7_OWN_MICROS, "configured_rate_card")]
+    assert isinstance(resumed.run_usage, MeasuredRunUsage)
+
+
+def test_the_resumed_issue_1078_leg_settles_its_own_tokens_not_the_session_total(tmp_path, monkeypatch):
+    # FIX_CI on tauri #1078: the CLI reported $8.14, the session's running total;
+    # the leg's own usage was 4 in, 1,443 out, 284,614 read, 29,637 written.
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage({SONNET: _model(56, 38_557, 3_715_386, 570_363)}), resume=None)
+
+    leg(_ResultMessage({SONNET: _model(60, 40_000, 4_000_000, 600_000)}, _usage(4, 1_443, 284_614, 29_637),
+                       total_cost_usd=8.14))
+
+    # 8 + 14430 + 28462 + 118548 micros.
+    assert _charges(store)[1] == (161_448, "configured_rate_card")
+
+
+def test_a_resumed_leg_with_no_baseline_settles_its_upper_bound(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+
+    resumed = leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)))
+
+    # Its own Sonnet usage (18,653 micros) plus Haiku's session-cumulative usage
+    # (8 + 2258 + 4913 + 16895): above the exact 24,397, never below.
+    assert _charges(store) == [(18_653 + 24_074, "estimate")]
+    assert "no usage snapshot" in resumed.run_usage.detail
+
+
+def test_an_interrupted_previous_leg_is_bounded_by_charging_its_tokens_again(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    streamed = types.SimpleNamespace(model=SONNET, usage={"input_tokens": 2, "output_tokens": 0,
+                                                         "cache_read_input_tokens": 20_000,
+                                                         "cache_creation_input_tokens": 0})
+    leg(streamed)  # no result: its stream estimate is charged, and it leaves no snapshot
+
+    leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)))
+
+    # The next leg's delta runs from r6, so it includes the interrupted leg's
+    # tokens again: an overcharge bounded by what that leg spent.
+    assert _charges(store) == [(_R6_MICROS, "configured_rate_card"), (2_004, "estimate"),
+                               (_R7_OWN_MICROS, "configured_rate_card")]
+
+
+def test_counters_that_went_backwards_settle_the_upper_bound(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R7, _usage(8, 539, 73_696, 10_734)), resume=None)
+
+    resumed = leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)))
+
+    # Its own Sonnet usage plus Haiku's cumulative usage: r6's price.
+    assert _charges(store)[1] == (_R6_MICROS, "estimate")
+    assert "went backwards" in resumed.run_usage.detail
+
+
+@pytest.mark.parametrize("snapshot", [
+    None, {}, "snapshot", [[1, 1, 1, 1]], {SONNET: [1, 1, 1]}, {SONNET: [1, 1, 1, -1]}, {SONNET: [1, 1, 1, True]},
+    {SONNET: [1, 1, 1, 10**13]}, {SONNET: [1, 1, 1, 1], SONNET.upper(): [1, 1, 1, 1]},
+    {f"m{i}": [1, 1, 1, 1] for i in range(65)},
+])
+def test_a_malformed_or_huge_recorded_snapshot_is_no_baseline(snapshot):
+    assert parse_snapshot("s1", snapshot) is None
+
+
+def test_a_recorded_snapshot_round_trips():
+    samples = parse_snapshot("s1", {SONNET: [4, 293, 32_374, 7_721], HAIKU: [8, 491, 42_580, 14_969]})
+    assert samples is not None and parse_snapshot("s1", snapshot_record(samples)) == samples
+
+
+def test_tokens_from_a_model_with_no_harness_rate_settle_the_reserved_maximum(tmp_path, monkeypatch):
+    # A stale CLI prices an unknown model at a fallback; the harness trusts neither.
+    leg, store = _session(tmp_path, monkeypatch)
+
+    result = leg(_ResultMessage({SONNET: _FRESH[SONNET], "claude-haiku-6": _model(1, 1, 1, 1)}), resume=None)
+
+    assert _charges(store) == [(10_000_000, "estimate")]
+    assert "no harness rate for claude-haiku-6" in result.run_usage.detail
+
+
+def test_a_resumed_leg_prices_the_concrete_model_its_alias_resolved_to(tmp_path, monkeypatch):
+    # The init names what the CLI resolved the plan's model to; a model the
+    # card does not know is never priced at another model's rate.
+    leg, store = _session(tmp_path, monkeypatch)
+    init = types.SimpleNamespace(subtype="init", data={"model": "claude-sonnet-6", "session_id": "s1"})
+
+    leg(init, _ResultMessage({"claude-sonnet-6": _model(1, 1, 1, 1)}, _usage(1, 1, 1, 1)))
+
+    assert _charges(store) == [(10_000_000, "estimate")]
 
 
 # ── the rate card ─────────────────────────────────────────────────────────────

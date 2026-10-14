@@ -204,61 +204,54 @@ def _tokens(raw: object, keys: tuple[str, ...]) -> TokenUsage:
     return TokenUsage(*values, source=UsageSource.PROVIDER)
 
 
-def _per_model(session: str, raw: object, main: str) -> tuple[ModelUsage, ...]:
+def _per_model(session: str, raw: object) -> tuple[ModelUsage, ...]:
     if not isinstance(raw, dict) or len(raw) > _MAX_MODELS:
         raise ValueError("per-model usage is not a bounded mapping")
-    parsed = tuple(ModelUsage(session, name, _tokens(counters, _MODEL_USAGE_KEYS)) for name, counters in raw.items())
-    # A model entry with no tokens bought nothing, so it needs no rate.
-    return tuple(s for s in parsed if s.usage.total_tokens) or (ModelUsage(session, main, TokenUsage(0, 0)),)
+    return tuple(ModelUsage(session, name, _tokens(counters, _MODEL_USAGE_KEYS)) for name, counters in raw.items())
 
 
 def claude_leg_usage(msg: Any, *, session_id: str, main_model: str, resumed: bool, delegated: bool,
-                     maximum: Money, rates: RateTable | None) -> RunUsage:
-    """This leg's token usage per model, from its result envelope (#389).
+                     maximum: Money, rates: RateTable | None) -> tuple[RunUsage, tuple[ModelUsage, ...]]:
+    """(this leg's usage, the session's cumulative per-model usage), from the
+    result envelope (#389).
 
     On CLI 2.1.294 `modelUsage` names every model the leg used, subagents
     included, but on a resumed session it and `total_cost_usd` are
-    session-cumulative; the top-level `usage` is this leg's own and covers only
-    the main loop. So a fresh leg is priced from `modelUsage`, and a resumed
-    one from `usage` at its main model. A resumed leg that delegated has no
-    per-leg subagent figure: its other models are bounded by their
-    session-cumulative usage, an estimate. A missing field falls back to the
-    other; with neither, usage is charged zero with a gap (ADR 0002).
-    Malformed counters, or usage by a model with no harness rate, settle at
-    the reserved maximum rather than at any fallback price.
+    session-cumulative; the top-level `usage` is this leg's own main loop
+    only. A fresh leg is priced from `modelUsage`. A resumed leg's exact usage
+    is its cumulative counters less the previous leg's, which accounting
+    holds; this returns the upper bound used when that baseline is missing:
+    the main loop's own usage plus the other models' session-cumulative
+    usage, or all of it when the leg started a subagent (which may share the
+    main model). Absent usage is charged zero with a gap (ADR 0002); malformed
+    counters settle at the reserved maximum.
     """
     session = session_id or "unknown-session"
     main = main_model.strip()
     main = main if 0 < len(main) <= 256 else "<runtime-default>"
     own_raw, per_model_raw = getattr(msg, "usage", None), getattr(msg, "model_usage", None)
-    if own_raw is None and per_model_raw is None:
-        return EstimatedRunUsage("the result reported no usage; charged zero", (), rates)
     try:
-        # Only the fields priced are parsed: a malformed unused one is no evidence.
-        gap = ""
+        cumulative = _per_model(session, per_model_raw) if per_model_raw is not None else ()
         if not resumed and per_model_raw is not None:
-            samples = _per_model(session, per_model_raw, main)
-        elif own_raw is None:
-            samples = _per_model(session, per_model_raw, main)
-            gap = "the resumed leg reported no usage of its own; charged the session-cumulative usage"
+            priced, gap = cumulative, ""
+        elif resumed and cumulative and (delegated or own_raw is None):
+            priced, gap = cumulative, "upper bound: the session-cumulative usage"
+        elif own_raw is not None:
+            own = ModelUsage(session, main, _tokens(own_raw, _USAGE_KEYS))
+            others = tuple(s for s in cumulative if s.model.casefold() not in
+                           {main.casefold(), dict(CLAUDE_ALIASES).get(main.casefold(), main).casefold()})
+            priced = (own, *others)
+            gap = ("upper bound: the main loop's own usage plus other models' session-cumulative usage" if resumed
+                   else "the result reported no per-model usage; priced its main loop only")
         else:
-            samples = (ModelUsage(session, main, _tokens(own_raw, _USAGE_KEYS)),)
-            if not resumed:
-                gap = "the result reported no per-model usage; priced its main loop only"
-            elif delegated:
-                concrete = dict(CLAUDE_ALIASES).get(main.casefold(), main).casefold()
-                samples += tuple(s for s in (_per_model(session, per_model_raw, main) if per_model_raw else ())
-                                 if s.model.casefold() not in {main.casefold(), concrete})
-                gap = ("the resumed leg delegated to subagents, whose per-leg usage the CLI does not report: other "
-                       "models are charged their session-cumulative usage, subagents on the main model are uncounted")
-        unrated = sorted({s.model for s in samples if s.usage.total_tokens and rates is not None
-                          and not rates.priceable(s.model)})
-        if not unrated:
-            return EstimatedRunUsage(gap, samples, rates) if gap else MeasuredRunUsage(samples, rates)
-        detail = f"no harness rate for {', '.join(unrated)[:400]}; charged the reserved maximum"
+            return EstimatedRunUsage("the result reported no usage; charged zero", (), rates), ()
+        # A model entry with no tokens bought nothing, so it needs no rate.
+        samples = tuple(s for s in priced if s.usage.total_tokens) or (ModelUsage(session, main, TokenUsage(0, 0)),)
+        usage = EstimatedRunUsage(gap, samples, rates) if gap else MeasuredRunUsage(samples, rates)
+        return usage, cumulative
     except (ValueError, TypeError) as exc:
         detail = f"Claude usage counters malformed ({str(exc)[:200]}); charged the reserved maximum"
-    return reserved_maximum_usage(session, main, maximum, UsageSource.PROVIDER, detail)
+    return reserved_maximum_usage(session, main, maximum, UsageSource.PROVIDER, detail), ()
 
 
 # The CLI's own dollar figure is a cross-check, never settlement (#389). It
@@ -453,18 +446,22 @@ class AgentRunner(AgentRuntime):
     def _priced(self, task: RuntimePlan, result: AgentResult, final: Any, delegated: bool) -> AgentResult:
         """The leg's usage and its price at the harness rates, the one
         settlement path Codex legs share."""
-        observed = claude_leg_usage(final, session_id=result.session_id, main_model=result.model or task.model or "",
-                                    resumed=bool(task.resume), delegated=delegated,
-                                    maximum=Money.from_major("USD", task.max_budget_usd), rates=self._rate_table)
+        observed, cumulative = claude_leg_usage(
+            final, session_id=result.session_id, main_model=result.model or task.model or "",
+            resumed=bool(task.resume), delegated=delegated, maximum=Money.from_major("USD", task.max_budget_usd),
+            rates=self._rate_table)
         amount = price_run_usage(observed, self._rate_table)
-        if isinstance(observed, EstimatedRunUsage):
+        # A resumed leg's bound is replaced by its exact delta when accounting
+        # holds the session's previous snapshot; it logs only if not.
+        if isinstance(observed, EstimatedRunUsage) and not (task.resume and cumulative):
             self._log(f"sdk: PRICING — {observed.detail}")
         # A resumed session's CLI figure is session-cumulative: nothing to compare.
         elif not task.resume and cli_overstates(amount, result.cost_usd):
             self._log(f"sdk: PRICE CROSS-CHECK — tokens at harness rates price this leg ${amount.micros / 1e6:.4f}; "
                       f"the CLI reported ${result.cost_usd:.4f}, over {_CROSS_CHECK_RATIO}x that. Settling on "
                       "the harness figure; check the CLI's model support and the rate table")
-        return dataclasses.replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
+        return dataclasses.replace(result, run_usage=observed, session_usage=cumulative,
+                                   cost_usd=amount.micros / 1_000_000)
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         import claude_agent_sdk

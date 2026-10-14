@@ -28,7 +28,7 @@ MAX_BUDGET_STATUS = "error_max_budget_usd"
 DAILY_HEADROOM_STATUS = "daily_headroom_exhausted"
 
 from .contracts import PricingBasis
-from .run_usage import RunUsage
+from .run_usage import ModelUsage, RunUsage
 
 
 _DECLARED_STATUS_KEYS = ("status", "decision")
@@ -266,6 +266,9 @@ class AgentResult:
     stream_usage: dict | None = None
     # Runtime-authored only: structured model output cannot supply accounting.
     run_usage: RunUsage | None = None
+    # Runtime-authored: the session's cumulative per-model counters at this
+    # leg's end (Claude), the baseline its next resumed leg prices from.
+    session_usage: tuple[ModelUsage, ...] = ()
     # Accounting-authored settlement provenance for completion telemetry.
     pricing_basis: PricingBasis | None = None
 

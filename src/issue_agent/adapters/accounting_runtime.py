@@ -34,7 +34,17 @@ from ..domain.review import parse_verdict
 from ..domain.triage import criteria_wanted, offered_blockers, offered_duplicates, parse_steward, parse_triage
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
-from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
+from ..domain.run_usage import (
+    EstimatedRunUsage,
+    MeasuredRunUsage,
+    ModelUsage,
+    bounded_by_rates,
+    parse_snapshot,
+    price_run_usage,
+    snapshot_record,
+    total_usage,
+    usage_since,
+)
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -258,6 +268,7 @@ class AccountingRuntime(AgentRuntime):
         except BaseException:
             self._recover_or_release(run_id)
             raise
+        result = self._resumed_usage(task, result)
         if self.role in LEG_ROLES:
             # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
@@ -289,8 +300,31 @@ class AccountingRuntime(AgentRuntime):
                 **({"tier": tier} if tier else {}),
                 # The effort the plan asked for (a runtime may degrade it, e.g. Claude xhigh off Opus); absent when none was set.
                 **({"effort": task.effort.value} if task.effort is not None else {}),
+                # The session's cumulative usage: the next resumed leg's baseline.
+                **({"session_usage": snapshot_record(result.session_usage)} if result.session_usage else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result, maximum)
+
+    def _resumed_usage(self, task: RuntimePlan, result: AgentResult) -> AgentResult:
+        """A resumed leg's own usage: the session's cumulative counters less
+        those its previous settled leg left. Without that baseline (a leg
+        that ended before a result), or when the counters went backwards, the
+        runtime's upper bound stands (#389)."""
+        if not task.resume or not result.session_usage:
+            return result
+        session = result.session_id or task.resume
+        previous = parse_snapshot(session, self.store.session_usage_snapshot(self.repository, session))
+        delta = usage_since(result.session_usage, previous) if previous is not None else None
+        if delta is None:
+            bound = result.run_usage
+            reason = ("no usage snapshot from the session's previous leg" if previous is None
+                      else "the session's usage counters went backwards")
+            return replace(result, run_usage=replace(bound, detail=f"{reason}; {bound.detail}"[:2048])) \
+                if isinstance(bound, EstimatedRunUsage) else result
+        model = task.model or result.model or "<runtime-default>"
+        samples = delta or (ModelUsage(session, model, TokenUsage(0, 0)),)
+        rates = result.run_usage.rates if result.run_usage is not None else None
+        return replace(result, run_usage=MeasuredRunUsage(samples, rates or self.rate_table))
 
     def _owner(self) -> str:
         return self.owner_id or f"{self.repository}:{self.role}"
@@ -309,8 +343,10 @@ class AccountingRuntime(AgentRuntime):
         card = None
         try:
             if isinstance(observed, (MeasuredRunUsage, EstimatedRunUsage)):
-                usage = total_usage(observed.samples)
                 card = observed.rates or self.rate_table
+                observed = bounded_by_rates(observed, card, maximum)
+                gap = observed.detail if isinstance(observed, EstimatedRunUsage) else ""
+                usage = total_usage(observed.samples)
                 amount = price_run_usage(observed, card)
                 if isinstance(observed, MeasuredRunUsage) and card is not None and all(
                     card.priceable(s.model) for s in observed.samples
@@ -363,7 +399,7 @@ class AccountingRuntime(AgentRuntime):
             from .codex_runner import remove_spend_evidence
 
             remove_spend_evidence(self.spend_evidence_dir, run_id)
-        return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis)
+        return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis, run_usage=observed)
 
     def _caps_armed(self) -> bool:
         return any(

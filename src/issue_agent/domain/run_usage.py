@@ -93,6 +93,64 @@ def reserved_maximum_usage(
     return EstimatedRunUsage(detail, (sample,))
 
 
+# A session's cumulative per-model counters as one leg left them, kept with
+# the leg so the session's next resumed leg can price its own delta (#389).
+_SNAPSHOT_MODELS = 64
+_SNAPSHOT_COUNTER = 10**12
+
+
+def snapshot_record(samples: tuple[ModelUsage, ...]) -> dict[str, list[int]]:
+    return {s.model: [s.usage.input_tokens, s.usage.output_tokens, s.usage.cache_read_tokens,
+                      s.usage.cache_write_tokens] for s in samples}
+
+
+def parse_snapshot(session_id: str, raw: object) -> tuple[ModelUsage, ...] | None:
+    """A recorded snapshot, or None when absent or malformed."""
+    if not isinstance(raw, dict) or not 0 < len(raw) <= _SNAPSHOT_MODELS:
+        return None
+    try:
+        samples = tuple(ModelUsage(session_id, name, TokenUsage(*counters)) for name, counters in raw.items()
+                        if isinstance(counters, list) and len(counters) == 4
+                        and all(type(c) is int and 0 <= c <= _SNAPSHOT_COUNTER for c in counters))
+        _validate_samples(samples)
+    except (ValueError, TypeError):
+        return None
+    return samples if len(samples) == len(raw) else None
+
+
+def usage_since(current: tuple[ModelUsage, ...], previous: tuple[ModelUsage, ...]) -> tuple[ModelUsage, ...] | None:
+    """Per-model usage between two cumulative snapshots of one session, or
+    None when a counter or model went backwards (the counters were reset)."""
+    before = {s.model.strip().casefold(): s.usage for s in previous}
+    now = {s.model.strip().casefold() for s in current}
+    if not set(before) <= now:
+        return None
+    delta: list[ModelUsage] = []
+    for sample in current:
+        prior = before.get(sample.model.strip().casefold(), TokenUsage(0, 0))
+        counters = tuple(a - b for a, b in zip(
+            (sample.usage.input_tokens, sample.usage.output_tokens, sample.usage.cache_read_tokens,
+             sample.usage.cache_write_tokens),
+            (prior.input_tokens, prior.output_tokens, prior.cache_read_tokens, prior.cache_write_tokens)))
+        if min(counters) < 0:
+            return None
+        if any(counters):
+            delta.append(ModelUsage(sample.session_id, sample.model, TokenUsage(*counters, source=sample.usage.source)))
+    return tuple(delta)
+
+
+def bounded_by_rates(observed: RunUsage, table: RateTable | None, maximum: Money) -> RunUsage:
+    """Tokens a model with no rate spent settle at the reserved maximum: a
+    fallback price is never trusted (#389)."""
+    unrated = sorted({s.model for s in observed.samples if table is not None and s.reported_cost is None
+                      and s.usage.total_tokens and not table.priceable(s.model)})
+    if not unrated:
+        return observed
+    first = observed.samples[0]
+    return reserved_maximum_usage(first.session_id, first.model, maximum, first.usage.source,
+                                  f"no harness rate for {', '.join(unrated)[:400]}; charged the reserved maximum")
+
+
 def price_run_usage(observed: RunUsage, table: RateTable | None) -> Money:
     table = observed.rates or table
     currency = table.currency if table is not None else "USD"

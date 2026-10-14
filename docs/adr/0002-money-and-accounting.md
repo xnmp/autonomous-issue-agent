@@ -70,10 +70,18 @@ provider process groups before settlement.
 Claude's result dollars are never charged (#389). On CLI 2.1.294 the result's
 per-model `modelUsage` includes subagents but, like `total_cost_usd`, is
 session-cumulative on resume; its top-level `usage` is the leg's own main loop
-only. A fresh leg prices `modelUsage`; a resumed leg prices `usage` at its main
-model (#287). A resumed leg that started a subagent has no per-leg subagent
-figure: its other models are charged their session-cumulative usage, and
-subagents on the main model go uncounted, as an estimate. Per-message stream counts stay an interrupted leg's estimate only: their
+only (#287). A fresh leg prices `modelUsage`. Each completed leg records the
+session's cumulative `modelUsage` in its `result_json` (`session_usage`); a
+resumed leg prices, per model, its cumulative counters less those of the
+session's latest ended leg that recorded one, exact for subagents too. With no
+such snapshot, or a counter that went backwards, it settles an upper bound as
+an estimate with the reason in its gap: its own `usage` at the main model plus
+the other models' session-cumulative usage, or all of the session-cumulative
+usage when it started a subagent (which may run on the main model). It errs
+high, never low. A leg interrupted before its result records no snapshot, so
+the next leg's delta also covers the interrupted leg's tokens, already charged
+from its stream: an accepted overcharge bounded by that leg's spend.
+Per-message stream counts stay an interrupted leg's estimate only: their
 output counts are placeholders. Missing Claude accounting nevertheless settles
 and releases capacity.
 A normal return supersedes a recovery estimate, including zero recovery after a

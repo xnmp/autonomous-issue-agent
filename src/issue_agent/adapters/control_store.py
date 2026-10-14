@@ -750,6 +750,26 @@ class SQLiteControlStore:
             )
             return True
 
+    def session_usage_snapshot(self, repository: str, session: str) -> object | None:
+        """The cumulative usage snapshot the session's latest settled leg
+        recorded with its result, if any (#389)."""
+        if not session:
+            return None
+        with self._read() as db:
+            rows = db.execute(
+                "SELECT result_json FROM legs WHERE repository=? AND session_id=? AND state='ended' "
+                "AND result_json IS NOT NULL ORDER BY ended_at DESC, rowid DESC LIMIT 64",
+                (canonical_repository(repository), session),
+            ).fetchall()
+        for row in rows:
+            try:
+                snapshot = json.loads(row["result_json"]).get("session_usage")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if snapshot is not None:
+                return snapshot
+        return None
+
     def record_unpaid_leg(
         self, run_id: RunId, *, repository: str, role: str, kind: str, owner_id: str,
         issue: int, number: int, head: str, runtime: str,
