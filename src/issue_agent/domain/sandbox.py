@@ -28,6 +28,8 @@ class Access(Enum):
     THROWAWAY = "overlay"
     # An empty, leg-private directory.
     PRIVATE = "tmpfs"
+    # Host device nodes, usable as on the host.
+    DEVICE = "dev"
 
 
 @dataclass(frozen=True)
@@ -94,11 +96,19 @@ SYSTEM_ROOTS = (
     "/run/current-system", "/run/wrappers", "/run/systemd/resolve",
 )
 
+# GPU render nodes (as Flatpak's `--device=dri`). Xvfb and WebKitGTK load the
+# host's EGL vendor libraries even when rendering in software, and NVIDIA's
+# aborts when it finds no render node, so a native E2E display cannot start.
+DEVICES = ("/dev/dri",)
+
 # Toolchain installs under HOME. Read-only: a leg that could rewrite a compiler
 # or interpreter would poison the operator's own builds outside the sandbox.
+# Cargo's config is among them: its linker and rustflags are part of every
+# artifact's hash, so a leg without it rebuilt a shared CARGO_TARGET_DIR from
+# scratch (tauri probe, 2026-10-14). Its tokens live in credentials.toml.
 HOME_TOOLCHAINS = (
-    ".rustup", ".cargo/bin", ".bun/bin", ".local/bin", ".local/share/uv/python", ".nvm",
-    ".npm-global", ".deno/bin", ".nix-profile", ".cache/ms-playwright",
+    ".rustup", ".cargo/bin", ".cargo/config.toml", ".cargo/config", ".bun/bin", ".local/bin",
+    ".local/share/uv/python", ".nvm", ".npm-global", ".deno/bin", ".nix-profile", ".cache/ms-playwright",
 )
 
 # Download caches: a per-leg overlay. Reads hit the operator's cache; a leg's
@@ -175,10 +185,13 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     required.append(Mount(cwd, writable))
     if facts.git is not None:
         common, own = _normal(facts.git.common_dir), _normal(facts.git.worktree_dir)
-        # The repository's config, hooks and other checkouts' links stay
-        # read-only: the harness runs git in every checkout outside the
-        # sandbox, so a leg that could write them could run code there.
-        required.append(Mount(common, Access.READ_ONLY))
+        # The repository's config, hooks and other checkouts' links never
+        # change on the host: the harness runs git in every checkout outside
+        # the sandbox, so a leg that could write them could run code there. A
+        # fix leg's git still writes beside them (packed-refs.lock on every
+        # commit, a scratch `git worktree add`), so its writes there land in
+        # an overlay that vanishes with the leg (probe, 2026-10-14).
+        required.append(Mount(common, Access.THROWAWAY if facts.writable else Access.READ_ONLY))
         if facts.writable:
             required += [Mount(posixpath.join(common, d), Access.READ_WRITE) for d in ("objects", "refs")]
             required.append(Mount(own, Access.READ_WRITE))
@@ -194,12 +207,18 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     optional += [Mount(posixpath.normpath(p), Access.READ_ONLY, optional=True)
                  for p in facts.search_path if isinstance(p, str) and p.startswith("/") and "\0" not in p]
     optional += [Mount(posixpath.join(home, p), Access.THROWAWAY, optional=True) for p in HOME_CACHES]
+    optional += [Mount(p, Access.DEVICE, optional=True) for p in DEVICES]
     if facts.git is not None and facts.writable:
         optional.append(Mount(posixpath.join(_normal(facts.git.common_dir), "logs"), Access.READ_WRITE,
                               optional=True))
     optional = [m for m in optional if not exposes(m.path, protected)]
 
-    private = [Mount(home, Access.PRIVATE), Mount("/tmp", Access.PRIVATE), Mount("/var/tmp", Access.PRIVATE)]
+    # /tmp/.X11-unix exists, as on a host, so a leg's own Xvfb listens on a
+    # socket file in its private /tmp, not only on the abstract socket every
+    # leg and the host share. /dev/shm is its own tmpfs, as on a host: bwrap's
+    # /dev makes it a plain directory, and tauri's tests rely on the mount.
+    private = [Mount(home, Access.PRIVATE), Mount("/tmp", Access.PRIVATE), Mount("/tmp/.X11-unix", Access.PRIVATE),
+               Mount("/var/tmp", Access.PRIVATE), Mount("/dev/shm", Access.PRIVATE)]
     # One mount per path, the first named winning: required facts over
     # optional conventions. A stable depth sort puts parents first and, at one
     # depth, private directories before binds.

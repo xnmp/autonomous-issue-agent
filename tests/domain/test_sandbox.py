@@ -58,12 +58,22 @@ def test_a_fix_leg_writes_its_checkout_and_publishes():
     assert not {"GH_TOKEN", "GITHUB_TOKEN"} & unset
 
 
-def test_the_harness_runs_git_there_so_git_config_hooks_and_links_stay_read_only():
+def test_the_harness_runs_git_there_so_a_fix_leg_never_changes_git_config_hooks_or_links():
     plan = leg_mount_plan(facts())
 
+    # Writes beside them (packed-refs.lock, a scratch worktree) vanish with the leg.
     for path in (f"{GIT.common_dir}/config", f"{GIT.common_dir}/hooks/post-checkout",
-                 f"{GIT.common_dir}/packed-refs", f"{GIT.common_dir}/worktrees/issue-9/commondir",
-                 f"{GIT.worktree_dir}/commondir", f"{GIT.worktree_dir}/gitdir", f"{WORKTREE}/.git"):
+                 f"{GIT.common_dir}/packed-refs", f"{GIT.common_dir}/worktrees/issue-9/commondir"):
+        assert visible(plan, path) is Access.THROWAWAY, path
+    # Its own checkout's links sit in a directory it writes, so they are read-only.
+    for path in (f"{GIT.worktree_dir}/commondir", f"{GIT.worktree_dir}/gitdir", f"{WORKTREE}/.git"):
+        assert visible(plan, path) is Access.READ_ONLY, path
+
+
+def test_a_reviewer_sees_the_whole_repository_read_only():
+    plan = leg_mount_plan(facts(writable=False))
+
+    for path in (f"{GIT.common_dir}/config", f"{GIT.common_dir}/packed-refs", f"{GIT.worktree_dir}/HEAD"):
         assert visible(plan, path) is Access.READ_ONLY, path
 
 
@@ -99,10 +109,20 @@ def test_toolchains_are_read_only_and_download_caches_are_thrown_away():
     assert visible(plan, "/home/op/.local/share/uv/python/cpython/bin/python3") is Access.READ_ONLY
     assert visible(plan, "/home/op/.cargo/registry/src/crate/lib.rs") is Access.THROWAWAY
     assert visible(plan, "/home/op/.cache/uv/wheels/x.whl") is Access.THROWAWAY
+    assert visible(plan, "/home/op/.cargo/config.toml") is Access.READ_ONLY  # linker and rustflags
     assert visible(plan, "/home/op/.cargo/credentials.toml") is Access.PRIVATE
     assert visible(plan, "/usr/lib/libc.so") is Access.READ_ONLY
     assert visible(plan, "/tmp/scratch") is Access.PRIVATE
     assert visible(plan, "/run/user/1000/bus") is None
+
+
+def test_a_leg_gets_gpu_render_nodes_and_its_own_x_socket_directory_but_no_host_display():
+    plan = leg_mount_plan(facts())
+
+    assert visible(plan, "/dev/dri/renderD128") is Access.DEVICE
+    assert access(plan, "/tmp/.X11-unix") is Access.PRIVATE
+    assert visible(plan, "/tmp/.X11-unix/X0") is Access.PRIVATE  # never the host's socket
+    assert access(plan, "/dev/shm") is Access.PRIVATE  # its own tmpfs, as on a host
 
 
 def test_parents_are_mounted_before_what_they_contain():

@@ -66,6 +66,14 @@ have one; keep your context for reasoning, design and code.
    which replaces the whole body: keep the Acceptance Criteria section and the
    `Closes #` line.
 
+## Your sandbox
+You run under bubblewrap: HOME and `/tmp` are empty and private, there is no
+Docker socket, and writes to the repository's `.git` outside your branch's
+objects and refs (config, a scratch `git worktree add`) vanish when the leg
+ends. Other legs share the X abstract-socket namespace but not `/tmp`, so
+`xvfb-run -a` can pick a display another leg holds: use `xvfb-run -d`, or give
+Xvfb `-nolisten local`.
+
 ## Hard rules
 - Never bypass the repo's git hooks: no `--no-verify`, commit `-n`, `HUSKY=0`,
   or `core.hooksPath` override. Push only when they pass.

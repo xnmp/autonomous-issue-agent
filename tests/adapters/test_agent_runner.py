@@ -624,6 +624,7 @@ class _Sandbox:
 
     def __init__(self, refuse: str = ""):
         self.refuse, self.launches = refuse, []
+        self.launcher = "/usr/bin/bwrap"  # an executable stand-in, set per test
 
     def launch(self, command, *, cwd, env, runtime_state=(), scratch=(), read_only=False):
         from issue_agent.adapters.leg_sandbox import Launch, SandboxRefused
@@ -632,15 +633,17 @@ class _Sandbox:
             raise SandboxRefused(self.refuse)
         self.launches.append({"command": tuple(command), "cwd": cwd, "runtime_state": tuple(runtime_state),
                               "read_only": read_only})
-        return Launch(("/usr/bin/bwrap", "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
+        return Launch((self.launcher, "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
 
 
 def _supervised_cli_runner(tmp_path, monkeypatch, sandbox):
     from issue_agent.adapters.process_supervisor import ProcessSupervisor
 
-    cli = tmp_path / "claude"
-    cli.write_text("#!/bin/sh\n")
-    cli.chmod(0o755)
+    cli, launcher = tmp_path / "claude", tmp_path / "bwrap"
+    for executable in (cli, launcher):
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+    sandbox.launcher = str(launcher)
     monkeypatch.setenv("CLAUDE_BIN", str(cli))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(sys.modules["claude_agent_sdk"], "__file__", str(tmp_path / "sdk" / "__init__.py"),
@@ -661,7 +664,7 @@ def test_a_claude_leg_execs_its_cli_through_the_sandbox_with_its_credential(tmp_
 
     assert result.status == "done"
     env = capture["options"]["env"]
-    assert json.loads(env["ISSUE_AGENT_SUPERVISED_TARGET"]) == ["/usr/bin/bwrap", "--sandboxed", "--",
+    assert json.loads(env["ISSUE_AGENT_SUPERVISED_TARGET"]) == [sandbox.launcher, "--sandboxed", "--",
                                                                 os.path.realpath(cli)]
     assert env["GH_TOKEN"] == "leg-token" and "GH_TOKEN" in env["ISSUE_AGENT_CHILD_ENV_KEYS"].split()
     # The session store `--resume` needs is the CLI's own, for this checkout.

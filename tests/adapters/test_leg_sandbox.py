@@ -108,16 +108,81 @@ def test_a_fix_leg_commits_and_git_answers_github_with_its_one_token(host):
     script = ('echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -qm a && echo committed; '
               'printf "protocol=https\\nhost=github.com\\n\\n" | git credential fill | grep "^password=" ; '
               'echo x >> .git 2>/dev/null || echo link-ro; '
-              f'echo x >> "{host["target"]}/.git/config" 2>/dev/null || echo config-ro; '
-              f'touch "{host["target"]}/.git/hooks/post-checkout" 2>/dev/null || echo hooks-ro; '
-              f'touch "{host["target"]}/.git/commondir" 2>/dev/null || echo common-root-ro')
+              'echo x >> "$(git rev-parse --git-dir)/commondir" 2>/dev/null || echo own-links-ro; '
+              f'printf "[core]\\n\\tfsmonitor = touch /tmp/pwned\\n" >> "{host["target"]}/.git/config"; '
+              f'echo "touch /tmp/pwned" > "{host["target"]}/.git/hooks/post-checkout"; '
+              f'echo /elsewhere > "{host["target"]}/.git/commondir"')
+    hooks = sorted(p.name for p in (host["target"] / ".git/hooks").iterdir())
 
     done = run_leg(sandbox(host), host, script)
 
-    assert done.stdout.split() == ["committed", f"password={FAKE_TOKEN}", "link-ro", "config-ro", "hooks-ro",
-                                   "common-root-ro"]
+    assert done.stdout.split() == ["committed", f"password={FAKE_TOKEN}", "link-ro", "own-links-ro"], done.stderr
+    assert "packed-refs" not in done.stderr  # git writes its lock beside config on every commit
     assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["target"]).strip() == "a"
+    # The leg's writes to what the harness's git reads outside vanished with it.
     assert "fsmonitor" not in (host["target"] / ".git/config").read_text()
+    assert sorted(p.name for p in (host["target"] / ".git/hooks").iterdir()) == hooks
+    assert not (host["target"] / ".git/commondir").exists()
+    assert _git("rev-parse", "HEAD", cwd=host["worktree"]).strip()
+
+
+@needs_bwrap
+def test_git_in_a_leg_never_starts_maintenance_on_the_object_store_other_checkouts_share(host):
+    commit = "echo {0} > {0} && git add {0} && GIT_TRACE=1 git -c user.name=t -c user.email=t@t commit -qm {0}"
+
+    done = run_leg(sandbox(host), host, commit.format("inside"))
+    outside = subprocess.run(["/bin/sh", "-c", commit.format("outside")], cwd=host["worktree"],
+                             capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    assert "maintenance run" not in done.stderr
+    assert "maintenance run" in outside.stderr  # the control: git's default starts it after a commit
+
+
+@needs_bwrap
+def test_a_scratch_worktree_works_inside_a_fix_leg_and_leaves_no_trace(host):
+    before = _git("worktree", "list", "--porcelain", cwd=host["target"])
+
+    done = run_leg(sandbox(host), host, 'git worktree add -q --detach /tmp/base HEAD && git -C /tmp/base log -1 --format=%s')
+
+    assert done.stdout.split() == ["init"], done.stderr
+    assert _git("worktree", "list", "--porcelain", cwd=host["target"]) == before
+
+
+@needs_bwrap
+def test_dev_shm_is_its_own_mount_inside_a_leg(host):
+    # tauri's native-directory and recovery tests require it (probe, 2026-10-14).
+    done = run_leg(sandbox(host), host, 'stat -c %m /dev/shm; touch /dev/shm/x && echo writable')
+
+    assert done.stdout.split() == ["/dev/shm", "writable"], done.stderr
+
+
+_XVFB = shutil.which("Xvfb")
+_XVFB_RUN = shutil.which("xvfb-run")
+_XPROP = shutil.which("xprop")
+
+
+@needs_bwrap
+@pytest.mark.skipif(not (_XVFB and _XVFB_RUN and _XPROP), reason="no Xvfb, xvfb-run and xprop on this host")
+def test_two_legs_each_start_their_own_virtual_display(host):
+    # Tauri's native E2E runs under xvfb-run. Xvfb aborted in the sandbox
+    # without a GPU render node (NVIDIA's EGL vendor library) or a
+    # /tmp/.X11-unix to listen in; legs share the abstract socket namespace,
+    # so `-d` is what keeps two legs' displays apart.
+    first = "xvfb-run -d -s '-screen 0 320x240x24' sh -c 'xprop -root -f LEG 8s -set LEG first && echo $DISPLAY && sleep 6'"
+    second = "sleep 2; xvfb-run -d -s '-screen 0 320x240x24' sh -c 'echo $DISPLAY; xprop -root LEG'"
+    box = sandbox(host)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8"}
+    legs = [box.launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env) for script in (first, second)]
+    running = [subprocess.Popen(leg.argv, env={**env, **leg.env}, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True) for leg in legs]
+    (one, err_one), (two, err_two) = (p.communicate(timeout=60) for p in running)
+
+    assert running[0].returncode == 0, err_one
+    assert running[1].returncode == 0, err_two
+    display_one, display_two = one.split()[0], two.split()[0]
+    assert display_one.startswith(":") and display_two.startswith(":") and display_one != display_two
+    assert "first" not in two  # the second leg's display is its own
 
 
 @needs_bwrap
@@ -295,6 +360,18 @@ def test_a_missing_bwrap_is_named_and_refuses_every_launch(host):
 
     assert "not installed" in (box.preflight() or "")
     assert box.posture().startswith("unavailable:")
+    with pytest.raises(SandboxRefused):
+        box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+
+
+def test_a_bwrap_too_old_for_overlays_is_named_and_refuses_every_launch(host):
+    def old(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 1, "", "bwrap: Unknown option --overlay-src\n")
+
+    box = LegSandbox(home=str(host["home"]), repository=str(host["target"]), writable=True,
+                     which=lambda name, **_: f"/usr/bin/{name}", run=old)
+
+    assert "0.10 or newer" in (box.preflight() or "")
     with pytest.raises(SandboxRefused):
         box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
 

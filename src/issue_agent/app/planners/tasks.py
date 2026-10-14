@@ -408,11 +408,9 @@ def build_rebase_task(
 
 
 # ── review side ─────────────────────────────────────────────────────────────
-# Read-mostly reviewer toolset.
-REVIEW_TOOLS = (
-    "Read", "Bash(git diff *)", "Bash(gh pr diff *)", "Bash(gh pr view *)",
-    "Bash(cat *)", "Bash(ls *)",
-)
+# Read-mostly reviewer toolset. No `gh`: a review leg holds no GitHub
+# credential (#413); its prompt carries the issue and it diffs locally.
+REVIEW_TOOLS = ("Read", "Bash(git diff *)", "Bash(cat *)", "Bash(ls *)")
 REVIEW_DENY = ("Edit", "Write")
 
 

@@ -7,7 +7,8 @@ operator reference.
 ## First run
 
 Prerequisites: `git`, `gh`, `jq`, `uv`, `bwrap` (bubblewrap 0.10 or newer, with
-unprivileged user namespaces; Linux only), and at least one configured runtime
+unprivileged user namespaces; Linux only; Ubuntu 24.04 and Debian 12 ship older
+ones, so build a release as CI does), and at least one configured runtime
 (`claude` or `codex`).
 
 ```bash

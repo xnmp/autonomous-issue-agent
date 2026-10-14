@@ -73,13 +73,25 @@ jobs:
       # real-sandbox tests skip and a regression in the boundary ships unseen.
       # Ubuntu's AppArmor blocks the unprivileged user namespaces bwrap needs.
       # This runner VM is ephemeral, so lifting that restriction affects only
-      # this job, never the operator's machine.
+      # this job, never the operator's machine. Ubuntu 24.04's bubblewrap is
+      # 0.9.0, older than the overlays legs need (0.10), so build a pinned
+      # upstream release instead.
       - name: Enable bubblewrap
+        env:
+          BWRAP_TAG: v0.11.2
+          BWRAP_COMMIT: 1b80120ef26a28e065e67f89bfef873f13bdd317
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get install -y --no-install-recommends meson ninja-build libcap-dev
+          src="$RUNNER_TEMP/bubblewrap"
+          git clone -q --depth 1 --branch "$BWRAP_TAG" https://github.com/containers/bubblewrap.git "$src"
+          test "$(git -C "$src" rev-parse HEAD)" = "$BWRAP_COMMIT"
+          meson setup -Dman=disabled -Dtests=false -Dselinux=disabled "$src/build" "$src"
+          ninja -C "$src/build"
+          sudo install -m 0755 "$src/build/bwrap" /usr/local/bin/bwrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          bwrap --ro-bind / / --unshare-all true
+          bwrap --version
+          bwrap --ro-bind / / --unshare-all --tmpfs /tmp --overlay-src /usr --tmp-overlay /tmp/o true
 
       - name: Test resource capacity
         run: |

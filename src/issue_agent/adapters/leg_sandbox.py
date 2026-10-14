@@ -38,9 +38,11 @@ _GITFILE_LIMIT = 4096
 
 # Environment git config: never written into the checkout. The empty helper
 # drops any helper /etc/gitconfig names; a publishing leg then answers GitHub
-# from $GH_TOKEN. push.default=current: the repository config is read-only in
-# the sandbox, so `git push -u` cannot record an upstream for the next leg.
-_GIT_CONFIG = (("credential.helper", ""),)
+# from $GH_TOKEN. push.default=current: what a leg writes to the repository
+# config vanishes with it, so `git push -u` cannot record an upstream for the
+# next leg. No auto-maintenance: it would repack and prune the object store
+# other checkouts share; the harness's own git, outside the sandbox, keeps it.
+_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"))
 _PUBLISH_GIT_CONFIG = (
     ("credential.https://github.com.helper",
      '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'),
@@ -132,6 +134,8 @@ def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
         return ("--ro-bind", path, path)
     if mount.access is Access.READ_WRITE:
         return ("--bind", path, path)
+    if mount.access is Access.DEVICE:
+        return ("--dev-bind", path, path)
     return ("--overlay-src", path, "--tmp-overlay", path) if os.path.isdir(path) else ()
 
 
@@ -233,6 +237,10 @@ class LegSandbox:
             return f"bubblewrap probe failed to run ({type(exc).__name__})"
         if done.returncode != 0:
             detail = (done.stderr or "").strip().splitlines()
+            if any("Unknown option" in line for line in detail):
+                # Ubuntu 24.04 ships 0.9.0, which predates the overlays.
+                return (f"bubblewrap is too old ({detail[-1][:120]}); legs need 0.10 or newer for "
+                        "--overlay-src")
             return (f"bubblewrap cannot create a sandbox here (exit {done.returncode}: "
                     f"{(detail[-1] if detail else 'no message')[:200]}); unprivileged user namespaces "
                     "must be enabled")

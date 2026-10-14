@@ -41,8 +41,10 @@ The leg sandbox (#413, 2026-10-14) makes credential placement enforceable.
 Every paid leg, Claude or Codex, runs under bubblewrap with a private HOME and
 PID namespace and only the mounts `domain/sandbox.py` plans from facts the
 harness holds (checkout, git metadata, runtime binary and session store,
-toolchains on PATH). The repository's config, hooks and checkout links stay
-read-only, because the harness runs git in every checkout outside the sandbox.
+toolchains on PATH). The repository's config, hooks and checkout links never
+change on the host, because the harness runs git in every checkout outside the
+sandbox: a review leg sees them read-only, a fix leg through an overlay its
+writes vanish with.
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
 the act layer. Paid legs are refused when bwrap is missing or cannot create a
