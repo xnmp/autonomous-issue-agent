@@ -15,7 +15,7 @@ from issue_agent.adapters.journal import Journal, JournalingRuntime
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
-from issue_agent.domain.contracts import Money, TokenUsage, UsageSource
+from issue_agent.domain.contracts import TokenUsage, UsageSource
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import ModelRates, RateTable
 from issue_agent.domain.run_usage import EstimatedRunUsage, MeasuredRunUsage, ModelUsage
@@ -47,17 +47,11 @@ def test_interrupted_unusaged_request_settles_zero_without_the_reserved_maximum(
     [
         ("estimated", "estimate"),
         ("measured", "configured_rate_card"),
-        ("reported", "provider_reported"),
         ("streamed", "estimate"),
     ],
 )
 def test_journalled_run_cost_matches_the_committed_settlement(tmp_path, usage_kind, expected_basis):
-    sample = ModelUsage(
-        ROOT,
-        "sol",
-        TokenUsage(100, 0, source=UsageSource.ROLLOUT),
-        reported_cost=Money("USD", 200) if usage_kind == "reported" else None,
-    )
+    sample = ModelUsage(ROOT, "sol", TokenUsage(100, 0, source=UsageSource.ROLLOUT))
     observed = (
         EstimatedRunUsage("one request has no receipt", (sample,), RATES)
         if usage_kind == "estimated"

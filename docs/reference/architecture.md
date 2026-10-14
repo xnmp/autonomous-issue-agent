@@ -155,13 +155,14 @@ count toward daily and per-issue lifetime caps; they are not attempts, so
 derive restarts attempt counts from GitHub. A downgrade is refused: older
 binaries do not recognise the new schema.
 
-Completed legs settle from the sum of usable request receipts, otherwise streamed
-usage at the captured rate card, otherwise zero for interrupted/unusable requests.
-Partial evidence produces `basis=estimate`;
-the reserved maximum is never charged as an estimate.
+Completed legs, Claude and Codex alike, settle their per-model token usage at the
+captured rate card; a runtime's own dollar figure is never charged (#389).
+Interrupted legs price streamed usage at the same card, otherwise zero.
+Partial evidence produces `basis=estimate`; malformed counters, or tokens spent
+by a model the card cannot price, settle at the reserved maximum as an estimate.
 Live work retains its reservation and stops its process group on a metering
 fault that prevents cap enforcement. See [ADR 0002](../adr/0002-money-and-accounting.md)
-for runtime provenance, Claude's remaining cumulative-cost gap, and deferred late
+for runtime provenance, Claude's resumed-session usage rules, and deferred late
 corrections.
 The coordinator (`app/recovery.py`) walks each stale reservation in one fixed
 order: a live lease preserves it; otherwise surviving request evidence settles

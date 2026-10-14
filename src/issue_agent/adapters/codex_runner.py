@@ -39,6 +39,7 @@ from ..domain.run_usage import (
     ModelUsage,
     RunUsage,
     price_run_usage,
+    reserved_maximum_usage as reserved_maximum,
 )
 from ..domain.outcome import (
     AgentResult,
@@ -1046,13 +1047,9 @@ def _is_rate_limited(stderr: str) -> bool:
 
 
 def reserved_maximum_usage(session_id: str, model: str, max_budget_usd: float, detail: str) -> EstimatedRunUsage:
-    """Malformed counters settle at the reservation's maximum: the leg's real
-    spend is unknown but bounded by it, so the caps never see less."""
-    charge = Money.from_major("USD", max_budget_usd)
-    sample = ModelUsage(session_id or "unknown-session", model.strip() or "<runtime-default>",
-                        TokenUsage(0, 0, source=UsageSource.ROLLOUT), reported_cost=charge)
-    return EstimatedRunUsage(f"rollout counters malformed ({detail[:200]}); charged the reserved maximum",
-                             (sample,))
+    """Malformed rollout counters settle at the reservation's maximum."""
+    return reserved_maximum(session_id, model, Money.from_major("USD", max_budget_usd), UsageSource.ROLLOUT,
+                            f"rollout counters malformed ({detail[:200]}); charged the reserved maximum")
 
 
 def _malformed_counters(detail: str, session_id: str, usage: dict | None) -> AgentResult:

@@ -25,6 +25,9 @@ from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.contracts import Money
 from ..domain.pricing import (
+    CLAUDE_ALIASES,
+    CLAUDE_CACHE_WRITE_MULTIPLIER,
+    CLAUDE_DEFAULT_MODEL_RATES,
     BudgetPolicy,
     ModelRates,
     RateTable,
@@ -145,11 +148,13 @@ class HarnessConfig:
     # Wall cap per session: a stream limping after suspend/resume resets the
     # idle clock forever (FAILURE-MODES #60). 0 disables.
     agent_max_runtime: float = _knob(2700.0, env="AGENT_MAX_RUNTIME_SECONDS")
-    # USD/MTok used when a provider reports no billed cost. Synthetic on a
-    # subscription, but the quota is real: these let the spend caps bound
-    # token volume. `CODEX_COST_PER_MTOK='model=IN/OUT[/CACHED_IN],...'` prices
-    # per model (#43); cached input defaults to a tenth of input and must be
-    # positive when given (#89). Unnamed models use the two scalars.
+    # USD/MTok the harness prices tokens at. Synthetic on a subscription, but
+    # the quota is real: these let the spend caps bound token volume.
+    # `CODEX_COST_PER_MTOK='model=IN/OUT[/CACHED_IN],...'` prices per model
+    # (#43) and wins over the shipped Codex and Claude rates; cached input
+    # defaults to a tenth of input and must be positive when given (#89).
+    # Unnamed Codex models use the two scalars; an unnamed Claude model has
+    # no price and is refused admission (#389).
     codex_cost_per_mtok_in: float = _knob(5.0)
     codex_cost_per_mtok_out: float = _knob(30.0)
     codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = _knob((), coerce="rate_table")
@@ -219,6 +224,15 @@ class HarnessConfig:
         if any(cap > 0 for cap in caps) and not self.codex_budget_priceable:
             errors.append("armed spend caps require positive input/output pricing; "
                           "set CODEX_COST_PER_MTOK_IN/OUT or disable every spend cap")
+        # Admission refuses a Claude leg on a model with no harness rate (#389):
+        # refuse the configuration instead of parking every item it dispatches.
+        card = rate_table(self, RuntimeName.CLAUDE.value) if any(cap > 0 for cap in caps) else None
+        routes = (*(self.fix_route(t) for t in TIER_LADDER), *(self.review_route(t) for t in (None, *TIER_LADDER)),
+                  self.triage_route(), self.steward_route())
+        if card is not None and (unrated := sorted({model for runtime, model, _ in routes if model
+                                                    and runtime is RuntimeName.CLAUDE and not card.priceable(model)})):
+            errors.append(f"armed spend caps need a harness rate for every Claude model; {', '.join(unrated)} has "
+                          "none: add it to CODEX_COST_PER_MTOK or disable every spend cap")
         return tuple(errors)
 
     def _route_specs(self) -> tuple[tuple[str, str], ...]:
@@ -332,21 +346,35 @@ def _route(spec: str) -> ModelRoute | None:
 
 def rate_table(cfg: HarnessConfig, runtime_name: str) -> RateTable | None:
     """The one rate card the live budget kill, settlement and recovery price
-    with. Codex also carries the shipped per-model defaults; other runtimes
-    price synthetically from the configured rates alone."""
+    with. Codex carries its shipped per-model defaults and prices unnamed
+    models at the scalar rates. Claude carries its list rates and prices no
+    unnamed model: a CLI's fallback price for a model newer than it is never
+    trusted (#389), so an unrated model blocks admission instead."""
     micros = usd_per_million_to_micros
+    cached = dict(cfg.codex_cost_per_mtok_cached_in)
+    codex = runtime_name == RuntimeName.CODEX.value
     try:
-        fallback = ModelRates(micros(cfg.codex_cost_per_mtok_in), micros(cfg.codex_cost_per_mtok_out),
-                              micros(cfg.codex_cost_per_mtok_in / 10), micros(cfg.codex_cost_per_mtok_in))
-        cached = dict(cfg.codex_cost_per_mtok_cached_in)
-        codex = runtime_name == RuntimeName.CODEX.value
-        rates = {
-            model: ModelRates(micros(rate_in), micros(rate_out),
-                              micros(cached.get(model, default_cache_read_rate(model, rate_in))),
-                              micros(default_cache_write_rate(model, rate_in)))
-            for model, rate_in, rate_out in (
-                with_default_model_rates(cfg.codex_cost_per_mtok) if codex else cfg.codex_cost_per_mtok)
-        }
+        if codex:
+            fallback: ModelRates | None = ModelRates(
+                micros(cfg.codex_cost_per_mtok_in), micros(cfg.codex_cost_per_mtok_out),
+                micros(cfg.codex_cost_per_mtok_in / 10), micros(cfg.codex_cost_per_mtok_in))
+            rates = {
+                model: ModelRates(micros(rate_in), micros(rate_out),
+                                  micros(cached.get(model, default_cache_read_rate(model, rate_in))),
+                                  micros(default_cache_write_rate(model, rate_in)))
+                for model, rate_in, rate_out in with_default_model_rates(cfg.codex_cost_per_mtok)
+            }
+        else:
+            fallback = None
+            # Operator rows win over the shipped list rates, so a new model is
+            # priceable before the defaults catch up.
+            rows = {model: (rate_in, rate_out, read) for model, rate_in, rate_out, read in CLAUDE_DEFAULT_MODEL_RATES}
+            rows.update({model: (rate_in, rate_out, cached.get(model, default_cache_read_rate(model, rate_in)))
+                         for model, rate_in, rate_out in cfg.codex_cost_per_mtok})
+            rows.update({alias: rows[model] for alias, model in CLAUDE_ALIASES if alias not in rows})
+            rates = {model: ModelRates(micros(rate_in), micros(rate_out), micros(read),
+                                       micros(rate_in * CLAUDE_CACHE_WRITE_MULTIPLIER))
+                     for model, (rate_in, rate_out, read) in rows.items()}
     except ValueError:
         return None
     # Shipped defaults change without an overlay edit, so a receipt names the
@@ -354,10 +382,11 @@ def rate_table(cfg: HarnessConfig, runtime_name: str) -> RateTable | None:
     version = hashlib.sha256(json.dumps({
         "config": cfg.config_version,
         "rates": {model.strip().casefold(): asdict(value) for model, value in rates.items()},
-        "fallback": asdict(fallback),
+        "fallback": asdict(fallback) if fallback is not None else None,
     }, sort_keys=True).encode()).hexdigest()[:16]
-    card = "codex-config" if codex else f"{runtime_name}-synthetic-config"
-    return RateTable(card, version, "USD", rates, UnknownModelPolicy.USE_FALLBACK, fallback)
+    if fallback is not None:
+        return RateTable("codex-config", version, "USD", rates, UnknownModelPolicy.USE_FALLBACK, fallback)
+    return RateTable(f"{runtime_name}-list-rates", version, "USD", rates, UnknownModelPolicy.REJECT)
 
 
 def supervision_dir(cfg: HarnessConfig, role: str) -> str:

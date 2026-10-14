@@ -11,6 +11,16 @@ carry source provenance. Charges declare their basis:
 `provider_reported`, `configured_rate_card`, `estimate`, `reconciled`,
 `synthetic`, or `learned_estimate`; quota is separate from money.
 
+Amended 2026-10-14 (#389): no leg settles on a runtime's own dollar figure.
+Claude legs, like Codex legs, price their token usage per model at the
+harness rate card; the CLI's `total_cost_usd` is a logged cross-check only.
+With caps armed, a configured Claude model the card cannot price fails config
+validation and a plan naming one is refused admission; tokens an unrated model
+spent anyway (an unpinned default, a subagent) settle at the reserved maximum,
+completed or interrupted. Haiku 5.5 is priced at its long-prompt tier, since
+usage is per leg rather than per request. `provider_reported` remains only on
+historical rows.
+
 Every paid run reserves its quoted maximum transactionally before execution.
 Repository, global, and issue limits are checked in the same SQLite transaction.
 A returned leg always settles from usable receipts and cumulative usage at the
@@ -57,12 +67,15 @@ rewrites an immutable return. Running work, live leases and reservations proven
 never launched retain their existing recovery rules. Forced shutdown still reaps
 provider process groups before settlement.
 
-Claude's positive result dollars remain the legacy cumulative session estimate.
-Its per-message input/cache counts can be deduplicated by `message_id`, but
-per-message output counts are placeholders, result usage excludes subagents,
-and background text forwarding is optional. Correcting resumed/forked Claude cost
-(#287) requires whole-tree per-request evidence; this change does not claim that
-correction. Missing Claude accounting nevertheless settles and releases capacity.
+Claude's result dollars are never charged (#389). On CLI 2.1.294 the result's
+per-model `modelUsage` includes subagents but, like `total_cost_usd`, is
+session-cumulative on resume; its top-level `usage` is the leg's own main loop
+only. A fresh leg prices `modelUsage`; a resumed leg prices `usage` at its main
+model (#287). A resumed leg that started a subagent has no per-leg subagent
+figure: its other models are charged their session-cumulative usage, and
+subagents on the main model go uncounted, as an estimate. Per-message stream counts stay an interrupted leg's estimate only: their
+output counts are placeholders. Missing Claude accounting nevertheless settles
+and releases capacity.
 A normal return supersedes a recovery estimate, including zero recovery after a
 PR-repair unreturned acknowledgment. Charge origin (`recovery_estimate` or
 `normal_return`) is typed and persisted independently of pricing basis. A normal

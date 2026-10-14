@@ -48,6 +48,8 @@ class MeasuredRunUsage:
         _validate_samples(self.samples)
         if not self.samples:
             raise ValueError("measured run usage cannot infer a free run from no evidence")
+        if any(s.reported_cost is not None for s in self.samples):
+            raise ValueError("measured usage is priced from its tokens; a fixed charge is an estimate")
         if self.rates is not None and not isinstance(self.rates, RateTable):
             raise ValueError("run pricing requires a frozen rate table")
 
@@ -78,6 +80,17 @@ def total_usage(samples: tuple[ModelUsage, ...]) -> TokenUsage:
         sum(s.usage.cache_write_tokens for s in samples),
         samples[0].usage.source if samples else TokenUsage(0, 0).source,
     )
+
+
+def reserved_maximum_usage(
+    session_id: str, model: str, maximum: Money, source: UsageSource, detail: str,
+) -> EstimatedRunUsage:
+    """A leg whose spend cannot be priced settles at its reservation's
+    maximum: the real spend is unknown but bounded by it, so the caps never
+    see less."""
+    sample = ModelUsage(session_id or "unknown-session", model.strip() or "<runtime-default>",
+                        TokenUsage(0, 0, source=source), reported_cost=maximum)
+    return EstimatedRunUsage(detail, (sample,))
 
 
 def price_run_usage(observed: RunUsage, table: RateTable | None) -> Money:

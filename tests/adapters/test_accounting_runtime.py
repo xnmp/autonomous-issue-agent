@@ -12,9 +12,10 @@ from issue_agent.adapters.accounting_runtime import AccountingRuntime, _default_
 from issue_agent.adapters.codex_runner import CodexRunner, spend_evidence_path, write_spend_evidence
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.contracts import Money, RunId
+from issue_agent.domain.contracts import Money, RunId, TokenUsage
 from issue_agent.domain.outcome import AgentResult, DAILY_HEADROOM_STATUS, ExitReason, MAX_BUDGET_STATUS
 from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable, UnknownModelPolicy
+from issue_agent.domain.run_usage import MeasuredRunUsage, ModelUsage
 
 
 def _policy(maximum=2_000_000):
@@ -177,13 +178,13 @@ _ARMED, _CAPS_OFF, _UNPRICED = "armed", "caps-off", "unpriced"
         # ...and an explicit unpriced opt-out (no rate card) still reserves and settles.
         (AgentResult(False, status="untracked", cost_usd=0, usage=None), "codex", _UNPRICED, (0, "estimate")),
         (AgentResult(False, status="ok", cost_usd=0, session_id="subscription"), "claude", _UNPRICED, (0, "estimate")),
-        # Valid provider dollars survive malformed token telemetry; unusable ones
-        # fall back to the stream estimate.
+        # A runtime's own dollar figure is never priced (#389): without usable
+        # tokens a leg settles a marked zero estimate, with them the tokens price.
         (
             AgentResult(False, status="done", cost_usd=1.25, usage={"input_tokens": "bad"}),
             "claude",
             _ARMED,
-            (1_250_000, "provider_reported"),
+            (0, "estimate"),
         ),
         *(
             (AgentResult(False, status="done", cost_usd=bad, stream_usage=_STREAM), "claude", _ARMED, (800, "estimate"))
@@ -457,7 +458,9 @@ def test_fix_admission_refusal_is_a_daily_wait_only_for_daily_caps(tmp_path, cap
 
 
 def test_a_completed_leg_settles_and_the_daily_cap_gates_with_no_event_log_or_outbox(tmp_path) -> None:
-    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1.25, session_id="receipt"))
+    # 250k input tokens at the fallback $5/MTok: $1.25.
+    tokens = MeasuredRunUsage((ModelUsage("receipt", "gpt-test", TokenUsage(250_000, 0)),))
+    runtime = Runtime(AgentResult(False, status="ok", session_id="receipt", run_usage=tokens))
     wrapper, store = _wrapper(tmp_path, runtime)
 
     settled = _work(wrapper, model="gpt-test")

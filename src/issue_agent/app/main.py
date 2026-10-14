@@ -25,11 +25,12 @@ from ..adapters.github import GitHubGateway, Identity
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from ..adapters.systemd_notify import SystemdNotifier
 from ..adapters.worktree import Worktrees
+from ..domain.agent_task import RuntimeName
 from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
 from ..domain.recovery import RecoveryTrigger
 from ..domain.repository import canonical_repository
-from .config import HarnessConfig, from_env, render_agent_md, supervision_dir
+from .config import HarnessConfig, from_env, rate_table, render_agent_md, supervision_dir
 from .fix import compose_fix_daemon
 from .review import compose_review_daemon
 from .review_identity import review_identity as _app_identity
@@ -150,6 +151,7 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
         log=log, debug=env.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
         idle_timeout=cfg.agent_idle_timeout or None, max_runtime=cfg.agent_max_runtime or None,
         process_supervisor=ProcessSupervisor(supervision_dir(cfg, role)),
+        rate_table=rate_table(cfg, RuntimeName.CLAUDE.value),
     )
     if role == "fix":
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
