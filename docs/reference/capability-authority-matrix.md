@@ -15,11 +15,9 @@ What a leg sees (`domain/sandbox.py`):
 
 | Visible | Access |
 |---|---|
-| its checkout; for a fix leg also the repository's `objects/`, `refs/`, `logs/` and its own `worktrees/<name>/` | fix: read-write; review/light: read-only |
-| the repository's `.git` (config, hooks, other checkouts' links), but for objects, refs and reflogs | fix: per-leg overlay (git's lock files, `push -u`'s config and a scratch `git worktree add` work; nothing reaches the host); review/light: read-only |
-| the repository's `objects/`, `refs/`, `logs/` | fix: read-write, live (the host's ref changes and lock files are the leg's); review/light: read-only |
-| the repository's `packed-refs` (created empty when absent) | read-only as of launch (a leg's `pack-refs` fails instead of pruning the host's loose refs; the launch sets the repository never to pack refs) |
-| the checkout's `.git` link and its own `commondir`, `gitdir` and `config.worktree` (the harness's git reads it as config where `extensions.worktreeConfig` is on; emptied at every launch, since the harness sets nothing there) | read-only |
+| its checkout: a fix leg's is a clone of its own (`clone --reference`), with its own refs, packed-refs, reflogs and new objects; a review leg's is a worktree pinned at the reviewed head | fix: read-write; review/light: read-only |
+| a fix clone's `config`, `hooks/` and `commondir` (written `.`, the clone itself, at every launch: git follows a commondir in any gitdir, and the harness runs git in the clone outside the sandbox); its `.git` is a mount point the leg cannot replace | read-only (`push -u` and `branch -D` still succeed, printing that config is unwritable; residuals §2) |
+| the repository's object store, which a fix clone borrows (`objects/info/alternates`, checked at launch to name exactly it); for a review worktree, the repository's whole `.git` | read-only (GIT-OBJECTS closed: review checkouts read these objects); the repository's refs, packed-refs and config are not visible to a fix leg |
 | `/dev/shm` | its own empty tmpfs |
 | the runtime binary; `/usr`, `/etc` (whole: operator secrets live in HOME, root-only files stay unreadable), `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.cargo/config.toml` (its linker and rustflags hash every artifact in a shared `CARGO_TARGET_DIR`), `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |
 | `~/.cargo/registry`, `~/.cargo/git`, `~/.cache/uv`, `~/.bun/install/cache`, `~/.npm` | per-leg overlay (writes discarded) |
@@ -35,9 +33,8 @@ sessions), state and control dirs (SQLite), other checkouts' files, other
 repositories, `/run` (D-Bus, agent and Docker sockets; a bus on an abstract
 socket stays reachable, residuals §1.1), the host's X and Wayland sockets, and
 host processes
-(`--unshare-pid`, so no `/proc/<daemon>/environ`). Git in a leg runs no
-auto-maintenance (`gc.auto=0`, `maintenance.auto=false` in its environment), so
-it never repacks the object store other checkouts share.
+(`--unshare-pid`, so no `/proc/<daemon>/environ`). Git in a fix leg keeps its
+own maintenance: a gc in a clone repacks and prunes only the clone's own objects.
 
 | Concern | Authority | Failure posture |
 |---|---|---|

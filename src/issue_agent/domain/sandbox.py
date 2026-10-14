@@ -43,12 +43,11 @@ class Mount:
 
 @dataclass(frozen=True)
 class GitLink:
-    """A checkout's git metadata, validated by the adapter against the target
-    repository: `common_dir` is the repository's `.git`, `worktree_dir` this
-    checkout's `<common>/worktrees/<name>`."""
+    """Git data outside the checkout that the checkout reads, validated by the
+    adapter against the target repository: a review worktree's repository
+    `.git`, or the repository's object store a fix clone borrows."""
 
-    common_dir: str
-    worktree_dir: str
+    shared: str
 
 
 @dataclass(frozen=True)
@@ -187,33 +186,20 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
                                                                  *facts.scratch)]
     required.append(Mount(cwd, writable))
     if facts.git is not None:
-        common, own = _normal(facts.git.common_dir), _normal(facts.git.worktree_dir)
-        # The repository's config, hooks and other checkouts' links never
-        # change on the host: the harness runs git in every checkout outside
-        # the sandbox, so a leg that could write them could run code there. A
-        # fix leg's git still writes beside them (packed-refs.lock on every
-        # commit, config on `push -u`, a scratch `git worktree add`), so its
-        # writes there land in an overlay that vanishes with the leg (probe,
-        # 2026-10-14).
-        required.append(Mount(common, Access.THROWAWAY if facts.writable else Access.READ_ONLY))
+        # Read-only to every leg: review checkouts read these objects, and git
+        # does not re-hash on read (GIT-OBJECTS, closed by fix clones).
+        required.append(Mount(_normal(facts.git.shared), Access.READ_ONLY))
         if facts.writable:
-            # Objects, loose refs and reflogs are the host's, live, locks included.
-            required += [Mount(posixpath.join(common, d), Access.READ_WRITE) for d in ("objects", "refs")]
-            # packed-refs is read-only as of launch: git replaces it by rename,
-            # which the overlay would keep private, so a leg's `git pack-refs`
-            # would prune the host's loose refs and keep the packed copy. The
-            # launch sets the repository never to pack refs
-            # (`leg_sandbox._LOOSE_REFS`): a host pack moved a running leg's
-            # branch out of the live refs/ and the leg lost it (tauri #1106,
-            # 2026-10-15).
-            required.append(Mount(posixpath.join(common, "packed-refs"), Access.READ_ONLY))
-            required.append(Mount(own, Access.READ_WRITE))
-            # Its own links and config.worktree, which the harness's git reads
-            # as repository config (hooksPath, fsmonitor) wherever the repository
-            # enables extensions.worktreeConfig, stay read-only.
-            required += [Mount(posixpath.join(own, f), Access.READ_ONLY)
-                         for f in ("commondir", "gitdir", "config.worktree")]
-            required.append(Mount(posixpath.join(cwd, ".git"), Access.READ_ONLY))
+            # A fix leg works in its own clone, so its refs, packed-refs and
+            # new objects are its own (a host ref pack once hid a running
+            # leg's branch, tauri #1106). The harness runs git there outside
+            # the sandbox, so what that git obeys stays as the harness made it:
+            # config, hooks, and a commondir naming the clone itself (git
+            # follows one in any gitdir). `.git` is a mount point the leg
+            # cannot swap for a link.
+            dot = posixpath.join(cwd, ".git")
+            required += [Mount(dot, Access.READ_WRITE),
+                         *(Mount(posixpath.join(dot, name), Access.READ_ONLY) for name in ("config", "hooks", "commondir"))]
     for mount in required:
         if exposed := exposes(mount.path, protected):
             raise UnsafeMount(f"{mount.access.value} mount {mount.path} would expose {exposed}")
@@ -226,9 +212,6 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     optional += [Mount(posixpath.join(home, p), Access.THROWAWAY, optional=True) for p in HOME_CACHES]
     optional += [Mount(p, Access.DEVICE, optional=True) for p in facts.devices
                  if isinstance(p, str) and _RENDER_NODE.fullmatch(p)]
-    if facts.git is not None and facts.writable:
-        optional.append(Mount(posixpath.join(_normal(facts.git.common_dir), "logs"), Access.READ_WRITE,
-                              optional=True))
     optional = [m for m in optional if not exposes(m.path, protected)]
 
     # /tmp/.X11-unix exists, as on a host, so a leg's own Xvfb listens on a

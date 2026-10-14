@@ -32,25 +32,8 @@ class FakeGit:
         return GitResult(0, "")
 
 
-def _adds(fg):
-    return [args for args, _cwd in fg.calls if args[:2] == ["worktree", "add"]]
-
-
 def _deleted_branch(git) -> bool:
     return any(args[:2] == ["branch", "-D"] for args, _cwd in git.calls)
-
-
-def test_ensure_reuses_existing_worktree():
-    fg = FakeGit(
-        {
-            "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-5\nbranch refs/heads/fix/5-x\n"),
-            "branch --show-current": GitResult(0, "fix/5-x\n"),
-        }
-    )
-    # /repo isn't a real directory in the test environment — the honesty check
-    # (M20, below) is exercised separately; these git-wiring tests fake it away.
-    assert Worktrees("/repo", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x").endswith("issue-5")
-    assert _adds(fg) == []  # existing → no `worktree add`
 
 
 def test_concurrent_worktree_setup_serializes_shared_git_metadata():
@@ -77,50 +60,6 @@ def test_concurrent_worktree_setup_serializes_shared_git_metadata():
     assert paths[0].endswith("issue-5")
     assert paths[1].endswith("issue-6")
     assert maximum == 1
-
-
-def test_ensure_does_not_reuse_issue_with_prefix_collision():
-    fg = FakeGit(
-        {
-            "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-50\n"),
-            "show-ref": GitResult(1, ""),
-            "branch --show-current": GitResult(0, "fix/5-x"),
-        }
-    )
-    Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x")
-
-    assert _adds(fg)
-
-
-def test_ensure_creates_from_base_when_no_branch():
-    fg = FakeGit(
-        {
-            "worktree list": GitResult(0, ""),  # none yet
-            "branch --show-current": GitResult(0, "fix/5-x"),
-            "show-ref": GitResult(1, ""),  # branch doesn't exist
-        }
-    )
-    Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x")
-    add = _adds(fg)
-    assert add and "-b" in add[0] and "origin/dev" in add[0]
-
-
-# ── M20: `ensure` must be HONEST about readiness ──────────────────────────────
-def test_ensure_raises_when_every_worktree_add_attempt_fails():
-    """Before this, `ensure` returned the path regardless of whether any
-    `worktree add` actually succeeded — the caller logged "ready" and
-    dispatched the agent into a directory that was never created. With the
-    REAL default `path_exists` (os.path.isdir) and a repo dir that plainly
-    doesn't exist on disk, `ensure` must raise rather than lie."""
-    fg = FakeGit(
-        {
-            "worktree list": GitResult(0, ""),  # none yet
-            "show-ref": GitResult(1, ""),  # branch doesn't exist
-            "worktree add": GitResult(1, "fatal: boom"),  # every add attempt fails
-        }
-    )
-    with pytest.raises(WorktreeUnavailable):
-        Worktrees("/definitely/not/a/real/repo-dir", base_branch="dev", run=fg).ensure(5, "fix/5-x")
 
 
 # ── M20: the git runner must be bounded and must surface failures ────────────
@@ -166,14 +105,6 @@ class RemovalGit:
         if args[:2] == ["show-ref", "--verify"]:
             return GitResult(0 if self.branch_present else 1, "")
         return GitResult(0, "")
-
-
-def test_remove_calls_remove_prune_and_deletes_the_issue_branch():
-    git = RemovalGit()
-    Worktrees("/repo", run=git).remove(5)
-    kinds = [a[0][:2] for a in git.calls]
-    assert ["worktree", "remove"] in kinds and ["worktree", "prune"] in kinds
-    assert (["branch", "-D", "fix/5-small-win"], "/repo") in git.calls
 
 
 def test_remove_failure_is_retriable_and_preserves_branch():

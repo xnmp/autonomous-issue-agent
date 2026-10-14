@@ -42,15 +42,11 @@ _KEY_AUTH = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOK
 
 # Environment git config: never written into the checkout. The empty helper
 # drops any helper /etc/gitconfig names; a publishing leg then answers GitHub
-# from $GH_TOKEN. push.default=current: what a leg writes to the repository
-# config vanishes with it, so `git push -u` cannot record an upstream for the
-# next leg. No auto-maintenance: it would repack and prune the object store
-# other checkouts share; the harness's own git, outside the sandbox, keeps it.
-# No pruning fetch (origin's own setting wins over fetch.prune): a
-# remote-tracking ref is usually packed, and a leg cannot
-# rewrite packed-refs (`domain.sandbox`), so the prune would fail the fetch.
-_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"), ("fetch.prune", "false"),
-               ("remote.origin.prune", "false"))
+# from $GH_TOKEN. push.default=current: a fix clone's config is read-only, so
+# `push -u` records no upstream. A pruning fetch drops a tracking ref whose
+# branch is gone before walking it: once the repository prunes a merged
+# branch's borrowed objects, that ref would fail every fetch (probe, 2026-10-15).
+_GIT_CONFIG = (("credential.helper", ""), ("fetch.prune", "true"))
 _PUBLISH_GIT_CONFIG = (
     ("credential.https://github.com.helper",
      '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'),
@@ -73,7 +69,10 @@ class Launch:
 
 
 def _read_small(path: str) -> str:
-    with open(path, encoding="utf-8", errors="replace") as stream:
+    """Never waits: a leg can plant a FIFO where a clone's alternates live."""
+    with open(os.open(path, os.O_RDONLY | os.O_NONBLOCK), encoding="utf-8", errors="replace") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError(f"{path} is not a plain file")
         return stream.read(_GITFILE_LIMIT).strip()
 
 
@@ -97,18 +96,28 @@ def repository_common_dir(repository: str) -> str:
 
 
 def git_link(cwd: str, repository: str) -> GitLink | None:
-    """The checkout's git metadata, or None when `cwd` is not a checkout.
+    """The git data the checkout reads from the target, or None when `cwd` is
+    not a checkout.
 
-    The leg can write its checkout, so its `.git` link is a claim: it must name
-    `<target .git>/worktrees/<name>`, whose own back-link and common-dir link
-    name this checkout and the target. A link that does not is refused, never
+    A leg can write a fix clone, so what its `.git` names is a claim: a clone
+    must borrow exactly the target's objects; a review worktree's link must
+    name `<target .git>/worktrees/<name>`, whose own back-link and common-dir
+    link name this checkout and the target. Anything else is refused, never
     mounted (it could point the mount, and the harness's own git, anywhere)."""
     dot = os.path.join(cwd, ".git")
     if not os.path.lexists(dot):
         return None
     common = repository_common_dir(repository)
+    if os.path.isdir(dot) and not os.path.islink(dot):
+        try:
+            borrowed = os.path.realpath(_read_small(os.path.join(dot, "objects", "info", "alternates")))
+        except OSError as exc:
+            raise SandboxRefused(f"{cwd} is a repository that borrows nothing from {repository}") from exc
+        if borrowed != os.path.realpath(os.path.join(common, "objects")):
+            raise SandboxRefused(f"{cwd} does not borrow the objects of {repository}")
+        return GitLink(borrowed)
     if os.path.islink(dot) or not os.path.isfile(dot):
-        raise SandboxRefused(f"{cwd} is not a harness worktree of {repository}")
+        raise SandboxRefused(f"{cwd} is not a harness checkout of {repository}")
     try:
         own = _gitfile_target(dot)
         back = os.path.realpath(_read_small(os.path.join(own, "gitdir")))
@@ -118,7 +127,7 @@ def git_link(cwd: str, repository: str) -> GitLink | None:
     if (os.path.dirname(own) != os.path.join(common, "worktrees") or back != os.path.realpath(dot)
             or shared != common):
         raise SandboxRefused(f"{cwd}'s git link does not resolve to a worktree of {repository}")
-    return GitLink(common, own)
+    return GitLink(common)
 
 
 def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
@@ -159,11 +168,12 @@ def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...
     return (*args, "--chdir", plan.cwd)
 
 
-def _empty_worktree_config(path: str) -> None:
-    """Mounted read-only, so it must exist, and empty: the harness owns its
-    worktrees and sets nothing there, so any content is a leg's from before
-    the mount (a hooksPath or fsmonitor the harness's git would run). A link,
-    FIFO or hard link there is tampering; it is never followed or waited on."""
+def _own_commondir(path: str) -> None:
+    """A fix clone's `.git/commondir`, mounted read-only, so it must exist:
+    written `.`, the clone itself (git dies on an empty one). Other content
+    is a leg's from before the mount (a gitdir whose config the harness's git
+    would obey). A link, FIFO or hard link there is tampering; it is never
+    followed or waited on."""
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
     except OSError as exc:
@@ -173,55 +183,9 @@ def _empty_worktree_config(path: str) -> None:
         if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
             raise SandboxRefused(f"{path} is not a plain file")
         os.ftruncate(fd, 0)
+        os.write(fd, b".\n")
     finally:
         os.close(fd)
-
-
-def _ensure_packed_refs(common: str) -> None:
-    """A fix leg sees `packed-refs` read-only, so it must exist: without it
-    the leg's `git pack-refs` would pack into its overlay and delete the
-    host's loose refs. An empty one is what git reads when there is none."""
-    path = os.path.join(common, "packed-refs")
-    try:
-        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644))
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        raise SandboxRefused(f"{path} cannot be created ({exc.strerror})") from exc
-    if os.path.islink(path) or not os.path.isfile(path):
-        raise SandboxRefused(f"{path} is not a plain file")
-
-
-# The repository config that keeps every git on the host, the harness's and
-# the operator's, from packing refs: a fix leg reads packed-refs as of its
-# launch, so a pack while it runs moves its branch out of the live refs/ and
-# the leg loses it (tauri #1106, 2026-10-15: the auto-maintenance a fetch
-# starts runs pack-refs once 16 refs are loose; gc.packRefs alone misses it).
-_LOOSE_REFS = (("gc.packRefs", "false"), ("maintenance.pack-refs.enabled", "false"))
-
-
-def _keep_refs_loose(common: str, run: Callable[..., subprocess.CompletedProcess]) -> None:
-    """Set each key in the repository config, then check the value git
-    actually uses (an include or the main checkout's config.worktree can
-    override the file); a leg does not start on a repository that may pack."""
-    config = os.path.join(common, "config")
-
-    def git(*args: str) -> subprocess.CompletedProcess:
-        return run(["git", *args], capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
-
-    try:
-        for key, value in _LOOSE_REFS:
-            if (git("config", "--file", config, "--get", key).stdout or "").strip() != value:
-                done = git("config", "--file", config, key, value)
-                if done.returncode != 0:
-                    raise SandboxRefused(f"cannot set {key}={value} in {config}: "
-                                         f"{(done.stderr or '').strip()[:200]}")
-            effective = (git("--git-dir", common, "config", "--get", key).stdout or "").strip()
-            if effective != value:
-                raise SandboxRefused(f"{key} is {effective!r} for {common} despite its config (an include or "
-                                     f"config.worktree overrides it); a fix leg needs {value}")
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise SandboxRefused(f"cannot read {config} ({type(exc).__name__})") from exc
 
 
 def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
@@ -374,10 +338,8 @@ class LegSandbox:
             build_cache = (os.path.realpath(build),)
         writes = self.writable and not read_only
         link = git_link(root, self.repository)
-        if link is not None and writes:
-            _ensure_packed_refs(link.common_dir)
-            _keep_refs_loose(link.common_dir, self._run)
-            _empty_worktree_config(os.path.join(link.worktree_dir, "config.worktree"))
+        if link is not None and writes:  # a shared worktree's `.git` is a file: refused here
+            _own_commondir(os.path.join(root, ".git", "commondir"))
         try:
             plan = leg_mount_plan(LegFacts(
                 home=self.home, cwd=root, writable=writes,

@@ -17,7 +17,9 @@ HOME = "/home/op"
 HARNESS = "/home/op/Repos/harness"
 STATE = "/home/op/.local/state/issue-agent"
 WORKTREE = "/home/op/Repos/target/.claude/worktrees/issue-5"
-GIT = GitLink("/home/op/Repos/target/.git", "/home/op/Repos/target/.git/worktrees/issue-5")
+REPOSITORY = "/home/op/Repos/target/.git"
+GIT = GitLink(f"{REPOSITORY}/objects")  # a fix clone borrows the repository's objects
+REVIEW_GIT = GitLink(REPOSITORY)  # a review worktree reads the repository's .git
 CLAUDE = "/home/op/.claude"
 
 def facts(**overrides) -> LegFacts:
@@ -48,9 +50,9 @@ def test_a_fix_leg_writes_its_checkout_and_publishes():
     plan = leg_mount_plan(facts())
 
     assert visible(plan, f"{WORKTREE}/src/app.py") is Access.READ_WRITE
-    assert visible(plan, f"{GIT.common_dir}/objects/ab/cdef") is Access.READ_WRITE
-    assert visible(plan, f"{GIT.common_dir}/refs/heads/fix/5") is Access.READ_WRITE
-    assert visible(plan, f"{GIT.worktree_dir}/index") is Access.READ_WRITE
+    # Its clone's refs, packed-refs, objects and index are its own.
+    for path in ("refs/heads/fix/5", "packed-refs", "objects/ab/cdef", "index", "HEAD", "logs/HEAD"):
+        assert visible(plan, f"{WORKTREE}/.git/{path}") is Access.READ_WRITE, path
     assert plan.publishes and plan.cwd == WORKTREE
     # Its one token arrives from the launcher; every other GitHub token is unset.
     unset = {name for name, value in plan.env if value is None}
@@ -58,42 +60,38 @@ def test_a_fix_leg_writes_its_checkout_and_publishes():
     assert not {"GH_TOKEN", "GITHUB_TOKEN"} & unset
 
 
-def test_the_harness_runs_git_there_so_a_fix_leg_never_changes_git_config_hooks_or_links():
+def test_the_harness_runs_git_in_a_fix_clone_so_a_leg_never_changes_what_that_git_obeys():
     plan = leg_mount_plan(facts())
 
-    # Writes beside them (packed-refs.lock, config on `push -u`, a scratch worktree) vanish with the leg.
-    for path in (f"{GIT.common_dir}/config", f"{GIT.common_dir}/hooks/post-checkout", f"{GIT.common_dir}/commondir",
-                 f"{GIT.common_dir}/packed-refs.lock", f"{GIT.common_dir}/worktrees/issue-9/commondir"):
-        assert visible(plan, path) is Access.THROWAWAY, path
-    # Its own checkout's links sit in a directory it writes, so they are read-only.
-    for path in (f"{GIT.worktree_dir}/commondir", f"{GIT.worktree_dir}/gitdir", f"{GIT.worktree_dir}/config.worktree",
-                 f"{WORKTREE}/.git"):
-        assert visible(plan, path) is Access.READ_ONLY, path
+    for path in ("config", "hooks/reference-transaction", "commondir"):
+        assert visible(plan, f"{WORKTREE}/.git/{path}") is Access.READ_ONLY, path
+    # A mount point: the leg cannot swap `.git` for a link to a gitdir of its own.
+    assert access(plan, f"{WORKTREE}/.git") is Access.READ_WRITE
 
 
-def test_a_fix_leg_shares_live_refs_but_cannot_rewrite_packed_refs():
+def test_a_fix_leg_cannot_rewrite_objects_a_review_checkout_reads():
     plan = leg_mount_plan(facts())
 
-    for path in ("objects/pack/p.pack", "refs/heads/fix/5", "refs/heads/fix/5.lock", "logs/HEAD"):
-        assert visible(plan, f"{GIT.common_dir}/{path}") is Access.READ_WRITE, path
-    # Never the overlay's: a packed-refs a leg rewrote there would stay private
-    # while its `pack-refs` pruned the host's loose refs.
-    assert access(plan, f"{GIT.common_dir}/packed-refs") is Access.READ_ONLY
+    # GIT-OBJECTS, closed: the repository's store, its refs and packed-refs are
+    # out of a fix leg's reach.
+    for path in ("objects/ab/cdef", "objects/pack/p.pack"):
+        assert visible(plan, f"{REPOSITORY}/{path}") is Access.READ_ONLY, path
+    for path in ("refs/heads/fix/5", "packed-refs", "config", "hooks/post-checkout"):
+        assert visible(plan, f"{REPOSITORY}/{path}") is Access.PRIVATE, path  # the leg's own empty HOME
 
 
 def test_a_reviewer_sees_the_whole_repository_read_only():
-    plan = leg_mount_plan(facts(writable=False))
+    plan = leg_mount_plan(facts(writable=False, git=REVIEW_GIT))
 
-    for path in (f"{GIT.common_dir}/config", f"{GIT.common_dir}/packed-refs", f"{GIT.worktree_dir}/HEAD"):
-        assert visible(plan, path) is Access.READ_ONLY, path
+    for path in ("config", "packed-refs", "worktrees/review-pr-5/HEAD", "objects/ab/cdef"):
+        assert visible(plan, f"{REPOSITORY}/{path}") is Access.READ_ONLY, path
 
 
 def test_a_reviewer_reads_its_checkout_and_holds_no_credential():
-    plan = leg_mount_plan(facts(writable=False))
+    plan = leg_mount_plan(facts(writable=False, git=REVIEW_GIT))
 
     assert visible(plan, f"{WORKTREE}/src/app.py") is Access.READ_ONLY
-    assert visible(plan, f"{GIT.common_dir}/objects/ab/cdef") is Access.READ_ONLY
-    assert visible(plan, f"{GIT.worktree_dir}/index") is Access.READ_ONLY
+    assert visible(plan, f"{WORKTREE}/.git") is Access.READ_ONLY
     assert not plan.publishes
     unset = {name for name, value in plan.env if value is None}
     assert {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"} <= unset

@@ -27,7 +27,7 @@ from issue_agent.adapters.leg_sandbox import (
     git_link,
 )
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
-from issue_agent.adapters.worktree import _subprocess_git
+from issue_agent.adapters.worktree import Worktrees, _subprocess_git
 from issue_agent.domain.contracts import RunId
 
 _UNAVAILABLE = LegSandbox(home="/nonexistent", repository="/nonexistent", writable=False).preflight()
@@ -45,7 +45,8 @@ def _git(*args: str, cwd: Path) -> str:
 @pytest.fixture
 def host(tmp_path: Path) -> dict[str, Path]:
     """A fake operator: HOME with planted credentials, a harness checkout with
-    config/shared.env, and a target repository with one issue worktree."""
+    config/shared.env, and a target repository (origin a bare repository
+    reached as GitHub is, over a transport) with one issue's fix clone."""
     home, harness, target = tmp_path / "home", tmp_path / "harness", tmp_path / "target"
     for path, text in ((home / ".config/gh/hosts.yml", "github.com:\n  oauth_token: planted-gh\n"),
                        (home / ".ssh/id_ed25519", "planted-ssh-key\n"),
@@ -54,11 +55,15 @@ def host(tmp_path: Path) -> dict[str, Path]:
                        (target / "config/shared.env", "PLANTED=target-config\n")):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+    upstream = tmp_path / "upstream.git"
+    _git("init", "-q", "--bare", "-b", "dev", str(upstream), cwd=tmp_path)
     _git("init", "-q", "-b", "dev", cwd=target)
     _git("commit", "-q", "--allow-empty", "-m", "init", cwd=target)
-    worktree = target / ".claude/worktrees/issue-5"
-    _git("worktree", "add", "-q", "-b", "fix/5-x", str(worktree), cwd=target)
-    return {"home": home, "harness": harness, "target": target, "worktree": worktree, "tmp": tmp_path}
+    _git("remote", "add", "origin", f"file://{upstream}", cwd=target)
+    _git("push", "-q", "origin", "dev", cwd=target)
+    worktree = Path(Worktrees(str(target)).ensure(5, "fix/5-x"))
+    return {"home": home, "harness": harness, "target": target, "worktree": worktree, "tmp": tmp_path,
+            "upstream": upstream}
 
 
 def sandbox(host: dict[str, Path], *, writable: bool = True, credential: str | None = FAKE_TOKEN) -> LegSandbox:
@@ -108,39 +113,16 @@ def test_a_reviewer_reads_its_checkout_and_writes_nothing(host):
 def test_a_fix_leg_commits_and_git_answers_github_with_its_one_token(host):
     script = ('echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -qm a && echo committed; '
               'printf "protocol=https\\nhost=github.com\\n\\n" | git credential fill | grep "^password=" ; '
-              'echo x >> .git 2>/dev/null || echo link-ro; '
-              'echo x >> "$(git rev-parse --git-dir)/commondir" 2>/dev/null || echo own-links-ro; '
-              'echo "[core] hooksPath = /tmp" >> "$(git rev-parse --git-dir)/config.worktree" 2>/dev/null '
-              '|| echo worktree-config-ro; '
-              f'printf "[core]\\n\\tfsmonitor = touch /tmp/pwned\\n" >> "{host["target"]}/.git/config"; '
-              f'echo "touch /tmp/pwned" > "{host["target"]}/.git/hooks/post-checkout"; '
-              f'echo /elsewhere > "{host["target"]}/.git/commondir"')
-    hooks = sorted(p.name for p in (host["target"] / ".git/hooks").iterdir())
+              'git init -q --bare /tmp/remote.git && git push -q -u /tmp/remote.git fix/5-x && '
+              'git -C /tmp/remote.git log -1 --format=%s fix/5-x')
 
     done = run_leg(sandbox(host), host, script)
 
-    assert done.stdout.split() == ["committed", f"password={FAKE_TOKEN}", "link-ro", "own-links-ro",
-                                   "worktree-config-ro"], done.stderr
-    assert "packed-refs" not in done.stderr  # git writes its lock beside config on every commit
-    assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["target"]).strip() == "a"
-    # The leg's writes to what the harness's git reads outside vanished with it.
-    assert "fsmonitor" not in (host["target"] / ".git/config").read_text()
-    assert sorted(p.name for p in (host["target"] / ".git/hooks").iterdir()) == hooks
-    assert not (host["target"] / ".git/commondir").exists()
-    assert _git("rev-parse", "HEAD", cwd=host["worktree"]).strip()
-
-
-@needs_bwrap
-def test_git_in_a_leg_never_starts_maintenance_on_the_object_store_other_checkouts_share(host):
-    commit = "echo {0} > {0} && git add {0} && GIT_TRACE=1 git -c user.name=t -c user.email=t@t commit -qm {0}"
-
-    done = run_leg(sandbox(host), host, commit.format("inside"))
-    outside = subprocess.run(["/bin/sh", "-c", commit.format("outside")], cwd=host["worktree"],
-                             capture_output=True, text=True)
-
-    assert done.returncode == 0, done.stderr
-    assert "maintenance run" not in done.stderr
-    assert "maintenance run" in outside.stderr  # the control: git's default starts it after a commit
+    # `push -u` publishes and succeeds although the clone's config is read-only.
+    assert done.stdout.split() == ["committed", f"password={FAKE_TOKEN}", "a"], done.stderr
+    # The commit and its branch live in the leg's clone, never in the repository.
+    assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["worktree"]).strip() == "a"
+    assert not _git("branch", "--list", "fix/5-x", cwd=host["target"]).strip()
 
 
 @needs_bwrap
@@ -341,133 +323,144 @@ def _fix_leg(host: dict[str, Path], script: str) -> subprocess.Popen:
 
 
 @needs_bwrap
-def test_a_host_ref_update_reaches_a_running_fix_leg(host):
-    leg = _fix_leg(host, 'git rev-parse -q --verify refs/heads/other || echo none; read _; '
-                         'git rev-parse refs/heads/other; git rev-parse HEAD')
-    try:
-        assert leg.stdout.readline().strip() == "none"
-        _git("commit", "-q", "--allow-empty", "-m", "host", cwd=host["worktree"])
-        _git("update-ref", "refs/heads/other", "HEAD", cwd=host["target"])
-        out, err = leg.communicate("go\n", timeout=30)
-    finally:
-        leg.kill()
-    assert out.split() == [_git("rev-parse", "dev", cwd=host["target"]).strip(),
-                           _git("rev-parse", "fix/5-x", cwd=host["target"]).strip()], err
-
-
-@needs_bwrap
-def test_no_host_fetch_packs_a_running_legs_branch_away(host):
-    upstream = host["tmp"] / "upstream.git"
-    _git("init", "-q", "--bare", "-b", "dev", str(upstream), cwd=host["tmp"])
-    _git("remote", "add", "origin", str(upstream), cwd=host["target"])
-    _git("push", "-q", "origin", "dev", cwd=host["target"])
+def test_no_host_ref_pack_or_gc_hides_a_running_legs_branch(host):
+    # tauri #1106: the host packed refs while a fix leg ran, and the leg found
+    # itself on an unborn branch. A clone's refs are its own.
     for index in range(20):  # past the 16 loose refs at which auto-maintenance packs
         _git("branch", f"b{index}", cwd=host["target"])
     leg = _fix_leg(host, 'read _; git rev-parse --abbrev-ref HEAD; git log -1 --format=%s')
     try:
-        for fetch in (lambda: _subprocess_git(["-c", "maintenance.autoDetach=false", "fetch", "origin", "dev"],
-                                              str(host["target"])).code,  # the harness's
-                      lambda: len(_git("-c", "maintenance.autoDetach=false", "fetch", "-q", "origin", "dev",
-                                       cwd=host["target"])) * 0):  # the operator's
-            _git("commit", "-q", "--allow-empty", "-m", "upstream", cwd=host["target"])
-            _git("push", "-q", "origin", "HEAD:dev", cwd=host["target"])
-            _git("reset", "-q", "--hard", "HEAD~1", cwd=host["target"])
-            assert fetch() == 0
+        _git("pack-refs", "--all", "--prune", cwd=host["target"])
+        _git("-c", "maintenance.autoDetach=false", "fetch", "-q", "origin", "dev", cwd=host["target"])
+        _git("gc", "-q", "--prune=now", cwd=host["target"])
         out, err = leg.communicate("go\n", timeout=30)
     finally:
         leg.kill()
     assert out.split() == ["fix/5-x", "init"], err
-    assert (host["target"] / ".git/refs/heads/fix/5-x").is_file()
 
 
 @needs_bwrap
-def test_git_works_quietly_in_a_fix_leg_and_its_pack_refs_cannot_prune_the_hosts_refs(host):
+def test_git_works_quietly_in_a_fix_leg_and_never_reaches_the_repositorys_refs(host):
     refs = _git("show-ref", cwd=host["target"])
     script = ('set -e; echo a > a; git add a; git commit -qm a; echo b > a; git stash -q; git stash pop -q; '
-              'git commit -qam b; git branch scratch; git branch -qD scratch; git tag t; git tag -d t >/dev/null; '
-              'git rebase -q HEAD~1; git fetch -q "$(git rev-parse --git-common-dir)" dev:refs/remotes/o/dev; '
-              'git worktree add -q /tmp/side HEAD; git -C /tmp/side log -1 --format=%s; set +e; '
-              'git pack-refs --all 2>/dev/null || echo pack-refused; echo done')
+              'git commit -qam b; git branch scratch; git tag t; git pack-refs --all; git branch -qD scratch; '
+              'git tag -d t >/dev/null; git rebase -q HEAD~1; git worktree add -q /tmp/side HEAD; '
+              'git -C /tmp/side log -1 --format=%s; git gc -q; echo done')
 
     out, err = _fix_leg(host, script).communicate(timeout=60)
 
-    assert out.split() == ["b", "pack-refused", "done"], err
-    assert "error" not in err.lower() and "fatal" not in err.lower(), err
-    after = _git("show-ref", cwd=host["target"])
-    assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["target"]).strip() == "b"
-    # Every ref the host had is still there, loose; the leg's fetch reached the host.
-    assert set(refs.split("\n")[:-1]) - set(after.split("\n")) <= {
-        line for line in refs.split("\n") if line.endswith("refs/heads/fix/5-x")}
-    assert "refs/remotes/o/dev" in after
-    assert (host["target"] / ".git/refs/heads/dev").is_file()
-    assert not (host["target"] / ".git/worktrees/side").exists()
+    assert out.split() == ["b", "done"], err
+    # Only the read-only config speaks up (`branch -D` drops its section), and git carries on.
+    assert all("config" in line for line in err.splitlines()), err
+    assert _git("show-ref", cwd=host["target"]) == refs
+    assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["worktree"]).strip() == "b"
 
 
 @needs_bwrap
-def test_a_fix_leg_cannot_plant_what_the_harnesss_git_would_obey_in_the_repository(host):
-    common = host["target"] / ".git"
-    script = (f'echo /elsewhere > "{common}/commondir"; '
-              f'printf "[core]\\n\\thooksPath = /tmp\\n" > "{common}/config.worktree"; '
-              f'mkdir -p "{common}/modules/x" "{common}/remotes" && echo evil > "{common}/modules/x/config"; '
-              f'echo "URL: /evil" > "{common}/remotes/origin"; echo evil > "{common}/hooks/pre-commit"; '
-              f'echo evil >> "{common}/HEAD"; echo "[x]" >> "{common}/config"; echo done')
-    _fix_leg(host, "true").communicate(timeout=30)  # a launch's own preconditions (packed-refs, loose refs)
-    before = {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()}
+def test_a_fix_leg_cannot_plant_what_the_harnesss_git_obeys_in_its_clone(host):
+    dot, marker = host["worktree"] / ".git", host["tmp"] / "pwned"
+    evil = f'printf "[core]\\n\\tfsmonitor = touch {marker}; echo\\n"'
+    script = (f'{evil} >> .git/config 2>/dev/null || echo config-ro; '
+              f'printf "#!/bin/sh\\ntouch {marker}\\n" > .git/hooks/reference-transaction 2>/dev/null '
+              '|| echo hooks-ro; '
+              'echo /tmp > .git/commondir 2>/dev/null || echo commondir-ro; '
+              'mv .git .git-old 2>/dev/null || echo dot-git-pinned; '
+              f'echo x > "{host["target"]}/.git/objects/planted" 2>/dev/null || echo objects-ro')
+    _fix_leg(host, "true").communicate(timeout=30)  # a launch's own precondition: an empty commondir
+    before = {p.name: p.read_bytes() for p in dot.iterdir() if p.is_file()}
 
     out, err = _fix_leg(host, script).communicate(timeout=30)
 
-    assert out.split() == ["done"], err
-    assert {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()} == before
-    assert not {"commondir", "config.worktree", "modules", "remotes"} & {p.name for p in common.iterdir()}
-    assert not (common / "hooks/pre-commit").exists()
+    assert out.split() == ["config-ro", "hooks-ro", "commondir-ro", "dot-git-pinned", "objects-ro"], err
+    assert {p.name: p.read_bytes() for p in dot.iterdir() if p.is_file()} == before
+    for harness_git in (["status"], ["reset", "--hard", "HEAD"]):  # what sync and the guidance read run
+        assert _subprocess_git(harness_git, str(host["worktree"])).code == 0
+    assert not marker.exists()
 
 
 @needs_bwrap
-def test_a_fix_leg_never_prunes_on_fetch(host):
-    _git("config", "fetch.prune", "true", cwd=host["target"])
-    _git("config", "remote.origin.prune", "true", cwd=host["target"])
+def test_a_merged_branch_the_repository_pruned_never_breaks_a_fix_legs_fetch(host):
+    # A clone borrows the objects of every branch it tracks from the
+    # repository. Once a merged branch is deleted and the repository prunes
+    # its objects, the clone's ref names objects that exist nowhere it can
+    # read; a pruning fetch drops that ref before walking it (probe, 2026-10-15).
+    _git("checkout", "-q", "-b", "other", cwd=host["target"])
+    _git("commit", "-q", "--allow-empty", "-m", "other", cwd=host["target"])
+    _git("push", "-q", "origin", "other", cwd=host["target"])
+    _git("checkout", "-q", "dev", cwd=host["target"])
+    clone = Worktrees(str(host["target"])).ensure(6, "fix/6-y")
+    for step in (["push", "-q", "origin", ":other"], ["branch", "-q", "-D", "other"], ["fetch", "-q", "--prune"],
+                 ["reflog", "expire", "--expire=now", "--all"], ["gc", "-q", "--prune=now"]):
+        _git(*step, cwd=host["target"])
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"])}
+    leg_env = sandbox(host).launch(["/bin/true"], cwd=clone, env=env).env
 
-    out, err = _fix_leg(host, "git config fetch.prune; git config remote.origin.prune").communicate(timeout=30)
+    def fetch(extra: dict[str, str]) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, env={**os.environ, **extra},
+                              capture_output=True, text=True)
 
-    assert out.split() == ["false", "false"], err
-
-
-@needs_bwrap
-def test_a_repository_whose_include_would_pack_refs_again_refuses_the_fix_leg(host):
-    (host["tmp"] / "packs.gitconfig").write_text("[gc]\n\tpackRefs = true\n")
-    _fix_leg(host, "true").communicate(timeout=30)  # the launch writes the keys first
-    with open(host["target"] / ".git/config", "a") as config:
-        config.write(f"[include]\n\tpath = {host['tmp'] / 'packs.gitconfig'}\n")
-
-    with pytest.raises(SandboxRefused, match="gc.packRefs"):
-        _fix_leg(host, "true")
-
-
-def test_a_checkout_whose_git_link_points_elsewhere_is_refused(host):
-    evil = host["worktree"] / "evil"
-    (evil / "worktrees").mkdir(parents=True)
-    (host["worktree"] / ".git").write_text(f"gitdir: {evil}\n")
-
-    with pytest.raises(SandboxRefused):
-        git_link(str(host["worktree"]), str(host["target"]))
+    assert fetch({}).returncode != 0  # the control: git's default fetch fails on the stale ref
+    assert fetch(leg_env).returncode == 0
+    assert fetch(leg_env).returncode == 0
 
 
-def test_a_checkout_link_into_another_worktree_is_refused(host):
-    other = host["target"] / ".claude/worktrees/issue-6"
-    _git("worktree", "add", "-q", "-b", "fix/6-y", str(other), cwd=host["target"])
-    (host["worktree"] / ".git").write_text((other / ".git").read_text())
-
-    with pytest.raises(SandboxRefused):
-        git_link(str(host["worktree"]), str(host["target"]))
-
-
-def test_a_valid_worktree_resolves_to_its_own_git_metadata(host):
+def test_a_valid_fix_clone_borrows_the_repositorys_objects(host):
     link = git_link(str(host["worktree"]), str(host["target"]))
 
-    assert link is not None
-    assert link.common_dir == os.path.realpath(host["target"] / ".git")
-    assert Path(link.worktree_dir).parent == Path(link.common_dir) / "worktrees"
+    assert link is not None and link.shared == os.path.realpath(host["target"] / ".git/objects")
     assert git_link(str(host["tmp"]), str(host["target"])) is None
+
+
+@pytest.mark.parametrize("alternates", [None, "fifo", "/elsewhere/objects", "{objects}\n/elsewhere/objects"])
+def test_a_clone_that_borrows_anything_but_the_repositorys_objects_is_refused(host, alternates):
+    path = host["worktree"] / ".git/objects/info/alternates"
+    if alternates is None:
+        path.unlink()
+    elif alternates == "fifo":  # a read would wait forever and wedge the daemon
+        path.unlink()
+        os.mkfifo(path)
+    else:
+        path.write_text(alternates.format(objects=host["target"] / ".git/objects"))
+
+    with pytest.raises(SandboxRefused):
+        git_link(str(host["worktree"]), str(host["target"]))
+
+
+@pytest.fixture
+def review(host: dict[str, Path]) -> Path:
+    checkout = host["target"] / ".claude/worktrees/review-pr-7"
+    _git("worktree", "add", "-q", "--detach", str(checkout), cwd=host["target"])
+    return checkout
+
+
+def test_a_review_worktree_reads_the_repositorys_git_dir(host, review):
+    link = git_link(str(review), str(host["target"]))
+
+    assert link is not None and link.shared == os.path.realpath(host["target"] / ".git")
+
+
+def test_a_checkout_whose_git_link_points_elsewhere_is_refused(host, review):
+    evil = review / "evil"
+    (evil / "worktrees").mkdir(parents=True)
+    (review / ".git").write_text(f"gitdir: {evil}\n")
+
+    with pytest.raises(SandboxRefused):
+        git_link(str(review), str(host["target"]))
+
+
+def test_a_checkout_link_into_another_worktree_is_refused(host, review):
+    other = host["target"] / ".claude/worktrees/review-pr-8"
+    _git("worktree", "add", "-q", "--detach", str(other), cwd=host["target"])
+    (review / ".git").write_text((other / ".git").read_text())
+
+    with pytest.raises(SandboxRefused):
+        git_link(str(review), str(host["target"]))
+
+
+@needs_bwrap
+def test_a_fix_leg_never_writes_a_shared_worktree(host, review):
+    with pytest.raises(SandboxRefused):
+        sandbox(host).launch(["/bin/true"], cwd=str(review), env={"PATH": "/usr/bin:/bin"})
 
 
 def test_a_missing_bwrap_is_named_and_refuses_every_launch(host):
@@ -481,36 +474,30 @@ def test_a_missing_bwrap_is_named_and_refuses_every_launch(host):
 
 
 @needs_bwrap
-def test_worktree_config_a_leg_planted_before_the_mount_is_emptied_at_launch(host):
-    admin = Path(git_link(str(host["worktree"]), str(host["target"])).worktree_dir)
-    (admin / "config.worktree").write_text("[core]\n\tfsmonitor = touch /tmp/pwned\n")
+def test_a_commondir_planted_before_the_mount_is_reset_to_the_clone_at_launch(host):
+    commondir = host["worktree"] / ".git/commondir"
+    commondir.write_text(str(host["tmp"]))
 
     done = run_leg(sandbox(host), host, "echo ran")
 
     assert done.stdout.split() == ["ran"], done.stderr
-    assert (admin / "config.worktree").read_text() == ""
+    common = _subprocess_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], str(host["worktree"]))
+    assert Path(common.out.strip()).resolve() == (host["worktree"] / ".git").resolve()
 
 
 @needs_bwrap
-@pytest.mark.parametrize("plant", ["fifo", "hardlink"])
-def test_a_worktree_config_that_is_not_a_plain_file_refuses_the_leg(host, plant):
-    admin = Path(git_link(str(host["worktree"]), str(host["target"])).worktree_dir)
+@pytest.mark.parametrize("plant", ["fifo", "hardlink", "symlink"])
+def test_a_commondir_that_is_not_a_plain_file_refuses_the_leg(host, plant):
+    commondir = host["worktree"] / ".git/commondir"
     if plant == "fifo":
-        os.mkfifo(admin / "config.worktree")
-    else:
+        os.mkfifo(commondir)
+    elif plant == "hardlink":
         (host["tmp"] / "shared").write_text("")
-        os.link(host["tmp"] / "shared", admin / "config.worktree")
+        os.link(host["tmp"] / "shared", commondir)
+    else:
+        commondir.symlink_to(host["tmp"] / "elsewhere")
 
-    with pytest.raises(SandboxRefused, match="config.worktree"):
-        sandbox(host).launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
-
-
-@needs_bwrap
-def test_a_linked_worktree_config_is_tampering_and_refuses_the_leg(host):
-    admin = Path(git_link(str(host["worktree"]), str(host["target"])).worktree_dir)
-    (admin / "config.worktree").symlink_to(host["tmp"] / "elsewhere")
-
-    with pytest.raises(SandboxRefused, match="config.worktree"):
+    with pytest.raises(SandboxRefused, match="commondir"):
         sandbox(host).launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
     assert not (host["tmp"] / "elsewhere").exists()
 
