@@ -706,7 +706,7 @@ def test_a_provider_api_error_end_is_a_machine_failure_whose_session_stays_resum
         result="Failed to authenticate: OAuth session expired", total_cost_usd=0.1))
     assert r.is_error
     assert classify_leg(r, resumed=False) is LegClass.MACHINE
-    assert classify_leg(r, resumed=True) is LegClass.MACHINE
+    assert classify_leg(r, resumed=True) is LegClass.AGENT  # a permanent error must not loop free
     assert resumable_session(r) == "s1"
 
 

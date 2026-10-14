@@ -109,7 +109,7 @@ import pytest
 
 from dataclasses import replace
 
-from issue_agent.domain.outcome import LegClass, classify_leg, resumable_session
+from issue_agent.domain.outcome import PROVIDER_REFUSED_SUBTYPE, LegClass, classify_leg, resumable_session
 
 
 @pytest.mark.parametrize(
@@ -155,3 +155,12 @@ def test_a_blocked_return_is_a_question_and_an_error_is_agent_work():
 def test_unknown_or_garbage_status_counts_as_agent_work():
     for status in ("", "pr_opened", "x" * 100_000, "BLOCKED"):
         assert classify_leg(_ok(status), resumed=False) is LegClass.AGENT
+
+
+@pytest.mark.parametrize("reason", [ExitReason.TRANSPORT_DEATH, ExitReason.AGENT_ERROR])
+def test_a_provider_refused_end_is_machine_fresh_and_an_attempt_on_its_resume(reason):
+    # Claude's api_error and codex's provider failure share this marker; a
+    # permanent provider error must not loop free (#418).
+    ended = AgentResult(is_error=True, exit_reason=reason, envelope_subtype=PROVIDER_REFUSED_SUBTYPE, session_id="s")
+    assert classify_leg(ended, resumed=False) is LegClass.MACHINE
+    assert classify_leg(ended, resumed=True) is LegClass.AGENT

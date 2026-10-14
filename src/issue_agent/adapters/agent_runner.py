@@ -668,6 +668,8 @@ class AgentRunner(AgentRuntime):
                                                    exit_reason=ExitReason.NO_RESULT, usage=usage_acc,
                                                    stream_usage=usage_acc))
         result = self._priced(task, with_stream_identity(result_to_agent_result(final)), final, delegated, exited)
+        if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE:
+            self._log(f"sdk: provider ended the turn ({result.summary[:200]}) — machine failure, not an attempt")
         reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
             self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "
