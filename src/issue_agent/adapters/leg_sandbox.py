@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ..domain.sandbox import (
-    CLAUDE_LOGIN_SHARED, Access, GitLink, LegFacts, LoginDir, Mount, MountPlan, UnsafeMount, claude_session_store,
+    CLAUDE_CONFIG_DIRS, CLAUDE_CONFIG_FILES, CLAUDE_LOGIN_SHARED, Access, GitLink, LegFacts, LoginDir, Mount, MountPlan, UnsafeMount, claude_session_store,
     exposes, leg_mount_plan, protected_paths,
 )
 
@@ -225,6 +225,27 @@ def claude_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
     return (store,)
 
 
+def _ensure_inert(config: str) -> None:
+    """A hidden entry needs a mount point, so each config name Claude obeys
+    exists before a leg starts: an empty directory, or an empty read-only file
+    (read as no settings; a read-only empty `.config.json` is never chosen as
+    global config). Present ones are left as they are."""
+    try:
+        for name in CLAUDE_CONFIG_DIRS:
+            try:
+                os.mkdir(os.path.join(config, name), 0o755)
+            except FileExistsError:
+                pass
+        for name in CLAUDE_CONFIG_FILES:
+            try:
+                os.close(os.open(os.path.join(config, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o444))
+            except FileExistsError:
+                pass
+    except OSError as exc:
+        raise SandboxRefused(f"cannot shield Claude's config dir {config} ({exc.strerror})") from exc
+
+
 def claude_login(env: Mapping[str, str]) -> LoginDir | None:
     """Claude's config dir as the leg's shared login, listed now so all the
     operator's state there (settings, hooks, history, other projects) is
@@ -233,6 +254,7 @@ def claude_login(env: Mapping[str, str]) -> LoginDir | None:
     config = _claude_config(env)
     if any(env.get(name) for name in _KEY_AUTH) or not os.path.isfile(os.path.join(config, ".credentials.json")):
         return None
+    _ensure_inert(config)
     try:
         entries = tuple(sorted(os.listdir(config)))
     except OSError as exc:

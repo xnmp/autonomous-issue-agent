@@ -509,6 +509,26 @@ def test_the_operators_claude_state_is_hidden_and_cannot_be_replaced(host):
     assert (config / "hooks/pre.sh").read_text() == "planted-hook\n"
 
 
+@needs_bwrap
+def test_a_leg_cannot_create_config_the_operators_claude_would_obey(host):
+    config = _plant_claude_config(host)
+    (config / "settings.json").unlink()
+    names = ("settings.json", "settings.local.json", ".config.json", "keybindings.json", "commands/x.md",
+             "output-styles/x.md", "agents/x.md", "skills/x/SKILL.md", "rules/x.md", "plugins/x")
+    script = "".join(f'mkdir -p "$(dirname "{config}/{n}")" 2>/dev/null; echo evil > "{config}/{n}" 2>/dev/null; '
+                     for n in names) + "echo done"
+
+    out, err = _claude_leg(host, script).communicate(timeout=30)
+
+    assert out.strip() == "done", err
+    for name in names:
+        path = config / name
+        assert not path.exists() or path.read_bytes() == b"", name
+    # Absent names were made empty and inert; the global config stays ~/.claude.json.
+    assert (config / ".config.json").stat().st_mode & 0o222 == 0
+    assert (config / "settings.json").read_bytes() == b""
+
+
 def test_a_leg_with_its_own_key_or_token_mounts_none_of_the_operators_claude_state(host):
     _plant_claude_config(host)
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
@@ -519,7 +539,7 @@ def test_a_leg_with_its_own_key_or_token_mounts_none_of_the_operators_claude_sta
 
 def test_a_login_directory_too_full_to_hide_refuses_the_leg_with_its_reason(host):
     config = _plant_claude_config(host)
-    for index in range(1_001):
+    for index in range(1_001 - len(os.listdir(config))):
         (config / f"junk-{index}").touch()
 
     with pytest.raises(SandboxRefused, match="entries"):

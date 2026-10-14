@@ -165,6 +165,14 @@ _RENDER_NODE = re.compile(r"/dev/dri/renderD[0-9]+")
 CLAUDE_LOGIN_SHARED = (".credentials.json", ".oauth_refresh.lock", ".oauth_refresh.lock.owner",
                        ".storage-write.lock")
 
+# What the operator's own Claude reads from its config dir as settings, memory
+# or extensions (CLI 2.1.299). A leg shares that dir read-write, so each is
+# hidden even where the operator has none: one a leg created would run in the
+# operator's sessions (hooks, mcpServers) or prompt them. `.config.json`
+# replaces `~/.claude.json` as global config only when non-empty or writable.
+CLAUDE_CONFIG_FILES = ("settings.json", "settings.local.json", "CLAUDE.md", ".config.json", "keybindings.json")
+CLAUDE_CONFIG_DIRS = ("agents", "commands", "skills", "hooks", "plugins", "rules", "output-styles")
+
 # Claude Code's project-directory name limit; longer paths get a hash suffix
 # whose function the CLI does not publish (CLI 2.1.299).
 _CLAUDE_PROJECT_NAME_LIMIT = 200
@@ -317,6 +325,6 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
 
 
 __all__ = [
-    "CLAUDE_LOGIN_SHARED", "Access", "GitLink", "LegFacts", "LoginDir", "Mount", "MountPlan", "UnsafeMount",
+    "CLAUDE_CONFIG_DIRS", "CLAUDE_CONFIG_FILES", "CLAUDE_LOGIN_SHARED", "Access", "GitLink", "LegFacts", "LoginDir", "Mount", "MountPlan", "UnsafeMount",
     "claude_session_store", "exposes", "leg_mount_plan", "login_mounts", "protected_paths",
 ]
