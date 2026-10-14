@@ -11,9 +11,15 @@ def bash(cmd):
     "curl http://x", "wget x", "a && curl x", "a; wget x", "a | curl x", "a || curl x",
     "FOO=1 curl x", "env curl x", "/usr/bin/curl x", 'bash -c "curl x"', "sh -c 'a && wget y'",
     "gh api repos/x", "gh auth token", "gh secret list", "echo hi\ncurl x",
+    "gh run watch 123", "timeout 590 gh run watch 38476005415 --interval 60",
+    "timeout -k 5 -s KILL --preserve-status 60 curl x",
 ])
 def test_denied_bash_carries_reason(cmd):
     assert bash(cmd)
+
+
+def test_ci_wait_reason_says_to_end_the_leg():
+    assert "end the leg" in bash("gh run watch 1")
 
 
 def test_curl_reason_points_to_alternative():
@@ -23,6 +29,8 @@ def test_curl_reason_points_to_alternative():
 @pytest.mark.parametrize("cmd", [
     "bun run dev", "agent-browser open http://localhost:1436", "gh pr create", "gh issue view 3",
     "echo curl", "grep curl README.md", "ls", "", "curlish x",
+    "gh run view 123 --log-failed", "gh run rerun 123 --failed", "gh pr checks 12",
+    "timeout 60 bun test", "timeout", "timeout -s",
 ])
 def test_allowed_bash_passes(cmd):
     assert bash(cmd) is None
