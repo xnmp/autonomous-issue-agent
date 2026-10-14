@@ -198,8 +198,8 @@ class GitHubAct:
         state = self.control.claim_key(key) if action.key else "new"
         # GitHub, not the key, says whether the comment is there. A confirmed
         # key is a read-back that once saw it, so a fresh read that does not is
-        # a deletion (derive asks again only when its own, possibly stale,
-        # observation lacks the comment); a claimed key may have landed unseen.
+        # a deletion (derive asks again when its own, possibly stale,
+        # observation lacks the comment, and it may lack it while it is there); a claimed key may have landed unseen.
         if state != "new":
             if self.gateway.has_comment(kind, action.number, action.body):
                 self.control.confirm_key(key)
@@ -224,7 +224,7 @@ class GitHubAct:
             # derive moves on; the link itself is never touched again.
             closed = blocker_closed_comment(self.marker, action.blocker)
             if not self.gateway.has_comment("issue", action.issue, closed):
-                self.log(f"issue #{action.issue}: blocked-by comment {action.key} was deleted; closing the matter again")
+                self.log(f"issue #{action.issue}: closing comment for {action.key} not found; posting it")
                 self.gateway.comment("issue", action.issue, closed)
             return
         try:

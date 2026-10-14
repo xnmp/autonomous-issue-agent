@@ -139,6 +139,7 @@ def test_a_deleted_triage_comment_is_posted_again_so_the_issue_reaches_resolve(t
     act.execute(action)
     gh.comments.clear()  # a human deletes it; derive keeps returning TriageNote
     act.execute(action)
+    act.execute(action)  # present again: nothing more
     assert gh.posted == [action.body, action.body] and gh.comments == [action.body]
 
 
