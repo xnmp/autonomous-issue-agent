@@ -229,7 +229,7 @@ def test_no_slots_means_no_heavy_dispatch(slots):
 # ── reply and question text ──────────────────────────────────────────────────
 
 
-def test_the_reply_is_every_human_comment_after_the_leg_in_order():
+def test_the_reply_is_the_first_human_comment_after_the_leg():
     after = T0 + timedelta(minutes=5)
     comments = (
         Comment("alice", "too early", (T0 + timedelta(minutes=4)).isoformat()),
@@ -239,7 +239,8 @@ def test_the_reply_is_every_human_comment_after_the_leg_in_order():
         Comment("ci[bot]", "coverage", (T0 + timedelta(minutes=9)).isoformat()),
         Comment("carol", "undated", "yesterday"),
     )
-    assert human_reply(comments, after, H, ()) == "@alice: first\n\n@bob: second"
+    assert human_reply(comments, after, H, ()) == comments[2]
+    assert human_reply(comments[:1] + comments[3:], after, H, ()) is None  # no human answered yet
 
 
 def test_342_the_reply_skips_comments_inside_any_of_the_items_leg_windows():
@@ -250,7 +251,8 @@ def test_342_the_reply_skips_comments_inside_any_of_the_items_leg_windows():
         Comment("fix-bot", "agent progress", (T0 + timedelta(minutes=8)).isoformat()),
         Comment("fix-bot", "follow-up", (T0 + timedelta(minutes=11)).isoformat()),
     )
-    assert human_reply(comments, after, H, (capped,)) == "@fix-bot: answer\n\n@fix-bot: follow-up"
+    assert human_reply(comments, after, H, (capped,)) == comments[0]
+    assert human_reply(comments[1:], after, H, (capped,)) == comments[2]  # the mid-leg comment is the agent's
 
 
 # ── Facts (round 2) ───────────────────────────────────────────────────────

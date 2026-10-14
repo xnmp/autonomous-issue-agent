@@ -29,7 +29,6 @@ from ..domain.actions import (
 )
 from ..domain.labels import Label
 from ..domain.policy import blocker_closed_comment, blocker_comment
-from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict
 from ..domain.triage import link_refusal
@@ -40,7 +39,6 @@ from .github import FixObservationIncomplete, GhUnavailable
 # whether to post.
 _COMMENT_NAMESPACE = "fix-comment"
 _ISSUE_NAMESPACE = "fix-issue"
-_PR_BODY_LIMIT = 60000
 # Stable across retries: the comment's read-back matches its exact body.
 _GITHUB_REFUSED = "GitHub would not read or write the link"
 
@@ -307,10 +305,12 @@ class GitHubAct:
         if self.gateway.pull_request_for_branch(action.branch) is not None:
             return
         issue = self.gateway.get_issue(action.issue)
-        criteria = issue_acceptance_criteria(issue.body or "", [c.body for c in issue.comments])
-        body = complete_pr_body(self.latest_resolve_summary(action.issue), action.issue, self.repository, criteria)
-        if len(body) > _PR_BODY_LIMIT:
-            body = complete_pr_body("", action.issue, self.repository, criteria)
+        # The agent writes the whole description (AGENT.md step 9). Without
+        # one the PR still names its issue; nothing depends on that line,
+        # since merge closes the issue itself and the reviewer's bar is the
+        # steward's criteria, not this body.
+        written = self.latest_resolve_summary(action.issue)
+        body = written if written.strip() else f"Closes #{action.issue}"
         self.gateway.open_pull_request(action.branch, self.base_branch, issue.title or action.branch, body)
         if self.gateway.pull_request_for_branch(action.branch) is None:
             raise RuntimeError(f"issue #{action.issue}: PR for {action.branch} not confirmed")
@@ -318,7 +318,8 @@ class GitHubAct:
 
     def latest_resolve_summary(self, issue: int) -> str:
         """The agent's summary from the issue's latest returned resolve leg:
-        an untrusted claim, used only as the PR description."""
+        the PR description it wrote, an untrusted claim used only as that.
+        The receipt bounds it (20,000 characters) below GitHub's body limit."""
         runs = [
             r for r in self.control.leg_runs(self.repository, (issue,))
             if r.kind == "RESOLVE" and r.receipt is not None and isinstance(r.receipt.get("summary"), str)

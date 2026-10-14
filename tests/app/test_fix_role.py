@@ -166,7 +166,8 @@ class FakeGitHub:
 
     def comment(self, kind: str, number: int, body: str, *, author: str = FIX_BOT) -> None:
         store = self.issues if kind == "issue" else self.prs
-        store[number] = replace(store[number], comments=(*store[number].comments, Comment(author, body, _now())))
+        url = f"https://github.com/o/r/{'issues' if kind == 'issue' else 'pull'}/{number}#issuecomment-{len(store[number].comments) + 1}"
+        store[number] = replace(store[number], comments=(*store[number].comments, Comment(author, body, _now(), url)))
         self._lossy("comment")
 
     def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
@@ -405,10 +406,11 @@ def test_resolve_runs_once_under_its_lease_then_the_harness_opens_one_pr(role):
     assert OpenPullRequest(5, "fix/5-null-token-crashes") in tick(composed)
     assert tick(composed) == []  # CI pending on the new PR: wait
     assert [p.head_ref_name for p in gh.prs.values()] == ["fix/5-null-token-crashes"]
-    pr = gh.prs[100]
-    assert "Fixed the null token." in pr.body and "#5" in pr.body
+    assert gh.prs[100].body == "Fixed the null token."  # the agent's description, unchanged
     task = agent.tasks[0]
     assert "git push -u origin fix/5-null-token-crashes" in task.prompt
+    # The agent reads the issue itself: a pointer, not the pasted text.
+    assert "gh issue view 5 --comments" in task.prompt and "Steps: ..." not in task.prompt
     assert task.env["GIT_AUTHOR_EMAIL"] == "fix-bot@users.noreply.github.com"
 
 
@@ -548,7 +550,10 @@ def test_a_question_stops_for_a_human_and_the_reply_resumes_the_same_session(rol
     assert dispatched(tick(composed), AgentKind.RESOLVE)
     resumed = agent.tasks[1]
     assert resumed.resume == "s-q"
-    assert "410, it is gone for good." in resumed.prompt
+    reply = gh.issues[5].comments[-1]
+    # A pointer to the answer, which the agent reads (with any edit) itself.
+    assert reply.url in resumed.prompt and "gh issue view 5 --comments" in resumed.prompt
+    assert "410, it is gone for good." not in resumed.prompt
 
 
 # ── Fix round (slice 5b review): regressions ─────────────────────────────────
@@ -657,7 +662,7 @@ def test_a_machine_death_after_the_answer_keeps_the_answer(role, later):
     later()
     assert dispatched(tick(composed), AgentKind.RESOLVE)
     retried = agent.tasks[2]
-    assert retried.resume == "s-q" and "410." in retried.prompt
+    assert retried.resume == "s-q" and gh.issues[5].comments[-1].url in retried.prompt
 
 
 def test_342_the_agents_own_mid_leg_comment_is_not_the_reply_and_a_later_one_is(role, later):
@@ -691,8 +696,9 @@ def test_342_the_agents_own_mid_leg_comment_is_not_the_reply_and_a_later_one_is(
     later()
     assert dispatched(tick(composed), AgentKind.FIX_CI)
     continued = agent.tasks[2].prompt
-    assert "Mock the clock." in continued and "Also pin the timezone." in continued
-    assert "Progress report" not in continued
+    urls = {c.body: c.url for c in gh.prs[100].comments}
+    assert urls["Mock the clock."] in continued  # the answer it points at
+    assert urls["Progress report: still red after the retry."] not in continued
 
 
 def test_a_human_closed_pr_is_reopened_once_the_agent_pushes_again(role):
@@ -912,12 +918,12 @@ def test_steward_then_triage_then_one_comment_then_resolve_each_on_its_own_route
     assert resolve.model == "claude-opus-5-5" and resolve.resume is None  # never a light session
     assert "A null token returns 401, not 500" in resolve.prompt
     assert tick(composed) == [OpenPullRequest(5, "fix/5-null-token-crashes")]
-    assert "A null token returns 401, not 500" in gh.prs[100].body
+    assert gh.prs[100].body == "Fixed the null token."  # the agent writes the description
     assert len(gh.comments_with("issue", 5, "Acceptance criteria")) == 1
     assert len(gh.comments_with("issue", 5, "issue-agent:triage")) == 1
 
 
-def test_an_issue_with_its_own_criteria_keeps_them_as_the_contract(role):
+def test_an_issue_with_its_own_criteria_is_resolved_against_the_issue(role):
     own = "Crash on null token.\n\n## Acceptance criteria\n- [ ] The API answers 401"
     gh = FakeGitHub(issues={5: replace(ready(), body=own)})
     light = triaged("high")
@@ -929,8 +935,9 @@ def test_an_issue_with_its_own_criteria_keeps_them_as_the_contract(role):
     tick(composed)  # the triage comment: the tier only
     tick(composed)  # RESOLVE
     assert gh.comments_with("issue", 5, "Acceptance criteria") == []
-    assert tick(composed) == [OpenPullRequest(5, "fix/5-null-token-crashes")]
-    assert "The API answers 401" in gh.prs[100].body and "A null token returns 401" not in gh.prs[100].body
+    resolve = agent.tasks[2].prompt
+    assert "steward acceptance criteria" not in resolve and "A null token returns 401" not in resolve
+    assert "gh issue view 5 --comments" in resolve and "The API answers 401" not in resolve
 
 
 def test_light_legs_cut_off_by_the_wall_cap_count_once_and_the_issue_resolves_at_the_default_tier(role):

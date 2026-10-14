@@ -223,11 +223,12 @@ class ReviewCheckouts:
     def path(self, pr: int) -> str:
         return os.path.join(self.worktree_root, f"review-pr-{pr}")
 
-    def ensure(self, pr: int, head_sha: str) -> str:
-        """An absolute path whose checkout IS `head_sha`, or
+    def ensure(self, pr: int, head_sha: str, base_ref: str, base_sha: str) -> str:
+        """An absolute path whose checkout IS `head_sha`, with `base_sha` (the
+        tip of `base_ref`) present so the reviewer can diff base...head, or
         `WorktreeUnavailable`: never a stale or dirty view."""
-        if not head_sha:
-            raise WorktreeUnavailable("review checkout needs a head SHA")
+        if not head_sha or not base_ref or not base_sha:
+            raise WorktreeUnavailable("review checkout needs the head SHA and the base ref and SHA")
         with self._mutation_lock:
             abs_path = os.path.join(self.repo_dir, self.path(pr))
             is_worktree = False
@@ -238,14 +239,16 @@ class ReviewCheckouts:
                 is_worktree = self._is_this_worktree(pr, abs_path)
                 if not is_worktree:
                     self._remove_stale_dir(pr, abs_path)
-            if (is_worktree and self._ensured.get(pr) == head_sha
+            if (is_worktree and self._ensured.get(pr) == head_sha and self._has_commit(base_sha)
                     and self._git(["rev-parse", "HEAD"], abs_path).out.strip() == head_sha):
                 return abs_path
             # GitHub always serves refs/pull/<n>/head; a bare SHA fetch may be refused.
-            self._git(["fetch", "origin", f"refs/pull/{pr}/head", "--quiet"], self.repo_dir)
-            if self._git(["cat-file", "-e", f"{head_sha}^{{commit}}"], self.repo_dir).code != 0:
-                raise WorktreeUnavailable(f"reviewed head {head_sha} for PR #{pr} is not reachable after fetching "
-                                          "its PR ref (force-pushed away?) — defer and re-observe")
+            self._git(["fetch", "origin", f"refs/pull/{pr}/head", f"refs/heads/{base_ref}", "--quiet"],
+                      self.repo_dir)
+            for name, sha in (("reviewed head", head_sha), ("base", base_sha)):
+                if not self._has_commit(sha):
+                    raise WorktreeUnavailable(f"{name} {sha} for PR #{pr} is not reachable after fetching its "
+                                              "refs (force-pushed away?) — defer and re-observe")
             if is_worktree:
                 # Re-verified after the (up to 60s) fetch, right before mutating.
                 if not self._is_this_worktree(pr, abs_path):
@@ -268,6 +271,19 @@ class ReviewCheckouts:
                                           f"reviewed head {head_sha[:12]!r}")
             self._ensured[pr] = head_sha
             return abs_path
+
+    def has_changes(self, base_sha: str, head_sha: str) -> bool:
+        """Whether base...head (GitHub's PR diff) changes anything. A git
+        failure is not an empty diff: it raises, so the round defers."""
+        # --name-only, not --quiet: --quiet's "differs" exit is the same 1 a
+        # timeout or a missing object returns.
+        result = self._git(["diff", "--name-only", f"{base_sha}...{head_sha}"], self.repo_dir)
+        if result.code != 0:
+            raise WorktreeUnavailable(f"git diff {base_sha[:12]}...{head_sha[:12]} failed — defer")
+        return bool(result.out.strip())
+
+    def _has_commit(self, sha: str) -> bool:
+        return self._git(["cat-file", "-e", f"{sha}^{{commit}}"], self.repo_dir).code == 0
 
     def _is_this_worktree(self, pr: int, abs_path: str) -> bool:
         """Whether git says the directory's toplevel is the directory. A link

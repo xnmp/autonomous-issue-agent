@@ -6,8 +6,9 @@ head and the review bot has no verdict on that head. Every other Action
 (labels, stop comments, merges, the other legs) is the fix role's, so
 `needs-human` keeps one writer and a REVIEW attempt cap is stopped by fix.
 
-A REVIEW leg reads the exact head (a detached checkout pinned to it and the
-base...head diff), runs the configured review model once, and the harness
+A REVIEW leg reads the exact head (a detached checkout pinned to it, where
+the agent diffs base...head itself), runs the configured review model once,
+and the harness
 submits the parsed verdict as one GitHub review on that commit under the
 review bot's identity. The verdict is the agent's claim: anything but an
 exact APPROVE or REQUEST_CHANGES with a body is no verdict, and the leg
@@ -40,7 +41,7 @@ from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
 from .config import REVIEW_DISPATCH_CAPACITY, HarnessConfig
 from .planners import tasks
-from .tick import Choose, Slots, Role, compose_role, leg_class, run_item, run_leg, stderr_log
+from .tick import Choose, Slots, Role, compose_role, leg_class, run_item, run_leg, steward_criteria, stderr_log
 
 
 def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int) -> tuple[Action, ...]:
@@ -177,7 +178,7 @@ class ReviewLegs:
             self._submit(action, verdict)
             return
         try:
-            task = self._task(action, pr)
+            task = self._task(action, issue, pr, runs)
         except _NothingToReview:
             self.log(f"REVIEW PR #{action.number}: base...head is empty at {action.head[:12]}; "
                      "nothing to review (counted as an attempt)")
@@ -212,25 +213,27 @@ class ReviewLegs:
         self.log(f"REVIEW PR #{pr}: GitHub refused the {verdict.event} on {head[:12]} (counted as an attempt)")
         self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
 
-    def _task(self, action: RunAgent, pr: PRView):
+    def _task(self, action: RunAgent, issue: int, pr: PRView, runs: Iterable[LegRun]):
         runtime, model, effort = self.route(action.tier)
         self.log(f"REVIEW PR #{action.number}: tier {getattr(action.tier, 'value', '(none)')} -> "
                  f"{runtime.value if runtime else '(default runtime)'}:{model or '(default model)'}{':' + effort.value if effort else ''}")
-        cwd = self.checkouts.ensure(action.number, action.head)
+        base = pr.base_ref_oid
+        cwd = self.checkouts.ensure(action.number, action.head, pr.base_ref_name, base)
+        if not self.checkouts.has_changes(base, action.head):
+            raise _NothingToReview
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd, runtime)
-        diff = self.gateway.pr_diff(action.number, pr.base_ref_oid, action.head)
-        if diff.head_oid != action.head or diff.base_oid != pr.base_ref_oid:
-            raise RuntimeError("the revision-bound diff does not match the reviewed head")
-        if not diff.text.strip():
-            raise _NothingToReview
+        criteria = steward_criteria(runs)
         discussion = format_pr_discussion(pr.comments)
         prior = _prior_review(pr, self.settings.harness.review_bot)
-        task = tasks.build_review_task(
-            action.number, as_untrusted(pr.title), as_untrusted(pr.body), as_untrusted(diff.text),
-            self.task_config, discussion=as_untrusted(discussion) if discussion else None,
+        context = tasks.ReviewContext(
+            as_untrusted(pr.title), as_untrusted(pr.body), criteria=criteria,
+            # No steward criteria (the issue stated its own): the issue is the bar.
+            issue_body=None if criteria is not None else as_untrusted(self.gateway.get_issue(issue).body or ""),
+            discussion=as_untrusted(discussion) if discussion else None,
             prior_review=as_untrusted(prior) if prior else None,
         )
+        task = tasks.build_review_task(action.number, issue, action.head, base, context, self.task_config)
         return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort or task.effort)
 
 

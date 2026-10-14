@@ -2,6 +2,7 @@
 confirmed by a read-back after it, so a lost reply or a replay never posts
 twice, and a stop comment never lands on an item that is not yet stopped."""
 
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,8 @@ import pytest
 from issue_agent.adapters.act import GitHubAct
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.github import BlockerLinkFacts, FixObservationIncomplete, GhUnavailable
-from issue_agent.domain.actions import LinkBlockedBy, PostComment, Target
+from issue_agent.domain.actions import LinkBlockedBy, OpenPullRequest, PostComment, Target
+from issue_agent.domain.contracts import RunId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import blocker_comment
 from issue_agent.domain.state import BLOCKER_TAG
@@ -491,3 +493,54 @@ def test_a_state_change_that_does_not_read_back_raises(tmp_path, action):
     gh.issues[41] = IssueView(41, "CI: y failing on dev", state="closed")
     with pytest.raises(RuntimeError, match="not confirmed"):
         _act(tmp_path, gh).execute(action)
+# ── opening the PR (Q11): the agent's description, unchanged ─────────────────
+
+
+class PrGateway:
+    def __init__(self):
+        self.opened: list[tuple[str, str, str, str]] = []
+
+    def pull_request_for_branch(self, branch):
+        return 100 if self.opened else None
+
+    def get_issue(self, number):
+        return SimpleNamespace(title="Null token crashes", body="## Acceptance criteria\n- [ ] 401", comments=())
+
+    def open_pull_request(self, branch, base, title, body):
+        self.opened.append((branch, base, title, body))
+
+
+def _opened_body(tmp_path, *results) -> str:
+    gh = PrGateway()
+    act = _act(tmp_path, gh)
+    for result in results:
+        act.control.record_unpaid_leg(
+            RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="RESOLVE", owner_id="o",
+            issue=5, number=5, head="", runtime="claude", leg_class="agent", result=result)
+    act.execute(OpenPullRequest(5, "fix/5-null-token"))
+    ((branch, base, title, body),) = gh.opened
+    assert (branch, base, title) == ("fix/5-null-token", "dev", "Null token crashes")
+    return body
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "Fixed it.\n\n## Acceptance Criteria\n- [x] 401\n\nCloses #5",
+        "No criteria and no closing line",  # the harness adds neither
+        "Unclosed fence:\n```python\nprint(1)",  # malformed Markdown is the author's
+        "x" * 20_000,  # the receipt's ceiling
+    ],
+    ids=["complete", "bare", "unclosed-fence", "huge"],
+)
+def test_the_pr_opens_with_the_agents_description_unchanged(tmp_path, written):
+    assert _opened_body(tmp_path, {"summary": written}) == written
+
+
+@pytest.mark.parametrize(
+    "results",
+    [(), ({"summary": ""},), ({"summary": "  \n"},), ({"summary": 7},), ({},)],
+    ids=["no-leg", "empty", "blank", "not-text", "no-summary"],
+)
+def test_without_a_written_description_the_pr_still_names_its_issue(tmp_path, results):
+    assert _opened_body(tmp_path, *results) == "Closes #5"

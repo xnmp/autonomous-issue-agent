@@ -24,7 +24,7 @@ from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
-from issue_agent.domain.world import PullRequestDiff, Review
+from issue_agent.domain.world import Review
 from tests.app.test_fix_role import (
     FIX_BOT,
     REVIEW_BOT,
@@ -53,13 +53,9 @@ class ReviewGitHub(FakeGitHub):
     refuse_submit: int = 0  # submissions GitHub refuses with a 4xx
     refused: int = 0
     login: str = REVIEW_BOT  # who the review credential acts as
-    diff: str = "diff --git a/x.py b/x.py\n+fix\n"
 
     def viewer_login(self) -> str:
         return self.login
-
-    def pr_diff(self, pr: int, base_oid: str, head_oid: str) -> PullRequestDiff:
-        return PullRequestDiff(base_oid, head_oid, self.diff)
 
     def reviewed_on(self, pr: int, head: str, login: str) -> bool:
         return any(
@@ -87,15 +83,21 @@ class ReviewGitHub(FakeGitHub):
 
 
 class FakeCheckouts:
-    def __init__(self, root: Path):
-        self.root = root
-        self.pinned: list[tuple[int, str]] = []
+    """Pinned checkouts whose base...head diff is `changed` (False: empty)."""
 
-    def ensure(self, pr: int, head: str) -> str:
-        self.pinned.append((pr, head))
+    def __init__(self, root: Path, changed: bool = True):
+        self.root = root
+        self.changed = changed
+        self.pinned: list[tuple[int, str, str, str]] = []
+
+    def ensure(self, pr: int, head: str, base_ref: str, base: str) -> str:
+        self.pinned.append((pr, head, base_ref, base))
         path = self.root / f"review-pr-{pr}"
         path.mkdir(parents=True, exist_ok=True)
         return str(path)
+
+    def has_changes(self, base: str, head: str) -> bool:
+        return self.changed
 
     def remove(self, pr: int) -> None:
         pass
@@ -151,7 +153,7 @@ def roles(tmp_path):
 def green(**fields) -> ReviewGitHub:
     """Issue 5 with its PR #100 open, CI green on h1."""
     gh = ReviewGitHub(issues={5: ready()}, **fields)
-    open_pr(gh, head="h1", ci="pass")
+    open_pr(gh, head="h1", ci="pass", base_ref_name="dev", base_ref_oid="b1")
     return gh
 
 
@@ -193,9 +195,11 @@ def test_a_green_head_without_a_bot_review_gets_one_review_leg_and_one_review_on
     assert tick(review) == []  # reviewed: nothing more is owed on h1
 
     assert gh.submitted == [(100, "APPROVE", "Correct and tested.", "h1")]
-    assert len(agent.tasks) == 1 and roles.checkouts.pinned == [(100, "h1")]
+    assert len(agent.tasks) == 1 and roles.checkouts.pinned == [(100, "h1", "dev", "b1")]
     task = agent.tasks[0]
-    assert task.cwd.endswith("review-pr-100") and "diff --git a/x.py" in task.prompt
+    # The reviewer diffs its pinned checkout itself: pointers, no pasted diff.
+    assert task.cwd.endswith("review-pr-100") and "git diff b1...h1" in task.prompt
+    assert "<untrusted_diff_json>" not in task.prompt
 
 
 def test_a_review_on_a_moved_head_is_skipped_without_a_paid_leg(roles):
@@ -290,10 +294,10 @@ def test_the_bots_previous_review_reaches_the_next_rounds_reviewer(roles):
     assert "<untrusted_prior_review_json>" in second and "Handle a None token in parse()." in second
 
 
-def test_a_head_with_nothing_to_review_stops_for_a_human_without_a_paid_leg(roles):
-    gh = green(diff="")
+def test_a_head_with_nothing_to_review_stops_for_a_human_without_a_paid_leg(roles, tmp_path):
+    gh = green()
     agent = Agent()
-    review = roles.review(gh, agent)
+    review = roles.review(gh, agent, checkouts=FakeCheckouts(tmp_path / "empty", changed=False))
     for _ in range(3):
         tick(review)
 
@@ -437,3 +441,34 @@ def test_the_reviewer_runs_at_the_effort_of_the_fixers_tier_route(roles):
     reviewer = Agent(verdict("APPROVE"))
     tick(roles.review(gh, reviewer, **tiers))
     assert reviewer.tasks[0].effort is Effort.HIGH
+
+
+# ── the bar the reviewer judges against (agent-autonomy audit, item 3) ───────
+
+
+def test_the_reviewer_judges_against_the_stewards_criteria_not_the_pr_description(roles):
+    from issue_agent.domain.triage import Steward
+    from tests.app.test_fix_role import seed_light_legs
+
+    gh = green()
+    gh.prs[100] = replace(gh.prs[100], body="## Acceptance Criteria\n- whatever the author says")
+    agent = Agent(verdict("APPROVE"))
+    review = roles.review(gh, agent)
+    seed_light_legs(review, 5, STEWARD={"steward": Steward(acceptance_criteria=("A null token returns 401",)).record()})
+    tick(review)
+
+    prompt = agent.tasks[0].prompt
+    bar = prompt.split("<untrusted_steward_acceptance_criteria_json>")[1].split("</untrusted_steward")[0]
+    assert "A null token returns 401" in bar and "whatever the author says" not in bar
+    assert "<untrusted_issue_body_json>" not in prompt
+
+
+def test_without_steward_criteria_the_reviewer_is_briefed_the_issue(roles):
+    gh = green()
+    gh.issues[5] = replace(gh.issues[5], body="## Acceptance criteria\n- [ ] The API answers 401")
+    agent = Agent(verdict("APPROVE"))
+    tick(roles.review(gh, agent))
+
+    prompt = agent.tasks[0].prompt
+    assert "The API answers 401" in prompt.split("<untrusted_issue_body_json>")[1]
+    assert gh.submitted == [(100, "APPROVE", "Looks right.", "h1")]

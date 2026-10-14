@@ -53,7 +53,11 @@ def test_parse_pr_maps_the_graphql_shape():
                     "commit": {"oid": "sha-graphql"},
                 }
             ],
-            "comments": [{"author": {"login": "alice"}, "body": "Use A.", "createdAt": "t2"}],
+            "comments": [
+                {"author": {"login": "alice"}, "body": "Use A.", "createdAt": "t2",
+                 "url": "https://github.com/o/r/pull/100#issuecomment-1"},
+                {"author": {"login": "bob"}, "body": "B.", "createdAt": "t3", "url": 7},  # malformed: no link
+            ],
             "files": [{"path": "backend/app/__init__.py"}, {"path": "backend/x.py"}],
         }
     )
@@ -70,7 +74,8 @@ def test_parse_pr_maps_the_graphql_shape():
         "APPROVED",
         "sha-graphql",
     )
-    assert pr.comments == (Comment("alice", "Use A.", "t2"),)
+    assert pr.comments == (Comment("alice", "Use A.", "t2", "https://github.com/o/r/pull/100#issuecomment-1"),
+                           Comment("bob", "B.", "t3"))
     assert pr.changed_files == frozenset({"backend/app/__init__.py", "backend/x.py"})
     assert parse_pr({"number": 100, "state": "OPEN"}).changed_files == frozenset()
 
@@ -254,16 +259,6 @@ def test_viewer_login_names_the_identity_the_credential_acts_as():
 def test_submit_review_returns_false_on_failure():
     # a failed POST (422/403) → runner returns "" (and logs stderr) → False.
     assert GitHubGateway("o/r", runner=FakeRunner()).submit_review(100, "APPROVE", "lgtm", "head") is False
-
-
-def test_pr_diff_is_fetched_for_exact_observed_revisions_and_never_invented():
-    fr = FakeRunner({"api -H Accept: application/vnd.github.v3.diff": "diff text"})
-
-    evidence = GitHubGateway("o/r", runner=fr).pr_diff(100, "base-sha", "head-sha")
-
-    assert (evidence.base_oid, evidence.head_oid) == ("base-sha", "head-sha")
-    assert "repos/o/r/compare/base-sha...head-sha" in fr.calls[0][0]
-    assert GitHubGateway("o/r", runner=FakeRunner()).pr_diff(100, "base-sha", "head-sha").text == ""
 
 
 def test_get_issue_parses_response():

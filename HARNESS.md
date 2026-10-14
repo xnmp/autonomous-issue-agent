@@ -202,8 +202,9 @@ or update-branch bound to the decided head, a PR opened only when the branch
 has no open one) or claims an idempotency key in SQLite and confirms it with a
 GitHub read-back. The fix agent pushes its own `fix/<issue>-` branch with `git
 push` and returns; the harness opens the PR from that branch (when it is ahead
-of base, and has no PR or was pushed after a human closed its PR), using the
-agent's summary as the description. An agent's question is recorded with its
+of base, and has no PR or was pushed after a human closed its PR), with the
+agent's summary, unchanged, as the description (AGENT.md step 9 has the agent
+write the whole of it). An agent's question is recorded with its
 leg and carried by the `needs-human` stop comment; reply on that thread to
 answer it. Harness comments are recognised by the marker and a harness login
 together. The review role writes through the same `act` step: one GitHub
