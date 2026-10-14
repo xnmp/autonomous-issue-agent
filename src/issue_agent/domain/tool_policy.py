@@ -1,10 +1,12 @@
-"""Tool calls the fixer may not make: credential hygiene only.
+"""Tool calls the fixer may not make: credential hygiene (plus the two CI rows
+PR #403 removes).
 
 These rules feed the SDK's `disallowed_tools`, the one policy that holds under
-bypassPermissions (a deny rule beats bypass). They are rarely hit and the SDK's
-bare "Permission to use ... has been denied" explains itself. Network tools are
-allowed: agents fetch docs, research and probe local servers like an engineer,
-and the supported posture is trusted inbound content only (CLAUDE.md).
+bypassPermissions (a deny rule beats bypass). They get the SDK's bare
+"Permission to use ... has been denied"; AGENT.md says not to retry it.
+Network tools are allowed: agents fetch docs, research and probe local servers
+like an engineer, and the supported posture is trusted inbound content only
+(CLAUDE.md).
 """
 
 from __future__ import annotations

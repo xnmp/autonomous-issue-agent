@@ -2,7 +2,7 @@
 shapes): prompt, schema, tool policy, budget, model and session.
 
 Every fixer leg, fresh or resumed, carries the full AGENT.md: Claude rebuilds
-the system prompt on each run and never stores it in the transcript, so a
+the system prompt on each run and never replays it from the transcript, so a
 resumed leg sees only what this leg sends. The reviewer gets read-only tools.
 """
 

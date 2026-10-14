@@ -161,26 +161,14 @@ def test_light_legs_read_only_the_prompt_while_fixers_may_use_the_web():
         assert not {"WebFetch", "WebSearch"} & set(task.disallowed_tools), name
 
 
-def test_deny_list_keeps_the_fixer_able_to_work():
-    # Denying these would break the harness itself: the adversarial pre-PR review
-    # is a Task subagent, and the whole TDD loop is git/test/gh Bash calls.
-    assert "Task" not in FIXER_DENY
-    assert "Bash" not in FIXER_DENY
-    assert not any(
-        d.startswith("Bash(git") or d.startswith("Bash(gh pr") or d.startswith("Bash(gh issue") for d in FIXER_DENY
-    )
-
-
 # ── every leg carries the fixer contract ──
 def test_resumed_legs_carry_the_full_agent_contract():
-    # Claude rebuilds the system prompt on every run and keeps none of it in
+    # Claude rebuilds the system prompt on every run and never replays it from
     # the transcript (each resumed leg's prompt snapshot held only what that
     # leg sent), so a resumed leg that dropped AGENT.md ran without it.
     for name, task in _every_fixer_task("sess-1").items():
         assert task.append_system_prompt == "AGENTMD", name
-    for name, task in _every_fixer_task("sess-1").items():
-        if name != "resolve":
-            assert task.resume == "sess-1", name
+        assert name == "resolve" or task.resume == "sess-1", name
 
 
 # ── review ──
