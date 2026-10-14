@@ -31,7 +31,11 @@ _GIT_TIMEOUT_S = 60.0
 # A leg writes its checkout, so it can plant a submodule whose `.git` names a
 # gitdir with its own config; the harness's git never enters one (#413: the
 # sandboxed leg cannot touch the repository config, only its checkout).
-_NO_RECURSION = ("-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false")
+# Fix legs see `packed-refs` as of their launch, so the harness's git never
+# packs refs: a `gc --auto` its fetch started moved a running leg's branch out
+# of the live refs/ and the leg lost it (tauri #1106, 2026-10-15). Object
+# maintenance still runs.
+_HOST_GIT = ("-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false", "-c", "gc.packRefs=false")
 
 
 def _subprocess_git(args: list[str], cwd: str) -> GitResult:
@@ -40,7 +44,7 @@ def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     `worktree add` failure once handed back a path that did not exist)."""
     command = f"git {' '.join(args)} (cwd={cwd})"
     try:
-        res = subprocess.run(["git", *_NO_RECURSION, *args], cwd=cwd, capture_output=True, text=True,
+        res = subprocess.run(["git", *_HOST_GIT, *args], cwd=cwd, capture_output=True, text=True,
                              timeout=_GIT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         print(f"[worktree] git timed out after {_GIT_TIMEOUT_S:g}s and was killed: {command}", file=sys.stderr)

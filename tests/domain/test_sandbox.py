@@ -67,14 +67,24 @@ def test_a_fix_leg_writes_its_checkout_and_publishes():
 def test_the_harness_runs_git_there_so_a_fix_leg_never_changes_git_config_hooks_or_links():
     plan = leg_mount_plan(facts())
 
-    # Writes beside them (packed-refs.lock, a scratch worktree) vanish with the leg.
-    for path in (f"{GIT.common_dir}/config", f"{GIT.common_dir}/hooks/post-checkout",
-                 f"{GIT.common_dir}/packed-refs", f"{GIT.common_dir}/worktrees/issue-9/commondir"):
+    # Writes beside them (packed-refs.lock, config on `push -u`, a scratch worktree) vanish with the leg.
+    for path in (f"{GIT.common_dir}/config", f"{GIT.common_dir}/hooks/post-checkout", f"{GIT.common_dir}/commondir",
+                 f"{GIT.common_dir}/packed-refs.lock", f"{GIT.common_dir}/worktrees/issue-9/commondir"):
         assert visible(plan, path) is Access.THROWAWAY, path
     # Its own checkout's links sit in a directory it writes, so they are read-only.
     for path in (f"{GIT.worktree_dir}/commondir", f"{GIT.worktree_dir}/gitdir", f"{GIT.worktree_dir}/config.worktree",
                  f"{WORKTREE}/.git"):
         assert visible(plan, path) is Access.READ_ONLY, path
+
+
+def test_a_fix_leg_shares_live_refs_but_cannot_rewrite_packed_refs():
+    plan = leg_mount_plan(facts())
+
+    for path in ("objects/pack/p.pack", "refs/heads/fix/5", "refs/heads/fix/5.lock", "logs/HEAD"):
+        assert visible(plan, f"{GIT.common_dir}/{path}") is Access.READ_WRITE, path
+    # Never the overlay's: a packed-refs a leg rewrote there would stay private
+    # while its `pack-refs` pruned the host's loose refs.
+    assert access(plan, f"{GIT.common_dir}/packed-refs") is Access.READ_ONLY
 
 
 def test_a_reviewer_sees_the_whole_repository_read_only():

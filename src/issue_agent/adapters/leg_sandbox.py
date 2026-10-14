@@ -25,6 +25,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -37,6 +38,12 @@ _NAMESPACES = ("--die-with-parent", "--unshare-pid", "--new-session", "--unshare
                "--unshare-cgroup-try")
 _PROBE_TIMEOUT_S = 10.0
 _GITFILE_LIMIT = 4096
+# A leg hides each entry of Claude's config dir with its own mount; past this
+# many, bwrap's argv outgrows the kernel's limit, so a leg that filled the
+# directory would stop every later one with an opaque exec error.
+_LOGIN_ENTRY_LIMIT = 1000
+# The leg's runtime authenticates without the operator's login file.
+_KEY_AUTH = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 # Environment git config: never written into the checkout. The empty helper
 # drops any helper /etc/gitconfig names; a publishing leg then answers GitHub
@@ -115,7 +122,7 @@ def git_link(cwd: str, repository: str) -> GitLink | None:
     return GitLink(common, own)
 
 
-def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
+def _render(mount: Mount, protected: Sequence[str], empty: str) -> tuple[str, ...]:
     path = mount.path
     if mount.access is Access.PRIVATE:
         return ("--tmpfs", path)
@@ -125,7 +132,7 @@ def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
         # target); inside the sandbox it resolves to what the plan shows.
         if os.path.islink(path) or not os.path.lexists(path):
             return ()
-        return ("--tmpfs", path) if os.path.isdir(path) else ("--ro-bind", os.devnull, path)
+        return ("--tmpfs", path) if os.path.isdir(path) else ("--ro-bind", empty, path)
     # A top-level system link (/bin -> usr/bin) stays a link.
     if mount.optional and os.path.dirname(path) == "/" and os.path.islink(path):
         return ("--symlink", os.readlink(path), path)
@@ -148,12 +155,14 @@ def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
     return ("--overlay-src", path, "--tmp-overlay", path) if os.path.isdir(path) else ()
 
 
-def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...]:
+def bwrap_arguments(plan: MountPlan, protected: Sequence[str], empty: str = os.devnull) -> tuple[str, ...]:
     """The plan as bwrap options. The root stays a read-only tmpfs, so
-    nothing outside the mounts exists for the leg."""
+    nothing outside the mounts exists for the leg. `empty` is what a hidden
+    file shows: an empty regular file (the leg's mounts are nodev, so a bound
+    /dev/null fails to open and Claude reports a broken settings file)."""
     args: list[str] = [*_NAMESPACES, "--dev", "/dev", "--proc", "/proc"]
     for mount in plan.mounts:
-        args += _render(mount, protected)
+        args += _render(mount, protected, empty)
     args += ["--remount-ro", "/"]
     for name, value in plan.env:
         args += ["--unsetenv", name] if value is None else ["--setenv", name, value]
@@ -176,6 +185,21 @@ def _empty_worktree_config(path: str) -> None:
         os.ftruncate(fd, 0)
     finally:
         os.close(fd)
+
+
+def _ensure_packed_refs(common: str) -> None:
+    """A fix leg sees `packed-refs` read-only, so it must exist: without it
+    the leg's `git pack-refs` would pack into its overlay and delete the
+    host's loose refs. An empty one is what git reads when there is none."""
+    path = os.path.join(common, "packed-refs")
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644))
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise SandboxRefused(f"{path} cannot be created ({exc.strerror})") from exc
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise SandboxRefused(f"{path} is not a plain file")
 
 
 def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
@@ -204,14 +228,18 @@ def claude_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
 def claude_login(env: Mapping[str, str]) -> LoginDir | None:
     """Claude's config dir as the leg's shared login, listed now so all the
     operator's state there (settings, hooks, history, other projects) is
-    hidden. None without a login file (an API-key leg needs none)."""
+    hidden. None without a login file, or when the leg authenticates with a
+    key or token of its own: then nothing of the operator's is mounted."""
     config = _claude_config(env)
-    if not os.path.isfile(os.path.join(config, ".credentials.json")):
+    if any(env.get(name) for name in _KEY_AUTH) or not os.path.isfile(os.path.join(config, ".credentials.json")):
         return None
     try:
         entries = tuple(sorted(os.listdir(config)))
     except OSError as exc:
         raise SandboxRefused(f"Claude's config dir is unreadable ({type(exc).__name__})") from exc
+    if len(entries) > _LOGIN_ENTRY_LIMIT:
+        raise SandboxRefused(f"{config} holds {len(entries)} entries; a leg hides each with a mount, past "
+                             f"{_LOGIN_ENTRY_LIMIT} bwrap cannot start (clear what does not belong there)")
     return LoginDir(config, CLAUDE_LOGIN_SHARED, entries)
 
 
@@ -255,6 +283,7 @@ class LegSandbox:
         self._bwrap = bwrap
         self._which = which
         self._run = run
+        self._empty = ""
 
     def __repr__(self) -> str:
         return (f"LegSandbox(repository={self.repository!r}, writable={self.writable}, "
@@ -266,6 +295,15 @@ class LegSandbox:
 
     def _binary(self) -> str | None:
         return self._which(self._bwrap)
+
+    def _empty_file(self) -> str:
+        """An empty, read-only regular file in a private directory, made again
+        if a temp cleaner removed it."""
+        if not (self._empty and os.path.isfile(self._empty) and os.path.getsize(self._empty) == 0):
+            path = os.path.join(tempfile.mkdtemp(prefix="issue-agent-sandbox-"), "empty")
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444))
+            self._empty = path
+        return self._empty
 
     def preflight(self) -> str | None:
         """Why legs cannot be sandboxed here, or None. Probes the namespaces
@@ -337,6 +375,7 @@ class LegSandbox:
         writes = self.writable and not read_only
         link = git_link(root, self.repository)
         if link is not None and writes:
+            _ensure_packed_refs(link.common_dir)
             _empty_worktree_config(os.path.join(link.worktree_dir, "config.worktree"))
         try:
             plan = leg_mount_plan(LegFacts(
@@ -349,7 +388,8 @@ class LegSandbox:
             ))
         except UnsafeMount as exc:
             raise SandboxRefused(str(exc)) from exc
-        argv = (self._binary() or self._bwrap, *bwrap_arguments(plan, protected_paths(self.home, self.protected)),
+        argv = (self._binary() or self._bwrap, *bwrap_arguments(plan, protected_paths(self.home, self.protected),
+                                                                    self._empty_file()),
                 "--", binary, *command[1:])
         credential = self._credential if plan.publishes else None
         added = _git_config_env(_GIT_CONFIG + (_PUBLISH_GIT_CONFIG if plan.publishes else ()))

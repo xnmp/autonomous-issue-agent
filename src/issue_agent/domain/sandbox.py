@@ -145,6 +145,7 @@ HOME_SECRETS = (
     ".claude.json",
 )
 
+
 # Temp dirs point inside the sandbox; XDG overrides fall back to HOME, which is private.
 LEG_ENV: tuple[tuple[str, str | None], ...] = (
     ("TMPDIR", "/tmp"), ("TMP", "/tmp"), ("TEMP", "/tmp"),
@@ -235,11 +236,20 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
         # change on the host: the harness runs git in every checkout outside
         # the sandbox, so a leg that could write them could run code there. A
         # fix leg's git still writes beside them (packed-refs.lock on every
-        # commit, a scratch `git worktree add`), so its writes there land in
-        # an overlay that vanishes with the leg (probe, 2026-10-14).
+        # commit, config on `push -u`, a scratch `git worktree add`), so its
+        # writes there land in an overlay that vanishes with the leg (probe,
+        # 2026-10-14).
         required.append(Mount(common, Access.THROWAWAY if facts.writable else Access.READ_ONLY))
         if facts.writable:
+            # Objects, loose refs and reflogs are the host's, live, locks included.
             required += [Mount(posixpath.join(common, d), Access.READ_WRITE) for d in ("objects", "refs")]
+            # packed-refs is read-only as of launch: git replaces it by rename,
+            # which the overlay would keep private, so a leg's `git pack-refs`
+            # would prune the host's loose refs and keep the packed copy. The
+            # harness's git never packs refs (`worktree._HOST_GIT`): a host gc
+            # that did moved a running leg's branch out of the live refs/ and
+            # the leg lost it (tauri #1106, 2026-10-15).
+            required.append(Mount(posixpath.join(common, "packed-refs"), Access.READ_ONLY))
             required.append(Mount(own, Access.READ_WRITE))
             # Its own links and config.worktree, which the harness's git reads
             # as repository config (hooksPath, fsmonitor) wherever the repository

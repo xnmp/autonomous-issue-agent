@@ -28,6 +28,7 @@ from issue_agent.adapters.leg_sandbox import (
     git_link,
 )
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.adapters.worktree import _subprocess_git
 from issue_agent.domain.contracts import RunId
 
 _UNAVAILABLE = LegSandbox(home="/nonexistent", repository="/nonexistent", writable=False).preflight()
@@ -331,6 +332,84 @@ def test_runtime_state_is_shared_with_the_host_at_the_same_path(host):
     assert (Path(env["CODEX_HOME"]) / "rollout").read_text() == "r\n"
 
 
+def _fix_leg(host: dict[str, Path], script: str) -> subprocess.Popen:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    leg = sandbox(host).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env)
+    return subprocess.Popen(leg.argv, env={**env, **leg.env}, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+
+@needs_bwrap
+def test_a_host_ref_update_reaches_a_running_fix_leg(host):
+    leg = _fix_leg(host, 'git rev-parse -q --verify refs/heads/other || echo none; read _; '
+                         'git rev-parse refs/heads/other; git rev-parse HEAD')
+    try:
+        assert leg.stdout.readline().strip() == "none"
+        _git("commit", "-q", "--allow-empty", "-m", "host", cwd=host["worktree"])
+        _git("update-ref", "refs/heads/other", "HEAD", cwd=host["target"])
+        out, err = leg.communicate("go\n", timeout=30)
+    finally:
+        leg.kill()
+    assert out.split() == [_git("rev-parse", "dev", cwd=host["target"]).strip(),
+                           _git("rev-parse", "fix/5-x", cwd=host["target"]).strip()], err
+
+
+@needs_bwrap
+def test_the_harnesss_own_git_never_packs_a_running_legs_branch_away(host):
+    leg = _fix_leg(host, 'read _; git rev-parse --abbrev-ref HEAD; git log -1 --format=%s')
+    try:
+        # A `gc --auto` the harness's fetch starts runs a full gc.
+        assert _subprocess_git(["gc", "--quiet"], str(host["target"])).code == 0
+        out, err = leg.communicate("go\n", timeout=30)
+    finally:
+        leg.kill()
+    assert out.split() == ["fix/5-x", "init"], err
+    assert (host["target"] / ".git/refs/heads/fix/5-x").is_file()
+
+
+@needs_bwrap
+def test_git_works_quietly_in_a_fix_leg_and_its_pack_refs_cannot_prune_the_hosts_refs(host):
+    refs = _git("show-ref", cwd=host["target"])
+    script = ('set -e; echo a > a; git add a; git commit -qm a; echo b > a; git stash -q; git stash pop -q; '
+              'git commit -qam b; git branch scratch; git branch -qD scratch; git tag t; git tag -d t >/dev/null; '
+              'git rebase -q HEAD~1; git fetch -q "$(git rev-parse --git-common-dir)" dev:refs/remotes/o/dev; '
+              'git worktree add -q /tmp/side HEAD; git -C /tmp/side log -1 --format=%s; set +e; '
+              'git pack-refs --all 2>/dev/null || echo pack-refused; echo done')
+
+    out, err = _fix_leg(host, script).communicate(timeout=60)
+
+    assert out.split() == ["b", "pack-refused", "done"], err
+    assert "error" not in err.lower() and "fatal" not in err.lower(), err
+    after = _git("show-ref", cwd=host["target"])
+    assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["target"]).strip() == "b"
+    # Every ref the host had is still there, loose; the leg's fetch reached the host.
+    assert set(refs.split("\n")[:-1]) - set(after.split("\n")) <= {
+        line for line in refs.split("\n") if line.endswith("refs/heads/fix/5-x")}
+    assert "refs/remotes/o/dev" in after
+    assert (host["target"] / ".git/refs/heads/dev").is_file()
+    assert not (host["target"] / ".git/worktrees/side").exists()
+
+
+@needs_bwrap
+def test_a_fix_leg_cannot_plant_what_the_harnesss_git_would_obey_in_the_repository(host):
+    common = host["target"] / ".git"
+    script = (f'echo /elsewhere > "{common}/commondir"; '
+              f'printf "[core]\\n\\thooksPath = /tmp\\n" > "{common}/config.worktree"; '
+              f'mkdir -p "{common}/modules/x" "{common}/remotes" && echo evil > "{common}/modules/x/config"; '
+              f'echo "URL: /evil" > "{common}/remotes/origin"; echo evil > "{common}/hooks/pre-commit"; '
+              f'echo evil >> "{common}/HEAD"; echo "[x]" >> "{common}/config"; echo done')
+    # The launch adds an empty packed-refs where there was none; nothing else.
+    before = {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()}
+
+    out, err = _fix_leg(host, script).communicate(timeout=30)
+
+    assert out.split() == ["done"], err
+    assert {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()} == {**before, "packed-refs": b""}
+    assert not {"commondir", "config.worktree", "modules", "remotes"} & {p.name for p in common.iterdir()}
+    assert not (common / "hooks/pre-commit").exists()
+
+
 def _plant_claude_config(host: dict[str, Path]) -> Path:
     """A fake operator ~/.claude: a login, settings with a hook, history,
     another project's transcript, a hooks dir. No real credential."""
@@ -410,6 +489,7 @@ def test_the_operators_claude_state_is_hidden_and_cannot_be_replaced(host):
     reads = " ".join(f'"{config}/{p}"' for p in ("settings.json", "history.jsonl", "CLAUDE.md", "hooks/pre.sh",
                                                   "projects/-home-op-other/s.jsonl"))
     script = (f'cat {reads} 2>/dev/null; ls -A "{config}/hooks" "{config}/projects"; '
+              f'[ -f "{config}/settings.json" ] && [ ! -s "{config}/settings.json" ] && echo empty-file; '
               f'echo evil > "{config}/hooks/pre.sh"; '
               f'rm -f "{config}/settings.json" 2>/dev/null || echo rm-refused; '
               f'echo evil > "{config}/x" && mv "{config}/x" "{config}/CLAUDE.md" 2>/dev/null || echo mv-refused; '
@@ -422,11 +502,28 @@ def test_the_operators_claude_state_is_hidden_and_cannot_be_replaced(host):
     # Its own session store is the only project it sees.
     assert out.split() == [f"{config}/hooks:", f"{config}/projects:",
                            os.path.basename(claude_runtime_state({"HOME": str(host["home"])}, str(host["worktree"]))[0]),
-                           "rm-refused", "mv-refused", "write-refused", "done"], err
+                           "empty-file", "rm-refused", "mv-refused", "write-refused", "done"], err
     assert (config / "settings.json").read_text() == '{"hooks": "planted-settings"}'
     assert (config / "CLAUDE.md").read_text() == "planted-memory\n"
     assert (config / "history.jsonl").read_text() == "planted-history\n"
     assert (config / "hooks/pre.sh").read_text() == "planted-hook\n"
+
+
+def test_a_leg_with_its_own_key_or_token_mounts_none_of_the_operators_claude_state(host):
+    _plant_claude_config(host)
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        assert claude_login({"HOME": str(host["home"]), name: "k"}) is None
+    assert claude_login({"HOME": str(host["home"]), "ANTHROPIC_API_KEY": ""}) is not None
+    assert claude_login({"HOME": str(host["tmp"] / "nobody")}) is None  # no login file
+
+
+def test_a_login_directory_too_full_to_hide_refuses_the_leg_with_its_reason(host):
+    config = _plant_claude_config(host)
+    for index in range(1_001):
+        (config / f"junk-{index}").touch()
+
+    with pytest.raises(SandboxRefused, match="entries"):
+        claude_login({"HOME": str(host["home"])})
 
 
 def test_a_checkout_whose_git_link_points_elsewhere_is_refused(host):
