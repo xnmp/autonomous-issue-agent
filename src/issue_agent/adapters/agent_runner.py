@@ -40,6 +40,7 @@ from ..domain.run_usage import (
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
+    PROVIDER_REFUSED_SUBTYPE,
     declared_status,
     reclassify_pending_background_block,
 )
@@ -164,12 +165,17 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     # run reports total_cost_usd == 0.00.
     usage = getattr(msg, "usage", None)
     turns = getattr(msg, "num_turns", None)
+    exit_reason = exit_reason_from_envelope(subtype, is_error)
+    if is_error and getattr(msg, "terminal_reason", None) == "api_error":
+        # The provider ended the leg (auth failure, 5xx, overload; #418): the
+        # codex shape, a machine failure whose session stays resumable.
+        exit_reason, subtype = ExitReason.TRANSPORT_DEATH, PROVIDER_REFUSED_SUBTYPE
     return AgentResult(
         is_error=is_error, status=status, envelope_subtype=subtype, summary=summary, needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0), model=reported_model(msg),
         session_id=reported_session(msg),
         structured=structured if isinstance(structured, dict) else None,
-        exit_reason=exit_reason_from_envelope(subtype, is_error),
+        exit_reason=exit_reason,
         usage=usage if isinstance(usage, dict) else None, num_turns=turns if isinstance(turns, int) else None,
     )
 
