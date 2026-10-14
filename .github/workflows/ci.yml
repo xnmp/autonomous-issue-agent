@@ -20,8 +20,10 @@ permissions:
 
 jobs:
   test:
-    # This repository has one native runner; GitHub serializes jobs on it.
-    runs-on: [self-hosted, linux, x64, issue-agent-ci]
+    # GitHub-hosted, never self-hosted: the repository is public, and a fork PR
+    # runs `make test` with its own code. A runner on the operator's machine
+    # would hand that code the harness credentials.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       TEST_WORKERS: "4"
@@ -71,8 +73,8 @@ jobs:
         run: |
           nproc
           free -h
-          df -h "$XDG_RUNTIME_DIR"
-          df -i "$XDG_RUNTIME_DIR"
+          df -h "${XDG_RUNTIME_DIR:-/tmp}"
+          df -i "${XDG_RUNTIME_DIR:-/tmp}"
 
       # Reuse the existing bounded process group and per-run scratch cleanup
       # for every check, including the hostile-environment replay.
