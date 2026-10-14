@@ -383,7 +383,7 @@ def test_label_values_and_frecency():
         (dash.Working("ci", None, "h", "r", None), "ci"),
         (dash.Working("ci_queued", None, "h", "r", None), "ci"),
         *((dash.Working(activity, None, "h", "r", None), "ci")
-          for activity in ("merge", "update", "open_pr", "release", "triage_note")),
+          for activity in ("merge", "update", "open_pr", "release", "triage_note", "blocker_link")),
         (dash.Waiting("slot", "h", "r", None), "slot"),
         *((dash.Waiting(on, "h", "r", None), "waiting")
           for on in ("branch-protection", "human-review", "headroom", "backoff", "blocked", "github")),
@@ -451,3 +451,15 @@ def test_a_blocked_issue_rails_at_triage_before_its_first_act_and_at_its_last_st
     blocked = Wait(WaitReason.BLOCKED, (BlockerRef(9),))
     assert dash.rail(blocked, has_pr=False, legs=()).current == "triage"
     assert dash.rail(blocked, has_pr=False, legs=(leg("RESOLVE", 0),)).current == "resolve"
+
+
+
+def test_a_pending_blocker_link_is_ci_lane_work_at_the_triage_stage():
+    from issue_agent.domain.state import LinkBlocker
+
+    link = LinkBlocker(4, "Needs #4", "2026-10-13T07:00:00+00:00")
+    board = status(link)
+    assert isinstance(board, dash.Working)
+    assert (board.activity, board.group, board.headline) == ("blocker_link", "ci", "Linking blocker")
+    assert "#4" in board.reason
+    assert dash.rail(link, has_pr=False, legs=()).current == "triage"

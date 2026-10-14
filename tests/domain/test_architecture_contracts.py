@@ -29,6 +29,7 @@ REMOTE_WRITES = frozenset(
         "rerun_failed_checks",
         "submit_review",
         "update_branch",
+        "add_blocked_by",
     }
 )
 

@@ -31,7 +31,7 @@ from ..domain.outcome import (
 )
 from ..domain.policy import question_text
 from ..domain.review import parse_verdict
-from ..domain.triage import criteria_wanted, offered_duplicates, parse_steward, parse_triage
+from ..domain.triage import criteria_wanted, offered_blockers, offered_duplicates, parse_steward, parse_triage
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
@@ -273,7 +273,7 @@ class AccountingRuntime(AgentRuntime):
                         triage = parse_triage(result.structured)
                     else:
                         steward = parse_steward(result.structured, offered_duplicates(task.schema), issue,
-                                                criteria_wanted(task.schema))
+                                                criteria_wanted(task.schema), offered_blockers(task.schema))
             verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
             self.store.record_result(run_id, leg.value, session=resumable_session(result) or "", result={
                 # The PR body the harness opens a RESOLVE's branch with (Q11).

@@ -91,6 +91,7 @@ const BoardWorking = z
       "update",
       "open_pr",
       "triage_note",
+      "blocker_link",
       "release",
     ]),
     group: z.enum(["agent", "ci"]),

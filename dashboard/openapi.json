@@ -412,6 +412,7 @@
               "update",
               "open_pr",
               "triage_note",
+              "blocker_link",
               "release"
             ],
             "title": "Activity",

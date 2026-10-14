@@ -96,6 +96,25 @@ class UpdateBranch:
 
 
 @dataclass(frozen=True)
+class LinkBlockedBy:
+    """Write GitHub's "#`issue` is blocked by #`blocker`" link a steward proposed,
+    then one comment carrying `reason` (or why act refused the link on its fresh
+    reads). Keyed like PostComment: a link a human later deletes is never
+    re-added."""
+
+    issue: int
+    blocker: int
+    reason: str
+    key: str
+
+    def __post_init__(self) -> None:
+        if (type(self.issue) is not int or type(self.blocker) is not int or self.issue <= 0 or self.blocker <= 0
+                or self.issue == self.blocker or not isinstance(self.reason, str) or not self.reason
+                or not isinstance(self.key, str) or not self.key):
+            raise ValueError("a blocker link needs two distinct issues, a reason and a key")
+
+
+@dataclass(frozen=True)
 class RunAgent:
     """Dispatch one paid leg. `number` is the issue for STEWARD, TRIAGE and RESOLVE,
     else the PR."""
@@ -136,6 +155,7 @@ Action = Union[
     MergePullRequest,
     OpenPullRequest,
     UpdateBranch,
+    LinkBlockedBy,
     RunAgent,
 ]
 
@@ -146,6 +166,7 @@ __all__ = [
     "ISSUE_ACTS",
     "ROUTED_ACTS",
     "check_tier",
+    "LinkBlockedBy",
     "MergePullRequest",
     "OpenPullRequest",
     "PostComment",

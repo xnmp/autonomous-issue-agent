@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from types import MappingProxyType
 
 from ..adapters.control_store import LegRun
@@ -27,7 +27,7 @@ from ..domain.effort import Effort
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
-from ..domain.policy import actions as policy_actions
+from ..domain.policy import actions as policy_actions, dispatch_order
 from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
@@ -43,19 +43,11 @@ _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 _LIGHT_ACTS = frozenset(kind for kind in AgentKind if not kind.holds_dispatch_slot)
 
 
-def dispatch_order(keys: Iterable[ItemKey], waiting_since: Mapping[ItemKey, datetime]) -> list[ItemKey]:
-    """Who gets a scarce slot first: PR-stage items before issue-stage (finish
-    work in progress before starting new), then the item that has waited longest
-    (its newest leg end; none = never served = oldest), then by number so the
-    order is total. #1125 starved behind #1039/#1117/#1122 under issues-first,
-    by-number order."""
-    never = datetime.min.replace(tzinfo=timezone.utc)
-    return sorted(keys, key=lambda k: (k.target is not Target.PR, waiting_since.get(k, never), k.number))
-
-
 def fix_actions(
     states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int, *, merge: bool = True,
     light: int | None = None, waiting_since: Mapping[ItemKey, datetime] = MappingProxyType({}),
+    touches: Mapping[int, tuple[str, ...]] = MappingProxyType({}), busy: frozenset[str] = frozenset(),
+    now: datetime | None = None,
 ) -> tuple[Action, ...]:
     """The tick's Actions for the fix role: all but REVIEW dispatches. At most
     `slots` slot-holding dispatches, granted in `dispatch_order`; STEWARD and TRIAGE hold
@@ -63,7 +55,7 @@ def fix_actions(
     `merge` off (AUTO_MERGE=false) an approved green PR waits for a human."""
     per_item = {key: policy_actions({key: state}, harness) for key, state in states.items()}
     granted: set[RunAgent] = set()
-    for key in dispatch_order(per_item, waiting_since):
+    for key in dispatch_order(per_item, waiting_since, touches, busy, now):
         for action in per_item[key]:
             if not isinstance(action, RunAgent) or action.kind not in _FIX_ACTS:
                 continue
@@ -260,12 +252,17 @@ class FixLegs:
             return
         if steward:
             index = [row for row in _soft_rows(self.gateway.issue_index, self.log) if row[0] != action.number]
-            listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title in index) or "(none)"
+            listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title, _ in index) or "(none)"
             task = tasks.build_steward_task(
                 action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
-                tuple(n for n, _, _ in index), cwd, model=model, runtime=runtime, effort=effort,
+                tuple(n for n, _, _, _ in index), cwd, model=model, runtime=runtime, effort=effort,
                 max_budget_usd=self.settings.triage_budget_usd,
                 criteria_wanted=not has_acceptance_criteria(subject.body or ""),
+                # Only issues the harness itself will work on and close: model
+                # output must not hold a ready issue behind an epic, an
+                # unadmitted issue or one parked for a human.
+                blockable=tuple(n for n, state, _, labels in index if state == "open"
+                                and Label.AI_READY in labels and Label.NEEDS_HUMAN not in labels),
             )
         else:
             criteria = _criteria(self.control.leg_runs(self.settings.repository, (action.number,)))
@@ -377,8 +374,14 @@ def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:
             issue = harness_branch_issue(pr.head_ref_name)
             if pr_key(pr.number) not in waiting and issue is not None and issue_key(issue) in waiting:
                 waiting[pr_key(pr.number)] = waiting[issue_key(issue)]
+        # The steward's path guesses against the files open harness PRs change: ordering only.
+        touches = {k.number: found.steward.touches for k, ends in local.legs.items()
+                   if k.target is Target.ISSUE and (found := latest_steward(ends)) is not None
+                   and found.steward is not None}
+        busy = frozenset(f for pr in world.prs if pr.state == "OPEN" and harness_branch_issue(pr.head_ref_name)
+                         for f in pr.changed_files)
         return fix_actions(states, settings.harness, slots.heavy, merge=settings.auto_merge,
-                           light=slots.light, waiting_since=waiting)
+                           light=slots.light, waiting_since=waiting, touches=touches, busy=busy, now=local.now)
     return choose
 
 

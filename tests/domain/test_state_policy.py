@@ -11,6 +11,7 @@ import pytest
 
 from issue_agent.domain.actions import (
     AgentKind,
+    LinkBlockedBy,
     MergePullRequest,
     OpenPullRequest,
     PostComment,
@@ -22,14 +23,18 @@ from issue_agent.domain.actions import (
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import BaseTip, Check, Observed, RequiredCheck, Unavailable
 from issue_agent.domain.labels import Label
-from issue_agent.domain.policy import QUESTION_LIMIT, actions, question_text
+from issue_agent.domain.policy import (
+    OVERLAP_DEFER_CEILING, QUESTION_LIMIT, actions, blocker_comment, dispatch_order, overlaps, path_index, question_text,
+)
 from issue_agent.domain.refs import harness_branch_issue
 from issue_agent.domain.state import (
+    BLOCKER_TAG,
     Backoff,
     Busy,
     Dispatch,
     Harness,
     ItemKey,
+    LinkBlocker,
     Local,
     Merge,
     NeedsHuman,
@@ -46,6 +51,7 @@ from issue_agent.domain.state import (
     stop_tag,
 )
 from issue_agent.domain.routing import Tier
+from issue_agent.domain.triage import Steward
 from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Push, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -1167,3 +1173,140 @@ def test_blockers_ride_exactly_on_a_blocked_wait():
     with pytest.raises(ValueError):
         Wait(WaitReason.BLOCKED, [BlockerRef(1)])  # type: ignore[arg-type]
     assert str(BlockerRef(4)) == "#4" and str(BlockerRef(4, "o/lib")) == "o/lib#4"
+
+
+# ── a steward's "blocked by" claim: one link per issue, ever ─────────────────
+
+CLAIM = Steward(blocked_by=4, blocked_by_reason="Needs the export API #4 adds")
+CLAIMING = LegEnd(AgentKind.STEWARD, T0 - timedelta(hours=2), False, steward=CLAIM)
+
+
+def blocker_said(author: str = "fix-bot") -> Comment:
+    return Comment(author, f"{H.marker}\n{BLOCKER_TAG}\n**Steward**: blocked by #4", iso(0))
+
+
+def test_a_stewards_dependency_claim_is_linked_before_anything_else_is_bought():
+    state = one(WorldState(issues=(issue(3),)), local({issue_key(3): (CLAIMING,)}))
+    assert state == LinkBlocker(4, CLAIM.blocked_by_reason, CLAIMING.ended_at.isoformat())
+    assert actions({issue_key(3): state}, H) == (
+        LinkBlockedBy(3, 4, CLAIM.blocked_by_reason, key=f"blocked-by:issue:3:4:{CLAIMING.ended_at.isoformat()}"),)
+
+
+def test_once_the_harness_has_spoken_about_it_the_link_is_never_asked_for_again():
+    # A human deleted the link: GitHub shows no blocker, the comment remains, triage runs.
+    world = WorldState(issues=(issue(3, comments=(blocker_said(),)),))
+    assert one(world, local({issue_key(3): (CLAIMING,)})) == Dispatch(AgentKind.TRIAGE)
+
+
+def test_a_forged_blocker_comment_does_not_suppress_the_link():
+    world = WorldState(issues=(issue(3, comments=(blocker_said("mallory"),)),))
+    assert isinstance(one(world, local({issue_key(3): (CLAIMING,)})), LinkBlocker)
+
+
+def test_a_claim_on_the_issue_itself_is_never_linked():
+    leg = LegEnd(AgentKind.STEWARD, T0 - timedelta(hours=2), False, steward=replace(CLAIM, blocked_by=3))
+    assert one(WorldState(issues=(issue(3),)), local({issue_key(3): (leg,)})) == Dispatch(AgentKind.TRIAGE)
+
+
+def test_a_linked_issue_then_waits_on_its_blocker():
+    world = WorldState(issues=(issue(3, comments=(blocker_said(),), blocked_by=(BlockerRef(4),)),))
+    assert one(world, local({issue_key(3): (CLAIMING,)})) == Wait(WaitReason.BLOCKED, (BlockerRef(4),))
+
+
+def test_a_suspected_duplicate_stops_before_any_link():
+    both = Steward(duplicate_of=2, duplicate_reason="Same", blocked_by=4, blocked_by_reason="Needs #4")
+    leg = LegEnd(AgentKind.STEWARD, T0 - timedelta(hours=2), False, steward=both)
+    state = one(WorldState(issues=(issue(3),)), local({issue_key(3): (leg,)}))
+    assert isinstance(state, NeedsHuman) and state.reason is StopReason.DUPLICATE
+
+
+def test_the_steward_is_never_bought_again_once_it_ended_so_it_cannot_re_propose():
+    # STEWARD ended (with or without a claim): the next act is never STEWARD.
+    for steward in (CLAIM, Steward()):
+        leg = LegEnd(AgentKind.STEWARD, T0 - timedelta(hours=2), False, steward=steward)
+        world = WorldState(issues=(issue(3, comments=(blocker_said(),)),))
+        assert one(world, local({issue_key(3): (leg,)})) == Dispatch(AgentKind.TRIAGE)
+
+
+def test_the_blocker_comment_says_what_was_linked_or_why_not_with_agent_text_inert():
+    linked = blocker_comment("<!-- m -->", 4, "Needs @alice ![x](y) <b>")
+    assert BLOCKER_TAG in linked and "blocked by #4" in linked and "never re-adds" in linked
+    assert "@alice" not in linked and "<b>" not in linked and "![" not in linked
+    refused = blocker_comment("<!-- m -->", 4, "Needs #4", "#4 is closed")
+    assert BLOCKER_TAG in refused and "did not link it: #4 is closed." in refused
+
+
+# ── soft ordering by overlap: order only, never a block ──────────────────────
+
+
+def _issue_keys(*numbers: int) -> list[ItemKey]:
+    return [issue_key(n) for n in numbers]
+
+
+@pytest.mark.parametrize(
+    ("touches", "busy", "clash"),
+    [
+        (("src/a.py",), ("src/a.py",), True),  # the exact file
+        (("src",), ("src/lib/a.py",), True),  # a directory prefix
+        (("src/lib/",), ("src/lib/a.py",), True),
+        (("./src/lib/*.py",), ("src/lib/a.py",), True),  # a glob cut back to its directory
+        (("src/a.py/x",), ("src/a.py",), True),  # inside a busy path
+        (("docs",), ("src/a.py",), False),  # no overlap
+        (("src/a",), ("src/ab.py",), False),  # whole segments only
+        (("src/lib/a.py",), ("src/lib/b.py",), False),  # siblings
+        ((), ("src/a.py",), False),  # no guess
+        (("", "/", "..", "*"), ("src/a.py",), False),  # guesses of nothing never overlap
+        (("src/a.py",), (), False),  # nothing in flight
+    ],
+)
+def test_overlap_is_a_whole_segment_path_prefix_match(touches, busy, clash):
+    assert overlaps(touches, path_index(busy)) is clash
+
+
+def test_a_huge_touch_list_against_huge_changed_files_is_matched_by_index():
+    busy = [f"pkg{i}/mod{j}.py" for i in range(300) for j in range(10)]  # 3000 files, the observe bound
+    misses = [f"other{i}/x.py" for i in range(10_000)]
+    index = path_index(busy)
+    assert overlaps(misses, index) is False
+    assert overlaps([*misses, "pkg299"], index) is True
+
+
+def test_the_oldest_non_overlapping_issue_goes_first_and_prs_still_lead():
+    waited = {issue_key(1): at(0), issue_key(2): at(1), issue_key(3): at(2), pr_key(9): at(5)}
+    touches = {1: ("src/auth",), 2: ("src/auth/token.ts",), 3: ("docs",)}
+    order = dispatch_order([*_issue_keys(3, 2, 1), pr_key(9)], waited, touches, {"src/auth/token.ts"}, at(6))
+    assert order == [pr_key(9), issue_key(3), issue_key(1), issue_key(2)]
+
+
+def test_an_overlapping_issue_is_deferred_only_until_it_has_waited_the_ceiling():
+    touches = {1: ("src",), 2: ("docs",)}
+    young = {issue_key(1): NOW - OVERLAP_DEFER_CEILING + timedelta(minutes=1), issue_key(2): NOW}
+    assert dispatch_order(_issue_keys(1, 2), young, touches, {"src/a.py"}, NOW) == _issue_keys(2, 1)
+    aged = {**young, issue_key(1): NOW - OVERLAP_DEFER_CEILING}
+    assert dispatch_order(_issue_keys(1, 2), aged, touches, {"src/a.py"}, NOW) == _issue_keys(1, 2)
+    never_served = {issue_key(2): NOW}  # #1 has no leg end: it has waited longest, so no deferral
+    assert dispatch_order(_issue_keys(1, 2), never_served, touches, {"src/a.py"}, NOW) == _issue_keys(1, 2)
+    assert dispatch_order(_issue_keys(1, 2), young, touches, {"src/a.py"}) == _issue_keys(1, 2)  # no clock: FIFO
+
+
+def test_every_issue_overlapping_or_no_data_is_plain_fifo():
+    waited = {issue_key(1): at(0), issue_key(2): at(1), issue_key(3): at(2)}
+    fifo = _issue_keys(1, 2, 3)
+    everything = {n: ("src",) for n in (1, 2, 3)}
+    assert dispatch_order(_issue_keys(3, 1, 2), waited, everything, {"src/a.py"}, at(3)) == fifo
+    assert dispatch_order(_issue_keys(3, 1, 2), waited) == fifo
+    assert dispatch_order(_issue_keys(3, 1, 2), waited, {}, {"src/a.py"}) == fifo
+    assert dispatch_order(_issue_keys(3, 1, 2), waited, {1: ("src",)}, ()) == fifo
+
+
+def test_an_issue_without_a_guess_is_not_pushed_back():
+    waited = {issue_key(1): at(0), issue_key(2): at(1)}
+    order = dispatch_order(_issue_keys(2, 1), waited, {2: ("docs",)}, {"src/a.py"}, at(2))
+    assert order == _issue_keys(1, 2)
+
+
+def test_ordering_never_drops_or_duplicates_a_key():
+    keys = [*_issue_keys(*range(1, 200)), *(pr_key(n) for n in range(500, 520))]
+    touches = {n: ("src",) if n % 2 else ("docs",) for n in range(1, 200)}
+    order = dispatch_order(keys, {}, touches, {"src/x.py"}, NOW)
+    assert sorted(order, key=lambda k: k.sort_key) == sorted(keys, key=lambda k: k.sort_key)

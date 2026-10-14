@@ -89,7 +89,7 @@ def leg_class(run: LegRun) -> LegClass:
     return next((c for c in (LegClass.AGENT, LegClass.ASKED) if raw == c.value), LegClass.MACHINE)
 
 
-def leg_end(run: LegRun) -> LegEnd | None:
+def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | None:
     """A recorded leg as derive's `LegEnd`. A run without a `leg` receipt
     never returned (died, reclaimed, refused before launch): a machine end."""
     kind = dispatched_kind(run.kind)
@@ -104,16 +104,18 @@ def leg_end(run: LegRun) -> LegEnd | None:
     ran = leg is not LegClass.MACHINE
     triage = parse_triage(receipt.get("triage")) if kind is AgentKind.TRIAGE and ran else None
     # A legacy combined TRIAGE record carries the steward's fields too.
-    steward = (steward_from_record(receipt.get("steward" if kind is AgentKind.STEWARD else "triage"))
-               if kind in (AgentKind.STEWARD, AgentKind.TRIAGE) and ran else None)
+    raw = receipt.get("steward" if kind is AgentKind.STEWARD else "triage")
+    steward = steward_from_record(raw, run.issue) if kind in (AgentKind.STEWARD, AgentKind.TRIAGE) and ran else None
+    if log is not None and steward is not None and steward != steward_from_record(raw):
+        log(f"issue #{run.issue}: a recorded steward claim names the issue itself; dropped")
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
                   triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")))
 
 
-def local_legs(runs: Iterable[LegRun]) -> dict[ItemKey, tuple[LegEnd, ...]]:
+def local_legs(runs: Iterable[LegRun], log: Callable[[str], None] | None = None) -> dict[ItemKey, tuple[LegEnd, ...]]:
     out: dict[ItemKey, list[LegEnd]] = {}
     for run in runs:
-        key, end = run_item(run), leg_end(run)
+        key, end = run_item(run), leg_end(run, log)
         if key is not None and end is not None:
             out.setdefault(key, []).append(end)
     return {key: tuple(sorted(ends, key=lambda e: e.ended_at)) for key, ends in out.items()}
@@ -181,7 +183,7 @@ class Facts:
             capped = None
         return Local(
             now=self.now(),
-            legs=local_legs(runs),
+            legs=local_legs(runs, self.log),
             leases=leased_items(active, self.held_issues()),
             headroom=capped is not None and self.headroom(),
             lifetime_capped=capped or frozenset(),

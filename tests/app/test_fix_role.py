@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.github import BlockerLinkFacts
 from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, OpenPullRequest, RunAgent
@@ -64,11 +65,27 @@ class FakeGitHub:
         with self.lock:
             now = _now()
             return WorldState(
-                issues=tuple(i for i in self.issues.values() if i.state == "open"),
+                issues=tuple(self._open_blockers(i) for i in self.issues.values() if i.state == "open"),
                 prs=tuple(self.prs.values()),
                 branches=tuple(Branch(b, self.pushed_at.get(b, now)) for b in self.branches if self._owed(b)),
                 now=now,
             )
+
+    def _open_blockers(self, issue: IssueView) -> IssueView:
+        """GitHub lists only a blocker that is still open (a closed one is resolved)."""
+        return replace(issue, blocked_by=tuple(
+            b for b in issue.blocked_by if b.repository or self.issues.get(b.number, issue).state == "open"))
+
+    def blocker_link(self, issue: int, blocker: int) -> BlockerLinkFacts:
+        mine, theirs = self._open_blockers(self.issues[issue]), self._open_blockers(self.issues[blocker])
+        return BlockerLinkFacts(f"I{issue}", f"I{blocker}", self.issues[blocker].state == "open",
+                                BlockerRef(blocker) in mine.blocked_by,
+                                tuple(b.number for b in theirs.blocked_by if not b.repository))
+
+    def add_blocked_by(self, issue_id: str, blocker_id: str) -> None:
+        issue, blocker = int(issue_id[1:]), int(blocker_id[1:])
+        current = self.issues[issue]
+        self.issues[issue] = replace(current, blocked_by=(*current.blocked_by, BlockerRef(blocker)))
 
     def _owed(self, branch: str) -> bool:
         """GitHub's answer to "is this branch owed a PR": none ever, or pushed
@@ -86,8 +103,8 @@ class FakeGitHub:
     def get_issue(self, number: int) -> IssueView:
         return self.issues[number]
 
-    def issue_index(self) -> tuple[tuple[int, str, str], ...]:
-        return tuple((n, i.state, i.title) for n, i in sorted(self.issues.items()))
+    def issue_index(self) -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
+        return tuple((n, i.state, i.title, i.labels) for n, i in sorted(self.issues.items()))
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         return self.prs[number]
@@ -1047,3 +1064,90 @@ def test_a_blocked_issue_buys_nothing_until_its_blocker_closes_then_starts_by_it
 
     gh.issues[5] = replace(gh.issues[5], blocked_by=())  # GitHub drops a closed blocker from the open set
     assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+
+
+
+def stewarded(*, blocked_by: int | None = None, touches: tuple[str, ...] = (), session: str = "t1"):
+    """The steward's claim with a dependency and path guesses, or TRIAGE's grade."""
+    steward = {"acceptance_criteria": ["Exports open in the viewer"], "duplicate_of": None, "duplicate_reason": "",
+               "blocked_by": blocked_by, "blocked_by_reason": "Needs the export API #2 adds" if blocked_by else "",
+               "touches": list(touches)}
+
+    def run(task):
+        claim = {"tier": "med", "rationale": "x"} if "tier" in task.schema["properties"] else steward
+        return AgentResult(False, structured=claim, cost_usd=0.01, session_id=session)
+    return run
+
+
+def _linked_issue(role):
+    # #2 is the harness's own work (ai-ready), held behind #3, a human's design issue.
+    gh = FakeGitHub(issues={5: ready(), 2: replace(ready(2, "Add the export API"), blocked_by=(BlockerRef(3),)),
+                            3: IssueView(3, title="Design the export format")})
+    light = stewarded(blocked_by=2)
+    agent = Agent(light, light)
+    composed, _ = role(gh, agent, triaged=False)
+    assert dispatched(tick(composed), AgentKind.STEWARD) == [RunAgent(AgentKind.STEWARD, 5)]
+    assert agent.tasks[0].schema["properties"]["blocked_by"]["enum"] == [2, None]
+    assert "Overlap is not a dependency" in agent.tasks[0].prompt
+    tick(composed)  # the link, then its one comment
+    assert gh.issues[5].blocked_by == (BlockerRef(2),)
+    assert len(gh.comments_with("issue", 5, "blocked by #2")) == 1
+    assert tick(composed) == []  # held: nothing is bought while #2 is open
+    return gh, agent, composed
+
+
+def test_a_stewards_dependency_is_linked_holds_the_issue_and_releases_when_the_blocker_closes(role):
+    gh, agent, composed = _linked_issue(role)
+    gh.close_issue(2, "completed", "")
+    assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
+
+
+@pytest.mark.parametrize("labels", [frozenset(), frozenset({Label.AI_READY, Label.NEEDS_HUMAN})])
+def test_a_steward_is_offered_as_blockers_only_open_issues_the_harness_will_work_on(role, labels):
+    gh = FakeGitHub(issues={5: ready(), 2: IssueView(2, title="Epic: exports", labels=labels),
+                            4: replace(ready(4, "Add the export API"), blocked_by=(BlockerRef(3),)),
+                            3: IssueView(3, title="Design the export format"),
+                            6: replace(ready(6, "Old export"), state="closed")})
+    agent = Agent(stewarded(), stewarded())
+    composed, _ = role(gh, agent, triaged=False)
+    tick(composed)
+    assert agent.tasks[0].schema["properties"]["blocked_by"]["enum"] == [4, None]
+
+
+def test_a_link_a_human_deletes_is_never_re_added(role):
+    gh, agent, composed = _linked_issue(role)
+    gh.issues[5] = replace(gh.issues[5], blocked_by=())  # deleted on GitHub
+    assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
+    tick(composed)
+    assert gh.issues[5].blocked_by == () and len(gh.comments_with("issue", 5, "blocked by #2")) == 1
+
+
+def test_a_free_slot_goes_to_the_oldest_issue_clear_of_open_pr_files_and_otherwise_fifo(role):
+    gh = FakeGitHub(issues={5: ready(5), 6: ready(6, "Docs typo"), 7: ready(7, "In flight")})
+    open_pr(gh, 7, changed_files=frozenset({"src/auth/token.ts"}))
+    gate = threading.Event()
+    agent = SplitAgent(_blocked(gate, _DONE), triaged())
+    composed, _ = role(gh, agent, triaged=False, FIX_DISPATCH_CONCURRENCY="1")
+    for number, touches in ((5, ["src/auth/"]), (6, ["docs/typo.md"])):
+        composed.control.record_unpaid_leg(
+            RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="STEWARD", owner_id="seed",
+            issue=number, number=number, head="", runtime="claude", leg_class="agent",
+            result={"steward": {"acceptance_criteria": [], "duplicate_of": None, "duplicate_reason": "",
+                                "touches": touches}})
+        composed.control.record_unpaid_leg(  # an unusable grade: no triage comment is owed
+            RunId(uuid.uuid4().hex), repository="o/r", role="fix", kind="TRIAGE", owner_id="seed",
+            issue=number, number=number, head="", runtime="claude", leg_class="agent", result={})
+    try:
+        # #5 waited longer but guesses src/auth/, which PR 100 changes: #6 gets the one slot.
+        assert dispatched(composed.daemon.tick(), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 6, tier=Tier.MED)]
+    finally:
+        gate.set()
+        composed.daemon.wait_for_dispatches()
+
+
+def test_deleting_both_the_link_and_its_comment_closes_the_matter_and_triage_proceeds(role):
+    gh, agent, composed = _linked_issue(role)
+    gh.issues[5] = replace(gh.issues[5], blocked_by=(), comments=())  # a human removes both
+    tick(composed)  # one closing comment, no new link
+    assert gh.issues[5].blocked_by == () and len(gh.comments_with("issue", 5, "will not write that link again")) == 1
+    assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
