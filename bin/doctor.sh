@@ -210,7 +210,7 @@ _placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
 _placeholder_vars="$_placeholder_vars REVIEW_BOT"
 # REVIEW_BOT_TOKEN may live as a systemd credential (encrypted file, readable
 # only inside the unit): then it is set, though not in this shell.
-_review_cred="$HOME/.config/issue-agent/credentials/REVIEW_BOT_TOKEN.cred"
+_review_cred="$HOME/.config/credstore.encrypted/REVIEW_BOT_TOKEN"
 if [ -z "${REVIEW_BOT_TOKEN:-}" ] && [ ! -f "$_review_cred" ]; then
   _placeholder_vars="$_placeholder_vars GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
 fi

@@ -1,6 +1,6 @@
 import pytest
 
-from issue_agent.app.main import _load_agent_env
+from issue_agent.app.main import _load_agent_env, _validate_reload_candidate
 
 
 def _delivered(tmp_path, **files):
@@ -26,3 +26,15 @@ def test_the_daemon_refuses_to_start_when_the_env_file_also_carries_the_secret(t
 
     with pytest.raises(ValueError, match="FIX_BOT_TOKEN"):  # _serve maps ValueError to INVALID_CONFIG
         _load_agent_env(env)
+
+
+def test_a_reload_after_the_plaintext_was_removed_refuses_when_the_credential_is_not_delivered(tmp_path):
+    store = tmp_path / "home" / ".config" / "credstore.encrypted"
+    store.mkdir(parents=True)
+    (store / "FIX_BOT_TOKEN").write_text("encrypted")
+    env_file = tmp_path / "agent.env"
+    env_file.write_text("REPO=o/r\n")
+    env = {"AGENT_ENV": str(env_file), "HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"}
+
+    with pytest.raises(ValueError, match="FIX_BOT_TOKEN"):
+        _validate_reload_candidate(env, "fix")

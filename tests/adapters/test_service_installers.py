@@ -620,36 +620,3 @@ def test_systemd_dashboard_port_owner_unknown_is_refused(tmp_path):
 
     assert result.returncode != 0
     assert "PID unknown" in result.stderr
-
-
-def _install_with_credentials(tmp_path, present):
-    env, home, _ = _environment(tmp_path, systemd=True)
-    creds = home / ".config" / "issue-agent" / "credentials"
-    creds.mkdir(parents=True)
-    for name in present:
-        (creds / f"{name}.cred").write_text("opaque")
-    assert _install(env).returncode == 0
-    fix, review = _role_units(sorted(_artifacts(home, True).glob("*.service")))
-    lines = lambda unit: [x for x in unit.read_text().splitlines() if x.startswith("LoadCredentialEncrypted=")]  # noqa: E731
-    return creds, fix, review, lines
-
-
-def test_systemd_units_load_each_role_its_own_github_token_and_both_the_claude_token(tmp_path):
-    creds, fix, review, lines = _install_with_credentials(
-        tmp_path, ("FIX_BOT_TOKEN", "REVIEW_BOT_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"))
-
-    assert lines(fix) == [f"LoadCredentialEncrypted=FIX_BOT_TOKEN:{creds}/FIX_BOT_TOKEN.cred",
-                          f"LoadCredentialEncrypted=CLAUDE_CODE_OAUTH_TOKEN:{creds}/CLAUDE_CODE_OAUTH_TOKEN.cred"]
-    assert lines(review) == [f"LoadCredentialEncrypted=REVIEW_BOT_TOKEN:{creds}/REVIEW_BOT_TOKEN.cred",
-                             f"LoadCredentialEncrypted=CLAUDE_CODE_OAUTH_TOKEN:{creds}/CLAUDE_CODE_OAUTH_TOKEN.cred"]
-
-
-def test_systemd_units_emit_no_line_for_an_absent_credential_file(tmp_path):
-    # A line for a missing file fails the unit at start.
-    _creds, fix, review, lines = _install_with_credentials(tmp_path, ("REVIEW_BOT_TOKEN",))
-
-    assert lines(fix) == []
-    assert len(lines(review)) == 1
-    for unit in (fix, review):
-        assert "@CREDENTIALS@" not in unit.read_text()
-        assert "TasksMax=4096" in unit.read_text()

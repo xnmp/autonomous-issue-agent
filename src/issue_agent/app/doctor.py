@@ -21,7 +21,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Callable
 
-from ..adapters.credentials import SECRET_NAMES, stored_names
+from ..adapters.credentials import SECRET_NAMES, in_credstore
 
 
 @dataclass(frozen=True)
@@ -83,19 +83,19 @@ def codex_findings(env: dict, which: Callable[..., str | None] = shutil.which) -
 
 
 def secret_source_findings(env: dict, stored: tuple[str, ...]) -> tuple[Finding, ...]:
-    """Where each secret comes from: a systemd credential (an encrypted file
-    on this host, delivered by the service units) or the env file. Both is an
-    error: two sources of truth for one secret. Values are never shown."""
+    """Where each secret comes from, judged from the env file's `env` and the
+    credstore files' existence (never decrypted, values never shown). Both
+    sources is an error: two sources of truth for one secret."""
     findings: list[Finding] = []
     for name in SECRET_NAMES:
         inline = bool(str(env.get(name) or "").strip())
         if name in stored and inline:
-            findings.append(Finding("error", f"{name} is set in both a systemd credential and the env file; "
+            findings.append(Finding("error", f"{name} is set in both the credstore and the env file; "
                                              "delete the plaintext line."))
         elif name in stored:
-            findings.append(Finding("info", f"{name}: systemd credential"))
-        elif inline:
-            findings.append(Finding("info", f"{name}: env"))
+            findings.append(Finding("info", f"{name}: systemd credential (services only)"))
+        else:
+            findings.append(Finding("info", f"{name}: {'env file' if inline else 'absent'}"))
     return tuple(findings)
 
 
@@ -271,11 +271,20 @@ def sandbox_findings(probe: Callable[[], str | None] | None = None) -> tuple[Fin
 
 
 def doctor_findings(name: str, composed: dict, active_env_path: str) -> tuple[tuple[str, tuple[Finding, ...]], ...]:
-    """The table of offline checks `issue-agent doctor` renders."""
+    """The table of offline checks `issue-agent doctor` renders. The three
+    secrets are judged from the env file alone: the operator's shell exports
+    are not what a service sees."""
+    home = os.path.expanduser("~")
+    stored = tuple(n for n in SECRET_NAMES if in_credstore(home, n))
+    text = _read(os.path.expanduser(composed.get("AGENT_ENV") or active_env_path))
+    if text is not None:
+        from_file = env_assignments(text)
+        composed = {**{k: v for k, v in composed.items() if k not in SECRET_NAMES},
+                    **{k: _unquoted(from_file[k]) for k in SECRET_NAMES if k in from_file}}
     return (
         ("leg sandbox", sandbox_findings()),
-        ("secrets", secret_source_findings(composed, stored_names(os.path.expanduser("~")))),
-        ("identity", identity_findings(composed, stored_names(os.path.expanduser("~")))),
+        ("secrets", secret_source_findings(composed, stored)),
+        ("identity", identity_findings(composed, stored)),
         ("codex binary", codex_findings(composed)),
         ("installed services", service_findings(name, active_env_path)),
     )

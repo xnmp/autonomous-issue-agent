@@ -48,10 +48,12 @@ writes vanish with.
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
 the act layer. Secrets reach the daemons as systemd encrypted
-credentials where the host has them (`LoadCredentialEncrypted=`, decrypted into
+credentials where the host has them (`ImportCredential=` of
+`~/.config/credstore.encrypted/NAME`, decrypted into
 `$CREDENTIALS_DIRECTORY` for that unit alone; `FIX_BOT_TOKEN` on the fix unit,
 `REVIEW_BOT_TOKEN` on the review unit): config load fills each secret from
-there, refuses a secret that also appears in the env file, and the credential
+there, refuses a secret that also appears in the env file or that exists in the
+credstore yet never arrived (no fallback to the ambient login), and the credential
 directory never enters a leg's environment. Claude legs authenticate with their
 own `CLAUDE_CODE_OAUTH_TOKEN` (the one secret on both units, passed to Claude
 legs only), which leaves the operator's `~/.claude` unmounted. launchd and

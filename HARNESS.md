@@ -114,31 +114,32 @@ equivalent terminating commands are appropriate.
 
 `FIX_BOT_TOKEN`, `REVIEW_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` (the legs'
 own Claude login, so legs never share the operator's `~/.claude`) can live as
-systemd encrypted credentials instead of plaintext in `config/shared.env`.
-`issue-agent install-service` adds `LoadCredentialEncrypted=` to the fix unit
-(`FIX_BOT_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) and the review unit
-(`REVIEW_BOT_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) for each file below that
-exists when you install; an absent file adds nothing and the env value is used.
+systemd encrypted credentials instead of plaintext in `config/shared.env`. The
+fix unit imports `FIX_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`, the review unit
+`REVIEW_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` (`ImportCredential=`, re-read
+from `~/.config/credstore.encrypted/<NAME>` on every unit start; a missing file
+is skipped, so the env file still works).
 
 ```bash
-mkdir -p -m 0700 ~/.config/issue-agent/credentials
+mkdir -p -m 0700 ~/.config/credstore.encrypted
 claude setup-token        # prints a long-lived token for CLAUDE_CODE_OAUTH_TOKEN
 for NAME in CLAUDE_CODE_OAUTH_TOKEN FIX_BOT_TOKEN REVIEW_BOT_TOKEN; do
-  systemd-ask-password -n "$NAME:" \
-    | systemd-creds encrypt --user --name="$NAME" - ~/.config/issue-agent/credentials/$NAME.cred
+  systemd-ask-password -n "token:" \
+    | systemd-creds encrypt --user --name="$NAME" - ~/.config/credstore.encrypted/$NAME
 done
 # delete the plaintext FIX_BOT_TOKEN / REVIEW_BOT_TOKEN / CLAUDE_CODE_OAUTH_TOKEN
-# lines from config/shared.env, then:
+# lines from config/shared.env, then re-install so the units carry the imports:
 issue-agent install-service
-issue-agent doctor        # prints "<NAME>: systemd credential" or "<NAME>: env"
+issue-agent doctor   # "<NAME>: systemd credential (services only)" | "env file" | "absent"
 ```
 
-A secret present in both the credential and the env file refuses to start
-(config error naming the variable). Credential values are never copied into a
-snapshot or log. Foreground `issue-agent start` and macOS launchd have no
-credential directory and keep reading the env file; `doctor` cannot probe a
-`REVIEW_BOT_TOKEN` it cannot decrypt. Governing decision: ADR 0001 (leg
-sandbox, #413).
+A secret in both the credential and the env file refuses to start, naming the
+variable. A secret whose credstore file exists but that reaches the process
+neither as a credential nor in the environment also refuses (no silent fall
+back to your `gh` login): foreground `issue-agent start` therefore needs the
+value exported, or use the service. Credential values are never copied into a
+snapshot or log, and doctor never decrypts. launchd keeps env-file secrets.
+Governing decision: ADR 0001 (leg sandbox, #413).
 
 ## Running unattended
 

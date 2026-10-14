@@ -144,26 +144,6 @@ trap cleanup EXIT
 # that systemd's minimal default PATH cannot. Escaped for the sed RHS — PATH
 # entries may legitimately contain '&', '\' or the '|' delimiter.
 _install_path_escaped="$(printf '%s' "$PATH" | sed -e 's/[&|\\]/\\&/g')"
-
-# Secrets kept as systemd encrypted credentials (HARNESS.md "Secrets"): one
-# LoadCredentialEncrypted= line per secret whose file exists NOW (a missing file
-# would fail the unit at start; an absent secret emits nothing and the daemon
-# falls back to the env file). Least privilege: each unit gets only the GitHub
-# token its role uses; both get the Claude leg token.
-CRED_DIR="$SNAP_DIR/credentials"
-credential_lines() {
-  local role="$1" name lines=""
-  case "$role" in
-    issue-agent-fix-watcher)    set -- FIX_BOT_TOKEN CLAUDE_CODE_OAUTH_TOKEN ;;
-    issue-agent-review-watcher) set -- REVIEW_BOT_TOKEN CLAUDE_CODE_OAUTH_TOKEN ;;
-    *)                          set -- ;;
-  esac
-  for name in "$@"; do
-    [ -f "$CRED_DIR/$name.cred" ] || continue
-    lines="${lines:+$lines\\n}LoadCredentialEncrypted=$name:$CRED_DIR/$name.cred"
-  done
-  printf '%s' "$lines" | sed -e 's/[&|]/\\&/g'
-}
 for index in "${!services[@]}"; do
   s="${services[$index]}"
   src="$HARNESS_ROOT/ops/systemd/$s.service"
@@ -172,7 +152,6 @@ for index in "${!services[@]}"; do
       -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" -e "s#@NAME@#$NAME#g" \
       -e "s#@DEPLOYMENT_ID@#$DEPLOYMENT_NAME#g" \
       -e "s|@INSTALL_PATH@|$_install_path_escaped|g" \
-      -e "s|@CREDENTIALS@|$(credential_lines "$s")|g" \
       -e "s#@UV_BIN@#$UV_BIN#g" "$src" > "$candidate"
   "$SYSTEMD_ANALYZE" --user verify "$candidate"
 done

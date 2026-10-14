@@ -511,7 +511,7 @@ one review per head, no command queue),
 `adapters/codex_home.py`, `adapters/codex_runner.py` (root-rollout usage, priced
 once per leg; native sub-agents disabled in the isolated profile),
 `adapters/control_path.py`, `adapters/control_store.py`,
-`adapters/credentials.py` (systemd encrypted credentials fill the three secrets at config load),
+`adapters/credentials.py` (credstore secrets delivered by `ImportCredential=` fill the three secrets at config load; fails closed),
 `adapters/env_file.py`,
 `adapters/github.py`,
 `adapters/github_ci.py` (reads branch protection and rulesets into the required-check inventory),

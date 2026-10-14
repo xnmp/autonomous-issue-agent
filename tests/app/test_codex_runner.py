@@ -391,6 +391,25 @@ printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCRE
     ]
 
 
+def test_a_codex_leg_never_receives_the_claude_oauth_token(tmp_path, monkeypatch):
+    observed = tmp_path / "environment.txt"
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-leg-login")
+    body = (
+        r"""
+printf '%s\n' "${CLAUDE_CODE_OAUTH_TOKEN-unset}" > "$OBSERVED_ENV"
+"""
+        + _DONE
+    )
+    result = asyncio.run(
+        CodexRunner(
+            codex_bin=_fake_codex(tmp_path, body), env={"OPENAI_API_KEY": "test-key", "OBSERVED_ENV": str(observed)}
+        ).run(RuntimePlan(prompt="x", model="m"))
+    )
+
+    assert result.status == "done"
+    assert observed.read_text().strip() == "unset"
+
+
 def test_run_registers_process_group_before_codex_executes(tmp_path):
     state_dir = tmp_path / "state"
     body = (

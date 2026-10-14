@@ -15,9 +15,12 @@ Type=notify
 NotifyAccess=all
 ExecStart=@UV_BIN@ run --extra sdk python -m issue_agent.app.main fix
 WorkingDirectory=@HARNESS_ROOT@
-# Encrypted secrets (systemd-creds), filled in by bin/install-systemd.sh with
-# one line per credential file present at install time; empty otherwise.
-@CREDENTIALS@
+# Encrypted secrets, imported at every unit start from
+# ~/.config/credstore.encrypted/NAME (HARNESS.md "Secrets"); a missing file is
+# skipped and the daemon then reads the env file. Each role gets only its own
+# GitHub token; both get the Claude leg token.
+ImportCredential=FIX_BOT_TOKEN
+ImportCredential=CLAUDE_CODE_OAUTH_TOKEN
 Environment=AGENT_ENV=@CONFIG@
 Environment=ISSUE_AGENT_DEPLOYMENT_ID=@DEPLOYMENT_ID@
 Environment=TARGET_DIR=@TARGET_DIR@
