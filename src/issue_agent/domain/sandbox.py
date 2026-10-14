@@ -70,6 +70,11 @@ class LegFacts:
     build_cache: tuple[str, ...] = ()
     # Per-run files the harness hands the runtime (codex's schema and output).
     scratch: tuple[str, ...] = ()
+    # The host's GPU render nodes. Xvfb and WebKitGTK load its EGL vendor
+    # libraries even when rendering in software, and NVIDIA's aborts without
+    # one, so no native E2E display starts. Render nodes only: never the
+    # display (card) nodes the compositor drives.
+    devices: tuple[str, ...] = ()
     # Never mounted, nor any directory holding one: HOME, the harness checkout,
     # state and control dirs. A mount strictly inside one is allowed.
     protected: tuple[str, ...] = ()
@@ -95,11 +100,6 @@ SYSTEM_ROOTS = (
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt", "/nix", "/sys",
     "/run/current-system", "/run/wrappers", "/run/systemd/resolve",
 )
-
-# GPU render nodes (as Flatpak's `--device=dri`). Xvfb and WebKitGTK load the
-# host's EGL vendor libraries even when rendering in software, and NVIDIA's
-# aborts when it finds no render node, so a native E2E display cannot start.
-DEVICES = ("/dev/dri",)
 
 # Toolchain installs under HOME. Read-only: a leg that could rewrite a compiler
 # or interpreter would poison the operator's own builds outside the sandbox.
@@ -132,6 +132,8 @@ LEG_ENV: tuple[tuple[str, str | None], ...] = (
 # The GitHub credentials a leg may hold. Only a publishing leg keeps the first
 # two (its one token, set by the launcher); the sandbox unsets the rest.
 PUBLICATION_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+_RENDER_NODE = re.compile(r"/dev/dri/renderD[0-9]+")
 
 # Claude Code's project-directory name limit; longer paths get a hash suffix
 # whose function the CLI does not publish (CLI 2.1.299).
@@ -195,7 +197,11 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
         if facts.writable:
             required += [Mount(posixpath.join(common, d), Access.READ_WRITE) for d in ("objects", "refs")]
             required.append(Mount(own, Access.READ_WRITE))
-            required += [Mount(posixpath.join(own, f), Access.READ_ONLY) for f in ("commondir", "gitdir")]
+            # Its own links and config.worktree, which the harness's git reads
+            # as repository config (hooksPath, fsmonitor) wherever the repository
+            # enables extensions.worktreeConfig, stay read-only.
+            required += [Mount(posixpath.join(own, f), Access.READ_ONLY)
+                         for f in ("commondir", "gitdir", "config.worktree")]
             required.append(Mount(posixpath.join(cwd, ".git"), Access.READ_ONLY))
     for mount in required:
         if exposed := exposes(mount.path, protected):
@@ -207,7 +213,8 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
     optional += [Mount(posixpath.normpath(p), Access.READ_ONLY, optional=True)
                  for p in facts.search_path if isinstance(p, str) and p.startswith("/") and "\0" not in p]
     optional += [Mount(posixpath.join(home, p), Access.THROWAWAY, optional=True) for p in HOME_CACHES]
-    optional += [Mount(p, Access.DEVICE, optional=True) for p in DEVICES]
+    optional += [Mount(p, Access.DEVICE, optional=True) for p in facts.devices
+                 if isinstance(p, str) and _RENDER_NODE.fullmatch(p)]
     if facts.git is not None and facts.writable:
         optional.append(Mount(posixpath.join(_normal(facts.git.common_dir), "logs"), Access.READ_WRITE,
                               optional=True))

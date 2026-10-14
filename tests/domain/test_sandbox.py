@@ -66,7 +66,8 @@ def test_the_harness_runs_git_there_so_a_fix_leg_never_changes_git_config_hooks_
                  f"{GIT.common_dir}/packed-refs", f"{GIT.common_dir}/worktrees/issue-9/commondir"):
         assert visible(plan, path) is Access.THROWAWAY, path
     # Its own checkout's links sit in a directory it writes, so they are read-only.
-    for path in (f"{GIT.worktree_dir}/commondir", f"{GIT.worktree_dir}/gitdir", f"{WORKTREE}/.git"):
+    for path in (f"{GIT.worktree_dir}/commondir", f"{GIT.worktree_dir}/gitdir", f"{GIT.worktree_dir}/config.worktree",
+                 f"{WORKTREE}/.git"):
         assert visible(plan, path) is Access.READ_ONLY, path
 
 
@@ -117,9 +118,11 @@ def test_toolchains_are_read_only_and_download_caches_are_thrown_away():
 
 
 def test_a_leg_gets_gpu_render_nodes_and_its_own_x_socket_directory_but_no_host_display():
-    plan = leg_mount_plan(facts())
+    plan = leg_mount_plan(facts(devices=("/dev/dri/renderD128", "/dev/dri/card1", "/dev/dri", "/dev/mem",
+                                         "/dev/dri/renderD128/../card1")))
 
     assert visible(plan, "/dev/dri/renderD128") is Access.DEVICE
+    assert {m.path for m in plan.mounts if m.access is Access.DEVICE} == {"/dev/dri/renderD128"}
     assert access(plan, "/tmp/.X11-unix") is Access.PRIVATE
     assert visible(plan, "/tmp/.X11-unix/X0") is Access.PRIVATE  # never the host's socket
     assert access(plan, "/dev/shm") is Access.PRIVATE  # its own tmpfs, as on a host

@@ -17,12 +17,13 @@ What a leg sees (`domain/sandbox.py`):
 |---|---|
 | its checkout; for a fix leg also the repository's `objects/`, `refs/`, `logs/` and its own `worktrees/<name>/` | fix: read-write; review/light: read-only |
 | the repository's `.git` (config, hooks, packed-refs, other checkouts' links) | fix: per-leg overlay (git's lock files and a scratch `git worktree add` work; nothing reaches the host); review/light: read-only |
-| the checkout's `.git` link and its own `commondir`/`gitdir` | read-only |
+| the checkout's `.git` link and its own `commondir`, `gitdir` and `config.worktree` (the harness's git reads it as config where `extensions.worktreeConfig` is on; emptied at every launch, since the harness sets nothing there) | read-only |
+| `/dev/shm` | its own empty tmpfs |
 | the runtime binary; `/usr`, `/etc` (whole: operator secrets live in HOME, root-only files stay unreadable), `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.cargo/config.toml` (its linker and rustflags hash every artifact in a shared `CARGO_TARGET_DIR`), `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |
 | `~/.cargo/registry`, `~/.cargo/git`, `~/.cache/uv`, `~/.bun/install/cache`, `~/.npm` | per-leg overlay (writes discarded) |
 | the runtime session store and login (`~/.claude/projects/<checkout>`, `.credentials.json`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write (the login too: refresh rotates it; residuals §1.1) |
 | HOME, `/tmp` (with an empty `/tmp/.X11-unix`, so a leg's own Xvfb has a socket directory), `/var/tmp` | empty, leg-private |
-| GPU render nodes (`/dev/dri`, as Flatpak's `--device=dri`): NVIDIA's EGL library aborts Xvfb and WebKitGTK without one | device |
+| GPU render nodes (`/dev/dri/renderD*`, never the display `card*` nodes): NVIDIA's EGL library aborts Xvfb and WebKitGTK without one | device |
 | network | on (no egress filter) |
 
 Not visible: `config/` and the rest of the harness checkout, the operator's

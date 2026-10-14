@@ -109,6 +109,8 @@ def test_a_fix_leg_commits_and_git_answers_github_with_its_one_token(host):
               'printf "protocol=https\\nhost=github.com\\n\\n" | git credential fill | grep "^password=" ; '
               'echo x >> .git 2>/dev/null || echo link-ro; '
               'echo x >> "$(git rev-parse --git-dir)/commondir" 2>/dev/null || echo own-links-ro; '
+              'echo "[core] hooksPath = /tmp" >> "$(git rev-parse --git-dir)/config.worktree" 2>/dev/null '
+              '|| echo worktree-config-ro; '
               f'printf "[core]\\n\\tfsmonitor = touch /tmp/pwned\\n" >> "{host["target"]}/.git/config"; '
               f'echo "touch /tmp/pwned" > "{host["target"]}/.git/hooks/post-checkout"; '
               f'echo /elsewhere > "{host["target"]}/.git/commondir"')
@@ -116,7 +118,8 @@ def test_a_fix_leg_commits_and_git_answers_github_with_its_one_token(host):
 
     done = run_leg(sandbox(host), host, script)
 
-    assert done.stdout.split() == ["committed", f"password={FAKE_TOKEN}", "link-ro", "own-links-ro"], done.stderr
+    assert done.stdout.split() == ["committed", f"password={FAKE_TOKEN}", "link-ro", "own-links-ro",
+                                   "worktree-config-ro"], done.stderr
     assert "packed-refs" not in done.stderr  # git writes its lock beside config on every commit
     assert _git("log", "-1", "--format=%s", "fix/5-x", cwd=host["target"]).strip() == "a"
     # The leg's writes to what the harness's git reads outside vanished with it.
@@ -362,6 +365,41 @@ def test_a_missing_bwrap_is_named_and_refuses_every_launch(host):
     assert box.posture().startswith("unavailable:")
     with pytest.raises(SandboxRefused):
         box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+
+
+@needs_bwrap
+def test_worktree_config_a_leg_planted_before_the_mount_is_emptied_at_launch(host):
+    admin = Path(git_link(str(host["worktree"]), str(host["target"])).worktree_dir)
+    (admin / "config.worktree").write_text("[core]\n\tfsmonitor = touch /tmp/pwned\n")
+
+    done = run_leg(sandbox(host), host, "echo ran")
+
+    assert done.stdout.split() == ["ran"], done.stderr
+    assert (admin / "config.worktree").read_text() == ""
+
+
+@needs_bwrap
+@pytest.mark.parametrize("plant", ["fifo", "hardlink"])
+def test_a_worktree_config_that_is_not_a_plain_file_refuses_the_leg(host, plant):
+    admin = Path(git_link(str(host["worktree"]), str(host["target"])).worktree_dir)
+    if plant == "fifo":
+        os.mkfifo(admin / "config.worktree")
+    else:
+        (host["tmp"] / "shared").write_text("")
+        os.link(host["tmp"] / "shared", admin / "config.worktree")
+
+    with pytest.raises(SandboxRefused, match="config.worktree"):
+        sandbox(host).launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
+
+
+@needs_bwrap
+def test_a_linked_worktree_config_is_tampering_and_refuses_the_leg(host):
+    admin = Path(git_link(str(host["worktree"]), str(host["target"])).worktree_dir)
+    (admin / "config.worktree").symlink_to(host["tmp"] / "elsewhere")
+
+    with pytest.raises(SandboxRefused, match="config.worktree"):
+        sandbox(host).launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin:/bin"})
+    assert not (host["tmp"] / "elsewhere").exists()
 
 
 def test_a_bwrap_too_old_for_overlays_is_named_and_refuses_every_launch(host):

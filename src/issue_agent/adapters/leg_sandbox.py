@@ -20,8 +20,10 @@ config. Nothing here logs or returns a token in a loggable value.
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
+import stat
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -149,6 +151,24 @@ def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...
     for name, value in plan.env:
         args += ["--unsetenv", name] if value is None else ["--setenv", name, value]
     return (*args, "--chdir", plan.cwd)
+
+
+def _empty_worktree_config(path: str) -> None:
+    """Mounted read-only, so it must exist, and empty: the harness owns its
+    worktrees and sets nothing there, so any content is a leg's from before
+    the mount (a hooksPath or fsmonitor the harness's git would run). A link,
+    FIFO or hard link there is tampering; it is never followed or waited on."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    except OSError as exc:
+        raise SandboxRefused(f"{path} is not a plain file ({exc.strerror})") from exc
+    try:
+        status = os.fstat(fd)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise SandboxRefused(f"{path} is not a plain file")
+        os.ftruncate(fd, 0)
+    finally:
+        os.close(fd)
 
 
 def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
@@ -286,13 +306,18 @@ class LegSandbox:
         if os.path.isabs(build):
             os.makedirs(build, exist_ok=True)
             build_cache = (os.path.realpath(build),)
+        writes = self.writable and not read_only
+        link = git_link(root, self.repository)
+        if link is not None and writes:
+            _empty_worktree_config(os.path.join(link.worktree_dir, "config.worktree"))
         try:
             plan = leg_mount_plan(LegFacts(
-                home=self.home, cwd=root, writable=self.writable and not read_only,
-                git=git_link(root, self.repository), runtime_binary=binary, runtime_support=support,
+                home=self.home, cwd=root, writable=writes,
+                git=link, runtime_binary=binary, runtime_support=support,
                 runtime_state=tuple(os.path.abspath(p) for p in runtime_state),
                 search_path=tuple(env.get("PATH", "").split(os.pathsep)), build_cache=build_cache,
                 scratch=tuple(os.path.abspath(p) for p in scratch), protected=self.protected,
+                devices=tuple(sorted(glob.glob("/dev/dri/renderD*"))),
             ))
         except UnsafeMount as exc:
             raise SandboxRefused(str(exc)) from exc
