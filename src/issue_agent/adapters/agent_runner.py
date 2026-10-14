@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .child_env import CHILD_ENV_MANIFEST
-from .leg_sandbox import LegSandbox, SandboxRefused, claude_login, claude_runtime_state
+from .leg_sandbox import LegSandbox, SandboxRefused, claude_runtime_state
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
 from ..domain.pricing import RateTable, claude_model
@@ -490,7 +490,6 @@ class AgentRunner(AgentRuntime):
                 try:
                     launch = self._sandbox.launch(command, cwd=cwd, env=leg_env,
                                                   runtime_state=claude_runtime_state(leg_env, cwd),
-                                                  login=claude_login(leg_env),
                                                   read_only=task.read_only)
                 except SandboxRefused as exc:
                     self._log(f"sdk: SANDBOX REFUSED — {exc}")

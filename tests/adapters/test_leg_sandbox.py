@@ -22,7 +22,6 @@ import pytest
 from issue_agent.adapters.leg_sandbox import (
     LegSandbox,
     SandboxRefused,
-    claude_login,
     claude_runtime_state,
     codex_runtime_state,
     git_link,
@@ -314,7 +313,8 @@ def _sleepers(cwd: Path) -> list[int]:
 
 @needs_bwrap
 def test_runtime_state_is_shared_with_the_host_at_the_same_path(host):
-    env = {"HOME": str(host["home"]), "CODEX_HOME": str(host["tmp"] / "state/codex-hooks/k")}
+    env = {"HOME": str(host["home"]), "CLAUDE_CODE_OAUTH_TOKEN": "t",
+           "CODEX_HOME": str(host["tmp"] / "state/codex-hooks/k")}
     os.makedirs(env["CODEX_HOME"])
     (host["home"] / ".codex").mkdir()
     (host["home"] / ".codex/auth.json").write_text("{}")
@@ -422,143 +422,6 @@ def test_a_fix_leg_cannot_plant_what_the_harnesss_git_would_obey_in_the_reposito
     assert not (common / "hooks/pre-commit").exists()
 
 
-def _plant_claude_config(host: dict[str, Path]) -> Path:
-    """A fake operator ~/.claude: a login, settings with a hook, history,
-    another project's transcript, a hooks dir. No real credential."""
-    config = host["home"] / ".claude"
-    for name, text in ((".credentials.json", '{"fake": "v1"}'), ("history.jsonl", "planted-history\n"),
-                       ("projects/-home-op-other/s.jsonl", "planted-transcript\n"),
-                       ("hooks/pre.sh", "planted-hook\n"), ("CLAUDE.md", "planted-memory\n")):
-        (config / name).parent.mkdir(parents=True, exist_ok=True)
-        (config / name).write_text(text)
-    (config / "settings.json").write_text('{"hooks": "planted-settings"}')
-    return config
-
-
-def _claude_leg(host: dict[str, Path], script: str) -> subprocess.Popen:
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8"}
-    store = claude_runtime_state(env, str(host["worktree"]))
-    leg = sandbox(host).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env,
-                               runtime_state=store, login=claude_login(env))
-    return subprocess.Popen(leg.argv, env={**env, **leg.env}, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
-
-
-def _replace_by_rename(path: Path, text: str) -> None:
-    """How Claude Code writes its login: a new inode renamed over the old."""
-    staged = path.with_name(path.name + ".tmp.host")
-    staged.write_text(text)
-    os.replace(staged, path)
-
-
-@needs_bwrap
-def test_a_running_leg_reads_the_login_the_host_replaced_by_rename(host):
-    config = _plant_claude_config(host)
-    login = config / ".credentials.json"
-    leg = _claude_leg(host, f'cat "{login}"; echo; read _; cat "{login}"; echo')
-    try:
-        assert leg.stdout.readline().strip() == '{"fake": "v1"}'
-        before = login.stat().st_ino
-        _replace_by_rename(login, '{"fake": "v2"}')
-        assert login.stat().st_ino != before
-        out, err = leg.communicate("go\n", timeout=30)
-    finally:
-        leg.kill()
-    assert out.strip() == '{"fake": "v2"}', err
-
-
-@needs_bwrap
-def test_a_legs_login_written_by_rename_reaches_the_host(host):
-    config = _plant_claude_config(host)
-    login = config / ".credentials.json"
-    before = login.stat().st_ino
-
-    leg = _claude_leg(host, f'printf "%s" \'{{"fake": "leg"}}\' > "{login}.tmp.leg" && '
-                            f'mv "{login}.tmp.leg" "{login}" && echo renamed')
-    out, err = leg.communicate(timeout=30)
-
-    assert out.strip() == "renamed", err
-    assert login.read_text() == '{"fake": "leg"}'
-    assert login.stat().st_ino != before
-
-
-@needs_bwrap
-def test_the_refresh_lock_is_one_lock_for_the_leg_and_the_host(host):
-    config = _plant_claude_config(host)
-    (config / ".oauth_refresh.lock").mkdir()  # held by a host process at launch
-
-    leg = _claude_leg(host, f'mkdir "{config}/.oauth_refresh.lock" 2>/dev/null || echo held; '
-                            f'mkdir "{config}/.storage-write.lock" && echo taken')
-    out, err = leg.communicate(timeout=30)
-
-    assert out.split() == ["held", "taken"], err
-    assert (config / ".storage-write.lock").is_dir()
-
-
-@needs_bwrap
-def test_the_operators_claude_state_is_hidden_and_cannot_be_replaced(host):
-    config = _plant_claude_config(host)
-    reads = " ".join(f'"{config}/{p}"' for p in ("settings.json", "history.jsonl", "CLAUDE.md", "hooks/pre.sh",
-                                                  "projects/-home-op-other/s.jsonl"))
-    script = (f'cat {reads} 2>/dev/null; ls -A "{config}/hooks" "{config}/projects"; '
-              f'[ -f "{config}/settings.json" ] && [ ! -s "{config}/settings.json" ] && echo empty-file; '
-              f'echo evil > "{config}/hooks/pre.sh"; '
-              f'rm -f "{config}/settings.json" 2>/dev/null || echo rm-refused; '
-              f'echo evil > "{config}/x" && mv "{config}/x" "{config}/CLAUDE.md" 2>/dev/null || echo mv-refused; '
-              f'echo evil > "{config}/history.jsonl" 2>/dev/null || echo write-refused; echo done')
-
-    leg = _claude_leg(host, script)
-    out, err = leg.communicate(timeout=30)
-
-    assert "planted" not in out
-    # Its own session store is the only project it sees.
-    assert out.split() == [f"{config}/hooks:", f"{config}/projects:",
-                           os.path.basename(claude_runtime_state({"HOME": str(host["home"])}, str(host["worktree"]))[0]),
-                           "empty-file", "rm-refused", "mv-refused", "write-refused", "done"], err
-    assert (config / "settings.json").read_text() == '{"hooks": "planted-settings"}'
-    assert (config / "CLAUDE.md").read_text() == "planted-memory\n"
-    assert (config / "history.jsonl").read_text() == "planted-history\n"
-    assert (config / "hooks/pre.sh").read_text() == "planted-hook\n"
-
-
-@needs_bwrap
-def test_a_leg_cannot_create_config_the_operators_claude_would_obey(host):
-    config = _plant_claude_config(host)
-    (config / "settings.json").unlink()
-    names = ("settings.json", "settings.local.json", "keybindings.json", "commands/x.md",
-             "output-styles/x.md", "agents/x.md", "skills/x/SKILL.md", "rules/x.md", "plugins/x")
-    script = "".join(f'mkdir -p "$(dirname "{config}/{n}")" 2>/dev/null; echo evil > "{config}/{n}" 2>/dev/null; '
-                     for n in names) + "echo done"
-
-    out, err = _claude_leg(host, script).communicate(timeout=30)
-
-    assert out.strip() == "done", err
-    for name in names:
-        path = config / name
-        assert not path.exists() or path.read_bytes() == b"", name
-    # Absent names were made empty and inert.
-    assert (config / "settings.json").read_bytes() == b""
-
-
-def test_shielding_the_config_dir_never_creates_a_global_config_file(host):
-    # The CLI parses `.config.json` whenever it exists; an empty placeholder
-    # killed every Claude process on the host (incident 2026-10-15).
-    config = _plant_claude_config(host)
-
-    claude_login({"HOME": str(host["home"])})
-
-    assert not (config / ".config.json").exists()
-
-
-def test_a_symlinked_config_name_claude_obeys_refuses_the_leg(host):
-    config = _plant_claude_config(host)
-    (config / "settings.json").unlink()
-    (config / "settings.json").symlink_to(host["tmp"] / "managed-settings.json")
-
-    with pytest.raises(SandboxRefused, match="symlink"):
-        claude_login({"HOME": str(host["home"])})
-
-
 @needs_bwrap
 def test_a_fix_leg_never_prunes_on_fetch(host):
     _git("config", "fetch.prune", "true", cwd=host["target"])
@@ -578,23 +441,6 @@ def test_a_repository_whose_include_would_pack_refs_again_refuses_the_fix_leg(ho
 
     with pytest.raises(SandboxRefused, match="gc.packRefs"):
         _fix_leg(host, "true")
-
-
-def test_a_leg_with_its_own_key_or_token_mounts_none_of_the_operators_claude_state(host):
-    _plant_claude_config(host)
-    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
-        assert claude_login({"HOME": str(host["home"]), name: "k"}) is None
-    assert claude_login({"HOME": str(host["home"]), "ANTHROPIC_API_KEY": ""}) is not None
-    assert claude_login({"HOME": str(host["tmp"] / "nobody")}) is None  # no login file
-
-
-def test_a_login_directory_too_full_to_hide_refuses_the_leg_with_its_reason(host):
-    config = _plant_claude_config(host)
-    for index in range(1_001 - len(os.listdir(config))):
-        (config / f"junk-{index}").touch()
-
-    with pytest.raises(SandboxRefused, match="entries"):
-        claude_login({"HOME": str(host["home"])})
 
 
 def test_a_checkout_whose_git_link_points_elsewhere_is_refused(host):
@@ -693,17 +539,40 @@ def test_a_bwrap_that_cannot_create_namespaces_refuses_every_launch(host):
         box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
 
 
-@needs_bwrap
-def test_a_review_leg_with_its_own_oauth_token_sees_no_operator_claude_state_and_no_github_token(host):
+def _plant_claude_config(host: dict[str, Path]) -> Path:
+    """A fake operator ~/.claude: a login, settings with a hook, history,
+    another project's transcript. No real credential."""
+    config = host["home"] / ".claude"
+    for name, text in ((".credentials.json", '{"fake": "v1"}'), ("history.jsonl", "planted-history\n"),
+                       ("projects/-home-op-other/s.jsonl", "planted-transcript\n"),
+                       ("hooks/pre.sh", "planted-hook\n"), ("CLAUDE.md", "planted-memory\n"),
+                       ("settings.json", '{"hooks": "planted-settings"}')):
+        (config / name).parent.mkdir(parents=True, exist_ok=True)
+        (config / name).write_text(text)
+    return config
+
+
+@pytest.mark.parametrize("env_extra", [{}, {"ANTHROPIC_API_KEY": ""}, {"CLAUDE_CODE_OAUTH_TOKEN": ""}],
+                         ids=["absent", "blank-key", "blank-token"])
+def test_a_claude_leg_without_its_own_credential_is_refused_naming_the_fix_even_with_an_operator_login(host, env_extra):
     _plant_claude_config(host)
+
+    with pytest.raises(SandboxRefused, match=r"claude setup-token.*credstore\.encrypted/CLAUDE_CODE_OAUTH_TOKEN"):
+        claude_runtime_state({"HOME": str(host["home"]), **env_extra}, str(host["worktree"]))
+
+
+@needs_bwrap
+@pytest.mark.parametrize("name", ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_a_claude_leg_with_its_own_credential_sees_only_its_session_store_of_the_operators_claude_dir(host, name):
+    config = _plant_claude_config(host)
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8",
-           "CLAUDE_CODE_OAUTH_TOKEN": "leg-login"}
-    assert claude_login(env) is None
-    script = 'ls -A "$HOME/.claude" 2>&1; echo "gh=${GH_TOKEN:-none}${GITHUB_TOKEN:-}"; echo "oauth=$CLAUDE_CODE_OAUTH_TOKEN"'
+           name: "leg-login"}
+    store = claude_runtime_state(env, str(host["worktree"]))
+    script = 'find "$HOME/.claude" | sort; echo "gh=${GH_TOKEN:-none}${GITHUB_TOKEN:-}"; echo "cred=$' + name + '"'
     leg = sandbox(host, writable=False).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env,
-                                               login=claude_login(env))
+                                               runtime_state=store)
 
     out = subprocess.run(leg.argv, env={**env, **leg.env}, capture_output=True, text=True, timeout=60).stdout
 
-    assert ".credentials.json" not in out and "settings.json" not in out
-    assert "gh=none" in out and "oauth=leg-login" in out
+    assert out.split() == [f"{config}", f"{config}/projects", store[0], "gh=none", "cred=leg-login"]
+    assert (config / ".credentials.json").read_text() == '{"fake": "v1"}'

@@ -627,19 +627,20 @@ class _Sandbox:
         self.refuse, self.launches = refuse, []
         self.launcher = "/usr/bin/bwrap"  # an executable stand-in, set per test
 
-    def launch(self, command, *, cwd, env, runtime_state=(), login=None, scratch=(), read_only=False):
+    def launch(self, command, *, cwd, env, runtime_state=(), scratch=(), read_only=False):
         from issue_agent.adapters.leg_sandbox import Launch, SandboxRefused
 
         if self.refuse:
             raise SandboxRefused(self.refuse)
         self.launches.append({"command": tuple(command), "cwd": cwd, "runtime_state": tuple(runtime_state),
-                              "login": login, "read_only": read_only})
+                              "read_only": read_only})
         return Launch((self.launcher, "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
 
 
 def _supervised_cli_runner(tmp_path, monkeypatch, sandbox):
     from issue_agent.adapters.process_supervisor import ProcessSupervisor
 
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "leg-login")
     cli, launcher = tmp_path / "claude", tmp_path / "bwrap"
     for executable in (cli, launcher):
         executable.write_text("#!/bin/sh\n")
@@ -660,15 +661,10 @@ def test_a_claude_leg_execs_its_cli_through_the_sandbox_with_its_credential(tmp_
                       capture=capture)
     sandbox = _Sandbox()
     runner, cli = _supervised_cli_runner(tmp_path, monkeypatch, sandbox)
-    (tmp_path / "home/.claude").mkdir(parents=True)
-    (tmp_path / "home/.claude/.credentials.json").write_text("{}")
 
     result = asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
 
     assert result.status == "done"
-    # An OAuth login is shared as its directory, with the session store listed in it.
-    login = sandbox.launches[0]["login"]
-    assert login.path == str(tmp_path / "home/.claude") and "projects" in login.entries
     env = capture["options"]["env"]
     assert json.loads(env["ISSUE_AGENT_SUPERVISED_TARGET"]) == [sandbox.launcher, "--sandboxed", "--",
                                                                 os.path.realpath(cli)]
@@ -721,3 +717,15 @@ def test_a_clean_envelope_is_not_reclassified_by_a_stale_api_error_terminal_reas
     r = result_to_agent_result(FakeResult(subtype="success", terminal_reason="api_error"))
     assert r.exit_reason is ExitReason.OK
     assert classify_leg(r, resumed=False) is LegClass.AGENT
+
+
+def test_a_claude_leg_with_no_credential_of_its_own_is_blocked_before_launch(tmp_path, monkeypatch):
+    sandbox = _Sandbox()
+    runner, _ = _supervised_cli_runner(tmp_path, monkeypatch, sandbox)
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+
+    result = asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
+
+    assert result.status == "blocked" and "claude setup-token" in result.summary
+    assert sandbox.launches == []

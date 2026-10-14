@@ -113,7 +113,8 @@ equivalent terminating commands are appropriate.
 ### Secrets as systemd credentials (Linux)
 
 `FIX_BOT_TOKEN`, `REVIEW_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` (the legs'
-own Claude login, so legs never share the operator's `~/.claude`) can live as
+own Claude login, required: a Claude leg without it, `ANTHROPIC_API_KEY` or
+`ANTHROPIC_AUTH_TOKEN` is refused, and legs never share the operator's `~/.claude`) can live as
 systemd encrypted credentials instead of plaintext in `config/shared.env`. The
 fix unit imports `FIX_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN`, the review unit
 `REVIEW_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` (`ImportCredential=`, re-read
