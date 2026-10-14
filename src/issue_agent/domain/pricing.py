@@ -40,6 +40,10 @@ CLAUDE_DEFAULT_MODEL_RATES: tuple[tuple[str, float, float, float], ...] = (
     ("claude-opus-5-5", 4.0, 20.0, 0.20),
     ("claude-sonnet-5-5", 2.0, 10.0, 0.10),
     ("claude-haiku-5-5", 0.50, 2.50, 0.05),
+    # The CLI's own small model (CLI 2.1.299): it lands in a session's
+    # modelUsage without being requested, and unrated it settled a $0.40 rebase
+    # at the $50 reserved maximum (tauri #1128, 2026-10-15).
+    ("claude-haiku-4-5-20251001", 1.0, 5.0, 0.10),
 )
 # The CLI's aliases, as CLI 2.1.294 resolves them (checked 2026-10-14), so a
 # plan naming one passes admission. Settlement prices the concrete model the
