@@ -15,6 +15,12 @@ Type=notify
 NotifyAccess=all
 ExecStart=@UV_BIN@ run --extra sdk python -m issue_agent.app.main review
 WorkingDirectory=@HARNESS_ROOT@
+# Encrypted secrets, imported at every unit start from
+# ~/.config/credstore.encrypted/NAME (HARNESS.md "Secrets"); a missing file is
+# skipped and the daemon then reads the env file. Each role gets only its own
+# GitHub token; both get the Claude leg token.
+ImportCredential=REVIEW_BOT_TOKEN
+ImportCredential=CLAUDE_CODE_OAUTH_TOKEN
 Environment=AGENT_ENV=@CONFIG@
 Environment=ISSUE_AGENT_DEPLOYMENT_ID=@DEPLOYMENT_ID@
 Environment=TARGET_DIR=@TARGET_DIR@
@@ -41,9 +47,12 @@ KillSignal=SIGTERM
 KillMode=mixed
 FinalKillSignal=SIGKILL
 MemoryMax=4G
-# Independent review reruns Chromium acceptance suites under this cgroup.
-# Preserve observation headroom while MemoryMax remains the hard boundary.
-TasksMax=1024
+# Every thread counts as a task. Tauri legs (cargo/rustc plus Chromium or
+# WebKit acceptance runs) exceeded 1024 twice on 2026-10-14 with concurrent
+# legs, so the cap is 4096. MemoryMax stays the hard resource bound; this
+# limit exists so a runaway leg (fork bomb, incident #63) cannot exhaust the
+# user's pid space.
+TasksMax=4096
 StandardOutput=journal
 StandardError=journal
 # The manager can record a terminal result even when the daemon cannot flush;

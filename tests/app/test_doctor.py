@@ -9,8 +9,10 @@ import pytest
 
 from issue_agent.app.doctor import (
     codex_findings,
+    doctor_findings,
     env_assignments,
     identity_findings,
+    secret_source_findings,
     parse_unit,
     sandbox_findings,
     service_findings,
@@ -212,6 +214,29 @@ def test_a_whitespace_token_is_an_error(var):
     assert _levels(identity_findings(env), var) == {"error"}
 
 
+def test_stored_systemd_credentials_satisfy_the_identity_check_without_env_values():
+    findings = identity_findings({}, stored=("FIX_BOT_TOKEN", "REVIEW_BOT_TOKEN"))
+
+    assert not [f for f in findings if f.level == "error"]
+
+
+def test_a_missing_fix_token_is_still_an_error_when_only_the_review_token_is_stored():
+    assert _levels(identity_findings({}, stored=("REVIEW_BOT_TOKEN",)), "FIX_BOT_TOKEN is not set") == {"error"}
+
+
+def test_secret_sources_are_reported_without_values_and_both_sources_is_an_error():
+    env = {"REVIEW_BOT_TOKEN": "ghp_planted", "CLAUDE_CODE_OAUTH_TOKEN": "sk-planted"}
+
+    findings = secret_source_findings(env, stored=("FIX_BOT_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"))
+
+    messages = [f.message for f in findings]
+    assert "FIX_BOT_TOKEN: systemd credential (services only)" in messages
+    assert "REVIEW_BOT_TOKEN: env file" in messages
+    assert "CLAUDE_CODE_OAUTH_TOKEN: absent" in [f.message for f in secret_source_findings({}, ())]
+    assert _levels(findings, "CLAUDE_CODE_OAUTH_TOKEN") == {"error"}
+    assert not any("planted" in m for m in messages)
+
+
 def test_the_app_identity_needs_all_three_settings_and_a_readable_key(tmp_path):
     key = tmp_path / "app.pem"
     key.write_text("k")
@@ -281,3 +306,21 @@ def test_an_executable_pinned_codex_is_silent(tmp_path):
     codex.write_text("#!/bin/sh\n")
     codex.chmod(0o755)
     assert codex_findings({"FIXER_RUNTIME": "codex", "CODEX_BIN": f"'{codex}'"}) == ()
+
+
+def test_doctor_judges_the_secrets_from_the_env_file_not_the_operators_shell(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    store = tmp_path / ".config" / "credstore.encrypted"
+    store.mkdir(parents=True)
+    (store / "CLAUDE_CODE_OAUTH_TOKEN").write_text("encrypted")
+    snapshot = tmp_path / "active.env"
+    snapshot.write_text('FIX_BOT_TOKEN="ghp_a"\nREVIEW_BOT_TOKEN="ghp_b"\n')
+    shell = {"CLAUDE_CODE_OAUTH_TOKEN": "exported-in-my-shell", "AGENT_ENV": str(snapshot)}
+
+    table = dict(doctor_findings("x", shell, str(snapshot)))
+
+    messages = [f.message for f in table["secrets"]]
+    assert "CLAUDE_CODE_OAUTH_TOKEN: systemd credential (services only)" in messages
+    assert "FIX_BOT_TOKEN: env file" in messages
+    assert not [f for f in table["secrets"] if f.level == "error"]
+    assert not any("ghp_" in m or "exported" in m for m in messages)

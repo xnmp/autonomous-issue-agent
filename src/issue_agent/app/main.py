@@ -20,6 +20,7 @@ from ..adapters.control_store import (
     IncompatibleSchema,
     StoreWake,
 )
+from ..adapters.credentials import require_stored_secrets, with_credentials
 from ..adapters.env_file import source_env_file
 from ..adapters.github import GitHubGateway, Identity
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
@@ -48,10 +49,12 @@ def _load_agent_env(env: dict) -> dict:
     """
     path = env.get("AGENT_ENV", "")
     if not path:
-        return env
+        return with_credentials(env)
     loaded = source_env_file(path, env)
     loaded["AGENT_ENV"] = path
-    return loaded
+    # Secrets delivered by the unit (systemd encrypted credentials) join here,
+    # the one place every start and hot reload reads its environment.
+    return with_credentials(loaded)
 
 
 def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId, ...]:
@@ -73,8 +76,11 @@ def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId
     return tuple(recovered)
 
 
-def _validate_reload_candidate(env: dict[str, str]) -> None:
-    candidate = from_env(_load_agent_env(env))
+def _validate_reload_candidate(env: dict[str, str], role: str | None = None) -> None:
+    loaded = _load_agent_env(env)
+    if role:
+        require_stored_secrets(loaded, role)
+    candidate = from_env(loaded)
     candidate.validate()
 
 
@@ -127,6 +133,7 @@ def build_role(role: str, env: dict | None = None, scheduler_progress: Callable[
     # only a standalone caller (env=None) pays for it here (review S7/D3).
     if env is None:
         env = _load_agent_env(dict(os.environ))
+        require_stored_secrets(env, role)
     cfg = from_env(env)
     cfg.validate()
     if cfg.target_dir and os.path.isdir(cfg.target_dir):
@@ -207,6 +214,7 @@ def _serve(role: str) -> None:
     # via `_lock` (the open fd IS the lock; GC/exit releases it).
     try:
         env = _load_agent_env(dict(os.environ))
+        require_stored_secrets(env, role)
     except ValueError as exc:
         sys.stderr.write(f"{role}: invalid configuration — {exc}\n")
         raise SystemExit(ExitCode.INVALID_CONFIG) from exc
@@ -307,7 +315,7 @@ def _serve(role: str) -> None:
         watch = ReloadWatch(
             _HARNESS_ROOT,
             files=tuple(p for p in (os.environ.get("AGENT_ENV"),) if p),
-            validate=lambda: _validate_reload_candidate(dict(os.environ)),
+            validate=lambda: _validate_reload_candidate(dict(os.environ), role),
         )
         reload_check = watch.changed
     notifier.ready(f"{role} daemon initialized")

@@ -72,7 +72,7 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
         # reload marked four units failed at once under Burst=3).
         assert service["SuccessExitStatus"] == ["87"]
         assert service["RestartForceExitStatus"] == ["87"]
-        expected_tasks = "1024" if role in {"fix", "review"} else "512"
+        expected_tasks = "4096" if role in {"fix", "review"} else "512"
         assert service["TasksMax"] == [expected_tasks]
         assert service["MemoryMax"] == ["4G"]
         unit = _parse_unit(_read(path))["Unit"]

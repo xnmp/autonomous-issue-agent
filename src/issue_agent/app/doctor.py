@@ -21,6 +21,8 @@ import shutil
 from dataclasses import dataclass
 from typing import Callable
 
+from ..adapters.credentials import SECRET_NAMES, in_credstore
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -80,18 +82,38 @@ def codex_findings(env: dict, which: Callable[..., str | None] = shutil.which) -
     return ()
 
 
-def identity_findings(env: dict) -> tuple[Finding, ...]:
+def secret_source_findings(env: dict, stored: tuple[str, ...]) -> tuple[Finding, ...]:
+    """Where each secret comes from, judged from the env file's `env` and the
+    credstore files' existence (never decrypted, values never shown). Both
+    sources is an error: two sources of truth for one secret."""
+    findings: list[Finding] = []
+    for name in SECRET_NAMES:
+        inline = bool(str(env.get(name) or "").strip())
+        if name in stored and inline:
+            findings.append(Finding("error", f"{name} is set in both the credstore and the env file; "
+                                             "delete the plaintext line."))
+        elif name in stored:
+            findings.append(Finding("info", f"{name}: systemd credential (services only)"))
+        else:
+            findings.append(Finding("info", f"{name}: {'env file' if inline else 'absent'}"))
+    return tuple(findings)
+
+
+def identity_findings(env: dict, stored: tuple[str, ...] = ()) -> tuple[Finding, ...]:
     """The two-identity model: the fixer and the reviewer each on their own
-    credential (a GitHub App or REVIEW_BOT_TOKEN for review)."""
+    credential (a GitHub App or REVIEW_BOT_TOKEN for review). `stored` names
+    secrets held as systemd credentials: present, though not in `env`."""
     findings: list[Finding] = []
     fix = str(env.get("FIX_BOT_TOKEN") or "")
     review = str(env.get("REVIEW_BOT_TOKEN") or "")
+    has_fix = bool(fix) or "FIX_BOT_TOKEN" in stored
+    has_review = bool(review) or "REVIEW_BOT_TOKEN" in stored
     app = [str(env.get(k) or "") for k in ("GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE")]
     for name, value in (("FIX_BOT_TOKEN", fix), ("REVIEW_BOT_TOKEN", review)):
         if value and not value.strip():
             findings.append(Finding("error", f"{name} is whitespace: it is sent as a bearer token "
                                              "and GitHub 401s every call. Unset it or set a real token."))
-    if not fix:
+    if not has_fix:
         findings.append(Finding("error", "FIX_BOT_TOKEN is not set: fix legs run sandboxed with no GitHub "
                                          "credential and cannot push or read CI logs (#413)."))
     if any(app) and not all(app):
@@ -104,7 +126,7 @@ def identity_findings(env: dict) -> tuple[Finding, ...]:
         if not os.access(key, os.R_OK):
             findings.append(Finding("error", f"GH_APP_KEY_FILE {app[2]!r} is not readable: "
                                              "the reviewer cannot mint its token."))
-    elif (review and review == fix) or (not review and not fix):
+    elif (review and review == fix) or (not has_review and not has_fix):
         findings.append(Finding("error", "the fixer and the reviewer resolve to the same credential: "
                                          "GitHub 422s a review by the PR's author, so nothing can merge. "
                                          "Give the reviewer its own token or a GitHub App."))
@@ -249,10 +271,20 @@ def sandbox_findings(probe: Callable[[], str | None] | None = None) -> tuple[Fin
 
 
 def doctor_findings(name: str, composed: dict, active_env_path: str) -> tuple[tuple[str, tuple[Finding, ...]], ...]:
-    """The table of offline checks `issue-agent doctor` renders."""
+    """The table of offline checks `issue-agent doctor` renders. The three
+    secrets are judged from the env file alone: the operator's shell exports
+    are not what a service sees."""
+    home = os.path.expanduser("~")
+    stored = tuple(n for n in SECRET_NAMES if in_credstore(home, n))
+    text = _read(os.path.expanduser(composed.get("AGENT_ENV") or active_env_path))
+    if text is not None:
+        from_file = env_assignments(text)
+        composed = {**{k: v for k, v in composed.items() if k not in SECRET_NAMES},
+                    **{k: _unquoted(from_file[k]) for k in SECRET_NAMES if k in from_file}}
     return (
         ("leg sandbox", sandbox_findings()),
-        ("identity", identity_findings(composed)),
+        ("secrets", secret_source_findings(composed, stored)),
+        ("identity", identity_findings(composed, stored)),
         ("codex binary", codex_findings(composed)),
         ("installed services", service_findings(name, active_env_path)),
     )

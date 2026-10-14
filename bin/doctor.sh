@@ -208,7 +208,10 @@ _placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
 #   no token             → GitHub App path; the App fields are required
 # (app/main.py `_app_identity` resolves App token → static token → ambient.)
 _placeholder_vars="$_placeholder_vars REVIEW_BOT"
-if [ -z "${REVIEW_BOT_TOKEN:-}" ]; then
+# REVIEW_BOT_TOKEN may live as a systemd credential (encrypted file, readable
+# only inside the unit): then it is set, though not in this shell.
+_review_cred="$HOME/.config/credstore.encrypted/REVIEW_BOT_TOKEN"
+if [ -z "${REVIEW_BOT_TOKEN:-}" ] && [ ! -f "$_review_cred" ]; then
   _placeholder_vars="$_placeholder_vars GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
 fi
 for _var in $_placeholder_vars; do
@@ -272,7 +275,9 @@ if command -v gh >/dev/null 2>&1; then
     # does nothing" rather than as an error. Verify the token's identity AND
     # its access, since a PAT pasted from the wrong account is the same class
     # of silent identity mismatch as review C1.
-    if [ -n "${REVIEW_BOT_TOKEN:-}" ]; then
+    if [ -z "${REVIEW_BOT_TOKEN:-}" ] && [ -f "$_review_cred" ]; then
+      warn "REVIEW_BOT_TOKEN is a systemd credential: its identity and repo access are not probed here (only the service can decrypt it)"
+    elif [ -n "${REVIEW_BOT_TOKEN:-}" ]; then
       # gh prints its error BODY to stdout on a bad token, so an unguarded
       # capture yields `{ "message": ...` and reports it as a login. A GitHub
       # login is [A-Za-z0-9-] only, so charset-validating the first line both
