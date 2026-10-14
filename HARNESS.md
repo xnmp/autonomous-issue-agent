@@ -110,6 +110,36 @@ operator test commands.
 Do not put shell watch commands in `TEST_CMD`; `pytest`, `vitest run`, and
 equivalent terminating commands are appropriate.
 
+### Secrets as systemd credentials (Linux)
+
+`FIX_BOT_TOKEN`, `REVIEW_BOT_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` (the legs'
+own Claude login, so legs never share the operator's `~/.claude`) can live as
+systemd encrypted credentials instead of plaintext in `config/shared.env`.
+`issue-agent install-service` adds `LoadCredentialEncrypted=` to the fix unit
+(`FIX_BOT_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) and the review unit
+(`REVIEW_BOT_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) for each file below that
+exists when you install; an absent file adds nothing and the env value is used.
+
+```bash
+mkdir -p -m 0700 ~/.config/issue-agent/credentials
+claude setup-token        # prints a long-lived token for CLAUDE_CODE_OAUTH_TOKEN
+for NAME in CLAUDE_CODE_OAUTH_TOKEN FIX_BOT_TOKEN REVIEW_BOT_TOKEN; do
+  systemd-ask-password -n "$NAME:" \
+    | systemd-creds encrypt --user --name="$NAME" - ~/.config/issue-agent/credentials/$NAME.cred
+done
+# delete the plaintext FIX_BOT_TOKEN / REVIEW_BOT_TOKEN / CLAUDE_CODE_OAUTH_TOKEN
+# lines from config/shared.env, then:
+issue-agent install-service
+issue-agent doctor        # prints "<NAME>: systemd credential" or "<NAME>: env"
+```
+
+A secret present in both the credential and the env file refuses to start
+(config error naming the variable). Credential values are never copied into a
+snapshot or log. Foreground `issue-agent start` and macOS launchd have no
+credential directory and keep reading the env file; `doctor` cannot probe a
+`REVIEW_BOT_TOKEN` it cannot decrypt. Governing decision: ADR 0001 (leg
+sandbox, #413).
+
 ## Running unattended
 
 After a one-tick foreground canary succeeds:

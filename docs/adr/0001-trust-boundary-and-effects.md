@@ -47,7 +47,16 @@ sandbox: a review leg sees them read-only, a fix leg through an overlay its
 writes vanish with.
 A fix leg's one credential is `FIX_BOT_TOKEN`, passed in its environment; a
 review or light leg holds none; the review bot's token and App key never leave
-the act layer. Paid legs are refused when bwrap is missing or cannot create a
+the act layer. Secrets reach the daemons as systemd encrypted
+credentials where the host has them (`LoadCredentialEncrypted=`, decrypted into
+`$CREDENTIALS_DIRECTORY` for that unit alone; `FIX_BOT_TOKEN` on the fix unit,
+`REVIEW_BOT_TOKEN` on the review unit): config load fills each secret from
+there, refuses a secret that also appears in the env file, and the credential
+directory never enters a leg's environment. Claude legs authenticate with their
+own `CLAUDE_CODE_OAUTH_TOKEN` (the one secret on both units, passed to Claude
+legs only), which leaves the operator's `~/.claude` unmounted. launchd and
+foreground runs keep env-file secrets.
+Paid legs are refused when bwrap is missing or cannot create a
 sandbox: there is no unsandboxed mode and no per-repo knob. The sandbox
 replaces the "trusted inbound content only" operator constraint and the
 fixer's tool deny list; what a sandboxed leg can still reach is listed in

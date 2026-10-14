@@ -584,11 +584,13 @@ class CodexRunner(AgentRuntime):
         return task.model or self.default_model
 
     def _child_environment(self, task: RuntimePlan) -> dict[str, str]:
-        return child_process_env(
+        environment = child_process_env(
             os.environ,
             {**git_identity_env(self._resolved_model(task)), **self.env, **task.env},
             additional_keys=(self.provider.env_key,),
         )
+        environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)  # Claude's login; codex has no use for it
+        return environment
 
     @staticmethod
     def _accounting_home(environment: dict[str, str], cwd: str | None) -> str:

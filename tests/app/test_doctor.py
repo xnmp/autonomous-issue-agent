@@ -11,6 +11,7 @@ from issue_agent.app.doctor import (
     codex_findings,
     env_assignments,
     identity_findings,
+    secret_source_findings,
     parse_unit,
     sandbox_findings,
     service_findings,
@@ -210,6 +211,28 @@ def test_fix_and_review_on_one_credential_is_an_error(env):
 def test_a_whitespace_token_is_an_error(var):
     env = {"FIX_BOT_TOKEN": "a", "REVIEW_BOT_TOKEN": "b", var: "  "}
     assert _levels(identity_findings(env), var) == {"error"}
+
+
+def test_stored_systemd_credentials_satisfy_the_identity_check_without_env_values():
+    findings = identity_findings({}, stored=("FIX_BOT_TOKEN", "REVIEW_BOT_TOKEN"))
+
+    assert not [f for f in findings if f.level == "error"]
+
+
+def test_a_missing_fix_token_is_still_an_error_when_only_the_review_token_is_stored():
+    assert _levels(identity_findings({}, stored=("REVIEW_BOT_TOKEN",)), "FIX_BOT_TOKEN is not set") == {"error"}
+
+
+def test_secret_sources_are_reported_without_values_and_both_sources_is_an_error():
+    env = {"REVIEW_BOT_TOKEN": "ghp_planted", "CLAUDE_CODE_OAUTH_TOKEN": "sk-planted"}
+
+    findings = secret_source_findings(env, stored=("FIX_BOT_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"))
+
+    messages = [f.message for f in findings]
+    assert "FIX_BOT_TOKEN: systemd credential" in messages
+    assert "REVIEW_BOT_TOKEN: env" in messages
+    assert _levels(findings, "CLAUDE_CODE_OAUTH_TOKEN") == {"error"}
+    assert not any("planted" in m for m in messages)
 
 
 def test_the_app_identity_needs_all_three_settings_and_a_readable_key(tmp_path):

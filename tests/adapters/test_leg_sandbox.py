@@ -691,3 +691,19 @@ def test_a_bwrap_that_cannot_create_namespaces_refuses_every_launch(host):
     assert "uid map" in (box.preflight() or "")
     with pytest.raises(SandboxRefused):
         box.launch(["/bin/true"], cwd=str(host["worktree"]), env={"PATH": "/usr/bin"})
+
+
+@needs_bwrap
+def test_a_review_leg_with_its_own_oauth_token_sees_no_operator_claude_state_and_no_github_token(host):
+    _plant_claude_config(host)
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8",
+           "CLAUDE_CODE_OAUTH_TOKEN": "leg-login"}
+    assert claude_login(env) is None
+    script = 'ls -A "$HOME/.claude" 2>&1; echo "gh=${GH_TOKEN:-none}${GITHUB_TOKEN:-}"; echo "oauth=$CLAUDE_CODE_OAUTH_TOKEN"'
+    leg = sandbox(host, writable=False).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env,
+                                               login=claude_login(env))
+
+    out = subprocess.run(leg.argv, env={**env, **leg.env}, capture_output=True, text=True, timeout=60).stdout
+
+    assert ".credentials.json" not in out and "settings.json" not in out
+    assert "gh=none" in out and "oauth=leg-login" in out

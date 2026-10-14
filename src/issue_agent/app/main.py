@@ -20,6 +20,7 @@ from ..adapters.control_store import (
     IncompatibleSchema,
     StoreWake,
 )
+from ..adapters.credentials import with_credentials
 from ..adapters.env_file import source_env_file
 from ..adapters.github import GitHubGateway, Identity
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
@@ -48,10 +49,12 @@ def _load_agent_env(env: dict) -> dict:
     """
     path = env.get("AGENT_ENV", "")
     if not path:
-        return env
+        return with_credentials(env)
     loaded = source_env_file(path, env)
     loaded["AGENT_ENV"] = path
-    return loaded
+    # Secrets delivered by the unit (systemd encrypted credentials) join here,
+    # the one place every start and hot reload reads its environment.
+    return with_credentials(loaded)
 
 
 def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId, ...]:
