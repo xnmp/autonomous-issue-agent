@@ -47,6 +47,7 @@ class Comment:
     author: str
     body: str = ""
     created_at: str = ""
+    url: str = ""  # GitHub's link: how a fixer prompt points at a human's reply
 
     @property
     def is_bot(self) -> bool:
@@ -188,15 +189,6 @@ class PRView:
         """Clean but stale: mergeable (no conflict) yet the base advanced. Needs an
         update-branch before an armed auto-merge can land it."""
         return self.merge_state.upper() == "BEHIND" and not self.is_conflicting()
-
-
-@dataclass(frozen=True)
-class PullRequestDiff:
-    """Immutable review evidence for one exact base/head pair."""
-
-    base_oid: str
-    head_oid: str
-    text: str
 
 
 @dataclass(frozen=True)

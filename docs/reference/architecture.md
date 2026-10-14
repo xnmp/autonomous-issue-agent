@@ -191,7 +191,12 @@ PR is claimed by negative PR number without manufacturing a per-issue spend
 scope (ADR 0008).
 The review role (slice 5c) owes a REVIEW leg when CI is green on a harness PR's
 head and the review bot has no standing verdict on that head. The leg reads the
-exact head (a detached checkout and the revision-bound diff), and `GitHubAct`
+exact head: a detached checkout with the base fetched, where the agent runs
+`git diff <base>...<head>` itself (an empty diff is refused without a leg). It
+is briefed with the steward's acceptance criteria as the bar (the issue body
+when there are none; never the fixer-written PR description), the issue and its
+human comments (bounded), the PR text, the conversation and its own prior review: the Codex reviewer's read-only sandbox
+has no network, so it cannot fetch them. `GitHubAct`
 submits the parsed verdict as one review on that commit, read back first
 (a standing bot verdict on the head means it landed), so a crash after
 submission never posts a second review. The verdict is also kept on the leg's
@@ -396,11 +401,13 @@ trusted-inbound-only until the trigger-gated separately privileged artifact
 publisher is deployed.
 
 Visual screenshot evidence is judged by the independent reviewer (#327); image
-size remains capped at 700KB. The publication broker supplies missing issue
-linkage and acceptance criteria before capturing each new create/body-update
-command. Historical commands replay their captured bodies unchanged. Agent
-children still inherit direct publication capability, so direct `gh pr create`
-can bypass broker completion in the current advisory posture.
+size remains capped at 700KB. The harness opens a PR with the agent's own
+description unchanged; the reviewer's bar is the steward's criteria (or the
+issue). The issue's human comments are briefed as unauthenticated context: a
+narrowing counts only when the reviewer can tie it to one, and a description
+cannot lower the bar. Agent children still inherit direct
+publication capability, so a direct `gh pr create` is possible in the current
+advisory posture.
 Service upgrades likewise stage complete
 unit/plist-plus-private-config pairs; both systemd and launchd restore the
 previous pair if activation fails. Partial-role service upgrades are rejected:
@@ -440,8 +447,6 @@ leave durable escalations owed; settled Clear obsoletes other CI escalations),
 legs),
 `domain/labels.py`, `domain/leg.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
-`domain/pr_body.py` (completes a fixer's PR body with the issue's acceptance
-criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`,

@@ -402,9 +402,9 @@ def _env_name(name: str) -> str:
 
 
 def render_agent_md(text: str, cfg: HarnessConfig) -> str:
-    """Expand the AGENT.md template's one config variable: GPT models take a
+    """Expand the AGENT.md template's config variables: GPT models take a
     literal `$VAR` at face value (failure-modes #7)."""
-    return text.replace("$BASE_BRANCH", cfg.base_branch)
+    return text.replace("$BASE_BRANCH", cfg.base_branch).replace("$HARNESS_REPO", cfg.repo)
 
 
 def generated_env_reference() -> str:

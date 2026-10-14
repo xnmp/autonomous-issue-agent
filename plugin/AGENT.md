@@ -57,12 +57,14 @@ have one; keep your context for reasoning, design and code.
 9. Publish with plain git: commit, then `git push -u origin <your branch>`
    (`--force-with-lease` only after a rebase). Never run `gh pr create`: the
    harness opens the pull request from your pushed branch against
-   `$BASE_BRANCH`, using your final `summary` as the PR description (it adds
-   the acceptance criteria and the closing `Fixes #` line itself), so write
-   the summary as the PR description. On a later leg for an open PR, change
-   its description only with `gh pr edit <PR number> --body '…'`, which
-   replaces the whole body: keep its Acceptance Criteria section and its
-   `Fixes #` line.
+   `$BASE_BRANCH` with your final `summary`, unchanged, as its description. So
+   write `summary` as the complete PR description: what changed, how you
+   verified it, an `## Acceptance Criteria` section (the criteria you were
+   briefed with, else the issue's), and `Closes #<issue>`. On a later leg for an
+   open PR, change the description only with
+   `gh pr edit <PR number> --repo $HARNESS_REPO --body '…'`,
+   which replaces the whole body: keep the Acceptance Criteria section and the
+   `Closes #` line.
 
 ## Hard rules
 - Never bypass the repo's git hooks: no `--no-verify`, commit `-n`, `HUSKY=0`,

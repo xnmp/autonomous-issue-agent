@@ -23,6 +23,7 @@ from issue_agent.domain.state import (
     derive, issue_key, pr_key, stop_tag,
 )
 from issue_agent.domain.triage import (
+    states_criteria,
     MAX_CRITERIA, MAX_CRITERION, MAX_RATIONALE, MAX_TOUCHES, Steward, Triage, criteria_wanted, link_refusal,
     normalise_guess, normalise_path, offered_blockers, offered_duplicates, parse_steward, parse_touches, parse_triage,
     steward_from_record, steward_schema, triage_schema,
@@ -646,3 +647,25 @@ def test_a_blocker_and_its_reason_come_together():
     for blocked_by, reason in ((4, ""), (None, "why"), (0, "why"), (True, "why")):
         with pytest.raises(ValueError):
             Steward(blocked_by=blocked_by, blocked_by_reason=reason)
+
+
+# ── an issue that states its own criteria is not asked for any ───────────────
+
+
+@pytest.mark.parametrize(
+    "body,states",
+    [
+        ("Crash.\n\n## Acceptance criteria\n- [ ] 401", True),
+        ("   ### ACCEPTANCE CRITERIA (draft)\n- a", True),
+        ("We need acceptance criteria for this.", False),  # prose, not a heading
+        ("    ## Acceptance criteria", False),  # four spaces: indented code
+        ("#Acceptance criteria", False),  # not an ATX heading
+        ("<!-- template:\n## Acceptance criteria\n-->\nCrash.", False),  # a commented-out template heading
+        ("<!-- unclosed\n## Acceptance criteria", False),
+        ("", False),
+        ("x" * 1_000_000 + "\n## Acceptance criteria", True),
+    ],
+    ids=["heading", "upper-indented", "prose", "code-indent", "no-space", "html-comment", "unclosed-comment", "empty", "huge"],
+)
+def test_states_criteria_is_an_acceptance_criteria_heading(body, states):
+    assert states_criteria(body) is states

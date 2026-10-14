@@ -25,7 +25,7 @@ from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
-from ..domain.world import BlockerRef, Branch, Comment, IssueView, PRView, PullRequestDiff, Push, Review, WorldState
+from ..domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Push, Review, WorldState
 from .github_ci import base_issues, base_reports, base_runs, observe_checks
 
 # Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
@@ -185,7 +185,8 @@ def _labels(raw: list | None) -> frozenset[Label]:
 def _comments(raw: list | None) -> tuple[Comment, ...]:
     return tuple(
         Comment(author=_login(c.get("author")) if isinstance(c.get("author"), dict) else c.get("author", "") or "",
-                body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "")
+                body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "",
+                url=c.get("url", "") if isinstance(c.get("url"), str) else "")
         for c in raw or [])
 
 
@@ -275,7 +276,7 @@ def format_pr_discussion(
 _FIX_MAX_PAGES = {"issues": 10, "pullRequests": 10, "refs": 10}
 _FIX_NESTED_MAX = {"comments": 1000, "reviews": 500, "files": 3000, "timelineItems": 500, "contexts": 1000}
 _HARNESS_BRANCH_PREFIX = "fix/"
-_COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt}}}}"
+_COMMENTS = "comments(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} nodes{{author{{login}} body createdAt url}}}}"
 _LABELS = "labels(first:100){totalCount nodes{name}}"
 # Cross-references, paged in full like any nested connection: a merged harness
 # PR past one page must read as "unknown" (the issue is skipped), never as
@@ -889,15 +890,6 @@ class GitHubGateway:
     def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
         self._gh(["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
                   "--title", title, "--body", body])
-
-    def pr_diff(self, pr: int, base_oid: str, head_oid: str) -> PullRequestDiff:
-        """base...head as GitHub compares it. Empty text is GitHub's answer; an
-        outage raises `GhUnavailable`. The review role refuses an empty diff."""
-        if not base_oid or not head_oid:
-            raise ValueError("pull-request diff revisions are required")
-        text = self._gh(["api", "-H", "Accept: application/vnd.github.v3.diff",
-                         f"repos/{self.repo}/compare/{base_oid}...{head_oid}"])
-        return PullRequestDiff(base_oid, head_oid, text)
 
     # The two repair-prompt inputs fail SOFT to "": a weaker prompt beats no
     # dispatch, since the agent can rediscover the failure itself (D6).

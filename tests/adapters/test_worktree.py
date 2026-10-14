@@ -212,7 +212,9 @@ RC_PATH = "/repo/.claude/worktrees/review-pr-165"
 # that path — anything else is a plain dir whose git commands would hit the
 # PARENT repo (0d2e295 H1).
 TOPLEVEL_OK = {"rev-parse --show-toplevel": GitResult(0, RC_PATH + "\n")}
-HEAD_OK = {f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, SHA + "\n")}
+BASE = "9a1f0c2b7d3e4f5a6b7c8d9e0f1a2b3c4d5e6f70"
+BASE_OK = {f"cat-file -e {BASE}": GitResult(0, "")}
+HEAD_OK = {f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, SHA + "\n"), **BASE_OK}
 
 
 def _review_checkouts(table, exists=lambda p: False, remove_tree=None):
@@ -248,15 +250,16 @@ def test_review_checkout_creates_detached_worktree_at_head():
         return fg(args, cwd)
 
     rc = wt_mod.ReviewCheckouts("/repo", run=git, path_exists=lambda _p: bool(added), remove_tree=lambda p: None)
-    assert rc.ensure(165, SHA) == RC_PATH
+    assert rc.ensure(165, SHA, "dev", BASE) == RC_PATH
     joined = _joined(fg)
-    assert any(j.startswith("fetch origin refs/pull/165/head") for j in joined)
+    # The base ref is fetched with the head: the reviewer diffs base...head locally.
+    assert {"fetch origin refs/pull/165/head --quiet", "fetch origin refs/heads/dev --quiet"} <= set(joined)
     assert any(j.startswith(f"worktree add --detach .claude/worktrees/review-pr-165 {SHA}") for j in joined)
 
 
 def test_review_checkout_refreshes_existing_worktree_and_verifies_head():
     rc, fg = _review_checkouts({**TOPLEVEL_OK, **HEAD_OK}, exists=lambda p: True)
-    path = rc.ensure(165, SHA)
+    path = rc.ensure(165, SHA, "dev", BASE)
     joined = _joined(fg)
     assert any(j.startswith(f"checkout --detach {SHA}") for j in joined)
     assert any(j.startswith(f"reset --hard {SHA}") for j in joined)
@@ -264,7 +267,7 @@ def test_review_checkout_refreshes_existing_worktree_and_verifies_head():
     # Memoized second call for the same head revalidates cheaply (toplevel +
     # HEAD) but pays no fetch/refresh work.
     n = len(fg.calls)
-    assert rc.ensure(165, SHA) == path
+    assert rc.ensure(165, SHA, "dev", BASE) == path
     assert not any(j.startswith(("fetch", "checkout", "reset", "clean", "worktree")) for j in _joined(fg)[n:])
 
 
@@ -272,9 +275,11 @@ def test_review_checkout_refreshes_existing_worktree_and_verifies_head():
     "table",
     [
         # The head is unreachable.
-        {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(1, "")},
+        {**TOPLEVEL_OK, **BASE_OK, f"cat-file -e {SHA}": GitResult(1, "")},
         # The verified head differs.
-        {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, "deadbeef\n")},
+        {**TOPLEVEL_OK, **BASE_OK, f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, "deadbeef\n")},
+        # The base is unreachable: the reviewer could not diff base...head.
+        {**TOPLEVEL_OK, f"cat-file -e {SHA}": GitResult(0, ""), "rev-parse HEAD": GitResult(0, SHA + "\n")},
         # 0d2e295 H1 (exit codes): a failed checkout/reset must defer the round,
         # never fall through to the rev-parse confirmation.
         {**TOPLEVEL_OK, **HEAD_OK, f"checkout --detach {SHA}": GitResult(1, "index.lock held")},
@@ -283,16 +288,78 @@ def test_review_checkout_refreshes_existing_worktree_and_verifies_head():
 def test_review_checkout_defers_unless_the_pinned_head_is_checked_out(table):
     rc, _fg = _review_checkouts(table, exists=lambda p: True)
     with pytest.raises(WorktreeUnavailable):
-        rc.ensure(165, SHA)
+        rc.ensure(165, SHA, "dev", BASE)
+
+
+def test_a_moved_base_refetches_even_when_the_head_is_already_checked_out():
+    present = {SHA}
+
+    def git(args):
+        if args[:2] == ["cat-file", "-e"]:
+            return GitResult(0 if args[2].removesuffix("^{commit}") in present else 1, "")
+        if args[0] == "fetch":
+            present.add(BASE)
+        if args == ["rev-parse", "--show-toplevel"]:
+            return GitResult(0, RC_PATH + "\n")
+        return None
+
+    calls: list[list[str]] = []
+    rc = wt_mod.ReviewCheckouts("/repo", run=lambda a, c: (calls.append(a), _review_git(git)(a, c))[1],
+                                path_exists=lambda p: True, remove_tree=lambda p: None)
+    rc._ensured[165] = SHA  # this head was checked out last round
+    assert rc.ensure(165, SHA, "dev", BASE) == RC_PATH
+    assert any(a[0] == "fetch" for a in calls) and BASE in present
+
+
+def test_a_base_ref_that_cannot_be_fetched_still_fetches_the_head_and_names_the_base():
+    def git(args):
+        if args[:3] == ["fetch", "origin", "refs/heads/dev"]:
+            return GitResult(128, "")  # the base branch was renamed
+        if args[:2] == ["cat-file", "-e"]:
+            return GitResult(0 if args[2].startswith(SHA) else 1, "")
+        return None
+
+    calls: list[list[str]] = []
+    rc = wt_mod.ReviewCheckouts("/repo", run=lambda a, c: (calls.append(a), _review_git(git)(a, c))[1],
+                                path_exists=lambda p: False, remove_tree=lambda p: None)
+    with pytest.raises(WorktreeUnavailable, match=f"base {BASE}"):
+        rc.ensure(165, SHA, "dev", BASE)
+    assert ["fetch", "origin", "refs/pull/165/head", "--quiet"] in calls
+
+
+@pytest.mark.parametrize(
+    "answer,changed",
+    [(GitResult(0, ""), False), (GitResult(0, "src/x.py\n"), True)],
+    ids=["empty", "changed"],
+)
+def test_has_changes_reads_the_three_dot_diff(answer, changed):
+    rc, fg = _review_checkouts({f"diff --name-only {BASE}...{SHA}": answer})
+    assert rc.has_changes(BASE, SHA) is changed
+
+
+def test_a_failed_diff_is_not_an_empty_one():
+    # A timeout or a missing object must defer the round, never read as
+    # "nothing to review" (which costs an attempt).
+    rc, _fg = _review_checkouts({"diff --name-only": GitResult(1, "")})
+    with pytest.raises(WorktreeUnavailable):
+        rc.has_changes(BASE, SHA)
+
+
+def test_review_checkout_needs_the_base():
+    rc, fg = _review_checkouts({**TOPLEVEL_OK, **HEAD_OK})
+    for ref, base in (("", BASE), ("dev", "")):
+        with pytest.raises(WorktreeUnavailable):
+            rc.ensure(165, SHA, ref, base)
+    assert fg.calls == []
 
 
 def test_review_checkout_remove_forgets_memo():
     rc, fg = _review_checkouts({**TOPLEVEL_OK, **HEAD_OK}, exists=lambda p: True)
-    rc.ensure(165, SHA)
+    rc.ensure(165, SHA, "dev", BASE)
     rc.remove(165)
     assert any(j.startswith("worktree remove --force .claude/worktrees/review-pr-165") for j in _joined(fg))
     n = len(fg.calls)
-    rc.ensure(165, SHA)  # re-ensures after removal (no stale memo)
+    rc.ensure(165, SHA, "dev", BASE)  # re-ensures after removal (no stale memo)
     assert len(fg.calls) > n
 
 
@@ -310,7 +377,7 @@ def test_review_checkout_never_mutates_a_plain_dir_on_the_worktree_path():
         exists=lambda p: True,
         remove_tree=removed.append,
     )
-    assert rc.ensure(165, SHA) == RC_PATH
+    assert rc.ensure(165, SHA, "dev", BASE) == RC_PATH
     assert removed == [RC_PATH]
     joined = _joined(fg)
     # The dir was recreated as a real worktree, and never mutated in place.
@@ -326,7 +393,7 @@ def test_review_checkout_defers_when_the_stale_dir_cannot_be_removed():
         {"rev-parse --show-toplevel": GitResult(0, "/repo\n")}, exists=lambda p: True, remove_tree=explode
     )
     with pytest.raises(WorktreeUnavailable):
-        rc.ensure(165, SHA)
+        rc.ensure(165, SHA, "dev", BASE)
 
 
 def test_review_checkout_defers_when_the_dir_cannot_be_classified():
@@ -338,7 +405,7 @@ def test_review_checkout_defers_when_the_dir_cannot_be_classified():
         {"rev-parse --show-toplevel": GitResult(1, "")}, exists=lambda p: True, remove_tree=removed.append
     )
     with pytest.raises(WorktreeUnavailable):
-        rc.ensure(165, SHA)
+        rc.ensure(165, SHA, "dev", BASE)
     assert removed == []
 
 
@@ -359,7 +426,7 @@ def test_review_checkout_reverifies_the_worktree_after_the_fetch():
         "/repo", run=_review_git(flapping), path_exists=lambda p: True, remove_tree=lambda p: None
     )
     with pytest.raises(WorktreeUnavailable):
-        rc.ensure(165, SHA)
+        rc.ensure(165, SHA, "dev", BASE)
 
 
 def _squatted(tmp_path, target):
@@ -389,7 +456,7 @@ def test_review_checkout_unlinks_a_symlink_without_touching_its_pointee(tmp_path
         return None
 
     exploded: list[str] = []
-    wt_mod.ReviewCheckouts(str(repo), run=_review_git(git), remove_tree=exploded.append).ensure(165, SHA)
+    wt_mod.ReviewCheckouts(str(repo), run=_review_git(git), remove_tree=exploded.append).ensure(165, SHA, "dev", BASE)
 
     assert not link.is_symlink()  # the squatting link itself is gone…
     assert (victim / "keep.txt").read_text() == "sibling checkout"  # …pointee intact
@@ -425,7 +492,7 @@ def test_review_checkout_add_only_succeeds_because_prune_ran_first():
     rc = wt_mod.ReviewCheckouts(
         "/repo", run=_review_git(git), path_exists=lambda p: state["added"], remove_tree=lambda p: None
     )
-    assert rc.ensure(165, SHA) == RC_PATH
+    assert rc.ensure(165, SHA, "dev", BASE) == RC_PATH
 
 
 def test_a_symlink_to_the_parent_repo_is_never_classified_as_the_worktree(tmp_path):
@@ -446,7 +513,7 @@ def test_a_symlink_to_the_parent_repo_is_never_classified_as_the_worktree(tmp_pa
             link.mkdir()
         return None
 
-    wt_mod.ReviewCheckouts(str(repo), run=_review_git(git), remove_tree=lambda p: None).ensure(165, SHA)
+    wt_mod.ReviewCheckouts(str(repo), run=_review_git(git), remove_tree=lambda p: None).ensure(165, SHA, "dev", BASE)
 
     assert mutated == []  # nothing ran inside the link
     assert not link.is_symlink()  # squatter replaced by a real dir

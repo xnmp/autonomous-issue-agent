@@ -28,16 +28,16 @@ from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
 from ..domain.policy import actions as policy_actions, base_ci_actions, dispatch_order
-from ..domain.pr_body import has_acceptance_criteria
 from ..domain.refs import harness_branch_issue, slugify
 from ..domain.routing import DEFAULT_TIER, Tier
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, latest_steward, pr_key
+from ..domain.triage import states_criteria
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
 from ..adapters.act import GitHubAct
 from .config import HarnessConfig
 from .planners import tasks
-from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, leg_end, local_legs, run_item, run_leg, stderr_log
+from .tick import Choose, Role, Slots, compose_role, dispatch_item, leg_class, local_legs, run_item, run_leg, steward_criteria, stderr_log
 
 _FIX_ACTS = DISPATCHABLE - {AgentKind.REVIEW}
 _LIGHT_ACTS = frozenset(kind for kind in AgentKind if not kind.holds_dispatch_slot)
@@ -76,10 +76,13 @@ def fix_actions(
     return tuple(out)
 
 
-def human_reply(comments: Iterable[Comment], after: datetime, harness: Harness, legs: Iterable[LegEnd]) -> str:
-    """The human comments (derive's definition, so none inside one of the
-    item's leg windows) posted after `after`, oldest first."""
-    return "\n\n".join(f"@{c.author}: {c.body}" for at, c in human_comments(comments, harness, legs) if at > after)
+def human_reply(
+    comments: Iterable[Comment], after: datetime, harness: Harness, legs: Iterable[LegEnd],
+) -> Comment | None:
+    """The first human comment (derive's definition, so none inside one of
+    the item's leg windows) posted after `after`: the answer the fixer's
+    prompt points at; it reads that comment and any later ones itself."""
+    return next((c for at, c in human_comments(comments, harness, legs) if at > after), None)
 
 
 Route = tuple[RuntimeName, "str | None", "Effort | None"]
@@ -196,11 +199,13 @@ class FixLegs:
                 self.prepare_cwd(cwd, runtime)
             # Every leg of the item, either role's, as derive sees them (#342).
             reply = human_reply(subject.comments, asked.completed_at, self.settings.harness,
-                                local_legs(recorded).get(item, ())) if asked else ""
+                                local_legs(recorded).get(item, ())) if asked else None
             # No route effort keeps the global FIX_EFFORT.
             cfg = replace(self.task_config, runtime=runtime, model=model, effort=effort or self.task_config.effort)
-            criteria = _criteria(recorded) if action.kind is AgentKind.RESOLVE else ()
-            task = self._task(action, subject, cwd, runs, cut_off, asked, reply, cfg, runtime, criteria)
+            task = self._task(action, subject, cwd, runs, cut_off, asked, cfg, runtime, recorded)
+            if asked is not None:
+                target = "issue" if action.kind is AgentKind.RESOLVE else "pr"
+                task = tasks.with_human_reply(task, self.settings.repository, target, action.number, reply)
             task = replace(task, env={**task.env, **self._git_identity()})
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")
@@ -257,7 +262,7 @@ class FixLegs:
                 action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
                 tuple(n for n, _, _, _ in index), cwd, model=model, runtime=runtime, effort=effort,
                 max_budget_usd=self.settings.triage_budget_usd,
-                criteria_wanted=not has_acceptance_criteria(subject.body or ""),
+                criteria_wanted=not states_criteria(subject.body or ""),
                 # Only issues the harness itself will work on and close: model
                 # output must not hold a ready issue behind an epic, an
                 # unadmitted issue or one parked for a human.
@@ -265,11 +270,10 @@ class FixLegs:
                                 and Label.AI_READY in labels and Label.NEEDS_HUMAN not in labels),
             )
         else:
-            criteria = _criteria(self.control.leg_runs(self.settings.repository, (action.number,)))
             task = tasks.build_triage_task(
                 action.number, as_untrusted(subject.title), as_untrusted(subject.body), cwd,
                 model=model, runtime=runtime, effort=effort, max_budget_usd=self.settings.triage_budget_usd,
-                criteria=as_untrusted("\n".join(f"- {c}" for c in criteria)) if criteria else None,
+                criteria=steward_criteria(self.control.leg_runs(self.settings.repository, (action.number,))),
             )
         self.log(f"{name} #{action.number}: {runtime.value}:{model or '(default model)'}"
                  f"{':' + effort.value if effort else ''}")
@@ -288,23 +292,19 @@ class FixLegs:
 
     def _task(
         self, action: RunAgent, subject, cwd: str, runs: list[LegRun], cut_off: LegRun | None, asked: LegRun | None,
-        reply: str, cfg: tasks.FixTaskConfig, runtime: RuntimeName, criteria: tuple[str, ...] = (),
+        cfg: tasks.FixTaskConfig, runtime: RuntimeName, recorded: Iterable[LegRun],
     ):
         """`cut_off` is the machine end this leg continues; `asked` the agent
-        leg whose question a human has since answered with `reply`."""
+        leg whose question a human has since answered (the caller points at
+        the answer). A fresh session is briefed like a first RESOLVE."""
         if action.kind is AgentKind.RESOLVE:
             if cut_off is not None:
                 return tasks.build_continue_task(cwd, self._session([cut_off], runtime), cfg)
-            if asked is not None:
-                if session := self._session([asked], runtime):
-                    return tasks.build_resume_task(as_untrusted(reply), cwd, session, cfg)
-                return tasks.build_fresh_reply_task(
-                    action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(reply), cwd, cfg,
-                )
+            if asked is not None and (session := self._session([asked], runtime)):
+                return tasks.build_resume_task(cwd, session, cfg)
             return tasks.build_resolve_task(
-                action.number, as_untrusted(subject.title), as_untrusted(subject.body), cwd, cfg,
-                self._resolve_branch(action.number, subject.title),
-                as_untrusted("\n".join(f"- {c}" for c in criteria)) if criteria else None,
+                action.number, cwd, cfg, self._resolve_branch(action.number, subject.title),
+                steward_criteria(recorded),
             )
         # PR-stage legs continue the issue's latest session on their runtime: it wrote the code.
         session = self._session(runs, runtime)
@@ -329,16 +329,7 @@ class FixLegs:
                 as_untrusted(_soft(lambda: self.gateway.review_comments(action.number), self.log)),
                 cwd, session, cfg,
             )
-        return tasks.with_human_reply(task, as_untrusted(reply)) if reply else task
-
-
-def _criteria(runs: Iterable[LegRun]) -> tuple[str, ...]:
-    """The acceptance criteria of the issue's latest agent-ended STEWARD leg
-    (or legacy combined TRIAGE leg), as derive reads it."""
-    ends = tuple(end for r in runs if r.kind in (AgentKind.STEWARD.name, AgentKind.TRIAGE.name)
-                 and (end := leg_end(r)) is not None)
-    found = latest_steward(ends)
-    return found.steward.acceptance_criteria if found is not None and found.steward is not None else ()
+        return task
 
 
 def _soft_rows(read: Callable[[], tuple], log: Callable[[str], None]) -> tuple:

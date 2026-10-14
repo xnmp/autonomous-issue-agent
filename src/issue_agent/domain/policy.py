@@ -125,8 +125,8 @@ def needs_human_key(key: ItemKey, stop: NeedsHuman) -> str:
 
 def triage_comment(state: TriageNote, harness: Harness) -> str:
     """The one triage comment: the tier, triage's rationale and the steward's
-    acceptance criteria (a heading `pr_body.issue_acceptance_criteria` finds,
-    so they reach the PR body), never an implementation plan. An issue that
+    acceptance criteria (for humans; legs read them from the steward's
+    receipt), never an implementation plan. An issue that
     states its own criteria was asked for none (`triage.criteria_wanted`).
     Agent text was neutralised and bounded by `triage.parse_triage` /
     `parse_steward`; here it is also made inert to mentions and images under

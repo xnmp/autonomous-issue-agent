@@ -58,7 +58,8 @@ from ..domain.policy import question_text
 from ..domain.ports import SpendReconciler
 from ..domain.recovery import RecoveryTrigger
 from ..domain.refs import harness_branch_issue
-from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, pr_key
+from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, derive, issue_key, latest_steward, pr_key
+from ..domain.trust import Untrusted, as_untrusted
 from ..domain.routing import parse_tier
 from ..domain.triage import parse_triage, steward_from_record
 from ..domain.supervision import (
@@ -110,6 +111,17 @@ def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | N
         log(f"issue #{run.issue}: a recorded steward claim names the issue itself; dropped")
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
                   triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")))
+
+
+def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:
+    """The acceptance criteria of the issue's latest agent-ended STEWARD leg
+    (or legacy combined TRIAGE leg), as derive reads it, as a prompt list:
+    agent text the steward's parser laundered, so still untrusted."""
+    ends = tuple(end for r in runs if r.kind in (AgentKind.STEWARD.name, AgentKind.TRIAGE.name)
+                 and (end := leg_end(r)) is not None)
+    found = latest_steward(ends)
+    criteria = found.steward.acceptance_criteria if found is not None and found.steward is not None else ()
+    return as_untrusted("\n".join(f"- {c}" for c in criteria)) if criteria else None
 
 
 def local_legs(runs: Iterable[LegRun], log: Callable[[str], None] | None = None) -> dict[ItemKey, tuple[LegEnd, ...]]:
