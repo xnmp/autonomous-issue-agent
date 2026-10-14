@@ -146,7 +146,7 @@ There is no command governor. Every leg runs under bubblewrap (#413): a private
 HOME and only its checkout, toolchains and runtime session store; no harness
 checkout, config, state or other repos. A fix leg holds FIX_BOT_TOKEN, a review
 leg no GitHub credential, so inbound content cannot reach the review bot or the
-operator's login; the remaining exposure is in the residuals (§1.1). See the
+operator's `gh` login; the remaining exposure is in the residuals (§1.1). See the
 capability matrix before changing runtime/tool/credential boundaries.
 
 ## Package and test commands

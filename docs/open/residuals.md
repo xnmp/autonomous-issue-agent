@@ -23,7 +23,8 @@ entry.
 
 Every leg runs under bubblewrap (#413; `docs/reference/capability-authority-matrix.md`).
 The review bot's token, the GitHub App key, the operator's `gh` login, SSH
-keys, keyrings, the harness checkout and the control store are out of reach
+keys, keyring files and `/run` sockets, the harness checkout and the control
+store are out of reach
 (`CRED-HOME` is closed). Slice 6a deleted the command governor, so inside the
 sandbox the agent can run any command. What remains:
 
@@ -31,10 +32,10 @@ sandbox the agent can run any command. What remains:
 |---|---|---|
 | A fix leg holds `FIX_BOT_TOKEN`: it can push any branch, open or edit PRs, comment and read Actions logs the token allows. A token that bypasses branch protection (an admin's PAT) lets a hijacked leg merge around review | The leg must publish; the token's scope is the bound. The owner chooses the account | the owner gives `FIX_BOT_TOKEN` a non-admin account with no protection bypass |
 | `GIT-OBJECTS`: a fix leg writes the repository's shared object store and refs; review checkouts read the same store, so a leg could rewrite an object a later review checks out (git does not re-hash on read) | Commits need a writable store; a separate store for review is a larger change | review checkouts from a separate clone, or verifying the reviewed tree against GitHub's; `tests/test_residuals.py` |
-| The network is on, so loopback services (`127.0.0.1`) and abstract-namespace unix sockets of the host are reachable | Owner decision: the sandbox isolates credentials and files, not egress | a host service that trusts any local connection; then `--unshare-net` plus a proxy |
+| The network is on, so loopback services (`127.0.0.1`) and abstract-namespace unix sockets of the host are reachable, including a D-Bus session bus or secret service listening on an abstract socket (classic `dbus-daemon`; `/run/user` buses are not mounted) | Owner decision: the sandbox isolates credentials and files, not egress | a host service that trusts any local connection; then `--unshare-net` plus a proxy |
 | `CARGO_TARGET_DIR` is mounted read-write when the leg's env names one outside the checkout; a target dir shared with the operator's own builds (ballast's) lets a leg plant build outputs those builds run | Shared incremental builds are why the knob exists | point it at a harness-only directory (tauri and keifu already do) |
 | Teardown inside the sandbox is SIGKILL: bwrap does not forward SIGTERM, so a runtime never sees a graceful stop | `--die-with-parent` and the PID namespace guarantee every sandboxed process dies; the runtimes' session files are written as they go | a runtime that loses resumable state on SIGKILL |
-| Claude's OAuth login file is mounted read-write (refresh writes it) but its lock is leg-private, so two legs refreshing at once are not serialized | Same race exists against the operator's own CLI | an auth failure traced to a concurrent refresh; then `CLAUDE_CODE_OAUTH_TOKEN` or an API key |
+| The model-provider login (Claude's `.credentials.json`, codex's `auth.json`) is mounted read-write: a leg can read, overwrite or rotate it, breaking or swapping the operator's own Claude/Codex login; Claude's refresh lock is leg-private, so two legs refreshing at once are not serialized | The leg runs on that login and refreshing rotates the refresh token, so a private copy would strand the operator's file after the first refresh; read access alone already lets a leg rotate it away | an incident of a tampered or rotated login; then per-leg API keys (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`) or a credential broker instead of the operator's login |
 | macOS (launchd) has no bubblewrap: paid legs are refused there | No silent unsandboxed fallback (#413) | a macOS deployment: sandbox-exec or a VM |
 
 ### 1.2 Agent-written claims are not authorization evidence

@@ -17,16 +17,17 @@ What a leg sees (`domain/sandbox.py`):
 |---|---|
 | its checkout; for a fix leg also the repository's `objects/`, `refs/`, `logs/` and its own `worktrees/<name>/` | fix: read-write; review/light: read-only |
 | the repository's `.git` (config, hooks, other checkouts' links), the checkout's `.git` link | read-only |
-| the runtime binary; `/usr`, `/etc`, `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |
+| the runtime binary; `/usr`, `/etc` (whole: operator secrets live in HOME, root-only files stay unreadable), `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |
 | `~/.cargo/registry`, `~/.cargo/git`, `~/.cache/uv`, `~/.bun/install/cache`, `~/.npm` | per-leg overlay (writes discarded) |
-| the runtime session store and login (`~/.claude/projects/<checkout>`, `.credentials.json`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write |
+| the runtime session store and login (`~/.claude/projects/<checkout>`, `.credentials.json`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write (the login too: refresh rotates it; residuals §1.1) |
 | HOME, `/tmp`, `/var/tmp` | empty, leg-private |
 | network | on (no egress filter) |
 
 Not visible: `config/` and the rest of the harness checkout, the operator's
 HOME (`~/.config/gh`, `~/.ssh`, keyrings, `~/.claude.json`, settings, other
 sessions), state and control dirs (SQLite), other checkouts' files, other
-repositories, `/run` (D-Bus, agent sockets), and host processes
+repositories, `/run` (D-Bus, agent sockets; a bus on an abstract socket stays
+reachable, residuals §1.1), and host processes
 (`--unshare-pid`, so no `/proc/<daemon>/environ`).
 
 | Concern | Authority | Failure posture |
