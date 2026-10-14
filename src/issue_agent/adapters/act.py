@@ -196,11 +196,16 @@ class GitHubAct:
             raise RuntimeError(f"{kind} #{action.number}: stop comment withheld until needs-human is applied")
         key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
         state = self.control.claim_key(key) if action.key else "new"
-        if state == "done":
-            return
-        if state == "claimed" and self.gateway.has_comment(kind, action.number, action.body):
-            self.control.confirm_key(key)
-            return
+        # GitHub, not the key, says whether the comment is there. A confirmed
+        # key is a read-back that once saw it, so a fresh read that does not is
+        # a deletion (derive asks again when its own, possibly stale,
+        # observation lacks the comment, and it may lack it while it is there); a claimed key may have landed unseen.
+        if state != "new":
+            if self.gateway.has_comment(kind, action.number, action.body):
+                self.control.confirm_key(key)
+                return
+            if state == "done":
+                self.log(f"{kind} #{action.number}: comment {action.key} was deleted; posting it again")
         self.gateway.comment(kind, action.number, action.body)
         if action.key:
             if not self.gateway.has_comment(kind, action.number, action.body):
@@ -219,6 +224,7 @@ class GitHubAct:
             # derive moves on; the link itself is never touched again.
             closed = blocker_closed_comment(self.marker, action.blocker)
             if not self.gateway.has_comment("issue", action.issue, closed):
+                self.log(f"issue #{action.issue}: closing comment for {action.key} not found; posting it")
                 self.gateway.comment("issue", action.issue, closed)
             return
         try:

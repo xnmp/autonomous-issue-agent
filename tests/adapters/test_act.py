@@ -2,6 +2,8 @@
 confirmed by a read-back after it, so a lost reply or a replay never posts
 twice, and a stop comment never lands on an item that is not yet stopped."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from issue_agent.adapters.act import GitHubAct
@@ -57,9 +59,44 @@ def test_a_keyed_comment_lands_once_across_a_lost_reply_and_later_replays(tmp_pa
     with pytest.raises(RuntimeError, match="reply was lost"):
         act.execute(STOP)
     act.execute(STOP)  # the claimed key reads the landed comment back
-    gh.comments.clear()  # deleted on GitHub later: the confirmed key still holds
-    act.execute(STOP)
+    act.execute(STOP)  # derive asks again on a stale observation: the comment is there
 
+    assert gh.posted == [STOP.body]
+
+
+def test_a_settled_comment_a_human_deleted_is_posted_again_once_and_logged(tmp_path):
+    gh, logs = Gateway(labels={Label.NEEDS_HUMAN.value}), []
+    act = _act(tmp_path, gh)
+    act.log = logs.append
+    act.execute(STOP)
+    gh.comments.clear()  # deleted on GitHub: GitHub, not the settled key, says it is gone
+    act.execute(STOP)
+    act.execute(STOP)  # the repost is there: nothing more
+
+    assert gh.posted == [STOP.body, STOP.body]
+    assert len(logs) == 1 and "deleted" in logs[0] and STOP.key in logs[0]
+
+
+def test_a_comment_whose_presence_cannot_be_read_is_not_posted_again(tmp_path):
+    from issue_agent.adapters.github import GitHubGateway
+
+    class Unreadable(Gateway):
+        reply: object = "readable"
+
+        def has_comment(self, kind, number, body):
+            if self.reply == "readable":
+                return super().has_comment(kind, number, body)
+            return GitHubGateway.has_comment(SimpleNamespace(_view=lambda *a: self.reply), kind, number, body)
+
+    gh = Unreadable(labels={Label.NEEDS_HUMAN.value})
+    act = _act(tmp_path, gh)
+    act.execute(STOP)
+    for reply in (None, [], {}, {"comments": None}, {"comments": "x"}):
+        gh.reply = reply
+        with pytest.raises(FixObservationIncomplete):
+            act.execute(STOP)
+    gh.reply = {"comments": [None, 7, {"body": STOP.body}]}  # junk entries beside the real one
+    act.execute(STOP)
     assert gh.posted == [STOP.body]
 
 
@@ -86,6 +123,24 @@ def test_the_triage_comment_posts_once_however_often_derive_asks_for_it(tmp_path
     act.execute(action)
     act.execute(action)  # an observation that lags the post asks again
     assert gh.posted == [action.body]
+
+
+def test_a_deleted_triage_comment_is_posted_again_so_the_issue_reaches_resolve(tmp_path):
+    from issue_agent.domain.policy import triage_comment
+    from issue_agent.domain.routing import Tier
+    from issue_agent.domain.state import Harness, TriageNote
+    from issue_agent.domain.triage import Steward, Triage
+
+    harness = Harness("fix-bot", "review-bot")
+    note = TriageNote(Triage(Tier.LOW), "2026-10-01T12:00:00+00:00", Steward(("Esc closes it",)))
+    action = PostComment(Target.ISSUE, 5, triage_comment(note, harness), key=f"triage:issue:5:{note.anchor}")
+    gh = Gateway()
+    act = _act(tmp_path, gh)
+    act.execute(action)
+    gh.comments.clear()  # a human deletes it; derive keeps returning TriageNote
+    act.execute(action)
+    act.execute(action)  # present again: nothing more
+    assert gh.posted == [action.body, action.body] and gh.comments == [action.body]
 
 
 # ── a steward's "blocked by" claim ───────────────────────────────────────────
