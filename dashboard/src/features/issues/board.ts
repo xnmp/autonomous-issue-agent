@@ -47,7 +47,7 @@ export const GROUP_META: Record<BoardGroup, { label: string; hint: string; tone:
   },
   waiting: {
     label: "Waiting",
-    hint: "Held by something outside the harness: branch protection, a human review, spend headroom, a retry backoff or GitHub. Nothing for you to do.",
+    hint: "Held by something outside the harness: branch protection, a human review, spend headroom, a retry backoff, an open blocking issue or GitHub. Nothing for you to do.",
     tone: "muted",
   },
 };
@@ -366,6 +366,11 @@ export function primaryAction(board: BoardStatus, action: IssueCard["action"]): 
   if (board.status !== "needs_you") return null;
   if (action === "unblock") return { kind: "unblock", label: "Unblock" };
   return board.target === "pr" ? { kind: "open_pr", label: "Open PR" } : { kind: "open_issue", label: "Open issue" };
+}
+
+/** Where the headline links, if anywhere: a blocked wait names its blocker. */
+export function headlineUrl(board: BoardStatus): string | null {
+  return board.status === "waiting" ? (board.headline_url ?? null) : null;
 }
 
 /** The row's second line: why it is in its group, in one line. */

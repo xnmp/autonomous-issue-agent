@@ -753,7 +753,11 @@ test("shows derived states, legs, leases and caps through FastAPI and the produc
   await expect(headline("Asked a question")).toHaveText("Answer the agent's question");
   await expect(headline("Running now")).toHaveText("Resolve running");
   await expect(headline("Has a PR")).toHaveText("CI running");
-  await expect(headline("Queued work")).toHaveText("Resolve next");
+  // No leg has run on it yet, so its first act is STEWARD (#380 split it from TRIAGE).
+  await expect(headline("Queued work")).toHaveText("Steward next");
+  // GitHub's "blocked by" names open #1: it waits, its headline linking to the blocker.
+  const blocked = page.getByRole("region", { name: "Waiting", exact: true }).getByRole("link", { name: "Blocked by #1" });
+  await expect(blocked).toHaveAttribute("href", "https://github.com/o/demo/issues/1");
 
   await page.getByRole("tab", { name: "Overview" }).click();
   const leases = page.getByRole("region", { name: "Leases" });

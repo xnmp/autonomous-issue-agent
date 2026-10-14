@@ -9,6 +9,7 @@ import {
   boardTone,
   groupCounts,
   groupItems,
+  headlineUrl,
   historyView,
   plainHarnessMessage,
   primaryAction,
@@ -161,6 +162,7 @@ function BoardRow({
   const { board } = item;
   const nowMs = useNow(30_000);
   const wait = waitCell(board, nowMs);
+  const href = headlineUrl(board);
   const drawerId = `board-drawer-${item.issue}`;
   // The title button is described by what a sighted reader scans across the
   // row: the headline and reason, the rail (its label names every count) and
@@ -194,7 +196,20 @@ function BoardRow({
           </div>
         </div>
         <div id={sayId} className={`board-say${board.status === "needs_you" ? " board-say-owned" : ""}`}>
-          <span className="board-headline">{board.headline}</span>
+          {href ? (
+            <a
+              className="board-headline board-headline-link"
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              title="open the blocking issue on GitHub"
+              onClick={(event) => event.stopPropagation()}
+            >
+              {board.headline}
+            </a>
+          ) : (
+            <span className="board-headline">{board.headline}</span>
+          )}
           <span className="board-reason">{sayLine(board)}</span>
         </div>
         <div className="board-rail">

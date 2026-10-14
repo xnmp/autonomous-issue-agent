@@ -267,11 +267,13 @@ export interface components {
             group: "slot" | "waiting";
             /** Headline */
             headline: string;
+            /** Headline Url */
+            headline_url?: string | null;
             /**
              * On
              * @enum {string}
              */
-            on: "branch-protection" | "human-review" | "headroom" | "backoff" | "github" | "slot";
+            on: "branch-protection" | "human-review" | "headroom" | "backoff" | "blocked" | "github" | "slot";
             /** Reason */
             reason: string;
             /** Since Ts */

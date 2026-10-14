@@ -28,7 +28,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
-from issue_agent.domain.world import Branch, Comment, IssueView, PRView, Review, WorldState
+from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Review, WorldState
 
 FIX_BOT, REVIEW_BOT = "fix-bot", "review-bot"
 
@@ -1035,3 +1035,15 @@ def test_the_recorded_leg_result_names_the_effort_it_ran_at(role):
     tick(composed)
     (run,) = (r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "FIX_CI")
     assert (run.receipt["tier"], run.receipt["effort"]) == ("med", "high")
+
+
+def test_a_blocked_issue_buys_nothing_until_its_blocker_closes_then_starts_by_itself(role):
+    gh = FakeGitHub(issues={5: replace(ready(), blocked_by=(BlockerRef(9, "o/lib"),))})
+    agent = Agent(pushed(gh, "fix/5-null-token-crashes", "h1"))
+    composed, _ = role(gh, agent)
+
+    assert tick(composed) == [] and tick(composed) == []
+    assert agent.tasks == [] and gh.prs == {}
+
+    gh.issues[5] = replace(gh.issues[5], blocked_by=())  # GitHub drops a closed blocker from the open set
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]

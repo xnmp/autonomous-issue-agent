@@ -35,6 +35,16 @@ def pr_url(repo: str, number: int) -> str:
     return f"https://github.com/{repo}/pull/{number}"
 
 
+def board_payload(status: dash.BoardStatus, repo: str) -> dict:
+    """A board status as the API carries it: a blocked wait's headline links to its blocker."""
+    out = asdict(status)
+    if isinstance(status, dash.Waiting):
+        blocker = status.blocker
+        del out["blocker"]
+        out["headline_url"] = issue_url(blocker.repository or repo, blocker.number) if blocker else None
+    return out
+
+
 def _iso(stamp: datetime | None) -> str | None:
     return stamp.astimezone(timezone.utc).isoformat() if stamp is not None else None
 
@@ -131,7 +141,7 @@ def issue_card(item: Item, repo: str, gh_issue: Mapping | None, models: Mapping[
         "pr": item.pr.number if item.pr else None,
         "pr_url": pr_url(repo, item.pr.number) if item.pr else None,
         "pr_ci_state": dash.ci_display(item.pr),
-        "board": asdict(item.status),
+        "board": board_payload(item.status, repo),
         "action": dash.primary_action(item.status, held=item.held),
         "rail": asdict(dash.rail(item.state, has_pr=item.pr is not None, legs=item.legs)),
         "history": [asdict(visit) for visit in dash.history(item.legs)],
@@ -281,7 +291,7 @@ def issue_detail(
         "title": title,
         "url": issue_url(repo, number),
         "labels": _labels(item, gh_issue) if item else (labels_of(dict(gh_issue)) if gh_issue else []),
-        "board": asdict(item.status) if item else None,
+        "board": board_payload(item.status, repo) if item else None,
         "action": dash.primary_action(item.status, held=item.held) if item else None,
         "done": done,
         "held_for_human": item.held if item else False,

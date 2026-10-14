@@ -318,6 +318,14 @@ only what is missing, and reads it back; repeating a request moves nothing,
 and a write whose reply was lost is observed rather than repeated. There is no
 command queue, typed resolve command or retry grant (deleted in slice 5d-1).
 
+To hold an issue until another lands, mark it "blocked by" that issue on
+GitHub (issue dependencies; any repository). The harness only reads the link:
+while a blocker is open, the issue gets no STEWARD, TRIAGE or RESOLVE leg and
+the board shows it under Waiting as "Blocked by #N". It starts by itself once
+every blocker is closed, whatever the close reason. An issue that already has
+an open harness PR is not held. A `blockedBy` read the harness cannot parse is
+logged and never blocks.
+
 The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Origin,
 and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
 account; it is not a multi-user authentication service.

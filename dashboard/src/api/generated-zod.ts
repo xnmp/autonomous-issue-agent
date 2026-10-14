@@ -104,11 +104,13 @@ const BoardWaiting = z
   .object({
     group: z.enum(["slot", "waiting"]),
     headline: z.string(),
+    headline_url: z.union([z.string(), z.null()]).optional(),
     on: z.enum([
       "branch-protection",
       "human-review",
       "headroom",
       "backoff",
+      "blocked",
       "github",
       "slot",
     ]),

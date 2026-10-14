@@ -24,7 +24,7 @@ from issue_agent.domain.state import (
     stop_tag,
 )
 from issue_agent.domain.checks import Check, Observed
-from issue_agent.domain.world import Comment, PRView, Push
+from issue_agent.domain.world import BlockerRef, Comment, PRView, Push
 
 T0 = datetime(2026, 10, 13, 8, 0, tzinfo=timezone.utc)
 HARNESS = Harness(fix_bot="fixbot", review_bot="reviewbot")
@@ -386,7 +386,7 @@ def test_label_values_and_frecency():
           for activity in ("merge", "update", "open_pr", "release", "triage_note")),
         (dash.Waiting("slot", "h", "r", None), "slot"),
         *((dash.Waiting(on, "h", "r", None), "waiting")
-          for on in ("branch-protection", "human-review", "headroom", "backoff", "github")),
+          for on in ("branch-protection", "human-review", "headroom", "backoff", "blocked", "github")),
         (dash.NeedsYou("question", "h", None, "issue", None), "needs_you"),
     ],
 )
@@ -404,6 +404,7 @@ def test_every_board_status_lands_in_one_group(board, group):
         (Refresh("h1"), "ci"),
         (Wait(WaitReason.HEADROOM), "waiting"),
         (Backoff(AgentKind.RESOLVE, at(30)), "waiting"),
+        (Wait(WaitReason.BLOCKED, (BlockerRef(9),)), "waiting"),
         (NeedsHuman(StopReason.QUESTION, "-", question="q"), "needs_you"),
     ],
 )
@@ -417,3 +418,36 @@ def test_slot_usage_counts_heavy_legs_against_capacity_and_light_ones_beside_it(
               dash.Working("ci", None, "h", "r", None), dash.Waiting("slot", "h", "r", None)]
     assert dash.slot_usage(boards, 3) == dash.SlotUsage(capacity=3, heavy=2, light=2)
     assert dash.slot_usage([], 3) == dash.SlotUsage(3, 0, 0)
+
+
+# ── blocked by ───────────────────────────────────────────────────────────────
+
+
+def test_a_blocked_wait_is_headlined_by_its_blocker_in_the_waiting_lane():
+    board = status(Wait(WaitReason.BLOCKED, (BlockerRef(9),)))
+    assert isinstance(board, dash.Waiting)
+    assert (board.group, board.on, board.headline, board.blocker) == ("waiting", "blocked", "Blocked by #9", BlockerRef(9))
+    assert "starts by itself" in board.reason
+
+
+def test_several_blockers_headline_the_lowest_own_repository_one_and_count_the_rest():
+    board = status(Wait(WaitReason.BLOCKED, (BlockerRef(2, "x/lib"), BlockerRef(12), BlockerRef(5))))
+    assert isinstance(board, dash.Waiting)
+    assert (board.headline, board.blocker) == ("Blocked by #5", BlockerRef(5))
+    assert "2 more" in board.reason
+
+
+def test_a_cross_repository_blocker_is_named_with_its_repository():
+    board = status(Wait(WaitReason.BLOCKED, (BlockerRef(2, "x/lib"),)))
+    assert isinstance(board, dash.Waiting) and board.headline == "Blocked by x/lib#2"
+
+
+def test_a_huge_blocker_list_keeps_a_one_line_headline():
+    board = status(Wait(WaitReason.BLOCKED, tuple(BlockerRef(n) for n in range(10_000, 0, -1))))
+    assert isinstance(board, dash.Waiting) and board.headline == "Blocked by #1" and "9999 more" in board.reason
+
+
+def test_a_blocked_issue_rails_at_triage_before_its_first_act_and_at_its_last_stage_after():
+    blocked = Wait(WaitReason.BLOCKED, (BlockerRef(9),))
+    assert dash.rail(blocked, has_pr=False, legs=()).current == "triage"
+    assert dash.rail(blocked, has_pr=False, legs=(leg("RESOLVE", 0),)).current == "resolve"

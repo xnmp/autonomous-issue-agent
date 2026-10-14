@@ -10,6 +10,7 @@ submittedAt, createdAt) so the adapter mapping is mechanical.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 
 from .identity import is_bot_login
@@ -79,6 +80,34 @@ class Branch:
     committed_at: str = ""
 
 
+_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+@dataclass(frozen=True)
+class BlockerRef:
+    """An open issue that GitHub's "blocked by" relationship names for an issue.
+    `repository` is "" for the observed repository, else its `owner/name`.
+    Provenance: anyone with triage access to the repository can set the link.
+    It can only delay new work, never start or approve it."""
+
+    number: int
+    repository: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.number) is not int or self.number <= 0:
+            raise ValueError("a blocker is a positive issue number")
+        if not isinstance(self.repository, str) or (self.repository and not _REPOSITORY_RE.fullmatch(self.repository)):
+            raise ValueError("a blocker's repository is empty or owner/name")
+
+    def __str__(self) -> str:
+        return f"{self.repository}#{self.number}"
+
+    @property
+    def sort_key(self) -> tuple[bool, str, int]:
+        """The observed repository's blockers first, then by repository and number."""
+        return (self.repository != "", self.repository.casefold(), self.number)
+
+
 @dataclass(frozen=True)
 class IssueView:
     number: int
@@ -92,6 +121,8 @@ class IssueView:
     # When `needs-human` was last applied ("" = not observed). A reply older
     # than that never releases: the operator parked the item after it.
     needs_human_labeled_at: str = ""
+    # Its still-open blockers; closed ones (completed or not planned) are gone.
+    blocked_by: tuple[BlockerRef, ...] = ()
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -194,6 +225,7 @@ __all__ = [
     "Comment",
     "Push",
     "Branch",
+    "BlockerRef",
     "IssueView",
     "PRView",
     "WorldState",

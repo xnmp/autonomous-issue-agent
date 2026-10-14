@@ -25,7 +25,7 @@ from ..domain.ci import parse_timestamp
 from ..domain.identity import login_eq
 from ..domain.labels import Label
 from ..domain.refs import harness_branch_issue
-from ..domain.world import Branch, Comment, IssueView, PRView, PullRequestDiff, Push, Review, WorldState
+from ..domain.world import BlockerRef, Branch, Comment, IssueView, PRView, PullRequestDiff, Push, Review, WorldState
 from .github_ci import base_reports, observe_checks
 
 # Hard ceiling on any single `gh` call: `gh pr view` with lazily computed
@@ -271,9 +271,12 @@ _TIMELINE = ("timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:100{before})
 # The newest label applications: when `needs-human` was last applied.
 _LABELED = ("labeled:timelineItems(itemTypes:[LABELED_EVENT],last:100){pageInfo{hasPreviousPage} "
             "nodes{... on LabeledEvent{createdAt label{name}}}}")
+# GitHub's native "blocked by" issue dependencies, in the same query (no
+# per-issue round-trip). One page: GitHub caps a relationship well below 100.
+_BLOCKED_BY = "blockedBy(first:100){totalCount nodes{number state repository{nameWithOwner}}}"
 _FIX_ISSUE = (
     "id number title state author{login} " + _LABELS + " " + _LABELED + " "
-    + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="")
+    + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="") + " " + _BLOCKED_BY
 )
 _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
             "nodes{{author{{login}} state submittedAt body commit{{oid}}}}}}")
@@ -360,8 +363,58 @@ def _needs_human_labeled_at(node: dict, labels: frozenset[Label]) -> str:
     return ""
 
 
-def parse_fix_issue(node: object, comments: list) -> IssueView:
-    """One issue node (with its fully paged comments) → IssueView."""
+def parse_blockers(raw: object, repository: str) -> tuple[tuple[BlockerRef, ...], str]:
+    """An issue's `blockedBy` connection → its still-open blockers (sorted) and
+    what could not be read ("" when all of it could). A closed blocker is
+    resolved whatever its reason. Unreadable data never blocks: an absent or
+    malformed connection is no blockers, a malformed node is dropped, and a
+    blocker GitHub counts but does not list (past the page, or a repository
+    this token cannot see) is unseen."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("nodes"), list):
+        return (), "blockedBy is absent or malformed"
+    nodes = raw["nodes"]
+    found: set[BlockerRef] = set()
+    dropped = 0
+    for node in nodes:
+        try:
+            ref = _open_blocker(node, repository)
+        except ValueError:
+            dropped += 1
+            continue
+        if ref is not None:
+            found.add(ref)
+    problems = [f"{dropped} malformed blocker(s) dropped"] if dropped else []
+    total = raw.get("totalCount")
+    if type(total) is int and total > len(nodes):
+        problems.append(f"{total - len(nodes)} blocker(s) unseen")
+    return tuple(sorted(found, key=lambda b: b.sort_key)), "; ".join(problems)
+
+
+def _blockers_only(errors: object) -> bool:
+    """No errors, or only errors inside a `blockedBy` connection (e.g. a blocker
+    in a repository this token cannot see): GitHub nulls that part, which
+    `parse_blockers` reads as unreadable. A link must never skip the tick."""
+    if not errors:
+        return True
+    return isinstance(errors, list) and all(
+        isinstance(e, dict) and isinstance(e.get("path"), list) and "blockedBy" in e["path"] for e in errors)
+
+
+def _open_blocker(node: object, repository: str) -> BlockerRef | None:
+    """One blocker node → its ref while open, None once closed; ValueError if malformed."""
+    if not isinstance(node, dict) or node.get("state") not in ("OPEN", "CLOSED"):
+        raise ValueError("blocker state is malformed")
+    repo = node.get("repository")
+    name = repo.get("nameWithOwner") if isinstance(repo, dict) else None
+    number = node.get("number")
+    if not isinstance(name, str) or not name or type(number) is not int:
+        raise ValueError("blocker identity is malformed")
+    ref = BlockerRef(number, "" if name.casefold() == repository.casefold() else name)
+    return ref if node["state"] == "OPEN" else None
+
+
+def parse_fix_issue(node: object, comments: list, blocked_by: tuple[BlockerRef, ...] = ()) -> IssueView:
+    """One issue node (with its fully paged comments and parsed blockers) → IssueView."""
     if not isinstance(node, dict) or type(node.get("number")) is not int or node["number"] <= 0:
         raise FixObservationIncomplete("issue identity is malformed")
     state = node.get("state")
@@ -371,7 +424,7 @@ def parse_fix_issue(node: object, comments: list) -> IssueView:
     return IssueView(
         number=node["number"], title=node.get("title") or "", labels=labels,
         comments=_comments(comments), author=_login(node.get("author")), state=state.lower(),
-        needs_human_labeled_at=_needs_human_labeled_at(node, labels),
+        needs_human_labeled_at=_needs_human_labeled_at(node, labels), blocked_by=blocked_by,
     )
 
 
@@ -577,7 +630,7 @@ class GitHubGateway:
         for key, value in variables.items():
             args += ["-f", f"{key}={value}"]
         raw = self._gh_json(args)
-        if not isinstance(raw, dict) or raw.get("errors") or not isinstance(raw.get("data"), dict):
+        if not isinstance(raw, dict) or not isinstance(raw.get("data"), dict) or not _blockers_only(raw.get("errors")):
             raise FixObservationIncomplete("GraphQL answered with errors or no data")
         return raw["data"]
 
@@ -646,7 +699,10 @@ class GitHubGateway:
                 xrefs = self._nested(node, "timelineItems", _TIMELINE, on="Issue", backward=True)
                 if comments is None or xrefs is None:
                     raise FixObservationIncomplete("comments or cross-references exceed their bound")
-                issues.append(parse_fix_issue(node, comments))
+                blockers, problem = parse_blockers(node.get("blockedBy"), self.repo)
+                if problem:
+                    sys.stderr.write(f"issue #{number}: {problem}; unreadable blockers never block\n")
+                issues.append(parse_fix_issue(node, comments, blockers))
                 merged.update((p.number, p) for p in parse_merged_harness_prs(xrefs, self.repo))
             except FixObservationIncomplete as exc:
                 self._skip_item("issue", number if type(number) is int else 0, exc)

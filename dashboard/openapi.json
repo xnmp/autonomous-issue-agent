@@ -319,12 +319,24 @@
             "title": "Headline",
             "type": "string"
           },
+          "headline_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headline Url"
+          },
           "on": {
             "enum": [
               "branch-protection",
               "human-review",
               "headroom",
               "backoff",
+              "blocked",
               "github",
               "slot"
             ],
