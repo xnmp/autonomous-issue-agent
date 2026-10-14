@@ -12,6 +12,7 @@ the daemon logs it and the next tick re-derives from GitHub.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 
 from ..domain.actions import (
     Action,
@@ -30,7 +31,7 @@ from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict
 from ..domain.triage import link_refusal
-from .github import FixObservationIncomplete
+from .github import FixObservationIncomplete, GhUnavailable
 
 # A stored key's text is never changed: a rename orphans the keys already
 # claimed (the cutover carried them in this form), and a claimed key decides
@@ -128,6 +129,7 @@ class GitHubAct:
             raise TypeError(f"act does not execute {action!r}")
 
     def merge(self, action: MergePullRequest) -> None:
+        merged_after = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         # --match-head-commit: a push after the decision is never merged.
         if not self.gateway.enable_auto_merge(action.pr, self.merge_method, action.head):
             raise RuntimeError(f"PR #{action.pr}: merge of {action.head[:12]} did not land")
@@ -136,6 +138,10 @@ class GitHubAct:
         issue = harness_branch_issue(pr.head_ref_name)
         if issue is None:
             return
+        # The merge closes the issue, so the merged PR is never observed again:
+        # this is the one place its runs are known to be pointless. Runs
+        # created after the merge started are post-merge workflows.
+        self.cancel_runs(f"PR #{action.pr} ({pr.head_ref_name})", pr.head_ref_name, merged_after)
         if not self.gateway.is_issue_closed(issue):
             # A non-default base does not close the issue through `Fixes #N`.
             self.gateway.close_issue(issue, "completed", f"{self.marker}\nResolved by #{action.pr}.")
@@ -143,6 +149,37 @@ class GitHubAct:
             self.remove_worktree(issue)
         except Exception as exc:  # noqa: BLE001 - a stale worktree is disk, not state
             self.log(f"issue #{issue}: worktree removal failed after merge: {exc}")
+
+    def cancel_runs(self, label: str, branch: str, created_before: str) -> None:
+        """Cancel the unfinished workflow runs of a merged harness branch that
+        were created before `created_before` (UTC `YYYY-MM-DDTHH:MM:SSZ`); a
+        later run is a post-merge workflow (a `closed` deploy or cleanup) that
+        must finish. The target's own `concurrency` groups already cancel a
+        superseded push; what no group covers is a run still going after the
+        merge, since no further push arrives. Never raises: a missing
+        `actions:write` (403), a run that just completed (409) or an unreadable
+        list costs one log line, never the merge's follow-through. The run list
+        is the read-back, so a replay finds nothing to do."""
+        try:
+            stale = tuple(i for i, status, created in self.gateway.branch_runs(branch)
+                          if status != "completed" and created < created_before)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            self.log(f"{label}: merged-branch run cancel unavailable: {exc}")
+            return
+        failed: list[str] = []
+        done = 0
+        for run_id in stale:
+            try:
+                self.gateway.cancel_run(run_id)
+                done += 1
+            except GhUnavailable as exc:  # throttled or down: the rest would only deepen it
+                failed.append(f"{run_id}: {exc}")
+                break
+            except Exception as exc:  # noqa: BLE001 - one run's 403/409 must not block the rest
+                failed.append(f"{run_id}: {exc}")
+        if stale:
+            self.log(f"{label}: cancelled {done}/{len(stale)} workflow runs left on the merged branch"
+                     + (f"; first failure {failed[0]}" if failed else ""))
 
     def relabel(self, action: Relabel) -> None:
         relabel(

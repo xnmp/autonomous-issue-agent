@@ -53,6 +53,8 @@ class FakeGitHub:
     issues: dict[int, IssueView] = field(default_factory=dict)
     prs: dict[int, PRView] = field(default_factory=dict)
     branches: dict[str, str] = field(default_factory=dict)  # name -> pushed head
+    runs: dict[int, str] = field(default_factory=dict)  # run id -> branch; all in progress
+    cancelled: list[int] = field(default_factory=list)
     pushed_at: dict[str, str] = field(default_factory=dict)  # name -> last push
     closed_at: dict[int, str] = field(default_factory=dict)  # PR -> when a human closed it
     merged: list[tuple[int, str]] = field(default_factory=list)
@@ -177,6 +179,12 @@ class FakeGitHub:
 
     def update_branch(self, pr: int, expected_head: str) -> bool:
         return self.prs[pr].head_ref_oid == expected_head
+
+    def branch_runs(self, branch: str) -> tuple[tuple[int, str, str], ...]:
+        return tuple((i, "in_progress", "2020-01-01T00:00:00Z") for i, b in self.runs.items() if b == branch)
+
+    def cancel_run(self, run_id: int) -> None:
+        self.cancelled.append(run_id)
 
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self.closed.append(number)
@@ -1151,3 +1159,13 @@ def test_deleting_both_the_link_and_its_comment_closes_the_matter_and_triage_pro
     tick(composed)  # one closing comment, no new link
     assert gh.issues[5].blocked_by == () and len(gh.comments_with("issue", 5, "will not write that link again")) == 1
     assert dispatched(tick(composed), AgentKind.TRIAGE) == [RunAgent(AgentKind.TRIAGE, 5)]
+
+
+def test_merging_cancels_every_unfinished_run_on_the_merged_branch_only(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, reviews=_APPROVED)
+    gh.runs = {1: "fix/5-null-token-crashes", 2: "fix/5-null-token-crashes", 3: "dev", 4: "fix/9-someone-else"}
+    composed, _ = role(gh, Agent())
+
+    assert MergePullRequest(100, "h1") in tick(composed)
+    assert gh.cancelled == [1, 2]
