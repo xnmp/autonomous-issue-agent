@@ -194,8 +194,8 @@ head and the review bot has no standing verdict on that head. The leg reads the
 exact head: a detached checkout with the base fetched, where the agent runs
 `git diff <base>...<head>` itself (an empty diff is refused without a leg). It
 is briefed with the steward's acceptance criteria as the bar (the issue body
-when there are none; never the fixer-written PR description), the PR text, the
-conversation and its own prior review: the Codex reviewer's read-only sandbox
+when there are none; never the fixer-written PR description), the issue and its
+human comments (bounded), the PR text, the conversation and its own prior review: the Codex reviewer's read-only sandbox
 has no network, so it cannot fetch them. `GitHubAct`
 submits the parsed verdict as one review on that commit, read back first
 (a standing bot verdict on the head means it landed), so a crash after
@@ -403,7 +403,9 @@ publisher is deployed.
 Visual screenshot evidence is judged by the independent reviewer (#327); image
 size remains capped at 700KB. The harness opens a PR with the agent's own
 description unchanged; the reviewer's bar is the steward's criteria (or the
-issue), so a description cannot lower it. Agent children still inherit direct
+issue). The issue's human comments are briefed as unauthenticated context: a
+narrowing counts only when the reviewer can tie it to one, and a description
+cannot lower the bar. Agent children still inherit direct
 publication capability, so a direct `gh pr create` is possible in the current
 advisory posture.
 Service upgrades likewise stage complete

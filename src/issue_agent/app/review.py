@@ -34,7 +34,7 @@ from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
 from ..domain.routing import Tier
-from ..domain.state import DerivedState, Harness, ItemKey, Local, human_comments, issue_key, pr_key
+from ..domain.state import DerivedState, Harness, ItemKey, Local, human_comments, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
@@ -92,8 +92,8 @@ class _NothingToReview(Exception):
     """The head's base...head diff is empty: an end retrying cannot change."""
 
 
-# The prior review rides along whole up to this size; it is the bot's own
-# body, already bounded by REVIEW_BODY_LIMIT, so this only trims the extreme.
+# The prior review and the issue body ride along whole up to this size; the
+# review is the bot's own body (REVIEW_BODY_LIMIT), so this trims the extreme.
 _PRIOR_REVIEW_BYTES = 20_000
 
 
@@ -213,6 +213,23 @@ class ReviewLegs:
         self.log(f"REVIEW PR #{pr}: GitHub refused the {verdict.event} on {head[:12]} (counted as an attempt)")
         self.accounting.record_refused_leg(attempt={"verdict": {"event": verdict.event, "body": verdict.body}})
 
+    def _issue(self, issue: int, runs: Iterable[LegRun], *, required: bool) -> tuple[str, str]:
+        """The issue's body and human comments, each bounded. Derive's
+        definition of human: a comment inside any of the issue's leg windows
+        (either role, issue or PR stage) is the agent's, whatever its login.
+        Context when the steward's criteria are the bar, so a failed read
+        then leaves them alone; without criteria it is the bar and raises."""
+        try:
+            subject = self.gateway.get_issue(issue)
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            if required:
+                raise
+            self.log(f"REVIEW issue #{issue}: issue unreadable, judged on the steward's criteria alone: {exc}")
+            return "", ""
+        legs = tuple(end for ends in local_legs(runs).values() for end in ends)
+        human = tuple(c for _, c in human_comments(subject.comments, self.settings.harness, legs))
+        return _bounded(subject.author or "author", subject.body or ""), format_pr_discussion(human)
+
     def _task(self, action: RunAgent, issue: int, pr: PRView, runs: Iterable[LegRun]):
         runtime, model, effort = self.route(action.tier)
         self.log(f"REVIEW PR #{action.number}: tier {getattr(action.tier, 'value', '(none)')} -> "
@@ -225,19 +242,21 @@ class ReviewLegs:
             self.prepare_cwd(cwd, runtime)
         discussion = format_pr_discussion(pr.comments)
         prior = _prior_review(pr, self.settings.harness.review_bot)
-        subject = self.gateway.get_issue(issue)
-        # Derive's definition of a human comment: the agent's own (inside a
-        # leg window, possibly under the operator's login) is not an answer.
-        legs = local_legs(runs).get(issue_key(issue), ())
-        thread = format_pr_discussion(tuple(c for _, c in human_comments(subject.comments, self.settings.harness, legs)))
+        criteria = steward_criteria(runs)
+        body, thread = self._issue(issue, runs, required=criteria is None)
         context = tasks.ReviewContext(
-            as_untrusted(pr.title), as_untrusted(pr.body), criteria=steward_criteria(runs),
-            issue_body=as_untrusted(subject.body or ""), issue_thread=as_untrusted(thread) if thread else None,
+            as_untrusted(pr.title), as_untrusted(pr.body), criteria=criteria,
+            issue_body=as_untrusted(body), issue_thread=as_untrusted(thread) if thread else None,
             discussion=as_untrusted(discussion) if discussion else None,
             prior_review=as_untrusted(prior) if prior else None,
         )
         task = tasks.build_review_task(action.number, issue, action.head, base, context, self.task_config)
         return replace(task, cwd=cwd, runtime=runtime, model=model, effort=effort or task.effort)
+
+
+def _bounded(author: str, text: str) -> str:
+    return format_pr_discussion((Comment(author, text),), body_bytes=_PRIOR_REVIEW_BYTES,
+                                total_bytes=_PRIOR_REVIEW_BYTES)
 
 
 def _prior_review(pr: PRView, bot: str) -> str:
@@ -246,10 +265,7 @@ def _prior_review(pr: PRView, bot: str) -> str:
     whether the new commits answer it rather than re-judge from scratch."""
     mine = [r for r in pr.reviews if login_eq(r.author, bot) and r.body.strip()]
     latest = max(mine, key=lambda r: r.submitted_at, default=None)
-    if latest is None:
-        return ""
-    return format_pr_discussion((Comment(latest.author, latest.body),),
-                                body_bytes=_PRIOR_REVIEW_BYTES, total_bytes=_PRIOR_REVIEW_BYTES)
+    return _bounded(latest.author, latest.body) if latest is not None else ""
 
 
 def compose_review_daemon(

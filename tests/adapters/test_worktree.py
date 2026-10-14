@@ -311,6 +311,22 @@ def test_a_moved_base_refetches_even_when_the_head_is_already_checked_out():
     assert any(a[0] == "fetch" for a in calls) and BASE in present
 
 
+def test_a_base_ref_that_cannot_be_fetched_still_fetches_the_head_and_names_the_base():
+    def git(args):
+        if args[:3] == ["fetch", "origin", "refs/heads/dev"]:
+            return GitResult(128, "")  # the base branch was renamed
+        if args[:2] == ["cat-file", "-e"]:
+            return GitResult(0 if args[2].startswith(SHA) else 1, "")
+        return None
+
+    calls: list[list[str]] = []
+    rc = wt_mod.ReviewCheckouts("/repo", run=lambda a, c: (calls.append(a), _review_git(git)(a, c))[1],
+                                path_exists=lambda p: False, remove_tree=lambda p: None)
+    with pytest.raises(WorktreeUnavailable, match=f"base {BASE}"):
+        rc.ensure(165, SHA, "dev", BASE)
+    assert ["fetch", "origin", "refs/pull/165/head", "--quiet"] in calls
+
+
 @pytest.mark.parametrize(
     "answer,changed",
     [(GitResult(0, ""), False), (GitResult(0, "src/x.py\n"), True)],

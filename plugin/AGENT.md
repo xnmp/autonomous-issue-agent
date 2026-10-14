@@ -61,7 +61,8 @@ have one; keep your context for reasoning, design and code.
    write `summary` as the complete PR description: what changed, how you
    verified it, an `## Acceptance Criteria` section (the criteria you were
    briefed with, else the issue's), and `Closes #<issue>`. On a later leg for an
-   open PR, change the description only with `gh pr edit <PR number> --body '…'`,
+   open PR, change the description only with
+   `gh pr edit <PR number> --repo $HARNESS_REPO --body '…'`,
    which replaces the whole body: keep the Acceptance Criteria section and the
    `Closes #` line.
 

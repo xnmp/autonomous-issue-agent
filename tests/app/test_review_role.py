@@ -488,6 +488,8 @@ def test_a_human_answer_on_the_issue_reaches_the_reviewer_and_harness_comments_d
 
 def test_a_git_failure_on_the_emptiness_check_is_a_machine_end_not_an_attempt(roles, tmp_path):
     from issue_agent.adapters.worktree import WorktreeUnavailable
+    from issue_agent.app.tick import leg_class
+    from issue_agent.domain.outcome import LegClass
 
     class Broken(FakeCheckouts):
         def has_changes(self, base: str, head: str) -> bool:
@@ -500,4 +502,64 @@ def test_a_git_failure_on_the_emptiness_check_is_a_machine_end_not_an_attempt(ro
 
     assert agent.tasks == [] and gh.submitted == []
     (run,) = review.control.leg_runs("o/r", (5,))
-    assert run.receipt is None or run.receipt.get("leg") not in ("agent", "asked")  # machine: backs off, no attempt
+    assert leg_class(run) is LegClass.MACHINE  # backs off; no REVIEW attempt is spent
+
+
+def test_an_agents_unmarked_issue_comment_during_a_pr_stage_leg_is_not_briefed_as_a_humans(roles):
+    # The agent inherits the operator's credentials and comments unmarked;
+    # only its leg window says it is not a human (#342). A PR-stage leg's
+    # window counts too, or a repair leg could lower its own review bar.
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.domain.contracts import RunId
+    import time
+
+    gh = ReviewGitHub(issues={5: ready()})
+    open_pr(gh, head="h1", ci="fail", base_ref_name="dev", base_ref_oid="b1")
+
+    def repair_posts_on_the_issue(task):
+        env = task.env
+        SQLiteControlStore(env["ISSUE_AGENT_CONTROL_DB"]).register_process_lease(
+            RunId(env["ISSUE_AGENT_RUN_ID"]), expected_owner_id=env["ISSUE_AGENT_OWNER_ID"],
+            pid=999_999, pgid=999_999, process_start_ticks=1,
+        )
+        gh.comment("issue", 5, "Scope agreed: drop the 410 case.", author=FIX_BOT)
+        time.sleep(0.01)
+        gh.push("fix/5-null-token-crashes", "h2", ci="pass")
+        return AgentResult(False, status="pushed", summary="Fixed CI.", cost_usd=0.1, session_id="s1")
+
+    assert dispatched(tick(roles.fix(gh, Agent(repair_posts_on_the_issue))), AgentKind.FIX_CI)
+    gh.comment("issue", 5, "Keep the 404 case.", author="alice")
+    reviewer = Agent(verdict("APPROVE"))
+    tick(roles.review(gh, reviewer))
+
+    thread = reviewer.tasks[0].prompt.split("<untrusted_issue_comments_json>")[1].split("</untrusted_issue")[0]
+    assert "Keep the 404 case." in thread and "drop the 410 case" not in thread
+
+
+def test_an_unreadable_issue_leaves_the_stewards_criteria_as_the_bar(roles):
+    from issue_agent.domain.triage import Steward
+    from tests.app.test_fix_role import seed_light_legs
+
+    class Unreadable(ReviewGitHub):
+        def get_issue(self, number):
+            raise GhUnavailable("timeout", "gh issue view timed out")
+
+    gh = Unreadable(issues={5: ready()})
+    open_pr(gh, head="h1", ci="pass", base_ref_name="dev", base_ref_oid="b1")
+    agent = Agent(verdict("APPROVE"))
+    review = roles.review(gh, agent)
+    seed_light_legs(review, 5, STEWARD={"steward": Steward(acceptance_criteria=("A null token returns 401",)).record()})
+    tick(review)
+    assert "A null token returns 401" in agent.tasks[0].prompt and gh.submitted
+
+
+def test_without_criteria_an_unreadable_issue_buys_no_blind_review(roles):
+    class Unreadable(ReviewGitHub):
+        def get_issue(self, number):
+            raise GhUnavailable("timeout", "gh issue view timed out")
+
+    gh = Unreadable(issues={5: ready()})
+    open_pr(gh, head="h1", ci="pass", base_ref_name="dev", base_ref_oid="b1")
+    blind = Agent()
+    tick(roles.review(gh, blind))
+    assert blind.tasks == [] and gh.submitted == []  # a machine end: backs off and re-reads

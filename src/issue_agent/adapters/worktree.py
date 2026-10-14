@@ -251,7 +251,7 @@ class ReviewCheckouts:
                     raise WorktreeUnavailable(f"{name} {sha} for PR #{pr} is not reachable after fetching its "
                                               "ref (force-pushed away, or the base renamed?) — defer and re-observe")
             if is_worktree:
-                # Re-verified after the (up to 60s) fetch, right before mutating.
+                # Re-verified after the (up to 60s each) fetches, right before mutating.
                 if not self._is_this_worktree(pr, abs_path):
                     raise WorktreeUnavailable(f"review worktree for PR #{pr} stopped being a worktree during "
                                               "fetch — defer")
