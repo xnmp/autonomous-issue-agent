@@ -46,7 +46,7 @@ _FIXER_REVIEW_AUTHORIZATION = (
     "a FAIL), plus one evidence-capture child if screenshots are still uncaptured. "
     "They share this leg's budget and use the tool defaults; they may inspect and "
     "run verification but may not edit source, publish, or delegate. This grant "
-    "does not extend to implementation delegation.\n\n"
+    "does not extend to implementation delegation or separate paid CLI sessions.\n\n"
 )
 
 # AGENT.md carries this for every leg; the ADDRESS_REVIEW prompt still repeats it.

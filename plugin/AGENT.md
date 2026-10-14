@@ -49,7 +49,7 @@ have one; keep your context for reasoning, design and code.
      flow through, so reverting the implementation leaves it green.
    - **Untested seam**: no test asserts at the user-visible or contract result a
      criterion names.
-   Fix each finding and re-verify before you push.
+   Fix each finding, then re-verify, including what the fix itself may break.
 9. Publish with plain git: commit, then `git push -u origin <your branch>`
    (`--force-with-lease` only after a rebase). Never run `gh pr create`: the
    harness opens the pull request from your pushed branch against
