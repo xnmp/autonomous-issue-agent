@@ -30,8 +30,8 @@ from .actions import ISSUE_ACTS, AgentKind
 from .checks import Observed
 from .ci import Clear, Executing, Failed, Queued, Waiting as CiWaiting, parse_timestamp, reduce_ci
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, Merge, NeedsHuman, OpenPR, Refresh, Release, StopReason,
-    TriageNote, Wait, WaitReason, stop_tag,
+    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Release,
+    StopReason, TriageNote, Wait, WaitReason, stop_tag,
 )
 from .triage import Steward, Triage
 from .world import BlockerRef, Comment, PRView
@@ -226,7 +226,7 @@ class Working:
     free action (merge, branch update, PR open, release) runs next tick.
     `group` is the board lane: only a running leg is in the agent lane."""
 
-    activity: str  # agent | ci | ci_queued | merge | update | open_pr | triage_note | release
+    activity: str  # agent | ci | ci_queued | merge | update | open_pr | triage_note | blocker_link | release
     act: str | None
     headline: str
     reason: str
@@ -364,6 +364,9 @@ def board_status(
     if isinstance(state, TriageNote):
         return Working("triage_note", None, "Posting triage", "Triage graded it; its comment posts next tick.",
                        _iso(ended))
+    if isinstance(state, LinkBlocker):
+        return Working("blocker_link", None, "Linking blocker",
+                       f"Steward found it needs #{state.blocker} first; the link is written next tick.", _iso(ended))
     if isinstance(state, Release):
         return Working("release", None, "Releasing", "A human replied; needs-human comes off next tick.",
                        _iso(ended))
@@ -528,7 +531,8 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
         return _STAGE_OF_KIND[state.act.name]
     if isinstance(state, NeedsHuman) and state.reason is StopReason.REVIEW_ROUNDS:
         return Stage.REVIEW
-    if isinstance(state, TriageNote) or isinstance(state, NeedsHuman) and state.reason is StopReason.DUPLICATE:
+    if (isinstance(state, (TriageNote, LinkBlocker))
+            or isinstance(state, NeedsHuman) and state.reason is StopReason.DUPLICATE):
         return Stage.TRIAGE
     if isinstance(state, Merge):
         return Stage.MERGE

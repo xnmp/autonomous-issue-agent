@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable
 
 from ..domain.actions import (
     Action,
+    LinkBlockedBy,
     MergePullRequest,
     OpenPullRequest,
     PostComment,
@@ -24,15 +25,20 @@ from ..domain.actions import (
     UpdateBranch,
 )
 from ..domain.labels import Label
+from ..domain.policy import blocker_closed_comment, blocker_comment
 from ..domain.pr_body import complete_pr_body, issue_acceptance_criteria
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict
+from ..domain.triage import link_refusal
+from .github import FixObservationIncomplete
 
 # A stored key's text is never changed: a rename orphans the keys already
 # claimed (the cutover carried them in this form), and a claimed key decides
 # whether to post.
 _COMMENT_NAMESPACE = "fix-comment"
 _PR_BODY_LIMIT = 60000
+# Stable across retries: the comment's read-back matches its exact body.
+_GITHUB_REFUSED = "GitHub would not read or write the link"
 
 
 def submit_review(gateway, pr: int, head: str, verdict: Verdict, bot: str) -> bool:
@@ -116,6 +122,8 @@ class GitHubAct:
             self.post(action)
         elif isinstance(action, OpenPullRequest):
             self.open_pr(action)
+        elif isinstance(action, LinkBlockedBy):
+            self.link_blocker(action)
         else:
             raise TypeError(f"act does not execute {action!r}")
 
@@ -161,6 +169,57 @@ class GitHubAct:
             if not self.gateway.has_comment(kind, action.number, action.body):
                 raise RuntimeError(f"{kind} #{action.number}: comment {action.key} not confirmed")
             self.control.confirm_key(key)
+
+    def link_blocker(self, action: LinkBlockedBy) -> None:
+        """A steward's "blocked by" claim, rechecked on fresh reads
+        (`triage.link_refusal`), linked and read back, then one comment saying
+        so or why not. Keyed: once done, nothing here runs again, so a link a
+        human deletes stays deleted (derive also stops at the comment)."""
+        key = f"{_COMMENT_NAMESPACE}:{self.repository}:{action.key}"
+        if self.control.claim_key(key) == "done":
+            # Derive asks again only when the harness's comment is gone (a
+            # human deleted it). Say once more that the matter is closed, so
+            # derive moves on; the link itself is never touched again.
+            closed = blocker_closed_comment(self.marker, action.blocker)
+            if not self.gateway.has_comment("issue", action.issue, closed):
+                self.gateway.comment("issue", action.issue, closed)
+            return
+        try:
+            refusal = self._link(action)
+        except FixObservationIncomplete as exc:
+            # GitHub answered and would not read or write it (a deleted or
+            # transferred blocker, a refused mutation): retrying every tick
+            # changes nothing, so it is a refusal. GhUnavailable (no answer) raises.
+            self.log(f"issue #{action.issue}: blocked-by #{action.blocker}: {str(exc)[:300]}")
+            refusal = _GITHUB_REFUSED
+        if refusal:
+            self.log(f"issue #{action.issue}: steward's blocked-by #{action.blocker} refused: {refusal}")
+        body = blocker_comment(self.marker, action.blocker, action.reason, refusal)
+        if not self.gateway.has_comment("issue", action.issue, body):
+            self.gateway.comment("issue", action.issue, body)
+            if not self.gateway.has_comment("issue", action.issue, body):
+                raise RuntimeError(f"issue #{action.issue}: blocked-by comment not confirmed")
+        self.control.confirm_key(key)
+
+    def _link(self, action: LinkBlockedBy) -> str:
+        """Link it unless fresh reads refuse; the refusal, or "" once linked."""
+        facts = self.gateway.blocker_link(action.issue, action.blocker)
+        if facts.linked:  # whatever changed since (a retry after a lost reply), the link is there
+            return ""
+        refusal = link_refusal(action.issue, action.blocker, facts.blocker_open, facts.blocker_blocked_by)
+        if refusal:
+            return refusal
+        try:
+            self.gateway.add_blocked_by(facts.issue_id, facts.blocker_id)
+        except FixObservationIncomplete:
+            # An error reply is not proof of no write (a commit before the
+            # error, an unclassified gh failure): only a read says it did not land.
+            if not self.gateway.blocker_link(action.issue, action.blocker).linked:
+                raise
+        if not self.gateway.blocker_link(action.issue, action.blocker).linked:
+            raise RuntimeError(f"issue #{action.issue}: blocked-by #{action.blocker} not confirmed")
+        self.log(f"issue #{action.issue}: linked blocked by #{action.blocker}")
+        return ""
 
     def open_pr(self, action: OpenPullRequest) -> None:
         if self.gateway.pull_request_for_branch(action.branch) is not None:

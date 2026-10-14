@@ -204,9 +204,12 @@ def build_steward_task(
     max_budget_usd: float,
     criteria_wanted: bool = True,
     effort: Effort | None = None,
+    blockable: tuple[int, ...] = (),
 ) -> RuntimePlan:
-    """STEWARD: state testable acceptance criteria and flag a suspected
-    duplicate among `offered` (the other issues listed in `others`).
+    """STEWARD: state testable acceptance criteria, flag a suspected
+    duplicate among `offered` (the other issues listed in `others`), propose a
+    genuine dependency among `blockable` (the open ones), and guess the paths
+    the fix touches (dispatch ordering only).
     Deliberately no plan: the fixer designs, the reviewer judges. An issue
     that states its own criteria is not asked for any: its section stays the
     contract the PR body carries."""
@@ -227,11 +230,23 @@ def build_steward_task(
         "issues listed below, with a one-line duplicate_reason naming what they share. "
         "Never claim a duplicate merely because the reports look similar or touch the same "
         "area; when unsure, null. A human judges every claim.\n\n"
+        "## blocked_by — a genuine dependency\n"
+        "Set it only when this issue cannot be correctly done until another OPEN issue listed "
+        "below lands, for example because it needs a feature, API or data model that issue adds. "
+        "Give a one-line blocked_by_reason naming what this issue needs from it. Overlap is not a "
+        "dependency: never set it because the issues touch the same area, the same files or the same "
+        "component, or because doing one first would merely be tidier. When unsure, null. The harness "
+        "links it on GitHub; a human can delete the link.\n\n"
+        "## touches — a rough guess\n"
+        "Up to 30 repository file paths (e.g. `src/auth/token.ts`) the fix will most likely change, "
+        "from the text alone. Name specific files, not directories; when you cannot name a file, "
+        "leave it out. An empty list is fine.\n\n"
         f"{_fenced('issue title', title)}\n\n"
         f"{_fenced('issue body', body)}\n\n"
         f"{_fenced('other issues', others)}"
     )
-    return _light_plan(prompt, steward_schema(offered, criteria_wanted), cwd, model, runtime, effort, max_budget_usd)
+    return _light_plan(prompt, steward_schema(offered, criteria_wanted, blockable), cwd, model, runtime, effort,
+                       max_budget_usd)
 
 
 def build_triage_task(

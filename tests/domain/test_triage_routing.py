@@ -15,7 +15,7 @@ from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
-from issue_agent.domain.policy import actions
+from issue_agent.domain.policy import actions, overlaps, path_index
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.routing import DEFAULT_TIER, ModelRoute, Tier, escalate, parse_model_route, parse_tier
 from issue_agent.domain.state import (
@@ -23,8 +23,9 @@ from issue_agent.domain.state import (
     derive, issue_key, pr_key, stop_tag,
 )
 from issue_agent.domain.triage import (
-    MAX_CRITERIA, MAX_CRITERION, MAX_RATIONALE, Steward, Triage, criteria_wanted, offered_duplicates, parse_steward,
-    parse_triage, steward_from_record, steward_schema, triage_schema,
+    MAX_CRITERIA, MAX_CRITERION, MAX_RATIONALE, MAX_TOUCHES, Steward, Triage, criteria_wanted, link_refusal,
+    normalise_guess, normalise_path, offered_blockers, offered_duplicates, parse_steward, parse_touches, parse_triage,
+    steward_from_record, steward_schema, triage_schema,
 )
 from issue_agent.domain.world import Comment, IssueView, PRView, Push, WorldState
 
@@ -459,10 +460,21 @@ def test_a_well_formed_steward_parses():
     {**OK, "duplicate_reason": 3},
     {**OK, "acceptance_criteria": ["x"] * (MAX_CRITERIA + 1)},
     {**OK, "acceptance_criteria": ["x" * (MAX_CRITERION + 1)]},
-    {**OK, "duplicate_of": 2, "duplicate_reason": "x" * 10_000},
+    {**OK, "blocked_by_reason": ["no"]},
 ])
 def test_malformed_or_oversized_steward_output_is_no_steward(raw):
     assert parse_steward(raw, (2,), 3) is None
+
+
+@pytest.mark.parametrize("raw", [
+    {**OK, "duplicate_of": 2, "duplicate_reason": "x" * 10_000},
+    {**OK, "duplicate_of": None, "duplicate_reason": "x" * 501},  # a long "why none"
+    {**OK, "blocked_by": None, "blocked_by_reason": "x" * 501},
+    {**OK, "blocked_by": 2, "blocked_by_reason": "x" * 501},
+])
+def test_an_oversized_claim_reason_drops_only_that_claim(raw):
+    steward = parse_steward(raw, (2,), 3, blockable=(2,))
+    assert steward == Steward(("A works", "B works"))
 
 
 def test_a_duplicate_survives_only_if_offered_distinct_and_explained():
@@ -512,7 +524,11 @@ def test_a_steward_record_needs_its_criteria_list_and_a_tier_only_record_is_no_s
 
 def test_the_schemas_ask_for_exactly_their_own_fields():
     assert set(triage_schema()["properties"]) == {"tier", "rationale"}
-    assert set(steward_schema(())["properties"]) == {"acceptance_criteria", "duplicate_of", "duplicate_reason"}
+    assert set(steward_schema(())["properties"]) == {
+        "acceptance_criteria", "duplicate_of", "duplicate_reason", "blocked_by", "blocked_by_reason", "touches"}
+    # Strict structured output: every property is required (a nullable or empty answer is still an answer).
+    schema = steward_schema(())
+    assert set(schema["required"]) == set(schema["properties"])
 
 
 def test_the_schema_offers_exactly_the_listed_issues_and_reads_them_back():
@@ -522,3 +538,111 @@ def test_the_schema_offers_exactly_the_listed_issues_and_reads_them_back():
     assert steward_schema([])["properties"]["duplicate_of"] == {"type": "null"}
     assert offered_duplicates(None) == offered_duplicates({"properties": 1}) == frozenset()
     assert len(offered_duplicates(steward_schema(range(1, 100_000)))) == 300
+
+
+# ── STEWARD's dependency claim and path guesses ──────────────────────────────
+
+
+def test_a_blocked_by_claim_survives_only_for_an_offered_open_issue_with_a_reason():
+    claim = {**OK, "blocked_by": 4, "blocked_by_reason": "Needs the export API #4 adds"}
+    steward = parse_steward(claim, (2, 4), 3, blockable=(4,))
+    assert (steward.blocked_by, steward.blocked_by_reason) == (4, "Needs the export API #4 adds")
+    assert parse_steward(claim, (2, 4), 3, blockable=()).blocked_by is None  # offered, but not open
+    assert parse_steward({**claim, "blocked_by": 3}, (3,), 3, blockable=(3,)).blocked_by is None  # itself
+    assert parse_steward({**claim, "blocked_by_reason": ""}, (4,), 3, blockable=(4,)).blocked_by is None
+    for bad in (True, "4", 4.0, 0, -4, None, 2**40):
+        dropped = parse_steward({**claim, "blocked_by": bad}, (4,), 3, blockable=(4,))
+        assert dropped is not None and (dropped.blocked_by, dropped.blocked_by_reason) == (None, "")
+    assert parse_steward({**claim, "blocked_by_reason": "x" * 501}, (4,), 3, blockable=(4,)).blocked_by is None
+
+
+def test_the_claims_and_guesses_read_back_from_the_record_and_legacy_records_have_none():
+    claim = {**OK, "blocked_by": 4, "blocked_by_reason": "Needs #4", "touches": ["src/a.py", "docs/"]}
+    steward = parse_steward(claim, (), 3, blockable=(4,))
+    assert steward is not None and steward.touches == ("src/a.py", "docs")
+    assert steward_from_record(steward.record()) == steward
+    legacy = steward_from_record({"acceptance_criteria": ["A"], "duplicate_of": None, "duplicate_reason": ""})
+    assert legacy == Steward(("A",))
+
+
+def test_the_schema_offers_open_issues_as_blockers_and_reads_them_back():
+    schema = steward_schema((2, 4, 5), blockable=(5, 4))
+    assert schema["properties"]["blocked_by"]["enum"] == [4, 5, None]
+    assert offered_blockers(schema) == frozenset({4, 5}) and offered_duplicates(schema) == frozenset({2, 4, 5})
+    assert steward_schema((2,))["properties"]["blocked_by"] == {"type": "null"}
+    assert offered_blockers(None) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        (["src/a.py"], ("src/a.py",)),
+        (["./src//lib/", "/docs", " tests "], ("src/lib", "docs", "tests")),
+        (["src/**/*.ts", "web/*"], ("src", "web")),
+        (["src/components/Button*.tsx", "lib/a?.py", "y/{a,b}"], ("src/components", "lib", "y")),
+        # Brackets are literal: SvelteKit/Next route files, not globs.
+        (["src/routes/[slug]/+page.svelte", "app/[id]/page.tsx"], ("src/routes/[slug]/+page.svelte", "app/[id]/page.tsx")),
+        (["src/a.py", "src/a.py"], ("src/a.py",)),
+        (["", "/", ".", "*", "../etc", "a/../b", "bad\x00name"], ()),
+        ([], ()),
+        (None, ()),
+        ("src/a.py", ()),
+        ([1, "src"], ("src",)),  # a bad entry drops alone
+        (["x" * 201, "docs"], ("docs",)),
+        ([f"f{i}" for i in range(MAX_TOUCHES + 5)], tuple(f"f{i}" for i in range(MAX_TOUCHES))),  # truncated
+    ],
+)
+def test_touches_are_normalised_bounded_and_malformed_lists_are_none(raw, want):
+    assert parse_touches(raw) == want
+
+
+def test_a_malformed_touches_list_drops_only_the_guess():
+    steward = parse_steward({**OK, "touches": "everything"}, (), 3)
+    assert steward is not None and steward.touches == () and steward.acceptance_criteria == ("A works", "B works")
+
+
+@pytest.mark.parametrize("normalise", [normalise_path, normalise_guess])
+def test_normalising_a_path_is_idempotent(normalise):
+    for raw in ("./a//b/", "a/*", "a", "a/b.c", "a/[id]/b.tsx", "a/*/b{c}"):
+        assert normalise(normalise(raw)) == normalise(raw)
+
+
+def test_a_changed_file_is_taken_literally_never_as_a_glob():
+    for path in ("src/routes/[slug]/+page.svelte", "pages/[id].vue", "src/a*b.ts", "docs/what?.md", "x/{a,b}.c"):
+        assert normalise_path(path) == path
+
+
+def test_a_bracket_route_file_in_flight_overlaps_its_guess_but_not_its_siblings():
+    busy = path_index(["src/routes/[slug]/+page.svelte"])
+    assert overlaps(["src/routes/[slug]/+page.svelte"], busy) and overlaps(["src/routes"], busy)
+    assert not overlaps(["src/routes/about/+page.svelte"], busy)
+
+
+def test_a_recorded_claim_naming_the_issue_itself_is_dropped():
+    claim = {**OK, "blocked_by": 3, "blocked_by_reason": "Needs itself", "duplicate_of": 3, "duplicate_reason": "Same"}
+    steward = steward_from_record(claim, 3)
+    assert steward is not None and steward.blocked_by is None and steward.duplicate_of is None
+    assert steward.acceptance_criteria == ("A works", "B works")
+    assert steward_from_record(claim, 4) == Steward(
+        ("A works", "B works"), duplicate_of=3, duplicate_reason="Same", blocked_by=3, blocked_by_reason="Needs itself")
+
+
+@pytest.mark.parametrize(
+    ("issue", "blocker", "open_", "its_blockers", "refused"),
+    [
+        (3, 4, True, (), ""),
+        (3, 4, True, (9, 10), ""),
+        (3, 3, True, (), "an issue cannot block itself"),
+        (3, 4, False, (), "#4 is closed"),
+        (3, 4, True, (9, 3), "#4 is itself blocked by this issue, so linking would make a cycle"),
+    ],
+)
+def test_link_refusal_rechecks_the_claim_on_fresh_reads(issue, blocker, open_, its_blockers, refused):
+    assert link_refusal(issue, blocker, open_, its_blockers) == refused
+
+
+def test_a_blocker_and_its_reason_come_together():
+    assert Steward(blocked_by=4, blocked_by_reason="why").blocked_by == 4
+    for blocked_by, reason in ((4, ""), (None, "why"), (0, "why"), (True, "why")):
+        with pytest.raises(ValueError):
+            Steward(blocked_by=blocked_by, blocked_by_reason=reason)

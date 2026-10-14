@@ -296,7 +296,7 @@ export interface components {
              * Activity
              * @enum {string}
              */
-            activity: "agent" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "triage_note" | "release";
+            activity: "agent" | "ci" | "ci_queued" | "merge" | "update" | "open_pr" | "triage_note" | "blocker_link" | "release";
             /**
              * Group
              * @enum {string}

@@ -272,6 +272,14 @@ def test_get_issue_parses_response():
     assert iss.number == 5 and iss.has(Label.AI_READY)
 
 
+def test_the_issue_index_carries_only_harness_labels_and_tolerates_a_missing_list():
+    rows = [{"number": 2, "state": "OPEN", "title": "Epic", "labels": [{"name": "epic"}, {"name": "ai-ready"}]},
+            {"number": 3, "state": "CLOSED", "title": "Old"}, {"number": 4, "state": "OPEN", "labels": "junk"}]
+    index = GitHubGateway("o/r", runner=FakeRunner({"issue list": rows})).issue_index()
+    assert index == ((2, "open", "Epic", frozenset({Label.AI_READY})), (3, "closed", "Old", frozenset()),
+                     (4, "open", "", frozenset()))
+
+
 # ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
 def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
     fr = FakeRunner(

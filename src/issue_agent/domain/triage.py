@@ -1,6 +1,8 @@
 """The TRIAGE and STEWARD acts' results. Pure.
 
-STEWARD writes testable acceptance criteria and flags a suspected duplicate;
+STEWARD writes testable acceptance criteria, flags a suspected duplicate,
+proposes a genuine dependency ("blocked by") and guesses the paths the fix
+touches;
 TRIAGE grades the difficulty tier that routes the issue (owner, 2026-10-14:
 one act each, on its own model). Before the split one TRIAGE result carried
 all of it, and such legacy records still read back: `steward_from_record`
@@ -13,7 +15,10 @@ accounting runtime applies to the leg's output before recording it in the
 leg's `result_json`. The one cross-reference, `duplicate_of`, is laundered
 against the issue numbers the harness itself offered the leg: the schema the
 harness writes enumerates them (read from GitHub at dispatch), so a number
-outside that list is dropped, not trusted. Anything malformed or oversized
+outside that list is dropped, not trusted. `blocked_by` is laundered the same
+way against the open issues offered, and `link_refusal` rechecks it on fresh
+reads before the harness writes the link. `touches` only orders dispatch, so a
+malformed list drops to none rather than failing the result. Anything malformed or oversized
 parses to None, which readers treat as no data: the issue runs at the default
 tier, with no criteria, no duplicate stop and no comment line for it.
 
@@ -33,6 +38,8 @@ MAX_CRITERION = 500
 MAX_REASON = 500
 MAX_RATIONALE = 2000
 MAX_OFFERED = 300
+MAX_TOUCHES = 30
+MAX_TOUCH = 200
 _MAX_ISSUE = 2_147_483_647
 
 
@@ -58,14 +65,27 @@ class Steward:
     acceptance_criteria: tuple[str, ...] = ()
     duplicate_of: int | None = None
     duplicate_reason: str = ""
+    # An open issue this one cannot be correctly done before (never mere overlap).
+    blocked_by: int | None = None
+    blocked_by_reason: str = ""
+    # Repo paths (files or directories) the fix is expected to change: a guess.
+    touches: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.duplicate_of is not None and (type(self.duplicate_of) is not int or self.duplicate_of <= 0):
-            raise ValueError("duplicate_of is a positive issue number or None")
+        for name in ("duplicate_of", "blocked_by"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} is a positive issue number or None")
+        if (self.blocked_by is None) != (not self.blocked_by_reason):
+            raise ValueError("a blocker is carried exactly with its reason")
+        if not isinstance(self.touches, tuple) or any(not isinstance(t, str) or not t for t in self.touches):
+            raise ValueError("touches is a tuple of paths")
 
     def record(self) -> dict[str, object]:
         return {"acceptance_criteria": list(self.acceptance_criteria),
-                "duplicate_of": self.duplicate_of, "duplicate_reason": self.duplicate_reason}
+                "duplicate_of": self.duplicate_of, "duplicate_reason": self.duplicate_reason,
+                "blocked_by": self.blocked_by, "blocked_by_reason": self.blocked_by_reason,
+                "touches": list(self.touches)}
 
 
 def _text(raw: object, limit: int) -> str | None:
@@ -91,7 +111,56 @@ def parse_triage(raw: object) -> Triage | None:
     return Triage(tier, rationale) if tier is not None and rationale is not None else None
 
 
-def _steward(raw: object, allowed: Callable[[int], bool], criteria_wanted: bool) -> Steward | None:
+def parse_touches(raw: object) -> tuple[str, ...]:
+    """The steward's path guesses, normalised (`normalise_guess`), at most
+    MAX_TOUCHES of them; anything but a list is none. A guess that is not a
+    bounded string, or normalises to nothing (the repo root, `..`), is dropped:
+    the latter would overlap everything."""
+    if not isinstance(raw, list):
+        return ()
+    paths = (normalise_guess(item) for item in raw if isinstance(item, str) and len(item) <= MAX_TOUCH)
+    return tuple(dict.fromkeys(p for p in paths if p))[:MAX_TOUCHES]
+
+
+def normalise_guess(raw: str) -> str:
+    """A steward path guess as a path: a glob (`*`, `?`, `{`) is cut back to the
+    whole directory before it (`src/Button*.tsx` is `src`). Brackets stay
+    literal: `app/[id]/page.tsx` is a real route path far more often than a glob."""
+    path = raw.strip()
+    glob = min((i for i in (path.find(c) for c in "*?{") if i >= 0), default=-1)
+    return normalise_path(path[: max(path.rfind("/", 0, glob), 0)] if glob >= 0 else path)
+
+
+def normalise_path(raw: str) -> str:
+    """A repo-relative path, taken literally, for prefix matching: no
+    surrounding blanks or slashes and no `./`. A path leaving the repo (`..`)
+    or holding a control character is "" (none). GitHub's changed files go
+    through this alone: `src/routes/[slug]/+page.svelte` is a file."""
+    path = raw.strip()
+    parts = [part for part in path.replace("\\", "/").split("/") if part not in ("", ".")]
+    if not parts or ".." in parts or any(not part.isprintable() for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def _issue_claim(raw: Mapping, key: str, why_key: str, allowed: Callable[[int], bool]) -> tuple[int | None, str] | None:
+    """A cross-reference claim (`duplicate_of`, `blocked_by`) with its one-line
+    reason: kept only with a known target and a bounded, stated reason. A reason
+    that is not text makes the whole result malformed (None); an unknown target
+    or an oversized reason (a model explaining why there is none) drops only the claim."""
+    raw_reason = raw.get(why_key) or ""
+    if not isinstance(raw_reason, str):
+        return None
+    reason = _text(raw_reason, MAX_REASON) or ""
+    target = raw.get(key)
+    if isinstance(target, int) and not isinstance(target, bool) and 0 < target <= _MAX_ISSUE and allowed(target) and reason:
+        return target, reason
+    return None, ""
+
+
+def _steward(
+    raw: object, allowed: Callable[[int], bool], criteria_wanted: bool, blockable: Callable[[int], bool],
+) -> Steward | None:
     if not isinstance(raw, Mapping):
         return None
     # The list is required whenever the schema asked for it, and in every
@@ -103,31 +172,38 @@ def _steward(raw: object, allowed: Callable[[int], bool], criteria_wanted: bool)
     criteria = tuple(_text(item, MAX_CRITERION) for item in criteria_raw)
     if any(item is None for item in criteria):
         return None
-    reason = _text(raw.get("duplicate_reason") or "", MAX_REASON)
-    if reason is None:
+    # A claim needs a known target and a stated reason; failing either drops
+    # only the claim, toward no stop and no link.
+    dup = _issue_claim(raw, "duplicate_of", "duplicate_reason", allowed)
+    block = _issue_claim(raw, "blocked_by", "blocked_by_reason", blockable)
+    if dup is None or block is None:
         return None
-    dup = raw.get("duplicate_of")
-    # A suspected duplicate needs a known target and a stated reason; failing
-    # either drops only the claim, toward no stop.
-    valid_dup = type(dup) is int and 0 < dup <= _MAX_ISSUE and allowed(dup) and bool(reason)
     kept = tuple(c for c in criteria if c) if criteria_wanted else ()
-    return Steward(kept, dup if valid_dup else None, reason if valid_dup else "")  # type: ignore[arg-type]
+    return Steward(kept, dup[0], dup[1], block[0], block[1], parse_touches(raw.get("touches")))
 
 
-def parse_steward(raw: object, offered: Iterable[int], issue: int, criteria_wanted: bool = True) -> Steward | None:
+def parse_steward(
+    raw: object, offered: Iterable[int], issue: int, criteria_wanted: bool = True, blockable: Iterable[int] = (),
+) -> Steward | None:
     """The agent's output for issue `issue` as a Steward, or None if malformed.
-    `duplicate_of` survives only if it is one of `offered` and not `issue`;
+    `duplicate_of` survives only if it is one of `offered`, `blocked_by` only if
+    one of `blockable` (the open issues offered), and neither if it is `issue`;
     criteria survive only if the harness asked for them (`criteria_wanted`)."""
     numbers = frozenset(n for n in offered if type(n) is int and n != issue)
-    return _steward(raw, numbers.__contains__, criteria_wanted)
+    blockers = frozenset(n for n in blockable if type(n) is int and n != issue)
+    return _steward(raw, numbers.__contains__, criteria_wanted, blockers.__contains__)
 
 
-def steward_from_record(raw: object) -> Steward | None:
-    """A recorded (already laundered) steward result. A legacy combined
-    TRIAGE record has the same keys, so it reads as one; a tier-only record
-    (post-split TRIAGE) lacks the criteria list and reads as None. Records
-    always carry the list (`Steward.record`), even when empty."""
-    return _steward(raw, lambda _n: True, True)
+def steward_from_record(raw: object, issue: int | None = None) -> Steward | None:
+    """A recorded (already laundered) steward result for `issue`. A legacy
+    combined TRIAGE record has the same keys, so it reads as one; a tier-only
+    record (post-split TRIAGE) lacks the criteria list and reads as None.
+    Records always carry the list (`Steward.record`), even when empty. A claim
+    naming the issue itself (a corrupt record: the write-time parse forbids
+    it) is dropped, never acted on."""
+    def other(n: int) -> bool:
+        return n != issue
+    return _steward(raw, other, True, other)
 
 
 def triage_schema() -> dict:
@@ -143,22 +219,30 @@ def triage_schema() -> dict:
     }
 
 
-def steward_schema(offered: Iterable[int], criteria_wanted: bool = True) -> dict:
+def _enum(numbers: Iterable[int]) -> dict:
+    listed = sorted({n for n in numbers if type(n) is int and 0 < n <= _MAX_ISSUE})[:MAX_OFFERED]
+    return {"type": ["integer", "null"], "enum": [*listed, None]} if listed else {"type": "null"}
+
+
+def steward_schema(offered: Iterable[int], criteria_wanted: bool = True, blockable: Iterable[int] = ()) -> dict:
     """STEWARD's output contract. `duplicate_of` enumerates the issues the
-    harness offered (the laundering list `offered_duplicates` reads back). An
+    harness offered and `blocked_by` the open ones among them (the laundering
+    lists `offered_duplicates` / `offered_blockers` read back). An
     issue that states its own acceptance criteria gets none: its section stays
     the contract (`criteria_wanted` reads that back). The `acceptance_criteria`
     property is omitted then."""
-    numbers = sorted({n for n in offered if type(n) is int and 0 < n <= _MAX_ISSUE})[:MAX_OFFERED]
-    dup: dict = {"type": ["integer", "null"], "enum": [*numbers, None]} if numbers else {"type": "null"}
     return {
         "type": "object",
         "properties": {
             **({"acceptance_criteria": {"type": "array", "items": {"type": "string"}}} if criteria_wanted else {}),
-            "duplicate_of": dup,
+            "duplicate_of": _enum(offered),
             "duplicate_reason": {"type": "string"},
+            "blocked_by": _enum(blockable),
+            "blocked_by_reason": {"type": "string"},
+            "touches": {"type": "array", "items": {"type": "string"}},
         },
-        "required": [*(["acceptance_criteria"] if criteria_wanted else []), "duplicate_of", "duplicate_reason"],
+        "required": [*(["acceptance_criteria"] if criteria_wanted else []), "duplicate_of", "duplicate_reason",
+                     "blocked_by", "blocked_by_reason", "touches"],
         "additionalProperties": False,
     }
 
@@ -171,10 +255,9 @@ def criteria_wanted(schema: object) -> bool:
         return True
 
 
-def offered_duplicates(schema: object) -> frozenset[int]:
-    """The issue numbers a `steward_schema` offered; empty for anything else."""
+def _offered(schema: object, key: str) -> frozenset[int]:
     try:
-        values = schema["properties"]["duplicate_of"].get("enum", ())  # type: ignore[index]
+        values = schema["properties"][key].get("enum", ())  # type: ignore[index]
     except (KeyError, TypeError, AttributeError):
         return frozenset()
     if not isinstance(values, list):
@@ -182,5 +265,30 @@ def offered_duplicates(schema: object) -> frozenset[int]:
     return frozenset(n for n in values if type(n) is int and n > 0)
 
 
-__all__ = ["Steward", "Triage", "criteria_wanted", "offered_duplicates", "parse_steward", "parse_triage",
-           "steward_from_record", "steward_schema", "triage_schema"]
+def offered_duplicates(schema: object) -> frozenset[int]:
+    """The issue numbers a `steward_schema` offered; empty for anything else."""
+    return _offered(schema, "duplicate_of")
+
+
+def offered_blockers(schema: object) -> frozenset[int]:
+    """The open issue numbers a `steward_schema` offered as blockers; empty for anything else."""
+    return _offered(schema, "blocked_by")
+
+
+def link_refusal(issue: int, blocker: int, blocker_open: bool, blocker_blocked_by: Iterable[int]) -> str:
+    """Why the harness must not write "#`issue` blocked by #`blocker`", judged on
+    fresh reads at write time ("" when it may): the claim was laundered at
+    dispatch, but the blocker may have closed since, and a blocker that is
+    itself blocked by this issue would make a cycle neither can leave."""
+    if blocker == issue:
+        return "an issue cannot block itself"
+    if not blocker_open:
+        return f"#{blocker} is closed"
+    if issue in blocker_blocked_by:
+        return f"#{blocker} is itself blocked by this issue, so linking would make a cycle"
+    return ""
+
+
+__all__ = ["Steward", "Triage", "criteria_wanted", "link_refusal", "normalise_guess", "normalise_path", "offered_blockers",
+           "offered_duplicates", "parse_steward", "parse_touches", "parse_triage", "steward_from_record",
+           "steward_schema", "triage_schema"]

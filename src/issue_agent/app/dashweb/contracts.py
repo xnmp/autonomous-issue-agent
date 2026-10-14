@@ -229,7 +229,8 @@ class BoardWorking(Contract):
     status: Literal["working"]
     # agent: a running leg; ci: CI and the free GitHub-side actions.
     group: Literal["agent", "ci"]
-    activity: Literal["agent", "ci", "ci_queued", "merge", "update", "open_pr", "triage_note", "release"]
+    activity: Literal["agent", "ci", "ci_queued", "merge", "update", "open_pr", "triage_note", "blocker_link",
+                      "release"]
     act: str | None
     headline: str
     reason: str

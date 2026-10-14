@@ -413,6 +413,36 @@ def _open_blocker(node: object, repository: str) -> BlockerRef | None:
     return ref if node["state"] == "OPEN" else None
 
 
+@dataclass(frozen=True)
+class BlockerLinkFacts:
+    """A fresh read of both ends of a proposed "blocked by" link."""
+
+    issue_id: str
+    blocker_id: str
+    blocker_open: bool
+    linked: bool  # the issue is already blocked by the blocker
+    blocker_blocked_by: tuple[int, ...]  # this repository's open issues blocking the blocker
+
+
+def parse_blocker_link(raw: object, repository: str, blocker: int) -> BlockerLinkFacts:
+    """Both issues of a link read in one query. Unreadable identities, or a
+    blocker whose own blockers cannot all be read (the cycle check would be a
+    guess), raise; act refuses the link then. The issue's own list only says
+    whether the link already exists: a gap there can at worst make
+    addBlockedBy answer an error, which act also refuses."""
+    subject = raw.get("subject") if isinstance(raw, dict) else None
+    target = raw.get("blocker") if isinstance(raw, dict) else None
+    if (not isinstance(subject, dict) or not isinstance(target, dict) or target.get("state") not in ("OPEN", "CLOSED")
+            or not all(isinstance(n.get("id"), str) and n["id"] for n in (subject, target))):
+        raise FixObservationIncomplete("a blocker link's issues are unreadable")
+    mine, _ = parse_blockers(subject.get("blockedBy"), repository)
+    theirs, problem = parse_blockers(target.get("blockedBy"), repository)
+    if problem:
+        raise FixObservationIncomplete(f"#{blocker}'s own blockers are unreadable: {problem}")
+    return BlockerLinkFacts(subject["id"], target["id"], target["state"] == "OPEN", BlockerRef(blocker) in mine,
+                            tuple(b.number for b in theirs if not b.repository))
+
+
 def parse_fix_issue(node: object, comments: list, blocked_by: tuple[BlockerRef, ...] = ()) -> IssueView:
     """One issue node (with its fully paged comments and parsed blockers) → IssueView."""
     if not isinstance(node, dict) or type(node.get("number")) is not int or node["number"] <= 0:
@@ -749,17 +779,32 @@ class GitHubGateway:
                              "— red PR checks are charged to the PR\n")
             return None
 
-    def issue_index(self, limit: int = 300) -> tuple[tuple[int, str, str], ...]:
-        """(number, state, title) of the repository's most recent issues, open
-        and closed: the candidates a TRIAGE leg may name as a duplicate. An
-        unreadable listing raises; the leg then offers none."""
+    def issue_index(self, limit: int = 300) -> tuple[tuple[int, str, str, frozenset[Label]], ...]:
+        """(number, state, title, harness labels) of the repository's most
+        recent issues, open and closed: the candidates a STEWARD leg may name
+        as a duplicate or a blocker. An unreadable listing raises; the leg then
+        offers none."""
         data = self._gh_json(["issue", "list", "--repo", self.repo, "--state", "all", "--json",
-                              "number,state,title", "--limit", str(limit)])
+                              "number,state,title,labels", "--limit", str(limit)])
         if not isinstance(data, list):
             raise FixObservationIncomplete("issue listing is unreadable")
-        return tuple((row["number"], str(row.get("state") or "").lower(), str(row.get("title") or ""))
+        return tuple((row["number"], str(row.get("state") or "").lower(), str(row.get("title") or ""),
+                      _labels(row.get("labels") if isinstance(row.get("labels"), list) else None))
                      for row in data if isinstance(row, dict) and type(row.get("number")) is int
                      and row["number"] > 0)
+
+    def blocker_link(self, issue: int, blocker: int) -> BlockerLinkFacts:
+        """Both ends of a proposed "#issue blocked by #blocker" link, fresh."""
+        if type(issue) is not int or type(blocker) is not int or issue <= 0 or blocker <= 0:
+            raise ValueError("a blocker link joins two issue numbers")
+        fields = "id state " + _BLOCKED_BY
+        page = self._repository_page(f"subject:issue(number:{issue}){{{fields}}} blocker:issue(number:{blocker}){{{fields}}}")
+        return parse_blocker_link(page, self.repo, blocker)
+
+    def add_blocked_by(self, issue_id: str, blocker_id: str) -> None:
+        """GitHub's addBlockedBy; the caller reads the link back."""
+        self._graphql("mutation($issue:ID!,$blocker:ID!){addBlockedBy(input:{issueId:$issue,blockingIssueId:$blocker})"
+                      "{issue{number}}}", issue=issue_id, blocker=blocker_id)
 
     def pull_request_for_branch(self, branch: str) -> int | None:
         """The open PR whose head is `branch` in this repository. A closed one

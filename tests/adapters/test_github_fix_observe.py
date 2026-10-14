@@ -15,6 +15,8 @@ from issue_agent.adapters.github import (
     parse_fix_issue,
     parse_fix_pr,
     parse_fix_refs,
+    BlockerLinkFacts,
+    parse_blocker_link,
     parse_blockers,
     parse_merged_harness_prs,
 )
@@ -645,3 +647,57 @@ def test_any_other_graphql_error_still_fails_the_read():
         answers = [json.dumps({"data": {"repository": repository}, "errors": errors})]
         with pytest.raises(FixObservationIncomplete):
             GitHubGateway("o/r", runner=lambda argv, _t: answers.pop(0)).build_world("dev")
+
+
+# ── writing a steward's "blocked by" link ────────────────────────────────────
+
+
+def link_page(*, subject_blockers=(), blocker_state="OPEN", blocker_blockers=()) -> dict:
+    return {"subject": {"id": "I5", "state": "OPEN", "blockedBy": blocked_by(*subject_blockers)},
+            "blocker": {"id": "I4", "state": blocker_state, "blockedBy": blocked_by(*blocker_blockers)}}
+
+
+def test_a_link_read_reports_both_ends_with_only_this_repositorys_open_blockers_of_the_blocker():
+    page = link_page(subject_blockers=(blocker(4),),
+                     blocker_blockers=(blocker(5), blocker(7, "CLOSED"), blocker(5, repo="x/y")))
+    assert parse_blocker_link(page, "o/r", 4) == BlockerLinkFacts("I5", "I4", True, True, (5,))
+    assert parse_blocker_link(link_page(blocker_state="CLOSED"), "o/r", 4).blocker_open is False
+
+
+@pytest.mark.parametrize(
+    "page",
+    [None, {}, {"subject": None, "blocker": {}}, {**link_page(), "blocker": {"id": "I4", "state": "GONE"}},
+     {**link_page(), "subject": {"id": "", "blockedBy": blocked_by()}},
+     {**link_page(), "blocker": {"id": "I4", "state": "OPEN", "blockedBy": None}},
+     {**link_page(), "blocker": {"id": "I4", "state": "OPEN", "blockedBy": blocked_by(None, blocker(9))}},
+     {**link_page(), "blocker": {"id": "I4", "state": "OPEN", "blockedBy": blocked_by(total=3)}}],
+)
+def test_an_unreadable_link_read_raises_so_nothing_is_written_on_a_guess(page):
+    with pytest.raises(FixObservationIncomplete):
+        parse_blocker_link(page, "o/r", 4)
+
+
+def test_gaps_in_the_issues_own_blockers_do_not_stop_the_link_read():
+    page = {**link_page(), "subject": {"id": "I5", "blockedBy": blocked_by(None, blocker(4), total=9)}}
+    assert parse_blocker_link(page, "o/r", 4).linked is True
+
+
+def test_the_link_is_read_in_one_query_and_written_with_add_blocked_by():
+    calls = []
+
+    def runner(argv, _token):
+        calls.append(argv)
+        query = next(a for a in argv if a.startswith("query="))
+        if query.startswith("query=mutation"):
+            return json.dumps({"data": {"addBlockedBy": {"issue": {"number": 5}}}})
+        return json.dumps({"data": {"repository": link_page()}})
+
+    gateway = GitHubGateway("o/r", runner=runner)
+    assert gateway.blocker_link(5, 4).linked is False
+    gateway.add_blocked_by("I5", "I4")
+    read, write = (next(a for a in argv if a.startswith("query=")) for argv in calls)
+    assert "subject:issue(number:5)" in read and "blocker:issue(number:4)" in read
+    assert "addBlockedBy(input:{issueId:$issue,blockingIssueId:$blocker})" in write
+    assert "issue=I5" in calls[1] and "blocker=I4" in calls[1]
+    with pytest.raises(ValueError):
+        gateway.blocker_link(5, True)

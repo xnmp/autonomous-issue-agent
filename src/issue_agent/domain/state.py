@@ -33,8 +33,11 @@ Precedence, the single place it is defined (first match wins, per item):
 6a. Stewardship an issue with no agent-ended STEWARD leg (a legacy combined
                TRIAGE result counts as one) -> STEWARD (gated as in step 8).
                Stewarded: a laundered `duplicate_of` with no released
-               duplicate stop -> NeedsHuman(DUPLICATE). Then no agent-ended
-               TRIAGE leg -> TRIAGE (gated likewise); then no harness triage
+               duplicate stop -> NeedsHuman(DUPLICATE). Then a laundered
+               `blocked_by` and no harness blocker comment yet -> LinkBlocker
+               (free; the comment, written after the link or its refusal,
+               ends it, so a link a human deletes stays deleted). Then no
+               agent-ended TRIAGE leg -> TRIAGE (gated likewise); then no harness triage
                comment yet -> TriageNote (free; tier, rationale and criteria
                in the one comment); else step 7.
 7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
@@ -108,6 +111,8 @@ _STANDING = frozenset({REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, "DISMISSED"})
 _STOP_TAG_RE = re.compile(r"<!-- needs-human:([a-z-]+) -->")
 # Carried by the harness's one triage comment per issue; derive reads it back.
 TRIAGE_TAG = "<!-- issue-agent:triage -->"
+# Carried by the harness's one comment about a steward's "blocked by" claim.
+BLOCKER_TAG = "<!-- issue-agent:blocked-by -->"
 
 
 @dataclass(frozen=True)
@@ -287,6 +292,21 @@ class TriageNote:
 
 
 @dataclass(frozen=True)
+class LinkBlocker:
+    """A steward named an open issue this one cannot be done before: link it
+    on GitHub (free). `anchor` is the steward leg's end, keying the write."""
+
+    blocker: int
+    reason: str
+    anchor: str
+
+    def __post_init__(self) -> None:
+        if (type(self.blocker) is not int or self.blocker <= 0 or not isinstance(self.reason, str) or not self.reason
+                or not isinstance(self.anchor, str) or not self.anchor):
+            raise ValueError("a blocker link requires the blocker, the reason and an anchor")
+
+
+@dataclass(frozen=True)
 class Release:
     """A qualifying reply released the stop: remove `needs-human`. The item
     proceeds next tick, with its counts reset past the released stop comment."""
@@ -349,7 +369,8 @@ class Backoff:
             raise ValueError("backoff requires a dispatchable act and an aware time")
 
 
-DerivedState = Dispatch | Merge | Refresh | OpenPR | TriageNote | Release | Wait | NeedsHuman | Busy | Backoff
+DerivedState = (Dispatch | Merge | Refresh | OpenPR | TriageNote | LinkBlocker | Release | Wait | NeedsHuman | Busy
+                | Backoff)
 
 
 @dataclass(frozen=True)
@@ -462,6 +483,8 @@ def _proceed(
             step = Dispatch(AgentKind.STEWARD)
         elif (stop := _duplicate_stop(steward, stops, anchor)) is not None:
             return stop
+        elif (link := _blocker_link(steward, item.issue, item.comments, harness)) is not None:
+            return link
         elif triage is None:
             step = Dispatch(AgentKind.TRIAGE)
         else:
@@ -537,6 +560,17 @@ def _duplicate_stop(leg: LegEnd, stops: list[tuple[datetime, str]], anchor: str)
     if steward is None or steward.duplicate_of is None or any(code == StopReason.DUPLICATE.value for _, code in stops):
         return None
     return NeedsHuman(StopReason.DUPLICATE, anchor, duplicate_of=steward.duplicate_of, detail=steward.duplicate_reason)
+
+
+def _blocker_link(leg: LegEnd, issue: int, comments: tuple[Comment, ...], harness: Harness) -> LinkBlocker | None:
+    """The link a steward's dependency claim owes, until the harness has said
+    anything about one on this issue: at most one link per issue, ever. A
+    claim on the issue itself is never one (the record read drops it too)."""
+    steward = leg.steward
+    if steward is None or steward.blocked_by in (None, issue) or any(
+            harness.wrote(c) and BLOCKER_TAG in c.body for c in comments):
+        return None
+    return LinkBlocker(steward.blocked_by, steward.blocked_by_reason, leg.ended_at.isoformat())
 
 
 def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> DerivedState:
@@ -668,6 +702,7 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
 __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
     "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "TriageNote", "TRIAGE_TAG",
+    "BLOCKER_TAG", "LinkBlocker",
     "Release", "Wait", "NeedsHuman",
     "Busy", "Backoff", "DerivedState", "derive", "human_comments", "latest_steward", "touches_github",
 ]

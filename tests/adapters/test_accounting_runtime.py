@@ -559,13 +559,27 @@ def test_a_triage_result_records_the_tier_and_nothing_the_steward_owns(tmp_path)
 def test_a_steward_result_is_recorded_laundered_against_the_issues_the_harness_offered(tmp_path) -> None:
     from issue_agent.domain.triage import steward_schema
 
-    claim = {"acceptance_criteria": ["Esc closes it"], "duplicate_of": 9, "duplicate_reason": "same"}
+    claim = {"acceptance_criteria": ["Esc closes it"], "duplicate_of": 9, "duplicate_reason": "same",
+             "blocked_by": 2, "blocked_by_reason": "needs it", "touches": ["./src/ui/", 7]}
     wrapper, store = _light_wrapper(tmp_path, "STEWARD", AgentResult(False, structured=claim, session_id="s"))
-    _work(wrapper, schema=steward_schema([2, 4]))  # 9 was never offered
+    _work(wrapper, schema=steward_schema([2, 4], blockable=[4]))  # 9 never offered; 2 offered but not open; 7 not a path
     receipt = _receipt(store)
     assert receipt["leg"] == "agent"
     assert receipt["steward"] == {"acceptance_criteria": ["Esc closes it"], "duplicate_of": None,
-                                  "duplicate_reason": ""} and "triage" not in receipt
+                                  "duplicate_reason": "", "blocked_by": None, "blocked_by_reason": "",
+                                  "touches": ["src/ui"]} and "triage" not in receipt
+
+
+def test_a_steward_dependency_on_an_offered_open_issue_is_recorded_with_its_path_guesses(tmp_path) -> None:
+    from issue_agent.domain.triage import steward_schema
+
+    claim = {"acceptance_criteria": [], "duplicate_of": None, "duplicate_reason": "",
+             "blocked_by": 4, "blocked_by_reason": "needs the API #4 adds", "touches": ["./src/ui/", "docs"]}
+    wrapper, store = _light_wrapper(tmp_path, "STEWARD", AgentResult(False, structured=claim, session_id="s"))
+    _work(wrapper, schema=steward_schema([2, 4], blockable=[4]))
+    steward = _receipt(store)["steward"]
+    assert (steward["blocked_by"], steward["blocked_by_reason"], steward["touches"]) == (
+        4, "needs the API #4 adds", ["src/ui", "docs"])
 
 
 def test_steward_criteria_are_dropped_when_the_issue_states_its_own(tmp_path) -> None:

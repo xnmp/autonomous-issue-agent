@@ -59,6 +59,15 @@ def test_a_run_without_an_agent_receipt_is_a_machine_end(receipt):
     assert end is not None and end.machine and end.question is None
 
 
+def test_a_recorded_steward_claim_on_the_issue_itself_is_dropped_and_logged():
+    claim = {"acceptance_criteria": ["A"], "duplicate_of": None, "duplicate_reason": "",
+             "blocked_by": 5, "blocked_by_reason": "Needs #5"}
+    lines: list[str] = []
+    end = leg_end(run("STEWARD", receipt={"leg": "agent", "steward": claim}), lines.append)
+    assert end is not None and end.steward is not None and end.steward.blocked_by is None
+    assert end.steward.acceptance_criteria == ("A",) and len(lines) == 1 and "#5" in lines[0]
+
+
 def test_an_asked_receipt_is_an_agent_end_carrying_its_question():
     end = leg_end(run(receipt={"leg": "asked", "question": "404 or 410?"}))
     assert end is not None and (end.machine, end.question) == (False, "404 or 410?")

@@ -326,6 +326,21 @@ every blocker is closed, whatever the close reason. An issue that already has
 an open harness PR is not held. A `blockedBy` read the harness cannot parse is
 logged and never blocks.
 
+The steward may also propose such a link, but only for a genuine dependency:
+the issue cannot be correctly done until another open issue lands. Overlap is
+not a dependency. The harness treats the proposal as an untrusted claim. The
+target must be an open issue the leg was offered, must not be the issue itself,
+and must not itself be blocked by it (re-read when the link is written). Then
+the harness links it and posts one comment with the reason, or one saying why
+it refused. That comment ends the matter: delete the link on GitHub and the
+harness never re-adds it.
+
+Among ready issues, dispatch prefers the oldest whose steward-guessed paths
+(`touches`, kept in the STEWARD leg's result) overlap no file that an open
+harness PR changes. This changes order only. With every candidate overlapping,
+or no guesses, it is plain FIFO. A paid scheduler leg is the deferred
+alternative (#388).
+
 The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Origin,
 and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
 account; it is not a multi-user authentication service.
