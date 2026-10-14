@@ -159,6 +159,33 @@ def test_a_head_only_a_review_fetched_survives_the_repositorys_gc_once_synced(tm
     git(path, "fsck", "--connectivity-only", "--no-dangling")
 
 
+@pytest.mark.parametrize("planted", ["logs/HEAD", "refs/remotes"])
+def test_sync_never_writes_through_a_link_a_leg_left_in_its_clone(tmp_path, repo, planted):
+    # A reflog append or a ref under a linked directory would land in a host file.
+    worktrees = Worktrees(str(repo))
+    path = worktrees.ensure(703, "fix/703-new")
+    git(path, "push", "-q", "origin", "fix/703-new")
+    victim = tmp_path / "operator-file"
+    victim.mkdir() if planted == "refs/remotes" else victim.write_text("operator\n")
+    link = os.path.join(path, ".git", planted)
+    subprocess.run(["rm", "-rf", link], check=True)
+    os.symlink(victim, link)
+
+    with pytest.raises(WorktreeUnavailable, match="link"):
+        worktrees.sync(703, "fix/703-new", git(path, "rev-parse", "HEAD"))
+
+    assert (list(victim.iterdir()) == [] if victim.is_dir() else victim.read_text() == "operator\n")
+
+
+def test_a_clone_has_the_hooks_directory_a_leg_mounts_even_from_a_bare_template(tmp_path, repo, monkeypatch):
+    (tmp_path / "template").mkdir()
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(tmp_path / "template"))
+
+    path = Worktrees(str(repo)).ensure(703, "fix/703-new")
+
+    assert os.path.isdir(os.path.join(path, ".git/hooks"))
+
+
 def test_remove_deletes_the_clone_and_any_retained_branch(repo):
     worktrees = Worktrees(str(repo))
     path = worktrees.ensure(703, "fix/703-new")

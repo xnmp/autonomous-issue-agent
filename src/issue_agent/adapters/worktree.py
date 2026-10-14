@@ -82,14 +82,9 @@ class WorktreeBranchAmbiguous(RuntimeError):
 
 
 class Worktrees:
-    """Per-issue fix checkouts under `worktree_root`, relative to `repo_dir`.
-
-    Each is a clone of origin (`clone --reference`) that borrows the
-    repository's objects, read-only to its legs, and keeps its refs,
-    packed-refs and new objects private: a host ref pack once hid a running
-    leg's branch (tauri #1106), and a leg could rewrite objects review
-    checkouts read (GIT-OBJECTS). A worktree from before the clones is
-    replaced by a clone of its branch (ADR 0001; drop once none remains)."""
+    """Per-issue fix clones under `worktree_root`, relative to `repo_dir`,
+    borrowing its objects (ADR 0001: tauri #1106, GIT-OBJECTS). A worktree
+    from before the clones becomes a clone of its branch (drop once none is left)."""
 
     def __init__(self, repo_dir: str, worktree_root: str = ".claude/worktrees", base_branch: str = "dev",
                  run: GitRunner = _subprocess_git, path_exists: Callable[[str], bool] = os.path.isdir):
@@ -191,7 +186,8 @@ class Worktrees:
                     and self._git(["checkout", "--quiet", "-b", branch, retained or f"origin/{self.base_branch}"],
                                   scratch).code == 0)
             if made:
-                try:
+                try:  # a leg's launch mounts hooks/, which a bare init.templateDir leaves out
+                    os.makedirs(os.path.join(scratch, ".git", "hooks"), exist_ok=True)
                     os.rename(scratch, abs_path)
                 except OSError:
                     made = False
@@ -217,6 +213,10 @@ class Worktrees:
             observed = self._git(["rev-parse", remote], self.repo_dir)
             if fetched.code != 0 or observed.code != 0 or observed.out.strip() != head:
                 raise WorktreeUnavailable(f"branch {branch!r} is not at the decided head {head[:12]}")
+            # A link a leg left in `.git` would aim these ref and reflog writes at a host file.
+            for root, dirs, files in os.walk(os.path.join(path, ".git")):
+                if any(os.path.islink(os.path.join(root, name)) for name in (*dirs, *files)):
+                    raise WorktreeUnavailable(f"issue #{issue}'s clone holds a link in {root!r}; not writing there")
             # The clone's tracking ref is what `push --force-with-lease` checks.
             for step in (["update-ref", remote, head], ["reset", "--hard", head]):
                 if self._git(step, path).code != 0:

@@ -411,11 +411,14 @@ def test_a_valid_fix_clone_borrows_the_repositorys_objects(host):
     assert git_link(str(host["tmp"]), str(host["target"])) is None
 
 
-@pytest.mark.parametrize("alternates", [None, "/elsewhere/objects", "{objects}\n/elsewhere/objects"])
+@pytest.mark.parametrize("alternates", [None, "fifo", "/elsewhere/objects", "{objects}\n/elsewhere/objects"])
 def test_a_clone_that_borrows_anything_but_the_repositorys_objects_is_refused(host, alternates):
     path = host["worktree"] / ".git/objects/info/alternates"
     if alternates is None:
         path.unlink()
+    elif alternates == "fifo":  # a read would wait forever and wedge the daemon
+        path.unlink()
+        os.mkfifo(path)
     else:
         path.write_text(alternates.format(objects=host["target"] / ".git/objects"))
 

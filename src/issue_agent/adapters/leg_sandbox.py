@@ -42,11 +42,10 @@ _KEY_AUTH = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOK
 
 # Environment git config: never written into the checkout. The empty helper
 # drops any helper /etc/gitconfig names; a publishing leg then answers GitHub
-# from $GH_TOKEN. push.default=current: a fix clone's config is read-only to
-# the leg, so `git push -u` cannot record an upstream. A pruning fetch drops a
-# remote-tracking ref whose branch is gone before the fetch walks it: the
-# clone borrows the repository's objects, and once the repository prunes a
-# merged branch's, that ref would fail every later fetch (probe, 2026-10-15).
+# from $GH_TOKEN. push.default=current: a fix clone's config is read-only, so
+# `push -u` records no upstream. A pruning fetch drops a tracking ref whose
+# branch is gone before walking it: once the repository prunes a merged
+# branch's borrowed objects, that ref would fail every fetch (probe, 2026-10-15).
 _GIT_CONFIG = (("credential.helper", ""), ("fetch.prune", "true"))
 _PUBLISH_GIT_CONFIG = (
     ("credential.https://github.com.helper",
@@ -70,7 +69,10 @@ class Launch:
 
 
 def _read_small(path: str) -> str:
-    with open(path, encoding="utf-8", errors="replace") as stream:
+    """Never waits: a leg can plant a FIFO where a clone's alternates live."""
+    with open(os.open(path, os.O_RDONLY | os.O_NONBLOCK), encoding="utf-8", errors="replace") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError(f"{path} is not a plain file")
         return stream.read(_GITFILE_LIMIT).strip()
 
 
