@@ -648,7 +648,9 @@ def _supervised_cli_runner(tmp_path, monkeypatch, sandbox):
     sandbox.launcher = str(launcher)
     monkeypatch.setenv("CLAUDE_BIN", str(cli))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(sys.modules["claude_agent_sdk"], "__file__", str(tmp_path / "sdk" / "__init__.py"),
+    # Imported here: the runner imports the SDK lazily, so a test run alone
+    # would find no module to patch.
+    monkeypatch.setattr(pytest.importorskip("claude_agent_sdk"), "__file__", str(tmp_path / "sdk" / "__init__.py"),
                         raising=False)
     return AgentRunner(process_supervisor=ProcessSupervisor(str(tmp_path / "sup")), leg_sandbox=sandbox), cli
 
