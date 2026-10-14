@@ -26,12 +26,13 @@ from typing import Any
 from .child_env import CHILD_ENV_MANIFEST
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
-from ..domain.pricing import CLAUDE_ALIASES, RateTable
+from ..domain.pricing import RateTable, claude_model
 from ..domain.run_usage import (
     EstimatedRunUsage,
     MeasuredRunUsage,
     ModelUsage,
     RunUsage,
+    bounded_by_rates,
     price_run_usage,
     reserved_maximum_usage,
 )
@@ -241,7 +242,7 @@ def claude_leg_usage(msg: Any, *, session_id: str, main_model: str, resumed: boo
         elif own_raw is not None:
             own = ModelUsage(session, main, _tokens(own_raw, _USAGE_KEYS))
             others = tuple(s for s in cumulative if s.model.casefold() not in
-                           {main.casefold(), dict(CLAUDE_ALIASES).get(main.casefold(), main).casefold()})
+                           {main.casefold(), claude_model(main).casefold()})
             priced = (own, *others)
             gap = ("upper bound: the main loop's own usage plus other models' session-cumulative usage" if resumed
                    else "the result reported no per-model usage; priced its main loop only")
@@ -445,17 +446,24 @@ class AgentRunner(AgentRuntime):
         self._log(f"sdk: WALL — {elapsed:.0f}s exceeded max {self._max_runtime:.0f}s, but a ResultMessage was "
                   "already captured; honouring it")
 
-    def _priced(self, task: RuntimePlan, result: AgentResult, final: Any, delegated: bool) -> AgentResult:
+    def _priced(self, task: RuntimePlan, result: AgentResult, final: Any, delegated: bool,
+                exited: bool) -> AgentResult:
         """The leg's usage and its price at the harness rates, the one
         settlement path Codex legs share."""
-        observed, cumulative = claude_leg_usage(
+        maximum = Money.from_major("USD", task.max_budget_usd)
+        bound, cumulative = claude_leg_usage(
             final, session_id=result.session_id, main_model=result.model or task.model or "",
-            resumed=bool(task.resume), delegated=delegated, maximum=Money.from_major("USD", task.max_budget_usd),
-            rates=self._rate_table)
+            resumed=bool(task.resume), delegated=delegated, maximum=maximum, rates=self._rate_table)
+        observed = bounded_by_rates(bound, self._rate_table, maximum)
+        # The CLI persists its cumulative counters for the next resume only on
+        # its own exit; one torn down after its result may restore stale ones,
+        # so its snapshot is no baseline and its next leg prices from an
+        # earlier one, erring high.
+        cumulative = cumulative if exited else ()
         amount = price_run_usage(observed, self._rate_table)
         # A resumed leg's bound is replaced by its exact delta when accounting
         # holds the session's previous snapshot; it logs only if not.
-        if isinstance(observed, EstimatedRunUsage) and not (task.resume and cumulative):
+        if isinstance(observed, EstimatedRunUsage) and (observed is not bound or not (task.resume and cumulative)):
             self._log(f"sdk: PRICING — {observed.detail}")
         # A resumed session's CLI figure is session-cumulative: nothing to compare.
         elif not task.resume and cli_overstates(amount, result.cost_usd):
@@ -501,6 +509,7 @@ class AgentRunner(AgentRuntime):
         live_children: set[str] = set()
         children_at_result: frozenset[str] = frozenset()
         delegated = False  # whether this leg started any subagent (resumed-leg pricing)
+        exited = True  # False once the harness tears the CLI down after its result
 
         def with_stream_identity(result: AgentResult) -> AgentResult:
             # The init model and session are the only attribution and resume
@@ -525,6 +534,7 @@ class AgentRunner(AgentRuntime):
                         if final is None:
                             return with_stream_identity(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
                         self._honour_captured(elapsed)
+                        exited = False
                         break
                 message: Any = _NO_MESSAGE
                 stream_ended = False
@@ -555,7 +565,7 @@ class AgentRunner(AgentRuntime):
                                     is_error=True, status="timeout", exit_reason=ExitReason.IDLE_TIMEOUT,
                                     summary=f"agent idle >{self._idle_timeout:.0f}s (no stream event)",
                                     usage=usage_acc, stream_usage=usage_acc))
-                            stream_ended = True
+                            stream_ended, exited = True, False
                             break
                         elapsed = now - started_at
                         if self._max_runtime is not None and elapsed >= self._max_runtime:
@@ -564,7 +574,7 @@ class AgentRunner(AgentRuntime):
                             if final is None:
                                 return with_stream_identity(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
                             self._honour_captured(elapsed)
-                            stream_ended = True
+                            stream_ended, exited = True, False
                             break
                     if stream_ended:
                         break
@@ -646,7 +656,7 @@ class AgentRunner(AgentRuntime):
             return with_stream_identity(AgentResult(is_error=True, summary="no ResultMessage from query()",
                                                    exit_reason=ExitReason.NO_RESULT, usage=usage_acc,
                                                    stream_usage=usage_acc))
-        result = self._priced(task, with_stream_identity(result_to_agent_result(final)), final, delegated)
+        result = self._priced(task, with_stream_identity(result_to_agent_result(final)), final, delegated, exited)
         reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
             self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "

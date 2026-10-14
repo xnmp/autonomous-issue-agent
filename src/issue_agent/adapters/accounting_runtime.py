@@ -34,7 +34,7 @@ from ..domain.policy import question_text
 from ..domain.review import parse_verdict
 from ..domain.triage import criteria_wanted, offered_blockers, offered_duplicates, parse_steward, parse_triage
 from ..domain.ports import StaleReservationReconciler
-from ..domain.pricing import CLAUDE_ALIASES, BudgetPolicy, RateTable, price
+from ..domain.pricing import BudgetPolicy, RateTable, claude_model, price
 from ..domain.run_usage import (
     EstimatedRunUsage,
     MeasuredRunUsage,
@@ -321,15 +321,16 @@ class AccountingRuntime(AgentRuntime):
             # delta means the CLI restored stale counters.
             own = _token_usage(result.usage, self.runtime_name)
             main = result.model or task.model or ""
-            floor = (ModelUsage(session, dict(CLAUDE_ALIASES).get(main.casefold(), main), own),) if own and main else ()
-            delta = usage_since(result.session_usage, previous, floor) if previous is not None else None
+            floor = (ModelUsage(session, claude_model(main), own),) if own and main else ()
+            delta = usage_since(result.session_usage, previous, floor) if previous is not None and floor else None
             reason = ("no usage snapshot from the session's previous leg" if previous is None
+                      else "the leg reported no usage of its own to check the delta against" if not floor
                       else "the session's usage counters were reset")
             if delta is not None:
                 samples = delta or (ModelUsage(session, main or "<runtime-default>", TokenUsage(0, 0)),)
                 rates = result.run_usage.rates if result.run_usage is not None else None
                 return replace(result, run_usage=MeasuredRunUsage(samples, rates or self.rate_table))
-        except (sqlite3.Error, ValueError, TypeError, ArithmeticError) as exc:
+        except (sqlite3.Error, RuntimeError, ValueError, TypeError, ArithmeticError) as exc:
             reason = f"the session's usage delta is unavailable ({type(exc).__name__})"
         bound = result.run_usage
         if not isinstance(bound, EstimatedRunUsage):

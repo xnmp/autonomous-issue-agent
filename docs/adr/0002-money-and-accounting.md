@@ -77,13 +77,18 @@ session's latest ended leg that recorded one (matched on the session it ran,
 resumable or not), exact for subagents too. With no such snapshot, or counters
 that were reset (one went backwards, a model vanished, or the main model's
 delta is below the leg's own `usage`, as when the CLI restores stale counters
-from its transcript), or an unreadable baseline, it settles an upper bound as
-an estimate with the reason in its gap: its own `usage` at the main model plus
+from its transcript), with no top-level `usage` to check the delta against, or
+with an unreadable baseline, it settles an upper bound as an estimate with the
+reason in its gap: its own `usage` at the main model plus
 the other models' session-cumulative usage, or all of the session-cumulative
 usage when it started a subagent (which may run on the main model). It errs
-high, never low. A leg interrupted before its result records no snapshot, so
-the next leg's delta also covers the interrupted leg's tokens, already charged
-from its stream: an accepted overcharge bounded by that leg's spend.
+high, never low. The CLI persists its counters for the next resume on its own
+exit, so a leg the harness tears down after its result (the wall or idle cap)
+records no snapshot and settles its own bound. A leg interrupted before its
+result, or settled at the reserved maximum for malformed counters, records none
+either. In each case the next leg's delta, taken from the earlier snapshot, also
+covers the unrecorded leg's tokens: an accepted overcharge bounded by that
+leg's spend.
 Per-message stream counts stay an interrupted leg's estimate only: their
 output counts are placeholders. Missing Claude accounting nevertheless settles
 and releases capacity.

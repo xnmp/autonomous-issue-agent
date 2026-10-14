@@ -51,6 +51,11 @@ CLAUDE_ALIASES: tuple[tuple[str, str], ...] = (
 CLAUDE_CACHE_WRITE_MULTIPLIER = 2.0
 
 
+def claude_model(name: str) -> str:
+    """The concrete model a CLI alias names, else the name itself."""
+    return dict(CLAUDE_ALIASES).get(name.strip().casefold(), name.strip())
+
+
 def with_default_model_rates(
     configured: tuple[tuple[str, float, float], ...],
 ) -> tuple[tuple[str, float, float], ...]:

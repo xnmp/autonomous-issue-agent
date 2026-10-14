@@ -135,6 +135,15 @@ def test_a_malformed_top_level_usage_a_fresh_leg_does_not_price_from_is_ignored(
     assert fresh.cost_usd == _SONNET_MICROS / 1e6
 
 
+def test_tokens_from_an_unrated_model_log_the_reserved_maximum_not_a_cross_check(monkeypatch):
+    result, lines = _leg(monkeypatch, _ResultMessage({SONNET: _FRESH[SONNET], "claude-haiku-6": _model(1, 1, 1, 1)},
+                                                     total_cost_usd=6.89))
+
+    assert result.cost_usd == 10.0
+    assert any("PRICING" in line and "no harness rate for claude-haiku-6" in line for line in lines)
+    assert not any("CROSS-CHECK" in line for line in lines)
+
+
 def test_a_model_entry_with_no_tokens_needs_no_rate(monkeypatch):
     result, lines = _leg(monkeypatch, _ResultMessage({SONNET: _FRESH[SONNET], "<synthetic>": _model(0, 0, 0, 0)}))
 
@@ -308,9 +317,16 @@ _R7_OWN_MICROS = 24_397
 
 def _session(tmp_path, monkeypatch, repository="o/r"):
     """Run legs of one session through accounting over a real AgentRunner."""
-    wrapper, store = _accounting(tmp_path, AgentRunner(rate_table=CLAUDE), repository)
+    runners: list[AgentRunner] = []
 
-    def leg(*messages, resume="s1"):
+    class Inner:
+        async def run(self, task):
+            return await runners[-1].run(task)
+
+    wrapper, store = _accounting(tmp_path, Inner(), repository)
+
+    def leg(*messages, resume="s1", runner=None):
+        runners.append(runner or AgentRunner(rate_table=CLAUDE))
         async def query(prompt, options):
             for message in messages:
                 yield message
@@ -408,7 +424,8 @@ def test_a_leg_that_ended_unresumable_still_leaves_the_sessions_baseline(tmp_pat
 
 def test_counters_restored_stale_are_a_reset_not_a_cheap_leg(tmp_path, monkeypatch):
     # The CLI restores cumulative counters from its transcript; a lost entry
-    # restarts them, and a larger leg would still pass a backwards check.
+    # restarts them, and a larger leg would still pass a backwards check. The
+    # main model's delta below the leg's own usage is what exposes it.
     leg, store = _session(tmp_path, monkeypatch)
     leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
     restarted = {SONNET: _model(10, 600, 80_000, 9_000), HAIKU: _model(10, 600, 50_000, 15_000)}
@@ -419,6 +436,34 @@ def test_counters_restored_stale_are_a_reset_not_a_cheap_leg(tmp_path, monkeypat
     # (5 + 1500 + 2500 + 15000): the bound, not the 2,947-micro difference.
     assert _charges(store)[1] == (69_025, "estimate")
     assert "were reset" in resumed.run_usage.detail
+
+
+def test_a_leg_torn_down_after_its_result_leaves_no_baseline(tmp_path, monkeypatch):
+    # The wall cap closes the CLI after the result arrived: the CLI may not
+    # have persisted its counters, so the next leg prices from r6, erring high.
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    ticks = iter([0.0, 0.0, 0.0])
+    capped = AgentRunner(rate_table=CLAUDE, max_runtime=900.0, wall_clock=lambda: next(ticks, 10_000.0))
+    leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)), runner=capped)
+
+    leg(_ResultMessage({**_R7, SONNET: _model(9, 539, 73_696, 10_734)}, _usage(1, 0, 0, 0)))
+
+    # The torn-down leg settles its own upper bound; the next leg its 1 input
+    # token plus the torn-down leg's whole delta again.
+    assert _charges(store)[1:] == [(18_653 + 24_074, "estimate"), (_R7_OWN_MICROS + 2, "configured_rate_card")]
+
+
+def test_a_resumed_leg_reporting_no_usage_of_its_own_settles_the_upper_bound(tmp_path, monkeypatch):
+    # Without its own usage nothing checks the delta, so an unchanged counter
+    # would read as a free leg.
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+
+    resumed = leg(_ResultMessage(_R6))
+
+    assert _charges(store)[1] == (_R6_MICROS, "estimate")
+    assert "no usage of its own" in resumed.run_usage.detail
 
 
 def test_a_snapshot_from_another_session_or_repository_is_no_baseline(tmp_path, monkeypatch):
