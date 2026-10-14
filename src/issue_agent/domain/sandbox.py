@@ -216,12 +216,18 @@ def _entry_name(name: object) -> bool:
 
 
 def login_mounts(login: LoginDir) -> tuple[Mount, ...]:
-    """The login directory read-write, each unshared entry hidden."""
+    """The login directory read-write, each unshared entry hidden. A shared
+    name's staging files (`.credentials.json.tmp.<hex>`) stay visible: a mount
+    moves with its entry, so a hidden one the host then renamed onto the login
+    would hide the login itself from the leg."""
     path = _normal(login.path)
-    shared = set(login.shared)
+
+    def shared(name: str) -> bool:
+        return any(name == s or name.startswith(s + ".") for s in login.shared)
+
     return (Mount(path, Access.READ_WRITE),
             *(Mount(posixpath.join(path, name), Access.HIDDEN) for name in dict.fromkeys(login.entries)
-              if _entry_name(name) and name not in shared))
+              if _entry_name(name) and not shared(name)))
 
 
 def leg_mount_plan(facts: LegFacts) -> MountPlan:
@@ -254,9 +260,10 @@ def leg_mount_plan(facts: LegFacts) -> MountPlan:
             # packed-refs is read-only as of launch: git replaces it by rename,
             # which the overlay would keep private, so a leg's `git pack-refs`
             # would prune the host's loose refs and keep the packed copy. The
-            # harness's git never packs refs (`worktree._HOST_GIT`): a host gc
-            # that did moved a running leg's branch out of the live refs/ and
-            # the leg lost it (tauri #1106, 2026-10-15).
+            # launch sets the repository never to pack refs
+            # (`leg_sandbox._LOOSE_REFS`): a host pack moved a running leg's
+            # branch out of the live refs/ and the leg lost it (tauri #1106,
+            # 2026-10-15).
             required.append(Mount(posixpath.join(common, "packed-refs"), Access.READ_ONLY))
             required.append(Mount(own, Access.READ_WRITE))
             # Its own links and config.worktree, which the harness's git reads

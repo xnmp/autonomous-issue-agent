@@ -138,6 +138,14 @@ def test_everything_else_in_the_login_directory_is_hidden_but_the_legs_own_sessi
     assert visible(plan, f"{CLAUDE}/projects/x/s.jsonl") is Access.READ_WRITE
 
 
+def test_a_login_staging_file_stays_visible_so_its_rename_cannot_carry_a_mask_onto_the_login():
+    plan = leg_mount_plan(facts(login=LoginDir(CLAUDE, CLAUDE_LOGIN_SHARED, (
+        ".credentials.json.tmp.5c5a9cfb", ".oauth_refresh.lock.owner.tmp.1", "settings.json.tmp.2", ".credentialsX"))))
+
+    hidden = {m.path for m in plan.mounts if m.access is Access.HIDDEN}
+    assert hidden == {f"{CLAUDE}/settings.json.tmp.2", f"{CLAUDE}/.credentialsX"}
+
+
 def test_a_path_entry_inside_a_hidden_entry_does_not_re_expose_it():
     plan = leg_mount_plan(facts(search_path=(f"{CLAUDE}/local/bin", f"{CLAUDE}/hooks"),
                                 runtime_support=(f"{CLAUDE}/local",)))

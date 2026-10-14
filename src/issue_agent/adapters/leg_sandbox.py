@@ -51,7 +51,9 @@ _KEY_AUTH = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOK
 # config vanishes with it, so `git push -u` cannot record an upstream for the
 # next leg. No auto-maintenance: it would repack and prune the object store
 # other checkouts share; the harness's own git, outside the sandbox, keeps it.
-_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"))
+# No pruning fetch: a remote-tracking ref is usually packed, and a leg cannot
+# rewrite packed-refs (`domain.sandbox`), so the prune would fail the fetch.
+_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"), ("fetch.prune", "false"))
 _PUBLISH_GIT_CONFIG = (
     ("credential.https://github.com.helper",
      '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'),
@@ -202,6 +204,28 @@ def _ensure_packed_refs(common: str) -> None:
         raise SandboxRefused(f"{path} is not a plain file")
 
 
+# The repository config that keeps every git on the host, the harness's and
+# the operator's, from packing refs: a fix leg reads packed-refs as of its
+# launch, so a pack while it runs moves its branch out of the live refs/ and
+# the leg loses it (tauri #1106, 2026-10-15: the auto-maintenance a fetch
+# starts runs pack-refs once 16 refs are loose; gc.packRefs alone misses it).
+_LOOSE_REFS = (("gc.packRefs", "false"), ("maintenance.pack-refs.enabled", "false"))
+
+
+def _keep_refs_loose(common: str, run: Callable[..., subprocess.CompletedProcess]) -> None:
+    config = os.path.join(common, "config")
+    try:
+        for key, value in _LOOSE_REFS:
+            current = run(["git", "config", "--file", config, "--get", key], capture_output=True, text=True,
+                          timeout=_PROBE_TIMEOUT_S)
+            if (current.stdout or "").strip() != value and run(
+                    ["git", "config", "--file", config, key, value], capture_output=True, text=True,
+                    timeout=_PROBE_TIMEOUT_S).returncode != 0:
+                raise SandboxRefused(f"cannot set {key}={value} in {config}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxRefused(f"cannot read {config} ({type(exc).__name__})") from exc
+
+
 def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
     env = {"GIT_CONFIG_COUNT": str(len(entries))}
     for index, (key, value) in enumerate(entries):
@@ -229,7 +253,13 @@ def _ensure_inert(config: str) -> None:
     """A hidden entry needs a mount point, so each config name Claude obeys
     exists before a leg starts: an empty directory, or an empty read-only file
     (read as no settings; a read-only empty `.config.json` is never chosen as
-    global config). Present ones are left as they are."""
+    global config). Present ones are left as they are. A link there cannot be
+    hidden (a mount lands on its target) and the leg could replace it, so the
+    leg is refused (home-manager links these into /nix/store)."""
+    for name in (*CLAUDE_CONFIG_FILES, *CLAUDE_CONFIG_DIRS):
+        if os.path.islink(os.path.join(config, name)):
+            raise SandboxRefused(f"{config}/{name} is a symlink, which a Claude leg sharing that directory could "
+                                 "replace; give legs their own login (residuals §1.1)")
     try:
         for name in CLAUDE_CONFIG_DIRS:
             try:
@@ -319,13 +349,28 @@ class LegSandbox:
         return self._which(self._bwrap)
 
     def _empty_file(self) -> str:
-        """An empty, read-only regular file in a private directory, made again
-        if a temp cleaner removed it."""
-        if not (self._empty and os.path.isfile(self._empty) and os.path.getsize(self._empty) == 0):
-            path = os.path.join(tempfile.mkdtemp(prefix="issue-agent-sandbox-"), "empty")
-            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444))
-            self._empty = path
-        return self._empty
+        """An empty, read-only regular file in this user's private directory
+        under the temp dir, shared by every sandbox and made again if a temp
+        cleaner removed it."""
+        if self._empty and os.path.isfile(self._empty) and os.path.getsize(self._empty) == 0:
+            return self._empty
+        directory = os.path.join(tempfile.gettempdir(), f"issue-agent-sandbox-{os.getuid()}")
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        status = os.lstat(directory)
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077:
+            raise SandboxRefused(f"{directory} is not this user's private directory")
+        path = os.path.join(directory, "empty")
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444))
+        except FileExistsError:
+            pass
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path):
+            raise SandboxRefused(f"{path} is not an empty file")
+        self._empty = path
+        return path
 
     def preflight(self) -> str | None:
         """Why legs cannot be sandboxed here, or None. Probes the namespaces
@@ -398,6 +443,7 @@ class LegSandbox:
         link = git_link(root, self.repository)
         if link is not None and writes:
             _ensure_packed_refs(link.common_dir)
+            _keep_refs_loose(link.common_dir, self._run)
             _empty_worktree_config(os.path.join(link.worktree_dir, "config.worktree"))
         try:
             plan = leg_mount_plan(LegFacts(

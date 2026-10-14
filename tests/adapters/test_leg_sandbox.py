@@ -356,11 +356,23 @@ def test_a_host_ref_update_reaches_a_running_fix_leg(host):
 
 
 @needs_bwrap
-def test_the_harnesss_own_git_never_packs_a_running_legs_branch_away(host):
+def test_no_host_fetch_packs_a_running_legs_branch_away(host):
+    upstream = host["tmp"] / "upstream.git"
+    _git("init", "-q", "--bare", "-b", "dev", str(upstream), cwd=host["tmp"])
+    _git("remote", "add", "origin", str(upstream), cwd=host["target"])
+    _git("push", "-q", "origin", "dev", cwd=host["target"])
+    for index in range(20):  # past the 16 loose refs at which auto-maintenance packs
+        _git("branch", f"b{index}", cwd=host["target"])
     leg = _fix_leg(host, 'read _; git rev-parse --abbrev-ref HEAD; git log -1 --format=%s')
     try:
-        # A `gc --auto` the harness's fetch starts runs a full gc.
-        assert _subprocess_git(["gc", "--quiet"], str(host["target"])).code == 0
+        for fetch in (lambda: _subprocess_git(["-c", "maintenance.autoDetach=false", "fetch", "origin", "dev"],
+                                              str(host["target"])).code,  # the harness's
+                      lambda: len(_git("-c", "maintenance.autoDetach=false", "fetch", "-q", "origin", "dev",
+                                       cwd=host["target"])) * 0):  # the operator's
+            _git("commit", "-q", "--allow-empty", "-m", "upstream", cwd=host["target"])
+            _git("push", "-q", "origin", "HEAD:dev", cwd=host["target"])
+            _git("reset", "-q", "--hard", "HEAD~1", cwd=host["target"])
+            assert fetch() == 0
         out, err = leg.communicate("go\n", timeout=30)
     finally:
         leg.kill()
@@ -399,13 +411,13 @@ def test_a_fix_leg_cannot_plant_what_the_harnesss_git_would_obey_in_the_reposito
               f'mkdir -p "{common}/modules/x" "{common}/remotes" && echo evil > "{common}/modules/x/config"; '
               f'echo "URL: /evil" > "{common}/remotes/origin"; echo evil > "{common}/hooks/pre-commit"; '
               f'echo evil >> "{common}/HEAD"; echo "[x]" >> "{common}/config"; echo done')
-    # The launch adds an empty packed-refs where there was none; nothing else.
+    _fix_leg(host, "true").communicate(timeout=30)  # a launch's own preconditions (packed-refs, loose refs)
     before = {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()}
 
     out, err = _fix_leg(host, script).communicate(timeout=30)
 
     assert out.split() == ["done"], err
-    assert {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()} == {**before, "packed-refs": b""}
+    assert {p.name: p.read_bytes() for p in common.iterdir() if p.is_file()} == before
     assert not {"commondir", "config.worktree", "modules", "remotes"} & {p.name for p in common.iterdir()}
     assert not (common / "hooks/pre-commit").exists()
 
@@ -527,6 +539,24 @@ def test_a_leg_cannot_create_config_the_operators_claude_would_obey(host):
     # Absent names were made empty and inert; the global config stays ~/.claude.json.
     assert (config / ".config.json").stat().st_mode & 0o222 == 0
     assert (config / "settings.json").read_bytes() == b""
+
+
+def test_a_symlinked_config_name_claude_obeys_refuses_the_leg(host):
+    config = _plant_claude_config(host)
+    (config / "settings.json").unlink()
+    (config / "settings.json").symlink_to(host["tmp"] / "managed-settings.json")
+
+    with pytest.raises(SandboxRefused, match="symlink"):
+        claude_login({"HOME": str(host["home"])})
+
+
+@needs_bwrap
+def test_a_fix_leg_never_prunes_on_fetch(host):
+    _git("config", "fetch.prune", "true", cwd=host["target"])
+
+    out, err = _fix_leg(host, "git config fetch.prune").communicate(timeout=30)
+
+    assert out.strip() == "false", err
 
 
 def test_a_leg_with_its_own_key_or_token_mounts_none_of_the_operators_claude_state(host):

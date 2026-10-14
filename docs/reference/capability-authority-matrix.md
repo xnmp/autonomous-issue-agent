@@ -18,7 +18,7 @@ What a leg sees (`domain/sandbox.py`):
 | its checkout; for a fix leg also the repository's `objects/`, `refs/`, `logs/` and its own `worktrees/<name>/` | fix: read-write; review/light: read-only |
 | the repository's `.git` (config, hooks, other checkouts' links), but for objects, refs and reflogs | fix: per-leg overlay (git's lock files, `push -u`'s config and a scratch `git worktree add` work; nothing reaches the host); review/light: read-only |
 | the repository's `objects/`, `refs/`, `logs/` | fix: read-write, live (the host's ref changes and lock files are the leg's); review/light: read-only |
-| the repository's `packed-refs` (created empty when absent) | read-only as of launch (a leg's `pack-refs` fails instead of pruning the host's loose refs; the harness's git never packs refs) |
+| the repository's `packed-refs` (created empty when absent) | read-only as of launch (a leg's `pack-refs` fails instead of pruning the host's loose refs; the launch sets the repository never to pack refs) |
 | the checkout's `.git` link and its own `commondir`, `gitdir` and `config.worktree` (the harness's git reads it as config where `extensions.worktreeConfig` is on; emptied at every launch, since the harness sets nothing there) | read-only |
 | `/dev/shm` | its own empty tmpfs |
 | the runtime binary; `/usr`, `/etc` (whole: operator secrets live in HOME, root-only files stay unreadable), `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.cargo/config.toml` (its linker and rustflags hash every artifact in a shared `CARGO_TARGET_DIR`), `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |

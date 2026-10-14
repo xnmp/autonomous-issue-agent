@@ -488,8 +488,7 @@ def ensure_harness_worktree(target_dir: str, base_branch: str, explicit: str = "
         if os.listdir(wt):
             err(f"{wt} exists and is not a worktree of this repo — pass --worktree-path.")
             return ""
-    # Running fix legs read packed-refs as of their launch (leg_sandbox).
-    _run(["git", "-c", "gc.packRefs=false", "fetch", "origin", base_branch], cwd=target_dir)
+    _run(["git", "fetch", "origin", base_branch], cwd=target_dir)
     ref = f"origin/{base_branch}"
     if not _run(["git", "rev-parse", "--verify", "--quiet", ref], cwd=target_dir):
         ref = _run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=target_dir) or "HEAD"
