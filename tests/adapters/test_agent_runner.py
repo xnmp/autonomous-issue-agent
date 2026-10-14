@@ -626,13 +626,13 @@ class _Sandbox:
         self.refuse, self.launches = refuse, []
         self.launcher = "/usr/bin/bwrap"  # an executable stand-in, set per test
 
-    def launch(self, command, *, cwd, env, runtime_state=(), scratch=(), read_only=False):
+    def launch(self, command, *, cwd, env, runtime_state=(), login=None, scratch=(), read_only=False):
         from issue_agent.adapters.leg_sandbox import Launch, SandboxRefused
 
         if self.refuse:
             raise SandboxRefused(self.refuse)
         self.launches.append({"command": tuple(command), "cwd": cwd, "runtime_state": tuple(runtime_state),
-                              "read_only": read_only})
+                              "login": login, "read_only": read_only})
         return Launch((self.launcher, "--sandboxed", "--", *command), {"GH_TOKEN": "leg-token"}, "bwrap: test")
 
 
@@ -659,10 +659,15 @@ def test_a_claude_leg_execs_its_cli_through_the_sandbox_with_its_credential(tmp_
                       capture=capture)
     sandbox = _Sandbox()
     runner, cli = _supervised_cli_runner(tmp_path, monkeypatch, sandbox)
+    (tmp_path / "home/.claude").mkdir(parents=True)
+    (tmp_path / "home/.claude/.credentials.json").write_text("{}")
 
     result = asyncio.run(runner.run(RuntimePlan(prompt="x", cwd=str(tmp_path))))
 
     assert result.status == "done"
+    # An OAuth login is shared as its directory, with the session store listed in it.
+    login = sandbox.launches[0]["login"]
+    assert login.path == str(tmp_path / "home/.claude") and "projects" in login.entries
     env = capture["options"]["env"]
     assert json.loads(env["ISSUE_AGENT_SUPERVISED_TARGET"]) == [sandbox.launcher, "--sandboxed", "--",
                                                                 os.path.realpath(cli)]

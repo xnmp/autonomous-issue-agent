@@ -25,18 +25,25 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ..domain.sandbox import (
-    Access, GitLink, LegFacts, Mount, MountPlan, UnsafeMount, claude_session_store, exposes, leg_mount_plan,
-    protected_paths,
+    CLAUDE_CONFIG_DIRS, CLAUDE_CONFIG_FILES, CLAUDE_LOGIN_SHARED, Access, GitLink, LegFacts, LoginDir, Mount, MountPlan, UnsafeMount, claude_session_store,
+    exposes, leg_mount_plan, protected_paths,
 )
 
 _NAMESPACES = ("--die-with-parent", "--unshare-pid", "--new-session", "--unshare-ipc", "--unshare-uts",
                "--unshare-cgroup-try")
 _PROBE_TIMEOUT_S = 10.0
 _GITFILE_LIMIT = 4096
+# A leg hides each entry of Claude's config dir with its own mount; past this
+# many, bwrap's argv outgrows the kernel's limit, so a leg that filled the
+# directory would stop every later one with an opaque exec error.
+_LOGIN_ENTRY_LIMIT = 1000
+# The leg's runtime authenticates without the operator's login file.
+_KEY_AUTH = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
 
 # Environment git config: never written into the checkout. The empty helper
 # drops any helper /etc/gitconfig names; a publishing leg then answers GitHub
@@ -44,7 +51,11 @@ _GITFILE_LIMIT = 4096
 # config vanishes with it, so `git push -u` cannot record an upstream for the
 # next leg. No auto-maintenance: it would repack and prune the object store
 # other checkouts share; the harness's own git, outside the sandbox, keeps it.
-_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"))
+# No pruning fetch (origin's own setting wins over fetch.prune): a
+# remote-tracking ref is usually packed, and a leg cannot
+# rewrite packed-refs (`domain.sandbox`), so the prune would fail the fetch.
+_GIT_CONFIG = (("credential.helper", ""), ("maintenance.auto", "false"), ("gc.auto", "0"), ("fetch.prune", "false"),
+               ("remote.origin.prune", "false"))
 _PUBLISH_GIT_CONFIG = (
     ("credential.https://github.com.helper",
      '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GH_TOKEN"; }; f'),
@@ -115,10 +126,17 @@ def git_link(cwd: str, repository: str) -> GitLink | None:
     return GitLink(common, own)
 
 
-def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
+def _render(mount: Mount, protected: Sequence[str], empty: str) -> tuple[str, ...]:
     path = mount.path
     if mount.access is Access.PRIVATE:
         return ("--tmpfs", path)
+    if mount.access is Access.HIDDEN:
+        # Gone since the listing: nothing to hide, and bwrap would create it
+        # on the host. A link is not followed (a mount would land on its
+        # target); inside the sandbox it resolves to what the plan shows.
+        if os.path.islink(path) or not os.path.lexists(path):
+            return ()
+        return ("--tmpfs", path) if os.path.isdir(path) else ("--ro-bind", empty, path)
     # A top-level system link (/bin -> usr/bin) stays a link.
     if mount.optional and os.path.dirname(path) == "/" and os.path.islink(path):
         return ("--symlink", os.readlink(path), path)
@@ -141,12 +159,14 @@ def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
     return ("--overlay-src", path, "--tmp-overlay", path) if os.path.isdir(path) else ()
 
 
-def bwrap_arguments(plan: MountPlan, protected: Sequence[str]) -> tuple[str, ...]:
+def bwrap_arguments(plan: MountPlan, protected: Sequence[str], empty: str = os.devnull) -> tuple[str, ...]:
     """The plan as bwrap options. The root stays a read-only tmpfs, so
-    nothing outside the mounts exists for the leg."""
+    nothing outside the mounts exists for the leg. `empty` is what a hidden
+    file shows: an empty regular file (the leg's mounts are nodev, so a bound
+    /dev/null fails to open and Claude reports a broken settings file)."""
     args: list[str] = [*_NAMESPACES, "--dev", "/dev", "--proc", "/proc"]
     for mount in plan.mounts:
-        args += _render(mount, protected)
+        args += _render(mount, protected, empty)
     args += ["--remount-ro", "/"]
     for name, value in plan.env:
         args += ["--unsetenv", name] if value is None else ["--setenv", name, value]
@@ -171,6 +191,53 @@ def _empty_worktree_config(path: str) -> None:
         os.close(fd)
 
 
+def _ensure_packed_refs(common: str) -> None:
+    """A fix leg sees `packed-refs` read-only, so it must exist: without it
+    the leg's `git pack-refs` would pack into its overlay and delete the
+    host's loose refs. An empty one is what git reads when there is none."""
+    path = os.path.join(common, "packed-refs")
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644))
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise SandboxRefused(f"{path} cannot be created ({exc.strerror})") from exc
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise SandboxRefused(f"{path} is not a plain file")
+
+
+# The repository config that keeps every git on the host, the harness's and
+# the operator's, from packing refs: a fix leg reads packed-refs as of its
+# launch, so a pack while it runs moves its branch out of the live refs/ and
+# the leg loses it (tauri #1106, 2026-10-15: the auto-maintenance a fetch
+# starts runs pack-refs once 16 refs are loose; gc.packRefs alone misses it).
+_LOOSE_REFS = (("gc.packRefs", "false"), ("maintenance.pack-refs.enabled", "false"))
+
+
+def _keep_refs_loose(common: str, run: Callable[..., subprocess.CompletedProcess]) -> None:
+    """Set each key in the repository config, then check the value git
+    actually uses (an include or the main checkout's config.worktree can
+    override the file); a leg does not start on a repository that may pack."""
+    config = os.path.join(common, "config")
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return run(["git", *args], capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+
+    try:
+        for key, value in _LOOSE_REFS:
+            if (git("config", "--file", config, "--get", key).stdout or "").strip() != value:
+                done = git("config", "--file", config, key, value)
+                if done.returncode != 0:
+                    raise SandboxRefused(f"cannot set {key}={value} in {config}: "
+                                         f"{(done.stderr or '').strip()[:200]}")
+            effective = (git("--git-dir", common, "config", "--get", key).stdout or "").strip()
+            if effective != value:
+                raise SandboxRefused(f"{key} is {effective!r} for {common} despite its config (an include or "
+                                     f"config.worktree overrides it); a fix leg needs {value}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxRefused(f"cannot read {config} ({type(exc).__name__})") from exc
+
+
 def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
     env = {"GIT_CONFIG_COUNT": str(len(entries))}
     for index, (key, value) in enumerate(entries):
@@ -179,23 +246,75 @@ def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
     return env
 
 
+def _claude_config(env: Mapping[str, str]) -> str:
+    return os.path.abspath(env.get("CLAUDE_CONFIG_DIR")
+                           or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".claude"))
+
+
 def claude_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
-    """Claude's session store for `cwd` (created) and its login file. Only
-    these: the rest of `~/.claude` holds settings, hooks and shell snapshots
-    the operator's own Claude runs outside the sandbox."""
-    config = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".claude")
+    """Claude's session store for `cwd`, created."""
     try:
-        store = claude_session_store(os.path.abspath(config), os.path.realpath(cwd))
+        store = claude_session_store(_claude_config(env), os.path.realpath(cwd))
     except UnsafeMount as exc:
         raise SandboxRefused(str(exc)) from exc
     os.makedirs(store, mode=0o700, exist_ok=True)
-    login = os.path.join(os.path.abspath(config), ".credentials.json")
-    return (store, login) if os.path.isfile(login) else (store,)
+    return (store,)
+
+
+def _ensure_inert(config: str) -> None:
+    """A hidden entry needs a mount point, so each config name Claude obeys
+    exists before a leg starts: an empty directory, or an empty read-only file
+    (read as no settings; a read-only empty `.config.json` is never chosen as
+    global config). Present ones are left as they are. A link there cannot be
+    hidden (a mount lands on its target) and the leg could replace it, so the
+    leg is refused (home-manager links these into /nix/store)."""
+    for name in (*CLAUDE_CONFIG_FILES, *CLAUDE_CONFIG_DIRS):
+        if os.path.islink(os.path.join(config, name)):
+            raise SandboxRefused(f"{config}/{name} is a symlink, which a Claude leg sharing that directory could "
+                                 "replace; give legs their own login (residuals §1.1)")
+    try:
+        for name in CLAUDE_CONFIG_DIRS:
+            try:
+                os.mkdir(os.path.join(config, name), 0o755)
+            except FileExistsError:
+                pass
+        for name in CLAUDE_CONFIG_FILES:
+            try:
+                os.close(os.open(os.path.join(config, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o444))
+            except FileExistsError:
+                pass
+    except OSError as exc:
+        raise SandboxRefused(f"cannot shield Claude's config dir {config} ({exc.strerror})") from exc
+
+
+def claude_login(env: Mapping[str, str]) -> LoginDir | None:
+    """Claude's config dir as the leg's shared login, listed now so all the
+    operator's state there (settings, hooks, history, other projects) is
+    hidden. None without a login file, or when the leg authenticates with a
+    key or token of its own: then nothing of the operator's is mounted."""
+    config = _claude_config(env)
+    if any(env.get(name) for name in _KEY_AUTH) or not os.path.isfile(os.path.join(config, ".credentials.json")):
+        return None
+    _ensure_inert(config)
+    try:
+        entries = tuple(sorted(os.listdir(config)))
+    except OSError as exc:
+        raise SandboxRefused(f"Claude's config dir is unreadable ({type(exc).__name__})") from exc
+    if len(entries) > _LOGIN_ENTRY_LIMIT:
+        raise SandboxRefused(f"{config} holds {len(entries)} entries; a leg hides each with a mount, past "
+                             f"{_LOGIN_ENTRY_LIMIT} bwrap cannot start (clear what does not belong there)")
+    return LoginDir(config, CLAUDE_LOGIN_SHARED, entries)
 
 
 def codex_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
     """The harness CODEX_HOME (sessions, config) and the operator login its
-    `auth.json` links to. Codex's default `~/.codex` is never mounted."""
+    `auth.json` links to. Codex's default `~/.codex` is never mounted.
+
+    The login is bound as a single file, unlike Claude's (`claude_login`):
+    codex rewrites `auth.json` in place (truncate and write, codex-rs
+    login/src/auth/storage.rs), so its inode never changes under a running
+    leg. A codex that replaces it by rename needs the login directory."""
     configured = env.get("CODEX_HOME", "")
     if not configured:
         raise SandboxRefused("a codex leg needs the harness CODEX_HOME")
@@ -228,6 +347,7 @@ class LegSandbox:
         self._bwrap = bwrap
         self._which = which
         self._run = run
+        self._empty = ""
 
     def __repr__(self) -> str:
         return (f"LegSandbox(repository={self.repository!r}, writable={self.writable}, "
@@ -239,6 +359,32 @@ class LegSandbox:
 
     def _binary(self) -> str | None:
         return self._which(self._bwrap)
+
+    def _empty_file(self) -> str:
+        """An empty, read-only regular file in this user's private directory
+        (the runtime dir where there is one, which no other user can claim),
+        shared by every sandbox and made again if a cleaner removed it."""
+        if self._empty and os.path.isfile(self._empty) and os.path.getsize(self._empty) == 0:
+            return self._empty
+        runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+        base = runtime if os.path.isabs(runtime) and os.path.isdir(runtime) else tempfile.gettempdir()
+        directory = os.path.join(base, f"issue-agent-sandbox-{os.getuid()}")
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+        status = os.lstat(directory)
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077:
+            raise SandboxRefused(f"{directory} is not this user's private directory")
+        path = os.path.join(directory, "empty")
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444))
+        except FileExistsError:
+            pass
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path):
+            raise SandboxRefused(f"{path} is not an empty file")
+        self._empty = path
+        return path
 
     def preflight(self) -> str | None:
         """Why legs cannot be sandboxed here, or None. Probes the namespaces
@@ -285,6 +431,7 @@ class LegSandbox:
         cwd: str,
         env: Mapping[str, str],
         runtime_state: Sequence[str] = (),
+        login: LoginDir | None = None,
         scratch: Sequence[str] = (),
         read_only: bool = False,
     ) -> Launch:
@@ -309,19 +456,22 @@ class LegSandbox:
         writes = self.writable and not read_only
         link = git_link(root, self.repository)
         if link is not None and writes:
+            _ensure_packed_refs(link.common_dir)
+            _keep_refs_loose(link.common_dir, self._run)
             _empty_worktree_config(os.path.join(link.worktree_dir, "config.worktree"))
         try:
             plan = leg_mount_plan(LegFacts(
                 home=self.home, cwd=root, writable=writes,
                 git=link, runtime_binary=binary, runtime_support=support,
-                runtime_state=tuple(os.path.abspath(p) for p in runtime_state),
+                runtime_state=tuple(os.path.abspath(p) for p in runtime_state), login=login,
                 search_path=tuple(env.get("PATH", "").split(os.pathsep)), build_cache=build_cache,
                 scratch=tuple(os.path.abspath(p) for p in scratch), protected=self.protected,
                 devices=tuple(sorted(glob.glob("/dev/dri/renderD*"))),
             ))
         except UnsafeMount as exc:
             raise SandboxRefused(str(exc)) from exc
-        argv = (self._binary() or self._bwrap, *bwrap_arguments(plan, protected_paths(self.home, self.protected)),
+        argv = (self._binary() or self._bwrap, *bwrap_arguments(plan, protected_paths(self.home, self.protected),
+                                                                    self._empty_file()),
                 "--", binary, *command[1:])
         credential = self._credential if plan.publishes else None
         added = _git_config_env(_GIT_CONFIG + (_PUBLISH_GIT_CONFIG if plan.publishes else ()))
@@ -334,6 +484,6 @@ class LegSandbox:
 
 
 __all__ = [
-    "Launch", "LegSandbox", "SandboxRefused", "bwrap_arguments", "claude_runtime_state", "codex_runtime_state",
-    "git_link", "repository_common_dir",
+    "Launch", "LegSandbox", "SandboxRefused", "bwrap_arguments", "claude_login", "claude_runtime_state",
+    "codex_runtime_state", "git_link", "repository_common_dir",
 ]
