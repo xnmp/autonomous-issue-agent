@@ -266,10 +266,11 @@ that matters is not "wrong answer" but "loop that bills forever":
   agent end (its receipt records the failure keys, which name when each
   failure's CI run began: an Actions run attempt's start; for another app's
   check or a status, which have no run start, its own start or post, which
-  over-counts). A FIX_CI try is started by a leg on a new head, or handed a
+  over-counts); an agent end at a per-leg cap (receipt `capped`) did not
+  finish, so it was handed nothing. A FIX_CI try is started by a leg on a new head, or handed a
   failure from a CI run that began after the head's first leg began and
   that no earlier leg was handed (a push, re-run or dispatch it or anyone
-  caused), or with no readable keys; a failure of a run that existed
+  caused), or with no readable keys, or after a capped leg on the head; a failure of a run that existed
   before, or was already handed, resumes the session at its tier, and
   ATTEMPT_CAP bounds every new run. The same evidence never dispatches: once the failing runs are
   complete with every failure handed, the harness re-runs the failed jobs
@@ -293,7 +294,8 @@ that matters is not "wrong answer" but "loop that bills forever":
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
 - the two per-leg caps share one rule (`outcome.leg_cap`): a first hit on a
   fresh session is a machine end, and the next leg resumes that session at
-  the same tier; a hit on the resumed leg is an attempt. A resume is bought
+  the same tier; a hit on the resumed leg is an attempt, and the next leg
+  runs one tier up on the same evidence. A resume is bought
   only while the issue cap still affords a leg at the dearer role's budget
   (`ISSUE_SPEND_CAP_USD` ≥ committed + max(`MAX_BUDGET_USD`,
   `REVIEW_BUDGET_USD`)); a budget hit spends at least `MAX_BUDGET_USD`

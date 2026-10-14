@@ -44,7 +44,7 @@ Precedence, the single place it is defined (first match wins, per item):
                for another head, or GitHub still shows the head the newest
                agent leg pushed away from (its end head) -> Wait; red ->
                FIX_CI with just the failures no repair on the head was handed
-               (tauri #1078), unless every red check is red or rerunning on
+               (tauri #1078; a capped leg was handed nothing), unless every red check is red or rerunning on
                the base tip too -> Wait (#313); none new -> Wait while a
                failing run still runs, else Rerun (free) if no run on the head
                is past its first attempt, else NeedsHuman (ATTEMPTS);
@@ -80,7 +80,7 @@ review of a new head) therefore never trips the cap; repeating one act
 without progress does. FIX_CI counts tries, not legs: a leg on a new head,
 handed a failure from a CI run that began after the head's first leg began
 and no earlier leg was handed (a push, re-run or dispatch it or anyone
-caused), or with no readable keys, starts a try; a leg within the step's own try runs at its tier and routes to
+caused), or with no readable keys, or after a capped leg on the head, starts a try; a leg within the step's own try runs at its tier and routes to
 the runtime holding the session.
 
 Untrusted timestamps fail toward stopping: an unparseable one never resets a
@@ -609,9 +609,10 @@ def _blocker_link(leg: LegEnd, issue: int, comments: tuple[Comment, ...], harnes
 
 def _handed(legs: tuple[LegEnd, ...], head: str, floor: datetime | None) -> frozenset[str]:
     """The failure keys FIX_CI agent ends on `head` were handed since the reset
-    floor. A machine end handed nothing (it never ran, or died); a human reset
-    (a comment, review or released stop) re-arms every failure."""
-    return frozenset(key for leg in legs if leg.kind is AgentKind.FIX_CI and leg.head == head
+    floor. A machine end handed nothing (it never ran, or died), and a capped
+    end did not finish its repair, so its failures go to the next leg; a human
+    reset (a comment, review or released stop) re-arms every failure."""
+    return frozenset(key for leg in legs if leg.kind is AgentKind.FIX_CI and leg.head == head and not leg.capped
                      and (floor is None or leg.ended_at > floor) for key in leg.evidence)
 
 
@@ -715,7 +716,8 @@ def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) 
     """The attempts in the act's current run of agent legs since the floor.
     FIX_CI counts tries, the step's own not counted (owner, PR #403): a
     failure of a CI run that existed before the head's first leg, or that an
-    earlier leg was handed, resumes at its tier; ATTEMPT_CAP bounds new runs."""
+    earlier leg was handed, resumes at its tier, unless the head's newest leg
+    was capped; ATTEMPT_CAP bounds new runs."""
     run: list[LegEnd] = []
     for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at)):  # ties: later-recorded is newer
         if floor is not None and leg.ended_at <= floor:
@@ -732,7 +734,8 @@ def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) 
         # A run already handed (a key of the same start) or begun before the head's first leg resumes; an
         # unreadable time or a keyless (legacy, corrupt) leg fails toward counting.
         same = list(takewhile(lambda leg: leg.head == head, reversed(earlier)))
-        if not same or not keys:
+        # A try ends with a cap hit on its resume (#411): the next leg is a new try, one tier up.
+        if not same or not keys or same[0].capped:
             return True
         since = same[-1].started_at or same[-1].ended_at
         handed = {began(key) for leg in same for key in leg.evidence}

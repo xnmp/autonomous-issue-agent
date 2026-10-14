@@ -56,9 +56,9 @@ def pr(observed: Observed, head: str = "h1", **kw) -> PRView:
 
 
 def fix_end(minute: float, *keys: str, head: str = "h1", machine: bool = False, tier: Tier | None = None,
-            end_head: str = "") -> LegEnd:
+            end_head: str = "", capped: bool = False) -> LegEnd:
     return LegEnd(AgentKind.FIX_CI, at(minute), machine, head, started_at=at(minute - 1),
-                  evidence=frozenset(keys), tier=tier, end_head=end_head)
+                  evidence=frozenset(keys), tier=tier, end_head=end_head, capped=capped)
 
 
 def state(view: PRView, *ends: LegEnd, now: float = 60):
@@ -288,6 +288,68 @@ def test_a_push_is_a_new_attempt():
     step = state(pr(pushed, head="h2"), fix_end(30, k(11), head="h1"))
     assert isinstance(step, Dispatch) and step.head == "h2" and step.evidence.keys == (k(11),)
     assert step.tier == escalate(DEFAULT_TIER, 1)
+
+
+# ── a per-leg cap is no finished repair (#411 semantics, owner 2026-10-14) ──
+
+
+def capped_pair(minute: float, *keys: str) -> tuple[LegEnd, LegEnd]:
+    """A first cap hit (a machine end) and its resume, capped again (an agent end)."""
+    return fix_end(minute - 5, machine=True), fix_end(minute, *keys, capped=True)
+
+
+def test_a_repair_capped_on_its_resume_hands_the_same_failure_to_a_leg_one_tier_up():
+    # The run is complete and the failure was handed: a finished repair would end in the re-run.
+    step = state(pr(DONE), *capped_pair(30, k(11)))
+    assert isinstance(step, Dispatch) and step.act is AgentKind.FIX_CI
+    assert step.evidence == CiFailures((CiFailure(k(11), UBUNTU, 11, 900),))  # not "handled": nobody finished it
+    assert step.tier == escalate(DEFAULT_TIER, 1)
+
+
+def test_a_repair_that_ended_normally_having_pushed_nothing_still_ends_in_the_rerun_then_a_stop():
+    assert state(pr(DONE), fix_end(30, k(11))) == Rerun("h1", ((900, 1),))
+    assert state(pr(DONE), fix_end(25, machine=True), fix_end(30, k(11))) == Rerun("h1", ((900, 1),))  # a resume
+    # The fresh leg after a capped one finishes: the existing path resumes.
+    assert state(pr(DONE), *capped_pair(30, k(11)), fix_end(40, k(11))) == Rerun("h1", ((900, 1),))
+    assert state(pr(RERUN), *capped_pair(30, k(11)), fix_end(40, k(11)), fix_end(50, k(21, attempt=2))) == stop(50)
+
+
+def test_capped_resumes_climb_one_tier_each_and_stop_at_the_attempt_cap():
+    two = (*capped_pair(20, k(11)), *capped_pair(30, k(11)))
+    climbed = state(pr(DONE), *two)
+    assert isinstance(climbed, Dispatch) and climbed.tier == escalate(DEFAULT_TIER, 2)
+    assert climbed.evidence.keys == (k(11),)
+    # The first cap of the next try is still no attempt: its resume runs at that try's tier.
+    resumed = state(pr(DONE), *two, fix_end(35, machine=True))
+    assert isinstance(resumed, Dispatch) and resumed.tier == escalate(DEFAULT_TIER, 2)
+    assert state(pr(DONE), *two, *capped_pair(40, k(11))) == stop(40)
+
+
+def test_a_capped_continuation_of_a_try_ends_that_try():
+    # A finished leg handed k11; the same run's later failure k12 continues its try at its tier and is capped.
+    legs = (fix_end(20, k(11)), fix_end(25, machine=True), fix_end(30, k(12), capped=True))
+    step = state(pr(SECOND), *legs)
+    assert isinstance(step, Dispatch) and step.evidence.keys == (k(12),) and step.evidence.handled == (UBUNTU,)
+    assert step.tier == escalate(DEFAULT_TIER, 1)
+
+
+def test_a_capped_leg_that_pushed_leaves_its_old_heads_evidence_behind():
+    # The cap fell after a push: the new head's CI is a new try, as any push is.
+    legs = (fix_end(25, machine=True), fix_end(30, k(11), capped=True, end_head="h2"))
+    assert state(pr(DONE), *legs) == Wait(WaitReason.CI_UNKNOWN)  # read-your-writes
+    pushed = ci(job(UBUNTU, 31, "fail", required=True, start=at(31).isoformat()), head="h2")
+    step = state(pr(pushed, head="h2"), *legs)
+    assert isinstance(step, Dispatch) and step.head == "h2" and step.tier == escalate(DEFAULT_TIER, 1)
+
+
+@pytest.mark.parametrize("bad", [
+    dict(capped=True, machine=True),
+    dict(capped=True, question="404 or 410?"),
+    dict(capped="yes"), dict(capped=1), dict(capped=None),
+])
+def test_a_capped_end_is_an_agent_end_that_asked_nothing(bad):
+    with pytest.raises(ValueError):
+        LegEnd(AgentKind.FIX_CI, at(30), bad.pop("machine", False), "h1", **bad)
 
 
 def test_a_machine_end_was_handed_nothing_so_the_evidence_is_retried_after_the_backoff():

@@ -114,7 +114,8 @@ def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | N
     end_head = receipt.get("end_head")
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
                   triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")), evidence=evidence,
-                  end_head=end_head if ran and isinstance(end_head, str) and len(end_head) <= 64 else "")
+                  end_head=end_head if ran and isinstance(end_head, str) and len(end_head) <= 64 else "",
+                  capped=leg is LegClass.AGENT and receipt.get("capped") is True)
 
 
 def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:

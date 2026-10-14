@@ -68,6 +68,9 @@ class LegEnd:
     # The commit the leg's PR branch was at on the remote when it ended, as the
     # harness read it ("" when unread): not `head` means the leg pushed.
     end_head: str = ""
+    # The harness ended this agent end at a per-leg cap (`outcome.leg_cap`, minted
+    # by the accounting runtime): it did not finish with the evidence it was handed.
+    capped: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -76,6 +79,8 @@ class LegEnd:
             raise ValueError("leg end requires an aware end time")
         if type(self.machine) is not bool:
             raise ValueError("leg end requires an exact machine classification")
+        if type(self.capped) is not bool or (self.capped and (self.machine or self.question is not None)):
+            raise ValueError("only an agent end that asked nothing can be capped")
         if not isinstance(self.head, str) or not isinstance(self.end_head, str):
             raise ValueError("leg end heads must be strings")
         if self.question is not None and (not isinstance(self.question, str) or not self.question or self.machine):
