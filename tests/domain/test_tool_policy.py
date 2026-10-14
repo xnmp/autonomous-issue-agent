@@ -26,6 +26,7 @@ def test_the_fixer_keeps_its_working_tools():
 
 
 def test_ci_and_review_reads_are_not_denied():
-    # PR #403: agents read job logs and inline review comments with `gh api`;
-    # waiting for CI is a legitimate answer to missing evidence (tauri #1078).
+    # PR #403: agents read job logs and inline review comments with `gh api`.
+    # The `gh run watch` deny went because a repair is always handed its
+    # evidence (tauri #1078); AGENT.md carries the no-wait rule.
     assert not [r for r in FIXER_DENY if r.startswith(("Bash(gh api", "Bash(gh run"))]

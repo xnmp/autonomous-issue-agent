@@ -318,7 +318,7 @@ def test_review_task_carries_the_bots_prior_review_as_fenced_data():
 _REVIEW_BUILDER_NAME_RE = re.compile(r"^build_.*review.*$")
 
 # build_address_review_task is the FIXER's builder (addressing a reviewer's
-# feedback on its OWN PR, via review_body/inline — no title/body/diff params, no
+# feedback on its OWN PR, via the change request — no title/body/diff params, no
 # APPROVE verdict, nothing feeding auto-merge). Different data flow, not in M23/D14's
 # scope. Listed here so the completeness assertion documents the exclusion instead
 # of silently shrinking the discovered set to match whatever this test happens to
@@ -360,11 +360,11 @@ _REVIEW_JUDGMENT_BUILDERS = {
 # ── P1R-14: the FIXER's own repair-loop builders must fence THEIR untrusted
 # inputs too — same pattern as M23 above, extended to build_address_review_task
 # and build_fix_ci_task (explicitly excluded from _NOT_REVIEW_JUDGMENT_BUILDERS'
-# scope above, since their data flow — review_body, failed check names —
-# differs from a reviewer's title/body/diff judgment). Inline
-# review comments are writable by ANY user with read access to the repo (not
-# just the PR author), and a CI log echoes attacker-influenced PR titles/branch
-# names verbatim; the consumer here is the FIXER running under
+# scope above, since their data flow — the review body, failed check names —
+# differs from a reviewer's title/body/diff judgment). A review body is
+# writable by ANY user with read access to the repo (not just the PR author),
+# and check names echo attacker-influenced PR titles/branch names verbatim;
+# the consumer here is the FIXER running under
 # `permission_mode=bypassPermissions` with no command filter, so `curl … | sh`
 # embedded in either input is runnable. Fields
 # discovered BY NAME so a future fixer input-carrying builder is automatically

@@ -13,9 +13,8 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 
 from .actions import (
-    ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent,
-    SetIssueState, Target, UpdateBranch,
-    RerunFailedJobs,
+    ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel,
+    RerunFailedJobs, RunAgent, SetIssueState, Target, UpdateBranch,
 )
 from .checks import BaseCI
 from .ci import GREEN_CONCLUSIONS, base_verdicts, parse_timestamp
