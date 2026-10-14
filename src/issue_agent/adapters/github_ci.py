@@ -18,7 +18,7 @@ _REPORTS = """query($owner:String!,$repo:String!,$number:Int!,$commit:ID!,$pr:ID
  node(id:$commit){... on Commit{oid statusCheckRollup{contexts(first:100,after:$endCursor){
  totalCount pageInfo{hasNextPage endCursor} nodes{__typename
  ... on CheckRun{id databaseId name status conclusion startedAt detailsUrl isRequired(pullRequestId:$pr)
- checkSuite{app{databaseId}}}
+ checkSuite{app{databaseId} workflowRun{runAttempt createdAt}}}
  ... on StatusContext{id createdAt context state targetUrl isRequired(pullRequestId:$pr)}}}}}}}"""
 
 
@@ -71,6 +71,8 @@ def _report(node):
             raise ValueError("unknown check conclusion")
         app = node["checkSuite"]["app"]
         app_id = app["databaseId"] if app is not None else None
+        run = node["checkSuite"].get("workflowRun") or {}
+        attempt, created = run.get("runAttempt"), run.get("createdAt")
         url = node["detailsUrl"]
         if node["startedAt"] is not None and not isinstance(node["startedAt"], str):
             raise ValueError("check start time is malformed")
@@ -79,6 +81,7 @@ def _report(node):
         state = conclusion if state == "COMPLETED" else state
     elif kind == "StatusContext":
         state, name, start, app_id, url = node["state"], node["context"], node["createdAt"], None, node["targetUrl"]
+        attempt = created = None
         if state not in {"EXPECTED", "PENDING", "SUCCESS", "ERROR", "FAILURE"}:
             raise ValueError("unknown commit status")
         bucket = "pass" if state == "SUCCESS" else "pending" if state in {"EXPECTED", "PENDING"} else "fail"
@@ -88,8 +91,15 @@ def _report(node):
         raise ValueError("report URL is malformed")
     import re
     match = re.search(r"/actions/runs/([0-9]+)(?:/|$)", url or "")
+    if kind == "CheckRun" and match:  # an Actions job: when its run began, as for every job of the run
+        start = created if isinstance(created, str) else ""
+    check_id = node.get("databaseId") if kind == "CheckRun" else None
+    if isinstance(check_id, str) and check_id.isascii() and check_id.isdecimal():
+        check_id = int(check_id)
     return Check(name, state, bucket, start, int(match[1]) if match else None,
-                 node["isRequired"], app_id, "check" if kind == "CheckRun" else "status")
+                 node["isRequired"], app_id, "check" if kind == "CheckRun" else "status",
+                 check_id if type(check_id) is int and check_id > 0 else None,
+                 attempt if match and type(attempt) is int and attempt > 0 else None)
 
 
 def base_reports(nodes) -> tuple[Check, ...]:
@@ -142,6 +152,36 @@ def _checked_merge(selected):
     if type(count) is not int or count < 0:
         raise ValueError("test-merge check count is malformed")
     return merge if count else None
+
+
+def _current(repo, reports, query):
+    """The reports without jobs of an earlier attempt of their run (owner, PR
+    #403), which the rollup lists until the latest attempt's replace them: each
+    reads as pending while that attempt has no jobs or unfinished ones. The
+    run's other checks began when its latest attempt did (`Check.started_at`)."""
+    old, settling, begun = {}, {}, {}
+    for run, attempt in sorted({(c.run_id, c.run_attempt) for c in reports if c.kind == "check" and (c.run_attempt or 1) > 1}):
+        pages = query(["api", "--paginate", "--slurp", f"repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=100"])
+        if not isinstance(pages, list) or not pages or not all(isinstance(p, dict) and isinstance(p.get("jobs"), list)
+                                                               for p in pages):
+            raise ValueError("re-run jobs are unavailable")
+        jobs = [job for page in pages for job in page["jobs"]]
+        if any(not isinstance(job, dict) or any(type(job.get(k)) is not int or job[k] <= 0 for k in ("id", "run_attempt"))
+               for job in jobs):
+            raise ValueError("re-run job identity is malformed")
+        old[run] = frozenset(job["id"] for job in jobs if job["run_attempt"] < attempt)
+        latest = [job for job in jobs if job["run_attempt"] == attempt]
+        settling[run] = not latest or any(job.get("status") != "completed" for job in latest)
+        # The attempt began when its jobs were created (copies included); unreadable reads as "".
+        begun[run] = min((at if isinstance(at := job.get("created_at"), str) else "" for job in latest), default="")
+
+    def superseded(check):
+        return check.kind == "check" and check.run_id in old and check.check_id in old[check.run_id]
+
+    return tuple(replace(c, started_at=begun[c.run_id]) if c.kind == "check" and c.run_id in begun else c
+                 for c in reports if not superseded(c)) + tuple(
+        replace(c, state="QUEUED", bucket="pending", check_id=None) for c in reports
+        if superseded(c) and settling[c.run_id])
 
 
 def observe_checks(repo: str, pr, query) -> CIObservation:
@@ -234,6 +274,7 @@ def observe_checks(repo: str, pr, query) -> CIObservation:
         if any(c.required and policy and not (None in by_context.get(c.name, ())
                 or c.app_id in by_context.get(c.name, ())) for c in reports):
             raise ValueError("required reports contradict policy inventory")
+        reports = _current(repo, reports, query)
         if required_policy(repo, pr.base_ref_name, query) != policy:
             raise ValueError("required policy changed during observation")
         return Observed(pr.head_ref_oid, commit["oid"], policy, reports)

@@ -621,6 +621,28 @@ def test_the_routed_tier_a_leg_ran_at_is_recorded_with_it(tmp_path) -> None:
     assert _receipt(store)["tier"] == "high"
 
 
+@pytest.mark.parametrize("evidence,recorded", [(("check:11", "check:12"), ["check:11", "check:12"]), ((), None)])
+def test_the_ci_failures_a_leg_was_handed_are_recorded_with_it(tmp_path, evidence, recorded) -> None:
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", session_id="s")),
+                              context=("fix", "RESOLVE", 3, 3))  # the budget policy this fixture prices
+    wrapper.set_context("fix", "RESOLVE", 3, 3)
+    _work(wrapper, evidence=evidence)
+    assert _receipt(store).get("evidence") == recorded
+
+
+@pytest.mark.parametrize("branch,probe,recorded", [
+    ("fix/3-x", lambda b: {"fix/3-x": "a" * 40}[b], "a" * 40),  # read from the remote after the leg
+    ("fix/3-x", lambda _b: "", None),  # unread: nothing recorded
+    ("", lambda _b: "a" * 40, None),  # a leg with no branch (light acts) reads nothing
+])
+def test_the_remote_head_a_leg_left_is_recorded_with_it(tmp_path, branch, probe, recorded) -> None:
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="pushed", session_id="s")),
+                              context=("fix", "RESOLVE", 3, 3), remote_head=probe)
+    wrapper.set_context("fix", "RESOLVE", 3, 3)
+    _work(wrapper, branch=branch)
+    assert _receipt(store).get("end_head") == recorded
+
+
 def test_a_leg_planned_for_another_runtime_is_refused_by_this_runtimes_accounting(tmp_path) -> None:
     from issue_agent.domain.agent_task import RuntimeName
 

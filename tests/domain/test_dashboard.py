@@ -24,10 +24,12 @@ from issue_agent.domain.state import (
     stop_tag,
 )
 from issue_agent.domain.checks import Check, Observed
+from issue_agent.domain.evidence import ChangeRequest, CiFailure, CiFailures
 from issue_agent.domain.world import BlockerRef, Comment, PRView, Push
 
 T0 = datetime(2026, 10, 13, 8, 0, tzinfo=timezone.utc)
 HARNESS = Harness(fix_bot="fixbot", review_bot="reviewbot")
+_RED = CiFailures((CiFailure("check:1@9.1", "test", 1, 9),))
 
 
 def at(minutes: float) -> datetime:
@@ -161,7 +163,8 @@ def test_moving_states_are_working(state, activity):
 @pytest.mark.parametrize("act", list(AgentKind))
 @pytest.mark.parametrize("legs", [[], [leg("RESOLVE", 0, ended=2)]])
 def test_every_dispatch_waits_in_the_slot_lane_whatever_the_leg_history(act, legs):
-    board = status(Dispatch(act, "" if act in ISSUE_ACTS else "h1"), legs=legs)
+    evidence = {AgentKind.FIX_CI: _RED, AgentKind.ADDRESS_REVIEW: ChangeRequest("reviewbot", "h1", body="Handle None.")}
+    board = status(Dispatch(act, "" if act in ISSUE_ACTS else "h1", evidence=evidence.get(act)), legs=legs)
     assert isinstance(board, dash.Waiting)
     # #1105: a light act (STEWARD, TRIAGE) never waits for an agent slot.
     reason = "Waiting for a free agent slot." if act.holds_dispatch_slot else (
@@ -331,7 +334,7 @@ def test_the_rail_counts_legs_and_remembers_a_rewind():
         leg("REBASE", 6, number=9),
         leg("RESOLVE", 8, state="released"),
     )
-    rail = dash.rail(Dispatch(AgentKind.FIX_CI, "h1"), has_pr=True, legs=legs)
+    rail = dash.rail(Dispatch(AgentKind.FIX_CI, "h1", evidence=_RED), has_pr=True, legs=legs)
     assert (rail.current, rail.furthest) == ("ci", "review")
     assert (rail.resolve_attempts, rail.review_rounds, rail.ci_runs, rail.steps) == (1, 1, 2, 4)
     assert rail.live is False
@@ -458,7 +461,7 @@ def test_every_board_status_lands_in_one_group(board, group):
 @pytest.mark.parametrize(
     "state,group",
     [
-        (Dispatch(AgentKind.FIX_CI, "h1"), "slot"),
+        (Dispatch(AgentKind.FIX_CI, "h1", evidence=_RED), "slot"),
         (Dispatch(AgentKind.RESOLVE), "slot"),
         (Wait(WaitReason.CI_PENDING), "ci"),
         (Merge("h1"), "ci"),

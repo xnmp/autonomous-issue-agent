@@ -62,6 +62,12 @@ class LegEnd:
     steward: Steward | None = None
     # The routed tier the leg ran at, when recorded (legs before routing have none).
     tier: Tier | None = None
+    # The CI failure keys a FIX_CI agent end was handed (`evidence.failure_key`);
+    # derive never hands them to another repair of the same head.
+    evidence: frozenset[str] = frozenset()
+    # The commit the leg's PR branch was at on the remote when it ended, as the
+    # harness read it ("" when unread): not `head` means the leg pushed.
+    end_head: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentKind):
@@ -70,8 +76,8 @@ class LegEnd:
             raise ValueError("leg end requires an aware end time")
         if type(self.machine) is not bool:
             raise ValueError("leg end requires an exact machine classification")
-        if not isinstance(self.head, str):
-            raise ValueError("leg end head must be a string")
+        if not isinstance(self.head, str) or not isinstance(self.end_head, str):
+            raise ValueError("leg end heads must be strings")
         if self.question is not None and (not isinstance(self.question, str) or not self.question or self.machine):
             raise ValueError("only an agent end can carry a question, and it is non-empty text")
         if self.started_at is not None and (
@@ -90,6 +96,10 @@ class LegEnd:
             raise ValueError("only a STEWARD or TRIAGE agent end carries a steward result")
         if self.tier is not None and not isinstance(self.tier, Tier):
             raise ValueError("leg tier must be a Tier")
+        if not isinstance(self.evidence, frozenset) or any(not isinstance(k, str) or not k for k in self.evidence) or (
+            self.evidence and (self.kind is not AgentKind.FIX_CI or self.machine)
+        ):
+            raise ValueError("only a FIX_CI agent end carries the failure keys it was handed")
 
 
 def machine_backoff_until(ends: Iterable[LegEnd], kind: AgentKind) -> datetime | None:

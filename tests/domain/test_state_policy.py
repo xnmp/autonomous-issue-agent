@@ -22,6 +22,7 @@ from issue_agent.domain.actions import (
 )
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import BaseTip, Check, Observed, RequiredCheck, Unavailable
+from issue_agent.domain.evidence import ChangeRequest, new_failures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.policy import (
     OVERLAP_DEFER_CEILING, QUESTION_LIMIT, actions, blocker_comment, dispatch_order, overlaps, path_index, question_text,
@@ -77,6 +78,15 @@ def ci(bucket: str = "pass", head: str = HEAD, state: str = "COMPLETED") -> Obse
 GREEN, RED, PENDING = ci("pass"), ci("fail"), ci("pending", state="IN_PROGRESS")
 
 
+def fixing(tier: Tier | None = None, ci_: Observed = RED) -> Dispatch:
+    """FIX_CI handed every failure on the head (none handed before)."""
+    return Dispatch(FIX, HEAD, tier, new_failures(ci_, ()))
+
+
+def addressing(author: str = "review-bot", body: str = "") -> Dispatch:
+    return Dispatch(ADDR, HEAD, evidence=ChangeRequest(author, HEAD, body=body))
+
+
 def pr(number: int = 7, issue: int = 3, **kw) -> PRView:
     kw.setdefault("head_ref_name", f"fix/{issue}-slug")
     kw.setdefault("head_ref_oid", HEAD)
@@ -104,7 +114,9 @@ def stop(reason: StopReason, minute: float) -> Comment:
 
 
 def legs(kind: AgentKind, *minutes: float, machine: bool = False) -> tuple[LegEnd, ...]:
-    return tuple(LegEnd(kind, at(m), machine) for m in minutes)
+    """Agent legs ending at `minutes`. A FIX_CI try is one push (PR #403), so
+    each FIX_CI leg here pushed a head of its own."""
+    return tuple(LegEnd(kind, at(m), machine, f"pushed-{m}" if kind is AgentKind.FIX_CI else "") for m in minutes)
 
 
 # A triage leg that returned nothing usable: the issue proceeds at the default
@@ -177,7 +189,7 @@ def test_harness_branch_parser_rejects_malformed_input(raw):
 
 
 def test_red_required_check_on_head_dispatches_fix_ci():
-    assert pr_state(pr(ci=RED)) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED)) == fixing()
 
 
 def _red_base(*red: str, ref: str = "dev") -> BaseTip:
@@ -198,19 +210,19 @@ def test_313_a_red_base_is_not_charged_to_every_open_pr():
 
 
 def test_313_a_pr_red_beyond_the_base_still_gets_fix_ci():
-    assert pr_state_in(pr(ci=_two_red(), base_ref_name="dev"), _red_base("test")) == Dispatch(FIX, HEAD)
-    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), _red_base("lint")) == Dispatch(FIX, HEAD)
+    assert pr_state_in(pr(ci=_two_red(), base_ref_name="dev"), _red_base("test")) == fixing(ci_=_two_red())
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), _red_base("lint")) == fixing()
 
 
 @pytest.mark.parametrize("base", [None, _red_base("test", ref="main")])
 def test_313_an_unread_or_other_base_charges_the_pr(base):
     # Absent base evidence, or a tip of a branch this PR does not target.
-    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), base) == Dispatch(FIX, HEAD)
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), base) == fixing()
 
 
 def test_313_the_pr_resumes_when_the_base_goes_green():
     green = BaseTip("dev", "b10", (Check("test", "SUCCESS", "pass"),))
-    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), green) == Dispatch(FIX, HEAD)
+    assert pr_state_in(pr(ci=RED, base_ref_name="dev"), green) == fixing()
 
 
 def test_313_a_base_twin_still_running_is_waited_for():
@@ -248,7 +260,7 @@ def test_green_pr_without_a_bot_verdict_on_head_is_reviewed(reviews):
 
 
 def test_bot_changes_requested_on_head_dispatches_address_review():
-    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1),))) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1),))) == addressing()
 
 
 def test_bot_approval_on_green_head_merges_bound_to_that_head():
@@ -258,12 +270,12 @@ def test_bot_approval_on_green_head_merges_bound_to_that_head():
 
 
 def test_approval_never_merges_a_red_head():
-    assert pr_state(pr(ci=RED, reviews=(review("APPROVED", 1),))) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED, reviews=(review("APPROVED", 1),))) == fixing()
 
 
 def test_latest_bot_verdict_on_head_wins():
     assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1), review("APPROVED", 2)))) == Merge(HEAD)
-    assert pr_state(pr(reviews=(review("APPROVED", 1), review("CHANGES_REQUESTED", 2)))) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=(review("APPROVED", 1), review("CHANGES_REQUESTED", 2)))) == addressing()
 
 
 def test_push_after_approval_needs_a_fresh_review():
@@ -378,7 +390,7 @@ def test_released_item_proceeds_with_attempts_reset_past_the_stop():
     # Label removed (by policy after a reply, or by a human): the stop comment
     # is the release boundary, so the three earlier attempts no longer count.
     view = pr(ci=RED, comments=(stop(StopReason.ATTEMPTS, 10),))
-    assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2, 3)))) == Dispatch(FIX, HEAD)
+    assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2, 3)))) == fixing()
 
 
 def test_issue_stage_needs_human_uses_the_issue_thread():
@@ -392,7 +404,7 @@ def test_issue_stage_needs_human_uses_the_issue_thread():
 
 def test_two_attempts_dispatch_and_the_third_stops_with_a_reason():
     view = pr(ci=RED)
-    assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2)))) == Dispatch(FIX, HEAD, Tier.XHIGH)
+    assert pr_state(view, local(pr_legs(*legs(FIX, 1, 2)))) == fixing(Tier.XHIGH)
     states = derive(WorldState(prs=(view,)), local(pr_legs(*legs(FIX, 1, 2, 3))), H)
     assert states == {pr_key(7): NeedsHuman(StopReason.ATTEMPTS, iso(3), FIX)}
     label, comment = actions(states, H)
@@ -407,7 +419,7 @@ def test_resolve_attempts_cap_on_the_issue():
 
 def test_machine_failures_never_count_as_attempts():
     history = legs(FIX, 1, 2, 3, 4, 5, machine=True) + legs(FIX, 6, 7)
-    assert pr_state(pr(ci=RED), local(pr_legs(*history))) == Dispatch(FIX, HEAD, Tier.XHIGH)
+    assert pr_state(pr(ci=RED), local(pr_legs(*history))) == fixing(Tier.XHIGH)
 
 
 def test_attempts_are_per_action_and_per_item():
@@ -425,7 +437,7 @@ def test_attempts_are_per_action_and_per_item():
 )
 def test_a_non_harness_comment_review_or_push_resets_attempts(change):
     loc = local(pr_legs(*legs(FIX, 1, 2, 3, 11)))
-    assert pr_state(pr(ci=RED, **change), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
+    assert pr_state(pr(ci=RED, **change), loc) == fixing(Tier.HIGH)
 
 
 @pytest.mark.parametrize(
@@ -461,7 +473,7 @@ def seq(*steps: tuple[AgentKind, str] | tuple[AgentKind, str, bool]) -> dict:
 
 
 def test_fix_ci_red_fix_red_three_times_caps():
-    loc = local(seq((FIX, "a"), (FIX, "b"), (FIX, HEAD)))
+    loc = local(seq((FIX, "a"), (FIX, "b"), (FIX, "c")))  # three pushes, each red again
     assert pr_state(pr(ci=RED), loc) == NeedsHuman(StopReason.ATTEMPTS, iso(2), FIX)
 
 
@@ -483,15 +495,15 @@ def test_three_reviews_of_the_same_head_cap():
 
 
 def test_machine_legs_inside_a_run_neither_break_nor_count():
-    loc = local(seq((FIX, "a"), (FIX, "a", True), (REVIEW, "a", True), (FIX, "b"), (FIX, "b", True), (FIX, HEAD)))
+    loc = local(seq((FIX, "a"), (FIX, "a", True), (REVIEW, "a", True), (FIX, "b"), (FIX, "b", True), (FIX, "c")))
     assert pr_state(pr(ci=RED), local(loc.legs, now=at(100))) == NeedsHuman(StopReason.ATTEMPTS, iso(5), FIX)
-    two = local(seq((FIX, "a"), (FIX, "a", True), (FIX, HEAD)), now=at(100))
-    assert pr_state(pr(ci=RED), two) == Dispatch(FIX, HEAD, Tier.XHIGH)
+    two = local(seq((FIX, "a"), (FIX, "a", True), (FIX, "b")), now=at(100))
+    assert pr_state(pr(ci=RED), two) == fixing(Tier.XHIGH)
 
 
 def test_another_acts_agent_leg_ends_the_run():
-    loc = local(seq((FIX, "a"), (FIX, "b"), (AgentKind.ADDRESS_REVIEW, "b"), (FIX, HEAD)))
-    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
+    loc = local(seq((FIX, "a"), (FIX, "b"), (AgentKind.ADDRESS_REVIEW, "b"), (FIX, "c")))
+    assert pr_state(pr(ci=RED), loc) == fixing(Tier.HIGH)
 
 
 def test_leg_end_head_must_be_a_string():
@@ -505,16 +517,16 @@ APPROVED_BY_BOT = review("APPROVED", 5)
 
 
 def test_human_change_request_on_head_dispatches_address_review_before_bot_review():
-    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice"),))) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=(review("CHANGES_REQUESTED", 1, author="alice"),))) == addressing("alice")
     assert pr_state(pr(reviews=(APPROVED_BY_BOT, review("CHANGES_REQUESTED", 6, author="alice")))) == Dispatch(
-        ADDR, HEAD
+        ADDR, HEAD, evidence=ChangeRequest("alice", HEAD)
     )
 
 
 def test_human_change_request_driven_address_review_counts_attempts_not_bot_rounds():
     bot_rounds = tuple(review("CHANGES_REQUESTED", m, head=f"old{m}") for m in (1, 2, 3))
     view = pr(reviews=(*bot_rounds, review("CHANGES_REQUESTED", 4, author="alice")))
-    assert pr_state(view) == Dispatch(ADDR, HEAD)  # three bot rounds, yet no rounds stop
+    assert pr_state(view) == addressing("alice")  # three bot rounds, yet no rounds stop
     after_review = local({pr_key(7): tuple(LegEnd(ADDR, at(10 + m), False, head=HEAD) for m in range(3))})
     assert pr_state(view, after_review) == NeedsHuman(StopReason.ATTEMPTS, iso(12), ADDR)
 
@@ -563,7 +575,7 @@ def test_harness_reviewers_are_not_humans():
 
 def test_third_bot_change_request_stops_instead_of_addressing():
     rounds = tuple(review("CHANGES_REQUESTED", m, head=h) for m, h in ((1, "a"), (2, "b"), (3, HEAD)))
-    assert pr_state(pr(reviews=rounds[1:])) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=rounds[1:])) == addressing()
     assert pr_state(pr(reviews=rounds)) == NeedsHuman(StopReason.REVIEW_ROUNDS, "-")
 
 
@@ -574,7 +586,7 @@ def test_rounds_do_not_block_an_approved_head():
 
 def test_human_engagement_resets_review_rounds():
     rounds = tuple(review("CHANGES_REQUESTED", m, head=h) for m, h in ((1, "a"), (2, "b"), (3, HEAD)))
-    assert pr_state(pr(reviews=rounds, comments=(human(2.5),))) == Dispatch(ADDR, HEAD)
+    assert pr_state(pr(reviews=rounds, comments=(human(2.5),))) == addressing()
 
 
 def test_untimed_bot_change_requests_still_count_as_rounds():
@@ -588,7 +600,7 @@ def test_untimed_bot_change_requests_still_count_as_rounds():
 def test_machine_failure_backs_off_then_dispatches():
     history = pr_legs(*legs(FIX, 0, machine=True))
     assert pr_state(pr(ci=RED), local(history, now=at(0.5))) == Backoff(FIX, at(1))
-    assert pr_state(pr(ci=RED), local(history, now=at(2))) == Dispatch(FIX, HEAD)
+    assert pr_state(pr(ci=RED), local(history, now=at(2))) == fixing()
     assert actions({pr_key(7): Backoff(FIX, at(1))}, H) == ()
 
 
@@ -668,7 +680,7 @@ WF = frozenset({".github/workflows/ci.yml"})
             local(),
             Dispatch(AgentKind.REBASE, HEAD),
         ),
-        (pr(ci=RED, merge_state="BEHIND"), local(), Dispatch(FIX, HEAD)),
+        (pr(ci=RED, merge_state="BEHIND"), local(), fixing()),
         (pr(merge_state="BEHIND", reviews=(review("APPROVED", 1),)), local(), Refresh(HEAD)),
     ],
 )
@@ -747,7 +759,7 @@ def test_local_legs_cannot_be_mutated_after_construction():
     source = {pr_key(7): legs(FIX, 1)}
     loc = local(source)
     source[pr_key(7)] = legs(FIX, 1, 2, 3)
-    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
+    assert pr_state(pr(ci=RED), loc) == fixing(Tier.HIGH)
 
 
 def test_ten_thousand_comments_with_a_late_reply_release():
@@ -845,7 +857,7 @@ def test_after_release_the_answered_question_redispatches_with_a_fresh_count():
 
 def test_a_later_agent_leg_supersedes_an_old_question():
     loc = local(pr_legs(asked(FIX, 1), *legs(FIX, 2)))
-    assert pr_state(pr(ci=RED), loc) == Dispatch(FIX, HEAD, Tier.XHIGH)
+    assert pr_state(pr(ci=RED), loc) == fixing(Tier.XHIGH)
 
 
 def test_a_machine_end_after_a_question_does_not_hide_it():
@@ -874,7 +886,7 @@ def test_leg_end_rejects_contradictory_question_or_window(bad):
 
 
 def windowed(kind: AgentKind, start: float, end: float) -> LegEnd:
-    return LegEnd(kind, at(end), False, started_at=at(start))
+    return LegEnd(kind, at(end), False, f"pushed-{end}" if kind is AgentKind.FIX_CI else "", started_at=at(start))
 
 
 def test_the_agents_own_unmarked_comment_inside_its_leg_is_not_a_reset():
@@ -886,7 +898,7 @@ def test_the_agents_own_unmarked_comment_inside_its_leg_is_not_a_reset():
 def test_the_same_comment_outside_every_leg_window_resets():
     between = Comment("alice", "try the other approach", iso(3.5))
     loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
-    assert pr_state(pr(ci=RED, comments=(between,)), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
+    assert pr_state(pr(ci=RED, comments=(between,)), loc) == fixing(Tier.HIGH)
 
 
 # ── One definition of a human comment (#342) ────────────────────────────────
@@ -949,7 +961,7 @@ def test_a_comment_at_the_leg_start_instant_is_outside_the_window():
     # The window is (start, end]: a human comment the leg was dispatched on is a reset.
     edge = Comment("alice", "go", iso(4))
     loc = local(pr_legs(windowed(FIX, 0.5, 1), windowed(FIX, 2, 3), windowed(FIX, 4, 5)))
-    assert pr_state(pr(ci=RED, comments=(edge,)), loc) == Dispatch(FIX, HEAD, Tier.HIGH)
+    assert pr_state(pr(ci=RED, comments=(edge,)), loc) == fixing(Tier.HIGH)
 
 
 # ── Publication: the agent pushes, the harness opens (Q11, slice 5b) ─────────

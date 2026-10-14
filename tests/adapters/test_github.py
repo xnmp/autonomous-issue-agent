@@ -12,9 +12,6 @@ from types import SimpleNamespace
 import pytest
 
 from issue_agent.adapters.github import (
-    _FAILED_LOG_BYTES,
-    _FAILED_LOG_LINES,
-    _REVIEW_COMMENTS_TOTAL_BYTES,
     GhUnavailable,
     GitHubGateway,
     Identity,
@@ -26,7 +23,6 @@ from issue_agent.adapters.github import (
     build_submit_review_args,
     classify_gh_failure,
     format_pr_discussion,
-    format_review_comments,
     parse_pr,
 )
 from issue_agent.domain.checks import Unavailable
@@ -285,16 +281,6 @@ def test_the_issue_index_lists_one_authors_issues_when_asked():
     assert argv[argv.index("--author") + 1] == "@me" and argv[argv.index("--limit") + 1] == "1000"
 
 
-# ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
-def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
-    fr = FakeRunner(
-        {"api repos/o/r/actions/runs/77": {"id": 77, "head_sha": "head", "run_attempt": 2}, "run view 77": "boom"}
-    )
-    assert GitHubGateway("o/r", runner=fr).failed_run_log("head", (77,)) == "boom"
-    argv = fr.calls[-1][0]
-    assert argv[argv.index("--attempt") + 1] == "2"
-
-
 # ── V10: infra failure ≠ "nothing to do" ──────────────────────────────────────
 def _run_with(monkeypatch, stderr, rc=1):
     monkeypatch.setattr(
@@ -459,154 +445,17 @@ def test_one_huge_comment_is_capped_and_says_so():
     assert "old point" in text  # the rest of the thread survives
 
 
-# ── review M13 / D6: the two repair legs' prompt inputs ───────────────────────
-def test_format_review_comments_renders_path_line_author_body():
-    """review M13: the fixer never saw the file:line asks reviewers actually make.
-    Formatting lives in Python (not in a jq filter inside an argv) so this text —
-    the whole point of the feature — is assertable."""
-    raw = [
-        {
-            "path": "a.py",
-            "line": 12,
-            "user": {"login": "rev"},
-            "body": "rename this",
-            "created_at": "t1",
-            "in_reply_to_id": None,
-        },
-        # line null (outdated hunk) → original_line, as the bash's `.line // 0` did
-        {
-            "path": "b.py",
-            "line": None,
-            "original_line": 3,
-            "user": {"login": "rev"},
-            "body": "  drop the flag  ",
-            "created_at": "t2",
-        },
-        # a REPLY is the fixer's own thread, not a new ask → excluded
-        {
-            "path": "a.py",
-            "line": 12,
-            "user": {"login": "fixer"},
-            "body": "done",
-            "created_at": "t3",
-            "in_reply_to_id": 99,
-        },
-    ]
-    assert format_review_comments(raw).splitlines() == ["a.py:12 (rev): rename this", "b.py:3 (rev): drop the flag"]
-
-
-@pytest.mark.parametrize(
-    "raw",
-    [
-        None,
-        [],
-        {"message": "Not Found"},  # an API error object
-        [{"body": "no path, no line, no user"}],  # every field missing
-        ["not-a-dict"],
-    ],
-)
-def test_format_review_comments_tolerates_every_malformed_shape(raw):
-    assert isinstance(format_review_comments(raw), str)  # never raises
-
-
-def test_review_comments_fetches_top_level_comments_and_formats_them():
-    raw = [{"path": "a.py", "line": 4, "user": {"login": "rev"}, "body": "fix", "created_at": "t1"}]
-    fr = FakeRunner({"api repos/o/r/pulls/100/comments": raw})
-    assert GitHubGateway("o/r", runner=fr).review_comments(100) == "a.py:4 (rev): fix"
-    argv = fr.calls[0][0]
-    assert argv[1] == "api" and argv[2].startswith("repos/o/r/pulls/100/comments")
-    # per_page: the endpoint's default page is 30 and we keep the NEWEST few —
-    # reading page 1 only would hand the fixer the OLDEST asks (review C2's shape).
-    assert "per_page=100" in argv[2]
-
-
-@pytest.mark.parametrize(
-    "fetch",
-    [
-        # D6: a comment fetch may never kill a dispatch — address-review must still
-        # run with the review BODY alone rather than not run at all.
-        lambda gw: gw.review_comments(100),
-        # D6: nor a log fetch — the fixer can rediscover the failure itself, but
-        # only if it is actually dispatched.
-        lambda gw: gw.failed_run_log("head", (1,)),
-    ],
-    ids=["review-comments", "failed-run-log"],
-)
-@pytest.mark.parametrize(
-    "runner",
-    [
-        _raising_runner(GhUnavailable("rate-limit", "API rate limit exceeded")),
-        _raising_runner(RuntimeError("gh boom")),
-        FakeRunner(),  # gh answered ""
-    ],
-)
-def test_prompt_input_fetches_fail_soft_to_empty_string(fetch, runner):
-    assert fetch(GitHubGateway("o/r", runner=runner)) == ""
-
-
-def test_failed_run_log_tails_only_the_observed_revision_bound_run():
-    log = "\n".join(f"line {i}" for i in range(1, 301))
-    fr = FakeRunner(
-        {"api repos/o/r/actions/runs/4242": {"id": 4242, "head_sha": "head", "run_attempt": 1}, "run view 4242": log}
-    )
-    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (4242,))
-    assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
-    view_argv = fr.calls[-1][0]
-    assert view_argv[1:4] == ["run", "view", "4242"] and "--log-failed" in view_argv
-
-
-@pytest.mark.parametrize(
-    "evidence",
-    [
-        {"id": 1, "head_sha": "old-head", "run_attempt": 1},
-        {"id": 2, "head_sha": "head", "run_attempt": 1},
-        {"id": 1, "head_sha": "head", "run_attempt": True},
-        {"id": "bad", "head_sha": "head", "run_attempt": 1},
-        {},
-        None,
-    ],
-)
-def test_failed_run_log_never_borrows_a_stale_or_unverified_run(evidence):
-    fr = FakeRunner(
-        {"api repos/o/r/actions/runs/1": evidence, "run list": [{"databaseId": 2}], "run view 1": "wrong log"}
-    )
-    assert GitHubGateway("o/r", runner=fr).failed_run_log("head", (1,)) == ""
-    assert not any(c[0][1] == "run" for c in fr.calls)
-
-
-@pytest.mark.parametrize("head,run_ids", [("", (1,)), ("head", ()), ("head", (True,)), ("head", (-1,))])
-def test_failed_run_log_empty_when_identity_is_unknown(head, run_ids):
-    fr = FakeRunner({"run list": []})
-    assert GitHubGateway("o/r", runner=fr).failed_run_log(head, run_ids) == ""
-    assert fr.calls == []
-
-
-# ── P1R-13: `tail -150` bounds LINE count, not bytes ──────────────────────────
-def test_failed_run_log_bounds_by_bytes_not_just_lines():
-    """Repro: a log whose lines are individually enormous (a minified bundle,
-    a base64 blob, a per-line JSON dump) sails straight through the 150-LINE
-    cap — measured, a 200MB CI log's last 150 lines was still a
-    150,001,711-char prompt. ONE 5MB line (well within the 150-line cap) is
-    enough to demonstrate the byte ceiling holds independently."""
-    fr = FakeRunner(
-        {"api repos/o/r/actions/runs/1": {"id": 1, "head_sha": "head", "run_attempt": 1}, "run view 1": "x" * 5_000_000}
-    )
-    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (1,))
-    assert len(out.encode("utf-8")) <= _FAILED_LOG_BYTES
-    assert out  # anti-vacuity: real (truncated) content survives, not wiped to ""
-
-
-def test_format_review_comments_bounds_pathological_comment_bytes():
-    """P1R-13 repro: an inline review comment is writable by ANY user with
-    read access to the repo (not just the PR author) — 10 x 500KB comments is
-    otherwise a ~4MB prompt slipping through the OLD item-count-only cap."""
-    raw = [
-        {"path": f"f{n}.py", "line": n, "user": {"login": "rev"}, "body": "A" * 500_000, "created_at": f"t{n:02d}"}
-        for n in range(1, 11)
-    ]
-    out = format_review_comments(raw)
-    assert len(out.encode("utf-8")) <= _REVIEW_COMMENTS_TOTAL_BYTES
-    assert out  # anti-vacuity: not wiped to "", just bounded
+# ── review ids: the agent reads a change request's inline comments by it ──
+@pytest.mark.parametrize("raw,review_id", [
+    ({"databaseId": 42, "id": "PRR_node", "state": "CHANGES_REQUESTED"}, 42),  # GraphQL: the node id is no review id
+    ({"id": 42, "state": "CHANGES_REQUESTED"}, 42),  # REST
+    ({"id": "PRR_node", "state": "CHANGES_REQUESTED"}, None),
+    ({"databaseId": 0, "state": "CHANGES_REQUESTED"}, None),
+    ({"databaseId": True, "state": "CHANGES_REQUESTED"}, None),
+])
+def test_a_review_carries_its_id_only_when_github_gave_a_real_one(raw, review_id):
+    pr = parse_pr({"number": 1, "headRefName": "fix/1-x", "headRefOid": "h", "state": "OPEN", "reviews": [raw]})
+    assert pr.reviews[0].id == review_id
 
 
 # ── #48: a failed `gh pr checks` is UNKNOWN, not an empty world ──────────────
@@ -622,86 +471,19 @@ def test_unread_checks_are_unknown_not_an_empty_world(checks):
     assert pr.checks == () and isinstance(pr.ci, Unavailable)
 
 
-# ── per-job failed logs (tauri #1078: run-level --log-failed refuses mid-run) ──
-_RUN = {"id": 9, "head_sha": "head", "run_attempt": 2}
+# ── the harness's one re-run of a head (owner, PR #403) ─────────────────────
+def test_run_attempt_reads_the_runs_current_attempt():
+    fr = FakeRunner({"api repos/o/r/actions/runs/900": {"id": 900, "run_attempt": 2, "status": "queued"}})
+    assert GitHubGateway("o/r", runner=fr).run_attempt(900) == 2
 
 
-def _job_runner(jobs, logs, run=None, run_level=""):
-    """A run whose jobs are `jobs`; `logs` maps job id -> text ("" = gh's 404/410 answer)."""
-    # FakeRunner answers the FIRST matching prefix, so the longer jobs key goes first.
-    responses = {"api repos/o/r/actions/runs/9/attempts/2/jobs": jobs}
-    responses.update({f"api repos/o/r/actions/jobs/{i}/logs": text for i, text in logs.items()})
-    responses.update({"api repos/o/r/actions/runs/9": run or _RUN, "run view 9": run_level})
-    return FakeRunner(responses)
+@pytest.mark.parametrize("answer", [{}, {"run_attempt": 0}, {"run_attempt": "2"}, {"run_attempt": True}, [], ""])
+def test_an_unreadable_run_raises(answer):
+    with pytest.raises(ValueError):
+        GitHubGateway("o/r", runner=FakeRunner({"api repos/o/r/actions/runs/900": answer})).run_attempt(900)
 
 
-def _jobs(*rows):
-    return {"jobs": [{"id": i, "name": n, "conclusion": c} for i, n, c in rows]}
-
-
-def test_in_progress_run_still_yields_the_failed_jobs_log():
-    fr = _job_runner(_jobs((1, "smoke-ubuntu", "failure"), (2, "smoke-windows", None), (3, "lint", "success"), (4, "slow", "timed_out")),
-                     {1: "setup\n##[group]Run tests\nFAILED test_x\n##[error]exit 1\ncleanup", 2: "unfinished", 4: "timed out here"},
-                     run_level="")  # gh run view refuses while the run is in progress
-    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
-    assert "FAILED test_x" in out and "smoke-ubuntu" in out and "timed out here" in out
-    assert "unfinished" not in out and "setup" not in out and "cleanup" not in out
-    assert not any(c[0][1] == "run" for c in fr.calls)
-
-
-def test_multiple_failed_jobs_are_concatenated_and_bounded():
-    big = "\n".join(f"job1 line {i}" for i in range(5000))
-    fr = _job_runner(_jobs((1, "a", "failure"), (2, "b", "failure")), {1: big, 2: "b broke"})
-    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
-    assert out.endswith("b broke") and "== job: b ==" in out
-    assert len(out.encode()) <= _FAILED_LOG_BYTES and len(out.splitlines()) <= _FAILED_LOG_LINES
-
-
-def test_failed_jobs_across_runs_are_all_read():
-    fr = FakeRunner({
-        "api repos/o/r/actions/runs/9/attempts/1": _jobs((1, "a", "failure")),
-        "api repos/o/r/actions/runs/9": {**_RUN, "run_attempt": 1},
-        "api repos/o/r/actions/runs/8/attempts/1": _jobs((2, "b", "failure")),
-        "api repos/o/r/actions/runs/8": {"id": 8, "head_sha": "head", "run_attempt": 1},
-        "api repos/o/r/actions/jobs/1/logs": "boom A", "api repos/o/r/actions/jobs/2/logs": "boom B",
-    })
-    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9, 8))
-    assert "boom A" in out and "boom B" in out
-
-
-@pytest.mark.parametrize("run", [{**_RUN, "head_sha": "other"}, {**_RUN, "run_attempt": "x"}])
-def test_head_or_attempt_mismatch_reads_no_job_log(run):
-    fr = _job_runner(_jobs((1, "a", "failure")), {1: "boom"}, run=run)
-    assert GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,)) == ""
-    assert not any("jobs" in c[0][2] for c in fr.calls)
-
-
-def test_attempt_pins_the_job_listing():
-    fr = _job_runner(_jobs((1, "a", "failure")), {1: "boom"})
-    GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
-    assert any("runs/9/attempts/2/jobs" in c[0][2] for c in fr.calls)
-
-
-def test_expired_job_log_falls_back_to_run_level_then_empty():
-    jobs = _jobs((1, "a", "failure"))
-    assert GitHubGateway("o/r", runner=_job_runner(jobs, {1: ""}, run_level="run-level tail")).failed_run_log(
-        "head", (9,)) == "run-level tail"
-    assert GitHubGateway("o/r", runner=_job_runner(jobs, {1: ""})).failed_run_log("head", (9,)) == ""
-
-
-def test_empty_result_says_why_on_stderr(capsys):
-    GitHubGateway("o/r", runner=_job_runner(_jobs((1, "a", "failure")), {1: ""})).failed_run_log("head", (9,))
-    assert "failed-run log empty" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("jobs", ["not json{", {"jobs": "x"}, [], {"jobs": [None, 3, {"id": True, "conclusion": "failure"}]},
-                                  _jobs((1, "a", "success"), (2, "b", "cancelled"))])
-def test_malformed_or_failure_free_job_lists_fall_back_to_run_level(jobs):
-    fr = _job_runner(jobs, {1: "unused", 2: "unused"}, run_level="run-level tail")
-    assert GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,)) == "run-level tail"
-
-
-def test_huge_job_log_is_truncated_to_the_byte_bound():
-    fr = _job_runner(_jobs((1, "a", "failure")), {1: "x" * 5_000_000})
-    out = GitHubGateway("o/r", runner=fr).failed_run_log("head", (9,))
-    assert out and len(out.encode()) <= _FAILED_LOG_BYTES
+def test_a_rerun_posts_the_failed_jobs_rerun():
+    fr = FakeRunner({"api --method POST": "{}"})
+    GitHubGateway("o/r", runner=fr).rerun_failed_checks(900)  # the act layer reads the attempt back
+    assert fr.calls[0][0][1:] == ["api", "--method", "POST", "repos/o/r/actions/runs/900/rerun-failed-jobs"]

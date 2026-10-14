@@ -14,6 +14,7 @@ from issue_agent.app.tick import Facts, leased_items, leg_end, local_legs, run_i
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
 from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
+from issue_agent.domain.evidence import CiFailure, CiFailures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.state import Harness, Local, derive, issue_key, pr_key
 from issue_agent.domain.world import Comment, IssueView, PRView, Review, WorldState
@@ -51,6 +52,27 @@ def test_each_run_belongs_to_its_issue_or_pr_item(recorded, item):
 def test_a_returned_agent_leg_is_one_attempt_with_its_window():
     end = leg_end(run("FIX_CI", number=100, head="h1", leg="agent", started=0, minute=3))
     assert end == LegEnd(AgentKind.FIX_CI, T0 + timedelta(minutes=3), False, "h1", started_at=T0)
+
+
+@pytest.mark.parametrize("kind,leg,raw,keys", [
+    ("FIX_CI", "agent", ["check:11", "check:12"], frozenset({"check:11", "check:12"})),
+    ("FIX_CI", "agent", "check:11", frozenset()),  # malformed: nothing handed, so it is handed again
+    ("FIX_CI", "machine", ["check:11"], frozenset()),  # a machine end handed nothing
+    ("REBASE", "agent", ["check:11"], frozenset()),  # only a CI repair is handed failures
+])
+def test_a_fix_ci_agent_end_reads_back_the_failures_it_was_handed(kind, leg, raw, keys):
+    end = leg_end(run(kind, number=100, head="h1", receipt={"leg": leg, "evidence": raw}))
+    assert end is not None and end.evidence == keys
+
+
+@pytest.mark.parametrize("leg,raw,head", [
+    ("agent", "h2", "h2"),
+    ("agent", None, ""), ("agent", 7, ""), ("agent", ["h2"], ""), ("agent", "f" * 65, ""),  # malformed: unread
+    ("machine", "h2", ""),  # a machine end recorded no receipt worth reading
+])
+def test_an_agent_end_reads_back_the_remote_head_it_left(leg, raw, head):
+    end = leg_end(run("FIX_CI", number=100, head="h1", receipt={"leg": leg, "end_head": raw}))
+    assert end is not None and end.end_head == head
 
 
 @pytest.mark.parametrize("receipt", [None, {}, {"leg": "machine"}, {"leg": "AGENT"}, {"leg": 1}])
@@ -106,9 +128,13 @@ def test_local_legs_group_both_roles_legs_by_item_in_end_order():
     ]
 
 
+_FAILED = CiFailures((CiFailure("check:1@9.1", "test", 1, 9),))
+
+
 def test_leases_cover_own_dispatches_and_other_holders_issues_only():
     held = leased_items(
-        [RunAgent(AgentKind.RESOLVE, 5), RunAgent(AgentKind.FIX_CI, 100, head="h1")], [7, 0, -3, "8", True, None]
+        [RunAgent(AgentKind.RESOLVE, 5), RunAgent(AgentKind.FIX_CI, 100, head="h1", evidence=_FAILED)],
+        [7, 0, -3, "8", True, None]
     )
     assert held == frozenset({issue_key(5), pr_key(100), issue_key(7)})
 

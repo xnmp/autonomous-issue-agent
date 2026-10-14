@@ -15,20 +15,22 @@ from datetime import datetime, timedelta, timezone
 from .actions import (
     ISSUE_ACTS, Action, FileIssue, LinkBlockedBy, MergePullRequest, OpenPullRequest, PostComment, Relabel, RunAgent,
     SetIssueState, Target, UpdateBranch,
+    RerunFailedJobs,
 )
 from .checks import BaseCI
 from .ci import GREEN_CONCLUSIONS, base_verdicts, parse_timestamp
 from .labels import Label
 from .triage import normalise_guess, normalise_path
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh,
+    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Rerun,
     Release, StopReason, TriageNote, Wait, stop_tag, ATTEMPT_CAP, BLOCKER_TAG, REVIEW_ROUND_CAP, TRIAGE_TAG,
 )
 
 _WHY = {
     StopReason.WORKFLOW_PATH: "this PR changes files under `.github/`, which a human must judge.",
     StopReason.LIFETIME_CAP: "this issue has spent its lifetime budget; raising the cap is a grant.",
-    StopReason.ATTEMPTS: f"{{act}} ran {ATTEMPT_CAP} times without progress since the last human activity.",
+    StopReason.ATTEMPTS: (f"{{act}} made no progress since the last human activity ({ATTEMPT_CAP} attempts in a row, "
+                          "or a CI repair left every failure on its head unrepaired)."),
     StopReason.REVIEW_ROUNDS: f"the reviewer requested changes {REVIEW_ROUND_CAP} times; the dispute needs a human.",
     StopReason.QUESTION: "the agent asked a question that needs a human's judgment:",
     StopReason.DUPLICATE: "steward suspects this issue duplicates #{dup}:",
@@ -214,7 +216,7 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
     if isinstance(state, Dispatch):
         if (state.act in ISSUE_ACTS) != (key.target is Target.ISSUE):
             raise ValueError("issue acts dispatch exactly on issues")
-        return (RunAgent(state.act, key.number, head=state.head, tier=state.tier),)
+        return (RunAgent(state.act, key.number, head=state.head, tier=state.tier, evidence=state.evidence),)
     if isinstance(state, TriageNote):
         if key.target is not Target.ISSUE:
             raise ValueError("a triage note is posted exactly on an issue")
@@ -229,6 +231,8 @@ def _for(key: ItemKey, state: DerivedState, harness: Harness) -> tuple[Action, .
         return (MergePullRequest(key.number, state.head),)
     if isinstance(state, Refresh):
         return (UpdateBranch(key.number, state.head),)
+    if isinstance(state, Rerun):
+        return (RerunFailedJobs(key.number, state.head, state.runs),)
     if isinstance(state, OpenPR):
         if key.target is not Target.ISSUE:
             raise ValueError("a PR is opened exactly for an issue")

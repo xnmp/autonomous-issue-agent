@@ -23,3 +23,9 @@ def test_the_fixer_keeps_its_working_tools():
     # The pre-push review is a Task subagent; the TDD loop is git/test/gh Bash work.
     assert not {"Task", "Bash", "Read", "Edit", "Write"} & set(FIXER_DENY)
     assert not [r for r in FIXER_DENY if r.startswith(("Bash(git", "Bash(gh pr", "Bash(gh issue"))]
+
+
+def test_ci_and_review_reads_are_not_denied():
+    # PR #403: agents read job logs and inline review comments with `gh api`;
+    # waiting for CI is a legitimate answer to missing evidence (tauri #1078).
+    assert not [r for r in FIXER_DENY if r.startswith(("Bash(gh api", "Bash(gh run"))]

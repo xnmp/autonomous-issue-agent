@@ -200,6 +200,9 @@ class FakeWorktrees:
     def prune_validate(self):
         return 0
 
+    def remote_head(self, branch):
+        return ""
+
 
 class FakeRunner:
     def __init__(self, result):

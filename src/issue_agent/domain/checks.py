@@ -19,17 +19,27 @@ class Check:
     name: str
     state: str = ""
     bucket: str = ""
+    # When the report's CI run began: an Actions job's run attempt (so every
+    # job of one attempt shares it), another app's check run, a status's post.
     started_at: str = ""
     run_id: int | None = None
     required: bool = False
     app_id: int | None = None
     kind: str = "check"
+    # A check run's database id: for a GitHub Actions job, its job id. Each run
+    # attempt mints new ones, so it identifies one failure (domain.evidence).
+    check_id: int | None = None
+    # The Actions run's latest attempt (1 first, +1 per re-run); the
+    # observation drops checks an attempt superseded (adapters.github_ci).
+    run_attempt: int | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.name, str) or not self.name
                 or any(not isinstance(v, str) for v in (self.state, self.bucket, self.started_at))
                 or type(self.required) is not bool or self.kind not in {"check", "status"}
-                or any(v is not None and (type(v) is not int or v <= 0) for v in (self.app_id, self.run_id))):
+                or self.check_id is not None and self.kind != "check"
+                or any(v is not None and (type(v) is not int or v <= 0)
+                       for v in (self.app_id, self.run_id, self.check_id, self.run_attempt))):
             raise ValueError("check report is malformed")
 
 

@@ -5,6 +5,7 @@ tests with a fake; the default shells out."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -175,6 +176,15 @@ class Worktrees:
             if self._git(["reset", "--hard", head], path).code != 0:
                 raise WorktreeUnavailable(f"cannot reset issue #{issue} checkout to {head[:12]}")
             return path
+
+    def remote_head(self, branch: str) -> str:
+        """The commit `branch` is at on the remote, read from the harness's own
+        checkout, never the agent's report: a leg's push shows here before
+        GitHub's PR view has it. Never raises; "" when unreadable."""
+        ref = f"refs/heads/{branch}"
+        listed = self._git(["ls-remote", "origin", ref], self.repo_dir)
+        sha, _, name = listed.out.strip().partition("\t")
+        return sha if listed.code == 0 and name == ref and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) else ""
 
     def remove(self, issue: int) -> None:
         """Remove the issue's worktree and its branch, each step verified."""

@@ -31,7 +31,7 @@ from .actions import ISSUE_ACTS, AgentKind
 from .checks import Observed
 from .ci import Clear, Executing, Failed, Queued, Waiting as CiWaiting, parse_timestamp, reduce_ci
 from .state import (
-    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Release,
+    Backoff, Busy, DerivedState, Dispatch, Harness, ItemKey, LinkBlocker, Merge, NeedsHuman, OpenPR, Refresh, Release, Rerun,
     StopReason, TriageNote, Wait, WaitReason, stop_tag,
 )
 from .triage import Steward, Triage
@@ -379,6 +379,9 @@ def board_status(
     if isinstance(state, Refresh):
         return Working("update", None, "Updating branch", "Behind its base; GitHub updates it next tick.",
                        _iso(ended))
+    if isinstance(state, Rerun):
+        return Working("ci", None, "Re-running failed jobs",
+                       "The repair left its failures as a flake; the harness re-runs them once per head.", _iso(ended))
     if isinstance(state, OpenPR):
         return Working("open_pr", None, "Opening PR", f"Branch {state.branch} is pushed without a PR.",
                        _iso(ended))
@@ -574,7 +577,7 @@ def current_stage(state: DerivedState | None, *, has_pr: bool, legs: tuple[LegRo
         return Stage.TRIAGE
     if isinstance(state, Merge):
         return Stage.MERGE
-    if isinstance(state, Refresh):
+    if isinstance(state, (Refresh, Rerun)):
         return Stage.CI
     if isinstance(state, OpenPR):
         return Stage.RESOLVE

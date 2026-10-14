@@ -40,6 +40,7 @@ class Review:
     submitted_at: str = ""
     body: str = ""
     commit_id: str = ""
+    id: int | None = None  # GitHub's review id (REST `id`, GraphQL `databaseId`); None when not read
 
 
 @dataclass(frozen=True)

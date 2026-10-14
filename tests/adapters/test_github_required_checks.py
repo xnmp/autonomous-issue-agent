@@ -8,7 +8,7 @@ import pytest
 
 from issue_agent.adapters.github import GhUnavailable, GitHubGateway, Identity, _subprocess_runner
 from issue_agent.domain.checks import Observed, Unavailable
-from issue_agent.domain.ci import Clear, reduce_ci
+from issue_agent.domain.ci import Clear, Waiting, reduce_ci
 
 
 @pytest.mark.parametrize("query_name", ["_METADATA", "_REPORTS"])
@@ -92,7 +92,7 @@ def page(nodes, *, more=False, cursor=None, total=None, head="head", revision="h
     }
 
 
-def gateway(*, branch=None, rules=None, pages=None, meta=None):
+def gateway(*, branch=None, rules=None, pages=None, meta=None, jobs=None):
     branch = (
         {
             "protected": True,
@@ -107,6 +107,8 @@ def gateway(*, branch=None, rules=None, pages=None, meta=None):
     def run(argv, token):
         if argv[1:3] == ["pr", "view"]:
             return json.dumps({"number": 3, "headRefOid": "head", "baseRefName": "dev"})
+        if jobs is not None and any("/actions/runs/77/jobs?filter=all" in v for v in argv):
+            return json.dumps(jobs)
         if any("/rules/branches/" in v for v in argv):
             return json.dumps([[]] if rules is None else rules)
         if any("/branches/" in v for v in argv):
@@ -453,3 +455,125 @@ def test_required_status_infers_only_unambiguous_app_provenance():
 )
 def test_malformed_report_scalar_types_are_unavailable(changes):
     assert isinstance(gateway(pages=[page([report(**changes)])]).get_pr(3).ci, Unavailable)
+
+
+def test_each_observed_check_run_carries_its_job_id_so_a_rerun_is_new_evidence():
+    # tauri #1078: a failure's identity is its check run (an Actions job id),
+    # which every run attempt mints anew.
+    url = "https://github.com/o/r/actions/runs/77/job/10"
+    nodes = [report(id="a1", databaseId=10, conclusion="FAILURE", detailsUrl=url),
+             report(name="lint", id="b1", databaseId="11", isRequired=False)]
+    ci = gateway(pages=[page(nodes)]).get_pr(3).ci
+    assert isinstance(ci, Observed)
+    assert {(c.name, c.run_id, c.check_id) for c in ci.reports} == {("unit", 77, 10), ("lint", None, 11)}
+
+
+@pytest.mark.parametrize("attempt,observed", [(2, 2), (1, 1), (None, None), (0, None), ("2", None), (True, None)])
+def test_an_actions_check_carries_its_runs_attempt(attempt, observed):
+    # A re-run is visible in the observation: the harness re-runs a head once (PR #403).
+    url = "https://github.com/o/r/actions/runs/77/job/10"
+    suite = {"app": {"databaseId": 1}, "workflowRun": {"runAttempt": attempt}}
+    other = report(name="lint", id="b1", databaseId=11, isRequired=False, checkSuite=suite)  # no Actions run URL
+    nodes = [report(id="a1", databaseId=10, detailsUrl=url, checkSuite=suite), other]
+    ci = gateway(pages=[page(nodes)], jobs=[{"jobs": [{"id": 10, "run_attempt": 2, "status": "completed"}]}]).get_pr(3).ci
+    assert isinstance(ci, Observed)
+    assert {c.name: c.run_attempt for c in ci.reports} == {"unit": observed, "lint": None}
+
+
+# ── a re-run's superseded check runs are not current (owner, PR #403) ───────
+
+RUN_URL = "https://github.com/o/r/actions/runs/77/job/"
+SECOND = {"app": {"databaseId": 1}, "workflowRun": {"runAttempt": 2}}
+
+
+def _rerun_ci(nodes, jobs):
+    return gateway(pages=[page(nodes)], jobs=jobs).get_pr(3).ci
+
+
+def _job(job, attempt, status="completed"):
+    return {"id": job, "run_attempt": attempt, "status": status}
+
+
+def _failed(job, name="unit", **kw):
+    return report(name=name, id=f"n{job}", databaseId=job, conclusion="FAILURE", detailsUrl=RUN_URL + str(job),
+                  checkSuite=SECOND, **kw)
+
+
+def test_a_check_run_the_latest_attempt_superseded_is_ignored():
+    new = report(id="a2", databaseId=20, detailsUrl=RUN_URL + "20", checkSuite=SECOND)
+    ci = _rerun_ci([_failed(10), new], [{"jobs": [_job(10, 1), _job(20, 2)]}])
+    assert isinstance(ci, Observed) and [(c.check_id, c.bucket) for c in ci.reports] == [(20, "pass")]
+    assert isinstance(reduce_ci(ci), Clear)  # the old attempt's failure no longer counts
+
+
+@pytest.mark.parametrize("latest", [[], [_job(20, 2, "queued")]])
+def test_a_rerun_accepted_whose_jobs_are_not_done_is_pending_not_failed(latest):
+    ci = _rerun_ci([_failed(10)], [{"jobs": [_job(10, 1), *latest]}])
+    assert isinstance(ci, Observed)
+    assert [(c.name, c.bucket, c.check_id, c.run_attempt) for c in ci.reports] == [("unit", "pending", None, 2)]
+    assert isinstance(reduce_ci(ci), Waiting)
+
+
+def test_a_superseded_job_absent_from_a_finished_attempt_is_dropped_not_pending_forever():
+    # A matrix that changed on "re-run all jobs": attempt 1's job has no twin in attempt 2.
+    ci = _rerun_ci([_failed(10, name="shard-a", isRequired=False)], [{"jobs": [_job(10, 1), _job(20, 2)]}])
+    assert isinstance(ci, Observed) and ci.reports == ()
+
+
+def test_a_partial_rerun_keeps_the_jobs_it_copied_into_the_new_attempt():
+    # GitHub copies the jobs a partial re-run does not re-run into the new attempt, under new ids.
+    copied = report(name="lint", id="b2", databaseId=21, isRequired=False, detailsUrl=RUN_URL + "21",
+                    checkSuite=SECOND)
+    ci = _rerun_ci([_failed(20), copied], [{"jobs": [_job(10, 1), _job(11, 1), _job(20, 2), _job(21, 2)]}])
+    assert isinstance(ci, Observed) and {c.check_id for c in ci.reports} == {20, 21}
+
+
+def test_a_check_that_is_no_job_of_its_run_is_kept():
+    # A test reporter's check run attached to the workflow's suite: never a job, never superseded.
+    ci = _rerun_ci([_failed(99, name="junit report", isRequired=False), _failed(20)],
+                   [{"jobs": [_job(10, 1), _job(20, 2)]}])
+    assert isinstance(ci, Observed) and {c.check_id for c in ci.reports} == {99, 20}
+
+
+@pytest.mark.parametrize("jobs", [{}, [], [{}], [{"jobs": None}], [{"jobs": [{"id": "20", "run_attempt": 2}]}],
+                                  [{"jobs": [{"id": 0, "run_attempt": 2}]}], [{"jobs": [None]}],
+                                  [{"jobs": [{"id": True, "run_attempt": 2}]}], [{"jobs": [{"id": 20}]}],
+                                  [{"jobs": [{"id": 20, "run_attempt": "2"}]}]])
+def test_malformed_rerun_jobs_make_ci_unavailable(jobs):
+    assert isinstance(_rerun_ci([_failed(10)], jobs), Unavailable)
+
+
+def test_unreadable_rerun_jobs_make_ci_unavailable():
+    assert isinstance(_rerun_ci([_failed(10)], None), Unavailable)  # the fake refuses an unexpected read
+
+
+def test_a_first_attempt_or_an_absent_attempt_reads_no_jobs():
+    for suite in ({"app": {"databaseId": 1}, "workflowRun": {"runAttempt": 1}},
+                  {"app": {"databaseId": 1}, "workflowRun": None}):
+        failed = report(id="a1", databaseId=10, conclusion="FAILURE", detailsUrl=RUN_URL + "10", checkSuite=suite)
+        ci = _rerun_ci([failed], None)  # any jobs read would be refused
+        assert isinstance(ci, Observed) and [c.check_id for c in ci.reports] == [10]
+
+
+# ── when a failure's CI run began: what tells a resume from a new try (PR #403) ──
+
+
+@pytest.mark.parametrize("created,start", [("2026-10-14T01:00:00Z", "2026-10-14T01:00:00Z"), (None, ""), (7, "")])
+def test_an_actions_job_begins_when_its_run_did(created, start):
+    # A job queued behind `needs` starts late, but it belongs to the run its push caused.
+    suite = {"app": {"databaseId": 1}, "workflowRun": {"runAttempt": 1, "createdAt": created}}
+    late = report(id="a1", databaseId=10, startedAt="2026-10-14T01:20:00Z", detailsUrl=RUN_URL + "10", checkSuite=suite)
+    other = report(name="lint", id="b1", databaseId=11, isRequired=False, startedAt="2026-10-14T01:05:00Z")
+    ci = gateway(pages=[page([late, other])]).get_pr(3).ci
+    assert isinstance(ci, Observed)
+    assert {c.name: c.started_at for c in ci.reports} == {"unit": start, "lint": "2026-10-14T01:05:00Z"}
+
+
+def test_a_rerun_job_begins_when_its_attempt_did_copies_included():
+    jobs = [_job(10, 1), {**_job(20, 2), "created_at": "2026-10-14T02:00:05Z"},
+            {**_job(21, 2), "created_at": "2026-10-14T02:00:01Z"}]  # 21 a copy: GitHub created it with the attempt
+    copied = report(name="lint", id="b2", databaseId=21, isRequired=False, detailsUrl=RUN_URL + "21", checkSuite=SECOND)
+    ci = _rerun_ci([_failed(20), copied], [{"jobs": jobs}])
+    assert isinstance(ci, Observed) and {c.started_at for c in ci.reports} == {"2026-10-14T02:00:01Z"}
+    unread = _rerun_ci([_failed(20)], [{"jobs": [_job(10, 1), _job(20, 2)]}])  # no created_at: fails toward a new try
+    assert isinstance(unread, Observed) and [c.started_at for c in unread.reports] == [""]

@@ -34,6 +34,11 @@ class RuntimePlan:
     # Repository guidance: execution context after the task, never
     # authoritative task input.
     context_suffix: str = ""
+    # The CI failure keys this plan hands the agent (`domain.evidence`): the
+    # leg's receipt records them, so derive never hands them again on its head.
+    evidence: tuple[str, ...] = ()
+    # The branch the leg works on; its receipt records the branch's remote commit at the end.
+    branch: str = ""
 
     @property
     def rendered_prompt(self) -> str:

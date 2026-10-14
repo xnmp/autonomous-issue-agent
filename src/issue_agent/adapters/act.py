@@ -22,6 +22,7 @@ from ..domain.actions import (
     OpenPullRequest,
     PostComment,
     Relabel,
+    RerunFailedJobs,
     RunAgent,
     SetIssueState,
     Target,
@@ -118,6 +119,8 @@ class GitHubAct:
         elif isinstance(action, UpdateBranch):
             if not self.gateway.update_branch(action.pr, action.head):
                 raise RuntimeError(f"PR #{action.pr}: update-branch did not land on {action.head[:12]}")
+        elif isinstance(action, RerunFailedJobs):
+            self.rerun(action)
         elif isinstance(action, Relabel):
             self.relabel(action)
         elif isinstance(action, PostComment):
@@ -185,6 +188,19 @@ class GitHubAct:
         if stale:
             self.log(f"{label}: cancelled {done}/{len(stale)} workflow runs left on the merged branch"
                      + (f"; first failure {failed[0]}" if failed else ""))
+
+    def rerun(self, action: RerunFailedJobs) -> None:
+        """The harness's one re-run of a head's failed jobs, read back by each
+        run's attempt so a replay posts nothing. A refusal raises and repeats
+        each poll, as update-branch's does, until a push or a human."""
+        for run_id, observed in action.runs:
+            if self.gateway.run_attempt(run_id) > observed:
+                continue
+            self.gateway.rerun_failed_checks(run_id)
+            if self.gateway.run_attempt(run_id) <= observed:
+                raise RuntimeError(f"PR #{action.pr}: re-run of run {run_id} was refused or did not land")
+            self.log(f"PR #{action.pr}: re-ran the failed jobs of run {run_id} on {action.head[:12]} "
+                     "(the harness's one re-run of this head)")
 
     def relabel(self, action: Relabel) -> None:
         relabel(
