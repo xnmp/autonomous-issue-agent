@@ -838,15 +838,19 @@ def test_a_reload_drain_holds_heavy_legs_but_starts_light_ones_while_a_heavy_leg
     def sleep(_seconds):
         beats.append(json.loads(heartbeat.read_text()))
         slots.append((daemon.available_dispatch_slots, daemon.available_light_slots))
-        if len(beats) == 2:
-            _wait_until(lambda: (AgentKind.STEWARD, 1105) in started)
+        if len(beats) == 2:  # STEWARD was admitted on tick 2 while FIX_CI ran
             release.set()
+            # The no-op sleep spins ticks faster than the released worker gets the
+            # GIL; join on the drain's own fact, not a tick count.
+            daemon.wait_for_dispatches()
 
     with pytest.raises(SystemExit) as stopped:
         daemon.run_forever(sleep=sleep, now=lambda: 0, max_ticks=10, reload_check=lambda: True)
 
     assert stopped.value.code == RELOAD_EXIT_CODE
-    assert started == [(AgentKind.FIX_CI, 1078), (AgentKind.STEWARD, 1105)]  # RESOLVE 9 held
+    assert len(beats) == 2  # exits on the first tick after the heavy leg drains
+    # Worker threads append in scheduling order, not submission order.
+    assert len(started) == 2 and set(started) == {(AgentKind.FIX_CI, 1078), (AgentKind.STEWARD, 1105)}  # RESOLVE 9 held
     assert beats[0]["reload_pending"] is True
     assert beats[0]["in_flight"] == [{"kind": "FIX_CI", "number": 1078}]
     assert slots[0] == (0, 2)  # decide sees no heavy slot but the whole light lane
