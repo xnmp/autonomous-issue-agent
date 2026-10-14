@@ -7,6 +7,7 @@ is the leg's own main loop only.
 """
 
 import asyncio
+import sqlite3
 import sys
 import types
 from dataclasses import dataclass
@@ -220,15 +221,15 @@ class _Runtime:
         return self.result
 
 
-def _accounting(tmp_path, inner):
+def _accounting(tmp_path, inner, repository="o/r"):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
     wrapper = AccountingRuntime(
-        inner, store, "o/r", "fix", Money("USD", 50_000_000), None, None, "cfg", "claude",
+        inner, store, repository, "fix", Money("USD", 50_000_000), None, None, "cfg", "claude",
         BudgetPolicy({("fix", "RESOLVE"): Money("USD", 10_000_000)}), CLAUDE,
     )
     wrapper.set_context("fix", "RESOLVE", 1, 1)
-    store.lease("o/r", "fix", 1, wrapper._owner())
+    store.lease(repository, "fix", 1, wrapper._owner())
     return wrapper, store
 
 
@@ -305,9 +306,9 @@ _R6_MICROS = 55_390
 _R7_OWN_MICROS = 24_397
 
 
-def _session(tmp_path, monkeypatch):
+def _session(tmp_path, monkeypatch, repository="o/r"):
     """Run legs of one session through accounting over a real AgentRunner."""
-    wrapper, store = _accounting(tmp_path, AgentRunner(rate_table=CLAUDE))
+    wrapper, store = _accounting(tmp_path, AgentRunner(rate_table=CLAUDE), repository)
 
     def leg(*messages, resume="s1"):
         async def query(prompt, options):
@@ -319,8 +320,8 @@ def _session(tmp_path, monkeypatch):
         fake.ResultMessage = _ResultMessage
         fake.query = query
         monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
-        store.unlease("o/r", "fix", 1, wrapper._owner())
-        store.lease("o/r", "fix", 1, wrapper._owner())
+        store.unlease(repository, "fix", 1, wrapper._owner())
+        store.lease(repository, "fix", 1, wrapper._owner())
         return asyncio.run(wrapper.run(RuntimePlan(prompt="x", model=SONNET, max_budget_usd=10, resume=resume)))
 
     return leg, store
@@ -388,21 +389,100 @@ def test_counters_that_went_backwards_settle_the_upper_bound(tmp_path, monkeypat
 
     # Its own Sonnet usage plus Haiku's cumulative usage: r6's price.
     assert _charges(store)[1] == (_R6_MICROS, "estimate")
-    assert "went backwards" in resumed.run_usage.detail
+    assert "were reset" in resumed.run_usage.detail
+
+
+def test_a_leg_that_ended_unresumable_still_leaves_the_sessions_baseline(tmp_path, monkeypatch):
+    # A leg that exhausted its budget is not resumed itself, but its turns are
+    # in the session the next leg resumes: they are charged once.
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013), subtype="error_max_budget_usd", is_error=True))
+    third = {SONNET: _model(12, 700, 100_000, 12_000), HAIKU: _R7[HAIKU]}
+
+    leg(_ResultMessage(third, _usage(4, 161, 26_304, 1_266)))
+
+    # Sonnet 4/161/26,304/1,266: 8 + 1610 + 2630.4 + 5064 micros, rounded up.
+    assert _charges(store)[2] == (9_313, "configured_rate_card")
+
+
+def test_counters_restored_stale_are_a_reset_not_a_cheap_leg(tmp_path, monkeypatch):
+    # The CLI restores cumulative counters from its transcript; a lost entry
+    # restarts them, and a larger leg would still pass a backwards check.
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    restarted = {SONNET: _model(10, 600, 80_000, 9_000), HAIKU: _model(10, 600, 50_000, 15_000)}
+
+    resumed = leg(_ResultMessage(restarted, _usage(10, 600, 80_000, 9_000)))
+
+    # Its own Sonnet usage (20 + 6000 + 8000 + 36000) plus all of Haiku's
+    # (5 + 1500 + 2500 + 15000): the bound, not the 2,947-micro difference.
+    assert _charges(store)[1] == (69_025, "estimate")
+    assert "were reset" in resumed.run_usage.detail
+
+
+def test_a_snapshot_from_another_session_or_repository_is_no_baseline(tmp_path, monkeypatch):
+    other_repo, _ = _session(tmp_path, monkeypatch, repository="o/other")
+    other_repo(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721), session_id="s2"), resume=None)
+
+    resumed = leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)))
+
+    assert "no usage snapshot" in resumed.run_usage.detail
+
+
+def test_the_latest_of_the_sessions_snapshots_is_the_baseline(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+    leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)))
+
+    leg(_ResultMessage({**_R7, SONNET: _model(9, 539, 73_696, 10_734)}, _usage(1, 0, 0, 0)))
+
+    assert _charges(store)[2] == (2, "configured_rate_card")
+
+
+def test_an_unreadable_baseline_settles_the_upper_bound(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+
+    def broken(*_args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "session_usage_snapshot", broken)
+    resumed = leg(_ResultMessage(_R7, _usage(4, 246, 41_322, 3_013)))
+
+    assert _charges(store)[1] == (18_653 + 24_074, "estimate")
+    assert "delta is unavailable" in resumed.run_usage.detail
+
+
+def test_a_resumed_leg_with_malformed_per_model_usage_settles_the_reserved_maximum(tmp_path, monkeypatch):
+    leg, store = _session(tmp_path, monkeypatch)
+    leg(_ResultMessage(_R6, _usage(4, 293, 32_374, 7_721)), resume=None)
+
+    leg(_ResultMessage({SONNET: _model("8", 539, 73_696, 10_734)}, _usage(4, 246, 41_322, 3_013)))
+
+    assert _charges(store)[1] == (10_000_000, "estimate")
+
+
+_GOOD = {SONNET: [1, 1, 1, 1]}
 
 
 @pytest.mark.parametrize("snapshot", [
-    None, {}, "snapshot", [[1, 1, 1, 1]], {SONNET: [1, 1, 1]}, {SONNET: [1, 1, 1, -1]}, {SONNET: [1, 1, 1, True]},
-    {SONNET: [1, 1, 1, 10**13]}, {SONNET: [1, 1, 1, 1], SONNET.upper(): [1, 1, 1, 1]},
-    {f"m{i}": [1, 1, 1, 1] for i in range(65)},
+    None, {}, "snapshot", {"session_id": "s1"}, {"session_id": "s2", "models": _GOOD}, {"models": _GOOD},
+    *({"session_id": "s1", "models": models} for models in (
+        {}, [[1, 1, 1, 1]], {SONNET: [1, 1, 1]}, {SONNET: [1, 1, 1, -1]}, {SONNET: [1, 1, 1, True]},
+        {SONNET: [1, 1, 1, 10**13]}, {SONNET: [1, 1, 1, 1], SONNET.upper(): [1, 1, 1, 1]},
+        {f"m{i}": [1, 1, 1, 1] for i in range(65)})),
 ])
-def test_a_malformed_or_huge_recorded_snapshot_is_no_baseline(snapshot):
+def test_a_malformed_huge_or_foreign_recorded_snapshot_is_no_baseline(snapshot):
     assert parse_snapshot("s1", snapshot) is None
 
 
 def test_a_recorded_snapshot_round_trips():
-    samples = parse_snapshot("s1", {SONNET: [4, 293, 32_374, 7_721], HAIKU: [8, 491, 42_580, 14_969]})
-    assert samples is not None and parse_snapshot("s1", snapshot_record(samples)) == samples
+    samples = parse_snapshot("s1", {"session_id": "s1", "models": {SONNET: [4, 293, 32_374, 7_721],
+                                                                   HAIKU: [8, 491, 42_580, 14_969]}})
+    assert samples is not None and parse_snapshot("s1", snapshot_record("s1", samples)) == samples
 
 
 def test_tokens_from_a_model_with_no_harness_rate_settle_the_reserved_maximum(tmp_path, monkeypatch):

@@ -99,44 +99,54 @@ _SNAPSHOT_MODELS = 64
 _SNAPSHOT_COUNTER = 10**12
 
 
-def snapshot_record(samples: tuple[ModelUsage, ...]) -> dict[str, list[int]]:
-    return {s.model: [s.usage.input_tokens, s.usage.output_tokens, s.usage.cache_read_tokens,
-                      s.usage.cache_write_tokens] for s in samples}
+def snapshot_record(session_id: str, samples: tuple[ModelUsage, ...]) -> dict[str, object]:
+    return {"session_id": session_id, "models": {s.model: list(_counters(s.usage)) for s in samples}}
 
 
 def parse_snapshot(session_id: str, raw: object) -> tuple[ModelUsage, ...] | None:
-    """A recorded snapshot, or None when absent or malformed."""
-    if not isinstance(raw, dict) or not 0 < len(raw) <= _SNAPSHOT_MODELS:
+    """A snapshot the session recorded, or None when absent, another
+    session's, or malformed."""
+    if not isinstance(raw, dict) or raw.get("session_id") != session_id:
+        return None
+    models = raw.get("models")
+    if not isinstance(models, dict) or not 0 < len(models) <= _SNAPSHOT_MODELS:
         return None
     try:
-        samples = tuple(ModelUsage(session_id, name, TokenUsage(*counters)) for name, counters in raw.items()
+        samples = tuple(ModelUsage(session_id, name, TokenUsage(*counters)) for name, counters in models.items()
                         if isinstance(counters, list) and len(counters) == 4
                         and all(type(c) is int and 0 <= c <= _SNAPSHOT_COUNTER for c in counters))
         _validate_samples(samples)
     except (ValueError, TypeError):
         return None
-    return samples if len(samples) == len(raw) else None
+    return samples if len(samples) == len(models) else None
 
 
-def usage_since(current: tuple[ModelUsage, ...], previous: tuple[ModelUsage, ...]) -> tuple[ModelUsage, ...] | None:
+def usage_since(current: tuple[ModelUsage, ...], previous: tuple[ModelUsage, ...],
+                floor: tuple[ModelUsage, ...] = ()) -> tuple[ModelUsage, ...] | None:
     """Per-model usage between two cumulative snapshots of one session, or
-    None when a counter or model went backwards (the counters were reset)."""
+    None when the counters were reset: one went backwards, a model vanished,
+    or the delta is below `floor`, usage the leg is known to have spent."""
     before = {s.model.strip().casefold(): s.usage for s in previous}
-    now = {s.model.strip().casefold() for s in current}
-    if not set(before) <= now:
+    if not set(before) <= {s.model.strip().casefold() for s in current}:
         return None
-    delta: list[ModelUsage] = []
+    delta: dict[str, ModelUsage] = {}
     for sample in current:
-        prior = before.get(sample.model.strip().casefold(), TokenUsage(0, 0))
-        counters = tuple(a - b for a, b in zip(
-            (sample.usage.input_tokens, sample.usage.output_tokens, sample.usage.cache_read_tokens,
-             sample.usage.cache_write_tokens),
-            (prior.input_tokens, prior.output_tokens, prior.cache_read_tokens, prior.cache_write_tokens)))
+        prior = _counters(before.get(sample.model.strip().casefold(), TokenUsage(0, 0)))
+        counters = tuple(a - b for a, b in zip(_counters(sample.usage), prior))
         if min(counters) < 0:
             return None
-        if any(counters):
-            delta.append(ModelUsage(sample.session_id, sample.model, TokenUsage(*counters, source=sample.usage.source)))
-    return tuple(delta)
+        delta[sample.model.strip().casefold()] = ModelUsage(
+            sample.session_id, sample.model, TokenUsage(*counters, source=sample.usage.source))
+    for known in floor:
+        spent = delta.get(known.model.strip().casefold())
+        least = _counters(known.usage)
+        if any(least) and (spent is None or any(a < b for a, b in zip(_counters(spent.usage), least))):
+            return None
+    return tuple(s for s in delta.values() if s.usage.total_tokens)
+
+
+def _counters(usage: TokenUsage) -> tuple[int, int, int, int]:
+    return usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens
 
 
 def bounded_by_rates(observed: RunUsage, table: RateTable | None, maximum: Money) -> RunUsage:

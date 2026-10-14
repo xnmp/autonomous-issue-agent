@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import sqlite3
 import uuid
 import contextvars
 from dataclasses import dataclass, field, replace
@@ -33,7 +34,7 @@ from ..domain.policy import question_text
 from ..domain.review import parse_verdict
 from ..domain.triage import criteria_wanted, offered_blockers, offered_duplicates, parse_steward, parse_triage
 from ..domain.ports import StaleReservationReconciler
-from ..domain.pricing import BudgetPolicy, RateTable, price
+from ..domain.pricing import CLAUDE_ALIASES, BudgetPolicy, RateTable, price
 from ..domain.run_usage import (
     EstimatedRunUsage,
     MeasuredRunUsage,
@@ -301,30 +302,39 @@ class AccountingRuntime(AgentRuntime):
                 # The effort the plan asked for (a runtime may degrade it, e.g. Claude xhigh off Opus); absent when none was set.
                 **({"effort": task.effort.value} if task.effort is not None else {}),
                 # The session's cumulative usage: the next resumed leg's baseline.
-                **({"session_usage": snapshot_record(result.session_usage)} if result.session_usage else {}),
+                **({"session_usage": snapshot_record(result.session_id or task.resume or "", result.session_usage)}
+                   if result.session_usage else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result, maximum)
 
     def _resumed_usage(self, task: RuntimePlan, result: AgentResult) -> AgentResult:
         """A resumed leg's own usage: the session's cumulative counters less
-        those its previous settled leg left. Without that baseline (a leg
-        that ended before a result), or when the counters went backwards, the
+        those its previous ended leg recorded. Without that baseline (no leg
+        of the session recorded one), or when the counters were reset, the
         runtime's upper bound stands (#389)."""
         if not task.resume or not result.session_usage:
             return result
         session = result.session_id or task.resume
-        previous = parse_snapshot(session, self.store.session_usage_snapshot(self.repository, session))
-        delta = usage_since(result.session_usage, previous) if previous is not None else None
-        if delta is None:
-            bound = result.run_usage
+        try:
+            previous = parse_snapshot(session, self.store.session_usage_snapshot(self.repository, session))
+            # The leg's own main-loop usage is part of its delta: a smaller
+            # delta means the CLI restored stale counters.
+            own = _token_usage(result.usage, self.runtime_name)
+            main = result.model or task.model or ""
+            floor = (ModelUsage(session, dict(CLAUDE_ALIASES).get(main.casefold(), main), own),) if own and main else ()
+            delta = usage_since(result.session_usage, previous, floor) if previous is not None else None
             reason = ("no usage snapshot from the session's previous leg" if previous is None
-                      else "the session's usage counters went backwards")
-            return replace(result, run_usage=replace(bound, detail=f"{reason}; {bound.detail}"[:2048])) \
-                if isinstance(bound, EstimatedRunUsage) else result
-        model = task.model or result.model or "<runtime-default>"
-        samples = delta or (ModelUsage(session, model, TokenUsage(0, 0)),)
-        rates = result.run_usage.rates if result.run_usage is not None else None
-        return replace(result, run_usage=MeasuredRunUsage(samples, rates or self.rate_table))
+                      else "the session's usage counters were reset")
+            if delta is not None:
+                samples = delta or (ModelUsage(session, main or "<runtime-default>", TokenUsage(0, 0)),)
+                rates = result.run_usage.rates if result.run_usage is not None else None
+                return replace(result, run_usage=MeasuredRunUsage(samples, rates or self.rate_table))
+        except (sqlite3.Error, ValueError, TypeError, ArithmeticError) as exc:
+            reason = f"the session's usage delta is unavailable ({type(exc).__name__})"
+        bound = result.run_usage
+        if not isinstance(bound, EstimatedRunUsage):
+            return result
+        return replace(result, run_usage=replace(bound, detail=f"{reason}; {bound.detail}"[:2048]))
 
     def _owner(self) -> str:
         return self.owner_id or f"{self.repository}:{self.role}"

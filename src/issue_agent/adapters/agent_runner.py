@@ -207,6 +207,8 @@ def _tokens(raw: object, keys: tuple[str, ...]) -> TokenUsage:
 def _per_model(session: str, raw: object) -> tuple[ModelUsage, ...]:
     if not isinstance(raw, dict) or len(raw) > _MAX_MODELS:
         raise ValueError("per-model usage is not a bounded mapping")
+    if len({str(name).strip().casefold() for name in raw}) != len(raw):
+        raise ValueError("per-model usage names a model twice")
     return tuple(ModelUsage(session, name, _tokens(counters, _MODEL_USAGE_KEYS)) for name, counters in raw.items())
 
 

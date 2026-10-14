@@ -73,8 +73,11 @@ session-cumulative on resume; its top-level `usage` is the leg's own main loop
 only (#287). A fresh leg prices `modelUsage`. Each completed leg records the
 session's cumulative `modelUsage` in its `result_json` (`session_usage`); a
 resumed leg prices, per model, its cumulative counters less those of the
-session's latest ended leg that recorded one, exact for subagents too. With no
-such snapshot, or a counter that went backwards, it settles an upper bound as
+session's latest ended leg that recorded one (matched on the session it ran,
+resumable or not), exact for subagents too. With no such snapshot, or counters
+that were reset (one went backwards, a model vanished, or the main model's
+delta is below the leg's own `usage`, as when the CLI restores stale counters
+from its transcript), or an unreadable baseline, it settles an upper bound as
 an estimate with the reason in its gap: its own `usage` at the main model plus
 the other models' session-cumulative usage, or all of the session-cumulative
 usage when it started a subagent (which may run on the main model). It errs
