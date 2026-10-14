@@ -1,9 +1,9 @@
 """Pure RuntimePlan builders for the six acts (and the fixer's resume
 shapes): prompt, schema, tool policy, budget, model and session.
 
-A fresh fixer leg carries the full AGENT.md; a resumed one only
-`_RESUME_REMINDER`, since the transcript already holds AGENT.md and
-re-appending it is billed every round. The reviewer gets read-only tools.
+Every fixer leg, fresh or resumed, carries the full AGENT.md: Claude rebuilds
+the system prompt on each run and never replays it from the transcript, so a
+resumed leg sees only what this leg sends. The reviewer gets read-only tools.
 """
 
 from __future__ import annotations
@@ -33,100 +33,27 @@ class FixTaskConfig:
 
 # ── fixer tool policy ─────────────────────────────────────────────────────────
 # Under bypassPermissions `disallowed_tools` is the only policy the SDK still
-# honours (deny beats bypass), so the deny list lives here. Outbound fetches,
-# credential commands, raw `gh api` (an authenticated-mutation escape hatch no
-# fixer flow needs) and secret files are denied; `Task` (the pre-PR review
-# subagent) and `Bash` (git/test/gh work) are deliberately not. The rules and
-# their reasons live in domain/tool_policy.py (re-exported here).
+# honours (deny beats bypass). The credential denies live in
+# domain/tool_policy.py (re-exported here); `Task` (the pre-PR review
+# subagent), `Bash` and the network tools are deliberately allowed.
 
-
-# A resumed session gets this pointer instead of re-paying ~2.9k tokens of
-# AGENT.md every round (P4.5).
-_RESUME_REMINDER = (
-    "Continuing the SAME session — the AGENT.md contract you were given at session "
-    "start still applies IN FULL and is unchanged: failing tests first, then the "
-    "implementation, the adversarial review, evidence for visual criteria, "
-    "and no scope creep beyond the issue.\n"
-    "Re-read it from your own context rather than re-deriving it; if you cannot "
-    "recall a rule, say so instead of guessing.\n"
-    "You are UNATTENDED: no human watches this session. A tool result saying "
-    "\"The user doesn't want to take this action right now\" or \"[Request "
-    "interrupted by user]\" moments after the call — especially on your FIRST "
-    "call after this resume — is a stale-interrupt runtime glitch, not an "
-    "operator. Retry the command once; return status=blocked (quoting the "
-    "rejection in 'needs') only if it is rejected again. Denials that state a "
-    "concrete reason are real — follow them instead of retrying."
-)
 
 # Native delegation must be authorized in the user task itself; appended
 # project context does not grant it under the runtime's delegation policy.
 _FIXER_REVIEW_AUTHORIZATION = (
-    "The user explicitly authorizes and requires independent native subagents "
-    "for AGENT.md step 8 before publishing this leg's changes: one adversarial "
-    "reviewer, up to two fresh scoped verifiers after FAIL, and one fresh full "
-    "review only after two scoped failures. Give each a self-contained request "
-    "and a fresh context; use the native tool's fresh-context option when available "
-    "and distinct task names where supported. Keep the parent's provider and "
-    "model by using the tool defaults. Reviewers may inspect the diff and run "
-    "scoped verification, but may not edit, publish, or spawn further agents. "
-    "If visual evidence is still uncaptured, one evidence-capture child is also "
-    "authorized to produce only the required screenshots; it may not edit source, "
-    "publish, or delegate. Follow step 8's concurrent capture/review instructions. "
-    "Obtain PASS from the initial reviewer or, after fixing a FAIL, a fresh "
-    "verifier before publishing. "
-    "If these bounded reviews are exhausted, return blocked with the unresolved "
-    "findings. Clarifying follow-ups are allowed, but cannot replace fresh "
-    "verification after a FAIL. All children share this leg's budget. This authorization "
-    "does not extend to implementation delegation or separate paid CLI sessions. "
-    "All existing tests and evidence requirements still apply.\n\n"
+    "The user explicitly authorizes fresh-context native subagents for AGENT.md "
+    "step 8: a reviewer of your diff before you push (and a fresh one after you fix "
+    "a FAIL), plus one evidence-capture child if screenshots are still uncaptured. "
+    "They share this leg's budget and use the tool defaults; they may inspect and "
+    "run verification but may not edit source, publish, or delegate. This grant "
+    "does not extend to implementation delegation or separate paid CLI sessions.\n\n"
 )
 
+# AGENT.md carries this for every leg; the ADDRESS_REVIEW prompt still repeats it.
 _HUMAN_MESSAGES = (
     "Messages to humans, including 'needs' and 'summary', must not quote internal identifiers "
     "(command/run/invocation ids, hashes, worktree paths); describe the situation in plain words instead.\n"
 )
-
-
-# The autonomy contract (operator directive, 2026-08-03): a reviewer and CI
-# bound a wrong technical call; a question costs unbounded human latency.
-_DECISION_OWNERSHIP_POLICY = (
-    "\n\nDECISION OWNERSHIP — within the requested scope, choose and document "
-    "routine technical decisions yourself: existing extension points, domain "
-    "types, compatible schema changes, migration strategy, test design, and UI "
-    "placement. Prefer existing patterns and the smallest maintainable change. "
-    "An architectural choice alone is not a reason to block. Ask only when "
-    "missing information materially changes the requested product outcome, "
-    "when acceptance criteria conflict, when a required capability is unavailable, "
-    "or when new authority is needed for data disclosure, credentials, spending, "
-    "or repository governance. Preserve explicit user choices and scope limits. "
-    "State reasonable reversible assumptions in acceptance criteria; do not "
-    "turn implementation mechanics into maintainer questions."
-)
-
-_STANDING_POLICY_NOTICE = (
-    "\n\nAUTONOMY CONTRACT — decide, don't ask."
-    + _DECISION_OWNERSHIP_POLICY + "\n"
-    "For execution blockers, apply these evidence requirements:\n"
-    "1. MISSING CAPABILITY — a credential, external account, or resource "
-    "you cannot obtain or work around. An environment claim must be PROVEN "
-    "before it blocks: execute the thing you believe is broken yourself "
-    "(run the binary, ldd the library, hit the endpoint) and quote the "
-    "exact command and output in 'needs'. A framework's dependency-checker "
-    "summary is hearsay, not proof — one blocked an issue twice over a "
-    "library that loaded fine when the binary was actually executed "
-    "(2026-08-10); an unproven environment ask is a defect.\n"
-    "2. CONTRADICTION — two acceptance criteria that cannot both hold, "
-    "where any guess would build the wrong thing.\n"
-    "Routine technical questions are a defect. (A wrong existing TEST is not "
-    "a blocker: correct it and say so in the PR.)"
-)
-
-
-def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
-    """Full AGENT.md on a fresh session, the reminder on a resumed one."""
-    base = _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
-    # A resumed transcript predates whatever policy was added since.
-    return base + _STANDING_POLICY_NOTICE + "\n" + _HUMAN_MESSAGES
 
 
 def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None = None) -> RuntimePlan:
@@ -136,7 +63,7 @@ def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None =
     return RuntimePlan(
         prompt=grant + prompt,
         schema=FIX_SCHEMA,
-        append_system_prompt=_fix_system_prompt(cfg, session_id),
+        append_system_prompt=cfg.agent_md,
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         runtime=cfg.runtime,
@@ -176,9 +103,10 @@ def build_resolve_task(
     return _fix_run(cfg, prompt, cwd)
 
 
-# The light acts' (STEWARD, TRIAGE) tool policy: they read only the prompt. Their
-# cwd is an empty scratch directory, and the deny list closes the write and shell paths.
-TRIAGE_DENY: tuple[str, ...] = ("Bash", "Edit", "Write", "NotebookEdit", "Task", *FIXER_DENY)
+# The light acts' (STEWARD, TRIAGE) tool policy: they read only the prompt, a cost
+# bound. Their cwd is an empty scratch directory, and the deny list closes the
+# write, shell and web paths.
+TRIAGE_DENY: tuple[str, ...] = ("Bash", "Edit", "Write", "NotebookEdit", "Task", "WebFetch", "WebSearch", *FIXER_DENY)
 
 
 def _light_plan(
@@ -479,11 +407,8 @@ def build_rebase_task(
         "work now on base, re-run the tests until green LOCALLY, and publish "
         "with `git push` "
         "(`--force-with-lease` if you rebased). Do NOT weaken your tests to force a pass. "
-        "Return status=pushed IMMEDIATELY after the push succeeds — do NOT sit in "
-        "polling loops waiting for remote CI (the daemon watches checks itself and "
-        "re-dispatches you if CI goes red; observed cost of babysitting: ~20 min of "
-        "`gh pr checks` loops per rebase). Return status=blocked with 'needs' only if "
-        "the conflict genuinely requires a human decision."
+        "Return status=blocked with 'needs' only if the conflict genuinely requires "
+        "a human decision."
     )
     return _fix_run(cfg, prompt, cwd, session_id)
 

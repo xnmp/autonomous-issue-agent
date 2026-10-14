@@ -1,150 +1,27 @@
-"""Denied tool calls and the reason each carries.
+"""Tool calls the fixer may not make: credential hygiene (plus the two CI rows
+PR #403 removes).
 
-One table feeds both enforcement points: the SDK's `disallowed_tools` (the
-boundary; a deny rule beats bypassPermissions) and a PreToolUse hook that
-returns the reason, because the bare deny tells the agent nothing and #1078
-read a denied curl probe as "dev server denied". Security never depends on the
-hook: it denies only commands that really invoke a listed program (it may also
-catch wrapper forms such as `env curl`), and stays silent when unsure.
+These rules feed the SDK's `disallowed_tools`, the one policy that holds under
+bypassPermissions (a deny rule beats bypass). They get the SDK's bare
+"Permission to use ... has been denied"; AGENT.md says not to retry it.
+Network tools are allowed: agents fetch docs, research and probe local servers
+like an engineer, and the supported posture is trusted inbound content only
+(CLAUDE.md).
 """
 
 from __future__ import annotations
 
-import fnmatch
-import re
-import shlex
-from dataclasses import dataclass
-from typing import Any
-
-_FETCH = "network fetch is denied by policy; to probe or screenshot a local dev server use `agent-browser` or Playwright `page.screenshot`"
-_GH = "raw/credential gh commands are denied by policy; use the `gh` subcommands the task needs (gh pr, gh issue, gh run)"
-_SECRET = "reading secret files (.env, *.pem, id_rsa*) is denied by policy; ask for the needed value in your result instead"
-
-
-@dataclass(frozen=True)
-class DeniedTool:
-    rule: str  # Claude permission-rule syntax: "Tool" or "Tool(specifier)"
-    reason: str
-
-
-DENIED_TOOLS: tuple[DeniedTool, ...] = (
-    DeniedTool("WebFetch", "WebFetch is denied by policy (outbound network is closed); work from the repository and the issue text"),
-    DeniedTool("WebSearch", "WebSearch is denied by policy (outbound network is closed); work from the repository and the issue text"),
-    DeniedTool("Bash(curl:*)", "`curl`: " + _FETCH),
-    DeniedTool("Bash(wget:*)", "`wget`: " + _FETCH),
-    DeniedTool("Bash(gh auth:*)", "`gh auth` is denied by policy; credentials are managed by the harness"),
-    DeniedTool("Bash(gh secret:*)", "`gh secret` is denied by policy; credentials are managed by the harness"),
-    DeniedTool("Bash(gh api:*)", "`gh api` " + _GH),
+FIXER_DENY: tuple[str, ...] = (
+    "Bash(gh auth:*)",
+    "Bash(gh secret:*)",
+    "Bash(gh api:*)",
     # #1128: a FIX_CI leg watched a 50-minute run for 40 minutes, holding a slot
     # and the hot-reload drain, so nothing else dispatched.
-    DeniedTool("Bash(gh run watch:*)", "`gh run watch` is denied by policy: do not wait for CI inside a leg "
-               "(nor `gh pr checks --watch` or sleep loops); push or re-run, then end the leg, and the harness "
-               "re-dispatches when CI reports"),
-    DeniedTool("Read(.env)", _SECRET),
-    DeniedTool("Read(.env.*)", _SECRET),
-    DeniedTool("Read(**/.env)", _SECRET),
-    DeniedTool("Read(**/.env.*)", _SECRET),
-    DeniedTool("Read(**/*.pem)", _SECRET),
-    DeniedTool("Read(**/id_rsa*)", _SECRET),
+    "Bash(gh run watch:*)",
+    "Read(.env)",
+    "Read(.env.*)",
+    "Read(**/.env)",
+    "Read(**/.env.*)",
+    "Read(**/*.pem)",
+    "Read(**/id_rsa*)",
 )
-
-FIXER_DENY: tuple[str, ...] = tuple(d.rule for d in DENIED_TOOLS)
-_REASONS: dict[str, str] = {d.rule: d.reason for d in DENIED_TOOLS}
-
-
-def has_reasons(rules: tuple[str, ...]) -> bool:
-    return any(r in _REASONS for r in rules)
-
-_RULE = re.compile(r"^(?P<tool>[A-Za-z_][\w]*)(?:\((?P<spec>.*)\))?$", re.S)
-_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
-# Prefixes that run their argument: `env curl x` is still curl.
-_WRAPPERS = frozenset({"env", "command", "exec", "nohup", "time", "sudo", "nice", "builtin"})
-_SHELLS = frozenset({"bash", "sh", "zsh", "dash"})
-_MAX_CMD = 100_000  # beyond this the hook stays silent; the backstop still denies
-_MAX_DEPTH = 4
-
-
-def _tokens(command: str) -> list[str] | None:
-    """Quote-aware tokens with operators split out; None when unparseable."""
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";|&\n")
-    lex.whitespace = " \t\r"
-    lex.whitespace_split = True
-    try:
-        return list(lex)
-    except ValueError:
-        return None
-
-
-def _argvs(command: str, depth: int = 0) -> list[list[str]]:
-    """Every simple command in `command`: compound segments, wrapper-stripped,
-    plus the body of `sh -c '...'`. Unparseable input and heredocs (whose body
-    is data, not commands) yield nothing: the hook then stays silent and the
-    deny rule alone decides."""
-    toks = _tokens(command)
-    if toks is None or any("<<" in t for t in toks):
-        return []
-    segs: list[list[str]] = [[]]
-    for t in toks:
-        if t and set(t) <= set(";|&\n"):
-            segs.append([])
-        else:
-            segs[-1].append(t)
-    out: list[list[str]] = []
-    for words in segs:
-        while words and (_ASSIGN.match(words[0]) or words[0] in _WRAPPERS or words[0] == "timeout"):
-            words = _strip_timeout(words[1:]) if words[0] == "timeout" else words[1:]
-        if not words:
-            continue
-        out.append(words)
-        if depth < _MAX_DEPTH and words[0].rsplit("/", 1)[-1] in _SHELLS and "-c" in words[1:-1]:
-            out.extend(_argvs(words[words.index("-c") + 1], depth + 1))
-    return out
-
-
-def _strip_timeout(words: list[str]) -> list[str]:
-    """`timeout [-s SIG] [-k DUR] [--opt] DURATION cmd...` runs cmd (#1128 wrapped
-    its CI watch in one)."""
-    i = 0
-    while i < len(words) and words[i].startswith("-"):
-        i += 2 if words[i] in ("-s", "-k") else 1
-    return words[i + 1:]
-
-
-def _bash_match(spec: str, command: str) -> bool:
-    prefix = spec[:-2] if spec.endswith(":*") else spec
-    want = prefix.split()
-    return any(
-        len(a) >= len(want) and [a[0].rsplit("/", 1)[-1], *a[1:len(want)]] == want
-        for a in _argvs(command)
-    )
-
-
-def _read_match(spec: str, path: str) -> bool:
-    # Basename match: the union of the root-relative and `**/` rules, so the
-    # hook explains at least what the rules deny.
-    return fnmatch.fnmatch(path.rsplit("/", 1)[-1], spec.removeprefix("**/"))
-
-
-def denial_reason(tool_name: str, tool_input: Any, rules: tuple[str, ...]) -> str | None:
-    """The reason a call matches a deny rule in `rules`, or None. Total: any
-    malformed input yields None (the rules themselves still deny)."""
-    if not isinstance(tool_name, str):
-        return None
-    arg = tool_input if isinstance(tool_input, dict) else {}
-    for rule in rules:
-        reason = _REASONS.get(rule)
-        m = _RULE.match(rule)
-        if reason is None or m is None or m["tool"] != tool_name:
-            continue
-        spec = m["spec"]
-        if spec is None:
-            return reason
-        if tool_name == "Bash":
-            cmd = arg.get("command")
-            if isinstance(cmd, str) and len(cmd) <= _MAX_CMD and _bash_match(spec, cmd):
-                return reason
-        elif tool_name == "Read":
-            path = arg.get("file_path")
-            if isinstance(path, str) and len(path) <= _MAX_CMD and _read_match(spec, path):
-                return reason
-    return None

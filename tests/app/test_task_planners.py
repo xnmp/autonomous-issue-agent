@@ -23,6 +23,7 @@ from issue_agent.app.planners.tasks import (
     build_resume_task,
     build_rebase_task,
     build_review_task,
+    build_steward_task,
 )
 
 
@@ -30,19 +31,10 @@ FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_b
 U = as_untrusted
 
 
-@pytest.mark.parametrize("session", ["", "session"])
-def test_fixer_human_message_guidance_survives_fresh_and_resumed_sessions(session):
-    task = build_resume_task(U("reply"), "/wt", session, FIX_CFG)
-    assert "must not quote internal identifiers" in task.append_system_prompt
-
-
 def test_resolve_task():
     t = build_resolve_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG, "fix/5-null-token")
     assert t.schema is FIX_SCHEMA
-    # AGENT.md first, then the standing autonomy contract (operator directive
-    # 2026-08-03): technical calls are the fixer's, and a question is a defect.
-    assert t.append_system_prompt.startswith("AGENTMD")
-    assert "AUTONOMY CONTRACT" in t.append_system_prompt
+    assert t.append_system_prompt == "AGENTMD"
     assert t.cwd == "/wt/issue-5"
     assert "issue #5" in t.prompt and "off dev" in t.prompt
     assert "crashes" in t.prompt
@@ -61,23 +53,16 @@ def test_resolve_task():
     ],
 )
 def test_publishing_task_authorizes_bounded_native_review_in_user_prompt(builder, args):
+    # The runtime honours a delegation grant only in the user task, never in
+    # appended context; Codex runs with native sub-agents disabled.
     cfg = replace(FIX_CFG, runtime=RuntimeName.CLAUDE)
     task = builder(*args, cfg)
     assert "native subagents" not in builder(*args, replace(FIX_CFG, runtime=RuntimeName.CODEX)).prompt
     authorization = task.prompt.split("\n\n", 1)[0]
-    assert "user explicitly authorizes and requires independent native subagents" in authorization
-    assert "fresh context" in authorization
-    assert "parent's provider and model" in authorization
-    assert "may not edit, publish, or spawn further agents" in authorization
-    assert "up to two fresh scoped verifiers after FAIL" in authorization
-    assert "one fresh full review only after two scoped failures" in authorization
-    assert "one evidence-capture child" in authorization
-    assert (
-        "Obtain PASS from the initial reviewer or, after fixing a FAIL, a fresh verifier before publishing"
-        in authorization
-    )
-    assert "separate paid CLI sessions" in authorization
-    assert "existing tests and evidence requirements still apply" in authorization
+    assert "user explicitly authorizes fresh-context native subagents for AGENT.md step 8" in authorization
+    assert "may not edit source, publish, or delegate" in authorization
+    assert "does not extend to implementation delegation" in authorization
+    assert "native subagents" not in task.append_system_prompt
     assert "<untrusted_" not in authorization
 
 
@@ -165,42 +150,25 @@ def test_every_fixer_leg_carries_the_deny_list():
         assert task.disallowed_tools == FIXER_DENY, f"{name} leg has no tool denies"
 
 
-def test_deny_list_blocks_exfiltration_and_credential_paths():
-    denied = set(FIXER_DENY)
-    # outbound network
-    assert {"WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"} <= denied
-    # credential + raw-API escape hatches around the gh guardrails
-    assert {"Bash(gh auth:*)", "Bash(gh secret:*)", "Bash(gh api:*)"} <= denied
-    # secrets on disk, at the root and at any depth
-    assert {"Read(.env)", "Read(.env.*)", "Read(**/.env)", "Read(**/.env.*)"} <= denied
-    assert {"Read(**/*.pem)", "Read(**/id_rsa*)"} <= denied
+def test_light_legs_read_only_the_prompt_while_fixers_may_use_the_web():
+    # STEWARD/TRIAGE are bounded in cost by reading only their prompt; the
+    # fixer researches and probes local servers like an engineer.
+    light = build_steward_task(5, U("t"), U("b"), U("others"), (), "/scratch",
+                               model=None, runtime=None, max_budget_usd=0.5)
+    assert {"WebFetch", "WebSearch", "Bash"} <= set(light.disallowed_tools)
+    assert set(FIXER_DENY) <= set(light.disallowed_tools)
+    for name, task in _every_fixer_task().items():
+        assert not {"WebFetch", "WebSearch"} & set(task.disallowed_tools), name
 
 
-def test_deny_list_keeps_the_fixer_able_to_work():
-    # Denying these would break the harness itself: the adversarial pre-PR review
-    # is a Task subagent, and the whole TDD loop is git/test/gh Bash calls.
-    assert "Task" not in FIXER_DENY
-    assert "Bash" not in FIXER_DENY
-    assert not any(
-        d.startswith("Bash(git") or d.startswith("Bash(gh pr") or d.startswith("Bash(gh issue") for d in FIXER_DENY
-    )
-
-
-# ── AGENT.md prompt diet on resumed legs (P4.5) ──
-def test_resumed_legs_do_not_repay_for_agent_md():
-    # AGENT.md is already in the resumed transcript server-side; re-appending it
-    # buys nothing and is billed again every round.
-    resumed = {name: task for name, task in _every_fixer_task("sess-1").items() if name != "resolve"}
-    for name, task in resumed.items():
-        assert task.append_system_prompt != "AGENTMD", f"{name} re-appended AGENT.md"
-        assert "AGENTMD" not in task.append_system_prompt, name
-        # …but the contract must still be asserted as in force.
-        low = task.append_system_prompt.lower()
-        assert "still applies" in low and "agent.md" in low, name
-        # The reminder itself stays short; the standing policy notice appended
-        # after it is separately bounded and applies to every leg.
-        reminder = task.append_system_prompt.split("\n\nAUTONOMY CONTRACT")[0]
-        assert len(reminder) < 1000, f"{name} reminder is not short"
+# ── every leg carries the fixer contract ──
+def test_resumed_legs_carry_the_full_agent_contract():
+    # Claude rebuilds the system prompt on every run and never replays it from
+    # the transcript (each resumed leg's prompt snapshot held only what that
+    # leg sent), so a resumed leg that dropped AGENT.md ran without it.
+    for name, task in _every_fixer_task("sess-1").items():
+        assert task.append_system_prompt == "AGENTMD", name
+        assert name == "resolve" or task.resume == "sess-1", name
 
 
 # ── review ──

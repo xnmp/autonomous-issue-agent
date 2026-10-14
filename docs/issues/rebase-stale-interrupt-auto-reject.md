@@ -44,8 +44,8 @@ or it is racy.
 
 ## Mitigations in the harness (2026-07-26)
 
-1. `plugin/AGENT.md` ("No interactive user exists") + `_RESUME_REMINDER`
-   (`app/planners/tasks.py`): the agents are told this exact message in an
+1. `plugin/AGENT.md` ("No interactive user exists", which every leg carries,
+   resumed ones included, since 2026-10-14 replaced `_RESUME_REMINDER`): the agents are told this exact message in an
    unattended session is a runtime glitch — retry once, block only on a second
    rejection, and keep treating reasoned denials as real.
 2. `domain/outcome.py`: a blocked rebase/fix-ci now posts the agent's `needs`

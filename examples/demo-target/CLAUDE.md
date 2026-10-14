@@ -9,6 +9,8 @@ end-to-end. Keep it tiny: the point is to watch the issue → branch → red →
 - `tests/` — pytest. `test_operations.py` is the baseline; agents ADD files here.
 
 ## Conventions (the fix agent must follow these)
+- Read `INVARIANTS.md` before coding: its rules override your defaults. If one
+  seems wrong, block and explain; never violate or work around it.
 - Tests are pytest, discovered as `tests/test_*.py` or `*_regression.py`.
 - Functions are pure and fully type-annotated.
 - A `fix/` branch must add a regression test that fails before the fix and passes
