@@ -214,3 +214,111 @@ def test_a_link_that_lands_before_github_answers_with_an_error_is_reported_as_li
     gh = LandsThenErrors()
     _act(tmp_path, gh).execute(LINK)
     assert gh.linked and gh.posted == [blocker_comment("m", 4, LINK.reason)]
+
+
+# --- cancelling the workflow runs a merge left running ---------------------
+
+import json  # noqa: E402
+
+from issue_agent.adapters.github import GhUnavailable, GitHubGateway  # noqa: E402
+
+CUTOFF = "2026-10-14T10:00:00Z"
+
+
+class _Gh:
+    """A fake `gh` at the runner seam, answering the way the real runner does:
+    a refused cancel (403/409) is an EMPTY answer, an accepted one `{}`."""
+
+    def __init__(self, runs, *, refused=()):
+        self.runs, self.refused = runs, set(refused)
+        self.cancelled: list[int] = []
+        self.listed = ""
+
+    def __call__(self, argv, token):
+        if argv[1] == "api" and "/actions/runs?" in argv[2]:
+            self.listed = argv[2]
+            return self.runs if isinstance(self.runs, str) else json.dumps({"workflow_runs": self.runs})
+        if argv[1:3] == ["api", "--method"] and argv[4].endswith("/cancel"):
+            run_id = int(argv[4].split("/")[-2])
+            if run_id in self.refused:
+                return ""
+            self.cancelled.append(run_id)
+            return "{}"
+        raise AssertionError(argv)
+
+
+def _cancel(tmp_path, gh):
+    lines: list[str] = []
+    act = _act(tmp_path, GitHubGateway("o/r", runner=gh))
+    act.log = lines.append
+    act.cancel_runs("PR #7", "fix/3-slug", CUTOFF)
+    return lines
+
+
+def _run(i, status, created="2026-10-14T09:00:00Z", repo="o/r"):
+    return {"id": i, "status": status, "created_at": created, "head_repository": {"full_name": repo}}
+
+
+def test_unfinished_runs_are_cancelled_but_not_finished_ones_or_post_merge_workflows(tmp_path):
+    gh = _Gh([_run(1, "in_progress"), _run(2, "queued"), _run(3, "completed"),
+              _run(4, "queued", "2026-10-14T10:00:00Z"), _run(5, "in_progress", "2026-10-14T10:00:05Z")])
+    _cancel(tmp_path, gh)
+    assert gh.cancelled == [1, 2] and "branch=fix%2F3-slug" in gh.listed
+
+
+def test_a_fork_run_on_a_same_named_branch_is_never_cancelled(tmp_path):
+    odd = {"id": 5, "status": "queued", "created_at": "2026-10-14T09:00:00Z"}  # head repository absent
+    bad = {**odd, "id": 6, "head_repository": {"full_name": 7}}  # malformed
+    null = {**odd, "id": 7, "head_repository": None}  # deleted fork
+    gh = _Gh([_run(1, "queued", repo="someone/r"), _run(2, "queued"), _run(3, "queued", repo="O/R"), odd, bad, null])
+    _cancel(tmp_path, gh)
+    assert gh.cancelled == [2, 3]
+
+
+def test_a_braces_body_is_a_successful_cancel_and_an_empty_answer_a_refusal(tmp_path):
+    assert _cancel(tmp_path, _Gh([_run(1, "queued")])) == ["PR #7: cancelled 1/1 workflow runs left on the merged branch"]
+    assert "0/1" in _cancel(tmp_path, _Gh([_run(1, "queued")], refused={1}))[0]
+
+
+def test_a_refused_cancel_is_logged_once_and_the_rest_still_cancel(tmp_path):
+    gh = _Gh([_run(1, "queued"), _run(2, "queued"), _run(3, "queued")], refused={1, 2})
+    lines = _cancel(tmp_path, gh)
+    assert gh.cancelled == [3] and len(lines) == 1 and "1/3" in lines[0] and "refused" in lines[0]
+
+
+def test_a_throttled_github_stops_the_cancel_loop(tmp_path):
+    class Throttled(_Gh):
+        def __call__(self, argv, token):
+            if argv[1:3] == ["api", "--method"]:
+                self.cancelled.append(-1)
+                raise GhUnavailable("rate-limit", "slow down")
+            return super().__call__(argv, token)
+
+    gh = Throttled([_run(i, "queued") for i in range(1, 50)])
+    lines = _cancel(tmp_path, gh)
+    assert gh.cancelled == [-1] and len(lines) == 1 and "0/49" in lines[0]
+
+
+@pytest.mark.parametrize("runs", ["not json{", "{}", '"text"', "null", "[1, null]", '{"workflow_runs": 3}',
+                                  '{"workflow_runs": [1, null, {"id": "x"}]}'])
+def test_a_malformed_run_list_is_survived_without_cancelling(tmp_path, runs):
+    gh = _Gh(runs)
+    assert gh.cancelled == [] and len(_cancel(tmp_path, gh)) <= 1 and gh.cancelled == []
+
+
+def test_an_empty_run_list_is_silent(tmp_path):
+    assert _cancel(tmp_path, _Gh([])) == []
+
+
+def test_a_huge_run_list_is_bounded(tmp_path):
+    gh = _Gh([_run(i, "queued") for i in range(1, 5001)])
+    _cancel(tmp_path, gh)
+    assert gh.cancelled == list(range(1, 101))
+
+
+def test_an_unreachable_github_cancels_nothing_and_does_not_raise(tmp_path):
+    def down(argv, token):
+        raise RuntimeError("gh exploded")
+
+    lines = _cancel(tmp_path, down)
+    assert len(lines) == 1 and "unavailable" in lines[0]

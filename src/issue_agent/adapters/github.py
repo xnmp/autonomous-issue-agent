@@ -72,6 +72,10 @@ def _cap_bytes(text: str, max_bytes: int) -> str:
     return text if len(encoded) <= max_bytes else encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+# `gh run list` returns at most this many runs; a branch with more is cancelled over later ticks' observations.
+_RUN_SCAN_LIMIT = 100
+
+
 class GhUnavailable(RuntimeError):
     """GitHub could not ANSWER (auth, rate limit, network, 5xx, local resource
     exhaustion), as opposed to answering "nothing" (V10). Mapping every
@@ -995,6 +999,40 @@ class GitHubGateway:
             return False
         return (isinstance(data, dict) and data.get("headRefOid") == expected_head
                 and str(data.get("state") or "").upper() == "MERGED")
+
+    def branch_runs(self, branch: str) -> tuple[tuple[int, str, str], ...]:
+        """(id, status, created-at) of the newest workflow runs on
+        `branch` that were built from THIS repository, at most
+        `_RUN_SCAN_LIMIT`. REST, not `gh run list`: only the REST items carry
+        `head_repository`, and a fork's same-named branch must never be
+        cancelled, so a run with an absent or malformed head repository is
+        skipped. Raises ValueError on a payload that is not a run list. Works
+        after the branch is deleted."""
+        data = self._gh_json(["api", f"repos/{self.repo}/actions/runs?branch={quote(branch, safe='')}"
+                              f"&per_page={_RUN_SCAN_LIMIT}"])
+        rows = data.get("workflow_runs") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("workflow run list is unreadable")
+        out = []
+        for row in rows[:_RUN_SCAN_LIMIT]:
+            if not isinstance(row, dict):
+                continue
+            head_repo = row.get("head_repository")
+            name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+            if (not isinstance(name, str) or name.casefold() != self.repo.casefold()
+                    or type(row.get("id")) is not int or row["id"] <= 0
+                    or not isinstance(row.get("status"), str) or not isinstance(row.get("created_at"), str)):
+                continue
+            out.append((row["id"], row["status"], row["created_at"]))
+        return tuple(out)
+
+    def cancel_run(self, run_id: int) -> None:
+        """Request the cancel; raises when GitHub refused it. GitHub answers
+        202 with a `{}` body, which `gh api` prints; the runner turns a refusal
+        (403 without actions:write, 409 on a finished run) into an empty
+        answer, so only a truly empty answer is a refusal."""
+        if not self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/cancel"]).strip():
+            raise RuntimeError(f"run {run_id}: cancel refused")
 
     def update_branch(self, pr: int, expected_head: str) -> bool:
         """Merge base into a BEHIND head. Fail-soft: an 'already up to date' or
