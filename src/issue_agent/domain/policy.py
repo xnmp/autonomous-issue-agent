@@ -37,6 +37,11 @@ _WHY = {
 _HOW = {
     StopReason.LIFETIME_CAP: "Raise the per-issue budget, then reply here or remove the `needs-human` label.",
     StopReason.QUESTION: "Reply here with the answer (the agent resumes with it), or remove the `needs-human` label.",
+    # A reply is not routed to the agent here: it approves the change (tauri
+    # PR #1155, 2026-10-15, where an operator's "revert it" reply released it).
+    StopReason.WORKFLOW_PATH: ("Replying here or removing the `needs-human` label approves the `.github/` change and "
+                               "sends the PR on to review. To have it changed instead, say so in that reply: the "
+                               "reviewer reads the thread and can request the change."),
     StopReason.DUPLICATE: ("If it is a duplicate, close this issue. If not, reply here or remove the "
                            "`needs-human` label and the harness resolves it."),
 }

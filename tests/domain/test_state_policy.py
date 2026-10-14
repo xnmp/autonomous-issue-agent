@@ -306,6 +306,8 @@ def test_pr_touching_github_paths_needs_a_human(path):
     label, comment = actions(states, H)
     assert label == Relabel(Target.PR, 7, remove=None, add=Label.NEEDS_HUMAN)
     assert isinstance(comment, PostComment) and H.marker in comment.body and comment.key
+    # A reply releases the stop as approval; the comment must say so (tauri PR #1155).
+    assert "approves the `.github/` change" in comment.body
 
 
 @pytest.mark.parametrize("path", ["src/.github/x", ".githubx/y", "docs/github.md"])
