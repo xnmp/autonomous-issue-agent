@@ -28,6 +28,7 @@ from ..domain.outcome import (
     RETURN_REFUSED_STATUS,
     LegClass,
     classify_leg,
+    leg_cap,
     resumable_session,
 )
 from ..domain.policy import question_text
@@ -313,6 +314,8 @@ class AccountingRuntime(AgentRuntime):
                 **({"evidence": list(task.evidence)} if task.evidence else {}),
                 # Read-your-writes: the branch's remote commit as the leg left it.
                 **({"end_head": end_head} if end_head else {}),
+                # A per-leg cap ended it: it did not finish with its evidence, which derive hands on (#411).
+                **({"capped": True} if leg_cap(result.exit_reason) else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result, maximum)
 

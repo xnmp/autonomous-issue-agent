@@ -849,6 +849,29 @@ def test_a_cap_hit_on_the_resume_is_an_attempt_whichever_caps_they_were(role, la
     assert _resolve_legs(composed) == ["machine", "agent", "agent"]
 
 
+@pytest.mark.parametrize("first", ["wall", "budget"])
+@pytest.mark.parametrize("second", ["wall", "budget"])
+def test_a_repair_capped_on_its_resume_hands_the_same_failure_to_a_leg_one_tier_up(role, later, first, second):
+    # A capped leg did not finish its repair: its failure is not handed, so the
+    # head is neither re-run unrepaired nor stopped for ATTEMPTS.
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(_cap_hit(first, "s-1"), _cap_hit(second, "s-1"), did_nothing("s-2"))
+    composed, _ = role(gh, agent, **TIERS)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    later()
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # resumes, and hits a cap again
+    fresh = dispatched(tick(composed), AgentKind.FIX_CI)
+
+    assert gh.harness_reruns == [] and Label.NEEDS_HUMAN not in gh.prs[100].labels
+    assert fresh and fresh[0].tier is Tier.HIGH
+    capped, resumed, retried = agent.tasks
+    # A PR-stage leg continues the issue's latest session on its runtime, the tier-up leg too.
+    assert resumed.resume == retried.resume == "s-1" and (capped.model, resumed.model, retried.model) == (
+        "claude-sonnet-5-5", "claude-sonnet-5-5", "claude-opus-5-5")
+    assert capped.evidence == resumed.evidence == retried.evidence  # the same unfixed failure
+
+
 def test_a_budget_hit_never_buys_past_the_issues_lifetime_cap(role, later):
     # The lifetime cap is the human's grant: a machine end does not route around it.
     gh = FakeGitHub(issues={5: ready()})

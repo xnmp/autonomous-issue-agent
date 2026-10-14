@@ -16,7 +16,8 @@ from issue_agent.domain.backoff import LegEnd
 from issue_agent.domain.checks import Check, Observed, RequiredCheck
 from issue_agent.domain.evidence import CiFailure, CiFailures
 from issue_agent.domain.labels import Label
-from issue_agent.domain.state import Harness, Local, derive, issue_key, pr_key
+from issue_agent.domain.routing import DEFAULT_TIER, escalate
+from issue_agent.domain.state import Dispatch, Harness, Local, Rerun, derive, issue_key, pr_key
 from issue_agent.domain.world import Comment, IssueView, PRView, Review, WorldState
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -73,6 +74,49 @@ def test_a_fix_ci_agent_end_reads_back_the_failures_it_was_handed(kind, leg, raw
 def test_an_agent_end_reads_back_the_remote_head_it_left(leg, raw, head):
     end = leg_end(run("FIX_CI", number=100, head="h1", receipt={"leg": leg, "end_head": raw}))
     assert end is not None and end.end_head == head
+
+
+def _after_capped_resume(capped: object, leg: str = "agent"):
+    """derive's step for a PR whose complete required run failed, after a
+    FIX_CI first cap hit and a resume recorded with `capped` (absent: MISSING)."""
+    key = "check:11@2026-10-01T11:50:00Z"
+    check = Check("test", "FAILURE", "fail", "2026-10-01T11:50:00Z", run_id=900, required=True, check_id=11,
+                  run_attempt=1)
+    view = PRView(number=100, head_ref_name="fix/5-x", head_ref_oid="h1", mergeable="MERGEABLE",
+                  merge_state="CLEAN", ci=Observed("h1", "h1", frozenset({RequiredCheck("test")}), (check,)))
+    receipt = {"leg": leg, "evidence": [key], **({} if capped is MISSING else {"capped": capped})}
+    runs = (run("FIX_CI", number=100, head="h1", leg="machine", started=0, minute=1),
+            run("FIX_CI", number=100, head="h1", started=2, minute=3, receipt=receipt))
+    now = T0 + timedelta(minutes=10)
+    return derive(WorldState(prs=(view,), now=now.isoformat()), Local(now=now, legs=local_legs(runs)), H)[pr_key(100)]
+
+
+MISSING = object()
+
+
+def test_a_recorded_cap_on_the_resume_hands_the_failure_to_a_leg_one_tier_up():
+    step = _after_capped_resume(True)
+    assert isinstance(step, Dispatch) and step.act is AgentKind.FIX_CI and step.tier is escalate(DEFAULT_TIER, 1)
+
+
+@pytest.mark.parametrize("capped", [
+    MISSING,  # a receipt from before caps were recorded
+    "true", 1, None, [True], {"capped": True},  # malformed
+])
+def test_an_absent_or_malformed_cap_record_is_a_finished_repair(capped):
+    # Fails toward the cheaper path: a finished repair ends in the free re-run.
+    assert _after_capped_resume(capped) == Rerun("h1", ((900, 1),))
+
+
+def test_a_cap_recorded_on_an_asked_end_is_no_cap_and_never_breaks_the_tick():
+    # The writer never records both (a cap is checked before a question); the parse boundary still holds.
+    end = leg_end(run("FIX_CI", number=100, head="h1", receipt={"leg": "asked", "question": "404?", "capped": True}))
+    assert end is not None and not end.capped and end.question == "404?"
+
+
+def test_a_cap_recorded_on_a_machine_end_hands_nothing_and_counts_nothing():
+    step = _after_capped_resume(True, leg="machine")
+    assert isinstance(step, Dispatch) and step.act is AgentKind.FIX_CI and step.tier is escalate(DEFAULT_TIER, 0)
 
 
 @pytest.mark.parametrize("receipt", [None, {}, {"leg": "machine"}, {"leg": "AGENT"}, {"leg": 1}])
