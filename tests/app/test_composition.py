@@ -153,7 +153,7 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
     control.register_process_lease(
         run_id, expected_owner_id="o/r:fix", pid=999_999, pgid=999_999, process_start_ticks=1
     )
-    prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix", state_dir="", role="fix")  # type: ignore[arg-type]
+    prepare, _ = shutdown_hooks(control, None, owner_id="o/r:fix")  # type: ignore[arg-type]
     prepare()
     # The forced-shutdown intent is durable before teardown starts.
     assert control.has_cancellation_intent(run_id)
@@ -163,13 +163,10 @@ def test_a_codex_leg_killed_at_shutdown_keeps_its_reservation_for_boot_recovery(
         control,
         CodexSpendReconciler(control, (str(tmp_path / "unreadable-yet"),)),
         owner_id="o/r:fix",
-        state_dir=str(tmp_path / "state"),
-        role="fix",
     )[1]()
 
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
     assert [lease.run_id for lease in control.leases()] == [run_id]
-    assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
     # Boot: the group is reaped, its lease reclaimed, and the measured
     # rollout settles the leg.
     assert control.reclaim_dead_leases("o/r:fix", lambda _pid, _ticks: False) == (run_id,)

@@ -133,8 +133,8 @@ with streamed usage marked as an estimate and interrupted requests charged zero.
 Unavailable/corrupt SQLite authority or missing required pre-launch pricing blocks
 paid admission while observation and reconciliation continue.
 
-`SIGTERM` stops admission, cancels/drains active work within a bound, writes
-handover/receipts, kills remaining groups, and exits with a
+`SIGTERM` stops admission, cancels/drains active work within a bound, records
+cancellation receipts, kills remaining groups, and exits with a
 stable taxonomy. Boot and suspension recovery kill orphans, reclaim leases,
 and reconcile unsettled spend.
 

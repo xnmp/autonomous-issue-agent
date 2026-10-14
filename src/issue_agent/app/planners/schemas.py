@@ -16,7 +16,7 @@ FIX_SCHEMA: dict = {
         "summary": {"type": "string"},
         "needs": {"type": "string", "description": "if blocked, exactly what is needed"},
     },
-    "required": ["status", "ticket_key", "summary"],
+    "required": ["status", "summary"],
 }
 
 # The REVIEW leg's verdict claim, parsed by `domain.review.parse_verdict`.

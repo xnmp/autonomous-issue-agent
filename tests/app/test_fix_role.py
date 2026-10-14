@@ -26,7 +26,7 @@ from issue_agent.domain.contracts import RunId
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.checks import BaseCI, BaseIssue, BaseRun, Check, Observed, RequiredCheck
 from issue_agent.domain.labels import Label
-from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.outcome import MAX_BUDGET_STATUS, AgentResult, ExitReason
 from issue_agent.domain.routing import Tier
 from issue_agent.domain.state import StopReason, stop_tag
 from issue_agent.domain.world import BlockerRef, Branch, Comment, IssueView, PRView, Review, WorldState
@@ -739,6 +739,74 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
                   key=lambda r: r.completed_at)
     assert [r.receipt["leg"] if r.receipt else None for r in runs] == ["machine", None, "agent"]
     assert agent.tasks[2].resume == "s-wall"
+
+
+# ── per-leg caps: a budget hit is a wall timeout (owner, 2026-10-14) ────────
+
+TIERS = {"FIX_MODEL_MED": "claude:claude-sonnet-5-5", "FIX_MODEL_HIGH": "claude:claude-opus-5-5"}
+
+
+def _cap_hit(cap: str, session: str, cost: float = 0.1):
+    """A leg the harness ended at a per-leg cap with its session intact."""
+    spent = cap == "budget"
+    return lambda _task: AgentResult(
+        True, status=MAX_BUDGET_STATUS if spent else "", envelope_subtype=MAX_BUDGET_STATUS if spent else "",
+        exit_reason=ExitReason.BUDGET_EXHAUSTED if spent else ExitReason.WALL_TIMEOUT, cost_usd=cost,
+        session_id=session)
+
+
+def _resolve_legs(composed) -> list[str | None]:
+    runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "RESOLVE"),
+                  key=lambda r: r.completed_at)
+    return [r.receipt["leg"] if r.receipt else None for r in runs]
+
+
+def test_a_first_budget_hit_resumes_its_session_at_the_same_tier_and_is_no_attempt(role, later):
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(_cap_hit("budget", "s-1"), pushed(gh, "fix/5-null-token-crashes", "h1", session="s-1"))
+    composed, _ = role(gh, agent, **TIERS)
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+    assert tick(composed) == []  # a machine end: backing off, no attempt
+    later()
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.MED)]
+
+    first, resumed = agent.tasks
+    assert first.resume is None and resumed.resume == "s-1"
+    assert first.model == resumed.model == "claude-sonnet-5-5"
+    assert _resolve_legs(composed) == ["machine", "agent"]
+    assert OpenPullRequest(5, "fix/5-null-token-crashes") in tick(composed)
+
+
+@pytest.mark.parametrize("first", ["wall", "budget"])
+@pytest.mark.parametrize("second", ["wall", "budget"])
+def test_a_cap_hit_on_the_resume_is_an_attempt_whichever_caps_they_were(role, later, first, second):
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(_cap_hit(first, "s-1"), _cap_hit(second, "s-1"),
+                  pushed(gh, "fix/5-null-token-crashes", "h1", session="s-2"))
+    composed, _ = role(gh, agent, **TIERS)
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    later()
+    assert dispatched(tick(composed), AgentKind.RESOLVE)  # resumes, and hits a cap again
+    assert dispatched(tick(composed), AgentKind.RESOLVE) == [RunAgent(AgentKind.RESOLVE, 5, tier=Tier.HIGH)]
+
+    capped, resumed, fresh = agent.tasks
+    assert (capped.resume, resumed.resume, fresh.resume) == (None, "s-1", None)
+    assert (capped.model, resumed.model, fresh.model) == ("claude-sonnet-5-5",) * 2 + ("claude-opus-5-5",)
+    assert _resolve_legs(composed) == ["machine", "agent", "agent"]
+
+
+def test_a_budget_hit_never_buys_past_the_issues_lifetime_cap(role, later):
+    # The lifetime cap is the human's grant: a machine end does not route around it.
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(_cap_hit("budget", "s-1", cost=0.6))
+    composed, _ = role(gh, agent, ISSUE_SPEND_CAP_USD="1", MAX_BUDGET_USD="0.6", REVIEW_BUDGET_USD="0.6")
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    later()
+    tick(composed)
+
+    assert Label.NEEDS_HUMAN in gh.issues[5].labels
+    assert len(gh.comments_with("issue", 5, stop_tag(StopReason.LIFETIME_CAP))) == 1
+    assert len(agent.tasks) == 1 and _resolve_legs(composed) == ["machine"]
 
 
 def test_a_claude_stream_cut_off_by_the_wall_cap_after_init_resumes_that_session(role, later, monkeypatch):

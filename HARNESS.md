@@ -70,7 +70,10 @@ Important fields:
   gate runs it. It must terminate.
 - `FIXER_RUNTIME=claude|codex`;
   `REVIEWER_RUNTIME=claude|codex`.
-- `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
+- `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg. A fix leg that hits its
+  budget or the wall cap resumes its session once at the same tier; a second
+  hit on that resume counts as an attempt. `ISSUE_SPEND_CAP_USD` still stops
+  the issue for a human.
 - Routing (refactor decisions 15, 27): a STEWARD leg writes each admitted
   issue's acceptance criteria and flags duplicates; a TRIAGE leg then grades it
   `low|med|high|xhigh`; one harness comment posts the tier and criteria. Fix

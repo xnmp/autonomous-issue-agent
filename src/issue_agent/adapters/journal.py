@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from ..domain.contracts import Money
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death, pre_admission_refusal
 from ..domain.run_usage import EstimatedRunUsage, MeasuredRunUsage
-from .handover import HandoverScope, retire_delivered_handover, with_previous_handover, write_exhaustion_handover
 from .runtime_plan import AgentRuntime, ContextualRuntime, RunIdentityRuntime, RuntimePlan
 
 # The SDK usage counters worth keeping. `cost_usd` is 0.00 on a subscription
@@ -80,17 +79,15 @@ class RunContext:
 
 class JournalingRuntime:
     """An `AgentRuntime` decorator: journals each leg's start before the await
-    and its end after it (including when the await raises), and carries the
-    exhausted-leg handover across legs of one issue."""
+    and its end after it (including when the await raises)."""
 
     def __init__(self, inner: AgentRuntime, journal: Journal, repo: str = "", role: str = "",
-                 runtime: str = "", state_dir: str = ""):
+                 runtime: str = ""):
         self.inner = inner
         self.journal = journal
         self.repo = repo
         self.role = role
         self.runtime = runtime
-        self.state_dir = state_dir
         self._context = contextvars.ContextVar(f"journal_run_context_{id(self)}", default=RunContext(role=role))
 
     def __getattr__(self, name: str):
@@ -116,8 +113,6 @@ class JournalingRuntime:
         mid-run), and the raise path writes its own end line before the
         exception continues upward unchanged."""
         ctx = self.context
-        scope = HandoverScope(role=ctx.role, issue=ctx.issue, state_dir=self.state_dir)
-        prepared = with_previous_handover(task, scope)
         run_id, leg_id = uuid.uuid4().hex, uuid.uuid4().hex
         try:
             self.journal.emit("agent_run_start", {**ctx.correlation(run_id, leg_id), "model": task.model or "",
@@ -128,10 +123,10 @@ class JournalingRuntime:
             self.inner.set_run_identity(run_id, leg_id)
         t0 = time.monotonic()
         try:
-            result = await self.inner.run(prepared.task)
+            result = await self.inner.run(task)
         except BaseException as exc:  # noqa: BLE001 — recorded, never handled
-            # Cancellation and Ctrl-C settle the started leg too, with an
-            # operator-cancelled handover instead of an infrastructure death.
+            # Cancellation and Ctrl-C settle the started leg too, as an
+            # operator cancel instead of an infrastructure death.
             cancelled = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
             # A transport death the INPUT causes gets its own shape (#13).
             det = None if cancelled else deterministic_death(
@@ -141,15 +136,11 @@ class JournalingRuntime:
                 model=str(getattr(exc, "harness_resolved_model", "") or ""),
                 session_id=str(getattr(exc, "harness_session_id", "") or ""),
                 exit_reason=ExitReason.OPERATOR_CANCELLED if cancelled else ExitReason.TRANSPORT_DEATH)
-            if cancelled:
-                write_exhaustion_handover(task, terminal, scope)
             self._record(task, terminal, time.monotonic() - t0, run_id, leg_id,
                          error=f"{type(exc).__name__}: {str(exc)[:200]}",
                          deterministic=det.signature if det else None, detail=(det.path or None) if det else None)
             raise
         self._record(task, result, time.monotonic() - t0, run_id, leg_id)
-        retire_delivered_handover(task, result, scope, prepared.handover_digest)
-        write_exhaustion_handover(task, result, scope)
         return result
 
     def _record(self, task: RuntimePlan, result: AgentResult, duration_s: float, run_id: str, leg_id: str,
