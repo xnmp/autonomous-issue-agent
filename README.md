@@ -75,7 +75,8 @@ What it does not protect against:
   an approving review.
 - **An AI reviewer is not a human reviewer.** It misses things. Treat the
   development branch as a staging area.
-- **Reported costs are estimates**, not provider invoices.
+- **Reported costs are the harness's own figures**: token counts priced at list
+  rates, not provider invoices.
 
 Use it first on repositories where a bad merge to the development branch is
 cheap to undo. The full, plain list of accepted risks is in
