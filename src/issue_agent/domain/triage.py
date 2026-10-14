@@ -249,6 +249,8 @@ def steward_schema(offered: Iterable[int], criteria_wanted: bool = True, blockab
 
 
 # An ATX heading (at most three leading spaces) titled "acceptance criteria".
+# An issue template's commented-out heading is not the author's criteria.
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
 _AC_HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+acceptance criteria\b", re.IGNORECASE | re.MULTILINE)
 
 
@@ -256,7 +258,7 @@ def states_criteria(issue_body: str) -> bool:
     """Whether an issue states its own acceptance criteria, so the steward is
     not asked for any. A heading inside a code block also counts: the cost is
     a steward that writes none, and the reviewer then judges against the issue."""
-    return _AC_HEADING.search(issue_body) is not None
+    return _AC_HEADING.search(_HTML_COMMENT.sub("", issue_body)) is not None
 
 
 def criteria_wanted(schema: object) -> bool:

@@ -401,11 +401,11 @@ trusted-inbound-only until the trigger-gated separately privileged artifact
 publisher is deployed.
 
 Visual screenshot evidence is judged by the independent reviewer (#327); image
-size remains capped at 700KB. The publication broker supplies missing issue
-linkage and acceptance criteria before capturing each new create/body-update
-command. Historical commands replay their captured bodies unchanged. Agent
-children still inherit direct publication capability, so direct `gh pr create`
-can bypass broker completion in the current advisory posture.
+size remains capped at 700KB. The harness opens a PR with the agent's own
+description unchanged; the reviewer's bar is the steward's criteria (or the
+issue), so a description cannot lower it. Agent children still inherit direct
+publication capability, so a direct `gh pr create` is possible in the current
+advisory posture.
 Service upgrades likewise stage complete
 unit/plist-plus-private-config pairs; both systemd and launchd restore the
 previous pair if activation fails. Partial-role service upgrades are rejected:

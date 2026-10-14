@@ -660,10 +660,12 @@ def test_a_blocker_and_its_reason_come_together():
         ("We need acceptance criteria for this.", False),  # prose, not a heading
         ("    ## Acceptance criteria", False),  # four spaces: indented code
         ("#Acceptance criteria", False),  # not an ATX heading
+        ("<!-- template:\n## Acceptance criteria\n-->\nCrash.", False),  # a commented-out template heading
+        ("<!-- unclosed\n## Acceptance criteria", False),
         ("", False),
         ("x" * 1_000_000 + "\n## Acceptance criteria", True),
     ],
-    ids=["heading", "upper-indented", "prose", "code-indent", "no-space", "empty", "huge"],
+    ids=["heading", "upper-indented", "prose", "code-indent", "no-space", "html-comment", "unclosed-comment", "empty", "huge"],
 )
 def test_states_criteria_is_an_acceptance_criteria_heading(body, states):
     assert states_criteria(body) is states

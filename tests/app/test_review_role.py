@@ -460,7 +460,6 @@ def test_the_reviewer_judges_against_the_stewards_criteria_not_the_pr_descriptio
     prompt = agent.tasks[0].prompt
     bar = prompt.split("<untrusted_steward_acceptance_criteria_json>")[1].split("</untrusted_steward")[0]
     assert "A null token returns 401" in bar and "whatever the author says" not in bar
-    assert "<untrusted_issue_body_json>" not in prompt
 
 
 def test_without_steward_criteria_the_reviewer_is_briefed_the_issue(roles):
@@ -472,3 +471,33 @@ def test_without_steward_criteria_the_reviewer_is_briefed_the_issue(roles):
     prompt = agent.tasks[0].prompt
     assert "The API answers 401" in prompt.split("<untrusted_issue_body_json>")[1]
     assert gh.submitted == [(100, "APPROVE", "Looks right.", "h1")]
+
+
+def test_a_human_answer_on_the_issue_reaches_the_reviewer_and_harness_comments_do_not(roles):
+    # A scope change a human answered on the issue after the steward ran must
+    # reach the reviewer, or it rejects the fixer for honouring it.
+    gh = green()
+    gh.comment("issue", 5, "<!-- issue-agent -->\nharness note", author=FIX_BOT)
+    gh.comment("issue", 5, "Yes, drop the 410 case.", author="alice")
+    agent = Agent(verdict("APPROVE"))
+    tick(roles.review(gh, agent))
+
+    thread = agent.tasks[0].prompt.split("<untrusted_issue_comments_json>")[1].split("</untrusted_issue")[0]
+    assert "drop the 410 case" in thread and "harness note" not in thread
+
+
+def test_a_git_failure_on_the_emptiness_check_is_a_machine_end_not_an_attempt(roles, tmp_path):
+    from issue_agent.adapters.worktree import WorktreeUnavailable
+
+    class Broken(FakeCheckouts):
+        def has_changes(self, base: str, head: str) -> bool:
+            raise WorktreeUnavailable("git diff timed out")
+
+    gh = green()
+    agent = Agent()
+    review = roles.review(gh, agent, checkouts=Broken(tmp_path / "broken"))
+    tick(review)
+
+    assert agent.tasks == [] and gh.submitted == []
+    (run,) = review.control.leg_runs("o/r", (5,))
+    assert run.receipt is None or run.receipt.get("leg") not in ("agent", "asked")  # machine: backs off, no attempt

@@ -205,7 +205,7 @@ class FixLegs:
             task = self._task(action, subject, cwd, runs, cut_off, asked, cfg, runtime, recorded)
             if asked is not None:
                 target = "issue" if action.kind is AgentKind.RESOLVE else "pr"
-                task = tasks.with_human_reply(task, target, action.number, reply)
+                task = tasks.with_human_reply(task, self.settings.repository, target, action.number, reply)
             task = replace(task, env={**task.env, **self._git_identity()})
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")

@@ -410,7 +410,7 @@ def test_resolve_runs_once_under_its_lease_then_the_harness_opens_one_pr(role):
     task = agent.tasks[0]
     assert "git push -u origin fix/5-null-token-crashes" in task.prompt
     # The agent reads the issue itself: a pointer, not the pasted text.
-    assert "gh issue view 5 --comments" in task.prompt and "Steps: ..." not in task.prompt
+    assert "gh issue view 5 --repo o/r --comments" in task.prompt and "Steps: ..." not in task.prompt
     assert task.env["GIT_AUTHOR_EMAIL"] == "fix-bot@users.noreply.github.com"
 
 
@@ -552,7 +552,7 @@ def test_a_question_stops_for_a_human_and_the_reply_resumes_the_same_session(rol
     assert resumed.resume == "s-q"
     reply = gh.issues[5].comments[-1]
     # A pointer to the answer, which the agent reads (with any edit) itself.
-    assert reply.url in resumed.prompt and "gh issue view 5 --comments" in resumed.prompt
+    assert reply.url in resumed.prompt and "gh issue view 5 --repo o/r --comments" in resumed.prompt
     assert "410, it is gone for good." not in resumed.prompt
 
 
@@ -937,7 +937,7 @@ def test_an_issue_with_its_own_criteria_is_resolved_against_the_issue(role):
     assert gh.comments_with("issue", 5, "Acceptance criteria") == []
     resolve = agent.tasks[2].prompt
     assert "steward acceptance criteria" not in resolve and "A null token returns 401" not in resolve
-    assert "gh issue view 5 --comments" in resolve and "The API answers 401" not in resolve
+    assert "gh issue view 5 --repo o/r --comments" in resolve and "The API answers 401" not in resolve
 
 
 def test_light_legs_cut_off_by_the_wall_cap_count_once_and_the_issue_resolves_at_the_default_tier(role):

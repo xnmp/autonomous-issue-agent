@@ -253,7 +253,7 @@ def test_review_checkout_creates_detached_worktree_at_head():
     assert rc.ensure(165, SHA, "dev", BASE) == RC_PATH
     joined = _joined(fg)
     # The base ref is fetched with the head: the reviewer diffs base...head locally.
-    assert any(j.startswith("fetch origin refs/pull/165/head refs/heads/dev") for j in joined)
+    assert {"fetch origin refs/pull/165/head --quiet", "fetch origin refs/heads/dev --quiet"} <= set(joined)
     assert any(j.startswith(f"worktree add --detach .claude/worktrees/review-pr-165 {SHA}") for j in joined)
 
 

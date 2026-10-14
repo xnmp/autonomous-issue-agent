@@ -34,14 +34,14 @@ from ..domain.policy import actions as policy_actions
 from ..domain.refs import harness_branch_issue
 from ..domain.review import Verdict, parse_verdict
 from ..domain.routing import Tier
-from ..domain.state import DerivedState, Harness, ItemKey, Local, pr_key
+from ..domain.state import DerivedState, Harness, ItemKey, Local, human_comments, issue_key, pr_key
 from ..domain.trust import as_untrusted
 from ..domain.world import REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED, Comment, PRView, WorldState
 from ..adapters.github import format_pr_discussion
 from ..adapters.worktree import ReviewCheckouts
 from .config import REVIEW_DISPATCH_CAPACITY, HarnessConfig
 from .planners import tasks
-from .tick import Choose, Slots, Role, compose_role, leg_class, run_item, run_leg, steward_criteria, stderr_log
+from .tick import Choose, Slots, Role, compose_role, leg_class, local_legs, run_item, run_leg, steward_criteria, stderr_log
 
 
 def review_actions(states: Mapping[ItemKey, DerivedState], harness: Harness, slots: int) -> tuple[Action, ...]:
@@ -223,13 +223,16 @@ class ReviewLegs:
             raise _NothingToReview
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd, runtime)
-        criteria = steward_criteria(runs)
         discussion = format_pr_discussion(pr.comments)
         prior = _prior_review(pr, self.settings.harness.review_bot)
+        subject = self.gateway.get_issue(issue)
+        # Derive's definition of a human comment: the agent's own (inside a
+        # leg window, possibly under the operator's login) is not an answer.
+        legs = local_legs(runs).get(issue_key(issue), ())
+        thread = format_pr_discussion(tuple(c for _, c in human_comments(subject.comments, self.settings.harness, legs)))
         context = tasks.ReviewContext(
-            as_untrusted(pr.title), as_untrusted(pr.body), criteria=criteria,
-            # No steward criteria (the issue stated its own): the issue is the bar.
-            issue_body=None if criteria is not None else as_untrusted(self.gateway.get_issue(issue).body or ""),
+            as_untrusted(pr.title), as_untrusted(pr.body), criteria=steward_criteria(runs),
+            issue_body=as_untrusted(subject.body or ""), issue_thread=as_untrusted(thread) if thread else None,
             discussion=as_untrusted(discussion) if discussion else None,
             prior_review=as_untrusted(prior) if prior else None,
         )

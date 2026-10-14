@@ -243,12 +243,13 @@ class ReviewCheckouts:
                     and self._git(["rev-parse", "HEAD"], abs_path).out.strip() == head_sha):
                 return abs_path
             # GitHub always serves refs/pull/<n>/head; a bare SHA fetch may be refused.
-            self._git(["fetch", "origin", f"refs/pull/{pr}/head", f"refs/heads/{base_ref}", "--quiet"],
-                      self.repo_dir)
+            # Two fetches: one missing ref (a renamed base) fails a joint fetch whole.
+            for ref in (f"refs/pull/{pr}/head", f"refs/heads/{base_ref}"):
+                self._git(["fetch", "origin", ref, "--quiet"], self.repo_dir)
             for name, sha in (("reviewed head", head_sha), ("base", base_sha)):
                 if not self._has_commit(sha):
                     raise WorktreeUnavailable(f"{name} {sha} for PR #{pr} is not reachable after fetching its "
-                                              "refs (force-pushed away?) — defer and re-observe")
+                                              "ref (force-pushed away, or the base renamed?) — defer and re-observe")
             if is_worktree:
                 # Re-verified after the (up to 60s) fetch, right before mutating.
                 if not self._is_this_worktree(pr, abs_path):
