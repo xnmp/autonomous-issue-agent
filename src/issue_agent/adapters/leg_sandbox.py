@@ -264,8 +264,7 @@ def claude_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
 def _ensure_inert(config: str) -> None:
     """A hidden entry needs a mount point, so each config name Claude obeys
     exists before a leg starts: an empty directory, or an empty read-only file
-    (read as no settings; a read-only empty `.config.json` is never chosen as
-    global config). Present ones are left as they are. A link there cannot be
+    (read as no settings). Present ones are left as they are. A link there cannot be
     hidden (a mount lands on its target) and the leg could replace it, so the
     leg is refused (home-manager links these into /nix/store)."""
     for name in (*CLAUDE_CONFIG_FILES, *CLAUDE_CONFIG_DIRS):
