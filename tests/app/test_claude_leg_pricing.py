@@ -144,6 +144,15 @@ def test_tokens_from_an_unrated_model_log_the_reserved_maximum_not_a_cross_check
     assert not any("CROSS-CHECK" in line for line in lines)
 
 
+def test_the_clis_own_small_model_is_priced_not_charged_the_reserved_maximum(monkeypatch):
+    # $1/$5 per MTok, reads $0.10: 1.00 + 1.00 + 0.10.
+    result, lines = _leg(monkeypatch, _ResultMessage(
+        {SONNET: _FRESH[SONNET], "claude-haiku-4-5-20251001": _model(1_000_000, 200_000, 1_000_000, 0)}))
+
+    assert result.cost_usd == (_SONNET_MICROS + 2_100_000) / 1e6
+    assert not any("no harness rate" in line for line in lines)
+
+
 def test_a_model_entry_with_no_tokens_needs_no_rate(monkeypatch):
     result, lines = _leg(monkeypatch, _ResultMessage({SONNET: _FRESH[SONNET], "<synthetic>": _model(0, 0, 0, 0)}))
 
