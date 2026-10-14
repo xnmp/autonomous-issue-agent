@@ -393,3 +393,10 @@ def test_every_builder_fences_its_untrusted_inputs(table):
 @pytest.mark.parametrize("task_env", [{}, {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"}])
 def test_claude_launch_options_disable_background_tasks(plan, task_env):
     assert build_option_kwargs(replace(plan, env=task_env))["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+
+
+def test_fix_ci_prompt_tells_the_agent_not_to_wait_when_the_log_is_missing():
+    empty = build_fix_ci_task(9, U("fail"), U(""), "/wt", "s", FIX_CFG)
+    full = build_fix_ci_task(9, U("fail"), U("log"), "/wt", "s", FIX_CFG)
+    assert "could not obtain the CI log" in empty.prompt and "Do NOT wait for CI" in empty.prompt
+    assert "could not obtain the CI log" not in full.prompt

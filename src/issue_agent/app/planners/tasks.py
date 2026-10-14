@@ -458,6 +458,9 @@ def build_fix_ci_task(
         f"{_FIX_CI_DIAGNOSE}\n\n"
         f"{_fenced('failed check names', failed_checks)}\n\n"
         f"{_fenced('ci log tail', failed_log)}"
+        + ("" if failed_log.value.strip() else
+           "\n\nThe harness could not obtain the CI log. Do NOT wait for CI (no `gh run watch`, no polling); "
+           "diagnose from the check names and the code, or return status=blocked with 'needs'.")
     )
     return _fix_run(cfg, prompt, cwd, session_id)
 
