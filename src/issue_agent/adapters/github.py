@@ -963,10 +963,13 @@ class GitHubGateway:
 
     def has_comment(self, kind: str, number: int, body: str) -> bool:
         """Whether this exact comment exists: probed after an ambiguous failed
-        write, since a timeout can arrive after GitHub accepted the POST."""
+        write, since a timeout can arrive after GitHub accepted the POST, and
+        before a settled comment is posted again. A reply that is not a comment
+        list is no answer: absent would post a duplicate."""
         data = self._view(kind, number, "comments")
-        return isinstance(data, dict) and any(isinstance(item, dict) and item.get("body") == body
-                                              for item in (data.get("comments") or []))
+        if not isinstance(data, dict) or not isinstance(data.get("comments"), list):
+            raise FixObservationIncomplete(f"{kind} #{number}: comments were not answered")
+        return any(isinstance(item, dict) and item.get("body") == body for item in data["comments"])
 
     def is_issue_closed(self, issue: int) -> bool:
         data = self._view("issue", issue, "state")
