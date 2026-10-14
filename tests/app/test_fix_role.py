@@ -743,10 +743,14 @@ def test_a_wall_cap_after_a_transport_death_still_resumes_once_and_then_counts(r
 
 # ── per-leg caps: a budget hit is a wall timeout (owner, 2026-10-14) ────────
 
-TIERS = {"FIX_MODEL_MED": "claude:claude-sonnet-5-5", "FIX_MODEL_HIGH": "claude:claude-opus-5-5"}
+# A cap hit spends at least the leg budget (it stops on the crossing), and a
+# resume is only bought while the issue cap still affords a leg at the
+# dearer role's budget: $1 legs under the default $25 issue cap.
+TIERS = {"FIX_MODEL_MED": "claude:claude-sonnet-5-5", "FIX_MODEL_HIGH": "claude:claude-opus-5-5",
+         "MAX_BUDGET_USD": "1", "REVIEW_BUDGET_USD": "1"}
 
 
-def _cap_hit(cap: str, session: str, cost: float = 0.1):
+def _cap_hit(cap: str, session: str, cost: float = 1.05):
     """A leg the harness ended at a per-leg cap with its session intact."""
     spent = cap == "budget"
     return lambda _task: AgentResult(

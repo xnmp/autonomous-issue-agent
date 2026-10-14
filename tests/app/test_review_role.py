@@ -31,6 +31,7 @@ from tests.app.test_fix_role import (
     Agent,
     FakeGitHub,
     FakeWorktrees,
+    _cap_hit,
     _now,
     died,
     dispatched,
@@ -373,6 +374,22 @@ def test_three_unparseable_verdicts_on_one_head_stop_for_a_human_written_by_the_
     stops = gh.comments_with("pr", 100, stop_tag(StopReason.ATTEMPTS))
     assert len(stops) == 1 and "REVIEW" in stops[0].body and stops[0].author == FIX_BOT
     assert gh.submitted == [] and len(agent.tasks) == 3
+
+
+@pytest.mark.parametrize("cap", ["wall", "budget"])
+def test_a_capped_review_is_an_attempt_redispatched_without_backoff_until_the_cap(roles, cap):
+    # A REVIEW never resumes, so either per-leg cap is one attempt (#51: a
+    # budget-capped review must not re-dispatch forever as a free machine end).
+    gh = green()
+    agent = Agent(*(_cap_hit(cap, "r1") for _ in range(3)))
+    review = roles.review(gh, agent)
+    for _ in range(3):
+        assert dispatched(tick(review), AgentKind.REVIEW)
+    assert tick(review) == []  # capped: the review role writes nothing
+
+    assert capped_for_a_human(gh, roles)
+    assert gh.submitted == [] and len(agent.tasks) == 3
+    assert all(task.resume is None for task in agent.tasks)
 
 
 def test_a_machine_death_counts_no_attempt_and_backs_off(roles, later):

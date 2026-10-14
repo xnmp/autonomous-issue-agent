@@ -73,7 +73,9 @@ Important fields:
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg. A fix leg that hits its
   budget or the wall cap resumes its session once at the same tier; a second
   hit on that resume counts as an attempt. `ISSUE_SPEND_CAP_USD` still stops
-  the issue for a human.
+  the issue for a human, and it does so before any leg it cannot afford at
+  the dearer of the two budgets. With the defaults (10 / 15 / 25), one budget
+  hit already leaves no room for the resume; size the issue cap to allow it.
 - Routing (refactor decisions 15, 27): a STEWARD leg writes each admitted
   issue's acceptance criteria and flags duplicates; a TRIAGE leg then grades it
   `low|med|high|xhigh`; one harness comment posts the tier and criteria. Fix

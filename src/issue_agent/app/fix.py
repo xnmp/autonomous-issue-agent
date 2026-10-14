@@ -179,7 +179,7 @@ class FixLegs:
         last = next((i for i in range(len(mine) - 1, -1, -1) if leg_class(mine[i]) is not LegClass.MACHINE), -1)
         asked = mine[last] if last >= 0 and leg_class(mine[last]) is LegClass.ASKED else None
         # Resume once (classify_leg): continue the newest machine end since that
-        # leg that left a session; a wall cap on the continuation is an attempt.
+        # leg that left a session; a cap hit on the continuation is an attempt.
         cut_off = next((r for r in reversed(mine[last + 1:]) if self._session([r], runtime)), None)
         self.log(f"{action.kind.name} #{action.number}: tier {getattr(action.tier, 'value', '?')} -> "
                  f"{runtime.value}:{model or '(default model)'}{':' + effort.value if effort else ''}")
@@ -235,7 +235,7 @@ class FixLegs:
         name = action.kind.name
         route = (self.settings.steward_route or self.settings.triage_route) if steward else self.settings.triage_route
         runtime, model, effort = route or self.settings.route(Tier.LOW)
-        # resumed: the light acts never resume, so a wall timeout is their one
+        # resumed: the light acts never resume, so a leg cap is their one
         # attempt (STEWARD: no criteria; TRIAGE: DEFAULT_TIER), not a machine
         # end retried forever.
         self.runtime.set_context("fix", name, action.number, action.number, claim_target=action.number,

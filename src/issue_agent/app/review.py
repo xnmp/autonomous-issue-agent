@@ -166,7 +166,7 @@ class ReviewLegs:
             self.log(f"REVIEW PR #{action.number}: skipped — already reviewed at {action.head[:12]}")
             return
         runs = self.control.leg_runs(self.settings.repository, (issue,))
-        # A REVIEW leg never resumes a session, so a wall cap is an attempt.
+        # A REVIEW leg never resumes a session, so a leg cap (wall or spend) is an attempt.
         self.runtime.set_context("review", action.kind.name, action.number, issue, claim_target=issue,
                                  head=action.head, resumed=True,
                                  tier=action.tier.value if action.tier is not None else "")
