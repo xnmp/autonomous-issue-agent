@@ -22,6 +22,7 @@ import pytest
 from issue_agent.adapters.leg_sandbox import (
     LegSandbox,
     SandboxRefused,
+    claude_login,
     claude_runtime_state,
     codex_runtime_state,
     git_link,
@@ -328,6 +329,104 @@ def test_runtime_state_is_shared_with_the_host_at_the_same_path(host):
     assert done.stdout.strip() == "{}"
     assert Path(store, "s.jsonl").read_text() == "s\n"
     assert (Path(env["CODEX_HOME"]) / "rollout").read_text() == "r\n"
+
+
+def _plant_claude_config(host: dict[str, Path]) -> Path:
+    """A fake operator ~/.claude: a login, settings with a hook, history,
+    another project's transcript, a hooks dir. No real credential."""
+    config = host["home"] / ".claude"
+    for name, text in ((".credentials.json", '{"fake": "v1"}'), ("history.jsonl", "planted-history\n"),
+                       ("projects/-home-op-other/s.jsonl", "planted-transcript\n"),
+                       ("hooks/pre.sh", "planted-hook\n"), ("CLAUDE.md", "planted-memory\n")):
+        (config / name).parent.mkdir(parents=True, exist_ok=True)
+        (config / name).write_text(text)
+    (config / "settings.json").write_text('{"hooks": "planted-settings"}')
+    return config
+
+
+def _claude_leg(host: dict[str, Path], script: str) -> subprocess.Popen:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(host["home"]), "LANG": "C.UTF-8"}
+    store = claude_runtime_state(env, str(host["worktree"]))
+    leg = sandbox(host).launch(["/bin/sh", "-c", script], cwd=str(host["worktree"]), env=env,
+                               runtime_state=store, login=claude_login(env))
+    return subprocess.Popen(leg.argv, env={**env, **leg.env}, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+
+
+def _replace_by_rename(path: Path, text: str) -> None:
+    """How Claude Code writes its login: a new inode renamed over the old."""
+    staged = path.with_name(path.name + ".tmp.host")
+    staged.write_text(text)
+    os.replace(staged, path)
+
+
+@needs_bwrap
+def test_a_running_leg_reads_the_login_the_host_replaced_by_rename(host):
+    config = _plant_claude_config(host)
+    login = config / ".credentials.json"
+    leg = _claude_leg(host, f'cat "{login}"; echo; read _; cat "{login}"; echo')
+    try:
+        assert leg.stdout.readline().strip() == '{"fake": "v1"}'
+        before = login.stat().st_ino
+        _replace_by_rename(login, '{"fake": "v2"}')
+        assert login.stat().st_ino != before
+        out, err = leg.communicate("go\n", timeout=30)
+    finally:
+        leg.kill()
+    assert out.strip() == '{"fake": "v2"}', err
+
+
+@needs_bwrap
+def test_a_legs_login_written_by_rename_reaches_the_host(host):
+    config = _plant_claude_config(host)
+    login = config / ".credentials.json"
+    before = login.stat().st_ino
+
+    leg = _claude_leg(host, f'printf "%s" \'{{"fake": "leg"}}\' > "{login}.tmp.leg" && '
+                            f'mv "{login}.tmp.leg" "{login}" && echo renamed')
+    out, err = leg.communicate(timeout=30)
+
+    assert out.strip() == "renamed", err
+    assert login.read_text() == '{"fake": "leg"}'
+    assert login.stat().st_ino != before
+
+
+@needs_bwrap
+def test_the_refresh_lock_is_one_lock_for_the_leg_and_the_host(host):
+    config = _plant_claude_config(host)
+    (config / ".oauth_refresh.lock").mkdir()  # held by a host process at launch
+
+    leg = _claude_leg(host, f'mkdir "{config}/.oauth_refresh.lock" 2>/dev/null || echo held; '
+                            f'mkdir "{config}/.storage-write.lock" && echo taken')
+    out, err = leg.communicate(timeout=30)
+
+    assert out.split() == ["held", "taken"], err
+    assert (config / ".storage-write.lock").is_dir()
+
+
+@needs_bwrap
+def test_the_operators_claude_state_is_hidden_and_cannot_be_replaced(host):
+    config = _plant_claude_config(host)
+    reads = " ".join(f'"{config}/{p}"' for p in ("settings.json", "history.jsonl", "CLAUDE.md", "hooks/pre.sh",
+                                                  "projects/-home-op-other/s.jsonl"))
+    script = (f'cat {reads} 2>/dev/null; ls -A "{config}/hooks" "{config}/projects"; '
+              f'echo evil > "{config}/hooks/pre.sh"; '
+              f'rm -f "{config}/settings.json" 2>/dev/null || echo rm-refused; '
+              f'echo evil > "{config}/x" && mv "{config}/x" "{config}/CLAUDE.md" 2>/dev/null || echo mv-refused; '
+              f'echo evil > "{config}/history.jsonl" 2>/dev/null || echo write-refused; echo done')
+
+    leg = _claude_leg(host, script)
+    out, err = leg.communicate(timeout=30)
+
+    assert "planted" not in out
+    # Its own session store is the only project it sees.
+    assert out.split() == [f"{config}/hooks:", f"{config}/projects:",
+                           os.path.basename(claude_runtime_state({"HOME": str(host["home"])}, str(host["worktree"]))[0]),
+                           "rm-refused", "mv-refused", "write-refused", "done"], err
+    assert (config / "settings.json").read_text() == '{"hooks": "planted-settings"}'
+    assert (config / "CLAUDE.md").read_text() == "planted-memory\n"
+    assert (config / "history.jsonl").read_text() == "planted-history\n"
+    assert (config / "hooks/pre.sh").read_text() == "planted-hook\n"
 
 
 def test_a_checkout_whose_git_link_points_elsewhere_is_refused(host):

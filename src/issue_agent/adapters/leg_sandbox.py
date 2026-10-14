@@ -29,8 +29,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ..domain.sandbox import (
-    Access, GitLink, LegFacts, Mount, MountPlan, UnsafeMount, claude_session_store, exposes, leg_mount_plan,
-    protected_paths,
+    CLAUDE_LOGIN_SHARED, Access, GitLink, LegFacts, LoginDir, Mount, MountPlan, UnsafeMount, claude_session_store,
+    exposes, leg_mount_plan, protected_paths,
 )
 
 _NAMESPACES = ("--die-with-parent", "--unshare-pid", "--new-session", "--unshare-ipc", "--unshare-uts",
@@ -119,6 +119,13 @@ def _render(mount: Mount, protected: Sequence[str]) -> tuple[str, ...]:
     path = mount.path
     if mount.access is Access.PRIVATE:
         return ("--tmpfs", path)
+    if mount.access is Access.HIDDEN:
+        # Gone since the listing: nothing to hide, and bwrap would create it
+        # on the host. A link is not followed (a mount would land on its
+        # target); inside the sandbox it resolves to what the plan shows.
+        if os.path.islink(path) or not os.path.lexists(path):
+            return ()
+        return ("--tmpfs", path) if os.path.isdir(path) else ("--ro-bind", os.devnull, path)
     # A top-level system link (/bin -> usr/bin) stays a link.
     if mount.optional and os.path.dirname(path) == "/" and os.path.islink(path):
         return ("--symlink", os.readlink(path), path)
@@ -179,23 +186,43 @@ def _git_config_env(entries: Sequence[tuple[str, str]]) -> dict[str, str]:
     return env
 
 
+def _claude_config(env: Mapping[str, str]) -> str:
+    return os.path.abspath(env.get("CLAUDE_CONFIG_DIR")
+                           or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".claude"))
+
+
 def claude_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
-    """Claude's session store for `cwd` (created) and its login file. Only
-    these: the rest of `~/.claude` holds settings, hooks and shell snapshots
-    the operator's own Claude runs outside the sandbox."""
-    config = env.get("CLAUDE_CONFIG_DIR") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".claude")
+    """Claude's session store for `cwd`, created."""
     try:
-        store = claude_session_store(os.path.abspath(config), os.path.realpath(cwd))
+        store = claude_session_store(_claude_config(env), os.path.realpath(cwd))
     except UnsafeMount as exc:
         raise SandboxRefused(str(exc)) from exc
     os.makedirs(store, mode=0o700, exist_ok=True)
-    login = os.path.join(os.path.abspath(config), ".credentials.json")
-    return (store, login) if os.path.isfile(login) else (store,)
+    return (store,)
+
+
+def claude_login(env: Mapping[str, str]) -> LoginDir | None:
+    """Claude's config dir as the leg's shared login, listed now so all the
+    operator's state there (settings, hooks, history, other projects) is
+    hidden. None without a login file (an API-key leg needs none)."""
+    config = _claude_config(env)
+    if not os.path.isfile(os.path.join(config, ".credentials.json")):
+        return None
+    try:
+        entries = tuple(sorted(os.listdir(config)))
+    except OSError as exc:
+        raise SandboxRefused(f"Claude's config dir is unreadable ({type(exc).__name__})") from exc
+    return LoginDir(config, CLAUDE_LOGIN_SHARED, entries)
 
 
 def codex_runtime_state(env: Mapping[str, str], cwd: str) -> tuple[str, ...]:
     """The harness CODEX_HOME (sessions, config) and the operator login its
-    `auth.json` links to. Codex's default `~/.codex` is never mounted."""
+    `auth.json` links to. Codex's default `~/.codex` is never mounted.
+
+    The login is bound as a single file, unlike Claude's (`claude_login`):
+    codex rewrites `auth.json` in place (truncate and write, codex-rs
+    login/src/auth/storage.rs), so its inode never changes under a running
+    leg. A codex that replaces it by rename needs the login directory."""
     configured = env.get("CODEX_HOME", "")
     if not configured:
         raise SandboxRefused("a codex leg needs the harness CODEX_HOME")
@@ -285,6 +312,7 @@ class LegSandbox:
         cwd: str,
         env: Mapping[str, str],
         runtime_state: Sequence[str] = (),
+        login: LoginDir | None = None,
         scratch: Sequence[str] = (),
         read_only: bool = False,
     ) -> Launch:
@@ -314,7 +342,7 @@ class LegSandbox:
             plan = leg_mount_plan(LegFacts(
                 home=self.home, cwd=root, writable=writes,
                 git=link, runtime_binary=binary, runtime_support=support,
-                runtime_state=tuple(os.path.abspath(p) for p in runtime_state),
+                runtime_state=tuple(os.path.abspath(p) for p in runtime_state), login=login,
                 search_path=tuple(env.get("PATH", "").split(os.pathsep)), build_cache=build_cache,
                 scratch=tuple(os.path.abspath(p) for p in scratch), protected=self.protected,
                 devices=tuple(sorted(glob.glob("/dev/dri/renderD*"))),
@@ -334,6 +362,6 @@ class LegSandbox:
 
 
 __all__ = [
-    "Launch", "LegSandbox", "SandboxRefused", "bwrap_arguments", "claude_runtime_state", "codex_runtime_state",
-    "git_link", "repository_common_dir",
+    "Launch", "LegSandbox", "SandboxRefused", "bwrap_arguments", "claude_login", "claude_runtime_state",
+    "codex_runtime_state", "git_link", "repository_common_dir",
 ]

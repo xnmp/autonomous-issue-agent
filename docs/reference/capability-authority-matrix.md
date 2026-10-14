@@ -21,7 +21,8 @@ What a leg sees (`domain/sandbox.py`):
 | `/dev/shm` | its own empty tmpfs |
 | the runtime binary; `/usr`, `/etc` (whole: operator secrets live in HOME, root-only files stay unreadable), `/opt`, `/nix`, `/sys`, the resolver; toolchains on PATH, `~/.rustup`, `~/.cargo/bin`, `~/.cargo/config.toml` (its linker and rustflags hash every artifact in a shared `CARGO_TARGET_DIR`), `~/.bun/bin`, uv's Pythons, `~/.nvm`, Playwright browsers | read-only |
 | `~/.cargo/registry`, `~/.cargo/git`, `~/.cache/uv`, `~/.bun/install/cache`, `~/.npm` | per-leg overlay (writes discarded) |
-| the runtime session store and login (`~/.claude/projects/<checkout>`, `.credentials.json`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write (the login too: refresh rotates it; residuals §1.1) |
+| the runtime session store and login (`~/.claude/projects/<checkout>`; the harness CODEX_HOME and the `auth.json` it links), `CARGO_TARGET_DIR`, codex's per-run scratch | read-write (the login too: refresh rotates it; residuals §1.1) |
+| Claude's config dir `~/.claude`, when it holds an OAuth login: bound whole so the login the host renames and the refresh lock stay shared; only `.credentials.json`, `.oauth_refresh.lock(.owner)` and `.storage-write.lock` show through | read-write directory; every other entry present at launch hidden (empty, and a mount point the leg cannot replace) |
 | HOME, `/tmp` (with an empty `/tmp/.X11-unix`, so a leg's own Xvfb has a socket directory), `/var/tmp` | empty, leg-private |
 | GPU render nodes (`/dev/dri/renderD*`, never the display `card*` nodes): NVIDIA's EGL library aborts Xvfb and WebKitGTK without one | device |
 | network | on (no egress filter) |
