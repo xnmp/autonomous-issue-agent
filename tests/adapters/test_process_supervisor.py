@@ -389,6 +389,30 @@ def test_supervised_paid_command_refuses_exec_after_launcher_death(tmp_path) -> 
     assert _registrations(supervisor) == ()
 
 
+def test_supervised_sdk_cli_execs_its_command_with_the_sdk_arguments_appended(tmp_path) -> None:
+    # The command is the sandbox wrapping the CLI (#413): its own arguments
+    # come first, then the SDK's.
+    seen = tmp_path / "argv"
+    script = tmp_path / "wrapper.sh"
+    script.write_text(f'printf "%s\\n" "$@" > "{seen}"\n')
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    wrapper, supervised_env = supervisor.supervised_cli(RunId("sdk-cmd"), ("/bin/sh", str(script), "--sandboxed"))
+
+    completed = subprocess.run([wrapper, "--sdk-argument"], env={**os.environ, **supervised_env}, timeout=30)
+
+    assert completed.returncode == 0
+    assert seen.read_text().splitlines() == ["--sandboxed", "--sdk-argument"]
+
+
+def test_supervised_sdk_cli_refuses_an_unexecutable_command(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+
+    with pytest.raises(ValueError):
+        supervisor.supervised_cli(RunId("sdk-none"), (str(tmp_path / "missing"),))
+    with pytest.raises(ValueError):
+        supervisor.supervised_cli(RunId("sdk-empty"), ())
+
+
 def test_supervised_sdk_cli_registers_session_before_target_executes(tmp_path) -> None:
     marker = tmp_path / "target-started"
     target = tmp_path / "claude"
@@ -408,7 +432,7 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(tmp_path) -
     target.chmod(0o755)
     supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
     run_id = RunId("sdk-cli")
-    wrapper, supervised_env = supervisor.supervised_cli(run_id, str(target))
+    wrapper, supervised_env = supervisor.supervised_cli(run_id, (str(target),))
     process = subprocess.Popen(
         [wrapper, "--sdk-argument"],
         env={

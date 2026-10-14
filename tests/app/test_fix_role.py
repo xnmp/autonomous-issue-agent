@@ -449,7 +449,7 @@ def test_resolve_runs_once_under_its_lease_then_the_harness_opens_one_pr(role):
     assert [p.head_ref_name for p in gh.prs.values()] == ["fix/5-null-token-crashes"]
     assert gh.prs[100].body == "Fixed the null token."  # the agent's description, unchanged
     task = agent.tasks[0]
-    assert "git push -u origin fix/5-null-token-crashes" in task.prompt
+    assert "git push origin fix/5-null-token-crashes" in task.prompt
     # The agent reads the issue itself: a pointer, not the pasted text.
     assert "gh issue view 5 --repo o/r --comments" in task.prompt and "Steps: ..." not in task.prompt
     assert task.env["GIT_AUTHOR_EMAIL"] == "fix-bot@users.noreply.github.com"

@@ -28,6 +28,11 @@ GitRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
 # synchronous daemon (review M20, the same class as the 14-minute `gh` hang).
 _GIT_TIMEOUT_S = 60.0
 
+# A leg writes its checkout, so it can plant a submodule whose `.git` names a
+# gitdir with its own config; the harness's git never enters one (#413: the
+# sandboxed leg cannot touch the repository config, only its checkout).
+_NO_RECURSION = ("-c", "submodule.recurse=false", "-c", "fetch.recurseSubmodules=false")
+
 
 def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     """`git` in `cwd`, bounded. Never raises: a timeout or spawn failure is a
@@ -35,7 +40,8 @@ def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     `worktree add` failure once handed back a path that did not exist)."""
     command = f"git {' '.join(args)} (cwd={cwd})"
     try:
-        res = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=_GIT_TIMEOUT_S)
+        res = subprocess.run(["git", *_NO_RECURSION, *args], cwd=cwd, capture_output=True, text=True,
+                             timeout=_GIT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         print(f"[worktree] git timed out after {_GIT_TIMEOUT_S:g}s and was killed: {command}", file=sys.stderr)
         return GitResult(1, "")

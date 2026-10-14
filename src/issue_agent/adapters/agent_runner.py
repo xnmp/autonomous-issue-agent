@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .child_env import CHILD_ENV_MANIFEST
+from .leg_sandbox import LegSandbox, SandboxRefused, claude_runtime_state
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
 from ..domain.pricing import RateTable, claude_model
@@ -48,8 +49,7 @@ from ..domain.outcome import (
 _WATCHDOG_POLL_SLICE = 30.0
 _NO_MESSAGE = object()
 
-# bypassPermissions: the task's tool lists and the trusted-inbound-content
-# posture (capability matrix) are the boundary, not the classifier.
+# bypassPermissions: the leg sandbox (#413) is the boundary, not the classifier.
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
 # Ceiling on ONE decoded SDK stream message. The SDK default (1MB) kills the
@@ -397,7 +397,12 @@ class AgentRunner(AgentRuntime):
         max_buffer_size: int | None = DEFAULT_MAX_BUFFER_BYTES,
         process_supervisor: Any = None,
         rate_table: RateTable | None = None,
+        leg_sandbox: LegSandbox | None = None,
     ):
+        # The sandbox wraps the CLI behind the supervisor's wrapper: the SDK
+        # takes one executable, so it needs that wrapper to carry bwrap.
+        if leg_sandbox is not None and process_supervisor is None:
+            raise ValueError("a sandboxed runner needs a process supervisor")
         self.permission_mode = permission_mode
         self._log = log or (lambda _m: None)
         self._debug = debug  # per-message tracing
@@ -414,6 +419,7 @@ class AgentRunner(AgentRuntime):
         self._max_buffer_size = max_buffer_size
         self._process_supervisor = process_supervisor
         self._rate_table = rate_table
+        self._sandbox = leg_sandbox
 
     def _slice_timeout(self) -> float:
         """The poll slice, floored by any shorter armed cap."""
@@ -471,7 +477,22 @@ class AgentRunner(AgentRuntime):
             if executable is None:
                 raise FileNotFoundError("Claude CLI executable is unavailable — set CLAUDE_BIN "
                                         "to an absolute path to pin it")
-            wrapper, supervisor_env = self._process_supervisor.supervised_cli(supervised_run_id, executable)
+            command: tuple[str, ...] = (os.path.realpath(executable),)
+            if self._sandbox is not None:
+                cwd = task.cwd or os.getcwd()
+                leg_env = {**os.environ, **kwargs["env"]}
+                try:
+                    launch = self._sandbox.launch(command, cwd=cwd, env=leg_env,
+                                                  runtime_state=claude_runtime_state(leg_env, cwd),
+                                                  read_only=task.read_only)
+                except SandboxRefused as exc:
+                    self._log(f"sdk: SANDBOX REFUSED — {exc}")
+                    return AgentResult(is_error=True, status="blocked", summary=f"sandbox unavailable: {exc}",
+                                       exit_reason=ExitReason.RUNTIME_UNAVAILABLE, model=task.model or "")
+                self._log(f"sdk: {launch.summary}")
+                command = launch.argv
+                kwargs["env"] = {**kwargs["env"], **launch.env}
+            wrapper, supervisor_env = self._process_supervisor.supervised_cli(supervised_run_id, command)
             kwargs["cli_path"] = wrapper
             kwargs["env"] = {**kwargs.get("env", {}), **supervisor_env}
             kwargs["env"][CHILD_ENV_MANIFEST] = " ".join(sorted(kwargs["env"]))

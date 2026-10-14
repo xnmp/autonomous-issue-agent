@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -82,8 +82,10 @@ class JournalingRuntime:
     and its end after it (including when the await raises)."""
 
     def __init__(self, inner: AgentRuntime, journal: Journal, repo: str = "", role: str = "",
-                 runtime: str = ""):
+                 runtime: str = "", sandbox: Callable[[], str] | None = None):
         self.inner = inner
+        # What the leg starts under ("bwrap 0.13.0" or "unavailable: ..."), #413.
+        self.sandbox = sandbox
         self.journal = journal
         self.repo = repo
         self.role = role
@@ -116,7 +118,8 @@ class JournalingRuntime:
         run_id, leg_id = uuid.uuid4().hex, uuid.uuid4().hex
         try:
             self.journal.emit("agent_run_start", {**ctx.correlation(run_id, leg_id), "model": task.model or "",
-                                                  "kind": ctx.kind, "role": ctx.role, "number": ctx.number})
+                                                  "kind": ctx.kind, "role": ctx.role, "number": ctx.number,
+                                                  **({"sandbox": self.sandbox()} if self.sandbox else {})})
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run_start ({exc})\n")
         if isinstance(self.inner, RunIdentityRuntime):

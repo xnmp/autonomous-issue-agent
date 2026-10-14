@@ -1,7 +1,7 @@
 from issue_agent.adapters.child_env import child_process_env, without_supervisor_authority
 
 
-def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
+def test_child_environment_is_allowlisted_and_inherits_no_publication_credentials():
     inherited = {
         "PATH": "/bin",
         "HOME": "/home/agent",
@@ -12,7 +12,7 @@ def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
         "UNRELATED": "ambient",
     }
 
-    selected = child_process_env(inherited, {"ISSUE_AGENT_RUN_ID": "run-1", "GH_TOKEN": "still-denied"})
+    selected = child_process_env(inherited, {"ISSUE_AGENT_RUN_ID": "run-1"})
 
     assert selected == {
         "PATH": "/bin",
@@ -20,6 +20,14 @@ def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
         "ANTHROPIC_AUTH_TOKEN": "runtime-secret",
         "ISSUE_AGENT_RUN_ID": "run-1",
     }
+
+
+def test_an_explicit_leg_credential_wins_over_an_inherited_one():
+    # A fix leg's one token is named by the harness (the leg sandbox, #413);
+    # the daemon's ambient token never reaches it.
+    selected = child_process_env({"GH_TOKEN": "ambient", "PATH": "/bin"}, {"GH_TOKEN": "leg-token"})
+
+    assert selected == {"PATH": "/bin", "GH_TOKEN": "leg-token"}
 
 
 def test_provider_specific_auth_key_can_be_admitted_explicitly():

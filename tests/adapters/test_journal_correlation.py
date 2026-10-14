@@ -73,3 +73,15 @@ def test_issue_numbered_and_numberless_contexts_never_claim_a_pr(role: str, kind
 
     assert correlations
     assert set(correlations) == {(issue, None)}
+
+
+def test_a_leg_start_records_the_sandbox_it_starts_under():
+    # #413: the field-verification observable for the leg sandbox.
+    sink = _CapturingSink()
+    runtime = JournalingRuntime(_Inner("done"), sink, repo="o/r", role="fix", sandbox=lambda: "bwrap 0.13.0")
+    runtime.set_context("fix", "RESOLVE", 5, 5)
+
+    asyncio.run(runtime.run(RuntimePlan(prompt="p")))
+
+    starts = [fields for event, fields in sink.events if event == "agent_run_start"]
+    assert [s["sandbox"] for s in starts] == ["bwrap 0.13.0"]

@@ -12,7 +12,6 @@ import re
 from dataclasses import dataclass, replace
 from typing import TypeGuard
 
-from ...domain.tool_policy import FIXER_DENY  # noqa: F401  (re-export)
 from ...domain.evidence import ChangeRequest, CiFailures
 from ...domain.trust import Untrusted, as_untrusted, untrusted_block
 from ...domain.agent_task import RuntimeName
@@ -36,10 +35,8 @@ class FixTaskConfig:
 
 
 # ── fixer tool policy ─────────────────────────────────────────────────────────
-# Under bypassPermissions `disallowed_tools` is the only policy the SDK still
-# honours (deny beats bypass). The credential denies live in
-# domain/tool_policy.py (re-exported here); `Task` (the pre-PR review
-# subagent), `Bash` and the network tools are deliberately allowed.
+# None: the leg sandbox (#413) is the credential boundary, so the fixer's
+# former deny list (`gh auth`, `.env`, keys) guarded nothing it can reach.
 
 
 # Native delegation must be authorized in the user task itself; appended
@@ -68,7 +65,6 @@ def _fix_run(cfg: FixTaskConfig, prompt: str, cwd: str, session_id: str | None =
         prompt=grant + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=cfg.agent_md,
-        disallowed_tools=FIXER_DENY,
         model=cfg.model,
         runtime=cfg.runtime,
         effort=cfg.effort,
@@ -108,7 +104,7 @@ def build_resolve_task(
 # The light acts' (STEWARD, TRIAGE) tool policy: they read only the prompt, a cost
 # bound. Their cwd is an empty scratch directory, and the deny list closes the
 # write, shell and web paths.
-TRIAGE_DENY: tuple[str, ...] = ("Bash", "Edit", "Write", "NotebookEdit", "Task", "WebFetch", "WebSearch", *FIXER_DENY)
+TRIAGE_DENY: tuple[str, ...] = ("Bash", "Edit", "Write", "NotebookEdit", "Task", "WebFetch", "WebSearch")
 
 
 def _light_plan(
@@ -224,7 +220,7 @@ def build_triage_task(
 
 # Q11: the agent pushes its branch with git; the harness opens the PR.
 _PUSH_CONTRACT = (
-    "Commit your work and push it with `git push -u origin {branch}`; the harness "
+    "Commit your work and push it with `git push origin {branch}`; the harness "
     "opens the pull request from that branch (never run `gh pr create`). Return "
     "status=pushed once the push succeeds, or status=blocked with 'needs' set to "
     "exactly what you need if you cannot proceed."
@@ -412,11 +408,9 @@ def build_rebase_task(
 
 
 # ── review side ─────────────────────────────────────────────────────────────
-# Read-mostly reviewer toolset.
-REVIEW_TOOLS = (
-    "Read", "Bash(git diff *)", "Bash(gh pr diff *)", "Bash(gh pr view *)",
-    "Bash(cat *)", "Bash(ls *)",
-)
+# Read-mostly reviewer toolset. No `gh`: a review leg holds no GitHub
+# credential (#413); its prompt carries the issue and it diffs locally.
+REVIEW_TOOLS = ("Read", "Bash(git diff *)", "Bash(cat *)", "Bash(ls *)")
 REVIEW_DENY = ("Edit", "Write")
 
 

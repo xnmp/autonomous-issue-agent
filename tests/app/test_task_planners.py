@@ -15,7 +15,6 @@ from issue_agent.domain.evidence import ChangeRequest, CiFailure, CiFailures
 from issue_agent.domain.trust import as_untrusted
 from issue_agent.app.planners.schemas import FIX_SCHEMA, REVIEW_SCHEMA
 from issue_agent.app.planners.tasks import (
-    FIXER_DENY,
     FixTaskConfig,
     ReviewContext,
     ReviewTaskConfig,
@@ -199,9 +198,10 @@ def _every_fixer_task(session: str = "s1"):
     }
 
 
-def test_every_fixer_leg_carries_the_deny_list():
+def test_no_fixer_leg_carries_a_tool_deny_list():
+    # #413: the leg sandbox, not a tool deny list, keeps credentials out of reach.
     for name, task in _every_fixer_task().items():
-        assert task.disallowed_tools == FIXER_DENY, f"{name} leg has no tool denies"
+        assert task.disallowed_tools == (), name
 
 
 def test_light_legs_read_only_the_prompt_while_fixers_may_use_the_web():
@@ -210,7 +210,6 @@ def test_light_legs_read_only_the_prompt_while_fixers_may_use_the_web():
     light = build_steward_task(5, U("t"), U("b"), U("others"), (), "/scratch",
                                model=None, runtime=None, max_budget_usd=0.5)
     assert {"WebFetch", "WebSearch", "Bash"} <= set(light.disallowed_tools)
-    assert set(FIXER_DENY) <= set(light.disallowed_tools)
     for name, task in _every_fixer_task().items():
         assert not {"WebFetch", "WebSearch"} & set(task.disallowed_tools), name
 
