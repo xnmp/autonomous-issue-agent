@@ -45,15 +45,21 @@ have one; keep your context for reasoning, design and code.
    re-capture only the affected ones, and keep each image mapped to its criterion
    in the PR body.
 7. `docs:` update folder `CLAUDE.md` with non-obvious learnings.
-8. Pre-push review: before pushing, have a fresh-context subagent review the
-   diff against the acceptance criteria (without subagents, review it yourself in
-   one fresh pass). It FAILs on bugs and on any of:
+8. Publish first: once your tests pass and the suite is green, commit and push
+   (step 9) before any further review or polish, so a leg that is stopped later
+   still leaves its fix published (tauri #1051 and #795 finished their fix, then
+   lost it unpushed to more review rounds). Then review: have one fresh-context
+   subagent review the pushed diff against the acceptance criteria (without
+   subagents, review it yourself in one fresh pass). It FAILs on bugs and on any of:
    - **Tautological test**: passes whether or not the change is there.
    - **Wrong-layer test**: asserts something the observable behaviour does not
      flow through, so reverting the implementation leaves it green.
    - **Untested seam**: no test asserts at the user-visible or contract result a
      criterion names.
-   Fix each finding, then re-verify, including what the fix itself may break.
+   Fix each finding, re-verify, including what the fix itself may break, and
+   push the fixes; re-capture any `evidence/` screenshot a fix changed. One
+   review round is enough: the independent reviewer is the next one, so do not
+   start another.
 9. Publish with plain git: commit, then `git push origin <your branch>`
    (`--force-with-lease` only after a rebase). Never run `gh pr create`: the
    harness opens the pull request from your pushed branch against
@@ -61,7 +67,8 @@ have one; keep your context for reasoning, design and code.
    write `summary` as the complete PR description: what changed, how you
    verified it, an `## Acceptance Criteria` section (the criteria you were
    briefed with, else the issue's), and `Closes #<issue>`. On a later leg for an
-   open PR, change the description only with
+   open PR whose body is only `Closes #<issue>` (an earlier leg was stopped after
+   publishing), write the full description first. Otherwise change it only with
    `gh pr edit <PR number> --repo $HARNESS_REPO --body '…'`,
    which replaces the whole body: keep the Acceptance Criteria section and the
    `Closes #` line.
@@ -90,7 +97,8 @@ Xvfb `-nolisten local`.
 - Never call `gh issue create`. If completion is prevented, return
   `status=blocked` with a focused harness-issue title and reproduction in `needs`
   for the operator to file.
-- After a push, end the leg: the harness watches CI and dispatches a new leg if
+- After the push that follows your review (or your first push, if the review
+  found nothing), end the leg: the harness watches CI and dispatches a new leg if
   it fails. Never wait for CI inside a leg (`gh run watch`, `gh pr checks
   --watch`, polling loops); one leg watched a run for 40 minutes and stalled
   every other dispatch (tauri #1128).
