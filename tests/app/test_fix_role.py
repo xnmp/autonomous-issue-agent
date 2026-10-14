@@ -809,6 +809,27 @@ def _cap_hit(cap: str, session: str, cost: float = 1.05):
         usage={"input_tokens": 0, "output_tokens": round(cost * 100_000)}, session_id=session)
 
 
+def _api_error(session: str):
+    """A Claude leg the provider ended (#418), parsed from its real envelope."""
+    from types import SimpleNamespace
+
+    from issue_agent.adapters.agent_runner import result_to_agent_result
+    return lambda _task: result_to_agent_result(SimpleNamespace(
+        is_error=True, subtype="success", terminal_reason="api_error", session_id=session,
+        result="Failed to authenticate", total_cost_usd=0.0, usage={"input_tokens": 0, "output_tokens": 100_000}))
+
+
+def test_a_provider_ended_leg_is_a_machine_end_and_a_second_on_its_resume_counts(role, later):
+    gh = FakeGitHub(issues={5: ready()})
+    agent = Agent(_api_error("s-1"), _api_error("s-1"))
+    composed, _ = role(gh, agent, **TIERS)
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    later()
+    assert dispatched(tick(composed), AgentKind.RESOLVE)
+    assert [t.resume for t in agent.tasks] == [None, "s-1"]
+    assert _resolve_legs(composed) == ["machine", "agent"]
+
+
 def _resolve_legs(composed) -> list[str | None]:
     runs = sorted((r for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "RESOLVE"),
                   key=lambda r: r.completed_at)

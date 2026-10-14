@@ -40,6 +40,7 @@ from ..domain.run_usage import (
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
+    PROVIDER_REFUSED_SUBTYPE,
     declared_status,
     reclassify_pending_background_block,
 )
@@ -164,12 +165,17 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     # run reports total_cost_usd == 0.00.
     usage = getattr(msg, "usage", None)
     turns = getattr(msg, "num_turns", None)
+    exit_reason = exit_reason_from_envelope(subtype, is_error)
+    if is_error and getattr(msg, "terminal_reason", None) == "api_error":
+        # The provider ended the leg (auth failure, 5xx, overload, or a
+        # permanent 400; #418): codex's shape, so classify_leg bounds it.
+        exit_reason, subtype = ExitReason.TRANSPORT_DEATH, PROVIDER_REFUSED_SUBTYPE
     return AgentResult(
         is_error=is_error, status=status, envelope_subtype=subtype, summary=summary, needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0), model=reported_model(msg),
         session_id=reported_session(msg),
         structured=structured if isinstance(structured, dict) else None,
-        exit_reason=exit_reason_from_envelope(subtype, is_error),
+        exit_reason=exit_reason,
         usage=usage if isinstance(usage, dict) else None, num_turns=turns if isinstance(turns, int) else None,
     )
 
@@ -662,6 +668,8 @@ class AgentRunner(AgentRuntime):
                                                    exit_reason=ExitReason.NO_RESULT, usage=usage_acc,
                                                    stream_usage=usage_acc))
         result = self._priced(task, with_stream_identity(result_to_agent_result(final)), final, delegated, exited)
+        if result.envelope_subtype == PROVIDER_REFUSED_SUBTYPE:
+            self._log(f"sdk: provider ended the turn ({result.summary[:200]}) — a machine failure unless this leg resumed one")
         reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
             self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "

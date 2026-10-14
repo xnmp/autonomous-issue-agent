@@ -28,7 +28,7 @@ from issue_agent.adapters.agent_runner import (
 )
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.effort import EFFORT_LADDER, Effort
-from issue_agent.domain.outcome import ExitReason
+from issue_agent.domain.outcome import ExitReason, LegClass, classify_leg, resumable_session
 
 
 def _run(**runner):
@@ -121,6 +121,7 @@ class FakeResult:
     session_id: str = ""
     subtype: str = ""
     usage: object = None
+    terminal_reason: object = None
 
 
 def test_result_reads_structured_output():
@@ -697,3 +698,26 @@ def test_a_claude_leg_the_sandbox_refuses_never_starts(tmp_path, monkeypatch):
 def test_a_sandbox_without_a_process_supervisor_is_a_wiring_error():
     with pytest.raises(ValueError):
         AgentRunner(leg_sandbox=_Sandbox())
+
+
+def test_a_provider_api_error_end_is_a_machine_failure_whose_session_stays_resumable():
+    r = result_to_agent_result(FakeResult(
+        is_error=True, subtype="success", terminal_reason="api_error", session_id="s1",
+        result="Failed to authenticate: OAuth session expired", total_cost_usd=0.1))
+    assert r.is_error
+    assert classify_leg(r, resumed=False) is LegClass.MACHINE
+    assert classify_leg(r, resumed=True) is LegClass.AGENT  # a permanent error must not loop free
+    assert resumable_session(r) == "s1"
+
+
+@pytest.mark.parametrize("terminal", [None, "", "completed", "max_turns", 7, ["api_error"]])
+def test_an_agent_error_without_a_provider_terminal_reason_stays_an_attempt(terminal):
+    r = result_to_agent_result(FakeResult(is_error=True, terminal_reason=terminal, session_id="s1"))
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+    assert classify_leg(r, resumed=False) is LegClass.AGENT
+
+
+def test_a_clean_envelope_is_not_reclassified_by_a_stale_api_error_terminal_reason():
+    r = result_to_agent_result(FakeResult(subtype="success", terminal_reason="api_error"))
+    assert r.exit_reason is ExitReason.OK
+    assert classify_leg(r, resumed=False) is LegClass.AGENT
