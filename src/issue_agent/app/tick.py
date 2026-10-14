@@ -304,7 +304,9 @@ class Daemon:
     terminalize: Callable[[], object] | None = None
     _state: DaemonState = field(default=DaemonState.STARTING, init=False, repr=False)
     _dispatch_pool: ThreadPoolExecutor = field(init=False, repr=False)
-    _dispatch_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    # Guards `_dispatches`; notified when a finished dispatch leaves it.
+    _dispatch_lock: threading.Condition = field(default_factory=lambda: threading.Condition(threading.Lock()),
+                                                init=False, repr=False)
     _shutdown_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _dispatches: dict[Future[None], tuple[RunAgent, Hashable]] = field(default_factory=dict, init=False, repr=False)
     # A hot reload waits for paid work to drain (`_admitting`).
@@ -402,6 +404,7 @@ class Daemon:
     def _dispatch_done(self, future: Future[None]) -> None:
         with self._dispatch_lock:
             entry = self._dispatches.pop(future, None)
+            self._dispatch_lock.notify_all()
         if entry is None:
             return
         if future.cancelled():
@@ -424,11 +427,13 @@ class Daemon:
         return True
 
     def wait_for_dispatches(self) -> None:
-        """Wait for the current set without closing admission (tests)."""
+        """Wait until the current set has left the in-flight set, its slots and
+        keys free, without closing admission (tests). A future wakes its
+        waiters before it runs `_dispatch_done`, so waiting on the futures
+        alone could return while the drain still counted them."""
         with self._dispatch_lock:
             pending = tuple(self._dispatches)
-        if pending:
-            wait(pending)
+            self._dispatch_lock.wait_for(lambda: self._dispatches.keys().isdisjoint(pending))
 
     def shutdown_dispatches(self, *, cancel: bool) -> bool:
         """Close admission, optionally cancel active async work, and join. The
