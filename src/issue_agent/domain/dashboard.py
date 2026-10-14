@@ -25,6 +25,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
+from types import MappingProxyType
 
 from .actions import ISSUE_ACTS, AgentKind
 from .checks import Observed
@@ -240,10 +241,10 @@ class Working:
 
 @dataclass(frozen=True)
 class Waiting:
-    """A wait on something outside the harness. `blocker` is the issue a
+    """A wait the operator need not act on (a slot or a reload included). `blocker` is the issue a
     blocked wait names in its headline."""
 
-    on: str  # branch-protection | human-review | headroom | backoff | blocked | github | slot
+    on: str  # branch-protection | human-review | headroom | backoff | blocked | github | reload | slot
     headline: str
     reason: str
     since_ts: str | None
@@ -326,12 +327,18 @@ def board_status(
     last_end: datetime | None,
     harness: Harness,
     now: datetime,
+    reload_held: Mapping[str, tuple[int, ...]] = MappingProxyType({}),
+    ready_at: datetime | None = None,
 ) -> BoardStatus:
     """One item's board status from its derived state. `legs` are the item's
     issue's legs, oldest first; `comments` are the item's own (where its stop
     comment is posted); `last_end` is the newest end among the legs derive
     keyed to this item (its episode boundary, `state._decide`). `now` bounds
-    step start times: a Working row's `since_ts` is when its step began."""
+    step start times: a Working row's `since_ts` is when its step began.
+    `reload_held` maps a role draining for a hot reload to the items of the
+    heavy legs it waits on (`reload_held`). `ready_at` is when the issue was
+    last labelled ready: a queued item waits from the later of that and its
+    episode's last end, never from a leg of an earlier episode."""
     ended = last_end if last_end is not None else max((x.ended_at for x in legs if x.ended_at), default=None)
     running = next((leg for leg in reversed(legs) if leg.running), None)
     if isinstance(state, NeedsHuman):
@@ -352,7 +359,21 @@ def board_status(
                        "An agent leg holds this item.", _iso(since))
     if isinstance(state, Dispatch):
         act = state.act.name
-        return Waiting("slot", f"{_ACT_WORDS[act]} next", "Waiting for a free agent slot.", _iso(ended))
+        ready = ready_at if ready_at is not None and ready_at <= now else None
+        queued = _iso(max((at for at in (last_end, ready) if at is not None), default=None))
+        held = reload_held.get("review" if state.act is AgentKind.REVIEW else "fix")
+        # Light legs keep starting only while a heavy leg drains (`held`
+        # non-empty); once none does, they wait for the restart too.
+        if held is not None and (state.act.holds_dispatch_slot or not held):
+            legs_word = ", ".join(f"#{n}" for n in held)
+            why = (f"Restarts when {legs_word}'s leg ends." if len(held) == 1
+                   else f"Restarts when the legs of {legs_word} end." if held
+                   else "Starts after the harness restarts, once its running light legs end.")
+            return Waiting("reload", "Paused for a harness reload", why, queued)
+        if not state.act.holds_dispatch_slot:
+            return Waiting("slot", f"{_ACT_WORDS[act]} next",
+                           "Needs no agent slot; starts on the next tick unless every light slot is busy.", queued)
+        return Waiting("slot", f"{_ACT_WORDS[act]} next", "Waiting for a free agent slot.", queued)
     if isinstance(state, Merge):
         return Working("merge", None, "Merging", "Approved on its head with green CI.", _iso(ended))
     if isinstance(state, Refresh):
@@ -439,6 +460,23 @@ def _wait_status(
         WaitReason.MERGEABILITY_UNKNOWN: "GitHub is still computing mergeability.",
     }.get(reason, "Waiting on GitHub.")
     return Waiting("github", "Reading GitHub", detail, since)
+
+
+def beat_live(state: str, age_s: float | None) -> bool:
+    """A heartbeat speaks for its role only while running or draining and no
+    older than the staleness bound (a future stamp is not live either)."""
+    return state in ("running", "draining") and age_s is not None and 0 <= age_s <= STALE_AFTER_S
+
+
+def reload_held(*, state: str, age_s: float | None, reload_pending: bool,
+                in_flight: Iterable[tuple[str, int]]) -> tuple[int, ...] | None:
+    """The items of the heavy legs a role's pending hot reload waits on, from
+    its heartbeat; None unless a live (running or draining, not stale)
+    heartbeat reports the reload. Light legs keep starting during the drain,
+    so they hold nothing."""
+    if not reload_pending or not beat_live(state, age_s):
+        return None
+    return tuple(sorted({number for kind, number in in_flight if kind not in _LIGHT_ACT_NAMES}))
 
 
 @dataclass(frozen=True)

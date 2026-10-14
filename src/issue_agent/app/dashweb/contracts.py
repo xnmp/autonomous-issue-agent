@@ -241,7 +241,7 @@ class BoardWaiting(Contract):
     status: Literal["waiting"]
     # slot: waiting for a dispatch slot; waiting: an external wait.
     group: Literal["slot", "waiting"]
-    on: Literal["branch-protection", "human-review", "headroom", "backoff", "blocked", "github", "slot"]
+    on: Literal["branch-protection", "human-review", "headroom", "backoff", "blocked", "github", "reload", "slot"]
     headline: str
     reason: str
     since_ts: str | None

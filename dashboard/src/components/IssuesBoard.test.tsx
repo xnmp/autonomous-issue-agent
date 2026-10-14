@@ -255,6 +255,19 @@ describe("issues board row", () => {
     expect(within(row("Issue 171 title")).getByText("Daily cap reached")).toBeInTheDocument();
   });
 
+  it("puts heavy work paused by a harness reload under Waiting, saying which leg it waits on", () => {
+    stubFetch();
+    const paused: BoardStatus = {
+      status: "waiting", group: "waiting", on: "reload", headline: "Paused for a harness reload",
+      reason: "Restarts when #1078's leg ends.", since_ts: null,
+    };
+    renderBoard({ in_flight: [card(1105, paused)] });
+
+    const waiting = within(section("Waiting"));
+    expect(waiting.getByText("Paused for a harness reload")).toBeInTheDocument();
+    expect(waiting.getByText("Restarts when #1078's leg ends.")).toBeInTheDocument();
+  });
+
   it("draws the rail counts, amber thresholds and a rewound stage", () => {
     stubFetch();
     renderBoard({

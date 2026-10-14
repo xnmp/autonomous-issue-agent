@@ -273,7 +273,7 @@ export interface components {
              * On
              * @enum {string}
              */
-            on: "branch-protection" | "human-review" | "headroom" | "backoff" | "blocked" | "github" | "slot";
+            on: "branch-protection" | "human-review" | "headroom" | "backoff" | "blocked" | "github" | "reload" | "slot";
             /** Reason */
             reason: string;
             /** Since Ts */

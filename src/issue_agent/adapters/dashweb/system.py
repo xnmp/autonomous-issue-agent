@@ -50,11 +50,13 @@ def deployment_env(harness_root: str, name: str, inherited: Mapping[str, str]) -
 @dataclass(frozen=True)
 class Beat:
     """One role's `heartbeat.json` (written by `tick.Daemon` every tick):
-    when, its scheduler state, and the dispatches it holds as (kind, number)."""
+    when, its scheduler state, the dispatches it holds as (kind, number), and
+    whether a hot reload is draining them (absent or malformed: not)."""
 
     at: datetime
     state: str
     in_flight: tuple[tuple[str, int], ...] = ()
+    reload_pending: bool = False
 
 
 def read_beat(path: str) -> Beat | None:
@@ -71,7 +73,7 @@ def read_beat(path: str) -> Beat | None:
         return None
     flight = tuple((str(row["kind"]), row["number"]) for row in rows
                    if isinstance(row, dict) and isinstance(row.get("kind"), str) and type(row.get("number")) is int)
-    return Beat(at, state, flight)
+    return Beat(at, state, flight, payload.get("reload_pending") is True)
 
 
 def role_beats(state_dirs: Mapping[str, str]) -> dict[str, Beat | None]:

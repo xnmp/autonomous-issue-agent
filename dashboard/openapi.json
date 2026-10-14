@@ -338,6 +338,7 @@
               "backoff",
               "blocked",
               "github",
+              "reload",
               "slot"
             ],
             "title": "On",

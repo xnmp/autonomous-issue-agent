@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -795,3 +796,111 @@ def test_a_mutation_beside_a_dispatch_still_reticks():
     d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=1)
     d.wait_for_dispatches()
     assert slept == [5]
+
+
+def _drain_daemon(decisions, run_agent, heartbeat="", capacity=1):
+    """A fix daemon whose nth tick decides `decisions[n]` (then nothing)."""
+    ticks = []
+
+    def decide(_world):
+        ticks.append(1)
+        return list(decisions[len(ticks) - 1]) if len(ticks) <= len(decisions) else []
+
+    return Daemon("fix", lambda: WorldState(), decide, Executor(FakeGateway(), run_agent=run_agent),
+                  poll_seconds=1, dispatch_capacity=capacity, heartbeat_path=heartbeat)
+
+
+def _wait_until(condition, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.01)
+
+
+def test_a_reload_drain_holds_heavy_legs_but_starts_light_ones_while_a_heavy_leg_runs(tmp_path):
+    # #1105: a harness merge held STEWARD/TRIAGE for 45 min behind #1078's
+    # FIX_CI. Light legs keep starting while the heavy one drains; heavy ones wait.
+    release, started = threading.Event(), []
+
+    def run_agent(action):
+        started.append((action.kind, action.number))
+        if action.kind is AgentKind.FIX_CI:
+            assert release.wait(timeout=5)
+
+    heartbeat = tmp_path / "heartbeat.json"
+    daemon = _drain_daemon([
+        [RunAgent(AgentKind.FIX_CI, 1078)],
+        [RunAgent(AgentKind.STEWARD, 1105), RunAgent(AgentKind.RESOLVE, 9)],
+    ], run_agent, str(heartbeat), capacity=2)  # a heavy slot stays free: only the drain holds RESOLVE 9
+    beats, slots = [], []
+
+    def sleep(_seconds):
+        beats.append(json.loads(heartbeat.read_text()))
+        slots.append((daemon.available_dispatch_slots, daemon.available_light_slots))
+        if len(beats) == 2:
+            _wait_until(lambda: (AgentKind.STEWARD, 1105) in started)
+            release.set()
+
+    with pytest.raises(SystemExit) as stopped:
+        daemon.run_forever(sleep=sleep, now=lambda: 0, max_ticks=10, reload_check=lambda: True)
+
+    assert stopped.value.code == RELOAD_EXIT_CODE
+    assert started == [(AgentKind.FIX_CI, 1078), (AgentKind.STEWARD, 1105)]  # RESOLVE 9 held
+    assert beats[0]["reload_pending"] is True
+    assert beats[0]["in_flight"] == [{"kind": "FIX_CI", "number": 1078}]
+    assert slots[0] == (0, 2)  # decide sees no heavy slot but the whole light lane
+
+
+def test_once_no_heavy_leg_drains_no_light_leg_starts_so_the_reload_exits():
+    # No livelock: a light leg decided on every tick must not defer the exit.
+    release, started = threading.Event(), []
+
+    def run_agent(action):
+        started.append(action.number)
+        if action.number == 1:
+            assert release.wait(timeout=5)
+
+    daemon = _drain_daemon([[RunAgent(AgentKind.TRIAGE, n)] for n in range(1, 50)], run_agent)
+    sleeps = []
+
+    def sleep(_seconds):
+        sleeps.append(1)
+        if len(sleeps) == 3:
+            release.set()  # the one light leg in flight when the reload came ends
+            _wait_until(lambda: not daemon.active_dispatches)
+
+    with pytest.raises(SystemExit) as stopped:
+        daemon.run_forever(sleep=sleep, now=lambda: 0, max_ticks=50, reload_check=lambda: len(sleeps) >= 1)
+
+    assert stopped.value.code == RELOAD_EXIT_CODE
+    assert started == [1]
+    assert len(sleeps) == 3  # exits on the first tick after that leg ends
+
+
+def test_light_legs_started_during_the_drain_drain_before_the_exit():
+    release_heavy, release_light, started, finished = threading.Event(), threading.Event(), [], []
+
+    def run_agent(action):
+        started.append(action.number)
+        assert (release_heavy if action.kind is AgentKind.RESOLVE else release_light).wait(timeout=5)
+        finished.append(action.number)
+
+    daemon = _drain_daemon([[RunAgent(AgentKind.RESOLVE, 7)], [RunAgent(AgentKind.TRIAGE, 8)]], run_agent)
+    sleeps = []
+
+    def sleep(_seconds):
+        sleeps.append(1)
+        if len(sleeps) == 2:
+            _wait_until(lambda: 8 in started)
+            release_heavy.set()
+            _wait_until(lambda: 7 in finished)
+        if len(sleeps) == 4:
+            assert finished == [7]  # still draining the light leg: no exit yet
+            release_light.set()
+            _wait_until(lambda: not daemon.active_dispatches)
+
+    with pytest.raises(SystemExit) as stopped:
+        daemon.run_forever(sleep=sleep, now=lambda: 0, max_ticks=20, reload_check=lambda: True)
+
+    assert stopped.value.code == RELOAD_EXIT_CODE
+    assert finished == [7, 8]

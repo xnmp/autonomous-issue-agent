@@ -113,6 +113,7 @@ const BoardWaiting = z
       "backoff",
       "blocked",
       "github",
+      "reload",
       "slot",
     ]),
     reason: z.string(),
