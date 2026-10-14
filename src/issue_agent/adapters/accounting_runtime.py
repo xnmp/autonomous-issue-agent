@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import sqlite3
 import uuid
 import contextvars
 from dataclasses import dataclass, field, replace
@@ -33,8 +34,18 @@ from ..domain.policy import question_text
 from ..domain.review import parse_verdict
 from ..domain.triage import criteria_wanted, offered_blockers, offered_duplicates, parse_steward, parse_triage
 from ..domain.ports import StaleReservationReconciler
-from ..domain.pricing import BudgetPolicy, RateTable, price
-from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
+from ..domain.pricing import BudgetPolicy, RateTable, claude_model, price
+from ..domain.run_usage import (
+    EstimatedRunUsage,
+    MeasuredRunUsage,
+    ModelUsage,
+    bounded_by_rates,
+    parse_snapshot,
+    price_run_usage,
+    snapshot_record,
+    total_usage,
+    usage_since,
+)
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -170,12 +181,10 @@ class AccountingRuntime(AgentRuntime):
             if claim_target is not None
             else _default_claim_target(kind, number, issue)
         )
-        if (
-            self.runtime_name == "codex"
-            and self.rate_table is None
-            and self._caps_armed()
-        ):
-            return self._blocked("codex pricing is unavailable")
+        # An unpinned plan runs the runtime's default model, known only once it
+        # runs: settlement prices the model the runtime names (#389).
+        if self._caps_armed() and (self.rate_table is None or (task.model and not self.rate_table.priceable(task.model))):
+            return self._blocked(f"{self.runtime_name} has no harness rate for model {task.model!r}")
         if self.issue_cap is not None and issue is None:
             return self._blocked("issue spend scope is unavailable")
         limits = list(self._limits(now, issue))
@@ -260,6 +269,7 @@ class AccountingRuntime(AgentRuntime):
         except BaseException:
             self._recover_or_release(run_id)
             raise
+        result = self._resumed_usage(task, result)
         if self.role in LEG_ROLES:
             # The leg's class, recorded before settlement: a run that ends
             # without this receipt (died, reclaimed, refused) is a machine end.
@@ -291,8 +301,41 @@ class AccountingRuntime(AgentRuntime):
                 **({"tier": tier} if tier else {}),
                 # The effort the plan asked for (a runtime may degrade it, e.g. Claude xhigh off Opus); absent when none was set.
                 **({"effort": task.effort.value} if task.effort is not None else {}),
+                # The session's cumulative usage: the next resumed leg's baseline.
+                **({"session_usage": snapshot_record(result.session_id or task.resume or "", result.session_usage)}
+                   if result.session_usage else {}),
             })
-        return self._settle_result(run_id, task.model or result.model or reserved_model, result)
+        return self._settle_result(run_id, task.model or result.model or reserved_model, result, maximum)
+
+    def _resumed_usage(self, task: RuntimePlan, result: AgentResult) -> AgentResult:
+        """A resumed leg's own usage: the session's cumulative counters less
+        those its previous ended leg recorded. Without that baseline (no leg
+        of the session recorded one), or when the counters were reset, the
+        runtime's upper bound stands (#389)."""
+        if not task.resume or not result.session_usage:
+            return result
+        session = result.session_id or task.resume
+        try:
+            previous = parse_snapshot(session, self.store.session_usage_snapshot(self.repository, session))
+            # The leg's own main-loop usage is part of its delta: a smaller
+            # delta means the CLI restored stale counters.
+            own = _token_usage(result.usage, self.runtime_name)
+            main = result.model or task.model or ""
+            floor = (ModelUsage(session, claude_model(main), own),) if own and main else ()
+            delta = usage_since(result.session_usage, previous, floor) if previous is not None and floor else None
+            reason = ("no usage snapshot from the session's previous leg" if previous is None
+                      else "the leg reported no usage of its own to check the delta against" if not floor
+                      else "the session's usage counters were reset")
+            if delta is not None:
+                samples = delta or (ModelUsage(session, main or "<runtime-default>", TokenUsage(0, 0)),)
+                rates = result.run_usage.rates if result.run_usage is not None else None
+                return replace(result, run_usage=MeasuredRunUsage(samples, rates or self.rate_table))
+        except (sqlite3.Error, RuntimeError, ValueError, TypeError, ArithmeticError) as exc:
+            reason = f"the session's usage delta is unavailable ({type(exc).__name__})"
+        bound = result.run_usage
+        if not isinstance(bound, EstimatedRunUsage):
+            return result
+        return replace(result, run_usage=replace(bound, detail=f"{reason}; {bound.detail}"[:2048]))
 
     def _owner(self) -> str:
         return self.owner_id or f"{self.repository}:{self.role}"
@@ -301,7 +344,8 @@ class AccountingRuntime(AgentRuntime):
         self.record_refused_leg()
         return _blocked(detail)
 
-    def _settle_result(self, run_id: RunId, model: str | None, result: AgentResult) -> AgentResult:
+    def _settle_result(self, run_id: RunId, model: str | None, result: AgentResult,
+                       maximum: Money) -> AgentResult:
         observed = result.run_usage
         gap = observed.detail if isinstance(observed, EstimatedRunUsage) else ""
         usage = None
@@ -310,25 +354,20 @@ class AccountingRuntime(AgentRuntime):
         card = None
         try:
             if isinstance(observed, (MeasuredRunUsage, EstimatedRunUsage)):
-                usage = total_usage(observed.samples)
                 card = observed.rates or self.rate_table
+                observed = bounded_by_rates(observed, card, maximum)
+                gap = observed.detail if isinstance(observed, EstimatedRunUsage) else ""
+                usage = total_usage(observed.samples)
                 amount = price_run_usage(observed, card)
-                if isinstance(observed, MeasuredRunUsage) and all(s.reported_cost is not None for s in observed.samples):
-                    basis = PricingBasis.PROVIDER_REPORTED
-                elif isinstance(observed, MeasuredRunUsage) and card is not None and all(
+                if isinstance(observed, MeasuredRunUsage) and card is not None and all(
                     card.priceable(s.model) for s in observed.samples
                 ):
                     basis = PricingBasis.CONFIGURED_RATE_CARD
                 else:
                     gap = gap or "some request models have no configured rates"
             else:
-                try:
-                    provider_amount = Money.from_major("USD", result.cost_usd)
-                    if provider_amount.micros > 2**63 - 1:
-                        raise ValueError("provider dollars exceed SQLite's money bound")
-                except (ValueError, TypeError, ArithmeticError):
-                    provider_amount = Money.zero()
-                    gap = "provider dollars malformed; using usable token evidence"
+                # No runtime usage receipt: an interrupted leg. A runtime's own
+                # dollar figure is never priced (#389); its tokens are.
                 for raw in (result.usage, result.stream_usage):
                     try:
                         candidate = _token_usage(raw, self.runtime_name)
@@ -339,16 +378,14 @@ class AccountingRuntime(AgentRuntime):
                         usage = candidate
                         if usage.total_tokens:
                             break
-                if self.runtime_name != "codex" and provider_amount.micros > 0:
-                    amount = provider_amount
-                    basis = PricingBasis.PROVIDER_REPORTED
-                elif usage is not None and usage.trusted_for_accounting and self.rate_table is not None and model:
-                    amount = price(usage, self.rate_table.rates_for(model), self.rate_table.currency)
+                if usage is not None and usage.trusted_for_accounting and self.rate_table is not None and model:
                     card = self.rate_table
-                    gap = "request receipts unavailable; streamed usage priced at configured rates"
-                elif provider_amount.micros > 0 and not (isinstance(result.usage, dict) and result.usage.get("source") not in {"provider", "rollout", "reconciled"}):
-                    amount = provider_amount
-                    gap = "only the runtime's priced usage estimate is available"
+                    if card.priceable(model):
+                        amount = price(usage, card.rates_for(model), card.currency)
+                        gap = "request receipts unavailable; streamed usage priced at configured rates"
+                    else:  # never a fallback price (#389)
+                        amount = maximum if usage.total_tokens else Money.zero(card.currency)
+                        gap = f"no harness rate for {model[:200]!r}; streamed usage charged the reserved maximum"
                 else:
                     usage = None
                     gap = "request receipts and priceable usage unavailable; interrupted requests charged zero"
@@ -373,7 +410,7 @@ class AccountingRuntime(AgentRuntime):
             from .codex_runner import remove_spend_evidence
 
             remove_spend_evidence(self.spend_evidence_dir, run_id)
-        return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis)
+        return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis, run_usage=observed)
 
     def _caps_armed(self) -> bool:
         return any(

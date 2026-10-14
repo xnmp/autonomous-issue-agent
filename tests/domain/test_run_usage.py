@@ -72,17 +72,21 @@ def test_model_switches_within_the_session_bound_preserve_every_charge():
     assert price_run_usage(MeasuredRunUsage(samples), table) == Money("USD", 66)
 
 
-def test_reported_request_costs_and_frozen_token_prices_share_one_total():
-    observed = MeasuredRunUsage(
-        (
-            ModelUsage("reported", "no-card-model", TokenUsage(100, 0), Money("USD", 700)),
-            ModelUsage("estimated", "known", TokenUsage(100, 0)),
-        )
+def test_fixed_charges_and_frozen_token_prices_share_one_total():
+    samples = (
+        ModelUsage("reported", "no-card-model", TokenUsage(100, 0), Money("USD", 700)),
+        ModelUsage("estimated", "known", TokenUsage(100, 0)),
     )
     table = RateTable("card", "v1", "USD", {"known": ModelRates(2_000_000, 1, 1, 1)})
-    assert price_run_usage(observed, table) == Money("USD", 900)
+    assert price_run_usage(EstimatedRunUsage("fixed charge", samples), table) == Money("USD", 900)
     with pytest.raises(ValueError, match="currency"):
-        price_run_usage(MeasuredRunUsage((replace(observed.samples[0], reported_cost=Money("EUR", 700)),)), table)
+        price_run_usage(EstimatedRunUsage("fixed", (replace(samples[0], reported_cost=Money("EUR", 700)),)), table)
+
+
+def test_measured_usage_is_priced_from_tokens_never_a_fixed_charge():
+    # A fixed charge (the reserved maximum) is an estimate by construction (#389).
+    with pytest.raises(ValueError, match="fixed charge"):
+        MeasuredRunUsage((ModelUsage("s", "m", TokenUsage(100, 0), Money("USD", 700)),))
 
 
 def test_same_session_and_model_keep_per_request_prices_and_rounding():
@@ -90,7 +94,7 @@ def test_same_session_and_model_keep_per_request_prices_and_rounding():
     table = RateTable("card", "v1", "USD", {"low": ModelRates(100_000, 1, 1, 1)})
     assert price_run_usage(MeasuredRunUsage(samples), table) == Money("USD", 2)
     assert price_run_usage(
-        MeasuredRunUsage((replace(samples[0], reported_cost=Money("USD", 900)), samples[1])), table
+        EstimatedRunUsage("fixed", (replace(samples[0], reported_cost=Money("USD", 900)), samples[1])), table
     ) == Money("USD", 901)
     assert total_usage(samples).input_tokens == 2
     with pytest.raises(ValueError, match="unique"):
@@ -110,9 +114,9 @@ def test_frozen_observation_rates_keep_live_and_terminal_prices_equal_when_calle
         ModelUsage("parent", "low", TokenUsage(100, 0), Money("USD", 900), "receipt"),
         ModelUsage("parent", "low", TokenUsage(100, 0)),
     )
-    for observed in (MeasuredRunUsage(samples, frozen), EstimatedRunUsage("remainder", samples, frozen)):
-        assert price_run_usage(observed, None) == Money("USD", 1100)
-        assert price_run_usage(observed, changed) == Money("USD", 1100)
+    for observed in (MeasuredRunUsage(samples[1:], frozen), EstimatedRunUsage("remainder", samples, frozen)):
+        assert price_run_usage(observed, None) == price_run_usage(observed, changed)
+    assert price_run_usage(EstimatedRunUsage("remainder", samples, frozen), changed) == Money("USD", 1100)
 
 
 @pytest.mark.parametrize("rates", [True, "card", {}])

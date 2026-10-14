@@ -29,6 +29,33 @@ CODEX_DEFAULT_MODEL_RATES: tuple[tuple[str, float, float], ...] = (
 )
 
 
+# Claude list rates (model, input, output, cache read) in USD/MTok, read from
+# https://platform.claude.com/docs/en/about-claude/pricing on 2026-10-14.
+# Cache writes price at the 1-hour TTL, 2x input: the main loop of a leg writes
+# 1h entries, and the rate bounds a subagent's 5-minute writes (1.25x) from
+# above. Haiku 5.5 bills 5x for a request whose prompt exceeds 100K tokens;
+# usage is per leg, not per request, so the long-prompt tier is the bound.
+CLAUDE_DEFAULT_MODEL_RATES: tuple[tuple[str, float, float, float], ...] = (
+    ("claude-fable-5-1", 10.0, 50.0, 0.25),
+    ("claude-opus-5-5", 4.0, 20.0, 0.20),
+    ("claude-sonnet-5-5", 2.0, 10.0, 0.10),
+    ("claude-haiku-5-5", 0.50, 2.50, 0.05),
+)
+# The CLI's aliases, as CLI 2.1.294 resolves them (checked 2026-10-14), so a
+# plan naming one passes admission. Settlement prices the concrete model the
+# envelope names, so a CLI that resolves an alias elsewhere is caught there.
+CLAUDE_ALIASES: tuple[tuple[str, str], ...] = (
+    ("fable", "claude-fable-5-1"), ("opus", "claude-opus-5-5"),
+    ("sonnet", "claude-sonnet-5-5"), ("haiku", "claude-haiku-5-5"),
+)
+CLAUDE_CACHE_WRITE_MULTIPLIER = 2.0
+
+
+def claude_model(name: str) -> str:
+    """The concrete model a CLI alias names, else the name itself."""
+    return dict(CLAUDE_ALIASES).get(name.strip().casefold(), name.strip())
+
+
 def with_default_model_rates(
     configured: tuple[tuple[str, float, float], ...],
 ) -> tuple[tuple[str, float, float], ...]:

@@ -25,7 +25,17 @@ from typing import Any
 
 from .child_env import CHILD_ENV_MANIFEST
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
-from ..domain.contracts import RunId
+from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
+from ..domain.pricing import RateTable, claude_model
+from ..domain.run_usage import (
+    EstimatedRunUsage,
+    MeasuredRunUsage,
+    ModelUsage,
+    RunUsage,
+    bounded_by_rates,
+    price_run_usage,
+    reserved_maximum_usage,
+)
 from ..domain.tool_policy import denial_reason, has_reasons
 from ..domain.outcome import (
     AgentResult,
@@ -178,6 +188,95 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     )
 
 
+# Counter keys in the envelope's per-model `modelUsage` and in its top-level
+# `usage`, in TokenUsage order; all four are always present (CLI 2.1.294).
+_MODEL_USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")
+_USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+_MAX_TOKENS = 10**12  # accounting's bound on one counter
+_MAX_MODELS = 64
+
+
+def _tokens(raw: object, keys: tuple[str, ...]) -> TokenUsage:
+    if not isinstance(raw, dict) or any(key not in raw for key in keys):
+        raise ValueError("a token counter is missing")
+    values = tuple(raw[key] for key in keys)
+    if any(type(value) is not int or not 0 <= value <= _MAX_TOKENS for value in values):
+        raise ValueError("a token counter is not a bounded integer")
+    return TokenUsage(*values, source=UsageSource.PROVIDER)
+
+
+def _per_model(session: str, raw: object) -> tuple[ModelUsage, ...]:
+    if not isinstance(raw, dict) or len(raw) > _MAX_MODELS:
+        raise ValueError("per-model usage is not a bounded mapping")
+    if len({str(name).strip().casefold() for name in raw}) != len(raw):
+        raise ValueError("per-model usage names a model twice")
+    return tuple(ModelUsage(session, name, _tokens(counters, _MODEL_USAGE_KEYS)) for name, counters in raw.items())
+
+
+def claude_leg_usage(msg: Any, *, session_id: str, main_model: str, resumed: bool, delegated: bool,
+                     maximum: Money, rates: RateTable | None) -> tuple[RunUsage, tuple[ModelUsage, ...]]:
+    """(this leg's usage, the session's cumulative per-model usage), from the
+    result envelope (#389).
+
+    On CLI 2.1.294 `modelUsage` names every model the leg used, subagents
+    included, but on a resumed session it and `total_cost_usd` are
+    session-cumulative; the top-level `usage` is this leg's own main loop
+    only. A fresh leg is priced from `modelUsage`. A resumed leg's exact usage
+    is its cumulative counters less the previous leg's, which accounting
+    holds; this returns the upper bound used when that baseline is missing:
+    the main loop's own usage plus the other models' session-cumulative
+    usage, or all of it when the leg started a subagent (which may share the
+    main model). Absent usage is charged zero with a gap (ADR 0002); malformed
+    counters settle at the reserved maximum.
+    """
+    session = session_id or "unknown-session"
+    main = main_model.strip()
+    main = main if 0 < len(main) <= 256 else "<runtime-default>"
+    own_raw, per_model_raw = getattr(msg, "usage", None), getattr(msg, "model_usage", None)
+    try:
+        cumulative = _per_model(session, per_model_raw) if per_model_raw is not None else ()
+        if not resumed and per_model_raw is not None:
+            priced, gap = cumulative, ""
+        elif resumed and cumulative and (delegated or own_raw is None):
+            priced, gap = cumulative, "upper bound: the session-cumulative usage"
+        elif own_raw is not None:
+            own = ModelUsage(session, main, _tokens(own_raw, _USAGE_KEYS))
+            others = tuple(s for s in cumulative if s.model.casefold() not in
+                           {main.casefold(), claude_model(main).casefold()})
+            priced = (own, *others)
+            gap = ("upper bound: the main loop's own usage plus other models' session-cumulative usage" if resumed
+                   else "the result reported no per-model usage; priced its main loop only")
+        else:
+            return EstimatedRunUsage("the result reported no usage; charged zero", (), rates), ()
+        # A model entry with no tokens bought nothing, so it needs no rate.
+        samples = tuple(s for s in priced if s.usage.total_tokens) or (ModelUsage(session, main, TokenUsage(0, 0)),)
+        usage = EstimatedRunUsage(gap, samples, rates) if gap else MeasuredRunUsage(samples, rates)
+        return usage, cumulative
+    except (ValueError, TypeError) as exc:
+        detail = f"Claude usage counters malformed ({str(exc)[:200]}); charged the reserved maximum"
+    return reserved_maximum_usage(session, main, maximum, UsageSource.PROVIDER, detail), ()
+
+
+# The CLI's own dollar figure is a cross-check, never settlement (#389). It
+# warns only when the CLI's figure is over 3x ours: the direction in which the
+# harness could be under-charging (stale rates) or the CLI over-reporting (a
+# stale CLI's fallback price, the session total 35x a leg's tokens on #1078).
+# The other direction is the card's deliberate upper bounds (Haiku's
+# long-prompt tier, 1h writes). 3x clears the known 2x disagreement on Sonnet
+# 5.5 cache reads ($0.10 published, $0.20 in CLI 2.1.294).
+_CROSS_CHECK_RATIO = 3
+
+
+def cli_overstates(harness: Money, reported_usd: float) -> bool:
+    """Whether the CLI's figure is over _CROSS_CHECK_RATIO times ours. A zero
+    or unusable figure (a subscription reports 0.00) compares nothing."""
+    try:
+        reported = Money.from_major(harness.currency, reported_usd).micros
+    except (ValueError, TypeError, ArithmeticError):
+        return False
+    return reported > _CROSS_CHECK_RATIO * harness.micros
+
+
 def _short(value: Any, limit: int = 200) -> str:
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[:limit] + "…"
@@ -311,6 +410,7 @@ class AgentRunner(AgentRuntime):
         max_runtime: float | None = None,
         max_buffer_size: int | None = DEFAULT_MAX_BUFFER_BYTES,
         process_supervisor: Any = None,
+        rate_table: RateTable | None = None,
     ):
         self.permission_mode = permission_mode
         self._log = log or (lambda _m: None)
@@ -327,6 +427,7 @@ class AgentRunner(AgentRuntime):
         self._max_runtime = max_runtime
         self._max_buffer_size = max_buffer_size
         self._process_supervisor = process_supervisor
+        self._rate_table = rate_table
 
     def _slice_timeout(self) -> float:
         """The poll slice, floored by any shorter armed cap."""
@@ -344,6 +445,33 @@ class AgentRunner(AgentRuntime):
     def _honour_captured(self, elapsed: float) -> None:
         self._log(f"sdk: WALL — {elapsed:.0f}s exceeded max {self._max_runtime:.0f}s, but a ResultMessage was "
                   "already captured; honouring it")
+
+    def _priced(self, task: RuntimePlan, result: AgentResult, final: Any, delegated: bool,
+                exited: bool) -> AgentResult:
+        """The leg's usage and its price at the harness rates, the one
+        settlement path Codex legs share."""
+        maximum = Money.from_major("USD", task.max_budget_usd)
+        bound, cumulative = claude_leg_usage(
+            final, session_id=result.session_id, main_model=result.model or task.model or "",
+            resumed=bool(task.resume), delegated=delegated, maximum=maximum, rates=self._rate_table)
+        observed = bounded_by_rates(bound, self._rate_table, maximum)
+        # The CLI persists its cumulative counters for the next resume only on
+        # its own exit; one torn down after its result may restore stale ones,
+        # so its snapshot is no baseline and its next leg prices from an
+        # earlier one, erring high.
+        cumulative = cumulative if exited else ()
+        amount = price_run_usage(observed, self._rate_table)
+        # A resumed leg's bound is replaced by its exact delta when accounting
+        # holds the session's previous snapshot; it logs only if not.
+        if isinstance(observed, EstimatedRunUsage) and (observed is not bound or not (task.resume and cumulative)):
+            self._log(f"sdk: PRICING — {observed.detail}")
+        # A resumed session's CLI figure is session-cumulative: nothing to compare.
+        elif not task.resume and cli_overstates(amount, result.cost_usd):
+            self._log(f"sdk: PRICE CROSS-CHECK — tokens at harness rates price this leg ${amount.micros / 1e6:.4f}; "
+                      f"the CLI reported ${result.cost_usd:.4f}, over {_CROSS_CHECK_RATIO}x that. Settling on "
+                      "the harness figure; check the CLI's model support and the rate table")
+        return dataclasses.replace(result, run_usage=observed, session_usage=cumulative,
+                                   cost_usd=amount.micros / 1_000_000)
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         import claude_agent_sdk
@@ -380,6 +508,8 @@ class AgentRunner(AgentRuntime):
         # leg can never consume their notification (#255).
         live_children: set[str] = set()
         children_at_result: frozenset[str] = frozenset()
+        delegated = False  # whether this leg started any subagent (resumed-leg pricing)
+        exited = True  # False once the harness tears the CLI down after its result
 
         def with_stream_identity(result: AgentResult) -> AgentResult:
             # The init model and session are the only attribution and resume
@@ -404,6 +534,7 @@ class AgentRunner(AgentRuntime):
                         if final is None:
                             return with_stream_identity(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
                         self._honour_captured(elapsed)
+                        exited = False
                         break
                 message: Any = _NO_MESSAGE
                 stream_ended = False
@@ -434,7 +565,7 @@ class AgentRunner(AgentRuntime):
                                     is_error=True, status="timeout", exit_reason=ExitReason.IDLE_TIMEOUT,
                                     summary=f"agent idle >{self._idle_timeout:.0f}s (no stream event)",
                                     usage=usage_acc, stream_usage=usage_acc))
-                            stream_ended = True
+                            stream_ended, exited = True, False
                             break
                         elapsed = now - started_at
                         if self._max_runtime is not None and elapsed >= self._max_runtime:
@@ -443,7 +574,7 @@ class AgentRunner(AgentRuntime):
                             if final is None:
                                 return with_stream_identity(self._wall_timeout(elapsed, last_trace, usage_acc, msg_count))
                             self._honour_captured(elapsed)
-                            stream_ended = True
+                            stream_ended, exited = True, False
                             break
                     if stream_ended:
                         break
@@ -454,7 +585,9 @@ class AgentRunner(AgentRuntime):
                         break
                 msg_count += 1
                 last_kind, last_msg = type(message).__name__, message
-                resolved_model = reported_model(message) or resolved_model
+                # The first model named is the init's, the main loop's: a later
+                # assistant message may be a subagent's.
+                resolved_model = resolved_model or reported_model(message)
                 resolved_session = resolved_session or reported_session(message)
                 usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
                 # A background-requested turn end carries terminal_reason on a
@@ -464,6 +597,7 @@ class AgentRunner(AgentRuntime):
                 if (transition := background_task_transition(message)) is not None:
                     task_id, still_pending = transition
                     (live_children.add if still_pending else live_children.discard)(task_id)
+                    delegated = delegated or still_pending
                 last_trace = _trace_message(message)  # always: abort lines print it
                 if self._debug:
                     self._log(f"sdk: {last_trace}")
@@ -522,7 +656,7 @@ class AgentRunner(AgentRuntime):
             return with_stream_identity(AgentResult(is_error=True, summary="no ResultMessage from query()",
                                                    exit_reason=ExitReason.NO_RESULT, usage=usage_acc,
                                                    stream_usage=usage_acc))
-        result = with_stream_identity(result_to_agent_result(final))
+        result = self._priced(task, with_stream_identity(result_to_agent_result(final)), final, delegated, exited)
         reclassified = reclassify_pending_background_block(result, len(children_at_result))
         if reclassified is not result:
             self._log(f"sdk: BACKGROUND CHILD PENDING — the leg declared {result.status!r} while its own background "
