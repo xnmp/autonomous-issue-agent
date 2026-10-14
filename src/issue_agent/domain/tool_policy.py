@@ -35,6 +35,11 @@ DENIED_TOOLS: tuple[DeniedTool, ...] = (
     DeniedTool("Bash(gh auth:*)", "`gh auth` is denied by policy; credentials are managed by the harness"),
     DeniedTool("Bash(gh secret:*)", "`gh secret` is denied by policy; credentials are managed by the harness"),
     DeniedTool("Bash(gh api:*)", "`gh api` " + _GH),
+    # #1128: a FIX_CI leg watched a 50-minute run for 40 minutes, holding a slot
+    # and the hot-reload drain, so nothing else dispatched.
+    DeniedTool("Bash(gh run watch:*)", "`gh run watch` is denied by policy: do not wait for CI inside a leg "
+               "(nor `gh pr checks --watch` or sleep loops); push or re-run, then end the leg, and the harness "
+               "re-dispatches when CI reports"),
     DeniedTool("Read(.env)", _SECRET),
     DeniedTool("Read(.env.*)", _SECRET),
     DeniedTool("Read(**/.env)", _SECRET),
@@ -86,14 +91,23 @@ def _argvs(command: str, depth: int = 0) -> list[list[str]]:
             segs[-1].append(t)
     out: list[list[str]] = []
     for words in segs:
-        while words and (_ASSIGN.match(words[0]) or words[0] in _WRAPPERS):
-            words = words[1:]
+        while words and (_ASSIGN.match(words[0]) or words[0] in _WRAPPERS or words[0] == "timeout"):
+            words = _strip_timeout(words[1:]) if words[0] == "timeout" else words[1:]
         if not words:
             continue
         out.append(words)
         if depth < _MAX_DEPTH and words[0].rsplit("/", 1)[-1] in _SHELLS and "-c" in words[1:-1]:
             out.extend(_argvs(words[words.index("-c") + 1], depth + 1))
     return out
+
+
+def _strip_timeout(words: list[str]) -> list[str]:
+    """`timeout [-s SIG] [-k DUR] [--opt] DURATION cmd...` runs cmd (#1128 wrapped
+    its CI watch in one)."""
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in ("-s", "-k") else 1
+    return words[i + 1:]
 
 
 def _bash_match(spec: str, command: str) -> bool:
