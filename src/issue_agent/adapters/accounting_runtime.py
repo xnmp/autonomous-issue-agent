@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import sqlite3
 import uuid
 import contextvars
@@ -76,6 +76,8 @@ class AccountingRuntime(AgentRuntime):
     spend_evidence_dir: str = ""
     owner_id: str = ""
     reservation_reconciler: StaleReservationReconciler | None = None
+    # A branch's remote commit (`Worktrees.remote_head`), recorded as the head a leg left.
+    remote_head: Callable[[str], str] | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, str, bool, str]
     ] = field(
@@ -285,6 +287,9 @@ class AccountingRuntime(AgentRuntime):
                         steward = parse_steward(result.structured, offered_duplicates(task.schema), issue,
                                                 criteria_wanted(task.schema), offered_blockers(task.schema))
             verdict = parse_verdict(result.structured) if kind == "REVIEW" and not result.is_error else None
+            # Synchronous: an await here would let a drain's cancel skip the receipt and settlement. Never
+            # raises (`Worktrees.remote_head`); "" when unread, and derive then decides on what GitHub shows.
+            end_head = self.remote_head(task.branch) if task.branch and self.remote_head else ""
             self.store.record_result(run_id, leg.value, session=resumable_session(result) or "", result={
                 # The PR body the harness opens a RESOLVE's branch with (Q11).
                 "summary": (result.summary or "")[:_SUMMARY_LIMIT],
@@ -304,6 +309,10 @@ class AccountingRuntime(AgentRuntime):
                 # The session's cumulative usage: the next resumed leg's baseline.
                 **({"session_usage": snapshot_record(result.session_id or task.resume or "", result.session_usage)}
                    if result.session_usage else {}),
+                # The CI failures the leg was handed: derive hands each to one repair per head.
+                **({"evidence": list(task.evidence)} if task.evidence else {}),
+                # Read-your-writes: the branch's remote commit as the leg left it.
+                **({"end_head": end_head} if end_head else {}),
             })
         return self._settle_result(run_id, task.model or result.model or reserved_model, result, maximum)
 

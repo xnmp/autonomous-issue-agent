@@ -255,6 +255,38 @@ that matters is not "wrong answer" but "loop that bills forever":
 - derived attempt caps (`domain/state.py`): consecutive agent legs of one act
   without progress, REVIEW counted per head, and bot change-request rounds,
   each stopping at `needs-human`; nothing is stored for them.
+- evidence before dispatch (tauri #1078): a FIX_CI or ADDRESS_REVIEW action
+  carries what it repairs, read from the observation, and neither can be
+  built empty: FIX_CI the failed checks (name, Actions job and run when it is
+  one), whose logs the agent reads itself from the job-logs endpoint (which,
+  unlike `gh run view --log-failed`, serves a finished job of a running run);
+  ADDRESS_REVIEW the change request (reviewer, head, review id, body), whose
+  inline comments the agent reads itself with `gh api`. No agent is told
+  "CI failed" with nothing to read. A head's failure is handed to one FIX_CI
+  agent end (its receipt records the failure keys, which name when each
+  failure's CI run began: an Actions run attempt's start; for another app's
+  check or a status, which have no run start, its own start or post, which
+  over-counts). A FIX_CI try is started by a leg on a new head, or handed a
+  failure from a CI run that began after the head's first leg began and
+  that no earlier leg was handed (a push, re-run or dispatch it or anyone
+  caused), or with no readable keys; a failure of a run that existed
+  before, or was already handed, resumes the session at its tier, and
+  ATTEMPT_CAP bounds every new run. The same evidence never dispatches: once the failing runs are
+  complete with every failure handed, the harness re-runs the failed jobs
+  once per head (free, read back by run attempt; a run past its first
+  attempt was re-run already), and after that the item stops at
+  `needs-human` (ATTEMPTS); the reply that releases it re-arms the evidence.
+  No timer guards this; derive reads its own writes. A PR-stage leg's
+  receipt records `end_head`, the branch's commit on the remote as the
+  harness read it (`git ls-remote` from its own checkout) after the leg;
+  while GitHub still shows the head the newest leg pushed away from, the
+  item waits (CI_UNKNOWN) until it does or a human resets. The CI
+  observation drops check runs that are jobs of an earlier attempt of their
+  run (`actions/runs/<run>/jobs?filter=all`) and reads them as pending while
+  the latest attempt has no jobs or unfinished ones, so it needs Actions
+  read on the observing token. A refused harness re-run repeats one log line
+  per poll, as a refused update-branch does, until a push or a human
+  (residuals §2).
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices the root rollout counters with the captured rate card and
   kills the process group on crossing
@@ -442,6 +474,9 @@ after same-head cancellation until the free rerun is spent. Unavailable reads
 leave durable escalations owed; settled Clear obsoletes other CI escalations),
 `domain/contracts.py`, `domain/dashboard.py`,
 `domain/effort.py`,
+`domain/evidence.py` (what a repair is handed: FIX_CI its CI failures, keyed
+by check run so each failure of a head goes to one repair; ADDRESS_REVIEW its
+change request; neither constructible empty),
 `domain/identity.py`,
 `domain/backoff.py` (per-item machine-failure backoff derived from ended
 legs),

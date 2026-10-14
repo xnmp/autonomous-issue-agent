@@ -22,8 +22,8 @@ from ..adapters.control_store import LegRun
 from ..domain.actions import ISSUE_ACTS, Action, AgentKind, MergePullRequest, RunAgent, Target
 from ..domain.agent_task import RuntimeName
 from ..domain.backoff import LegEnd, dispatched_kind
-from ..domain.ci import failed_checks
 from ..domain.effort import Effort
+from ..domain.evidence import ChangeRequest, CiFailures
 from ..domain.labels import Label
 from ..domain.leg import Leg, LegTarget
 from ..domain.outcome import LegClass
@@ -33,7 +33,7 @@ from ..domain.routing import DEFAULT_TIER, Tier
 from ..domain.state import DISPATCHABLE, DerivedState, Harness, ItemKey, Local, Wait, WaitReason, human_comments, issue_key, latest_steward, pr_key
 from ..domain.triage import states_criteria
 from ..domain.trust import as_untrusted
-from ..domain.world import REVIEW_CHANGES_REQUESTED, Comment, WorldState
+from ..domain.world import Comment, WorldState
 from ..adapters.act import GitHubAct
 from .config import HarnessConfig
 from .planners import tasks
@@ -152,7 +152,7 @@ class FixLegs:
                 return
             issue = action.number
         else:
-            subject = self.gateway.get_pr(action.number, mergeability=False, checks=action.kind is AgentKind.FIX_CI)
+            subject = self.gateway.get_pr(action.number, mergeability=False, checks=False)
             issue = harness_branch_issue(subject.head_ref_name)
             if subject.state != "OPEN" or issue is None or subject.head_ref_oid != action.head:
                 self.log(f"{action.kind.name} PR #{action.number}: skipped — PR closed or head moved")
@@ -189,12 +189,16 @@ class FixLegs:
         self.runtime.set_context("fix", action.kind.name, action.number, issue, claim_target=issue,
                                  head=action.head, resumed=cut_off is not None,
                                  tier=action.tier.value if action.tier is not None else "")
+        if isinstance(action.evidence, CiFailures):
+            self.log(f"FIX_CI #{action.number}: handed on {action.head[:12]}: "
+                     f"{', '.join(f.name for f in action.evidence.failures)[:300]}")
         try:
             if action.kind is AgentKind.RESOLVE:
                 branch = self._resolve_branch(issue, subject.title)
                 cwd = self.worktrees.ensure(issue, branch)
             else:
-                cwd = self.worktrees.sync(issue, subject.head_ref_name, action.head)
+                branch = subject.head_ref_name
+                cwd = self.worktrees.sync(issue, branch, action.head)
             if self.prepare_cwd is not None:
                 self.prepare_cwd(cwd, runtime)
             # Every leg of the item, either role's, as derive sees them (#342).
@@ -206,7 +210,7 @@ class FixLegs:
             if asked is not None:
                 target = "issue" if action.kind is AgentKind.RESOLVE else "pr"
                 task = tasks.with_human_reply(task, self.settings.repository, target, action.number, reply)
-            task = replace(task, env={**task.env, **self._git_identity()})
+            task = replace(task, env={**task.env, **self._git_identity()}, branch=branch)
         except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
             self.log(f"{action.kind.name} #{action.number}: preparation failed: {exc}")
             self.accounting.record_refused_leg()
@@ -256,7 +260,14 @@ class FixLegs:
             self.accounting.record_refused_leg()
             return
         if steward:
-            index = [row for row in _soft_rows(self.gateway.issue_index, self.log) if row[0] != action.number]
+            try:
+                # The steward judges duplicates and blockers against this index:
+                # a failed read is a machine end, never a blind one-shot steward.
+                index = [row for row in self.gateway.issue_index() if row[0] != action.number]
+            except Exception as exc:  # noqa: BLE001 - recorded as a machine end below
+                self.log(f"{name} #{action.number}: not dispatched — issue index unavailable: {exc}")
+                self.accounting.record_refused_leg()
+                return
             listing = "\n".join(f"#{n} ({state}) {title[:200]}" for n, state, title, _ in index) or "(none)"
             task = tasks.build_steward_task(
                 action.number, as_untrusted(subject.title), as_untrusted(subject.body), as_untrusted(listing),
@@ -308,47 +319,15 @@ class FixLegs:
             )
         # PR-stage legs continue the issue's latest session on their runtime: it wrote the code.
         session = self._session(runs, runtime)
-        if action.kind is AgentKind.FIX_CI:
-            checks = failed_checks(subject.ci)
-            run_ids = tuple(dict.fromkeys(c.run_id for c in checks if c.run_id is not None))
-            task = tasks.build_fix_ci_task(
-                action.number, as_untrusted(", ".join(c.name for c in checks)),
-                as_untrusted(_soft(lambda: self.gateway.failed_run_log(action.head, run_ids), self.log)),
-                cwd, session, cfg,
-            )
+        if isinstance(action.evidence, CiFailures):
+            task = tasks.build_fix_ci_task(action.number, action.evidence, cwd, session, cfg)
+        elif isinstance(action.evidence, ChangeRequest):
+            task = tasks.build_address_review_task(action.number, action.evidence, cwd, session, cfg)
         elif action.kind is AgentKind.REBASE:
             task = tasks.build_rebase_task(action.number, self.settings.base_branch, cwd, session, cfg)
         else:
-            review = max(
-                (r for r in subject.reviews
-                 if r.commit_id == action.head and r.state.upper() == REVIEW_CHANGES_REQUESTED),
-                key=lambda r: r.submitted_at, default=None,
-            )
-            task = tasks.build_address_review_task(
-                action.number, as_untrusted(review.body if review is not None else ""),
-                as_untrusted(_soft(lambda: self.gateway.review_comments(action.number), self.log)),
-                cwd, session, cfg,
-            )
+            raise ValueError(f"{action.kind.name} has no evidence to repair")
         return task
-
-
-def _soft_rows(read: Callable[[], tuple], log: Callable[[str], None]) -> tuple:
-    """A listing as prompt input: a failed read offers nothing."""
-    try:
-        return tuple(read())
-    except Exception as exc:  # noqa: BLE001 - context, never control flow
-        log(f"prompt input unavailable: {exc}")
-        return ()
-
-
-def _soft(read: Callable[[], str], log: Callable[[str], None]) -> str:
-    """A prompt input: context, never control flow. A failed read leaves the
-    leg with a weaker prompt instead of killing it."""
-    try:
-        return read() or ""
-    except Exception as exc:  # noqa: BLE001 - see docstring
-        log(f"prompt input unavailable: {exc}")
-        return ""
 
 
 def fix_choose(settings: FixSettings, log: Callable[[str], None]) -> Choose:

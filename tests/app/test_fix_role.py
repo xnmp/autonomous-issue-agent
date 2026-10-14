@@ -38,11 +38,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _ci(head: str, bucket: str) -> Observed:
-    state = "IN_PROGRESS" if bucket == "pending" else "COMPLETED"
-    return Observed(
-        head, head, frozenset({RequiredCheck("test")}), (Check("test", state=state, bucket=bucket, required=True),)
-    )
+def _ci(head: str, bucket: str, attempt: int = 1) -> Observed:
+    """One required Actions job; each head and run attempt mints its own job id."""
+    state = {"pending": "IN_PROGRESS", "fail": "FAILURE"}.get(bucket, "SUCCESS")  # a completed run reports its conclusion
+    job = sum(map(ord, head)) * 100 + attempt
+    check = Check("test", state=state, bucket=bucket, started_at=_now(), run_id=900, required=True, check_id=job,
+                  run_attempt=attempt)
+    return Observed(head, head, frozenset({RequiredCheck("test")}), (check,))
 
 
 @dataclass
@@ -60,6 +62,8 @@ class FakeGitHub:
     merged: list[tuple[int, str]] = field(default_factory=list)
     closed: list[int] = field(default_factory=list)
     lose_reply: set[str] = field(default_factory=set)
+    rerun_result: str = "fail"  # how the harness's re-run of the failed jobs comes out
+    harness_reruns: list[int] = field(default_factory=list)  # run ids the harness re-ran
     lock: threading.Lock = field(default_factory=threading.Lock)
     # The base branch's completed push runs, when each issue was last closed,
     # and the issues GitHub's search has not indexed yet.
@@ -145,11 +149,13 @@ class FakeGitHub:
     def is_issue_closed(self, issue: int) -> bool:
         return self.issues[issue].state != "open"
 
-    def failed_run_log(self, head: str, run_ids) -> str:
-        return "AssertionError: expected 2, got 3"
+    def run_attempt(self, run_id: int) -> int:
+        return max(c.run_attempt or 1 for p in self.prs.values() for c in p.checks if c.run_id == run_id)
 
-    def review_comments(self, pr: int) -> str:
-        return ""
+    def rerun_failed_checks(self, run_id: int) -> None:
+        self.harness_reruns.append(run_id)
+        number = next(n for n, p in self.prs.items() if any(c.run_id == run_id for c in p.checks))
+        self.rerun(number, self.rerun_result)
 
     # ── writes ──
     def _lossy(self, name: str) -> None:
@@ -236,6 +242,13 @@ class FakeGitHub:
                         p, head_ref_oid=head, ci=_ci(head, ci), reviews=(), mergeable="MERGEABLE", merge_state="CLEAN"
                     )
 
+    def rerun(self, number: int, bucket: str = "fail") -> None:
+        """`gh run rerun --failed`: a new attempt of the head's run, new job ids."""
+        with self.lock:
+            p = self.prs[number]
+            attempt = max(c.run_attempt or 1 for c in p.checks) + 1
+            self.prs[number] = replace(p, ci=_ci(p.head_ref_oid, bucket, attempt))
+
     def close_pr(self, number: int) -> None:
         """A human closes the PR unmerged."""
         with self.lock:
@@ -247,9 +260,14 @@ class FakeGitHub:
 
 
 class FakeWorktrees:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, gh: FakeGitHub | None = None):
         self.root = root
+        self.gh = gh
         self.removed: list[int] = []
+
+    def remote_head(self, branch: str) -> str:
+        """`git ls-remote`: the branch as pushed, before GitHub's PR view shows it."""
+        return self.gh.branches.get(branch, "") if self.gh is not None else ""
 
     def ensure(self, issue: int, branch: str) -> str:
         path = self.root / f"issue-{issue}"
@@ -296,6 +314,29 @@ def did_nothing(session: str = "s1"):
     return lambda _task: AgentResult(False, status="pushed", cost_usd=0.1, session_id=session)
 
 
+def red_pushes(gh: FakeGitHub, count: int):
+    """Agent legs that each push a new head of the PR branch, whose CI fails."""
+    return [pushed(gh, "fix/5-null-token-crashes", f"h{n + 2}", ci="fail") for n in range(count)]
+
+
+def unseen_push(gh: FakeGitHub, branch: str, head: str):
+    """The agent pushes, but GitHub's PR view does not show it yet."""
+    def step(_task):
+        gh.branches[branch] = head
+        return AgentResult(False, status="pushed", cost_usd=0.1, session_id="s1")
+
+    return step
+
+
+def reran(gh: FakeGitHub, number: int = 100, bucket: str = "fail", session: str = "s1"):
+    """The agent re-runs the failed jobs and ends the leg (inconclusive evidence)."""
+    def step(_task):
+        gh.rerun(number, bucket)
+        return AgentResult(False, status="pushed", cost_usd=0.1, session_id=session)
+
+    return step
+
+
 def died(_task):
     raise ConnectionError("stream reset by peer")
 
@@ -330,7 +371,7 @@ def role(tmp_path):
             ),
             control_authority_root=str(tmp_path / "machine-state"),
         )
-        worktrees = FakeWorktrees(tmp_path / "worktrees")
+        worktrees = FakeWorktrees(tmp_path / "worktrees", gh)
         composed = compose_fix_daemon(cfg, gh, worktrees, agent, log=log)
         if triaged:
             # Light legs that returned nothing usable: the issue resolves at the
@@ -464,7 +505,7 @@ def test_each_pr_state_dispatches_its_leg_bound_to_the_head_and_resumes_the_sess
     shape = dict(shape)
     gh.prs[100] = replace(gh.prs[100], ci=_ci("h1", shape.pop("ci", "pass")), **shape)
 
-    assert dispatched(tick(composed), kind) == [RunAgent(kind, 100, head="h1")]
+    assert [(a.kind, a.number, a.head) for a in dispatched(tick(composed), kind)] == [(kind, 100, "h1")]
     task = agent.tasks[1]
     assert task.resume == "s-resolve"
     assert gh.prs[100].head_ref_oid == "h2"
@@ -473,7 +514,7 @@ def test_each_pr_state_dispatches_its_leg_bound_to_the_head_and_resumes_the_sess
 def test_three_unproductive_attempts_stop_with_one_label_and_one_comment(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    agent = Agent(did_nothing(), did_nothing(), did_nothing())
+    agent = Agent(*red_pushes(gh, 3))  # each push fails again: new evidence, no progress
     composed, _ = role(gh, agent)
     for _ in range(3):
         assert dispatched(tick(composed), AgentKind.FIX_CI)
@@ -510,7 +551,7 @@ def test_auto_merge_off_leaves_an_approved_pr_for_a_human(role):
 def test_a_lost_stop_comment_reply_is_not_posted_twice(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    composed, _ = role(gh, Agent(did_nothing(), did_nothing(), did_nothing()))
+    composed, _ = role(gh, Agent(*red_pushes(gh, 3)))
     for _ in range(3):
         tick(composed)
     gh.lose_reply.add("comment")
@@ -628,7 +669,7 @@ def test_a_stop_comment_that_failed_is_posted_later_and_a_reply_then_releases(ro
     # P1-2: the label landed, the comment did not.
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    composed, _ = role(gh, Agent(did_nothing(), did_nothing(), did_nothing()))
+    composed, _ = role(gh, Agent(*red_pushes(gh, 3)))
     for _ in range(3):
         tick(composed)
     comment = gh.comment
@@ -1116,7 +1157,7 @@ def test_many_unstewarded_issues_run_light_legs_up_to_the_concurrency_at_once_an
 def test_a_repeated_fix_act_escalates_its_model_one_tier_per_attempt(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    agent = Agent(did_nothing(), did_nothing())
+    agent = Agent(*red_pushes(gh, 2))
     composed, _ = role(gh, agent, **ROUTES, FIX_MODEL_MED="claude:claude-sonnet-5-5")
     tick(composed)
     tick(composed)
@@ -1139,7 +1180,7 @@ def test_unset_tier_specs_keep_the_single_configured_fixer(role):
 def test_a_routed_legs_task_carries_the_routes_effort_and_an_omitted_one_uses_the_global_knob(role):
     gh = FakeGitHub(issues={5: ready()})
     open_pr(gh, ci="fail")
-    agent = Agent(did_nothing(), did_nothing())
+    agent = Agent(*red_pushes(gh, 2))
     composed, _ = role(gh, agent, FIX_EFFORT="low", FIX_MODEL_MED="claude:claude-sonnet-5-5:high",
                        FIX_MODEL_HIGH="claude:claude-opus-5-5")
     tick(composed)
@@ -1437,3 +1478,181 @@ def test_an_unread_base_files_and_closes_nothing(role):
     gh.build_world = lambda base, **_: WorldState(now=_now())  # type: ignore[method-assign]
     tick(composed)
     assert base_issues(gh) == {}
+
+
+# ── a repair carries its evidence (tauri #1078) ─────────────────────────────
+
+
+def _with_sibling(gh: FakeGitHub, bucket: str, job: int = 7) -> None:
+    """The run's non-required sibling job (#1078: windows smoke ran ~50 min), begun with its run."""
+    pr = gh.prs[100]
+    assert isinstance(pr.ci, Observed)
+    state = {"pending": "IN_PROGRESS", "fail": "FAILURE"}.get(bucket, "SUCCESS")  # a completed run reports its conclusion
+    first = pr.ci.reports[0]
+    windows = Check("smoke (windows)", state=state, bucket=bucket, started_at=first.started_at, run_id=900,
+                    check_id=job, run_attempt=1)
+    gh.prs[100] = replace(pr, ci=replace(pr.ci, reports=(first, windows)))
+
+
+def test_a_fix_ci_leg_is_told_which_jobs_failed_and_reads_their_logs_itself(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(did_nothing())
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    job = sum(map(ord, "h1")) * 100 + 1
+    assert f"gh api --allow-escape-sequences repos/o/r/actions/jobs/{job}/logs" in agent.tasks[0].prompt
+    assert "gh run rerun" not in agent.tasks[0].prompt  # the harness re-runs, never the agent
+
+
+def test_an_address_review_leg_reads_the_reviews_inline_comments_itself(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, reviews=(Review("CHANGES_REQUESTED", "alice", body="", submitted_at=_now(), commit_id="h1", id=77),))
+    agent = Agent(did_nothing())
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.ADDRESS_REVIEW)  # an inline-only review dispatches too
+    assert "gh api --paginate repos/o/r/pulls/100/reviews/77/comments" in agent.tasks[0].prompt
+
+
+def test_a_repair_spans_the_ci_run_resuming_its_session_once_per_new_failure(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    _with_sibling(gh, "pending")  # the first failure lands while a sibling job still runs
+    agent = Agent(did_nothing(session="s-ci"), did_nothing(session="s-ci"))
+    # A climbed tier would route to another runtime, which cannot resume the session.
+    composed, _ = role(gh, agent, FIX_MODEL_MED="claude:claude-sonnet-5-5", FIX_MODEL_HIGH="codex:gpt-6-luna")
+
+    first = dispatched(tick(composed), AgentKind.FIX_CI)
+    assert first and [f.name for f in first[0].evidence.failures] == ["test"]
+    assert first[0].evidence.running == ("smoke (windows)",)
+    assert tick(composed) == []  # the same evidence, the sibling still running: nothing to buy
+
+    _with_sibling(gh, "fail")
+    second = dispatched(tick(composed), AgentKind.FIX_CI)
+    assert second and [f.name for f in second[0].evidence.failures] == ["smoke (windows)"]
+    assert agent.tasks[1].resume == "s-ci"  # the same session, handed only the new failure
+    assert [t.model for t in agent.tasks] == ["claude-sonnet-5-5"] * 2  # a resume is no attempt: no tier climb
+    tiers = [r.receipt["tier"] for r in composed.control.leg_runs("o/r", (5,)) if r.kind == "FIX_CI"]
+    assert tiers == ["med", "med"]
+    assert "repos/o/r/actions/jobs/7/logs" in agent.tasks[1].prompt
+    assert "handed to an earlier leg on this head: test" in agent.tasks[1].prompt
+
+    tick(composed)  # nothing pushed, complete, nothing new, never re-run: the harness re-runs the failed jobs once
+    assert len(agent.tasks) == 2 and gh.harness_reruns == [900] and Label.NEEDS_HUMAN not in gh.prs[100].labels
+
+
+
+def test_a_failure_after_the_harness_rerun_is_a_counted_attempt_and_a_second_leave_stops(role):
+    gh = FakeGitHub(issues={5: ready()})  # the harness's re-run fails again
+    open_pr(gh, ci="fail")
+    agent = Agent(did_nothing(), did_nothing(), did_nothing())
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    tick(composed)
+    assert gh.harness_reruns == [900]
+    second = dispatched(tick(composed), AgentKind.FIX_CI)
+    assert second and second[0].tier is Tier.HIGH  # a re-run is a new attempt: the tier climbs
+    for _ in range(3):
+        tick(composed)  # the re-run head left unrepaired: one stop, never a second re-run
+    assert len(agent.tasks) == 2 and gh.harness_reruns == [900] and Label.NEEDS_HUMAN in gh.prs[100].labels
+    assert len(gh.comments_with("pr", 100, stop_tag(StopReason.ATTEMPTS))) == 1
+
+
+def test_a_flake_left_while_other_jobs_still_run_ends_in_a_harness_rerun_not_needs_human(role):
+    gh = FakeGitHub(issues={5: ready()}, rerun_result="pass")
+    open_pr(gh, ci="fail")
+    _with_sibling(gh, "pending")
+    agent = Agent(did_nothing())  # the agent judged `test` a flake and pushed nothing
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    _with_sibling(gh, "pass")
+    tick(composed)
+    assert gh.harness_reruns == [900] and Label.NEEDS_HUMAN not in gh.prs[100].labels
+    for _ in range(2):
+        tick(composed)
+    assert len(agent.tasks) == 1 and Label.NEEDS_HUMAN not in gh.prs[100].labels  # the re-run went green
+
+
+def test_a_repair_that_leaves_a_rerun_heads_failures_unrepaired_stops_for_a_human_once(role):
+    # Not bought again on the same evidence, and not parked silently either.
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    gh.rerun(100)  # someone re-ran this head already: the harness's one re-run is spent
+    agent = Agent(did_nothing(), did_nothing())
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    for _ in range(3):
+        assert not dispatched(tick(composed), AgentKind.FIX_CI)
+    assert len(agent.tasks) == 1 and Label.NEEDS_HUMAN in gh.prs[100].labels
+    assert len(gh.comments_with("pr", 100, stop_tag(StopReason.ATTEMPTS))) == 1
+
+    gh.comment("pr", 100, "It was a flake; try again.", author="alice")
+    tick(composed)  # released
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # a human reset re-arms the same evidence
+    assert len(agent.tasks) == 2
+
+
+def test_a_push_github_does_not_show_yet_is_waited_on_then_repaired_once_shown(role):
+    # Read-your-writes (PR #403): the harness reads the branch on the remote after the leg.
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(unseen_push(gh, "fix/5-null-token-crashes", "h2"), did_nothing())
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    for _ in range(3):  # h1's CI is no longer the PR's: no re-run, no stop, no repair
+        assert tick(composed) == []
+    assert gh.harness_reruns == [] and Label.NEEDS_HUMAN not in gh.prs[100].labels
+
+    gh.push("fix/5-null-token-crashes", "h2", "fail")  # GitHub catches up
+    second = dispatched(tick(composed), AgentKind.FIX_CI)
+    assert second and second[0].head == "h2"
+
+
+def test_a_new_run_on_the_head_after_a_leg_is_a_counted_try_and_a_pre_existing_runs_failure_resumes(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    _with_sibling(gh, "pending")
+    agent = Agent(did_nothing(), did_nothing(), did_nothing())
+    composed, _ = role(gh, agent)
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    _with_sibling(gh, "fail")  # the run that already existed fails later: the same try
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    pr = gh.prs[100]
+    assert isinstance(pr.ci, Observed)
+    lint = Check("lint", state="FAILURE", bucket="fail", started_at=_now(), run_id=901, check_id=4242, run_attempt=1)
+    gh.prs[100] = replace(pr, ci=replace(pr.ci, reports=(*pr.ci.reports, lint)))  # e.g. a label-triggered workflow
+    assert dispatched(tick(composed), AgentKind.FIX_CI)
+    tiers = [r.receipt["tier"] for r in sorted(composed.control.leg_runs("o/r", (5,)), key=lambda r: r.completed_at)
+             if r.kind == "FIX_CI"]
+    assert tiers == ["med", "med", "high"]
+
+
+def test_a_rerun_attempt_and_a_new_head_each_dispatch_again(role):
+    gh = FakeGitHub(issues={5: ready()})
+    open_pr(gh, ci="fail")
+    agent = Agent(reran(gh), pushed(gh, "fix/5-null-token-crashes", "h2", ci="fail"), did_nothing())
+    composed, _ = role(gh, agent)
+
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # reruns: the new attempt fails
+    assert dispatched(tick(composed), AgentKind.FIX_CI)  # new attempt's evidence; pushes h2, which fails
+    third = dispatched(tick(composed), AgentKind.FIX_CI)
+    assert third and third[0].head == "h2" and not third[0].evidence.handled  # a new head starts fresh
+    assert len({key for t in agent.tasks for key in t.evidence}) == 3
+
+
+def test_an_unreadable_issue_index_dispatches_no_steward(role, later):
+    gh = FakeGitHub(issues={5: ready()})
+    lines: list[str] = []
+    agent = Agent(triaged())
+    composed, _ = role(gh, agent, lines.append, triaged=False)
+    index = gh.issue_index
+
+    def unreadable():
+        raise RuntimeError("issue listing is unreadable")
+
+    gh.issue_index = unreadable
+    tick(composed)
+    assert any("STEWARD #5: not dispatched — issue index unavailable" in x for x in lines)
+    gh.issue_index = index
+    later()
+    assert dispatched(tick(composed), AgentKind.STEWARD)

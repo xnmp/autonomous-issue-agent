@@ -493,6 +493,8 @@ def test_a_state_change_that_does_not_read_back_raises(tmp_path, action):
     gh.issues[41] = IssueView(41, "CI: y failing on dev", state="closed")
     with pytest.raises(RuntimeError, match="not confirmed"):
         _act(tmp_path, gh).execute(action)
+
+
 # ── opening the PR (Q11): the agent's description, unchanged ─────────────────
 
 
@@ -544,3 +546,53 @@ def test_the_pr_opens_with_the_agents_description_unchanged(tmp_path, written):
 )
 def test_without_a_written_description_the_pr_still_names_its_issue(tmp_path, results):
     assert _opened_body(tmp_path, *results) == "Closes #5"
+
+
+# ── the harness's one re-run of a head (owner, PR #403) ─────────────────────
+class RunGateway(Gateway):
+    """Workflow runs by id -> current attempt; a POST re-run bumps it."""
+
+    def __init__(self, attempts):
+        super().__init__()
+        self.attempts = dict(attempts)
+        self.inert_runs: set[int] = set()  # GitHub refuses these (403, too old): the attempt never moves
+        self.reruns: list[int] = []
+
+    def run_attempt(self, run_id):
+        return self.attempts[run_id]
+
+    def rerun_failed_checks(self, run_id):
+        self.reruns.append(run_id)
+        if run_id not in self.inert_runs:
+            self.attempts[run_id] += 1
+
+
+def _rerun_act(tmp_path, gh, lines):
+    act = _act(tmp_path, gh)
+    act.log = lines.append
+    return act
+
+
+def test_a_rerun_lands_once_with_one_journal_line_and_a_replay_posts_nothing(tmp_path):
+    from issue_agent.domain.actions import RerunFailedJobs
+
+    gh, lines = RunGateway({900: 1, 901: 1}), []
+    act = _rerun_act(tmp_path, gh, lines)
+    action = RerunFailedJobs(7, "h1" * 10, ((900, 1), (901, 1)))
+    act.execute(action)
+    act.execute(action)  # derive asked again before the observation showed the new attempt
+    assert gh.reruns == [900, 901]
+    assert [x for x in lines if "re-ran" in x] == [
+        f"PR #7: re-ran the failed jobs of run {r} on h1h1h1h1h1h1 (the harness's one re-run of this head)"
+        for r in (900, 901)]
+
+
+def test_a_refused_rerun_raises_after_journaling_the_runs_that_landed(tmp_path):
+    from issue_agent.domain.actions import RerunFailedJobs
+
+    gh, lines = RunGateway({900: 1, 901: 1}), []
+    gh.inert_runs = {901}
+    with pytest.raises(RuntimeError, match="run 901"):
+        _rerun_act(tmp_path, gh, lines).execute(RerunFailedJobs(7, "h1", ((900, 1), (901, 1))))
+    assert [x for x in lines if "re-ran" in x] == [
+        "PR #7: re-ran the failed jobs of run 900 on h1 (the harness's one re-run of this head)"]

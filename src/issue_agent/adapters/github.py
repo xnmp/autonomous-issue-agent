@@ -34,36 +34,10 @@ from .github_ci import base_issues, base_reports, base_runs, observe_checks
 _GH_TIMEOUT_S = 30.0
 _LOGGED_GH_ARGV_BYTES = 2 * 1024
 
-# Prompt-input bounds (review M13/P1R-13). Inline comments are writable by
-# anyone with read access, and `tail -N` bounds lines, not bytes: a 200MB CI
-# log's last 150 lines was once a 150M-char prompt.
-_INLINE_COMMENT_LIMIT = 8
-_FAILED_LOG_LINES = 150
-_FAILED_LOG_BYTES = 20_000
+# Prompt-input bounds (review M13/P1R-13): PR comments are writable by anyone
+# with read access.
 _REVIEW_COMMENT_BODY_BYTES = 2_000
 _REVIEW_COMMENTS_TOTAL_BYTES = 20_000
-
-
-def _tail(text: str, lines: int, max_bytes: int | None = None) -> str:
-    """The last `lines` lines, then the last `max_bytes` UTF-8 bytes; a cut
-    multi-byte character is dropped."""
-    out = "\n".join((text or "").splitlines()[-lines:])
-    encoded = out.encode("utf-8", errors="ignore")
-    if max_bytes is None or len(encoded) <= max_bytes:
-        return out
-    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
-
-
-def _failed_step_section(log: str) -> str:
-    """The failed step's section of a raw job log, as `--log-failed` shows it:
-    from the last `##[group]` opener before the first `##[error]`, through the
-    last `##[error]`. A log without markers is returned whole (the caller tails it)."""
-    rows = (log or "").splitlines()
-    errors = [i for i, row in enumerate(rows) if "##[error]" in row]
-    if not errors:
-        return log or ""
-    start = next((i for i in range(errors[0], -1, -1) if "##[group]" in rows[i]), 0)
-    return "\n".join(rows[start:errors[-1] + 1])
 
 
 def _cap_bytes(text: str, max_bytes: int) -> str:
@@ -198,9 +172,12 @@ def _reviews(raw: list | None) -> tuple[Review, ...]:
         author = _login(r.get("author")) or _login(r.get("user"))
         commit = r.get("commit")
         commit_id = (commit.get("oid", "") if isinstance(commit, dict) else "") or r.get("commit_id", "") or ""
+        # REST `id` is the review id; a GraphQL `id` is a node id, so only `databaseId` there.
+        review_id = r.get("databaseId", r.get("id"))
         out.append(Review(state=r.get("state", "") or "", author=author,
                           submitted_at=r.get("submittedAt") or r.get("submitted_at") or "",
-                          body=r.get("body", "") or "", commit_id=commit_id))
+                          body=r.get("body", "") or "", commit_id=commit_id,
+                          id=review_id if type(review_id) is int and review_id > 0 else None))
     return tuple(out)
 
 
@@ -229,24 +206,6 @@ def _changed_files(files: object) -> frozenset[str]:
     if not isinstance(files, list):
         return frozenset()
     return frozenset(str(f["path"]) for f in files if isinstance(f, dict) and f.get("path"))
-
-
-def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> str:
-    """`GET /pulls/{n}/comments` → the fixer's `path:line (author): body` block:
-    top-level comments only (replies are the fixer's own thread), the newest
-    `limit`, each and the whole block byte-capped (review M13, P1R-13). Any
-    malformed shape degrades to a weaker prompt, never a dead dispatch."""
-    if not isinstance(raw, list):
-        return ""
-    tops = sorted((c for c in raw if isinstance(c, dict) and c.get("in_reply_to_id") is None),
-                  key=lambda c: str(c.get("created_at") or c.get("createdAt") or ""))
-    out = []
-    for c in tops[-limit:] if limit > 0 else tops:
-        author = _login(c.get("user")) or _login(c.get("author"))
-        line = c.get("line") or c.get("original_line") or 0
-        body = _cap_bytes((c.get("body", "") or "").strip(), _REVIEW_COMMENT_BODY_BYTES)
-        out.append(f"{c.get('path', '') or ''}:{line} ({author}): {body}")
-    return _cap_bytes("\n".join(out), _REVIEW_COMMENTS_TOTAL_BYTES)
 
 
 def _marked_cap(text: str, max_bytes: int) -> str:
@@ -296,7 +255,7 @@ _FIX_ISSUE = (
     + _COMMENTS.format(before="") + " " + _TIMELINE.format(before="") + " " + _BLOCKED_BY
 )
 _REVIEWS = ("reviews(last:100{before}){{totalCount pageInfo{{hasPreviousPage startCursor}} "
-            "nodes{{author{{login}} state submittedAt body commit{{oid}}}}}}")
+            "nodes{{databaseId author{{login}} state submittedAt body commit{{oid}}}}}}")
 _FILES = "files(first:100{after}){{totalCount pageInfo{{hasNextPage endCursor}} nodes{{path}}}}"
 _FIX_PR = (
     "id number state headRefName headRefOid baseRefName baseRefOid title author{login} "
@@ -851,7 +810,7 @@ class GitHubGateway:
         recent issues, open and closed (by `author`, `@me` for this token's
         login, if given; gh reads it as `createdBy`, not the search index):
         the candidates a STEWARD leg may name as a duplicate or a blocker. An
-        unreadable listing raises; the leg then offers none."""
+        unreadable listing raises; the STEWARD leg is then refused (a machine end)."""
         data = self._gh_json(["issue", "list", "--repo", self.repo, "--state", "all", "--json",
                               "number,state,title,labels", "--limit", str(limit),
                               *(["--author", author] if author else [])])
@@ -890,81 +849,6 @@ class GitHubGateway:
     def open_pull_request(self, branch: str, base: str, title: str, body: str) -> None:
         self._gh(["pr", "create", "--repo", self.repo, "--head", branch, "--base", base,
                   "--title", title, "--body", body])
-
-    # The two repair-prompt inputs fail SOFT to "": a weaker prompt beats no
-    # dispatch, since the agent can rediscover the failure itself (D6).
-    def workflow_run_attempts(self, head: str | tuple[str, ...], run_ids: tuple[int, ...]) -> dict[int, int] | None:
-        """Attempt counters for exact workflow runs, after SHA verification."""
-        if not head or not run_ids or any(run_id <= 0 for run_id in run_ids):
-            return None
-        heads = (head,) if isinstance(head, str) else head
-        attempts: dict[int, int] = {}
-        for run_id in dict.fromkeys(run_ids):
-            raw = self._gh_json(["api", f"repos/{self.repo}/actions/runs/{run_id}"])
-            if not isinstance(raw, dict) or int(raw.get("id") or 0) != run_id or str(raw.get("head_sha") or "") not in heads:
-                return None
-            attempt = raw.get("run_attempt")
-            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
-                return None
-            attempts[run_id] = attempt
-        return attempts
-
-    def failed_run_log(self, head: str, run_ids: tuple[int, ...], *, lines: int = _FAILED_LOG_LINES) -> str:
-        """Bounded failed logs of the observed runs, verified against the
-        observed head (a branch's latest failed run may be an older revision)
-        and pinned to the attempt so a rerun cannot swap the evidence."""
-        if not head or not run_ids or any(type(n) is not int or n <= 0 for n in run_ids):
-            return ""
-        try:
-            attempts = self.workflow_run_attempts(head, run_ids)
-            if attempts is None:
-                return ""
-            logs = [self._run_failure_log(run_id, attempt, lines) for run_id, attempt in attempts.items()]
-            out = _tail("\n\n".join(log for log in logs if log), lines, max_bytes=_FAILED_LOG_BYTES)
-        except Exception as exc:  # noqa: BLE001 — a missing log must not block the fix
-            sys.stderr.write(f"failed-run log unavailable ({type(exc).__name__}: {str(exc)[:120]})\n")
-            return ""
-        if not out:
-            sys.stderr.write(f"failed-run log empty for runs {list(run_ids)}: no failed job log was readable\n")
-        return out
-
-    def _run_failure_log(self, run_id: int, attempt: int, lines: int) -> str:
-        """Per-job REST logs first: `gh run view --log-failed` refuses while ANY
-        job of the run is still running (tauri #1078: the agent got an empty
-        log for ~50 min), but the job-logs endpoint serves each completed job.
-        Run-level `--log-failed` stays as the fallback (e.g. job list unreadable)."""
-        try:
-            log = self._failed_job_logs(run_id, attempt, lines)
-        except Exception:  # noqa: BLE001 — fall back to the run-level log
-            log = ""
-        return log or _tail(self._gh(["run", "view", str(run_id), "--repo", self.repo, "--attempt", str(attempt),
-                                      "--log-failed"]), lines, max_bytes=_FAILED_LOG_BYTES)
-
-    def _failed_job_logs(self, run_id: int, attempt: int, lines: int) -> str:
-        # One page: a >100-job matrix falls back to the run-level log.
-        raw = self._gh_json(["api", f"repos/{self.repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100"])
-        jobs = raw.get("jobs") if isinstance(raw, dict) else None
-        if not isinstance(jobs, list):
-            return ""
-        parts = []
-        for job in jobs:
-            job_id = job.get("id") if isinstance(job, dict) else None
-            if not isinstance(job, dict) or job.get("conclusion") not in ("failure", "timed_out") or type(job_id) is not int or job_id <= 0:
-                continue
-            text = _failed_step_section(self._gh(["api", f"repos/{self.repo}/actions/jobs/{job_id}/logs"]))
-            if text.strip():
-                parts.append(f"== job: {_one_line(str(job.get('name') or job_id))} ==\n"
-                             + _tail(text, lines, max_bytes=_FAILED_LOG_BYTES))
-        return "\n\n".join(parts)
-
-    def review_comments(self, pr: int, *, limit: int = _INLINE_COMMENT_LIMIT) -> str:
-        """The newest inline review comments. `per_page=100`: the default page
-        of 30 would hand the fixer the OLDEST comments on a busy PR."""
-        try:
-            return format_review_comments(self._gh_json(["api", f"repos/{self.repo}/pulls/{pr}/comments?per_page=100"]),
-                                          limit=limit)
-        except Exception:  # noqa: BLE001 — a missing comment list must not block the fix
-            return ""
 
     def viewer_login(self) -> str:
         """This credential's login, or "". GraphQL `viewer`, not REST `/user`:
@@ -1080,6 +964,21 @@ class GitHubGateway:
         answer, so only a truly empty answer is a refusal."""
         if not self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/cancel"]).strip():
             raise RuntimeError(f"run {run_id}: cancel refused")
+
+    def run_attempt(self, run_id: int) -> int:
+        """A workflow run's current attempt: the read-back of a re-run. Raises
+        on an answer that is not a run."""
+        data = self._gh_json(["api", f"repos/{self.repo}/actions/runs/{run_id}"])
+        attempt = data.get("run_attempt") if isinstance(data, dict) else None
+        if type(attempt) is not int or attempt <= 0:
+            raise ValueError(f"run {run_id} is unreadable")
+        return attempt
+
+    def rerun_failed_checks(self, run_id: int) -> None:
+        """Request a completed run's failed-jobs re-run (a new run attempt).
+        The caller reads the attempt back: a refusal (403, a run still going)
+        comes back from the runner as an empty answer, not an error."""
+        self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"])
 
     def update_branch(self, pr: int, expected_head: str) -> bool:
         """Merge base into a BEHIND head. Fail-soft: an 'already up to date' or

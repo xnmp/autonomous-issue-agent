@@ -71,7 +71,7 @@ def reduce_ci(observation: CIObservation) -> Clear | Waiting | Failed | Unavaila
         key=lambda r: (r.context, r.app_id or 0)))
     if missing:
         return Waiting(MissingRequired(missing))
-    pending = tuple(c for c in eligible if _is_pending(c))
+    pending = tuple(c for c in eligible if is_pending(c))
     if pending:
         return Waiting(Executing(pending) if any(c.state != "QUEUED" for c in pending) else Queued(pending))
     failures = tuple(c for c in eligible if c.bucket == "fail")
@@ -107,7 +107,7 @@ def _identity(check: Check) -> tuple[str, str, int | None]:
     return (check.kind, check.name, check.app_id if check.kind == "check" else None)
 
 
-def _is_pending(check: Check) -> bool:
+def is_pending(check: Check) -> bool:
     return check.bucket == "pending" or check.state in ("QUEUED", "IN_PROGRESS")
 
 
@@ -156,10 +156,4 @@ def base_verdicts(runs: Iterable[BaseRun]) -> tuple[tuple[BaseRun, BaseRun, bool
         streak = [latest, *itertools.takewhile(lambda r: (r.conclusion in RED_CONCLUSIONS) == red, older)]
         out.append((latest, streak[-1], len(streak) <= len(older)))
     return tuple(out)
-
-
-def failed_checks(checks: CIObservation) -> tuple[Check, ...]:
-    """Settled failures covered by the repository CI policy."""
-    result = reduce_ci(checks)
-    return result.checks if isinstance(result, Failed) else ()
 

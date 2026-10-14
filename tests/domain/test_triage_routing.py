@@ -283,10 +283,16 @@ def test_each_earlier_attempt_escalates_the_next_one_rung(prior, tier):
     assert state_of(world, legs) == Dispatch(AgentKind.RESOLVE, tier=tier)
 
 
+def routed(state) -> tuple:
+    """A dispatch's act, head and tier (its evidence is test_state_policy's)."""
+    assert isinstance(state, Dispatch), state
+    return (state.act, state.head, state.tier)
+
+
 def test_escalation_is_capped_at_xhigh():
     legs = {issue_key(3): (*done(Tier.XHIGH),), pr_key(7): (fix_leg(AgentKind.FIX_CI, 1),
                                                                       fix_leg(AgentKind.FIX_CI, 2))}
-    assert state_of(WorldState(prs=(green_pr(bucket="fail"),)), legs) == Dispatch(AgentKind.FIX_CI, HEAD, Tier.XHIGH)
+    assert routed(state_of(WorldState(prs=(green_pr(bucket="fail"),)), legs)) == (AgentKind.FIX_CI, HEAD, Tier.XHIGH)
 
 
 @pytest.mark.parametrize("kind_pr", [
@@ -299,18 +305,18 @@ def test_pr_stage_acts_route_by_the_issues_triage_tier(kind_pr):
     if "mergeable" in shape:
         pr = PRView(**{**pr.__dict__, "mergeable": "CONFLICTING"})
     legs = {issue_key(3): (*done(Tier.HIGH),)}
-    assert state_of(WorldState(prs=(pr,)), legs) == Dispatch(kind, HEAD, Tier.HIGH)
+    assert routed(state_of(WorldState(prs=(pr,)), legs)) == (kind, HEAD, Tier.HIGH)
 
 
 def test_a_pre_routing_pr_without_triage_runs_at_the_default_tier():
-    assert state_of(WorldState(prs=(green_pr(bucket="fail"),))) == Dispatch(AgentKind.FIX_CI, HEAD, DEFAULT_TIER)
+    assert routed(state_of(WorldState(prs=(green_pr(bucket="fail"),)))) == (AgentKind.FIX_CI, HEAD, DEFAULT_TIER)
 
 
 def test_a_human_reset_drops_escalation_back_to_the_triaged_tier():
     legs = {issue_key(3): (*done(Tier.LOW),),
             pr_key(7): (fix_leg(AgentKind.FIX_CI, 1), fix_leg(AgentKind.FIX_CI, 2))}
     pr = green_pr(bucket="fail", comments=(Comment("alice", "try again", iso(3)),))
-    assert state_of(WorldState(prs=(pr,)), legs) == Dispatch(AgentKind.FIX_CI, HEAD, Tier.LOW)
+    assert routed(state_of(WorldState(prs=(pr,)), legs)) == (AgentKind.FIX_CI, HEAD, Tier.LOW)
 
 
 # ── derive: the reviewer's tier ─────────────────────────────────────────────

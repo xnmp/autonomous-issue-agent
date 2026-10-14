@@ -10,8 +10,12 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Union
 
+from .evidence import ChangeRequest, CiFailures
 from .labels import Label
 from .routing import DEFAULT_TIER, Tier
+
+# What a repair is handed: FIX_CI its failures, ADDRESS_REVIEW its change request.
+Evidence = Union[CiFailures, ChangeRequest]
 
 
 class Target(Enum):
@@ -96,6 +100,17 @@ class UpdateBranch:
 
 
 @dataclass(frozen=True)
+class RerunFailedJobs:
+    """Re-run the failed jobs of each (run id, observed attempt) on the PR's
+    head (free, no agent). The run's attempt is the read-back: a run already
+    past the observed attempt was re-run, so a replay posts nothing."""
+
+    pr: int
+    head: str
+    runs: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
 class LinkBlockedBy:
     """Write GitHub's "#`issue` is blocked by #`blocker`" link a steward proposed,
     then one comment carrying `reason` (or why act refused the link on its fresh
@@ -147,9 +162,12 @@ class RunAgent:
     # The difficulty tier the leg runs at (a fix act's already escalated for
     # this attempt); see `check_tier`.
     tier: Tier | None = None
+    # What the leg repairs; see `check_evidence`.
+    evidence: Evidence | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tier", check_tier(self.kind, self.tier))
+        check_evidence(self.kind, self.evidence)
 
 
 ISSUE_ACTS = frozenset({AgentKind.STEWARD, AgentKind.TRIAGE, AgentKind.RESOLVE})
@@ -169,12 +187,27 @@ def check_tier(kind: AgentKind, tier: Tier | None) -> Tier | None:
     return tier
 
 
+_EVIDENCE: dict[AgentKind, type] = {AgentKind.FIX_CI: CiFailures, AgentKind.ADDRESS_REVIEW: ChangeRequest}
+
+
+def check_evidence(kind: AgentKind, evidence: object) -> None:
+    """A repair is built only with what it repairs (tauri #1078 dispatched
+    FIX_CI on an empty log): FIX_CI with its CiFailures, ADDRESS_REVIEW with
+    its ChangeRequest; every other act carries none."""
+    want = _EVIDENCE.get(kind)
+    if want is None and evidence is not None:
+        raise ValueError(f"{kind.name} carries no evidence")
+    if want is not None and not isinstance(evidence, want):
+        raise ValueError(f"{kind.name} requires its {want.__name__}")
+
+
 Action = Union[
     Relabel,
     PostComment,
     MergePullRequest,
     OpenPullRequest,
     UpdateBranch,
+    RerunFailedJobs,
     LinkBlockedBy,
     FileIssue,
     SetIssueState,
@@ -187,8 +220,10 @@ __all__ = [
     "AgentKind",
     "ISSUE_ACTS",
     "ROUTED_ACTS",
+    "check_evidence",
     "check_tier",
     "FileIssue",
+    "Evidence",
     "LinkBlockedBy",
     "MergePullRequest",
     "OpenPullRequest",
@@ -198,4 +233,5 @@ __all__ = [
     "SetIssueState",
     "Target",
     "UpdateBranch",
+    "RerunFailedJobs",
 ]

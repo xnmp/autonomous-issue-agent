@@ -52,6 +52,7 @@ from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
 from ..domain.actions import ISSUE_ACTS, Action, AgentKind, RunAgent
 from ..domain.backoff import LegEnd, dispatched_kind
+from ..domain.evidence import recorded_keys
 from ..domain.leg import Leg
 from ..domain.outcome import AgentResult, LegClass, pre_admission_refusal
 from ..domain.policy import question_text
@@ -109,8 +110,11 @@ def leg_end(run: LegRun, log: Callable[[str], None] | None = None) -> LegEnd | N
     steward = steward_from_record(raw, run.issue) if kind in (AgentKind.STEWARD, AgentKind.TRIAGE) and ran else None
     if log is not None and steward is not None and steward != steward_from_record(raw):
         log(f"issue #{run.issue}: a recorded steward claim names the issue itself; dropped")
+    evidence = recorded_keys(receipt.get("evidence")) if kind is AgentKind.FIX_CI and ran else frozenset()
+    end_head = receipt.get("end_head")
     return LegEnd(kind, run.completed_at, leg is LegClass.MACHINE, run.head, question=question, started_at=started,
-                  triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")))
+                  triage=triage, steward=steward, tier=parse_tier(receipt.get("tier")), evidence=evidence,
+                  end_head=end_head if ran and isinstance(end_head, str) and len(end_head) <= 64 else "")
 
 
 def steward_criteria(runs: Iterable[LegRun]) -> Untrusted | None:
@@ -1003,6 +1007,7 @@ def compose_role(
             cap(cfg.issue_spend_cap_usd), cfg.config_version, name.value, budget_policy(cfg),
             rate_table(cfg, name.value), spend_evidence_dir(state_dir), owner_id=owner_id,
             reservation_reconciler=recovery,
+            remote_head=worktrees.remote_head if worktrees is not None else None,
         )
         chains[name] = JournalingRuntime(accountings[name], journal, repo=cfg.repo, role=role, runtime=name.value)
 

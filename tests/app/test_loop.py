@@ -16,6 +16,7 @@ from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.reload import RELOAD_EXIT_CODE
 from issue_agent.app.tick import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS, CancellableAsyncDispatch, Daemon
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
+from issue_agent.domain.evidence import CiFailure, CiFailures
 from issue_agent.domain.labels import Label
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.supervision import ExitCode
@@ -829,7 +830,7 @@ def test_a_reload_drain_holds_heavy_legs_but_starts_light_ones_while_a_heavy_leg
 
     heartbeat = tmp_path / "heartbeat.json"
     daemon = _drain_daemon([
-        [RunAgent(AgentKind.FIX_CI, 1078)],
+        [RunAgent(AgentKind.FIX_CI, 1078, head="h1", evidence=CiFailures((CiFailure("check:1@9.1", "smoke", 1, 9),)))],
         [RunAgent(AgentKind.STEWARD, 1105), RunAgent(AgentKind.RESOLVE, 9)],
     ], run_agent, str(heartbeat), capacity=2)  # a heavy slot stays free: only the drain holds RESOLVE 9
     beats, slots = [], []

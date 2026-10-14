@@ -19,6 +19,7 @@ from issue_agent.app.config import from_env
 from issue_agent.app.fix import compose_fix_daemon
 from issue_agent.app.review import compose_review_daemon
 from issue_agent.domain.actions import AgentKind, MergePullRequest, RunAgent
+from issue_agent.domain.evidence import ChangeRequest
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.effort import Effort
@@ -359,7 +360,8 @@ def test_a_bot_change_request_is_addressed_by_the_fix_role_not_reviewed_again(ro
     fix = roles.fix(gh, Agent(lambda _t: AgentResult(False, status="pushed", cost_usd=0.1, session_id="s1")))
 
     assert tick(review) == []
-    assert dispatched(tick(fix), AgentKind.ADDRESS_REVIEW) == [RunAgent(AgentKind.ADDRESS_REVIEW, 100, head="h1")]
+    assert dispatched(tick(fix), AgentKind.ADDRESS_REVIEW) == [
+        RunAgent(AgentKind.ADDRESS_REVIEW, 100, head="h1", evidence=ChangeRequest(REVIEW_BOT, "h1", body="Handle None."))]
 
 
 def test_three_unparseable_verdicts_on_one_head_stop_for_a_human_written_by_the_fix_role(roles):

@@ -41,8 +41,13 @@ Precedence, the single place it is defined (first match wins, per item):
                comment yet -> TriageNote (free; tier, rationale and criteria
                in the one comment); else step 7.
 7. Item state  PR: head unknown -> Wait; conflicted -> REBASE; CI unread or
-               for another head -> Wait; red -> FIX_CI, unless every red
-               check is red or rerunning on the base tip too -> Wait (#313);
+               for another head, or GitHub still shows the head the newest
+               agent leg pushed away from (its end head) -> Wait; red ->
+               FIX_CI with just the failures no repair on the head was handed
+               (tauri #1078), unless every red check is red or rerunning on
+               the base tip too -> Wait (#313); none new -> Wait while a
+               failing run still runs, else Rerun (free) if no run on the head
+               is past its first attempt, else NeedsHuman (ATTEMPTS);
                pending -> Wait; green and BEHIND -> Refresh; a human's standing CHANGES_REQUESTED on
                head -> ADDRESS_REVIEW; no bot verdict on head -> REVIEW; bot
                CHANGES_REQUESTED on head -> ADDRESS_REVIEW; bot APPROVED head ->
@@ -72,7 +77,11 @@ Attempts for act A (Q21) are the tail run of A's agent legs after the reset
 floor: machine legs are skipped, any other act's agent leg ends the run, and
 REVIEW counts only legs on the current head. Progress (an act changing, or a
 review of a new head) therefore never trips the cap; repeating one act
-without progress does.
+without progress does. FIX_CI counts tries, not legs: a leg on a new head,
+handed a failure from a CI run that began after the head's first leg began
+and no earlier leg was handed (a push, re-run or dispatch it or anyone
+caused), or with no readable keys, starts a try; a leg within the step's own try runs at its tier and routes to
+the runtime holding the session.
 
 Untrusted timestamps fail toward stopping: an unparseable one never resets a
 count or releases a stop, and an unparseable bot review still counts as a round.
@@ -83,16 +92,18 @@ is never a reset: only a push by a known non-harness login is.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from itertools import takewhile
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
 
-from .actions import ISSUE_ACTS, ROUTED_ACTS, AgentKind, Target, check_tier
+from .actions import ISSUE_ACTS, ROUTED_ACTS, AgentKind, Evidence, Target, check_evidence, check_tier
 from .backoff import LegEnd, machine_backoff_until
 from .checks import Check, Observed
-from .ci import BaseRed, Clear, Failed, Waiting, charge, parse_timestamp, reduce_ci
+from .ci import BaseRed, Clear, Failed, Waiting, charge, is_pending, parse_timestamp, reduce_ci
+from .evidence import ChangeRequest, CiFailures, began, new_failures
 from .identity import login_eq
 from .labels import Label
 from .refs import harness_branch_issue
@@ -234,6 +245,8 @@ class Dispatch:
     head: str = ""  # "" exactly for the issue acts (STEWARD, TRIAGE, RESOLVE): no PR yet
     # The leg's tier: see `actions.check_tier`.
     tier: Tier | None = None
+    # What a repair is handed: see `actions.check_evidence`.
+    evidence: Evidence | None = None
 
     def __post_init__(self) -> None:
         if self.act not in DISPATCHABLE:
@@ -244,6 +257,7 @@ class Dispatch:
         else:
             _need_head(self.head)
         object.__setattr__(self, "tier", check_tier(self.act, self.tier))
+        check_evidence(self.act, self.evidence)
 
 
 @dataclass(frozen=True)
@@ -262,6 +276,21 @@ class Refresh:
 
     def __post_init__(self) -> None:
         _need_head(self.head)
+
+
+@dataclass(frozen=True)
+class Rerun:
+    """Re-run the failed jobs of each (run id, attempt) on `head`, free: the
+    harness, never the agent, re-runs a failure the leg left as a flake, once
+    per head (owner, PR #403)."""
+
+    head: str
+    runs: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        _need_head(self.head)
+        if not self.runs or any(type(r) is not int or type(a) is not int or r <= 0 or a <= 0 for r, a in self.runs):
+            raise ValueError("a re-run names at least one run and its observed attempt")
 
 
 @dataclass(frozen=True)
@@ -369,8 +398,8 @@ class Backoff:
             raise ValueError("backoff requires a dispatchable act and an aware time")
 
 
-DerivedState = (Dispatch | Merge | Refresh | OpenPR | TriageNote | LinkBlocker | Release | Wait | NeedsHuman | Busy
-                | Backoff)
+DerivedState = (Dispatch | Merge | Refresh | Rerun | OpenPR | TriageNote | LinkBlocker | Release | Wait | NeedsHuman
+                | Busy | Backoff)
 
 
 @dataclass(frozen=True)
@@ -476,6 +505,7 @@ def _proceed(
 
     issue_legs = local.legs.get(issue_key(item.issue), ())
     triage = _latest_triage(issue_legs)
+    floor = _reset_floor(item, [at for at, _ in human], last_stop, harness)
     if pr is None:
         # STEWARD first: a duplicate stops before any grading is bought.
         steward = latest_steward(issue_legs)
@@ -494,14 +524,18 @@ def _proceed(
             if graded is not None and not any(harness.wrote(c) and TRIAGE_TAG in c.body for c in item.comments):
                 return TriageNote(graded, triage.ended_at.isoformat(), criteria)
             step = Dispatch(AgentKind.RESOLVE)
+    elif (last_agent is not None and last_agent.end_head not in ("", last_agent.head)
+          and pr.head_ref_oid == last_agent.head and (floor is None or floor < last_agent.ended_at)):
+        # Read-your-writes, not a timer (owner, PR #403): the newest leg pushed and
+        # GitHub does not show it yet. A human reset since then ends the wait.
+        return Wait(WaitReason.CI_UNKNOWN)
     else:
-        step = _pr_step(pr, harness, item.base)
+        step = _pr_step(pr, harness, item.base, _handed(legs, pr.head_ref_oid, floor), anchor)
     if not isinstance(step, Dispatch):
         return step
     # Before the gates: nothing is spent, and a stop would ask a human to act on an issue that is only waiting.
     if step.act in ISSUE_ACTS and item.blocked_by:
         return Wait(WaitReason.BLOCKED, item.blocked_by)
-    floor = _reset_floor(item, [at for at, _ in human], last_stop, harness)
     if (step.act is AgentKind.ADDRESS_REVIEW and pr is not None
             and _bot_verdict_on_head(pr, harness) == REVIEW_CHANGES_REQUESTED
             and _rounds(pr, floor, harness) >= REVIEW_ROUND_CAP):
@@ -518,7 +552,7 @@ def _proceed(
         return Wait(WaitReason.HEADROOM)
     triaged = triage.triage.tier if triage is not None and triage.triage is not None else None
     if step.act in ROUTED_ACTS:
-        return Dispatch(step.act, step.head, escalate(triaged or DEFAULT_TIER, attempts))
+        return Dispatch(step.act, step.head, escalate(triaged or DEFAULT_TIER, attempts), step.evidence)
     if step.act is AgentKind.REVIEW and pr is not None:
         return Dispatch(step.act, step.head, _review_tier(pr, harness, legs, local, item.issue) or triaged)
     return step
@@ -573,7 +607,17 @@ def _blocker_link(leg: LegEnd, issue: int, comments: tuple[Comment, ...], harnes
     return LinkBlocker(steward.blocked_by, steward.blocked_by_reason, leg.ended_at.isoformat())
 
 
-def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> DerivedState:
+def _handed(legs: tuple[LegEnd, ...], head: str, floor: datetime | None) -> frozenset[str]:
+    """The failure keys FIX_CI agent ends on `head` were handed since the reset
+    floor. A machine end handed nothing (it never ran, or died); a human reset
+    (a comment, review or released stop) re-arms every failure."""
+    return frozenset(key for leg in legs if leg.kind is AgentKind.FIX_CI and leg.head == head
+                     and (floor is None or leg.ended_at > floor) for key in leg.evidence)
+
+
+def _pr_step(
+    pr: PRView, harness: Harness, base: tuple[Check, ...] | None, handed: frozenset[str], anchor: str,
+) -> DerivedState:
     head = pr.head_ref_oid
     if not head:
         return Wait(WaitReason.HEAD_UNKNOWN)
@@ -586,7 +630,20 @@ def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> De
     if isinstance(ci, Failed):
         ci = charge(ci, base)
     if isinstance(ci, Failed):
-        return Dispatch(AgentKind.FIX_CI, head)
+        fresh = new_failures(pr.ci, handed)
+        if fresh is not None:
+            return Dispatch(AgentKind.FIX_CI, head, evidence=fresh)
+        runs = {(c.run_id, c.run_attempt) for c in pr.ci.reports
+                if c.bucket == "fail" and c.run_id is not None and c.run_attempt is not None}
+        if any(is_pending(c) and c.run_id in {r for r, _ in runs} for c in pr.ci.reports):
+            # A failing run may still hand the session a new failure, and GitHub
+            # will not re-run a run in progress. Another run's check never holds this.
+            return Wait(WaitReason.CI_PENDING)
+        # A repair had every failure and pushed nothing: the same evidence cannot help. A
+        # flake gets one harness re-run per head; a run past attempt 1 was re-run already.
+        if runs and all((c.run_attempt or 1) == 1 for c in pr.ci.reports):
+            return Rerun(head, tuple(sorted(runs)))
+        return NeedsHuman(StopReason.ATTEMPTS, anchor, AgentKind.FIX_CI)
     # The base is the repo's to fix (Q13: flakes are the repo's). The PR
     # waits uncharged and resumes when the base tip stops failing.
     if isinstance(ci, BaseRed):
@@ -598,14 +655,17 @@ def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> De
     # Before review: updating moves the head, which would void a review on it.
     if pr.is_behind():
         return Refresh(head)
-    human_heads = _human_change_requests(pr, harness)
+    standing = _human_change_requests(pr, harness)
+    human_heads = frozenset(standing.values())
     if head in human_heads:
-        return Dispatch(AgentKind.ADDRESS_REVIEW, head)
+        return Dispatch(AgentKind.ADDRESS_REVIEW, head,
+                        evidence=_change_request(pr, lambda login: standing.get(login.strip().casefold()) == head))
     verdict = _bot_verdict_on_head(pr, harness)
     if verdict is None:
         return Dispatch(AgentKind.REVIEW, head)
     if verdict == REVIEW_CHANGES_REQUESTED:
-        return Dispatch(AgentKind.ADDRESS_REVIEW, head)
+        return Dispatch(AgentKind.ADDRESS_REVIEW, head,
+                        evidence=_change_request(pr, lambda login: login_eq(login, harness.review_bot)))
     if human_heads:
         return Wait(WaitReason.HUMAN_CHANGES_REQUESTED)
     # BLOCKED with green CI and the bot's approval: branch protection waits on
@@ -613,6 +673,16 @@ def _pr_step(pr: PRView, harness: Harness, base: tuple[Check, ...] | None) -> De
     if pr.mergeable.upper() != "MERGEABLE" or pr.merge_state.upper() == "BLOCKED":
         return Wait(WaitReason.MERGEABILITY_UNKNOWN)
     return Merge(head)
+
+
+def _change_request(pr: PRView, by: Callable[[str], bool]) -> ChangeRequest:
+    """The newest CHANGES_REQUESTED review on the head by a reviewer `by`
+    accepts: both callers saw one (the bot's verdict, or a human's standing
+    request, on this head)."""
+    review = max((r for r in pr.reviews if r.commit_id == pr.head_ref_oid and r.author.strip() and by(r.author)
+                  and r.state.upper() == REVIEW_CHANGES_REQUESTED),
+                 key=lambda r: (parse_timestamp(r.submitted_at) is not None, r.submitted_at))
+    return ChangeRequest(review.author, pr.head_ref_oid, review.id, review.body)
 
 
 def _bot_verdict_on_head(pr: PRView, harness: Harness) -> str | None:
@@ -625,10 +695,11 @@ def _bot_verdict_on_head(pr: PRView, harness: Harness) -> str | None:
     return max(verdicts)[3] if verdicts else None
 
 
-def _human_change_requests(pr: PRView, harness: Harness) -> frozenset[str]:
-    """Heads carrying a non-harness reviewer's standing CHANGES_REQUESTED: that
-    reviewer's latest APPROVED/CHANGES_REQUESTED/DISMISSED review is a change
-    request. A later approval or dismissal by the same reviewer clears it."""
+def _human_change_requests(pr: PRView, harness: Harness) -> Mapping[str, str]:
+    """Each non-harness reviewer (casefolded login) with a standing
+    CHANGES_REQUESTED, and the head it is on: that reviewer's latest
+    APPROVED/CHANGES_REQUESTED/DISMISSED review is a change request. A later
+    approval or dismissal by the same reviewer clears it."""
     latest: dict[str, tuple[bool, str, int, str, str]] = {}
     for i, r in enumerate(pr.reviews):
         state = r.state.upper()
@@ -637,11 +708,15 @@ def _human_change_requests(pr: PRView, harness: Harness) -> frozenset[str]:
         rank = (parse_timestamp(r.submitted_at) is not None, r.submitted_at, i, state, r.commit_id)
         who = r.author.strip().casefold()
         latest[who] = max(latest.get(who, rank), rank)
-    return frozenset(commit for _, _, _, state, commit in latest.values() if state == REVIEW_CHANGES_REQUESTED)
+    return {who: commit for who, (_, _, _, state, commit) in latest.items() if state == REVIEW_CHANGES_REQUESTED}
 
 
 def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) -> int:
-    run = 0
+    """The attempts in the act's current run of agent legs since the floor.
+    FIX_CI counts tries, the step's own not counted (owner, PR #403): a
+    failure of a CI run that existed before the head's first leg, or that an
+    earlier leg was handed, resumes at its tier; ATTEMPT_CAP bounds new runs."""
+    run: list[LegEnd] = []
     for leg in reversed(sorted(legs, key=lambda leg: leg.ended_at)):  # ties: later-recorded is newer
         if floor is not None and leg.ended_at <= floor:
             break
@@ -649,8 +724,24 @@ def _attempts(legs: tuple[LegEnd, ...], step: Dispatch, floor: datetime | None) 
             continue
         if leg.kind is not step.act or (step.act is AgentKind.REVIEW and leg.head != step.head):
             break
-        run += 1
-    return run
+        run.append(leg)
+    if step.act is not AgentKind.FIX_CI:
+        return len(run)
+
+    def new_try(head: str, keys: Iterable[str], earlier: list[LegEnd]) -> bool:
+        # A run already handed (a key of the same start) or begun before the head's first leg resumes; an
+        # unreadable time or a keyless (legacy, corrupt) leg fails toward counting.
+        same = list(takewhile(lambda leg: leg.head == head, reversed(earlier)))
+        if not same or not keys:
+            return True
+        since = same[-1].started_at or same[-1].ended_at
+        handed = {began(key) for leg in same for key in leg.evidence}
+        return any((at := began(key)) is None or (at > since and at not in handed) for key in keys)
+
+    oldest = run[::-1]
+    keys = step.evidence.keys if isinstance(step.evidence, CiFailures) else ()
+    return sum(new_try(leg.head, leg.evidence, oldest[:i]) for i, leg in enumerate(oldest)) - (
+        not new_try(step.head, keys, oldest))
 
 
 def human_comments(
@@ -701,7 +792,7 @@ def _rounds(pr: PRView, floor: datetime | None, harness: Harness) -> int:
 
 __all__ = [
     "ATTEMPT_CAP", "REVIEW_ROUND_CAP", "DISPATCHABLE", "ItemKey", "issue_key", "pr_key", "Harness", "Local",
-    "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "OpenPR", "TriageNote", "TRIAGE_TAG",
+    "WaitReason", "StopReason", "stop_tag", "Dispatch", "Merge", "Refresh", "Rerun", "OpenPR", "TriageNote", "TRIAGE_TAG",
     "BLOCKER_TAG", "LinkBlocker",
     "Release", "Wait", "NeedsHuman",
     "Busy", "Backoff", "DerivedState", "derive", "human_comments", "latest_steward", "touches_github",

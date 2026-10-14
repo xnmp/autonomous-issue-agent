@@ -518,3 +518,20 @@ def test_a_symlink_to_the_parent_repo_is_never_classified_as_the_worktree(tmp_pa
     assert mutated == []  # nothing ran inside the link
     assert not link.is_symlink()  # squatter replaced by a real dir
     assert (repo / "precious.txt").read_text() == "operator work"
+
+
+SHA_A = "a" * 40
+
+
+@pytest.mark.parametrize("result,head", [
+    (GitResult(0, f"{SHA_A}\trefs/heads/fix/5-x\n"), SHA_A),
+    (GitResult(0, ""), ""),  # the branch is gone from the remote
+    (GitResult(128, ""), ""),  # unreachable remote
+    (GitResult(0, f"{SHA_A}\trefs/heads/fix/5-xy\n"), ""),  # another ref answered
+    (GitResult(0, "not-a-sha\trefs/heads/fix/5-x\n"), ""),
+])
+def test_the_remote_head_is_read_from_the_server_from_the_harness_checkout(result, head):
+    # Read-your-writes (PR #403): what a leg pushed, whatever it reports.
+    fg = FakeGit({"ls-remote": result})
+    assert Worktrees("/repo", run=fg).remote_head("fix/5-x") == head
+    assert fg.calls == [(["ls-remote", "origin", "refs/heads/fix/5-x"], "/repo")]
