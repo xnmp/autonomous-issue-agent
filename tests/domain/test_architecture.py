@@ -43,12 +43,29 @@ def test_policy_files_one_pass_then_readies_it_without_refiling():
     (action,) = architecture_actions(world(), H)
     assert isinstance(action, FileIssue)
     assert action.title == "Architecture pass (first)"
-    assert H.marker in action.body and "plugin/AGENT.md" in action.body
+    assert H.marker in action.body
     assert architecture_actions(world(PASS, observed=PassInFlight(PASS)), H) == (
         Relabel(Target.ISSUE, 7, None, Label.AI_READY),)
     ready = replace(PASS, labels=frozenset({Label.AI_READY}))
     assert architecture_actions(world(ready, observed=PassInFlight(ready)), H) == ()
     assert derive(world(ready), Local(now=NOW), H) == {issue_key(7): Dispatch(AgentKind.RESOLVE, tier=Tier.HIGH)}
+
+
+def test_issue_body_supplies_the_complete_bounded_pass_contract():
+    (action,) = architecture_actions(world(), H)
+    assert isinstance(action, FileIssue)
+    for instruction in (
+        "docs/architecture-pressure.md", "Covered through: <full commit sha on base>",
+        "from that SHA (exclusive) to the current base tip (inclusive)", "from the beginning",
+        "PRs' review threads", "residual sections", "seam", "evidence links", "trend",
+        "candidate intervention", "reconsideration trigger", "expiry", "drop expired entries",
+        "keep the ledger small", "defer", "at most **3**", "`tech-debt`", "Never mark",
+        "`ai-ready`", "link each from the ledger", "Closes #<issue>",
+    ):
+        assert instruction in action.body
+    assert "plugin/AGENT.md" not in action.body
+    assert len(action.body) < 3000
+    assert architecture_actions(world(observed=PassEnded(7, 5)), H)[0].body == action.body
 
 
 def test_needs_human_pass_is_neither_readied_nor_replaced():

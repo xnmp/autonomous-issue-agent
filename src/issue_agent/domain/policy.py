@@ -131,6 +131,31 @@ def blocker_closed_comment(marker: str, blocker: int) -> str:
             "the harness will not write that link again.")
 
 
+_ARCHITECTURE_TASK = """Review architectural pressure in the target repository.
+
+- Read `docs/architecture-pressure.md` and its line `Covered through: <full commit sha on base>`.
+  Inspect all changes from that SHA (exclusive) to the current base tip (inclusive);
+  when the line or ledger is absent, inspect from the beginning of the base history.
+  Read the related PRs' review threads and residual sections. Record the full base commit SHA
+  actually inspected in `Covered through`; never advance it to uninspected changes or use
+  the previous pass's completion time as the coverage boundary.
+- Update the ledger with these fields for each pressured seam: seam; evidence links
+  (commits, PRs, review threads, residuals); trend; candidate intervention (the smallest
+  abstraction that removes several special cases); reconsideration trigger (an explicit
+  intervention threshold); expiry. Ground each entry and intervention in that evidence.
+  Merge overlapping entries, drop expired entries and keep the ledger small. "defer" is
+  a valid verdict; do not invent refactors to fill a quota.
+- For entries past their intervention threshold, use `gh` to file at most **3** issues
+  labelled `tech-debt` across all legs of this pass. Check for existing filings first and
+  reuse them. Link this pass issue from each filing and link each from the ledger.
+  Never mark these issues `ai-ready`; a human chooses which debt to work. This is the
+  only exception to the fixer's issue-filing prohibition.
+- Commit and push your normal fix branch with the ledger update, even when the verdict
+  is defer. Follow the normal publication workflow and end the summary with `Closes #<issue>`;
+  the harness opens the PR and runs independent review and merge.
+"""
+
+
 def architecture_actions(world: WorldState, harness: Harness) -> tuple[Action, ...]:
     """File and ready an ordinary pass issue through the base-CI path (ADR 0017)."""
     observed = world.architecture
@@ -141,9 +166,7 @@ def architecture_actions(world: WorldState, harness: Harness) -> tuple[Action, .
     if not architecture_owed(observed):
         return ()
     title = f"Architecture pass (after #{observed.number})" if isinstance(observed, PassEnded) else "Architecture pass (first)"
-    return (FileIssue(title, f"{harness.marker}\nFollow the Architecture pass section of the fixer instructions "
-                      "in plugin/AGENT.md. Update docs/architecture-pressure.md, "
-                      "then commit and push your normal fix branch. The harness opens the PR.", f"architecture:{title}"),)
+    return (FileIssue(title, f"{harness.marker}\n{_ARCHITECTURE_TASK}", f"architecture:{title}"),)
 
 
 def base_ci_actions(health: BaseHealth | None, marker: str,

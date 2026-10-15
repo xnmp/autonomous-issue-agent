@@ -63,7 +63,7 @@ class Server(ServedGitHub):
             if '"Architecture pass"' in pairs["q"]:
                 self.pass_queries.append(pairs["q"])
                 result = self.search if self.search is not None else {
-                    "nodes": sorted(self.passes, key=lambda n: n["number"], reverse=True)[:5],
+                    "nodes": sorted(self.passes, key=lambda n: n["number"], reverse=True)[:20],
                     "issueCount": len(self.passes)}
             return json.dumps({"data": {"search": result}})
         return super().__call__(argv, token)
@@ -150,6 +150,27 @@ def test_older_pass_details_and_label_history_do_not_control_the_trigger():
 def test_non_bot_or_non_prefix_search_hits_are_ignored(changes):
     node = {**pass_issue(), **changes}
     assert filing(world(Server(passes=(node,))))[0].title == "Architecture pass (first)"
+
+
+@pytest.mark.parametrize("noise_count", [1, 6, 19])
+def test_newer_phrase_matches_do_not_hide_the_newest_genuine_pass(noise_count):
+    noise = tuple({**pass_issue(10 + n), "title": "Discuss Architecture pass"} for n in range(noise_count))
+    server = Server(passes=(pass_issue(6), pass_issue(7, closed=NOW.isoformat())) + noise,
+                    merges=work_merges(5))
+    assert filing(world(server))[0].title == "Architecture pass (after #7)"
+    assert len(server.pass_queries) == 1
+
+
+@pytest.mark.parametrize("total", [20, 21, 1000])
+def test_twenty_non_genuine_hits_are_unknown_not_owed_and_logged_once(total, capsys):
+    noise = [{**pass_issue(n), "title": "Discuss Architecture pass"} for n in range(1, 21)]
+    server = Server(search={"nodes": noise, "issueCount": total}, issues=(issue_node(),))
+    observed = world(server)
+    assert observed.architecture is None
+    assert architecture_actions(observed, H) == ()
+    assert [i.number for i in observed.issues] == [5]
+    assert not server.count_queries and len(server.pass_queries) == 1
+    assert capsys.readouterr().err.count("architecture unread this poll") == 1
 
 
 def test_a_merge_for_another_issue_or_repo_does_not_end_an_open_pass():
@@ -239,7 +260,7 @@ def test_optional_graphql_error_does_not_lose_ordinary_work():
     class ErrorServer(Server):
         def __call__(self, argv, token):
             result = super().__call__(argv, token)
-            if any(a.startswith("query=") and "first:5)" in a for a in argv):
+            if any(a.startswith("query=") and "first:20)" in a for a in argv):
                 return json.dumps({"data": {"search": None}, "errors": [{"message": "unreadable"}]})
             return result
     observed = world(ErrorServer(issues=(issue_node(),)))

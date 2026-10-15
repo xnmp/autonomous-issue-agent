@@ -359,7 +359,7 @@ _BASE_ISSUES = ("query($q:String!){search(query:$q,type:ISSUE,first:100){issueCo
                 "... on IssueComment{author{login} body} "
                 "... on ClosedEvent{closer{... on PullRequest{mergeCommit{oid}} ... on Commit{oid}}}}}}}}}")
 
-_PASS_ISSUES = ('query($q:String!){search(query:$q,type:ISSUE,first:5){issueCount nodes{... on Issue{'
+_PASS_ISSUES = ('query($q:String!){search(query:$q,type:ISSUE,first:20){issueCount nodes{... on Issue{'
                 'number title state closedAt author{login} ' + _LABELS + ' '
                 + _TIMELINE.format(before="") + '}}}}')
 _MERGED_COUNT = 'query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}'
@@ -889,7 +889,7 @@ class GitHubGateway:
                 f'repo:{self.repo} is:issue author:{filer} in:title "Architecture pass" sort:created-desc')).get("search")
             if (not isinstance(search, dict) or not isinstance(search.get("nodes"), list)
                     or type(search.get("issueCount")) is not int or not 0 <= search["issueCount"] <= 2**63 - 1
-                    or len(search["nodes"]) != min(5, search["issueCount"])):
+                    or len(search["nodes"]) != min(20, search["issueCount"])):
                 return None
             for node in search["nodes"]:
                 if (not isinstance(node, dict) or not isinstance(node.get("title"), str) or len(node["title"]) > 256
@@ -900,7 +900,9 @@ class GitHubGateway:
                 if architecture_pass(issue, filer):
                     break
             else:
-                return NoPass() if search["issueCount"] <= 5 else None
+                if search["issueCount"] >= 20:
+                    raise FixObservationIncomplete("no genuine pass among 20 search hits")
+                return NoPass()
             if node.get("state") not in ("OPEN", "CLOSED"):
                 return None
             issue = replace(issue, state=node["state"].lower(), labels=_complete_labels(node))

@@ -161,12 +161,15 @@ harness PR's merge time, or otherwise its issue's close time. The strict
 boundary excludes the pass PR itself. Only the newest pass matters: it is in
 flight while open without a merged harness PR, including when parked with
 `needs-human`. A merged PR ends even an issue left open on a non-default base.
-Each tick searches the newest five bot-authored pass issues, open or closed,
+Each tick searches the newest 20 bot-authored title hits, open or closed,
+filters by the exact `Architecture pass` prefix and takes the newest pass,
 with state, close time and existing harness-PR cross-reference facts, then
 counts merges after the end when needed: at most two extra GraphQL requests.
-Missing, malformed or truncated required facts defer filing. Ledger history,
-base-head comparisons and elapsed age do not participate in the trigger.
-There is no watermark, counter, table, daemon or configuration knob.
+Missing, malformed or truncated required facts defer filing. Twenty hits with
+no genuine pass also defer, with one log line per observation and no pagination.
+Ledger history, base-head comparisons and elapsed age do not participate in
+the trigger. There is no harness watermark, counter, table, daemon or
+configuration knob.
 
 Like required base-CI issues, the newest in-flight pass is readied with `ai-ready`
 unless already ready or marked `needs-human`. Recognition requires FIX_BOT's
@@ -176,11 +179,16 @@ STEWARD and TRIAGE and supplies a fixed HIGH starting tier through existing
 routing and escalation. Base-fix priority and base-failure charging remain
 specific to required base-CI repairs.
 
-The fixer prompt owns the pass instructions because the leg cannot read the
-harness checkout. The ledger holds evidence-linked pressure entries, trends,
-small candidate interventions, reconsideration thresholds and expiries; the
-agent merges entries and drops expired ones. Defer is valid. It may file at
-most three `tech-debt` issues for thresholds crossed, reuse existing issues,
+The harness-written issue body holds the complete fixed, bounded pass contract
+so both fixer and independent reviewer receive it without the harness checkout.
+The ledger records `Covered through: <full commit sha on base>`: each pass
+inspects changes after that commit through the current base tip, or from the
+beginning when absent, and records only the full base SHA actually inspected.
+Merges during review remain covered by the next pass even though the trigger
+counts only merges after completion. The ledger holds evidence-linked pressure
+entries, trends, small candidate interventions, reconsideration thresholds and
+expiries; the agent merges entries and drops expired ones. Defer is valid. It
+may file at most three `tech-debt` issues for thresholds crossed, reuse existing issues,
 and link them from the ledger, never marking them `ai-ready`. This bounded
 authority is the sole exception to the fixer's issue-filing prohibition.
 Both fix and review consult an entry when a change touches its seam.
