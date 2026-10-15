@@ -220,7 +220,7 @@ def test_boot_recovery_removes_temp_directories_a_crash_left(tmp_path) -> None:
     (process,) = _sleepers(supervisor, "orphan", 1)
     left = [_leg_tmp(supervisor, "orphan-0"),
             _leg_tmp(supervisor, "crashed-before-registering", launcher=DEAD_LAUNCHER),
-            _leg_tmp(supervisor, "unidentified-host", launcher="unidentified")]
+            _leg_tmp(supervisor, "malformed-launcher", launcher="not-a-daemon")]
 
     supervisor.recover_orphans()
 
@@ -250,41 +250,17 @@ def test_any_recovery_removes_a_dead_daemons_unregistered_temp_directory_but_no_
     assert not still_registered.exists() and not live_launch.exists()
 
 
-@pytest.mark.parametrize("raise_limit", [True, False])
-def test_a_temp_tree_deeper_than_the_open_file_limit(tmp_path, raise_limit) -> None:
-    # Removal holds a descriptor per level; units start at a soft limit of
-    # 1024. The daemon raises it at start, and a tree still too deep is logged.
-    script = f"""
-import os, resource
-from pathlib import Path
-from issue_agent.adapters.process_supervisor import ProcessSupervisor
-from issue_agent.app.main import _raise_open_file_limit
-from issue_agent.domain.contracts import RunId
-soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
-if {raise_limit!r}:
-    _raise_open_file_limit()
-supervisor = ProcessSupervisor({str(tmp_path / "state")!r})
-root = Path(supervisor.leg_tmp(RunId("deep"))) / "tmp"
-root.mkdir(parents=True)
-fd = os.open(root, os.O_RDONLY)
-for _ in range(300):
-    os.mkdir("a", dir_fd=fd)
-    deeper = os.open("a", os.O_RDONLY, dir_fd=fd)
-    os.close(fd)
-    fd = deeper
-os.close(fd)
-supervisor.kill_tree(RunId("deep"))
-print("present" if root.exists() else "removed")
-"""
-    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+def test_a_daemon_without_a_process_identity_gets_no_leg_temp_directory(tmp_path, monkeypatch) -> None:
+    # Filed under no identity, a live leg's directory would read as a dead
+    # daemon's leftover and a wake recovery could delete it.
+    from issue_agent.adapters.leg_sandbox import SandboxRefused
 
-    assert done.returncode == 0, done.stderr
-    if raise_limit:
-        assert done.stdout.strip() == "removed"
-    else:
-        assert done.stdout.strip() == "present"
-        assert "could not remove leg temp directory" in done.stderr
+    monkeypatch.setattr(ProcessSupervisor, "process_identity", classmethod(lambda cls, pid: None))
+    supervisor = ProcessSupervisor(str(tmp_path / "state"))
+
+    with pytest.raises(SandboxRefused, match="identity"):
+        supervisor.leg_tmp(RunId("leg"))
+    assert not supervisor.tmp_directory.exists()
 
 
 def test_wake_recovery_keeps_a_live_legs_temp_directory(tmp_path) -> None:

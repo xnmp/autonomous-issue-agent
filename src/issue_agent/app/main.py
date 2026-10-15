@@ -77,17 +77,23 @@ def _recover_pre_adapter_processes(cfg: HarnessConfig, role: str) -> tuple[RunId
     return tuple(recovered)
 
 
+_OPEN_FILES = 65536
+
+
 def _raise_open_file_limit() -> None:
-    """The soft open-file limit up to the hard one: removing a leg's temp
-    directory holds a descriptor per level of its tree, and units start at
-    systemd's 1024 (#470). Legs inherit it. Best-effort: a host that refuses
-    keeps its limit, and a tree too deep is logged at removal."""
+    """The soft open-file limit up to 65536, or the hard limit if lower:
+    removing a leg's temp directory holds a descriptor per level of its tree,
+    and units start at systemd's 1024 (#470). Legs inherit it, so it stops
+    short of a hard limit at nr_open (2^31), where programs that close every
+    descriptor or use select() break. Best-effort: a host that refuses keeps
+    its limit, and a tree too deep is logged at removal."""
     try:
         import resource
 
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if soft != hard:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        target = _OPEN_FILES if hard == resource.RLIM_INFINITY else min(hard, _OPEN_FILES)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
     except (ImportError, ValueError, OSError):  # macOS refuses an unlimited hard limit
         pass
 

@@ -20,6 +20,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .atomic_file import atomic_write
+from .leg_sandbox import SandboxRefused
 from ..domain.contracts import RunId
 from .signal_log import send_signal
 
@@ -129,11 +130,13 @@ class ProcessSupervisor:
         goes with the run's processes (`kill_tree`), or with recovery after a
         crash. It is filed under this daemon's identity, because the sandbox
         makes it before any launch intent exists: a recovery in another daemon
-        tells a crash's leftover from a live launch by that identity alone.
-        A host without /proc never launches (`prepare_launch` refuses it)."""
+        tells a crash's leftover from a live launch by that identity alone,
+        so a leg whose launcher has none is refused (a host without /proc)."""
         me = self.process_identity(os.getpid())
-        launcher = f"{me.pid}-{me.start_ticks}" if me is not None else "unidentified"
-        return str(self.tmp_directory / launcher / self._safe_name(run_id))
+        if me is None:
+            raise SandboxRefused("the daemon's process identity is unreadable (no /proc), so a leg's temp "
+                                 "directory could not be told from a crash's leftover")
+        return str(self.tmp_directory / f"{me.pid}-{me.start_ticks}" / self._safe_name(run_id))
 
     def prepare_launch(self, run_id: RunId) -> str:
         """Persist a generation-token intent before a provider can be spawned."""
