@@ -975,10 +975,12 @@ class GitHubGateway:
         return attempt
 
     def rerun_failed_checks(self, run_id: int) -> None:
-        """Request a completed run's failed-jobs re-run (a new run attempt).
-        The caller reads the attempt back: a refusal (403, a run still going)
-        comes back from the runner as an empty answer, not an error."""
-        self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"])
+        """Request a completed run's failed-jobs re-run (a new run attempt);
+        raises when GitHub refused it. A 2xx answer prints `{}`; the runner
+        turns a refusal (403, a run still going) into an empty answer. The
+        run read lags the POST, so the answer is the receipt, not a read-back."""
+        if not self._gh(["api", "--method", "POST", f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs"]).strip():
+            raise RuntimeError(f"run {run_id}: re-run refused")
 
     def update_branch(self, pr: int, expected_head: str) -> bool:
         """Merge base into a BEHIND head. Fail-soft: an 'already up to date' or

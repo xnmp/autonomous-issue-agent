@@ -550,12 +550,14 @@ def test_without_a_written_description_the_pr_still_names_its_issue(tmp_path, re
 
 # ── the harness's one re-run of a head (owner, PR #403) ─────────────────────
 class RunGateway(Gateway):
-    """Workflow runs by id -> current attempt; a POST re-run bumps it."""
+    """Workflow runs by id -> current attempt; a POST re-run bumps it, but the
+    run read lags it as GitHub's does (#433): `lagging` runs still read the old attempt."""
 
     def __init__(self, attempts):
         super().__init__()
         self.attempts = dict(attempts)
         self.inert_runs: set[int] = set()  # GitHub refuses these (403, too old): the attempt never moves
+        self.lagging: set[int] = set()
         self.reruns: list[int] = []
 
     def run_attempt(self, run_id):
@@ -563,7 +565,9 @@ class RunGateway(Gateway):
 
     def rerun_failed_checks(self, run_id):
         self.reruns.append(run_id)
-        if run_id not in self.inert_runs:
+        if run_id in self.inert_runs:
+            raise RuntimeError(f"run {run_id}: re-run refused")
+        if run_id not in self.lagging:
             self.attempts[run_id] += 1
 
 
@@ -585,6 +589,17 @@ def test_a_rerun_lands_once_with_one_journal_line_and_a_replay_posts_nothing(tmp
     assert [x for x in lines if "re-ran" in x] == [
         f"PR #7: re-ran the failed jobs of run {r} on h1h1h1h1h1h1 (the harness's one re-run of this head)"
         for r in (900, 901)]
+
+
+def test_a_rerun_whose_run_read_still_shows_the_old_attempt_counts_as_landed(tmp_path):
+    from issue_agent.domain.actions import RerunFailedJobs
+
+    gh, lines = RunGateway({900: 1}), []
+    gh.lagging = {900}  # 201 on the POST, old attempt on the immediate GET
+    _rerun_act(tmp_path, gh, lines).execute(RerunFailedJobs(7, "h1", ((900, 1),)))
+    assert gh.reruns == [900]
+    assert [x for x in lines if "re-ran" in x] == [
+        "PR #7: re-ran the failed jobs of run 900 on h1 (the harness's one re-run of this head)"]
 
 
 def test_a_refused_rerun_raises_after_journaling_the_runs_that_landed(tmp_path):
